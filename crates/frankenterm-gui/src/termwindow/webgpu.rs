@@ -25,7 +25,7 @@ use frankenterm_gui::glyph_quad_staging::{
     GlyphQuadSoaBuffers, GlyphQuadStagingInstance, GlyphQuadStagingVertex,
     moonshot_instanced_glyph_quads_enabled as lib_moonshot_instanced_glyph_quads_enabled,
 };
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::fmt;
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
@@ -192,7 +192,7 @@ impl fmt::Display for WebGpuSurfaceTextureError {
 }
 
 impl std::error::Error for WebGpuSurfaceTextureError {}
-const WEBGPU_PIPELINE_CACHE_WGPU_VERSION_LABEL: &str = "wgpu-25.0.2";
+const WEBGPU_PIPELINE_CACHE_WGPU_VERSION_LABEL: &str = "wgpu-29.0.3";
 const WEBGPU_SHADER_SOURCE: &str = include_str!("../shader.wgsl");
 
 // ft-6flqa: these presentation/scanout decision probes are kept compiled
@@ -655,10 +655,27 @@ pub struct WebGpuGlyphQuadInstanceBuffers {
     pub instance_count: u32,
 }
 
+/// An owned swapchain image acquired before CPU geometry construction.
+///
+/// The wrapper is intentionally not `Clone`: exactly one render attempt owns
+/// presentation or discard of the surface texture.
+pub(crate) struct AcquiredWebGpuFrame {
+    pub(crate) texture: wgpu::SurfaceTexture,
+    pub(crate) suboptimal: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SurfaceConfigureOutcome {
+    Ready,
+    DeferredZeroExtent,
+}
+
 pub struct WebGpuState {
     pub adapter_info: wgpu::AdapterInfo,
     pub downlevel_caps: wgpu::DownlevelCapabilities,
-    pub surface: wgpu::Surface<'static>,
+    instance: wgpu::Instance,
+    adapter: wgpu::Adapter,
+    surface: RefCell<wgpu::Surface<'static>>,
     pub device: wgpu::Device,
     pub queue: Arc<wgpu::Queue>,
     pub config: RefCell<wgpu::SurfaceConfiguration>,
@@ -672,6 +689,7 @@ pub struct WebGpuState {
     pub texture_bind_group_layout: wgpu::BindGroupLayout,
     pub texture_nearest_sampler: wgpu::Sampler,
     pub texture_linear_sampler: wgpu::Sampler,
+    needs_force_configure: Cell<bool>,
     pub handle: RawHandlePair,
 }
 
@@ -1140,6 +1158,18 @@ fn resize_surface_extent(dimensions: Dimensions) -> (u32, u32) {
     )
 }
 
+fn should_configure_surface(
+    previous_requested: (u32, u32),
+    configured: (u32, u32),
+    requested: (u32, u32),
+    force: bool,
+) -> bool {
+    force
+        || configured != requested
+        || previous_requested.0 == 0
+        || previous_requested.1 == 0
+}
+
 fn select_composite_alpha_mode(
     alpha_modes: &[wgpu::CompositeAlphaMode],
 ) -> wgpu::CompositeAlphaMode {
@@ -1520,7 +1550,9 @@ impl WebGpuState {
         Ok(Self {
             adapter_info,
             downlevel_caps,
-            surface,
+            instance,
+            adapter,
+            surface: RefCell::new(surface),
             device,
             queue,
             config: RefCell::new(config),
@@ -1534,6 +1566,7 @@ impl WebGpuState {
             texture_bind_group_layout,
             texture_nearest_sampler,
             texture_linear_sampler,
+            needs_force_configure: Cell::new(false),
         })
     }
 
@@ -1601,7 +1634,7 @@ impl WebGpuState {
     }
 
     #[allow(unused_mut)]
-    pub fn resize(&self, mut dims: Dimensions) {
+    fn effective_surface_dimensions(&self, mut dims: Dimensions) -> Dimensions {
         // During a live resize on Windows, the Dimensions that we're processing may be
         // lagging behind the true client size. We have to take the very latest value
         // from the window or else the underlying driver will raise an error about
@@ -1616,20 +1649,166 @@ impl WebGpuState {
             }
             _ => {}
         }
+        dims
+    }
 
-        if dims == *self.dimensions.borrow() {
-            return;
-        }
+    fn configure_surface(
+        &self,
+        dims: Dimensions,
+        force: bool,
+    ) -> anyhow::Result<SurfaceConfigureOutcome> {
+        let dims = self.effective_surface_dimensions(dims);
+        let previous_requested = *self.dimensions.borrow();
         *self.dimensions.borrow_mut() = dims;
-        let mut config = self.config.borrow_mut();
         let (width, height) = resize_surface_extent(dims);
-        config.width = width;
-        config.height = height;
-        if config.width > 0 && config.height > 0 {
-            // Avoid reconfiguring with a 0 sized surface, as webgpu will
-            // panic in that case
-            // <https://github.com/wezterm/wezterm/issues/2881>
-            self.surface.configure(&self.device, &config);
+        if width == 0 || height == 0 {
+            // Preserve the last valid applied configuration.  Mutating it to
+            // zero would make our model disagree with wgpu, which rejects a
+            // zero-sized configure call.
+            return Ok(SurfaceConfigureOutcome::DeferredZeroExtent);
+        }
+
+        let current = self.config.borrow().clone();
+        if !should_configure_surface(
+            resize_surface_extent(previous_requested),
+            (current.width, current.height),
+            (width, height),
+            force,
+        ) {
+            return Ok(SurfaceConfigureOutcome::Ready);
+        }
+
+        let mut next = current;
+        next.width = width;
+        next.height = height;
+        {
+            let surface = self.surface.borrow();
+            surface.configure(&self.device, &next);
+        }
+        *self.config.borrow_mut() = next;
+        self.needs_force_configure.set(false);
+        Ok(SurfaceConfigureOutcome::Ready)
+    }
+
+    /// Resize only when the applied pixel extent changed. Errors are logged
+    /// here because legacy resize notifications have no error return channel;
+    /// the acquisition path below repeats the operation with typed handling.
+    pub fn resize(&self, dims: Dimensions) {
+        if let Err(err) = self.configure_surface(dims, false) {
+            log::warn!("failed to resize webgpu surface: {err:#}");
+        }
+    }
+
+    /// Prepare the surface before acquisition. A suboptimal prior frame forces
+    /// same-size configuration only after that frame has been presented or
+    /// discarded.
+    pub(crate) fn prepare_surface(
+        &self,
+        dims: Dimensions,
+    ) -> anyhow::Result<SurfaceConfigureOutcome> {
+        let outcome = self.configure_surface(dims, false)?;
+        if outcome == SurfaceConfigureOutcome::Ready && self.needs_force_configure.get() {
+            return self.configure_surface(dims, true);
+        }
+        Ok(outcome)
+    }
+
+    pub(crate) fn force_configure(
+        &self,
+        dims: Dimensions,
+    ) -> anyhow::Result<SurfaceConfigureOutcome> {
+        self.configure_surface(dims, true)
+    }
+
+    pub(crate) fn recreate_surface(
+        &self,
+        dims: Dimensions,
+    ) -> anyhow::Result<SurfaceConfigureOutcome> {
+        let dims = self.effective_surface_dimensions(dims);
+        let (width, height) = resize_surface_extent(dims);
+        if width == 0 || height == 0 {
+            *self.dimensions.borrow_mut() = dims;
+            return Ok(SurfaceConfigureOutcome::DeferredZeroExtent);
+        }
+
+        let target = unsafe {
+            wgpu::SurfaceTargetUnsafe::from_display_and_window(&self.handle, &self.handle)?
+        };
+        let candidate: wgpu::Surface<'static> = unsafe {
+            self.instance.create_surface_unsafe(target)?
+        };
+        if !self.adapter.is_surface_supported(&candidate) {
+            return Err(anyhow!(
+                "replacement surface is incompatible with the active webgpu adapter"
+            ));
+        }
+
+        let caps = candidate.get_capabilities(&self.adapter);
+        let mut next = self.config.borrow().clone();
+        if !caps.formats.contains(&next.format) {
+            return Err(anyhow!(
+                "replacement surface does not support active pipeline format {:?}; renderer rebuild required",
+                next.format
+            ));
+        }
+        if !caps.usages.contains(next.usage) {
+            return Err(anyhow!(
+                "replacement surface does not support active usage {:?}; renderer rebuild required",
+                next.usage
+            ));
+        }
+        if !caps.present_modes.contains(&next.present_mode) {
+            if caps.present_modes.contains(&wgpu::PresentMode::Fifo) {
+                next.present_mode = wgpu::PresentMode::Fifo;
+            } else {
+                return Err(anyhow!(
+                    "replacement surface has no compatible presentation mode"
+                ));
+            }
+        }
+        next.alpha_mode = select_composite_alpha_mode(&caps.alpha_modes);
+        next.view_formats = select_surface_view_formats(next.format, &self.downlevel_caps);
+        next.width = width;
+        next.height = height;
+
+        // Configure the candidate before publishing it. No texture can refer
+        // to this fresh surface, so this cannot violate wgpu's live-texture
+        // configure precondition.
+        candidate.configure(&self.device, &next);
+        let old = self.surface.replace(candidate);
+        *self.config.borrow_mut() = next;
+        *self.dimensions.borrow_mut() = dims;
+        self.needs_force_configure.set(false);
+        drop(old);
+        Ok(SurfaceConfigureOutcome::Ready)
+    }
+
+    pub(crate) fn acquire_surface_frame(
+        &self,
+    ) -> Result<AcquiredWebGpuFrame, WebGpuSurfaceTextureError> {
+        let current = {
+            let surface = self.surface.borrow();
+            surface.get_current_texture()
+        };
+        match current {
+            wgpu::CurrentSurfaceTexture::Success(texture) => Ok(AcquiredWebGpuFrame {
+                texture,
+                suboptimal: false,
+            }),
+            wgpu::CurrentSurfaceTexture::Suboptimal(texture) => {
+                self.needs_force_configure.set(true);
+                Ok(AcquiredWebGpuFrame {
+                    texture,
+                    suboptimal: true,
+                })
+            }
+            wgpu::CurrentSurfaceTexture::Timeout => Err(WebGpuSurfaceTextureError::Timeout),
+            wgpu::CurrentSurfaceTexture::Occluded => Err(WebGpuSurfaceTextureError::Occluded),
+            wgpu::CurrentSurfaceTexture::Outdated => Err(WebGpuSurfaceTextureError::Outdated),
+            wgpu::CurrentSurfaceTexture::Lost => Err(WebGpuSurfaceTextureError::Lost),
+            wgpu::CurrentSurfaceTexture::Validation => {
+                Err(WebGpuSurfaceTextureError::Validation)
+            }
         }
     }
 }
@@ -1645,7 +1824,7 @@ mod tests {
         decide_webgpu_present_from_probe, decide_webgpu_tearing_free_present,
         initial_surface_extent, padded_readback_bytes_per_row, resize_surface_extent,
         select_composite_alpha_mode, select_surface_format, select_surface_view_formats,
-        select_view_formats_for_format, wait_for_webgpu_readback_map,
+        select_view_formats_for_format, should_configure_surface, wait_for_webgpu_readback_map,
         webgpu_direct_scanout_compositor, webgpu_pipeline_cache_hash, webgpu_vrr_probe_inputs,
     };
     use anyhow::anyhow;
@@ -1963,7 +2142,7 @@ mod tests {
         assert_eq!(probe.version.ft_binary_hash, 0xfeed_cafe);
         assert!(probe.driver_label.contains("nvidia"));
         assert!(probe.driver_label.contains("535.154.05"));
-        assert!(probe.cache_filename.ends_with("-wgpu-25.0.2.bin"));
+        assert!(probe.cache_filename.ends_with("-wgpu-29.0.3.bin"));
     }
 
     #[test]
@@ -2547,6 +2726,32 @@ mod tests {
             }),
             (0, u32::MAX)
         );
+    }
+
+    #[test]
+    fn same_extent_outdated_recovery_still_forces_configuration() {
+        assert!(!should_configure_surface(
+            (1280, 720),
+            (1280, 720),
+            (1280, 720),
+            false,
+        ));
+        assert!(should_configure_surface(
+            (1280, 720),
+            (1280, 720),
+            (1280, 720),
+            true,
+        ));
+    }
+
+    #[test]
+    fn restoring_from_zero_reconfigures_even_to_prior_applied_extent() {
+        assert!(should_configure_surface(
+            (0, 0),
+            (1280, 720),
+            (1280, 720),
+            false,
+        ));
     }
 
     #[test]

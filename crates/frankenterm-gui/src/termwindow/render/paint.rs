@@ -1,11 +1,9 @@
 use crate::termwindow::frame_budget::{OpKind, OpPriority};
-use crate::termwindow::{RenderFrame, TermWindowNotif};
-use ::window::WindowOps;
+use crate::termwindow::{DamageGeneration, RenderAttemptFailure};
 use ::window::bitmaps::atlas::{AtlasAllocationFailure, OutOfTextureSpace};
 use anyhow::Context;
 use frankenterm_core::frame_budget_a11y_gate::ReduceMotionState;
 use frankenterm_font::ClearShapeCache;
-use promise::spawn::sleep;
 use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -15,8 +13,34 @@ pub enum AllowImage {
     No,
 }
 
+/// A frame that crossed the renderer's synchronous presentation boundary.
+///
+/// OpenGL finish/swap and WebGPU submit/present have already returned
+/// successfully. This is deliberately not a claim of asynchronous GPU
+/// completion or visible scanout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PaintOutcome {
+    pub(crate) damage_generation: DamageGeneration,
+    post_present: PostPresentWork,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PostPresentWork {
+    animation_due: Option<Instant>,
+    should_schedule_animation: bool,
+    should_force_frame_budget_paint: bool,
+}
+
+const MAX_PAINT_PASSES: usize = 16;
+
 impl crate::TermWindow {
-    pub fn paint_impl(&mut self, frame: &mut RenderFrame) {
+    pub(crate) fn paint_impl<P>(
+        &mut self,
+        present: P,
+    ) -> Result<PaintOutcome, RenderAttemptFailure>
+    where
+        P: FnOnce(&mut Self) -> Result<(), RenderAttemptFailure>,
+    {
         self.num_frames += 1;
         // Per ft-d6nrd / ft-96uy6: tick the per-frame budget allocator
         // at the top of paint, then reconcile any carry-over cosmetic
@@ -42,119 +66,112 @@ impl crate::TermWindow {
             }
         }
 
-        'pass: for pass in 0.. {
-            let _dirty_quad_budget = self.frame_budget_should_run_render_op_with_reduce_motion(
-                OpKind::DirtyQuadRebuild,
-                OpPriority::Required,
-                frame_reduce_motion,
-            );
-            match self.paint_pass(frame_reduce_motion) {
-                Ok(_) => match self.render_state.as_mut() {
-                    Some(render_state) => {
-                        // NOTE: the previous revision deferred quad-buffer
-                        // *growth* while a resize gesture was active. That was
-                        // a perf optimization to avoid per-resize-event GPU
-                        // buffer reallocations, but it was incorrect: the
-                        // geometry pass had already written `next_quad`
-                        // quads to a buffer whose capacity is now too small,
-                        // so the subsequent draw call sliced out-of-range
-                        // (panic before the unwrap→let-else fix at
-                        // draw.rs:264, transparent window after it). Always
-                        // grow on demand. Elastic-buffer *shrinking* during a
-                        // gesture is still deferred via
-                        // ElasticBuffer::try_shrink_if_idle — that's a
-                        // separate concern handled in elastic_buffer.rs.
-
-                        match render_state.allocate_more_quads() {
-                            Ok(change) => {
-                                let snapshot = render_state.quad_allocation_snapshot();
-                                self.quad_buffer_policy.record_live_allocation(
-                                    snapshot.used,
-                                    snapshot.capacity,
-                                    change.reallocation_count,
-                                );
-                                if !change.allocated {
-                                    break 'pass;
-                                }
-                                self.invalidate_fancy_tab_bar();
-                                self.invalidate_modal();
-                            }
-                            Err(err) => {
-                                log::error!("{:#}", err);
-                                break 'pass;
-                            }
-                        }
-                    }
-                    None => {
-                        log::error!("paint_pass succeeded without initialized render state");
-                        break 'pass;
-                    }
-                },
-                Err(err) => {
-                    if let Some(&OutOfTextureSpace {
-                        size: Some(size),
-                        current_size,
-                        failure: AtlasAllocationFailure::Capacity,
-                        ..
-                    }) = err.root_cause().downcast_ref::<OutOfTextureSpace>()
-                    {
-                        let result = if pass == 0 {
-                            // Let's try clearing out the atlas and trying again
-                            // self.clear_texture_atlas()
-                            log::trace!("recreate_texture_atlas");
-                            self.recreate_texture_atlas(Some(current_size))
-                        } else {
-                            log::trace!("grow texture atlas to {}", size);
-                            self.recreate_texture_atlas(Some(size))
-                        };
-                        self.invalidate_fancy_tab_bar();
-                        self.invalidate_modal();
-
-                        if let Err(err) = result {
-                            self.allow_images = match self.allow_images {
-                                AllowImage::Yes => AllowImage::Scale(2),
-                                AllowImage::Scale(2) => AllowImage::Scale(4),
-                                AllowImage::Scale(4) => AllowImage::Scale(8),
-                                AllowImage::Scale(8) => AllowImage::No,
-                                AllowImage::No | _ => {
-                                    log::error!(
-                                        "Failed to {} texture: {}",
-                                        if pass == 0 { "clear" } else { "resize" },
-                                        err
+        let geometry_result = 'pass: {
+            for pass in 0..MAX_PAINT_PASSES {
+                let _dirty_quad_budget = self
+                    .frame_budget_should_run_render_op_with_reduce_motion(
+                        OpKind::DirtyQuadRebuild,
+                        OpPriority::Required,
+                        frame_reduce_motion,
+                    );
+                match self.paint_pass(frame_reduce_motion) {
+                    Ok(_) => match self.render_state.as_mut() {
+                        Some(render_state) => {
+                            // NOTE: the previous revision deferred quad-buffer
+                            // *growth* while a resize gesture was active. That was
+                            // incorrect because geometry had already outgrown the
+                            // buffer. Always grow on demand; idle shrinking remains
+                            // separately gated in elastic_buffer.rs.
+                            match render_state.allocate_more_quads() {
+                                Ok(change) => {
+                                    let snapshot = render_state.quad_allocation_snapshot();
+                                    self.quad_buffer_policy.record_live_allocation(
+                                        snapshot.used,
+                                        snapshot.capacity,
+                                        change.reallocation_count,
                                     );
-                                    break 'pass;
+                                    if !change.allocated {
+                                        break 'pass Ok(());
+                                    }
+                                    self.invalidate_fancy_tab_bar();
+                                    self.invalidate_modal();
                                 }
-                            };
-
-                            log::info!(
-                                "Not enough texture space ({:#}); \
-                                     will retry render with {:?}",
-                                err,
-                                self.allow_images,
-                            );
+                                Err(err) => {
+                                    break 'pass Err(err.context("allocate_more_quads"));
+                                }
+                            }
                         }
-                    } else if err.root_cause().downcast_ref::<ClearShapeCache>().is_some() {
-                        self.invalidate_fancy_tab_bar();
-                        self.invalidate_modal();
-                        self.shape_generation += 1;
-                        self.shape_cache.borrow_mut().clear();
-                        self.line_to_ele_shape_cache.borrow_mut().clear();
-                    } else {
-                        log::error!("paint_pass failed: {:#}", err);
-                        break 'pass;
+                        None => {
+                            break 'pass Err(anyhow::anyhow!(
+                                "paint_pass succeeded without initialized render state"
+                            ));
+                        }
+                    },
+                    Err(err) => {
+                        if let Some(&OutOfTextureSpace {
+                            size: Some(size),
+                            current_size,
+                            failure: AtlasAllocationFailure::Capacity,
+                            ..
+                        }) = err.root_cause().downcast_ref::<OutOfTextureSpace>()
+                        {
+                            let result = if pass == 0 {
+                                log::trace!("recreate_texture_atlas");
+                                self.recreate_texture_atlas(Some(current_size))
+                            } else {
+                                log::trace!("grow texture atlas to {}", size);
+                                self.recreate_texture_atlas(Some(size))
+                            };
+                            self.invalidate_fancy_tab_bar();
+                            self.invalidate_modal();
+
+                            if let Err(err) = result {
+                                self.allow_images = match self.allow_images {
+                                    AllowImage::Yes => AllowImage::Scale(2),
+                                    AllowImage::Scale(2) => AllowImage::Scale(4),
+                                    AllowImage::Scale(4) => AllowImage::Scale(8),
+                                    AllowImage::Scale(8) => AllowImage::No,
+                                    AllowImage::No => {
+                                        break 'pass Err(err.context(if pass == 0 {
+                                            "clear texture atlas"
+                                        } else {
+                                            "resize texture atlas"
+                                        }));
+                                    }
+                                };
+
+                                log::info!(
+                                    "Not enough texture space ({:#}); \
+                                         will retry render with {:?}",
+                                    err,
+                                    self.allow_images,
+                                );
+                            }
+                        } else if err.root_cause().downcast_ref::<ClearShapeCache>().is_some() {
+                            self.invalidate_fancy_tab_bar();
+                            self.invalidate_modal();
+                            self.shape_generation += 1;
+                            self.shape_cache.borrow_mut().clear();
+                            self.line_to_ele_shape_cache.borrow_mut().clear();
+                        } else {
+                            break 'pass Err(err.context("paint_pass"));
+                        }
                     }
                 }
             }
-        }
-        log::debug!("paint_impl before call_draw elapsed={:?}", start.elapsed());
 
-        self.call_draw(frame).ok();
-        // Per ft-jvj78 (cont of ft-5ykn9): consult the substrate's
-        // `should_clear_at_frame_end` predicate and reset every
-        // per-pane dirty bitmap when allowed. Coarse whole-screen
-        // invalidations (font/theme/resize/focus) leave the marks
-        // across the boundary so the next paint still observes them.
-        self.clear_dirty_lines_after_frame();
+            break 'pass Err(anyhow::anyhow!(
+                "paint did not converge within {MAX_PAINT_PASSES} passes"
+            ));
+        };
+
+        let present_result = geometry_result
+            .map_err(RenderAttemptFailure::paint)
+            .and_then(|()| {
+                log::debug!("paint_impl before call_draw elapsed={:?}", start.elapsed());
+                let damage_generation = self.damage_generation();
+                present(self).map(|()| damage_generation)
+            });
 
         // Scheduling the next animation frame is cosmetic: reduce-motion
         // skips it entirely, and frame pressure defers it into the
@@ -167,9 +184,8 @@ impl crate::TermWindow {
                 frame_reduce_motion,
             );
         let _bulk_drained = self.frame_budget_try_bulk_drain_cosmetic();
-        // Per ft-d6nrd / ft-96uy6: close out the allocator after
-        // draining cosmetic carry-over so `frame_budget_telemetry()`
-        // reflects real render decisions from this frame.
+        // Close out the allocator even when geometry/draw fails so frame-budget
+        // accounting cannot leak across retries.
         let _frame_end = self.frame_budget_end_frame();
         let should_force_frame_budget_paint = self.frame_budget_should_force_paint();
         self.last_frame_duration = start.elapsed();
@@ -181,42 +197,30 @@ impl crate::TermWindow {
         metrics::histogram!("gui.paint.impl").record(self.last_frame_duration);
         metrics::histogram!("gui.paint.impl.rate").record(1.);
 
-        // If self.has_animation is some, then the last render detected
-        // image attachments with multiple frames, so we also need to
-        // invalidate the viewport when the next frame is due
-        if should_force_frame_budget_paint {
+        present_result.map(|damage_generation| PaintOutcome {
+            damage_generation,
+            post_present: PostPresentWork {
+                animation_due,
+                should_schedule_animation,
+                should_force_frame_budget_paint,
+            },
+        })
+    }
+
+    /// Runs invalidations that are valid only after the backend has accepted
+    /// presentation. Keeping this out of `paint_impl` prevents a failed OpenGL
+    /// swap from bypassing the bounded retry lane via an immediate animation or
+    /// frame-budget repaint.
+    pub(crate) fn complete_presented_paint(&mut self, outcome: PaintOutcome) {
+        if outcome.post_present.should_force_frame_budget_paint {
             if let Some(window) = self.window.clone() {
                 window.invalidate();
             }
         }
 
-        if self.focused.is_some() && should_schedule_animation {
-            if let Some(next_due) = animation_due {
-                let prior = self.scheduled_animation.borrow_mut().take();
-                match prior {
-                    Some(prior) if prior <= next_due => {
-                        // Already due before that time
-                    }
-                    _ => {
-                        self.scheduled_animation.borrow_mut().replace(next_due);
-                        if let Some(window) = self.window.clone() {
-                            promise::spawn::spawn(async move {
-                                sleep(next_due.saturating_duration_since(Instant::now())).await;
-                                let win = window.clone();
-                                window.notify(TermWindowNotif::Apply(Box::new(move |tw| {
-                                    tw.scheduled_animation.borrow_mut().take();
-                                    win.invalidate();
-                                })));
-                            })
-                            .detach();
-                        } else {
-                            log::debug!(
-                                "Skipping scheduled animation invalidation for detached window"
-                            );
-                            self.scheduled_animation.borrow_mut().take();
-                        }
-                    }
-                }
+        if self.focused.is_some() && outcome.post_present.should_schedule_animation {
+            if let Some(next_due) = outcome.post_present.animation_due {
+                self.schedule_animation_wake(next_due);
             }
         }
     }

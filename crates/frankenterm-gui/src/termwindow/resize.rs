@@ -60,6 +60,12 @@ impl super::TermWindow {
             return;
         }
 
+        // A real non-zero resize is a legitimate recovery signal for a stale,
+        // lost, timed-out, or occluded presentation surface. It may reopen
+        // only those surface-related recovery states; renderer invariant
+        // circuits remain closed until reinitialization.
+        self.note_render_surface_recovery_signal();
+
         // ft-kciew: notify the quad-buffer policy of the gesture
         // boundary so the underlying GPU buffer (continuation
         // bead) won't reallocate during a drag. Idempotent on an

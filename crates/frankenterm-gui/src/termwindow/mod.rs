@@ -20,7 +20,8 @@ use crate::termwindow::background::{
 };
 use crate::termwindow::keyevent::{KeyTableArgs, KeyTableState};
 use crate::termwindow::modal::Modal;
-use crate::termwindow::render::paint::AllowImage;
+use crate::termwindow::render::draw::{DrawFailure, DrawFailureStage};
+use crate::termwindow::render::paint::{AllowImage, PaintOutcome};
 use crate::termwindow::render::{
     CachedLineState, LineQuadCacheKey, LineQuadCacheValue, LineToEleShapeCacheKey,
     LineToElementShapeItem,
@@ -59,6 +60,7 @@ use frankenterm_gui::triple_buffer_gui::{
 use frankenterm_gui::{
     terminal_pane_id_to_u64, terminal_u16_from_stable_delta, terminal_u16_from_usize,
 };
+use futures::future::{AbortHandle, AbortRegistration, Abortable};
 use frankenterm_toast_notification::persistent_toast_notification;
 use lfucache::*;
 use mlua::{FromLua, LuaSerdeExt, UserData, UserDataFields};
@@ -935,6 +937,10 @@ pub struct TermWindow {
     /// invalidate everything (font swap, theme change). Both
     /// signals are consumed by the render path together.
     dirty_lines: HashMap<PaneId, render::dirty_lines::DirtyLineBitmap>,
+    /// Monotonic identity of dirty-state mutations. A frame captures this
+    /// immediately before draw and may settle damage only if presentation
+    /// succeeds with the same non-exhausted generation.
+    damage_generation: DamageGeneration,
     /// Tracks whether the last dirty-marking event observed by this
     /// TermWindow was a coarse whole-screen invalidation (font swap,
     /// theme change, resize, focus change). Per the
@@ -946,6 +952,14 @@ pub struct TermWindow {
     /// (cont of ft-5ykn9). Each whole-screen event source flips this
     /// flag; per-cell sources leave it false.
     last_dirty_event_was_whole_screen: bool,
+    /// Admission/circuit state for renderer recovery.  Dirty state continues
+    /// to accumulate while a retry is cooling down, but expensive geometry is
+    /// admitted only by a healthy renderer or an exact retry ticket.
+    render_recovery_state: RenderRecoveryState,
+    /// Single cancellable wake lane shared by renderer retries and animation.
+    /// Ticket validation remains authoritative even if cancellation races a
+    /// task that has already posted its notification.
+    render_wake_state: RenderWakeState,
     /// Gate for the iter-dirty render-pass clean-line accounting
     /// path (ft-8pcwy / ft-jvj78 / ft-gwzrm). The live source
     /// wiring marks PTY, cursor, selection, and whole-screen events
@@ -1076,8 +1090,6 @@ pub struct TermWindow {
     /// We use this to attempt to do something reasonable
     /// if we run out of texture space
     allow_images: AllowImage,
-    scheduled_animation: RefCell<Option<Instant>>,
-
     created: Instant,
 
     pub last_frame_duration: Duration,
@@ -1376,7 +1388,49 @@ pub(crate) fn evaluate_frame_budget_reduce_motion_gate(
     frame_budget_a11y::evaluate_reduce_motion_gate(a11y_op, motion, base)
 }
 
-/// Free-function helper for `TermWindow::clear_dirty_lines_after_frame`
+/// Monotonic identity of the dirty state captured by a frame.
+///
+/// Exhaustion is sticky: once `u64::MAX` cannot be advanced, no frame may
+/// clear dirty state until the renderer is reconstructed. This avoids the
+/// false equality that a saturating counter would otherwise create.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct DamageGeneration {
+    value: u64,
+    exhausted: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DamageAdvanceOutcome {
+    Advanced,
+    ExhaustedNow,
+    AlreadyExhausted,
+}
+
+impl DamageGeneration {
+    fn advance(&mut self) -> DamageAdvanceOutcome {
+        if self.exhausted {
+            return DamageAdvanceOutcome::AlreadyExhausted;
+        }
+        match self.value.checked_add(1) {
+            Some(next) => {
+                self.value = next;
+                DamageAdvanceOutcome::Advanced
+            }
+            None => {
+                self.exhausted = true;
+                DamageAdvanceOutcome::ExhaustedNow
+            }
+        }
+    }
+
+    const fn can_commit(self, captured: Self) -> bool {
+        !self.exhausted
+            && self.value == captured.value
+            && self.exhausted == captured.exhausted
+    }
+}
+
+/// Free-function helper for frame damage settlement
 /// so the predicate wiring is unit-testable without needing to
 /// stand up a full `TermWindow`. Per ft-jvj78.
 ///
@@ -1402,6 +1456,191 @@ fn run_clear_dirty_lines_after_frame(
     // Always reset — the next whole-screen event must set the flag
     // explicitly via `mark_all_panes_dirty`.
     *last_was_whole_screen = false;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum RenderFailureStage {
+    Paint,
+    Draw(DrawFailureStage),
+    SurfaceAcquire(webgpu::WebGpuSurfaceTextureError),
+    BackendFinish,
+    /// Injectable settlement stage. The current wgpu submit API is
+    /// synchronously infallible; asynchronous device loss is outside this seam.
+    #[allow(dead_code)]
+    Submission,
+    /// Injectable settlement stage. The current wgpu present API returns `()`;
+    /// asynchronous presentation/device errors are outside this seam.
+    #[allow(dead_code)]
+    Present,
+}
+
+impl RenderFailureStage {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Paint => "paint",
+            Self::Draw(stage) => stage.label(),
+            Self::SurfaceAcquire(webgpu::WebGpuSurfaceTextureError::Timeout) => {
+                "surface_timeout"
+            }
+            Self::SurfaceAcquire(webgpu::WebGpuSurfaceTextureError::Occluded) => {
+                "surface_occluded"
+            }
+            Self::SurfaceAcquire(webgpu::WebGpuSurfaceTextureError::Outdated) => {
+                "surface_outdated"
+            }
+            Self::SurfaceAcquire(webgpu::WebGpuSurfaceTextureError::Lost) => "surface_lost",
+            Self::SurfaceAcquire(webgpu::WebGpuSurfaceTextureError::Validation) => {
+                "surface_validation"
+            }
+            Self::BackendFinish => "backend_finish",
+            Self::Submission => "submission",
+            Self::Present => "present",
+        }
+    }
+
+    const fn accepts_surface_recovery_signal(self) -> bool {
+        matches!(
+            self,
+            Self::SurfaceAcquire(webgpu::WebGpuSurfaceTextureError::Timeout)
+                | Self::SurfaceAcquire(webgpu::WebGpuSurfaceTextureError::Occluded)
+                | Self::SurfaceAcquire(webgpu::WebGpuSurfaceTextureError::Outdated)
+                | Self::SurfaceAcquire(webgpu::WebGpuSurfaceTextureError::Lost)
+        )
+    }
+}
+
+/// A typed failure for one admitted render attempt.
+///
+/// Keeping the stage beside the source means retry policy never depends on
+/// parsing an error string or traversing an `anyhow` chain.  OpenGL can also
+/// retain a draw error as primary while recording a failed mandatory frame
+/// finish as secondary.
+#[derive(Debug)]
+pub(crate) struct RenderAttemptFailure {
+    stage: RenderFailureStage,
+    source: anyhow::Error,
+    secondary_finish: Option<anyhow::Error>,
+}
+
+impl RenderAttemptFailure {
+    pub(crate) fn new(stage: RenderFailureStage, source: anyhow::Error) -> Self {
+        Self {
+            stage,
+            source,
+            secondary_finish: None,
+        }
+    }
+
+    pub(crate) fn paint(source: anyhow::Error) -> Self {
+        Self::new(RenderFailureStage::Paint, source)
+    }
+
+    fn draw(source: anyhow::Error) -> Self {
+        let stage = source
+            .downcast_ref::<DrawFailure>()
+            .map_or(DrawFailureStage::RenderCommands, DrawFailure::stage);
+        Self::new(RenderFailureStage::Draw(stage), source)
+    }
+
+    fn backend_finish(source: anyhow::Error) -> Self {
+        Self::new(RenderFailureStage::BackendFinish, source)
+    }
+
+    fn with_secondary_finish(mut self, source: anyhow::Error) -> Self {
+        self.secondary_finish = Some(source);
+        self
+    }
+
+    const fn stage(&self) -> RenderFailureStage {
+        self.stage
+    }
+}
+
+impl std::fmt::Display for RenderAttemptFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} render failure: {:#}", self.stage.label(), self.source)?;
+        if let Some(secondary) = &self.secondary_finish {
+            write!(f, "; frame finish also failed: {secondary:#}")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for RenderAttemptFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
+
+fn combine_glium_draw_and_finish(
+    draw_result: anyhow::Result<()>,
+    finish_result: anyhow::Result<()>,
+) -> Result<(), RenderAttemptFailure> {
+    match (draw_result, finish_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(draw), Ok(())) => Err(RenderAttemptFailure::draw(draw)),
+        (Ok(()), Err(finish)) => Err(RenderAttemptFailure::backend_finish(finish)),
+        (Err(draw), Err(finish)) => {
+            Err(RenderAttemptFailure::draw(draw).with_secondary_finish(finish))
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum FrameCompletion {
+    Presented(DamageGeneration),
+    Failed(RenderFailureStage),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DamageCommitOutcome {
+    Cleared,
+    RetainedWholeScreen,
+    RetainedStale,
+    RetainedFailure,
+    RetainedEpochExhausted,
+}
+
+impl DamageCommitOutcome {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Cleared => "cleared",
+            Self::RetainedWholeScreen => "retained_whole_screen",
+            Self::RetainedStale => "retained_stale",
+            Self::RetainedFailure => "retained_failure",
+            Self::RetainedEpochExhausted => "retained_epoch_exhausted",
+        }
+    }
+
+    const fn needs_follow_up_paint(self) -> bool {
+        matches!(self, Self::RetainedWholeScreen | Self::RetainedStale)
+    }
+}
+
+fn settle_frame_damage(
+    bitmaps: &mut HashMap<PaneId, render::dirty_lines::DirtyLineBitmap>,
+    last_was_whole_screen: &mut bool,
+    current_generation: DamageGeneration,
+    completion: FrameCompletion,
+) -> DamageCommitOutcome {
+    match completion {
+        FrameCompletion::Failed(_stage) => DamageCommitOutcome::RetainedFailure,
+        FrameCompletion::Presented(_) if current_generation.exhausted => {
+            DamageCommitOutcome::RetainedEpochExhausted
+        }
+        FrameCompletion::Presented(captured) if !current_generation.can_commit(captured) => {
+            DamageCommitOutcome::RetainedStale
+        }
+        FrameCompletion::Presented(_) => {
+            let retained_whole_screen = *last_was_whole_screen;
+            run_clear_dirty_lines_after_frame(bitmaps, last_was_whole_screen);
+            if retained_whole_screen {
+                DamageCommitOutcome::RetainedWholeScreen
+            } else {
+                DamageCommitOutcome::Cleared
+            }
+        }
+    }
 }
 
 impl TermWindow {
@@ -1525,6 +1764,27 @@ impl TermWindow {
             bitmap.mark_all();
         }
         self.last_dirty_event_was_whole_screen = true;
+        self.advance_damage_generation();
+    }
+
+    pub(crate) const fn damage_generation(&self) -> DamageGeneration {
+        self.damage_generation
+    }
+
+    fn advance_damage_generation(&mut self) {
+        if self.damage_generation.advance() == DamageAdvanceOutcome::ExhaustedNow {
+            // A saturated epoch must never compare equal to arbitrary later
+            // damage. Make exhaustion sticky and conservatively retain a full
+            // repaint until this TermWindow is reconstructed.
+            for bitmap in self.dirty_lines.values_mut() {
+                bitmap.mark_all();
+            }
+            self.last_dirty_event_was_whole_screen = true;
+            metrics::counter!("gui.render.damage_epoch_exhausted").increment(1);
+            log::error!(
+                "render damage generation exhausted; retaining full damage until reconstruction"
+            );
+        }
     }
 
     /// Lazy getter for a pane's dirty bitmap. Sizes the bitmap to
@@ -1542,6 +1802,13 @@ impl TermWindow {
         if bitmap.capacity() != visible_rows {
             bitmap.resize(visible_rows);
         }
+        // Every live caller marks rows and invokes `record_dirty_event` once
+        // after this getter; that call fences both bitmap creation/resize and
+        // the row mutation with one generation advance. Once the epoch is
+        // exhausted, new/grown bitmaps must join the sticky full-redraw set.
+        if self.damage_generation.exhausted {
+            bitmap.mark_all();
+        }
         bitmap
     }
 
@@ -1549,21 +1816,183 @@ impl TermWindow {
     /// this the HashMap would leak entries for every pane the user
     /// has ever opened.
     pub fn forget_dirty_lines_for_pane(&mut self, pane_id: PaneId) {
-        self.dirty_lines.remove(&pane_id);
+        if self.dirty_lines.remove(&pane_id).is_some() {
+            self.advance_damage_generation();
+        }
     }
 
-    /// Frame-end hook: clear every per-pane dirty bitmap iff the
-    /// substrate's `should_clear_at_frame_end` predicate says so.
-    /// Coarse whole-screen events (font/theme/resize/focus) leave
-    /// the marks across the boundary so the next frame still sees
-    /// them. Per ft-jvj78 (cont of ft-5ykn9).
-    ///
-    /// Called from `paint_impl` after the frame has been submitted.
-    pub fn clear_dirty_lines_after_frame(&mut self) {
-        run_clear_dirty_lines_after_frame(
+    fn settle_render_damage(&mut self, completion: FrameCompletion) -> DamageCommitOutcome {
+        let outcome = settle_frame_damage(
             &mut self.dirty_lines,
             &mut self.last_dirty_event_was_whole_screen,
+            self.damage_generation,
+            completion,
         );
+        metrics::counter!("gui.render.damage_settlement", "outcome" => outcome.label())
+            .increment(1);
+        outcome
+    }
+
+    fn complete_presented_frame(&mut self, outcome: PaintOutcome) {
+        let settlement = self.settle_render_damage(FrameCompletion::Presented(
+            outcome.damage_generation,
+        ));
+        self.render_recovery_state.record_success();
+        if self.render_wake_state.cancel() {
+            metrics::counter!("gui.render.retry", "action" => "cancelled_by_success")
+                .increment(1);
+        }
+        self.complete_presented_paint(outcome);
+        if settlement.needs_follow_up_paint() {
+            if let Some(window) = self.window.as_ref() {
+                window.invalidate();
+            }
+        }
+    }
+
+    fn retain_failed_frame(&mut self, stage: RenderFailureStage) {
+        let _ = self.settle_render_damage(FrameCompletion::Failed(stage));
+        metrics::counter!("gui.render.frame_failure", "stage" => stage.label()).increment(1);
+    }
+
+    fn plan_render_wake(
+        &mut self,
+        reason: RenderWakeReason,
+        due: Instant,
+    ) -> Option<RenderWakeTicket> {
+        let Some(window) = self.window.clone() else {
+            log::debug!("cannot schedule render wake for detached window");
+            return None;
+        };
+
+        let now = Instant::now();
+        match self.render_wake_state.plan(reason, due, now) {
+            RenderWakePlan::Kept { ticket } => {
+                metrics::counter!("gui.render.wake", "action" => "kept").increment(1);
+                Some(ticket)
+            }
+            RenderWakePlan::Schedule {
+                ticket,
+                delay,
+                registration,
+            } => {
+                metrics::counter!("gui.render.wake", "action" => "scheduled").increment(1);
+                metrics::histogram!("gui.render.wake_delay_ms")
+                    .record(delay.as_secs_f64() * 1_000.0);
+                log::debug!(
+                    "scheduled {:?} render wake ticket {} after {:?}",
+                    reason,
+                    ticket.0,
+                    delay
+                );
+                promise::spawn::spawn(async move {
+                    let _ = Abortable::new(
+                        async move {
+                            sleep(delay).await;
+                            let wake_window = window.clone();
+                            window.notify(TermWindowNotif::Apply(Box::new(move |tw| {
+                                match tw.render_wake_state.dispatch(ticket) {
+                                    RenderWakeDispatch::Fired(RenderWakeReason::Retry(_stage)) => {
+                                        if tw.render_recovery_state.mark_retry_ready(ticket) {
+                                            metrics::counter!(
+                                                "gui.render.retry",
+                                                "action" => "dispatched"
+                                            )
+                                            .increment(1);
+                                            wake_window.invalidate();
+                                        } else {
+                                            metrics::counter!(
+                                                "gui.render.retry",
+                                                "action" => "stale_recovery"
+                                            )
+                                            .increment(1);
+                                        }
+                                    }
+                                    RenderWakeDispatch::Fired(RenderWakeReason::Animation) => {
+                                        metrics::counter!(
+                                            "gui.render.animation_wake",
+                                            "action" => "dispatched"
+                                        )
+                                        .increment(1);
+                                        wake_window.invalidate();
+                                    }
+                                    RenderWakeDispatch::Stale => {
+                                        metrics::counter!(
+                                            "gui.render.wake",
+                                            "action" => "stale"
+                                        )
+                                        .increment(1);
+                                    }
+                                }
+                            })));
+                        },
+                        registration,
+                    )
+                    .await;
+                })
+                .detach();
+                Some(ticket)
+            }
+            RenderWakePlan::Exhausted => {
+                metrics::counter!("gui.render.wake", "action" => "ticket_exhausted")
+                    .increment(1);
+                log::error!("render wake ticket space exhausted; opening renderer circuit");
+                None
+            }
+        }
+    }
+
+    fn schedule_render_retry(&mut self, stage: RenderFailureStage, delay: Duration) {
+        let now = Instant::now();
+        let due = now.checked_add(delay).unwrap_or(now);
+        match self.plan_render_wake(RenderWakeReason::Retry(stage), due) {
+            Some(ticket) => {
+                self.render_recovery_state.enter_cooldown(ticket, stage);
+                metrics::counter!("gui.render.retry", "action" => "scheduled").increment(1);
+            }
+            None => self.render_recovery_state.open_circuit(stage),
+        }
+    }
+
+    pub(crate) fn schedule_animation_wake(&mut self, due: Instant) {
+        if !matches!(self.render_recovery_state.mode, RenderRecoveryMode::Healthy) {
+            metrics::counter!("gui.render.animation_wake", "action" => "suppressed_recovery")
+                .increment(1);
+            return;
+        }
+        let _ = self.plan_render_wake(RenderWakeReason::Animation, due);
+    }
+
+    fn handle_render_failure(&mut self, failure: &RenderAttemptFailure) {
+        let stage = failure.stage();
+        self.retain_failed_frame(stage);
+        match self.render_recovery_state.record_failure(stage) {
+            RenderRecoveryDirective::RetryAfter(delay) => {
+                self.schedule_render_retry(stage, delay);
+            }
+            RenderRecoveryDirective::Park => {
+                self.render_wake_state.cancel();
+                self.render_recovery_state.park(stage);
+                metrics::counter!("gui.render.retry", "action" => "parked").increment(1);
+            }
+            RenderRecoveryDirective::OpenCircuit => {
+                self.render_wake_state.cancel();
+                self.render_recovery_state.open_circuit(stage);
+                metrics::counter!("gui.render.retry", "action" => "circuit_open")
+                    .increment(1);
+            }
+        }
+    }
+
+    pub(crate) fn note_render_surface_recovery_signal(&mut self) {
+        if self
+            .render_recovery_state
+            .record_surface_recovery_signal()
+        {
+            self.render_wake_state.cancel();
+            metrics::counter!("gui.render.retry", "action" => "surface_signal_reopened")
+                .increment(1);
+        }
     }
 
     /// Aggregate dirty-line telemetry across every registered
@@ -1615,6 +2044,7 @@ impl TermWindow {
         source: frankenterm_core::dirty_line_telemetry::DirtyEventSource,
     ) {
         self.dirty_marks_by_source.record(source);
+        self.advance_damage_generation();
     }
 
     /// Per ft-i6k6u: source-tagged variant of mark_all_panes_dirty.
@@ -1627,7 +2057,9 @@ impl TermWindow {
         source: frankenterm_core::dirty_line_telemetry::DirtyEventSource,
     ) {
         self.mark_all_panes_dirty();
-        self.record_dirty_event(source);
+        // `mark_all_panes_dirty` already advanced the damage generation for
+        // this event. Record attribution directly to avoid double-advancing.
+        self.dirty_marks_by_source.record(source);
     }
 
     pub fn publish_terminal_state_snapshot(
@@ -2091,6 +2523,9 @@ impl TermWindow {
         self.record_idle_event(idle_detector::IdleEvent::FocusChange);
         log::trace!("Setting focus to {:?}", focused);
         self.focused = if focused { Some(Instant::now()) } else { None };
+        if focused {
+            self.note_render_surface_recovery_signal();
+        }
         self.quad_generation += 1;
         self.mark_all_panes_dirty_with_source(
             frankenterm_core::dirty_line_telemetry::DirtyEventSource::FocusChange,
@@ -2123,6 +2558,7 @@ impl TermWindow {
     }
 
     fn created(&mut self, ctx: RenderContext) -> anyhow::Result<()> {
+        self.render_wake_state.cancel();
         self.render_state = None;
 
         let render_info = ctx.renderer_info();
@@ -2136,30 +2572,358 @@ impl TermWindow {
             config::wezterm_version(),
         );
         self.render_state.replace(render_state);
+        self.render_recovery_state.record_reinitialized();
         self.record_quad_buffer_allocation_snapshot(0);
 
         Ok(())
     }
 }
 
+const RENDER_RETRY_DELAYS_MS: [u64; 6] = [8, 16, 32, 64, 128, 250];
+const MAX_TIMEOUT_RENDER_RETRIES: u32 = 6;
+const MAX_STALE_SURFACE_RETRIES: u32 = 3;
+const MAX_PAINT_RETRIES: u32 = 2;
+const MAX_BACKEND_RETRIES: u32 = 3;
+const OCCLUDED_REPAINT_PROBE_DELAY: Duration = Duration::from_millis(250);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RenderWakeTicket(u64);
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum RenderWakeReason {
+    Retry(RenderFailureStage),
+    Animation,
+}
+
+struct RenderWakeAbort {
+    handle: AbortHandle,
+}
+
+impl Drop for RenderWakeAbort {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
+}
+
+struct PendingRenderWake {
+    ticket: RenderWakeTicket,
+    due: Instant,
+    reason: RenderWakeReason,
+    _abort: RenderWakeAbort,
+}
+
+enum RenderWakePlan {
+    Schedule {
+        ticket: RenderWakeTicket,
+        delay: Duration,
+        registration: AbortRegistration,
+    },
+    Kept {
+        ticket: RenderWakeTicket,
+    },
+    Exhausted,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum RenderWakeDispatch {
+    Fired(RenderWakeReason),
+    Stale,
+}
+
+#[derive(Default)]
+struct RenderWakeState {
+    next_ticket: u64,
+    exhausted: bool,
+    pending: Option<PendingRenderWake>,
+}
+
+impl RenderWakeState {
+    fn plan(
+        &mut self,
+        reason: RenderWakeReason,
+        due: Instant,
+        now: Instant,
+    ) -> RenderWakePlan {
+        if self.exhausted {
+            return RenderWakePlan::Exhausted;
+        }
+
+        if let Some(pending) = self.pending.as_ref() {
+            let keep_existing = match (pending.reason, reason) {
+                // A retry is the admission gate.  An animation must never
+                // bypass it, and duplicate failures coalesce into its ticket.
+                (RenderWakeReason::Retry(_), _) => true,
+                (RenderWakeReason::Animation, RenderWakeReason::Animation) => {
+                    pending.due <= due
+                }
+                (RenderWakeReason::Animation, RenderWakeReason::Retry(_)) => false,
+            };
+            if keep_existing {
+                return RenderWakePlan::Kept {
+                    ticket: pending.ticket,
+                };
+            }
+        }
+
+        let Some(next_ticket) = self.next_ticket.checked_add(1) else {
+            self.exhausted = true;
+            self.pending.take();
+            return RenderWakePlan::Exhausted;
+        };
+        self.next_ticket = next_ticket;
+        let ticket = RenderWakeTicket(next_ticket);
+        let (handle, registration) = AbortHandle::new_pair();
+        // Taking the prior lease aborts its physical sleeper.  Exact ticket
+        // validation below is still required for a callback already queued.
+        self.pending.take();
+        self.pending = Some(PendingRenderWake {
+            ticket,
+            due,
+            reason,
+            _abort: RenderWakeAbort { handle },
+        });
+        RenderWakePlan::Schedule {
+            ticket,
+            delay: due.saturating_duration_since(now),
+            registration,
+        }
+    }
+
+    fn cancel(&mut self) -> bool {
+        self.pending.take().is_some()
+    }
+
+    fn dispatch(&mut self, ticket: RenderWakeTicket) -> RenderWakeDispatch {
+        if self.pending.as_ref().map(|pending| pending.ticket) != Some(ticket) {
+            return RenderWakeDispatch::Stale;
+        }
+        match self.pending.take() {
+            Some(pending) => RenderWakeDispatch::Fired(pending.reason),
+            None => RenderWakeDispatch::Stale,
+        }
+    }
+
+    #[cfg(test)]
+    fn pending_ticket(&self) -> Option<RenderWakeTicket> {
+        self.pending.as_ref().map(|pending| pending.ticket)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum RenderRecoveryMode {
+    Healthy,
+    Cooldown {
+        ticket: RenderWakeTicket,
+        stage: RenderFailureStage,
+    },
+    RetryReady { stage: RenderFailureStage },
+    Parked {
+        stage: RenderFailureStage,
+    },
+    CircuitOpen {
+        stage: RenderFailureStage,
+    },
+}
+
+impl Default for RenderRecoveryMode {
+    fn default() -> Self {
+        Self::Healthy
+    }
+}
+
+#[derive(Debug, Default)]
+struct RenderRecoveryState {
+    mode: RenderRecoveryMode,
+    /// Monotonic negative evidence for the current no-success incident.
+    /// Failure-stage changes and external surface signals must not reset it;
+    /// only a presented frame or complete renderer reinitialization may do so.
+    failed_attempts_since_success: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PaintAdmission {
+    Admit,
+    SuppressCooldown,
+    SuppressParked,
+    SuppressCircuit,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RenderRecoveryDirective {
+    RetryAfter(Duration),
+    Park,
+    OpenCircuit,
+}
+
+fn retry_delay(failed_attempts_since_success: u32) -> Duration {
+    let index = usize::try_from(failed_attempts_since_success.saturating_sub(1))
+        .unwrap_or(usize::MAX)
+        .min(RENDER_RETRY_DELAYS_MS.len() - 1);
+    Duration::from_millis(RENDER_RETRY_DELAYS_MS[index])
+}
+
+fn render_recovery_directive(
+    stage: RenderFailureStage,
+    failed_attempts_since_success: u32,
+) -> RenderRecoveryDirective {
+    let retry_with_limit = |limit| {
+        if failed_attempts_since_success <= limit {
+            RenderRecoveryDirective::RetryAfter(retry_delay(failed_attempts_since_success))
+        } else {
+            RenderRecoveryDirective::OpenCircuit
+        }
+    };
+
+    match stage {
+        RenderFailureStage::SurfaceAcquire(webgpu::WebGpuSurfaceTextureError::Occluded) => {
+            RenderRecoveryDirective::Park
+        }
+        RenderFailureStage::SurfaceAcquire(webgpu::WebGpuSurfaceTextureError::Validation)
+        | RenderFailureStage::Draw(DrawFailureStage::RenderCommands)
+        | RenderFailureStage::Draw(DrawFailureStage::MissingGlyphProgram)
+        | RenderFailureStage::Draw(DrawFailureStage::BufferSliceBounds) => {
+            RenderRecoveryDirective::OpenCircuit
+        }
+        RenderFailureStage::SurfaceAcquire(webgpu::WebGpuSurfaceTextureError::Timeout) => {
+            if failed_attempts_since_success <= MAX_TIMEOUT_RENDER_RETRIES {
+                RenderRecoveryDirective::RetryAfter(retry_delay(failed_attempts_since_success))
+            } else {
+                // Acquisition-only retries have established persistent
+                // occlusion/driver pressure. Wait for resize/focus rather than
+                // running a permanent timer.
+                RenderRecoveryDirective::Park
+            }
+        }
+        RenderFailureStage::SurfaceAcquire(webgpu::WebGpuSurfaceTextureError::Outdated)
+        | RenderFailureStage::SurfaceAcquire(webgpu::WebGpuSurfaceTextureError::Lost) => {
+            if failed_attempts_since_success <= MAX_STALE_SURFACE_RETRIES {
+                RenderRecoveryDirective::RetryAfter(retry_delay(failed_attempts_since_success))
+            } else {
+                RenderRecoveryDirective::Park
+            }
+        }
+        RenderFailureStage::Paint => retry_with_limit(MAX_PAINT_RETRIES),
+        RenderFailureStage::Draw(DrawFailureStage::BackendDraw)
+        | RenderFailureStage::BackendFinish
+        | RenderFailureStage::Submission
+        | RenderFailureStage::Present => retry_with_limit(MAX_BACKEND_RETRIES),
+    }
+}
+
+impl RenderRecoveryState {
+    fn admit(&mut self) -> PaintAdmission {
+        match self.mode {
+            RenderRecoveryMode::Healthy => PaintAdmission::Admit,
+            RenderRecoveryMode::RetryReady { .. } => {
+                // Preserve the failure count until a frame actually presents.
+                self.mode = RenderRecoveryMode::Healthy;
+                PaintAdmission::Admit
+            }
+            RenderRecoveryMode::Cooldown { .. } => PaintAdmission::SuppressCooldown,
+            RenderRecoveryMode::Parked { .. } => PaintAdmission::SuppressParked,
+            RenderRecoveryMode::CircuitOpen { .. } => PaintAdmission::SuppressCircuit,
+        }
+    }
+
+    fn record_failure(&mut self, stage: RenderFailureStage) -> RenderRecoveryDirective {
+        self.failed_attempts_since_success =
+            self.failed_attempts_since_success.saturating_add(1);
+        render_recovery_directive(stage, self.failed_attempts_since_success)
+    }
+
+    fn enter_cooldown(&mut self, ticket: RenderWakeTicket, stage: RenderFailureStage) {
+        self.mode = RenderRecoveryMode::Cooldown { ticket, stage };
+    }
+
+    fn mark_retry_ready(&mut self, ticket: RenderWakeTicket) -> bool {
+        match self.mode {
+            RenderRecoveryMode::Cooldown {
+                ticket: expected,
+                stage,
+            } if expected == ticket => {
+                self.mode = RenderRecoveryMode::RetryReady { stage };
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn park(&mut self, stage: RenderFailureStage) {
+        self.mode = RenderRecoveryMode::Parked { stage };
+    }
+
+    fn open_circuit(&mut self, stage: RenderFailureStage) {
+        self.mode = RenderRecoveryMode::CircuitOpen { stage };
+    }
+
+    fn record_success(&mut self) {
+        self.mode = RenderRecoveryMode::Healthy;
+        self.failed_attempts_since_success = 0;
+    }
+
+    fn record_reinitialized(&mut self) {
+        self.record_success();
+    }
+
+    fn record_surface_recovery_signal(&mut self) -> bool {
+        let stage = match self.mode {
+            RenderRecoveryMode::Cooldown { stage, .. }
+            | RenderRecoveryMode::RetryReady { stage, .. }
+            | RenderRecoveryMode::Parked { stage }
+            | RenderRecoveryMode::CircuitOpen { stage } => stage,
+            RenderRecoveryMode::Healthy => return false,
+        };
+        if !stage.accepts_surface_recovery_signal() {
+            return false;
+        }
+        self.mode = RenderRecoveryMode::Healthy;
+        true
+    }
+
+    const fn parked_occluded_stage(&self) -> Option<RenderFailureStage> {
+        match self.mode {
+            RenderRecoveryMode::Parked {
+                stage:
+                    stage @ RenderFailureStage::SurfaceAcquire(
+                        webgpu::WebGpuSurfaceTextureError::Occluded,
+                    ),
+            } => Some(stage),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum WebGpuSurfaceErrorAction {
-    Retry,
-    SkipFrame,
-    Fail,
+    ForceConfigure,
+    RecreateSurface,
+    DeferToRecoveryPolicy,
 }
 
 fn classify_webgpu_surface_error(
     err: &webgpu::WebGpuSurfaceTextureError,
 ) -> WebGpuSurfaceErrorAction {
     match err {
-        webgpu::WebGpuSurfaceTextureError::Lost | webgpu::WebGpuSurfaceTextureError::Outdated => {
-            WebGpuSurfaceErrorAction::Retry
+        webgpu::WebGpuSurfaceTextureError::Outdated => {
+            WebGpuSurfaceErrorAction::ForceConfigure
+        }
+        webgpu::WebGpuSurfaceTextureError::Lost => {
+            WebGpuSurfaceErrorAction::RecreateSurface
         }
         webgpu::WebGpuSurfaceTextureError::Timeout
-        | webgpu::WebGpuSurfaceTextureError::Occluded => WebGpuSurfaceErrorAction::SkipFrame,
-        webgpu::WebGpuSurfaceTextureError::Validation => WebGpuSurfaceErrorAction::Fail,
+        | webgpu::WebGpuSurfaceTextureError::Occluded
+        | webgpu::WebGpuSurfaceTextureError::Validation => {
+            WebGpuSurfaceErrorAction::DeferToRecoveryPolicy
+        }
     }
+}
+
+const fn webgpu_repair_failure_stage() -> RenderFailureStage {
+    // Once force-configure or replacement-surface construction itself fails,
+    // the original Outdated/Lost event is no longer the actionable cause.
+    // Treat the failed repair as validation/reconstruction evidence so a
+    // resize or focus signal cannot silently reopen it as a transient fault.
+    RenderFailureStage::SurfaceAcquire(webgpu::WebGpuSurfaceTextureError::Validation)
 }
 
 impl TermWindow {
@@ -2319,10 +3083,13 @@ impl TermWindow {
             quad_generation: 0,
             shape_generation: 0,
             dirty_lines: HashMap::new(),
+            damage_generation: DamageGeneration::default(),
             // Per ft-jvj78: first paint is treated as a whole-screen
             // event so the dirty bitmap is not silently cleared
             // before any pane has had a chance to populate it.
             last_dirty_event_was_whole_screen: true,
+            render_recovery_state: RenderRecoveryState::default(),
+            render_wake_state: RenderWakeState::default(),
             // Per ft-gwzrm: live dirty sources are wired, and the
             // render path only records a clean-line skip after a
             // cached quad list was actually reused.
@@ -2401,7 +3168,6 @@ impl TermWindow {
             event_states: HashMap::new(),
             current_event: None,
             has_animation: RefCell::new(None),
-            scheduled_animation: RefCell::new(None),
             allow_images: AllowImage::Yes,
             semantic_zones: HashMap::new(),
             ui_items: vec![],
@@ -2567,6 +3333,7 @@ impl TermWindow {
                 // the window is gone and we'll linger forever.
                 // <https://github.com/wezterm/wezterm/issues/3522>
                 self.clear_all_overlays();
+                self.release_render_resources_before_window();
                 Ok(false)
             }
             WindowEvent::CloseRequested => {
@@ -2617,14 +3384,11 @@ impl TermWindow {
                 Ok(true)
             }
             WindowEvent::SetInnerSizeCompleted => {
-                self.resizes_pending -= 1;
+                self.resizes_pending = self.resizes_pending.saturating_sub(1);
+                self.note_render_surface_recovery_signal();
                 if self.is_repaint_pending {
                     self.is_repaint_pending = false;
-                    if self.webgpu.is_some() {
-                        self.do_paint_webgpu()?;
-                    } else {
-                        self.do_paint(window);
-                    }
+                    self.paint_if_admitted(window)?;
                 }
                 self.apply_pending_scale_changes();
                 Ok(true)
@@ -2660,10 +3424,8 @@ impl TermWindow {
                 if self.resizes_pending > 0 {
                     self.is_repaint_pending = true;
                     Ok(true)
-                } else if self.webgpu.is_some() {
-                    self.do_paint_webgpu()
                 } else {
-                    Ok(self.do_paint(window))
+                    self.paint_if_admitted(window)
                 }
             }
             WindowEvent::Notification(item) => {
@@ -2717,71 +3479,205 @@ impl TermWindow {
         }
     }
 
+    fn paint_if_admitted(&mut self, window: &Window) -> anyhow::Result<bool> {
+        match self.render_recovery_state.admit() {
+            PaintAdmission::Admit => {
+                if self.webgpu.is_some() {
+                    self.do_paint_webgpu()
+                } else {
+                    Ok(self.do_paint(window))
+                }
+            }
+            PaintAdmission::SuppressCooldown => {
+                metrics::counter!("gui.render.paint_admission", "decision" => "cooldown")
+                    .increment(1);
+                Ok(true)
+            }
+            PaintAdmission::SuppressParked => {
+                metrics::counter!("gui.render.paint_admission", "decision" => "parked")
+                    .increment(1);
+                if let Some(stage) = self.render_recovery_state.parked_occluded_stage() {
+                    // WindowEvent does not distinguish OS exposure from an
+                    // application invalidation. Convert either source into at
+                    // most one delayed acquisition-only probe: Cooldown then
+                    // suppresses every subsequent repaint until the exact wake
+                    // ticket fires. A failed probe parks again and requires a
+                    // new repaint request, so there is no permanent timer.
+                    self.schedule_render_retry(stage, OCCLUDED_REPAINT_PROBE_DELAY);
+                    metrics::counter!(
+                        "gui.render.retry",
+                        "action" => "occluded_repaint_probe"
+                    )
+                    .increment(1);
+                }
+                Ok(true)
+            }
+            PaintAdmission::SuppressCircuit => {
+                metrics::counter!("gui.render.paint_admission", "decision" => "circuit_open")
+                    .increment(1);
+                Ok(true)
+            }
+        }
+    }
+
+    fn release_render_resources_before_window(&mut self) {
+        self.render_wake_state.cancel();
+        // RenderState owns another Rc<WebGpuState>; release it first, then the
+        // TermWindow Rc, so the unsafe raw-handle surface is gone before the
+        // native window/front-end registration can be forgotten.
+        drop(self.render_state.take());
+        drop(self.webgpu.take());
+        drop(self.gl.take());
+    }
+
     fn do_paint(&mut self, window: &Window) -> bool {
-        let gl = match self.gl.as_ref() {
+        let gl = match self.gl.as_ref().map(Rc::clone) {
             Some(gl) => gl,
             None => return false,
         };
 
         if gl.is_context_lost() {
-            log::error!("opengl context was lost; should reinit");
-            window.close();
-            if let Some(front_end) = try_front_end() {
-                front_end.forget_known_window(window);
-            }
+            let failure = RenderAttemptFailure::new(
+                RenderFailureStage::Draw(DrawFailureStage::BackendDraw),
+                anyhow!("OpenGL context was lost; renderer reinitialization required"),
+            );
+            self.handle_render_failure(&failure);
+            log::error!("{failure:#}");
             return false;
         }
 
-        let mut frame = glium::Frame::new(
-            Rc::clone(&gl),
-            (
-                self.dimensions.pixel_width as u32,
-                self.dimensions.pixel_height as u32,
-            ),
-        );
-        self.paint_impl(&mut RenderFrame::Glium(&mut frame));
-        window.finish_frame(frame).is_ok()
+        let dimensions = self.dimensions;
+        let outcome = match self.paint_impl(move |tw| {
+            // Construct the linear glium Frame only after geometry succeeds.
+            // Once constructed it is consumed exactly once, even when drawing
+            // fails, because glium's Drop otherwise panics.
+            let mut frame = glium::Frame::new(
+                gl,
+                (
+                    dimensions.pixel_width as u32,
+                    dimensions.pixel_height as u32,
+                ),
+            );
+            let draw_result = tw.call_draw_glium(&mut frame);
+            let finish_result = window.finish_frame(frame);
+            combine_glium_draw_and_finish(draw_result, finish_result)
+        }) {
+            Ok(outcome) => outcome,
+            Err(failure) => {
+                self.handle_render_failure(&failure);
+                log::warn!("OpenGL paint failed; retaining damage: {failure:#}");
+                return false;
+            }
+        };
+        self.complete_presented_frame(outcome);
+        true
     }
 
     fn do_paint_webgpu(&mut self) -> anyhow::Result<bool> {
-        let Some(webgpu) = self.webgpu.as_mut() else {
+        let Some(webgpu) = self.webgpu.as_ref().map(Rc::clone) else {
             log::warn!("cannot paint webgpu frame before webgpu state is initialized");
             return Ok(false);
         };
-        webgpu.resize(self.dimensions);
-        match self.do_paint_webgpu_impl() {
-            Ok(ok) => Ok(ok),
-            Err(err) => {
-                match err
-                    .downcast_ref::<webgpu::WebGpuSurfaceTextureError>()
-                    .map(classify_webgpu_surface_error)
-                {
-                    Some(WebGpuSurfaceErrorAction::Retry) => {
-                        log::warn!("webgpu surface became stale; retrying after resize");
-                        let Some(webgpu) = self.webgpu.as_mut() else {
-                            log::warn!("cannot retry webgpu frame: webgpu state is gone");
-                            return Ok(false);
-                        };
-                        webgpu.resize(self.dimensions);
-                        return self.do_paint_webgpu_impl();
-                    }
-                    Some(WebGpuSurfaceErrorAction::SkipFrame) => {
-                        log::warn!("webgpu surface timed out acquiring the next frame; skipping");
-                        if let Some(window) = self.window.as_ref() {
-                            window.invalidate();
-                        }
-                        return Ok(true);
-                    }
-                    Some(WebGpuSurfaceErrorAction::Fail) | None => {}
-                }
-                Err(err)
+        let dimensions = self.dimensions;
+        let acquired = match Self::acquire_webgpu_frame_with_repair(&webgpu, dimensions) {
+            Ok(acquired) => acquired,
+            Err(failure) => {
+                self.handle_render_failure(&failure);
+                log::warn!("WebGPU acquisition failed; retaining damage: {failure:#}");
+                return Ok(true);
             }
-        }
+        };
+
+        let outcome = match self.paint_impl(move |tw| {
+            tw.call_draw_webgpu(acquired)
+                .map_err(RenderAttemptFailure::draw)
+        }) {
+            Ok(outcome) => outcome,
+            Err(failure) => {
+                self.handle_render_failure(&failure);
+                log::warn!("WebGPU paint failed; retaining damage: {failure:#}");
+                return Ok(true);
+            }
+        };
+        self.complete_presented_frame(outcome);
+        Ok(true)
     }
 
-    fn do_paint_webgpu_impl(&mut self) -> anyhow::Result<bool> {
-        self.paint_impl(&mut RenderFrame::WebGpu);
-        Ok(true)
+    fn acquire_webgpu_frame_with_repair(
+        webgpu: &WebGpuState,
+        dimensions: Dimensions,
+    ) -> Result<webgpu::AcquiredWebGpuFrame, RenderAttemptFailure> {
+        match webgpu.prepare_surface(dimensions) {
+            Ok(webgpu::SurfaceConfigureOutcome::Ready) => {}
+            Ok(webgpu::SurfaceConfigureOutcome::DeferredZeroExtent) => {
+                return Err(RenderAttemptFailure::new(
+                    RenderFailureStage::SurfaceAcquire(
+                        webgpu::WebGpuSurfaceTextureError::Occluded,
+                    ),
+                    anyhow!("webgpu surface has zero extent; waiting for resize/focus"),
+                ));
+            }
+            Err(err) => {
+                return Err(RenderAttemptFailure::new(
+                    RenderFailureStage::SurfaceAcquire(
+                        webgpu::WebGpuSurfaceTextureError::Validation,
+                    ),
+                    err.context("prepare webgpu surface"),
+                ));
+            }
+        }
+
+        let first_error = match webgpu.acquire_surface_frame() {
+            Ok(frame) => return Ok(frame),
+            Err(err) => err,
+        };
+        let repair = match classify_webgpu_surface_error(&first_error) {
+            WebGpuSurfaceErrorAction::ForceConfigure => {
+                metrics::counter!("gui.render.retry", "action" => "force_configure")
+                    .increment(1);
+                webgpu
+                    .force_configure(dimensions)
+                    .context("force-configure outdated webgpu surface")
+            }
+            WebGpuSurfaceErrorAction::RecreateSurface => {
+                metrics::counter!("gui.render.retry", "action" => "recreate_surface")
+                    .increment(1);
+                webgpu
+                    .recreate_surface(dimensions)
+                    .context("recreate lost webgpu surface")
+            }
+            WebGpuSurfaceErrorAction::DeferToRecoveryPolicy => {
+                return Err(RenderAttemptFailure::new(
+                    RenderFailureStage::SurfaceAcquire(first_error),
+                    first_error.into(),
+                ));
+            }
+        };
+
+        match repair {
+            Ok(webgpu::SurfaceConfigureOutcome::Ready) => {}
+            Ok(webgpu::SurfaceConfigureOutcome::DeferredZeroExtent) => {
+                return Err(RenderAttemptFailure::new(
+                    RenderFailureStage::SurfaceAcquire(
+                        webgpu::WebGpuSurfaceTextureError::Occluded,
+                    ),
+                    anyhow!("webgpu repair deferred for zero surface extent"),
+                ));
+            }
+            Err(err) => {
+                return Err(RenderAttemptFailure::new(
+                    webgpu_repair_failure_stage(),
+                    err.context(format!(
+                        "webgpu surface repair failed after {first_error}"
+                    )),
+                ));
+            }
+        }
+
+        webgpu.acquire_surface_frame().map_err(|err| {
+            // Only one immediate repair is permitted per admitted paint.
+            RenderAttemptFailure::new(RenderFailureStage::SurfaceAcquire(err), err.into())
+        })
     }
 
     fn dispatch_notif(&mut self, notif: TermWindowNotif, window: &Window) -> anyhow::Result<()> {
@@ -6459,6 +7355,7 @@ impl TermWindow {
 impl Drop for TermWindow {
     fn drop(&mut self) {
         self.clear_all_overlays();
+        self.release_render_resources_before_window();
         if let Some(window) = self.window.take() {
             if let Some(fe) = try_front_end() {
                 fe.forget_known_window(&window);
@@ -6470,17 +7367,24 @@ impl Drop for TermWindow {
 #[cfg(test)]
 mod tests {
     use super::{
+        DamageAdvanceOutcome, DamageCommitOutcome, DamageGeneration, DrawFailure,
+        DrawFailureStage, FrameCompletion, PaintAdmission, RenderAttemptFailure,
+        RenderFailureStage, RenderRecoveryDirective, RenderRecoveryState, RenderWakeDispatch,
+        RenderWakePlan, RenderWakeReason, RenderWakeState,
         SyncOutputDoctorSnapshot, UIItem, UIItemType, WebGpuSurfaceErrorAction,
         a11y_op_kind_from_frame_budget_op, base_policy_for_frame_budget_state,
-        classify_webgpu_surface_error, default_frame_budget_cost_ns,
+        classify_webgpu_surface_error, combine_glium_draw_and_finish,
+        default_frame_budget_cost_ns,
         evaluate_frame_budget_reduce_motion_gate, frame_budget, mark_cursor_rows_dirty,
         mark_stable_row_ranges_dirty, mark_stable_rows_dirty,
         pane_health_snapshot_from_watchdoged_health, record_drained_frame_budget_ops,
         record_frame_budget_execution_outstanding, record_sync_output_mux_event,
-        reduce_motion_state_from_preference, render, run_clear_dirty_lines_after_frame,
-        should_force_paint_for_frame_budget, should_run_frame_budget_decision,
-        should_skip_clean_line, webgpu,
+        reduce_motion_state_from_preference, render, render_recovery_directive,
+        run_clear_dirty_lines_after_frame, settle_frame_damage, should_force_paint_for_frame_budget,
+        should_run_frame_budget_decision, should_skip_clean_line, webgpu,
+        webgpu_repair_failure_stage,
     };
+    use std::time::{Duration, Instant};
 
     #[test]
     fn ui_item_hit_test_uses_half_open_extents() {
@@ -7504,34 +8408,511 @@ mod tests {
     }
 
     #[test]
-    fn webgpu_surface_error_classification_retries_stale_surfaces() {
+    fn failed_submission_or_present_retains_exact_damage_and_whole_screen_state() {
+        let mut original: HashMap<usize, render::dirty_lines::DirtyLineBitmap> = HashMap::new();
+        let mut bm = render::dirty_lines::DirtyLineBitmap::new(24);
+        bm.mark(2);
+        bm.mark(19);
+        original.insert(7, bm);
+
+        for stage in [
+            RenderFailureStage::Submission,
+            RenderFailureStage::Present,
+        ] {
+            let mut bitmaps = original.clone();
+            let before = bitmaps.clone();
+            let mut whole_screen = true;
+            let generation = DamageGeneration::default();
+
+            let outcome = settle_frame_damage(
+                &mut bitmaps,
+                &mut whole_screen,
+                generation,
+                FrameCompletion::Failed(stage),
+            );
+
+            assert_eq!(outcome, DamageCommitOutcome::RetainedFailure);
+            assert_eq!(bitmaps, before, "{stage:?} changed dirty rows");
+            assert!(whole_screen, "{stage:?} consumed whole-screen state");
+        }
+    }
+
+    #[test]
+    fn stale_presented_generation_cannot_clear_newer_damage() {
+        let captured = DamageGeneration::default();
+        let mut current = captured;
+        assert_eq!(current.advance(), DamageAdvanceOutcome::Advanced);
+        let mut bitmaps: HashMap<usize, render::dirty_lines::DirtyLineBitmap> = HashMap::new();
+        let mut bm = render::dirty_lines::DirtyLineBitmap::new(24);
+        bm.mark(11);
+        bitmaps.insert(3, bm);
+        let before = bitmaps.clone();
+        let mut whole_screen = false;
+
+        let outcome = settle_frame_damage(
+            &mut bitmaps,
+            &mut whole_screen,
+            current,
+            FrameCompletion::Presented(captured),
+        );
+
+        assert_eq!(outcome, DamageCommitOutcome::RetainedStale);
+        assert_eq!(bitmaps, before);
+        assert!(!whole_screen);
+    }
+
+    #[test]
+    fn matching_presented_generation_clears_per_cell_damage() {
+        let mut generation = DamageGeneration::default();
+        assert_eq!(generation.advance(), DamageAdvanceOutcome::Advanced);
+        let mut bitmaps: HashMap<usize, render::dirty_lines::DirtyLineBitmap> = HashMap::new();
+        let mut bm = render::dirty_lines::DirtyLineBitmap::new(24);
+        bm.mark(4);
+        bitmaps.insert(5, bm);
+        let mut whole_screen = false;
+
+        let outcome = settle_frame_damage(
+            &mut bitmaps,
+            &mut whole_screen,
+            generation,
+            FrameCompletion::Presented(generation),
+        );
+
+        assert_eq!(outcome, DamageCommitOutcome::Cleared);
+        assert_eq!(bitmaps.get(&5).expect("pane retained").count(), 0);
+    }
+
+    #[test]
+    fn exhausted_damage_generation_is_sticky_and_never_commits() {
+        let mut generation = DamageGeneration {
+            value: u64::MAX,
+            exhausted: false,
+        };
+        let captured = generation;
+        assert_eq!(generation.advance(), DamageAdvanceOutcome::ExhaustedNow);
+        assert_eq!(
+            generation.advance(),
+            DamageAdvanceOutcome::AlreadyExhausted
+        );
+
+        let mut bitmaps: HashMap<usize, render::dirty_lines::DirtyLineBitmap> = HashMap::new();
+        let mut bm = render::dirty_lines::DirtyLineBitmap::new(8);
+        bm.mark_all();
+        bitmaps.insert(1, bm);
+        let before = bitmaps.clone();
+        let mut whole_screen = true;
+        let outcome = settle_frame_damage(
+            &mut bitmaps,
+            &mut whole_screen,
+            generation,
+            FrameCompletion::Presented(captured),
+        );
+
+        assert_eq!(outcome, DamageCommitOutcome::RetainedEpochExhausted);
+        assert_eq!(bitmaps, before);
+        assert!(whole_screen);
+    }
+
+    #[test]
+    fn render_recovery_backoff_is_bounded_and_permanent_errors_open() {
+        let timeout = RenderFailureStage::SurfaceAcquire(
+            webgpu::WebGpuSurfaceTextureError::Timeout,
+        );
+        for (attempt, expected_ms) in [8, 16, 32, 64, 128, 250].into_iter().enumerate() {
+            let attempt = u32::try_from(attempt).expect("bounded retry index fits u32") + 1;
+            assert_eq!(
+                render_recovery_directive(timeout, attempt),
+                RenderRecoveryDirective::RetryAfter(Duration::from_millis(expected_ms))
+            );
+        }
+        assert_eq!(
+            render_recovery_directive(timeout, 7),
+            RenderRecoveryDirective::Park
+        );
+        assert_eq!(
+            render_recovery_directive(
+                RenderFailureStage::Draw(DrawFailureStage::MissingGlyphProgram),
+                1,
+            ),
+            RenderRecoveryDirective::OpenCircuit
+        );
+        assert_eq!(
+            render_recovery_directive(
+                RenderFailureStage::Draw(DrawFailureStage::BufferSliceBounds),
+                1,
+            ),
+            RenderRecoveryDirective::OpenCircuit
+        );
+    }
+
+    #[test]
+    fn alternating_stale_surface_stages_cannot_reset_retry_budget() {
+        let outdated = RenderFailureStage::SurfaceAcquire(
+            webgpu::WebGpuSurfaceTextureError::Outdated,
+        );
+        let lost =
+            RenderFailureStage::SurfaceAcquire(webgpu::WebGpuSurfaceTextureError::Lost);
+        let mut recovery = RenderRecoveryState::default();
+
+        assert_eq!(
+            recovery.record_failure(outdated),
+            RenderRecoveryDirective::RetryAfter(Duration::from_millis(8))
+        );
+        assert_eq!(
+            recovery.record_failure(lost),
+            RenderRecoveryDirective::RetryAfter(Duration::from_millis(16))
+        );
+        assert_eq!(
+            recovery.record_failure(outdated),
+            RenderRecoveryDirective::RetryAfter(Duration::from_millis(32))
+        );
+        assert_eq!(recovery.record_failure(lost), RenderRecoveryDirective::Park);
+    }
+
+    #[test]
+    fn alternating_backend_stages_cannot_reset_retry_budget() {
+        let draw = RenderFailureStage::Draw(DrawFailureStage::BackendDraw);
+        let finish = RenderFailureStage::BackendFinish;
+        let mut recovery = RenderRecoveryState::default();
+
+        assert!(matches!(
+            recovery.record_failure(draw),
+            RenderRecoveryDirective::RetryAfter(_)
+        ));
+        assert!(matches!(
+            recovery.record_failure(finish),
+            RenderRecoveryDirective::RetryAfter(_)
+        ));
+        assert!(matches!(
+            recovery.record_failure(draw),
+            RenderRecoveryDirective::RetryAfter(_)
+        ));
+        assert_eq!(
+            recovery.record_failure(finish),
+            RenderRecoveryDirective::OpenCircuit
+        );
+    }
+
+    #[test]
+    fn surface_signal_preserves_incident_evidence_until_present() {
+        let timeout = RenderFailureStage::SurfaceAcquire(
+            webgpu::WebGpuSurfaceTextureError::Timeout,
+        );
+        let mut recovery = RenderRecoveryState::default();
+        assert_eq!(
+            recovery.record_failure(timeout),
+            RenderRecoveryDirective::RetryAfter(Duration::from_millis(8))
+        );
+        recovery.park(timeout);
+        assert!(recovery.record_surface_recovery_signal());
+        assert_eq!(recovery.failed_attempts_since_success, 1);
+        assert_eq!(
+            recovery.record_failure(timeout),
+            RenderRecoveryDirective::RetryAfter(Duration::from_millis(16))
+        );
+
+        recovery.record_success();
+        assert_eq!(
+            recovery.record_failure(timeout),
+            RenderRecoveryDirective::RetryAfter(Duration::from_millis(8))
+        );
+    }
+
+    #[test]
+    fn render_wake_keeps_earlier_animation_without_losing_live_state() {
+        let now = Instant::now();
+        let mut state = RenderWakeState::default();
+        let first_ticket = match state.plan(
+            RenderWakeReason::Animation,
+            now + Duration::from_millis(10),
+            now,
+        ) {
+            RenderWakePlan::Schedule { ticket, .. } => ticket,
+            _ => panic!("first animation must schedule"),
+        };
+        match state.plan(
+            RenderWakeReason::Animation,
+            now + Duration::from_millis(20),
+            now,
+        ) {
+            RenderWakePlan::Kept { ticket } => assert_eq!(ticket, first_ticket),
+            _ => panic!("later animation must keep earlier wake"),
+        }
+        assert_eq!(state.pending_ticket(), Some(first_ticket));
+        assert_eq!(
+            state.dispatch(first_ticket),
+            RenderWakeDispatch::Fired(RenderWakeReason::Animation)
+        );
+        assert_eq!(state.dispatch(first_ticket), RenderWakeDispatch::Stale);
+    }
+
+    #[test]
+    fn retry_supersedes_animation_and_animation_cannot_bypass_retry() {
+        let now = Instant::now();
+        let mut state = RenderWakeState::default();
+        let animation = match state.plan(
+            RenderWakeReason::Animation,
+            now + Duration::from_millis(5),
+            now,
+        ) {
+            RenderWakePlan::Schedule { ticket, .. } => ticket,
+            _ => panic!("animation must schedule"),
+        };
+        let stage = RenderFailureStage::Paint;
+        let retry = match state.plan(
+            RenderWakeReason::Retry(stage),
+            now + Duration::from_millis(8),
+            now,
+        ) {
+            RenderWakePlan::Schedule { ticket, .. } => ticket,
+            _ => panic!("retry must replace animation"),
+        };
+        assert_ne!(retry, animation);
+        assert_eq!(state.dispatch(animation), RenderWakeDispatch::Stale);
+        match state.plan(
+            RenderWakeReason::Animation,
+            now + Duration::from_millis(1),
+            now,
+        ) {
+            RenderWakePlan::Kept { ticket } => assert_eq!(ticket, retry),
+            _ => panic!("animation must not replace retry"),
+        }
+        assert_eq!(
+            state.dispatch(retry),
+            RenderWakeDispatch::Fired(RenderWakeReason::Retry(stage))
+        );
+    }
+
+    #[test]
+    fn success_cancel_then_fresh_failure_gets_a_fresh_ticket() {
+        let now = Instant::now();
+        let mut wakes = RenderWakeState::default();
+        let old = match wakes.plan(
+            RenderWakeReason::Retry(RenderFailureStage::Paint),
+            now + Duration::from_millis(250),
+            now,
+        ) {
+            RenderWakePlan::Schedule { ticket, .. } => ticket,
+            _ => panic!("old retry must schedule"),
+        };
+        assert!(wakes.cancel());
+        assert_eq!(wakes.dispatch(old), RenderWakeDispatch::Stale);
+
+        let (fresh, delay) = match wakes.plan(
+            RenderWakeReason::Retry(RenderFailureStage::Paint),
+            now + Duration::from_millis(8),
+            now,
+        ) {
+            RenderWakePlan::Schedule { ticket, delay, .. } => (ticket, delay),
+            _ => panic!("fresh retry must schedule"),
+        };
+        assert_ne!(fresh, old);
+        assert_eq!(delay, Duration::from_millis(8));
+    }
+
+    #[test]
+    fn checked_wake_ticket_exhaustion_cannot_alias_an_old_timer() {
+        let now = Instant::now();
+        let mut state = RenderWakeState {
+            next_ticket: u64::MAX,
+            ..RenderWakeState::default()
+        };
+        assert!(matches!(
+            state.plan(RenderWakeReason::Animation, now, now),
+            RenderWakePlan::Exhausted
+        ));
+        assert_eq!(state.pending_ticket(), None);
+    }
+
+    #[test]
+    fn cooldown_suppresses_external_repaint_until_exact_retry_is_ready() {
+        let stage = RenderFailureStage::SurfaceAcquire(
+            webgpu::WebGpuSurfaceTextureError::Timeout,
+        );
+        let ticket = super::RenderWakeTicket(7);
+        let mut recovery = RenderRecoveryState::default();
+        recovery.enter_cooldown(ticket, stage);
+        assert_eq!(recovery.admit(), PaintAdmission::SuppressCooldown);
+        assert!(!recovery.mark_retry_ready(super::RenderWakeTicket(8)));
+        assert_eq!(recovery.admit(), PaintAdmission::SuppressCooldown);
+        assert!(recovery.mark_retry_ready(ticket));
+        assert_eq!(recovery.admit(), PaintAdmission::Admit);
+    }
+
+    #[test]
+    fn occlusion_parks_without_a_self_wake_and_surface_signal_reopens() {
+        let stage = RenderFailureStage::SurfaceAcquire(
+            webgpu::WebGpuSurfaceTextureError::Occluded,
+        );
+        let mut recovery = RenderRecoveryState::default();
+        assert_eq!(
+            recovery.record_failure(stage),
+            RenderRecoveryDirective::Park
+        );
+        recovery.park(stage);
+        assert_eq!(recovery.parked_occluded_stage(), Some(stage));
+        assert_eq!(recovery.admit(), PaintAdmission::SuppressParked);
+        assert!(recovery.record_surface_recovery_signal());
+        assert_eq!(recovery.failed_attempts_since_success, 1);
+        assert_eq!(recovery.admit(), PaintAdmission::Admit);
+    }
+
+    #[test]
+    fn parked_repaint_probe_is_limited_to_occlusion() {
+        let occluded = RenderFailureStage::SurfaceAcquire(
+            webgpu::WebGpuSurfaceTextureError::Occluded,
+        );
+        let timeout = RenderFailureStage::SurfaceAcquire(
+            webgpu::WebGpuSurfaceTextureError::Timeout,
+        );
+        let mut recovery = RenderRecoveryState::default();
+
+        recovery.park(occluded);
+        assert_eq!(recovery.parked_occluded_stage(), Some(occluded));
+        recovery.park(timeout);
+        assert_eq!(recovery.parked_occluded_stage(), None);
+        recovery.enter_cooldown(super::RenderWakeTicket(9), occluded);
+        assert_eq!(recovery.parked_occluded_stage(), None);
+        recovery.open_circuit(occluded);
+        assert_eq!(recovery.parked_occluded_stage(), None);
+    }
+
+    #[test]
+    fn parked_occlusion_probe_requires_exact_wake_and_preserves_evidence() {
+        let stage = RenderFailureStage::SurfaceAcquire(
+            webgpu::WebGpuSurfaceTextureError::Occluded,
+        );
+        let now = Instant::now();
+        let mut recovery = RenderRecoveryState::default();
+        let mut wakes = RenderWakeState::default();
+
+        assert_eq!(
+            recovery.record_failure(stage),
+            RenderRecoveryDirective::Park
+        );
+        recovery.park(stage);
+        let ticket = match wakes.plan(
+            RenderWakeReason::Retry(stage),
+            now + super::OCCLUDED_REPAINT_PROBE_DELAY,
+            now,
+        ) {
+            RenderWakePlan::Schedule { ticket, .. } => ticket,
+            _ => panic!("parked occlusion repaint must schedule one probe"),
+        };
+        recovery.enter_cooldown(ticket, stage);
+        assert_eq!(recovery.failed_attempts_since_success, 1);
+        assert_eq!(recovery.admit(), PaintAdmission::SuppressCooldown);
+
+        let stale = super::RenderWakeTicket(ticket.0.saturating_add(1));
+        assert_eq!(wakes.dispatch(stale), RenderWakeDispatch::Stale);
+        assert!(!recovery.mark_retry_ready(stale));
+        assert_eq!(
+            wakes.dispatch(ticket),
+            RenderWakeDispatch::Fired(RenderWakeReason::Retry(stage))
+        );
+        assert!(recovery.mark_retry_ready(ticket));
+        assert_eq!(recovery.admit(), PaintAdmission::Admit);
+        assert_eq!(recovery.failed_attempts_since_success, 1);
+
+        assert_eq!(
+            recovery.record_failure(stage),
+            RenderRecoveryDirective::Park
+        );
+        recovery.park(stage);
+        assert_eq!(recovery.failed_attempts_since_success, 2);
+        assert_eq!(recovery.parked_occluded_stage(), Some(stage));
+    }
+
+    #[test]
+    fn invariant_circuit_is_not_reset_by_surface_signal() {
+        let stage = RenderFailureStage::Draw(DrawFailureStage::BufferSliceBounds);
+        let mut recovery = RenderRecoveryState::default();
+        recovery.open_circuit(stage);
+        assert!(!recovery.record_surface_recovery_signal());
+        assert_eq!(recovery.admit(), PaintAdmission::SuppressCircuit);
+    }
+
+    #[test]
+    fn glium_draw_failure_stays_primary_when_finish_also_fails() {
+        let failure = combine_glium_draw_and_finish(
+            Err(anyhow::anyhow!("draw failed")),
+            Err(anyhow::anyhow!("finish failed")),
+        )
+        .expect_err("combined failure expected");
+        assert_eq!(
+            failure.stage(),
+            RenderFailureStage::Draw(DrawFailureStage::RenderCommands)
+        );
+        assert!(failure.secondary_finish.is_some());
+
+        let finish_only = combine_glium_draw_and_finish(
+            Ok(()),
+            Err(anyhow::anyhow!("finish failed")),
+        )
+        .expect_err("finish failure expected");
+        assert_eq!(finish_only.stage(), RenderFailureStage::BackendFinish);
+    }
+
+    #[test]
+    fn draw_invariants_keep_distinct_typed_failure_stages() {
+        let missing = RenderAttemptFailure::draw(DrawFailure::new(
+            DrawFailureStage::MissingGlyphProgram,
+            anyhow::anyhow!("missing program"),
+        ));
+        assert_eq!(
+            missing.stage(),
+            RenderFailureStage::Draw(DrawFailureStage::MissingGlyphProgram)
+        );
+
+        let bounds = RenderAttemptFailure::draw(DrawFailure::new(
+            DrawFailureStage::BufferSliceBounds,
+            anyhow::anyhow!("slice bounds"),
+        ));
+        assert_eq!(
+            bounds.stage(),
+            RenderFailureStage::Draw(DrawFailureStage::BufferSliceBounds)
+        );
+    }
+
+    #[test]
+    fn failed_webgpu_repair_is_a_permanent_validation_stage() {
+        assert_eq!(
+            webgpu_repair_failure_stage(),
+            RenderFailureStage::SurfaceAcquire(
+                webgpu::WebGpuSurfaceTextureError::Validation,
+            )
+        );
+        assert_eq!(
+            render_recovery_directive(webgpu_repair_failure_stage(), 1),
+            RenderRecoveryDirective::OpenCircuit
+        );
+    }
+
+    #[test]
+    fn webgpu_surface_error_classification_distinguishes_repair_modes() {
         assert_eq!(
             classify_webgpu_surface_error(&webgpu::WebGpuSurfaceTextureError::Lost),
-            WebGpuSurfaceErrorAction::Retry
+            WebGpuSurfaceErrorAction::RecreateSurface
         );
         assert_eq!(
             classify_webgpu_surface_error(&webgpu::WebGpuSurfaceTextureError::Outdated),
-            WebGpuSurfaceErrorAction::Retry
+            WebGpuSurfaceErrorAction::ForceConfigure
         );
     }
 
     #[test]
-    fn webgpu_surface_error_classification_skips_timeout_frames() {
+    fn webgpu_surface_error_classification_defers_non_repair_errors_to_policy() {
         assert_eq!(
             classify_webgpu_surface_error(&webgpu::WebGpuSurfaceTextureError::Timeout),
-            WebGpuSurfaceErrorAction::SkipFrame
+            WebGpuSurfaceErrorAction::DeferToRecoveryPolicy
         );
         assert_eq!(
             classify_webgpu_surface_error(&webgpu::WebGpuSurfaceTextureError::Occluded),
-            WebGpuSurfaceErrorAction::SkipFrame
+            WebGpuSurfaceErrorAction::DeferToRecoveryPolicy
         );
-    }
-
-    #[test]
-    fn webgpu_surface_error_classification_fails_terminal_errors() {
         assert_eq!(
             classify_webgpu_surface_error(&webgpu::WebGpuSurfaceTextureError::Validation),
-            WebGpuSurfaceErrorAction::Fail
+            WebGpuSurfaceErrorAction::DeferToRecoveryPolicy
         );
     }
 }
