@@ -298,6 +298,7 @@ struct RpcBinding {
     generation: NonZeroU64,
     attempt_id: NonZeroU64,
     request: &'static str,
+    expected_response_ident: Option<NonZeroU64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1373,6 +1374,14 @@ impl RpcGenerationScope {
         &self,
         pdu: Pdu,
     ) -> impl std::future::Future<Output = anyhow::Result<Pdu>> + Send + 'static {
+        self.send_pdu_expect(pdu, None)
+    }
+
+    fn send_pdu_expect(
+        &self,
+        pdu: Pdu,
+        expected_response_ident: Option<NonZeroU64>,
+    ) -> impl std::future::Future<Output = anyhow::Result<Pdu>> + Send + 'static {
         let request = pdu.pdu_name();
         let rpc_transport = Arc::clone(&self.rpc_transport);
         let sender = self.sender.clone();
@@ -1398,6 +1407,7 @@ impl RpcGenerationScope {
                         generation,
                         attempt_id,
                         request,
+                        expected_response_ident,
                     },
                     RpcRetirementStage::Admission,
                     RpcDeliveryCertainty::DefinitelyNotSent,
@@ -1417,6 +1427,7 @@ impl RpcGenerationScope {
                 generation,
                 attempt_id,
                 request,
+                expected_response_ident,
             })
         });
         async move {
@@ -2108,7 +2119,13 @@ macro_rules! rpc {
             let start = std::time::Instant::now();
             // `send_pdu` binds synchronously here, before this future can be
             // moved into a detached task and first polled on a later transport.
-            let request = self.send_pdu(Pdu::$request_type(pdu));
+            let request = self.send_pdu_expect(
+                Pdu::$request_type(pdu),
+                Some(
+                    NonZeroU64::new(<$response_type as PduWireIdent>::IDENT)
+                        .expect("typed success response must have a nonzero wire identifier"),
+                ),
+            );
             async move {
                 let result = request.await;
                 let elapsed = start.elapsed();
@@ -2144,7 +2161,13 @@ macro_rules! rpc {
             &self,
         ) -> impl std::future::Future<Output = anyhow::Result<$response_type>> + Send + 'static {
             let start = std::time::Instant::now();
-            let request = self.send_pdu(Pdu::$request_type($request_type {}));
+            let request = self.send_pdu_expect(
+                Pdu::$request_type($request_type {}),
+                Some(
+                    NonZeroU64::new(<$response_type as PduWireIdent>::IDENT)
+                        .expect("typed success response must have a nonzero wire identifier"),
+                ),
+            );
             async move {
                 let result = request.await;
                 let elapsed = start.elapsed();
@@ -3642,6 +3665,12 @@ enum PendingRpcEffect {
     CoherentTopologyFence,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingResponseBodyDisposition {
+    Materialize(PendingRpcEffect),
+    DiscardKnownTombstone,
+}
+
 #[derive(Debug, Clone)]
 struct RpcMetrics {
     pending: metrics::Gauge,
@@ -3654,6 +3683,7 @@ struct RpcMetrics {
     retirement_reply_channel_full: metrics::Counter,
     future_serial: metrics::Counter,
     unmatched_serial: metrics::Counter,
+    unexpected_response_ident: metrics::Counter,
     serial_exhausted: metrics::Counter,
     reserve_failed: metrics::Counter,
     serial_collision: metrics::Counter,
@@ -3699,6 +3729,10 @@ impl RpcMetrics {
             unmatched_serial: metrics::counter!(
                 "mux.client.rpc.protocol_error.total",
                 "kind" => "unmatched_serial"
+            ),
+            unexpected_response_ident: metrics::counter!(
+                "mux.client.rpc.protocol_error.total",
+                "kind" => "unexpected_response_ident"
             ),
             serial_exhausted: metrics::counter!(
                 "mux.client.rpc.protocol_error.total",
@@ -3767,6 +3801,20 @@ enum PendingRpcError {
         pending_generation: NonZeroU64,
         transport_generation: NonZeroU64,
     },
+    #[error(
+        "server replied to {request} RPC serial {serial} with unexpected PDU ident \
+         {observed_ident}; expected ident {expected_response_ident} or ErrorResponse"
+    )]
+    UnexpectedResponseIdent {
+        serial: NonZeroU64,
+        request: &'static str,
+        expected_response_ident: u64,
+        observed_ident: u64,
+    },
+    #[error(
+        "RPC serial {serial} lost its exact abandoned-body discard eligibility before retirement"
+    )]
+    DiscardEligibilityChanged { serial: NonZeroU64 },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3939,7 +3987,84 @@ impl PendingReplies {
         self.highest_issued
     }
 
-    fn effect(&self, serial: NonZeroU64) -> Result<PendingRpcEffect, PendingRpcError> {
+    fn response_body_disposition(
+        &mut self,
+        serial: NonZeroU64,
+        header: &PduFrameHeader,
+    ) -> Result<PendingResponseBodyDisposition, PendingRpcError> {
+        let Some(pending) = self.map.get_mut(&serial) else {
+            if serial.get() > self.highest_issued {
+                self.metrics.future_serial.increment(1);
+                return Err(PendingRpcError::FutureSerial {
+                    serial,
+                    highest_issued: self.highest_issued,
+                });
+            }
+            self.metrics.unmatched_serial.increment(1);
+            return Err(PendingRpcError::UnmatchedSerial {
+                serial,
+                highest_issued: self.highest_issued,
+            });
+        };
+        if pending.binding.generation != self.generation {
+            return Err(PendingRpcError::ResponseGenerationMismatch {
+                serial,
+                pending_generation: pending.binding.generation,
+                transport_generation: self.generation,
+            });
+        }
+        // Header correlation is the ResponseMatch boundary even if the
+        // generation retires immediately before validation. Record it first so
+        // terminal diagnostics cannot regress to AwaitingResponse.
+        pending.stage = RpcRetirementStage::ResponseMatch;
+        self.rpc_transport.validate(
+            pending.binding,
+            RpcRetirementStage::ResponseMatch,
+            RpcDeliveryCertainty::OutcomeUnknown,
+            "transport retired before response body admission",
+        )?;
+
+        let observed_ident = header.ident();
+        let error_response_ident = <ErrorResponse as PduWireIdent>::IDENT;
+        if let Some(expected_response_ident) = pending.binding.expected_response_ident {
+            if observed_ident != expected_response_ident.get()
+                && observed_ident != error_response_ident
+            {
+                self.metrics.unexpected_response_ident.increment(1);
+                return Err(PendingRpcError::UnexpectedResponseIdent {
+                    serial,
+                    request: pending.binding.request,
+                    expected_response_ident: expected_response_ident.get(),
+                    observed_ident,
+                });
+            }
+        }
+        let may_discard = pending.effect == PendingRpcEffect::Ordinary
+            && pending.completion.is_closed()
+            // Only the exact typed success response is eligible. In
+            // particular, preserve ErrorResponse diagnostics and schema
+            // validation even after the caller abandons its waiter.
+            && pending.binding.expected_response_ident.map(NonZeroU64::get)
+                == Some(observed_ident)
+            && observed_ident != error_response_ident
+            // Raw compressed-byte drainage would bypass the established
+            // materialize/decompress/typed-schema path. Complete-frame,
+            // decoder-window, and decompressed-size policy remains separate;
+            // compressed tombstones conservatively stay on that path.
+            && !header.is_compressed();
+
+        if may_discard {
+            Ok(PendingResponseBodyDisposition::DiscardKnownTombstone)
+        } else {
+            Ok(PendingResponseBodyDisposition::Materialize(pending.effect))
+        }
+    }
+
+    fn complete_discarded_abandoned(
+        &mut self,
+        serial: NonZeroU64,
+        observed_ident: u64,
+    ) -> Result<(), PendingRpcError> {
         let Some(pending) = self.map.get(&serial) else {
             if serial.get() > self.highest_issued {
                 self.metrics.future_serial.increment(1);
@@ -3954,7 +4079,36 @@ impl PendingReplies {
                 highest_issued: self.highest_issued,
             });
         };
-        Ok(pending.effect)
+        if pending.binding.generation != self.generation {
+            return Err(PendingRpcError::ResponseGenerationMismatch {
+                serial,
+                pending_generation: pending.binding.generation,
+                transport_generation: self.generation,
+            });
+        }
+        self.rpc_transport.validate(
+            pending.binding,
+            RpcRetirementStage::ResponseMatch,
+            RpcDeliveryCertainty::OutcomeUnknown,
+            "transport retired while draining an abandoned response body",
+        )?;
+        let error_response_ident = <ErrorResponse as PduWireIdent>::IDENT;
+        if pending.effect != PendingRpcEffect::Ordinary
+            || !pending.completion.is_closed()
+            || pending.binding.expected_response_ident.map(NonZeroU64::get)
+                != Some(observed_ident)
+            || observed_ident == error_response_ident
+        {
+            return Err(PendingRpcError::DiscardEligibilityChanged { serial });
+        }
+
+        let _pending = self
+            .map
+            .remove(&serial)
+            .expect("validated abandoned RPC must remain present until exact body drainage");
+        self.metrics.pending.decrement(1);
+        self.metrics.abandoned.increment(1);
+        Ok(())
     }
 
     fn complete(
@@ -4145,6 +4299,16 @@ impl PendingReplies {
         completion: Sender<anyhow::Result<Pdu>>,
         request: &'static str,
     ) -> Result<Option<NonZeroU64>, PendingRpcError> {
+        self.admit_named_expect(completion, request, None)
+    }
+
+    #[cfg(test)]
+    fn admit_named_expect(
+        &mut self,
+        completion: Sender<anyhow::Result<Pdu>>,
+        request: &'static str,
+        expected_response_ident: Option<NonZeroU64>,
+    ) -> Result<Option<NonZeroU64>, PendingRpcError> {
         let attempt_id = self
             .rpc_transport
             .allocate_attempt(request)
@@ -4155,6 +4319,7 @@ impl PendingReplies {
                 generation: self.generation,
                 attempt_id,
                 request,
+                expected_response_ident,
             },
             PendingRpcEffect::Ordinary,
         )
@@ -4268,6 +4433,17 @@ async fn client_thread_async(
     enum NextEvent {
         Message(Result<ReaderMessage, async_channel::RecvError>),
         Readable(anyhow::Result<()>),
+    }
+
+    enum InboundPdu {
+        Decoded {
+            decoded: DecodedPdu,
+            effect: Option<PendingRpcEffect>,
+        },
+        Discarded {
+            serial: NonZeroU64,
+            body: DiscardedPduBody,
+        },
     }
 
     let result = async {
@@ -4637,15 +4813,53 @@ async fn client_thread_async(
                     return Err(NotReconnectableError::ClientWasDestroyed.into());
                 }
                 NextEvent::Readable(Ok(())) => {
-                    let decoded = dispatch_authority
-                        .rpc_transport
-                        .complete_before_terminal(Pdu::decode_async(
-                            &mut reader,
-                            Some(pending.highest_issued()),
-                        ))
+                    let rpc_transport = Arc::clone(&dispatch_authority.rpc_transport);
+                    let inbound = rpc_transport
+                        .complete_before_terminal(async {
+                            let mut selected_effect = None;
+                            let decoded = Pdu::decode_async_with_selector(
+                                &mut reader,
+                                Some(pending.highest_issued()),
+                                |header| {
+                                    let Some(serial) = NonZeroU64::new(header.serial()) else {
+                                        return Ok(PduBodyDisposition::Materialize);
+                                    };
+                                    match pending.response_body_disposition(serial, header)? {
+                                        PendingResponseBodyDisposition::Materialize(effect) => {
+                                            selected_effect = Some(effect);
+                                            Ok(PduBodyDisposition::Materialize)
+                                        }
+                                        PendingResponseBodyDisposition::DiscardKnownTombstone => {
+                                            Ok(PduBodyDisposition::Discard)
+                                        }
+                                    }
+                                },
+                            )
+                            .await?;
+
+                            match decoded {
+                                AsyncPduDecode::Decoded(decoded) => Ok(InboundPdu::Decoded {
+                                    decoded,
+                                    effect: selected_effect,
+                                }),
+                                AsyncPduDecode::Discarded {
+                                    serial,
+                                    ident,
+                                    body,
+                                } => {
+                                    let serial = NonZeroU64::new(serial).ok_or_else(|| {
+                                        anyhow!(
+                                            "codec discarded a serial-zero unilateral PDU body"
+                                        )
+                                    })?;
+                                    pending.complete_discarded_abandoned(serial, ident)?;
+                                    Ok(InboundPdu::Discarded { serial, body })
+                                }
+                            }
+                        })
                         .await?;
-                    match decoded {
-                        Ok(decoded) => {
+                    match inbound {
+                        Ok(InboundPdu::Decoded { decoded, effect }) => {
                             log::debug!(
                                 "decoded serial {} {}",
                                 decoded.serial,
@@ -4667,7 +4881,12 @@ async fn client_thread_async(
                             } else {
                                 let serial = NonZeroU64::new(decoded.serial)
                                     .expect("the unilateral serial-zero branch was handled above");
-                                let effect = pending.effect(serial)?;
+                                let effect = effect.ok_or_else(|| {
+                                    anyhow!(
+                                        "decoded RPC serial {} without exact response correlation",
+                                        serial
+                                    )
+                                })?;
                                 let topology_action =
                                     if effect == PendingRpcEffect::CoherentTopologyFence {
                                         Some(topology.on_response(serial, &decoded.pdu)?)
@@ -4717,6 +4936,14 @@ async fn client_thread_async(
                                     bail!("{reason}");
                                 }
                             }
+                        }
+                        Ok(InboundPdu::Discarded { serial, body }) => {
+                            log::debug!(
+                                "discarded {} encoded bytes in {} bounded-size chunks for abandoned RPC serial {}",
+                                body.encoded_bytes(),
+                                body.chunk_reads(),
+                                serial,
+                            );
                         }
                         Err(err) => {
                             pending.record_decode_protocol_error(&err);
@@ -6197,6 +6424,15 @@ impl Client {
         self.rpc_scope().send_pdu(pdu)
     }
 
+    fn send_pdu_expect(
+        &self,
+        pdu: Pdu,
+        expected_response_ident: Option<NonZeroU64>,
+    ) -> impl std::future::Future<Output = anyhow::Result<Pdu>> + Send + 'static {
+        self.rpc_scope()
+            .send_pdu_expect(pdu, expected_response_ident)
+    }
+
     pub(crate) fn rpc_scope(&self) -> RpcGenerationScope {
         RpcGenerationScope::capture(self.sender.clone(), Arc::clone(&self.rpc_transport))
     }
@@ -6372,6 +6608,7 @@ impl Client {
                 generation,
                 attempt_id,
                 request,
+                expected_response_ident: None,
             },
             pdu: Box::new(pdu),
             promise,
@@ -6562,6 +6799,7 @@ mod tests {
         retirement_reply_channel_full: Arc<MetricAtomicU64>,
         future_serial: Arc<MetricAtomicU64>,
         unmatched_serial: Arc<MetricAtomicU64>,
+        unexpected_response_ident: Arc<MetricAtomicU64>,
         serial_exhausted: Arc<MetricAtomicU64>,
         reserve_failed: Arc<MetricAtomicU64>,
         serial_collision: Arc<MetricAtomicU64>,
@@ -6581,6 +6819,7 @@ mod tests {
                 retirement_reply_channel_full: Arc::new(MetricAtomicU64::new(0)),
                 future_serial: Arc::new(MetricAtomicU64::new(0)),
                 unmatched_serial: Arc::new(MetricAtomicU64::new(0)),
+                unexpected_response_ident: Arc::new(MetricAtomicU64::new(0)),
                 serial_exhausted: Arc::new(MetricAtomicU64::new(0)),
                 reserve_failed: Arc::new(MetricAtomicU64::new(0)),
                 serial_collision: Arc::new(MetricAtomicU64::new(0)),
@@ -6601,6 +6840,9 @@ mod tests {
                 )),
                 future_serial: Counter::from_arc(Arc::clone(&probe.future_serial)),
                 unmatched_serial: Counter::from_arc(Arc::clone(&probe.unmatched_serial)),
+                unexpected_response_ident: Counter::from_arc(Arc::clone(
+                    &probe.unexpected_response_ident,
+                )),
                 serial_exhausted: Counter::from_arc(Arc::clone(&probe.serial_exhausted)),
                 reserve_failed: Counter::from_arc(Arc::clone(&probe.reserve_failed)),
                 serial_collision: Counter::from_arc(Arc::clone(&probe.serial_collision)),
@@ -6647,6 +6889,10 @@ mod tests {
     fn pending_replies_for_test() -> (PendingReplies, RpcMetricProbe) {
         let (metrics, probe) = RpcMetricProbe::new();
         (pending_replies_with_metrics(metrics), probe)
+    }
+
+    fn test_wire_ident<T: PduWireIdent>() -> NonZeroU64 {
+        NonZeroU64::new(T::IDENT).expect("test PDU wire identifier must be nonzero")
     }
 
     fn pending_replies_with_metrics(metrics: RpcMetrics) -> PendingReplies {
@@ -8644,6 +8890,505 @@ mod tests {
             1
         );
         assert_eq!(probe.pending(), 0.0);
+        probe.assert_balanced();
+    }
+
+    #[test]
+    fn abandoned_large_reply_discards_then_resynchronizes_live_and_unilateral_frames() {
+        let (mut pending, probe) = pending_replies_for_test();
+        let (live_tx, live_rx) = bounded(1);
+        let live_serial = pending
+            .admit_named_expect(live_tx, "Ping", Some(test_wire_ident::<Pong>()))
+            .expect("admit live request")
+            .expect("assign live serial");
+        let (abandoned_tx, abandoned_rx) = bounded(1);
+        let abandoned_serial = pending
+            .admit_named_expect(
+                abandoned_tx,
+                "SearchScrollbackRequest",
+                Some(test_wire_ident::<SearchScrollbackResponse>()),
+            )
+            .expect("admit eventual tombstone")
+            .expect("assign abandoned serial");
+        drop(abandoned_rx);
+
+        let results = (0_usize..16_384)
+            .map(|index| {
+                let row = isize::try_from(index).expect("test row fits isize");
+                mux::pane::SearchResult {
+                    start_y: row,
+                    start_x: index,
+                    end_y: row,
+                    end_x: index.saturating_add(1),
+                    match_id: index,
+                }
+            })
+            .collect();
+        let mut wire = Pdu::SearchScrollbackResponse(SearchScrollbackResponse { results })
+            .encode_frame_with_mode(abandoned_serial.get(), CompressionMode::Never)
+            .expect("encode large uncompressed abandoned response");
+        Pdu::PaneRemoved(PaneRemoved { pane_id: 77 })
+            .encode(&mut wire, 0)
+            .expect("encode unilateral successor");
+        Pdu::Pong(Pong {})
+            .encode(&mut wire, live_serial.get())
+            .expect("encode reordered live successor");
+        let mut reader = std::io::Cursor::new(wire);
+
+        asupersync_block_on(async {
+            let discarded = Pdu::decode_async_with_selector(
+                &mut reader,
+                Some(pending.highest_issued()),
+                |header| {
+                    let serial = NonZeroU64::new(header.serial())
+                        .expect("abandoned response serial is nonzero");
+                    assert_eq!(serial, abandoned_serial);
+                    assert_eq!(
+                        pending.response_body_disposition(serial, header)?,
+                        PendingResponseBodyDisposition::DiscardKnownTombstone
+                    );
+                    Ok(PduBodyDisposition::Discard)
+                },
+            )
+            .await
+            .expect("discard abandoned large body");
+            let AsyncPduDecode::Discarded {
+                serial,
+                ident,
+                body,
+            } = discarded
+            else {
+                panic!("known tombstone should not materialize its body");
+            };
+            assert_eq!(serial, abandoned_serial.get());
+            assert!(
+                pending.map.contains_key(&abandoned_serial),
+                "tombstone must remain correlated until its entire body drains"
+            );
+            assert!(body.encoded_bytes() > DiscardedPduBody::scratch_capacity());
+            assert_eq!(
+                body.max_chunk_bytes(),
+                DiscardedPduBody::scratch_capacity()
+            );
+            assert!(body.chunk_reads() > 1);
+            pending
+                .complete_discarded_abandoned(abandoned_serial, ident)
+                .expect("retire exact drained tombstone");
+
+            let unilateral = Pdu::decode_async(&mut reader, Some(pending.highest_issued()))
+                .await
+                .expect("unilateral frame after discard remains aligned");
+            assert_eq!(unilateral.serial, 0);
+            assert_eq!(
+                unilateral.pdu,
+                Pdu::PaneRemoved(PaneRemoved { pane_id: 77 })
+            );
+
+            let mut live_effect = None;
+            let live = Pdu::decode_async_with_selector(
+                &mut reader,
+                Some(pending.highest_issued()),
+                |header| {
+                    let serial = NonZeroU64::new(header.serial())
+                        .expect("live response serial is nonzero");
+                    match pending.response_body_disposition(serial, header)? {
+                        PendingResponseBodyDisposition::Materialize(effect) => {
+                            live_effect = Some(effect);
+                            Ok(PduBodyDisposition::Materialize)
+                        }
+                        PendingResponseBodyDisposition::DiscardKnownTombstone => {
+                            panic!("live waiter must never authorize discard")
+                        }
+                    }
+                },
+            )
+            .await
+            .expect("decode live response after abandoned body");
+            let AsyncPduDecode::Decoded(live) = live else {
+                panic!("live response must be materialized");
+            };
+            assert_eq!(live.serial, live_serial.get());
+            assert_eq!(live.pdu, Pdu::Pong(Pong {}));
+            assert_eq!(live_effect, Some(PendingRpcEffect::Ordinary));
+            pending
+                .complete(live_serial, live.pdu)
+                .expect("deliver live response");
+        });
+
+        assert_eq!(
+            live_rx
+                .try_recv()
+                .expect("live response must reach caller")
+                .expect("live response must be successful"),
+            Pdu::Pong(Pong {})
+        );
+        assert_eq!(RpcMetricProbe::counter(&probe.abandoned), 1);
+        assert_eq!(RpcMetricProbe::counter(&probe.delivered), 1);
+        probe.assert_balanced();
+    }
+
+    #[test]
+    fn abandoned_typed_error_response_is_always_materialized() {
+        let (mut pending, probe) = pending_replies_for_test();
+        let (completion_tx, completion_rx) = bounded(1);
+        let serial = pending
+            .admit_named_expect(completion_tx, "Ping", Some(test_wire_ident::<Pong>()))
+            .expect("admit typed request")
+            .expect("assign typed serial");
+        drop(completion_rx);
+
+        let reason = "remote diagnostic must remain schema-validated".to_string();
+        let wire = Pdu::ErrorResponse(ErrorResponse {
+            reason: reason.clone(),
+        })
+        .encode_frame_with_mode(serial.get(), CompressionMode::Never)
+        .expect("encode uncompressed error response");
+        let mut reader = std::io::Cursor::new(wire);
+
+        let decoded = asupersync_block_on(Pdu::decode_async_with_selector(
+            &mut reader,
+            Some(pending.highest_issued()),
+            |header| {
+                assert_eq!(header.serial(), serial.get());
+                assert_eq!(
+                    header.ident(),
+                    <ErrorResponse as PduWireIdent>::IDENT
+                );
+                assert_eq!(
+                    pending.response_body_disposition(serial, header)?,
+                    PendingResponseBodyDisposition::Materialize(PendingRpcEffect::Ordinary)
+                );
+                Ok(PduBodyDisposition::Materialize)
+            },
+        ))
+        .expect("error response must retain full decoding");
+        let AsyncPduDecode::Decoded(decoded) = decoded else {
+            panic!("ErrorResponse must never use raw body discard");
+        };
+        assert_eq!(
+            decoded.pdu,
+            Pdu::ErrorResponse(ErrorResponse { reason })
+        );
+        assert_eq!(
+            pending
+                .complete(serial, decoded.pdu)
+                .expect("retire abandoned decoded ErrorResponse")
+                .disposition,
+            ReplyDisposition::Abandoned
+        );
+        assert_eq!(RpcMetricProbe::counter(&probe.abandoned), 1);
+        probe.assert_balanced();
+    }
+
+    #[test]
+    fn discard_classifier_preserves_compressed_generic_and_topology_frames() {
+        {
+            let (mut pending, probe) = pending_replies_for_test();
+            let (completion_tx, completion_rx) = bounded(1);
+            let serial = pending
+                .admit_named_expect(completion_tx, "Ping", Some(test_wire_ident::<Pong>()))
+                .expect("admit typed compressed request")
+                .expect("assign typed compressed serial");
+            drop(completion_rx);
+            let wire = Pdu::Pong(Pong {})
+                .encode_frame_with_mode(serial.get(), CompressionMode::Always)
+                .expect("encode compressed typed response");
+            let mut reader = std::io::Cursor::new(wire);
+
+            let decoded = asupersync_block_on(Pdu::decode_async_with_selector(
+                &mut reader,
+                Some(pending.highest_issued()),
+                |header| {
+                    assert!(header.is_compressed());
+                    assert_eq!(
+                        pending.response_body_disposition(serial, header)?,
+                        PendingResponseBodyDisposition::Materialize(PendingRpcEffect::Ordinary)
+                    );
+                    Ok(PduBodyDisposition::Materialize)
+                },
+            ))
+            .expect("compressed tombstone must retain decompression and schema validation");
+            let AsyncPduDecode::Decoded(decoded) = decoded else {
+                panic!("compressed tombstone must never use raw body discard");
+            };
+            pending
+                .complete(serial, decoded.pdu)
+                .expect("retire decoded compressed tombstone");
+            assert_eq!(RpcMetricProbe::counter(&probe.abandoned), 1);
+            probe.assert_balanced();
+        }
+
+        {
+            let (mut pending, probe) = pending_replies_for_test();
+            let (completion_tx, completion_rx) = bounded(1);
+            let serial = pending
+                .admit_named(completion_tx, "generic-send-pdu")
+                .expect("admit generic request")
+                .expect("assign generic serial");
+            drop(completion_rx);
+            let wire = Pdu::Pong(Pong {})
+                .encode_frame_with_mode(serial.get(), CompressionMode::Never)
+                .expect("encode generic response");
+            let mut reader = std::io::Cursor::new(wire);
+
+            let decoded = asupersync_block_on(Pdu::decode_async_with_selector(
+                &mut reader,
+                Some(pending.highest_issued()),
+                |header| {
+                    assert_eq!(
+                        pending.response_body_disposition(serial, header)?,
+                        PendingResponseBodyDisposition::Materialize(PendingRpcEffect::Ordinary)
+                    );
+                    Ok(PduBodyDisposition::Materialize)
+                },
+            ))
+            .expect("generic request response must retain full decoding");
+            let AsyncPduDecode::Decoded(decoded) = decoded else {
+                panic!("generic request has no exact typed discard authority");
+            };
+            pending
+                .complete(serial, decoded.pdu)
+                .expect("retire decoded generic response");
+            assert_eq!(RpcMetricProbe::counter(&probe.abandoned), 1);
+            probe.assert_balanced();
+        }
+
+        {
+            let (mut pending, probe) = pending_replies_for_test();
+            let (completion_tx, completion_rx) = bounded(1);
+            let serial = pending
+                .admit_named_expect(completion_tx, "Ping", Some(test_wire_ident::<Pong>()))
+                .expect("admit topology-fence request")
+                .expect("assign topology-fence serial");
+            pending
+                .map
+                .get_mut(&serial)
+                .expect("admitted topology-fence request remains pending")
+                .effect = PendingRpcEffect::CoherentTopologyFence;
+            drop(completion_rx);
+            let wire = Pdu::Pong(Pong {})
+                .encode_frame_with_mode(serial.get(), CompressionMode::Never)
+                .expect("encode topology-fence response");
+            let mut reader = std::io::Cursor::new(wire);
+
+            let decoded = asupersync_block_on(Pdu::decode_async_with_selector(
+                &mut reader,
+                Some(pending.highest_issued()),
+                |header| {
+                    assert_eq!(
+                        pending.response_body_disposition(serial, header)?,
+                        PendingResponseBodyDisposition::Materialize(
+                            PendingRpcEffect::CoherentTopologyFence
+                        )
+                    );
+                    Ok(PduBodyDisposition::Materialize)
+                },
+            ))
+            .expect("topology-fence response must retain full decoding");
+            let AsyncPduDecode::Decoded(decoded) = decoded else {
+                panic!("topology-fence response must never use raw body discard");
+            };
+            pending
+                .complete(serial, decoded.pdu)
+                .expect("retire decoded topology-fence response");
+            assert_eq!(RpcMetricProbe::counter(&probe.abandoned), 1);
+            probe.assert_balanced();
+        }
+    }
+
+    #[test]
+    fn typed_wrong_response_ident_is_fatal_before_body_for_live_and_closed_waiters() {
+        let known_wrong_ident = <SearchScrollbackResponse as PduWireIdent>::IDENT;
+        let unknown_ident = 127_u64;
+        assert_eq!(Pdu::pdu_name_for_ident(unknown_ident), None);
+
+        for (caller_is_closed, observed_ident) in [false, true]
+            .into_iter()
+            .flat_map(|closed| [known_wrong_ident, unknown_ident].map(|ident| (closed, ident)))
+        {
+            let (mut pending, probe) = pending_replies_for_test();
+            let (completion_tx, completion_rx) = bounded(1);
+            let serial = pending
+                .admit_named_expect(completion_tx, "Ping", Some(test_wire_ident::<Pong>()))
+                .expect("admit typed request")
+                .expect("assign typed serial");
+            let completion_rx = if caller_is_closed {
+                drop(completion_rx);
+                None
+            } else {
+                Some(completion_rx)
+            };
+
+            let mut wire = Pdu::SearchScrollbackResponse(SearchScrollbackResponse {
+                results: vec![mux::pane::SearchResult {
+                    start_y: 1,
+                    start_x: 2,
+                    end_y: 1,
+                    end_x: 3,
+                    match_id: 4,
+                }],
+            })
+            .encode_frame_with_mode(serial.get(), CompressionMode::Never)
+            .expect("encode wrong typed response");
+            if observed_ident == unknown_ident {
+                let length_field_len = wire
+                    .iter()
+                    .position(|byte| byte & 0x80 == 0)
+                    .map(|index| index.saturating_add(1))
+                    .expect("encoded frame length has a terminating LEB128 byte");
+                let serial_field_len = wire[length_field_len..]
+                    .iter()
+                    .position(|byte| byte & 0x80 == 0)
+                    .map(|index| index.saturating_add(1))
+                    .expect("encoded serial has a terminating LEB128 byte");
+                let ident_offset = length_field_len.saturating_add(serial_field_len);
+                let ident_byte = wire
+                    .get_mut(ident_offset)
+                    .expect("encoded frame contains an identifier byte");
+                assert_eq!(
+                    u64::from(*ident_byte),
+                    known_wrong_ident,
+                    "test mutation assumes both identifiers use one-byte LEB128"
+                );
+                *ident_byte = u8::try_from(unknown_ident).expect("unknown test ident fits u8");
+            }
+            let wire_len = wire.len();
+            let mut reader = std::io::Cursor::new(wire);
+            let error = asupersync_block_on(Pdu::decode_async_with_selector(
+                &mut reader,
+                Some(pending.highest_issued()),
+                |header| {
+                    let serial = NonZeroU64::new(header.serial())
+                        .expect("typed response serial is nonzero");
+                    let disposition = pending.response_body_disposition(serial, header)?;
+                    Ok(match disposition {
+                        PendingResponseBodyDisposition::Materialize(_) => {
+                            PduBodyDisposition::Materialize
+                        }
+                        PendingResponseBodyDisposition::DiscardKnownTombstone => {
+                            PduBodyDisposition::Discard
+                        }
+                    })
+                },
+            ))
+            .expect_err("wrong response ident must fail before body consumption");
+            assert!(matches!(
+                error.downcast_ref::<PendingRpcError>(),
+                Some(PendingRpcError::UnexpectedResponseIdent {
+                    serial: observed,
+                    request: "Ping",
+                    expected_response_ident,
+                    observed_ident: rejected_ident,
+                }) if *observed == serial
+                    && *rejected_ident == observed_ident
+                    && *expected_response_ident == <Pong as PduWireIdent>::IDENT
+            ));
+            assert!(
+                usize::try_from(reader.position()).expect("cursor position fits usize") < wire_len,
+                "wrong-ident rejection must leave the payload unread for terminal teardown"
+            );
+            assert!(pending.map.contains_key(&serial));
+            assert_eq!(
+                pending.map[&serial].stage,
+                RpcRetirementStage::ResponseMatch,
+                "header correlation must advance retirement diagnostics before failure"
+            );
+            assert_eq!(RpcMetricProbe::counter(&probe.abandoned), 0);
+            assert_eq!(
+                RpcMetricProbe::counter(&probe.unexpected_response_ident),
+                1
+            );
+
+            pending.fail_after_decode_error(&error);
+            if let Some(completion_rx) = completion_rx {
+                assert!(completion_rx
+                    .try_recv()
+                    .expect("live waiter must be woken by terminal teardown")
+                    .is_err());
+            }
+            assert_eq!(RpcMetricProbe::counter(&probe.abandoned), 0);
+            probe.assert_balanced();
+        }
+    }
+
+    #[test]
+    fn matched_header_records_response_stage_before_retirement_validation() {
+        let (mut pending, probe) = pending_replies_for_test();
+        let (completion_tx, completion_rx) = bounded(1);
+        let serial = pending
+            .admit_named_expect(
+                completion_tx,
+                "SearchScrollbackRequest",
+                Some(test_wire_ident::<SearchScrollbackResponse>()),
+            )
+            .expect("admit typed request")
+            .expect("assign typed serial");
+        let wire = Pdu::SearchScrollbackResponse(SearchScrollbackResponse {
+            results: vec![mux::pane::SearchResult {
+                start_y: 1,
+                start_x: 2,
+                end_y: 1,
+                end_x: 3,
+                match_id: 4,
+            }],
+        })
+            .encode_frame_with_mode(serial.get(), CompressionMode::Never)
+            .expect("encode response whose header will race retirement");
+        let wire_len = wire.len();
+        let mut reader = std::io::Cursor::new(wire);
+
+        pending.rpc_transport.mark_incarnation_terminal(
+            RpcTransportError::AttemptIdentityExhausted {
+                request: "retirement-race",
+            },
+        );
+        let error = asupersync_block_on(Pdu::decode_async_with_selector(
+            &mut reader,
+            Some(pending.highest_issued()),
+            |header| {
+                assert_eq!(header.serial(), serial.get());
+                let disposition = pending.response_body_disposition(serial, header)?;
+                Ok(match disposition {
+                    PendingResponseBodyDisposition::Materialize(_) => {
+                        PduBodyDisposition::Materialize
+                    }
+                    PendingResponseBodyDisposition::DiscardKnownTombstone => {
+                        PduBodyDisposition::Discard
+                    }
+                })
+            },
+        ))
+        .expect_err("retirement at exact header correlation must fail closed");
+
+        assert!(matches!(
+            error.downcast_ref::<PendingRpcError>(),
+            Some(PendingRpcError::IncarnationTerminal(
+                RpcTransportError::Retired {
+                    request: "SearchScrollbackRequest",
+                    stage: RpcRetirementStage::ResponseMatch,
+                    certainty: RpcDeliveryCertainty::OutcomeUnknown,
+                    reason,
+                    ..
+                }
+            )) if reason == "transport retired before response body admission"
+        ));
+        assert!(
+            usize::try_from(reader.position()).expect("cursor position fits usize") < wire_len,
+            "retirement validation must leave the response body unread"
+        );
+        assert_eq!(
+            pending.map[&serial].stage,
+            RpcRetirementStage::ResponseMatch,
+            "header correlation must be visible even when transport validation fails"
+        );
+
+        pending.fail_after_decode_error(&error);
+        assert!(
+            completion_rx
+                .try_recv()
+                .expect("retirement must wake the live response waiter")
+                .is_err()
+        );
         probe.assert_balanced();
     }
 

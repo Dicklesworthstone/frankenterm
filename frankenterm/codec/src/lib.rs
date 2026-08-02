@@ -714,6 +714,9 @@ const COMPRESSED_MASK: u64 = 1 << 63;
 /// malformed or malicious length fields.
 const MAX_PDU_SIZE: usize = 256 * 1024 * 1024;
 const PAYLOAD_READ_CHUNK: usize = 64 * 1024;
+// Keep the abandoned-body memory envelope independent from materializing
+// decoder growth-policy tuning.
+const DISCARDED_PAYLOAD_READ_CHUNK: usize = 64 * 1024;
 
 fn max_pdu_read_limit() -> anyhow::Result<u64> {
     u64::try_from(MAX_PDU_SIZE)
@@ -1026,6 +1029,106 @@ async fn read_payload_chunked_async<R: Unpin + AsyncRead + std::fmt::Debug>(
     Ok(data)
 }
 
+/// Validated mux frame metadata whose payload has not yet been read.
+///
+/// The fields are intentionally private and this type is intentionally neither
+/// `Clone` nor `Copy`. It is exposed only by reference to the synchronous
+/// selector passed to [`Pdu::decode_async_with_selector`], so external callers
+/// cannot leave the ordered stream half-consumed by taking ownership of it.
+#[derive(Debug, PartialEq, Eq)]
+pub struct PduFrameHeader {
+    frame_len: u64,
+    data_len: usize,
+    serial: u64,
+    ident: u64,
+    is_compressed: bool,
+}
+
+impl PduFrameHeader {
+    /// Request/reply correlation serial from the validated frame header.
+    #[must_use]
+    pub const fn serial(&self) -> u64 {
+        self.serial
+    }
+
+    /// PDU identifier/version tag from the validated frame header.
+    #[must_use]
+    pub const fn ident(&self) -> u64 {
+        self.ident
+    }
+
+    /// Encoded payload bytes that follow this header on the stream.
+    #[must_use]
+    pub const fn encoded_payload_len(&self) -> usize {
+        self.data_len
+    }
+
+    /// Whether the encoded payload carries the frame compression flag.
+    #[must_use]
+    pub const fn is_compressed(&self) -> bool {
+        self.is_compressed
+    }
+}
+
+/// Non-content accounting for one successfully discarded frame body.
+///
+/// These values make the fixed-memory contract directly testable without
+/// retaining or formatting any payload bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DiscardedPduBody {
+    encoded_bytes: usize,
+    chunk_reads: usize,
+    max_chunk_bytes: usize,
+}
+
+/// Body action selected after validated frame metadata is available and before
+/// any payload allocation or materialization occurs.
+///
+/// `Discard` is an authorization decision by the selector: it consumes the
+/// encoded bytes of an uncompressed body without deserializing or validating
+/// that body's payload schema. Compressed bodies cannot use this path and are
+/// rejected before any raw drainage begins.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PduBodyDisposition {
+    Materialize,
+    Discard,
+}
+
+/// Result of one codec-owned header-plus-body async operation.
+#[derive(Debug, PartialEq)]
+pub enum AsyncPduDecode {
+    Decoded(DecodedPdu),
+    Discarded {
+        serial: u64,
+        ident: u64,
+        body: DiscardedPduBody,
+    },
+}
+
+impl DiscardedPduBody {
+    #[must_use]
+    pub const fn encoded_bytes(self) -> usize {
+        self.encoded_bytes
+    }
+
+    #[must_use]
+    pub const fn chunk_reads(self) -> usize {
+        self.chunk_reads
+    }
+
+    #[must_use]
+    pub const fn max_chunk_bytes(self) -> usize {
+        self.max_chunk_bytes
+    }
+
+    /// Fixed scratch-buffer capacity used by every discarded body, independent
+    /// of the peer-advertised payload length.
+    #[must_use]
+    pub const fn scratch_capacity() -> usize {
+        DISCARDED_PAYLOAD_READ_CHUNK
+    }
+}
+
 fn decoded_payload_len(
     label: &str,
     len: u64,
@@ -1057,12 +1160,11 @@ fn decoded_payload_len(
     }
 }
 
-/// Decode a frame.
-/// See encode_raw() for the frame format.
-async fn decode_raw_async<R: Unpin + AsyncRead + std::fmt::Debug>(
+/// Validate and consume only a frame header, leaving its payload unread.
+async fn decode_raw_header_async<R: Unpin + AsyncRead + std::fmt::Debug>(
     r: &mut R,
     max_serial: Option<u64>,
-) -> anyhow::Result<Decoded> {
+) -> anyhow::Result<PduFrameHeader> {
     let (len, _len_len) = read_u64_async_with_len(r)
         .await
         .context("decode_raw_async failed to read PDU length")?;
@@ -1108,13 +1210,84 @@ async fn decode_raw_async<R: Unpin + AsyncRead + std::fmt::Debug>(
         metrics::histogram!("pdu.decode.size").record(data_len as f64);
     }
 
-    let data = read_payload_chunked_async(r, data_len, len, serial, ident).await?;
-    Ok(Decoded {
-        ident,
+    Ok(PduFrameHeader {
+        frame_len: len,
+        data_len,
         serial,
-        data,
+        ident,
         is_compressed,
     })
+}
+
+async fn decode_raw_body_async<R: Unpin + AsyncRead + std::fmt::Debug>(
+    r: &mut R,
+    header: PduFrameHeader,
+) -> anyhow::Result<Decoded> {
+    let data = read_payload_chunked_async(
+        r,
+        header.data_len,
+        header.frame_len,
+        header.serial,
+        header.ident,
+    )
+    .await?;
+    Ok(Decoded {
+        ident: header.ident,
+        serial: header.serial,
+        data,
+        is_compressed: header.is_compressed,
+    })
+}
+
+async fn discard_raw_body_async<R: Unpin + AsyncRead + std::fmt::Debug>(
+    r: &mut R,
+    header: PduFrameHeader,
+) -> anyhow::Result<DiscardedPduBody> {
+    let mut scratch = [0_u8; DISCARDED_PAYLOAD_READ_CHUNK];
+    let mut consumed = 0_usize;
+    let mut chunk_reads = 0_usize;
+    let mut max_chunk_bytes = 0_usize;
+
+    while consumed < header.data_len {
+        let read_len = header
+            .data_len
+            .saturating_sub(consumed)
+            .min(scratch.len());
+        r.read_exact(&mut scratch[..read_len]).await.with_context(|| {
+            format!(
+                "discarding bytes {}..{} of {} for abandoned PDU body \
+                 with serial={} ident={}",
+                consumed,
+                consumed.saturating_add(read_len),
+                header.data_len,
+                header.serial,
+                header.ident,
+            )
+        })?;
+        consumed = consumed
+            .checked_add(read_len)
+            .context("discarded PDU payload length overflow")?;
+        chunk_reads = chunk_reads
+            .checked_add(1)
+            .context("discarded PDU chunk count overflow")?;
+        max_chunk_bytes = max_chunk_bytes.max(read_len);
+    }
+
+    Ok(DiscardedPduBody {
+        encoded_bytes: consumed,
+        chunk_reads,
+        max_chunk_bytes,
+    })
+}
+
+/// Decode a frame.
+/// See encode_raw() for the frame format.
+async fn decode_raw_async<R: Unpin + AsyncRead + std::fmt::Debug>(
+    r: &mut R,
+    max_serial: Option<u64>,
+) -> anyhow::Result<Decoded> {
+    let header = decode_raw_header_async(r, max_serial).await?;
+    decode_raw_body_async(r, header).await
 }
 
 /// Decode a frame.
@@ -1249,6 +1422,14 @@ macro_rules! deserialize_pdu_payload {
     };
 }
 
+/// Stable numeric wire identity generated for each concrete PDU payload type.
+///
+/// Typed RPC callers use this associated constant rather than performing a
+/// string lookup at admission time.
+pub trait PduWireIdent {
+    const IDENT: u64;
+}
+
 macro_rules! pdu {
     ($( $name:ident:$vers:expr $(=> $decoder:path)?),* $(,)?) => {
         #[derive(PartialEq, Debug)]
@@ -1259,6 +1440,12 @@ macro_rules! pdu {
                 $name($name)
             ,)*
         }
+
+        $(
+            impl PduWireIdent for $name {
+                const IDENT: u64 = $vers;
+            }
+        )*
 
         impl Pdu {
             pub fn encode<W: std::io::Write>(&self, w: W, serial: u64) -> Result<(), Error> {
@@ -1414,6 +1601,18 @@ macro_rules! pdu {
                 }
             }
 
+            /// Resolve a validated wire identifier without reading or
+            /// deserializing its payload.
+            #[must_use]
+            pub fn pdu_name_for_ident(ident: u64) -> Option<&'static str> {
+                match ident {
+                    $(
+                        $vers => Some(stringify!($name)),
+                    )*
+                    _ => None,
+                }
+            }
+
             pub fn decode<R: std::io::Read>(r: R) -> Result<DecodedPdu, Error> {
                 Self::decode_impl(r, true)
             }
@@ -1461,16 +1660,12 @@ macro_rules! pdu {
                 }
             }
 
-            pub async fn decode_async<R>(r: &mut R, max_serial: Option<u64>) -> Result<DecodedPdu, Error>
-                where R: std::marker::Unpin,
-                      R: AsyncRead,
-                      R: std::fmt::Debug
-            {
-                let decoded = decode_raw_async(r, max_serial).await.context("decoding a PDU")?;
+            fn decode_materialized_async(decoded: Decoded) -> Result<DecodedPdu, Error> {
                 match decoded.ident {
                     $(
                         $vers => {
                             metrics::histogram!("pdu.size", "pdu" => stringify!($name)).record(decoded.data.len() as f64);
+                            metrics::histogram!("pdu.size.rate", "pdu" => stringify!($name)).record(decoded.data.len() as f64);
                             Ok(DecodedPdu {
                                 serial: decoded.serial,
                                 pdu: Pdu::$name(deserialize_pdu_payload!(
@@ -1483,10 +1678,96 @@ macro_rules! pdu {
                     ,)*
                     _ => {
                         metrics::histogram!("pdu.size", "pdu" => "??").record(decoded.data.len() as f64);
+                        metrics::histogram!("pdu.size.rate", "pdu" => "??").record(decoded.data.len() as f64);
                         Ok(DecodedPdu {
                             serial: decoded.serial,
                             pdu: Pdu::Invalid{ident:decoded.ident}
                         })
+                    }
+                }
+            }
+
+            /// Decode one complete frame while allowing a synchronous policy
+            /// decision after its header is validated and before its body is
+            /// allocated. The codec retains ownership of the header and always
+            /// consumes the selected body action before returning success.
+            ///
+            /// # Stream state after an error
+            ///
+            /// A partial-header failure, selector error, rejected compressed
+            /// discard, or body-read error may leave the reader away from a
+            /// frame boundary. The caller must retire that ordered stream; it
+            /// must not infer recoverability from the observed cursor position
+            /// or attempt to decode another frame from it.
+            pub async fn decode_async_with_selector<R, F>(
+                r: &mut R,
+                max_serial: Option<u64>,
+                select_body: F,
+            ) -> Result<AsyncPduDecode, Error>
+                where R: std::marker::Unpin,
+                      R: AsyncRead,
+                      R: std::fmt::Debug,
+                      F: FnOnce(&PduFrameHeader) -> Result<PduBodyDisposition, Error>
+            {
+                let header = decode_raw_header_async(r, max_serial)
+                    .await
+                    .context("decoding a PDU")?;
+                match select_body(&header)? {
+                    PduBodyDisposition::Materialize => {
+                        let decoded = decode_raw_body_async(r, header)
+                            .await
+                            .context("decoding a PDU")?;
+                        Ok(AsyncPduDecode::Decoded(Self::decode_materialized_async(decoded)?))
+                    }
+                    PduBodyDisposition::Discard => {
+                        // A raw compressed-byte drain would bypass the existing
+                        // materializing decompression and typed-schema path.
+                        // Keep that case there until a bounded streaming policy
+                        // defines complete-frame and size-limit semantics.
+                        if header.is_compressed() {
+                            bail!(
+                                "refusing to discard compressed PDU body without bounded zstd validation"
+                            );
+                        }
+                        let serial = header.serial();
+                        let ident = header.ident();
+                        let discarded = discard_raw_body_async(r, header)
+                            .await
+                            .context("discarding an abandoned PDU body")?;
+                        metrics::counter!("pdu.decode.discarded.frames").increment(1);
+                        metrics::counter!("pdu.decode.discarded.encoded_bytes").increment(
+                            u64::try_from(discarded.encoded_bytes()).unwrap_or(u64::MAX),
+                        );
+                        metrics::counter!("pdu.decode.discarded.chunk_reads").increment(
+                            u64::try_from(discarded.chunk_reads()).unwrap_or(u64::MAX),
+                        );
+                        metrics::histogram!("pdu.decode.discarded.max_chunk.size")
+                            .record(discarded.max_chunk_bytes() as f64);
+                        let pdu_name = Self::pdu_name_for_ident(ident).unwrap_or("??");
+                        metrics::histogram!("pdu.size", "pdu" => pdu_name)
+                            .record(discarded.encoded_bytes() as f64);
+                        metrics::histogram!("pdu.size.rate", "pdu" => pdu_name)
+                            .record(discarded.encoded_bytes() as f64);
+                        Ok(AsyncPduDecode::Discarded {
+                            serial,
+                            ident,
+                            body: discarded,
+                        })
+                    }
+                }
+            }
+
+            pub async fn decode_async<R>(r: &mut R, max_serial: Option<u64>) -> Result<DecodedPdu, Error>
+                where R: std::marker::Unpin,
+                      R: AsyncRead,
+                      R: std::fmt::Debug
+            {
+                match Self::decode_async_with_selector(r, max_serial, |_| {
+                    Ok(PduBodyDisposition::Materialize)
+                }).await? {
+                    AsyncPduDecode::Decoded(decoded) => Ok(decoded),
+                    AsyncPduDecode::Discarded { .. } => {
+                        bail!("materializing PDU decode unexpectedly discarded its body")
                     }
                 }
             }
@@ -5231,6 +5512,137 @@ mod test {
                 .expect("the serial ceiling is inclusive");
             assert_eq!(decoded.serial, 10);
             assert_eq!(decoded.data, b"exact");
+        });
+    }
+
+    #[test]
+    fn async_selector_discard_is_fixed_bound_and_exactly_resynchronizes() {
+        for data_len in [
+            DISCARDED_PAYLOAD_READ_CHUNK - 1,
+            DISCARDED_PAYLOAD_READ_CHUNK,
+            DISCARDED_PAYLOAD_READ_CHUNK + 1,
+        ] {
+            runtime::block_on(async {
+                let mut wire = Vec::new();
+                encode_raw(99, 1, &vec![0x5a; data_len], false, &mut wire)
+                    .expect("encode discard candidate");
+                Pdu::Pong(Pong {})
+                    .encode(&mut wire, 2)
+                    .expect("encode live successor");
+                let mut reader = runtime::Cursor::new(wire);
+
+                let discarded = Pdu::decode_async_with_selector(
+                    &mut reader,
+                    Some(2),
+                    |header| {
+                        assert_eq!(header.serial(), 1);
+                        assert_eq!(header.ident(), 99);
+                        assert_eq!(header.encoded_payload_len(), data_len);
+                        assert!(!header.is_compressed());
+                        Ok(PduBodyDisposition::Discard)
+                    },
+                )
+                .await
+                .expect("discard exact body");
+                let AsyncPduDecode::Discarded {
+                    serial,
+                    ident,
+                    body,
+                } = discarded
+                else {
+                    panic!("selector requested discard but codec materialized the body");
+                };
+                assert_eq!(serial, 1);
+                assert_eq!(ident, 99);
+                assert_eq!(body.encoded_bytes(), data_len);
+                assert!(body.max_chunk_bytes() <= DiscardedPduBody::scratch_capacity());
+                assert_eq!(
+                    body.chunk_reads(),
+                    data_len.div_ceil(DiscardedPduBody::scratch_capacity())
+                );
+
+                let successor = Pdu::decode_async(&mut reader, Some(2))
+                    .await
+                    .expect("discard must leave the next frame exactly aligned");
+                assert_eq!(successor.serial, 2);
+                assert_eq!(successor.pdu, Pdu::Pong(Pong {}));
+            });
+        }
+    }
+
+    #[test]
+    fn async_selector_rejects_oversize_header_before_body_selection() {
+        runtime::block_on(async {
+            let mut header = Vec::new();
+            let frame_len = u64::try_from(MAX_PDU_SIZE)
+                .expect("MAX_PDU_SIZE fits u64")
+                .checked_add(3)
+                .expect("test frame length fits u64");
+            leb128::write::unsigned(&mut header, frame_len).expect("encode frame length");
+            leb128::write::unsigned(&mut header, 1).expect("encode serial");
+            leb128::write::unsigned(&mut header, 99).expect("encode ident");
+            let mut reader = runtime::Cursor::new(header);
+            let mut selector_was_called = false;
+
+            let error = Pdu::decode_async_with_selector(&mut reader, Some(1), |_| {
+                selector_was_called = true;
+                Ok(PduBodyDisposition::Discard)
+            })
+            .await
+            .expect_err("oversize payload declaration must fail before selection");
+            assert!(
+                error.to_string().contains("exceeds maximum"),
+                "unexpected oversize-header error: {error:#}"
+            );
+            assert!(
+                !selector_was_called,
+                "invalid length must not reach the body-disposition authority"
+            );
+        });
+    }
+
+    #[test]
+    fn async_selector_truncated_discard_fails_closed() {
+        runtime::block_on(async {
+            let mut wire = Vec::new();
+            encode_raw(99, 1, &[0x41; 128], false, &mut wire)
+                .expect("encode discard candidate");
+            wire.pop().expect("encoded frame has a payload byte");
+            let mut reader = runtime::Cursor::new(wire);
+
+            let error = Pdu::decode_async_with_selector(&mut reader, Some(1), |_| {
+                Ok(PduBodyDisposition::Discard)
+            })
+            .await
+            .expect_err("truncated discarded body must fail closed");
+            assert!(
+                error.to_string().contains("discarding an abandoned PDU body"),
+                "unexpected truncated-discard error: {error:#}"
+            );
+        });
+    }
+
+    #[test]
+    fn async_selector_never_raw_discards_compressed_payloads() {
+        runtime::block_on(async {
+            let wire = Pdu::WriteToPane(WriteToPane {
+                pane_id: 7,
+                data: vec![b'x'; 4 * 1024],
+            })
+            .encode_frame_with_mode(1, CompressionMode::Always)
+            .expect("encode compressed frame");
+            let mut reader = runtime::Cursor::new(wire);
+
+            let error = Pdu::decode_async_with_selector(&mut reader, Some(1), |header| {
+                assert!(header.is_compressed());
+                Ok(PduBodyDisposition::Discard)
+            })
+            .await
+            .expect_err("compressed discard without zstd validation must fail closed");
+            assert!(
+                error.to_string().contains("refusing to discard compressed PDU body"),
+                "unexpected compressed-discard error: {error:#}"
+            );
         });
     }
 
