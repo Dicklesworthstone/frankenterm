@@ -1998,7 +1998,6 @@ impl Pdu {
                 | Self::SendMouseEvent(_)
                 | Self::SendPaste(_)
                 | Self::Resize(_)
-                | Self::SetClipboard(_)
                 | Self::SetPaneZoomed(_)
                 | Self::SpawnV2(_)
         )
@@ -5931,6 +5930,18 @@ mod test {
     #[test]
     fn pdu_is_user_input_kill_pane_is_false() {
         assert!(!Pdu::KillPane(KillPane { pane_id: 0 }).is_user_input());
+    }
+
+    #[test]
+    fn server_unilateral_clipboard_is_not_client_input() {
+        assert!(
+            !Pdu::SetClipboard(SetClipboard {
+                pane_id: 55,
+                clipboard: Some("copied".to_string()),
+                selection: ClipboardSelection::Clipboard,
+            })
+            .is_user_input()
+        );
     }
 
     // --- Additional encode/decode edge cases ---

@@ -1415,6 +1415,8 @@ pub struct SessionHandler {
     topology_stream_id: TopologyStreamId,
     per_pane: HashMap<PaneId, TrackedPane>,
     client_id: Option<Arc<ClientId>>,
+    #[cfg(test)]
+    client_input_activity_updates: usize,
     proxy_client_id: Option<ClientId>,
 }
 
@@ -1454,6 +1456,8 @@ impl SessionHandler {
             topology_stream_id,
             per_pane: HashMap::new(),
             client_id: None,
+            #[cfg(test)]
+            client_input_activity_updates: 0,
             proxy_client_id: None,
         }
     }
@@ -1600,7 +1604,17 @@ impl SessionHandler {
             if decoded.pdu.is_user_input() {
                 match self.owner.authority().acquire() {
                     Ok(mux) => {
-                        let _ = mux.client_had_input_if_same(client_id);
+                        #[cfg(not(test))]
+                        {
+                            let _ = mux.client_had_input_if_same(client_id);
+                        }
+                        #[cfg(test)]
+                        if mux.client_had_input_if_same(client_id) {
+                            self.client_input_activity_updates = self
+                                .client_input_activity_updates
+                                .checked_add(1)
+                                .expect("test client-input activity counter overflow");
+                        }
                     }
                     Err(err) => {
                         log::warn!("dropped client input activity marker: {err:#}");
@@ -3816,6 +3830,92 @@ mod tests {
             "stale handler cleanup must preserve the equal-valued replacement client"
         );
         assert!(mux.unregister_client_if_same(&replacement_client));
+    }
+
+    #[test]
+    fn forbidden_clipboard_does_not_record_client_input_but_valid_write_does() {
+        let _lock = crate::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let executor = SimpleExecutor::new();
+        let mux = Arc::new(Mux::new(None));
+        let pane_id = 7_007;
+        let pane: Arc<dyn Pane> = Arc::new(FakePane::new_with_id(pane_id, None));
+        mux.add_pane(&pane).expect("register writable test pane");
+
+        let client = test_client_id("forbidden-clipboard-activity", 41_009);
+        let (sender, captured) = capturing_sender();
+        let mut handler =
+            SessionHandler::new_for_session(sender, SessionOwner::new(Arc::clone(&mux)));
+        handler.process_one(DecodedPdu {
+            serial: 901,
+            pdu: Pdu::SetClientId(SetClientId {
+                client_id: client,
+                is_proxy: false,
+            }),
+        });
+        assert_eq!(
+            take_response(&captured).pdu,
+            Pdu::UnitResponse(UnitResponse {})
+        );
+
+        handler.process_one(DecodedPdu {
+            serial: 902,
+            pdu: Pdu::SetClipboard(codec::SetClipboard {
+                pane_id,
+                clipboard: Some("must-not-apply".to_string()),
+                selection: frankenterm_term::ClipboardSelection::Clipboard,
+            }),
+        });
+
+        let rejected = take_response(&captured);
+        assert_eq!(rejected.serial, 902);
+        match rejected.pdu {
+            Pdu::ErrorResponse(ErrorResponse { reason }) => assert!(
+                reason.contains("expected a request"),
+                "forbidden SetClipboard should fail request dispatch, got {reason}"
+            ),
+            other => panic!("expected ErrorResponse for forbidden SetClipboard, got {other:?}"),
+        }
+        assert_eq!(
+            handler.client_input_activity_updates,
+            0,
+            "a rejected server-unilateral PDU must not refresh client activity"
+        );
+
+        handler.process_one(DecodedPdu {
+            serial: 903,
+            pdu: Pdu::WriteToPane(WriteToPane {
+                pane_id,
+                data: b"accepted-input".to_vec(),
+            }),
+        });
+        assert_eq!(
+            handler.client_input_activity_updates,
+            1,
+            "one accepted client-input request must record exactly one activity update"
+        );
+
+        for _ in 0..32 {
+            if captured
+                .lock()
+                .unwrap_or_else(|err| err.into_inner())
+                .iter()
+                .any(|response| response.serial == 903)
+            {
+                break;
+            }
+            executor.tick().expect("drive valid pane write");
+        }
+        let written = {
+            let mut responses = captured.lock().unwrap_or_else(|err| err.into_inner());
+            let index = responses
+                .iter()
+                .position(|response| response.serial == 903)
+                .expect("valid pane write must produce a correlated response");
+            responses.remove(index)
+        };
+        assert_eq!(written.pdu, Pdu::UnitResponse(UnitResponse {}));
     }
 
     #[test]
