@@ -40,7 +40,7 @@ use smol::prelude::*;
 
 use std::collections::{HashMap, HashSet};
 use std::convert::{TryFrom, TryInto};
-use std::io::{Cursor, Read};
+use std::io::{BufReader, Cursor, Read};
 use std::ops::Range;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -713,6 +713,11 @@ const COMPRESSED_MASK: u64 = 1 << 63;
 /// Maximum allowed PDU payload size (256 MB). Prevents allocation bombs from
 /// malformed or malicious length fields.
 const MAX_PDU_SIZE: usize = 256 * 1024 * 1024;
+// `bounded_varbincode` legitimately performs many small reads. Feeding those
+// directly into zstd would turn field decoding into repeated decompressor/FFI
+// calls. Small authority PDUs use a modest floor; larger compressed payloads
+// scale only as far as zstd's bounded recommended output size.
+const MIN_EXACT_ZSTD_DECODE_BUFFER_SIZE: usize = 8 * 1024;
 const PAYLOAD_READ_CHUNK: usize = 64 * 1024;
 // Keep the abandoned-body memory envelope independent from materializing
 // decoder growth-policy tuning.
@@ -1978,9 +1983,9 @@ pdu! {
     GetSemanticZonesResponse: 78,
     RenderApplicationUpdateV1: 79,
     RenderApplicationResultV1: 80,
-    ListPanesCoherent: 81,
-    ListPanesCoherentResponse: 82,
-    TopologyEvent: 83,
+    ListPanesCoherent: 81 => deserialize_list_panes_coherent,
+    ListPanesCoherentResponse: 82 => deserialize_list_panes_coherent_response,
+    TopologyEvent: 83 => deserialize_topology_event,
     RenderApplicationUpdate: 84,
     RenderApplicationResult: 85,
 }
@@ -2169,6 +2174,97 @@ fn materialize_uncompressed_payload<'a>(
         );
     }
     Ok(std::borrow::Cow::Owned(decompressed))
+}
+
+/// Decode an authority-bearing schema that is closed for its current wire ID.
+///
+/// Bytes after the outer frame remain valid input for the next PDU, but bytes
+/// left inside this payload are neither a legacy extension nor a future field:
+/// accepting them would give multiple encodings the same topology authority.
+/// Schema growth must therefore use a new PDU identifier.
+fn deserialize_exact_payload<T: serde::de::DeserializeOwned>(
+    data: &[u8],
+    is_compressed: bool,
+    payload_name: &'static str,
+) -> Result<T, Error> {
+    if !is_compressed {
+        let mut reader = data;
+        let decoded = bounded_varbincode::deserialize::<T, _>(&mut reader)?;
+        if !reader.is_empty() {
+            bail!("{payload_name} payload has trailing schema bytes");
+        }
+        return Ok(decoded);
+    }
+
+    // Decode straight through zstd instead of materializing a second complete
+    // copy of a potentially 256 MiB coherent snapshot.  The extra byte in the
+    // limit distinguishes a legal boundary-sized value from decompressed data
+    // that crossed the cap.
+    let read_limit = max_pdu_read_limit()?;
+    // `data` is already a `BufRead`; using it directly avoids allocating a
+    // fresh zstd-sized `BufReader` for every compressed authority PDU.
+    let decoder = zstd::Decoder::with_buffer(data)?.single_frame();
+    // The already-materialized, outer-frame-bounded compressed length is only
+    // a performance hint. Both ends are clamped, so hostile input cannot pick
+    // an unbounded output allocation and small topology events stay small.
+    let recommended_output_size = zstd::Decoder::<&[u8]>::recommended_output_size()
+        .max(MIN_EXACT_ZSTD_DECODE_BUFFER_SIZE);
+    let output_buffer_size = data
+        .len()
+        .clamp(MIN_EXACT_ZSTD_DECODE_BUFFER_SIZE, recommended_output_size);
+    let mut reader = BufReader::with_capacity(output_buffer_size, decoder).take(read_limit);
+    let decoded = bounded_varbincode::deserialize::<T, _>(&mut reader)?;
+    let decoded_bytes = read_limit
+        .checked_sub(reader.limit())
+        .context("counting decoded exact PDU payload bytes")?;
+    if decoded_bytes > u64::try_from(MAX_PDU_SIZE).context("MAX_PDU_SIZE does not fit in u64")? {
+        bail!(
+            "decompressed PDU payload size exceeds maximum {}",
+            MAX_PDU_SIZE
+        );
+    }
+
+    // One read is sufficient.  A byte proves that the schema was not exact;
+    // EOF proves that zstd reached and validated the end of the frame.  Do not
+    // drain a hostile compressed tail just to calculate an exact error count.
+    let mut trailing = [0_u8; 1];
+    if reader
+        .read(&mut trailing)
+        .with_context(|| format!("validating {payload_name} compressed payload termination"))?
+        != 0
+    {
+        bail!("{payload_name} payload has trailing schema bytes");
+    }
+    // The successful EOF probe above guarantees that the decompressed-output
+    // buffer is empty, so unwrapping it cannot discard unread schema bytes.
+    let buffered_decoder = reader.into_inner();
+    debug_assert!(buffered_decoder.buffer().is_empty());
+    let decoder = buffered_decoder.into_inner();
+    if !decoder.finish().is_empty() {
+        bail!("{payload_name} payload has trailing compressed frame bytes");
+    }
+    Ok(decoded)
+}
+
+fn deserialize_list_panes_coherent(
+    data: &[u8],
+    is_compressed: bool,
+) -> Result<ListPanesCoherent, Error> {
+    deserialize_exact_payload(data, is_compressed, "ListPanesCoherent")
+}
+
+fn deserialize_list_panes_coherent_response(
+    data: &[u8],
+    is_compressed: bool,
+) -> Result<ListPanesCoherentResponse, Error> {
+    deserialize_exact_payload(data, is_compressed, "ListPanesCoherentResponse")
+}
+
+fn deserialize_topology_event(
+    data: &[u8],
+    is_compressed: bool,
+) -> Result<TopologyEvent, Error> {
+    deserialize_exact_payload(data, is_compressed, "TopologyEvent")
 }
 
 fn deserialize_get_codec_version_response(
@@ -4682,6 +4778,281 @@ mod test {
         assert!(offered.contains(TopologyCapabilities::FENCED_SNAPSHOT_V1));
         assert!(!TopologyCapabilities::NONE.contains(offered));
         assert_eq!(offered.bits(), (1_u64 << 63) | 1);
+    }
+
+    fn encode_authority_payload_with_trailing_schema_byte<T: Serialize>(
+        ident: u64,
+        serial: u64,
+        value: &T,
+        mode: CompressionMode,
+    ) -> Vec<u8> {
+        let (payload, is_compressed) = serialize_with_mode(&(value, 0xa5_u8), mode)
+            .expect("authority payload with trailing byte should serialize");
+        let mut frame = Vec::new();
+        encode_raw(ident, serial, &payload, is_compressed, &mut frame)
+            .expect("authority payload with trailing byte should frame");
+        frame
+    }
+
+    fn encode_authority_payload_with_truncated_zstd<T: Serialize>(
+        ident: u64,
+        serial: u64,
+        value: &T,
+    ) -> Vec<u8> {
+        let (uncompressed, is_compressed) = serialize_with_mode(value, CompressionMode::Never)
+            .expect("authority payload should serialize");
+        assert!(!is_compressed);
+        let mut encoder = zstd::Encoder::new(Vec::new(), zstd::DEFAULT_COMPRESSION_LEVEL)
+            .expect("checksum-bearing zstd encoder should initialize");
+        encoder
+            .include_checksum(true)
+            .expect("zstd encoder should enable its frame checksum");
+        std::io::Write::write_all(&mut encoder, &uncompressed)
+            .expect("zstd encoder should receive the complete authority value");
+        let mut payload = encoder
+            .finish()
+            .expect("checksum-bearing authority frame should finish");
+        payload
+            .pop()
+            .expect("checksum-bearing authority payload should not be empty");
+        let mut frame = Vec::new();
+        encode_raw(ident, serial, &payload, true, &mut frame)
+            .expect("truncated compressed authority payload should still frame");
+        frame
+    }
+
+    fn encode_authority_payload_with_compressed_suffix<T: Serialize>(
+        ident: u64,
+        serial: u64,
+        value: &T,
+        suffix: &[u8],
+    ) -> Vec<u8> {
+        let (mut payload, is_compressed) =
+            serialize_with_mode(value, CompressionMode::Always)
+                .expect("authority payload should compress");
+        assert!(is_compressed);
+        payload.extend_from_slice(suffix);
+        let mut frame = Vec::new();
+        encode_raw(ident, serial, &payload, true, &mut frame)
+            .expect("authority payload with compressed suffix should frame");
+        frame
+    }
+
+    #[test]
+    fn topology_authority_pdus_reject_inner_trailing_bytes_in_both_compression_modes() {
+        let request = ListPanesCoherent {
+            supported: TopologyCapabilities::FENCED_SNAPSHOT_V1,
+            required: TopologyCapabilities::FENCED_SNAPSHOT_V1,
+        };
+        let response = ListPanesCoherentResponse {
+            negotiated: TopologyCapabilities::FENCED_SNAPSHOT_V1,
+            stream_id: TopologyStreamId::from_bytes([0x61; 16]),
+            outcome: ListPanesCoherentOutcome::Unsupported {
+                supported: TopologyCapabilities::NONE,
+            },
+        };
+        let event = TopologyEvent {
+            stream_id: TopologyStreamId::from_bytes([0x62; 16]),
+            revision: TopologyRevision::new(7),
+            event: TopologyEventKind::Empty,
+        };
+
+        for mode in [CompressionMode::Never, CompressionMode::Always] {
+            let malformed_frames = [
+                (
+                    "ListPanesCoherent",
+                    encode_authority_payload_with_trailing_schema_byte(81, 1, &request, mode),
+                ),
+                (
+                    "ListPanesCoherentResponse",
+                    encode_authority_payload_with_trailing_schema_byte(82, 2, &response, mode),
+                ),
+                (
+                    "TopologyEvent",
+                    encode_authority_payload_with_trailing_schema_byte(83, 3, &event, mode),
+                ),
+            ];
+
+            for (payload_name, frame) in malformed_frames {
+                let err = Pdu::decode(frame.as_slice())
+                    .expect_err("topology authority payload must reject trailing schema bytes");
+                let message = format!("{err:#}");
+                assert!(
+                    message.contains(&format!(
+                        "{payload_name} payload has trailing schema bytes"
+                    )),
+                    "unexpected {} rejection under {:?}: {}",
+                    payload_name,
+                    mode,
+                    message,
+                );
+
+                let async_err = runtime::block_on(async {
+                    let mut reader = runtime::Cursor::new(frame);
+                    Pdu::decode_async(&mut reader, None)
+                        .await
+                        .expect_err(
+                            "async topology authority payload must reject trailing schema bytes",
+                        )
+                });
+                let async_message = format!("{async_err:#}");
+                assert!(
+                    async_message.contains(&format!(
+                        "{payload_name} payload has trailing schema bytes"
+                    )),
+                    "unexpected async {} rejection under {:?}: {}",
+                    payload_name,
+                    mode,
+                    async_message,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn exact_authority_decode_leaves_the_next_outer_frame_buffered() {
+        let request = Pdu::ListPanesCoherent(ListPanesCoherent {
+            supported: TopologyCapabilities::FENCED_SNAPSHOT_V1,
+            required: TopologyCapabilities::FENCED_SNAPSHOT_V1,
+        });
+        let event = Pdu::TopologyEvent(TopologyEvent {
+            stream_id: TopologyStreamId::from_bytes([0x63; 16]),
+            revision: TopologyRevision::new(8),
+            event: TopologyEventKind::PaneAdded { pane_id: 9 },
+        });
+        let first_frame = request
+            .encode_frame_with_mode(11, CompressionMode::Never)
+            .expect("encode first authority frame");
+        let second_frame = event
+            .encode_frame_with_mode(12, CompressionMode::Always)
+            .expect("encode second authority frame");
+        let mut concatenated = first_frame.clone();
+        concatenated.extend_from_slice(&second_frame);
+
+        let mut sync_reader = Cursor::new(concatenated.clone());
+        let decoded = Pdu::decode(&mut sync_reader).expect("sync decode first authority frame");
+        assert_eq!(decoded.serial, 11);
+        assert_eq!(decoded.pdu, request);
+        let decoded = Pdu::decode(&mut sync_reader).expect("sync decode second authority frame");
+        assert_eq!(decoded.serial, 12);
+        assert_eq!(decoded.pdu, event);
+        assert_eq!(
+            usize::try_from(sync_reader.position()).expect("cursor position should fit usize"),
+            concatenated.len()
+        );
+
+        let (decoded_first, decoded_second) = runtime::block_on(async {
+            let mut reader = runtime::Cursor::new(concatenated.clone());
+            let first = Pdu::decode_async(&mut reader, None)
+                .await
+                .expect("async decode first authority frame");
+            let second = Pdu::decode_async(&mut reader, None)
+                .await
+                .expect("async decode second authority frame");
+            (first, second)
+        });
+        assert_eq!(decoded_first.serial, 11);
+        assert_eq!(decoded_first.pdu, request);
+        assert_eq!(decoded_second.serial, 12);
+        assert_eq!(decoded_second.pdu, event);
+
+        let mut buffered = first_frame;
+        buffered.extend_from_slice(&second_frame);
+
+        let decoded = Pdu::stream_decode(&mut buffered)
+            .expect("decode first authority frame")
+            .expect("first authority frame should be complete");
+        assert_eq!(decoded.serial, 11);
+        assert_eq!(decoded.pdu, request);
+        assert_eq!(buffered, second_frame);
+
+        let decoded = Pdu::stream_decode(&mut buffered)
+            .expect("decode second authority frame")
+            .expect("second authority frame should remain complete");
+        assert_eq!(decoded.serial, 12);
+        assert_eq!(decoded.pdu, event);
+        assert!(buffered.is_empty());
+    }
+
+    #[test]
+    fn compressed_exact_authority_decode_validates_zstd_termination_after_value() {
+        let request = ListPanesCoherent {
+            supported: TopologyCapabilities::FENCED_SNAPSHOT_V1,
+            required: TopologyCapabilities::FENCED_SNAPSHOT_V1,
+        };
+        let frame = encode_authority_payload_with_truncated_zstd(81, 13, &request);
+
+        let sync_error = Pdu::decode(frame.as_slice())
+            .expect_err("sync authority decode must reject truncated zstd termination");
+        assert!(
+            format!("{sync_error:#}").contains(
+                "validating ListPanesCoherent compressed payload termination"
+            ),
+            "sync truncated-zstd rejection should come from the post-value EOF probe: {:#}",
+            sync_error
+        );
+
+        let async_error = runtime::block_on(async {
+            let mut reader = runtime::Cursor::new(frame);
+            Pdu::decode_async(&mut reader, None)
+                .await
+                .expect_err("async authority decode must reject truncated zstd termination")
+        });
+        assert!(
+            format!("{async_error:#}").contains(
+                "validating ListPanesCoherent compressed payload termination"
+            ),
+            "async truncated-zstd rejection should come from the post-value EOF probe: {:#}",
+            async_error
+        );
+    }
+
+    #[test]
+    fn compressed_exact_authority_decode_rejects_unread_frame_suffixes() {
+        let request = ListPanesCoherent {
+            supported: TopologyCapabilities::FENCED_SNAPSHOT_V1,
+            required: TopologyCapabilities::FENCED_SNAPSHOT_V1,
+        };
+        let empty_frame = zstd::stream::encode_all(
+            std::io::empty(),
+            zstd::DEFAULT_COMPRESSION_LEVEL,
+        )
+        .expect("empty zstd frame should encode");
+        let empty_skippable_frame = [
+            0x50, 0x2a, 0x4d, 0x18, // skippable-frame magic, little endian
+            0x00, 0x00, 0x00, 0x00, // zero-byte payload length
+        ];
+
+        for (suffix_name, suffix) in [
+            ("empty zstd frame", empty_frame.as_slice()),
+            ("empty skippable frame", empty_skippable_frame.as_slice()),
+        ] {
+            let frame =
+                encode_authority_payload_with_compressed_suffix(81, 14, &request, suffix);
+            let sync_error = Pdu::decode(frame.as_slice())
+                .expect_err("sync authority decode must reject a compressed frame suffix");
+            assert!(
+                format!("{sync_error:#}")
+                    .contains("ListPanesCoherent payload has trailing compressed frame bytes"),
+                "unexpected sync rejection for {}: {:#}",
+                suffix_name,
+                sync_error
+            );
+
+            let async_error = runtime::block_on(async {
+                let mut reader = runtime::Cursor::new(frame);
+                Pdu::decode_async(&mut reader, None)
+                    .await
+                    .expect_err("async authority decode must reject a compressed frame suffix")
+            });
+            assert!(
+                format!("{async_error:#}")
+                    .contains("ListPanesCoherent payload has trailing compressed frame bytes"),
+                "unexpected async rejection for {}: {:#}",
+                suffix_name,
+                async_error
+            );
+        }
     }
 
     #[test]
