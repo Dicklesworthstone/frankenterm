@@ -1327,6 +1327,182 @@ impl FlushWaiter {
     }
 }
 
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TestWorkerCommitPhase {
+    Pending,
+    ExactRetry,
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+enum TestWorkerCommitEvent {
+    BeforeWake {
+        waiting_epoch: u64,
+        retry_pending: bool,
+    },
+    CommitEntered {
+        commit_epoch: u64,
+        phase: TestWorkerCommitPhase,
+        batch: PendingBatch,
+    },
+    CommitFinished {
+        commit_epoch: u64,
+        phase: TestWorkerCommitPhase,
+        result: TestWorkerCommitResult,
+    },
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum TestWorkerCommitAction {
+    Run(WriteInterruption),
+    ReturnDefinite(PersistenceFailure),
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum TestWorkerCommitResult {
+    Committed(CommitReceipt),
+    Failed(PersistenceFailureCode),
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum TestWorkerDirectiveAction {
+    ContinueWake,
+    Commit(TestWorkerCommitAction),
+    ContinueAfterCommit,
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct TestWorkerCommitDirective {
+    epoch: u64,
+    action: TestWorkerDirectiveAction,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TestWorkerStopped {
+    waiting_epoch: u64,
+    commit_epoch: u64,
+}
+
+/// Per-worker deterministic commit gates used only by unit tests.
+///
+/// Events use a capacity-one channel and nonblocking sends so a dropped,
+/// disconnected, or backpressured event receiver fails closed. The harness
+/// intentionally blocks the worker at each gate until it sends the exact
+/// epoch-matched directive or disconnects the directive channel. Disconnect
+/// or a mismatched/invalid directive asks the worker to stop and drain every
+/// admitted waiter as `WorkerStopped`.
+#[cfg(test)]
+struct TestWorkerCommitControl {
+    events: flume::Sender<TestWorkerCommitEvent>,
+    directives: flume::Receiver<TestWorkerCommitDirective>,
+    stopped: flume::Sender<TestWorkerStopped>,
+    waiting_epoch: u64,
+    commit_epoch: u64,
+}
+
+#[cfg(test)]
+impl TestWorkerCommitControl {
+    fn before_wake(&mut self, retry_pending: bool) -> bool {
+        let Some(waiting_epoch) = self.waiting_epoch.checked_add(1) else {
+            return false;
+        };
+        self.waiting_epoch = waiting_epoch;
+        if self
+            .events
+            .try_send(TestWorkerCommitEvent::BeforeWake {
+                waiting_epoch: self.waiting_epoch,
+                retry_pending,
+            })
+            .is_err()
+        {
+            return false;
+        }
+        matches!(
+            self.directives.recv(),
+            Ok(TestWorkerCommitDirective {
+                epoch,
+                action: TestWorkerDirectiveAction::ContinueWake,
+            }) if epoch == self.waiting_epoch
+        )
+    }
+
+    fn enter_commit(
+        &mut self,
+        phase: TestWorkerCommitPhase,
+        batch: &PendingBatch,
+    ) -> Option<TestWorkerCommitAction> {
+        self.commit_epoch = self.commit_epoch.checked_add(1)?;
+        if self
+            .events
+            .try_send(TestWorkerCommitEvent::CommitEntered {
+                commit_epoch: self.commit_epoch,
+                phase,
+                batch: batch.clone(),
+            })
+            .is_err()
+        {
+            return None;
+        }
+        let action = match self.directives.recv().ok()? {
+            TestWorkerCommitDirective {
+                epoch,
+                action: TestWorkerDirectiveAction::Commit(action),
+            } if epoch == self.commit_epoch => action,
+            _ => return None,
+        };
+        if matches!(
+            &action,
+            TestWorkerCommitAction::ReturnDefinite(failure)
+                if failure.may_have_published_generation()
+        ) {
+            return None;
+        }
+        Some(action)
+    }
+
+    fn commit_finished(
+        &mut self,
+        phase: TestWorkerCommitPhase,
+        result: &Result<BatchCommit, PersistenceFailure>,
+    ) -> bool {
+        let result = match result {
+            Ok(committed) => TestWorkerCommitResult::Committed(committed.receipt),
+            Err(failure) => TestWorkerCommitResult::Failed(failure.code()),
+        };
+        if self
+            .events
+            .try_send(TestWorkerCommitEvent::CommitFinished {
+                commit_epoch: self.commit_epoch,
+                phase,
+                result,
+            })
+            .is_err()
+        {
+            return false;
+        }
+        matches!(
+            self.directives.recv(),
+            Ok(TestWorkerCommitDirective {
+                epoch,
+                action: TestWorkerDirectiveAction::ContinueAfterCommit,
+            }) if epoch == self.commit_epoch
+        )
+    }
+
+    fn report_stopped(&self) {
+        let _ = self.stopped.try_send(TestWorkerStopped {
+            waiting_epoch: self.waiting_epoch,
+            commit_epoch: self.commit_epoch,
+        });
+    }
+}
+
 #[derive(Default)]
 struct CoordinatorPending {
     batch: PendingBatch,
@@ -1336,6 +1512,8 @@ struct CoordinatorPending {
     waiter_count: usize,
     next_semantic_sequence: u64,
     unreported_semantic_failure: Option<SemanticFailureOutcome>,
+    #[cfg(test)]
+    worker_commit_control: Option<TestWorkerCommitControl>,
 }
 
 impl CoordinatorPending {
@@ -1613,9 +1791,90 @@ fn resolve_exact_retry(
     Ok(())
 }
 
+#[cfg(test)]
+fn controlled_worker_commit(
+    shared: &CoordinatorShared,
+    batch: &PendingBatch,
+    control: &mut Option<TestWorkerCommitControl>,
+    phase: TestWorkerCommitPhase,
+) -> Option<Result<BatchCommit, PersistenceFailure>> {
+    let Some(control) = control.as_mut() else {
+        return Some(commit_batch(
+            &shared.primary_path,
+            batch,
+            WriteInterruption::None,
+        ));
+    };
+    let result = match control.enter_commit(phase, batch)? {
+        TestWorkerCommitAction::Run(interruption) => commit_batch(
+            &shared.primary_path,
+            batch,
+            interruption,
+        ),
+        TestWorkerCommitAction::ReturnDefinite(failure) => Err(failure),
+    };
+    if control.commit_finished(phase, &result) {
+        Some(result)
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+fn controlled_worker_exact_retry(
+    shared: &CoordinatorShared,
+    batch: &PendingBatch,
+    control: &mut Option<TestWorkerCommitControl>,
+) -> Option<Result<(), PersistenceFailure>> {
+    Some(
+        controlled_worker_commit(
+            shared,
+            batch,
+            control,
+            TestWorkerCommitPhase::ExactRetry,
+        )?
+        .map(|committed| {
+            let _ = acknowledge_committed_batch(shared, batch, &committed);
+        }),
+    )
+}
+
+#[cfg(test)]
+fn controlled_worker_receive_wake(
+    control: &mut Option<TestWorkerCommitControl>,
+    receiver: &flume::Receiver<()>,
+    retry_pending: bool,
+) -> bool {
+    if control
+        .as_mut()
+        .is_some_and(|control| !control.before_wake(retry_pending))
+    {
+        return false;
+    }
+    receiver.recv().is_ok()
+}
+
 fn persistence_worker(shared: Arc<CoordinatorShared>, receiver: flume::Receiver<()>) {
+    #[cfg(test)]
+    let mut worker_commit_control = {
+        let mut pending = lock_pending(&shared.pending);
+        pending.worker_commit_control.take()
+    };
     let mut retry_batch = None;
-    while receiver.recv().is_ok() {
+    while {
+        #[cfg(test)]
+        {
+            controlled_worker_receive_wake(
+                &mut worker_commit_control,
+                &receiver,
+                retry_batch.is_some(),
+            )
+        }
+        #[cfg(not(test))]
+        {
+            receiver.recv().is_ok()
+        }
+    } {
         let deadline = Instant::now() + WRITE_DEBOUNCE;
         loop {
             let must_flush_now = {
@@ -1637,12 +1896,26 @@ fn persistence_worker(shared: Arc<CoordinatorShared>, receiver: flume::Receiver<
         }
 
         if let Some(batch) = retry_batch.take() {
-            match resolve_exact_retry(&shared, &batch) {
+            #[cfg(test)]
+            let retry_result = match controlled_worker_exact_retry(
+                &shared,
+                &batch,
+                &mut worker_commit_control,
+            ) {
+                Some(result) => result,
+                None => break,
+            };
+            #[cfg(not(test))]
+            let retry_result = resolve_exact_retry(&shared, &batch);
+            match retry_result {
                 Ok(()) => {}
                 Err(failure) => {
-                    if failure.may_have_published_generation() {
-                        retry_batch = Some(batch);
-                    }
+                    // This batch is already exact-retry debt from an earlier
+                    // commit that may have published. A later failure cannot
+                    // prove the predecessor absent, regardless of its own
+                    // classification, so successors must remain fenced behind
+                    // the same frozen snapshot until it resolves.
+                    retry_batch = Some(batch);
                     log::warn!(
                         "window-state: exact in-flight retry rejected ({:?})",
                         failure.code()
@@ -1663,6 +1936,24 @@ fn persistence_worker(shared: Arc<CoordinatorShared>, receiver: flume::Receiver<
             (batch, flush_waiters, binding_waiters)
         };
 
+        #[cfg(test)]
+        let result = match controlled_worker_commit(
+            &shared,
+            &batch,
+            &mut worker_commit_control,
+            TestWorkerCommitPhase::Pending,
+        ) {
+            Some(result) => result,
+            None => {
+                respond_transaction_failure(
+                    &PersistenceFailure::WorkerStopped,
+                    flush_waiters,
+                    binding_waiters,
+                );
+                break;
+            }
+        };
+        #[cfg(not(test))]
         let result = commit_batch(&shared.primary_path, &batch, WriteInterruption::None);
         match result {
             Ok(committed) => {
@@ -1717,6 +2008,11 @@ fn persistence_worker(shared: Arc<CoordinatorShared>, receiver: flume::Receiver<
             .send(Err(PersistenceFailure::WorkerStopped));
     }
     pending.waiter_count = 0;
+    drop(pending);
+    #[cfg(test)]
+    if let Some(control) = worker_commit_control.as_ref() {
+        control.report_stopped();
+    }
 }
 
 fn validate_workspace(workspace: &str) -> Result<(), PersistenceFailure> {
@@ -3515,6 +3811,248 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Barrier;
 
+    const CONTROLLED_WORKER_WATCHDOG: Duration = Duration::from_secs(5);
+
+    struct ControlledPersistenceWorker {
+        writer: Option<PersistenceWriter>,
+        events: Option<flume::Receiver<TestWorkerCommitEvent>>,
+        directives: Option<flume::Sender<TestWorkerCommitDirective>>,
+        stopped: flume::Receiver<TestWorkerStopped>,
+        join: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl ControlledPersistenceWorker {
+        fn open(primary_path: PathBuf) -> Self {
+            let (event_sender, events) = flume::bounded(1);
+            let (directives, directive_receiver) = flume::bounded(1);
+            let (stopped_sender, stopped) = flume::bounded(1);
+            let control = TestWorkerCommitControl {
+                events: event_sender,
+                directives: directive_receiver,
+                stopped: stopped_sender,
+                waiting_epoch: 0,
+                commit_epoch: 0,
+            };
+            let shared = Arc::new(CoordinatorShared {
+                primary_path,
+                pending: Mutex::new(CoordinatorPending {
+                    worker_commit_control: Some(control),
+                    ..CoordinatorPending::default()
+                }),
+            });
+            let (wake, receiver) = flume::bounded(1);
+            let writer = PersistenceWriter {
+                shared: Arc::clone(&shared),
+                wake,
+            };
+            let join = std::thread::Builder::new()
+                .name("ft-layout-persistence-controlled".to_string())
+                .spawn(move || persistence_worker(shared, receiver))
+                .expect("spawn controlled persistence worker");
+            Self {
+                writer: Some(writer),
+                events: Some(events),
+                directives: Some(directives),
+                stopped,
+                join: Some(join),
+            }
+        }
+
+        fn writer(&self) -> &PersistenceWriter {
+            self.writer.as_ref().expect("controlled writer is live")
+        }
+
+        fn next_event(&self) -> TestWorkerCommitEvent {
+            self.events
+                .as_ref()
+                .expect("controlled event receiver is connected")
+                .recv_timeout(CONTROLLED_WORKER_WATCHDOG)
+                .expect("controlled worker event")
+        }
+
+        fn expect_waiting(&self, waiting_epoch: u64, retry_pending: bool) {
+            match self.next_event() {
+                TestWorkerCommitEvent::BeforeWake {
+                    waiting_epoch: actual_epoch,
+                    retry_pending: actual_retry,
+                } => {
+                    assert_eq!(actual_epoch, waiting_epoch);
+                    assert_eq!(actual_retry, retry_pending);
+                }
+                TestWorkerCommitEvent::CommitEntered { .. } => {
+                    panic!("expected worker to wait for a wake")
+                }
+                TestWorkerCommitEvent::CommitFinished { .. } => {
+                    panic!("expected worker to wait for a wake")
+                }
+            }
+        }
+
+        fn expect_commit(
+            &self,
+            commit_epoch: u64,
+            phase: TestWorkerCommitPhase,
+        ) -> PendingBatch {
+            match self.next_event() {
+                TestWorkerCommitEvent::CommitEntered {
+                    commit_epoch: actual_epoch,
+                    phase: actual_phase,
+                    batch,
+                } => {
+                    assert_eq!(actual_epoch, commit_epoch);
+                    assert_eq!(actual_phase, phase);
+                    batch
+                }
+                TestWorkerCommitEvent::BeforeWake { .. } => {
+                    panic!("expected worker to enter a commit")
+                }
+                TestWorkerCommitEvent::CommitFinished { .. } => {
+                    panic!("expected worker to enter a commit")
+                }
+            }
+        }
+
+        fn expect_commit_finished(
+            &self,
+            commit_epoch: u64,
+            phase: TestWorkerCommitPhase,
+        ) -> TestWorkerCommitResult {
+            match self.next_event() {
+                TestWorkerCommitEvent::CommitFinished {
+                    commit_epoch: actual_epoch,
+                    phase: actual_phase,
+                    result: actual_result,
+                } => {
+                    assert_eq!(actual_epoch, commit_epoch);
+                    assert_eq!(actual_phase, phase);
+                    actual_result
+                }
+                TestWorkerCommitEvent::BeforeWake { .. }
+                | TestWorkerCommitEvent::CommitEntered { .. } => {
+                    panic!("expected worker to finish a commit")
+                }
+            }
+        }
+
+        fn send_directive(&self, epoch: u64, action: TestWorkerDirectiveAction) {
+            self.directives
+                .as_ref()
+                .expect("controlled directive sender is connected")
+                .try_send(TestWorkerCommitDirective {
+                    epoch,
+                    action,
+                })
+                .expect("release controlled worker epoch");
+        }
+
+        fn continue_wake(&self, waiting_epoch: u64) {
+            self.send_directive(waiting_epoch, TestWorkerDirectiveAction::ContinueWake);
+        }
+
+        fn release_commit(&self, commit_epoch: u64, action: TestWorkerCommitAction) {
+            self.send_directive(
+                commit_epoch,
+                TestWorkerDirectiveAction::Commit(action),
+            );
+        }
+
+        fn continue_after_commit(&self, commit_epoch: u64) {
+            self.send_directive(
+                commit_epoch,
+                TestWorkerDirectiveAction::ContinueAfterCommit,
+            );
+        }
+
+        fn wake_without_waiter(&self) {
+            self.writer()
+                .wake_worker()
+                .expect("wake controlled persistence worker");
+        }
+
+        fn admit_batch_with_flush(
+            &self,
+            batch: PendingBatch,
+        ) -> flume::Receiver<CommitResult> {
+            let (sender, receiver) = flume::bounded(1);
+            {
+                let mut pending = lock_pending(&self.writer().shared.pending);
+                assert!(pending.batch.window_states.is_empty());
+                assert!(pending.batch.overlay_mutations.is_empty());
+                assert!(pending.batch.ensure_bindings.is_empty());
+                assert!(pending.flush_waiters.is_empty());
+                assert!(pending.binding_waiters.is_empty());
+                assert_eq!(pending.waiter_count, 0);
+                pending.batch = batch;
+                pending.flush_waiters.push(FlushWaiter::new(sender));
+                pending.waiter_count = 1;
+            }
+            self.wake_without_waiter();
+            receiver
+        }
+
+        fn admit_batch_with_flush_and_binding(
+            &self,
+            mut batch: PendingBatch,
+            fingerprint: PrivacySafeTargetFingerprint,
+        ) -> (
+            flume::Receiver<CommitResult>,
+            flume::Receiver<BindingResult>,
+        ) {
+            let (flush_sender, flush_receiver) = flume::bounded(1);
+            let (binding_sender, binding_receiver) = flume::bounded(1);
+            batch.ensure_bindings.insert(fingerprint);
+            {
+                let mut pending = lock_pending(&self.writer().shared.pending);
+                assert!(pending.batch.window_states.is_empty());
+                assert!(pending.batch.overlay_mutations.is_empty());
+                assert!(pending.batch.ensure_bindings.is_empty());
+                assert!(pending.flush_waiters.is_empty());
+                assert!(pending.binding_waiters.is_empty());
+                assert_eq!(pending.waiter_count, 0);
+                pending.batch = batch;
+                pending
+                    .binding_waiters
+                    .insert(fingerprint, vec![binding_sender]);
+                pending
+                    .flush_waiters
+                    .push(FlushWaiter::new(flush_sender));
+                pending.waiter_count = 2;
+            }
+            self.wake_without_waiter();
+            (flush_receiver, binding_receiver)
+        }
+
+        fn disconnect_directives(&mut self) {
+            self.directives.take();
+        }
+
+        fn disconnect_events(&mut self) {
+            self.events.take();
+        }
+
+        fn wait_stopped_and_join(mut self) -> TestWorkerStopped {
+            self.writer.take();
+            self.directives.take();
+            self.events.take();
+            let stopped = self
+                .stopped
+                .recv_timeout(CONTROLLED_WORKER_WATCHDOG)
+                .expect("controlled worker stopped event");
+            self.join
+                .take()
+                .expect("controlled worker join handle")
+                .join()
+                .expect("controlled persistence worker exits");
+            stopped
+        }
+
+        fn stop_and_join(mut self) -> TestWorkerStopped {
+            self.writer.take();
+            self.directives.take();
+            self.wait_stopped_and_join()
+        }
+    }
+
     fn local_slot(value: u8) -> StableTabSlot {
         StableTabSlot::local(
             StableLocalSessionId::from_bytes([0x11; 16]),
@@ -5243,6 +5781,845 @@ mod tests {
             preflight.rejected_bindings[&second_fingerprint].code(),
             PersistenceFailureCode::Quota
         );
+    }
+
+    #[test]
+    fn controlled_worker_retries_frozen_update_without_spin_or_successor_bypass() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("window-state.json");
+        let window = window_id(11_055);
+        let worker = ControlledPersistenceWorker::open(path.clone());
+        worker.expect_waiting(1, false);
+
+        let mut initial = PendingBatch::default();
+        initial
+            .queue_overlay_live(None, local_overlay(window, 1, 80))
+            .expect("queue initial frozen overlay");
+        let initial_flush = worker.admit_batch_with_flush(initial);
+        worker.continue_wake(1);
+        let entered = worker.expect_commit(1, TestWorkerCommitPhase::Pending);
+        assert_eq!(entered.overlay_mutations[&window].desired_revision(), 1);
+        worker.release_commit(
+            1,
+            TestWorkerCommitAction::Run(WriteInterruption::AfterDirectorySync),
+        );
+        assert_eq!(
+            worker.expect_commit_finished(1, TestWorkerCommitPhase::Pending),
+            TestWorkerCommitResult::Failed(PersistenceFailureCode::Io)
+        );
+
+        // This is the true acknowledgement-loss interval: the real journal
+        // commit and its lock have completed, but the worker has not yet
+        // acknowledged or rejected its frozen snapshot.
+        worker
+            .writer()
+            .queue_overlay(Some(1), local_overlay(window, 2, 81))
+            .expect("queue post-commit successor");
+        let successor_flush = worker.writer().flush().expect("successor flush");
+        worker.continue_after_commit(1);
+        assert_eq!(
+            initial_flush
+                .recv_timeout(CONTROLLED_WORKER_WATCHDOG)
+                .expect("initial ambiguous result")
+                .expect_err("ambiguous publication is not an acknowledgement")
+                .code(),
+            PersistenceFailureCode::Io
+        );
+
+        worker.expect_waiting(2, true);
+        worker.continue_wake(2);
+        let first_retry = worker.expect_commit(2, TestWorkerCommitPhase::ExactRetry);
+        assert_eq!(
+            first_retry.overlay_mutations[&window].desired_revision(),
+            1
+        );
+        worker.release_commit(
+            2,
+            TestWorkerCommitAction::Run(WriteInterruption::AfterDirectorySync),
+        );
+        assert_eq!(
+            worker.expect_commit_finished(2, TestWorkerCommitPhase::ExactRetry),
+            TestWorkerCommitResult::Failed(PersistenceFailureCode::Io)
+        );
+        worker.continue_after_commit(2);
+        assert_eq!(
+            successor_flush
+                .recv_timeout(CONTROLLED_WORKER_WATCHDOG)
+                .expect("repeated retry result")
+                .expect_err("repeated ambiguous retry fails the waiting barrier")
+                .code(),
+            PersistenceFailureCode::Io
+        );
+
+        // The event is emitted immediately before a blocking wake receive.
+        // With no token queued, observing retry_pending=true is a causal
+        // no-spin proof rather than a time-based assertion.
+        worker.expect_waiting(3, true);
+        let non_io_retry_flush = worker.writer().flush().expect("non-I/O retry flush");
+        worker.continue_wake(3);
+        let second_retry = worker.expect_commit(3, TestWorkerCommitPhase::ExactRetry);
+        assert_eq!(
+            second_retry.overlay_mutations[&window].desired_revision(),
+            1
+        );
+        worker.release_commit(
+            3,
+            TestWorkerCommitAction::ReturnDefinite(PersistenceFailure::Corrupt {
+                reason: "controlled definite exact-retry failure".to_string(),
+            }),
+        );
+        assert_eq!(
+            worker.expect_commit_finished(3, TestWorkerCommitPhase::ExactRetry),
+            TestWorkerCommitResult::Failed(PersistenceFailureCode::Corrupt)
+        );
+        worker.continue_after_commit(3);
+        assert_eq!(
+            non_io_retry_flush
+                .recv_timeout(CONTROLLED_WORKER_WATCHDOG)
+                .expect("non-I/O retry result")
+                .expect_err("definite retry failure reaches its waiter")
+                .code(),
+            PersistenceFailureCode::Corrupt
+        );
+
+        // Retry debt predates the Corrupt result, so the exact predecessor
+        // remains fenced even though the latest failure was non-I/O.
+        worker.expect_waiting(4, true);
+        let recovery_flush = worker.writer().flush().expect("recovery flush");
+        worker.continue_wake(4);
+        let third_retry = worker.expect_commit(4, TestWorkerCommitPhase::ExactRetry);
+        assert_eq!(
+            third_retry.overlay_mutations[&window].desired_revision(),
+            1
+        );
+        worker.release_commit(
+            4,
+            TestWorkerCommitAction::Run(WriteInterruption::None),
+        );
+        assert!(matches!(
+            worker.expect_commit_finished(4, TestWorkerCommitPhase::ExactRetry),
+            TestWorkerCommitResult::Committed(CommitReceipt {
+                wrote_new_generation: false,
+                ..
+            })
+        ));
+        worker.continue_after_commit(4);
+
+        let successor = worker.expect_commit(5, TestWorkerCommitPhase::Pending);
+        assert_eq!(successor.overlay_mutations[&window].desired_revision(), 2);
+        worker.release_commit(
+            5,
+            TestWorkerCommitAction::ReturnDefinite(PersistenceFailure::Corrupt {
+                reason: "controlled definite successor failure".to_string(),
+            }),
+        );
+        assert_eq!(
+            worker.expect_commit_finished(5, TestWorkerCommitPhase::Pending),
+            TestWorkerCommitResult::Failed(PersistenceFailureCode::Corrupt)
+        );
+        worker.continue_after_commit(5);
+        assert_eq!(
+            recovery_flush
+                .recv_timeout(CONTROLLED_WORKER_WATCHDOG)
+                .expect("definite successor result")
+                .expect_err("definite successor failure reaches its waiter")
+                .code(),
+            PersistenceFailureCode::Corrupt
+        );
+
+        // A definite successor failure retains ordinary pending work but does
+        // not manufacture ambiguous retry debt.
+        worker.expect_waiting(5, false);
+        {
+            let pending = lock_pending(&worker.writer().shared.pending);
+            assert_eq!(
+                pending.batch.overlay_mutations[&window].desired_revision(),
+                2
+            );
+            assert!(pending.flush_waiters.is_empty());
+            assert!(pending.binding_waiters.is_empty());
+            assert_eq!(pending.waiter_count, 0);
+        }
+        let final_flush = worker.writer().flush().expect("final successor flush");
+        worker.continue_wake(5);
+        let successor_retry = worker.expect_commit(6, TestWorkerCommitPhase::Pending);
+        assert_eq!(
+            successor_retry.overlay_mutations[&window].desired_revision(),
+            2
+        );
+        worker.release_commit(
+            6,
+            TestWorkerCommitAction::Run(WriteInterruption::None),
+        );
+        let successor_receipt = match worker
+            .expect_commit_finished(6, TestWorkerCommitPhase::Pending)
+        {
+            TestWorkerCommitResult::Committed(receipt) => receipt,
+            TestWorkerCommitResult::Failed(code) => {
+                panic!("successor retry failed unexpectedly: {code:?}")
+            }
+        };
+        assert!(successor_receipt.wrote_new_generation);
+        assert_eq!(successor_receipt.committed_updates, 1);
+        worker.continue_after_commit(6);
+        assert_eq!(
+            final_flush
+                .recv_timeout(CONTROLLED_WORKER_WATCHDOG)
+                .expect("final successor result")
+                .expect("final successor commit"),
+            successor_receipt
+        );
+
+        worker.expect_waiting(6, false);
+        let barrier = worker.writer().flush().expect("post-success barrier");
+        worker.continue_wake(6);
+        let empty = worker.expect_commit(7, TestWorkerCommitPhase::Pending);
+        assert!(empty.window_states.is_empty());
+        assert!(empty.overlay_mutations.is_empty());
+        assert!(empty.ensure_bindings.is_empty());
+        worker.release_commit(
+            7,
+            TestWorkerCommitAction::Run(WriteInterruption::None),
+        );
+        let barrier_receipt = match worker
+            .expect_commit_finished(7, TestWorkerCommitPhase::Pending)
+        {
+            TestWorkerCommitResult::Committed(receipt) => receipt,
+            TestWorkerCommitResult::Failed(code) => {
+                panic!("post-success barrier failed unexpectedly: {code:?}")
+            }
+        };
+        assert!(!barrier_receipt.wrote_new_generation);
+        assert_eq!(barrier_receipt.store_revision, successor_receipt.store_revision);
+        worker.continue_after_commit(7);
+        assert_eq!(
+            barrier
+                .recv_timeout(CONTROLLED_WORKER_WATCHDOG)
+                .expect("post-success barrier result")
+                .expect("post-success barrier succeeds"),
+            barrier_receipt
+        );
+        worker.expect_waiting(7, false);
+
+        let snapshot = load_snapshot_at(&path).expect("load controlled successor");
+        assert_eq!(
+            snapshot
+                .overlay(window)
+                .expect("successor overlay")
+                .local_revision(),
+            2
+        );
+        let pending = lock_pending(&worker.writer().shared.pending);
+        assert!(pending.batch.overlay_mutations.is_empty());
+        assert!(pending.flush_waiters.is_empty());
+        assert!(pending.binding_waiters.is_empty());
+        assert_eq!(pending.waiter_count, 0);
+        drop(pending);
+
+        assert_eq!(
+            worker.stop_and_join(),
+            TestWorkerStopped {
+                waiting_epoch: 7,
+                commit_epoch: 7,
+            }
+        );
+    }
+
+    #[test]
+    fn controlled_worker_retires_post_snapshot_successor_and_drains_dropped_waiters() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("window-state.json");
+        let mut seed = PendingBatch::default();
+        seed.queue_window_state(
+            "seed".to_string(),
+            PersistedWindowState {
+                maximized: true,
+                fullscreen: false,
+            },
+        )
+        .expect("queue journal seed");
+        commit_for_test(&path, &seed, WriteInterruption::None)
+            .expect("seed controlled journal");
+
+        let window = window_id(11_056);
+        let fingerprint = PrivacySafeTargetFingerprint::from_bytes([0x82; 32]);
+        let worker = ControlledPersistenceWorker::open(path.clone());
+        worker.expect_waiting(1, false);
+
+        let mut initial = PendingBatch::default();
+        initial
+            .queue_overlay_live(None, local_overlay(window, 1, 82))
+            .expect("queue frozen live overlay");
+        let initial_flush = worker.admit_batch_with_flush(initial);
+        worker.continue_wake(1);
+        let entered = worker.expect_commit(1, TestWorkerCommitPhase::Pending);
+        assert!(matches!(
+            &entered.overlay_mutations[&window].desired,
+            DesiredOverlayState::Live(overlay) if overlay.local_revision() == 1
+        ));
+        worker.release_commit(
+            1,
+            TestWorkerCommitAction::Run(WriteInterruption::AfterSync),
+        );
+        assert_eq!(
+            worker.expect_commit_finished(1, TestWorkerCommitPhase::Pending),
+            TestWorkerCommitResult::Failed(PersistenceFailureCode::Io)
+        );
+
+        // Admit the delete and all of its waiters only after the real journal
+        // write has returned, while acknowledgement of the frozen live
+        // predecessor is still gated.
+        worker
+            .writer()
+            .queue_overlay_delete(window, Some(1))
+            .expect("queue post-snapshot retirement");
+        let retirement_flush = worker.writer().flush().expect("retirement flush");
+        drop(worker.writer().flush().expect("dropped retirement flush"));
+        let binding = worker
+            .writer()
+            .ensure_domain_binding(fingerprint)
+            .expect("retirement binding waiter");
+        drop(
+            worker
+                .writer()
+                .ensure_domain_binding(fingerprint)
+                .expect("dropped retirement binding waiter"),
+        );
+        worker.continue_after_commit(1);
+        assert_eq!(
+            initial_flush
+                .recv_timeout(CONTROLLED_WORKER_WATCHDOG)
+                .expect("initial live result")
+                .expect_err("ambiguous live publication is not acknowledged")
+                .code(),
+            PersistenceFailureCode::Io
+        );
+
+        worker.expect_waiting(2, true);
+        worker.continue_wake(2);
+        let retry = worker.expect_commit(2, TestWorkerCommitPhase::ExactRetry);
+        assert!(matches!(
+            &retry.overlay_mutations[&window].desired,
+            DesiredOverlayState::Live(overlay) if overlay.local_revision() == 1
+        ));
+        worker.release_commit(
+            2,
+            TestWorkerCommitAction::Run(WriteInterruption::None),
+        );
+        assert!(matches!(
+            worker.expect_commit_finished(2, TestWorkerCommitPhase::ExactRetry),
+            TestWorkerCommitResult::Committed(_)
+        ));
+        worker.continue_after_commit(2);
+
+        let retirement = worker.expect_commit(3, TestWorkerCommitPhase::Pending);
+        let retirement_mutation = &retirement.overlay_mutations[&window];
+        assert_eq!(retirement_mutation.base_revision, Some(1));
+        assert!(matches!(
+            &retirement_mutation.desired,
+            DesiredOverlayState::Deleted {
+                last_local_revision: 1,
+                ..
+            }
+        ));
+        assert!(retirement.ensure_bindings.contains(&fingerprint));
+        worker.release_commit(
+            3,
+            TestWorkerCommitAction::Run(WriteInterruption::None),
+        );
+        let retirement_receipt = match worker
+            .expect_commit_finished(3, TestWorkerCommitPhase::Pending)
+        {
+            TestWorkerCommitResult::Committed(receipt) => receipt,
+            TestWorkerCommitResult::Failed(code) => {
+                panic!("retirement successor failed unexpectedly: {code:?}")
+            }
+        };
+        assert!(retirement_receipt.wrote_new_generation);
+        assert_eq!(retirement_receipt.committed_updates, 2);
+        worker.continue_after_commit(3);
+
+        assert_eq!(
+            retirement_flush
+                .recv_timeout(CONTROLLED_WORKER_WATCHDOG)
+                .expect("retirement flush result")
+                .expect("retirement successor commits"),
+            retirement_receipt
+        );
+        let committed_binding = binding
+            .recv_timeout(CONTROLLED_WORKER_WATCHDOG)
+            .expect("retirement binding result")
+            .expect("retirement binding commits");
+        worker.expect_waiting(3, false);
+        assert!(matches!(
+            retirement_flush.try_recv(),
+            Err(flume::TryRecvError::Disconnected)
+        ));
+        assert!(matches!(
+            binding.try_recv(),
+            Err(flume::TryRecvError::Disconnected)
+        ));
+
+        let snapshot = load_snapshot_at(&path).expect("load retired successor");
+        assert!(snapshot.overlay(window).is_none());
+        assert_eq!(
+            snapshot
+                .tombstone(window)
+                .expect("durable retirement tombstone")
+                .last_local_revision(),
+            1
+        );
+        assert_eq!(snapshot.binding_for(fingerprint), Some(committed_binding));
+        let pending = lock_pending(&worker.writer().shared.pending);
+        assert!(pending.batch.window_states.is_empty());
+        assert!(pending.batch.overlay_mutations.is_empty());
+        assert!(pending.batch.ensure_bindings.is_empty());
+        assert!(pending.flush_waiters.is_empty());
+        assert!(pending.binding_waiters.is_empty());
+        assert_eq!(pending.waiter_count, 0);
+        drop(pending);
+
+        assert_eq!(
+            worker.stop_and_join(),
+            TestWorkerStopped {
+                waiting_epoch: 3,
+                commit_epoch: 3,
+            }
+        );
+    }
+
+    #[test]
+    fn controlled_worker_reports_sticky_semantic_failure_exactly_once() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("window-state.json");
+        let window = window_id(11_057);
+        let mut initial = PendingBatch::default();
+        initial
+            .queue_overlay_live(None, local_overlay(window, 1, 83))
+            .expect("queue initial semantic-test overlay");
+        commit_for_test(&path, &initial, WriteInterruption::None)
+            .expect("commit initial semantic-test overlay");
+
+        let fingerprint = PrivacySafeTargetFingerprint::from_bytes([0x84; 32]);
+        let worker = ControlledPersistenceWorker::open(path.clone());
+        worker.expect_waiting(1, false);
+        worker
+            .writer()
+            .queue_overlay(Some(2), local_overlay(window, 3, 85))
+            .expect("admit durable-CAS rejection candidate");
+        let binding = worker
+            .writer()
+            .ensure_domain_binding(fingerprint)
+            .expect("semantic-test binding waiter");
+        worker.continue_wake(1);
+
+        let rejected = worker.expect_commit(1, TestWorkerCommitPhase::Pending);
+        assert_eq!(rejected.overlay_mutations[&window].base_revision, Some(2));
+        assert!(rejected.ensure_bindings.contains(&fingerprint));
+        worker.release_commit(
+            1,
+            TestWorkerCommitAction::Run(WriteInterruption::None),
+        );
+        let partial_receipt = match worker
+            .expect_commit_finished(1, TestWorkerCommitPhase::Pending)
+        {
+            TestWorkerCommitResult::Committed(receipt) => receipt,
+            TestWorkerCommitResult::Failed(code) => {
+                panic!("partitioned semantic commit failed unexpectedly: {code:?}")
+            }
+        };
+        assert_eq!(partial_receipt.committed_updates, 1);
+        assert_eq!(partial_receipt.rejected_updates, 1);
+        worker.continue_after_commit(1);
+
+        let committed_binding = binding
+            .recv_timeout(CONTROLLED_WORKER_WATCHDOG)
+            .expect("semantic-test binding result")
+            .expect("unrelated binding commits");
+        worker.expect_waiting(2, false);
+        {
+            let pending = lock_pending(&worker.writer().shared.pending);
+            assert!(pending.batch.overlay_mutations.is_empty());
+            assert!(pending.batch.ensure_bindings.is_empty());
+            assert_eq!(
+                pending
+                    .unreported_semantic_failure
+                    .as_ref()
+                    .expect("sticky semantic failure")
+                    .failure
+                    .code(),
+                PersistenceFailureCode::OverlayCasConflict
+            );
+            assert_eq!(pending.waiter_count, 0);
+        }
+
+        let reporting_flush = worker.writer().flush().expect("reporting flush");
+        worker.continue_wake(2);
+        let reporting_batch = worker.expect_commit(2, TestWorkerCommitPhase::Pending);
+        assert!(reporting_batch.window_states.is_empty());
+        assert!(reporting_batch.overlay_mutations.is_empty());
+        assert!(reporting_batch.ensure_bindings.is_empty());
+        worker.release_commit(
+            2,
+            TestWorkerCommitAction::Run(WriteInterruption::None),
+        );
+        worker.expect_commit_finished(2, TestWorkerCommitPhase::Pending);
+        worker.continue_after_commit(2);
+        assert_eq!(
+            reporting_flush
+                .recv_timeout(CONTROLLED_WORKER_WATCHDOG)
+                .expect("reporting flush result")
+                .expect_err("first later flush reports sticky rejection")
+                .code(),
+            PersistenceFailureCode::OverlayCasConflict
+        );
+
+        worker.expect_waiting(3, false);
+        assert!(matches!(
+            reporting_flush.try_recv(),
+            Err(flume::TryRecvError::Disconnected)
+        ));
+        let clean_flush = worker.writer().flush().expect("post-report flush");
+        worker.continue_wake(3);
+        let clean_batch = worker.expect_commit(3, TestWorkerCommitPhase::Pending);
+        assert!(clean_batch.window_states.is_empty());
+        assert!(clean_batch.overlay_mutations.is_empty());
+        assert!(clean_batch.ensure_bindings.is_empty());
+        worker.release_commit(
+            3,
+            TestWorkerCommitAction::Run(WriteInterruption::None),
+        );
+        let clean_receipt = match worker
+            .expect_commit_finished(3, TestWorkerCommitPhase::Pending)
+        {
+            TestWorkerCommitResult::Committed(receipt) => receipt,
+            TestWorkerCommitResult::Failed(code) => {
+                panic!("post-report barrier failed unexpectedly: {code:?}")
+            }
+        };
+        worker.continue_after_commit(3);
+        assert_eq!(
+            clean_flush
+                .recv_timeout(CONTROLLED_WORKER_WATCHDOG)
+                .expect("post-report flush result")
+                .expect("sticky rejection was consumed exactly once"),
+            clean_receipt
+        );
+        worker.expect_waiting(4, false);
+
+        let snapshot = load_snapshot_at(&path).expect("load semantic-test state");
+        assert_eq!(snapshot.binding_for(fingerprint), Some(committed_binding));
+        assert_eq!(
+            snapshot
+                .overlay(window)
+                .expect("rejected overlay remains unchanged")
+                .local_revision(),
+            1
+        );
+        let pending = lock_pending(&worker.writer().shared.pending);
+        assert!(pending.unreported_semantic_failure.is_none());
+        assert!(pending.flush_waiters.is_empty());
+        assert!(pending.binding_waiters.is_empty());
+        assert_eq!(pending.waiter_count, 0);
+        drop(pending);
+
+        assert_eq!(
+            worker.stop_and_join(),
+            TestWorkerStopped {
+                waiting_epoch: 4,
+                commit_epoch: 3,
+            }
+        );
+    }
+
+    #[test]
+    fn controlled_worker_before_wake_disconnect_drains_every_admitted_waiter() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("window-state.json");
+        let window = window_id(11_058_010);
+        let fingerprint = PrivacySafeTargetFingerprint::from_bytes([0x89; 32]);
+        let mut worker = ControlledPersistenceWorker::open(path.clone());
+        worker.expect_waiting(1, false);
+        let mut batch = PendingBatch::default();
+        batch
+            .queue_overlay_live(None, local_overlay(window, 1, 89))
+            .expect("admit pre-wake disconnect overlay");
+        let (flush, binding) =
+            worker.admit_batch_with_flush_and_binding(batch, fingerprint);
+        let shared = Arc::clone(&worker.writer().shared);
+
+        // The admitted work has queued a wake token, but the worker is still
+        // outside the receive at the deterministic BeforeWake gate.
+        worker.disconnect_directives();
+        assert_eq!(
+            flush
+                .recv_timeout(CONTROLLED_WORKER_WATCHDOG)
+                .expect("pre-wake disconnect flush response")
+                .expect_err("pre-wake disconnect stops flush")
+                .code(),
+            PersistenceFailureCode::WorkerStopped
+        );
+        assert_eq!(
+            binding
+                .recv_timeout(CONTROLLED_WORKER_WATCHDOG)
+                .expect("pre-wake disconnect binding response")
+                .expect_err("pre-wake disconnect stops binding")
+                .code(),
+            PersistenceFailureCode::WorkerStopped
+        );
+        assert_eq!(
+            worker.wait_stopped_and_join(),
+            TestWorkerStopped {
+                waiting_epoch: 1,
+                commit_epoch: 0,
+            }
+        );
+        assert!(!path.exists());
+        let pending = lock_pending(&shared.pending);
+        assert!(pending.batch.overlay_mutations.contains_key(&window));
+        assert!(pending.batch.ensure_bindings.contains(&fingerprint));
+        assert!(pending.flush_waiters.is_empty());
+        assert!(pending.binding_waiters.is_empty());
+        assert_eq!(pending.waiter_count, 0);
+    }
+
+    #[test]
+    fn controlled_worker_rejects_stale_commit_epoch_before_writing() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("window-state.json");
+        let window = window_id(11_058_011);
+        let fingerprint = PrivacySafeTargetFingerprint::from_bytes([0x8a; 32]);
+        let worker = ControlledPersistenceWorker::open(path.clone());
+        worker.expect_waiting(1, false);
+        let mut batch = PendingBatch::default();
+        batch
+            .queue_overlay_live(None, local_overlay(window, 1, 90))
+            .expect("admit stale-epoch overlay");
+        let (flush, binding) =
+            worker.admit_batch_with_flush_and_binding(batch, fingerprint);
+        let shared = Arc::clone(&worker.writer().shared);
+        worker.continue_wake(1);
+        worker.expect_commit(1, TestWorkerCommitPhase::Pending);
+
+        // A directive from any earlier epoch must fail closed before the
+        // requested commit action can touch storage.
+        worker.send_directive(
+            0,
+            TestWorkerDirectiveAction::Commit(TestWorkerCommitAction::Run(
+                WriteInterruption::None,
+            )),
+        );
+        assert_eq!(
+            flush
+                .recv_timeout(CONTROLLED_WORKER_WATCHDOG)
+                .expect("stale-epoch flush response")
+                .expect_err("stale epoch stops flush")
+                .code(),
+            PersistenceFailureCode::WorkerStopped
+        );
+        assert_eq!(
+            binding
+                .recv_timeout(CONTROLLED_WORKER_WATCHDOG)
+                .expect("stale-epoch binding response")
+                .expect_err("stale epoch stops binding")
+                .code(),
+            PersistenceFailureCode::WorkerStopped
+        );
+        assert_eq!(
+            worker.wait_stopped_and_join(),
+            TestWorkerStopped {
+                waiting_epoch: 1,
+                commit_epoch: 1,
+            }
+        );
+        assert!(!path.exists());
+        let pending = lock_pending(&shared.pending);
+        assert!(pending.batch.overlay_mutations.contains_key(&window));
+        assert!(pending.batch.ensure_bindings.contains(&fingerprint));
+        assert!(pending.flush_waiters.is_empty());
+        assert!(pending.binding_waiters.is_empty());
+        assert_eq!(pending.waiter_count, 0);
+    }
+
+    #[test]
+    fn controlled_worker_directive_disconnect_drains_every_admitted_waiter() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("window-state.json");
+        let window = window_id(11_058);
+        let fingerprint = PrivacySafeTargetFingerprint::from_bytes([0x86; 32]);
+        let mut worker = ControlledPersistenceWorker::open(path.clone());
+        worker.expect_waiting(1, false);
+        let mut batch = PendingBatch::default();
+        batch
+            .queue_overlay_live(None, local_overlay(window, 1, 86))
+            .expect("admit disconnect overlay");
+        let (flush, binding) =
+            worker.admit_batch_with_flush_and_binding(batch, fingerprint);
+        let shared = Arc::clone(&worker.writer().shared);
+        worker.continue_wake(1);
+        worker.expect_commit(1, TestWorkerCommitPhase::Pending);
+        worker.disconnect_directives();
+
+        assert_eq!(
+            flush
+                .recv_timeout(CONTROLLED_WORKER_WATCHDOG)
+                .expect("directive-disconnect flush response")
+                .expect_err("directive disconnect stops flush")
+                .code(),
+            PersistenceFailureCode::WorkerStopped
+        );
+        assert_eq!(
+            binding
+                .recv_timeout(CONTROLLED_WORKER_WATCHDOG)
+                .expect("directive-disconnect binding response")
+                .expect_err("directive disconnect stops binding")
+                .code(),
+            PersistenceFailureCode::WorkerStopped
+        );
+        assert_eq!(
+            worker.wait_stopped_and_join(),
+            TestWorkerStopped {
+                waiting_epoch: 1,
+                commit_epoch: 1,
+            }
+        );
+        assert!(!path.exists());
+        let pending = lock_pending(&shared.pending);
+        assert!(pending.batch.overlay_mutations.contains_key(&window));
+        assert!(pending.batch.ensure_bindings.contains(&fingerprint));
+        assert!(pending.flush_waiters.is_empty());
+        assert!(pending.binding_waiters.is_empty());
+        assert_eq!(pending.waiter_count, 0);
+    }
+
+    #[test]
+    fn controlled_worker_post_commit_disconnect_preserves_recoverable_durable_state() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("window-state.json");
+        let window = window_id(11_058_100);
+        let fingerprint = PrivacySafeTargetFingerprint::from_bytes([0x88; 32]);
+        let mut worker = ControlledPersistenceWorker::open(path.clone());
+        worker.expect_waiting(1, false);
+        let mut batch = PendingBatch::default();
+        batch
+            .queue_overlay_live(None, local_overlay(window, 1, 88))
+            .expect("admit post-commit disconnect overlay");
+        let (flush, binding) =
+            worker.admit_batch_with_flush_and_binding(batch, fingerprint);
+        let shared = Arc::clone(&worker.writer().shared);
+        worker.continue_wake(1);
+        worker.expect_commit(1, TestWorkerCommitPhase::Pending);
+        worker.release_commit(
+            1,
+            TestWorkerCommitAction::Run(WriteInterruption::AfterDirectorySync),
+        );
+        assert_eq!(
+            worker.expect_commit_finished(1, TestWorkerCommitPhase::Pending),
+            TestWorkerCommitResult::Failed(PersistenceFailureCode::Io)
+        );
+
+        // The real write has returned and its journal lock is gone, but the
+        // worker has not acknowledged the frozen batch or answered waiters.
+        // Disconnecting this release gate must stop cleanly without claiming
+        // that the durably recoverable publication was acknowledged.
+        worker.disconnect_directives();
+        assert_eq!(
+            flush
+                .recv_timeout(CONTROLLED_WORKER_WATCHDOG)
+                .expect("post-commit disconnect flush response")
+                .expect_err("post-commit disconnect stops flush")
+                .code(),
+            PersistenceFailureCode::WorkerStopped
+        );
+        assert_eq!(
+            binding
+                .recv_timeout(CONTROLLED_WORKER_WATCHDOG)
+                .expect("post-commit disconnect binding response")
+                .expect_err("post-commit disconnect stops binding")
+                .code(),
+            PersistenceFailureCode::WorkerStopped
+        );
+        assert_eq!(
+            worker.wait_stopped_and_join(),
+            TestWorkerStopped {
+                waiting_epoch: 1,
+                commit_epoch: 1,
+            }
+        );
+
+        let snapshot = load_snapshot_at(&path).expect("recover post-commit publication");
+        assert_eq!(
+            snapshot
+                .overlay(window)
+                .expect("durably published overlay remains recoverable")
+                .local_revision(),
+            1
+        );
+        assert!(snapshot.binding_for(fingerprint).is_some());
+        let pending = lock_pending(&shared.pending);
+        // No acknowledgement occurred, so the exact admitted batch remains
+        // intact even though every waiter was drained as WorkerStopped.
+        assert!(pending.batch.overlay_mutations.contains_key(&window));
+        assert!(pending.batch.ensure_bindings.contains(&fingerprint));
+        assert!(pending.flush_waiters.is_empty());
+        assert!(pending.binding_waiters.is_empty());
+        assert_eq!(pending.waiter_count, 0);
+    }
+
+    #[test]
+    fn controlled_worker_event_disconnect_drains_every_admitted_waiter() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("window-state.json");
+        let window = window_id(11_059);
+        let fingerprint = PrivacySafeTargetFingerprint::from_bytes([0x87; 32]);
+        let mut worker = ControlledPersistenceWorker::open(path.clone());
+        worker.expect_waiting(1, false);
+        worker
+            .writer()
+            .queue_overlay(None, local_overlay(window, 1, 87))
+            .expect("admit event-disconnect overlay");
+        let flush = worker.writer().flush().expect("event-disconnect flush");
+        let binding = worker
+            .writer()
+            .ensure_domain_binding(fingerprint)
+            .expect("event-disconnect binding");
+        let shared = Arc::clone(&worker.writer().shared);
+
+        // Drop the event receiver while the worker is still held at the
+        // already-observed wake gate. Its subsequent CommitEntered try_send
+        // therefore fails deterministically rather than racing a receiver.
+        worker.disconnect_events();
+        worker.continue_wake(1);
+        assert_eq!(
+            flush
+                .recv_timeout(CONTROLLED_WORKER_WATCHDOG)
+                .expect("event-disconnect flush response")
+                .expect_err("event disconnect stops flush")
+                .code(),
+            PersistenceFailureCode::WorkerStopped
+        );
+        assert_eq!(
+            binding
+                .recv_timeout(CONTROLLED_WORKER_WATCHDOG)
+                .expect("event-disconnect binding response")
+                .expect_err("event disconnect stops binding")
+                .code(),
+            PersistenceFailureCode::WorkerStopped
+        );
+        assert_eq!(
+            worker.wait_stopped_and_join(),
+            TestWorkerStopped {
+                waiting_epoch: 1,
+                commit_epoch: 1,
+            }
+        );
+        assert!(!path.exists());
+        let pending = lock_pending(&shared.pending);
+        assert!(pending.batch.overlay_mutations.contains_key(&window));
+        assert!(pending.batch.ensure_bindings.contains(&fingerprint));
+        assert!(pending.flush_waiters.is_empty());
+        assert!(pending.binding_waiters.is_empty());
+        assert_eq!(pending.waiter_count, 0);
     }
 
     #[test]
