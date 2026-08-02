@@ -831,7 +831,10 @@ experiment. It is not converted into a flattering keep or a durable rejection.
   `55c63aa37f4c072cb4d05f7fa256474564c822ed` keeps finite per-collection,
   per-string, tab-count, and waiter bounds, and partitions terminal workspace
   and domain-binding quota failures by lineage so one impossible request does
-  not strand unrelated valid work.
+  not strand unrelated valid work. Revision `4022f395e` adds transaction-wide,
+  serializer-grounded encoded-byte admission and exact lineage isolation;
+  revision `939662b1e` adds literal-limit and all-maxima adversarial fixtures
+  without weakening the final physical encoder guard.
 - **Proof boundary:** finite item counts prevent unbounded cardinality, but do
   not establish the aggregate serialized-byte envelope, peak encoder memory,
   write amplification, or long-session RSS behavior. No live session or
@@ -1067,12 +1070,44 @@ experiment. It is not converted into a flattering keep or a durable rejection.
   still has an adversarial quadratic candidate-trial bound under the
   cross-process lock, tracked by `.5.2.1`; no lock-hold performance claim is
   made, and the deterministic persistence suite does not prove the separate
-  authoritative cross-process reorder protocol. It also does not yet exercise
-  a real 4 MiB exact boundary, one all-maxima escaped composite, cross-process
-  byte growth near the physical ceiling, mixed byte rejection through worker
-  receipts and injected crash points, or a retained maximum encoded/admitted
-  byte artifact. The current lowered-limit boundary and read-side oversized
-  fixture are not substitutes for those literal acceptance cases.
+  authoritative cross-process reorder protocol. Revision `939662b1e` now
+  constructs the real 4 MiB conservative admission boundary, rejects its
+  deterministic one-byte successor as `EncodedQuota`, and constructs one
+  all-maxima composite spanning maximally escaped workspace keys, maximum-width
+  bindings, overlays, remote slots, and tombstones. Exact-source strict-remote
+  boundary job `j-29958204528001155` passed on `vmi1152480`, and GUI all-target
+  check `j-29958204528001154` passed on `vmi1293453`; all-maxima job
+  `j-29958204528001156` passed on `vmi1153651`. Revision `fde6e012b` adds a
+  deterministic controlled-worker race at one byte below the ceiling: an
+  intervening writer consumes that byte after the worker freezes a mixed
+  batch, then the worker reloads under the file lock, commits the independent
+  overlay lineage, rejects only the stale workspace growth, and reports the
+  typed semantic failure to its real flush waiter. The same revision retries
+  that partitioned batch across all five injected slot-write crash points and
+  emits admitted-versus-physical byte evidence under `--nocapture`. Its focused
+  exact-source job `j-29958204528001184`, GUI check
+  `j-29958204528001186` remain active. GUI all-target Clippy
+  `j-29958204528001187` passed on `vmi1149989` with warnings denied; revision
+  `8024ee3ec` still needs exact-current Clippy because it adds test-process
+  code in the same module.
+  Workspace format proof `j-29958204528001185` failed on broad committed-tree
+  rustfmt drift in unrelated shared client/server files and is tracked by
+  `ft-teo0x`; it is not a formatting PASS for this work. Initial admission on
+  `vmi1167313` failed closed under `RCH-I002`; two same-worker follow-ups failed
+  closed under `RCH-I005`. No local result substitutes for those refusals. The
+  conservative authority is exactly 4 MiB, while the
+  hash-dependent physical encoding is only asserted to remain at or below that
+  ceiling, not to equal it byte-for-byte. The new deterministic writer
+  interposition exercises authority reload and file-lock admission but is not
+  an operating-system process-scheduling or target-filesystem power-loss
+  artifact. Revision `8024ee3ec` corrects that evidence boundary by replacing
+  the intervening call with a dedicated remote test-helper process and a
+  child-written revision marker that makes a zero-test filter fail closed.
+  Focused job `j-29958204528001191` and GUI all-target check
+  `j-29958204528001192` remain active, so literal process interposition is still
+  under proof rather than credited. Target-filesystem power-loss remains an
+  explicit nonclaim. Final-source proof remains pending, and the `.5.2.1`
+  selector bound remains separate.
 - **Decision:** reject one-pass backfill and false quota receipts. Keep exact
   one-addition-maximal rejection now. Keep `.5.2` open for its physical-ceiling,
   concurrent-growth, crash-receipt, and retained-size evidence, and require
@@ -1428,9 +1463,15 @@ experiment. It is not converted into a flattering keep or a durable rejection.
   Older focused/Clippy jobs `j-29958204528001130` and
   `j-29958204528001129` target the rejected revision and failed with the same
   retained inference defect; they cannot qualify the correction. Corrected
-  focused render job `j-29958204528001148` is active on `vmi1227854`, and
-  corrected warnings-denied Clippy `j-29958204528001150` is active on
-  `vmi1264463`. Further admissions failed closed under `RCH-I005` or
+  focused render job `j-29958204528001148` passed on `vmi1227854` at exact
+  revision `97f7cee14`; that supports the specialized state-machine tests but
+  does not qualify its active recovery/deadline successor. Corrected
+  warnings-denied Clippy `j-29958204528001150` reached
+  `97f7cee14` on `vmi1264463` but rejected its wildcard arm for the sole
+  remaining `MuxPoolError::Pool(_)` variant under
+  `clippy::match_wildcard_for_single_variants`. That real lint is corrected in
+  the active recovery/deadline patch, but fresh exact-source Clippy remains
+  required after commit. Further admissions failed closed under `RCH-I005` or
   `RCH-I002`; no local result is substituted.
 - **Decision:** reject response-type matching duplicated outside the canonical
   render resolver and reject generic end-of-batch postprocessing for this
@@ -1678,6 +1719,44 @@ experiment. It is not converted into a flattering keep or a durable rejection.
   recovery, render fallback, circuit breaking, and telemetry through it. A new
   error variant must fail compilation or an exhaustive contract test until its
   decision is explicit.
+- **Rejected structural partial:** revision `6c86687df` made one exhaustive
+  `ProtocolErrorKind` table authoritative and routed the initial pool/fallback
+  consumers through it. Exact-source strict-remote focused job
+  `j-29958204528001144` passed its exhaustive-authority test, and affected
+  all-target check `j-29958204528001145` passed. Those gates prove the partial
+  compiles and its table test executes; they do not prove the policy is sound.
+  Independent review found that the three labels still collapsed distinct
+  retry and connection-disposition decisions, unstructured server
+  `RemoteError` was retried and discarded even for deterministic failures,
+  acquisition errors bypassed the state machine, subscription read timeout
+  retried a poisoned client, cancellation was not a typed classifier input,
+  and the non-Unix variant lacked the canonical surface.
+- **Rejected integration candidate:** a second static pass found that
+  `write_to_pane` and `send_paste` still used the replaying generic recovery
+  loop, while spawn, split, write, and paste all exposed post-invocation
+  failures to generic CLI fallback. A lost response could therefore execute a
+  keypress, paste, spawn, or split once over direct mux and again through
+  recovery or CLI. The same pass found that pipelined render retry and
+  sequential fallback each reset their attempt budget and counters, bounding
+  elapsed time but not work or traffic.
+- **Correction under proof:** revision `3d69c22ae` replaces the single label
+  with a total decision carrying independent error kind, retry authority,
+  connection reuse/discard, and cancellation axes; routes acquisition,
+  subscription, circuit, and fallback consumers through that decision;
+  represents an invoked mutation with unknown outcome as a typed
+  non-replayable error; routes every input/topology mutation through
+  acquisition-retry-only execution; and binds retry plus fallback to one
+  elapsed-time and logical-attempt budget. Its exact-source strict-remote
+  `frankenterm-core` all-target check `j-29958204528001173` passed on `ovh-a`.
+  Focused mutation no-replay job `j-29958204528001174` passed on
+  `vmi1293453` (1/1, 0 failures), and shared render-attempt job
+  `j-29958204528001175` passed on `ovh-b` (1/1, 0 failures).
+  Canonical-decision job `j-29958204528001189` and later-source core Clippy
+  remain active. Workspace format job `j-29958204528001185` is retained as a
+  failure: the exact committed tree carries broad rustfmt drift across shared
+  client/server files, tracked by `ft-teo0x`; it is not a formatting PASS for
+  this lane. Full generic post-write settle-or-poison proof remains owned by
+  `.5.9`, and the render deadline remains separately gated by `.8.4`.
 - **Decision:** reject retry/fallback counts and tail guarantees produced under
   divergent classifiers. More retries are not resilience when the connection
   state and operation deadline do not authorize them.
