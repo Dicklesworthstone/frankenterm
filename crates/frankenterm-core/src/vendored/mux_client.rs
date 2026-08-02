@@ -2618,7 +2618,7 @@ impl DirectMuxClient {
                         },
                     )?
                 };
-                Ok((total_bytes, survivor_bytes))
+                Ok::<(usize, usize), DirectMuxError>((total_bytes, survivor_bytes))
             })?;
         if snapshot_total_bytes != self.render_change_snapshot_bytes {
             return Err(DirectMuxError::RetainedStateAccounting {
@@ -2636,7 +2636,7 @@ impl DirectMuxClient {
                     },
                 )?;
                 if retained.pane_id == pane_id {
-                    Ok((total_bytes, state.1, state.2))
+                    Ok::<(usize, usize, usize), DirectMuxError>((total_bytes, state.1, state.2))
                 } else {
                     Ok((
                         total_bytes,
@@ -2695,7 +2695,7 @@ impl DirectMuxClient {
                     },
                 )?;
                 if targets.contains(pane_id) {
-                    Ok((total_bytes, state.1, state.2))
+                    Ok::<(usize, usize, usize), DirectMuxError>((total_bytes, state.1, state.2))
                 } else {
                     Ok((
                         total_bytes,
@@ -2727,7 +2727,7 @@ impl DirectMuxClient {
                     },
                 )?;
                 if targets.contains(&retained.pane_id) {
-                    Ok((total_bytes, state.1, state.2))
+                    Ok::<(usize, usize, usize), DirectMuxError>((total_bytes, state.1, state.2))
                 } else {
                     Ok((
                         total_bytes,
