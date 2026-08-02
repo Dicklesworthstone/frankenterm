@@ -5051,10 +5051,16 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
     use std::fs::OpenOptions;
+    use std::process::Command;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Barrier;
 
     const CONTROLLED_WORKER_WATCHDOG: Duration = Duration::from_secs(5);
+    const CROSS_PROCESS_GROWTH_HELPER: &str =
+        "window_state_persist::tests::near_ceiling_external_growth_process_helper";
+    const CROSS_PROCESS_STATE_PATH_ENV: &str = "FT_TEST_WINDOW_STATE_PATH";
+    const CROSS_PROCESS_WORKSPACE_ENV: &str = "FT_TEST_WINDOW_STATE_WORKSPACE";
+    const CROSS_PROCESS_MARKER_ENV: &str = "FT_TEST_WINDOW_STATE_MARKER";
 
     struct ControlledPersistenceWorker {
         writer: Option<PersistenceWriter>,
@@ -7006,20 +7012,33 @@ mod tests {
         );
         assert!(frozen.overlay_mutations.contains_key(&base_overlay.window_id()));
 
-        // Interpose another process' one-byte authority growth after the
-        // worker freezes its queued batch but before it takes the file lock.
-        // The worker must reload and partition against that exact authority.
-        let mut external_batch = PendingBatch::default();
-        external_batch
-            .queue_window_state(
-                external_growth_workspace.clone(),
-                one_byte_wider_state,
+        // Interpose a literal second process' one-byte authority growth after
+        // the worker freezes its queued batch but before it takes the file
+        // lock. The child must publish a success marker; a misspelled test
+        // filter therefore cannot silently turn this into a zero-test pass.
+        let child_marker = temp.path().join("external-growth-committed");
+        let child = Command::new(std::env::current_exe().expect("resolve test executable"))
+            .args(["--exact", CROSS_PROCESS_GROWTH_HELPER, "--nocapture"])
+            .env(CROSS_PROCESS_STATE_PATH_ENV, &path)
+            .env(
+                CROSS_PROCESS_WORKSPACE_ENV,
+                external_growth_workspace.as_str(),
             )
-            .expect("queue external one-byte authority growth");
-        let external = commit_for_test(&path, &external_batch, WriteInterruption::None)
-            .expect("publish intervening authority growth");
-        assert_eq!(external.receipt.committed_updates, 1);
-        assert_eq!(external.receipt.rejected_updates, 0);
+            .env(CROSS_PROCESS_MARKER_ENV, &child_marker)
+            .output()
+            .expect("run external authority writer process");
+        assert!(
+            child.status.success(),
+            "external authority writer failed: status={:?}\nstdout={}\nstderr={}",
+            child.status.code(),
+            String::from_utf8_lossy(&child.stdout),
+            String::from_utf8_lossy(&child.stderr),
+        );
+        assert_eq!(
+            std::fs::read_to_string(&child_marker)
+                .expect("external authority writer success marker"),
+            "2"
+        );
 
         worker.release_commit(
             1,
@@ -7104,6 +7123,42 @@ mod tests {
                 commit_epoch: 1,
             }
         );
+    }
+
+    #[test]
+    fn near_ceiling_external_growth_process_helper() {
+        let Some(path) = std::env::var_os(CROSS_PROCESS_STATE_PATH_ENV) else {
+            // Ordinary parent-suite execution must remain inert. This helper
+            // performs work only when the controlling test supplies all three
+            // private process-contract variables.
+            return;
+        };
+        let workspace = std::env::var(CROSS_PROCESS_WORKSPACE_ENV)
+            .expect("external authority writer workspace");
+        let marker = std::env::var_os(CROSS_PROCESS_MARKER_ENV)
+            .map(PathBuf::from)
+            .expect("external authority writer marker path");
+        let mut external_batch = PendingBatch::default();
+        external_batch
+            .queue_window_state(
+                workspace,
+                PersistedWindowState {
+                    maximized: false,
+                    fullscreen: true,
+                },
+            )
+            .expect("queue external one-byte authority growth");
+        let external = commit_for_test(
+            Path::new(&path),
+            &external_batch,
+            WriteInterruption::None,
+        )
+        .expect("publish intervening authority growth from child process");
+        assert_eq!(external.receipt.committed_updates, 1);
+        assert_eq!(external.receipt.rejected_updates, 0);
+        assert!(external.receipt.wrote_new_generation);
+        std::fs::write(marker, external.receipt.store_revision.to_string())
+            .expect("publish external authority writer success marker");
     }
 
     #[test]
