@@ -9363,6 +9363,17 @@ mod tests {
             .expect("queue initial destination");
         commit_for_test(&path, &initial, WriteInterruption::None)
             .expect("commit initial transfer authority");
+        // Initial publication creates one valid slot by design. Repair the
+        // missing journal peer before testing rejected-batch publication so
+        // durability maintenance cannot legitimately write a generation.
+        commit_for_test(
+            &path,
+            &PendingBatch::default(),
+            WriteInterruption::None,
+        )
+        .expect("establish healthy two-slot transfer authority");
+        let before = load_snapshot_at(&path).expect("load healthy transfer authority");
+        assert!(!before.degraded_recovery);
 
         let mut transfer = PendingBatch::default();
         transfer
@@ -9397,6 +9408,7 @@ mod tests {
         assert_eq!(rejected.receipt.committed_updates, 0);
         assert_eq!(rejected.receipt.rejected_updates, 2);
         assert!(!rejected.receipt.wrote_new_generation);
+        assert_eq!(rejected.receipt.store_revision, before.store_revision);
         assert!(rejected.accepted_overlay_ids.is_empty());
         for window_id in [source_window, destination_window] {
             assert_eq!(
@@ -9408,6 +9420,7 @@ mod tests {
         }
 
         let snapshot = load_snapshot_at(&path).expect("load rejected transfer authority");
+        assert_eq!(snapshot, before);
         assert_eq!(
             snapshot
                 .overlay(source_window)
@@ -9520,11 +9533,12 @@ mod tests {
         ];
         canonicalize_state(&mut state);
         validate_state(&state).expect("revision-ceiling authority is valid");
-        std::fs::write(
-            &path,
-            encode_disk_slot(&state).expect("encode revision-ceiling authority"),
-        )
-        .expect("write revision-ceiling authority");
+        let encoded = encode_disk_slot(&state).expect("encode revision-ceiling authority");
+        std::fs::write(&path, &encoded).expect("write primary revision-ceiling authority");
+        std::fs::write(shadow_file_name(&path), encoded)
+            .expect("write shadow revision-ceiling authority");
+        let before = load_snapshot_at(&path).expect("load healthy revision-ceiling authority");
+        assert!(!before.degraded_recovery);
 
         let mut transfer = PendingBatch::default();
         transfer
@@ -9571,7 +9585,7 @@ mod tests {
         }
 
         let snapshot = load_snapshot_at(&path).expect("reload revision-ceiling authority");
-        assert_eq!(snapshot.store_revision, u64::MAX);
+        assert_eq!(snapshot, before);
         assert_eq!(
             snapshot
                 .overlay(source_window)
