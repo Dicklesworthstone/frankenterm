@@ -3864,7 +3864,7 @@ mod tests {
             pdu: Pdu::SetClipboard(codec::SetClipboard {
                 pane_id,
                 clipboard: Some("must-not-apply".to_string()),
-                selection: frankenterm_term::ClipboardSelection::Clipboard,
+                selection: wezterm_term::ClipboardSelection::Clipboard,
             }),
         });
 
