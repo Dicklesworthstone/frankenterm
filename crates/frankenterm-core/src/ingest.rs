@@ -931,6 +931,50 @@ impl PaneCursor {
         }
     }
 
+    /// Capture the first snapshot of a replacement generation as one explicit
+    /// resynchronization gap.
+    ///
+    /// The cursor is rebuilt from durability-confirmed state before this call.
+    /// When its persisted tail is still visible, only bytes following that
+    /// anchor are carried by the gap.  If the anchor has scrolled away (or no
+    /// trusted anchor exists), the full visible snapshot is carried so the
+    /// consumer converges without pretending the discarded predecessor queue
+    /// was continuous.
+    pub(crate) fn capture_generation_resync(
+        &mut self,
+        current_snapshot: &str,
+        reason: &str,
+    ) -> CapturedSegment {
+        let (content, reason) = match self.resume_anchor.take() {
+            Some(anchor) => match resume_delta_from_anchor(&anchor, current_snapshot) {
+                DeltaResult::NoChange => (String::new(), reason.to_string()),
+                DeltaResult::Content(content) => (content, reason.to_string()),
+                DeltaResult::Gap {
+                    reason: anchor_reason,
+                    content,
+                } => (content, format!("{reason}:{anchor_reason}")),
+            },
+            None => (
+                current_snapshot.to_string(),
+                format!("{reason}:durable_anchor_unavailable"),
+            ),
+        };
+
+        self.last_snapshot = current_snapshot.to_string();
+        self.last_hash = Some(hash_text(current_snapshot));
+        self.in_gap = true;
+        let seq = self.next_seq;
+        self.bump_next_seq();
+
+        CapturedSegment {
+            pane_id: self.pane_id,
+            seq,
+            content,
+            kind: CapturedSegmentKind::Gap { reason },
+            captured_at: epoch_ms(),
+        }
+    }
+
     /// Emit a gap segment with the provided reason.
     pub fn emit_gap(&mut self, reason: &str) -> CapturedSegment {
         self.in_gap = true;
@@ -1873,6 +1917,46 @@ pub async fn persist_captured_segment_with_zone_with_cx(
     max_segment_bytes: usize,
     zone_type: Option<&str>,
 ) -> Result<PersistedCapture> {
+    persist_captured_segment_with_zone_and_guard_with_cx(
+        cx,
+        storage,
+        captured,
+        max_segment_bytes,
+        zone_type,
+        None,
+    )
+    .await
+}
+
+/// Persist one already-admitted capture event while delegating authority to
+/// each storage-writer command that may outlive this async caller.
+pub(crate) async fn persist_authorized_captured_segment_with_zone_with_cx(
+    cx: &crate::cx::Cx,
+    storage: &StorageHandle,
+    captured: &CapturedSegment,
+    max_segment_bytes: usize,
+    zone_type: Option<&str>,
+    guard: &crate::capture_authority::CapturePersistenceGuard,
+) -> Result<PersistedCapture> {
+    persist_captured_segment_with_zone_and_guard_with_cx(
+        cx,
+        storage,
+        captured,
+        max_segment_bytes,
+        zone_type,
+        Some(guard),
+    )
+    .await
+}
+
+async fn persist_captured_segment_with_zone_and_guard_with_cx(
+    cx: &crate::cx::Cx,
+    storage: &StorageHandle,
+    captured: &CapturedSegment,
+    max_segment_bytes: usize,
+    zone_type: Option<&str>,
+    guard: Option<&crate::capture_authority::CapturePersistenceGuard>,
+) -> Result<PersistedCapture> {
     cx.checkpoint()
         .map_err(|err| ingest_cancelled_error("persist_captured_segment", err))?;
 
@@ -1897,9 +1981,14 @@ pub async fn persist_captured_segment_with_zone_with_cx(
     // below for why that case is still recorded despite imprecise bounds.
     let gap = match &bounded_segment.kind {
         CapturedSegmentKind::Gap { reason } => {
-            storage
-                .record_gap_with_cx(cx, bounded_segment.pane_id, reason)
-                .await?
+            record_gap_with_optional_capture_hold(
+                cx,
+                storage,
+                bounded_segment.pane_id,
+                reason,
+                guard,
+            )
+            .await?
         }
         CapturedSegmentKind::Delta => None,
     };
@@ -1909,15 +1998,15 @@ pub async fn persist_captured_segment_with_zone_with_cx(
         CapturedSegmentKind::Delta => zone_type,
         CapturedSegmentKind::Gap { .. } => None,
     };
-    let stored = storage
-        .append_segment_with_zone_with_cx(
-            cx,
-            bounded_segment.pane_id,
-            &redacted_content,
-            None,
-            stored_zone_type,
-        )
-        .await?;
+    let stored = append_segment_with_optional_capture_hold(
+        cx,
+        storage,
+        bounded_segment.pane_id,
+        &redacted_content,
+        stored_zone_type,
+        guard,
+    )
+    .await?;
 
     // ft-5yi36 (open, analysis recorded here so it is not re-litigated): this
     // retry fires only when the pre-append call returned `None`, which happens
@@ -1948,9 +2037,14 @@ pub async fn persist_captured_segment_with_zone_with_cx(
     if gap.is_none()
         && let CapturedSegmentKind::Gap { reason } = &bounded_segment.kind
     {
-        gap = storage
-            .record_gap_with_cx(cx, bounded_segment.pane_id, reason)
-            .await?;
+        gap = record_gap_with_optional_capture_hold(
+            cx,
+            storage,
+            bounded_segment.pane_id,
+            reason,
+            guard,
+        )
+        .await?;
     }
 
     if stored.seq != bounded_segment.seq {
@@ -1958,9 +2052,14 @@ pub async fn persist_captured_segment_with_zone_with_cx(
             "seq_discontinuity:expected={},actual={}",
             bounded_segment.seq, stored.seq
         );
-        let discontinuity_gap = storage
-            .record_gap_with_cx(cx, bounded_segment.pane_id, &discontinuity_reason)
-            .await?;
+        let discontinuity_gap = record_gap_with_optional_capture_hold(
+            cx,
+            storage,
+            bounded_segment.pane_id,
+            &discontinuity_reason,
+            guard,
+        )
+        .await?;
 
         if gap.is_none() {
             gap = discontinuity_gap;
@@ -1971,6 +2070,52 @@ pub async fn persist_captured_segment_with_zone_with_cx(
         segment: stored,
         gap,
     })
+}
+
+async fn record_gap_with_optional_capture_hold(
+    cx: &crate::cx::Cx,
+    storage: &StorageHandle,
+    pane_id: u64,
+    reason: &str,
+    guard: Option<&crate::capture_authority::CapturePersistenceGuard>,
+) -> Result<Option<Gap>> {
+    match guard {
+        Some(guard) => {
+            storage
+                .record_capture_gap_with_cx(cx, pane_id, reason, guard.delegate_storage()?)
+                .await
+        }
+        None => storage.record_gap_with_cx(cx, pane_id, reason).await,
+    }
+}
+
+async fn append_segment_with_optional_capture_hold(
+    cx: &crate::cx::Cx,
+    storage: &StorageHandle,
+    pane_id: u64,
+    content: &str,
+    zone_type: Option<&str>,
+    guard: Option<&crate::capture_authority::CapturePersistenceGuard>,
+) -> Result<Segment> {
+    match guard {
+        Some(guard) => {
+            storage
+                .append_captured_segment_with_zone_with_cx(
+                    cx,
+                    pane_id,
+                    content,
+                    None,
+                    zone_type,
+                    guard.delegate_storage()?,
+                )
+                .await
+        }
+        None => {
+            storage
+                .append_segment_with_zone_with_cx(cx, pane_id, content, None, zone_type)
+                .await
+        }
+    }
 }
 
 fn hash_text(text: &str) -> u64 {

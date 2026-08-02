@@ -1,0 +1,46 @@
+{
+  "json": {
+    "category": "internal",
+    "code": "FT-9001",
+    "description": "An unexpected internal error occurred. This is likely a bug in ft.",
+    "error": "Capture authority error: capture authority transition is already in progress",
+    "hint": "Capture authority rejected an unsafe pane or source transition.",
+    "ok": false,
+    "remediation": {
+      "alternatives": [
+        "Retry discovery only after the exact predecessor source has drained; do not relabel queued capture events."
+      ],
+      "commands": [
+        {
+          "command": "ft status",
+          "label": "Status",
+          "platform": null
+        },
+        {
+          "command": "ft doctor",
+          "label": "Diagnostics",
+          "platform": null
+        }
+      ],
+      "learn_more": null,
+      "summary": "Capture authority rejected an unsafe pane or source transition."
+    },
+    "title": "Internal error"
+  },
+  "plain_lines": [
+    "Error: Internal error",
+    "",
+    "Capture authority error: capture authority transition is already in progress",
+    "",
+    "An unexpected internal error occurred. This is likely a bug in ft.",
+    "",
+    "Suggestions:",
+    "  • Capture authority rejected an unsafe pane or source transition.",
+    "  → Status: `ft status`",
+    "  → Diagnostics: `ft doctor`",
+    "  • Retry discovery only after the exact predecessor source has drained; do not relabel queued capture events.",
+    "",
+    "Error code: FT-9001",
+    "Run `ft why FT-9001` for more details."
+  ]
+}

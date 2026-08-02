@@ -284,7 +284,7 @@ impl CaptureLease {
 
         let counter = self.counter(stage);
         counter
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
                 current.checked_add(1)
             })
             .map_err(|_| CaptureAuthorityError::InflightCounterExhausted { stage })?;
@@ -394,7 +394,7 @@ fn release_inflight(inner: &CaptureLeaseInner, stage: CaptureGuardStage) {
         CaptureGuardStage::Persistence => &inner.persistence_inflight,
     };
     let previous = counter
-        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+        .try_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
             current.checked_sub(1)
         })
         .expect("capture in-flight guard released exactly once");
@@ -431,6 +431,44 @@ impl CapturePersistenceGuard {
     pub fn stamp(&self) -> CaptureStamp {
         self.0.inner.stamp
     }
+
+    /// Mint a non-cloneable child hold for a delegated persistence side effect.
+    ///
+    /// The caller already holds this admitted parent guard, so delegation is
+    /// allowed after revocation has begun: the child is causally part of the
+    /// accepted side-effect chain, not a new top-level event.  This is used by
+    /// the storage writer handoff, whose queued command can outlive the async
+    /// caller that submitted it.  The child keeps pane/source revocation
+    /// blocked until that detached command has committed or failed.
+    pub(crate) fn delegate_storage(
+        &self,
+    ) -> Result<CapturePersistenceHold, CaptureAuthorityError> {
+        let counter = &self.0.inner.persistence_inflight;
+        counter
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+                current.checked_add(1)
+            })
+            .map_err(|_| CaptureAuthorityError::InflightCounterExhausted {
+                stage: CaptureGuardStage::Persistence,
+            })?;
+
+        Ok(CapturePersistenceHold {
+            _guard: CaptureInflightGuard {
+                inner: Arc::clone(&self.0.inner),
+                stage: CaptureGuardStage::Persistence,
+            },
+        })
+    }
+}
+
+/// Non-cloneable, drop-only authority retained by a detached storage command.
+///
+/// This type deliberately exposes no delegation API: only an admitted parent
+/// [`CapturePersistenceGuard`] can mint one direct child for a concrete writer
+/// handoff, so queued storage work cannot amplify its own authority.
+#[derive(Debug)]
+pub(crate) struct CapturePersistenceHold {
+    _guard: CaptureInflightGuard,
 }
 
 struct CaptureRevocation {
@@ -645,6 +683,79 @@ impl CaptureAuthority {
         Ok(lease)
     }
 
+    /// Acquire persistence authority for an exact queued-event stamp.
+    ///
+    /// The lease is cloned while the authority map is locked, then admission
+    /// performs its increment-and-recheck after releasing that lock.  A
+    /// concurrent revocation therefore either observes this guard in its
+    /// drain count or makes the admission fail closed.  Queued events whose
+    /// pane/source entry has already been retired cannot accidentally bind to
+    /// a same-ID successor because both incarnation and source epoch are
+    /// compared exactly.
+    pub fn try_acquire_persistence(
+        &self,
+        stamp: CaptureStamp,
+        captured_global_pane_id: u64,
+    ) -> Result<CapturePersistenceGuard, CaptureAuthorityError> {
+        if captured_global_pane_id != stamp.global_pane_id() {
+            return Err(CaptureAuthorityError::PaneIdMismatch);
+        }
+
+        let lease = {
+            let state = self.lock_state()?;
+            let pane = state
+                .panes
+                .get(&stamp.global_pane_id())
+                .ok_or(CaptureAuthorityError::PaneNotActive {
+                    global_pane_id: stamp.global_pane_id(),
+                })?;
+            if pane.identity.pane_incarnation() != stamp.pane_incarnation() {
+                return Err(CaptureAuthorityError::StalePaneIncarnation {
+                    global_pane_id: stamp.global_pane_id(),
+                });
+            }
+            let source_kind = stamp.source_kind();
+            let lease = pane
+                .sources
+                .get(&source_kind)
+                .ok_or(CaptureAuthorityError::SourceNotActive { source_kind })?;
+            if lease.stamp() != stamp {
+                return Err(CaptureAuthorityError::StaleSourceEpoch { source_kind });
+            }
+            lease.clone()
+        };
+
+        lease.try_acquire_persistence(stamp, captured_global_pane_id)
+    }
+
+    /// Provisional native-ingress lookup for frames whose wire envelope does
+    /// not yet carry its connection/source epoch.
+    ///
+    /// This is intentionally crate-private and hard-coded to `NativePush` so
+    /// polling and streaming producers cannot accidentally relabel stale work.
+    /// The native connection-envelope child must replace this lookup with exact
+    /// stamp admission; until then, holding the returned guard before
+    /// coalescing at least prevents authority replacement after ingress.
+    #[cfg(feature = "native-wezterm")]
+    pub(crate) fn try_acquire_unstamped_native_producer(
+        &self,
+        global_pane_id: u64,
+    ) -> Result<CaptureProducerGuard, CaptureAuthorityError> {
+        let source_kind = CaptureSourceKind::NativePush;
+        let lease = {
+            let state = self.lock_state()?;
+            let pane = state
+                .panes
+                .get(&global_pane_id)
+                .ok_or(CaptureAuthorityError::PaneNotActive { global_pane_id })?;
+            pane.sources
+                .get(&source_kind)
+                .cloned()
+                .ok_or(CaptureAuthorityError::SourceNotActive { source_kind })?
+        };
+        lease.try_acquire_producer(lease.stamp(), global_pane_id)
+    }
+
     /// Begin or resume revoking one source.  A replacement handle can be
     /// reacquired after timeout, cancellation, or task loss.
     pub fn begin_source_revocation(
@@ -694,6 +805,42 @@ impl CaptureAuthority {
             identity,
             revocations,
         })
+    }
+
+    /// Revoke a pane synchronously and retire it only when no admitted work
+    /// remains.
+    ///
+    /// Standalone polling owns its task set outside the supervisor, so waiting
+    /// here would deadlock the very futures that must release their producer
+    /// guards. Returning `Ok(false)` leaves the exact predecessor
+    /// non-admitting and lets the caller poll those tasks before retrying.
+    pub(crate) fn retire_pane_if_drained(
+        &self,
+        identity: ActivePaneIdentity,
+    ) -> Result<bool, CaptureAuthorityError> {
+        let mut state = self.lock_state()?;
+        let pane = Self::authoritative_pane_mut(&mut state, identity)?;
+        let leases = pane.sources.values().cloned().collect::<Vec<_>>();
+        let revocations = leases
+            .iter()
+            .map(CaptureLease::revocation_handle)
+            .collect::<Result<Vec<_>, _>>()?;
+
+        pane.accepting_sources = false;
+        for lease in &leases {
+            lease.revoke_admission()?;
+        }
+        if revocations
+            .iter()
+            .any(|revocation| !revocation.is_drained())
+        {
+            return Ok(false);
+        }
+        for revocation in &revocations {
+            revocation.finish()?;
+        }
+        state.panes.remove(&identity.global_pane_id);
+        Ok(true)
     }
 
     fn authoritative_pane(
@@ -818,6 +965,7 @@ impl PaneRevocation {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime_async::CompatRuntime;
 
     fn run_async_test<F>(future: F)
     where
@@ -868,6 +1016,47 @@ mod tests {
             let second = authority.activate_pane(7).expect("second incarnation");
             assert!(second.pane_incarnation().get() > first.pane_incarnation().get());
         });
+    }
+
+    #[test]
+    fn synchronous_retirement_stays_closed_until_admitted_work_drains() {
+        let authority = CaptureAuthority::new();
+        let predecessor_pane = authority.activate_pane(8).expect("predecessor pane");
+        let predecessor = authority
+            .issue_source(predecessor_pane, CaptureSourceKind::Polling)
+            .expect("predecessor source");
+        let predecessor_stamp = predecessor.stamp();
+        let held = predecessor
+            .try_acquire_producer(predecessor_stamp, 8)
+            .expect("held predecessor producer");
+
+        assert!(!authority
+            .retire_pane_if_drained(predecessor_pane)
+            .expect("begin synchronous retirement"));
+        assert_eq!(
+            predecessor
+                .try_acquire_producer(predecessor_stamp, 8)
+                .unwrap_err(),
+            CaptureAuthorityError::LeaseNotAdmitting {
+                stage: CaptureGuardStage::Producer,
+            }
+        );
+
+        drop(held);
+        assert!(authority
+            .retire_pane_if_drained(predecessor_pane)
+            .expect("finish synchronous retirement"));
+        let successor_pane = authority.activate_pane(8).expect("successor pane");
+        let successor = authority
+            .issue_source(successor_pane, CaptureSourceKind::Polling)
+            .expect("successor source");
+        assert_ne!(successor.stamp(), predecessor_stamp);
+        assert_eq!(
+            authority
+                .try_acquire_persistence(predecessor_stamp, 8)
+                .unwrap_err(),
+            CaptureAuthorityError::StalePaneIncarnation { global_pane_id: 8 }
+        );
     }
 
     #[test]
@@ -1093,6 +1282,136 @@ mod tests {
                 .unwrap_err(),
             CaptureAuthorityError::PaneIdMismatch
         );
+        assert_eq!(lease.inflight_counts(), (0, 0));
+    }
+
+    #[test]
+    fn authority_lookup_rejects_replaced_source_and_reused_pane_id() {
+        run_async_test(async {
+            let authority = CaptureAuthority::new();
+            let predecessor_pane = authority.activate_pane(17).expect("predecessor pane");
+            let predecessor = authority
+                .issue_source(predecessor_pane, CaptureSourceKind::Polling)
+                .expect("predecessor source");
+            let predecessor_stamp = predecessor.stamp();
+
+            drop(
+                authority
+                    .try_acquire_persistence(predecessor_stamp, 17)
+                    .expect("current exact lookup"),
+            );
+            authority
+                .begin_source_revocation(predecessor_pane, predecessor_stamp)
+                .expect("predecessor source revocation")
+                .wait_with_cx(
+                    &crate::cx::for_testing(),
+                    Duration::from_millis(50),
+                )
+                .await
+                .expect("predecessor source drain");
+            let successor_source = authority
+                .issue_source(predecessor_pane, CaptureSourceKind::Polling)
+                .expect("successor source");
+            assert_eq!(
+                authority
+                    .try_acquire_persistence(predecessor_stamp, 17)
+                    .unwrap_err(),
+                CaptureAuthorityError::StaleSourceEpoch {
+                    source_kind: CaptureSourceKind::Polling,
+                }
+            );
+
+            authority
+                .begin_pane_revocation(predecessor_pane)
+                .expect("predecessor pane revocation")
+                .wait_with_cx(
+                    &crate::cx::for_testing(),
+                    Duration::from_millis(50),
+                )
+                .await
+                .expect("predecessor pane drain");
+            drop(successor_source);
+            let successor_pane = authority.activate_pane(17).expect("successor pane");
+            let _successor_lease = authority
+                .issue_source(successor_pane, CaptureSourceKind::Polling)
+                .expect("successor pane source");
+            assert_eq!(
+                authority
+                    .try_acquire_persistence(predecessor_stamp, 17)
+                    .unwrap_err(),
+                CaptureAuthorityError::StalePaneIncarnation { global_pane_id: 17 }
+            );
+        });
+    }
+
+    #[test]
+    fn delegated_storage_hold_blocks_drain_after_parent_drop() {
+        run_async_test(async {
+            let authority = CaptureAuthority::new();
+            let pane = authority.activate_pane(29).expect("pane");
+            let lease = authority
+                .issue_source(pane, CaptureSourceKind::Polling)
+                .expect("source");
+            let stamp = lease.stamp();
+            let parent = authority
+                .try_acquire_persistence(stamp, 29)
+                .expect("parent persistence guard");
+            let storage_hold = parent.delegate_storage().expect("delegated storage hold");
+            drop(parent);
+
+            let revocation = authority
+                .begin_source_revocation(pane, stamp)
+                .expect("source revocation");
+            assert_eq!(
+                revocation
+                    .wait_with_cx(
+                        &crate::cx::for_testing(),
+                        Duration::from_millis(1),
+                    )
+                    .await
+                    .unwrap_err(),
+                CaptureAuthorityError::DrainTimedOut
+            );
+            drop(storage_hold);
+            assert_eq!(
+                revocation
+                    .wait_with_cx(
+                        &crate::cx::for_testing(),
+                        Duration::from_millis(50),
+                    )
+                    .await
+                    .expect("drain after storage completion"),
+                stamp
+            );
+        });
+    }
+
+    #[test]
+    fn delegated_storage_hold_counter_exhaustion_fails_closed() {
+        let authority = CaptureAuthority::new();
+        let pane = authority.activate_pane(30).expect("pane");
+        let lease = authority
+            .issue_source(pane, CaptureSourceKind::Polling)
+            .expect("source");
+        let stamp = lease.stamp();
+        let parent = authority
+            .try_acquire_persistence(stamp, 30)
+            .expect("parent persistence guard");
+        lease
+            .inner
+            .persistence_inflight
+            .store(usize::MAX, Ordering::SeqCst);
+        assert_eq!(
+            parent.delegate_storage().unwrap_err(),
+            CaptureAuthorityError::InflightCounterExhausted {
+                stage: CaptureGuardStage::Persistence,
+            }
+        );
+        lease
+            .inner
+            .persistence_inflight
+            .store(1, Ordering::SeqCst);
+        drop(parent);
         assert_eq!(lease.inflight_counts(), (0, 0));
     }
 

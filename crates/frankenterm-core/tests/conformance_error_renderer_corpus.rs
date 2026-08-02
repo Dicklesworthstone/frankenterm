@@ -32,6 +32,7 @@ use frankenterm_core::error::{
     ConfigError, Error, PaneOperationSource, PatternError, RuntimeOperationSource, StorageError,
     WatchdogWarningSource, WeztermError, WorkflowError,
 };
+use frankenterm_core::capture_authority::CaptureAuthorityError;
 use frankenterm_core::output::{ErrorRenderer, OutputFormat};
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
@@ -118,6 +119,7 @@ fn assert_matches_golden(variant: &str, error: &Error) {
 /// has a fixture file. When a new variant lands in `Error`, add it here
 /// AND ship a golden — or this meta-test fires red.
 const TOP_LEVEL_VARIANTS: &[&str] = &[
+    "capture_authority",
     "wezterm",
     "storage",
     "pattern",
@@ -136,6 +138,12 @@ const TOP_LEVEL_VARIANTS: &[&str] = &[
 ];
 
 // ── per-variant tests ────────────────────────────────────────────────────────
+
+#[test]
+fn capture_authority_variant_matches_golden() {
+    let error = Error::CaptureAuthority(CaptureAuthorityError::TransitionInProgress);
+    assert_matches_golden("capture_authority", &error);
+}
 
 #[test]
 fn wezterm_variant_matches_golden() {

@@ -52,6 +52,7 @@ fn arb_skip_reason() -> impl Strategy<Value = CaptureSkipReason> {
         CaptureSkipReason::CaptureTimeout,
         CaptureSkipReason::CaptureCircuitOpen,
         CaptureSkipReason::CaptureError,
+        CaptureSkipReason::AuthorityRejected,
         CaptureSkipReason::NoChange,
         CaptureSkipReason::Changed,
         CaptureSkipReason::Shutdown,

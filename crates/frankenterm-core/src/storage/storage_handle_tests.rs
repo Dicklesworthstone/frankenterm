@@ -49,6 +49,150 @@ fn test_pane(pane_id: u64) -> PaneRecord {
     }
 }
 
+fn memory_pane_backend() -> RusqliteBackend {
+    let conn = Connection::open_in_memory().expect("open in-memory pane query database");
+    initialize_schema(&conn).expect("initialize pane query schema");
+    RusqliteBackend::new(conn)
+}
+
+#[test]
+fn query_panes_by_ids_empty_does_not_touch_the_backend() {
+    // Deliberately omit schema initialization.  The assertion can only pass if
+    // the empty-input fast path returns before attempting a SQL query.
+    let backend = RusqliteBackend::new(
+        Connection::open_in_memory().expect("open schema-free in-memory database"),
+    );
+
+    let panes = query_panes_by_ids_backend(&backend, Vec::new())
+        .expect("empty query should succeed");
+
+    assert!(panes.is_empty());
+}
+
+#[test]
+fn storage_handle_get_panes_by_ids_filters_missing_rows_and_preserves_uuid() {
+    run_async_test(async {
+        let db_path = temp_db_path();
+        let handle = StorageHandle::new(&db_path).await.unwrap();
+
+        let cx = crate::cx::for_testing();
+        assert!(
+            handle
+                .get_panes_by_ids_with_cx(&cx, &[])
+                .await
+                .expect("empty pane-ID handle query")
+                .is_empty()
+        );
+
+        let mut pane_two = test_pane(2);
+        pane_two.pane_uuid = Some("pane-uuid-2".to_string());
+        let mut pane_forty_two = test_pane(42);
+        pane_forty_two.pane_uuid = Some("pane-uuid-42".to_string());
+        handle.upsert_pane(pane_forty_two).await.unwrap();
+        handle.upsert_pane(pane_two).await.unwrap();
+
+        let panes = handle
+            .get_panes_by_ids_with_cx(&cx, &[42, 9_999, 2, 42])
+            .await
+            .expect("mixed pane-ID query");
+
+        assert_eq!(
+            panes.iter().map(|pane| pane.pane_id).collect::<Vec<_>>(),
+            vec![2, 42],
+            "requested rows should be sorted, missing IDs omitted, and duplicates collapsed"
+        );
+        assert_eq!(panes[0].pane_uuid.as_deref(), Some("pane-uuid-2"));
+        assert_eq!(panes[1].pane_uuid.as_deref(), Some("pane-uuid-42"));
+
+        handle.shutdown().await.unwrap();
+        let _ = std::fs::remove_file(&db_path);
+    });
+}
+
+#[test]
+fn query_panes_by_ids_chunks_large_unsorted_duplicate_sets() {
+    let backend = memory_pane_backend();
+    let pane_count = u64::try_from(PANE_IDS_PER_QUERY).unwrap() + 1;
+    for pane_id in 1..=pane_count {
+        upsert_pane_backend(&backend, &test_pane(pane_id)).expect("seed pane row");
+    }
+
+    let mut requested = (1..=pane_count).rev().collect::<Vec<_>>();
+    requested.push(1);
+    requested.push(pane_count);
+
+    let recording_backend = crate::storage_backend_trait::MockBackend::new();
+    assert!(
+        query_panes_by_ids_backend(&recording_backend, requested.clone())
+            .expect("record bounded pane-ID queries")
+            .is_empty()
+    );
+    let observed_queries = recording_backend.observed_queries();
+    assert_eq!(
+        observed_queries.len(),
+        2,
+        "257 unique IDs must issue exactly two bounded queries"
+    );
+    assert_eq!(observed_queries[0].1.len(), PANE_IDS_PER_QUERY);
+    assert_eq!(observed_queries[1].1.len(), 1);
+
+    let panes = query_panes_by_ids_backend(&backend, requested)
+        .expect("query spanning multiple bounded ID chunks");
+    let expected = (1..=pane_count).collect::<Vec<_>>();
+
+    assert_eq!(
+        panes.iter().map(|pane| pane.pane_id).collect::<Vec<_>>(),
+        expected,
+        "multi-chunk results should be globally sorted and deduplicated"
+    );
+}
+
+#[test]
+fn query_panes_by_ids_rejects_out_of_range_id_before_querying() {
+    // Deliberately omit schema initialization.  Seeing the conversion error
+    // rather than a missing-table error proves the entire ID set is validated
+    // before any prefix query is issued.
+    let backend = RusqliteBackend::new(
+        Connection::open_in_memory().expect("open schema-free in-memory database"),
+    );
+
+    let out_of_range = u64::MAX;
+    let error = query_panes_by_ids_backend(&backend, vec![1, out_of_range])
+        .expect_err("out-of-range pane ID must fail closed");
+    let expected = format!("pane_id value {out_of_range} exceeds i64 range");
+
+    assert!(
+        error.to_string().contains(&expected),
+        "unexpected out-of-range error: {error}"
+    );
+}
+
+#[test]
+fn storage_handle_get_panes_by_ids_honors_precancelled_context() {
+    run_async_test(async {
+        let db_path = temp_db_path();
+        let handle = StorageHandle::new(&db_path).await.unwrap();
+        let cancelled_cx = crate::cx::for_testing();
+        cancelled_cx.cancel_with(
+            crate::outcome::CancelKind::User,
+            Some("pre-cancel pane-ID query test"),
+        );
+
+        let error = handle
+            .get_panes_by_ids_with_cx(&cancelled_cx, &[1])
+            .await
+            .expect_err("pre-cancelled pane-ID query must fail before spawning blocking work");
+
+        assert!(
+            error.to_string().contains("get_panes_by_ids cancelled"),
+            "unexpected cancellation error: {error}"
+        );
+
+        handle.shutdown().await.unwrap();
+        let _ = std::fs::remove_file(&db_path);
+    });
+}
+
 #[cfg(unix)]
 #[test]
 fn storage_handle_sets_db_permissions() {
@@ -934,6 +1078,7 @@ fn writer_loop_does_not_dispatch_commands_queued_after_shutdown() {
             content_hash: None,
             respond: append_tx,
             zone_type: None,
+            capture_hold: None,
         })
         .is_ok()
     );

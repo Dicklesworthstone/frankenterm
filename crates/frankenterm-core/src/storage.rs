@@ -46,6 +46,7 @@ use frankenterm_core_audit_types::storage_audit::AuditFieldRedactor;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Result, StorageError};
+use crate::capture_authority::CapturePersistenceHold;
 use crate::events::event_identity_key;
 use crate::lru_cache::LruCache;
 use crate::policy::Redactor;
@@ -640,17 +641,23 @@ enum WriteCommand {
         content: String,
         content_hash: Option<String>,
         zone_type: Option<String>,
+        /// Delegated capture hold retained through durable writer completion.
+        capture_hold: Option<CapturePersistenceHold>,
         respond: oneshot::Sender<Result<Segment>>,
     },
     /// Record a gap event
     RecordGap {
         pane_id: u64,
         reason: String,
+        /// Delegated capture hold retained through durable writer completion.
+        capture_hold: Option<CapturePersistenceHold>,
         respond: oneshot::Sender<Result<Option<Gap>>>,
     },
     /// Record an event/detection
     RecordEvent {
         event: StoredEvent,
+        /// Delegated capture hold retained through durable writer completion.
+        capture_hold: Option<CapturePersistenceHold>,
         respond: oneshot::Sender<Result<i64>>,
     },
     /// Mark event as handled
@@ -2413,6 +2420,47 @@ impl StorageHandle {
         content_hash: Option<String>,
         zone_type: Option<&str>,
     ) -> Result<Segment> {
+        self.append_segment_with_zone_and_capture_hold_with_cx(
+            cx,
+            pane_id,
+            content,
+            content_hash,
+            zone_type,
+            None,
+        )
+        .await
+    }
+
+    /// Capture-authorized writer handoff for an output segment.
+    pub(crate) async fn append_captured_segment_with_zone_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        pane_id: u64,
+        content: &str,
+        content_hash: Option<String>,
+        zone_type: Option<&str>,
+        capture_hold: CapturePersistenceHold,
+    ) -> Result<Segment> {
+        self.append_segment_with_zone_and_capture_hold_with_cx(
+            cx,
+            pane_id,
+            content,
+            content_hash,
+            zone_type,
+            Some(capture_hold),
+        )
+        .await
+    }
+
+    async fn append_segment_with_zone_and_capture_hold_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        pane_id: u64,
+        content: &str,
+        content_hash: Option<String>,
+        zone_type: Option<&str>,
+        capture_hold: Option<CapturePersistenceHold>,
+    ) -> Result<Segment> {
         cx.checkpoint()
             .map_err(|err| StorageError::Database(format!("append_segment cancelled: {err}")))?;
         let timer = SwarmCapacityStageTimer::start(SwarmCapacityStage::StorageWrite, 0);
@@ -2425,6 +2473,7 @@ impl StorageHandle {
                     content: content.to_string(),
                     content_hash,
                     zone_type: zone_type.map(str::to_string),
+                    capture_hold,
                     respond: tx,
                 },
             )
@@ -2457,6 +2506,29 @@ impl StorageHandle {
         pane_id: u64,
         reason: &str,
     ) -> Result<Option<Gap>> {
+        self.record_gap_and_capture_hold_with_cx(cx, pane_id, reason, None)
+            .await
+    }
+
+    /// Capture-authorized writer handoff for a continuity gap.
+    pub(crate) async fn record_capture_gap_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        pane_id: u64,
+        reason: &str,
+        capture_hold: CapturePersistenceHold,
+    ) -> Result<Option<Gap>> {
+        self.record_gap_and_capture_hold_with_cx(cx, pane_id, reason, Some(capture_hold))
+            .await
+    }
+
+    async fn record_gap_and_capture_hold_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        pane_id: u64,
+        reason: &str,
+        capture_hold: Option<CapturePersistenceHold>,
+    ) -> Result<Option<Gap>> {
         cx.checkpoint()
             .map_err(|err| StorageError::Database(format!("record_gap cancelled: {err}")))?;
         let (tx, rx) = oneshot::channel();
@@ -2466,6 +2538,7 @@ impl StorageHandle {
                 WriteCommand::RecordGap {
                     pane_id,
                     reason: reason.to_string(),
+                    capture_hold,
                     respond: tx,
                 },
             )
@@ -2497,11 +2570,39 @@ impl StorageHandle {
         cx: &crate::cx::Cx,
         event: StoredEvent,
     ) -> Result<i64> {
+        self.record_event_and_capture_hold_with_cx(cx, event, None)
+            .await
+    }
+
+    /// Capture-authorized writer handoff for a detected event.
+    pub(crate) async fn record_capture_event_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        event: StoredEvent,
+        capture_hold: CapturePersistenceHold,
+    ) -> Result<i64> {
+        self.record_event_and_capture_hold_with_cx(cx, event, Some(capture_hold))
+            .await
+    }
+
+    async fn record_event_and_capture_hold_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        event: StoredEvent,
+        capture_hold: Option<CapturePersistenceHold>,
+    ) -> Result<i64> {
         cx.checkpoint()
             .map_err(|err| StorageError::Database(format!("record_event cancelled: {err}")))?;
         let (tx, rx) = oneshot::channel();
         self.write_tx
-            .send_with_cx(cx, WriteCommand::RecordEvent { event, respond: tx })
+            .send_with_cx(
+                cx,
+                WriteCommand::RecordEvent {
+                    event,
+                    capture_hold,
+                    respond: tx,
+                },
+            )
             .await
             .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
         Self::recv_writer_response(rx).await
@@ -6385,6 +6486,28 @@ impl StorageHandle {
         .await
     }
 
+    /// Fetch only the requested pane rows in bounded SQL batches.
+    pub(crate) async fn get_panes_by_ids_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        pane_ids: &[u64],
+    ) -> Result<Vec<PaneRecord>> {
+        cx.checkpoint()
+            .map_err(|err| StorageError::Database(format!("get_panes_by_ids cancelled: {err}")))?;
+        if pane_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let db_path = Arc::clone(&self.db_path);
+        let pane_ids = pane_ids.to_vec();
+
+        Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Task join error", move || {
+            pooled_backend(db_path.as_str(), |backend| {
+                query_panes_by_ids_backend(backend, pane_ids)
+            })
+        })
+        .await
+    }
+
     /// Get a specific pane
     pub async fn get_pane(&self, pane_id: u64) -> Result<Option<PaneRecord>> {
         let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
@@ -9002,11 +9125,13 @@ fn writer_coalesce_kind(cmd: &WriteCommand, group_commit_events: bool) -> Writer
 enum PendingEventOrGap {
     Event {
         event: Box<StoredEvent>,
+        capture_hold: Option<CapturePersistenceHold>,
         respond: WriterResultResponder<i64>,
     },
     Gap {
         pane_id: u64,
         reason: String,
+        capture_hold: Option<CapturePersistenceHold>,
         respond: WriterResultResponder<Option<Gap>>,
     },
 }
@@ -9014,17 +9139,24 @@ enum PendingEventOrGap {
 impl PendingEventOrGap {
     fn into_write_command(self) -> WriteCommand {
         match self {
-            PendingEventOrGap::Event { event, respond } => WriteCommand::RecordEvent {
+            PendingEventOrGap::Event {
+                event,
+                capture_hold,
+                respond,
+            } => WriteCommand::RecordEvent {
                 event: *event,
+                capture_hold,
                 respond: respond.into_sender(),
             },
             PendingEventOrGap::Gap {
                 pane_id,
                 reason,
+                capture_hold,
                 respond,
             } => WriteCommand::RecordGap {
                 pane_id,
                 reason,
+                capture_hold,
                 respond: respond.into_sender(),
             },
         }
@@ -9035,17 +9167,24 @@ fn pending_event_or_gap_from_command(
     cmd: WriteCommand,
 ) -> std::result::Result<PendingEventOrGap, Box<WriteCommand>> {
     match cmd {
-        WriteCommand::RecordEvent { event, respond } => Ok(PendingEventOrGap::Event {
+        WriteCommand::RecordEvent {
+            event,
+            capture_hold,
+            respond,
+        } => Ok(PendingEventOrGap::Event {
             event: Box::new(event),
+            capture_hold,
             respond: WriterResultResponder::new(respond),
         }),
         WriteCommand::RecordGap {
             pane_id,
             reason,
+            capture_hold,
             respond,
         } => Ok(PendingEventOrGap::Gap {
             pane_id,
             reason,
+            capture_hold,
             respond: WriterResultResponder::new(respond),
         }),
         other => Err(Box::new(other)),
@@ -9200,25 +9339,57 @@ fn dispatch_event_gap_group_commit_result(
 
             for (pending, committed) in group.into_iter().zip(results) {
                 match (pending, committed) {
-                    (PendingEventOrGap::Event { respond, .. }, EventGapCommitResult::Event(id)) => {
+                    (
+                        PendingEventOrGap::Event {
+                            capture_hold,
+                            respond,
+                            ..
+                        },
+                        EventGapCommitResult::Event(id),
+                    ) => {
                         respond.respond_best_effort(Ok(id));
+                        drop(capture_hold);
                     }
-                    (PendingEventOrGap::Gap { respond, .. }, EventGapCommitResult::Gap(gap)) => {
+                    (
+                        PendingEventOrGap::Gap {
+                            capture_hold,
+                            respond,
+                            ..
+                        },
+                        EventGapCommitResult::Gap(gap),
+                    ) => {
                         respond.respond_best_effort(Ok(gap));
+                        drop(capture_hold);
                     }
                     // Results are built in lockstep with `group`, so a kind
                     // mismatch is impossible; fail closed rather than mis-route.
-                    (PendingEventOrGap::Event { respond, .. }, _) => {
+                    (
+                        PendingEventOrGap::Event {
+                            capture_hold,
+                            respond,
+                            ..
+                        },
+                        _,
+                    ) => {
                         respond.respond_best_effort(Err(StorageError::Database(
                             "event/gap group commit result kind mismatch".to_string(),
                         )
                         .into()));
+                        drop(capture_hold);
                     }
-                    (PendingEventOrGap::Gap { respond, .. }, _) => {
+                    (
+                        PendingEventOrGap::Gap {
+                            capture_hold,
+                            respond,
+                            ..
+                        },
+                        _,
+                    ) => {
                         respond.respond_best_effort(Err(StorageError::Database(
                             "event/gap group commit result kind mismatch".to_string(),
                         )
                         .into()));
+                        drop(capture_hold);
                     }
                 }
             }
@@ -9238,11 +9409,21 @@ fn dispatch_event_gap_group_commit_result(
 fn fail_pending_event_gap(group: Vec<PendingEventOrGap>, message: String) {
     for pending in group {
         match pending {
-            PendingEventOrGap::Event { respond, .. } => {
+            PendingEventOrGap::Event {
+                capture_hold,
+                respond,
+                ..
+            } => {
                 respond.respond_best_effort(Err(StorageError::Database(message.clone()).into()));
+                drop(capture_hold);
             }
-            PendingEventOrGap::Gap { respond, .. } => {
+            PendingEventOrGap::Gap {
+                capture_hold,
+                respond,
+                ..
+            } => {
                 respond.respond_best_effort(Err(StorageError::Database(message.clone()).into()));
+                drop(capture_hold);
             }
         }
     }
@@ -9264,6 +9445,7 @@ struct PendingAppendSegmentWrite {
     content: String,
     content_hash: Option<String>,
     zone_type: Option<String>,
+    capture_hold: Option<CapturePersistenceHold>,
     respond: WriterResultResponder<Segment>,
 }
 
@@ -9274,6 +9456,7 @@ impl PendingAppendSegmentWrite {
             content: self.content,
             content_hash: self.content_hash,
             zone_type: self.zone_type,
+            capture_hold: self.capture_hold,
             respond: self.respond.into_sender(),
         }
     }
@@ -9288,12 +9471,14 @@ fn pending_append_segment_from_command(
             content,
             content_hash,
             zone_type,
+            capture_hold,
             respond,
         } => Ok(PendingAppendSegmentWrite {
             pane_id,
             content,
             content_hash,
             zone_type,
+            capture_hold,
             respond: WriterResultResponder::new(respond),
         }),
         other => Err(Box::new(other)),
@@ -9374,11 +9559,18 @@ fn dispatch_append_segment_group_commit_result(
             }
 
             for (pending, committed) in group.into_iter().zip(committed_segments) {
+                let PendingAppendSegmentWrite {
+                    pane_id,
+                    capture_hold,
+                    respond,
+                    ..
+                } = pending;
                 if committed.retained_tail_moved {
-                    disable_mmap_mirror_after_retained_tail_move(mmap_mirror, pending.pane_id);
+                    disable_mmap_mirror_after_retained_tail_move(mmap_mirror, pane_id);
                 }
                 mirror_segment_into_mmap(mmap_mirror, &committed.segment);
-                pending.respond.respond_best_effort(Ok(committed.segment));
+                respond.respond_best_effort(Ok(committed.segment));
+                drop(capture_hold);
             }
         }
         Err(error) => {
@@ -9395,8 +9587,14 @@ fn dispatch_append_segment_group_commit_result(
 
 fn fail_pending_append_segments(commands: Vec<PendingAppendSegmentWrite>, message: String) {
     for cmd in commands {
-        cmd.respond
+        let PendingAppendSegmentWrite {
+            capture_hold,
+            respond,
+            ..
+        } = cmd;
+        respond
             .respond_best_effort(Err(StorageError::Database(message.clone()).into()));
+        drop(capture_hold);
     }
 }
 
@@ -9416,14 +9614,29 @@ fn fail_undispatched_write_commands(commands: VecDeque<WriteCommand>, message: S
 
 fn fail_undispatched_write_command(cmd: WriteCommand, message: String) -> bool {
     match cmd {
-        WriteCommand::AppendSegment { respond, .. } => {
+        WriteCommand::AppendSegment {
+            capture_hold,
+            respond,
+            ..
+        } => {
             respond_oneshot_best_effort(respond, writer_panic_error(&message));
+            drop(capture_hold);
         }
-        WriteCommand::RecordGap { respond, .. } => {
+        WriteCommand::RecordGap {
+            capture_hold,
+            respond,
+            ..
+        } => {
             respond_oneshot_best_effort(respond, writer_panic_error(&message));
+            drop(capture_hold);
         }
-        WriteCommand::RecordEvent { respond, .. } => {
+        WriteCommand::RecordEvent {
+            capture_hold,
+            respond,
+            ..
+        } => {
             respond_oneshot_best_effort(respond, writer_panic_error(&message));
+            drop(capture_hold);
         }
         WriteCommand::MarkEventHandled { respond, .. }
         | WriteCommand::SetEventNote { respond, .. }
@@ -9618,14 +9831,29 @@ fn storage_io_command_name(cmd: &WriteCommand) -> &'static str {
 
 fn respond_storage_io_rejection(cmd: WriteCommand, message: String) {
     match cmd {
-        WriteCommand::AppendSegment { respond, .. } => {
+        WriteCommand::AppendSegment {
+            capture_hold,
+            respond,
+            ..
+        } => {
             respond_oneshot_best_effort(respond, Err(StorageError::Database(message).into()));
+            drop(capture_hold);
         }
-        WriteCommand::RecordGap { respond, .. } => {
+        WriteCommand::RecordGap {
+            capture_hold,
+            respond,
+            ..
+        } => {
             respond_oneshot_best_effort(respond, Err(StorageError::Database(message).into()));
+            drop(capture_hold);
         }
-        WriteCommand::RecordEvent { respond, .. } => {
+        WriteCommand::RecordEvent {
+            capture_hold,
+            respond,
+            ..
+        } => {
             respond_oneshot_best_effort(respond, Err(StorageError::Database(message).into()));
+            drop(capture_hold);
         }
         WriteCommand::RecordAuditAction { respond, .. } => {
             respond_oneshot_best_effort(respond, Err(StorageError::Database(message).into()));
@@ -9937,6 +10165,7 @@ mod writer_io_scheduler_tests {
             content: content.to_string(),
             content_hash: None,
             zone_type: None,
+            capture_hold: None,
             respond: tx,
         }
     }
@@ -9946,6 +10175,7 @@ mod writer_io_scheduler_tests {
         WriteCommand::RecordGap {
             pane_id,
             reason: reason.to_string(),
+            capture_hold: None,
             respond: tx,
         }
     }
@@ -9970,6 +10200,7 @@ mod writer_io_scheduler_tests {
                 handled_by_workflow_id: None,
                 handled_status: None,
             },
+            capture_hold: None,
             respond: tx,
         }
     }
@@ -10215,6 +10446,7 @@ mod writer_io_scheduler_tests {
                 content: "first group append".to_string(),
                 content_hash: Some("hash-first".to_string()),
                 zone_type: None,
+                capture_hold: None,
                 respond: first_tx,
             });
             batch.push_back(WriteCommand::AppendSegment {
@@ -10222,6 +10454,7 @@ mod writer_io_scheduler_tests {
                 content: "second group append".to_string(),
                 content_hash: None,
                 zone_type: None,
+                capture_hold: None,
                 respond: second_tx,
             });
 
@@ -10295,6 +10528,7 @@ mod writer_io_scheduler_tests {
                     content: "first mismatched group append".to_string(),
                     content_hash: None,
                     zone_type: None,
+                    capture_hold: None,
                     respond: WriterResultResponder::new(first_tx),
                 },
                 PendingAppendSegmentWrite {
@@ -10302,6 +10536,7 @@ mod writer_io_scheduler_tests {
                     content: "second mismatched group append".to_string(),
                     content_hash: None,
                     zone_type: None,
+                    capture_hold: None,
                     respond: WriterResultResponder::new(second_tx),
                 },
             ];
@@ -10443,6 +10678,7 @@ mod writer_io_scheduler_tests {
                 content: "first panic group append".to_string(),
                 content_hash: None,
                 zone_type: None,
+                capture_hold: None,
                 respond: first_tx,
             });
             batch.push_back(WriteCommand::AppendSegment {
@@ -10450,6 +10686,7 @@ mod writer_io_scheduler_tests {
                 content: "second panic group append".to_string(),
                 content_hash: None,
                 zone_type: None,
+                capture_hold: None,
                 respond: second_tx,
             });
 
@@ -10626,14 +10863,17 @@ mod writer_io_scheduler_tests {
             let group = vec![
                 PendingEventOrGap::Event {
                     event: Box::new(sample_event(7, "r1", 1_700_000_000_000, Some("k1"))),
+                    capture_hold: None,
                     respond: WriterResultResponder::new(tx1),
                 },
                 PendingEventOrGap::Event {
                     event: Box::new(sample_event(7, "r2", 1_700_000_000_001, Some("k2"))),
+                    capture_hold: None,
                     respond: WriterResultResponder::new(tx2),
                 },
                 PendingEventOrGap::Event {
                     event: Box::new(sample_event(7, "r3", 1_700_000_000_002, Some("k3"))),
+                    capture_hold: None,
                     respond: WriterResultResponder::new(tx3),
                 },
             ];
@@ -10695,15 +10935,18 @@ mod writer_io_scheduler_tests {
             let group = vec![
                 PendingEventOrGap::Event {
                     event: Box::new(sample_event(7, "r1", 1_700_000_000_000, Some("k1"))),
+                    capture_hold: None,
                     respond: WriterResultResponder::new(tx1),
                 },
                 PendingEventOrGap::Gap {
                     pane_id: 7,
                     reason: "capture gap".to_string(),
+                    capture_hold: None,
                     respond: WriterResultResponder::new(gtx),
                 },
                 PendingEventOrGap::Event {
                     event: Box::new(sample_event(7, "r2", 1_700_000_000_002, Some("k2"))),
+                    capture_hold: None,
                     respond: WriterResultResponder::new(tx2),
                 },
             ];
@@ -10760,10 +11003,12 @@ mod writer_io_scheduler_tests {
             let group = vec![
                 PendingEventOrGap::Event {
                     event: Box::new(sample_event(9, "r1", 1_700_000_000_000, Some("k1"))),
+                    capture_hold: None,
                     respond: WriterResultResponder::new(tx1),
                 },
                 PendingEventOrGap::Event {
                     event: Box::new(sample_event(9, "r2", 1_700_000_000_001, Some("k2"))),
+                    capture_hold: None,
                     respond: WriterResultResponder::new(tx2),
                 },
             ];
@@ -10892,10 +11137,12 @@ mod writer_io_scheduler_tests {
             let group = vec![
                 PendingEventOrGap::Event {
                     event: Box::new(sample_event(3, "r1", 1_700_000_000_000, Some("k1"))),
+                    capture_hold: None,
                     respond: WriterResultResponder::new(tx1),
                 },
                 PendingEventOrGap::Event {
                     event: Box::new(sample_event(3, "r2", 1_700_000_000_001, Some("k2"))),
+                    capture_hold: None,
                     respond: WriterResultResponder::new(tx2),
                 },
             ];
@@ -10942,6 +11189,7 @@ mod writer_io_scheduler_tests {
             let (tx, rx) = oneshot::channel();
             let mut pending = vec![PendingEventOrGap::Event {
                 event: Box::new(sample_event(4, "r1", 1_700_000_000_000, Some("k1"))),
+                capture_hold: None,
                 respond: WriterResultResponder::new(tx),
             }];
             let mut mmap_mirror = None;
@@ -10984,14 +11232,17 @@ mod writer_io_scheduler_tests {
             let mut batch = VecDeque::new();
             batch.push_back(WriteCommand::RecordEvent {
                 event: sample_event(7, "r1", 1_700_000_000_000, Some("k1")),
+                capture_hold: None,
                 respond: tx1,
             });
             batch.push_back(WriteCommand::RecordEvent {
                 event: sample_event(7, "r2", 1_700_000_000_001, Some("k2")),
+                capture_hold: None,
                 respond: tx2,
             });
             batch.push_back(WriteCommand::RecordEvent {
                 event: sample_event(7, "r3", 1_700_000_000_002, Some("k3")),
+                capture_hold: None,
                 respond: tx3,
             });
 
@@ -11355,11 +11606,13 @@ mod writer_io_scheduler_tests {
             content: "x".to_string(),
             content_hash: None,
             zone_type: None,
+            capture_hold: None,
             respond: tx,
         }));
         let (tx, _rx) = oneshot::channel();
         assert!(is_linger_eligible(&WriteCommand::RecordEvent {
             event: sample_event(1, "r", 1, None),
+            capture_hold: None,
             respond: tx,
         }));
         let (tx, _rx) = oneshot::channel();
@@ -11367,6 +11620,7 @@ mod writer_io_scheduler_tests {
             !is_linger_eligible(&WriteCommand::RecordGap {
                 pane_id: 1,
                 reason: "gap".to_string(),
+                capture_hold: None,
                 respond: tx,
             }),
             "gaps are GapAndContinuity (strict) and must bypass the linger"
@@ -11745,6 +11999,7 @@ fn dispatch_write_command_raw(
             content,
             content_hash,
             zone_type,
+            capture_hold,
             respond,
         } => {
             let respond = WriterResultResponder::new(respond);
@@ -11773,10 +12028,12 @@ fn dispatch_write_command_raw(
                 mirror_segment_into_mmap(mmap_mirror, segment);
             }
             respond_oneshot_best_effort(respond, result);
+            drop(capture_hold);
         }
         WriteCommand::RecordGap {
             pane_id,
             reason,
+            capture_hold,
             respond,
         } => {
             let respond = WriterResultResponder::new(respond);
@@ -11784,11 +12041,17 @@ fn dispatch_write_command_raw(
                 flush_segment_redactor_for_pane(backend, mmap_mirror, segment_redactors, pane_id)
                     .and_then(|()| record_gap_backend(backend, pane_id, &reason));
             respond_oneshot_best_effort(respond, result);
+            drop(capture_hold);
         }
-        WriteCommand::RecordEvent { event, respond } => {
+        WriteCommand::RecordEvent {
+            event,
+            capture_hold,
+            respond,
+        } => {
             let respond = WriterResultResponder::new(respond);
             let result = record_event_backend(backend, &event);
             respond_oneshot_best_effort(respond, result);
+            drop(capture_hold);
         }
         WriteCommand::MarkEventHandled {
             event_id,
@@ -21182,6 +21445,59 @@ fn query_panes_backend(backend: &dyn StorageBackend) -> Result<Vec<PaneRecord>> 
     rows.iter()
         .map(|row| pane_record_from_backend_cells(row))
         .collect()
+}
+
+/// Maximum number of pane IDs admitted to one SQLite `IN` query.
+const PANE_IDS_PER_QUERY: usize = 256;
+
+/// Query a bounded pane-ID set without scanning all historical pane rows.
+fn query_panes_by_ids_backend(
+    backend: &dyn StorageBackend,
+    mut pane_ids: Vec<u64>,
+) -> Result<Vec<PaneRecord>> {
+    if pane_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Normalize inside the blocking backend lane so a large discovery batch
+    // does not spend sort time on the async capture coordinator.  Sorting also
+    // makes the cross-chunk result order deterministic; deduplication prevents
+    // the same row from being returned once per chunk when an ID is repeated
+    // across a chunk boundary.
+    pane_ids.sort_unstable();
+    pane_ids.dedup();
+
+    // Validate the complete request before issuing any query.  SQLite stores
+    // pane IDs as signed integers, so an out-of-range ID must fail closed rather
+    // than execute a partial prefix of the batch.
+    let pane_ids = pane_ids
+        .into_iter()
+        .map(|pane_id| u64_to_i64(pane_id, "pane_id"))
+        .collect::<Result<Vec<_>>>()?;
+
+    let mut panes = Vec::with_capacity(pane_ids.len());
+    for chunk in pane_ids.chunks(PANE_IDS_PER_QUERY) {
+        let placeholders = vec!["?"; chunk.len()].join(", ");
+        let sql = format!(
+            "SELECT pane_id, pane_uuid, domain, window_id, tab_id, title, cwd, tty_name, \
+             first_seen_at, last_seen_at, observed, ignore_reason, last_decision_at \
+             FROM panes WHERE pane_id IN ({placeholders}) ORDER BY pane_id"
+        );
+        let params = chunk
+            .iter()
+            .copied()
+            .map(ToSqlValue::Integer)
+            .collect::<Vec<_>>();
+        let rows = backend
+            .query_map_cells(&sql, &params)
+            .map_err(|err| storage_backend_error("Query panes by IDs", err))?;
+        panes.extend(
+            rows.iter()
+                .map(|row| pane_record_from_backend_cells(row))
+                .collect::<Result<Vec<_>>>()?,
+        );
+    }
+    Ok(panes)
 }
 
 /// Query a specific pane through the trait-typed backend path.

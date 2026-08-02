@@ -37,6 +37,12 @@ use crate::config::{
     CaptureBudgetConfig, HotReloadableConfig, PaneFilterConfig, PanePriorityConfig, PatternsConfig,
     SnapshotConfig, SnapshotSchedulingMode,
 };
+use crate::capture_authority::{
+    ActivePaneIdentity, CaptureAuthority, CaptureLease, CapturePersistenceGuard,
+    CaptureSourceKind, PaneIncarnation,
+};
+#[cfg(feature = "native-wezterm")]
+use crate::capture_authority::CaptureProducerGuard;
 use crate::connector_inbound_bridge::{
     BridgeRouteResult, ConnectorBridgeError, ConnectorInboundBridge, ConnectorInboundBridgeConfig,
     ConnectorSignal,
@@ -59,7 +65,7 @@ use crate::fleet_scrollback_coordinator::{
 use crate::gc::{CacheCompactionStats, CacheGcSettings, compact_u64_map, should_vacuum};
 use crate::ingest::{
     CapturedSegment, CapturedSegmentKind, PaneCursor, PaneRegistry, PersistedCapture,
-    bounded_segment_for_persistence, persist_captured_segment_with_zone_with_cx,
+    bounded_segment_for_persistence, persist_authorized_captured_segment_with_zone_with_cx,
 };
 use crate::memory_budget::{BudgetLevel, MemoryBudgetConfig};
 use crate::memory_pressure::{MemoryPressureConfig, MemoryPressureMonitor, MemoryPressureTier};
@@ -69,7 +75,7 @@ use crate::patterns::{AgentType, Detection, DetectionContext, PatternEngine, Sev
 use crate::policy::Redactor;
 use crate::recording::RecordingManager;
 use crate::resize_scheduler::{ResizeSchedulerDebugSnapshot, ResizeStalledTransaction};
-use crate::runtime_async::{RwLock, mpsc, task::JoinHandle, watch};
+use crate::runtime_async::{RwLock, mpsc, oneshot, task::JoinHandle, watch};
 use crate::scrollback_tiers::ScrollbackTierSnapshot;
 #[cfg(all(feature = "vendored", unix))]
 use crate::sharding::{ShardId, decode_sharded_pane_id};
@@ -130,15 +136,48 @@ async fn persist_captured_segment_for_runtime(
     captured: &CapturedSegment,
     max_segment_bytes: usize,
     zone_type: Option<&str>,
+    persistence_guard: &CapturePersistenceGuard,
 ) -> Result<PersistedCapture> {
-    persist_captured_segment_with_zone_with_cx(
+    persist_authorized_captured_segment_with_zone_with_cx(
         runtime_cx,
         storage,
         captured,
         max_segment_bytes,
         zone_type,
+        persistence_guard,
     )
     .await
+}
+
+fn record_authorized_replay_egress(
+    adapter: &crate::replay_capture::CaptureAdapter,
+    captured: &CapturedSegment,
+    durable_sequence: u64,
+    persistence_guard: &CapturePersistenceGuard,
+) {
+    debug_assert_eq!(
+        captured.pane_id,
+        persistence_guard.stamp().global_pane_id(),
+        "capture authority was validated before replay egress"
+    );
+    let (segment_kind, is_gap) = crate::recording::captured_kind_to_segment(&captured.kind);
+    let gap_reason = match &captured.kind {
+        CapturedSegmentKind::Gap { reason } => Some(reason.clone()),
+        CapturedSegmentKind::Delta => None,
+    };
+    let event = crate::recording::EgressEvent {
+        pane_id: captured.pane_id,
+        text: captured.content.clone(),
+        segment_kind,
+        is_gap,
+        gap_reason,
+        encoding: crate::recording::RecorderTextEncoding::Utf8,
+        redaction: crate::recording::RecorderRedactionLevel::None,
+        occurred_at_ms: u64::try_from(captured.captured_at).unwrap_or(0),
+        sequence: durable_sequence,
+        global_sequence: adapter.global_sequence().next(),
+    };
+    adapter.capture_egress_event(&event);
 }
 
 #[derive(Debug, Clone)]
@@ -147,19 +186,24 @@ struct CachedSemanticZoneSnapshot {
     snapshot: Option<MuxSemanticSnapshot>,
 }
 
+type CapturePaneCacheKey = (u64, PaneIncarnation);
+
 async fn semantic_zone_type_for_captured_segment(
     runtime_cx: &RuntimeLoopCx,
     wezterm_handle: &WeztermHandle,
-    cache: &mut HashMap<u64, CachedSemanticZoneSnapshot>,
+    cache: &mut HashMap<CapturePaneCacheKey, CachedSemanticZoneSnapshot>,
     cache_ttl: Duration,
     captured: &CapturedSegment,
+    pane_incarnation: PaneIncarnation,
+    allow_live_lookup: bool,
 ) -> Option<String> {
     if !matches!(&captured.kind, CapturedSegmentKind::Delta) || captured.content.trim().is_empty() {
         return None;
     }
 
     let now = Instant::now();
-    if let Some(cached) = cache.get(&captured.pane_id)
+    let cache_key = (captured.pane_id, pane_incarnation);
+    if let Some(cached) = cache.get(&cache_key)
         && now.saturating_duration_since(cached.refreshed_at) <= cache_ttl
     {
         return cached
@@ -167,6 +211,13 @@ async fn semantic_zone_type_for_captured_segment(
             .as_ref()
             .and_then(|snapshot| infer_semantic_zone_type_for_segment(captured, snapshot))
             .map(str::to_string);
+    }
+
+    // Once discovery has published different metadata for a numeric pane ID,
+    // a live mux query can only describe the successor. Existing snapshots are
+    // incarnation-keyed and safe to reuse, but a cache miss must fail closed.
+    if !allow_live_lookup {
+        return None;
     }
 
     let snapshot = match wezterm_handle
@@ -184,7 +235,7 @@ async fn semantic_zone_type_for_captured_segment(
         }
     };
     cache.insert(
-        captured.pane_id,
+        cache_key,
         CachedSemanticZoneSnapshot {
             refreshed_at: now,
             snapshot: snapshot.clone(),
@@ -327,6 +378,7 @@ struct StreamingSubscriptionIdentity {
     socket_shard: ShardId,
     socket_path: PathBuf,
     generation: u32,
+    capture_stamp: crate::capture_authority::CaptureStamp,
 }
 
 /// Identifies one spawned task for exit reconciliation only.
@@ -341,6 +393,7 @@ struct StreamingTaskToken(u64);
 #[cfg(all(feature = "vendored", unix))]
 struct StreamingTask {
     identity: StreamingSubscriptionIdentity,
+    lease: CaptureLease,
     token: StreamingTaskToken,
     handle: JoinHandle<()>,
 }
@@ -367,11 +420,14 @@ enum StreamingTaskReconcileAction {
 // for every active pane on every discovery tick.
 fn streaming_task_reconcile_action(
     active: &StreamingSubscriptionIdentity,
-    desired: Option<(u64, u32)>,
+    desired: Option<(u64, u32, crate::capture_authority::CaptureStamp)>,
 ) -> StreamingTaskReconcileAction {
     match desired {
-        Some((global_pane_id, generation)) => {
-            if global_pane_id == active.global_pane_id && generation == active.generation {
+        Some((global_pane_id, generation, capture_stamp)) => {
+            if global_pane_id == active.global_pane_id
+                && generation == active.generation
+                && capture_stamp == active.capture_stamp
+            {
                 StreamingTaskReconcileAction::Keep
             } else {
                 StreamingTaskReconcileAction::Replace
@@ -508,11 +564,18 @@ async fn forward_vendored_streaming_delta(
     bridge: &mut StreamingBridge,
     capture_tx: &mpsc::Sender<CaptureEvent>,
     identity: &StreamingSubscriptionIdentity,
+    lease: &CaptureLease,
     delta: PaneDelta,
 ) -> Option<String> {
     let delta = match remap_vendored_streaming_delta(identity, delta) {
         Ok(delta) => delta,
         Err(reason) => return Some(reason),
+    };
+    let producer_guard = match lease
+        .try_acquire_producer(identity.capture_stamp, identity.global_pane_id)
+    {
+        Ok(guard) => guard,
+        Err(error) => return Some(format!("capture authority rejected stream: {error}")),
     };
     let exit_reason = match &delta {
         PaneDelta::Ended { reason, .. } => Some(reason.clone()),
@@ -520,7 +583,11 @@ async fn forward_vendored_streaming_delta(
     };
 
     for segment in bridge.process_delta(delta) {
-        if !send_runtime_channel(runtime_cx, capture_tx, CaptureEvent { segment }).await {
+        let event = match CaptureEvent::from_producer(segment, &producer_guard) {
+            Ok(event) => event,
+            Err(error) => return Some(format!("capture authority rejected stream: {error}")),
+        };
+        if !send_runtime_channel(runtime_cx, capture_tx, event).await {
             return Some("capture ingress closed".to_string());
         }
     }
@@ -563,6 +630,7 @@ struct PendingNativeOutput {
     last_timestamp_ms: i64,
     input_events: u32,
     bytes: Vec<u8>,
+    producer_guard: CaptureProducerGuard,
 }
 
 #[cfg(feature = "native-wezterm")]
@@ -572,6 +640,7 @@ struct CoalescedNativeOutput {
     bytes: Vec<u8>,
     timestamp_ms: i64,
     input_events: u32,
+    producer_guard: CaptureProducerGuard,
 }
 
 #[cfg(feature = "native-wezterm")]
@@ -600,6 +669,7 @@ impl NativeOutputCoalescer {
         bytes: Vec<u8>,
         timestamp_ms: i64,
         now_ms: u64,
+        producer_guard: CaptureProducerGuard,
     ) -> Option<CoalescedNativeOutput> {
         if bytes.is_empty() {
             return None;
@@ -612,20 +682,28 @@ impl NativeOutputCoalescer {
                     last_timestamp_ms: timestamp_ms,
                     input_events: 1,
                     bytes,
+                    producer_guard,
                 });
                 None
             }
             std::collections::hash_map::Entry::Occupied(mut o) => {
                 let pending = o.get_mut();
+                let source_changed =
+                    pending.producer_guard.stamp() != producer_guard.stamp();
 
-                if !pending.bytes.is_empty()
-                    && pending.bytes.len().saturating_add(bytes.len()) > self.max_bytes
+                if source_changed
+                    || (!pending.bytes.is_empty()
+                        && pending.bytes.len().saturating_add(bytes.len()) > self.max_bytes)
                 {
                     let flushed = CoalescedNativeOutput {
                         pane_id,
                         bytes: std::mem::take(&mut pending.bytes),
                         timestamp_ms: pending.last_timestamp_ms,
                         input_events: pending.input_events,
+                        producer_guard: std::mem::replace(
+                            &mut pending.producer_guard,
+                            producer_guard,
+                        ),
                     };
 
                     pending.first_seen_ms = now_ms;
@@ -662,6 +740,7 @@ impl NativeOutputCoalescer {
                     bytes: pending.bytes,
                     timestamp_ms: pending.last_timestamp_ms,
                     input_events: pending.input_events,
+                    producer_guard: pending.producer_guard,
                 });
             }
         }
@@ -677,6 +756,7 @@ impl NativeOutputCoalescer {
                 bytes: pending.bytes,
                 timestamp_ms: pending.last_timestamp_ms,
                 input_events: pending.input_events,
+                producer_guard: pending.producer_guard,
             })
     }
 
@@ -688,9 +768,30 @@ impl NativeOutputCoalescer {
                 bytes: pending.bytes,
                 timestamp_ms: pending.last_timestamp_ms,
                 input_events: pending.input_events,
+                producer_guard: pending.producer_guard,
             });
         }
         out
+    }
+}
+
+#[cfg(feature = "native-wezterm")]
+fn acquire_native_producer(
+    authority: &CaptureAuthority,
+    metrics: &RuntimeMetrics,
+    pane_id: u64,
+) -> Option<CaptureProducerGuard> {
+    match authority.try_acquire_unstamped_native_producer(pane_id) {
+        Ok(guard) => Some(guard),
+        Err(error) => {
+            metrics.capture_authority_rejections.increment();
+            debug!(
+                pane_id,
+                error = %error,
+                "Rejected native event before producer side effects"
+            );
+            None
+        }
     }
 }
 
@@ -775,11 +876,184 @@ struct StreamingTaskExit {
     reason: String,
 }
 
-#[cfg(all(feature = "vendored", unix))]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct DiscoveryRevision(u64);
+
+impl DiscoveryRevision {
+    const fn get(self) -> u64 {
+        self.0
+    }
+}
+
 #[derive(Clone)]
-struct ObservedStreamingPane {
+struct ObservedCapturePane {
     info: PaneInfo,
     generation: u32,
+    pane_uuid: String,
+    revision: DiscoveryRevision,
+}
+
+#[derive(Clone)]
+struct DiscoveryCapturePublication {
+    epoch: u64,
+    observed_panes: Arc<HashMap<u64, ObservedCapturePane>>,
+}
+
+impl Default for DiscoveryCapturePublication {
+    fn default() -> Self {
+        Self {
+            epoch: 0,
+            observed_panes: Arc::new(HashMap::new()),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct CaptureDurabilityCheckpoint {
+    revision: DiscoveryRevision,
+    next_seq: u64,
+    raw_tail: String,
+    certain: bool,
+}
+
+type CaptureCheckpointCache = Arc<StdMutex<LruCache<u64, CaptureDurabilityCheckpoint>>>;
+
+#[derive(Clone)]
+struct CapturePaneMetadata {
+    pane_uuid: String,
+    discovery_generation: u32,
+    discovery_revision: DiscoveryRevision,
+}
+
+struct ActiveCaptureBinding {
+    generation: u32,
+    pane_uuid: String,
+    revision: DiscoveryRevision,
+    identity: ActivePaneIdentity,
+    polling_lease: CaptureLease,
+    #[cfg(feature = "native-wezterm")]
+    native_lease: Option<CaptureLease>,
+    #[cfg(all(feature = "vendored", unix))]
+    streaming_lease: Option<CaptureLease>,
+}
+
+impl ActiveCaptureBinding {
+    fn matches_observed(&self, pane: &ObservedCapturePane) -> bool {
+        self.generation == pane.generation
+            && self.pane_uuid == pane.pane_uuid
+            && self.revision == pane.revision
+    }
+}
+
+fn allocate_discovery_revision(last_revision: &mut u64) -> Option<DiscoveryRevision> {
+    let next = last_revision.checked_add(1)?;
+    *last_revision = next;
+    Some(DiscoveryRevision(next))
+}
+
+fn allocate_discovery_publication_epoch(last_epoch: &mut u64) -> Option<u64> {
+    let next = last_epoch.checked_add(1)?;
+    *last_epoch = next;
+    Some(next)
+}
+
+const CAPTURE_AUTHORITY_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+
+async fn rollback_empty_capture_binding(
+    cx: &RuntimeLoopCx,
+    authority: &CaptureAuthority,
+    identity: ActivePaneIdentity,
+) -> bool {
+    let Ok(revocation) = authority.begin_pane_revocation(identity) else {
+        return false;
+    };
+    match revocation
+        .wait_with_cx(cx, CAPTURE_AUTHORITY_DRAIN_TIMEOUT)
+        .await
+    {
+        Ok(_) => true,
+        Err(error) => {
+            error!(
+                pane_id = identity.global_pane_id(),
+                error = %error,
+                "Failed to roll back partially activated capture binding"
+            );
+            false
+        }
+    }
+}
+
+async fn activate_capture_binding(
+    cx: &RuntimeLoopCx,
+    authority: &CaptureAuthority,
+    global_pane_id: u64,
+    generation: u32,
+    capture_metadata: &Arc<RwLock<HashMap<PaneIncarnation, CapturePaneMetadata>>>,
+    metadata: CapturePaneMetadata,
+) -> Result<ActiveCaptureBinding> {
+    let identity = authority.activate_pane(global_pane_id)?;
+    let pane_uuid = metadata.pane_uuid.clone();
+    let revision = metadata.discovery_revision;
+    capture_metadata
+        .write()
+        .await
+        .insert(identity.pane_incarnation(), metadata);
+    let polling_lease = match authority.issue_source(identity, CaptureSourceKind::Polling) {
+        Ok(lease) => lease,
+        Err(error) => {
+            if rollback_empty_capture_binding(cx, authority, identity).await {
+                capture_metadata
+                    .write()
+                    .await
+                    .remove(&identity.pane_incarnation());
+            }
+            return Err(error.into());
+        }
+    };
+
+    Ok(ActiveCaptureBinding {
+        generation,
+        pane_uuid,
+        revision,
+        identity,
+        polling_lease,
+        #[cfg(feature = "native-wezterm")]
+        native_lease: None,
+        #[cfg(all(feature = "vendored", unix))]
+        streaming_lease: None,
+    })
+}
+
+fn enable_native_capture_source(
+    authority: &CaptureAuthority,
+    binding: &mut ActiveCaptureBinding,
+    native_enabled: bool,
+) -> Result<()> {
+    #[cfg(feature = "native-wezterm")]
+    {
+        if native_enabled && binding.native_lease.is_none() {
+            binding.native_lease = Some(
+                authority.issue_source(binding.identity, CaptureSourceKind::NativePush)?,
+            );
+        }
+    }
+    #[cfg(not(feature = "native-wezterm"))]
+    {
+        let _ = (authority, binding, native_enabled);
+    }
+    Ok(())
+}
+
+async fn retire_capture_binding(
+    cx: &RuntimeLoopCx,
+    authority: &CaptureAuthority,
+    binding: &ActiveCaptureBinding,
+) -> Result<()> {
+    authority
+        .begin_pane_revocation(binding.identity)?
+        .wait_with_cx(cx, CAPTURE_AUTHORITY_DRAIN_TIMEOUT)
+        .await?;
+    Ok(())
 }
 
 #[cfg(all(feature = "vendored", unix))]
@@ -802,36 +1076,41 @@ fn streaming_subscription_config(
     }
 }
 
-#[cfg(all(feature = "vendored", unix))]
+#[cfg(all(test, feature = "vendored", unix))]
 fn vendored_streaming_identity_for_pane(
     socket_paths: &[PathBuf],
     global_pane_id: u64,
     generation: u32,
+    capture_stamp: crate::capture_authority::CaptureStamp,
 ) -> Option<StreamingSubscriptionIdentity> {
+    let (socket_shard, local_pane_id, socket_path) =
+        vendored_streaming_route_for_pane(socket_paths, global_pane_id)?;
+    Some(StreamingSubscriptionIdentity {
+        global_pane_id,
+        local_pane_id,
+        socket_shard,
+        socket_path,
+        generation,
+        capture_stamp,
+    })
+}
+
+#[cfg(all(feature = "vendored", unix))]
+fn vendored_streaming_route_for_pane(
+    socket_paths: &[PathBuf],
+    global_pane_id: u64,
+) -> Option<(ShardId, u64, PathBuf)> {
     if socket_paths.is_empty() {
         return None;
     }
-
     if socket_paths.len() == 1 {
-        return Some(StreamingSubscriptionIdentity {
-            global_pane_id,
-            local_pane_id: global_pane_id,
-            socket_shard: ShardId(0),
-            socket_path: socket_paths[0].clone(),
-            generation,
-        });
+        return Some((ShardId(0), global_pane_id, socket_paths[0].clone()));
     }
-
     let (shard_id, local_pane_id) = decode_sharded_pane_id(global_pane_id);
-    socket_paths.get(shard_id.0).cloned().map(|socket_path| {
-        StreamingSubscriptionIdentity {
-            global_pane_id,
-            local_pane_id,
-            socket_shard: shard_id,
-            socket_path,
-            generation,
-        }
-    })
+    socket_paths
+        .get(shard_id.0)
+        .cloned()
+        .map(|socket_path| (shard_id, local_pane_id, socket_path))
 }
 
 #[cfg(all(feature = "vendored", unix))]
@@ -1094,6 +1373,8 @@ pub struct RuntimeMetrics {
     segments_persisted: ShardedCounter,
     /// Count of events recorded
     events_recorded: ShardedCounter,
+    /// Count of queued capture events rejected by incarnation/source fencing.
+    capture_authority_rejections: ShardedCounter,
     /// Timestamp when runtime started (epoch ms)
     started_at: ShardedGauge,
     /// Last DB write timestamp (epoch ms)
@@ -1168,6 +1449,7 @@ impl Default for RuntimeMetrics {
         Self {
             segments_persisted: ShardedCounter::new(),
             events_recorded: ShardedCounter::new(),
+            capture_authority_rejections: ShardedCounter::new(),
             started_at: ShardedGauge::new(),
             last_db_write_at: ShardedGauge::new(),
             ingest_lag_sum_ms: ShardedCounter::new(),
@@ -1494,6 +1776,11 @@ impl RuntimeMetrics {
         self.events_recorded.get()
     }
 
+    /// Get queued capture events rejected before semantic side effects.
+    pub fn capture_authority_rejections(&self) -> u64 {
+        self.capture_authority_rejections.get()
+    }
+
     pub fn native_output_input_events(&self) -> u64 {
         self.native_output_input_events.get()
     }
@@ -1540,6 +1827,12 @@ pub struct ObservationRuntime {
     pattern_engine: Arc<RwLock<PatternEngine>>,
     /// Pane registry for discovery and tracking
     registry: Arc<RwLock<PaneRegistry>>,
+    /// Sole runtime authority for pane incarnations and capture source epochs.
+    capture_authority: CaptureAuthority,
+    /// Immutable metadata keyed by runtime-monotonic pane incarnation.
+    /// Entries outlive registry replacement until producer and persistence
+    /// guards for the predecessor have drained.
+    capture_metadata: Arc<RwLock<HashMap<PaneIncarnation, CapturePaneMetadata>>>,
     // LOCK ORDER (deadlock-avoidance doctrine): when more than one of the
     // three per-pane maps below is held at once, they MUST be acquired in this
     // declaration order — `cursors` → `detection_contexts` →
@@ -1635,6 +1928,8 @@ impl ObservationRuntime {
             storage,
             pattern_engine,
             registry: Arc::new(RwLock::new(registry)),
+            capture_authority: CaptureAuthority::new(),
+            capture_metadata: Arc::new(RwLock::new(HashMap::new())),
             cursors: Arc::new(RwLock::new(HashMap::new())),
             detection_contexts: Arc::new(RwLock::new(HashMap::new())),
             pane_activity_tracker: Arc::new(RwLock::new(HashMap::new())),
@@ -1832,6 +2127,18 @@ impl ObservationRuntime {
         // consumed by the persistence task.
         let (capture_ring_tx, capture_ring_rx) =
             spsc_channel::<CaptureEvent>(self.config.channel_buffer);
+        // Discovery publishes one immutable, revision-stamped capture view
+        // only after all registry/cursor setup for that tick is complete.  A
+        // watch channel retains the latest view across startup scheduling and
+        // coalesces superseded discovery ticks without losing pane identity.
+        let (discovery_publication_tx, discovery_publication_rx) =
+            watch::channel(DiscoveryCapturePublication::default());
+        // The hot path resets a successor cursor from the most recent
+        // durability-confirmed raw tail without touching SQLite.  Eviction is
+        // safe: transitions fall back to a strict storage read.
+        let capture_checkpoints: CaptureCheckpointCache = Arc::new(StdMutex::new(LruCache::new(
+            self.config.channel_buffer.max(1),
+        )));
 
         // Clone ingress sender for queue depth instrumentation before moving it.
         let capture_tx_probe = capture_ingress_tx.clone();
@@ -1841,7 +2148,7 @@ impl ObservationRuntime {
             .saturating_add(1);
 
         // Spawn discovery task
-        let discovery_handle = self.spawn_discovery_task();
+        let discovery_handle = self.spawn_discovery_task(discovery_publication_tx);
 
         let native_socket = self.config.native_event_socket.clone();
 
@@ -1849,7 +2156,11 @@ impl ObservationRuntime {
         // when vendored direct-mux sockets are configured, per-pane streaming
         // subscriptions. Native push events can still feed the same ingress
         // channel in parallel, with polling remaining the safety net.
-        let capture_handle = self.spawn_capture_task(capture_ingress_tx.clone());
+        let capture_handle = self.spawn_capture_task(
+            capture_ingress_tx.clone(),
+            discovery_publication_rx.clone(),
+            Arc::clone(&capture_checkpoints),
+        );
 
         // Spawn native event listener if socket path is configured and the
         // native-wezterm feature is compiled in. Auto-detection: always try
@@ -1880,6 +2191,8 @@ impl ObservationRuntime {
             capture_ring_rx,
             Arc::clone(&self.cursors),
             Arc::clone(&self.registry),
+            discovery_publication_rx,
+            capture_checkpoints,
         );
 
         // Spawn maintenance task
@@ -2825,7 +3138,10 @@ impl ObservationRuntime {
     }
 
     /// Spawn the pane discovery task.
-    fn spawn_discovery_task(&self) -> JoinHandle<()> {
+    fn spawn_discovery_task(
+        &self,
+        discovery_publication_tx: watch::Sender<DiscoveryCapturePublication>,
+    ) -> JoinHandle<()> {
         let registry = Arc::clone(&self.registry);
         let cursors = Arc::clone(&self.cursors);
         let detection_contexts = Arc::clone(&self.detection_contexts);
@@ -2845,20 +3161,31 @@ impl ObservationRuntime {
         let loop_cx = runtime_loop_cx();
         spawn_runtime_task(&loop_cx, move |loop_cx| async move {
             let mut current_interval = initial_interval;
+            let mut first_tick = true;
+            let mut last_discovery_revision = 0_u64;
+            let mut last_publication_epoch = 0_u64;
+            let mut discovery_revisions = HashMap::<u64, DiscoveryRevision>::new();
 
             loop {
-                // Wait for interval, checking shutdown periodically to ensure responsiveness
-                let deadline =
-                    runtime_deadline_after(Instant::now(), current_interval, "discovery interval");
-                loop {
-                    if shutdown_flag.load(Ordering::SeqCst) {
-                        break;
+                if first_tick {
+                    first_tick = false;
+                } else {
+                    // Wait for interval, checking shutdown periodically to ensure responsiveness
+                    let deadline = runtime_deadline_after(
+                        Instant::now(),
+                        current_interval,
+                        "discovery interval",
+                    );
+                    loop {
+                        if shutdown_flag.load(Ordering::SeqCst) {
+                            break;
+                        }
+                        if Instant::now() >= deadline {
+                            break;
+                        }
+                        // Sleep in short bursts to remain responsive to shutdown signals
+                        runtime_sleep(&loop_cx, Duration::from_millis(100)).await;
                     }
-                    if Instant::now() >= deadline {
-                        break;
-                    }
-                    // Sleep in short bursts to remain responsive to shutdown signals
-                    runtime_sleep(&loop_cx, Duration::from_millis(100)).await;
                 }
 
                 // Check shutdown flag
@@ -2884,9 +3211,67 @@ impl ObservationRuntime {
                 match wezterm.list_panes().await {
                     Ok(panes) => {
                         heartbeats.record_discovery();
+                        // Resolve stored UUIDs before first publication. Capture
+                        // snapshots the UUID and generation under the registry
+                        // lock; publishing a generated UUID and adopting the
+                        // stable one after an await lets a producer advance its
+                        // cursor under metadata that persistence must reject.
+                        let candidate_new_panes = {
+                            let reg = registry.read().await;
+                            panes
+                                .iter()
+                                .filter(|pane| reg.get_entry(pane.pane_id).is_none())
+                                .map(|pane| pane.pane_id)
+                                .collect::<Vec<_>>()
+                        };
+                        let mut stable_uuids = storage
+                            .get_panes_by_ids_with_cx(&loop_cx, &candidate_new_panes)
+                            .await
+                            .unwrap_or_else(|error| {
+                                warn!(
+                                    candidate_count = candidate_new_panes.len(),
+                                    error = %error,
+                                    "Failed to recover stable UUIDs for new panes"
+                                );
+                                Vec::new()
+                            })
+                            .into_iter()
+                            .filter_map(|record| {
+                                record
+                                    .pane_uuid
+                                    .map(|pane_uuid| (record.pane_id, pane_uuid))
+                            })
+                            .collect::<HashMap<_, _>>();
                         let (diff, new_entries) = {
                             let mut reg = registry.write().await;
                             let diff = reg.discovery_tick(panes);
+                            for pane_id in &diff.new_panes {
+                                let Some(stable_uuid) = stable_uuids.remove(pane_id) else {
+                                    continue;
+                                };
+                                let Some(generated_uuid) = reg
+                                    .get_entry(*pane_id)
+                                    .map(|entry| entry.pane_uuid.clone())
+                                else {
+                                    continue;
+                                };
+                                if stable_uuid == generated_uuid {
+                                    continue;
+                                }
+                                debug!(
+                                    pane_id,
+                                    old_uuid = %generated_uuid,
+                                    new_uuid = %stable_uuid,
+                                    "Adopting stable UUID before registry publication"
+                                );
+                                if !reg.adopt_uuid(*pane_id, stable_uuid.clone()) {
+                                    warn!(
+                                        pane_id,
+                                        rejected_uuid = %stable_uuid,
+                                        "Rejected stable UUID adoption due to registry collision"
+                                    );
+                                }
+                            }
                             let new_entries: Vec<_> = diff
                                 .new_panes
                                 .iter()
@@ -2899,8 +3284,26 @@ impl ObservationRuntime {
                             (diff, new_entries)
                         };
 
+                        for pane_id in &diff.closed_panes {
+                            discovery_revisions.remove(pane_id);
+                        }
+                        for pane_id in diff.new_panes.iter().chain(&diff.new_generations) {
+                            match allocate_discovery_revision(&mut last_discovery_revision) {
+                                Some(revision) => {
+                                    discovery_revisions.insert(*pane_id, revision);
+                                }
+                                None => {
+                                    discovery_revisions.remove(pane_id);
+                                    error!(
+                                        pane_id,
+                                        "Discovery revision namespace exhausted; refusing capture admission"
+                                    );
+                                }
+                            }
+                        }
+
                         // Handle new panes
-                        for (pane_id, mut entry) in new_entries {
+                        for (pane_id, entry) in new_entries {
                             if let Some(ref adapter) = replay_capture {
                                 adapter.capture_lifecycle(
                                     pane_id,
@@ -2912,45 +3315,6 @@ impl ObservationRuntime {
                                         "cwd": entry.info.cwd.clone(),
                                     }),
                                 );
-                            }
-
-                            // Check if pane exists in storage to recover stable UUID
-                            // ft-xbnl0.2.3 tick 251: cx-first storage in pane-setup block.
-                            let stable_uuid = {
-                                let result = storage
-                                    .get_pane_with_cx(&loop_cx, pane_id)
-                                    .await
-                                    .unwrap_or_else(|e| {
-                                        warn!(pane_id, error = %e, "Failed to check storage for existing pane");
-                                        None
-                                    });
-
-                                result.and_then(|r| r.pane_uuid)
-                            };
-
-                            if let Some(uuid) = stable_uuid {
-                                if uuid != entry.pane_uuid {
-                                    debug!(
-                                        pane_id,
-                                        old_uuid = %entry.pane_uuid,
-                                        new_uuid = %uuid,
-                                        "Adopting stable UUID from storage"
-                                    );
-                                    let adopted = {
-                                        let mut reg = registry.write().await;
-                                        reg.adopt_uuid(pane_id, uuid.clone())
-                                    };
-
-                                    if adopted {
-                                        entry.pane_uuid = uuid;
-                                    } else {
-                                        warn!(
-                                            pane_id,
-                                            rejected_uuid = %uuid,
-                                            "Rejected stable UUID adoption due to registry collision"
-                                        );
-                                    }
-                                }
                             }
 
                             // Upsert pane in storage
@@ -3224,6 +3588,52 @@ impl ObservationRuntime {
                                 crash_now_secs,
                             );
                         }
+
+                        let observed_panes = {
+                            let reg = registry.read().await;
+                            let observed_ids = reg.observed_pane_ids();
+                            let mut published = HashMap::with_capacity(observed_ids.len());
+                            for pane_id in observed_ids {
+                                let Some(entry) = reg.get_entry(pane_id) else {
+                                    continue;
+                                };
+                                let Some(revision) = discovery_revisions.get(&pane_id).copied()
+                                else {
+                                    continue;
+                                };
+                                published.insert(
+                                    pane_id,
+                                    ObservedCapturePane {
+                                        info: entry.info.clone(),
+                                        generation: entry.generation,
+                                        pane_uuid: entry.pane_uuid.clone(),
+                                        revision,
+                                    },
+                                );
+                            }
+                            Arc::new(published)
+                        };
+                        match allocate_discovery_publication_epoch(&mut last_publication_epoch) {
+                            Some(epoch) => {
+                                if discovery_publication_tx
+                                    .send(DiscoveryCapturePublication {
+                                        epoch,
+                                        observed_panes,
+                                    })
+                                    .is_err()
+                                {
+                                    debug!(
+                                        epoch,
+                                        "Discovery publication receiver closed; interval fallback remains active"
+                                    );
+                                }
+                            }
+                            None => {
+                                error!(
+                                    "Discovery publication namespace exhausted; capture remains fail-closed on its last complete view"
+                                );
+                            }
+                        }
                     }
                     Err(e) => {
                         heartbeats.record_discovery();
@@ -3243,16 +3653,25 @@ impl ObservationRuntime {
     /// - Poll slow when idle (capture_interval)
     /// - Respect concurrency limits (max_concurrent_captures)
     /// - Handle backpressure from downstream
-    fn spawn_capture_task(&self, capture_tx: mpsc::Sender<CaptureEvent>) -> JoinHandle<()> {
+    fn spawn_capture_task(
+        &self,
+        capture_tx: mpsc::Sender<CaptureEvent>,
+        mut discovery_publication_rx: watch::Receiver<DiscoveryCapturePublication>,
+        capture_checkpoints: CaptureCheckpointCache,
+    ) -> JoinHandle<()> {
         let registry = Arc::clone(&self.registry);
         let cursors = Arc::clone(&self.cursors);
+        let detection_contexts = Arc::clone(&self.detection_contexts);
+        let storage = self.storage.clone();
         let shutdown_flag = Arc::clone(&self.shutdown_flag);
         let discovery_interval = self.config.discovery_interval;
         let mut config_rx = self.config_rx.clone();
         let heartbeats = Arc::clone(&self.heartbeats);
         let wezterm_handle = Arc::clone(&self.wezterm_handle);
         let scheduler_snapshot = Arc::clone(&self.scheduler_snapshot);
-        let replay_capture = self.replay_capture.clone();
+        let capture_authority = self.capture_authority.clone();
+        let capture_metadata = Arc::clone(&self.capture_metadata);
+        let native_capture_enabled = self.config.native_event_socket.is_some();
         #[cfg(all(feature = "vendored", unix))]
         let vendored_streaming_enabled = !self.config.vendored_mux_socket_paths.is_empty();
         #[cfg(all(feature = "vendored", unix))]
@@ -3286,6 +3705,7 @@ impl ObservationRuntime {
         let loop_cx = runtime_loop_cx();
         spawn_runtime_task(&loop_cx, move |loop_cx| async move {
             let source = Arc::new(WeztermHandleSource::new(wezterm_handle));
+            let resync_source = Arc::clone(&source);
             let capture_tx_for_supervisor = capture_tx.clone();
             // Create tailer supervisor with budget enforcement
             let initial_budget = config_rx.borrow().capture_budgets.clone();
@@ -3298,11 +3718,6 @@ impl ObservationRuntime {
                 source,
                 initial_budget,
             );
-            if let Some(adapter) = replay_capture {
-                let egress_tap: crate::recording::SharedEgressTap = adapter.clone();
-                supervisor.set_egress_tap(egress_tap);
-                supervisor.set_global_sequence(adapter.global_sequence_handle());
-            }
 
             // Cache hot-reloadable pane priority config for scheduling.
             let mut pane_priorities = config_rx.borrow().pane_priorities.clone();
@@ -3317,8 +3732,9 @@ impl ObservationRuntime {
             // as the fast path on clean shutdown but is no longer load-bearing.
             #[cfg(all(feature = "vendored", unix))]
             let mut streaming_tasks: StreamingTasks = StreamingTasks::new();
-            #[cfg(all(feature = "vendored", unix))]
-            let mut observed_panes_cache: HashMap<u64, ObservedStreamingPane> = HashMap::new();
+            let mut observed_panes_cache = Arc::new(HashMap::<u64, ObservedCapturePane>::new());
+            let mut capture_bindings = HashMap::<u64, ActiveCaptureBinding>::new();
+            let mut pending_resyncs = HashMap::<u64, DiscoveryRevision>::new();
             #[cfg(all(feature = "vendored", unix))]
             let mut next_stream_task_token = 1_u64;
 
@@ -3355,7 +3771,57 @@ impl ObservationRuntime {
                         continue;
                     }
 
-                    streaming_tasks.remove(&pane_id);
+                    let task = streaming_tasks
+                        .remove(&pane_id)
+                        .expect("current streaming exit has an active task");
+                    let task_stamp = task.lease.stamp();
+                    let binding_identity = capture_bindings.get(&pane_id).and_then(|binding| {
+                        binding
+                            .streaming_lease
+                            .as_ref()
+                            .is_some_and(|lease| lease.stamp() == task_stamp)
+                            .then_some(binding.identity)
+                    });
+                    if let Some(binding_identity) = binding_identity {
+                        match capture_authority
+                            .begin_source_revocation(binding_identity, task_stamp)
+                        {
+                            Ok(revocation) => match revocation
+                                .wait_with_cx(&loop_cx, CAPTURE_AUTHORITY_DRAIN_TIMEOUT)
+                                .await
+                            {
+                                Ok(_) => {
+                                    if let Some(binding) = capture_bindings.get_mut(&pane_id)
+                                        && binding.streaming_lease.as_ref().is_some_and(|lease| {
+                                            lease.stamp() == task_stamp
+                                        })
+                                    {
+                                        binding.streaming_lease = None;
+                                    }
+                                }
+                                Err(error) => {
+                                    error!(
+                                        pane_id,
+                                        error = %error,
+                                        "Vendored streaming source remained draining after exit"
+                                    );
+                                }
+                            },
+                            Err(error) => {
+                                error!(
+                                    pane_id,
+                                    error = %error,
+                                    "Failed to begin vendored streaming source revocation"
+                                );
+                            }
+                        }
+                    } else {
+                        debug!(
+                            pane_id,
+                            source_epoch = task_stamp.source_epoch().get(),
+                            "Streaming exit no longer matches the pane's active source lease"
+                        );
+                    }
                     if observed_panes_cache.contains_key(&pane_id)
                         && should_record_streaming_fallback(&exit.reason)
                     {
@@ -3383,13 +3849,31 @@ impl ObservationRuntime {
                     let polling_observed_panes: HashMap<u64, PaneInfo> = observed_panes_cache
                         .iter()
                         .filter(|(pane_id, _)| !streaming_tasks.contains_key(*pane_id))
+                        .filter(|(pane_id, pane)| {
+                            capture_bindings
+                                .get(*pane_id)
+                                .is_some_and(|binding| binding.matches_observed(pane))
+                        })
                         .map(|(pane_id, pane)| (*pane_id, pane.info.clone()))
                         .collect();
-                    supervisor.sync_tailers(&polling_observed_panes);
+                    let polling_leases = polling_observed_panes
+                        .keys()
+                        .filter_map(|pane_id| {
+                            capture_bindings
+                                .get(pane_id)
+                                .map(|binding| (*pane_id, binding.polling_lease.clone()))
+                        })
+                        .collect();
+                    if let Err(error) = supervisor
+                        .sync_authorized_tailers(&polling_observed_panes, &polling_leases)
+                    {
+                        error!(error = %error, "Failed to authorize polling fallback");
+                    }
                 }
 
                 let now = Instant::now();
-                if now >= next_sync_tick {
+                let discovery_publication_pending = discovery_publication_rx.has_changed();
+                if now >= next_sync_tick || discovery_publication_pending {
                     next_sync_tick = now + discovery_interval;
                     heartbeats.record_capture();
 
@@ -3424,53 +3908,162 @@ impl ObservationRuntime {
                         }
                     }
 
-                    // Get current observed panes from registry. The vendored
-                    // streaming view retains the PaneEntry generation from the
-                    // same read lock as its PaneInfo, so task reconciliation
-                    // cannot combine metadata from one generation with the
-                    // identity of another.
+                    // Consume one fully-prepared immutable publication.  The
+                    // channel retains an update sent before this task first
+                    // runs and coalesces superseded ticks to their latest
+                    // monotonic revision-stamped view.
+                    let publication = discovery_publication_rx.borrow_and_clone();
+                    let publication_epoch = publication.epoch;
+                    observed_panes_cache = publication.observed_panes;
+                    let observed_pane_count = observed_panes_cache.len();
+
+                    let obsolete_bindings = capture_bindings
+                        .iter()
+                        .filter_map(|(pane_id, binding)| {
+                            let keep = observed_panes_cache
+                                .get(pane_id)
+                                .is_some_and(|pane| binding.matches_observed(pane));
+                            (!keep).then_some(*pane_id)
+                        })
+                        .collect::<Vec<_>>();
+
                     #[cfg(all(feature = "vendored", unix))]
-                    let observed_streaming_panes: HashMap<u64, ObservedStreamingPane> = {
-                        let reg = registry.read().await;
-                        let observed_ids = reg.observed_pane_ids();
-                        let mut streaming_panes = HashMap::with_capacity(observed_ids.len());
-                        for pane_id in observed_ids {
-                            let Some(entry) = reg.get_entry(pane_id) else {
-                                continue;
-                            };
-                            streaming_panes.insert(
-                                pane_id,
-                                ObservedStreamingPane {
-                                    info: entry.info.clone(),
-                                    generation: entry.generation,
-                                },
-                            );
+                    for pane_id in &obsolete_bindings {
+                        if let Some(task) = streaming_tasks.remove(pane_id) {
+                            task.handle.abort();
                         }
-                        streaming_panes
-                    };
-                    #[cfg(all(feature = "vendored", unix))]
-                    let observed_pane_count = observed_streaming_panes.len();
-                    #[cfg(not(all(feature = "vendored", unix)))]
-                    let observed_panes: HashMap<u64, PaneInfo> = {
-                        let reg = registry.read().await;
-                        reg.observed_pane_ids()
-                            .into_iter()
-                            .filter_map(|id| reg.get_entry(id).map(|e| (id, e.info.clone())))
-                            .collect()
-                    };
-                    #[cfg(not(all(feature = "vendored", unix)))]
-                    let observed_pane_count = observed_panes.len();
+                    }
+
+                    // Stop polling admission before revoking an obsolete pane.
+                    let retained_polling_panes = observed_panes_cache
+                        .iter()
+                        .filter(|(pane_id, pane)| {
+                            capture_bindings
+                                .get(*pane_id)
+                                .is_some_and(|binding| binding.matches_observed(pane))
+                        })
+                        .map(|(pane_id, pane)| (*pane_id, pane.info.clone()))
+                        .collect::<HashMap<_, _>>();
+                    let retained_polling_leases = retained_polling_panes
+                        .keys()
+                        .filter_map(|pane_id| {
+                            capture_bindings
+                                .get(pane_id)
+                                .map(|binding| (*pane_id, binding.polling_lease.clone()))
+                        })
+                        .collect::<HashMap<_, _>>();
+                    if let Err(error) = supervisor.sync_authorized_tailers(
+                        &retained_polling_panes,
+                        &retained_polling_leases,
+                    ) {
+                        error!(error = %error, "Failed to suspend obsolete polling bindings");
+                    }
+
+                    // Poll futures live in a FuturesUnordered and only make
+                    // progress while join_next is polled.  Once admission for
+                    // obsolete tailers is removed, settle their already-issued
+                    // polls before awaiting authority drain; otherwise a future
+                    // holding a producer guard could be parked by this very
+                    // task and force a deterministic drain timeout. Unrelated
+                    // polls remain live in the set and must not impose a
+                    // fleet-wide barrier for one pane transition.
+                    if !obsolete_bindings.is_empty() {
+                        let mut poll_drain_cancelled = false;
+                        while obsolete_bindings
+                            .iter()
+                            .any(|pane_id| supervisor.capture_inflight(*pane_id))
+                        {
+                            let Some((pane_id, outcome)) =
+                                poll_tasks.join_next_with_cx(&loop_cx).await
+                            else {
+                                poll_drain_cancelled = true;
+                                break;
+                            };
+                            supervisor.handle_poll_result(pane_id, outcome);
+                        }
+                        let obsolete_polls_remaining = obsolete_bindings
+                            .iter()
+                            .filter(|pane_id| supervisor.capture_inflight(**pane_id))
+                            .count();
+                        if poll_drain_cancelled || obsolete_polls_remaining > 0 {
+                            error!(
+                                pending_poll_tasks = poll_tasks.len(),
+                                obsolete_polls_remaining,
+                                "Capture poll drain was cancelled; leaving successors unpublished"
+                            );
+                            continue;
+                        }
+                    }
+
+                    for pane_id in obsolete_bindings {
+                        let Some(binding) = capture_bindings.get(&pane_id) else {
+                            continue;
+                        };
+                        match retire_capture_binding(&loop_cx, &capture_authority, binding).await {
+                            Ok(()) => {
+                                if let Some(retired) = capture_bindings.remove(&pane_id) {
+                                    capture_metadata
+                                        .write()
+                                        .await
+                                        .remove(&retired.identity.pane_incarnation());
+                                }
+                            }
+                            Err(error) => {
+                                error!(
+                                    pane_id,
+                                    error = %error,
+                                    "Capture pane remained fail-closed while draining"
+                                );
+                            }
+                        }
+                    }
+
+                    for (&pane_id, observed) in &observed_panes_cache {
+                        if capture_bindings.contains_key(&pane_id) {
+                            continue;
+                        }
+                        match activate_capture_binding(
+                            &loop_cx,
+                            &capture_authority,
+                            pane_id,
+                            observed.generation,
+                            native_capture_enabled,
+                            &capture_metadata,
+                            CapturePaneMetadata {
+                                pane_uuid: observed.pane_uuid.clone(),
+                                discovery_generation: observed.generation,
+                            },
+                        )
+                        .await
+                        {
+                            Ok(binding) => {
+                                capture_bindings.insert(pane_id, binding);
+                            }
+                            Err(error) => {
+                                error!(
+                                    pane_id,
+                                    generation = observed.generation,
+                                    error = %error,
+                                    "Failed to activate capture pane authority"
+                                );
+                            }
+                        }
+                    }
 
                     #[cfg(all(feature = "vendored", unix))]
                     {
-                        observed_panes_cache = observed_streaming_panes;
-
                         let obsolete_streams: Vec<(u64, bool)> = streaming_tasks
                             .iter()
                             .filter_map(|(pane_id, task)| {
-                                let desired_identity = observed_panes_cache
-                                    .get(pane_id)
-                                    .map(|pane| (*pane_id, pane.generation));
+                                let desired_identity = observed_panes_cache.get(pane_id).and_then(
+                                    |pane| {
+                                        capture_bindings.get(pane_id).and_then(|binding| {
+                                            binding.streaming_lease.as_ref().map(|lease| {
+                                                (*pane_id, pane.generation, lease.stamp())
+                                            })
+                                        })
+                                    },
+                                );
                                 match streaming_task_reconcile_action(
                                     &task.identity,
                                     desired_identity,
@@ -3488,6 +4081,54 @@ impl ObservationRuntime {
                         for (pane_id, has_replacement) in obsolete_streams {
                             if let Some(task) = streaming_tasks.remove(&pane_id) {
                                 task.handle.abort();
+                                let task_stamp = task.lease.stamp();
+                                let binding_identity = capture_bindings.get(&pane_id).and_then(
+                                    |binding| {
+                                        binding
+                                            .streaming_lease
+                                            .as_ref()
+                                            .is_some_and(|lease| lease.stamp() == task_stamp)
+                                            .then_some(binding.identity)
+                                    },
+                                );
+                                if let Some(binding_identity) = binding_identity {
+                                    match capture_authority
+                                        .begin_source_revocation(binding_identity, task_stamp)
+                                    {
+                                        Ok(revocation) => match revocation
+                                            .wait_with_cx(
+                                                &loop_cx,
+                                                CAPTURE_AUTHORITY_DRAIN_TIMEOUT,
+                                            )
+                                            .await
+                                        {
+                                            Ok(_) => {
+                                                if let Some(binding) =
+                                                    capture_bindings.get_mut(&pane_id)
+                                                    && binding.streaming_lease.as_ref().is_some_and(
+                                                        |lease| lease.stamp() == task_stamp,
+                                                    )
+                                                {
+                                                    binding.streaming_lease = None;
+                                                }
+                                            }
+                                            Err(error) => {
+                                                error!(
+                                                    pane_id,
+                                                    error = %error,
+                                                    "Obsolete stream source remained draining"
+                                                );
+                                            }
+                                        },
+                                        Err(error) => {
+                                            error!(
+                                                pane_id,
+                                                error = %error,
+                                                "Failed to revoke obsolete stream source"
+                                            );
+                                        }
+                                    }
+                                }
                                 debug!(
                                     pane_id,
                                     generation = task.identity.generation,
@@ -3506,22 +4147,22 @@ impl ObservationRuntime {
                                     continue;
                                 }
 
-                                let Some(identity) = vendored_streaming_identity_for_pane(
-                                    &vendored_mux_socket_paths,
-                                    pane_id,
-                                    observed_pane.generation,
-                                )
+                                let Some((socket_shard, local_pane_id, socket_path)) =
+                                    vendored_streaming_route_for_pane(
+                                        &vendored_mux_socket_paths,
+                                        pane_id,
+                                    )
                                 else {
                                     continue;
                                 };
 
-                                if !identity.socket_path.exists() {
+                                if !socket_path.exists() {
                                     debug!(
                                         pane_id,
-                                        generation = identity.generation,
-                                        local_pane_id = identity.local_pane_id,
-                                        socket_shard = identity.socket_shard.0,
-                                        path = %identity.socket_path.display(),
+                                        generation = observed_pane.generation,
+                                        local_pane_id,
+                                        socket_shard = socket_shard.0,
+                                        path = %socket_path.display(),
                                         "Skipping vendored pane streaming because mux socket is missing"
                                     );
                                     continue;
@@ -3532,11 +4173,113 @@ impl ObservationRuntime {
                                 else {
                                     error!(
                                         pane_id,
-                                        generation = identity.generation,
+                                        generation = observed_pane.generation,
                                         "Vendored streaming task token space exhausted; refusing to start an unidentifiable task"
                                     );
                                     continue;
                                 };
+
+                                let Some((binding_identity, existing_streaming_lease)) =
+                                    capture_bindings.get(&pane_id).and_then(|binding| {
+                                        binding.matches_observed(observed_pane).then(|| {
+                                            (binding.identity, binding.streaming_lease.clone())
+                                        })
+                                    })
+                                else {
+                                    continue;
+                                };
+
+                                // A prior task may have exited while its
+                                // source drain timed out. Resume that exact
+                                // fail-closed transition before issuing a
+                                // replacement epoch.
+                                if let Some(existing_lease) = existing_streaming_lease {
+                                    let existing_stamp = existing_lease.stamp();
+                                    let drained = match capture_authority
+                                        .begin_source_revocation(
+                                            binding_identity,
+                                            existing_stamp,
+                                        )
+                                    {
+                                        Ok(revocation) => revocation
+                                            .wait_with_cx(
+                                                &loop_cx,
+                                                CAPTURE_AUTHORITY_DRAIN_TIMEOUT,
+                                            )
+                                            .await,
+                                        Err(error) => Err(error),
+                                    };
+                                    match drained {
+                                        Ok(_) => {
+                                            if let Some(binding) =
+                                                capture_bindings.get_mut(&pane_id)
+                                                && binding.streaming_lease.as_ref().is_some_and(
+                                                    |lease| lease.stamp() == existing_stamp,
+                                                )
+                                            {
+                                                binding.streaming_lease = None;
+                                            }
+                                        }
+                                        Err(error) => {
+                                            error!(
+                                                pane_id,
+                                                error = %error,
+                                                "Vendored stream replacement remains fail-closed"
+                                            );
+                                            continue;
+                                        }
+                                    }
+                                }
+
+                                let streaming_lease = match capture_authority.issue_source(
+                                    binding_identity,
+                                    CaptureSourceKind::VendoredStreaming,
+                                ) {
+                                    Ok(lease) => lease,
+                                    Err(error) => {
+                                        error!(
+                                            pane_id,
+                                            error = %error,
+                                            "Failed to issue vendored streaming authority"
+                                        );
+                                        continue;
+                                    }
+                                };
+                                let identity = StreamingSubscriptionIdentity {
+                                    global_pane_id: pane_id,
+                                    local_pane_id,
+                                    socket_shard,
+                                    socket_path,
+                                    generation: observed_pane.generation,
+                                    capture_stamp: streaming_lease.stamp(),
+                                };
+                                let installed = capture_bindings
+                                    .get_mut(&pane_id)
+                                    .filter(|binding| binding.identity == binding_identity)
+                                    .is_some_and(|binding| {
+                                        binding.streaming_lease = Some(streaming_lease.clone());
+                                        true
+                                });
+                                if !installed {
+                                    if let Ok(revocation) = capture_authority
+                                        .begin_source_revocation(
+                                            binding_identity,
+                                            streaming_lease.stamp(),
+                                        )
+                                    {
+                                        let _ = revocation
+                                            .wait_with_cx(
+                                                &loop_cx,
+                                                CAPTURE_AUTHORITY_DRAIN_TIMEOUT,
+                                            )
+                                            .await;
+                                    }
+                                    error!(
+                                        pane_id,
+                                        "Capture binding changed while installing stream source"
+                                    );
+                                    continue;
+                                }
 
                                 let capture_tx = capture_tx.clone();
                                 let stream_exit_tx = stream_exit_tx.clone();
@@ -3544,6 +4287,7 @@ impl ObservationRuntime {
                                 let subscription_config = subscription_config.clone();
                                 let identity_for_task = identity.clone();
                                 let identity_for_exit = identity.clone();
+                                let lease_for_task = streaming_lease.clone();
                                 let stream_task_cx = loop_cx.clone();
                                 let handle = spawn_runtime_task(
                                     &stream_task_cx,
@@ -3553,6 +4297,7 @@ impl ObservationRuntime {
                                             vendored_mux_compression,
                                             subscription_config,
                                             capture_tx,
+                                            lease_for_task,
                                         ))
                                         .await;
                                         let final_reason = if shutdown_flag.load(Ordering::SeqCst)
@@ -3578,6 +4323,7 @@ impl ObservationRuntime {
                                     pane_id,
                                     StreamingTask {
                                         identity,
+                                        lease: streaming_lease,
                                         token,
                                         handle,
                                     },
@@ -3588,12 +4334,52 @@ impl ObservationRuntime {
                         let polling_observed_panes: HashMap<u64, PaneInfo> = observed_panes_cache
                             .iter()
                             .filter(|(pane_id, _)| !streaming_tasks.contains_key(*pane_id))
+                            .filter(|(pane_id, pane)| {
+                                capture_bindings
+                                    .get(*pane_id)
+                                    .is_some_and(|binding| binding.matches_observed(pane))
+                            })
                             .map(|(pane_id, pane)| (*pane_id, pane.info.clone()))
                             .collect();
-                        supervisor.sync_tailers(&polling_observed_panes);
+                        let polling_leases = polling_observed_panes
+                            .keys()
+                            .filter_map(|pane_id| {
+                                capture_bindings
+                                    .get(pane_id)
+                                    .map(|binding| (*pane_id, binding.polling_lease.clone()))
+                            })
+                            .collect::<HashMap<_, _>>();
+                        if let Err(error) = supervisor
+                            .sync_authorized_tailers(&polling_observed_panes, &polling_leases)
+                        {
+                            error!(error = %error, "Failed to authorize polling capture");
+                        }
                     }
                     #[cfg(not(all(feature = "vendored", unix)))]
-                    supervisor.sync_tailers(&observed_panes);
+                    {
+                        let polling_observed_panes = observed_panes_cache
+                            .iter()
+                            .filter(|(pane_id, pane)| {
+                                capture_bindings
+                                    .get(*pane_id)
+                                    .is_some_and(|binding| binding.matches_observed(pane))
+                            })
+                            .map(|(pane_id, pane)| (*pane_id, pane.info.clone()))
+                            .collect::<HashMap<_, _>>();
+                        let polling_leases = polling_observed_panes
+                            .keys()
+                            .filter_map(|pane_id| {
+                                capture_bindings
+                                    .get(pane_id)
+                                    .map(|binding| (*pane_id, binding.polling_lease.clone()))
+                            })
+                            .collect::<HashMap<_, _>>();
+                        if let Err(error) = supervisor
+                            .sync_authorized_tailers(&polling_observed_panes, &polling_leases)
+                        {
+                            error!(error = %error, "Failed to authorize polling capture");
+                        }
+                    }
 
                     // Update effective priorities (config rules + runtime overrides).
                     //
@@ -3631,6 +4417,7 @@ impl ObservationRuntime {
                     *scheduler_snapshot.write().await = supervisor.scheduler_snapshot();
 
                     debug!(
+                        discovery_publication_epoch = publication_epoch,
                         active_tailers = supervisor.active_count(),
                         observed_panes = observed_pane_count,
                         "Tailer sync tick"
@@ -3690,6 +4477,7 @@ impl ObservationRuntime {
         let metrics = Arc::clone(&self.metrics);
         let event_bus = self.event_bus.clone();
         let pane_filter = self.config.pane_filter.clone();
+        let capture_authority = self.capture_authority.clone();
 
         let loop_cx = runtime_loop_cx();
         spawn_runtime_task(&loop_cx, move |loop_cx| async move {
@@ -3743,6 +4531,7 @@ impl ObservationRuntime {
                             &capture_tx,
                             &cursors,
                             metrics.backpressure_metrics(),
+                            &item.producer_guard,
                         )
                         .await;
                     }
@@ -3769,11 +4558,39 @@ impl ObservationRuntime {
                                 timestamp_ms,
                                 dropped_bytes,
                             } => {
+                                let Some(producer_guard) = acquire_native_producer(
+                                    &capture_authority,
+                                    &metrics,
+                                    pane_id,
+                                ) else {
+                                    continue;
+                                };
                                 metrics.record_native_output_input(data.len());
+                                if data.is_empty() {
+                                    if dropped_bytes > 0 {
+                                        emit_native_output_gap(
+                                            pane_id,
+                                            &crate::native_events::native_output_truncation_gap_reason(
+                                                dropped_bytes,
+                                            ),
+                                            &capture_tx,
+                                            &cursors,
+                                            &producer_guard,
+                                        )
+                                        .await;
+                                    }
+                                    continue;
+                                }
                                 let now_ms =
                                     u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
                                 if let Some(item) =
-                                    coalescer.push(pane_id, data, timestamp_ms, now_ms)
+                                    coalescer.push(
+                                        pane_id,
+                                        data,
+                                        timestamp_ms,
+                                        now_ms,
+                                        producer_guard,
+                                    )
                                 {
                                     metrics.record_native_output_batch(
                                         item.input_events,
@@ -3786,6 +4603,7 @@ impl ObservationRuntime {
                                         &capture_tx,
                                         &cursors,
                                         metrics.backpressure_metrics(),
+                                        &item.producer_guard,
                                     )
                                     .await;
                                 }
@@ -3809,18 +4627,20 @@ impl ObservationRuntime {
                                             &capture_tx,
                                             &cursors,
                                             metrics.backpressure_metrics(),
+                                            &item.producer_guard,
+                                        )
+                                        .await;
+                                        emit_native_output_gap(
+                                            pane_id,
+                                            &crate::native_events::native_output_truncation_gap_reason(
+                                                dropped_bytes,
+                                            ),
+                                            &capture_tx,
+                                            &cursors,
+                                            &item.producer_guard,
                                         )
                                         .await;
                                     }
-                                    emit_native_output_gap(
-                                        pane_id,
-                                        &crate::native_events::native_output_truncation_gap_reason(
-                                            dropped_bytes,
-                                        ),
-                                        &capture_tx,
-                                        &cursors,
-                                    )
-                                    .await;
                                 }
                             }
                             NativeEvent::StateChange { pane_id, .. }
@@ -3837,6 +4657,7 @@ impl ObservationRuntime {
                                         &capture_tx,
                                         &cursors,
                                         metrics.backpressure_metrics(),
+                                        &item.producer_guard,
                                     )
                                     .await;
                                 }
@@ -3852,6 +4673,8 @@ impl ObservationRuntime {
                                     event_bus.as_ref(),
                                     &pane_filter,
                                     metrics.backpressure_metrics(),
+                                    &capture_authority,
+                                    &metrics,
                                 )
                                 .await;
                             }
@@ -3867,6 +4690,8 @@ impl ObservationRuntime {
                                     event_bus.as_ref(),
                                     &pane_filter,
                                     metrics.backpressure_metrics(),
+                                    &capture_authority,
+                                    &metrics,
                                 )
                                 .await;
                             }
@@ -3892,6 +4717,7 @@ impl ObservationRuntime {
                     &capture_tx,
                     &cursors,
                     metrics.backpressure_metrics(),
+                    &item.producer_guard,
                 )
                 .await;
             }
@@ -3990,17 +4816,59 @@ impl ObservationRuntime {
         let patterns_root = self.config.patterns_root.clone();
         let semantic_zone_cache_ttl = self.config.capture_interval.max(Duration::from_millis(1));
         let registry = Arc::clone(&registry);
+        let capture_authority = self.capture_authority.clone();
+        let capture_metadata = Arc::clone(&self.capture_metadata);
+        let replay_capture = self.replay_capture.clone();
 
         let loop_cx = runtime_loop_cx();
         spawn_runtime_task(&loop_cx, move |loop_cx| async move {
             let max_persist_segment_bytes = tuning.ingest.max_persist_segment_bytes;
-            let mut semantic_zone_cache = HashMap::<u64, CachedSemanticZoneSnapshot>::new();
+            let mut semantic_zone_cache =
+                HashMap::<CapturePaneCacheKey, CachedSemanticZoneSnapshot>::new();
+            let mut latest_incarnation_by_pane = HashMap::<u64, PaneIncarnation>::new();
             let mut bocpd_manager =
                 crate::bocpd::BocpdManager::new(crate::bocpd::BocpdConfig::default());
             let mut bocpd_last_capture_at = HashMap::<u64, i64>::new();
 
             // Process events until producer is closed and the ring is drained.
             while let Some(event) = capture_rx.recv().await {
+                let stamp = event.stamp();
+                let persistence_guard = match capture_authority
+                    .try_acquire_persistence(stamp, event.segment.pane_id)
+                {
+                    Ok(guard) => guard,
+                    Err(error) => {
+                        metrics.capture_authority_rejections.increment();
+                        debug!(
+                            source_kind = ?stamp.source_kind(),
+                            error = %error,
+                            "Rejected stale capture event before semantic side effects"
+                        );
+                        continue;
+                    }
+                };
+                let pane_incarnation = stamp.pane_incarnation();
+                let Some(capture_pane_metadata) = capture_metadata
+                    .read()
+                    .await
+                    .get(&pane_incarnation)
+                    .cloned()
+                else {
+                    metrics.capture_authority_rejections.increment();
+                    error!(
+                        pane_id = event.segment.pane_id,
+                        pane_incarnation = pane_incarnation.get(),
+                        "Capture authority admitted an event without immutable pane metadata"
+                    );
+                    continue;
+                };
+                let metadata_is_current = {
+                    let registry_guard = registry.read().await;
+                    registry_guard.get_entry(event.segment.pane_id).is_some_and(|entry| {
+                        entry.pane_uuid == capture_pane_metadata.pane_uuid
+                            && entry.generation == capture_pane_metadata.discovery_generation
+                    })
+                };
                 metrics.record_capture_queue_depth(capture_rx.depth());
                 heartbeats.record_persistence();
                 // Check shutdown flag - if set, drain remaining events quickly
@@ -4032,6 +4900,18 @@ impl ObservationRuntime {
                     }
                 }
                 let pane_id = event.segment.pane_id;
+                if let Some(previous_incarnation) =
+                    latest_incarnation_by_pane.insert(pane_id, pane_incarnation)
+                    && previous_incarnation != pane_incarnation
+                {
+                    semantic_zone_cache.retain(|(cached_pane_id, cached_incarnation), _| {
+                        *cached_pane_id != pane_id || *cached_incarnation == pane_incarnation
+                    });
+                    bocpd_manager.unregister_pane(pane_id);
+                    bocpd_last_capture_at.remove(&pane_id);
+                    let mut contexts = detection_contexts.write().await;
+                    contexts.remove(&pane_id);
+                }
                 let bounded_segment =
                     bounded_segment_for_persistence(&event.segment, max_persist_segment_bytes);
                 let captured_at = bounded_segment.captured_at;
@@ -4042,6 +4922,8 @@ impl ObservationRuntime {
                     &mut semantic_zone_cache,
                     semantic_zone_cache_ttl,
                     &bounded_segment,
+                    pane_incarnation,
+                    metadata_is_current,
                 )
                 .await;
 
@@ -4053,10 +4935,19 @@ impl ObservationRuntime {
                     &bounded_segment,
                     max_persist_segment_bytes,
                     zone_type.as_deref(),
+                    &persistence_guard,
                 )
                 .await
                 {
                     Ok(persisted) => {
+                        if let Some(ref adapter) = replay_capture {
+                            record_authorized_replay_egress(
+                                adapter,
+                                &bounded_segment,
+                                persisted.segment.seq,
+                                &persistence_guard,
+                            );
+                        }
                         // Check for sequence discontinuity and resync cursor if needed
                         if persisted.segment.seq != captured_seq {
                             warn!(
@@ -4090,7 +4981,7 @@ impl ObservationRuntime {
                         if let Some(ref manager) = recording {
                             // ft-xbnl0.2.3 tick 265: cx-first recording segment write.
                             if let Err(err) = manager
-                                .record_segment_with_cx(&loop_cx, &event.segment)
+                                .record_segment_with_cx(&loop_cx, &bounded_segment)
                                 .await
                             {
                                 warn!(
@@ -4173,12 +5064,7 @@ impl ObservationRuntime {
                                 "Pattern detections"
                             );
 
-                            let pane_uuid = {
-                                let registry_guard = registry.read().await;
-                                registry_guard
-                                    .get_entry(pane_id)
-                                    .map(|entry| entry.pane_uuid.clone())
-                            };
+                            let pane_uuid = Some(capture_pane_metadata.pane_uuid.clone());
 
                             // Persist each detection as an event
                             // ft-xbnl0.2.3 tick 265: cx-first recording detection loop (shared cx).
@@ -4209,7 +5095,26 @@ impl ObservationRuntime {
                                 );
 
                                 // ft-xbnl0.2.3 tick 251: cx-first event record.
-                                match storage.record_event_with_cx(&loop_cx, stored_event).await {
+                                let delegated_hold = match persistence_guard.delegate_storage() {
+                                    Ok(hold) => hold,
+                                    Err(error) => {
+                                        error!(
+                                            pane_id,
+                                            rule_id = detection.rule_id,
+                                            error = %error,
+                                            "Failed to delegate capture authority to event storage"
+                                        );
+                                        continue;
+                                    }
+                                };
+                                match storage
+                                    .record_capture_event_with_cx(
+                                        &loop_cx,
+                                        stored_event,
+                                        delegated_hold,
+                                    )
+                                    .await
+                                {
                                     Ok(event_id) => {
                                         metrics.events_recorded.increment();
 
@@ -4288,7 +5193,19 @@ async fn handle_native_event(
     event_bus: Option<&Arc<EventBus>>,
     pane_filter: &PaneFilterConfig,
     backpressure: &Arc<BackpressureMetrics>,
+    capture_authority: &CaptureAuthority,
+    metrics: &RuntimeMetrics,
 ) {
+    let pane_id = match &event {
+        NativeEvent::PaneOutput { pane_id, .. }
+        | NativeEvent::StateChange { pane_id, .. }
+        | NativeEvent::UserVarChanged { pane_id, .. }
+        | NativeEvent::PaneCreated { pane_id, .. }
+        | NativeEvent::PaneDestroyed { pane_id, .. } => *pane_id,
+    };
+    let Some(producer_guard) = acquire_native_producer(capture_authority, metrics, pane_id) else {
+        return;
+    };
     match event {
         NativeEvent::PaneOutput {
             pane_id,
@@ -4303,6 +5220,7 @@ async fn handle_native_event(
                 capture_tx,
                 cursors,
                 backpressure,
+                &producer_guard,
             )
             .await;
             if dropped_bytes > 0 {
@@ -4313,6 +5231,7 @@ async fn handle_native_event(
                     &crate::native_events::native_output_truncation_gap_reason(dropped_bytes),
                     capture_tx,
                     cursors,
+                    &producer_guard,
                 )
                 .await;
             }
@@ -4337,7 +5256,14 @@ async fn handle_native_event(
             }
 
             if let Some(segment) = gap_segment {
-                if capture_tx.try_send(CaptureEvent { segment }).is_err() {
+                let event = match CaptureEvent::from_producer(segment, &producer_guard) {
+                    Ok(event) => event,
+                    Err(error) => {
+                        debug!(pane_id, error = %error, "Rejected native state-change gap");
+                        return;
+                    }
+                };
+                if capture_tx.try_send(event).is_err() {
                     // [ft-0e179] Per-pane drop attribution. The aggregate
                     // `segments_dropped` counter was unwired prior to this
                     // change; both the aggregate and the per-pane map are
@@ -4472,6 +5398,7 @@ async fn emit_native_output_delta(
     capture_tx: &mpsc::Sender<CaptureEvent>,
     cursors: &Arc<RwLock<HashMap<u64, PaneCursor>>>,
     backpressure: &Arc<BackpressureMetrics>,
+    producer_guard: &CaptureProducerGuard,
 ) {
     if data.is_empty() {
         return;
@@ -4486,7 +5413,14 @@ async fn emit_native_output_delta(
     };
 
     if let Some(segment) = segment {
-        if capture_tx.try_send(CaptureEvent { segment }).is_err() {
+        let event = match CaptureEvent::from_producer(segment, producer_guard) {
+            Ok(event) => event,
+            Err(error) => {
+                debug!(pane_id, error = %error, "Rejected native output capture event");
+                return;
+            }
+        };
+        if capture_tx.try_send(event).is_err() {
             // [ft-0e179] Output drop is the high-volume case — a pane
             // producing faster than storage can drain saturates the
             // capture queue first. Per-pane attribution lets operators
@@ -4515,6 +5449,7 @@ async fn emit_native_output_gap(
     reason: &str,
     capture_tx: &mpsc::Sender<CaptureEvent>,
     cursors: &Arc<RwLock<HashMap<u64, PaneCursor>>>,
+    producer_guard: &CaptureProducerGuard,
 ) {
     let gap = {
         let mut cursors_guard = cursors.write().await;
@@ -4524,7 +5459,14 @@ async fn emit_native_output_gap(
     };
     match gap {
         Some(segment) => {
-            if capture_tx.try_send(CaptureEvent { segment }).is_err() {
+            let event = match CaptureEvent::from_producer(segment, producer_guard) {
+                Ok(event) => event,
+                Err(error) => {
+                    debug!(pane_id, error = %error, "Rejected native output gap event");
+                    return;
+                }
+            };
+            if capture_tx.try_send(event).is_err() {
                 debug!(
                     pane_id,
                     "native output gap marker dropped; capture queue full"
@@ -4546,6 +5488,7 @@ async fn run_vendored_streaming_capture(
     compression_mode: crate::config::VendoredCompressionMode,
     subscription_config: SubscriptionConfig,
     capture_tx: mpsc::Sender<CaptureEvent>,
+    capture_lease: CaptureLease,
 ) -> String {
     let runtime_cx = runtime_loop_cx();
 
@@ -4587,6 +5530,7 @@ async fn run_vendored_streaming_capture(
                     &mut bridge,
                     &capture_tx,
                     &identity,
+                    &capture_lease,
                     delta,
                 )
                 .await
@@ -6559,6 +7503,36 @@ mod tests {
     }
 
     #[test]
+    fn replay_egress_uses_the_durable_persistence_sequence() {
+        let authority = CaptureAuthority::new();
+        let pane = authority.activate_pane(9).expect("capture pane");
+        let lease = authority
+            .issue_source(pane, CaptureSourceKind::Polling)
+            .expect("capture source");
+        let persistence_guard = authority
+            .try_acquire_persistence(lease.stamp(), 9)
+            .expect("persistence guard");
+        let sink = Arc::new(crate::replay_capture::CollectingCaptureSink::new());
+        let adapter = crate::replay_capture::CaptureAdapter::new(
+            sink.clone(),
+            crate::replay_capture::CaptureConfig::default(),
+        );
+        let captured = CapturedSegment {
+            pane_id: 9,
+            seq: 3,
+            content: "durable sequence".to_string(),
+            kind: CapturedSegmentKind::Delta,
+            captured_at: 1_700_000_000_000,
+        };
+
+        record_authorized_replay_egress(&adapter, &captured, 7, &persistence_guard);
+
+        let events = sink.recorder_events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].sequence, 7);
+    }
+
+    #[test]
     fn semantic_zone_inference_uses_matching_zone_text() {
         let captured = CapturedSegment {
             pane_id: 9,
@@ -6664,12 +7638,24 @@ mod tests {
         });
     }
 
+    #[cfg(any(all(feature = "vendored", unix), feature = "native-wezterm"))]
+    fn test_capture_lease(global_pane_id: u64, source_kind: CaptureSourceKind) -> CaptureLease {
+        let authority = CaptureAuthority::new();
+        let pane = authority
+            .activate_pane(global_pane_id)
+            .expect("test pane authority");
+        authority
+            .issue_source(pane, source_kind)
+            .expect("test source authority")
+    }
+
     #[cfg(all(feature = "vendored", unix))]
     fn test_streaming_identity(
         global_pane_id: u64,
         local_pane_id: u64,
         socket_shard: usize,
         generation: u32,
+        lease: &CaptureLease,
     ) -> StreamingSubscriptionIdentity {
         StreamingSubscriptionIdentity {
             global_pane_id,
@@ -6677,6 +7663,7 @@ mod tests {
             socket_shard: ShardId(socket_shard),
             socket_path: PathBuf::from(format!("/tmp/wa-{socket_shard}.sock")),
             generation,
+            capture_stamp: lease.stamp(),
         }
     }
 
@@ -6687,13 +7674,15 @@ mod tests {
             let (capture_tx, mut capture_rx) = mpsc::channel(4);
             let loop_cx = runtime_loop_cx();
             let mut bridge = StreamingBridge::new();
-            let identity = test_streaming_identity(17, 17, 0, 0);
+            let lease = test_capture_lease(17, CaptureSourceKind::VendoredStreaming);
+            let identity = test_streaming_identity(17, 17, 0, 0, &lease);
 
             let exit_reason = forward_vendored_streaming_delta(
                 &loop_cx,
                 &mut bridge,
                 &capture_tx,
                 &identity,
+                &lease,
                 PaneDelta::Output {
                     pane_id: 17,
                     seqno: 1,
@@ -6723,13 +7712,15 @@ mod tests {
             let (capture_tx, mut capture_rx) = mpsc::channel(4);
             let loop_cx = runtime_loop_cx();
             let mut bridge = StreamingBridge::new();
-            let identity = test_streaming_identity(21, 21, 0, 0);
+            let lease = test_capture_lease(21, CaptureSourceKind::VendoredStreaming);
+            let identity = test_streaming_identity(21, 21, 0, 0, &lease);
 
             let output_reason = forward_vendored_streaming_delta(
                 &loop_cx,
                 &mut bridge,
                 &capture_tx,
                 &identity,
+                &lease,
                 PaneDelta::Output {
                     pane_id: 21,
                     seqno: 1,
@@ -6748,6 +7739,7 @@ mod tests {
                 &mut bridge,
                 &capture_tx,
                 &identity,
+                &lease,
                 PaneDelta::Ended {
                     pane_id: 21,
                     reason: "mux socket disconnected".to_string(),
@@ -6778,12 +7770,14 @@ mod tests {
 
             let loop_cx = runtime_loop_cx();
             let mut bridge = StreamingBridge::new();
-            let identity = test_streaming_identity(9, 9, 0, 0);
+            let lease = test_capture_lease(9, CaptureSourceKind::VendoredStreaming);
+            let identity = test_streaming_identity(9, 9, 0, 0, &lease);
             let exit_reason = forward_vendored_streaming_delta(
                 &loop_cx,
                 &mut bridge,
                 &capture_tx,
                 &identity,
+                &lease,
                 PaneDelta::Output {
                     pane_id: 9,
                     seqno: 1,
@@ -6805,15 +7799,25 @@ mod tests {
     }
 
     fn test_capture_event(seq: u64) -> CaptureEvent {
-        CaptureEvent {
-            segment: CapturedSegment {
+        let authority = CaptureAuthority::new();
+        let pane = authority.activate_pane(1).expect("test pane authority");
+        let lease = authority
+            .issue_source(pane, CaptureSourceKind::Polling)
+            .expect("test polling authority");
+        let guard = lease
+            .try_acquire_producer(lease.stamp(), 1)
+            .expect("test producer authority");
+        CaptureEvent::from_producer(
+            CapturedSegment {
                 pane_id: 1,
                 seq,
                 content: "test".to_string(),
                 kind: crate::ingest::CapturedSegmentKind::Delta,
                 captured_at: epoch_ms(),
             },
-        }
+            &guard,
+        )
+        .expect("stamped test capture event")
     }
 
     fn test_bocpd_segment(pane_id: u64, content: String, captured_at: i64) -> CapturedSegment {
@@ -7822,10 +8826,20 @@ mod tests {
     #[test]
     fn native_output_coalescer_batches_within_window() {
         let mut c = NativeOutputCoalescer::new(50, 200, 1024 * 1024);
+        let lease = test_capture_lease(1, CaptureSourceKind::NativePush);
 
-        assert!(c.push(1, b"a".to_vec(), 1000, 0).is_none());
-        assert!(c.push(1, b"b".to_vec(), 1001, 10).is_none());
-        assert!(c.push(1, b"c".to_vec(), 1002, 20).is_none());
+        for (bytes, timestamp_ms, now_ms) in [
+            (b"a".to_vec(), 1_000, 0),
+            (b"b".to_vec(), 1_001, 10),
+            (b"c".to_vec(), 1_002, 20),
+        ] {
+            let guard = lease
+                .try_acquire_producer(lease.stamp(), 1)
+                .expect("native producer guard");
+            assert!(
+                c.push(1, bytes, timestamp_ms, now_ms, guard).is_none()
+            );
+        }
 
         // Not due until >= window.
         assert!(c.drain_due(49).is_empty());
@@ -7842,7 +8856,11 @@ mod tests {
     #[test]
     fn native_output_coalescer_enforces_max_delay_when_window_is_large() {
         let mut c = NativeOutputCoalescer::new(1_000, 200, 1024 * 1024);
-        c.push(7, b"x".to_vec(), 555, 0);
+        let lease = test_capture_lease(7, CaptureSourceKind::NativePush);
+        let guard = lease
+            .try_acquire_producer(lease.stamp(), 7)
+            .expect("native producer guard");
+        c.push(7, b"x".to_vec(), 555, 0, guard);
 
         // Not due by window, but due by max_delay.
         assert!(c.drain_due(199).is_empty());
@@ -8470,6 +9488,14 @@ mod tests {
                 )])));
             let pane_filter = PaneFilterConfig::default();
             let backpressure = Arc::new(BackpressureMetrics::default());
+            let capture_authority = CaptureAuthority::new();
+            let pane_identity = capture_authority
+                .activate_pane(42)
+                .expect("native test pane authority");
+            let _native_lease = capture_authority
+                .issue_source(pane_identity, CaptureSourceKind::NativePush)
+                .expect("native test source authority");
+            let metrics = RuntimeMetrics::default();
             let runtime_cx = runtime_loop_cx();
 
             handle_native_event(
@@ -8486,6 +9512,8 @@ mod tests {
                 Some(&bus),
                 &pane_filter,
                 &backpressure,
+                &capture_authority,
+                &metrics,
             )
             .await;
 
@@ -8540,6 +9568,14 @@ mod tests {
                 )])));
             let pane_filter = PaneFilterConfig::default();
             let backpressure = Arc::new(BackpressureMetrics::default());
+            let capture_authority = CaptureAuthority::new();
+            let pane_identity = capture_authority
+                .activate_pane(7)
+                .expect("native test pane authority");
+            let _native_lease = capture_authority
+                .issue_source(pane_identity, CaptureSourceKind::NativePush)
+                .expect("native test source authority");
+            let metrics = RuntimeMetrics::default();
             let runtime_cx = runtime_loop_cx();
 
             handle_native_event(
@@ -8556,6 +9592,8 @@ mod tests {
                 None,
                 &pane_filter,
                 &backpressure,
+                &capture_authority,
+                &metrics,
             )
             .await;
 
@@ -9971,8 +11009,10 @@ mod tests {
     #[test]
     fn vendored_streaming_identity_for_single_backend_uses_raw_pane_id() {
         let socket_paths = vec![PathBuf::from("/tmp/wa.sock")];
-        let identity = vendored_streaming_identity_for_pane(&socket_paths, 42, 3)
-            .expect("single socket");
+        let lease = test_capture_lease(42, CaptureSourceKind::VendoredStreaming);
+        let identity =
+            vendored_streaming_identity_for_pane(&socket_paths, 42, 3, lease.stamp())
+                .expect("single socket");
         assert_eq!(identity.global_pane_id, 42);
         assert_eq!(identity.local_pane_id, 42);
         assert_eq!(identity.socket_shard, ShardId(0));
@@ -9989,8 +11029,14 @@ mod tests {
         ];
         let global_pane_id =
             crate::sharding::encode_sharded_pane_id(crate::sharding::ShardId(1), 7);
-        let identity = vendored_streaming_identity_for_pane(&socket_paths, global_pane_id, 9)
-            .expect("sharded socket");
+        let lease = test_capture_lease(global_pane_id, CaptureSourceKind::VendoredStreaming);
+        let identity = vendored_streaming_identity_for_pane(
+            &socket_paths,
+            global_pane_id,
+            9,
+            lease.stamp(),
+        )
+        .expect("sharded socket");
         assert_eq!(identity.global_pane_id, global_pane_id);
         assert_eq!(identity.local_pane_id, 7);
         assert_eq!(identity.socket_shard, ShardId(1));
@@ -10007,8 +11053,15 @@ mod tests {
         ];
         let global_pane_id =
             crate::sharding::encode_sharded_pane_id(crate::sharding::ShardId(3), 9);
+        let lease = test_capture_lease(global_pane_id, CaptureSourceKind::VendoredStreaming);
         assert!(
-            vendored_streaming_identity_for_pane(&socket_paths, global_pane_id, 0).is_none()
+            vendored_streaming_identity_for_pane(
+                &socket_paths,
+                global_pane_id,
+                0,
+                lease.stamp(),
+            )
+            .is_none()
         );
     }
 
@@ -10028,11 +11081,22 @@ mod tests {
             crate::sharding::ShardId(1),
             local_pane_id,
         );
-        let identity_zero =
-            vendored_streaming_identity_for_pane(&socket_paths, global_zero, 2)
-                .expect("shard zero identity");
-        let identity_one = vendored_streaming_identity_for_pane(&socket_paths, global_one, 4)
-            .expect("shard one identity");
+        let lease_zero = test_capture_lease(global_zero, CaptureSourceKind::VendoredStreaming);
+        let lease_one = test_capture_lease(global_one, CaptureSourceKind::VendoredStreaming);
+        let identity_zero = vendored_streaming_identity_for_pane(
+            &socket_paths,
+            global_zero,
+            2,
+            lease_zero.stamp(),
+        )
+        .expect("shard zero identity");
+        let identity_one = vendored_streaming_identity_for_pane(
+            &socket_paths,
+            global_one,
+            4,
+            lease_one.stamp(),
+        )
+        .expect("shard one identity");
 
         assert_eq!(identity_zero.local_pane_id, identity_one.local_pane_id);
         assert_ne!(identity_zero.global_pane_id, identity_one.global_pane_id);
@@ -10095,7 +11159,9 @@ mod tests {
     fn vendored_streaming_rejects_mismatched_local_id_before_bridge() {
         run_async_test(async {
             let global_pane_id = crate::sharding::encode_sharded_pane_id(ShardId(1), 7);
-            let identity = test_streaming_identity(global_pane_id, 7, 1, 5);
+            let lease =
+                test_capture_lease(global_pane_id, CaptureSourceKind::VendoredStreaming);
+            let identity = test_streaming_identity(global_pane_id, 7, 1, 5, &lease);
             for mismatched_delta in [
                 PaneDelta::Gap {
                     pane_id: 8,
@@ -10121,6 +11187,7 @@ mod tests {
                 &mut bridge,
                 &capture_tx,
                 &identity,
+                &lease,
                 PaneDelta::Output {
                     pane_id: 8,
                     seqno: 1,
@@ -10144,8 +11211,9 @@ mod tests {
     #[test]
     fn vendored_streaming_generation_change_replaces_task_and_ignores_stale_exit() {
         let global_pane_id = crate::sharding::encode_sharded_pane_id(ShardId(1), 7);
-        let old_identity = test_streaming_identity(global_pane_id, 7, 1, 4);
-        let replacement_identity = test_streaming_identity(global_pane_id, 7, 1, 5);
+        let lease = test_capture_lease(global_pane_id, CaptureSourceKind::VendoredStreaming);
+        let old_identity = test_streaming_identity(global_pane_id, 7, 1, 4, &lease);
+        let replacement_identity = test_streaming_identity(global_pane_id, 7, 1, 5, &lease);
         let old_exit = StreamingTaskExit {
             identity: old_identity.clone(),
             token: StreamingTaskToken(41),
@@ -10168,6 +11236,7 @@ mod tests {
                 Some((
                     replacement_identity.global_pane_id,
                     replacement_identity.generation,
+                    replacement_identity.capture_stamp,
                 )),
             ),
             StreamingTaskReconcileAction::Replace,
@@ -10178,6 +11247,7 @@ mod tests {
                 Some((
                     replacement_identity.global_pane_id,
                     replacement_identity.generation,
+                    replacement_identity.capture_stamp,
                 )),
             ),
             StreamingTaskReconcileAction::Keep,

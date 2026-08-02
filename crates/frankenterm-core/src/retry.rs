@@ -544,6 +544,11 @@ pub fn is_retryable(error: &Error) -> bool {
     use crate::error::{StorageError, WeztermError};
 
     match error {
+        // Authority failures are fail-closed lifecycle decisions.  Blindly
+        // replaying the rejected operation can attribute predecessor output to
+        // a successor pane/source; discovery must first establish and drain
+        // the exact transition.
+        Error::CaptureAuthority(_) => false,
         // I/O errors are generally retryable (network issues, timeouts)
         Error::Io(_) => true,
         // WezTerm CLI errors - some are retryable

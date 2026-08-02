@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock as StdRwLock};
 use std::time::{Duration, Instant};
 
-use crate::runtime_async::mpsc;
+use crate::runtime_async::{mpsc, oneshot};
 use crate::runtime_async::timeout;
 use crate::runtime_async::{RwLock, Semaphore};
 use futures::Stream;
@@ -19,6 +19,11 @@ use futures::stream::FuturesUnordered;
 use tracing::{debug, trace, warn};
 
 use crate::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig, get_or_register_circuit};
+use crate::capture_authority::CaptureAuthority;
+use crate::capture_authority::{
+    ActivePaneIdentity, CaptureAuthorityError, CaptureLease, CaptureProducerGuard,
+    CaptureSourceKind, CaptureStamp,
+};
 use crate::config::CaptureBudgetConfig;
 use crate::ingest::{CapturedSegment, PaneCursor, PaneRegistry};
 use crate::wezterm::{PaneInfo, PaneTextSource};
@@ -218,6 +223,8 @@ pub enum CaptureSkipReason {
     CaptureCircuitOpen,
     /// Capture operation returned an error.
     CaptureError,
+    /// Capture incarnation/source authority rejected stale producer work.
+    AuthorityRejected,
     /// Poll completed successfully and found no changed text.
     NoChange,
     /// Poll completed successfully and produced a changed capture segment.
@@ -246,6 +253,7 @@ impl CaptureSkipReason {
             Self::CaptureTimeout => "capture_timeout",
             Self::CaptureCircuitOpen => "capture_circuit_open",
             Self::CaptureError => "capture_error",
+            Self::AuthorityRejected => "authority_rejected",
             Self::NoChange => "no_change",
             Self::Changed => "changed",
             Self::Shutdown => "shutdown",
@@ -340,10 +348,60 @@ impl SchedulerTierSnapshot {
 }
 
 /// A captured segment event for persistence.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct CaptureEvent {
     /// The captured segment (includes pane_id, seq, content, kind, captured_at)
     pub segment: CapturedSegment,
+    /// Exact runtime-owned pane incarnation and producer source epoch.
+    stamp: CaptureStamp,
+    /// Present only for the generation-resync barrier.  The capture
+    /// coordinator must not expose successor producers until persistence has
+    /// durably acknowledged this exact event.
+    durability_ack: Option<oneshot::Sender<std::result::Result<u64, String>>>,
+}
+
+impl CaptureEvent {
+    /// Construct an event from a currently-held producer admission guard.
+    ///
+    /// Requiring the guard at construction makes it impossible for a polling,
+    /// streaming, or native producer to enqueue a bare pane-ID-only event.  The
+    /// caller must continue holding the guard through the actual queue send.
+    pub fn from_producer(
+        segment: CapturedSegment,
+        producer_guard: &CaptureProducerGuard,
+    ) -> Result<Self, CaptureAuthorityError> {
+        let stamp = producer_guard.stamp();
+        if segment.pane_id != stamp.global_pane_id() {
+            return Err(CaptureAuthorityError::PaneIdMismatch);
+        }
+        Ok(Self {
+            segment,
+            stamp,
+            durability_ack: None,
+        })
+    }
+
+    /// Exact immutable authority attached at producer admission.
+    #[must_use]
+    pub fn stamp(&self) -> CaptureStamp {
+        self.stamp
+    }
+
+    /// Attach the one-shot durability barrier used by a generation resync.
+    pub(crate) fn with_durability_ack(
+        mut self,
+        durability_ack: oneshot::Sender<std::result::Result<u64, String>>,
+    ) -> Self {
+        self.durability_ack = Some(durability_ack);
+        self
+    }
+
+    /// Transfer the optional durability barrier to the persistence consumer.
+    pub(crate) fn take_durability_ack(
+        &mut self,
+    ) -> Option<oneshot::Sender<std::result::Result<u64, String>>> {
+        self.durability_ack.take()
+    }
 }
 
 #[derive(Clone)]
@@ -984,6 +1042,10 @@ impl CaptureScheduler {
 
 // ─── Tailer Supervisor ──────────────────────────────────────────────
 
+struct StandaloneCaptureBinding {
+    identity: ActivePaneIdentity,
+}
+
 /// Supervisor for managing multiple pane tailers.
 pub struct TailerSupervisor<S>
 where
@@ -1008,8 +1070,15 @@ where
     semaphore: Arc<Semaphore>,
     /// Per-pane tailer state
     tailers: HashMap<u64, PaneTailer>,
+    /// Exact polling-source lease for each active tailer.
+    capture_leases: HashMap<u64, CaptureLease>,
     /// Panes currently being captured (to prevent duplicate polling)
     capturing_panes: HashSet<u64>,
+    /// Exact source stamp for every in-flight polling task.
+    ///
+    /// A marker survives tailer replacement/removal until the predecessor task
+    /// settles, preventing its late outcome from mutating a same-ID successor.
+    capturing_stamps: HashMap<u64, CaptureStamp>,
     /// Effective pane priorities for scheduling (lower = higher priority).
     ///
     /// This is updated by the runtime at sync ticks (config rules + runtime overrides).
@@ -1025,9 +1094,14 @@ where
     metrics: TailerMetrics,
     /// Supervisor metrics
     supervisor_metrics: SupervisorMetrics,
-    /// Optional egress tap for flight recorder capture (ft-oegrb.2.3)
+    /// Authority for standalone tailer consumers. Runtime orchestration
+    /// supplies its own exact leases through `sync_authorized_tailers`.
+    standalone_capture_authority: CaptureAuthority,
+    standalone_capture_bindings: HashMap<u64, StandaloneCaptureBinding>,
+    /// Optional standalone egress tap. Runtime-wide replay capture is emitted
+    /// after the common persistence authority gate instead.
     egress_tap: Option<crate::recording::SharedEgressTap>,
-    /// Process-wide global sequence for cross-pane merge ordering (ft-oegrb.2.4).
+    /// Process-wide ordering paired with the optional standalone egress tap.
     global_sequence: Arc<crate::recording::GlobalSequence>,
 }
 
@@ -1156,12 +1230,16 @@ where
             ),
             semaphore: Arc::new(Semaphore::new(max_concurrent)),
             tailers: HashMap::new(),
+            capture_leases: HashMap::new(),
             capturing_panes: HashSet::new(),
+            capturing_stamps: HashMap::new(),
             pane_priorities: HashMap::new(),
             priority_round_robin_offsets: HashMap::new(),
             scheduler: CaptureScheduler::new(CaptureBudgetConfig::default()),
             metrics: TailerMetrics::default(),
             supervisor_metrics: SupervisorMetrics::default(),
+            standalone_capture_authority: CaptureAuthority::new(),
+            standalone_capture_bindings: HashMap::new(),
             egress_tap: None,
             global_sequence: Arc::new(crate::recording::GlobalSequence::new()),
         }
@@ -1191,25 +1269,29 @@ where
             ),
             semaphore: Arc::new(Semaphore::new(max_concurrent)),
             tailers: HashMap::new(),
+            capture_leases: HashMap::new(),
             capturing_panes: HashSet::new(),
+            capturing_stamps: HashMap::new(),
             pane_priorities: HashMap::new(),
             priority_round_robin_offsets: HashMap::new(),
             scheduler: CaptureScheduler::new(budget),
             metrics: TailerMetrics::default(),
             supervisor_metrics: SupervisorMetrics::default(),
+            standalone_capture_authority: CaptureAuthority::new(),
+            standalone_capture_bindings: HashMap::new(),
             egress_tap: None,
             global_sequence: Arc::new(crate::recording::GlobalSequence::new()),
         }
     }
 
-    /// Set the egress tap for flight recorder capture.
+    /// Set the optional egress observer used by a standalone supervisor.
     pub fn set_egress_tap(&mut self, tap: crate::recording::SharedEgressTap) {
         self.egress_tap = Some(tap);
     }
 
-    /// Set the global sequence counter, sharing it with the ingress tap.
-    pub fn set_global_sequence(&mut self, seq: Arc<crate::recording::GlobalSequence>) {
-        self.global_sequence = seq;
+    /// Share a process-wide sequence with the standalone egress observer.
+    pub fn set_global_sequence(&mut self, sequence: Arc<crate::recording::GlobalSequence>) {
+        self.global_sequence = sequence;
     }
 
     /// Number of active tailers.
@@ -1218,10 +1300,166 @@ where
         self.tailers.len()
     }
 
-    /// Sync tailers with the current set of observed panes.
+    /// Whether an issued polling task for this pane has not yet reported its
+    /// exact stamped completion.
+    #[must_use]
+    pub(crate) fn capture_inflight(&self, pane_id: u64) -> bool {
+        self.capturing_stamps.contains_key(&pane_id)
+    }
+
+    /// Sync tailers with exact polling leases issued by the runtime authority.
+    pub fn sync_authorized_tailers(
+        &mut self,
+        observed_panes: &HashMap<u64, PaneInfo>,
+        leases: &HashMap<u64, CaptureLease>,
+    ) -> Result<(), CaptureAuthorityError> {
+        let mut desired = HashMap::with_capacity(observed_panes.len());
+        for pane_id in observed_panes.keys().copied() {
+            let lease = leases
+                .get(&pane_id)
+                .ok_or(CaptureAuthorityError::SourceNotActive {
+                    source_kind: CaptureSourceKind::Polling,
+                })?;
+            let stamp = lease.stamp();
+            if stamp.global_pane_id() != pane_id {
+                return Err(CaptureAuthorityError::PaneIdMismatch);
+            }
+            if stamp.source_kind() != CaptureSourceKind::Polling {
+                return Err(CaptureAuthorityError::StampMismatch);
+            }
+            desired.insert(pane_id, lease.clone());
+        }
+
+        let changed_leases = self
+            .capture_leases
+            .iter()
+            .filter_map(|(pane_id, current)| {
+                desired
+                    .get(pane_id)
+                    .is_some_and(|replacement| replacement.stamp() != current.stamp())
+                    .then_some(*pane_id)
+            })
+            .collect::<Vec<_>>();
+        for pane_id in changed_leases {
+            self.tailers.remove(&pane_id);
+            self.scheduler.remove_pane(pane_id);
+            self.pane_priorities.remove(&pane_id);
+            self.supervisor_metrics.tailers_stopped += 1;
+        }
+        self.capture_leases = desired;
+        self.sync_tailers_inner(observed_panes);
+        Ok(())
+    }
+
+    /// Sync a standalone supervisor, provisioning mandatory polling authority.
     ///
-    /// Adds tailers for new panes, removes tailers for departed panes.
+    /// The resulting events are stamped, but the authority is private to this
+    /// supervisor. Runtime persistence deliberately uses
+    /// [`Self::sync_authorized_tailers`] so a standalone lease cannot be
+    /// confused with runtime authority.
     pub fn sync_tailers(&mut self, observed_panes: &HashMap<u64, PaneInfo>) {
+        let departed = self
+            .standalone_capture_bindings
+            .keys()
+            .filter(|pane_id| !observed_panes.contains_key(*pane_id))
+            .copied()
+            .collect::<Vec<_>>();
+        for pane_id in departed {
+            self.capture_leases.remove(&pane_id);
+            let Some(identity) = self
+                .standalone_capture_bindings
+                .get(&pane_id)
+                .map(|binding| binding.identity)
+            else {
+                continue;
+            };
+            match self
+                .standalone_capture_authority
+                .retire_pane_if_drained(identity)
+            {
+                Ok(true) => {
+                    self.standalone_capture_bindings.remove(&pane_id);
+                }
+                Ok(false) => {
+                    debug!(pane_id, "Standalone polling predecessor is still draining");
+                }
+                Err(error) => {
+                    warn!(pane_id, error = %error, "Failed to retire standalone polling authority");
+                }
+            }
+        }
+
+        let mut admitted_panes = HashMap::with_capacity(observed_panes.len());
+        for (&pane_id, pane_info) in observed_panes {
+            if !self.capture_leases.contains_key(&pane_id) {
+                if let Some(identity) = self
+                    .standalone_capture_bindings
+                    .get(&pane_id)
+                    .map(|binding| binding.identity)
+                {
+                    match self
+                        .standalone_capture_authority
+                        .retire_pane_if_drained(identity)
+                    {
+                        Ok(true) => {
+                            self.standalone_capture_bindings.remove(&pane_id);
+                        }
+                        Ok(false) => {
+                            debug!(
+                                pane_id,
+                                "Refusing same-ID standalone polling replacement until predecessor drains"
+                            );
+                            continue;
+                        }
+                        Err(error) => {
+                            warn!(pane_id, error = %error, "Failed to resume standalone polling retirement");
+                            continue;
+                        }
+                    }
+                }
+
+                let identity = match self.standalone_capture_authority.activate_pane(pane_id) {
+                    Ok(identity) => identity,
+                    Err(error) => {
+                        warn!(pane_id, error = %error, "Failed to activate standalone polling pane");
+                        continue;
+                    }
+                };
+                let lease = match self
+                    .standalone_capture_authority
+                    .issue_source(identity, CaptureSourceKind::Polling)
+                {
+                    Ok(lease) => lease,
+                    Err(error) => {
+                        match self
+                            .standalone_capture_authority
+                            .retire_pane_if_drained(identity)
+                        {
+                            Ok(true) => {}
+                            Ok(false) => warn!(
+                                pane_id,
+                                "Empty standalone polling activation unexpectedly remained draining"
+                            ),
+                            Err(rollback_error) => warn!(
+                                pane_id,
+                                error = %rollback_error,
+                                "Failed to roll back empty standalone polling activation"
+                            ),
+                        }
+                        warn!(pane_id, error = %error, "Failed to issue standalone polling source");
+                        continue;
+                    }
+                };
+                self.capture_leases.insert(pane_id, lease);
+                self.standalone_capture_bindings
+                    .insert(pane_id, StandaloneCaptureBinding { identity });
+            }
+            admitted_panes.insert(pane_id, pane_info.clone());
+        }
+        self.sync_tailers_inner(&admitted_panes);
+    }
+
+    fn sync_tailers_inner(&mut self, observed_panes: &HashMap<u64, PaneInfo>) {
         self.supervisor_metrics.sync_count += 1;
 
         // Remove tailers for panes no longer observed
@@ -1234,7 +1472,7 @@ where
 
         for pane_id in to_remove {
             self.tailers.remove(&pane_id);
-            self.capturing_panes.remove(&pane_id);
+            self.capture_leases.remove(&pane_id);
             self.scheduler.remove_pane(pane_id);
             self.pane_priorities.remove(&pane_id);
             self.supervisor_metrics.tailers_stopped += 1;
@@ -1571,8 +1809,6 @@ where
                 tailer.record_selected();
             }
 
-            // Mark as capturing to prevent duplicate spawns
-            self.capturing_panes.insert(pane_id);
             let priority = self
                 .pane_priorities
                 .get(&pane_id)
@@ -1585,11 +1821,24 @@ where
             let registry = Arc::clone(&self.registry);
             let source = Arc::clone(&self.source);
             let capture_circuit_breaker = Arc::clone(&self.capture_circuit_breaker);
-            let egress_tap = self.egress_tap.clone();
-            let global_sequence = Arc::clone(&self.global_sequence);
+            let Some(capture_lease) = self.capture_leases.get(&pane_id).cloned() else {
+                if let Some(tailer) = self.tailers.get_mut(&pane_id) {
+                    tailer.record_skip(CaptureSkipReason::AuthorityRejected);
+                }
+                self.capturing_panes.remove(&pane_id);
+                continue;
+            };
+            let capture_stamp = capture_lease.stamp();
+            // Keep the exact source identity alongside the pane marker. The
+            // marker is intentionally retained across a lease replacement
+            // until this predecessor task settles.
+            self.capturing_panes.insert(pane_id);
+            self.capturing_stamps.insert(pane_id, capture_stamp);
             let overlap_size = self.config.overlap_size;
             let send_timeout = self.config.send_timeout;
             let capture_timeout = self.config.capture_timeout;
+            let egress_tap = self.egress_tap.clone();
+            let global_sequence = Arc::clone(&self.global_sequence);
 
             task_set.spawn_poll_task(async move {
                 let _permit = permit; // Hold permit for the duration of the task
@@ -1615,6 +1864,17 @@ where
                         permit
                     );
 
+                    let producer_guard = match capture_lease.try_acquire_producer(
+                        capture_lease.stamp(),
+                        pane_id,
+                    ) {
+                        Ok(guard) => guard,
+                        Err(error) => {
+                            drop(permit);
+                            return (pane_id, PollOutcome::AuthorityRejected(error));
+                        }
+                    };
+
                     let gap_segment = {
                         let mut cursors = cursors.write().await;
                         cursors
@@ -1623,7 +1883,6 @@ where
                     };
 
                     if let Some(segment) = gap_segment {
-                        // Fire egress tap for overflow gap (ft-oegrb.2.3)
                         if let Some(ref tap) = egress_tap {
                             use crate::recording::{
                                 EgressEvent, RecorderRedactionLevel, RecorderSegmentKind,
@@ -1642,13 +1901,30 @@ where
                                 global_sequence: global_sequence.next(),
                             });
                         }
-                        permit.send(CaptureEvent { segment });
+                        let event = match CaptureEvent::from_producer(segment, &producer_guard) {
+                            Ok(event) => event,
+                            Err(error) => {
+                                drop(permit);
+                                return (pane_id, PollOutcome::AuthorityRejected(error));
+                            }
+                        };
+                        permit.send(event);
                         return (pane_id, PollOutcome::OverflowGapEmitted);
                     }
 
                     drop(permit);
                     return (pane_id, PollOutcome::NoCursor);
                 }
+
+                let producer_guard = match capture_lease.try_acquire_producer(
+                    capture_lease.stamp(),
+                    pane_id,
+                ) {
+                    Ok(guard) => guard,
+                    Err(error) => {
+                        return (pane_id, PollOutcome::AuthorityRejected(error));
+                    }
+                };
 
                 let retry_after_ms = {
                     let mut guard = match capture_circuit_breaker.lock() {
@@ -1676,7 +1952,8 @@ where
                     permit
                 );
 
-                let text = match timeout(capture_timeout, source.get_text(pane_id, false)).await {
+                let text_result = timeout(capture_timeout, source.get_text(pane_id, false)).await;
+                let text = match text_result {
                     Ok(Ok(text)) => {
                         let mut guard = match capture_circuit_breaker.lock() {
                             Ok(guard) => guard,
@@ -1730,13 +2007,12 @@ where
 
                 if let Some(segment) = captured {
                     let bytes = segment.content.len() as u64;
-                    // Fire egress tap for captured segment (ft-oegrb.2.3)
                     if let Some(ref tap) = egress_tap {
                         use crate::recording::{
                             EgressEvent, RecorderRedactionLevel, RecorderTextEncoding,
                             captured_kind_to_segment, epoch_ms_now,
                         };
-                        let (seg_kind, is_gap) = captured_kind_to_segment(&segment.kind);
+                        let (segment_kind, is_gap) = captured_kind_to_segment(&segment.kind);
                         let gap_reason = match &segment.kind {
                             crate::ingest::CapturedSegmentKind::Gap { reason } => {
                                 Some(reason.clone())
@@ -1746,7 +2022,7 @@ where
                         tap.on_egress(EgressEvent {
                             pane_id,
                             text: segment.content.clone(),
-                            segment_kind: seg_kind,
+                            segment_kind,
                             is_gap,
                             gap_reason,
                             encoding: RecorderTextEncoding::Utf8,
@@ -1756,7 +2032,14 @@ where
                             global_sequence: global_sequence.next(),
                         });
                     }
-                    permit.send(CaptureEvent { segment });
+                    let event = match CaptureEvent::from_producer(segment, &producer_guard) {
+                        Ok(event) => event,
+                        Err(error) => {
+                            drop(permit);
+                            return (pane_id, PollOutcome::AuthorityRejected(error));
+                        }
+                    };
+                    permit.send(event);
                     (pane_id, PollOutcome::Changed { bytes })
                 } else {
                     drop(permit);
@@ -1785,6 +2068,19 @@ where
     pub fn handle_poll_result(&mut self, pane_id: u64, outcome: PollOutcome) {
         // Mark as no longer capturing so it can be polled again later
         self.capturing_panes.remove(&pane_id);
+        let completed_stamp = self.capturing_stamps.remove(&pane_id);
+        if let Some(completed_stamp) = completed_stamp {
+            let current_stamp = self.capture_leases.get(&pane_id).map(CaptureLease::stamp);
+            if current_stamp != Some(completed_stamp) {
+                debug!(
+                    pane_id,
+                    pane_incarnation = completed_stamp.pane_incarnation().get(),
+                    source_epoch = completed_stamp.source_epoch().get(),
+                    "Ignoring stale polling task completion"
+                );
+                return;
+            }
+        }
 
         if let Some(tailer) = self.tailers.get_mut(&pane_id) {
             match outcome {
@@ -1887,6 +2183,22 @@ where
                     self.metrics.capture_timeouts += 1;
                     warn!(pane_id, "Tailer capture timed out");
                 }
+                PollOutcome::AuthorityRejected(error) => {
+                    tailer.record_poll_outcome(
+                        false,
+                        false,
+                        CaptureSkipReason::AuthorityRejected,
+                        &self.config,
+                    );
+                    debug!(
+                        source_kind = ?self
+                            .capture_leases
+                            .get(&pane_id)
+                            .map(|lease| lease.stamp().source_kind()),
+                        error = %error,
+                        "Tailer producer authority rejected stale poll"
+                    );
+                }
                 PollOutcome::CircuitOpen { retry_after_ms } => {
                     tailer.record_poll_outcome(
                         false,
@@ -1927,6 +2239,8 @@ where
         );
         self.tailers.clear();
         self.capturing_panes.clear();
+        self.capturing_stamps.clear();
+        self.capture_leases.clear();
     }
 
     /// Get current metrics.
@@ -1955,6 +2269,8 @@ pub enum PollOutcome {
     NoCursor,
     ChannelClosed,
     CaptureTimeout,
+    /// Exact pane/source authority rejected this producer before mutation.
+    AuthorityRejected(CaptureAuthorityError),
     CircuitOpen {
         retry_after_ms: u64,
     },
@@ -3038,12 +3354,21 @@ mod tests {
             captured_at,
         };
 
-        let event = CaptureEvent { segment: seg };
+        let authority = CaptureAuthority::new();
+        let pane = authority.activate_pane(42).expect("test pane authority");
+        let lease = authority
+            .issue_source(pane, CaptureSourceKind::Polling)
+            .expect("test polling authority");
+        let guard = lease
+            .try_acquire_producer(lease.stamp(), 42)
+            .expect("test producer authority");
+        let event = CaptureEvent::from_producer(seg, &guard).expect("stamped capture event");
 
         assert_eq!(event.segment.pane_id, 42);
         assert_eq!(event.segment.seq, 10);
         assert_eq!(event.segment.content, "test content");
         assert!(event.segment.captured_at > 0);
+        assert_eq!(event.stamp(), lease.stamp());
     }
 
     #[test]
@@ -3527,6 +3852,7 @@ mod tests {
             PollOutcome::Backpressure => "send_backpressure",
             PollOutcome::ChannelClosed => "channel_closed",
             PollOutcome::CaptureTimeout => "capture_timeout",
+            PollOutcome::AuthorityRejected(_) => "authority_rejected",
             PollOutcome::CircuitOpen { .. } => "capture_circuit_open",
             PollOutcome::Error(_) => "capture_error",
             PollOutcome::NoCursor => "no_cursor",
@@ -4345,6 +4671,7 @@ mod tests {
                 "capture_circuit_open",
             ),
             (CaptureSkipReason::CaptureError, "capture_error"),
+            (CaptureSkipReason::AuthorityRejected, "authority_rejected"),
             (CaptureSkipReason::NoChange, "no_change"),
             (CaptureSkipReason::Changed, "changed"),
             (CaptureSkipReason::Shutdown, "shutdown"),
@@ -5716,6 +6043,72 @@ mod tests {
         let sm = supervisor.supervisor_metrics();
         assert_eq!(sm.tailers_started, 2); // still 2, not 4
         assert_eq!(sm.sync_count, 2);
+    }
+
+    #[test]
+    fn standalone_sync_readd_allocates_a_fresh_capture_stamp() {
+        let config = TailerConfig::default();
+        let (tx, _rx) = mpsc::channel(10);
+        let cursors = Arc::new(RwLock::new(HashMap::new()));
+        let registry = Arc::new(RwLock::new(crate::ingest::PaneRegistry::new()));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let source = Arc::new(StaticSource);
+        let mut supervisor =
+            TailerSupervisor::new(config, tx, cursors, registry, shutdown, source);
+
+        let mut panes = HashMap::new();
+        panes.insert(1, make_pane(1));
+        supervisor.sync_tailers(&panes);
+        let predecessor_stamp = supervisor.capture_leases[&1].stamp();
+
+        panes.clear();
+        supervisor.sync_tailers(&panes);
+        assert_eq!(supervisor.active_count(), 0);
+
+        panes.insert(1, make_pane(1));
+        supervisor.sync_tailers(&panes);
+        let successor_stamp = supervisor.capture_leases[&1].stamp();
+        assert_ne!(successor_stamp, predecessor_stamp);
+        assert_eq!(
+            supervisor
+                .standalone_capture_authority
+                .try_acquire_persistence(predecessor_stamp, 1)
+                .unwrap_err(),
+            CaptureAuthorityError::StalePaneIncarnation { global_pane_id: 1 }
+        );
+    }
+
+    #[test]
+    fn standalone_sync_refuses_readd_until_predecessor_guard_drains() {
+        let config = TailerConfig::default();
+        let (tx, _rx) = mpsc::channel(10);
+        let cursors = Arc::new(RwLock::new(HashMap::new()));
+        let registry = Arc::new(RwLock::new(crate::ingest::PaneRegistry::new()));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let source = Arc::new(StaticSource);
+        let mut supervisor =
+            TailerSupervisor::new(config, tx, cursors, registry, shutdown, source);
+
+        let mut panes = HashMap::new();
+        panes.insert(1, make_pane(1));
+        supervisor.sync_tailers(&panes);
+        let predecessor = supervisor.capture_leases[&1].clone();
+        let predecessor_stamp = predecessor.stamp();
+        let held = predecessor
+            .try_acquire_producer(predecessor_stamp, 1)
+            .expect("predecessor producer guard");
+
+        panes.clear();
+        supervisor.sync_tailers(&panes);
+        panes.insert(1, make_pane(1));
+        supervisor.sync_tailers(&panes);
+        assert_eq!(supervisor.active_count(), 0);
+        assert!(!supervisor.capture_leases.contains_key(&1));
+
+        drop(held);
+        supervisor.sync_tailers(&panes);
+        assert_eq!(supervisor.active_count(), 1);
+        assert_ne!(supervisor.capture_leases[&1].stamp(), predecessor_stamp);
     }
 
     #[test]

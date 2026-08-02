@@ -19,6 +19,7 @@
 use proptest::prelude::*;
 
 use frankenterm_core::Error as CoreError;
+use frankenterm_core::capture_authority::CaptureAuthorityError;
 use frankenterm_core::error::{
     ConfigError, PatternError, Remediation, RemediationCommand, StorageError, WeztermError,
     WorkflowError, format_error_with_remediation,
@@ -160,6 +161,8 @@ fn arb_config_error() -> impl Strategy<Value = ConfigError> {
 /// Arbitrary CoreError variant (excluding Io and Json which are hard to generate arbitrarily).
 fn arb_core_error() -> impl Strategy<Value = CoreError> {
     prop_oneof![
+        (0..1u8)
+            .prop_map(|_| CoreError::CaptureAuthority(CaptureAuthorityError::TransitionInProgress)),
         arb_wezterm_error().prop_map(CoreError::Wezterm),
         arb_storage_error().prop_map(CoreError::Storage),
         arb_pattern_error().prop_map(CoreError::Pattern),
@@ -789,6 +792,25 @@ proptest! {
 
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(30))]
+
+    #[test]
+    fn from_capture_authority_error_produces_typed_variant(_dummy in 0..1u8) {
+        let source = CaptureAuthorityError::TransitionInProgress;
+        let display_before = source.to_string();
+        let err: CoreError = source.into();
+        let is_capture_authority = matches!(err, CoreError::CaptureAuthority(_));
+        prop_assert!(
+            is_capture_authority,
+            "expected CaptureAuthority variant, got {:?}",
+            err
+        );
+        let display_after = err.to_string();
+        prop_assert!(
+            display_after.contains(&display_before),
+            "display should contain inner: {}",
+            display_after
+        );
+    }
 
     #[test]
     fn from_wezterm_error_produces_wezterm_variant(we in arb_wezterm_error()) {

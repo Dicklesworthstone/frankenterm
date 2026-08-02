@@ -152,6 +152,10 @@ pub enum WatchdogWarningSource {
 /// Main error type for frankenterm-core
 #[derive(Error, Debug)]
 pub enum Error {
+    /// Capture incarnation/source authority rejected an unsafe transition.
+    #[error("Capture authority error: {0}")]
+    CaptureAuthority(#[from] crate::capture_authority::CaptureAuthorityError),
+
     /// WezTerm CLI errors
     #[error("WezTerm error: {0}")]
     Wezterm(#[from] WeztermError),
@@ -262,6 +266,31 @@ impl Error {
     #[must_use]
     pub fn remediation(&self) -> Option<Remediation> {
         match self {
+            Self::CaptureAuthority(error) => Some(match error {
+                crate::capture_authority::CaptureAuthorityError::PaneIncarnationExhausted
+                | crate::capture_authority::CaptureAuthorityError::SourceEpochExhausted
+                | crate::capture_authority::CaptureAuthorityError::InflightCounterExhausted {
+                    ..
+                }
+                | crate::capture_authority::CaptureAuthorityError::AuthorityPoisoned => {
+                    Remediation::new(
+                        "Capture authority reached an internal safety limit or invalid state.",
+                    )
+                    .command("Diagnostics", "ft doctor")
+                    .command("Restart watcher", "ft watch")
+                    .alternative(
+                        "Preserve the diagnostic log and report the authority failure if it recurs.",
+                    )
+                }
+                _ => Remediation::new(
+                    "Capture authority rejected an unsafe pane or source transition.",
+                )
+                .command("Status", "ft status")
+                .command("Diagnostics", "ft doctor")
+                .alternative(
+                    "Retry discovery only after the exact predecessor source has drained; do not relabel queued capture events.",
+                ),
+            }),
             Self::Wezterm(err) => Some(err.remediation()),
             Self::Storage(err) => Some(err.remediation()),
             Self::Pattern(err) => Some(err.remediation()),
@@ -361,6 +390,7 @@ impl Error {
     pub fn error_kind(&self) -> crate::network_reliability::NetworkErrorKind {
         use crate::network_reliability::NetworkErrorKind;
         match self {
+            Self::CaptureAuthority(_) => NetworkErrorKind::Degraded,
             Self::Wezterm(e) => e.error_kind(),
             Self::Io(e) => crate::network_reliability::classify_io_error(e),
             Self::Cancelled(_) => NetworkErrorKind::Transient,
@@ -793,6 +823,9 @@ mod tests {
     fn remediation_available_for_error_variants() {
         let json_err = serde_json::from_str::<serde_json::Value>("").unwrap_err();
         let errors = vec![
+            Error::CaptureAuthority(
+                crate::capture_authority::CaptureAuthorityError::TransitionInProgress,
+            ),
             Error::Wezterm(WeztermError::CliNotFound),
             Error::Wezterm(WeztermError::NotRunning),
             Error::Wezterm(WeztermError::PaneNotFound(1)),
@@ -1524,6 +1557,24 @@ mod tests {
         assert_eq!(err.error_kind(), NetworkErrorKind::Degraded);
         let remediation = err.remediation().expect("missing remediation");
         assert!(remediation.summary.contains("mock_wezterm"));
+    }
+
+    #[test]
+    fn capture_authority_error_is_degraded_and_actionable() {
+        use crate::network_reliability::NetworkErrorKind;
+
+        let err = Error::CaptureAuthority(
+            crate::capture_authority::CaptureAuthorityError::TransitionInProgress,
+        );
+        assert_eq!(err.error_kind(), NetworkErrorKind::Degraded);
+        let remediation = err.remediation().expect("missing remediation");
+        assert!(remediation.summary.contains("Capture authority"));
+        assert!(
+            remediation
+                .alternatives
+                .iter()
+                .any(|alternative| alternative.contains("do not relabel"))
+        );
     }
 
     #[test]

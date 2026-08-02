@@ -226,6 +226,7 @@ current code does not emit all of them yet.
 | `capture_timeout` | `PollOutcome::CaptureTimeout` | `source.get_text` exceeded `capture_timeout`. |
 | `capture_circuit_open` | `PollOutcome::CircuitOpen` | Capture circuit breaker rejected the request. |
 | `capture_error` | `PollOutcome::Error` | Source returned an error that is not represented by a narrower reason. |
+| `authority_rejected` | `PollOutcome::AuthorityRejected` | The pane incarnation or polling source epoch became stale before producer mutation. |
 | `no_change` | `PollOutcome::NoChange` | Poll completed but produced no captured segment. |
 | `changed` | `PollOutcome::Changed` | Poll completed and produced a captured segment. |
 | `shutdown` | runtime shutdown flag | Supervisor stopped admitting polling work. |

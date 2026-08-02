@@ -34,6 +34,9 @@ impl ErrorRenderer {
     #[must_use]
     pub fn error_code(error: &Error) -> &'static str {
         match error {
+            // Capture authority is an internal coordination invariant until a
+            // dedicated public catalog code and operator contract are added.
+            Error::CaptureAuthority(_) => "FT-9001",
             Error::Wezterm(e) => match e {
                 WeztermError::CliNotFound => "FT-1001",
                 WeztermError::NotRunning => "FT-1002",
@@ -387,6 +390,12 @@ mod tests {
     #[test]
     fn error_codes_mapped_correctly() {
         let test_cases = [
+            (
+                Error::CaptureAuthority(
+                    crate::capture_authority::CaptureAuthorityError::TransitionInProgress,
+                ),
+                "FT-9001",
+            ),
             (Error::Wezterm(WeztermError::CliNotFound), "FT-1001"),
             (Error::Wezterm(WeztermError::NotRunning), "FT-1002"),
             (Error::Wezterm(WeztermError::PaneNotFound(1)), "FT-1010"),

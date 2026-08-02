@@ -292,6 +292,30 @@ proptest! {
 }
 
 // =============================================================================
+// Property: is_retryable — capture authority failures are not blindly retried
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(16))]
+
+    #[test]
+    fn capture_authority_errors_are_not_blindly_retried(stale_pane_id in any::<u64>()) {
+        use frankenterm_core::capture_authority::CaptureAuthorityError;
+
+        let transition = frankenterm_core::Error::CaptureAuthority(
+            CaptureAuthorityError::TransitionInProgress,
+        );
+        let stale = frankenterm_core::Error::CaptureAuthority(
+            CaptureAuthorityError::StalePaneIncarnation {
+                global_pane_id: stale_pane_id,
+            },
+        );
+        prop_assert!(!is_retryable(&transition));
+        prop_assert!(!is_retryable(&stale));
+    }
+}
+
+// =============================================================================
 // Property: is_retryable — IO errors are retryable
 // =============================================================================
 

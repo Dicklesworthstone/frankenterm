@@ -41,6 +41,7 @@
 use proptest::prelude::*;
 
 use frankenterm_core::Error as CoreError;
+use frankenterm_core::capture_authority::CaptureAuthorityError;
 use frankenterm_core::error::{
     ConfigError, PatternError, StorageError, WeztermError, WorkflowError,
 };
@@ -139,6 +140,8 @@ fn arb_config_error() -> impl Strategy<Value = ConfigError> {
 /// require special constructors not easily generated).
 fn arb_core_error() -> impl Strategy<Value = CoreError> {
     prop_oneof![
+        (0..1u8)
+            .prop_map(|_| CoreError::CaptureAuthority(CaptureAuthorityError::TransitionInProgress)),
         arb_wezterm_error().prop_map(CoreError::Wezterm),
         arb_storage_error().prop_map(CoreError::Storage),
         arb_pattern_error().prop_map(CoreError::Pattern),
