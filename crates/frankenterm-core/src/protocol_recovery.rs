@@ -292,7 +292,6 @@ pub fn classify_error_message(msg: &str) -> ProtocolErrorKind {
 /// wildcard. Adding a new `DirectMuxError` variant therefore fails compilation
 /// until every recovery axis is chosen here.
 #[cfg(all(feature = "vendored", unix))]
-#[must_use]
 pub fn mux_recovery_decision(err: &crate::vendored::DirectMuxError) -> MuxRecoveryDecision {
     use crate::vendored::DirectMuxError;
     use MuxConnectionDisposition::{Discard, Reuse};

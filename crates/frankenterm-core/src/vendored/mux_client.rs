@@ -240,7 +240,6 @@ impl DirectMuxError {
     }
 
     /// Return the canonical retry, connection, and cancellation decision.
-    #[must_use]
     pub fn recovery_decision(&self) -> MuxRecoveryDecision {
         mux_recovery_decision(self)
     }
