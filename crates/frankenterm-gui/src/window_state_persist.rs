@@ -1645,7 +1645,9 @@ impl PersistenceWriter {
     /// Resolve or create a stable domain binding on the storage worker.
     ///
     /// The returned receiver is intentionally asynchronous. Callers must await
-    /// it outside input, parser, resize, render, and present callbacks.
+    /// it outside input, parser, resize, render, and present callbacks. A remote
+    /// slot may use the binding ID only after the receiver resolves it as
+    /// durable; a queued allocation request is not publication authority.
     pub fn ensure_domain_binding(
         &self,
         target_fingerprint: PrivacySafeTargetFingerprint,
@@ -3565,6 +3567,9 @@ fn preflight_overlay_mutations(
         .iter()
         .map(|tombstone| (tombstone.window_id, tombstone))
         .collect::<BTreeMap<_, _>>();
+    // Only IDs already present in the loaded durable authority authenticate
+    // overlay slots. `batch.ensure_bindings` requests future allocation; it
+    // cannot authorize a guessed, not-yet-published ID in the same batch.
     let authoritative_binding_ids = state
         .domain_bindings
         .iter()
@@ -5040,6 +5045,10 @@ pub fn flush() -> Result<flume::Receiver<CommitResult>, PersistenceFailure> {
 }
 
 /// Resolve or create a stable domain binding on the default storage worker.
+///
+/// Callers may construct or queue remote slots with the returned ID only after
+/// the receiver resolves `Ok(binding_id)`; the request itself is not durable
+/// binding authority.
 pub fn ensure_domain_binding(
     target_fingerprint: PrivacySafeTargetFingerprint,
 ) -> Result<flume::Receiver<BindingResult>, PersistenceFailure> {
@@ -7018,6 +7027,7 @@ mod tests {
         // filter therefore cannot silently turn this into a zero-test pass.
         let child_marker = temp.path().join("external-growth-committed");
         let child = Command::new(std::env::current_exe().expect("resolve test executable"))
+            .env_clear()
             .args(["--exact", CROSS_PROCESS_GROWTH_HELPER, "--nocapture"])
             .env(CROSS_PROCESS_STATE_PATH_ENV, &path)
             .env(
@@ -10144,26 +10154,44 @@ mod tests {
     }
 
     #[test]
-    fn conflicting_claim_component_does_not_reject_disjoint_claim_in_either_order() {
+    fn disjoint_conflict_components_reject_exactly_their_own_claims_in_either_order() {
         for reverse in [false, true] {
             let temp = tempfile::tempdir().expect("tempdir");
             let path = temp.path().join("window-state.json");
-            let first_conflict = window_id(11_065);
-            let second_conflict = window_id(11_066);
-            let disjoint = window_id(11_067);
-            let conflicted_slot = local_slot(93);
-            let disjoint_slot = local_slot(94);
+            let first_conflict_left = window_id(0x10);
+            let first_conflict_right = window_id(0x11);
+            let second_conflict_left = window_id(0x20);
+            let second_conflict_right = window_id(0x21);
+            let disjoint = window_id(0x30);
+            let first_conflicted_slot = local_slot(0xa0);
+            let second_conflicted_slot = local_slot(0xb0);
+            let disjoint_slot = local_slot(0xc0);
             let order = if reverse {
-                [disjoint, second_conflict, first_conflict]
+                [
+                    disjoint,
+                    second_conflict_right,
+                    first_conflict_left,
+                    second_conflict_left,
+                    first_conflict_right,
+                ]
             } else {
-                [first_conflict, second_conflict, disjoint]
+                [
+                    first_conflict_right,
+                    second_conflict_left,
+                    disjoint,
+                    first_conflict_left,
+                    second_conflict_right,
+                ]
             };
             let mut batch = PendingBatch::default();
             for window_id in order {
-                let slot = if window_id == disjoint {
-                    disjoint_slot
+                let slot = if [first_conflict_left, first_conflict_right].contains(&window_id) {
+                    first_conflicted_slot
+                } else if [second_conflict_left, second_conflict_right].contains(&window_id) {
+                    second_conflicted_slot
                 } else {
-                    conflicted_slot
+                    assert_eq!(window_id, disjoint);
+                    disjoint_slot
                 };
                 batch
                     .queue_overlay_live(
@@ -10179,25 +10207,60 @@ mod tests {
                     )
                     .expect("queue ownership claimant");
             }
+            assert_eq!(
+                overlay_admission_components(&PersistedState::default(), &batch),
+                vec![
+                    vec![first_conflict_left, first_conflict_right],
+                    vec![second_conflict_left, second_conflict_right],
+                    vec![disjoint],
+                ]
+            );
 
             let committed = commit_for_test(&path, &batch, WriteInterruption::None)
                 .expect("partition conflicting and disjoint ownership components");
             assert_eq!(committed.receipt.committed_updates, 1);
-            assert_eq!(committed.receipt.rejected_updates, 2);
+            assert_eq!(committed.receipt.coalesced_updates, 0);
+            assert_eq!(committed.receipt.rejected_updates, 4);
             assert!(committed.receipt.wrote_new_generation);
             assert_eq!(committed.accepted_overlay_ids, BTreeSet::from([disjoint]));
-            for window_id in [first_conflict, second_conflict] {
+            assert_eq!(
+                committed
+                    .rejected_overlay_mutations
+                    .keys()
+                    .copied()
+                    .collect::<Vec<_>>(),
+                vec![
+                    first_conflict_left,
+                    first_conflict_right,
+                    second_conflict_left,
+                    second_conflict_right,
+                ]
+            );
+            for window_id in [
+                first_conflict_left,
+                first_conflict_right,
+                second_conflict_left,
+                second_conflict_right,
+            ] {
                 assert_eq!(
                     committed.rejected_overlay_mutations[&window_id]
-                        .failure
-                        .code(),
-                    PersistenceFailureCode::Invalid
+                        .failure,
+                    PersistenceFailure::invalid(
+                        "one stable tab identity would be owned by multiple layout windows"
+                    )
                 );
             }
 
             let snapshot = load_snapshot_at(&path).expect("load partitioned ownership claims");
-            assert!(snapshot.overlay(first_conflict).is_none());
-            assert!(snapshot.overlay(second_conflict).is_none());
+            assert_eq!(snapshot.store_revision, 1);
+            for window_id in [
+                first_conflict_left,
+                first_conflict_right,
+                second_conflict_left,
+                second_conflict_right,
+            ] {
+                assert!(snapshot.overlay(window_id).is_none());
+            }
             assert_eq!(
                 snapshot
                     .overlay(disjoint)
@@ -10379,12 +10442,13 @@ mod tests {
     }
 
     #[test]
-    fn unknown_remote_binding_rejects_only_its_overlay_lineage() {
+    fn unresolved_same_batch_binding_request_cannot_authorize_a_guessed_remote_id() {
         let temp = tempfile::tempdir().expect("tempdir");
         let path = temp.path().join("window-state.json");
         let invalid_window = window_id(11_100);
         let valid_window = window_id(11_101);
         let unknown_binding = DomainBindingId::from_bytes([0x86; 16]);
+        let fingerprint = PrivacySafeTargetFingerprint::from_bytes([0x85; 32]);
         let remote = remote_slot(unknown_binding, 0x87, 1, 1);
         let invalid_overlay = MixedDomainLayoutOverlay::new(
             invalid_window,
@@ -10395,6 +10459,7 @@ mod tests {
         )
         .expect("structurally valid overlay");
         let mut batch = PendingBatch::default();
+        batch.ensure_bindings.insert(fingerprint);
         batch
             .queue_overlay_live(None, invalid_overlay)
             .expect("queue cross-state-invalid overlay");
@@ -10413,18 +10478,25 @@ mod tests {
 
         let committed = commit_for_test(&path, &batch, WriteInterruption::None)
             .expect("partition unknown binding lineage");
+        assert_eq!(committed.receipt.committed_updates, 3);
+        assert_eq!(committed.receipt.coalesced_updates, 0);
         assert_eq!(committed.receipt.rejected_updates, 1);
         assert_eq!(
             committed.rejected_overlay_mutations[&invalid_window]
-                .failure
-                .code(),
-            PersistenceFailureCode::Invalid
+                .failure,
+            PersistenceFailure::invalid(
+                "overlay remote slot references an unknown domain binding"
+            )
         );
+        let committed_binding = committed.bindings[&fingerprint];
         assert!(committed.accepted_overlay_ids.contains(&valid_window));
         let snapshot = load_snapshot_at(&path).expect("load partitioned binding result");
         assert!(snapshot.overlay(invalid_window).is_none());
         assert!(snapshot.overlay(valid_window).is_some());
         assert!(snapshot.window_states["binding-check"].maximized);
+        assert!(snapshot.domain_bindings.iter().any(|record| {
+            record.target_fingerprint == fingerprint && record.binding_id == committed_binding
+        }));
     }
 
     #[test]
