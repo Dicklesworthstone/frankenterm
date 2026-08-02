@@ -3656,9 +3656,13 @@ fn union_overlay_components(parent: &mut [usize], left: usize, right: usize) {
 fn overlay_admission_components(
     state: &PersistedState,
     batch: &PendingBatch,
-    apply_overlay_ids: &BTreeSet<LayoutWindowId>,
 ) -> Vec<Vec<LayoutWindowId>> {
-    let window_ids = apply_overlay_ids.iter().copied().collect::<Vec<_>>();
+    // Ownership is a property of the complete requested transition, not only
+    // of mutations that passed their individual revision preflight.  A
+    // rejected destination can still claim a slot released by an otherwise
+    // valid source.  Omitting that destination would let the source commit its
+    // half of the transfer and destroy the atomic ownership hand-off.
+    let window_ids = batch.overlay_mutations.keys().copied().collect::<Vec<_>>();
     let index_by_window = window_ids
         .iter()
         .copied()
@@ -3704,6 +3708,24 @@ fn overlay_admission_components(
     let mut components = by_root.into_values().collect::<Vec<_>>();
     components.sort_by_key(|component| component[0]);
     components
+}
+
+const fn overlay_preflight_failure_precedence(failure: &PersistenceFailure) -> u8 {
+    match failure {
+        PersistenceFailure::Invalid { .. } => 0,
+        PersistenceFailure::RetiredOverlay { .. } => 1,
+        PersistenceFailure::StaleOverlay { .. } => 2,
+        PersistenceFailure::OverlayRevisionConflict { .. } => 3,
+        PersistenceFailure::OverlayCasConflict { .. } => 4,
+        PersistenceFailure::RevisionExhausted => 5,
+        PersistenceFailure::Quota { .. } => 6,
+        PersistenceFailure::EncodedQuota { .. } | PersistenceFailure::Oversized { .. } => 7,
+        PersistenceFailure::Corrupt { .. } => 8,
+        PersistenceFailure::UnsupportedVersion { .. } => 9,
+        PersistenceFailure::AmbiguousGeneration { .. } => 10,
+        PersistenceFailure::Io { .. } => 11,
+        PersistenceFailure::WorkerStopped => 12,
+    }
 }
 
 fn build_byte_admission_candidates(
@@ -3903,8 +3925,7 @@ fn partition_overlay_ownership_components(
     batch: &PendingBatch,
     preflight: &mut BatchPreflight,
 ) -> Vec<Vec<LayoutWindowId>> {
-    let components =
-        overlay_admission_components(state, batch, &preflight.overlays.apply_overlay_ids);
+    let components = overlay_admission_components(state, batch);
     let current_owners = state
         .overlays
         .iter()
@@ -3918,9 +3939,29 @@ fn partition_overlay_ownership_components(
         .collect::<HashMap<_, _>>();
     let mut valid_components = Vec::with_capacity(components.len());
     for component in components {
-        if overlay_component_tabs_are_unique(&current_owners, batch, &component) {
-            valid_components.push(component);
-        } else {
+        let component_failure = component
+            .iter()
+            .filter_map(|window_id| {
+                preflight
+                    .overlays
+                    .rejected_overlay_mutations
+                    .get(window_id)
+                    .map(|rejected| {
+                        (
+                            overlay_preflight_failure_precedence(&rejected.failure),
+                            *window_id,
+                            &rejected.failure,
+                        )
+                    })
+            })
+            .min_by_key(|(precedence, window_id, _)| (*precedence, *window_id))
+            .map(|(_, _, failure)| failure.clone());
+        if let Some(failure) = component_failure {
+            reject_overlay_admission_component(&component, batch, preflight, failure);
+            continue;
+        }
+
+        if !overlay_component_tabs_are_unique(&current_owners, batch, &component) {
             reject_overlay_admission_component(
                 &component,
                 batch,
@@ -3929,6 +3970,15 @@ fn partition_overlay_ownership_components(
                     "one stable tab identity would be owned by multiple layout windows",
                 ),
             );
+            continue;
+        }
+
+        let applied_component = component
+            .into_iter()
+            .filter(|window_id| preflight.overlays.apply_overlay_ids.contains(window_id))
+            .collect::<Vec<_>>();
+        if !applied_component.is_empty() {
+            valid_components.push(applied_component);
         }
     }
     valid_components
@@ -4332,6 +4382,11 @@ fn enforce_encoded_byte_admission(
     force_write: bool,
     maximum_bytes: u64,
 ) -> Result<(), PersistenceFailure> {
+    // Resolve semantic ownership components before deciding whether this batch
+    // needs a new store revision. A batch whose only apparent changes are a
+    // rejected ownership component publishes nothing and therefore remains
+    // admissible even when the revision namespace is already at its ceiling.
+    let overlay_components = partition_overlay_ownership_components(state, batch, preflight);
     let changing_workspace = preflight.accepted_workspaces.iter().any(|workspace| {
         state.window_states.get(workspace) != Some(&batch.window_states[workspace])
     });
@@ -4357,7 +4412,6 @@ fn enforce_encoded_byte_admission(
     let normalized_budget = EncodedStateBudget::from_state(state, published_revision)?;
     let physical_budget =
         EncodedStateBudget::from_state_with_physical_bindings(state, published_revision)?;
-    let overlay_components = partition_overlay_ownership_components(state, batch, preflight);
     let mut candidates = build_byte_admission_candidates(
         state,
         batch,
@@ -9276,6 +9330,257 @@ mod tests {
         assert!(snapshot.overlay(duplicate_window).is_none());
         assert!(snapshot.overlay(later_window).is_some());
         assert!(snapshot.window_states["duplicate-owner"].fullscreen);
+    }
+
+    #[test]
+    fn individually_rejected_acquirer_cannot_split_an_ownership_transfer() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("window-state.json");
+        let source_window = window_id(11_063);
+        let destination_window = window_id(11_064);
+        let slot = local_slot(92);
+        let mut initial = PendingBatch::default();
+        initial
+            .queue_overlay_live(None, local_overlay(source_window, 1, 92))
+            .expect("queue initial source owner");
+        initial
+            .queue_overlay_live(
+                None,
+                MixedDomainLayoutOverlay::new(
+                    destination_window,
+                    "default",
+                    1,
+                    Vec::new(),
+                    None,
+                )
+                .expect("initial empty destination"),
+            )
+            .expect("queue initial destination");
+        commit_for_test(&path, &initial, WriteInterruption::None)
+            .expect("commit initial transfer authority");
+
+        let mut transfer = PendingBatch::default();
+        transfer
+            .queue_overlay_live(
+                Some(1),
+                MixedDomainLayoutOverlay::new(
+                    source_window,
+                    "default",
+                    2,
+                    Vec::new(),
+                    None,
+                )
+                .expect("source release"),
+            )
+            .expect("queue source release");
+        transfer
+            .queue_overlay_live(
+                Some(2),
+                MixedDomainLayoutOverlay::new(
+                    destination_window,
+                    "default",
+                    3,
+                    vec![slot],
+                    Some(slot),
+                )
+                .expect("wrong-base destination acquisition"),
+            )
+            .expect("queue wrong-base destination acquisition");
+
+        let rejected = commit_for_test(&path, &transfer, WriteInterruption::None)
+            .expect("reject the complete transfer component");
+        assert_eq!(rejected.receipt.committed_updates, 0);
+        assert_eq!(rejected.receipt.rejected_updates, 2);
+        assert!(!rejected.receipt.wrote_new_generation);
+        assert!(rejected.accepted_overlay_ids.is_empty());
+        for window_id in [source_window, destination_window] {
+            assert_eq!(
+                rejected.rejected_overlay_mutations[&window_id]
+                    .failure
+                    .code(),
+                PersistenceFailureCode::OverlayCasConflict
+            );
+        }
+
+        let snapshot = load_snapshot_at(&path).expect("load rejected transfer authority");
+        assert_eq!(
+            snapshot
+                .overlay(source_window)
+                .expect("source ownership retained")
+                .slots(),
+            &[slot]
+        );
+        assert!(
+            snapshot
+                .overlay(destination_window)
+                .expect("destination retained")
+                .slots()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn conflicting_claim_component_does_not_reject_disjoint_claim_in_either_order() {
+        for reverse in [false, true] {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let path = temp.path().join("window-state.json");
+            let first_conflict = window_id(11_065);
+            let second_conflict = window_id(11_066);
+            let disjoint = window_id(11_067);
+            let conflicted_slot = local_slot(93);
+            let disjoint_slot = local_slot(94);
+            let order = if reverse {
+                [disjoint, second_conflict, first_conflict]
+            } else {
+                [first_conflict, second_conflict, disjoint]
+            };
+            let mut batch = PendingBatch::default();
+            for window_id in order {
+                let slot = if window_id == disjoint {
+                    disjoint_slot
+                } else {
+                    conflicted_slot
+                };
+                batch
+                    .queue_overlay_live(
+                        None,
+                        MixedDomainLayoutOverlay::new(
+                            window_id,
+                            "default",
+                            1,
+                            vec![slot],
+                            Some(slot),
+                        )
+                        .expect("new ownership claimant"),
+                    )
+                    .expect("queue ownership claimant");
+            }
+
+            let committed = commit_for_test(&path, &batch, WriteInterruption::None)
+                .expect("partition conflicting and disjoint ownership components");
+            assert_eq!(committed.receipt.committed_updates, 1);
+            assert_eq!(committed.receipt.rejected_updates, 2);
+            assert!(committed.receipt.wrote_new_generation);
+            assert_eq!(committed.accepted_overlay_ids, BTreeSet::from([disjoint]));
+            for window_id in [first_conflict, second_conflict] {
+                assert_eq!(
+                    committed.rejected_overlay_mutations[&window_id]
+                        .failure
+                        .code(),
+                    PersistenceFailureCode::Invalid
+                );
+            }
+
+            let snapshot = load_snapshot_at(&path).expect("load partitioned ownership claims");
+            assert!(snapshot.overlay(first_conflict).is_none());
+            assert!(snapshot.overlay(second_conflict).is_none());
+            assert_eq!(
+                snapshot
+                    .overlay(disjoint)
+                    .expect("disjoint claim committed")
+                    .slots(),
+                &[disjoint_slot]
+            );
+        }
+    }
+
+    #[test]
+    fn ownership_only_rejection_at_revision_ceiling_requires_no_publication() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("window-state.json");
+        let source_window = window_id(11_068);
+        let destination_window = window_id(11_069);
+        let slot = local_slot(95);
+        let mut state = PersistedState {
+            store_revision: u64::MAX,
+            ..PersistedState::default()
+        };
+        state.overlays = vec![
+            MixedDomainLayoutOverlay::new(
+                source_window,
+                "default",
+                1,
+                vec![slot],
+                Some(slot),
+            )
+            .expect("revision-ceiling source owner"),
+            MixedDomainLayoutOverlay::new(
+                destination_window,
+                "default",
+                1,
+                Vec::new(),
+                None,
+            )
+            .expect("revision-ceiling empty destination"),
+        ];
+        canonicalize_state(&mut state);
+        validate_state(&state).expect("revision-ceiling authority is valid");
+        std::fs::write(
+            &path,
+            encode_disk_slot(&state).expect("encode revision-ceiling authority"),
+        )
+        .expect("write revision-ceiling authority");
+
+        let mut transfer = PendingBatch::default();
+        transfer
+            .queue_overlay_live(
+                Some(1),
+                MixedDomainLayoutOverlay::new(
+                    source_window,
+                    "default",
+                    2,
+                    Vec::new(),
+                    None,
+                )
+                .expect("revision-ceiling source release"),
+            )
+            .expect("queue revision-ceiling source release");
+        transfer
+            .queue_overlay_live(
+                Some(2),
+                MixedDomainLayoutOverlay::new(
+                    destination_window,
+                    "default",
+                    3,
+                    vec![slot],
+                    Some(slot),
+                )
+                .expect("revision-ceiling wrong-base acquisition"),
+            )
+            .expect("queue revision-ceiling wrong-base acquisition");
+
+        let rejected = commit_for_test(&path, &transfer, WriteInterruption::None)
+            .expect("fully rejected transfer does not consume a store revision");
+        assert_eq!(rejected.receipt.store_revision, u64::MAX);
+        assert_eq!(rejected.receipt.committed_updates, 0);
+        assert_eq!(rejected.receipt.rejected_updates, 2);
+        assert!(!rejected.receipt.wrote_new_generation);
+        assert!(rejected.accepted_overlay_ids.is_empty());
+        for window_id in [source_window, destination_window] {
+            assert_eq!(
+                rejected.rejected_overlay_mutations[&window_id]
+                    .failure
+                    .code(),
+                PersistenceFailureCode::OverlayCasConflict
+            );
+        }
+
+        let snapshot = load_snapshot_at(&path).expect("reload revision-ceiling authority");
+        assert_eq!(snapshot.store_revision, u64::MAX);
+        assert_eq!(
+            snapshot
+                .overlay(source_window)
+                .expect("source ownership retained")
+                .slots(),
+            &[slot]
+        );
+        assert!(
+            snapshot
+                .overlay(destination_window)
+                .expect("destination retained")
+                .slots()
+                .is_empty()
+        );
     }
 
     #[test]
