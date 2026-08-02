@@ -1121,8 +1121,8 @@ impl DiscardedPduBody {
         self.max_chunk_bytes
     }
 
-    /// Fixed scratch-buffer capacity used by every discarded body, independent
-    /// of the peer-advertised payload length.
+    /// Maximum scratch-buffer capacity for a discarded body. Tiny payloads use
+    /// a smaller heap buffer; peer-advertised lengths can never raise this cap.
     #[must_use]
     pub const fn scratch_capacity() -> usize {
         DISCARDED_PAYLOAD_READ_CHUNK
@@ -1243,7 +1243,7 @@ async fn discard_raw_body_async<R: Unpin + AsyncRead + std::fmt::Debug>(
     r: &mut R,
     header: PduFrameHeader,
 ) -> anyhow::Result<DiscardedPduBody> {
-    // Keep the fixed discard window off the async worker stack.  This future is
+    // Keep the bounded discard window off the async worker stack. This future is
     // nested inside the client actor's already-large decode future; embedding a
     // 64 KiB array here can overflow bounded executor stacks while the future is
     // moved or polled.  Reserve fallibly before setting the length so allocation
@@ -5528,6 +5528,8 @@ mod test {
     #[test]
     fn async_selector_discard_is_fixed_bound_and_exactly_resynchronizes() {
         for data_len in [
+            0,
+            1,
             DISCARDED_PAYLOAD_READ_CHUNK - 1,
             DISCARDED_PAYLOAD_READ_CHUNK,
             DISCARDED_PAYLOAD_READ_CHUNK + 1,
