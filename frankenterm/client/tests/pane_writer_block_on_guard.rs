@@ -49,7 +49,8 @@ fn pane_writer_write_is_nonblocking_and_spawns_the_rpc() {
     for forbidden in ["block_on(", "block_on_io("] {
         assert!(
             !executable.contains(forbidden),
-            "PaneWriter::write must never wait synchronously via {forbidden}"
+            "PaneWriter::write must never wait synchronously via {}",
+            forbidden
         );
     }
 }
