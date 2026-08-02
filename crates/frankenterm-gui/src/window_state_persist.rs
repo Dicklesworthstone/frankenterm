@@ -5380,6 +5380,207 @@ mod tests {
             .collect()
     }
 
+    fn boundary_workspace_key(index: usize, encoded_bytes: usize) -> String {
+        let prefix = format!("{index:04x}");
+        assert!(prefix.len() <= encoded_bytes);
+        let mut workspace = String::with_capacity(encoded_bytes);
+        workspace.push_str(&prefix);
+        workspace.push_str(&"w".repeat(encoded_bytes - prefix.len()));
+        workspace
+    }
+
+    fn workspace_state_at_encoded_upper_bound(
+        target_bytes: u64,
+    ) -> (PersistedState, String) {
+        let window_state = PersistedWindowState {
+            maximized: true,
+            fullscreen: true,
+        };
+        let mut state = PersistedState {
+            store_revision: 1,
+            ..PersistedState::default()
+        };
+        let empty_slot_bytes = EncodedStateBudget::from_state(&state, state.store_revision)
+            .expect("count empty boundary state")
+            .upper_bound()
+            .expect("empty boundary state upper bound");
+        let window_state_bytes =
+            encoded_json_len(&window_state).expect("count boundary window state");
+        let workspace_count = u64::try_from(MAX_WORKSPACES).expect("workspace cap fits u64");
+        // Each map entry contributes the quoted ASCII key, one colon, the
+        // window-state value, and (except for the first entry) one comma. With
+        // `MAX_WORKSPACES` entries, the non-key contribution is therefore
+        // count * (value + two quotes + colon + comma) - one comma.
+        let fixed_collection_bytes = workspace_count
+            .checked_mul(
+                window_state_bytes
+                    .checked_add(4)
+                    .expect("boundary entry fixed bytes fit u64"),
+            )
+            .and_then(|bytes| bytes.checked_sub(1))
+            .expect("boundary collection fixed bytes fit u64");
+        let target_workspace_bytes = target_bytes
+            .checked_sub(empty_slot_bytes)
+            .and_then(|bytes| bytes.checked_sub(fixed_collection_bytes))
+            .expect("target leaves room for workspace keys");
+        let minimum_workspace_bytes = workspace_count
+            .checked_mul(4)
+            .expect("minimum workspace bytes fit u64");
+        let maximum_workspace_bytes = workspace_count
+            .checked_mul(
+                u64::try_from(MAX_WORKSPACE_BYTES).expect("workspace byte cap fits u64"),
+            )
+            .expect("maximum workspace bytes fit u64");
+        assert!(
+            (minimum_workspace_bytes..=maximum_workspace_bytes)
+                .contains(&target_workspace_bytes)
+        );
+
+        let mut remaining_workspace_bytes = target_workspace_bytes;
+        for index in 0..MAX_WORKSPACES {
+            let entries_after = MAX_WORKSPACES - index - 1;
+            let minimum_after = u64::try_from(entries_after)
+                .expect("remaining workspace count fits u64")
+                .checked_mul(4)
+                .expect("remaining minimum workspace bytes fit u64");
+            let workspace_bytes = remaining_workspace_bytes
+                .checked_sub(minimum_after)
+                .expect("boundary distribution retains minimum suffix")
+                .min(u64::try_from(MAX_WORKSPACE_BYTES).expect("workspace byte cap fits u64"));
+            let workspace_bytes =
+                usize::try_from(workspace_bytes).expect("workspace length fits usize");
+            assert!((4..=MAX_WORKSPACE_BYTES).contains(&workspace_bytes));
+            let workspace = boundary_workspace_key(index, workspace_bytes);
+            assert_eq!(workspace.len(), workspace_bytes);
+            assert!(state.window_states.insert(workspace, window_state).is_none());
+            remaining_workspace_bytes = remaining_workspace_bytes
+                .checked_sub(u64::try_from(workspace_bytes).expect("workspace length fits u64"))
+                .expect("distributed workspace bytes do not underflow");
+        }
+        assert_eq!(remaining_workspace_bytes, 0);
+        let changed_workspace = state
+            .window_states
+            .keys()
+            .next()
+            .expect("boundary state has workspaces")
+            .clone();
+        (state, changed_workspace)
+    }
+
+    fn maximum_width_index_bytes<const N: usize>(namespace: u8, mut index: usize) -> [u8; N] {
+        assert!(N >= 3);
+        assert!((100..=u8::MAX).contains(&namespace));
+        let mut bytes = [u8::MAX; N];
+        bytes[0] = namespace;
+        for byte in &mut bytes[1..] {
+            *byte = 100 + u8::try_from(index % 156).expect("base-156 digit fits u8");
+            index /= 156;
+        }
+        assert_eq!(index, 0, "test identity exceeded maximum-width namespace");
+        bytes
+    }
+
+    fn maximally_escaped_workspace_key(index: usize) -> String {
+        let mut workspace = format!("{index:04x}");
+        let escape_pairs = (MAX_WORKSPACE_BYTES - workspace.len()) / 2;
+        workspace.reserve(MAX_WORKSPACE_BYTES - workspace.len());
+        for _ in 0..escape_pairs {
+            workspace.push('"');
+            workspace.push('\\');
+        }
+        assert_eq!(workspace.len(), MAX_WORKSPACE_BYTES);
+        workspace
+    }
+
+    fn all_maxima_escaped_state() -> PersistedState {
+        let mut state = PersistedState {
+            store_revision: u64::MAX,
+            ..PersistedState::default()
+        };
+
+        for index in 0..MAX_WORKSPACES {
+            let workspace = maximally_escaped_workspace_key(index);
+            assert!(
+                state
+                    .window_states
+                    .insert(
+                        workspace,
+                        PersistedWindowState {
+                            maximized: index & 1 == 0,
+                            fullscreen: index & 2 == 0,
+                        },
+                    )
+                    .is_none()
+            );
+        }
+
+        state.domain_bindings = (0..MAX_DOMAIN_BINDINGS)
+            .map(|index| DomainBindingRecord {
+                target_fingerprint: PrivacySafeTargetFingerprint::from_bytes(
+                    maximum_width_index_bytes(101, index),
+                ),
+                binding_id: DomainBindingId::from_bytes(maximum_width_index_bytes(102, index)),
+            })
+            .collect();
+
+        let full_overlay_count = MAX_TOTAL_OVERLAY_TABS / MAX_TABS_PER_OVERLAY;
+        assert_eq!(
+            full_overlay_count
+                .checked_mul(MAX_TABS_PER_OVERLAY)
+                .expect("maximum overlay tab product fits usize"),
+            MAX_TOTAL_OVERLAY_TABS
+        );
+        let overlay_workspace = maximally_escaped_workspace_key(0);
+        for overlay_index in 0..MAX_LAYOUT_OVERLAYS {
+            let slots = if overlay_index < full_overlay_count {
+                let binding_id = state.domain_bindings[overlay_index].binding_id;
+                (0..MAX_TABS_PER_OVERLAY)
+                    .map(|tab_index| {
+                        let global_tab_index = overlay_index
+                            .checked_mul(MAX_TABS_PER_OVERLAY)
+                            .and_then(|base| base.checked_add(tab_index))
+                            .expect("global test tab index fits usize");
+                        StableTabSlot::remote(
+                            binding_id,
+                            StableMuxSessionId::from_bytes(maximum_width_index_bytes(
+                                103,
+                                global_tab_index,
+                            )),
+                            u64::MAX,
+                            u64::MAX,
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            };
+            let active = slots.first().copied();
+            state.overlays.push(
+                MixedDomainLayoutOverlay::new(
+                    LayoutWindowId::from_bytes(maximum_width_index_bytes(104, overlay_index)),
+                    &overlay_workspace,
+                    u64::MAX,
+                    slots,
+                    active,
+                )
+                .expect("all-maxima overlay is structurally valid"),
+            );
+        }
+
+        state.tombstones = (0..MAX_OVERLAY_TOMBSTONES)
+            .map(|index| {
+                OverlayTombstone::new(
+                    LayoutWindowId::from_bytes(maximum_width_index_bytes(105, index)),
+                    u64::MAX,
+                    u64::MAX,
+                )
+                .expect("all-maxima tombstone is structurally valid")
+            })
+            .collect();
+        canonicalize_state(&mut state);
+        state
+    }
+
     fn commit_for_test(
         path: &Path,
         batch: &PendingBatch,
@@ -6650,40 +6851,160 @@ mod tests {
 
     #[test]
     fn encoded_byte_admission_accepts_exact_boundary_and_rejects_plus_one() {
-        let state = PersistedState::default();
-        let workspace = "boundary-\"-\\-☃".to_string();
-        let mut batch = PendingBatch::default();
-        batch
+        assert_eq!(MAX_STATE_FILE_BYTES, 4 * 1024 * 1024);
+        let (state, workspace) = workspace_state_at_encoded_upper_bound(MAX_STATE_FILE_BYTES);
+        validate_published_state(&state)
+            .expect("literal 4 MiB boundary state is structurally valid");
+        let budget = EncodedStateBudget::from_state(&state, state.store_revision)
+            .expect("count literal 4 MiB boundary state");
+        assert_eq!(
+            budget.upper_bound().expect("boundary upper bound"),
+            MAX_STATE_FILE_BYTES
+        );
+        let encoded = encode_disk_slot(&state).expect("literal boundary state physically encodes");
+        assert!(
+            u64::try_from(encoded.len()).expect("encoded boundary length fits u64")
+                <= MAX_STATE_FILE_BYTES
+        );
+
+        let exact = preflight_batch(&state, &PendingBatch::default(), false)
+            .expect("literal 4 MiB byte boundary is admissible");
+        assert_eq!(exact.encoded_upper_bound, MAX_STATE_FILE_BYTES);
+
+        let mut plus_one = PendingBatch::default();
+        plus_one
             .queue_window_state(
                 workspace.clone(),
                 PersistedWindowState {
-                    maximized: true,
+                    // `false` is one JSON byte wider than the committed
+                    // `true`; every other field and collection is identical.
+                    maximized: false,
                     fullscreen: true,
                 },
             )
-            .expect("queue boundary workspace");
-        let exact_limit = preflight_batch_with_byte_limit(&state, &batch, false, u64::MAX)
-            .expect("measure exact boundary")
-            .encoded_upper_bound;
-
-        let exact = preflight_batch_with_byte_limit(&state, &batch, false, exact_limit)
-            .expect("exact byte boundary is admissible");
-        assert!(exact.accepted_workspaces.contains(&workspace));
-        assert_eq!(exact.encoded_upper_bound, exact_limit);
-
-        let below = preflight_batch_with_byte_limit(
-            &state,
-            &batch,
-            false,
-            exact_limit.checked_sub(1).expect("boundary is nonzero"),
-        )
-        .expect("one-byte-short budget yields a semantic rejection");
-        assert!(!below.accepted_workspaces.contains(&workspace));
+            .expect("queue one-byte-wider workspace value");
+        let rejected = preflight_batch(&state, &plus_one, false)
+            .expect("plus-one candidate yields a lineage-isolated rejection");
+        assert!(!rejected.accepted_workspaces.contains(&workspace));
+        assert_eq!(rejected.encoded_upper_bound, MAX_STATE_FILE_BYTES);
         assert_eq!(
-            below.rejected_workspaces[&workspace].code(),
-            PersistenceFailureCode::Oversized
+            rejected.rejected_workspaces[&workspace],
+            PersistenceFailure::EncodedQuota {
+                projected_upper_bound: MAX_STATE_FILE_BYTES + 1,
+                maximum: MAX_STATE_FILE_BYTES,
+            }
         );
-        assert!(below.encoded_upper_bound < exact_limit);
+    }
+
+    #[test]
+    fn all_maxima_escaped_composite_is_countable_and_rejected_before_publication() {
+        let state = all_maxima_escaped_state();
+        validate_published_state(&state)
+            .expect("all independent structural maxima compose into a valid state shape");
+        assert_eq!(state.window_states.len(), MAX_WORKSPACES);
+        assert_eq!(state.domain_bindings.len(), MAX_DOMAIN_BINDINGS);
+        assert_eq!(state.overlays.len(), MAX_LAYOUT_OVERLAYS);
+        assert_eq!(state.tombstones.len(), MAX_OVERLAY_TOMBSTONES);
+        assert_eq!(
+            state
+                .overlays
+                .iter()
+                .map(|overlay| overlay.slots.len())
+                .sum::<usize>(),
+            MAX_TOTAL_OVERLAY_TABS
+        );
+        assert_eq!(
+            state
+                .overlays
+                .iter()
+                .filter(|overlay| overlay.slots.len() == MAX_TABS_PER_OVERLAY)
+                .count(),
+            MAX_TOTAL_OVERLAY_TABS / MAX_TABS_PER_OVERLAY
+        );
+        assert!(state.window_states.keys().all(|workspace| {
+            workspace.len() == MAX_WORKSPACE_BYTES
+                && workspace.contains('"')
+                && workspace.contains('\\')
+                && encoded_json_len(workspace).expect("count escaped workspace")
+                    > u64::try_from(workspace.len()).expect("workspace length fits u64") + 2
+        }));
+        assert!(state.overlays.iter().all(|overlay| {
+            overlay.workspace.len() == MAX_WORKSPACE_BYTES
+                && overlay.local_revision == u64::MAX
+                && overlay.window_id.as_bytes().iter().all(|byte| *byte >= 100)
+        }));
+        assert!(state.tombstones.iter().all(|tombstone| {
+            tombstone.last_local_revision == u64::MAX
+                && tombstone.retired_at_store_revision == u64::MAX
+                && tombstone.window_id.as_bytes().iter().all(|byte| *byte >= 100)
+        }));
+
+        for binding in &state.domain_bindings {
+            assert!(
+                binding
+                    .target_fingerprint
+                    .as_bytes()
+                    .iter()
+                    .all(|byte| *byte >= 100)
+            );
+            assert!(binding.binding_id.as_bytes().iter().all(|byte| *byte >= 100));
+            assert_eq!(
+                encoded_json_len(binding).expect("count maximum-width binding"),
+                maximum_width_binding_len(binding.target_fingerprint)
+                    .expect("count normalized maximum-width binding")
+            );
+        }
+
+        let maximum_remote_slot_bytes = encoded_json_len(&StableTabSlot::remote(
+            DomainBindingId::from_bytes([u8::MAX; 16]),
+            StableMuxSessionId::from_bytes([u8::MAX; 16]),
+            u64::MAX,
+            u64::MAX,
+        ))
+        .expect("count canonical maximum-width remote slot");
+        for slot in state
+            .overlays
+            .iter()
+            .flat_map(|overlay| overlay.slots.iter())
+        {
+            let StableTabSlot::Remote {
+                binding_id,
+                session_id,
+                remote_window_id,
+                remote_tab_id,
+            } = slot
+            else {
+                panic!("all-maxima composite must use remote slots");
+            };
+            assert!(binding_id.as_bytes().iter().all(|byte| *byte >= 100));
+            assert!(session_id.as_bytes().iter().all(|byte| *byte >= 100));
+            assert_eq!(*remote_window_id, u64::MAX);
+            assert_eq!(*remote_tab_id, u64::MAX);
+            assert_eq!(
+                encoded_json_len(slot).expect("count maximum-width remote slot"),
+                maximum_remote_slot_bytes
+            );
+        }
+
+        let budget = EncodedStateBudget::from_state(&state, state.store_revision)
+            .expect("count deterministic all-maxima composite");
+        let projected_upper_bound = budget.upper_bound().expect("all-maxima upper bound");
+        let maximum_checksum_oracle = encoded_json_len(&BorrowedDiskSlot {
+            payload: &state,
+            sha256: [u8::MAX; 32],
+        })
+        .expect("count all-maxima serializer oracle");
+        assert_eq!(projected_upper_bound, maximum_checksum_oracle);
+        assert!(projected_upper_bound > MAX_STATE_FILE_BYTES);
+
+        let failure = encode_disk_slot(&state)
+            .expect_err("all-maxima composite must be rejected before slot publication");
+        let PersistenceFailure::Oversized { actual, maximum } = failure else {
+            panic!("all-maxima composite must fail with physical Oversized evidence");
+        };
+        assert_eq!(maximum, MAX_STATE_FILE_BYTES);
+        assert!(actual > MAX_STATE_FILE_BYTES);
+        assert!(actual <= projected_upper_bound);
     }
 
     #[test]
