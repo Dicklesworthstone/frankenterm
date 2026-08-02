@@ -1112,7 +1112,8 @@ pub struct Config {
     #[dynamic(default = "default_true")]
     pub unzoom_on_switch_pane: bool,
 
-    #[dynamic(default = "default_max_fps")]
+    /// Maximum timer-backed repaint rate. Valid values are 1 through 1,000.
+    #[dynamic(default = "default_max_fps", validate = "validate_max_fps")]
     pub max_fps: u64,
 
     #[dynamic(default = "default_shape_cache_size")]
@@ -2362,6 +2363,37 @@ fn validate_click_interval_ms(value: &u64) -> Result<(), String> {
     }
 }
 
+/// Lowest supported repaint-rate limit.
+pub const MIN_MAX_FPS: u64 = 1;
+
+/// Highest supported repaint-rate limit.
+///
+/// Timer-backed window implementations use millisecond resolution. Limiting
+/// the configured rate to 1,000 keeps their interval strictly positive rather
+/// than turning throttling into a zero-duration reschedule loop.
+pub const MAX_MAX_FPS: u64 = 1_000;
+
+fn validate_max_fps(value: &u64) -> Result<(), String> {
+    if (MIN_MAX_FPS..=MAX_MAX_FPS).contains(value) {
+        Ok(())
+    } else {
+        Err(format!(
+            "max_fps must be in {MIN_MAX_FPS}..={MAX_MAX_FPS}, got {value}"
+        ))
+    }
+}
+
+/// Convert a configured repaint-rate limit into a nonzero timer interval.
+///
+/// Dynamic configuration rejects values outside [`MIN_MAX_FPS`] through
+/// [`MAX_MAX_FPS`]. The clamp is intentional defense in depth for internal
+/// callers that construct or mutate [`Config`] directly.
+#[must_use]
+pub fn frame_interval_for_max_fps(max_fps: u64) -> Duration {
+    let bounded = max_fps.clamp(MIN_MAX_FPS, MAX_MAX_FPS);
+    Duration::from_millis(1_000 / bounded)
+}
+
 fn default_initial_rows() -> u16 {
     24
 }
@@ -3207,6 +3239,43 @@ mod tests {
         assert!(validate_click_interval_ms(&1).is_ok());
     }
 
+    #[test]
+    fn validate_max_fps_accepts_exact_supported_boundaries() {
+        assert!(validate_max_fps(&MIN_MAX_FPS).is_ok());
+        assert!(validate_max_fps(&default_max_fps()).is_ok());
+        assert!(validate_max_fps(&MAX_MAX_FPS).is_ok());
+    }
+
+    #[test]
+    fn validate_max_fps_rejects_zero_and_upper_bound_plus_one() {
+        assert!(validate_max_fps(&0).is_err());
+        assert!(validate_max_fps(&(MAX_MAX_FPS + 1)).is_err());
+    }
+
+    #[test]
+    fn frame_interval_is_nonzero_for_valid_and_defensive_inputs() {
+        assert_eq!(
+            frame_interval_for_max_fps(0),
+            Duration::from_millis(1_000)
+        );
+        assert_eq!(
+            frame_interval_for_max_fps(MIN_MAX_FPS),
+            Duration::from_millis(1_000)
+        );
+        assert_eq!(
+            frame_interval_for_max_fps(default_max_fps()),
+            Duration::from_millis(16)
+        );
+        assert_eq!(
+            frame_interval_for_max_fps(MAX_MAX_FPS),
+            Duration::from_millis(1)
+        );
+        assert_eq!(
+            frame_interval_for_max_fps(MAX_MAX_FPS + 1),
+            Duration::from_millis(1)
+        );
+    }
+
     // ── default_hyperlink_rules ────────────────────────────────
 
     #[test]
@@ -3527,6 +3596,29 @@ mod tests {
             Config::from_dynamic(&Value::Object(obj.into()), FromDynamicOptions::default())
                 .expect("click_interval_ms override should parse");
         assert_eq!(config.click_interval_ms, 1_500);
+    }
+
+    #[test]
+    fn config_from_dynamic_rejects_zero_max_fps() {
+        let mut obj = std::collections::BTreeMap::new();
+        obj.insert(Value::String("max_fps".into()), Value::U64(0));
+        assert!(
+            Config::from_dynamic(&Value::Object(obj.into()), FromDynamicOptions::default())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn config_from_dynamic_rejects_max_fps_above_timer_resolution() {
+        let mut obj = std::collections::BTreeMap::new();
+        obj.insert(
+            Value::String("max_fps".into()),
+            Value::U64(MAX_MAX_FPS + 1),
+        );
+        assert!(
+            Config::from_dynamic(&Value::Object(obj.into()), FromDynamicOptions::default())
+                .is_err()
+        );
     }
 
     #[test]

@@ -446,7 +446,7 @@ impl XWindowInner {
                 let window_id = self.window_id;
                 let max_fps = self.config.max_fps;
                 promise::spawn::spawn(async move {
-                    promise::spawn::sleep(std::time::Duration::from_millis(1000 / max_fps)).await;
+                    promise::spawn::sleep(config::frame_interval_for_max_fps(max_fps)).await;
                     XConnection::with_window_inner(window_id, move |inner| {
                         inner.paint_throttled = false;
                         if inner.invalidated {

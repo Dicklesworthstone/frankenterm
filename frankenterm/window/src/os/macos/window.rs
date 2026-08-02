@@ -3157,7 +3157,7 @@ impl WindowView {
                 let window_id = inner.window_id;
                 let max_fps = inner.config.max_fps;
                 promise::spawn::spawn(async move {
-                    promise::spawn::sleep(std::time::Duration::from_millis(1000 / max_fps)).await;
+                    promise::spawn::sleep(config::frame_interval_for_max_fps(max_fps)).await;
                     Connection::with_window_inner(window_id, move |inner| {
                         if let Some(window_view) = WindowView::get_this(unsafe { &**inner.view }) {
                             let mut state = window_view.inner.borrow_mut();

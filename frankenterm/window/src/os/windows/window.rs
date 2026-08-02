@@ -1706,7 +1706,7 @@ unsafe fn wm_paint(hwnd: HWND, _msg: UINT, _wparam: WPARAM, _lparam: LPARAM) -> 
     let window_id = inner.hwnd;
     let max_fps = inner.config.max_fps;
     promise::spawn::spawn(async move {
-        promise::spawn::sleep(std::time::Duration::from_millis(1000 / max_fps as u64)).await;
+        promise::spawn::sleep(config::frame_interval_for_max_fps(max_fps)).await;
         Connection::with_window_inner(window_id, move |inner| {
             inner.paint_throttled = false;
             if inner.invalidated {

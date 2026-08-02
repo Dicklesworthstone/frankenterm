@@ -795,7 +795,7 @@ impl GlyphCache {
             block_glyphs: AHashMap::new(),
             cursor_glyphs: AHashMap::new(),
             color: AHashMap::new(),
-            min_frame_duration: Duration::from_millis(1000 / fonts.config().max_fps as u64),
+            min_frame_duration: config::frame_interval_for_max_fps(fonts.config().max_fps),
             last_synced_version: 0,
         })
     }
@@ -828,7 +828,7 @@ impl GlyphCache {
             block_glyphs: AHashMap::new(),
             cursor_glyphs: AHashMap::new(),
             color: AHashMap::new(),
-            min_frame_duration: Duration::from_millis(1000 / fonts.config().max_fps as u64),
+            min_frame_duration: config::frame_interval_for_max_fps(fonts.config().max_fps),
             last_synced_version: 0,
         })
     }
