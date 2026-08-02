@@ -1096,6 +1096,11 @@ pub enum PduBodyDisposition {
 
 /// Result of one codec-owned header-plus-body async operation.
 #[derive(Debug, PartialEq)]
+// `DecodedPdu` already contains the deliberately inline `Pdu` enum. Boxing the
+// normal branch here would add a heap allocation to every live frame merely to
+// shrink this short-lived selector result; the discard branch exists to avoid
+// allocating abandoned payloads, not to penalize ordinary decoding.
+#[allow(clippy::large_enum_variant)]
 pub enum AsyncPduDecode {
     Decoded(DecodedPdu),
     Discarded {
