@@ -102,7 +102,8 @@ Direct `rch ... cargo fmt ...` is not a substitute: RCH classifies that command
 as light and rejects it when remote execution is required. The formatting
 wrapper is a composite proof. Its retained outer RCH invocation supplies the
 full-SHA clean/no-overlay source identity and worker/exit evidence; the remote
-test supplies toolchain identity, positive and negative formatter canaries, and
+test supplies toolchain identity, byte-exact reproduce/rewrite formatter
+canaries plus a diagnostic-error canary, and
 the workspace-wide `cargo fmt --all -- --check`. RCH clean mirrors do not
 contain `.git`, so the
 environment SHA is only a consistency label and must never be cited without

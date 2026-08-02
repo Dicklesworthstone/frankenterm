@@ -67,13 +67,14 @@ fn workspace_formatting_is_clean_under_rch_source_contract() {
         "fn main() {\n    println!(\"formatted canary\");\n}\n",
         "already-formatted canary",
     );
-    assert_rejected_rustfmt_stdin(
+    assert_rewritten_rustfmt_stdin(
         &repo_root,
         &rustfmt,
         "fn main(){println!(\"unformatted canary\");}\n",
+        "fn main() {\n    println!(\"unformatted canary\");\n}\n",
         "valid but unformatted canary",
     );
-    assert_rejected_rustfmt_stdin(
+    assert_malformed_rustfmt_stdin_fails(
         &repo_root,
         &rustfmt,
         "fn main( {\n",
@@ -86,7 +87,8 @@ fn workspace_formatting_is_clean_under_rch_source_contract() {
         .args(["fmt", "--all", "--", "--check"])
         .output()
         .unwrap_or_else(|err| panic!("spawn workspace cargo fmt --check: {err}"));
-    assert_command_success("cargo fmt --all -- --check", output);
+    let output = assert_command_success("cargo fmt --all -- --check", output);
+    assert_formatter_silent("cargo fmt --all -- --check", &output);
     println!(
         "workspace formatting check passed for requested revision {requested_sha}; exact source \
          identity remains bound by the retained RCH command"
@@ -145,9 +147,41 @@ fn assert_accepted_rustfmt_stdin(
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+    assert_eq!(
+        output.stdout,
+        source.as_bytes(),
+        "rustfmt changed {label}; stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
-fn assert_rejected_rustfmt_stdin(
+fn assert_rewritten_rustfmt_stdin(
+    repo_root: &Path,
+    rustfmt: &OsStr,
+    source: &str,
+    expected: &str,
+    label: &str,
+) {
+    assert_ne!(source, expected, "{label} must require a formatter rewrite");
+    let output = rustfmt_stdin_output(repo_root, rustfmt, source, label);
+    assert!(
+        output.status.success(),
+        "rustfmt failed to rewrite {label}; status={} stdout={} stderr={}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        output.stdout,
+        expected.as_bytes(),
+        "rustfmt did not produce the canonical rewrite for {label}; stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn assert_malformed_rustfmt_stdin_fails(
     repo_root: &Path,
     rustfmt: &OsStr,
     source: &str,
@@ -162,6 +196,16 @@ fn assert_rejected_rustfmt_stdin(
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+    let stderr = String::from_utf8(output.stderr)
+        .unwrap_or_else(|err| panic!("rustfmt {label} diagnostic must be UTF-8: {err}"));
+    assert!(
+        stderr.to_ascii_lowercase().contains("error"),
+        "rustfmt rejected {label} without a stable error marker: {stderr:?}"
+    );
+    assert!(
+        !stderr.contains("panicked") && !stderr.contains("thread '"),
+        "rustfmt crashed instead of diagnosing {label}: {stderr:?}"
+    );
 }
 
 fn rustfmt_stdin_output(
@@ -172,7 +216,7 @@ fn rustfmt_stdin_output(
 ) -> Output {
     let mut child = Command::new(rustfmt)
         .current_dir(repo_root)
-        .args(["--edition", "2024", "--check"])
+        .args(["--edition", "2024", "--emit", "stdout"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -198,4 +242,14 @@ fn assert_command_success(label: &str, output: Output) -> Output {
         String::from_utf8_lossy(&output.stderr)
     );
     output
+}
+
+fn assert_formatter_silent(label: &str, output: &Output) {
+    for (stream_name, bytes) in [("stdout", &output.stdout), ("stderr", &output.stderr)] {
+        assert!(
+            bytes.is_empty(),
+            "{label} emitted unexpected {stream_name} despite success: {}",
+            String::from_utf8_lossy(bytes)
+        );
+    }
 }

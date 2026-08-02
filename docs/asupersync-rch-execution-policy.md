@@ -68,10 +68,16 @@ RCH clean mirrors intentionally omit `.git`; inside the mirror,
 `FT_FORMAT_PROOF_SHA` is a consistency label, not an independent Git
 attestation. The test validates that label and the explicit source-mode
 contract, records nonempty and correctly prefixed Cargo, rustc, and rustfmt
-identities, requires rustfmt to accept an already-formatted stdin canary and
-reject valid-but-unformatted and malformed canaries with exit code 1, binds the
-nested Cargo formatter to that same rustfmt binary, and runs
-`cargo fmt --all -- --check` over the complete workspace.
+identities, requires rustfmt to reproduce an already-formatted stdin canary
+byte-for-byte, rewrite a valid-unformatted canary to exact canonical bytes, and
+reject malformed input with exit code 1 and a non-crash error diagnostic. This
+output oracle is
+deliberate: retained job `j-29958204528001099` showed that the pinned nightly
+printed a correct stdin `--check` diff while returning exit zero. The wrapper
+also binds the nested Cargo formatter to that same rustfmt binary and runs
+`cargo fmt --all -- --check` over the complete workspace. The wrapper rejects
+any stdout or stderr from that nested command even if its status is zero; a
+clean workspace formatting check must be silent.
 
 Exit zero is necessary but not sufficient because libtest succeeds when an
 exact filter matches zero tests. The retained transcript must also contain
@@ -87,7 +93,8 @@ workers with the same full SHA and distinct target directories, retaining both
 complete logs. Two runs on one worker, an unconfirmed scheduler-selected
 worker, or one passing run are not two-worker proof. Any missing/wrong worker,
 SHA or source-mode mismatch, RCH admission failure, local fallback, missing
-rustfmt, accepted negative canary, or formatting failure blocks the claim.
+rustfmt, reproduce/rewrite/error canary mismatch, or formatting failure blocks
+the claim.
 
 The current repository contract deliberately accepts 40-hex Git object names.
 It does not claim generic Git SHA-256 support. RCH's clean-overlay initiation
