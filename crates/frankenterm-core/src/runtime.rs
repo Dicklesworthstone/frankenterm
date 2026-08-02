@@ -72,7 +72,7 @@ use crate::resize_scheduler::{ResizeSchedulerDebugSnapshot, ResizeStalledTransac
 use crate::runtime_async::{RwLock, mpsc, task::JoinHandle, watch};
 use crate::scrollback_tiers::ScrollbackTierSnapshot;
 #[cfg(all(feature = "vendored", unix))]
-use crate::sharding::decode_sharded_pane_id;
+use crate::sharding::{ShardId, decode_sharded_pane_id};
 use crate::spsc_ring_buffer::{SpscConsumer, SpscProducer, channel as spsc_channel};
 #[cfg(feature = "native-wezterm")]
 use crate::storage::PaneRecord;
@@ -297,10 +297,11 @@ where
 /// RAII-guarded holder for the capture task's per-pane vendored streaming
 /// subtasks.
 ///
-/// The HashMap stores one `JoinHandle<()>` per observed pane while the
-/// capture loop is routing work via the vendored (mux-socket) fast path.
+/// The HashMap stores one generation- and route-bound `StreamingTask` per
+/// observed pane while the capture loop is routing work via the vendored
+/// (mux-socket) fast path.
 /// On a clean shutdown the capture loop explicitly drains this map and
-/// aborts each handle (see the `for (_pane_id, handle) in drain()` block at
+/// aborts each handle (see the `for (_pane_id, task) in drain()` block at
 /// the bottom of `spawn_capture_task`). However, if the capture future
 /// itself is dropped mid-flight — because a parent scope cancels the
 /// runtime JoinHandle, because an outer `select!` races to another branch,
@@ -315,7 +316,78 @@ where
 /// the capture future is dismantled.
 #[cfg(all(feature = "vendored", unix))]
 struct StreamingTasks {
-    tasks: HashMap<u64, JoinHandle<()>>,
+    tasks: HashMap<u64, StreamingTask>,
+}
+
+#[cfg(all(feature = "vendored", unix))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StreamingSubscriptionIdentity {
+    global_pane_id: u64,
+    local_pane_id: u64,
+    socket_shard: ShardId,
+    socket_path: PathBuf,
+    generation: u32,
+}
+
+/// Identifies one spawned task for exit reconciliation only.
+///
+/// This token does not stamp `CaptureEvent` values that have already entered
+/// the shared capture queues.  A generation/source-epoch envelope must reach
+/// persistence before queued old-generation output can be rejected there.
+#[cfg(all(feature = "vendored", unix))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StreamingTaskToken(u64);
+
+#[cfg(all(feature = "vendored", unix))]
+struct StreamingTask {
+    identity: StreamingSubscriptionIdentity,
+    token: StreamingTaskToken,
+    handle: JoinHandle<()>,
+}
+
+#[cfg(all(feature = "vendored", unix))]
+impl StreamingTask {
+    fn matches_exit(&self, exit: &StreamingTaskExit) -> bool {
+        streaming_exit_matches_active(&self.identity, self.token, exit)
+    }
+}
+
+#[cfg(all(feature = "vendored", unix))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamingTaskReconcileAction {
+    Keep,
+    Remove,
+    Replace,
+}
+
+#[cfg(all(feature = "vendored", unix))]
+// The socket route table is immutable for the lifetime of the capture task,
+// and global pane id deterministically selects its shard-local route. Comparing
+// global id plus PaneEntry generation therefore avoids cloning PathBuf routes
+// for every active pane on every discovery tick.
+fn streaming_task_reconcile_action(
+    active: &StreamingSubscriptionIdentity,
+    desired: Option<(u64, u32)>,
+) -> StreamingTaskReconcileAction {
+    match desired {
+        Some((global_pane_id, generation)) => {
+            if global_pane_id == active.global_pane_id && generation == active.generation {
+                StreamingTaskReconcileAction::Keep
+            } else {
+                StreamingTaskReconcileAction::Replace
+            }
+        }
+        None => StreamingTaskReconcileAction::Remove,
+    }
+}
+
+#[cfg(all(feature = "vendored", unix))]
+fn streaming_exit_matches_active(
+    active_identity: &StreamingSubscriptionIdentity,
+    active_token: StreamingTaskToken,
+    exit: &StreamingTaskExit,
+) -> bool {
+    active_token == exit.token && active_identity == &exit.identity
 }
 
 #[cfg(all(feature = "vendored", unix))]
@@ -329,7 +401,7 @@ impl StreamingTasks {
 
 #[cfg(all(feature = "vendored", unix))]
 impl std::ops::Deref for StreamingTasks {
-    type Target = HashMap<u64, JoinHandle<()>>;
+    type Target = HashMap<u64, StreamingTask>;
 
     fn deref(&self) -> &Self::Target {
         &self.tasks
@@ -346,8 +418,8 @@ impl std::ops::DerefMut for StreamingTasks {
 #[cfg(all(feature = "vendored", unix))]
 impl Drop for StreamingTasks {
     fn drop(&mut self) {
-        for (_pane_id, handle) in self.tasks.drain() {
-            handle.abort();
+        for (_pane_id, task) in self.tasks.drain() {
+            task.handle.abort();
         }
     }
 }
@@ -383,12 +455,65 @@ async fn send_runtime_channel<T>(
 }
 
 #[cfg(all(feature = "vendored", unix))]
+fn remap_vendored_streaming_delta(
+    identity: &StreamingSubscriptionIdentity,
+    delta: PaneDelta,
+) -> std::result::Result<PaneDelta, String> {
+    let actual_local_pane_id = match &delta {
+        PaneDelta::Output { pane_id, .. }
+        | PaneDelta::Gap { pane_id, .. }
+        | PaneDelta::Ended { pane_id, .. } => *pane_id,
+    };
+    if actual_local_pane_id != identity.local_pane_id {
+        return Err(format!(
+            "subscription pane identity mismatch: global pane {} generation {} shard {} expected local pane {} but received local pane {}",
+            identity.global_pane_id,
+            identity.generation,
+            identity.socket_shard.0,
+            identity.local_pane_id,
+            actual_local_pane_id,
+        ));
+    }
+
+    Ok(match delta {
+        PaneDelta::Output {
+            seqno,
+            delta_text,
+            title,
+            dirty_range_count,
+            dirty_row_count,
+            ..
+        } => PaneDelta::Output {
+            pane_id: identity.global_pane_id,
+            seqno,
+            delta_text,
+            title,
+            dirty_range_count,
+            dirty_row_count,
+        },
+        PaneDelta::Gap { reason, .. } => PaneDelta::Gap {
+            pane_id: identity.global_pane_id,
+            reason,
+        },
+        PaneDelta::Ended { reason, .. } => PaneDelta::Ended {
+            pane_id: identity.global_pane_id,
+            reason,
+        },
+    })
+}
+
+#[cfg(all(feature = "vendored", unix))]
 async fn forward_vendored_streaming_delta(
     runtime_cx: &RuntimeLoopCx,
     bridge: &mut StreamingBridge,
     capture_tx: &mpsc::Sender<CaptureEvent>,
+    identity: &StreamingSubscriptionIdentity,
     delta: PaneDelta,
 ) -> Option<String> {
+    let delta = match remap_vendored_streaming_delta(identity, delta) {
+        Ok(delta) => delta,
+        Err(reason) => return Some(reason),
+    };
     let exit_reason = match &delta {
         PaneDelta::Ended { reason, .. } => Some(reason.clone()),
         _ => None,
@@ -645,8 +770,23 @@ impl Default for RuntimeConfig {
 #[cfg(all(feature = "vendored", unix))]
 #[derive(Debug)]
 struct StreamingTaskExit {
-    pane_id: u64,
+    identity: StreamingSubscriptionIdentity,
+    token: StreamingTaskToken,
     reason: String,
+}
+
+#[cfg(all(feature = "vendored", unix))]
+#[derive(Clone)]
+struct ObservedStreamingPane {
+    info: PaneInfo,
+    generation: u32,
+}
+
+#[cfg(all(feature = "vendored", unix))]
+fn allocate_streaming_task_token(next: &mut u64) -> Option<StreamingTaskToken> {
+    let token = StreamingTaskToken(*next);
+    *next = (*next).checked_add(1)?;
+    Some(token)
 }
 
 #[cfg(all(feature = "vendored", unix))]
@@ -663,23 +803,35 @@ fn streaming_subscription_config(
 }
 
 #[cfg(all(feature = "vendored", unix))]
-fn vendored_streaming_socket_for_pane(
+fn vendored_streaming_identity_for_pane(
     socket_paths: &[PathBuf],
-    pane_id: u64,
-) -> Option<(u64, PathBuf)> {
+    global_pane_id: u64,
+    generation: u32,
+) -> Option<StreamingSubscriptionIdentity> {
     if socket_paths.is_empty() {
         return None;
     }
 
     if socket_paths.len() == 1 {
-        return Some((pane_id, socket_paths[0].clone()));
+        return Some(StreamingSubscriptionIdentity {
+            global_pane_id,
+            local_pane_id: global_pane_id,
+            socket_shard: ShardId(0),
+            socket_path: socket_paths[0].clone(),
+            generation,
+        });
     }
 
-    let (shard_id, local_pane_id) = decode_sharded_pane_id(pane_id);
-    socket_paths
-        .get(shard_id.0)
-        .cloned()
-        .map(|socket_path| (local_pane_id, socket_path))
+    let (shard_id, local_pane_id) = decode_sharded_pane_id(global_pane_id);
+    socket_paths.get(shard_id.0).cloned().map(|socket_path| {
+        StreamingSubscriptionIdentity {
+            global_pane_id,
+            local_pane_id,
+            socket_shard: shard_id,
+            socket_path,
+            generation,
+        }
+    })
 }
 
 #[cfg(all(feature = "vendored", unix))]
@@ -3166,7 +3318,9 @@ impl ObservationRuntime {
             #[cfg(all(feature = "vendored", unix))]
             let mut streaming_tasks: StreamingTasks = StreamingTasks::new();
             #[cfg(all(feature = "vendored", unix))]
-            let mut observed_panes_cache: HashMap<u64, PaneInfo> = HashMap::new();
+            let mut observed_panes_cache: HashMap<u64, ObservedStreamingPane> = HashMap::new();
+            #[cfg(all(feature = "vendored", unix))]
+            let mut next_stream_task_token = 1_u64;
 
             // Sync tailers periodically with discovery interval.
             // Keep the first sync immediate to preserve prior interval behavior.
@@ -3184,18 +3338,43 @@ impl ObservationRuntime {
 
                 #[cfg(all(feature = "vendored", unix))]
                 while let Ok(exit) = stream_exit_rx.try_recv() {
-                    streaming_tasks.remove(&exit.pane_id);
-                    if observed_panes_cache.contains_key(&exit.pane_id)
+                    let pane_id = exit.identity.global_pane_id;
+                    let is_current_exit = streaming_tasks
+                        .get(&pane_id)
+                        .is_some_and(|task| task.matches_exit(&exit));
+                    if !is_current_exit {
+                        debug!(
+                            pane_id,
+                            generation = exit.identity.generation,
+                            local_pane_id = exit.identity.local_pane_id,
+                            socket_shard = exit.identity.socket_shard.0,
+                            task_token = exit.token.0,
+                            reason = %exit.reason,
+                            "Ignoring stale vendored streaming task exit"
+                        );
+                        continue;
+                    }
+
+                    streaming_tasks.remove(&pane_id);
+                    if observed_panes_cache.contains_key(&pane_id)
                         && should_record_streaming_fallback(&exit.reason)
                     {
                         warn!(
-                            pane_id = exit.pane_id,
+                            pane_id,
+                            generation = exit.identity.generation,
+                            local_pane_id = exit.identity.local_pane_id,
+                            socket_shard = exit.identity.socket_shard.0,
+                            task_token = exit.token.0,
                             reason = %exit.reason,
                             "Vendored pane streaming ended; falling back to polling"
                         );
                     } else {
                         debug!(
-                            pane_id = exit.pane_id,
+                            pane_id,
+                            generation = exit.identity.generation,
+                            local_pane_id = exit.identity.local_pane_id,
+                            socket_shard = exit.identity.socket_shard.0,
+                            task_token = exit.token.0,
                             reason = %exit.reason,
                             "Vendored pane streaming ended"
                         );
@@ -3204,7 +3383,7 @@ impl ObservationRuntime {
                     let polling_observed_panes: HashMap<u64, PaneInfo> = observed_panes_cache
                         .iter()
                         .filter(|(pane_id, _)| !streaming_tasks.contains_key(*pane_id))
-                        .map(|(pane_id, pane)| (*pane_id, pane.clone()))
+                        .map(|(pane_id, pane)| (*pane_id, pane.info.clone()))
                         .collect();
                     supervisor.sync_tailers(&polling_observed_panes);
                 }
@@ -3245,7 +3424,33 @@ impl ObservationRuntime {
                         }
                     }
 
-                    // Get current observed panes from registry
+                    // Get current observed panes from registry. The vendored
+                    // streaming view retains the PaneEntry generation from the
+                    // same read lock as its PaneInfo, so task reconciliation
+                    // cannot combine metadata from one generation with the
+                    // identity of another.
+                    #[cfg(all(feature = "vendored", unix))]
+                    let observed_streaming_panes: HashMap<u64, ObservedStreamingPane> = {
+                        let reg = registry.read().await;
+                        let observed_ids = reg.observed_pane_ids();
+                        let mut streaming_panes = HashMap::with_capacity(observed_ids.len());
+                        for pane_id in observed_ids {
+                            let Some(entry) = reg.get_entry(pane_id) else {
+                                continue;
+                            };
+                            streaming_panes.insert(
+                                pane_id,
+                                ObservedStreamingPane {
+                                    info: entry.info.clone(),
+                                    generation: entry.generation,
+                                },
+                            );
+                        }
+                        streaming_panes
+                    };
+                    #[cfg(all(feature = "vendored", unix))]
+                    let observed_pane_count = observed_streaming_panes.len();
+                    #[cfg(not(all(feature = "vendored", unix)))]
                     let observed_panes: HashMap<u64, PaneInfo> = {
                         let reg = registry.read().await;
                         reg.observed_pane_ids()
@@ -3253,60 +3458,98 @@ impl ObservationRuntime {
                             .filter_map(|id| reg.get_entry(id).map(|e| (id, e.info.clone())))
                             .collect()
                     };
+                    #[cfg(not(all(feature = "vendored", unix)))]
+                    let observed_pane_count = observed_panes.len();
 
                     #[cfg(all(feature = "vendored", unix))]
                     {
-                        observed_panes_cache = observed_panes.clone();
+                        observed_panes_cache = observed_streaming_panes;
 
-                        let departed_streams: Vec<u64> = streaming_tasks
-                            .keys()
-                            .filter(|pane_id| !observed_panes_cache.contains_key(*pane_id))
-                            .copied()
+                        let obsolete_streams: Vec<(u64, bool)> = streaming_tasks
+                            .iter()
+                            .filter_map(|(pane_id, task)| {
+                                let desired_identity = observed_panes_cache
+                                    .get(pane_id)
+                                    .map(|pane| (*pane_id, pane.generation));
+                                match streaming_task_reconcile_action(
+                                    &task.identity,
+                                    desired_identity,
+                                ) {
+                                    StreamingTaskReconcileAction::Keep => None,
+                                    StreamingTaskReconcileAction::Remove => {
+                                        Some((*pane_id, false))
+                                    }
+                                    StreamingTaskReconcileAction::Replace => {
+                                        Some((*pane_id, true))
+                                    }
+                                }
+                            })
                             .collect();
-                        for pane_id in departed_streams {
-                            if let Some(handle) = streaming_tasks.remove(&pane_id) {
-                                handle.abort();
-                                debug!(pane_id, "Cancelled vendored streaming for departed pane");
+                        for (pane_id, has_replacement) in obsolete_streams {
+                            if let Some(task) = streaming_tasks.remove(&pane_id) {
+                                task.handle.abort();
+                                debug!(
+                                    pane_id,
+                                    generation = task.identity.generation,
+                                    local_pane_id = task.identity.local_pane_id,
+                                    socket_shard = task.identity.socket_shard.0,
+                                    task_token = task.token.0,
+                                    has_replacement,
+                                    "Cancelled obsolete vendored streaming task"
+                                );
                             }
                         }
 
                         if let Some(subscription_config) = vendored_subscription_config.clone() {
-                            for &pane_id in observed_panes_cache.keys() {
+                            for (&pane_id, observed_pane) in &observed_panes_cache {
                                 if streaming_tasks.contains_key(&pane_id) {
                                     continue;
                                 }
 
-                                let Some((subscription_pane_id, socket_path)) =
-                                    vendored_streaming_socket_for_pane(
-                                        &vendored_mux_socket_paths,
-                                        pane_id,
-                                    )
+                                let Some(identity) = vendored_streaming_identity_for_pane(
+                                    &vendored_mux_socket_paths,
+                                    pane_id,
+                                    observed_pane.generation,
+                                )
                                 else {
                                     continue;
                                 };
 
-                                if !socket_path.exists() {
+                                if !identity.socket_path.exists() {
                                     debug!(
                                         pane_id,
-                                        path = %socket_path.display(),
+                                        generation = identity.generation,
+                                        local_pane_id = identity.local_pane_id,
+                                        socket_shard = identity.socket_shard.0,
+                                        path = %identity.socket_path.display(),
                                         "Skipping vendored pane streaming because mux socket is missing"
                                     );
                                     continue;
                                 }
 
+                                let Some(token) =
+                                    allocate_streaming_task_token(&mut next_stream_task_token)
+                                else {
+                                    error!(
+                                        pane_id,
+                                        generation = identity.generation,
+                                        "Vendored streaming task token space exhausted; refusing to start an unidentifiable task"
+                                    );
+                                    continue;
+                                };
+
                                 let capture_tx = capture_tx.clone();
                                 let stream_exit_tx = stream_exit_tx.clone();
                                 let shutdown_flag = Arc::clone(&shutdown_flag);
                                 let subscription_config = subscription_config.clone();
-                                let socket_path_for_task = socket_path.clone();
+                                let identity_for_task = identity.clone();
+                                let identity_for_exit = identity.clone();
                                 let stream_task_cx = loop_cx.clone();
                                 let handle = spawn_runtime_task(
                                     &stream_task_cx,
                                     move |stream_task_cx| async move {
                                         let exit_reason = Box::pin(run_vendored_streaming_capture(
-                                            pane_id,
-                                            subscription_pane_id,
-                                            socket_path_for_task,
+                                            identity_for_task,
                                             vendored_mux_compression,
                                             subscription_config,
                                             capture_tx,
@@ -3323,21 +3566,29 @@ impl ObservationRuntime {
                                             &stream_task_cx,
                                             &stream_exit_tx,
                                             StreamingTaskExit {
-                                                pane_id,
+                                                identity: identity_for_exit,
+                                                token,
                                                 reason: final_reason,
                                             },
                                         )
                                         .await;
                                     },
                                 );
-                                streaming_tasks.insert(pane_id, handle);
+                                streaming_tasks.insert(
+                                    pane_id,
+                                    StreamingTask {
+                                        identity,
+                                        token,
+                                        handle,
+                                    },
+                                );
                             }
                         }
 
                         let polling_observed_panes: HashMap<u64, PaneInfo> = observed_panes_cache
                             .iter()
                             .filter(|(pane_id, _)| !streaming_tasks.contains_key(*pane_id))
-                            .map(|(pane_id, pane)| (*pane_id, pane.clone()))
+                            .map(|(pane_id, pane)| (*pane_id, pane.info.clone()))
                             .collect();
                         supervisor.sync_tailers(&polling_observed_panes);
                     }
@@ -3381,7 +3632,7 @@ impl ObservationRuntime {
 
                     debug!(
                         active_tailers = supervisor.active_count(),
-                        observed_panes = observed_panes.len(),
+                        observed_panes = observed_pane_count,
                         "Tailer sync tick"
                     );
                     continue;
@@ -3415,8 +3666,8 @@ impl ObservationRuntime {
             }
 
             #[cfg(all(feature = "vendored", unix))]
-            for (_pane_id, handle) in streaming_tasks.drain() {
-                handle.abort();
+            for (_pane_id, task) in streaming_tasks.drain() {
+                task.handle.abort();
             }
 
             // Graceful shutdown of all tailers
@@ -4291,9 +4542,7 @@ async fn emit_native_output_gap(
 
 #[cfg(all(feature = "vendored", unix))]
 async fn run_vendored_streaming_capture(
-    pane_id: u64,
-    subscription_pane_id: u64,
-    socket_path: PathBuf,
+    identity: StreamingSubscriptionIdentity,
     compression_mode: crate::config::VendoredCompressionMode,
     subscription_config: SubscriptionConfig,
     capture_tx: mpsc::Sender<CaptureEvent>,
@@ -4301,7 +4550,8 @@ async fn run_vendored_streaming_capture(
     let runtime_cx = runtime_loop_cx();
 
     let mut bridge = StreamingBridge::new();
-    let mut client_config = DirectMuxClientConfig::default().with_socket_path(socket_path.clone());
+    let mut client_config =
+        DirectMuxClientConfig::default().with_socket_path(identity.socket_path.clone());
     client_config.compression_mode = compression_mode;
 
     let client =
@@ -4314,25 +4564,32 @@ async fn run_vendored_streaming_capture(
         };
 
     info!(
-        pane_id,
-        local_pane_id = subscription_pane_id,
-        socket = %socket_path.display(),
+        pane_id = identity.global_pane_id,
+        local_pane_id = identity.local_pane_id,
+        socket_shard = identity.socket_shard.0,
+        generation = identity.generation,
+        socket = %identity.socket_path.display(),
         "Started vendored pane streaming subscription"
     );
 
     let mut subscription = subscribe_pane_output_with_inherited_cx(
         &runtime_cx,
         client,
-        subscription_pane_id,
+        identity.local_pane_id,
         subscription_config.clone(),
     );
 
     let exit_reason = loop {
         match subscription.next_with_cx(&runtime_cx).await {
             Some(delta) => {
-                if let Some(reason) =
-                    forward_vendored_streaming_delta(&runtime_cx, &mut bridge, &capture_tx, delta)
-                        .await
+                if let Some(reason) = forward_vendored_streaming_delta(
+                    &runtime_cx,
+                    &mut bridge,
+                    &capture_tx,
+                    &identity,
+                    delta,
+                )
+                .await
                 {
                     break reason;
                 }
@@ -6408,17 +6665,35 @@ mod tests {
     }
 
     #[cfg(all(feature = "vendored", unix))]
+    fn test_streaming_identity(
+        global_pane_id: u64,
+        local_pane_id: u64,
+        socket_shard: usize,
+        generation: u32,
+    ) -> StreamingSubscriptionIdentity {
+        StreamingSubscriptionIdentity {
+            global_pane_id,
+            local_pane_id,
+            socket_shard: ShardId(socket_shard),
+            socket_path: PathBuf::from(format!("/tmp/wa-{socket_shard}.sock")),
+            generation,
+        }
+    }
+
+    #[cfg(all(feature = "vendored", unix))]
     #[test]
     fn forward_vendored_streaming_delta_emits_capture_event() {
         run_async_test(async {
             let (capture_tx, mut capture_rx) = mpsc::channel(4);
             let loop_cx = runtime_loop_cx();
             let mut bridge = StreamingBridge::new();
+            let identity = test_streaming_identity(17, 17, 0, 0);
 
             let exit_reason = forward_vendored_streaming_delta(
                 &loop_cx,
                 &mut bridge,
                 &capture_tx,
+                &identity,
                 PaneDelta::Output {
                     pane_id: 17,
                     seqno: 1,
@@ -6448,11 +6723,13 @@ mod tests {
             let (capture_tx, mut capture_rx) = mpsc::channel(4);
             let loop_cx = runtime_loop_cx();
             let mut bridge = StreamingBridge::new();
+            let identity = test_streaming_identity(21, 21, 0, 0);
 
             let output_reason = forward_vendored_streaming_delta(
                 &loop_cx,
                 &mut bridge,
                 &capture_tx,
+                &identity,
                 PaneDelta::Output {
                     pane_id: 21,
                     seqno: 1,
@@ -6470,6 +6747,7 @@ mod tests {
                 &loop_cx,
                 &mut bridge,
                 &capture_tx,
+                &identity,
                 PaneDelta::Ended {
                     pane_id: 21,
                     reason: "mux socket disconnected".to_string(),
@@ -6500,10 +6778,12 @@ mod tests {
 
             let loop_cx = runtime_loop_cx();
             let mut bridge = StreamingBridge::new();
+            let identity = test_streaming_identity(9, 9, 0, 0);
             let exit_reason = forward_vendored_streaming_delta(
                 &loop_cx,
                 &mut bridge,
                 &capture_tx,
+                &identity,
                 PaneDelta::Output {
                     pane_id: 9,
                     seqno: 1,
@@ -9689,40 +9969,238 @@ mod tests {
 
     #[cfg(all(feature = "vendored", unix))]
     #[test]
-    fn vendored_streaming_socket_for_single_backend_uses_raw_pane_id() {
+    fn vendored_streaming_identity_for_single_backend_uses_raw_pane_id() {
         let socket_paths = vec![PathBuf::from("/tmp/wa.sock")];
-        let (pane_id, socket_path) =
-            vendored_streaming_socket_for_pane(&socket_paths, 42).expect("single socket");
-        assert_eq!(pane_id, 42);
-        assert_eq!(socket_path, PathBuf::from("/tmp/wa.sock"));
+        let identity = vendored_streaming_identity_for_pane(&socket_paths, 42, 3)
+            .expect("single socket");
+        assert_eq!(identity.global_pane_id, 42);
+        assert_eq!(identity.local_pane_id, 42);
+        assert_eq!(identity.socket_shard, ShardId(0));
+        assert_eq!(identity.socket_path, PathBuf::from("/tmp/wa.sock"));
+        assert_eq!(identity.generation, 3);
     }
 
     #[cfg(all(feature = "vendored", unix))]
     #[test]
-    fn vendored_streaming_socket_for_sharded_backend_decodes_pane_bits() {
+    fn vendored_streaming_identity_for_sharded_backend_decodes_pane_bits() {
         let socket_paths = vec![
             PathBuf::from("/tmp/wa-0.sock"),
             PathBuf::from("/tmp/wa-1.sock"),
         ];
         let global_pane_id =
             crate::sharding::encode_sharded_pane_id(crate::sharding::ShardId(1), 7);
-        let (pane_id, socket_path) =
-            vendored_streaming_socket_for_pane(&socket_paths, global_pane_id)
-                .expect("sharded socket");
-        assert_eq!(pane_id, 7);
-        assert_eq!(socket_path, PathBuf::from("/tmp/wa-1.sock"));
+        let identity = vendored_streaming_identity_for_pane(&socket_paths, global_pane_id, 9)
+            .expect("sharded socket");
+        assert_eq!(identity.global_pane_id, global_pane_id);
+        assert_eq!(identity.local_pane_id, 7);
+        assert_eq!(identity.socket_shard, ShardId(1));
+        assert_eq!(identity.socket_path, PathBuf::from("/tmp/wa-1.sock"));
+        assert_eq!(identity.generation, 9);
     }
 
     #[cfg(all(feature = "vendored", unix))]
     #[test]
-    fn vendored_streaming_socket_for_unknown_shard_returns_none() {
+    fn vendored_streaming_identity_for_unknown_shard_returns_none() {
         let socket_paths = vec![
             PathBuf::from("/tmp/wa-0.sock"),
             PathBuf::from("/tmp/wa-1.sock"),
         ];
         let global_pane_id =
             crate::sharding::encode_sharded_pane_id(crate::sharding::ShardId(3), 9);
-        assert!(vendored_streaming_socket_for_pane(&socket_paths, global_pane_id).is_none());
+        assert!(
+            vendored_streaming_identity_for_pane(&socket_paths, global_pane_id, 0).is_none()
+        );
+    }
+
+    #[cfg(all(feature = "vendored", unix))]
+    #[test]
+    fn vendored_streaming_remaps_equal_local_ids_on_two_shards_for_every_delta_variant() {
+        let socket_paths = vec![
+            PathBuf::from("/tmp/wa-0.sock"),
+            PathBuf::from("/tmp/wa-1.sock"),
+        ];
+        let local_pane_id = 7;
+        let global_zero = crate::sharding::encode_sharded_pane_id(
+            crate::sharding::ShardId(0),
+            local_pane_id,
+        );
+        let global_one = crate::sharding::encode_sharded_pane_id(
+            crate::sharding::ShardId(1),
+            local_pane_id,
+        );
+        let identity_zero =
+            vendored_streaming_identity_for_pane(&socket_paths, global_zero, 2)
+                .expect("shard zero identity");
+        let identity_one = vendored_streaming_identity_for_pane(&socket_paths, global_one, 4)
+            .expect("shard one identity");
+
+        assert_eq!(identity_zero.local_pane_id, identity_one.local_pane_id);
+        assert_ne!(identity_zero.global_pane_id, identity_one.global_pane_id);
+        assert_ne!(identity_zero.socket_shard, identity_one.socket_shard);
+
+        for identity in [&identity_zero, &identity_one] {
+            let output = remap_vendored_streaming_delta(
+                identity,
+                PaneDelta::Output {
+                    pane_id: local_pane_id,
+                    seqno: 11,
+                    delta_text: "delta".to_string(),
+                    title: "shell".to_string(),
+                    dirty_range_count: 2,
+                    dirty_row_count: 3,
+                },
+            )
+            .expect("matching output identity");
+            assert!(matches!(
+                output,
+                PaneDelta::Output {
+                    pane_id,
+                    seqno: 11,
+                    ..
+                } if pane_id == identity.global_pane_id
+            ));
+
+            let gap = remap_vendored_streaming_delta(
+                identity,
+                PaneDelta::Gap {
+                    pane_id: local_pane_id,
+                    reason: "gap".to_string(),
+                },
+            )
+            .expect("matching gap identity");
+            assert!(matches!(
+                gap,
+                PaneDelta::Gap { pane_id, reason }
+                    if pane_id == identity.global_pane_id && reason == "gap"
+            ));
+
+            let ended = remap_vendored_streaming_delta(
+                identity,
+                PaneDelta::Ended {
+                    pane_id: local_pane_id,
+                    reason: "ended".to_string(),
+                },
+            )
+            .expect("matching ended identity");
+            assert!(matches!(
+                ended,
+                PaneDelta::Ended { pane_id, reason }
+                    if pane_id == identity.global_pane_id && reason == "ended"
+            ));
+        }
+    }
+
+    #[cfg(all(feature = "vendored", unix))]
+    #[test]
+    fn vendored_streaming_rejects_mismatched_local_id_before_bridge() {
+        run_async_test(async {
+            let global_pane_id = crate::sharding::encode_sharded_pane_id(ShardId(1), 7);
+            let identity = test_streaming_identity(global_pane_id, 7, 1, 5);
+            for mismatched_delta in [
+                PaneDelta::Gap {
+                    pane_id: 8,
+                    reason: "wrong gap pane".to_string(),
+                },
+                PaneDelta::Ended {
+                    pane_id: 8,
+                    reason: "wrong ended pane".to_string(),
+                },
+            ] {
+                assert!(
+                    remap_vendored_streaming_delta(&identity, mismatched_delta).is_err(),
+                    "every non-output delta variant must fail closed on a local-id mismatch"
+                );
+            }
+
+            let (capture_tx, mut capture_rx) = mpsc::channel(1);
+            let loop_cx = runtime_loop_cx();
+            let mut bridge = StreamingBridge::new();
+
+            let exit_reason = forward_vendored_streaming_delta(
+                &loop_cx,
+                &mut bridge,
+                &capture_tx,
+                &identity,
+                PaneDelta::Output {
+                    pane_id: 8,
+                    seqno: 1,
+                    delta_text: "wrong pane".to_string(),
+                    title: "shell".to_string(),
+                    dirty_range_count: 1,
+                    dirty_row_count: 1,
+                },
+            )
+            .await
+            .expect("mismatch must end subscription");
+
+            assert!(exit_reason.contains("expected local pane 7"));
+            assert!(exit_reason.contains("received local pane 8"));
+            assert_eq!(bridge.events_processed(), 0);
+            assert!(capture_rx.try_recv().is_err());
+        });
+    }
+
+    #[cfg(all(feature = "vendored", unix))]
+    #[test]
+    fn vendored_streaming_generation_change_replaces_task_and_ignores_stale_exit() {
+        let global_pane_id = crate::sharding::encode_sharded_pane_id(ShardId(1), 7);
+        let old_identity = test_streaming_identity(global_pane_id, 7, 1, 4);
+        let replacement_identity = test_streaming_identity(global_pane_id, 7, 1, 5);
+        let old_exit = StreamingTaskExit {
+            identity: old_identity.clone(),
+            token: StreamingTaskToken(41),
+            reason: "old generation ended".to_string(),
+        };
+        let replacement_exit = StreamingTaskExit {
+            identity: replacement_identity.clone(),
+            token: StreamingTaskToken(42),
+            reason: "replacement ended".to_string(),
+        };
+        let stale_same_generation_exit = StreamingTaskExit {
+            identity: replacement_identity.clone(),
+            token: StreamingTaskToken(41),
+            reason: "prior task token ended".to_string(),
+        };
+
+        assert_eq!(
+            streaming_task_reconcile_action(
+                &old_identity,
+                Some((
+                    replacement_identity.global_pane_id,
+                    replacement_identity.generation,
+                )),
+            ),
+            StreamingTaskReconcileAction::Replace,
+        );
+        assert_eq!(
+            streaming_task_reconcile_action(
+                &replacement_identity,
+                Some((
+                    replacement_identity.global_pane_id,
+                    replacement_identity.generation,
+                )),
+            ),
+            StreamingTaskReconcileAction::Keep,
+        );
+        assert_eq!(
+            streaming_task_reconcile_action(&replacement_identity, None),
+            StreamingTaskReconcileAction::Remove,
+        );
+        assert!(!streaming_exit_matches_active(
+            &replacement_identity,
+            StreamingTaskToken(42),
+            &old_exit,
+        ));
+        assert!(!streaming_exit_matches_active(
+            &replacement_identity,
+            StreamingTaskToken(42),
+            &stale_same_generation_exit,
+        ));
+        assert!(streaming_exit_matches_active(
+            &replacement_identity,
+            StreamingTaskToken(42),
+            &replacement_exit,
+        ));
     }
 
     // =========================================================================
