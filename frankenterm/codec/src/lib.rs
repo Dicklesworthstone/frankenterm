@@ -1243,7 +1243,16 @@ async fn discard_raw_body_async<R: Unpin + AsyncRead + std::fmt::Debug>(
     r: &mut R,
     header: PduFrameHeader,
 ) -> anyhow::Result<DiscardedPduBody> {
-    let mut scratch = [0_u8; DISCARDED_PAYLOAD_READ_CHUNK];
+    // Keep the fixed discard window off the async worker stack.  This future is
+    // nested inside the client actor's already-large decode future; embedding a
+    // 64 KiB array here can overflow bounded executor stacks while the future is
+    // moved or polled.  Reserve fallibly before setting the length so allocation
+    // failure remains an ordinary decode error rather than an abort.
+    let mut scratch = Vec::new();
+    scratch
+        .try_reserve_exact(DISCARDED_PAYLOAD_READ_CHUNK)
+        .context("allocating abandoned-PDU discard scratch buffer")?;
+    scratch.resize(DISCARDED_PAYLOAD_READ_CHUNK, 0_u8);
     let mut consumed = 0_usize;
     let mut chunk_reads = 0_usize;
     let mut max_chunk_bytes = 0_usize;
