@@ -889,11 +889,16 @@ fn pdu_item(
 }
 
 #[cfg(test)]
-fn test_write_payload(decoded: Box<DecodedPdu>) -> WritePayload {
+fn test_reservation(class: OutboundClass) -> OutboundReservation {
     let budget = Arc::new(OutboundBudget::default());
-    let reservation = budget
-        .try_reserve(OutboundClass::Control, 0)
-        .expect("an empty test outbound budget should admit one control item");
+    budget
+        .try_reserve(class, 0)
+        .expect("an empty test outbound budget should admit one item")
+}
+
+#[cfg(test)]
+fn test_write_payload(decoded: Box<DecodedPdu>) -> WritePayload {
+    let reservation = test_reservation(OutboundClass::Control);
     WritePayload::Typed(ReservedDecodedPdu {
         decoded,
         reservation,
@@ -907,10 +912,7 @@ fn test_write_item(decoded: Box<DecodedPdu>) -> Item {
 
 #[cfg(test)]
 fn test_notification_item(notification: MuxNotification) -> Item {
-    let budget = Arc::new(OutboundBudget::default());
-    let reservation = budget
-        .try_reserve(OutboundClass::Bulk, 0)
-        .expect("an empty test outbound budget should admit one bulk item");
+    let reservation = test_reservation(OutboundClass::Bulk);
     Item::Notif(ReservedNotification {
         notification,
         reservation,
@@ -6576,11 +6578,17 @@ mod tests {
 
             let (full_tx, full_rx) = bounded(1);
             let (full_terminal, full_terminal_rx) = DispatchTerminal::channel();
+            let full_budget = Arc::new(OutboundBudget::default());
             full_tx
                 .try_send(Item::Readable)
                 .expect("fill dispatch notification queue");
             prop_assert!(
-                !queue_notification(&full_tx, &full_terminal, notification.clone()),
+                !queue_notification(
+                    &full_tx,
+                    &full_terminal,
+                    &full_budget,
+                    notification.clone(),
+                ),
                 "full notification queue must terminate the subscription"
             );
             prop_assert!(
@@ -6601,12 +6609,18 @@ mod tests {
             let full_calls = Arc::new(AtomicUsize::new(0));
             let full_calls_for_subscriber = Arc::clone(&full_calls);
             let (subscriber_terminal, subscriber_terminal_rx) = DispatchTerminal::channel();
+            let subscriber_budget = Arc::new(OutboundBudget::default());
             full_tx
                 .try_send(Item::Readable)
                 .expect("refill dispatch notification queue");
             mux.subscribe(move |notification| {
                 full_calls_for_subscriber.fetch_add(1, Ordering::Relaxed);
-                queue_notification(&full_tx, &subscriber_terminal, notification)
+                queue_notification(
+                    &full_tx,
+                    &subscriber_terminal,
+                    &subscriber_budget,
+                    notification,
+                )
             })
             .expect("test mux subscription should allocate an identifier");
             mux.notify(notification.clone());
@@ -6624,18 +6638,30 @@ mod tests {
 
             let (closed_tx, closed_rx) = bounded(1);
             let (closed_terminal, _closed_terminal_rx) = DispatchTerminal::channel();
+            let closed_budget = Arc::new(OutboundBudget::default());
             drop(closed_rx);
             prop_assert!(
-                !queue_notification(&closed_tx, &closed_terminal, notification.clone()),
+                !queue_notification(
+                    &closed_tx,
+                    &closed_terminal,
+                    &closed_budget,
+                    notification.clone(),
+                ),
                 "closed notification queue should report a dead subscription"
             );
 
             let mux = Mux::new(None);
             let closed_calls = Arc::new(AtomicUsize::new(0));
             let closed_calls_for_subscriber = Arc::clone(&closed_calls);
+            let closed_subscriber_budget = Arc::new(OutboundBudget::default());
             mux.subscribe(move |notification| {
                 closed_calls_for_subscriber.fetch_add(1, Ordering::Relaxed);
-                queue_notification(&closed_tx, &closed_terminal, notification)
+                queue_notification(
+                    &closed_tx,
+                    &closed_terminal,
+                    &closed_subscriber_budget,
+                    notification,
+                )
             })
             .expect("test mux subscription should allocate an identifier");
             mux.notify(notification.clone());
@@ -7001,11 +7027,12 @@ mod tests {
     fn response_enqueue_failure_trips_connection_terminal() {
         let (item_tx, item_rx) = bounded(1);
         let (terminal, terminal_rx) = DispatchTerminal::channel();
+        let budget = Arc::new(OutboundBudget::default());
         item_tx
             .try_send(Item::Readable)
             .expect("fill dispatch queue");
 
-        let err = queue_response_pdu(&item_tx, &terminal, Pdu::Pong(Pong {}), 41)
+        let err = queue_response_pdu(&item_tx, &terminal, &budget, Pdu::Pong(Pong {}), 41)
             .expect_err("response enqueue into a full queue must fail");
         assert!(
             format!("{err:#}").contains("mux dispatch item queue is full"),
@@ -7026,17 +7053,20 @@ mod tests {
     fn unilateral_conversion_preserves_notification_before_later_response() {
         let (item_tx, item_rx) = unbounded();
         item_tx
-            .try_send(Item::WritePdu(Box::new(DecodedPdu {
+            .try_send(test_write_item(Box::new(DecodedPdu {
                 pdu: Pdu::Pong(Pong {}),
                 serial: 77,
             })))
             .expect("queue later response");
         let mut deferred_item = None;
+        let (terminal, _terminal_rx) = DispatchTerminal::channel();
 
         let pending = prepare_unilateral_pdu(
             Pdu::PaneRemoved(codec::PaneRemoved { pane_id: 19 }),
+            test_reservation(OutboundClass::Bulk),
             &item_rx,
             &mut deferred_item,
+            &terminal,
         )
         .expect("notification and response should encode");
 
@@ -7072,12 +7102,13 @@ mod tests {
     fn full_notification_queue_terminates_mux_subscriber() {
         let (item_tx, item_rx) = bounded(1);
         let (terminal, terminal_rx) = DispatchTerminal::channel();
+        let budget = Arc::new(OutboundBudget::default());
         item_tx
             .try_send(Item::Readable)
             .expect("fill dispatch queue");
 
         assert!(
-            !queue_notification(&item_tx, &terminal, MuxNotification::Empty),
+            !queue_notification(&item_tx, &terminal, &budget, MuxNotification::Empty),
             "full notification queues must terminate the subscriber"
         );
         assert!(
@@ -7098,10 +7129,10 @@ mod tests {
             .expect("global test lock");
         let (item_tx, item_rx) = unbounded();
         item_tx
-            .try_send(Item::WritePdu(queued_ping(2)))
+            .try_send(test_write_item(queued_ping(2)))
             .expect("queue second ping");
         item_tx
-            .try_send(Item::Notif(MuxNotification::Empty))
+            .try_send(test_notification_item(MuxNotification::Empty))
             .expect("queue notification");
 
         let mut deferred_item = None;
@@ -7130,7 +7161,13 @@ mod tests {
             "batched writes should wait once"
         );
         assert!(
-            matches!(deferred_item, Some(Item::Notif(MuxNotification::Empty))),
+            matches!(
+                deferred_item,
+                Some(Item::Notif(ReservedNotification {
+                    notification: MuxNotification::Empty,
+                    ..
+                }))
+            ),
             "first non-write item should be preserved for the main loop"
         );
         assert!(
@@ -7143,7 +7180,7 @@ mod tests {
     fn dispatch_chooser_services_readable_input_before_a_continuous_internal_queue() {
         let (item_tx, item_rx) = unbounded();
         item_tx
-            .try_send(Item::Notif(MuxNotification::Empty))
+            .try_send(test_notification_item(MuxNotification::Empty))
             .expect("queue outbound notification");
         let stream = RecordingDispatchStream::default();
         let mut deferred_item = None;
@@ -7171,7 +7208,13 @@ mod tests {
             &mut prefer_read,
         ))
         .expect("outbound turn should remain live");
-        assert!(matches!(second, Item::Notif(MuxNotification::Empty)));
+        assert!(matches!(
+            second,
+            Item::Notif(ReservedNotification {
+                notification: MuxNotification::Empty,
+                ..
+            })
+        ));
         assert!(
             prefer_read,
             "the next turn must force another inbound readiness probe",
@@ -7324,7 +7367,7 @@ mod tests {
         let total_frames = OUTBOUND_WRITE_QUANTUM_FRAMES + 5;
         for serial in 2..=u64::try_from(total_frames).expect("test frame count fits u64") {
             item_tx
-                .try_send(Item::WritePdu(queued_ping(serial)))
+                .try_send(test_write_item(queued_ping(serial)))
                 .expect("queue outbound ping");
         }
         let mut deferred_item = None;
