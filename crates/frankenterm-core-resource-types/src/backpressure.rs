@@ -717,15 +717,27 @@ impl BackpressureMetrics {
     ///
     /// Found during a review pass over the last-20-commits swarm diff:
     /// bd8a715e landed the per-pane attribution map without wiring a
-    /// teardown hook; handle_native_event's `NativeEvent::PaneDestroyed`
-    /// arm and the `diff.closed_panes` loop in `ObservationRuntime::run`
-    /// now call this helper alongside `remove_runtime_pane_state_for_pane`.
+    /// teardown hook. The native `PaneDestroyed` handler clears attribution
+    /// promptly, while capture reconciliation repeats the idempotent cleanup
+    /// after exact authority retirement so a concurrent late drop cannot leak.
+    #[must_use]
     pub fn cleanup_pane(&self, pane_id: u64) -> bool {
+        self.cleanup_panes(&[pane_id]) == 1
+    }
+
+    /// Remove drop attribution for a correlated pane-retirement batch under
+    /// one map lock. Duplicate IDs are harmless and count as one removal.
+    /// Aggregate lifetime drop telemetry remains monotonic.
+    #[must_use]
+    pub fn cleanup_panes(&self, pane_ids: &[u64]) -> usize {
         let mut guard = self
             .dropped_by_pane
             .write()
             .unwrap_or_else(|e| e.into_inner());
-        guard.remove(&pane_id).is_some()
+        pane_ids
+            .iter()
+            .filter(|&&pane_id| guard.remove(&pane_id).is_some())
+            .count()
     }
 }
 
@@ -1268,6 +1280,24 @@ mod tests {
         assert!(!m.cleanup_pane(999));
         // Idempotent on a pane that was just removed.
         assert!(!m.cleanup_pane(2));
+    }
+
+    #[test]
+    fn cleanup_panes_batches_correlated_retirement_and_deduplicates_ids() {
+        let m = BackpressureMetrics::default();
+        for pane_id in 1..=4 {
+            m.record_segment_dropped(pane_id);
+        }
+
+        assert_eq!(m.cleanup_panes(&[2, 3, 2, 999]), 2);
+        assert_eq!(
+            m.segments_dropped_by_pane()
+                .keys()
+                .copied()
+                .collect::<HashSet<_>>(),
+            HashSet::from([1, 4]),
+        );
+        assert_eq!(m.segments_dropped_total(), 4);
     }
 
     #[test]

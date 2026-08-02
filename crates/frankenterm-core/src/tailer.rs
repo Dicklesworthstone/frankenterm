@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock as StdRwLock};
 use std::time::{Duration, Instant};
 
-use crate::runtime_async::{mpsc, oneshot};
+use crate::runtime_async::mpsc;
 use crate::runtime_async::timeout;
 use crate::runtime_async::{RwLock, Semaphore};
 use futures::{FutureExt, Stream, StreamExt};
@@ -353,8 +353,10 @@ impl SchedulerTierSnapshot {
 /// The capture coordinator retains this receipt while the provisional binding
 /// is unpublished.  Persistence decides it only after durable commit and any
 /// required cursor correction, or records a terminal failure on every earlier
-/// exit.  Unlike a one-shot receiver, the outcome remains inspectable after a
-/// coordinator timeout or scheduling delay.
+/// exit. Unlike a one-shot receiver, the outcome remains inspectable across
+/// arbitrary coordinator scheduling delay, allowing the coordinator to retain
+/// exactly one outstanding resync instead of timing out and duplicating work
+/// into a backlogged persistence queue.
 #[derive(Clone, Debug)]
 pub(crate) struct CaptureResyncReceipt {
     outcome: Arc<OnceLock<std::result::Result<u64, String>>>,
@@ -414,10 +416,6 @@ pub struct CaptureEvent {
     pub segment: CapturedSegment,
     /// Exact runtime-owned pane incarnation and producer source epoch.
     stamp: CaptureStamp,
-    /// Present only for the generation-resync barrier.  The capture
-    /// coordinator must not expose successor producers until persistence has
-    /// durably acknowledged this exact event.
-    durability_ack: Option<oneshot::Sender<std::result::Result<u64, String>>>,
     /// Drop-safe, inspectable receipt for a provisional generation resync.
     resync_decision: Option<CaptureResyncDecision>,
 }
@@ -439,7 +437,6 @@ impl CaptureEvent {
         Ok(Self {
             segment,
             stamp,
-            durability_ack: None,
             resync_decision: None,
         })
     }
@@ -448,22 +445,6 @@ impl CaptureEvent {
     #[must_use]
     pub fn stamp(&self) -> CaptureStamp {
         self.stamp
-    }
-
-    /// Attach the one-shot durability barrier used by a generation resync.
-    pub(crate) fn with_durability_ack(
-        mut self,
-        durability_ack: oneshot::Sender<std::result::Result<u64, String>>,
-    ) -> Self {
-        self.durability_ack = Some(durability_ack);
-        self
-    }
-
-    /// Transfer the optional durability barrier to the persistence consumer.
-    pub(crate) fn take_durability_ack(
-        &mut self,
-    ) -> Option<oneshot::Sender<std::result::Result<u64, String>>> {
-        self.durability_ack.take()
     }
 
     /// Attach the durable decision cell for a provisional generation resync.
@@ -1385,13 +1366,6 @@ where
     #[must_use]
     pub fn active_count(&self) -> usize {
         self.tailers.len()
-    }
-
-    /// Whether an issued polling task for this pane has not yet reported its
-    /// exact stamped completion.
-    #[must_use]
-    pub(crate) fn capture_inflight(&self, pane_id: u64) -> bool {
-        self.capturing_stamps.contains_key(&pane_id)
     }
 
     /// Sync tailers with exact polling leases issued by the runtime authority.
@@ -2724,12 +2698,15 @@ mod tests {
     #[test]
     fn capture_resync_receipt_is_single_assignment_and_drop_safe() {
         let (mut decision, receipt) = CaptureResyncDecision::channel();
+        let cloned_receipt = receipt.clone();
         assert_eq!(receipt.outcome(), None);
         decision.finish(Ok(7));
         decision.finish(Err("late overwrite".to_string()));
         assert_eq!(receipt.outcome(), Some(Ok(7)));
+        assert_eq!(cloned_receipt.outcome(), Some(Ok(7)));
         drop(decision);
         assert_eq!(receipt.outcome(), Some(Ok(7)));
+        assert_eq!(cloned_receipt.outcome(), Some(Ok(7)));
 
         let (undecided, dropped_receipt) = CaptureResyncDecision::channel();
         drop(undecided);

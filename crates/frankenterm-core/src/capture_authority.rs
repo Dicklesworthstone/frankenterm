@@ -776,7 +776,7 @@ impl CaptureAuthority {
     /// absence alone is not proof that their admitted producer or persistence
     /// work has completed, so lifecycle GC must retain their cursor and
     /// semantic state until exact retirement removes the authority entry.
-    pub(crate) fn retained_pane_ids(&self) -> Result<HashSet<u64>, CaptureAuthorityError> {
+    pub fn retained_pane_ids(&self) -> Result<HashSet<u64>, CaptureAuthorityError> {
         let state = self.lock_state()?;
         Ok(state.panes.keys().copied().collect())
     }
@@ -1121,6 +1121,45 @@ mod tests {
             .build()
             .expect("capture authority test runtime")
             .block_on(future);
+    }
+
+    #[test]
+    fn runtime_state_retention_includes_draining_incarnations_until_exact_retirement() {
+        let authority = CaptureAuthority::new();
+        let identity = authority.activate_pane(7).expect("activate pane");
+        let lease = authority
+            .issue_source(identity, CaptureSourceKind::Polling)
+            .expect("polling source");
+        let held = lease
+            .try_acquire_persistence(lease.stamp(), 7)
+            .expect("held persistence guard");
+
+        let _revocation = authority
+            .begin_pane_revocation(identity)
+            .expect("begin exact pane revocation");
+        assert_eq!(
+            authority.retained_pane_ids().expect("retention snapshot"),
+            HashSet::from([7]),
+            "registry GC must retain non-admitting panes while exact work drains"
+        );
+        assert!(
+            !authority
+                .retire_pane_if_drained(identity)
+                .expect("retry held retirement")
+        );
+
+        drop(held);
+        assert!(
+            authority
+                .retire_pane_if_drained(identity)
+                .expect("retire drained pane")
+        );
+        assert!(
+            authority
+                .retained_pane_ids()
+                .expect("post-retirement snapshot")
+                .is_empty()
+        );
     }
 
     #[test]
