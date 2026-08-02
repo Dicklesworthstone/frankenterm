@@ -78,7 +78,7 @@ pub(super) struct WaylandState {
 
 impl WaylandState {
     pub(super) fn new(globals: &GlobalList, qh: &QueueHandle<Self>) -> anyhow::Result<Self> {
-        let shm = Shm::bind(&globals, qh)?;
+        let shm = Shm::bind(globals, qh)?;
         let mem_pool = SlotPool::new(1, &shm)?;
 
         let compositor = CompositorState::bind(globals, qh)?;

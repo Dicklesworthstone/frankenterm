@@ -51,7 +51,7 @@ impl SeatHandler for WaylandState {
                     >(
                         qh,
                         &seat,
-                        &self.shm.wl_shm(),
+                        self.shm.wl_shm(),
                         surface,
                         ThemeSpec::System,
                         PointerUserData::new(seat.clone()),

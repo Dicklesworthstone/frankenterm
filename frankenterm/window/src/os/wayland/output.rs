@@ -205,11 +205,8 @@ impl Dispatch<ZwlrOutputManagerV1, GlobalData, WaylandState> for OutputManagerSt
             return;
         };
 
-        match event {
-            ZwlrOutputEvent::Head { head } => {
-                inner.zwlr_heads.insert(head.id(), head);
-            }
-            _ => {}
+        if let ZwlrOutputEvent::Head { head } = event {
+            inner.zwlr_heads.insert(head.id(), head);
         }
     }
 
@@ -256,8 +253,8 @@ impl Dispatch<ZwlrOutputHeadV1, OutputManagerData, WaylandState> for OutputManag
             }
             ZwlrOutputHeadEvent::Mode { mode } => {
                 let mode_id = mode.id();
-                info.mode_ids.push(mode_id.clone().into());
-                inner.zwlr_modes.insert(mode_id, mode.into());
+                info.mode_ids.push(mode_id.clone());
+                inner.zwlr_modes.insert(mode_id, mode);
             }
             ZwlrOutputHeadEvent::Enabled { enabled } => {
                 info.enabled = enabled != 0;

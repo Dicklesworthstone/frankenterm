@@ -68,7 +68,7 @@ trait WaylandDimensions {
 
 impl WaylandDimensions for Dimensions {
     fn dpi_factor(&self) -> f64 {
-        self.dpi as f64 / crate::DEFAULT_DPI as f64
+        self.dpi as f64 / crate::DEFAULT_DPI
     }
 
     fn pixels_to_surface(&self, pixels: i32) -> i32 {
@@ -458,10 +458,7 @@ impl WaylandWindow {
             FallbackFrame::new(&window, shm, subcompositor, qh.clone())
                 .expect("failed to create csd frame")
         };
-        let hidden = match decor_mode {
-            Some(DecorationMode::Client) => false,
-            _ => true,
-        };
+        let hidden = !matches!(decor_mode, Some(DecorationMode::Client));
         window_frame.set_hidden(hidden);
         if !hidden {
             window_frame.resize(
@@ -484,10 +481,10 @@ impl WaylandWindow {
         let copy_and_paste = CopyAndPaste::create();
         let pending_mouse = PendingMouse::create(window_id, &copy_and_paste);
 
-        {
-            let surface_to_pending = &mut conn.wayland_state.borrow_mut().surface_to_pending;
-            surface_to_pending.insert(surface.id(), Arc::clone(&pending_mouse));
-        }
+        conn.wayland_state
+            .borrow_mut()
+            .surface_to_pending
+            .insert(surface.id(), Arc::clone(&pending_mouse));
 
         let appearance = conn.get_appearance();
 
@@ -772,11 +769,17 @@ impl WindowOps for WaylandWindow {
     }
 
     fn maximize(&self) {
-        WaylandConnection::with_window_inner(self.0, move |inner| Ok(inner.maximize()));
+        WaylandConnection::with_window_inner(self.0, move |inner| {
+            inner.maximize();
+            Ok(())
+        });
     }
 
     fn restore(&self) {
-        WaylandConnection::with_window_inner(self.0, move |inner| Ok(inner.restore()));
+        WaylandConnection::with_window_inner(self.0, move |inner| {
+            inner.restore();
+            Ok(())
+        });
     }
 
     fn config_did_change(&self, config: &ConfigHandle) {
@@ -848,7 +851,7 @@ pub(crate) fn read_pipe_with_timeout(mut file: ReadPipe) -> anyhow::Result<Strin
             }
 
             match file.read(&mut buf) {
-                Ok(size) if size == 0 => {
+                Ok(0) => {
                     break;
                 }
                 Ok(size) => {
@@ -1145,7 +1148,7 @@ impl WaylandWindowInner {
         }
 
         if let Some((value_x, value_y)) = PendingMouse::scroll(&pending_mouse) {
-            let factor = self.get_dpi_factor() as f64;
+            let factor = self.get_dpi_factor();
 
             if value_x.signum() != self.hscroll_remainder.signum() {
                 // reset accumulator when changing scroll direction
@@ -1217,15 +1220,13 @@ impl WaylandWindowInner {
             self.window_state = window_state;
         }
 
-        if pending.configure.is_none() {
-            if pending.dpi.is_some() {
-                // Synthesize a pending configure event for the dpi change
-                pending.configure.replace((
-                    self.pixels_to_surface(self.dimensions.pixel_width as i32) as u32,
-                    self.pixels_to_surface(self.dimensions.pixel_height as i32) as u32,
-                ));
-                log::debug!("synthesize configure with {:?}", pending.configure);
-            }
+        if pending.configure.is_none() && pending.dpi.is_some() {
+            // Synthesize a pending configure event for the dpi change
+            pending.configure.replace((
+                self.pixels_to_surface(self.dimensions.pixel_width as i32) as u32,
+                self.pixels_to_surface(self.dimensions.pixel_height as i32) as u32,
+            ));
+            log::debug!("synthesize configure with {:?}", pending.configure);
         }
 
         if let Some(ref window_config) = pending.window_configure {
@@ -1426,25 +1427,23 @@ impl WaylandWindowInner {
         let active_surface_id = state.active_surface_id.borrow();
         let surface_id = surface.id();
 
-        if let Some(active_surface_id) = active_surface_id.as_ref() {
-            if surface_id == active_surface_id.clone() {
-                if self.text_cursor.map(|prior| prior != rect).unwrap_or(true) {
-                    self.text_cursor.replace(rect);
+        if active_surface_id.as_ref() == Some(&surface_id)
+            && self.text_cursor.map(|prior| prior != rect).unwrap_or(true)
+        {
+            self.text_cursor.replace(rect);
 
-                    let surface_udata = SurfaceUserData::from_wl(&surface);
-                    let factor = surface_udata.surface_data().scale_factor();
+            let surface_udata = SurfaceUserData::from_wl(&surface);
+            let factor = surface_udata.surface_data().scale_factor();
 
-                    if let Some(text_input) = &state.text_input {
-                        if let Some(input) = text_input.get_text_input_for_surface(&surface) {
-                            input.set_cursor_rectangle(
-                                rect.min_x() as i32 / factor,
-                                rect.min_y() as i32 / factor,
-                                rect.width() as i32 / factor,
-                                rect.height() as i32 / factor,
-                            );
-                            input.commit();
-                        }
-                    }
+            if let Some(text_input) = &state.text_input {
+                if let Some(input) = text_input.get_text_input_for_surface(&surface) {
+                    input.set_cursor_rectangle(
+                        rect.min_x() as i32 / factor,
+                        rect.min_y() as i32 / factor,
+                        rect.width() as i32 / factor,
+                        rect.height() as i32 / factor,
+                    );
+                    input.commit();
                 }
             }
         }
@@ -1571,21 +1570,6 @@ impl WaylandWindowInner {
         }
     }
 
-    /// Diagnostic accessor for the in-flight frame-callback count.
-    /// Linux integration tests use this to assert the chain-depth
-    /// invariant under the resize-storm reproducer the bead
-    /// (ft-mpc9b.3.2) targets. The lifetime peak is also exposed
-    /// for `ft doctor` once the GUI integration lands.
-    pub(crate) fn frame_callback_chain_depth(&self) -> u32 {
-        self.frame_callback_chain_depth
-    }
-
-    /// Lifetime peak of `frame_callback_chain_depth` since window
-    /// construction.
-    pub(crate) fn frame_callback_chain_depth_peak(&self) -> u32 {
-        self.frame_callback_chain_depth_peak
-    }
-
     fn surface(&self) -> &WlSurface {
         self.window
             .as_ref()
@@ -1644,8 +1628,10 @@ impl WaylandWindowInner {
         match &event {
             WlKeyboardEvent::Enter { keys, .. } => {
                 let key_codes = keys
-                    .chunks_exact(4)
-                    .map(|c| u32::from_ne_bytes(c.try_into().unwrap()))
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|chunk| u32::from_ne_bytes(*chunk))
                     .collect::<Vec<_>>();
                 log::trace!("keyboard event: Enter with keys: {:?}", key_codes);
                 self.emit_focus(mapper, true);
@@ -2187,6 +2173,7 @@ mod tests {
     use futures_util::future::Abortable;
     use promise::BrokenPromise;
     use smithay_client_toolkit::data_device_manager::ReadPipe;
+    use std::convert::TryFrom;
     use std::fs::File;
     use std::future::Future as StdFuture;
     use std::io::Write;

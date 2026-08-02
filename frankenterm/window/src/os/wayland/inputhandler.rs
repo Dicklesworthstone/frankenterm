@@ -1,6 +1,6 @@
 //! Implements zwp_text_input_v3 for handling IME
 use std::borrow::Borrow;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::{Mutex, MutexGuard};
 
 use smithay_client_toolkit::globals::GlobalData;
@@ -65,15 +65,15 @@ impl TextInputState {
         let inner = self.lock_inner("keyboard lookup")?;
         let keyboard_id = keyboard.id();
         let seat_id = inner.keyboard_to_seat.get(&keyboard_id)?;
-        inner.input_by_seat.get(&seat_id).cloned()
+        inner.input_by_seat.get(seat_id).cloned()
     }
 
     pub(super) fn get_text_input_for_surface(&self, surface: &WlSurface) -> Option<ZwpTextInputV3> {
         let inner = self.lock_inner("surface lookup")?;
         let surface_id = surface.id();
         let keyboard_id = inner.surface_to_keyboard.get(&surface_id)?;
-        let seat_id = inner.keyboard_to_seat.get(&keyboard_id)?;
-        inner.input_by_seat.get(&seat_id).cloned()
+        let seat_id = inner.keyboard_to_seat.get(keyboard_id)?;
+        inner.input_by_seat.get(seat_id).cloned()
     }
 
     fn get_text_input_for_seat(
@@ -85,8 +85,7 @@ impl TextInputState {
         let mut inner = self.lock_inner("seat lookup")?;
         let seat_id = seat.id();
         let input = inner.input_by_seat.entry(seat_id).or_insert_with(|| {
-            let input = mgr.get_text_input(seat, &qh, TextInputData::default());
-            input.into()
+            mgr.get_text_input(seat, qh, TextInputData::default())
         });
         Some(input.clone())
     }
@@ -139,10 +138,12 @@ impl TextInputState {
         inner
             .keyboard_to_seat
             .retain(|_, mapped_seat| mapped_seat != &seat_id);
-        let live_keyboards: HashSet<_> = inner.keyboard_to_seat.keys().cloned().collect();
-        inner
-            .surface_to_keyboard
-            .retain(|_, keyboard_id| live_keyboards.contains(keyboard_id));
+        let Inner {
+            keyboard_to_seat,
+            surface_to_keyboard,
+            ..
+        } = &mut *inner;
+        surface_to_keyboard.retain(|_, keyboard_id| keyboard_to_seat.contains_key(keyboard_id));
 
         if let Some(input) = inner.input_by_seat.remove(&seat_id) {
             input.disable();

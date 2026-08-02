@@ -38,7 +38,7 @@ impl PointerHandler for WaylandState {
                 self.active_surface_id = RefCell::new(Some(surface_id.clone()));
                 pstate.active_surface_id = Some(surface_id);
             }
-            if let Some(serial) = event_serial(&evt) {
+            if let Some(serial) = event_serial(evt) {
                 *self.last_serial.borrow_mut() = serial;
                 pstate.serial = serial;
             }
@@ -291,11 +291,7 @@ impl WaylandState {
                     }
                     PointerEventKind::Press { button, serial, .. }
                     | PointerEventKind::Release { button, serial, .. } => {
-                        let pressed = if matches!(evt.kind, PointerEventKind::Press { .. }) {
-                            true
-                        } else {
-                            false
-                        };
+                        let pressed = matches!(evt.kind, PointerEventKind::Press { .. });
                         let click = match button {
                             0x110 => FrameClick::Normal,
                             0x111 => FrameClick::Alternate,
