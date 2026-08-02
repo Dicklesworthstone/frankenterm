@@ -37,6 +37,7 @@ use crate::runtime_async::sleep;
 
 use super::mux_client::{
     DirectMuxClient, DirectMuxClientConfig, DirectMuxError, ProtocolErrorKind,
+    validate_render_batch_panes,
 };
 use codec::{
     GetLinesResponse, GetPaneRenderChangesResponse, GetSemanticZonesResponse, ListPanesResponse,
@@ -165,6 +166,23 @@ pub struct MuxPool {
     pipeline_timeout: Duration,
 }
 
+fn classify_render_batch_fallback(
+    protocol_kind: Option<ProtocolErrorKind>,
+    cancelled: bool,
+) -> bool {
+    !cancelled && protocol_kind == Some(ProtocolErrorKind::Recoverable)
+}
+
+fn should_fallback_render_batch(error: &MuxPoolError) -> bool {
+    match error {
+        MuxPoolError::Mux(mux_error) => classify_render_batch_fallback(
+            Some(mux_error.protocol_error_kind()),
+            mux_error.is_cancelled(),
+        ),
+        _ => classify_render_batch_fallback(None, false),
+    }
+}
+
 type MuxOpFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, DirectMuxError>> + Send + 'a>>;
 
 impl MuxPool {
@@ -191,6 +209,24 @@ impl MuxPool {
             pipeline_depth,
             pipeline_timeout,
         }
+    }
+
+    fn validate_render_batch_preflight(&self, pane_ids: &[u64]) -> Result<(), MuxPoolError> {
+        if let Err(error) = validate_render_batch_panes(pane_ids) {
+            let kind = error.protocol_error_kind();
+            if kind == ProtocolErrorKind::Permanent {
+                self.permanent_failures.fetch_add(1, Ordering::Relaxed);
+            }
+            tracing::debug!(
+                pane_count = pane_ids.len(),
+                kind = ?kind,
+                error = %error,
+                phase = "render_batch_preflight",
+                "mux render batch rejected before pool acquisition"
+            );
+            return Err(MuxPoolError::Mux(error));
+        }
+        Ok(())
     }
 
     /// Acquire a client from the pool or create a new one.
@@ -558,8 +594,10 @@ impl MuxPool {
 
     /// Poll render changes for many panes using depth-limited pipelining.
     ///
-    /// If pipelining fails, falls back to sequential requests on a fresh
-    /// connection so callers still receive results.
+    /// A non-cancelled, recoverable mux failure may fall back to sequential
+    /// requests on a fresh connection. Pool, permanent, transient, and
+    /// cancellation errors are returned without a second execution path.
+    /// Pane IDs must be unique; duplicates fail before pool acquisition.
     pub async fn get_pane_render_changes_batch(
         &self,
         pane_ids: Vec<u64>,
@@ -567,15 +605,21 @@ impl MuxPool {
         if pane_ids.is_empty() {
             return Ok(Vec::new());
         }
+        self.validate_render_batch_preflight(&pane_ids)?;
 
-        let depth = self.pipeline_depth;
+        let depth = self.pipeline_depth.min(pane_ids.len()).max(1);
         let timeout = self.pipeline_timeout;
         let pane_ids_for_pipeline = pane_ids.clone();
         let pipeline_result = self
             .execute_with_recovery("get_pane_render_changes_batch", move |client| {
                 let pane_ids = pane_ids_for_pipeline.clone();
                 Box::pin(async move {
-                    Box::pin(client.get_pane_render_changes_batch(&pane_ids, depth, timeout)).await
+                    Box::pin(client.get_pane_render_changes_batch_prevalidated(
+                        &pane_ids,
+                        depth,
+                        timeout,
+                    ))
+                    .await
                 })
             })
             .await;
@@ -586,7 +630,7 @@ impl MuxPool {
 
         match pipeline_result {
             Ok(result) => Ok(result),
-            Err(err) => {
+            Err(err) if should_fallback_render_batch(&err) => {
                 tracing::debug!(
                     error = %err,
                     depth,
@@ -597,17 +641,27 @@ impl MuxPool {
                     move |client| {
                         let pane_ids = pane_ids.clone();
                         Box::pin(async move {
-                            Box::pin(client.get_pane_render_changes_batch(&pane_ids, 1, timeout))
-                                .await
+                            Box::pin(client.get_pane_render_changes_batch_prevalidated(
+                                &pane_ids,
+                                1,
+                                timeout,
+                            ))
+                            .await
                         })
                     },
                 )
                 .await
             }
+            Err(err) => Err(err),
         }
     }
 
     /// Poll render changes for many panes using depth-limited pipelining and explicit `Cx`.
+    ///
+    /// A non-cancelled, recoverable mux failure may fall back to sequential
+    /// requests on a fresh connection. Pool, permanent, transient, and
+    /// cancellation errors are returned without a second execution path.
+    /// Pane IDs must be unique; duplicates fail before pool acquisition.
     pub async fn get_pane_render_changes_batch_with_cx(
         &self,
         cx: &Cx,
@@ -616,8 +670,9 @@ impl MuxPool {
         if pane_ids.is_empty() {
             return Ok(Vec::new());
         }
+        self.validate_render_batch_preflight(&pane_ids)?;
 
-        let depth = self.pipeline_depth;
+        let depth = self.pipeline_depth.min(pane_ids.len()).max(1);
         let timeout = self.pipeline_timeout;
         let pane_ids_for_pipeline = pane_ids.clone();
         let pipeline_cx = cx.clone();
@@ -626,7 +681,7 @@ impl MuxPool {
                 let pane_ids = pane_ids_for_pipeline.clone();
                 let pipeline_cx = pipeline_cx.clone();
                 Box::pin(async move {
-                    Box::pin(client.get_pane_render_changes_batch_with_cx(
+                    Box::pin(client.get_pane_render_changes_batch_with_cx_prevalidated(
                         &pipeline_cx,
                         &pane_ids,
                         depth,
@@ -643,7 +698,7 @@ impl MuxPool {
 
         match pipeline_result {
             Ok(result) => Ok(result),
-            Err(err) => {
+            Err(err) if should_fallback_render_batch(&err) => {
                 tracing::debug!(
                     error = %err,
                     depth,
@@ -657,7 +712,7 @@ impl MuxPool {
                         let pane_ids = pane_ids.clone();
                         let fallback_cx = fallback_cx.clone();
                         Box::pin(async move {
-                            Box::pin(client.get_pane_render_changes_batch_with_cx(
+                            Box::pin(client.get_pane_render_changes_batch_with_cx_prevalidated(
                                 &fallback_cx,
                                 &pane_ids,
                                 1,
@@ -669,6 +724,7 @@ impl MuxPool {
                 )
                 .await
             }
+            Err(err) => Err(err),
         }
     }
 
@@ -1490,6 +1546,50 @@ mod tests {
             assert_eq!(stats.connections_created, 0);
             assert_eq!(stats.connections_failed, 1);
         });
+    }
+
+    #[test]
+    fn render_batch_fallback_classification_is_exhaustive() {
+        for cancelled in [false, true] {
+            assert!(!classify_render_batch_fallback(None, cancelled));
+            assert!(!classify_render_batch_fallback(
+                Some(ProtocolErrorKind::Permanent),
+                cancelled,
+            ));
+            assert!(!classify_render_batch_fallback(
+                Some(ProtocolErrorKind::Transient),
+                cancelled,
+            ));
+            assert_eq!(
+                classify_render_batch_fallback(
+                    Some(ProtocolErrorKind::Recoverable),
+                    cancelled,
+                ),
+                !cancelled
+            );
+        }
+
+        assert!(should_fallback_render_batch(&MuxPoolError::Mux(
+            DirectMuxError::UnexpectedResponse {
+                expected: "expected".to_string(),
+                got: "unexpected".to_string(),
+            },
+        )));
+        assert!(!should_fallback_render_batch(&MuxPoolError::Mux(
+            DirectMuxError::DuplicateRenderBatchPane { pane_id: 7 },
+        )));
+        assert!(!should_fallback_render_batch(&MuxPoolError::Mux(
+            DirectMuxError::RemoteError("transient".to_string()),
+        )));
+        assert!(!should_fallback_render_batch(&MuxPoolError::Mux(
+            DirectMuxError::Io(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "mux render batch cancelled: test",
+            )),
+        )));
+        assert!(!should_fallback_render_batch(&MuxPoolError::Pool(
+            PoolError::AcquireTimeout,
+        )));
     }
 
     #[test]
@@ -2671,20 +2771,31 @@ mod tests {
     fn pool_batch_render_duplicate_pane_ids() {
         run_async_test(async {
             let temp_dir = tempfile::tempdir().expect("tempdir");
-            let socket_path = spawn_mock_server(&temp_dir).await;
+            let socket_path = temp_dir.path().join("unused-duplicate-pane.sock");
 
             let pool = MuxPool::new(pool_config(socket_path, 4));
 
-            // Requesting the same pane_id twice should return two responses.
-            let result = pool
+            let error = pool
                 .get_pane_render_changes_batch(vec![42, 42, 42])
                 .await
-                .expect("duplicate pane ids should succeed");
-
-            assert_eq!(result.len(), 3, "should get 3 responses for 3 requests");
-            for resp in &result {
-                assert_eq!(resp.pane_id, 42, "all responses should be for pane 42");
-            }
+                .expect_err("duplicate pane IDs must fail before pool acquisition");
+            let MuxPoolError::Mux(mux_error) = error else {
+                panic!("expected typed mux input error");
+            };
+            assert!(matches!(
+                &mux_error,
+                DirectMuxError::DuplicateRenderBatchPane { pane_id: 42 }
+            ));
+            assert_eq!(
+                mux_error.protocol_error_kind(),
+                ProtocolErrorKind::Permanent
+            );
+            let stats = pool.stats().await;
+            assert_eq!(stats.permanent_failures, 1);
+            assert_eq!(stats.connections_created, 0);
+            assert_eq!(stats.pool.total_acquired, 0);
+            assert_eq!(stats.pool.active_count, 0);
+            assert_eq!(stats.pool.idle_count, 0);
         });
     }
 
@@ -2692,19 +2803,31 @@ mod tests {
     fn pool_batch_render_duplicate_pane_ids_with_cx() {
         run_async_test(async {
             let temp_dir = tempfile::tempdir().expect("tempdir");
-            let socket_path = spawn_mock_server(&temp_dir).await;
+            let socket_path = temp_dir.path().join("unused-duplicate-pane-cx.sock");
             let pool = MuxPool::new(pool_config(socket_path, 4));
             let cx = crate::cx::for_testing();
 
-            let result = pool
+            let error = pool
                 .get_pane_render_changes_batch_with_cx(&cx, vec![42, 42, 42])
                 .await
-                .expect("duplicate pane ids with cx should succeed");
-
-            assert_eq!(result.len(), 3, "should get 3 responses for 3 requests");
-            for resp in &result {
-                assert_eq!(resp.pane_id, 42, "all responses should be for pane 42");
-            }
+                .expect_err("duplicate pane IDs with Cx must fail before pool acquisition");
+            let MuxPoolError::Mux(mux_error) = error else {
+                panic!("expected typed mux input error");
+            };
+            assert!(matches!(
+                &mux_error,
+                DirectMuxError::DuplicateRenderBatchPane { pane_id: 42 }
+            ));
+            assert_eq!(
+                mux_error.protocol_error_kind(),
+                ProtocolErrorKind::Permanent
+            );
+            let stats = pool.stats().await;
+            assert_eq!(stats.permanent_failures, 1);
+            assert_eq!(stats.connections_created, 0);
+            assert_eq!(stats.pool.total_acquired, 0);
+            assert_eq!(stats.pool.active_count, 0);
+            assert_eq!(stats.pool.idle_count, 0);
         });
     }
 
@@ -2819,6 +2942,55 @@ mod tests {
                 stats.connections_created, 2,
                 "fallback should create one failed pipeline connection and one sequential replacement"
             );
+        });
+    }
+
+    #[test]
+    fn one_pane_batches_use_effective_depth_and_never_outer_fallback() {
+        run_async_test(async {
+            for explicit_cx in [false, true] {
+                let temp_dir = tempfile::tempdir().expect("tempdir");
+                let socket_path = spawn_mock_server_unexpected_batch_render_once(&temp_dir).await;
+                let config = MuxPoolConfig {
+                    pool: PoolConfig {
+                        max_size: 4,
+                        idle_timeout: Duration::from_secs(60),
+                        acquire_timeout: Duration::from_millis(500),
+                    },
+                    mux: DirectMuxClientConfig::default().with_socket_path(socket_path),
+                    recovery: MuxRecoveryConfig {
+                        enabled: false,
+                        retry_policy: RetryPolicy::new(
+                            Duration::from_millis(0),
+                            Duration::from_millis(0),
+                            1.0,
+                            0.0,
+                            Some(1),
+                        ),
+                    },
+                    pipeline_depth: 32,
+                    pipeline_timeout: Duration::from_secs(5),
+                };
+                let pool = MuxPool::new(config);
+
+                let error = if explicit_cx {
+                    let cx = crate::cx::for_testing();
+                    pool.get_pane_render_changes_batch_with_cx(&cx, vec![10])
+                        .await
+                        .expect_err("one-pane Cx batch must not replay via outer fallback")
+                } else {
+                    pool.get_pane_render_changes_batch(vec![10])
+                        .await
+                        .expect_err("one-pane batch must not replay via outer fallback")
+                };
+                assert!(matches!(
+                    error,
+                    MuxPoolError::Mux(DirectMuxError::UnexpectedResponse { .. })
+                ));
+                let stats = pool.stats().await;
+                assert_eq!(stats.connections_created, 1);
+                assert_eq!(stats.recovery_attempts, 0);
+            }
         });
     }
 

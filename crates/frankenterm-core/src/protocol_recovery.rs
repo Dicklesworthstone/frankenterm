@@ -144,6 +144,7 @@ pub fn classify_error_message(msg: &str) -> ProtocolErrorKind {
         || lower.contains("proxy command not supported")
         || lower.contains("connection identity space exhausted")
         || lower.contains("invalid direct mux client limit")
+        || (lower.contains("duplicate pane") && lower.contains("render-change batch"))
     {
         return ProtocolErrorKind::Permanent;
     }
@@ -198,7 +199,8 @@ pub fn classify_mux_error(err: &crate::vendored::DirectMuxError) -> ProtocolErro
         | DirectMuxError::ProxyUnsupported
         | DirectMuxError::IncompatibleCodec { .. }
         | DirectMuxError::ConnectionIdExhausted
-        | DirectMuxError::InvalidLimit { .. } => ProtocolErrorKind::Permanent,
+        | DirectMuxError::InvalidLimit { .. }
+        | DirectMuxError::DuplicateRenderBatchPane { .. } => ProtocolErrorKind::Permanent,
 
         DirectMuxError::Disconnected
         | DirectMuxError::UnexpectedResponse { .. }
@@ -1034,6 +1036,14 @@ mod tests {
         );
     }
 
+    #[test]
+    fn classify_duplicate_render_batch_pane() {
+        assert_eq!(
+            classify_error_message("duplicate pane 7 in render-change batch"),
+            ProtocolErrorKind::Permanent
+        );
+    }
+
     #[cfg(all(feature = "vendored", unix))]
     #[test]
     fn classify_bounded_retention_mux_errors() {
@@ -1070,6 +1080,7 @@ mod tests {
             DirectMuxError::InvalidLimit {
                 field: "max_pending_responses",
             },
+            DirectMuxError::DuplicateRenderBatchPane { pane_id: 7 },
         ] {
             assert_eq!(classify_mux_error(&error), ProtocolErrorKind::Permanent);
         }

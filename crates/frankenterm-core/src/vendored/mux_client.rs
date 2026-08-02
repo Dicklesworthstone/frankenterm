@@ -192,6 +192,8 @@ pub enum DirectMuxError {
     RemoteError(String),
     #[error("pipeline batch timed out after {timeout_ms}ms")]
     BatchTimeout { timeout_ms: u64 },
+    #[error("duplicate pane {pane_id} in render-change batch")]
+    DuplicateRenderBatchPane { pane_id: u64 },
     #[error("unexpected response: expected {expected}, got {got}")]
     UnexpectedResponse { expected: String, got: String },
     #[error("codec version mismatch: local {local} != remote {remote} (version {remote_version})")]
@@ -252,7 +254,8 @@ impl DirectMuxError {
             | Self::SocketNotFound(_)
             | Self::ProxyUnsupported
             | Self::ConnectionIdExhausted
-            | Self::InvalidLimit { .. } => ProtocolErrorKind::Permanent,
+            | Self::InvalidLimit { .. }
+            | Self::DuplicateRenderBatchPane { .. } => ProtocolErrorKind::Permanent,
             Self::RemoteError(_) => ProtocolErrorKind::Transient,
             Self::Io(err) => match err.kind() {
                 std::io::ErrorKind::BrokenPipe
@@ -396,9 +399,8 @@ impl RetainedRenderChange {
                     resource: "render-change pane identity",
                 })
             }
-            other => Err(DirectMuxError::UnexpectedResponse {
-                expected: "retained GetPaneRenderChangesResponse".to_string(),
-                got: other.pdu_name().to_string(),
+            _ => Err(DirectMuxError::RetainedStateAccounting {
+                resource: "render-change retained PDU type",
             }),
         }
     }
@@ -419,6 +421,7 @@ pub struct DirectMuxClient {
     render_change_snapshot_bytes: usize,
     config: DirectMuxClientConfig,
     compression_mode: CompressionMode,
+    connection_poisoned: bool,
 }
 
 impl std::fmt::Debug for DirectMuxClient {
@@ -444,7 +447,347 @@ impl std::fmt::Debug for DirectMuxClient {
                 &self.render_change_snapshot_bytes,
             )
             .field("compression_mode", &self.compression_mode)
+            .field("connection_poisoned", &self.connection_poisoned)
             .finish_non_exhaustive()
+    }
+}
+
+/// Owns the mutable client borrow while a render batch is in progress.
+///
+/// The timeout wrappers are allowed to drop their inner future.  Keeping the
+/// cleanup state beside the client borrow means that ordinary Rust drop order
+/// can fail the connection closed without unsafe code or an asynchronous Drop
+/// implementation.
+struct RenderBatchGuard<'a> {
+    client: &'a mut DirectMuxClient,
+    pane_ids: &'a [u64],
+    in_flight: VecDeque<(usize, u64)>,
+    owned_serials: HashSet<u64>,
+    outputs: Vec<Option<GetPaneRenderChangesResponse>>,
+    next_request_idx: usize,
+    settled_count: usize,
+    first_error: Option<DirectMuxError>,
+    transport_ambiguous: bool,
+    batch_progressed: bool,
+    explicit_cx: bool,
+    disarmed: bool,
+}
+
+impl<'a> RenderBatchGuard<'a> {
+    fn new(
+        client: &'a mut DirectMuxClient,
+        pane_ids: &'a [u64],
+        depth: usize,
+        explicit_cx: bool,
+    ) -> Self {
+        Self {
+            client,
+            pane_ids,
+            in_flight: VecDeque::with_capacity(depth),
+            owned_serials: HashSet::with_capacity(depth),
+            outputs: std::iter::repeat_with(|| None)
+                .take(pane_ids.len())
+                .collect(),
+            next_request_idx: 0,
+            settled_count: 0,
+            first_error: None,
+            transport_ambiguous: false,
+            batch_progressed: false,
+            explicit_cx,
+            disarmed: false,
+        }
+    }
+
+    fn can_admit(&self) -> bool {
+        self.first_error.is_none() && self.next_request_idx < self.pane_ids.len()
+    }
+
+    fn ensure_request_tracking_aligned(&self) -> Result<(), DirectMuxError> {
+        if self.owned_serials.len() == self.in_flight.len() {
+            Ok(())
+        } else {
+            Err(DirectMuxError::RetainedStateAccounting {
+                resource: "render batch owned/in-flight request tracking",
+            })
+        }
+    }
+
+    fn record_issued(&mut self, request_idx: usize, serial: u64) -> Result<(), DirectMuxError> {
+        if !self.owned_serials.insert(serial) {
+            return Err(DirectMuxError::RetainedStateAccounting {
+                resource: "render batch request serials",
+            });
+        }
+        self.in_flight.push_back((request_idx, serial));
+        self.next_request_idx = request_idx.checked_add(1).ok_or(
+            DirectMuxError::RetainedStateAccounting {
+                resource: "render batch request index",
+            },
+        )?;
+        self.ensure_request_tracking_aligned()?;
+        Ok(())
+    }
+
+    async fn send_next(&mut self) -> Result<bool, DirectMuxError> {
+        if !self.can_admit() {
+            return Ok(false);
+        }
+        let request_idx = self.next_request_idx;
+        let pane_id = *self.pane_ids.get(request_idx).ok_or(
+            DirectMuxError::RetainedStateAccounting {
+                resource: "render batch ambient request index",
+            },
+        )?;
+        let serial = self
+            .client
+            .send_request_only_tracking(
+                Pdu::GetPaneRenderChanges(GetPaneRenderChanges {
+                    pane_id: pane_id as usize,
+                }),
+                Some(&mut self.transport_ambiguous),
+            )
+            .await?;
+        self.batch_progressed = true;
+        self.record_issued(request_idx, serial)?;
+        Ok(true)
+    }
+
+    async fn send_next_with_cx(&mut self, cx: &Cx) -> Result<bool, DirectMuxError> {
+        if !self.can_admit() {
+            return Ok(false);
+        }
+        let request_idx = self.next_request_idx;
+        let pane_id = *self.pane_ids.get(request_idx).ok_or(
+            DirectMuxError::RetainedStateAccounting {
+                resource: "render batch explicit-Cx request index",
+            },
+        )?;
+        let serial = self
+            .client
+            .send_request_only_with_cx_tracking(
+                cx,
+                Pdu::GetPaneRenderChanges(GetPaneRenderChanges {
+                    pane_id: pane_id as usize,
+                }),
+                Some(&mut self.transport_ambiguous),
+            )
+            .await?;
+        self.batch_progressed = true;
+        self.record_issued(request_idx, serial)?;
+        Ok(true)
+    }
+
+    fn remember_first_error(&mut self, pane_id: u64, error: DirectMuxError) {
+        if self.first_error.is_none() {
+            tracing::debug!(
+                connection_id = self.client.connection_id,
+                pane_id,
+                issued_count = self.next_request_idx,
+                settled_count = self.settled_count.saturating_add(1),
+                remaining_count = self.owned_serials.len(),
+                explicit_cx = self.explicit_cx,
+                error_kind = ?error.protocol_error_kind(),
+                error = %error,
+                phase = "render_batch_semantic_error",
+                "mux render batch recorded its first semantic error and will drain"
+            );
+            self.first_error = Some(error);
+        }
+    }
+
+    /// Returns true when this frame completed one request owned by the batch.
+    fn handle_decoded(&mut self, decoded: DecodedPdu) -> Result<bool, DirectMuxError> {
+        if decoded.serial == 0 {
+            self.client.stash_unilateral_pdu(decoded.pdu)?;
+            return Ok(false);
+        }
+
+        let Some(response_idx) = take_in_flight_slot(&mut self.in_flight, decoded.serial) else {
+            self.client
+                .stash_pending_response(decoded.serial, decoded.pdu)?;
+            return Ok(false);
+        };
+
+        self.client.complete_response_serial(decoded.serial)?;
+        if !self.owned_serials.remove(&decoded.serial) {
+            return Err(DirectMuxError::RetainedStateAccounting {
+                resource: "render batch completed serials",
+            });
+        }
+        if self
+            .outputs
+            .get(response_idx)
+            .ok_or(DirectMuxError::RetainedStateAccounting {
+                resource: "render batch response index",
+            })?
+            .is_some()
+        {
+            return Err(DirectMuxError::RetainedStateAccounting {
+                resource: "render batch response slots",
+            });
+        }
+
+        let pane_id = *self.pane_ids.get(response_idx).ok_or(
+            DirectMuxError::RetainedStateAccounting {
+                resource: "render batch response pane index",
+            },
+        )?;
+        let resolved = DirectMuxClient::response_from_pdu(decoded.pdu)
+            .and_then(|pdu| self.client.resolve_render_change_response(pane_id, pdu));
+        match resolved {
+            Ok(payload) => {
+                let output = self.outputs.get_mut(response_idx).ok_or(
+                    DirectMuxError::RetainedStateAccounting {
+                        resource: "render batch response storage",
+                    },
+                )?;
+                *output = Some(payload);
+            }
+            Err(error)
+                if matches!(
+                    &error,
+                    DirectMuxError::UnexpectedResponse { .. }
+                        | DirectMuxError::RemoteError(_)
+                ) =>
+            {
+                self.remember_first_error(pane_id, error);
+            }
+            Err(error) => return Err(error),
+        }
+        self.settled_count = self.settled_count.checked_add(1).ok_or(
+            DirectMuxError::RetainedStateAccounting {
+                resource: "render batch settled response count",
+            },
+        )?;
+        self.ensure_request_tracking_aligned()?;
+        if self.owned_serials.is_empty() {
+            self.transport_ambiguous = false;
+        }
+        Ok(true)
+    }
+
+    async fn run(&mut self, depth: usize) -> Result<(), DirectMuxError> {
+        while self.in_flight.len() < depth {
+            if !self.send_next().await? {
+                break;
+            }
+        }
+
+        while !self.in_flight.is_empty() {
+            let decoded = self.client.read_next_pdu().await?;
+            let completed_batch_request = self.handle_decoded(decoded)?;
+            if completed_batch_request && self.can_admit() && !self.send_next().await? {
+                return Err(DirectMuxError::RetainedStateAccounting {
+                    resource: "render batch ambient admission",
+                });
+            }
+        }
+        Ok(())
+    }
+
+    async fn run_with_cx(&mut self, cx: &Cx, depth: usize) -> Result<(), DirectMuxError> {
+        while self.in_flight.len() < depth {
+            if !self.send_next_with_cx(cx).await? {
+                break;
+            }
+        }
+
+        while !self.in_flight.is_empty() {
+            let decoded = self.client.read_next_pdu_with_cx(cx).await?;
+            let completed_batch_request = self.handle_decoded(decoded)?;
+            if completed_batch_request
+                && self.can_admit()
+                && !self.send_next_with_cx(cx).await?
+            {
+                return Err(DirectMuxError::RetainedStateAccounting {
+                    resource: "render batch explicit-Cx admission",
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn invalidate_target_render_state(&mut self) -> Result<(), DirectMuxError> {
+        self.client
+            .invalidate_render_state_for_panes(self.pane_ids)?;
+        Ok(())
+    }
+
+    fn finish(mut self) -> Result<Vec<GetPaneRenderChangesResponse>, DirectMuxError> {
+        if !self.in_flight.is_empty() || !self.owned_serials.is_empty() {
+            self.transport_ambiguous = true;
+            return Err(DirectMuxError::RetainedStateAccounting {
+                resource: "render batch completion",
+            });
+        }
+
+        if let Some(error) = self.first_error.take() {
+            self.invalidate_target_render_state()?;
+            tracing::trace!(
+                connection_id = self.client.connection_id,
+                request_count = self.pane_ids.len(),
+                settled_count = self.settled_count,
+                explicit_cx = self.explicit_cx,
+                phase = "render_batch_drained_error",
+                "mux render batch drained all issued requests before returning semantic error"
+            );
+            self.disarmed = true;
+            return Err(error);
+        }
+
+        let mut ordered = Vec::with_capacity(self.outputs.len());
+        for (request_idx, output) in std::mem::take(&mut self.outputs)
+            .into_iter()
+            .enumerate()
+        {
+            let Some(payload) = output else {
+                self.transport_ambiguous = true;
+                return Err(DirectMuxError::RetainedStateAccounting {
+                    resource: "render batch missing response",
+                });
+            };
+            let Some(expected_pane_id) = self.pane_ids.get(request_idx).copied() else {
+                self.transport_ambiguous = true;
+                return Err(DirectMuxError::RetainedStateAccounting {
+                    resource: "render batch output pane index",
+                });
+            };
+            if payload.pane_id as u64 != expected_pane_id {
+                self.transport_ambiguous = true;
+                return Err(DirectMuxError::RetainedStateAccounting {
+                    resource: "render batch output pane identity",
+                });
+            }
+            ordered.push(payload);
+        }
+        tracing::trace!(
+            connection_id = self.client.connection_id,
+            response_count = ordered.len(),
+            explicit_cx = self.explicit_cx,
+            phase = "render_batch_complete",
+            "mux render batch completed"
+        );
+        self.disarmed = true;
+        Ok(ordered)
+    }
+}
+
+impl Drop for RenderBatchGuard<'_> {
+    fn drop(&mut self) {
+        if self.disarmed {
+            return;
+        }
+        if self.transport_ambiguous {
+            self.client
+                .poison_render_connection("ambiguous render batch abandonment", self.explicit_cx);
+        } else if self.batch_progressed
+            && self.invalidate_target_render_state().is_err()
+        {
+            self.client.poison_render_connection(
+                "render batch abandonment cleanup accounting failure",
+                self.explicit_cx,
+            );
+        }
     }
 }
 
@@ -554,6 +897,7 @@ impl DirectMuxClient {
             pending_render_change_bytes: 0,
             render_change_snapshots: HashMap::new(),
             render_change_snapshot_bytes: 0,
+            connection_poisoned: false,
             config,
         };
 
@@ -692,8 +1036,8 @@ impl DirectMuxClient {
                 pane_id: pane_id as usize,
             }))
             .await?;
-        let response = self.await_response(serial).await?;
-        self.resolve_render_change_response(pane_id, response)
+        let response = self.await_response(serial).await;
+        self.settle_single_render_response(pane_id, response, false)
     }
 
     /// Poll render changes using an explicit capability context.
@@ -710,8 +1054,8 @@ impl DirectMuxClient {
                 }),
             )
             .await?;
-        let response = self.await_response_with_cx(cx, serial).await?;
-        self.resolve_render_change_response(pane_id, response)
+        let response = self.await_response_with_cx(cx, serial).await;
+        self.settle_single_render_response(pane_id, response, true)
     }
 
     /// Fetch specific lines from a pane's scrollback.
@@ -1328,7 +1672,8 @@ impl DirectMuxClient {
     /// Batch `GetPaneRenderChanges` requests with depth-limited pipelining.
     ///
     /// Responses are returned in the same order as `pane_ids`, regardless of
-    /// on-wire response ordering.
+    /// on-wire response ordering. Pane IDs must be unique; duplicates are
+    /// rejected before transport admission.
     pub async fn get_pane_render_changes_batch(
         &mut self,
         pane_ids: &[u64],
@@ -1338,34 +1683,53 @@ impl DirectMuxClient {
         if pane_ids.is_empty() {
             return Ok(Vec::new());
         }
+        validate_render_batch_panes(pane_ids)?;
+        self.get_pane_render_changes_batch_prevalidated(
+            pane_ids,
+            max_pipeline_depth,
+            pipeline_timeout,
+        )
+        .await
+    }
 
-        let requests = pane_ids
-            .iter()
-            .map(|pane_id| {
-                Pdu::GetPaneRenderChanges(GetPaneRenderChanges {
-                    pane_id: *pane_id as usize,
-                })
-            })
-            .collect::<Vec<_>>();
-
-        let responses =
-            Box::pin(self.batch(requests, max_pipeline_depth, pipeline_timeout)).await?;
-        let mut out = Vec::with_capacity(responses.len());
-        for response in responses {
-            match response {
-                Pdu::GetPaneRenderChangesResponse(payload) => out.push(payload),
-                other => {
-                    return Err(DirectMuxError::UnexpectedResponse {
-                        expected: "GetPaneRenderChangesResponse".to_string(),
-                        got: other.pdu_name().to_string(),
-                    });
-                }
-            }
+    /// Pool-only render batch core after unique-pane prevalidation.
+    ///
+    /// The caller must reject duplicate pane IDs before acquiring a client.
+    pub(super) async fn get_pane_render_changes_batch_prevalidated(
+        &mut self,
+        pane_ids: &[u64],
+        max_pipeline_depth: usize,
+        pipeline_timeout: Duration,
+    ) -> Result<Vec<GetPaneRenderChangesResponse>, DirectMuxError> {
+        if pane_ids.is_empty() {
+            return Ok(Vec::new());
         }
-        Ok(out)
+        debug_assert!(validate_render_batch_panes(pane_ids).is_ok());
+        self.ensure_connection_usable()?;
+        let depth = max_pipeline_depth.max(1).min(pane_ids.len());
+        self.ensure_outstanding_request_slots(depth)?;
+        let timeout_ms = duration_to_ms_u64(pipeline_timeout);
+        tracing::trace!(
+            connection_id = self.connection_id,
+            request_count = pane_ids.len(),
+            max_pipeline_depth = depth,
+            explicit_cx = false,
+            phase = "render_batch_start",
+            "starting mux render batch"
+        );
+        let mut guard = RenderBatchGuard::new(self, pane_ids, depth, false);
+        let result = Box::pin(timeout(pipeline_timeout, guard.run(depth))).await;
+        match result {
+            Ok(inner) => {
+                inner?;
+                guard.finish()
+            }
+            Err(_) => Err(DirectMuxError::BatchTimeout { timeout_ms }),
+        }
     }
 
     /// Batch render-change requests using an explicit capability context.
+    /// Pane IDs must be unique; duplicates are rejected before transport admission.
     pub async fn get_pane_render_changes_batch_with_cx(
         &mut self,
         cx: &Cx,
@@ -1376,32 +1740,62 @@ impl DirectMuxClient {
         if pane_ids.is_empty() {
             return Ok(Vec::new());
         }
+        validate_render_batch_panes(pane_ids)?;
+        self.get_pane_render_changes_batch_with_cx_prevalidated(
+            cx,
+            pane_ids,
+            max_pipeline_depth,
+            pipeline_timeout,
+        )
+        .await
+    }
 
-        let requests = pane_ids
-            .iter()
-            .map(|pane_id| {
-                Pdu::GetPaneRenderChanges(GetPaneRenderChanges {
-                    pane_id: *pane_id as usize,
-                })
-            })
-            .collect::<Vec<_>>();
-
-        let responses = self
-            .batch_with_cx(cx, requests, max_pipeline_depth, pipeline_timeout)
-            .await?;
-        let mut out = Vec::with_capacity(responses.len());
-        for response in responses {
-            match response {
-                Pdu::GetPaneRenderChangesResponse(payload) => out.push(payload),
-                other => {
-                    return Err(DirectMuxError::UnexpectedResponse {
-                        expected: "GetPaneRenderChangesResponse".to_string(),
-                        got: other.pdu_name().to_string(),
-                    });
-                }
-            }
+    /// Pool-only explicit-Cx render batch core after unique-pane prevalidation.
+    ///
+    /// The caller must reject duplicate pane IDs before acquiring a client.
+    pub(super) async fn get_pane_render_changes_batch_with_cx_prevalidated(
+        &mut self,
+        cx: &Cx,
+        pane_ids: &[u64],
+        max_pipeline_depth: usize,
+        pipeline_timeout: Duration,
+    ) -> Result<Vec<GetPaneRenderChangesResponse>, DirectMuxError> {
+        if pane_ids.is_empty() {
+            return Ok(Vec::new());
         }
-        Ok(out)
+        debug_assert!(validate_render_batch_panes(pane_ids).is_ok());
+        self.ensure_connection_usable()?;
+        checkpoint_mux_cx(cx, self.connection_id, "render_batch_wait")?;
+        let depth = max_pipeline_depth.max(1).min(pane_ids.len());
+        self.ensure_outstanding_request_slots(depth)?;
+        let timeout_ms = duration_to_ms_u64(pipeline_timeout);
+        tracing::trace!(
+            connection_id = self.connection_id,
+            request_count = pane_ids.len(),
+            max_pipeline_depth = depth,
+            explicit_cx = true,
+            phase = "render_batch_start",
+            "starting mux render batch"
+        );
+        let mut guard = RenderBatchGuard::new(self, pane_ids, depth, true);
+        let result = crate::runtime_async::timeout_with_cx(
+            cx,
+            pipeline_timeout,
+            guard.run_with_cx(cx, depth),
+        )
+        .await;
+        match result {
+            Ok(inner) => {
+                inner?;
+                guard.finish()
+            }
+            Err(timeout_err) => Err(classify_cx_timeout(
+                cx,
+                "render_batch_wait",
+                timeout_err,
+                DirectMuxError::BatchTimeout { timeout_ms },
+            )),
+        }
     }
 
     /// Send a batch of requests using depth-limited pipelining.
@@ -1427,10 +1821,9 @@ impl DirectMuxClient {
     /// ft-xbnl0.2.3 Cx-first sibling of [`batch`].
     ///
     /// Cancellation/budget/virtual-time propagate through each
-    /// pipelined request via the cx-aware inner loop. Also used
-    /// internally by `get_pane_render_changes_batch_with_cx`;
-    /// elevated to `pub` so external callers have a Cx-first
-    /// entry point for general PDU batching.
+    /// pipelined request via the cx-aware inner loop. This remains the
+    /// Cx-first entry point for general PDU batching; render-change batches
+    /// use their correlation-aware specialized path.
     pub async fn batch_with_cx(
         &mut self,
         cx: &Cx,
@@ -1605,6 +1998,44 @@ impl DirectMuxClient {
         Ok(ordered)
     }
 
+    fn ensure_connection_usable(&self) -> Result<(), DirectMuxError> {
+        if self.connection_poisoned {
+            Err(DirectMuxError::Disconnected)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn poison_render_connection(&mut self, reason: &'static str, explicit_cx: bool) {
+        let shutdown_error = self.stream.shutdown(std::net::Shutdown::Both).err();
+        tracing::warn!(
+            connection_id = self.connection_id,
+            reason,
+            explicit_cx,
+            outstanding_count = self.outstanding_requests.len(),
+            pending_response_count = self.pending_responses.len(),
+            pending_response_bytes = self.pending_response_bytes,
+            pending_render_change_count = self.pending_render_changes.len(),
+            pending_render_change_bytes = self.pending_render_change_bytes,
+            render_snapshot_count = self.render_change_snapshots.len(),
+            render_snapshot_bytes = self.render_change_snapshot_bytes,
+            read_buffer_bytes = self.read_buf.len(),
+            socket_shutdown_succeeded = shutdown_error.is_none(),
+            socket_shutdown_error = ?shutdown_error,
+            phase = "render_connection_poison",
+            "poisoning direct mux connection and clearing retained state"
+        );
+        self.connection_poisoned = true;
+        self.outstanding_requests = HashSet::new();
+        self.pending_responses = HashMap::new();
+        self.pending_response_bytes = 0;
+        self.pending_render_changes = VecDeque::new();
+        self.pending_render_change_bytes = 0;
+        self.render_change_snapshots = HashMap::new();
+        self.render_change_snapshot_bytes = 0;
+        self.read_buf = Vec::new();
+    }
+
     fn ensure_outstanding_request_slots(&self, additional: usize) -> Result<(), DirectMuxError> {
         let requested_count = self
             .outstanding_requests
@@ -1689,6 +2120,15 @@ impl DirectMuxClient {
     }
 
     async fn send_request_only(&mut self, pdu: Pdu) -> Result<u64, DirectMuxError> {
+        self.send_request_only_tracking(pdu, None).await
+    }
+
+    async fn send_request_only_tracking(
+        &mut self,
+        pdu: Pdu,
+        write_boundary_entered: Option<&mut bool>,
+    ) -> Result<u64, DirectMuxError> {
+        self.ensure_connection_usable()?;
         self.ensure_outstanding_request_capacity()?;
         let serial = next_request_serial(&mut self.serial)?;
         let pdu_name = pdu.pdu_name();
@@ -1704,6 +2144,9 @@ impl DirectMuxClient {
         pdu.encode_with_mode(&mut buf, serial, self.compression_mode)
             .map_err(|err| DirectMuxError::Codec(err.to_string()))?;
         let encoded_len = buf.len();
+        if let Some(write_boundary_entered) = write_boundary_entered {
+            *write_boundary_entered = true;
+        }
         match timeout(self.config.write_timeout, self.stream.write_all(&buf)).await {
             Ok(Ok(())) => {
                 tracing::trace!(
@@ -1749,6 +2192,17 @@ impl DirectMuxClient {
         cx: &Cx,
         pdu: Pdu,
     ) -> Result<u64, DirectMuxError> {
+        self.send_request_only_with_cx_tracking(cx, pdu, None)
+            .await
+    }
+
+    async fn send_request_only_with_cx_tracking(
+        &mut self,
+        cx: &Cx,
+        pdu: Pdu,
+        write_boundary_entered: Option<&mut bool>,
+    ) -> Result<u64, DirectMuxError> {
+        self.ensure_connection_usable()?;
         checkpoint_mux_cx(cx, self.connection_id, "request_start")?;
         self.ensure_outstanding_request_capacity()?;
         let serial = next_request_serial(&mut self.serial)?;
@@ -1767,6 +2221,9 @@ impl DirectMuxClient {
             .map_err(|err| DirectMuxError::Codec(err.to_string()))?;
         let encoded_len = buf.len();
         checkpoint_mux_cx(cx, self.connection_id, "request_write_wait")?;
+        if let Some(write_boundary_entered) = write_boundary_entered {
+            *write_boundary_entered = true;
+        }
         // Tick 199 (ft-xbnl0.2.3): route the write timeout through
         // timeout_with_cx so the caller's explicit cx bounds the
         // PDU write. Previously used ambient `timeout` — cancel
@@ -1904,6 +2361,49 @@ impl DirectMuxClient {
         }
     }
 
+    fn settle_single_render_response(
+        &mut self,
+        pane_id: u64,
+        response: Result<Pdu, DirectMuxError>,
+        explicit_cx: bool,
+    ) -> Result<GetPaneRenderChangesResponse, DirectMuxError> {
+        let result = match response {
+            Ok(response) => self.resolve_render_change_response(pane_id, response),
+            Err(error @ DirectMuxError::RemoteError(_)) => {
+                if let Err(cleanup_error) = self.invalidate_render_state_for_pane(pane_id) {
+                    self.poison_render_connection(
+                        "single render remote-error cleanup accounting failure",
+                        explicit_cx,
+                    );
+                    return Err(cleanup_error);
+                }
+                Err(error)
+            }
+            Err(error) => {
+                self.poison_render_connection(
+                    "single render response settlement failure",
+                    explicit_cx,
+                );
+                return Err(error);
+            }
+        };
+        if matches!(
+            &result,
+            Err(
+                DirectMuxError::RetentionLimitExceeded { .. }
+                    | DirectMuxError::Codec(_)
+                    | DirectMuxError::RetainedConnectionMismatch { .. }
+                    | DirectMuxError::RetainedStateAccounting { .. }
+            )
+        ) {
+            self.poison_render_connection(
+                "single render response retention failure",
+                explicit_cx,
+            );
+        }
+        result
+    }
+
     fn resolve_render_change_response(
         &mut self,
         pane_id: u64,
@@ -1911,17 +2411,29 @@ impl DirectMuxClient {
     ) -> Result<GetPaneRenderChangesResponse, DirectMuxError> {
         match response {
             Pdu::GetPaneRenderChangesResponse(payload) => {
+                if payload.pane_id as u64 != pane_id {
+                    self.invalidate_render_state_for_pane(pane_id)?;
+                    return Err(DirectMuxError::UnexpectedResponse {
+                        expected: format!("GetPaneRenderChangesResponse for pane {pane_id}"),
+                        got: format!(
+                            "GetPaneRenderChangesResponse for pane {}",
+                            payload.pane_id
+                        ),
+                    });
+                }
                 self.remember_render_change_snapshot(&payload)?;
                 Ok(payload)
             }
             Pdu::LivenessResponse(liveness) => {
                 if liveness.pane_id as u64 != pane_id {
+                    self.invalidate_render_state_for_pane(pane_id)?;
                     return Err(DirectMuxError::UnexpectedResponse {
                         expected: format!("LivenessResponse for pane {pane_id}"),
                         got: format!("LivenessResponse for pane {}", liveness.pane_id),
                     });
                 }
                 if !liveness.is_alive {
+                    self.invalidate_render_state_for_pane(pane_id)?;
                     return Err(DirectMuxError::RemoteError(format!(
                         "pane {pane_id} is not alive"
                     )));
@@ -1929,21 +2441,29 @@ impl DirectMuxClient {
                 if let Some(payload) = self.take_pending_render_change(pane_id)? {
                     return Ok(payload);
                 }
-                self.render_change_snapshots
+                if let Some(payload) = self
+                    .render_change_snapshots
                     .get(&pane_id)
                     .map(|snapshot| snapshot.decode(self.connection_id))
                     .transpose()?
-                    .ok_or_else(|| DirectMuxError::UnexpectedResponse {
-                        expected: format!(
-                            "GetPaneRenderChangesResponse or cached render snapshot for pane {pane_id}"
-                        ),
-                        got: "LivenessResponse without accompanying render delta".to_string(),
-                    })
+                {
+                    return Ok(payload);
+                }
+                self.invalidate_render_state_for_pane(pane_id)?;
+                Err(DirectMuxError::UnexpectedResponse {
+                    expected: format!(
+                        "GetPaneRenderChangesResponse or cached render snapshot for pane {pane_id}"
+                    ),
+                    got: "LivenessResponse without accompanying render delta".to_string(),
+                })
             }
-            other => Err(DirectMuxError::UnexpectedResponse {
-                expected: "LivenessResponse or GetPaneRenderChangesResponse".to_string(),
-                got: other.pdu_name().to_string(),
-            }),
+            other => {
+                self.invalidate_render_state_for_pane(pane_id)?;
+                Err(DirectMuxError::UnexpectedResponse {
+                    expected: "LivenessResponse or GetPaneRenderChangesResponse".to_string(),
+                    got: other.pdu_name().to_string(),
+                })
+            }
         }
     }
 
@@ -2080,39 +2600,177 @@ impl DirectMuxClient {
         &mut self,
         pane_id: u64,
     ) -> Result<(usize, bool), DirectMuxError> {
-        let snapshot_removed = if let Some(snapshot) =
-            self.render_change_snapshots.remove(&pane_id)
-        {
-            self.render_change_snapshot_bytes = self
-                .render_change_snapshot_bytes
-                .checked_sub(snapshot.retained_bytes())
-                .ok_or(DirectMuxError::RetainedStateAccounting {
-                    resource: "render change snapshots",
-                })?;
-            true
-        } else {
-            false
-        };
-
-        let before = self.pending_render_changes.len();
-        self.pending_render_changes
-            .retain(|retained| retained.pane_id != pane_id);
-        let pending_removed = before
-            .checked_sub(self.pending_render_changes.len())
-            .ok_or(DirectMuxError::RetainedStateAccounting {
-                resource: "pending unilateral render changes",
+        let (snapshot_total_bytes, next_snapshot_bytes) = self
+            .render_change_snapshots
+            .iter()
+            .try_fold((0usize, 0usize), |state, (retained_pane_id, snapshot)| {
+                let total_bytes = state.0.checked_add(snapshot.retained_bytes()).ok_or(
+                    DirectMuxError::RetainedStateAccounting {
+                        resource: "render change snapshots",
+                    },
+                )?;
+                let survivor_bytes = if *retained_pane_id == pane_id {
+                    state.1
+                } else {
+                    state.1.checked_add(snapshot.retained_bytes()).ok_or(
+                        DirectMuxError::RetainedStateAccounting {
+                            resource: "render change snapshots",
+                        },
+                    )?
+                };
+                Ok((total_bytes, survivor_bytes))
             })?;
-        self.pending_render_change_bytes = self
+        if snapshot_total_bytes != self.render_change_snapshot_bytes {
+            return Err(DirectMuxError::RetainedStateAccounting {
+                resource: "render change snapshots",
+            });
+        }
+        let snapshot_removed = self.render_change_snapshots.contains_key(&pane_id);
+        let (pending_total_bytes, pending_survivor_count, next_pending_bytes) = self
             .pending_render_changes
             .iter()
-            .try_fold(0usize, |bytes, retained| {
-                bytes.checked_add(retained.retained_bytes()).ok_or(
+            .try_fold((0usize, 0usize, 0usize), |state, retained| {
+                let total_bytes = state.0.checked_add(retained.retained_bytes()).ok_or(
                     DirectMuxError::RetainedStateAccounting {
                         resource: "pending unilateral render changes",
                     },
-                )
+                )?;
+                if retained.pane_id == pane_id {
+                    Ok((total_bytes, state.1, state.2))
+                } else {
+                    Ok((
+                        total_bytes,
+                        state.1.checked_add(1).ok_or(
+                            DirectMuxError::RetainedStateAccounting {
+                                resource: "pending unilateral render changes",
+                            },
+                        )?,
+                        state.2.checked_add(retained.retained_bytes()).ok_or(
+                            DirectMuxError::RetainedStateAccounting {
+                                resource: "pending unilateral render changes",
+                            },
+                        )?,
+                    ))
+                }
             })?;
+        if pending_total_bytes != self.pending_render_change_bytes {
+            return Err(DirectMuxError::RetainedStateAccounting {
+                resource: "pending unilateral render changes",
+            });
+        }
+        let pending_removed = self
+            .pending_render_changes
+            .len()
+            .checked_sub(pending_survivor_count)
+            .ok_or(DirectMuxError::RetainedStateAccounting {
+                resource: "pending unilateral render changes",
+            })?;
+
+        if snapshot_removed {
+            self.render_change_snapshots.remove(&pane_id);
+        }
+        self.render_change_snapshot_bytes = next_snapshot_bytes;
+        self.pending_render_changes
+            .retain(|retained| retained.pane_id != pane_id);
+        self.pending_render_change_bytes = next_pending_bytes;
         Ok((pending_removed, snapshot_removed))
+    }
+
+    fn invalidate_render_state_for_panes(
+        &mut self,
+        pane_ids: &[u64],
+    ) -> Result<(usize, usize), DirectMuxError> {
+        if pane_ids.is_empty() {
+            return Ok((0, 0));
+        }
+
+        let targets = pane_ids.iter().copied().collect::<HashSet<_>>();
+        let (snapshot_total_bytes, snapshot_survivor_count, next_snapshot_bytes) = self
+            .render_change_snapshots
+            .iter()
+            .try_fold((0usize, 0usize, 0usize), |state, (pane_id, retained)| {
+                let total_bytes = state.0.checked_add(retained.retained_bytes()).ok_or(
+                    DirectMuxError::RetainedStateAccounting {
+                        resource: "render change snapshots",
+                    },
+                )?;
+                if targets.contains(pane_id) {
+                    Ok((total_bytes, state.1, state.2))
+                } else {
+                    Ok((
+                        total_bytes,
+                        state.1.checked_add(1).ok_or(
+                            DirectMuxError::RetainedStateAccounting {
+                                resource: "render change snapshots",
+                            },
+                        )?,
+                        state.2.checked_add(retained.retained_bytes()).ok_or(
+                            DirectMuxError::RetainedStateAccounting {
+                                resource: "render change snapshots",
+                            },
+                        )?,
+                    ))
+                }
+            })?;
+        if snapshot_total_bytes != self.render_change_snapshot_bytes {
+            return Err(DirectMuxError::RetainedStateAccounting {
+                resource: "render change snapshots",
+            });
+        }
+        let (pending_total_bytes, pending_survivor_count, next_pending_bytes) = self
+            .pending_render_changes
+            .iter()
+            .try_fold((0usize, 0usize, 0usize), |state, retained| {
+                let total_bytes = state.0.checked_add(retained.retained_bytes()).ok_or(
+                    DirectMuxError::RetainedStateAccounting {
+                        resource: "pending unilateral render changes",
+                    },
+                )?;
+                if targets.contains(&retained.pane_id) {
+                    Ok((total_bytes, state.1, state.2))
+                } else {
+                    Ok((
+                        total_bytes,
+                        state.1.checked_add(1).ok_or(
+                            DirectMuxError::RetainedStateAccounting {
+                                resource: "pending unilateral render changes",
+                            },
+                        )?,
+                        state.2.checked_add(retained.retained_bytes()).ok_or(
+                            DirectMuxError::RetainedStateAccounting {
+                                resource: "pending unilateral render changes",
+                            },
+                        )?,
+                    ))
+                }
+            })?;
+        if pending_total_bytes != self.pending_render_change_bytes {
+            return Err(DirectMuxError::RetainedStateAccounting {
+                resource: "pending unilateral render changes",
+            });
+        }
+        let snapshots_removed = self
+            .render_change_snapshots
+            .len()
+            .checked_sub(snapshot_survivor_count)
+            .ok_or(DirectMuxError::RetainedStateAccounting {
+                resource: "render change snapshots",
+            })?;
+        let pending_removed = self
+            .pending_render_changes
+            .len()
+            .checked_sub(pending_survivor_count)
+            .ok_or(DirectMuxError::RetainedStateAccounting {
+                resource: "pending unilateral render changes",
+            })?;
+
+        self.render_change_snapshots
+            .retain(|pane_id, _| !targets.contains(pane_id));
+        self.render_change_snapshot_bytes = next_snapshot_bytes;
+        self.pending_render_changes
+            .retain(|retained| !targets.contains(&retained.pane_id));
+        self.pending_render_change_bytes = next_pending_bytes;
+        Ok((pending_removed, snapshots_removed))
     }
 
     fn idle_render_snapshot(
@@ -2384,6 +3042,16 @@ fn checked_retention_after_insert(
 
 fn duration_to_ms_u64(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+pub(super) fn validate_render_batch_panes(pane_ids: &[u64]) -> Result<(), DirectMuxError> {
+    let mut seen = HashSet::with_capacity(pane_ids.len());
+    for pane_id in pane_ids.iter().copied() {
+        if !seen.insert(pane_id) {
+            return Err(DirectMuxError::DuplicateRenderBatchPane { pane_id });
+        }
+    }
+    Ok(())
 }
 
 fn take_in_flight_slot(in_flight: &mut VecDeque<(usize, u64)>, serial: u64) -> Option<usize> {
@@ -2910,7 +3578,7 @@ mod tests {
     use proptest::prelude::*;
     use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     const COMPRESSED_MASK: u64 = 1 << 63;
 
@@ -3030,6 +3698,29 @@ mod tests {
             input_serial: None,
             seqno,
         }
+    }
+
+    fn assert_render_retention_members(
+        client: &DirectMuxClient,
+        expected_snapshot_keys: &HashSet<u64>,
+        expected_pending_panes: &[u64],
+    ) {
+        assert_eq!(
+            &client
+                .render_change_snapshots
+                .keys()
+                .copied()
+                .collect::<HashSet<_>>(),
+            expected_snapshot_keys
+        );
+        assert_eq!(
+            client
+                .pending_render_changes
+                .iter()
+                .map(|retained| retained.pane_id)
+                .collect::<Vec<_>>(),
+            expected_pending_panes
+        );
     }
 
     /// Like `run_async_test` but spawns a dedicated thread so the test gets
@@ -4133,6 +4824,150 @@ mod tests {
             assert!(client.render_change_snapshots.contains_key(&27));
             assert!(client.render_change_snapshot_bytes > 0);
 
+            client
+                .stash_unilateral_pdu(Pdu::GetPaneRenderChangesResponse(test_render_change(
+                    27,
+                    2,
+                    "wrong-liveness-pending",
+                )))
+                .expect("stage render delta before wrong-pane liveness");
+            let wrong_liveness = client
+                .resolve_render_change_response(
+                    27,
+                    Pdu::LivenessResponse(codec::LivenessResponse {
+                        pane_id: 99,
+                        is_alive: true,
+                    }),
+                )
+                .expect_err("wrong-pane liveness must fail closed");
+            assert!(matches!(
+                wrong_liveness,
+                DirectMuxError::UnexpectedResponse { .. }
+            ));
+            assert!(!client.render_change_snapshots.contains_key(&27));
+            assert!(client.pending_render_changes.is_empty());
+            assert_eq!(client.pending_render_change_bytes, 0);
+            assert_eq!(client.render_change_snapshot_bytes, 0);
+
+            let recovered = client
+                .resolve_render_change_response(
+                    27,
+                    Pdu::GetPaneRenderChangesResponse(test_render_change(
+                        27,
+                        3,
+                        "recovered-after-wrong-liveness",
+                    )),
+                )
+                .expect("connection remains reusable after a fully correlated identity error");
+            assert_eq!(recovered.pane_id, 27);
+            assert!(!client.connection_poisoned);
+
+            client
+                .stash_unilateral_pdu(Pdu::GetPaneRenderChangesResponse(test_render_change(
+                    27,
+                    4,
+                    "dead-pane-pending",
+                )))
+                .expect("stage render delta before dead liveness");
+            let dead = client
+                .resolve_render_change_response(
+                    27,
+                    Pdu::LivenessResponse(codec::LivenessResponse {
+                        pane_id: 27,
+                        is_alive: false,
+                    }),
+                )
+                .expect_err("dead liveness must invalidate retained pane state");
+            assert!(matches!(dead, DirectMuxError::RemoteError(_)));
+            assert!(!client.render_change_snapshots.contains_key(&27));
+            assert!(client.pending_render_changes.is_empty());
+            assert_eq!(client.pending_render_change_bytes, 0);
+            assert_eq!(client.render_change_snapshot_bytes, 0);
+
+            client
+                .resolve_render_change_response(
+                    27,
+                    Pdu::GetPaneRenderChangesResponse(test_render_change(
+                        27,
+                        5,
+                        "recovered-after-dead-liveness",
+                    )),
+                )
+                .expect("connection remains reusable after dead-pane settlement");
+            client
+                .stash_unilateral_pdu(Pdu::GetPaneRenderChangesResponse(test_render_change(
+                    27,
+                    6,
+                    "legacy-mismatch-pending",
+                )))
+                .expect("stage render delta before legacy identity mismatch");
+            let legacy_mismatch = client
+                .resolve_render_change_response(
+                    27,
+                    Pdu::GetPaneRenderChangesResponse(test_render_change(
+                        99,
+                        7,
+                        "wrong-legacy-pane",
+                    )),
+                )
+                .expect_err("legacy correlated payload must retain pane identity");
+            assert!(matches!(
+                legacy_mismatch,
+                DirectMuxError::UnexpectedResponse { .. }
+            ));
+            assert!(!client.render_change_snapshots.contains_key(&27));
+            assert!(!client.render_change_snapshots.contains_key(&99));
+            assert!(client.pending_render_changes.is_empty());
+            assert_eq!(client.pending_render_change_bytes, 0);
+            assert_eq!(client.render_change_snapshot_bytes, 0);
+            client
+                .resolve_render_change_response(
+                    27,
+                    Pdu::GetPaneRenderChangesResponse(test_render_change(
+                        27,
+                        8,
+                        "recovered-after-legacy-mismatch",
+                    )),
+                )
+                .expect("legacy mismatch cleanup leaves the connection reusable");
+            assert!(!client.connection_poisoned);
+
+            client
+                .stash_unilateral_pdu(Pdu::GetPaneRenderChangesResponse(test_render_change(
+                    28,
+                    9,
+                    "second-batch-target",
+                )))
+                .expect("stage a second target before batch-level error cleanup");
+            let batch_targets = [27, 28];
+            let mut guard = RenderBatchGuard::new(&mut client, &batch_targets, 2, false);
+            guard.first_error = Some(DirectMuxError::UnexpectedResponse {
+                expected: "valid render batch correlation".to_string(),
+                got: "synthetic correlated mismatch".to_string(),
+            });
+            let batch_error = guard
+                .finish()
+                .expect_err("failed batches must clean every target pane");
+            assert!(matches!(
+                batch_error,
+                DirectMuxError::UnexpectedResponse { .. }
+            ));
+            assert!(client.pending_render_changes.is_empty());
+            assert_eq!(client.pending_render_change_bytes, 0);
+            assert!(client.render_change_snapshots.is_empty());
+            assert_eq!(client.render_change_snapshot_bytes, 0);
+            assert!(!client.connection_poisoned);
+            client
+                .resolve_render_change_response(
+                    27,
+                    Pdu::GetPaneRenderChangesResponse(test_render_change(
+                        27,
+                        10,
+                        "recovered-after-batch-cleanup",
+                    )),
+                )
+                .expect("drained batch error cleanup leaves the connection reusable");
+
             client.config.max_pending_render_changes = 1;
             client
                 .stash_unilateral_pdu(Pdu::GetPaneRenderChangesResponse(test_render_change(
@@ -4169,6 +5004,38 @@ mod tests {
             assert!(client.pending_render_changes.is_empty());
             assert_eq!(client.pending_render_change_bytes, 0);
             assert!(!client.render_change_snapshots.contains_key(&28));
+
+            let serial_before_duplicate = client.serial;
+            let duplicate_error = client
+                .get_pane_render_changes_batch(&[27, 27], 2, Duration::from_secs(1))
+                .await
+                .expect_err("duplicate panes must fail before touching the closed transport");
+            assert!(matches!(
+                duplicate_error,
+                DirectMuxError::DuplicateRenderBatchPane { pane_id: 27 }
+            ));
+            assert_eq!(client.serial, serial_before_duplicate);
+            assert!(!client.connection_poisoned);
+
+            let cancelled_cx = crate::cx::for_testing();
+            cancelled_cx.cancel_with(
+                crate::outcome::CancelKind::User,
+                Some("cancel before render batch transport"),
+            );
+            let serial_before_cancel = client.serial;
+            let cancel_error = client
+                .get_pane_render_changes_batch_with_cx(
+                    &cancelled_cx,
+                    &[27],
+                    1,
+                    Duration::from_secs(1),
+                )
+                .await
+                .expect_err("pre-transport cancellation must fail without poisoning");
+            assert_cancelled_mux_io(&cancel_error);
+            assert_eq!(client.serial, serial_before_cancel);
+            assert!(client.outstanding_requests.is_empty());
+            assert!(!client.connection_poisoned);
 
             drop(client);
             server.await.expect("server task");
@@ -4410,7 +5277,19 @@ mod tests {
     }
 
     #[test]
-    fn batch_render_changes_preserves_request_order_with_out_of_order_responses() {
+    fn render_batch_duplicate_panes_fail_permanently_during_preflight() {
+        let error = validate_render_batch_panes(&[7, 9, 7])
+            .expect_err("duplicate pane IDs must be rejected before transport admission");
+        assert!(matches!(
+            &error,
+            DirectMuxError::DuplicateRenderBatchPane { pane_id: 7 }
+        ));
+        assert_eq!(error.protocol_error_kind(), ProtocolErrorKind::Permanent);
+        validate_render_batch_panes(&[7, 9, 11]).expect("unique pane IDs remain admissible");
+    }
+
+    #[test]
+    fn batch_render_changes_resolves_out_of_order_sidebands_and_liveness() {
         run_async_test(async {
             let temp_dir = tempfile::tempdir().expect("tempdir");
             let socket_path = temp_dir.path().join("batch-order.sock");
@@ -4422,6 +5301,7 @@ mod tests {
                 let (mut stream, _) = listener.accept().await.expect("accept");
                 let mut read_buf = Vec::new();
                 let mut batch_requests: Vec<(u64, usize)> = Vec::new();
+                let mut responses_sent = 0usize;
 
                 loop {
                     let mut temp = vec![0u8; 4096];
@@ -4456,42 +5336,36 @@ mod tests {
                             }
                             Pdu::GetPaneRenderChanges(request) => {
                                 batch_requests.push((decoded.serial, request.pane_id));
-                                if batch_requests.len() == 3 {
-                                    for (idx, (serial, pane_id)) in
+                                if batch_requests.len() == 2 {
+                                    for (idx, (_serial, pane_id)) in
                                         batch_requests.iter().rev().enumerate()
                                     {
-                                        let response = Pdu::GetPaneRenderChangesResponse(
-                                            GetPaneRenderChangesResponse {
-                                                pane_id: *pane_id,
-                                                mouse_grabbed: false,
-                                                alt_screen_active: false,
-                                                cursor_position:
-                                                    mux::renderable::StableCursorPosition::default(),
-                                                dimensions: mux::renderable::RenderableDimensions {
-                                                    cols: 80,
-                                                    viewport_rows: 24,
-                                                    scrollback_rows: 0,
-                                                    physical_top: 0,
-                                                    scrollback_top: 0,
-                                                    dpi: 96,
-                                                    pixel_width: 0,
-                                                    pixel_height: 0,
-                                                    reverse_video: false,
-                                                },
-                                                tiered_scrollback_status: None,
-                                                dirty_lines: Vec::new(),
-                                                title: format!("pane-{pane_id}"),
-                                                working_dir: None,
-                                                bonus_lines: Vec::new().into(),
-                                                input_serial: None,
-                                                seqno: idx + 1,
-                                            },
+                                        let sideband = Pdu::GetPaneRenderChangesResponse(
+                                            test_render_change(
+                                                *pane_id,
+                                                idx + 1,
+                                                &format!("pane-{pane_id}"),
+                                            ),
                                         );
-                                        write_response_pdu(&mut stream, &response, *serial)
+                                        write_response_pdu(&mut stream, &sideband, 0)
                                             .await
-                                            .expect("write response");
+                                            .expect("write sideband render delta");
                                     }
-                                    return;
+                                    for (serial, pane_id) in batch_requests.iter().rev() {
+                                        let liveness =
+                                            Pdu::LivenessResponse(codec::LivenessResponse {
+                                                pane_id: *pane_id,
+                                                is_alive: true,
+                                            });
+                                        write_response_pdu(&mut stream, &liveness, *serial)
+                                            .await
+                                            .expect("write correlated liveness response");
+                                    }
+                                    responses_sent += batch_requests.len();
+                                    batch_requests.clear();
+                                    if responses_sent == 6 {
+                                        return;
+                                    }
                                 }
                             }
                             _ => {}
@@ -4500,17 +5374,33 @@ mod tests {
                 }
             });
 
-            let config = direct_mux_client_config(socket_path);
+            let mut config = direct_mux_client_config(socket_path);
+            config.max_pending_render_changes = 2;
             let mut client = DirectMuxClient::connect(config).await.expect("connect");
             let responses = client
-                .get_pane_render_changes_batch(&[10, 20, 30], 3, Duration::from_secs(1))
+                .get_pane_render_changes_batch(
+                    &[10, 20, 30, 40, 50, 60],
+                    2,
+                    Duration::from_secs(1),
+                )
                 .await
                 .expect("batch request");
 
-            assert_eq!(responses.len(), 3);
-            assert_eq!(responses[0].pane_id, 10);
-            assert_eq!(responses[1].pane_id, 20);
-            assert_eq!(responses[2].pane_id, 30);
+            assert_eq!(responses.len(), 6);
+            for (response, pane_id) in responses
+                .iter()
+                .zip([10usize, 20, 30, 40, 50, 60])
+            {
+                assert_eq!(response.pane_id, pane_id);
+                assert_eq!(response.title, format!("pane-{pane_id}"));
+            }
+            assert!(client.outstanding_requests.is_empty());
+            assert!(client.pending_responses.is_empty());
+            assert_eq!(client.pending_response_bytes, 0);
+            assert!(client.pending_render_changes.is_empty());
+            assert_eq!(client.pending_render_change_bytes, 0);
+            assert_eq!(client.render_change_snapshots.len(), 6);
+            assert!(client.render_change_snapshot_bytes > 0);
 
             drop(client);
             server.await.expect("server task");
@@ -4518,7 +5408,7 @@ mod tests {
     }
 
     #[test]
-    fn batch_render_changes_with_cx_preserves_request_order_with_out_of_order_responses() {
+    fn batch_render_changes_with_cx_resolves_out_of_order_sidebands_and_liveness() {
         run_async_test(async {
             let cx = crate::cx::for_testing();
             let temp_dir = tempfile::tempdir().expect("tempdir");
@@ -4569,36 +5459,24 @@ mod tests {
                                     for (idx, (serial, pane_id)) in
                                         batch_requests.iter().rev().enumerate()
                                     {
-                                        let response = Pdu::GetPaneRenderChangesResponse(
-                                            GetPaneRenderChangesResponse {
-                                                pane_id: *pane_id,
-                                                mouse_grabbed: false,
-                                                alt_screen_active: false,
-                                                cursor_position:
-                                                    mux::renderable::StableCursorPosition::default(),
-                                                dimensions: mux::renderable::RenderableDimensions {
-                                                    cols: 80,
-                                                    viewport_rows: 24,
-                                                    scrollback_rows: 0,
-                                                    physical_top: 0,
-                                                    scrollback_top: 0,
-                                                    dpi: 96,
-                                                    pixel_width: 0,
-                                                    pixel_height: 0,
-                                                    reverse_video: false,
-                                                },
-                                                tiered_scrollback_status: None,
-                                                dirty_lines: Vec::new(),
-                                                title: format!("pane-{pane_id}"),
-                                                working_dir: None,
-                                                bonus_lines: Vec::new().into(),
-                                                input_serial: None,
-                                                seqno: idx + 1,
-                                            },
+                                        let sideband = Pdu::GetPaneRenderChangesResponse(
+                                            test_render_change(
+                                                *pane_id,
+                                                idx + 1,
+                                                &format!("pane-{pane_id}"),
+                                            ),
                                         );
-                                        write_response_pdu(&mut stream, &response, *serial)
+                                        write_response_pdu(&mut stream, &sideband, 0)
                                             .await
-                                            .expect("write response");
+                                            .expect("write sideband render delta");
+                                        let liveness =
+                                            Pdu::LivenessResponse(codec::LivenessResponse {
+                                                pane_id: *pane_id,
+                                                is_alive: true,
+                                            });
+                                        write_response_pdu(&mut stream, &liveness, *serial)
+                                            .await
+                                            .expect("write correlated liveness response");
                                     }
                                     return;
                                 }
@@ -4627,6 +5505,1165 @@ mod tests {
             assert_eq!(responses[0].pane_id, 10);
             assert_eq!(responses[1].pane_id, 20);
             assert_eq!(responses[2].pane_id, 30);
+            assert_eq!(responses[0].title, "pane-10");
+            assert_eq!(responses[1].title, "pane-20");
+            assert_eq!(responses[2].title, "pane-30");
+            assert!(client.outstanding_requests.is_empty());
+            assert!(client.pending_responses.is_empty());
+            assert_eq!(client.pending_response_bytes, 0);
+            assert!(client.pending_render_changes.is_empty());
+            assert_eq!(client.pending_render_change_bytes, 0);
+            assert_eq!(client.render_change_snapshots.len(), 3);
+            assert!(client.render_change_snapshot_bytes > 0);
+
+            drop(client);
+            server.await.expect("server task");
+        });
+    }
+
+    #[test]
+    fn render_batch_semantic_errors_drain_cleanup_and_reuse_connection() {
+        #[derive(Clone, Copy, Debug)]
+        enum SemanticCase {
+            WrongLegacyPane,
+            WrongLivenessPane,
+            DeadPane,
+            MissingDelta,
+            UnexpectedPdu,
+            ErrorResponse,
+        }
+
+        run_async_test(async {
+            for case in [
+                SemanticCase::WrongLegacyPane,
+                SemanticCase::WrongLivenessPane,
+                SemanticCase::DeadPane,
+                SemanticCase::MissingDelta,
+                SemanticCase::UnexpectedPdu,
+                SemanticCase::ErrorResponse,
+            ] {
+                let temp_dir = tempfile::tempdir().expect("tempdir");
+                let socket_path = temp_dir
+                    .path()
+                    .join(format!("render-semantic-{case:?}.sock"));
+                let listener = compat_unix::bind(&socket_path)
+                    .await
+                    .expect("bind listener");
+
+                let server = task::spawn(async move {
+                    let (mut stream, _) = listener.accept().await.expect("accept");
+                    let mut read_buf = Vec::new();
+                    let mut initial_requests: Vec<(u64, usize)> = Vec::new();
+                    let mut initial_batch_answered = false;
+
+                    loop {
+                        let mut temp = vec![0u8; 4096];
+                        let read = unix_stream_read(&mut stream, &mut temp)
+                            .await
+                            .expect("read");
+                        if read == 0 {
+                            break;
+                        }
+                        read_buf.extend_from_slice(&temp[..read]);
+
+                        while let Ok(Some(decoded)) = codec::Pdu::stream_decode(&mut read_buf) {
+                            match decoded.pdu {
+                                Pdu::GetCodecVersion(_) => {
+                                    let response =
+                                        Pdu::GetCodecVersionResponse(GetCodecVersionResponse {
+                                            codec_vers: CODEC_VERSION,
+                                            version_string: "render-semantic-test".to_string(),
+                                            executable_path: PathBuf::from("/bin/wezterm"),
+                                            config_file_path: None,
+                                            min_supported: codec::CODEC_VERSION_MIN_SUPPORTED,
+                                        });
+                                    write_response_pdu(&mut stream, &response, decoded.serial)
+                                        .await
+                                        .expect("write codec response");
+                                }
+                                Pdu::SetClientId(_) => {
+                                    write_response_pdu(
+                                        &mut stream,
+                                        &Pdu::UnitResponse(UnitResponse {}),
+                                        decoded.serial,
+                                    )
+                                    .await
+                                    .expect("write client response");
+                                }
+                                Pdu::GetPaneRenderChanges(request)
+                                    if !initial_batch_answered =>
+                                {
+                                    initial_requests.push((decoded.serial, request.pane_id));
+                                    if initial_requests.len() != 3 {
+                                        continue;
+                                    }
+
+                                    let (last_serial, last_pane) = initial_requests[2];
+                                    write_response_pdu(
+                                        &mut stream,
+                                        &Pdu::GetPaneRenderChangesResponse(test_render_change(
+                                            last_pane,
+                                            30,
+                                            "drained-last-target",
+                                        )),
+                                        last_serial,
+                                    )
+                                    .await
+                                    .expect("write out-of-order last target response");
+
+                                    let (bad_serial, bad_pane) = initial_requests[0];
+                                    if matches!(case, SemanticCase::MissingDelta) {
+                                        write_response_pdu(
+                                            &mut stream,
+                                            &Pdu::PaneRemoved(codec::PaneRemoved {
+                                                pane_id: bad_pane,
+                                            }),
+                                            0,
+                                        )
+                                        .await
+                                        .expect("invalidate pre-seeded missing-delta target");
+                                    }
+                                    let bad_response = match case {
+                                        SemanticCase::WrongLegacyPane => {
+                                            Pdu::GetPaneRenderChangesResponse(test_render_change(
+                                                700,
+                                                31,
+                                                "wrong-legacy-pane",
+                                            ))
+                                        }
+                                        SemanticCase::WrongLivenessPane => {
+                                            Pdu::LivenessResponse(codec::LivenessResponse {
+                                                pane_id: 700,
+                                                is_alive: true,
+                                            })
+                                        }
+                                        SemanticCase::DeadPane => {
+                                            Pdu::LivenessResponse(codec::LivenessResponse {
+                                                pane_id: bad_pane,
+                                                is_alive: false,
+                                            })
+                                        }
+                                        SemanticCase::MissingDelta => {
+                                            Pdu::LivenessResponse(codec::LivenessResponse {
+                                                pane_id: bad_pane,
+                                                is_alive: true,
+                                            })
+                                        }
+                                        SemanticCase::UnexpectedPdu => {
+                                            Pdu::UnitResponse(UnitResponse {})
+                                        }
+                                        SemanticCase::ErrorResponse => {
+                                            Pdu::ErrorResponse(codec::ErrorResponse {
+                                                reason: "semantic test remote error".to_string(),
+                                            })
+                                        }
+                                    };
+                                    write_response_pdu(&mut stream, &bad_response, bad_serial)
+                                        .await
+                                        .expect("write semantic error response");
+
+                                    let (middle_serial, middle_pane) = initial_requests[1];
+                                    write_response_pdu(
+                                        &mut stream,
+                                        &Pdu::GetPaneRenderChangesResponse(test_render_change(
+                                            middle_pane,
+                                            32,
+                                            "drained-middle-target",
+                                        )),
+                                        middle_serial,
+                                    )
+                                    .await
+                                    .expect("write final drained target response");
+                                    initial_batch_answered = true;
+                                }
+                                Pdu::GetPaneRenderChanges(request) => {
+                                    write_response_pdu(
+                                        &mut stream,
+                                        &Pdu::GetPaneRenderChangesResponse(test_render_change(
+                                            request.pane_id,
+                                            1,
+                                            "same-connection-reuse",
+                                        )),
+                                        decoded.serial,
+                                    )
+                                    .await
+                                    .expect("write same-connection reuse response");
+                                    return;
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                });
+
+                let config = direct_mux_client_config(socket_path);
+                let mut client = DirectMuxClient::connect(config).await.expect("connect");
+                for pane_id in [11usize, 22, 33, 999] {
+                    client
+                        .stash_unilateral_pdu(Pdu::GetPaneRenderChangesResponse(
+                            test_render_change(pane_id, 10, "pre-seeded-retention"),
+                        ))
+                        .expect("seed render retention");
+                }
+                let unrelated_snapshot_bytes = client
+                    .render_change_snapshots
+                    .get(&999)
+                    .expect("unrelated snapshot")
+                    .retained_bytes();
+                let unrelated_pending_bytes = client
+                    .pending_render_changes
+                    .iter()
+                    .find(|retained| retained.pane_id == 999)
+                    .expect("unrelated pending delta")
+                    .retained_bytes();
+                let unrelated_response_serial =
+                    next_request_serial(&mut client.serial).expect("reserve unrelated serial");
+                client
+                    .mark_request_outstanding(unrelated_response_serial)
+                    .expect("mark unrelated request outstanding");
+                client
+                    .stash_pending_response(
+                        unrelated_response_serial,
+                        Pdu::UnitResponse(UnitResponse {}),
+                    )
+                    .expect("stage unrelated pending response");
+                let unrelated_response_bytes = client.pending_response_bytes;
+
+                let error = client
+                    .get_pane_render_changes_batch(&[11, 22, 33], 3, Duration::from_secs(1))
+                    .await
+                    .expect_err("semantic response shape must fail after draining");
+                match case {
+                    SemanticCase::DeadPane | SemanticCase::ErrorResponse => {
+                        assert!(matches!(error, DirectMuxError::RemoteError(_)), "{case:?}");
+                    }
+                    _ => {
+                        assert!(
+                            matches!(error, DirectMuxError::UnexpectedResponse { .. }),
+                            "{case:?}"
+                        );
+                    }
+                }
+                assert_eq!(client.outstanding_requests.len(), 1, "{case:?}");
+                assert!(
+                    client
+                        .outstanding_requests
+                        .contains(&unrelated_response_serial),
+                    "{case:?}"
+                );
+                assert_eq!(client.pending_responses.len(), 1, "{case:?}");
+                assert!(
+                    client
+                        .pending_responses
+                        .contains_key(&unrelated_response_serial),
+                    "{case:?}"
+                );
+                assert_eq!(
+                    client.pending_response_bytes, unrelated_response_bytes,
+                    "{case:?}"
+                );
+                assert_eq!(client.pending_render_changes.len(), 1, "{case:?}");
+                assert_eq!(
+                    client.pending_render_changes[0].pane_id, 999,
+                    "{case:?}"
+                );
+                assert_eq!(
+                    client.pending_render_change_bytes, unrelated_pending_bytes,
+                    "{case:?}"
+                );
+                assert_eq!(client.render_change_snapshots.len(), 1, "{case:?}");
+                assert!(client.render_change_snapshots.contains_key(&999), "{case:?}");
+                assert_eq!(
+                    client.render_change_snapshot_bytes, unrelated_snapshot_bytes,
+                    "{case:?}"
+                );
+                assert!(!client.connection_poisoned, "{case:?}");
+
+                let preserved_response = client
+                    .await_response(unrelated_response_serial)
+                    .await
+                    .expect("unrelated pending response must survive target cleanup");
+                assert!(matches!(preserved_response, Pdu::UnitResponse(_)), "{case:?}");
+                assert!(client.outstanding_requests.is_empty(), "{case:?}");
+                assert!(client.pending_responses.is_empty(), "{case:?}");
+                assert_eq!(client.pending_response_bytes, 0, "{case:?}");
+
+                let reuse = client
+                    .get_pane_render_changes(77)
+                    .await
+                    .expect("fully drained semantic error must preserve aligned reuse");
+                assert_eq!(reuse.pane_id, 77, "{case:?}");
+                assert_eq!(reuse.title, "same-connection-reuse", "{case:?}");
+
+                drop(client);
+                server.await.expect("server task");
+            }
+        });
+    }
+
+    #[test]
+    fn single_render_error_response_clears_stale_state_and_preserves_reuse() {
+        run_async_test(async {
+            let cx = crate::cx::for_testing();
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let socket_path = temp_dir.path().join("single-render-error-response.sock");
+            let listener = compat_unix::bind(&socket_path)
+                .await
+                .expect("bind listener");
+
+            let server = task::spawn(async move {
+                let (mut stream, _) = listener.accept().await.expect("accept");
+                let mut read_buf = Vec::new();
+                let mut render_request_count = 0usize;
+
+                loop {
+                    let mut temp = vec![0u8; 4096];
+                    let read = unix_stream_read(&mut stream, &mut temp)
+                        .await
+                        .expect("read");
+                    if read == 0 {
+                        break;
+                    }
+                    read_buf.extend_from_slice(&temp[..read]);
+                    while let Ok(Some(decoded)) = codec::Pdu::stream_decode(&mut read_buf) {
+                        let response = match decoded.pdu {
+                            Pdu::GetCodecVersion(_) => {
+                                Pdu::GetCodecVersionResponse(GetCodecVersionResponse {
+                                    codec_vers: CODEC_VERSION,
+                                    version_string: "single-render-error-test".to_string(),
+                                    executable_path: PathBuf::from("/bin/wezterm"),
+                                    config_file_path: None,
+                                    min_supported: codec::CODEC_VERSION_MIN_SUPPORTED,
+                                })
+                            }
+                            Pdu::SetClientId(_) => Pdu::UnitResponse(UnitResponse {}),
+                            Pdu::GetPaneRenderChanges(request) => {
+                                render_request_count += 1;
+                                if matches!(render_request_count, 1 | 3) {
+                                    Pdu::ErrorResponse(codec::ErrorResponse {
+                                        reason: format!(
+                                            "single render remote error {render_request_count}"
+                                        ),
+                                    })
+                                } else {
+                                    Pdu::GetPaneRenderChangesResponse(test_render_change(
+                                        request.pane_id,
+                                        render_request_count,
+                                        "single-render-reuse",
+                                    ))
+                                }
+                            }
+                            _ => continue,
+                        };
+                        write_response_pdu(&mut stream, &response, decoded.serial)
+                            .await
+                            .expect("write response");
+                        if render_request_count == 4 {
+                            return;
+                        }
+                    }
+                }
+            });
+
+            let config = direct_mux_client_config(socket_path);
+            let mut client = DirectMuxClient::connect(config).await.expect("connect");
+            client
+                .stash_unilateral_pdu(Pdu::GetPaneRenderChangesResponse(test_render_change(
+                    27,
+                    10,
+                    "stale-before-ambient-error",
+                )))
+                .expect("seed ambient stale state");
+            let ambient_error = client
+                .get_pane_render_changes(27)
+                .await
+                .expect_err("ambient ErrorResponse must surface RemoteError");
+            assert!(matches!(ambient_error, DirectMuxError::RemoteError(_)));
+            assert!(!client.render_change_snapshots.contains_key(&27));
+            assert!(client.pending_render_changes.is_empty());
+            assert_eq!(client.pending_render_change_bytes, 0);
+            assert!(!client.connection_poisoned);
+            let ambient_reuse = client
+                .get_pane_render_changes(27)
+                .await
+                .expect("ambient connection remains aligned");
+            assert_eq!(ambient_reuse.title, "single-render-reuse");
+
+            client
+                .stash_unilateral_pdu(Pdu::GetPaneRenderChangesResponse(test_render_change(
+                    27,
+                    11,
+                    "stale-before-cx-error",
+                )))
+                .expect("seed Cx stale state");
+            let cx_error = client
+                .get_pane_render_changes_with_cx(&cx, 27)
+                .await
+                .expect_err("Cx ErrorResponse must surface RemoteError");
+            assert!(matches!(cx_error, DirectMuxError::RemoteError(_)));
+            assert!(!client.render_change_snapshots.contains_key(&27));
+            assert!(client.pending_render_changes.is_empty());
+            assert_eq!(client.pending_render_change_bytes, 0);
+            assert!(!client.connection_poisoned);
+            let cx_reuse = client
+                .get_pane_render_changes_with_cx(&cx, 27)
+                .await
+                .expect("Cx connection remains aligned");
+            assert_eq!(cx_reuse.title, "single-render-reuse");
+
+            drop(client);
+            server.await.expect("server task");
+        });
+    }
+
+    #[test]
+    fn later_prewrite_cx_cancellation_cleans_without_poisoning_aligned_connection() {
+        run_async_test(async {
+            let cx = crate::cx::for_testing();
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let socket_path = temp_dir.path().join("later-prewrite-cancel.sock");
+            let listener = compat_unix::bind(&socket_path)
+                .await
+                .expect("bind listener");
+
+            let server = task::spawn(async move {
+                let (mut stream, _) = listener.accept().await.expect("accept");
+                let mut read_buf = Vec::new();
+                let mut render_request_count = 0usize;
+                loop {
+                    let mut temp = vec![0u8; 4096];
+                    let read = unix_stream_read(&mut stream, &mut temp)
+                        .await
+                        .expect("read");
+                    if read == 0 {
+                        break;
+                    }
+                    read_buf.extend_from_slice(&temp[..read]);
+                    while let Ok(Some(decoded)) = codec::Pdu::stream_decode(&mut read_buf) {
+                        let response = match decoded.pdu {
+                            Pdu::GetCodecVersion(_) => {
+                                Pdu::GetCodecVersionResponse(GetCodecVersionResponse {
+                                    codec_vers: CODEC_VERSION,
+                                    version_string: "later-prewrite-cancel-test".to_string(),
+                                    executable_path: PathBuf::from("/bin/wezterm"),
+                                    config_file_path: None,
+                                    min_supported: codec::CODEC_VERSION_MIN_SUPPORTED,
+                                })
+                            }
+                            Pdu::SetClientId(_) => Pdu::UnitResponse(UnitResponse {}),
+                            Pdu::GetPaneRenderChanges(request) => {
+                                render_request_count += 1;
+                                if render_request_count == 1 {
+                                    assert_eq!(request.pane_id, 11);
+                                } else {
+                                    assert_eq!(request.pane_id, 77);
+                                }
+                                Pdu::GetPaneRenderChangesResponse(test_render_change(
+                                    request.pane_id,
+                                    render_request_count,
+                                    "later-prewrite-cancel-reuse",
+                                ))
+                            }
+                            _ => continue,
+                        };
+                        write_response_pdu(&mut stream, &response, decoded.serial)
+                            .await
+                            .expect("write response");
+                        if render_request_count == 2 {
+                            return;
+                        }
+                    }
+                }
+            });
+
+            let config = direct_mux_client_config(socket_path);
+            let mut client = DirectMuxClient::connect(config).await.expect("connect");
+            let targets = [11_u64, 22];
+            let mut guard = RenderBatchGuard::new(&mut client, &targets, 1, true);
+            assert!(guard.send_next_with_cx(&cx).await.expect("issue first"));
+            let decoded = guard
+                .client
+                .read_next_pdu_with_cx(&cx)
+                .await
+                .expect("read first response");
+            assert!(guard.handle_decoded(decoded).expect("settle first response"));
+            assert!(!guard.transport_ambiguous);
+            assert!(guard.owned_serials.is_empty());
+            assert!(guard.in_flight.is_empty());
+
+            cx.cancel_with(
+                crate::outcome::CancelKind::User,
+                Some("cancel before second render write boundary"),
+            );
+            let error = guard
+                .send_next_with_cx(&cx)
+                .await
+                .expect_err("second request must cancel before its write boundary");
+            assert_cancelled_mux_io(&error);
+            assert!(!guard.transport_ambiguous);
+            drop(guard);
+
+            assert!(!client.connection_poisoned);
+            assert!(client.outstanding_requests.is_empty());
+            assert!(!client.render_change_snapshots.contains_key(&11));
+            let reuse_cx = crate::cx::for_testing();
+            let reuse = client
+                .get_pane_render_changes_with_cx(&reuse_cx, 77)
+                .await
+                .expect("aligned connection remains reusable after clean cancellation");
+            assert_eq!(reuse.title, "later-prewrite-cancel-reuse");
+
+            drop(client);
+            server.await.expect("server task");
+        });
+    }
+
+    #[test]
+    fn post_write_render_retention_failure_poisons_and_shuts_down_socket() {
+        run_async_test(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let socket_path = temp_dir.path().join("post-write-retention-failure.sock");
+            let listener = compat_unix::bind(&socket_path)
+                .await
+                .expect("bind listener");
+
+            let server = task::spawn(async move {
+                let (mut stream, _) = listener.accept().await.expect("accept");
+                let mut read_buf = Vec::new();
+                loop {
+                    let mut temp = vec![0u8; 4096];
+                    let read = unix_stream_read(&mut stream, &mut temp)
+                        .await
+                        .expect("read");
+                    if read == 0 {
+                        return 0usize;
+                    }
+                    read_buf.extend_from_slice(&temp[..read]);
+                    while let Ok(Some(decoded)) = codec::Pdu::stream_decode(&mut read_buf) {
+                        let response = match decoded.pdu {
+                            Pdu::GetCodecVersion(_) => {
+                                Pdu::GetCodecVersionResponse(GetCodecVersionResponse {
+                                    codec_vers: CODEC_VERSION,
+                                    version_string: "retention-failure-test".to_string(),
+                                    executable_path: PathBuf::from("/bin/wezterm"),
+                                    config_file_path: None,
+                                    min_supported: codec::CODEC_VERSION_MIN_SUPPORTED,
+                                })
+                            }
+                            Pdu::SetClientId(_) => Pdu::UnitResponse(UnitResponse {}),
+                            Pdu::GetPaneRenderChanges(request) => {
+                                let response = Pdu::GetPaneRenderChangesResponse(
+                                    test_render_change(
+                                        request.pane_id,
+                                        1,
+                                        "must-exceed-snapshot-limit",
+                                    ),
+                                );
+                                write_response_pdu(&mut stream, &response, decoded.serial)
+                                    .await
+                                    .expect("write render response");
+                                let mut eof_probe = [0u8; 1];
+                                return unix_stream_read(&mut stream, &mut eof_probe)
+                                    .await
+                                    .expect("read poison shutdown EOF");
+                            }
+                            _ => continue,
+                        };
+                        write_response_pdu(&mut stream, &response, decoded.serial)
+                            .await
+                            .expect("write handshake response");
+                    }
+                }
+            });
+
+            let mut config = direct_mux_client_config(socket_path);
+            config.max_render_change_snapshots = 1;
+            let mut client = DirectMuxClient::connect(config).await.expect("connect");
+            client
+                .resolve_render_change_response(
+                    999,
+                    Pdu::GetPaneRenderChangesResponse(test_render_change(
+                        999,
+                        1,
+                        "occupy-only-snapshot-slot",
+                    )),
+                )
+                .expect("seed sole snapshot slot");
+
+            let error = client
+                .get_pane_render_changes_batch(&[11], 1, Duration::from_secs(1))
+                .await
+                .expect_err("post-write snapshot retention failure must fail closed");
+            assert!(matches!(
+                error,
+                DirectMuxError::RetentionLimitExceeded {
+                    resource: "render change snapshots",
+                    ..
+                }
+            ));
+            assert!(client.connection_poisoned);
+            assert!(client.outstanding_requests.is_empty());
+            assert!(client.render_change_snapshots.is_empty());
+            assert_eq!(client.render_change_snapshot_bytes, 0);
+            assert!(matches!(
+                client.list_panes().await,
+                Err(DirectMuxError::Disconnected)
+            ));
+
+            let peer_read = timeout(Duration::from_secs(1), server)
+                .await
+                .expect("poison must shut down peer before client drop")
+                .expect("server task");
+            assert_eq!(peer_read, 0);
+            drop(client);
+        });
+    }
+
+    #[test]
+    fn dropping_in_flight_render_batch_future_poisons_and_shuts_down_socket() {
+        run_async_test(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let socket_path = temp_dir.path().join("caller-drop-render-batch.sock");
+            let listener = compat_unix::bind(&socket_path)
+                .await
+                .expect("bind listener");
+            let request_observed = Arc::new(AtomicBool::new(false));
+            let server_observed = Arc::clone(&request_observed);
+
+            let server = task::spawn(async move {
+                let (mut stream, _) = listener.accept().await.expect("accept");
+                let mut read_buf = Vec::new();
+                loop {
+                    let mut temp = vec![0u8; 4096];
+                    let read = unix_stream_read(&mut stream, &mut temp)
+                        .await
+                        .expect("read");
+                    if read == 0 {
+                        return 0usize;
+                    }
+                    read_buf.extend_from_slice(&temp[..read]);
+                    while let Ok(Some(decoded)) = codec::Pdu::stream_decode(&mut read_buf) {
+                        match decoded.pdu {
+                            Pdu::GetCodecVersion(_) => {
+                                write_response_pdu(
+                                    &mut stream,
+                                    &Pdu::GetCodecVersionResponse(GetCodecVersionResponse {
+                                        codec_vers: CODEC_VERSION,
+                                        version_string: "caller-drop-test".to_string(),
+                                        executable_path: PathBuf::from("/bin/wezterm"),
+                                        config_file_path: None,
+                                        min_supported: codec::CODEC_VERSION_MIN_SUPPORTED,
+                                    }),
+                                    decoded.serial,
+                                )
+                                .await
+                                .expect("write codec response");
+                            }
+                            Pdu::SetClientId(_) => {
+                                write_response_pdu(
+                                    &mut stream,
+                                    &Pdu::UnitResponse(UnitResponse {}),
+                                    decoded.serial,
+                                )
+                                .await
+                                .expect("write client response");
+                            }
+                            Pdu::GetPaneRenderChanges(_) => {
+                                server_observed.store(true, Ordering::SeqCst);
+                                let mut eof_probe = [0u8; 1];
+                                return unix_stream_read(&mut stream, &mut eof_probe)
+                                    .await
+                                    .expect("read caller-drop shutdown EOF");
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            });
+
+            let config = direct_mux_client_config(socket_path);
+            let mut client = DirectMuxClient::connect(config).await.expect("connect");
+            client.config.read_timeout = Duration::from_secs(5);
+            let targets = [11_u64];
+            let mut batch = Box::pin(client.get_pane_render_changes_batch(
+                &targets,
+                1,
+                Duration::from_secs(5),
+            ));
+            std::future::poll_fn(|task_cx| {
+                match std::future::Future::poll(batch.as_mut(), task_cx) {
+                    std::task::Poll::Ready(result) => {
+                        panic!("stalled batch unexpectedly completed: {result:?}")
+                    }
+                    std::task::Poll::Pending
+                        if request_observed.load(Ordering::SeqCst) =>
+                    {
+                        std::task::Poll::Ready(())
+                    }
+                    std::task::Poll::Pending => {
+                        task_cx.waker().wake_by_ref();
+                        std::task::Poll::Pending
+                    }
+                }
+            })
+            .await;
+            drop(batch);
+
+            assert!(client.connection_poisoned);
+            assert!(client.outstanding_requests.is_empty());
+            assert!(client.pending_responses.is_empty());
+            assert!(client.read_buf.is_empty());
+            assert!(matches!(
+                client.list_panes().await,
+                Err(DirectMuxError::Disconnected)
+            ));
+
+            let peer_read = timeout(Duration::from_secs(1), server)
+                .await
+                .expect("caller-drop poison must shut down peer before client drop")
+                .expect("server task");
+            assert_eq!(peer_read, 0);
+            drop(client);
+        });
+    }
+
+    #[test]
+    fn render_invalidation_accounting_corruption_is_atomic_and_batch_cleanup_poisons() {
+        run_async_test(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let socket_path = temp_dir.path().join("render-accounting-corruption.sock");
+            let listener = compat_unix::bind(&socket_path)
+                .await
+                .expect("bind listener");
+
+            let server = task::spawn(async move {
+                let (mut stream, _) = listener.accept().await.expect("accept");
+                let mut read_buf = Vec::new();
+                let mut render_serials = Vec::new();
+                loop {
+                    let mut temp = vec![0u8; 4096];
+                    let read = unix_stream_read(&mut stream, &mut temp)
+                        .await
+                        .expect("read");
+                    if read == 0 {
+                        return 0usize;
+                    }
+                    read_buf.extend_from_slice(&temp[..read]);
+                    while let Ok(Some(decoded)) = codec::Pdu::stream_decode(&mut read_buf) {
+                        match decoded.pdu {
+                            Pdu::GetCodecVersion(_) => {
+                                write_response_pdu(
+                                    &mut stream,
+                                    &Pdu::GetCodecVersionResponse(GetCodecVersionResponse {
+                                        codec_vers: CODEC_VERSION,
+                                        version_string: "render-accounting-test".to_string(),
+                                        executable_path: PathBuf::from("/bin/wezterm"),
+                                        config_file_path: None,
+                                        min_supported: codec::CODEC_VERSION_MIN_SUPPORTED,
+                                    }),
+                                    decoded.serial,
+                                )
+                                .await
+                                .expect("write codec response");
+                            }
+                            Pdu::SetClientId(_) => {
+                                write_response_pdu(
+                                    &mut stream,
+                                    &Pdu::UnitResponse(UnitResponse {}),
+                                    decoded.serial,
+                                )
+                                .await
+                                .expect("write client response");
+                            }
+                            Pdu::GetPaneRenderChanges(_) => {
+                                render_serials.push(decoded.serial);
+                                if render_serials.len() == 2 {
+                                    for serial in render_serials.drain(..).rev() {
+                                        write_response_pdu(
+                                            &mut stream,
+                                            &Pdu::ErrorResponse(codec::ErrorResponse {
+                                                reason: "drained accounting cleanup error"
+                                                    .to_string(),
+                                            }),
+                                            serial,
+                                        )
+                                        .await
+                                        .expect("write drained semantic response");
+                                    }
+                                    let mut eof_probe = [0u8; 1];
+                                    return unix_stream_read(&mut stream, &mut eof_probe)
+                                        .await
+                                        .expect("read accounting-poison shutdown EOF");
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            });
+
+            let config = direct_mux_client_config(socket_path);
+            let mut client = DirectMuxClient::connect(config).await.expect("connect");
+            for pane_id in [11usize, 22, 999] {
+                client
+                    .stash_unilateral_pdu(Pdu::GetPaneRenderChangesResponse(
+                        test_render_change(pane_id, 1, "accounting-seed"),
+                    ))
+                    .expect("seed retained render state");
+            }
+            let bulk_targets = (1_000_u64..1_256).collect::<Vec<_>>();
+            for pane_id in bulk_targets.iter().copied() {
+                client
+                    .stash_unilateral_pdu(Pdu::GetPaneRenderChangesResponse(
+                        test_render_change(pane_id as usize, 1, "bulk-accounting-seed"),
+                    ))
+                    .expect("seed bulk retained render state");
+            }
+            let (pending_removed, snapshots_removed) = client
+                .invalidate_render_state_for_panes(&bulk_targets)
+                .expect("bulk invalidation should remove 256 targets in one checked pass");
+            assert_eq!(pending_removed, bulk_targets.len());
+            assert_eq!(snapshots_removed, bulk_targets.len());
+            assert_eq!(client.pending_render_changes.len(), 3);
+            assert_eq!(client.render_change_snapshots.len(), 3);
+            assert_eq!(
+                client.pending_render_change_bytes,
+                client
+                    .pending_render_changes
+                    .iter()
+                    .map(RetainedRenderChange::retained_bytes)
+                    .sum::<usize>()
+            );
+            assert_eq!(
+                client.render_change_snapshot_bytes,
+                client
+                    .render_change_snapshots
+                    .values()
+                    .map(RetainedRenderChange::retained_bytes)
+                    .sum::<usize>()
+            );
+            let snapshot_keys = client
+                .render_change_snapshots
+                .keys()
+                .copied()
+                .collect::<HashSet<_>>();
+            let pending_panes = client
+                .pending_render_changes
+                .iter()
+                .map(|retained| retained.pane_id)
+                .collect::<Vec<_>>();
+            let correct_snapshot_bytes = client.render_change_snapshot_bytes;
+            let correct_pending_bytes = client.pending_render_change_bytes;
+            assert!(correct_snapshot_bytes > 0);
+            assert!(correct_pending_bytes > 0);
+
+            client.pending_render_change_bytes = correct_pending_bytes + 1;
+            let error = client
+                .invalidate_render_state_for_pane(11)
+                .expect_err("single invalidation must reject pending-byte overcount");
+            assert!(matches!(
+                error,
+                DirectMuxError::RetainedStateAccounting {
+                    resource: "pending unilateral render changes"
+                }
+            ));
+            assert_render_retention_members(&client, &snapshot_keys, &pending_panes);
+            assert_eq!(client.pending_render_change_bytes, correct_pending_bytes + 1);
+            client.pending_render_change_bytes = correct_pending_bytes;
+
+            client.pending_render_change_bytes = correct_pending_bytes - 1;
+            let error = client
+                .invalidate_render_state_for_pane(11)
+                .expect_err("single invalidation must reject pending-byte undercount");
+            assert!(matches!(
+                error,
+                DirectMuxError::RetainedStateAccounting {
+                    resource: "pending unilateral render changes"
+                }
+            ));
+            assert_render_retention_members(&client, &snapshot_keys, &pending_panes);
+            assert_eq!(client.pending_render_change_bytes, correct_pending_bytes - 1);
+            client.pending_render_change_bytes = correct_pending_bytes;
+
+            client.render_change_snapshot_bytes = correct_snapshot_bytes + 1;
+            let error = client
+                .invalidate_render_state_for_pane(11)
+                .expect_err("single invalidation must reject snapshot-byte overcount");
+            assert!(matches!(
+                error,
+                DirectMuxError::RetainedStateAccounting {
+                    resource: "render change snapshots"
+                }
+            ));
+            assert_render_retention_members(&client, &snapshot_keys, &pending_panes);
+            assert_eq!(client.render_change_snapshot_bytes, correct_snapshot_bytes + 1);
+            client.render_change_snapshot_bytes = correct_snapshot_bytes;
+
+            client.render_change_snapshot_bytes = correct_snapshot_bytes - 1;
+            let error = client
+                .invalidate_render_state_for_pane(11)
+                .expect_err("single invalidation must reject snapshot-byte undercount");
+            assert!(matches!(
+                error,
+                DirectMuxError::RetainedStateAccounting {
+                    resource: "render change snapshots"
+                }
+            ));
+            assert_render_retention_members(&client, &snapshot_keys, &pending_panes);
+            assert_eq!(client.render_change_snapshot_bytes, correct_snapshot_bytes - 1);
+            client.render_change_snapshot_bytes = correct_snapshot_bytes;
+
+            client.pending_render_change_bytes = correct_pending_bytes + 1;
+            let error = client
+                .invalidate_render_state_for_panes(&[11, 22])
+                .expect_err("bulk invalidation must reject pending-byte overcount");
+            assert!(matches!(
+                error,
+                DirectMuxError::RetainedStateAccounting {
+                    resource: "pending unilateral render changes"
+                }
+            ));
+            assert_render_retention_members(&client, &snapshot_keys, &pending_panes);
+            assert_eq!(client.pending_render_change_bytes, correct_pending_bytes + 1);
+            client.pending_render_change_bytes = correct_pending_bytes;
+
+            client.pending_render_change_bytes = correct_pending_bytes - 1;
+            let error = client
+                .invalidate_render_state_for_panes(&[11, 22])
+                .expect_err("bulk invalidation must reject pending-byte undercount");
+            assert!(matches!(
+                error,
+                DirectMuxError::RetainedStateAccounting {
+                    resource: "pending unilateral render changes"
+                }
+            ));
+            assert_render_retention_members(&client, &snapshot_keys, &pending_panes);
+            assert_eq!(client.pending_render_change_bytes, correct_pending_bytes - 1);
+            client.pending_render_change_bytes = correct_pending_bytes;
+
+            client.render_change_snapshot_bytes = correct_snapshot_bytes + 1;
+            let error = client
+                .invalidate_render_state_for_panes(&[11, 22])
+                .expect_err("bulk invalidation must reject snapshot-byte overcount");
+            assert!(matches!(
+                error,
+                DirectMuxError::RetainedStateAccounting {
+                    resource: "render change snapshots"
+                }
+            ));
+            assert_render_retention_members(&client, &snapshot_keys, &pending_panes);
+            assert_eq!(client.render_change_snapshot_bytes, correct_snapshot_bytes + 1);
+
+            client.render_change_snapshot_bytes = correct_snapshot_bytes - 1;
+            let error = client
+                .invalidate_render_state_for_panes(&[11, 22])
+                .expect_err("bulk invalidation must reject snapshot-byte undercount");
+            assert!(matches!(
+                error,
+                DirectMuxError::RetainedStateAccounting {
+                    resource: "render change snapshots"
+                }
+            ));
+            assert_render_retention_members(&client, &snapshot_keys, &pending_panes);
+            assert_eq!(client.render_change_snapshot_bytes, correct_snapshot_bytes - 1);
+
+            client.render_change_snapshot_bytes = correct_snapshot_bytes + 1;
+
+            let error = client
+                .get_pane_render_changes_batch(&[11, 22], 2, Duration::from_secs(1))
+                .await
+                .expect_err("drained semantic cleanup accounting failure must poison");
+            assert!(matches!(
+                error,
+                DirectMuxError::RetainedStateAccounting {
+                    resource: "render change snapshots"
+                }
+            ));
+            assert!(client.connection_poisoned);
+            assert!(client.outstanding_requests.is_empty());
+            assert!(client.pending_responses.is_empty());
+            assert_eq!(client.pending_response_bytes, 0);
+            assert!(client.pending_render_changes.is_empty());
+            assert_eq!(client.pending_render_change_bytes, 0);
+            assert!(client.render_change_snapshots.is_empty());
+            assert_eq!(client.render_change_snapshot_bytes, 0);
+            assert!(client.read_buf.is_empty());
+
+            let peer_read = timeout(Duration::from_secs(1), server)
+                .await
+                .expect("cleanup poison must shut down peer before client drop")
+                .expect("server task");
+            assert_eq!(peer_read, 0);
+            drop(client);
+        });
+    }
+
+    #[test]
+    fn render_batch_disconnect_after_write_poisons_and_blocks_serial_reuse() {
+        run_async_test(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let socket_path = temp_dir.path().join("render-batch-disconnect.sock");
+            let listener = compat_unix::bind(&socket_path)
+                .await
+                .expect("bind listener");
+
+            let server = task::spawn(async move {
+                let (mut stream, _) = listener.accept().await.expect("accept");
+                let mut read_buf = Vec::new();
+                loop {
+                    let mut temp = vec![0u8; 4096];
+                    let read = unix_stream_read(&mut stream, &mut temp)
+                        .await
+                        .expect("read");
+                    if read == 0 {
+                        return;
+                    }
+                    read_buf.extend_from_slice(&temp[..read]);
+                    while let Ok(Some(decoded)) = codec::Pdu::stream_decode(&mut read_buf) {
+                        match decoded.pdu {
+                            Pdu::GetCodecVersion(_) => {
+                                write_response_pdu(
+                                    &mut stream,
+                                    &Pdu::GetCodecVersionResponse(GetCodecVersionResponse {
+                                        codec_vers: CODEC_VERSION,
+                                        version_string: "render-disconnect-test".to_string(),
+                                        executable_path: PathBuf::from("/bin/wezterm"),
+                                        config_file_path: None,
+                                        min_supported: codec::CODEC_VERSION_MIN_SUPPORTED,
+                                    }),
+                                    decoded.serial,
+                                )
+                                .await
+                                .expect("write codec response");
+                            }
+                            Pdu::SetClientId(_) => {
+                                write_response_pdu(
+                                    &mut stream,
+                                    &Pdu::UnitResponse(UnitResponse {}),
+                                    decoded.serial,
+                                )
+                                .await
+                                .expect("write client response");
+                            }
+                            Pdu::GetPaneRenderChanges(_) => return,
+                            _ => {}
+                        }
+                    }
+                }
+            });
+
+            let config = direct_mux_client_config(socket_path);
+            let mut client = DirectMuxClient::connect(config).await.expect("connect");
+            client
+                .stash_unilateral_pdu(Pdu::GetPaneRenderChangesResponse(test_render_change(
+                    999,
+                    1,
+                    "must-clear-on-disconnect",
+                )))
+                .expect("seed retained state");
+            let serial_before = client.serial;
+            let error = client
+                .get_pane_render_changes_batch(&[11], 1, Duration::from_secs(1))
+                .await
+                .expect_err("peer close after request write must fail batch");
+            assert!(matches!(error, DirectMuxError::Disconnected));
+            assert!(client.connection_poisoned);
+            assert!(client.outstanding_requests.is_empty());
+            assert!(client.pending_responses.is_empty());
+            assert_eq!(client.pending_response_bytes, 0);
+            assert!(client.pending_render_changes.is_empty());
+            assert_eq!(client.pending_render_change_bytes, 0);
+            assert!(client.render_change_snapshots.is_empty());
+            assert_eq!(client.render_change_snapshot_bytes, 0);
+            assert!(client.read_buf.is_empty());
+            assert_eq!(client.serial, serial_before + 1);
+            let poisoned_serial = client.serial;
+            assert!(matches!(
+                client.list_panes().await,
+                Err(DirectMuxError::Disconnected)
+            ));
+            assert_eq!(client.serial, poisoned_serial);
+
+            drop(client);
+            server.await.expect("server task");
+        });
+    }
+
+    #[test]
+    fn render_batch_liveness_only_reuses_valid_cached_snapshot() {
+        run_async_test(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let socket_path = temp_dir.path().join("render-batch-cached-liveness.sock");
+            let listener = compat_unix::bind(&socket_path)
+                .await
+                .expect("bind listener");
+
+            let server = task::spawn(async move {
+                let (mut stream, _) = listener.accept().await.expect("accept");
+                let mut read_buf = Vec::new();
+                loop {
+                    let mut temp = vec![0u8; 4096];
+                    let read = unix_stream_read(&mut stream, &mut temp)
+                        .await
+                        .expect("read");
+                    if read == 0 {
+                        return;
+                    }
+                    read_buf.extend_from_slice(&temp[..read]);
+                    while let Ok(Some(decoded)) = codec::Pdu::stream_decode(&mut read_buf) {
+                        let response = match decoded.pdu {
+                            Pdu::GetCodecVersion(_) => {
+                                Pdu::GetCodecVersionResponse(GetCodecVersionResponse {
+                                    codec_vers: CODEC_VERSION,
+                                    version_string: "cached-liveness-test".to_string(),
+                                    executable_path: PathBuf::from("/bin/wezterm"),
+                                    config_file_path: None,
+                                    min_supported: codec::CODEC_VERSION_MIN_SUPPORTED,
+                                })
+                            }
+                            Pdu::SetClientId(_) => Pdu::UnitResponse(UnitResponse {}),
+                            Pdu::GetPaneRenderChanges(request) => {
+                                assert_eq!(request.pane_id, 11);
+                                Pdu::LivenessResponse(codec::LivenessResponse {
+                                    pane_id: request.pane_id,
+                                    is_alive: true,
+                                })
+                            }
+                            _ => continue,
+                        };
+                        write_response_pdu(&mut stream, &response, decoded.serial)
+                            .await
+                            .expect("write response");
+                        if matches!(response, Pdu::LivenessResponse(_)) {
+                            return;
+                        }
+                    }
+                }
+            });
+
+            let config = direct_mux_client_config(socket_path);
+            let mut client = DirectMuxClient::connect(config).await.expect("connect");
+            client
+                .resolve_render_change_response(
+                    11,
+                    Pdu::GetPaneRenderChangesResponse(test_render_change(
+                        11,
+                        41,
+                        "cached-batch-snapshot",
+                    )),
+                )
+                .expect("seed cached snapshot");
+            let responses = client
+                .get_pane_render_changes_batch(&[11], 1, Duration::from_secs(1))
+                .await
+                .expect("liveness-only batch may reuse a valid cached snapshot");
+            assert_eq!(responses.len(), 1);
+            assert_eq!(responses[0].pane_id, 11);
+            assert_eq!(responses[0].seqno, 41);
+            assert_eq!(responses[0].title, "cached-batch-snapshot");
+            assert!(responses[0].dirty_lines.is_empty());
+            assert!(!client.connection_poisoned);
+            assert!(client.outstanding_requests.is_empty());
 
             drop(client);
             server.await.expect("server task");
@@ -5300,6 +7337,20 @@ mod tests {
                 DirectMuxError::BatchTimeout { timeout_ms } => assert_eq!(timeout_ms, 25),
                 other => panic!("expected BatchTimeout, got: {other}"),
             }
+            assert!(client.connection_poisoned);
+            assert!(client.outstanding_requests.is_empty());
+            assert!(client.pending_responses.is_empty());
+            assert_eq!(client.pending_response_bytes, 0);
+            assert!(client.pending_render_changes.is_empty());
+            assert_eq!(client.pending_render_change_bytes, 0);
+            assert!(client.render_change_snapshots.is_empty());
+            assert_eq!(client.render_change_snapshot_bytes, 0);
+            assert!(client.read_buf.is_empty());
+            let reuse_error = client
+                .list_panes()
+                .await
+                .expect_err("a timed-out render batch must poison direct connection reuse");
+            assert!(matches!(reuse_error, DirectMuxError::Disconnected));
 
             drop(client);
             server.await.expect("server task");
@@ -5419,6 +7470,20 @@ mod tests {
                 DirectMuxError::BatchTimeout { timeout_ms } => assert_eq!(timeout_ms, 25),
                 other => panic!("expected BatchTimeout, got: {other}"),
             }
+            assert!(client.connection_poisoned);
+            assert!(client.outstanding_requests.is_empty());
+            assert!(client.pending_responses.is_empty());
+            assert_eq!(client.pending_response_bytes, 0);
+            assert!(client.pending_render_changes.is_empty());
+            assert_eq!(client.pending_render_change_bytes, 0);
+            assert!(client.render_change_snapshots.is_empty());
+            assert_eq!(client.render_change_snapshot_bytes, 0);
+            assert!(client.read_buf.is_empty());
+            let reuse_error = client
+                .list_panes()
+                .await
+                .expect_err("a timed-out Cx render batch must poison direct connection reuse");
+            assert!(matches!(reuse_error, DirectMuxError::Disconnected));
 
             drop(client);
             server.await.expect("server task");
@@ -5546,6 +7611,20 @@ mod tests {
                 .await
                 .expect_err("batch with cx should surface cancellation");
             assert_cancelled_mux_io(&err);
+            assert!(client.connection_poisoned);
+            assert!(client.outstanding_requests.is_empty());
+            assert!(client.pending_responses.is_empty());
+            assert_eq!(client.pending_response_bytes, 0);
+            assert!(client.pending_render_changes.is_empty());
+            assert_eq!(client.pending_render_change_bytes, 0);
+            assert!(client.render_change_snapshots.is_empty());
+            assert_eq!(client.render_change_snapshot_bytes, 0);
+            assert!(client.read_buf.is_empty());
+            let reuse_error = client
+                .list_panes()
+                .await
+                .expect_err("a cancelled render batch must poison direct connection reuse");
+            assert!(matches!(reuse_error, DirectMuxError::Disconnected));
 
             drop(client);
             cancel.join().expect("cancel thread");
