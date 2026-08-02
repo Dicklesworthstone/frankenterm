@@ -1603,9 +1603,15 @@ async fn admit_capture_event_for_persistence(
             .observed_panes
             .get(&event.segment.pane_id)
             .is_some_and(|pane| {
-                pane.pane_uuid == metadata.pane_uuid
-                    && pane.generation == metadata.discovery_generation
-                    && pane.revision == metadata.discovery_revision
+                (
+                    pane.pane_uuid.as_str(),
+                    pane.generation,
+                    pane.revision,
+                ) == (
+                    metadata.pane_uuid.as_str(),
+                    metadata.discovery_generation,
+                    metadata.discovery_revision,
+                )
             })
     };
     if !is_current {
@@ -4614,7 +4620,9 @@ impl ObservationRuntime {
             // as the fast path on clean shutdown but is no longer load-bearing.
             #[cfg(all(feature = "vendored", unix))]
             let mut streaming_tasks: StreamingTasks = StreamingTasks::new();
-            let mut observed_panes_cache = Arc::new(HashMap::<u64, ObservedCapturePane>::new());
+            #[cfg(all(feature = "vendored", unix))]
+            let mut observed_panes_cache =
+                Arc::new(HashMap::<u64, ObservedCapturePane>::new());
             let mut capture_bindings = HashMap::<u64, ActiveCaptureBinding>::new();
             let mut pending_resync_bindings =
                 HashMap::<u64, PendingCaptureResyncBinding>::new();
@@ -4801,7 +4809,12 @@ impl ObservationRuntime {
                     // monotonic revision-stamped view.
                     let publication = discovery_publication_rx.borrow_and_clone();
                     let publication_epoch = publication.epoch;
-                    observed_panes_cache = Arc::clone(&publication.observed_panes);
+                    #[cfg(all(feature = "vendored", unix))]
+                    {
+                        observed_panes_cache = Arc::clone(&publication.observed_panes);
+                    }
+                    #[cfg(not(all(feature = "vendored", unix)))]
+                    let observed_panes_cache = Arc::clone(&publication.observed_panes);
                     let observed_pane_count = observed_panes_cache.len();
                     pending_resyncs.retain_authoritative(&publication);
                     completed_resyncs.retain(|pane_id, revision| {
