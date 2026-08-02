@@ -786,6 +786,98 @@ experiment. It is not converted into a flattering keep or a durable rejection.
 - **Primary retry condition:**
   > Credit this negative control only when the replacement uses a corpus identity different from the held alternate-screen corpus and the exact corrected revision fails specifically because the original effect does not survive continuously through its promised checkpoint.
 
+### IS-N020 — Deterministic tombstone eviction cannot preserve a never-reusable layout-window identity
+
+- **Classification:** wrong-model rejection; kept fail-closed structural guard
+- **Bead:** `ft-interactive-swarm-product-convergence-7xqz4.8.10.5.1`
+- **Rejected candidate:** an uncommitted bounded-retention design; it has no
+  retained candidate revision or qualifying runtime artifact.
+- **Retained structural revision:**
+  `55c63aa37f4c072cb4d05f7fa256474564c822ed`
+- **Rejected inference:** evicting the oldest deterministic overlay tombstone
+  was treated as safe because a later mutation carrying `base_revision =
+  Some(_)` still conflicts with an absent live overlay. That does not cover a
+  delayed or replayed create carrying `base_revision = None`: after eviction,
+  the store can no longer distinguish that stale lineage from a genuinely new
+  identity, so the retired window can be resurrected.
+- **Structural correction:** a stable `LayoutWindowId` is currently
+  never reusable. Its tombstone is therefore never pruned; the hard tombstone
+  cap rejects a new distinct retirement before removing its live overlay and
+  partitions that rejection from unrelated valid mutations. Existing
+  tombstone replays remain idempotent at the cap.
+- **Proof boundary:** this establishes only the fail-closed storage invariant.
+  It does not provide safe unbounded retention, compaction, a durable identity
+  generation, a public overlay durability receipt, or user-visible tab-order
+  restoration. Safe reclamation remains owned by the named Bead.
+- **Decision:** reject age-based, count-based, and deterministic-key eviction
+  until a durable identity-generation or equivalent non-reuse proof exists.
+- **Primary retry condition:**
+  > Retry tombstone reclamation only when every stale base=None create is provably distinguishable from a fresh identity across process restart, journal recovery, reconnect, and delayed replay, with cap and cap-plus-one tests that cannot resurrect a retired layout window.
+
+### IS-N021 — Independent item-count caps do not prove the aggregate 4 MiB journal envelope
+
+- **Classification:** false resource-envelope rejection; retained bounded
+  count guards
+- **Bead:** `ft-interactive-swarm-product-convergence-7xqz4.8.10.5.2`
+- **Rejected candidate:** the current count-only admission model; it is retained
+  as defense in depth but has no authority for the aggregate byte claim.
+- **Observed contradiction:** the existing independent ceilings allow 4,096
+  workspaces with 1,024-byte names before accounting for JSON syntax, escaped
+  expansion, window-state fields, domain bindings, overlays, tab slots,
+  tombstones, or the checksum envelope. That one collection alone can consume
+  4 MiB of raw string content, so the independent caps cannot imply that a
+  complete encoded transaction stays within 4 MiB.
+- **Retained structural revision:**
+  `55c63aa37f4c072cb4d05f7fa256474564c822ed` keeps finite per-collection,
+  per-string, tab-count, and waiter bounds, and partitions terminal workspace
+  and domain-binding quota failures by lineage so one impossible request does
+  not strand unrelated valid work.
+- **Proof boundary:** finite item counts prevent unbounded cardinality, but do
+  not establish the aggregate serialized-byte envelope, peak encoder memory,
+  write amplification, or long-session RSS behavior. No live session or
+  target-hardware memory measurement is claimed.
+- **Decision:** retain the count bounds, reject any statement that they prove
+  the 4 MiB aggregate envelope, and require transaction-wide encoded-byte
+  admission before publication.
+- **Primary retry condition:**
+  > Claim the 4 MiB journal envelope only after a pre-mutation aggregate-byte budget accounts for canonical encoding and escaping across every collection plus envelope/checksum overhead, rejects the exact byte limit plus one before publication, and is covered by adversarial maximum-width and maximum-escape fixtures.
+
+### IS-N022 — Ambiguous publication must resolve the exact frozen snapshot before any coalesced successor
+
+- **Classification:** crash-consistency rejection; kept exact-retry and
+  durability-barrier correction
+- **Bead:** `ft-interactive-swarm-product-convergence-7xqz4.8.10.5`
+- **Rejected candidates:** retrying the latest coalesced pending batch after an
+  ambiguous I/O result, and treating parseable bytes visible through a file
+  name as proof that the generation was durable.
+- **Rejected inference:** after a full write, file sync, directory sync, or
+  lost acknowledgement, the caller cannot know which generation is
+  authoritative. Replacing that exact in-flight batch with a newer coalesced
+  successor can skip its predecessor's CAS base, acknowledge the wrong
+  mutation, or publish a delete/update whose prerequisite never became
+  durable. Likewise, a valid checksum proves byte integrity, not that file and
+  directory metadata crossed the durability barrier.
+- **Structural correction:** revision
+  `55c63aa37f4c072cb4d05f7fa256474564c822ed` retains the exact frozen batch on
+  any I/O failure that may have published a generation and resolves that batch
+  before taking a successor snapshot. Idempotent recovery syncs the selected
+  authority and parent directory before success; `AfterDirectorySync` is a
+  distinct injected boundary rather than an alias for file sync. Rejected
+  snapshot lineages invalidate same-base descendants instead of allowing a
+  revision-skipping successor.
+- **Proof boundary:** the commit primitive and exact-retry helper have
+  deterministic interruption coverage, but the production
+  `persistence_worker` still invokes commits with `WriteInterruption::None`.
+  Consequently this revision does not yet prove the real worker's wake token,
+  retry slot, successor coalescing, flush/binding waiter transfer, disconnect,
+  or shutdown behavior under an injected ambiguous commit. That missing proof
+  is tracked by `ft-interactive-swarm-product-convergence-7xqz4.8.10.5.5`.
+- **Decision:** reject latest-state retry and visibility-as-durability. Retain
+  exact-snapshot replay and explicit file-plus-directory durability barriers,
+  without promoting helper-level evidence into worker or end-to-end authority.
+- **Primary retry condition:**
+  > Credit end-to-end crash consistency only when a test-only deterministic seam drives the real persistence worker through each ambiguous publication epoch and proves the exact frozen batch resolves before update and live-to-delete successors, with bounded wake, waiter, disconnect, repeated-failure, and shutdown behavior and no sleeps.
+
 ## Open hypothesis register
 
 These are not negative results. Each remains open until a retained same-window
