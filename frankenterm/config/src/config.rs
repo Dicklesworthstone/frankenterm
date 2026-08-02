@@ -2387,11 +2387,13 @@ fn validate_max_fps(value: &u64) -> Result<(), String> {
 ///
 /// Dynamic configuration rejects values outside [`MIN_MAX_FPS`] through
 /// [`MAX_MAX_FPS`]. The clamp is intentional defense in depth for internal
-/// callers that construct or mutate [`Config`] directly.
+/// callers that construct or mutate [`Config`] directly. Ceiling division is
+/// required here: rounding the millisecond interval down would allow the timer
+/// to exceed the configured frame-rate limit for non-divisors of 1,000.
 #[must_use]
 pub fn frame_interval_for_max_fps(max_fps: u64) -> Duration {
     let bounded = max_fps.clamp(MIN_MAX_FPS, MAX_MAX_FPS);
-    Duration::from_millis(1_000 / bounded)
+    Duration::from_millis(1_000_u64.div_ceil(bounded))
 }
 
 fn default_initial_rows() -> u16 {
@@ -3264,7 +3266,15 @@ mod tests {
         );
         assert_eq!(
             frame_interval_for_max_fps(default_max_fps()),
-            Duration::from_millis(16)
+            Duration::from_millis(17)
+        );
+        assert_eq!(
+            frame_interval_for_max_fps(3),
+            Duration::from_millis(334)
+        );
+        assert_eq!(
+            frame_interval_for_max_fps(999),
+            Duration::from_millis(2)
         );
         assert_eq!(
             frame_interval_for_max_fps(MAX_MAX_FPS),
@@ -3274,6 +3284,18 @@ mod tests {
             frame_interval_for_max_fps(MAX_MAX_FPS + 1),
             Duration::from_millis(1)
         );
+    }
+
+    #[test]
+    fn frame_interval_never_exceeds_the_valid_configured_rate() {
+        for max_fps in MIN_MAX_FPS..=MAX_MAX_FPS {
+            let interval_ms = frame_interval_for_max_fps(max_fps).as_millis();
+            assert!(interval_ms > 0, "max_fps={max_fps}");
+            assert!(
+                interval_ms * u128::from(max_fps) >= 1_000,
+                "max_fps={max_fps}, interval_ms={interval_ms}"
+            );
+        }
     }
 
     // ── default_hyperlink_rules ────────────────────────────────
