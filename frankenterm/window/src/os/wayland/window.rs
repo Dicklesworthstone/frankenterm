@@ -8,6 +8,7 @@ use std::os::fd::AsRawFd;
 use std::path::PathBuf;
 use std::ptr::NonNull;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -84,6 +85,48 @@ use super::copy_and_paste::{set_pipe_nonblocking, CopyAndPaste};
 use super::pointer::{PendingMouse, PointerUserData};
 use super::state::WaylandState;
 
+static INVALID_KEY_REPEAT_INFO_REPORTED: AtomicBool = AtomicBool::new(false);
+
+fn key_repeat_timing(rate: i32, delay_ms: i32) -> Option<(Duration, Duration)> {
+    if rate <= 0 || delay_ms < 0 {
+        return None;
+    }
+
+    let rate = u64::try_from(rate).ok()?;
+    let delay_ms = u64::try_from(delay_ms).ok()?;
+    let gap_ms = 1_000_u64.div_ceil(rate);
+    Some((
+        Duration::from_millis(delay_ms),
+        Duration::from_millis(gap_ms),
+    ))
+}
+
+fn repeat_count_for_elapsed(elapsed: Duration, gap: Duration, initial: bool) -> u16 {
+    let gap_nanos = gap.as_nanos();
+    if gap_nanos == 0 {
+        return u16::MAX;
+    }
+
+    let complete_gaps = elapsed.as_nanos() / gap_nanos;
+    let due = if initial {
+        complete_gaps.saturating_add(1)
+    } else {
+        complete_gaps.max(1)
+    };
+    u16::try_from(due).unwrap_or(u16::MAX)
+}
+
+fn report_invalid_key_repeat_info(rate: i32, delay_ms: i32) {
+    if INVALID_KEY_REPEAT_INFO_REPORTED
+        .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+        .is_ok()
+    {
+        log::warn!(
+            "Disabling Wayland key repeat after invalid repeat_info: rate={rate}, delay={delay_ms}"
+        );
+    }
+}
+
 #[derive(Debug)]
 pub(super) struct KeyRepeatState {
     pub(super) when: Instant,
@@ -92,31 +135,25 @@ pub(super) struct KeyRepeatState {
 
 impl KeyRepeatState {
     pub(super) fn schedule(state: Arc<Mutex<Self>>, window_id: usize) {
-        promise::spawn::spawn_into_main_thread(async move {
-            let delay;
-            let gap;
-            {
-                let Some(conn) = WaylandConnection::get() else {
-                    log::debug!(
-                        "Stopping Wayland key repeat: connection unavailable while reading repeat settings"
-                    );
-                    return;
-                };
-                let conn = conn.wayland();
-                let (rate, ddelay) = {
-                    let wstate = conn.wayland_state.borrow();
-                    (
-                        wstate.key_repeat_rate as u64,
-                        wstate.key_repeat_delay as u64,
-                    )
-                };
-                if rate == 0 {
-                    return;
-                }
-                delay = Duration::from_millis(ddelay);
-                gap = Duration::from_millis(1000 / rate);
+        let Some(conn) = WaylandConnection::get() else {
+            log::debug!(
+                "Stopping Wayland key repeat: connection unavailable while reading repeat settings"
+            );
+            return;
+        };
+        let conn = conn.wayland();
+        let (rate, delay_ms) = {
+            let wstate = conn.wayland_state.borrow();
+            (wstate.key_repeat_rate, wstate.key_repeat_delay)
+        };
+        let Some((delay, gap)) = key_repeat_timing(rate, delay_ms) else {
+            if rate < 0 || delay_ms < 0 {
+                report_invalid_key_repeat_info(rate, delay_ms);
             }
+            return;
+        };
 
+        promise::spawn::spawn_into_main_thread(async move {
             let mut initial = true;
             promise::spawn::sleep(delay).await;
             loop {
@@ -156,21 +193,13 @@ impl KeyRepeatState {
                         }
                     };
 
-                    let mut repeat_count = 1;
-
-                    let mut elapsed = st.when.elapsed();
-                    if initial {
-                        elapsed -= delay;
-                        initial = false;
-                    }
-
-                    // If our scheduling interval is longer than the repeat
-                    // gap, we need to inflate the repeat count to match
-                    // the intended rate
-                    while elapsed >= gap {
-                        repeat_count += 1;
-                        elapsed -= gap;
-                    }
+                    let elapsed = if initial {
+                        st.when.elapsed().saturating_sub(delay)
+                    } else {
+                        st.when.elapsed()
+                    };
+                    let repeat_count = repeat_count_for_elapsed(elapsed, gap, initial);
+                    initial = false;
 
                     let event = match st.event.clone() {
                         WindowKeyEvent::KeyEvent(mut key) => {
@@ -1863,7 +1892,8 @@ impl HasWindowHandle for WaylandWindow {
 #[cfg(test)]
 mod tests {
     use super::{
-        new_pending_first_configure, read_pipe_with_timeout, resolve_pending_first_configure,
+        key_repeat_timing, new_pending_first_configure, read_pipe_with_timeout,
+        repeat_count_for_elapsed, resolve_pending_first_configure,
     };
     use promise::BrokenPromise;
     use smithay_client_toolkit::data_device_manager::ReadPipe;
@@ -1873,11 +1903,67 @@ mod tests {
     use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd};
     use std::pin::Pin;
     use std::task::{Context, Poll, Waker};
+    use std::time::Duration;
 
     fn pipe_pair() -> (OwnedFd, OwnedFd) {
         let mut fds = [0; 2];
         assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
         unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) }
+    }
+
+    #[test]
+    fn key_repeat_timing_rejects_disabled_or_invalid_protocol_values() {
+        assert_eq!(key_repeat_timing(-1, 400), None);
+        assert_eq!(key_repeat_timing(0, 400), None);
+        assert_eq!(key_repeat_timing(25, -1), None);
+    }
+
+    #[test]
+    fn key_repeat_timing_is_positive_and_never_faster_than_requested() {
+        assert_eq!(
+            key_repeat_timing(25, 400),
+            Some((Duration::from_millis(400), Duration::from_millis(40)))
+        );
+
+        for (rate, expected_gap_ms) in [
+            (1, 1_000),
+            (25, 40),
+            (1_000, 1),
+            (1_001, 1),
+            (i32::MAX, 1),
+        ] {
+            let (delay, gap) = key_repeat_timing(rate, 0).expect("positive rate must be enabled");
+            assert_eq!(delay, Duration::ZERO);
+            assert_eq!(gap, Duration::from_millis(expected_gap_ms));
+            assert!(!gap.is_zero());
+            let rate = u32::try_from(rate).expect("test rates are positive");
+            assert!(gap.as_millis() * u128::from(rate) >= 1_000);
+        }
+    }
+
+    #[test]
+    fn repeat_count_is_exact_for_initial_on_time_and_late_wakes() {
+        let gap = Duration::from_millis(40);
+        assert_eq!(repeat_count_for_elapsed(Duration::ZERO, gap, true), 1);
+        assert_eq!(repeat_count_for_elapsed(gap, gap, true), 2);
+        assert_eq!(repeat_count_for_elapsed(Duration::ZERO, gap, false), 1);
+        assert_eq!(repeat_count_for_elapsed(gap, gap, false), 1);
+        assert_eq!(
+            repeat_count_for_elapsed(Duration::from_millis(80), gap, false),
+            2
+        );
+    }
+
+    #[test]
+    fn repeat_count_saturates_and_zero_gap_fails_finite() {
+        assert_eq!(
+            repeat_count_for_elapsed(Duration::MAX, Duration::from_millis(1), false),
+            u16::MAX
+        );
+        assert_eq!(
+            repeat_count_for_elapsed(Duration::from_secs(1), Duration::ZERO, false),
+            u16::MAX
+        );
     }
 
     #[test]
