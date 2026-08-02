@@ -1424,9 +1424,14 @@ experiment. It is not converted into a flattering keep or a durable rejection.
   on `vmi1227854` and failed with six `E0282`/`E0283` type-inference errors in
   checked-retention folds. Revision `97f7cee14` supplies the four explicit
   `DirectMuxError` result types; exact-source retry
-  `j-29958204528001135` is active. Older focused/Clippy jobs target the rejected
-  revision and cannot qualify the correction. Further focused admissions failed
-  closed under `RCH-I005` or `RCH-I002`; no local result is substituted.
+  `j-29958204528001135` passed the affected all-target check on `vmi1227854`.
+  Older focused/Clippy jobs `j-29958204528001130` and
+  `j-29958204528001129` target the rejected revision and failed with the same
+  retained inference defect; they cannot qualify the correction. Corrected
+  focused render job `j-29958204528001148` is active on `vmi1227854`, and
+  corrected warnings-denied Clippy `j-29958204528001150` is active on
+  `vmi1264463`. Further admissions failed closed under `RCH-I005` or
+  `RCH-I002`; no local result is substituted.
 - **Decision:** reject response-type matching duplicated outside the canonical
   render resolver and reject generic end-of-batch postprocessing for this
   sideband protocol. Keep the bead open until focused failure/cancellation/
@@ -1456,13 +1461,16 @@ experiment. It is not converted into a flattering keep or a durable rejection.
   the regression. Combined all-target job `j-29958204528001119` independently
   reached the same exact compile failure on `vmi1264463`; it is not a check
   pass. Revision `3e5cb8377` corrects that reference to the linked
-  `wezterm_term` crate, and exact focused retry `j-29958204528001124` is active
-  on `vmi1167313`. Earlier server/check/Clippy admission attempts failed closed
-  under `RCH-I005`, `RCH-I002`, `RCH-I003`, or `RCH-I001`. No local result is
-  substituted. The
-  generated route matrix must
-  subsequently validate `ClientRequest` before any activity accounting so a
-  future classification mistake cannot recreate the ordering defect.
+  `wezterm_term` crate. Exact focused retry `j-29958204528001124` then passed
+  the full-dispatch regression on `vmi1167313` (1 passed, 232 filtered): a
+  rejected `SetClipboard` records zero activity while an accepted
+  `WriteToPane` records one. Earlier server/check/Clippy admission attempts
+  failed closed under `RCH-I005`, `RCH-I002`, `RCH-I003`, or `RCH-I001`; no
+  local result is substituted. This focused pass does not supply the missing
+  exhaustive route, affected all-target check, Clippy, or formatting proof.
+  The generated route matrix must subsequently validate `ClientRequest` before
+  any activity accounting so a future classification mistake cannot recreate
+  the ordering defect.
 - **Decision:** reject semantic-name inference before request validation. Route
   authority must precede activity, mutation, allocation, and response work.
 - **Primary retry condition:**
@@ -1930,7 +1938,8 @@ experiment. It is not converted into a flattering keep or a durable rejection.
 - **Classification:** generation-revocation and persistence-admission rejection;
   stamped source epoch required
 - **Beads:** `ft-interactive-systems-performance-4tenz.5.5.3.5.8.5.1` and
-  `ft-interactive-systems-performance-4tenz.5.5.3.5.8.5.5`
+  `ft-interactive-systems-performance-4tenz.5.5.3.5.8.5.5`, with native and
+  replay-egress closure split into `.8.5.5.1` and `.8.5.5.2`
 - **Rejected candidate:** bind one generation and unique token to each vendored
   stream task, abort the old handle when a same-ID generation appears, ignore
   stale exit notifications, and treat that as proof that no old output can
@@ -1946,6 +1955,21 @@ experiment. It is not converted into a flattering keep or a durable rejection.
   pane-generation/source epoch before new authority commits, reject every old
   envelope before storage, cursor, pattern, event, or metric side effects, and
   emit the one justified gap/resync transition required for convergence.
+- **Resolved design boundary:** the non-optional stamp must use a checked
+  runtime-monotonic pane incarnation rather than the saturating, restartable
+  `PaneEntry.generation`, plus source kind and a checked source epoch. Producer
+  admission must cover cursor/bridge mutation, replay egress, and enqueue;
+  persistence must acquire an increment-and-recheck lease guard after dequeue
+  and hold it through its complete asynchronous side-effect chain. Revocation
+  closes the old lease to new guards and waits in-flight guards to zero before
+  promotion. Relay-only validation races revocation, while persistence-only
+  validation leaves stale producer-side cursor and replay effects.
+- **Native extension:** concurrent native connections currently merge bare
+  events, discard `Hello`, and coalesce only by pane ID. Connection epoch and
+  sequence must be stamped before that merge, readiness must be explicit, and
+  stale output, state, destroy, and user-variable events must pass the same
+  authority gate. Connection loss or queue loss is not pane removal and must
+  enter the sticky durable-gap/full-resync machine instead.
 - **Structural partial retained:** revision `d5e8b04ee` still fixes global versus
   shard-local identity, generation-aware task replacement, mismatch handling,
   and stale-exit removal. Those improvements are kept without upgrading the
