@@ -3467,6 +3467,12 @@ struct RpcReadinessReplayAccounting {
     replayed_bytes: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RpcReadinessReplayCompletion {
+    CurrentGeneration,
+    RetiredGeneration,
+}
+
 enum RpcReadinessNextAction {
     AwaitInFlightReplay,
     CommitReady,
@@ -3517,7 +3523,28 @@ impl RpcReadinessCoordinator {
         replay_generation: NonZeroU64,
         replayed_pdus: usize,
         replayed_bytes: usize,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<RpcReadinessReplayCompletion> {
+        // Replay workers are detached from the socket reader. A worker can
+        // finish after its reader has retired and after the shared control
+        // queue has been handed to a successor generation. That late
+        // completion is not an obligation of the successor and, critically,
+        // must not consume the successor's own in-flight replay accounting.
+        if replay_generation < reader_generation {
+            metrics::counter!(
+                "mux.client.rpc.readiness_replay_completion.total",
+                "outcome" => "retired_generation"
+            )
+            .increment(1);
+            return Ok(RpcReadinessReplayCompletion::RetiredGeneration);
+        }
+        if replay_generation > reader_generation {
+            bail!(
+                "future pre-ready replay completion for mux RPC generation {} reached reader {}",
+                replay_generation,
+                reader_generation
+            );
+        }
+
         let Some(expected) = self.replay.take() else {
             bail!(
                 "unexpected pre-ready replay completion for mux RPC generation {} on reader {}",
@@ -3525,7 +3552,7 @@ impl RpcReadinessCoordinator {
                 reader_generation
             );
         };
-        if replay_generation != reader_generation || replay_generation != expected.generation {
+        if replay_generation != expected.generation {
             bail!(
                 "unexpected pre-ready replay completion for mux RPC generation {} on reader {}",
                 replay_generation,
@@ -3542,7 +3569,7 @@ impl RpcReadinessCoordinator {
                 replayed_bytes
             );
         }
-        Ok(())
+        Ok(RpcReadinessReplayCompletion::CurrentGeneration)
     }
 
     fn replayed_in_flight(&self) -> (usize, usize) {
@@ -4652,14 +4679,26 @@ async fn client_thread_async(
                     replayed_bytes,
                     result,
                 })) => {
-                    if let Err(error) = readiness.finish_replay(
+                    let replay_completion = match readiness.finish_replay(
                         generation,
                         replay_generation,
                         replayed_pdus,
                         replayed_bytes,
                     ) {
-                        readiness.complete_error(&format!("{error:#}"));
-                        return Err(error);
+                        Ok(completion) => completion,
+                        Err(error) => {
+                            readiness.complete_error(&format!("{error:#}"));
+                            return Err(error);
+                        }
+                    };
+                    if replay_completion == RpcReadinessReplayCompletion::RetiredGeneration {
+                        log::trace!(
+                            "discarding readiness replay completion for retired mux RPC \
+                             generation {} on reader {}",
+                            replay_generation,
+                            generation
+                        );
+                        continue;
                     }
                     match result {
                         Ok(()) => {}
@@ -7756,6 +7795,91 @@ mod tests {
             .expect("duplicate-during-replay waiter must complete")
             .expect("duplicate-during-replay waiter must share success");
         assert!(readiness.waiters.waiting.is_empty());
+    }
+
+    #[test]
+    fn retired_readiness_replay_completion_cannot_consume_successor_accounting() {
+        let retired_generation =
+            NonZeroU64::new(INITIAL_CONNECTION_GENERATION).expect("generation is nonzero");
+        let successor_generation = NonZeroU64::new(
+            retired_generation
+                .get()
+                .checked_add(1)
+                .expect("test generation has a successor"),
+        )
+        .expect("successor generation is nonzero");
+        let mut queue = PreReadyUnilateralQueue::default();
+        queue
+            .enqueue(
+                unilateral(Pdu::WindowTitleChanged(WindowTitleChanged {
+                    window_id: 1,
+                    title: "successor replay".to_string(),
+                })),
+                0,
+                0,
+            )
+            .expect("queue successor pre-ready unilateral");
+
+        let mut readiness = RpcReadinessCoordinator::default();
+        let (successor_pdus, successor_bytes) = match readiness
+            .next_action(successor_generation, &mut queue)
+            .expect("start successor replay")
+        {
+            RpcReadinessNextAction::StartReplay {
+                batch,
+                replayed_bytes,
+            } => (batch.len(), replayed_bytes),
+            _ => panic!("queued successor work must start replay"),
+        };
+
+        assert_eq!(
+            readiness
+                .finish_replay(
+                    successor_generation,
+                    retired_generation,
+                    successor_pdus,
+                    successor_bytes,
+                )
+                .expect("retired completion must be ignored by the successor"),
+            RpcReadinessReplayCompletion::RetiredGeneration
+        );
+        assert_eq!(
+            readiness.replayed_in_flight(),
+            (successor_pdus, successor_bytes),
+            "retired completion must not consume successor replay authority"
+        );
+        let future_generation = NonZeroU64::new(
+            successor_generation
+                .get()
+                .checked_add(1)
+                .expect("successor test generation has a future"),
+        )
+        .expect("future generation is nonzero");
+        readiness
+            .finish_replay(
+                successor_generation,
+                future_generation,
+                successor_pdus,
+                successor_bytes,
+            )
+            .expect_err("a future-generation completion must fail closed");
+        assert_eq!(
+            readiness.replayed_in_flight(),
+            (successor_pdus, successor_bytes),
+            "future completion must not consume successor replay authority"
+        );
+        assert_eq!(
+            readiness
+                .finish_replay(
+                    successor_generation,
+                    successor_generation,
+                    successor_pdus,
+                    successor_bytes,
+                )
+                .expect("successor completion must retain exact accounting"),
+            RpcReadinessReplayCompletion::CurrentGeneration
+        );
+        assert_eq!(readiness.replayed_in_flight(), (0, 0));
     }
 
     #[test]
