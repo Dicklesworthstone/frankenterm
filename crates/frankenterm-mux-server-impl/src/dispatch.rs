@@ -37,6 +37,9 @@ use std::task::{Context as TaskContext, Waker};
 use wezterm_uds::UnixStream;
 
 pub const DISPATCH_ITEM_QUEUE_CAPACITY: usize = 4096;
+const DISPATCH_ITEM_QUEUE_CONTROL_RESERVE: usize = 64;
+const DISPATCH_ITEM_QUEUE_TOTAL_CAPACITY: usize =
+    DISPATCH_ITEM_QUEUE_CAPACITY + DISPATCH_ITEM_QUEUE_CONTROL_RESERVE;
 const TRANSIENT_WRITE_RETRY_LIMIT: usize = 8;
 const TMUX_CONTROL_MAX_LINE_BYTES: usize = 16 * 1024;
 /// Bound one outbound turn so an already-readable keypress cannot sit behind
@@ -55,10 +58,200 @@ const TOPOLOGY_PROTOCOL_FAILURE: &str =
     "mux topology fence observed an impossible stream transition";
 const TOPOLOGY_BUFFER_OVERFLOW: &str =
     "mux topology fence exceeded its retained event or byte bound";
+const OUTBOUND_BUDGET_OVERFLOW: &str =
+    "mux outbound delivery exceeded its retained topology or slot bound";
 const TOPOLOGY_REVISION_EXHAUSTED: &str =
     "mux topology revision authority is exhausted";
 const TOPOLOGY_FENCE_MAX_EVENTS: usize = 4096;
 const TOPOLOGY_FENCE_MAX_RETAINED_BYTES: usize = 4 * 1024 * 1024;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OutboundClass {
+    Control,
+    Bulk,
+    Topology,
+}
+
+impl OutboundClass {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Control => "control",
+            Self::Bulk => "bulk",
+            Self::Topology => "topology",
+        }
+    }
+
+    const fn is_bulk(self) -> bool {
+        !matches!(self, Self::Control)
+    }
+
+    const fn is_topology(self) -> bool {
+        matches!(self, Self::Topology)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OutboundBudgetLimit {
+    Arithmetic,
+    TotalSlots,
+    BulkSlots,
+    TopologyBytes,
+    MixedConnection,
+}
+
+impl OutboundBudgetLimit {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Arithmetic => "arithmetic",
+            Self::TotalSlots => "total_slots",
+            Self::BulkSlots => "bulk_slots",
+            Self::TopologyBytes => "topology_bytes",
+            Self::MixedConnection => "mixed_connection",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct OutboundBudgetState {
+    topology_bytes: usize,
+    total_slots: usize,
+    bulk_slots: usize,
+    peak_topology_bytes: usize,
+}
+
+#[derive(Debug, Default)]
+struct OutboundBudget {
+    state: ParkingMutex<OutboundBudgetState>,
+}
+
+impl OutboundBudget {
+    fn try_reserve(
+        self: &Arc<Self>,
+        class: OutboundClass,
+        topology_bytes: usize,
+    ) -> Result<OutboundReservation, OutboundBudgetLimit> {
+        debug_assert_eq!(class.is_topology(), topology_bytes != 0);
+        let mut state = self.state.lock();
+        let next_total_slots = state
+            .total_slots
+            .checked_add(1)
+            .ok_or(OutboundBudgetLimit::Arithmetic)?;
+        if next_total_slots > DISPATCH_ITEM_QUEUE_TOTAL_CAPACITY {
+            return Err(OutboundBudgetLimit::TotalSlots);
+        }
+
+        let bulk_slots = usize::from(class.is_bulk());
+        let next_bulk_slots = state
+            .bulk_slots
+            .checked_add(bulk_slots)
+            .ok_or(OutboundBudgetLimit::Arithmetic)?;
+        if next_bulk_slots > DISPATCH_ITEM_QUEUE_CAPACITY {
+            return Err(OutboundBudgetLimit::BulkSlots);
+        }
+
+        let next_topology_bytes = state
+            .topology_bytes
+            .checked_add(topology_bytes)
+            .ok_or(OutboundBudgetLimit::Arithmetic)?;
+        if next_topology_bytes > TOPOLOGY_FENCE_MAX_RETAINED_BYTES {
+            return Err(OutboundBudgetLimit::TopologyBytes);
+        }
+
+        state.total_slots = next_total_slots;
+        state.bulk_slots = next_bulk_slots;
+        state.topology_bytes = next_topology_bytes;
+        state.peak_topology_bytes = state.peak_topology_bytes.max(next_topology_bytes);
+        Ok(OutboundReservation {
+            budget: Arc::clone(self),
+            topology_bytes,
+            total_slots: 1,
+            bulk_slots,
+            is_topology: class.is_topology(),
+        })
+    }
+
+    fn reweight_topology_batch(
+        reservations: &mut [OutboundReservation],
+        retained_bytes: usize,
+    ) -> Result<(), OutboundBudgetLimit> {
+        let Some(first_topology_index) = reservations
+            .iter()
+            .position(|reservation| reservation.is_topology)
+        else {
+            return Ok(());
+        };
+        let budget = Arc::clone(&reservations[first_topology_index].budget);
+        if reservations
+            .iter()
+            .any(|reservation| !Arc::ptr_eq(&budget, &reservation.budget))
+        {
+            return Err(OutboundBudgetLimit::MixedConnection);
+        }
+        let current_batch_bytes = reservations
+            .iter()
+            .filter(|reservation| reservation.is_topology)
+            .try_fold(0_usize, |total, reservation| {
+                total.checked_add(reservation.topology_bytes)
+            })
+            .ok_or(OutboundBudgetLimit::Arithmetic)?;
+
+        let mut state = budget.state.lock();
+        let other_topology_bytes = state
+            .topology_bytes
+            .checked_sub(current_batch_bytes)
+            .ok_or(OutboundBudgetLimit::Arithmetic)?;
+        let next_topology_bytes = other_topology_bytes
+            .checked_add(retained_bytes)
+            .ok_or(OutboundBudgetLimit::Arithmetic)?;
+        if next_topology_bytes > TOPOLOGY_FENCE_MAX_RETAINED_BYTES {
+            return Err(OutboundBudgetLimit::TopologyBytes);
+        }
+        state.topology_bytes = next_topology_bytes;
+        state.peak_topology_bytes = state.peak_topology_bytes.max(next_topology_bytes);
+        for (index, reservation) in reservations.iter_mut().enumerate() {
+            if reservation.is_topology {
+                reservation.topology_bytes = if index == first_topology_index {
+                    retained_bytes
+                } else {
+                    0
+                };
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn snapshot(&self) -> OutboundBudgetState {
+        *self.state.lock()
+    }
+}
+
+#[derive(Debug)]
+struct OutboundReservation {
+    budget: Arc<OutboundBudget>,
+    topology_bytes: usize,
+    total_slots: usize,
+    bulk_slots: usize,
+    is_topology: bool,
+}
+
+impl Drop for OutboundReservation {
+    fn drop(&mut self) {
+        let mut state = self.budget.state.lock();
+        state.topology_bytes = state
+            .topology_bytes
+            .checked_sub(self.topology_bytes)
+            .expect("outbound topology-byte reservation underflow");
+        state.total_slots = state
+            .total_slots
+            .checked_sub(self.total_slots)
+            .expect("outbound total-slot reservation underflow");
+        state.bulk_slots = state
+            .bulk_slots
+            .checked_sub(self.bulk_slots)
+            .expect("outbound bulk-slot reservation underflow");
+    }
+}
 
 #[derive(Clone)]
 struct DispatchTerminal {
@@ -120,6 +313,36 @@ impl DispatchTerminal {
             _guard: guard,
         })
     }
+}
+
+fn reserve_outbound(
+    terminal: &DispatchTerminal,
+    budget: &Arc<OutboundBudget>,
+    class: OutboundClass,
+    topology_bytes: usize,
+) -> anyhow::Result<OutboundReservation> {
+    let Some(admission) = terminal.admit() else {
+        anyhow::bail!("mux dispatch connection is already terminal");
+    };
+    let reservation = match budget.try_reserve(class, topology_bytes) {
+        Ok(reservation) => reservation,
+        Err(limit) => {
+            admission.trip(OUTBOUND_BUDGET_OVERFLOW);
+            drop(admission);
+            metrics::counter!(
+                "mux.dispatch.outbound_budget.rejected",
+                "class" => class.label(),
+                "limit" => limit.label(),
+            )
+            .increment(1);
+            anyhow::bail!(
+                "mux outbound {class:?} reservation exceeded the {} bound",
+                limit.label()
+            );
+        }
+    };
+    drop(admission);
+    Ok(reservation)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -597,9 +820,33 @@ impl DispatchStream for AsyncSslStream {
 }
 
 #[derive(Debug)]
+struct ReservedNotification {
+    notification: MuxNotification,
+    reservation: OutboundReservation,
+}
+
+#[derive(Debug)]
+struct ReservedDecodedPdu {
+    decoded: Box<DecodedPdu>,
+    reservation: OutboundReservation,
+}
+
+#[derive(Debug)]
+struct EncodedOutboundFrame {
+    bytes: Vec<u8>,
+    reservation: OutboundReservation,
+}
+
+#[derive(Debug)]
+enum WritePayload {
+    Typed(ReservedDecodedPdu),
+    Encoded(EncodedOutboundFrame),
+}
+
+#[derive(Debug)]
 enum Item {
-    Notif(MuxNotification),
-    WritePdu(Box<DecodedPdu>),
+    Notif(ReservedNotification),
+    WritePdu(WritePayload),
     Readable,
 }
 
@@ -630,13 +877,53 @@ impl Drop for MuxSubscriptionGuard {
     }
 }
 
-fn pdu_item(pdu: Pdu, serial: u64) -> Item {
-    Item::WritePdu(Box::new(DecodedPdu { pdu, serial }))
+fn pdu_item(
+    pdu: Pdu,
+    serial: u64,
+    reservation: OutboundReservation,
+) -> Item {
+    Item::WritePdu(WritePayload::Typed(ReservedDecodedPdu {
+        decoded: Box::new(DecodedPdu { pdu, serial }),
+        reservation,
+    }))
+}
+
+#[cfg(test)]
+fn test_write_payload(decoded: Box<DecodedPdu>) -> WritePayload {
+    let budget = Arc::new(OutboundBudget::default());
+    let reservation = budget
+        .try_reserve(OutboundClass::Control, 0)
+        .expect("an empty test outbound budget should admit one control item");
+    WritePayload::Typed(ReservedDecodedPdu {
+        decoded,
+        reservation,
+    })
+}
+
+#[cfg(test)]
+fn test_write_item(decoded: Box<DecodedPdu>) -> Item {
+    Item::WritePdu(test_write_payload(decoded))
+}
+
+#[cfg(test)]
+fn test_notification_item(notification: MuxNotification) -> Item {
+    let budget = Arc::new(OutboundBudget::default());
+    let reservation = budget
+        .try_reserve(OutboundClass::Bulk, 0)
+        .expect("an empty test outbound budget should admit one bulk item");
+    Item::Notif(ReservedNotification {
+        notification,
+        reservation,
+    })
 }
 
 #[cfg(test)]
 fn queue_pdu(item_tx: &Sender<Item>, pdu: Pdu, serial: u64) -> anyhow::Result<()> {
-    match item_tx.try_send(pdu_item(pdu, serial)) {
+    let budget = Arc::new(OutboundBudget::default());
+    let reservation = budget
+        .try_reserve(OutboundClass::Control, 0)
+        .expect("an empty test outbound budget should admit one control item");
+    match item_tx.try_send(pdu_item(pdu, serial, reservation)) {
         Ok(()) => Ok(()),
         Err(TrySendError::Full(_)) => Err(anyhow::anyhow!(
             "mux dispatch item queue is full (capacity {DISPATCH_ITEM_QUEUE_CAPACITY}); applying client backpressure"
@@ -648,6 +935,7 @@ fn queue_pdu(item_tx: &Sender<Item>, pdu: Pdu, serial: u64) -> anyhow::Result<()
 fn queue_response_pdu(
     item_tx: &Sender<Item>,
     terminal: &DispatchTerminal,
+    budget: &Arc<OutboundBudget>,
     pdu: Pdu,
     serial: u64,
 ) -> anyhow::Result<()> {
@@ -659,7 +947,8 @@ fn queue_response_pdu(
     // Box the response before entering the connection's short admission
     // section. Large coherent snapshots must not extend this critical section
     // with allocator work.
-    let item = pdu_item(pdu, serial);
+    let reservation = reserve_outbound(terminal, budget, OutboundClass::Control, 0)?;
+    let item = pdu_item(pdu, serial, reservation);
     let Some(admission) = terminal.admit() else {
         anyhow::bail!("mux dispatch connection is already terminal");
     };
@@ -682,12 +971,50 @@ fn queue_response_pdu(
     }
 }
 
-fn queue_notification(
+fn queue_reserved_pdu(
+    item_tx: &Sender<Item>,
+    terminal: &DispatchTerminal,
+    decoded: Box<DecodedPdu>,
+    reservation: OutboundReservation,
+) -> anyhow::Result<()> {
+    let item = Item::WritePdu(WritePayload::Typed(ReservedDecodedPdu {
+        decoded,
+        reservation,
+    }));
+    let Some(admission) = terminal.admit() else {
+        anyhow::bail!("mux dispatch connection is already terminal");
+    };
+    match item_tx.try_send(item) {
+        Ok(()) => Ok(()),
+        Err(TrySendError::Full(item)) => {
+            admission.trip(NOTIFICATION_QUEUE_OVERFLOW);
+            drop(admission);
+            drop(item);
+            metrics::counter!("mux.dispatch.notification_queue.full").increment(1);
+            Err(anyhow::anyhow!(
+                "mux dispatch topology queue is full (bulk capacity \
+                 {DISPATCH_ITEM_QUEUE_CAPACITY}); applying client backpressure"
+            ))
+        }
+        Err(TrySendError::Closed(item)) => {
+            admission.trip(NOTIFICATION_QUEUE_CLOSED);
+            drop(admission);
+            drop(item);
+            Err(anyhow::anyhow!("mux dispatch topology queue is closed"))
+        }
+    }
+}
+
+fn queue_reserved_notification(
     item_tx: &Sender<Item>,
     terminal: &DispatchTerminal,
     notification: MuxNotification,
+    reservation: OutboundReservation,
 ) -> bool {
-    let item = Item::Notif(notification);
+    let item = Item::Notif(ReservedNotification {
+        notification,
+        reservation,
+    });
     let Some(admission) = terminal.admit() else {
         return false;
     };
@@ -701,12 +1028,9 @@ fn queue_notification(
                 .fetch_add(1, Ordering::Relaxed)
                 .saturating_add(1);
             metrics::counter!("mux.dispatch.notification_queue.full").increment(1);
-            // Saturation must not amplify into one synchronous formatting/I/O
-            // operation per dropped event. Powers-of-two sampling retains a
-            // useful escalation signal with logarithmic log volume.
             if dropped.is_power_of_two() {
                 log::warn!(
-                    "mux dispatch notification queue is full (capacity \
+                    "mux dispatch notification queue is full (bulk capacity \
                      {DISPATCH_ITEM_QUEUE_CAPACITY}); terminating the affected connection after \
                      {dropped} overflow(s) since process start"
                 );
@@ -722,11 +1046,24 @@ fn queue_notification(
     }
 }
 
+fn queue_notification(
+    item_tx: &Sender<Item>,
+    terminal: &DispatchTerminal,
+    budget: &Arc<OutboundBudget>,
+    notification: MuxNotification,
+) -> bool {
+    let Ok(reservation) = reserve_outbound(terminal, budget, OutboundClass::Bulk, 0) else {
+        return false;
+    };
+    queue_reserved_notification(item_tx, terminal, notification, reservation)
+}
+
 #[derive(Debug)]
 struct RetainedTopologyEvent {
     notification: MuxNotification,
     revision: TopologyRevision,
     retained_bytes: usize,
+    reservation: OutboundReservation,
 }
 
 // This covers the retained value and the separately stored BTreeMap key.  The
@@ -852,6 +1189,7 @@ impl Default for TopologyStreamState {
 struct TopologyStreamCoordinator {
     item_tx: Sender<Item>,
     terminal: DispatchTerminal,
+    outbound_budget: Arc<OutboundBudget>,
     stream_id: TopologyStreamId,
     state: ParkingMutex<TopologyStreamState>,
 }
@@ -865,6 +1203,7 @@ impl TopologyStreamCoordinator {
         Self {
             item_tx,
             terminal,
+            outbound_budget: Arc::new(OutboundBudget::default()),
             stream_id,
             state: ParkingMutex::new(TopologyStreamState::default()),
         }
@@ -923,7 +1262,12 @@ impl TopologyStreamCoordinator {
             if event.revision <= baseline_revision {
                 continue;
             }
-            if !queue_notification(&self.item_tx, &self.terminal, event.notification) {
+            if !queue_reserved_notification(
+                &self.item_tx,
+                &self.terminal,
+                event.notification,
+                event.reservation,
+            ) {
                 anyhow::bail!("failed to enqueue a pre-bind mux topology notification");
             }
         }
@@ -1020,6 +1364,7 @@ impl TopologyStreamCoordinator {
                             queue_response_pdu(
                                 &self.item_tx,
                                 &self.terminal,
+                                &self.outbound_budget,
                                 other,
                                 serial,
                             )?;
@@ -1030,6 +1375,7 @@ impl TopologyStreamCoordinator {
                             queue_response_pdu(
                                 &self.item_tx,
                                 &self.terminal,
+                                &self.outbound_budget,
                                 other,
                                 serial,
                             )?;
@@ -1064,6 +1410,7 @@ impl TopologyStreamCoordinator {
                 return queue_response_pdu(
                     &self.item_tx,
                     &self.terminal,
+                    &self.outbound_budget,
                     Pdu::ListPanesCoherentResponse(response),
                     serial,
                 );
@@ -1130,6 +1477,7 @@ impl TopologyStreamCoordinator {
                 queue_response_pdu(
                     &self.item_tx,
                     &self.terminal,
+                    &self.outbound_budget,
                     Pdu::ListPanesCoherentResponse(response),
                     serial,
                 )?;
@@ -1162,6 +1510,7 @@ impl TopologyStreamCoordinator {
                 queue_response_pdu(
                     &self.item_tx,
                     &self.terminal,
+                    &self.outbound_budget,
                     Pdu::ListPanesCoherentResponse(response),
                     serial,
                 )?;
@@ -1171,6 +1520,7 @@ impl TopologyStreamCoordinator {
                 queue_response_pdu(
                     &self.item_tx,
                     &self.terminal,
+                    &self.outbound_budget,
                     Pdu::ListPanesCoherentResponse(response),
                     serial,
                 )?;
@@ -1193,10 +1543,11 @@ impl TopologyStreamCoordinator {
         match in_flight.prior {
             TopologyFencePrior::Legacy => {
                 for event in in_flight.buffer.take_all() {
-                    if !queue_notification(
+                    if !queue_reserved_notification(
                         &self.item_tx,
                         &self.terminal,
                         event.notification,
+                        event.reservation,
                     ) {
                         anyhow::bail!(
                             "failed to restore a buffered legacy mux topology notification"
@@ -1246,17 +1597,21 @@ impl TopologyStreamCoordinator {
         let RetainedTopologyEvent {
             notification,
             revision,
+            reservation,
             ..
         } = event;
-        queue_response_pdu(
+        queue_reserved_pdu(
             &self.item_tx,
             &self.terminal,
-            Pdu::TopologyEvent(TopologyEvent {
-                stream_id: self.stream_id,
-                revision,
-                event: into_topology_event_kind(notification)?,
+            Box::new(DecodedPdu {
+                pdu: Pdu::TopologyEvent(TopologyEvent {
+                    stream_id: self.stream_id,
+                    revision,
+                    event: into_topology_event_kind(notification)?,
+                }),
+                serial: 0,
             }),
-            0,
+            reservation,
         )
     }
 
@@ -1273,7 +1628,12 @@ impl TopologyStreamCoordinator {
                     return false;
                 }
                 let accepted =
-                    queue_notification(&self.item_tx, &self.terminal, envelope.notification);
+                    queue_notification(
+                        &self.item_tx,
+                        &self.terminal,
+                        &self.outbound_budget,
+                        envelope.notification,
+                    );
                 if !accepted && self.terminal.is_tripped() {
                     self.discard_retained_state();
                 }
@@ -1318,11 +1678,34 @@ impl TopologyStreamCoordinator {
                 // begun. Whichever side acquires this lock first now defines
                 // whether the event is a predecessor legacy frame or a
                 // retained stamped successor.
-                return queue_notification(&self.item_tx, &self.terminal, notification);
+                let event = match retained_topology_event(
+                    notification,
+                    revision,
+                    &self.terminal,
+                    &self.outbound_budget,
+                ) {
+                    Ok(event) => event,
+                    Err(err) => {
+                        log::error!("failed to retain legacy mux topology event: {err:#}");
+                        self.terminal.trip(TOPOLOGY_BUFFER_OVERFLOW);
+                        return false;
+                    }
+                };
+                return queue_reserved_notification(
+                    &self.item_tx,
+                    &self.terminal,
+                    event.notification,
+                    event.reservation,
+                );
             }
         }
 
-        let event = match retained_topology_event(notification, revision) {
+        let event = match retained_topology_event(
+            notification,
+            revision,
+            &self.terminal,
+            &self.outbound_budget,
+        ) {
             Ok(event) => event,
             Err(err) => {
                 log::error!("failed to retain mux topology event: {err:#}");
@@ -1344,7 +1727,12 @@ impl TopologyStreamCoordinator {
         let phase = &mut state.phase;
         match phase {
             TopologyStreamPhase::Legacy => {
-                queue_notification(&self.item_tx, &self.terminal, event.notification)
+                queue_reserved_notification(
+                    &self.item_tx,
+                    &self.terminal,
+                    event.notification,
+                    event.reservation,
+                )
             }
             TopologyStreamPhase::Fencing(in_flight) => {
                 if let Err(err) = in_flight.buffer.insert(event) {
@@ -1406,6 +1794,8 @@ impl TopologyStreamCoordinator {
 fn retained_topology_event(
     notification: MuxNotification,
     revision: TopologyRevision,
+    terminal: &DispatchTerminal,
+    outbound_budget: &Arc<OutboundBudget>,
 ) -> anyhow::Result<RetainedTopologyEvent> {
     let dynamic_bytes = match &notification {
         MuxNotification::WindowWorkspaceChanged { workspace, .. } => workspace.capacity(),
@@ -1439,10 +1829,17 @@ fn retained_topology_event(
     let retained_bytes = RETAINED_TOPOLOGY_EVENT_ACCOUNTED_FIXED_BYTES
         .checked_add(dynamic_bytes)
         .context("counting retained mux topology event bytes")?;
+    let reservation = reserve_outbound(
+        terminal,
+        outbound_budget,
+        OutboundClass::Topology,
+        retained_bytes,
+    )?;
     Ok(RetainedTopologyEvent {
         notification,
         revision,
         retained_bytes,
+        reservation,
     })
 }
 
@@ -1499,14 +1896,20 @@ fn into_topology_event_kind(notification: MuxNotification) -> anyhow::Result<Top
 
 fn prepare_unilateral_pdu(
     pdu: Pdu,
+    reservation: OutboundReservation,
     item_rx: &Receiver<Item>,
     deferred_item: &mut Option<Item>,
+    terminal: &DispatchTerminal,
 ) -> anyhow::Result<PendingOutboundBatch> {
     prepare_pending_outbound_batch(
-        Box::new(DecodedPdu { pdu, serial: 0 }),
+        WritePayload::Typed(ReservedDecodedPdu {
+            decoded: Box::new(DecodedPdu { pdu, serial: 0 }),
+            reservation,
+        }),
         item_rx,
         deferred_item,
         codec::CompressionMode::Auto,
+        terminal,
     )
 }
 
@@ -1804,6 +2207,7 @@ where
 #[derive(Debug)]
 struct PendingOutboundBatch {
     bytes: Vec<u8>,
+    reservations: Vec<OutboundReservation>,
     offset: usize,
     transient_retries: usize,
     phase: PendingOutboundPhase,
@@ -1827,53 +2231,124 @@ enum OutboundService {
     Readable,
     Progress,
     Complete,
+    Terminal,
+}
+
+fn reweight_topology_batch(
+    terminal: &DispatchTerminal,
+    reservations: &mut [OutboundReservation],
+    retained_bytes: usize,
+) -> anyhow::Result<()> {
+    if !reservations
+        .iter()
+        .any(|reservation| reservation.is_topology)
+    {
+        return Ok(());
+    }
+    let Some(admission) = terminal.admit() else {
+        anyhow::bail!("mux dispatch connection is already terminal");
+    };
+    match OutboundBudget::reweight_topology_batch(reservations, retained_bytes) {
+        Ok(()) => {
+            drop(admission);
+            Ok(())
+        }
+        Err(limit) => {
+            admission.trip(OUTBOUND_BUDGET_OVERFLOW);
+            drop(admission);
+            metrics::counter!(
+                "mux.dispatch.outbound_budget.rejected",
+                "class" => OutboundClass::Topology.label(),
+                "limit" => limit.label(),
+            )
+            .increment(1);
+            anyhow::bail!(
+                "encoded mux topology delivery exceeded the {} bound",
+                limit.label()
+            )
+        }
+    }
+}
+
+fn encode_write_payload(
+    payload: WritePayload,
+    compression_mode: codec::CompressionMode,
+    terminal: &DispatchTerminal,
+) -> anyhow::Result<EncodedOutboundFrame> {
+    match payload {
+        WritePayload::Encoded(frame) => Ok(frame),
+        WritePayload::Typed(ReservedDecodedPdu {
+            decoded,
+            reservation,
+        }) => {
+            let bytes = decoded
+                .pdu
+                .encode_frame_with_mode(decoded.serial, compression_mode)
+                .context("encoding PDU frame")?;
+            let mut reservation = reservation;
+            let encoded_capacity = bytes.capacity();
+            let grows_topology_charge =
+                reservation.is_topology && encoded_capacity > reservation.topology_bytes;
+            if grows_topology_charge {
+                reweight_topology_batch(
+                    terminal,
+                    std::slice::from_mut(&mut reservation),
+                    encoded_capacity,
+                )?;
+            }
+            drop(decoded);
+            if !grows_topology_charge {
+                reweight_topology_batch(
+                    terminal,
+                    std::slice::from_mut(&mut reservation),
+                    encoded_capacity,
+                )?;
+            }
+            Ok(EncodedOutboundFrame { bytes, reservation })
+        }
+    }
 }
 
 fn prepare_pending_outbound_batch(
-    first: Box<DecodedPdu>,
+    first: WritePayload,
     item_rx: &Receiver<Item>,
     deferred_item: &mut Option<Item>,
     compression_mode: codec::CompressionMode,
+    terminal: &DispatchTerminal,
 ) -> anyhow::Result<PendingOutboundBatch> {
     debug_assert!(deferred_item.is_none());
-    let mut bytes = Vec::new();
-    let mut current = Some(first);
-    let mut frames = 0_usize;
+    let EncodedOutboundFrame {
+        mut bytes,
+        reservation,
+    } = encode_write_payload(first, compression_mode, terminal)?;
+    let mut reservations = vec![reservation];
+    let mut frames = 1_usize;
 
-    loop {
-        let Some(decoded) = current.take() else {
-            break;
-        };
-        let mut frame = Vec::new();
-        decoded
-            .pdu
-            .encode_with_mode(&mut frame, decoded.serial, compression_mode)
-            .context("encoding PDU frame")?;
-
-        if frames > 0
-            && bytes
-                .len()
-                .checked_add(frame.len())
-                .is_none_or(|next_len| next_len > OUTBOUND_WRITE_QUANTUM_BYTES)
-        {
-            *deferred_item = Some(Item::WritePdu(decoded));
-            break;
-        }
-
-        bytes.extend_from_slice(&frame);
-        frames = frames.saturating_add(1);
-        if frames >= OUTBOUND_WRITE_QUANTUM_FRAMES || bytes.len() >= OUTBOUND_WRITE_QUANTUM_BYTES {
-            break;
-        }
-
-        match item_rx.try_recv() {
-            Ok(Item::WritePdu(next)) => current = Some(next),
+    while frames < OUTBOUND_WRITE_QUANTUM_FRAMES
+        && bytes.len() < OUTBOUND_WRITE_QUANTUM_BYTES
+    {
+        let payload = match item_rx.try_recv() {
+            Ok(Item::WritePdu(payload)) => payload,
             Ok(other) => {
                 *deferred_item = Some(other);
                 break;
             }
             Err(TryRecvError::Empty | TryRecvError::Closed) => break,
+        };
+        let frame = encode_write_payload(payload, compression_mode, terminal)?;
+        if bytes
+            .len()
+            .checked_add(frame.bytes.len())
+            .is_none_or(|next_len| next_len > OUTBOUND_WRITE_QUANTUM_BYTES)
+        {
+            *deferred_item = Some(Item::WritePdu(WritePayload::Encoded(frame)));
+            break;
         }
+
+        bytes.extend_from_slice(&frame.bytes);
+        reservations.push(frame.reservation);
+        reweight_topology_batch(terminal, &mut reservations, bytes.capacity())?;
+        frames = frames.saturating_add(1);
     }
 
     metrics::histogram!("mux.dispatch.outbound_batch.frames").record(frames as f64);
@@ -1885,6 +2360,7 @@ fn prepare_pending_outbound_batch(
 
     Ok(PendingOutboundBatch {
         bytes,
+        reservations,
         offset: 0,
         transient_retries: 0,
         phase: PendingOutboundPhase::Writing,
@@ -1892,28 +2368,53 @@ fn prepare_pending_outbound_batch(
     })
 }
 
-async fn poll_dispatch_write_once<T>(stream: &mut T, bytes: &[u8]) -> io::Result<Option<usize>>
+enum ImmediateOutboundPoll<T> {
+    Terminal,
+    Pending,
+    Ready(io::Result<T>),
+}
+
+async fn poll_dispatch_write_once<T>(
+    stream: &mut T,
+    bytes: &[u8],
+    terminal: &DispatchTerminal,
+) -> ImmediateOutboundPoll<usize>
 where
     T: DispatchStream,
 {
     std::future::poll_fn(|cx| {
-        Poll::Ready(match Pin::new(&mut *stream).poll_write(cx, bytes) {
-            Poll::Ready(result) => result.map(Some),
-            Poll::Pending => Ok(None),
-        })
+        let outcome = {
+            let Some(_admission) = terminal.admit() else {
+                return Poll::Ready(ImmediateOutboundPoll::Terminal);
+            };
+            match Pin::new(&mut *stream).poll_write(cx, bytes) {
+                Poll::Ready(result) => ImmediateOutboundPoll::Ready(result),
+                Poll::Pending => ImmediateOutboundPoll::Pending,
+            }
+        };
+        Poll::Ready(outcome)
     })
     .await
 }
 
-async fn poll_dispatch_flush_once<T>(stream: &mut T) -> io::Result<Option<()>>
+async fn poll_dispatch_flush_once<T>(
+    stream: &mut T,
+    terminal: &DispatchTerminal,
+) -> ImmediateOutboundPoll<()>
 where
     T: DispatchStream,
 {
     std::future::poll_fn(|cx| {
-        Poll::Ready(match Pin::new(&mut *stream).poll_flush(cx) {
-            Poll::Ready(result) => result.map(Some),
-            Poll::Pending => Ok(None),
-        })
+        let outcome = {
+            let Some(_admission) = terminal.admit() else {
+                return Poll::Ready(ImmediateOutboundPoll::Terminal);
+            };
+            match Pin::new(&mut *stream).poll_flush(cx) {
+                Poll::Ready(result) => ImmediateOutboundPoll::Ready(result),
+                Poll::Pending => ImmediateOutboundPoll::Pending,
+            }
+        };
+        Poll::Ready(outcome)
     })
     .await
 }
@@ -1922,10 +2423,15 @@ async fn service_pending_outbound<T>(
     stream: &mut T,
     pending: &mut PendingOutboundBatch,
     io_uring_runtime: Option<&DispatchIoUringRuntime>,
+    terminal: &DispatchTerminal,
 ) -> anyhow::Result<OutboundService>
 where
     T: DispatchStream,
 {
+    let Some(admission) = terminal.admit() else {
+        return Ok(OutboundService::Terminal);
+    };
+    drop(admission);
     if pending.prefer_read
         && stream
             .try_readable_without_consuming()
@@ -1942,15 +2448,22 @@ where
         PendingOutboundPhase::Writing => {
             let turn_len = pending.remaining().len().min(OUTBOUND_WRITE_QUANTUM_BYTES);
             let turn_end = pending.offset.saturating_add(turn_len);
-            match poll_dispatch_write_once(stream, &pending.bytes[pending.offset..turn_end]).await {
-                Ok(Some(0)) => {
+            match poll_dispatch_write_once(
+                stream,
+                &pending.bytes[pending.offset..turn_end],
+                terminal,
+            )
+            .await
+            {
+                ImmediateOutboundPoll::Terminal => return Ok(OutboundService::Terminal),
+                ImmediateOutboundPoll::Ready(Ok(0)) => {
                     return Err(std::io::Error::new(
                         ErrorKind::WriteZero,
                         "failed to write mux PDU frame chunk",
                     )
                     .into());
                 }
-                Ok(Some(written)) => {
+                ImmediateOutboundPoll::Ready(Ok(written)) => {
                     pending.offset = pending.offset.saturating_add(written);
                     pending.transient_retries = 0;
                     pending.prefer_read = true;
@@ -1960,26 +2473,27 @@ where
                     }
                     return Ok(OutboundService::Progress);
                 }
-                Ok(None) => operation_polled_pending = true,
-                Err(err)
+                ImmediateOutboundPoll::Pending => operation_polled_pending = true,
+                ImmediateOutboundPoll::Ready(Err(err))
                     if is_transient_write_error(&err)
                         && pending.transient_retries < TRANSIENT_WRITE_RETRY_LIMIT =>
                 {
                     pending.transient_retries = pending.transient_retries.saturating_add(1);
                 }
-                Err(err) => return Err(err.into()),
+                ImmediateOutboundPoll::Ready(Err(err)) => return Err(err.into()),
             }
         }
-        PendingOutboundPhase::Flushing => match poll_dispatch_flush_once(stream).await {
-            Ok(Some(())) => return Ok(OutboundService::Complete),
-            Ok(None) => operation_polled_pending = true,
-            Err(err)
+        PendingOutboundPhase::Flushing => match poll_dispatch_flush_once(stream, terminal).await {
+            ImmediateOutboundPoll::Terminal => return Ok(OutboundService::Terminal),
+            ImmediateOutboundPoll::Ready(Ok(())) => return Ok(OutboundService::Complete),
+            ImmediateOutboundPoll::Pending => operation_polled_pending = true,
+            ImmediateOutboundPoll::Ready(Err(err))
                 if is_transient_write_error(&err)
                     && pending.transient_retries < TRANSIENT_WRITE_RETRY_LIMIT =>
             {
                 pending.transient_retries = pending.transient_retries.saturating_add(1);
             }
-            Err(err) => return Err(err.into()),
+            ImmediateOutboundPoll::Ready(Err(err)) => return Err(err.into()),
         },
     }
 
@@ -2048,13 +2562,23 @@ where
         .await
         .context("waiting for mux stream to become writable")?;
 
-    let mut current = Some(first);
-    while let Some(decoded) = current.take() {
-        let mut frame = Vec::new();
-        decoded
-            .pdu
-            .encode_with_mode(&mut frame, decoded.serial, compression_mode)
-            .context("encoding PDU frame")?;
+    let mut current = Some(test_write_payload(first));
+    while let Some(payload) = current.take() {
+        let (frame, _reservation) = match payload {
+            WritePayload::Typed(ReservedDecodedPdu {
+                decoded,
+                reservation,
+            }) => (
+                decoded
+                    .pdu
+                    .encode_frame_with_mode(decoded.serial, compression_mode)
+                    .context("encoding PDU frame")?,
+                reservation,
+            ),
+            WritePayload::Encoded(EncodedOutboundFrame { bytes, reservation }) => {
+                (bytes, reservation)
+            }
+        };
         write_frame_with_transient_retries(stream, &frame, io_uring_runtime)
             .await
             .context("encoding PDU to client")?;
@@ -2850,7 +3374,7 @@ where
         );
     }
 
-    let (item_tx, item_rx) = bounded::<Item>(DISPATCH_ITEM_QUEUE_CAPACITY);
+    let (item_tx, item_rx) = bounded::<Item>(DISPATCH_ITEM_QUEUE_TOTAL_CAPACITY);
     let (terminal, terminal_rx) = DispatchTerminal::channel();
     let mut deferred_item = None;
     let mut pending_outbound = None;
@@ -2902,8 +3426,12 @@ where
             let next_item = if let Some(pending) = pending_outbound.as_mut() {
                 let outbound_result = {
                     let terminal_event = terminal_rx.recv();
-                    let outbound =
-                        service_pending_outbound(&mut stream, pending, io_uring_runtime.as_ref());
+                    let outbound = service_pending_outbound(
+                        &mut stream,
+                        pending,
+                        io_uring_runtime.as_ref(),
+                        &terminal,
+                    );
                     pin_mut!(terminal_event);
                     pin_mut!(outbound);
                     match select(terminal_event, outbound).await {
@@ -2924,6 +3452,13 @@ where
                     Ok(OutboundService::Complete) => {
                         pending_outbound = None;
                         continue;
+                    }
+                    Ok(OutboundService::Terminal) => {
+                        let reason = terminal_rx
+                            .try_recv()
+                            .ok()
+                            .unwrap_or("mux dispatch connection entered terminal state");
+                        return Err(anyhow::anyhow!("mux dispatch terminated: {reason}"));
                     }
                     Err(err) => Err(err),
                 }
@@ -2971,6 +3506,7 @@ where
                         &item_rx,
                         &mut deferred_item,
                         codec::CompressionMode::Auto,
+                        &terminal,
                     ) {
                         Ok(pending) => {
                             pending_outbound = Some(pending);
@@ -2978,120 +3514,147 @@ where
                         Err(err) => return Err(err),
                     }
                 }
-                Ok(Item::Notif(MuxNotification::PaneOutput(pane_id))) => {
-                    handler.schedule_tracked_pane_push(pane_id);
-                }
-                Ok(Item::Notif(MuxNotification::PaneAdded(_pane_id))) => {}
-                Ok(Item::Notif(MuxNotification::PaneRemoved(pane_id))) => {
-                    handler.remove_per_pane(pane_id);
-                    pending_outbound = Some(prepare_unilateral_pdu(
-                        Pdu::PaneRemoved(codec::PaneRemoved { pane_id }),
-                        &item_rx,
-                        &mut deferred_item,
-                    )?);
-                }
-                Ok(Item::Notif(MuxNotification::Alert { pane_id, alert })) => {
-                    // ft-12e8l: use the non-inserting accessor. If the pane
-                    // was already removed (PaneRemoved arm above clears the
-                    // entry), re-inserting a fresh PerPane here would leak —
-                    // no subsequent PaneRemoved ever fires for a dead pane.
-                    // Silently drop the stale alert; the client can't render
-                    // a dead pane anyway. For client-initiated PDU arms that
-                    // are the first reference to a pane, per_pane (not this
-                    // helper) is still correct.
-                    if let Some(per_pane) = handler.per_pane_if_present(pane_id) {
-                        {
-                            let mut per_pane = per_pane
-                                .lock()
-                                .map_err(|err| anyhow::anyhow!("per-pane lock poisoned: {err}"))?;
-                            per_pane.notifications.push(alert);
+                Ok(Item::Notif(queued)) => {
+                    let ReservedNotification {
+                        notification,
+                        reservation,
+                    } = queued;
+                    match notification {
+                        MuxNotification::PaneOutput(pane_id) => {
+                            handler.schedule_tracked_pane_push(pane_id);
                         }
-                        handler.schedule_tracked_pane_push(pane_id);
-                    }
-                }
-                Ok(Item::Notif(MuxNotification::SaveToDownloads { .. })) => {}
-                Ok(Item::Notif(MuxNotification::AssignClipboard {
-                    pane_id,
-                    selection,
-                    clipboard,
-                })) => {
-                    pending_outbound = Some(prepare_unilateral_pdu(
-                        Pdu::SetClipboard(codec::SetClipboard {
+                        MuxNotification::PaneAdded(_pane_id) => {}
+                        MuxNotification::PaneRemoved(pane_id) => {
+                            handler.remove_per_pane(pane_id);
+                            pending_outbound = Some(prepare_unilateral_pdu(
+                                Pdu::PaneRemoved(codec::PaneRemoved { pane_id }),
+                                reservation,
+                                &item_rx,
+                                &mut deferred_item,
+                                &terminal,
+                            )?);
+                        }
+                        MuxNotification::Alert { pane_id, alert } => {
+                            // ft-12e8l: use the non-inserting accessor. If the pane
+                            // was already removed, re-inserting a fresh PerPane here
+                            // would leak because no later PaneRemoved can retire it.
+                            if let Some(per_pane) = handler.per_pane_if_present(pane_id) {
+                                {
+                                    let mut per_pane = per_pane.lock().map_err(|err| {
+                                        anyhow::anyhow!("per-pane lock poisoned: {err}")
+                                    })?;
+                                    per_pane.notifications.push(alert);
+                                }
+                                handler.schedule_tracked_pane_push(pane_id);
+                            }
+                        }
+                        MuxNotification::SaveToDownloads { .. } => {}
+                        MuxNotification::AssignClipboard {
                             pane_id,
-                            clipboard,
                             selection,
-                        }),
-                        &item_rx,
-                        &mut deferred_item,
-                    )?);
-                }
-                Ok(Item::Notif(MuxNotification::TabAddedToWindow { tab_id, window_id })) => {
-                    pending_outbound = Some(prepare_unilateral_pdu(
-                        Pdu::TabAddedToWindow(codec::TabAddedToWindow { tab_id, window_id }),
-                        &item_rx,
-                        &mut deferred_item,
-                    )?);
-                }
-                Ok(Item::Notif(MuxNotification::WindowRemoved(_window_id))) => {}
-                Ok(Item::Notif(MuxNotification::WindowCreated(_window_id))) => {}
-                Ok(Item::Notif(MuxNotification::WindowInvalidated(_window_id))) => {}
-                Ok(Item::Notif(MuxNotification::WindowWorkspaceChanged {
-                    window_id,
-                    workspace,
-                })) => {
-                    pending_outbound = Some(prepare_unilateral_pdu(
-                        Pdu::WindowWorkspaceChanged(codec::WindowWorkspaceChanged {
+                            clipboard,
+                        } => {
+                            pending_outbound = Some(prepare_unilateral_pdu(
+                                Pdu::SetClipboard(codec::SetClipboard {
+                                    pane_id,
+                                    clipboard,
+                                    selection,
+                                }),
+                                reservation,
+                                &item_rx,
+                                &mut deferred_item,
+                                &terminal,
+                            )?);
+                        }
+                        MuxNotification::TabAddedToWindow { tab_id, window_id } => {
+                            pending_outbound = Some(prepare_unilateral_pdu(
+                                Pdu::TabAddedToWindow(codec::TabAddedToWindow {
+                                    tab_id,
+                                    window_id,
+                                }),
+                                reservation,
+                                &item_rx,
+                                &mut deferred_item,
+                                &terminal,
+                            )?);
+                        }
+                        MuxNotification::WindowRemoved(_window_id)
+                        | MuxNotification::WindowCreated(_window_id)
+                        | MuxNotification::WindowInvalidated(_window_id) => {}
+                        MuxNotification::WindowWorkspaceChanged {
                             window_id,
                             workspace,
-                        }),
-                        &item_rx,
-                        &mut deferred_item,
-                    )?);
-                }
-                Ok(Item::Notif(MuxNotification::PaneFocused(pane_id))) => {
-                    pending_outbound = Some(prepare_unilateral_pdu(
-                        Pdu::PaneFocused(codec::PaneFocused { pane_id }),
-                        &item_rx,
-                        &mut deferred_item,
-                    )?);
-                }
-                Ok(Item::Notif(MuxNotification::TabResized(tab_id))) => {
-                    pending_outbound = Some(prepare_unilateral_pdu(
-                        Pdu::TabResized(codec::TabResized { tab_id }),
-                        &item_rx,
-                        &mut deferred_item,
-                    )?);
-                }
-                Ok(Item::Notif(MuxNotification::TabTitleChanged { tab_id, title })) => {
-                    pending_outbound = Some(prepare_unilateral_pdu(
-                        Pdu::TabTitleChanged(codec::TabTitleChanged { tab_id, title }),
-                        &item_rx,
-                        &mut deferred_item,
-                    )?);
-                }
-                Ok(Item::Notif(MuxNotification::WindowTitleChanged { window_id, title })) => {
-                    pending_outbound = Some(prepare_unilateral_pdu(
-                        Pdu::WindowTitleChanged(codec::WindowTitleChanged { window_id, title }),
-                        &item_rx,
-                        &mut deferred_item,
-                    )?);
-                }
-                Ok(Item::Notif(MuxNotification::WorkspaceRenamed {
-                    old_workspace,
-                    new_workspace,
-                })) => {
-                    pending_outbound = Some(prepare_unilateral_pdu(
-                        Pdu::RenameWorkspace(codec::RenameWorkspace {
+                        } => {
+                            pending_outbound = Some(prepare_unilateral_pdu(
+                                Pdu::WindowWorkspaceChanged(codec::WindowWorkspaceChanged {
+                                    window_id,
+                                    workspace,
+                                }),
+                                reservation,
+                                &item_rx,
+                                &mut deferred_item,
+                                &terminal,
+                            )?);
+                        }
+                        MuxNotification::PaneFocused(pane_id) => {
+                            pending_outbound = Some(prepare_unilateral_pdu(
+                                Pdu::PaneFocused(codec::PaneFocused { pane_id }),
+                                reservation,
+                                &item_rx,
+                                &mut deferred_item,
+                                &terminal,
+                            )?);
+                        }
+                        MuxNotification::TabResized(tab_id) => {
+                            pending_outbound = Some(prepare_unilateral_pdu(
+                                Pdu::TabResized(codec::TabResized { tab_id }),
+                                reservation,
+                                &item_rx,
+                                &mut deferred_item,
+                                &terminal,
+                            )?);
+                        }
+                        MuxNotification::TabTitleChanged { tab_id, title } => {
+                            pending_outbound = Some(prepare_unilateral_pdu(
+                                Pdu::TabTitleChanged(codec::TabTitleChanged { tab_id, title }),
+                                reservation,
+                                &item_rx,
+                                &mut deferred_item,
+                                &terminal,
+                            )?);
+                        }
+                        MuxNotification::WindowTitleChanged { window_id, title } => {
+                            pending_outbound = Some(prepare_unilateral_pdu(
+                                Pdu::WindowTitleChanged(codec::WindowTitleChanged {
+                                    window_id,
+                                    title,
+                                }),
+                                reservation,
+                                &item_rx,
+                                &mut deferred_item,
+                                &terminal,
+                            )?);
+                        }
+                        MuxNotification::WorkspaceRenamed {
                             old_workspace,
                             new_workspace,
-                        }),
-                        &item_rx,
-                        &mut deferred_item,
-                    )?);
+                        } => {
+                            pending_outbound = Some(prepare_unilateral_pdu(
+                                Pdu::RenameWorkspace(codec::RenameWorkspace {
+                                    old_workspace,
+                                    new_workspace,
+                                }),
+                                reservation,
+                                &item_rx,
+                                &mut deferred_item,
+                                &terminal,
+                            )?);
+                        }
+                        MuxNotification::SynchronizedOutput { .. }
+                        | MuxNotification::ActiveWorkspaceChanged(_)
+                        | MuxNotification::Empty => {}
+                    }
                 }
-                Ok(Item::Notif(MuxNotification::SynchronizedOutput { .. })) => {}
-                Ok(Item::Notif(MuxNotification::ActiveWorkspaceChanged(_))) => {}
-                Ok(Item::Notif(MuxNotification::Empty)) => {}
                 Err(err) => {
                     if is_clean_disconnect(&err) {
                         return Ok(());
@@ -3334,7 +3897,7 @@ mod tests {
     }
 
     fn idle_topology_coordinator() -> TopologyStreamCoordinator {
-        let (item_tx, _item_rx) = bounded(DISPATCH_ITEM_QUEUE_CAPACITY);
+        let (item_tx, _item_rx) = bounded(DISPATCH_ITEM_QUEUE_TOTAL_CAPACITY);
         let (terminal, _terminal_rx) = DispatchTerminal::channel();
         TopologyStreamCoordinator::new(
             item_tx,
@@ -3350,7 +3913,7 @@ mod tests {
         MuxSessionIncarnation,
         TopologyStreamId,
     ) {
-        let (item_tx, item_rx) = bounded(DISPATCH_ITEM_QUEUE_CAPACITY);
+        let (item_tx, item_rx) = bounded(DISPATCH_ITEM_QUEUE_TOTAL_CAPACITY);
         let (terminal, terminal_rx) = DispatchTerminal::channel();
         let stream_id = TopologyStreamId::from_bytes([0x5a; 16]);
         let session_incarnation = MuxSessionIncarnation::from_bytes([0xa5; 16]);
@@ -3404,16 +3967,31 @@ mod tests {
         }
     }
 
+    fn retain_topology_for_test(
+        coordinator: &TopologyStreamCoordinator,
+        notification: MuxNotification,
+        revision: TopologyRevision,
+    ) -> RetainedTopologyEvent {
+        retained_topology_event(
+            notification,
+            revision,
+            &coordinator.terminal,
+            &coordinator.outbound_budget,
+        )
+        .expect("test topology notification should fit its connection budget")
+    }
+
     #[test]
     fn retained_workspace_event_uses_its_mutation_point_payload() {
-        let retained = retained_topology_event(
+        let coordinator = idle_topology_coordinator();
+        let retained = retain_topology_for_test(
+            &coordinator,
             MuxNotification::WindowWorkspaceChanged {
                 window_id: 17,
                 workspace: "workspace-at-revision".to_string(),
             },
             TopologyRevision::new(9),
-        )
-        .expect("workspace notification should retain without live mux lookup");
+        );
 
         assert_eq!(retained.revision, TopologyRevision::new(9));
         let event = into_topology_event_kind(retained.notification)
@@ -3429,6 +4007,7 @@ mod tests {
 
     #[test]
     fn retained_dynamic_topology_events_charge_allocated_capacity() {
+        let coordinator = idle_topology_coordinator();
         let fixed_bytes = RETAINED_TOPOLOGY_EVENT_ACCOUNTED_FIXED_BYTES;
 
         let mut workspace = String::with_capacity(128);
@@ -3502,8 +4081,11 @@ mod tests {
         for (revision, (notification, dynamic_capacity, expected_event)) in
             (1_u64..).zip(cases)
         {
-            let retained = retained_topology_event(notification, TopologyRevision::new(revision))
-                .expect("dynamic topology notification should be retained");
+            let retained = retain_topology_for_test(
+                &coordinator,
+                notification,
+                TopologyRevision::new(revision),
+            );
             assert_eq!(
                 retained.retained_bytes,
                 fixed_bytes
@@ -3521,18 +4103,19 @@ mod tests {
     #[test]
     fn retained_large_title_is_held_once_and_moved_into_stamped_event() {
         const TITLE_BYTES: usize = 2_100_000;
+        let (coordinator, item_rx, _terminal_rx, _, stream_id) = bound_topology_coordinator();
 
         let title = "x".repeat(TITLE_BYTES);
         let title_allocation = title.as_ptr();
         let title_capacity = title.capacity();
-        let retained = retained_topology_event(
+        let retained = retain_topology_for_test(
+            &coordinator,
             MuxNotification::WindowTitleChanged {
                 window_id: 17,
                 title,
             },
             TopologyRevision::new(4),
-        )
-        .expect("large title beneath the byte budget should be retainable");
+        );
         assert_eq!(
             retained.retained_bytes,
             RETAINED_TOPOLOGY_EVENT_ACCOUNTED_FIXED_BYTES + title_capacity
@@ -3550,7 +4133,6 @@ mod tests {
         assert_eq!(buffer.retained_bytes, 0);
         assert!(buffer.events.is_empty());
 
-        let (coordinator, item_rx, _terminal_rx, _, stream_id) = bound_topology_coordinator();
         coordinator
             .queue_stamped_event(retained)
             .expect("retained title should queue as a stamped topology event");
@@ -3571,7 +4153,10 @@ mod tests {
 
     fn take_written_pdu(item_rx: &Receiver<Item>) -> DecodedPdu {
         match item_rx.try_recv().expect("queued dispatch item") {
-            Item::WritePdu(decoded) => *decoded,
+            Item::WritePdu(WritePayload::Typed(ReservedDecodedPdu { decoded, .. })) => *decoded,
+            Item::WritePdu(WritePayload::Encoded(_)) => {
+                panic!("expected queued typed PDU, got an encoded frame")
+            }
             other => panic!("expected queued PDU, got {other:?}"),
         }
     }
@@ -3929,7 +4514,7 @@ mod tests {
         let (sub_id, session_incarnation, baseline_revision) = mux
             .subscribe_with_topology_fence(|_| true)
             .expect("test fenced mux subscription should allocate an identifier");
-        let (item_tx, item_rx) = bounded(DISPATCH_ITEM_QUEUE_CAPACITY);
+        let (item_tx, item_rx) = bounded(DISPATCH_ITEM_QUEUE_TOTAL_CAPACITY);
         let (terminal, terminal_rx) = DispatchTerminal::channel();
         let coordinator = TopologyStreamCoordinator::new(
             item_tx,
@@ -4157,7 +4742,7 @@ mod tests {
 
     #[test]
     fn coherent_snapshot_cannot_predate_its_subscription_baseline() {
-        let (item_tx, item_rx) = bounded(DISPATCH_ITEM_QUEUE_CAPACITY);
+        let (item_tx, item_rx) = bounded(DISPATCH_ITEM_QUEUE_TOTAL_CAPACITY);
         let (terminal, terminal_rx) = DispatchTerminal::channel();
         let stream_id = TopologyStreamId::from_bytes([0x5b; 16]);
         let session_incarnation = MuxSessionIncarnation::from_bytes([0xa6; 16]);
@@ -4239,11 +4824,17 @@ mod tests {
         ));
         assert!(matches!(
             item_rx.try_recv().expect("first restored notification"),
-            Item::Notif(MuxNotification::PaneAdded(1))
+            Item::Notif(ReservedNotification {
+                notification: MuxNotification::PaneAdded(1),
+                ..
+            })
         ));
         assert!(matches!(
             item_rx.try_recv().expect("second restored notification"),
-            Item::Notif(MuxNotification::PaneRemoved(2))
+            Item::Notif(ReservedNotification {
+                notification: MuxNotification::PaneRemoved(2),
+                ..
+            })
         ));
         assert!(item_rx.is_empty());
     }
@@ -4352,7 +4943,7 @@ mod tests {
     fn topology_capacity_overflow_releases_prebind_and_established_gap_retention() {
         let mux = Mux::new(None);
 
-        let (item_tx, item_rx) = bounded(DISPATCH_ITEM_QUEUE_CAPACITY);
+        let (item_tx, item_rx) = bounded(DISPATCH_ITEM_QUEUE_TOTAL_CAPACITY);
         let (terminal, terminal_rx) = DispatchTerminal::channel();
         let stream_id = TopologyStreamId::from_bytes([0x6a; 16]);
         let coordinator = TopologyStreamCoordinator::new(item_tx, terminal, stream_id);
@@ -4461,7 +5052,7 @@ mod tests {
 
     #[test]
     fn topology_terminal_transition_is_linearizable_with_late_ingress() {
-        let (item_tx, item_rx) = bounded(DISPATCH_ITEM_QUEUE_CAPACITY);
+        let (item_tx, item_rx) = bounded(DISPATCH_ITEM_QUEUE_TOTAL_CAPACITY);
         let (terminal, terminal_rx) = DispatchTerminal::channel();
         let coordinator = Arc::new(TopologyStreamCoordinator::new(
             item_tx,
@@ -4592,7 +5183,7 @@ mod tests {
 
     #[test]
     fn pane_output_enqueue_bypasses_deep_topology_work_before_terminal_transition() {
-        let (item_tx, item_rx) = bounded(DISPATCH_ITEM_QUEUE_CAPACITY);
+        let (item_tx, item_rx) = bounded(DISPATCH_ITEM_QUEUE_TOTAL_CAPACITY);
         let (terminal, terminal_rx) = DispatchTerminal::channel();
         let coordinator = Arc::new(TopologyStreamCoordinator::new(
             item_tx,
@@ -4658,7 +5249,10 @@ mod tests {
         );
         assert!(matches!(
             item_rx.try_recv(),
-            Ok(Item::Notif(MuxNotification::PaneOutput(73)))
+            Ok(Item::Notif(ReservedNotification {
+                notification: MuxNotification::PaneOutput(73),
+                ..
+            }))
         ));
         assert!(item_rx.is_empty());
         let state = coordinator.state.lock();
@@ -5675,7 +6269,7 @@ mod tests {
                 match queued_item {
                     QueuedDispatchItem::WritePdu => {
                         item_tx
-                            .try_send(Item::WritePdu(queued_ping(next_serial)))
+                            .try_send(test_write_item(queued_ping(next_serial)))
                             .expect("queue generated ping");
                         if still_in_write_prefix {
                             expected_written_serials.push(next_serial);
@@ -5686,7 +6280,7 @@ mod tests {
                     }
                     QueuedDispatchItem::Notif => {
                         item_tx
-                            .try_send(Item::Notif(MuxNotification::Empty))
+                            .try_send(test_notification_item(MuxNotification::Empty))
                             .expect("queue generated notification");
                         if still_in_write_prefix {
                             expected_deferred = Some(QueuedDispatchItem::Notif);
@@ -5779,7 +6373,10 @@ mod tests {
                 match queued_item {
                     QueuedGeneratedDispatchItem::WritePdu(pdu) => {
                         item_tx
-                            .try_send(Item::WritePdu(queued_generated_pdu(next_serial, pdu.clone())))
+                            .try_send(test_write_item(queued_generated_pdu(
+                                next_serial,
+                                pdu.clone(),
+                            )))
                             .expect("queue generated PDU");
                         if still_in_write_prefix {
                             expected_written.push((next_serial, pdu));
@@ -5790,7 +6387,7 @@ mod tests {
                     }
                     QueuedGeneratedDispatchItem::Notif => {
                         item_tx
-                            .try_send(Item::Notif(MuxNotification::Empty))
+                            .try_send(test_notification_item(MuxNotification::Empty))
                             .expect("queue generated notification");
                         if still_in_write_prefix {
                             expected_deferred = Some(QueuedDispatchItem::Notif);
@@ -6070,7 +6667,10 @@ mod tests {
                 match queued_item {
                     QueuedGeneratedDispatchItem::WritePdu(pdu) => {
                         item_tx
-                            .try_send(Item::WritePdu(queued_generated_pdu(next_serial, pdu.clone())))
+                            .try_send(test_write_item(queued_generated_pdu(
+                                next_serial,
+                                pdu.clone(),
+                            )))
                             .expect("queue generated PDU");
                         if still_in_write_prefix {
                             expected_written.push((next_serial, pdu));
@@ -6081,7 +6681,7 @@ mod tests {
                     }
                     QueuedGeneratedDispatchItem::Notif => {
                         item_tx
-                            .try_send(Item::Notif(MuxNotification::Empty))
+                            .try_send(test_notification_item(MuxNotification::Empty))
                             .expect("queue generated notification");
                         if still_in_write_prefix {
                             expected_deferred = Some(QueuedDispatchItem::Notif);
@@ -6192,13 +6792,13 @@ mod tests {
                 match queued_item {
                     QueuedDispatchItem::WritePdu => {
                         item_tx
-                            .try_send(Item::WritePdu(queued_ping(next_serial)))
+                            .try_send(test_write_item(queued_ping(next_serial)))
                             .expect("queue generated ping");
                         next_serial += 1;
                     }
                     QueuedDispatchItem::Notif => {
                         item_tx
-                            .try_send(Item::Notif(MuxNotification::Empty))
+                            .try_send(test_notification_item(MuxNotification::Empty))
                             .expect("queue generated notification");
                     }
                     QueuedDispatchItem::Readable => {
@@ -6294,13 +6894,13 @@ mod tests {
                 match queued_item {
                     QueuedDispatchItem::WritePdu => {
                         item_tx
-                            .try_send(Item::WritePdu(queued_ping(next_serial)))
+                            .try_send(test_write_item(queued_ping(next_serial)))
                             .expect("queue generated ping");
                         next_serial += 1;
                     }
                     QueuedDispatchItem::Notif => {
                         item_tx
-                            .try_send(Item::Notif(MuxNotification::Empty))
+                            .try_send(test_notification_item(MuxNotification::Empty))
                             .expect("queue generated notification");
                     }
                     QueuedDispatchItem::Readable => {
