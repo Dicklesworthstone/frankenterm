@@ -86,6 +86,8 @@ impl SeatHandler for WaylandState {
             Capability::Keyboard => {
                 if self.seat_bindings.clear_keyboard_if_matches(&seat.id()) {
                     log::trace!("Lost keyboard capability for seat {:?}", seat.id());
+                    self.disable_current_keyboard_text_input();
+                    self.emit_keyboard_focus_lost();
                     if let Some(keyboard) = self.keyboard.take() {
                         if let Some(text_input) = &self.text_input {
                             text_input.forget_keyboard(&keyboard);
@@ -93,7 +95,6 @@ impl SeatHandler for WaylandState {
                         keyboard.release();
                     }
                     self.keyboard_mapper.take();
-                    self.keyboard_window_id.take();
                 }
             }
             Capability::Pointer => {
@@ -116,6 +117,7 @@ impl SeatHandler for WaylandState {
         let cleanup = self.seat_bindings.clear_removed_seat(&seat.id());
 
         if cleanup.keyboard {
+            self.emit_keyboard_focus_lost();
             if let Some(keyboard) = self.keyboard.take() {
                 if let Some(text_input) = &self.text_input {
                     text_input.forget_keyboard(&keyboard);
@@ -123,7 +125,6 @@ impl SeatHandler for WaylandState {
                 keyboard.release();
             }
             self.keyboard_mapper.take();
-            self.keyboard_window_id.take();
         }
 
         if cleanup.pointer {
@@ -149,6 +150,27 @@ impl SeatHandler for WaylandState {
 }
 
 impl WaylandState {
+    fn disable_current_keyboard_text_input(&self) {
+        if let (Some(text_input), Some(keyboard)) = (&self.text_input, &self.keyboard) {
+            if let Some(input) = text_input.get_text_input_for_keyboard(keyboard) {
+                input.disable();
+                input.commit();
+            }
+        }
+    }
+
+    fn emit_keyboard_focus_lost(&mut self) {
+        let Some(window_id) = self.keyboard_window_id.take() else {
+            return;
+        };
+        let Some(window) = self.window_by_id(window_id) else {
+            return;
+        };
+        window
+            .borrow_mut()
+            .emit_focus(self.keyboard_mapper.as_mut(), false);
+    }
+
     fn ensure_selection_devices_for_seat(&mut self, qh: &QueueHandle<Self>, seat: &WlSeat) {
         if self.data_device.is_none() {
             let data_device_manager = &self.data_device_manager_state;

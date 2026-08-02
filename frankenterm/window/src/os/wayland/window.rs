@@ -16,6 +16,7 @@ use anyhow::{anyhow, bail};
 use async_trait::async_trait;
 use config::ConfigHandle;
 use frankenterm_font::FontConfiguration;
+use futures_util::future::{AbortHandle, AbortRegistration, Abortable};
 use promise::{BrokenPromise, Future, Promise};
 use raw_window_handle::{
     DisplayHandle, HandleError, HasDisplayHandle, HasWindowHandle, RawWindowHandle,
@@ -51,7 +52,7 @@ use wezterm_input_types::{
 };
 
 use crate::wayland::WaylandConnection;
-use crate::x11::KeyboardWithFallback;
+use crate::x11::{KeyboardWithFallback, WaylandRepeatSeed};
 use crate::{
     Appearance, Clipboard, Connection, ConnectionOps, Dimensions, MouseCursor, Point, Rect,
     RequestedWindowGeometry, ResizeIncrement, ResolvedGeometry, Window, WindowEvent,
@@ -86,6 +87,7 @@ use super::pointer::{PendingMouse, PointerUserData};
 use super::state::WaylandState;
 
 static INVALID_KEY_REPEAT_INFO_REPORTED: AtomicBool = AtomicBool::new(false);
+static INVALID_WAYLAND_KEYCODE_REPORTED: AtomicBool = AtomicBool::new(false);
 
 fn key_repeat_timing(rate: i32, delay_ms: i32) -> Option<(Duration, Duration)> {
     if rate <= 0 || delay_ms < 0 {
@@ -101,19 +103,59 @@ fn key_repeat_timing(rate: i32, delay_ms: i32) -> Option<(Duration, Duration)> {
     ))
 }
 
-fn repeat_count_for_elapsed(elapsed: Duration, gap: Duration, initial: bool) -> u16 {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum KeyRepeatTimerPlan {
+    Wait(Duration),
+    Dispatch {
+        repeat_count: u16,
+        next_due: Duration,
+    },
+}
+
+fn key_repeat_timer_plan(
+    elapsed: Duration,
+    next_due: Duration,
+    gap: Duration,
+) -> Option<KeyRepeatTimerPlan> {
     let gap_nanos = gap.as_nanos();
     if gap_nanos == 0 {
-        return u16::MAX;
+        return None;
     }
 
-    let complete_gaps = elapsed.as_nanos() / gap_nanos;
-    let due = if initial {
-        complete_gaps.saturating_add(1)
-    } else {
-        complete_gaps.max(1)
+    let Some(overdue) = elapsed.checked_sub(next_due) else {
+        return Some(KeyRepeatTimerPlan::Wait(next_due - elapsed));
     };
-    u16::try_from(due).unwrap_or(u16::MAX)
+    let overdue_nanos = overdue.as_nanos();
+    let due = overdue_nanos
+        .checked_div(gap_nanos)?
+        .saturating_add(1);
+    let repeat_count = u16::try_from(due).unwrap_or(u16::MAX);
+    let remainder_nanos = overdue_nanos % gap_nanos;
+    let until_next_nanos = gap_nanos.checked_sub(remainder_nanos)?;
+    let until_next = Duration::from_nanos(u64::try_from(until_next_nanos).ok()?);
+    let next_due = elapsed.checked_add(until_next)?;
+    Some(KeyRepeatTimerPlan::Dispatch {
+        repeat_count,
+        next_due,
+    })
+}
+
+fn key_repeat_first_due(
+    elapsed: Duration,
+    delay: Duration,
+    gap: Duration,
+    last_dispatch: Option<Duration>,
+) -> Option<Duration> {
+    if gap.is_zero() {
+        return None;
+    }
+    match last_dispatch {
+        Some(last_dispatch) => last_dispatch
+            .checked_add(gap)
+            .map(|due| due.max(elapsed)),
+        None if elapsed >= delay => Some(elapsed),
+        None => Some(delay),
+    }
 }
 
 fn report_invalid_key_repeat_info(rate: i32, delay_ms: i32) {
@@ -127,100 +169,161 @@ fn report_invalid_key_repeat_info(rate: i32, delay_ms: i32) {
     }
 }
 
-#[derive(Debug)]
-pub(super) struct KeyRepeatState {
-    pub(super) when: Instant,
-    pub(super) event: WindowKeyEvent,
+fn report_invalid_wayland_keycode(key: u32) {
+    if INVALID_WAYLAND_KEYCODE_REPORTED
+        .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+        .is_ok()
+    {
+        log::warn!("Ignoring Wayland keyboard input with overflowing keycode {key}");
+    }
 }
 
-impl KeyRepeatState {
-    pub(super) fn schedule(state: Arc<Mutex<Self>>, window_id: usize) {
-        let Some(conn) = WaylandConnection::get() else {
-            log::debug!(
-                "Stopping Wayland key repeat: connection unavailable while reading repeat settings"
+struct KeyRepeatAbort {
+    handle: AbortHandle,
+}
+
+impl KeyRepeatAbort {
+    fn new_pair() -> (Self, AbortRegistration) {
+        let (handle, registration) = AbortHandle::new_pair();
+        (Self { handle }, registration)
+    }
+}
+
+impl Drop for KeyRepeatAbort {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
+}
+
+struct KeyRepeatTimerLease {
+    identity: Arc<()>,
+    _abort: KeyRepeatAbort,
+}
+
+struct HeldKeyRepeat {
+    seed: WaylandRepeatSeed,
+    origin: Instant,
+    last_dispatch: Option<Duration>,
+    timer: Option<KeyRepeatTimerLease>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CompositorRepeatTransition {
+    RetainHeld,
+    RetireMismatched,
+    Untracked,
+}
+
+fn compositor_repeat_transition(
+    held_key: Option<u32>,
+    repeated_key: u32,
+) -> CompositorRepeatTransition {
+    match held_key {
+        Some(held_key) if held_key == repeated_key => CompositorRepeatTransition::RetainHeld,
+        Some(_) => CompositorRepeatTransition::RetireMismatched,
+        None => CompositorRepeatTransition::Untracked,
+    }
+}
+
+fn key_repeat_window_event(mut event: WindowKeyEvent, repeat_count: u16) -> WindowEvent {
+    match &mut event {
+        WindowKeyEvent::KeyEvent(key) => {
+            key.repeat_count = repeat_count;
+            if let Some(raw) = key.raw.as_mut() {
+                raw.repeat_count = repeat_count;
+            }
+        }
+        WindowKeyEvent::RawKeyEvent(raw) => {
+            raw.repeat_count = repeat_count;
+        }
+    }
+    match event {
+        WindowKeyEvent::KeyEvent(key) => WindowEvent::KeyEvent(key),
+        WindowKeyEvent::RawKeyEvent(raw) => WindowEvent::RawKeyEvent(raw),
+    }
+}
+
+async fn run_key_repeat(
+    window_id: usize,
+    seed: WaylandRepeatSeed,
+    identity: Arc<()>,
+    origin: Instant,
+    initial_due: Duration,
+    gap: Duration,
+) {
+    let mut next_due = initial_due;
+    loop {
+        let Some(plan) = key_repeat_timer_plan(origin.elapsed(), next_due, gap) else {
+            log::warn!(
+                "Stopping Wayland key repeat for window {window_id}: invalid timer state"
             );
             return;
         };
-        let conn = conn.wayland();
-        let (rate, delay_ms) = {
-            let wstate = conn.wayland_state.borrow();
-            (wstate.key_repeat_rate, wstate.key_repeat_delay)
-        };
-        let Some((delay, gap)) = key_repeat_timing(rate, delay_ms) else {
-            if rate < 0 || delay_ms < 0 {
-                report_invalid_key_repeat_info(rate, delay_ms);
+
+        let repeat_count = match plan {
+            KeyRepeatTimerPlan::Wait(wait) => {
+                promise::spawn::sleep(wait).await;
+                continue;
             }
+            KeyRepeatTimerPlan::Dispatch {
+                repeat_count,
+                next_due: following_due,
+            } => {
+                next_due = following_due;
+                repeat_count
+            }
+        };
+
+        let (handle, translation) = {
+            let Some(conn) = WaylandConnection::get() else {
+                log::debug!(
+                    "Stopping Wayland key repeat for window {window_id}: connection unavailable"
+                );
+                return;
+            };
+            let conn = conn.wayland();
+            let Some(handle) = conn.window_by_id(window_id) else {
+                return;
+            };
+            let translation = {
+                let state = conn.wayland_state.borrow();
+                let Some(mapper) = state.keyboard_mapper.as_ref() else {
+                    log::debug!(
+                        "Stopping Wayland key repeat for window {window_id}: keyboard mapper unavailable"
+                    );
+                    return;
+                };
+                let Some(event) = mapper.translate_wayland_repeat(&seed) else {
+                    report_invalid_wayland_keycode(seed.key());
+                    return;
+                };
+                event
+            };
+            (handle, translation)
+        };
+
+        let mut inner = handle.borrow_mut();
+        let is_current = inner.key_repeat.as_ref().is_some_and(|held| {
+            held.timer
+                .as_ref()
+                .is_some_and(|timer| Arc::ptr_eq(&timer.identity, &identity))
+        });
+        if !is_current || inner.window.is_none() {
             return;
-        };
+        }
+        if let Some(held) = inner.key_repeat.as_mut() {
+            held.last_dispatch = Some(origin.elapsed());
+        }
+        inner
+            .events
+            .dispatch(key_repeat_window_event(translation, repeat_count));
+        drop(inner);
+        drop(handle);
 
-        promise::spawn::spawn_into_main_thread(async move {
-            let mut initial = true;
-            promise::spawn::sleep(delay).await;
-            loop {
-                {
-                    let handle = {
-                        let Some(conn) = WaylandConnection::get() else {
-                            log::debug!(
-                                "Stopping Wayland key repeat for window {window_id}: connection unavailable"
-                            );
-                            return;
-                        };
-                        let conn = conn.wayland();
-                        match conn.window_by_id(window_id) {
-                            Some(handle) => handle,
-                            None => return,
-                        }
-                    };
-
-                    let mut inner = handle.borrow_mut();
-
-                    if inner.key_repeat.as_ref().map(|(_, k)| Arc::as_ptr(k))
-                        != Some(Arc::as_ptr(&state))
-                    {
-                        // Key was released and/or some other key is doing
-                        // its own repetition now
-                        return;
-                    }
-
-                    let mut st = match state.lock() {
-                        Ok(st) => st,
-                        Err(_) => {
-                            log::warn!(
-                                "Stopping Wayland key repeat for window {window_id}: repeat state lock was poisoned"
-                            );
-                            inner.key_repeat.take();
-                            return;
-                        }
-                    };
-
-                    let elapsed = if initial {
-                        st.when.elapsed().saturating_sub(delay)
-                    } else {
-                        st.when.elapsed()
-                    };
-                    let repeat_count = repeat_count_for_elapsed(elapsed, gap, initial);
-                    initial = false;
-
-                    let event = match st.event.clone() {
-                        WindowKeyEvent::KeyEvent(mut key) => {
-                            key.repeat_count = repeat_count;
-                            WindowEvent::KeyEvent(key)
-                        }
-                        WindowKeyEvent::RawKeyEvent(mut raw) => {
-                            raw.repeat_count = repeat_count;
-                            WindowEvent::RawKeyEvent(raw)
-                        }
-                    };
-
-                    inner.events.dispatch(event);
-
-                    st.when = Instant::now();
-                }
-
-                promise::spawn::sleep(gap).await;
-            }
-        })
-        .detach();
+        // A slow event handler can leave the absolute deadline overdue. Yield
+        // after each coalesced dispatch so close, release, focus, and settings
+        // changes can run and abort this lease before another repeat batch.
+        futures_lite::future::yield_now().await;
     }
 }
 
@@ -495,10 +598,53 @@ impl WindowOps for WaylandWindow {
     }
 
     fn close(&self) {
-        WaylandConnection::with_window_inner(self.0, |inner| {
-            inner.close();
-            Ok(())
-        });
+        let window_id = self.0;
+        promise::spawn::spawn_into_main_thread(async move {
+            let Some(connection) = WaylandConnection::get() else {
+                log::debug!(
+                    "Dropping Wayland close for window {window_id}: connection unavailable"
+                );
+                return;
+            };
+            let connection = connection.wayland();
+            let Some(handle) = connection.window_by_id(window_id) else {
+                return;
+            };
+            let surface_id = {
+                let mut inner = handle.borrow_mut();
+                let surface_id = inner.window.as_ref().map(|window| window.wl_surface().id());
+                inner.close();
+                surface_id
+            };
+
+            let mut state = connection.wayland_state.borrow_mut();
+            let removed = state.windows.get_mut().remove(&window_id);
+            debug_assert!(
+                removed
+                    .as_ref()
+                    .is_some_and(|removed| Rc::ptr_eq(removed, &handle)),
+                "closed Wayland window registry entry changed before removal"
+            );
+            if state.keyboard_window_id == Some(window_id) {
+                if let (Some(text_input), Some(keyboard)) = (&state.text_input, &state.keyboard) {
+                    if let Some(input) = text_input.get_text_input_for_keyboard(keyboard) {
+                        input.disable();
+                        input.commit();
+                    }
+                }
+                state.keyboard_window_id = None;
+            }
+            if let Some(surface_id) = surface_id {
+                if let Some(text_input) = &state.text_input {
+                    text_input.forget_surface_id(&surface_id);
+                }
+                state.surface_to_pending.remove(&surface_id);
+                if *state.active_surface_id.get_mut() == Some(surface_id) {
+                    *state.active_surface_id.get_mut() = None;
+                }
+            }
+        })
+        .detach();
     }
 
     fn set_cursor(&self, cursor: Option<MouseCursor>) {
@@ -742,7 +888,7 @@ pub struct WaylandWindowInner {
     vscroll_remainder: f64,
     modifiers: Modifiers,
     leds: KeyboardLedStatus,
-    pub(super) key_repeat: Option<(u32, Arc<Mutex<KeyRepeatState>>)>,
+    key_repeat: Option<HeldKeyRepeat>,
     pub(super) pending_event: Arc<Mutex<PendingEvent>>,
     pub(super) pending_mouse: Arc<Mutex<PendingMouse>>,
     pending_first_configure: Option<PendingFirstConfigure>,
@@ -774,7 +920,73 @@ pub struct WaylandWindowInner {
 }
 
 impl WaylandWindowInner {
+    pub(super) fn cancel_key_repeat(&mut self) {
+        self.key_repeat.take();
+    }
+
+    fn replace_key_repeat(
+        &mut self,
+        seed: WaylandRepeatSeed,
+        window_id: usize,
+        rate: i32,
+        delay_ms: i32,
+    ) {
+        self.cancel_key_repeat();
+        self.key_repeat = Some(HeldKeyRepeat {
+            seed,
+            origin: Instant::now(),
+            last_dispatch: None,
+            timer: None,
+        });
+        self.refresh_key_repeat_timing(window_id, rate, delay_ms);
+    }
+
+    fn refresh_key_repeat_timing(&mut self, window_id: usize, rate: i32, delay_ms: i32) {
+        let Some(held) = self.key_repeat.as_mut() else {
+            return;
+        };
+        held.timer.take();
+        let Some((delay, gap)) = key_repeat_timing(rate, delay_ms) else {
+            if rate < 0 || delay_ms < 0 {
+                report_invalid_key_repeat_info(rate, delay_ms);
+            }
+            return;
+        };
+
+        let origin = held.origin;
+        let Some(initial_due) =
+            key_repeat_first_due(origin.elapsed(), delay, gap, held.last_dispatch)
+        else {
+            log::warn!("Stopping Wayland key repeat for window {window_id}: invalid first due");
+            return;
+        };
+        let seed = held.seed.clone();
+        let identity = Arc::new(());
+        let task_identity = Arc::clone(&identity);
+        let (abort, registration) = KeyRepeatAbort::new_pair();
+        held.timer = Some(KeyRepeatTimerLease {
+            identity,
+            _abort: abort,
+        });
+        promise::spawn::spawn_into_main_thread(async move {
+            let _ = Abortable::new(
+                run_key_repeat(
+                    window_id,
+                    seed,
+                    task_identity,
+                    origin,
+                    initial_due,
+                    gap,
+                ),
+                registration,
+            )
+            .await;
+        })
+        .detach();
+    }
+
     fn close(&mut self) {
+        self.cancel_key_repeat();
         self.events.dispatch(WindowEvent::Destroyed);
         self.window.take();
     }
@@ -1393,7 +1605,11 @@ impl WaylandWindowInner {
         }
     }
 
-    pub(crate) fn emit_focus(&mut self, mapper: &mut KeyboardWithFallback, focused: bool) {
+    pub(crate) fn emit_focus(
+        &mut self,
+        mapper: Option<&mut KeyboardWithFallback>,
+        focused: bool,
+    ) {
         // Clear the modifiers when we change focus, otherwise weird
         // things can happen.  For instance, if we lost focus because
         // CTRL+SHIFT+N was pressed to spawn a new window, we'd be
@@ -1401,8 +1617,10 @@ impl WaylandWindowInner {
         // be left in a broken state.
 
         self.modifiers = Modifiers::NONE;
-        mapper.update_modifier_state(0, 0, 0, 0);
-        self.key_repeat.take();
+        if let Some(mapper) = mapper {
+            mapper.update_modifier_state(0, 0, 0, 0);
+        }
+        self.cancel_key_repeat();
         self.events.dispatch(WindowEvent::FocusChanged(focused));
         self.text_cursor.take();
     }
@@ -1417,10 +1635,13 @@ impl WaylandWindowInner {
 
     pub(super) fn keyboard_event(
         &mut self,
-        mapper: &mut KeyboardWithFallback,
+        mapper: Option<&mut KeyboardWithFallback>,
         event: WlKeyboardEvent,
+        window_id: usize,
+        key_repeat_rate: i32,
+        key_repeat_delay: i32,
     ) {
-        match event {
+        match &event {
             WlKeyboardEvent::Enter { keys, .. } => {
                 let key_codes = keys
                     .chunks_exact(4)
@@ -1428,48 +1649,113 @@ impl WaylandWindowInner {
                     .collect::<Vec<_>>();
                 log::trace!("keyboard event: Enter with keys: {:?}", key_codes);
                 self.emit_focus(mapper, true);
+                return;
             }
             WlKeyboardEvent::Leave { .. } => {
                 self.emit_focus(mapper, false);
+                return;
             }
+            _ => {}
+        }
+
+        let Some(mapper) = mapper else {
+            log::debug!(
+                "Ignoring Wayland keyboard event before keymap initialization: {:?}",
+                event
+            );
+            return;
+        };
+        match event {
             WlKeyboardEvent::Key { key, state, .. } => {
-                let pressed = match state.into_result() {
-                    Ok(KeyState::Pressed) => true,
-                    Ok(KeyState::Released) => false,
+                if key.checked_add(8).is_none() {
+                    report_invalid_wayland_keycode(key);
+                    self.cancel_key_repeat();
+                    return;
+                }
+                let (pressed, compositor_repeated) = match state.into_result() {
+                    Ok(KeyState::Pressed) => (true, false),
+                    Ok(KeyState::Released) => (false, false),
+                    Ok(KeyState::Repeated) => (true, true),
                     Ok(key_state) => {
                         log::warn!(
                             "Ignoring Wayland keyboard event with unsupported key state {key_state:?}"
                         );
+                        self.cancel_key_repeat();
                         return;
                     }
                     Err(raw_state) => {
                         log::warn!(
                             "Ignoring Wayland keyboard event with unknown key state {raw_state:?}"
                         );
+                        self.cancel_key_repeat();
                         return;
                     }
                 };
-                if let Some(event) = mapper.process_wayland_key(key, pressed, &mut self.events) {
-                    let rep = Arc::new(Mutex::new(KeyRepeatState {
-                        when: Instant::now(),
-                        event,
-                    }));
-                    self.key_repeat.replace((key, Arc::clone(&rep)));
-                    let window_id = SurfaceUserData::from_wl(
-                        self.window
-                            .as_ref()
-                            .expect("window should exist")
-                            .wl_surface(),
-                    )
-                    .window_id;
-                    KeyRepeatState::schedule(rep, window_id);
-                } else if let Some((cur_key, _)) = self.key_repeat.as_ref() {
+                if compositor_repeated {
+                    // Protocol v10 permits compositor-owned repeats while
+                    // repeat_info advertises rate zero.  Abort any defensive
+                    // local timer but retain the held-key origin: a later
+                    // positive repeat_info hands repetition back to the
+                    // client while this key is still down.
+                    match compositor_repeat_transition(
+                        self.key_repeat.as_ref().map(|held| held.seed.key()),
+                        key,
+                    ) {
+                        CompositorRepeatTransition::RetainHeld => {
+                            let held = self
+                                .key_repeat
+                                .as_mut()
+                                .expect("matched held repeat must still exist");
+                            held.timer.take();
+                            held.last_dispatch = Some(held.origin.elapsed());
+                        }
+                        CompositorRepeatTransition::RetireMismatched
+                        | CompositorRepeatTransition::Untracked => {
+                            self.cancel_key_repeat();
+                            let now = Instant::now();
+                            self.key_repeat = Some(HeldKeyRepeat {
+                                seed: WaylandRepeatSeed::Uncomposed { key },
+                                origin: now,
+                                last_dispatch: Some(Duration::ZERO),
+                                timer: None,
+                            });
+                        }
+                    }
+                    let seed = self
+                        .key_repeat
+                        .as_ref()
+                        .expect("compositor repeat must establish held metadata")
+                        .seed
+                        .clone();
+                    if let Some(event) = mapper.translate_wayland_repeat(&seed) {
+                        self.events.dispatch(key_repeat_window_event(event, 1));
+                    } else {
+                        report_invalid_wayland_keycode(key);
+                        self.cancel_key_repeat();
+                    }
+                } else if let Some(seed) =
+                    mapper.process_wayland_key(key, pressed, &mut self.events)
+                {
+                    self.replace_key_repeat(
+                        seed,
+                        window_id,
+                        key_repeat_rate,
+                        key_repeat_delay,
+                    );
+                } else if let Some(active) = self.key_repeat.as_ref() {
                     // important to check that it's the same key, because the release of the previously
                     // repeated key can come right after the press of the newly held key
-                    if *cur_key == key {
-                        self.key_repeat.take();
+                    if active.seed.key() == key {
+                        self.cancel_key_repeat();
                     }
                 }
+            }
+            WlKeyboardEvent::RepeatInfo { .. } => {
+                self.refresh_key_repeat_timing(
+                    window_id,
+                    key_repeat_rate,
+                    key_repeat_delay,
+                );
             }
             WlKeyboardEvent::Modifiers {
                 mods_depressed,
@@ -1892,9 +2178,13 @@ impl HasWindowHandle for WaylandWindow {
 #[cfg(test)]
 mod tests {
     use super::{
-        key_repeat_timing, new_pending_first_configure, read_pipe_with_timeout,
-        repeat_count_for_elapsed, resolve_pending_first_configure,
+        CompositorRepeatTransition, KeyRepeatAbort, KeyRepeatTimerPlan,
+        compositor_repeat_transition, key_repeat_first_due, key_repeat_timer_plan,
+        key_repeat_timing, key_repeat_window_event, new_pending_first_configure,
+        read_pipe_with_timeout, resolve_pending_first_configure,
     };
+    use crate::{Handled, KeyCode, KeyEvent, Modifiers, RawKeyEvent, WindowEvent, WindowKeyEvent};
+    use futures_util::future::Abortable;
     use promise::BrokenPromise;
     use smithay_client_toolkit::data_device_manager::ReadPipe;
     use std::fs::File;
@@ -1904,6 +2194,29 @@ mod tests {
     use std::pin::Pin;
     use std::task::{Context, Poll, Waker};
     use std::time::Duration;
+    use wezterm_input_types::KeyboardLedStatus;
+
+    fn repeat_event() -> WindowKeyEvent {
+        let raw = RawKeyEvent {
+            key: KeyCode::RawCode(38),
+            modifiers: Modifiers::NONE,
+            leds: KeyboardLedStatus::empty(),
+            phys_code: None,
+            raw_code: 38,
+            repeat_count: 1,
+            key_is_down: true,
+            handled: Handled::new(),
+        };
+        let key = KeyEvent {
+            key: KeyCode::Char('a'),
+            modifiers: Modifiers::NONE,
+            leds: KeyboardLedStatus::empty(),
+            repeat_count: 1,
+            key_is_down: true,
+            raw: Some(raw.clone()),
+        };
+        WindowKeyEvent::KeyEvent(key)
+    }
 
     fn pipe_pair() -> (OwnedFd, OwnedFd) {
         let mut fds = [0; 2];
@@ -1924,6 +2237,12 @@ mod tests {
             key_repeat_timing(25, 400),
             Some((Duration::from_millis(400), Duration::from_millis(40)))
         );
+        assert_eq!(
+            key_repeat_timing(25, i32::MAX)
+                .expect("maximum protocol delay remains cancellable")
+                .0,
+            Duration::from_millis(u64::try_from(i32::MAX).expect("maximum delay is positive"))
+        );
 
         for (rate, expected_gap_ms) in [
             (1, 1_000),
@@ -1942,28 +2261,212 @@ mod tests {
     }
 
     #[test]
-    fn repeat_count_is_exact_for_initial_on_time_and_late_wakes() {
+    fn key_repeat_timer_plan_preserves_absolute_phase_after_late_wakes() {
         let gap = Duration::from_millis(40);
-        assert_eq!(repeat_count_for_elapsed(Duration::ZERO, gap, true), 1);
-        assert_eq!(repeat_count_for_elapsed(gap, gap, true), 2);
-        assert_eq!(repeat_count_for_elapsed(Duration::ZERO, gap, false), 1);
-        assert_eq!(repeat_count_for_elapsed(gap, gap, false), 1);
         assert_eq!(
-            repeat_count_for_elapsed(Duration::from_millis(80), gap, false),
-            2
+            key_repeat_timer_plan(Duration::ZERO, Duration::from_millis(400), gap),
+            Some(KeyRepeatTimerPlan::Wait(Duration::from_millis(400)))
+        );
+        assert_eq!(
+            key_repeat_timer_plan(
+                Duration::from_millis(400),
+                Duration::from_millis(400),
+                gap,
+            ),
+            Some(KeyRepeatTimerPlan::Dispatch {
+                repeat_count: 1,
+                next_due: Duration::from_millis(440),
+            })
+        );
+        assert_eq!(
+            key_repeat_timer_plan(
+                Duration::from_millis(450),
+                Duration::from_millis(440),
+                gap,
+            ),
+            Some(KeyRepeatTimerPlan::Dispatch {
+                repeat_count: 1,
+                next_due: Duration::from_millis(480),
+            })
+        );
+        assert_eq!(
+            key_repeat_timer_plan(
+                Duration::from_millis(520),
+                Duration::from_millis(480),
+                gap,
+            ),
+            Some(KeyRepeatTimerPlan::Dispatch {
+                repeat_count: 2,
+                next_due: Duration::from_millis(560),
+            })
         );
     }
 
     #[test]
-    fn repeat_count_saturates_and_zero_gap_fails_finite() {
+    fn key_repeat_timer_plan_saturates_and_stops_on_zero_gap() {
+        let plan = key_repeat_timer_plan(
+            Duration::from_secs(u64::from(u16::MAX) + 1),
+            Duration::ZERO,
+            Duration::from_millis(1),
+        )
+        .expect("positive gap must produce a finite plan");
+        assert!(matches!(
+            plan,
+            KeyRepeatTimerPlan::Dispatch {
+                repeat_count: u16::MAX,
+                ..
+            }
+        ));
         assert_eq!(
-            repeat_count_for_elapsed(Duration::MAX, Duration::from_millis(1), false),
-            u16::MAX
+            key_repeat_timer_plan(
+                Duration::from_secs(1),
+                Duration::ZERO,
+                Duration::ZERO,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn repeat_event_updates_outer_and_nested_counts() {
+        let WindowEvent::KeyEvent(key) = key_repeat_window_event(repeat_event(), 17) else {
+            panic!("mapped repeat seed must remain a key event");
+        };
+        assert_eq!(key.repeat_count, 17);
+        assert_eq!(key.raw.as_ref().map(|raw| raw.repeat_count), Some(17));
+    }
+
+    #[test]
+    fn raw_repeat_seed_stays_raw_and_updates_its_count() {
+        let WindowKeyEvent::KeyEvent(key) = repeat_event() else {
+            unreachable!("fixture is a mapped key event");
+        };
+        let raw = key.raw.expect("mapped key fixture carries raw provenance");
+        let WindowEvent::RawKeyEvent(raw) =
+            key_repeat_window_event(WindowKeyEvent::RawKeyEvent(raw), 3)
+        else {
+            panic!("raw repeat seed must remain a raw event");
+        };
+        assert_eq!(raw.repeat_count, 3);
+    }
+
+    #[test]
+    fn compositor_repeat_retains_matching_held_key_for_later_rate_handoff() {
+        assert_eq!(
+            compositor_repeat_transition(Some(7), 7),
+            CompositorRepeatTransition::RetainHeld
         );
         assert_eq!(
-            repeat_count_for_elapsed(Duration::from_secs(1), Duration::ZERO, false),
-            u16::MAX
+            compositor_repeat_transition(Some(7), 8),
+            CompositorRepeatTransition::RetireMismatched
         );
+        assert_eq!(
+            compositor_repeat_transition(None, 7),
+            CompositorRepeatTransition::Untracked
+        );
+    }
+
+    #[test]
+    fn repeat_info_update_preserves_key_down_origin_without_replaying_old_backlog() {
+        let elapsed = Duration::from_millis(750);
+        let delay = Duration::from_millis(400);
+        let faster_gap = Duration::from_millis(20);
+
+        assert_eq!(
+            key_repeat_first_due(elapsed, delay, faster_gap, None),
+            Some(elapsed)
+        );
+        assert_eq!(
+            key_repeat_first_due(
+                elapsed,
+                delay,
+                faster_gap,
+                Some(Duration::from_millis(740)),
+            ),
+            Some(Duration::from_millis(760))
+        );
+        assert_eq!(
+            key_repeat_first_due(
+                elapsed,
+                delay,
+                faster_gap,
+                Some(Duration::from_millis(400)),
+            ),
+            Some(elapsed)
+        );
+        assert_eq!(
+            key_repeat_first_due(
+                Duration::from_millis(250),
+                delay,
+                faster_gap,
+                None,
+            ),
+            Some(delay)
+        );
+        // Once any repeat has been dispatched, a later repeat_info delay is
+        // not a second initial-delay penalty; only the new gap controls the
+        // handoff phase.
+        assert_eq!(
+            key_repeat_first_due(
+                elapsed,
+                Duration::from_millis(900),
+                faster_gap,
+                Some(Duration::from_millis(740)),
+            ),
+            Some(Duration::from_millis(760))
+        );
+    }
+
+    #[test]
+    fn key_repeat_abort_cancels_a_pending_detached_wait_without_sleeping() {
+        let (abort, registration) = KeyRepeatAbort::new_pair();
+        let mut pending = Box::pin(Abortable::new(
+            std::future::pending::<()>(),
+            registration,
+        ));
+        let waker = Waker::noop().clone();
+        let mut cx = Context::from_waker(&waker);
+        assert!(matches!(pending.as_mut().poll(&mut cx), Poll::Pending));
+
+        drop(abort);
+
+        assert!(matches!(
+            pending.as_mut().poll(&mut cx),
+            Poll::Ready(Err(_))
+        ));
+    }
+
+    #[test]
+    fn replacing_and_clearing_repeat_aborts_only_the_retired_lease() {
+        let (predecessor, predecessor_registration) = KeyRepeatAbort::new_pair();
+        let (successor, successor_registration) = KeyRepeatAbort::new_pair();
+        let mut predecessor_wait = Box::pin(Abortable::new(
+            std::future::pending::<()>(),
+            predecessor_registration,
+        ));
+        let mut successor_wait = Box::pin(Abortable::new(
+            std::future::pending::<()>(),
+            successor_registration,
+        ));
+        let waker = Waker::noop().clone();
+        let mut cx = Context::from_waker(&waker);
+        let mut active = Some(predecessor);
+
+        active.replace(successor);
+        assert!(matches!(
+            predecessor_wait.as_mut().poll(&mut cx),
+            Poll::Ready(Err(_))
+        ));
+        assert!(matches!(
+            successor_wait.as_mut().poll(&mut cx),
+            Poll::Pending
+        ));
+
+        active.take();
+        assert!(matches!(
+            successor_wait.as_mut().poll(&mut cx),
+            Poll::Ready(Err(_))
+        ));
     }
 
     #[test]

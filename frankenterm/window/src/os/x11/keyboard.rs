@@ -43,6 +43,39 @@ pub struct KeyboardWithFallback {
     fallback: Keyboard,
 }
 
+#[cfg(feature = "wayland")]
+#[derive(Clone, Debug)]
+pub(crate) enum WaylandRepeatSeed {
+    RawHandled { key: u32 },
+    Uncomposed { key: u32 },
+    Composed { key: u32, event: KeyEvent },
+}
+
+#[cfg(feature = "wayland")]
+impl WaylandRepeatSeed {
+    pub(crate) fn key(&self) -> u32 {
+        match self {
+            Self::RawHandled { key } | Self::Uncomposed { key } | Self::Composed { key, .. } => {
+                *key
+            }
+        }
+    }
+}
+
+#[cfg(feature = "wayland")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RepeatProvenance {
+    RawHandled,
+    Uncomposed,
+    Composed,
+}
+
+struct RepeatCandidate {
+    event: WindowKeyEvent,
+    #[cfg(feature = "wayland")]
+    provenance: RepeatProvenance,
+}
+
 struct Compose {
     state: xkb::compose::State,
     composition: String,
@@ -146,6 +179,45 @@ impl Compose {
     }
 }
 
+fn resolve_uncomposed_key(
+    utf8: &str,
+    sym: xkb::Keysym,
+    original_sym: xkb::Keysym,
+    fallback_sym: Option<xkb::Keysym>,
+    raw_modifiers: Modifiers,
+) -> (Option<KeyCode>, xkb::Keysym) {
+    // Xkb returns terminal-oriented control expansions for modified keys.
+    // Preserve the symbolic key for CTRL/ALT/SUPER so bindings can still
+    // distinguish, for example, CTRL-i from Tab.
+    let key = if utf8.is_empty()
+        || raw_modifiers.intersects(Modifiers::CTRL | Modifiers::ALT | Modifiers::SUPER)
+    {
+        None
+    } else {
+        Some(KeyCode::composed(utf8))
+    };
+    let key_from_sym =
+        keysym_to_keycode(sym.into()).or_else(|| keysym_to_keycode(original_sym.into()));
+
+    // For modified non-ASCII layouts, prefer the default Latin fallback so
+    // shortcuts such as CTRL-C retain their physical intent.  Also use that
+    // fallback when the selected layout has no recognized symbolic mapping.
+    let use_fallback = if key.is_none()
+        && raw_modifiers.intersects(Modifiers::CTRL | Modifiers::ALT | Modifiers::SUPER)
+    {
+        matches!(key_from_sym, Some(KeyCode::Char(c)) if !c.is_ascii())
+    } else {
+        key.is_none() && key_from_sym.is_none()
+    };
+    let resolved_sym = if use_fallback {
+        fallback_sym.unwrap_or(sym)
+    } else {
+        sym
+    };
+
+    (key, resolved_sym)
+}
+
 fn default_keymap(context: &xkb::Context) -> Option<xkb::Keymap> {
     // use $XKB_DEFAULT_RULES or system default
     let system_default_rules = "";
@@ -180,21 +252,123 @@ impl KeyboardWithFallback {
         Self::new(selected)
     }
 
-    pub fn process_wayland_key(
+    #[cfg(feature = "wayland")]
+    pub(crate) fn process_wayland_key(
         &self,
         code: u32,
         pressed: bool,
         events: &mut WindowEventSender,
-    ) -> Option<WindowKeyEvent> {
+    ) -> Option<WaylandRepeatSeed> {
+        let xcode = xkb::Keycode::new(code.checked_add(8)?);
         let want_repeat = self.selected.wayland_key_repeats(code);
         let raw_modifiers = self.get_key_modifiers();
-        self.process_key_event_impl(
-            xkb::Keycode::new(code + 8),
+        let repeat = self.process_key_event_impl(
+            xcode,
             raw_modifiers,
             pressed,
             events,
             want_repeat,
-        )
+        )?;
+        match (repeat.provenance, repeat.event) {
+            (RepeatProvenance::RawHandled, WindowKeyEvent::RawKeyEvent(_)) => {
+                Some(WaylandRepeatSeed::RawHandled { key: code })
+            }
+            (RepeatProvenance::Uncomposed, WindowKeyEvent::KeyEvent(_)) => {
+                Some(WaylandRepeatSeed::Uncomposed { key: code })
+            }
+            (RepeatProvenance::Composed, WindowKeyEvent::KeyEvent(event)) => {
+                Some(WaylandRepeatSeed::Composed { key: code, event })
+            }
+            _ => {
+                log::error!("internal Wayland repeat provenance/event mismatch");
+                None
+            }
+        }
+    }
+
+    /// Translate one client- or compositor-generated Wayland repeat without
+    /// changing the compose state or dispatching an event.
+    ///
+    /// Ordinary keys are resolved against current modifiers/layout. Raw-only
+    /// handled keys refresh raw metadata, while post-compose payloads stay
+    /// frozen to preserve the character produced by the original key press.
+    #[cfg(feature = "wayland")]
+    pub(crate) fn translate_wayland_repeat(
+        &self,
+        seed: &WaylandRepeatSeed,
+    ) -> Option<WindowKeyEvent> {
+        if let WaylandRepeatSeed::Composed { event, .. } = seed {
+            return Some(WindowKeyEvent::KeyEvent(event.clone()));
+        }
+
+        let code = seed.key();
+        let xcode = xkb::Keycode::new(code.checked_add(8)?);
+        let raw_modifiers = self.get_key_modifiers();
+        let leds = self.get_led_status();
+        let raw_key_event = self.wayland_raw_key_event(
+            xcode,
+            raw_modifiers,
+            leds,
+            true,
+            Handled::new(),
+        );
+
+        if matches!(seed, WaylandRepeatSeed::RawHandled { .. }) {
+            return Some(WindowKeyEvent::RawKeyEvent(raw_key_event));
+        }
+
+        let xsym = self.selected.state.borrow().key_get_one_sym(xcode);
+        let utf8 = self.selected.state.borrow().key_get_utf8(xcode);
+        let fallback_xsym = self.fallback.state.borrow().key_get_one_sym(xcode);
+        let (key, ksym) = resolve_uncomposed_key(
+            &utf8,
+            xsym,
+            xsym,
+            Some(fallback_xsym),
+            raw_modifiers,
+        );
+        let Some(key) = key.or_else(|| {
+            keysym_to_keycode(ksym.into()).or_else(|| keysym_to_keycode(xsym.into()))
+        }) else {
+            return Some(WindowKeyEvent::RawKeyEvent(raw_key_event));
+        };
+
+        Some(WindowKeyEvent::KeyEvent(
+            KeyEvent {
+                key,
+                leds,
+                modifiers: raw_modifiers,
+                repeat_count: 1,
+                key_is_down: true,
+                raw: Some(raw_key_event.clone()),
+            }
+            .normalize_shift()
+            .resurface_positional_modifier_key(),
+        ))
+    }
+
+    fn wayland_raw_key_event(
+        &self,
+        xcode: xkb::Keycode,
+        modifiers: Modifiers,
+        leds: KeyboardLedStatus,
+        pressed: bool,
+        handled: Handled,
+    ) -> RawKeyEvent {
+        let phys_code = self.selected.phys_code_map.borrow().get(&xcode).copied();
+        RawKeyEvent {
+            key: match phys_code {
+                Some(phys) => KeyCode::Physical(phys),
+                None => KeyCode::RawCode(xcode.into()),
+            },
+            phys_code,
+            raw_code: xcode.into(),
+            modifiers,
+            leds,
+            repeat_count: 1,
+            key_is_down: pressed,
+            handled,
+        }
     }
 
     /// Compute the Modifier mask equivalent from the button mask
@@ -266,7 +440,7 @@ impl KeyboardWithFallback {
         // and restore the prior modifier state
         self.reapply_last_xcb_state();
 
-        result
+        result.map(|repeat| repeat.event)
     }
 
     fn process_key_event_impl(
@@ -276,30 +450,19 @@ impl KeyboardWithFallback {
         pressed: bool,
         events: &mut WindowEventSender,
         want_repeat: bool,
-    ) -> Option<WindowKeyEvent> {
-        let phys_code = self.selected.phys_code_map.borrow().get(&xcode).copied();
-
+    ) -> Option<RepeatCandidate> {
         let leds = self.get_led_status();
 
         let xsym = self.selected.state.borrow().key_get_one_sym(xcode);
         let fallback_xsym = self.fallback.state.borrow().key_get_one_sym(xcode);
         let handled = Handled::new();
 
-        let raw_key_event = RawKeyEvent {
-            key: match phys_code {
-                Some(phys) => KeyCode::Physical(phys),
-                None => KeyCode::RawCode(xcode.into()),
-            },
-            phys_code,
-            raw_code: xcode.into(),
-            modifiers: raw_modifiers,
-            leds,
-            repeat_count: 1,
-            key_is_down: pressed,
-            handled: handled.clone(),
-        };
+        let raw_key_event =
+            self.wayland_raw_key_event(xcode, raw_modifiers, leds, pressed, handled.clone());
 
         let mut kc = None;
+        #[cfg(feature = "wayland")]
+        let mut repeat_provenance = RepeatProvenance::Uncomposed;
 
         let ksym = if pressed {
             events.dispatch(WindowEvent::RawKeyEvent(raw_key_event.clone()));
@@ -309,7 +472,11 @@ impl KeyboardWithFallback {
                 log::trace!("process_key_event: raw key was handled; not processing further");
 
                 if want_repeat {
-                    return Some(WindowKeyEvent::RawKeyEvent(raw_key_event));
+                    return Some(RepeatCandidate {
+                        event: WindowKeyEvent::RawKeyEvent(raw_key_event),
+                        #[cfg(feature = "wayland")]
+                        provenance: RepeatProvenance::RawHandled,
+                    });
                 }
                 return None;
             }
@@ -329,6 +496,10 @@ impl KeyboardWithFallback {
                     return None;
                 }
                 FeedResult::Composed(utf8, sym) => {
+                    #[cfg(feature = "wayland")]
+                    {
+                        repeat_provenance = RepeatProvenance::Composed;
+                    }
                     if !utf8.is_empty() {
                         kc.replace(crate::KeyCode::composed(&utf8));
                     }
@@ -353,66 +524,23 @@ impl KeyboardWithFallback {
                     // <https://github.com/wezterm/wezterm/issues/1851>
                     // <https://github.com/wezterm/wezterm/issues/2845>
 
-                    if !utf8.is_empty()
-                        && !raw_modifiers
-                            .intersects(Modifiers::CTRL | Modifiers::ALT | Modifiers::SUPER)
-                    {
-                        kc.replace(crate::KeyCode::composed(&utf8));
-                    }
-
                     log::trace!(
                         "process_key_event: RawKeyEvent FeedResult::Nothing: \
                          {utf8:?}, {sym:?}. kc -> {kc:?} fallback_feed={fallback_feed:?}"
                     );
-
-                    let key_code_from_sym =
-                        keysym_to_keycode(sym.into()).or_else(|| keysym_to_keycode(xsym.into()));
-
-                    // If we have a modified key, and its expansion is non-ascii, such as cyrillic
-                    // "Es" (which appears visually similar to "c" in latin texts), then consider
-                    // this key expansion against the default latin layout.
-                    // This allows "CTRL-C" to work for users of cyrillic layouts
-
-                    if kc.is_none()
-                        && raw_modifiers
-                            .intersects(Modifiers::CTRL | Modifiers::ALT | Modifiers::SUPER)
-                    {
-                        match key_code_from_sym {
-                            Some(crate::KeyCode::Char(c)) if !c.is_ascii() => {
-                                // Potentially a Cyrillic or other non-european layout.
-                                // Consider shortcuts like CTRL-C against the default
-                                // latin layout
-                                match fallback_feed {
-                                    FeedResult::Nothing(_fb_utf8, fb_sym) => {
-                                        log::trace!(
-                                            "process_key_event: RawKeyEvent using fallback \
-                                             sym {fb_sym:?} because layout would expand to \
-                                             non-ascii text {c:?}"
-                                        );
-                                        fb_sym
-                                    }
-                                    _ => sym,
-                                }
-                            }
-                            _ => sym,
-                        }
-                    } else if kc.is_none() && key_code_from_sym.is_none() {
-                        // Not sure if this is a good idea, see
-                        // <https://github.com/wezterm/wezterm/issues/4910> for context.
-                        match fallback_feed {
-                            FeedResult::Nothing(_fb_utf8, fb_sym) => {
-                                log::trace!(
-                                    "process_key_event: RawKeyEvent using fallback \
-                                     sym {fb_sym:?} because layout did not expand to \
-                                     anything"
-                                );
-                                fb_sym
-                            }
-                            _ => sym,
-                        }
-                    } else {
-                        sym
-                    }
+                    let fallback_sym = match fallback_feed {
+                        FeedResult::Nothing(_, fallback_sym) => Some(fallback_sym),
+                        _ => None,
+                    };
+                    let (resolved_key, resolved_sym) = resolve_uncomposed_key(
+                        &utf8,
+                        sym,
+                        xsym,
+                        fallback_sym,
+                        raw_modifiers,
+                    );
+                    kc = resolved_key;
+                    resolved_sym
                 }
                 FeedResult::Cancelled => {
                     log::trace!("process_key_event: RawKeyEvent FeedResult::Cancelled");
@@ -450,7 +578,11 @@ impl KeyboardWithFallback {
         if pressed && want_repeat {
             events.dispatch(WindowEvent::KeyEvent(event.clone()));
             // Returns the event that should be repeated later
-            Some(WindowKeyEvent::KeyEvent(event))
+            Some(RepeatCandidate {
+                event: WindowKeyEvent::KeyEvent(event),
+                #[cfg(feature = "wayland")]
+                provenance: repeat_provenance,
+            })
         } else {
             events.dispatch(WindowEvent::KeyEvent(event));
             None
@@ -708,9 +840,12 @@ impl Keyboard {
 
     /// Returns true if a given wayland keycode allows for automatic key repeats
     pub fn wayland_key_repeats(&self, code: u32) -> bool {
+        let Some(code) = code.checked_add(8) else {
+            return false;
+        };
         self.keymap
             .borrow()
-            .key_repeats(xkb::Keycode::new(code + 8))
+            .key_repeats(xkb::Keycode::new(code))
     }
 
     pub fn get_device_id(&self) -> i32 {
@@ -952,4 +1087,165 @@ fn build_physkeycode_map(keymap: &xkb::Keymap) -> HashMap<xkb::Keycode, PhysKeyC
     }
 
     map
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_uncomposed_key;
+    #[cfg(feature = "wayland")]
+    use super::{KeyboardWithFallback, WaylandRepeatSeed};
+    use crate::Modifiers;
+    #[cfg(feature = "wayland")]
+    use crate::{KeyCode, WindowKeyEvent};
+    use xkbcommon::xkb;
+
+    #[cfg(feature = "wayland")]
+    fn us_keyboard() -> anyhow::Result<KeyboardWithFallback> {
+        let context = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
+        let keymap = xkb::Keymap::new_from_names(
+            &context,
+            "",
+            "",
+            "us",
+            "",
+            None,
+            xkb::KEYMAP_COMPILE_NO_FLAGS,
+        )
+        .ok_or_else(|| anyhow::anyhow!("failed to construct deterministic US keymap"))?;
+        KeyboardWithFallback::new_from_string(
+            keymap.get_as_string(xkb::KEYMAP_FORMAT_TEXT_V1),
+        )
+    }
+
+    #[cfg(feature = "wayland")]
+    #[test]
+    fn wayland_repeat_translation_tracks_shift_and_uses_fresh_handled_state() -> anyhow::Result<()> {
+        let keyboard = us_keyboard()?;
+        let uncomposed = WaylandRepeatSeed::Uncomposed { key: 30 };
+        assert!(
+            keyboard
+                .translate_wayland_repeat(&WaylandRepeatSeed::Uncomposed { key: u32::MAX })
+                .is_none()
+        );
+        // Linux evdev KEY_A. Wayland keycodes omit the XKB offset of eight.
+        let WindowKeyEvent::KeyEvent(unshifted) = keyboard
+            .translate_wayland_repeat(&uncomposed)
+            .expect("valid keycode must translate")
+        else {
+            panic!("uncomposed repeat must translate to a mapped key event");
+        };
+        assert_eq!(unshifted.key, KeyCode::Char('a'));
+
+        let raw_seed = WaylandRepeatSeed::RawHandled { key: 30 };
+        let WindowKeyEvent::RawKeyEvent(first_raw) = keyboard
+            .translate_wayland_repeat(&raw_seed)
+            .expect("valid raw keycode must translate")
+        else {
+            panic!("raw-handled repeat must remain a raw event");
+        };
+        first_raw.set_handled();
+        let WindowKeyEvent::RawKeyEvent(fresh_raw) = keyboard
+            .translate_wayland_repeat(&raw_seed)
+            .expect("valid raw keycode must translate")
+        else {
+            panic!("raw-handled repeat must remain a raw event");
+        };
+        assert!(!fresh_raw.handled.is_handled());
+
+        let shift_index = keyboard
+            .selected
+            .keymap
+            .borrow()
+            .mod_get_index(xkb::MOD_NAME_SHIFT);
+        assert_ne!(shift_index, xkb::MOD_INVALID);
+        let shift_mask = 1_u32
+            .checked_shl(shift_index)
+            .expect("valid XKB modifier index must fit its mask");
+        keyboard.update_modifier_state(shift_mask, 0, 0, 0);
+
+        let WindowKeyEvent::KeyEvent(shifted) = keyboard
+            .translate_wayland_repeat(&uncomposed)
+            .expect("valid shifted keycode must translate")
+        else {
+            panic!("uncomposed repeat must translate to a mapped key event");
+        };
+        assert_eq!(shifted.key, KeyCode::Char('A'));
+        assert!(
+            shifted
+                .raw
+                .as_ref()
+                .is_some_and(|raw| raw.modifiers.contains(Modifiers::SHIFT))
+        );
+        Ok(())
+    }
+
+    #[cfg(feature = "wayland")]
+    #[test]
+    fn wayland_repeat_translation_does_not_advance_or_clear_compose_state() -> anyhow::Result<()> {
+        let keyboard = us_keyboard()?;
+        keyboard.selected.compose_state.borrow_mut().composition = "sentinel".to_string();
+        let before_status = keyboard.selected.compose_state.borrow().state.status();
+
+        let _ = keyboard
+            .translate_wayland_repeat(&WaylandRepeatSeed::Uncomposed { key: 30 })
+            .expect("valid keycode must translate");
+
+        let compose = keyboard.selected.compose_state.borrow();
+        assert_eq!(compose.composition, "sentinel");
+        assert_eq!(compose.state.status(), before_status);
+        Ok(())
+    }
+
+    #[cfg(feature = "wayland")]
+    #[test]
+    fn composed_repeat_keeps_its_press_time_payload() -> anyhow::Result<()> {
+        let keyboard = us_keyboard()?;
+        let WindowKeyEvent::KeyEvent(mut composed) = keyboard
+            .translate_wayland_repeat(&WaylandRepeatSeed::Uncomposed { key: 30 })
+            .expect("valid keycode must translate")
+        else {
+            panic!("uncomposed seed must produce a key template");
+        };
+        composed.key = KeyCode::Char('é');
+        let seed = WaylandRepeatSeed::Composed {
+            key: 30,
+            event: composed,
+        };
+
+        let shift_index = keyboard
+            .selected
+            .keymap
+            .borrow()
+            .mod_get_index(xkb::MOD_NAME_SHIFT);
+        let shift_mask = 1_u32
+            .checked_shl(shift_index)
+            .expect("valid XKB modifier index must fit its mask");
+        keyboard.update_modifier_state(shift_mask, 0, 0, 0);
+
+        let WindowKeyEvent::KeyEvent(repeated) = keyboard
+            .translate_wayland_repeat(&seed)
+            .expect("composed seed must translate")
+        else {
+            panic!("composed seed must remain a key event");
+        };
+        assert_eq!(repeated.key, KeyCode::Char('é'));
+        Ok(())
+    }
+
+    #[test]
+    fn uncomposed_repeat_resolution_retains_ctrl_non_ascii_fallback() {
+        let selected = xkb::Keysym::new(xkb::keysyms::KEY_Cyrillic_es);
+        let fallback = xkb::Keysym::new(xkb::keysyms::KEY_c);
+
+        let (key, resolved) = resolve_uncomposed_key(
+            "с",
+            selected,
+            selected,
+            Some(fallback),
+            Modifiers::CTRL,
+        );
+
+        assert_eq!(key, None);
+        assert_eq!(resolved, fallback);
+    }
 }

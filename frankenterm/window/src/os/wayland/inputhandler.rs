@@ -99,6 +99,12 @@ impl TextInputState {
         }
     }
 
+    pub(super) fn forget_surface_id(&self, surface_id: &ObjectId) {
+        if let Some(mut inner) = self.lock_inner("surface removal") {
+            inner.surface_to_keyboard.remove(surface_id);
+        }
+    }
+
     pub(super) fn advise_seat(
         &self,
         seat: &WlSeat,
@@ -142,6 +148,7 @@ impl TextInputState {
             input.disable();
             input.commit();
             inner.pending_state.remove(&input.id());
+            input.destroy();
         }
     }
 
