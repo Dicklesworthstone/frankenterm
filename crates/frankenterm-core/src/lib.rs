@@ -155,6 +155,7 @@ pub mod capability_passport_store;
 pub mod capability_preflight;
 pub mod capability_probe;
 pub mod capacity_governor;
+pub mod capture_authority;
 #[cfg(feature = "session-resume")]
 pub mod casr_types;
 pub mod cass;
