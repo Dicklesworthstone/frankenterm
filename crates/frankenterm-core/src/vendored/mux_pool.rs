@@ -11,7 +11,10 @@
 //! - Each connection is a full `DirectMuxClient` with completed handshake
 //!   (codec version + client registration).
 //! - On success, the connection is returned to the pool for reuse.
-//! - On error, the connection is dropped (buffer state may be corrupt).
+//! - On error, the canonical mux recovery decision independently controls
+//!   retry and connection disposition. A client is reused only when that
+//!   decision permits reuse and the client's actual protocol state is not
+//!   poisoned; all other failed clients are discarded.
 //! - The underlying `Pool<C>` provides semaphore-based concurrency limiting
 //!   and idle timeout eviction.
 
@@ -26,9 +29,12 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use crate::cx::{self, Cx};
+use crate::cx::{self, Budget, Cx};
+use crate::outcome::CancelKind;
 use crate::pool::{Pool, PoolAcquireGuard, PoolConfig, PoolError, PoolStats};
-use crate::protocol_recovery::ProtocolErrorKind;
+use crate::protocol_recovery::{
+    MuxConnectionDisposition, MuxRecoveryDecision, ProtocolErrorKind, mux_recovery_decision,
+};
 use crate::retry::RetryPolicy;
 // Retained across cfg gates: used by `execute_with_recovery_inner`
 // (non-asupersync fallback) and by test-mod eviction tests under both
@@ -53,6 +59,12 @@ pub enum MuxPoolError {
     /// The mux client encountered an error.
     #[error("mux: {0}")]
     Mux(#[from] DirectMuxError),
+    /// A mutation was invoked but its completion could not be established.
+    ///
+    /// Callers must surface this error without replaying the mutation through
+    /// another transport, because request bytes may already have committed.
+    #[error("indeterminate mux mutation: {0}")]
+    IndeterminateMutation(#[source] DirectMuxError),
 }
 
 impl MuxPoolError {
@@ -65,7 +77,11 @@ impl MuxPoolError {
     /// Whether this error indicates the mux server disconnected.
     #[must_use]
     pub fn is_disconnected(&self) -> bool {
-        matches!(self, Self::Mux(DirectMuxError::Disconnected))
+        matches!(
+            self,
+            Self::Mux(DirectMuxError::Disconnected)
+                | Self::IndeterminateMutation(DirectMuxError::Disconnected)
+        )
     }
 }
 
@@ -166,24 +182,94 @@ pub struct MuxPool {
     pipeline_timeout: Duration,
 }
 
-fn classify_render_batch_fallback(
-    protocol_kind: Option<ProtocolErrorKind>,
-    cancelled: bool,
-) -> bool {
-    !cancelled && protocol_kind == Some(ProtocolErrorKind::Recoverable)
+fn classify_render_batch_fallback(decision: Option<MuxRecoveryDecision>) -> bool {
+    decision.is_some_and(is_transport_failover_decision)
+}
+
+fn is_transport_failover_decision(decision: MuxRecoveryDecision) -> bool {
+    decision.retry
+        && !decision.cancelled
+        && matches!(decision.connection, MuxConnectionDisposition::Discard)
 }
 
 fn should_fallback_render_batch(error: &MuxPoolError) -> bool {
     match error {
-        MuxPoolError::Mux(mux_error) => classify_render_batch_fallback(
-            Some(mux_error.protocol_error_kind()),
-            mux_error.is_cancelled(),
-        ),
-        _ => classify_render_batch_fallback(None, false),
+        MuxPoolError::Mux(mux_error) => {
+            classify_render_batch_fallback(Some(mux_recovery_decision(mux_error)))
+        }
+        MuxPoolError::Pool(_) | MuxPoolError::IndeterminateMutation(_) => {
+            classify_render_batch_fallback(None)
+        }
     }
 }
 
+fn duration_to_timeout_ms(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+fn require_render_batch_remaining(
+    remaining: Option<Duration>,
+    configured_timeout: Duration,
+) -> Result<Duration, DirectMuxError> {
+    remaining
+        .filter(|remaining| !remaining.is_zero())
+        .ok_or_else(|| DirectMuxError::BatchTimeout {
+            timeout_ms: duration_to_timeout_ms(configured_timeout),
+        })
+}
+
 type MuxOpFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, DirectMuxError>> + Send + 'a>>;
+
+/// One logical attempt budget shared by the pipelined render path and its
+/// sequential fallback. `started` advances only when another attempt is about
+/// to begin, after cancellation and deadline checks have passed.
+#[derive(Debug)]
+struct RenderAttemptState {
+    started: u32,
+    limit: u32,
+}
+
+impl RenderAttemptState {
+    fn new(limit: u32) -> Self {
+        Self {
+            started: 0,
+            limit: limit.max(1),
+        }
+    }
+
+    fn has_remaining(&self) -> bool {
+        self.started < self.limit
+    }
+
+    fn begin(&mut self) -> Option<u32> {
+        if !self.has_remaining() {
+            return None;
+        }
+        self.started = self.started.saturating_add(1);
+        Some(self.started)
+    }
+
+    fn recovery_started(&self) -> bool {
+        self.started > 1
+    }
+}
+
+/// Preserve whether a render failure happened before or after invoking the
+/// operation. Only post-invocation transport failures are eligible for the
+/// pipelined-to-sequential compatibility fallback.
+#[derive(Debug)]
+enum RenderExecutionError {
+    BeforeOperation(MuxPoolError),
+    Operation(MuxPoolError),
+}
+
+impl RenderExecutionError {
+    fn into_inner(self) -> MuxPoolError {
+        match self {
+            Self::BeforeOperation(error) | Self::Operation(error) => error,
+        }
+    }
+}
 
 impl MuxPool {
     /// Create a new mux connection pool.
@@ -211,15 +297,171 @@ impl MuxPool {
         }
     }
 
+    fn max_recovery_attempts(&self) -> u32 {
+        if self.recovery.enabled {
+            self.recovery.retry_policy.max_attempts.unwrap_or(1).max(1)
+        } else {
+            1
+        }
+    }
+
+    fn can_retry(&self, attempt: u32, decision: MuxRecoveryDecision) -> bool {
+        self.recovery.enabled
+            && attempt < self.max_recovery_attempts()
+            && decision.retry
+            && !decision.cancelled
+    }
+
+    fn render_attempt_limit(&self, depth: usize) -> u32 {
+        let configured = self.max_recovery_attempts();
+        if depth > 1 {
+            // Preserve one sequential compatibility fallback even when mux
+            // recovery is disabled or configured for a single attempt.
+            configured.max(2)
+        } else {
+            configured
+        }
+    }
+
+    fn can_retry_render(
+        &self,
+        attempts: &RenderAttemptState,
+        decision: MuxRecoveryDecision,
+    ) -> bool {
+        self.recovery.enabled
+            && attempts.has_remaining()
+            && decision.retry
+            && !decision.cancelled
+    }
+
+    fn record_permanent_failure(&self, decision: MuxRecoveryDecision) {
+        if decision.kind == ProtocolErrorKind::Permanent {
+            self.permanent_failures.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn checkpoint_cx(cx: &Cx) -> Result<(), MuxPoolError> {
+        cx.checkpoint()
+            .map_err(|_| MuxPoolError::Pool(PoolError::Cancelled))
+    }
+
+    fn render_batch_timeout_error(&self) -> MuxPoolError {
+        MuxPoolError::Mux(DirectMuxError::BatchTimeout {
+            timeout_ms: duration_to_timeout_ms(self.pipeline_timeout),
+        })
+    }
+
+    fn render_interruption_error(&self, cx: &Cx) -> MuxPoolError {
+        if matches!(
+            cx.cancel_reason().map(|reason| reason.kind),
+            Some(CancelKind::Deadline)
+        ) {
+            self.render_batch_timeout_error()
+        } else {
+            MuxPoolError::Pool(PoolError::Cancelled)
+        }
+    }
+
+    fn remaining_render_batch_time(
+        &self,
+        cx: &Cx,
+        deadline: &Budget,
+    ) -> Result<Duration, MuxPoolError> {
+        if cx.checkpoint().is_err() {
+            return Err(self.render_interruption_error(cx));
+        }
+
+        // This helper is deliberately private to the render-batch path, where
+        // `deadline` is always produced by `cx.budget_for_timeout`. Therefore
+        // it always carries a deadline (possibly tightened by an earlier
+        // ambient deadline), and `None` means that deadline has expired. Do
+        // not reuse this interpretation for an arbitrary `Budget`, where
+        // `None` can also mean "no deadline".
+        require_render_batch_remaining(deadline.remaining_time(cx.now()), self.pipeline_timeout)
+            .map_err(MuxPoolError::Mux)
+    }
+
+    fn begin_render_attempt(
+        &self,
+        cx: &Cx,
+        deadline: &Budget,
+        attempts: &mut RenderAttemptState,
+    ) -> Result<u32, MuxPoolError> {
+        self.remaining_render_batch_time(cx, deadline)?;
+        let attempt = attempts
+            .begin()
+            .expect("render attempt must be checked before beginning");
+        if attempt > 1 {
+            self.recovery_attempts.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(attempt)
+    }
+
+    async fn return_client_after_error(
+        &self,
+        cx: &Cx,
+        client: DirectMuxClient,
+        decision: MuxRecoveryDecision,
+    ) {
+        let poisoned = client.is_connection_poisoned();
+        let reusable = matches!(decision.connection, MuxConnectionDisposition::Reuse)
+            && !poisoned
+            && !cx.is_cancel_requested();
+        if reusable {
+            self.return_client_with_cx(cx, client).await;
+        } else {
+            tracing::trace!(
+                kind = ?decision.kind,
+                cancelled = decision.cancelled,
+                poisoned,
+                disposition = ?decision.connection,
+                "discarding mux connection after operation error"
+            );
+        }
+    }
+
+    async fn wait_before_retry_with_cx(
+        &self,
+        cx: &Cx,
+        failed_attempt: u32,
+    ) -> Result<(), MuxPoolError> {
+        Self::checkpoint_cx(cx)?;
+        let delay = self
+            .recovery
+            .retry_policy
+            .delay_for_attempt(failed_attempt.saturating_sub(1));
+        if !delay.is_zero() {
+            let _ = crate::runtime_async::sleep_with_cx(cx, delay).await;
+        }
+        Self::checkpoint_cx(cx)
+    }
+
+    async fn wait_before_render_retry_with_cx(
+        &self,
+        cx: &Cx,
+        deadline: &Budget,
+        failed_attempt: u32,
+    ) -> Result<(), MuxPoolError> {
+        let remaining = self.remaining_render_batch_time(cx, deadline)?;
+        let delay = self
+            .recovery
+            .retry_policy
+            .delay_for_attempt(failed_attempt.saturating_sub(1))
+            .min(remaining);
+        if !delay.is_zero() {
+            let _ = crate::runtime_async::sleep_with_cx(cx, delay).await;
+        }
+        self.remaining_render_batch_time(cx, deadline)?;
+        Ok(())
+    }
+
     fn validate_render_batch_preflight(&self, pane_ids: &[u64]) -> Result<(), MuxPoolError> {
         if let Err(error) = validate_render_batch_panes(pane_ids) {
-            let kind = error.protocol_error_kind();
-            if kind == ProtocolErrorKind::Permanent {
-                self.permanent_failures.fetch_add(1, Ordering::Relaxed);
-            }
+            let decision = mux_recovery_decision(&error);
+            self.record_permanent_failure(decision);
             tracing::debug!(
                 pane_count = pane_ids.len(),
-                kind = ?kind,
+                kind = ?decision.kind,
                 error = %error,
                 phase = "render_batch_preflight",
                 "mux render batch rejected before pool acquisition"
@@ -330,32 +572,77 @@ impl MuxPool {
         &self,
         cx: &Cx,
         op_name: &'static str,
-        mut op: Op,
+        op: Op,
     ) -> Result<T, MuxPoolError>
     where
-        Op: for<'a> FnMut(&'a mut DirectMuxClient) -> MuxOpFuture<'a, T>,
+        Op: for<'a> FnOnce(&'a mut DirectMuxClient) -> MuxOpFuture<'a, T>,
     {
-        let (mut client, _guard) = self.acquire_client_with_cx(cx).await?;
+        let mut attempt = 0u32;
+        let (mut client, _guard) = loop {
+            Self::checkpoint_cx(cx)?;
+            attempt = attempt.saturating_add(1);
+            if attempt > 1 {
+                self.recovery_attempts.fetch_add(1, Ordering::Relaxed);
+            }
+
+            match self.acquire_client_with_cx(cx).await {
+                Ok(acquired) => break acquired,
+                Err(MuxPoolError::Pool(error)) => return Err(MuxPoolError::Pool(error)),
+                Err(MuxPoolError::IndeterminateMutation(error)) => {
+                    return Err(MuxPoolError::IndeterminateMutation(error));
+                }
+                Err(MuxPoolError::Mux(error)) => {
+                    if cx.is_cancel_requested() {
+                        return Err(MuxPoolError::Pool(PoolError::Cancelled));
+                    }
+                    let decision = mux_recovery_decision(&error);
+                    if self.can_retry(attempt, decision) {
+                        tracing::debug!(
+                            op = op_name,
+                            attempt,
+                            max_attempts = self.max_recovery_attempts(),
+                            kind = ?decision.kind,
+                            error = %error,
+                            "non-idempotent mux op acquisition failed; retrying acquisition only"
+                        );
+                        self.wait_before_retry_with_cx(cx, attempt).await?;
+                        continue;
+                    }
+
+                    self.record_permanent_failure(decision);
+                    return Err(MuxPoolError::Mux(error));
+                }
+            }
+        };
+
+        // Acquiring a connection may be retried, but once this boundary is
+        // crossed the non-idempotent operation is invoked exactly once.
+        if let Err(error) = Self::checkpoint_cx(cx) {
+            drop(client);
+            return Err(error);
+        }
         let result = op(&mut client).await;
         match result {
             Ok(value) => {
                 self.return_client_with_cx(cx, client).await;
+                if attempt > 1 {
+                    self.recovery_successes.fetch_add(1, Ordering::Relaxed);
+                }
                 Ok(value)
             }
             Err(err) => {
-                let cancelled = err.is_cancelled();
-                let kind = err.protocol_error_kind();
-                if kind == ProtocolErrorKind::Permanent {
-                    self.permanent_failures.fetch_add(1, Ordering::Relaxed);
-                }
+                let decision = mux_recovery_decision(&err);
+                self.record_permanent_failure(decision);
                 tracing::debug!(
                     op = op_name,
-                    cancelled,
-                    kind = ?kind,
+                    cancelled = decision.cancelled,
+                    kind = ?decision.kind,
+                    connection = ?decision.connection,
                     error = %err,
-                    "non-idempotent mux pool op failed; dropping client without retry"
+                    "non-idempotent mux pool op failed without replay"
                 );
-                Err(MuxPoolError::Mux(err))
+                self.return_client_after_error(cx, client, decision).await;
+                Err(MuxPoolError::IndeterminateMutation(err))
             }
         }
     }
@@ -369,17 +656,55 @@ impl MuxPool {
     where
         Op: for<'a> FnMut(&'a mut DirectMuxClient) -> MuxOpFuture<'a, T>,
     {
-        let max_attempts = if self.recovery.enabled {
-            self.recovery.retry_policy.max_attempts.unwrap_or(1).max(1)
-        } else {
-            1
-        };
-
         let mut attempt: u32 = 0;
+        let mut retained_client: Option<(DirectMuxClient, PoolAcquireGuard)> = None;
         loop {
+            Self::checkpoint_cx(cx)?;
             attempt = attempt.saturating_add(1);
+            if attempt > 1 {
+                // Count a retry only after cancellation gates have passed and
+                // the next acquisition attempt is actually about to begin.
+                self.recovery_attempts.fetch_add(1, Ordering::Relaxed);
+            }
 
-            let (mut client, _guard) = self.acquire_client_with_cx(cx).await?;
+            let (mut client, guard) = if let Some(retained) = retained_client.take() {
+                retained
+            } else {
+                match self.acquire_client_with_cx(cx).await {
+                    Ok(acquired) => acquired,
+                    Err(MuxPoolError::Pool(error)) => return Err(MuxPoolError::Pool(error)),
+                    Err(MuxPoolError::IndeterminateMutation(error)) => {
+                        return Err(MuxPoolError::IndeterminateMutation(error));
+                    }
+                    Err(MuxPoolError::Mux(error)) => {
+                        if cx.is_cancel_requested() {
+                            return Err(MuxPoolError::Pool(PoolError::Cancelled));
+                        }
+                        let decision = mux_recovery_decision(&error);
+                        if self.can_retry(attempt, decision) {
+                            tracing::debug!(
+                                op = op_name,
+                                attempt,
+                                max_attempts = self.max_recovery_attempts(),
+                                cancelled = decision.cancelled,
+                                kind = ?decision.kind,
+                                error = %error,
+                                "mux pool acquisition failed; reconnecting and retrying"
+                            );
+                            self.wait_before_retry_with_cx(cx, attempt).await?;
+                            continue;
+                        }
+
+                        self.record_permanent_failure(decision);
+                        return Err(MuxPoolError::Mux(error));
+                    }
+                }
+            };
+
+            if let Err(error) = Self::checkpoint_cx(cx) {
+                drop(client);
+                return Err(error);
+            }
             let result = op(&mut client).await;
             match result {
                 Ok(value) => {
@@ -390,60 +715,47 @@ impl MuxPool {
                     return Ok(value);
                 }
                 Err(err) => {
-                    let cancelled = err.is_cancelled();
-                    let kind = err.protocol_error_kind();
-                    let can_retry = !cancelled
-                        && self.recovery.enabled
-                        && attempt < max_attempts
-                        && matches!(
-                            kind,
-                            ProtocolErrorKind::Recoverable | ProtocolErrorKind::Transient
-                        );
-                    if can_retry {
-                        self.recovery_attempts.fetch_add(1, Ordering::Relaxed);
+                    let decision = mux_recovery_decision(&err);
+                    if self.can_retry(attempt, decision) {
+                        let reuse_in_hand = matches!(
+                            decision.connection,
+                            MuxConnectionDisposition::Reuse
+                        ) && !client.is_connection_poisoned()
+                            && !cx.is_cancel_requested();
                         tracing::debug!(
                             op = op_name,
                             attempt,
-                            max_attempts,
-                            cancelled,
-                            kind = ?kind,
+                            max_attempts = self.max_recovery_attempts(),
+                            cancelled = decision.cancelled,
+                            kind = ?decision.kind,
+                            connection = ?decision.connection,
                             error = %err,
-                            "mux pool op failed; reconnecting and retrying"
+                            "mux pool op failed; applying recovery decision"
                         );
-
-                        let delay = self
-                            .recovery
-                            .retry_policy
-                            .delay_for_attempt(attempt.saturating_sub(1));
-                        if !delay.is_zero() {
-                            // Tick 195 (ft-xbnl0.2.3): route the retry
-                            // backoff through sleep_with_cx(cx, ...).
-                            // Previously this used
-                            // `cx::with_cx_async(cx, |_| sleep(delay))`
-                            // which discarded cx via `|_|` — the inner
-                            // ambient `sleep` then fell back to
-                            // `Cx::current()` thread-local lookup,
-                            // making the backoff timer bound to a
-                            // different cx than the enclosing
-                            // execute_with_recovery_with_cx path.
-                            let _ = crate::runtime_async::sleep_with_cx(cx, delay).await;
+                        if reuse_in_hand {
+                            self.wait_before_retry_with_cx(cx, attempt).await?;
+                            retained_client = Some((client, guard));
+                        } else {
+                            self.return_client_after_error(cx, client, decision).await;
+                            drop(guard);
+                            self.wait_before_retry_with_cx(cx, attempt).await?;
                         }
                         continue;
                     }
 
-                    if kind == ProtocolErrorKind::Permanent {
-                        self.permanent_failures.fetch_add(1, Ordering::Relaxed);
-                    }
+                    self.record_permanent_failure(decision);
 
                     tracing::debug!(
                         op = op_name,
                         attempt,
-                        max_attempts,
-                        cancelled,
-                        kind = ?kind,
+                        max_attempts = self.max_recovery_attempts(),
+                        cancelled = decision.cancelled,
+                        kind = ?decision.kind,
+                        connection = ?decision.connection,
                         error = %err,
-                        "mux pool op failed; dropping client"
+                        "mux pool op failed terminally"
                     );
+                    self.return_client_after_error(cx, client, decision).await;
                     return Err(MuxPoolError::Mux(err));
                 }
             }
@@ -481,8 +793,6 @@ impl MuxPool {
     ) -> Result<SpawnResponse, MuxPoolError> {
         let op_cx = cx.clone();
         self.execute_once_with_cx(cx, "spawn_v2", move |client| {
-            let spawn = spawn.clone();
-            let op_cx = op_cx.clone();
             Box::pin(async move { client.spawn_v2_with_cx(&op_cx, spawn).await })
         })
         .await
@@ -502,8 +812,6 @@ impl MuxPool {
     ) -> Result<SpawnResponse, MuxPoolError> {
         let op_cx = cx.clone();
         self.execute_once_with_cx(cx, "split_pane", move |client| {
-            let split = split.clone();
-            let op_cx = op_cx.clone();
             Box::pin(async move { client.split_pane_with_cx(&op_cx, split).await })
         })
         .await
@@ -592,75 +900,224 @@ impl MuxPool {
         .await
     }
 
+    async fn execute_render_batch_with_recovery_with_cx(
+        &self,
+        cx: &Cx,
+        op_name: &'static str,
+        pane_ids: &[u64],
+        depth: usize,
+        deadline: &Budget,
+        attempts: &mut RenderAttemptState,
+    ) -> Result<Vec<GetPaneRenderChangesResponse>, RenderExecutionError> {
+        let mut retained_client: Option<(DirectMuxClient, PoolAcquireGuard)> = None;
+        loop {
+            let attempt = self
+                .begin_render_attempt(cx, deadline, attempts)
+                .map_err(RenderExecutionError::BeforeOperation)?;
+
+            let (mut client, guard) = if let Some(retained) = retained_client.take() {
+                retained
+            } else {
+                match self.acquire_client_with_cx(cx).await {
+                    Ok(acquired) => acquired,
+                    Err(MuxPoolError::Pool(error)) => {
+                        return Err(RenderExecutionError::BeforeOperation(
+                            MuxPoolError::Pool(error),
+                        ));
+                    }
+                    Err(MuxPoolError::IndeterminateMutation(error)) => {
+                        return Err(RenderExecutionError::BeforeOperation(
+                            MuxPoolError::IndeterminateMutation(error),
+                        ));
+                    }
+                    Err(MuxPoolError::Mux(error)) => {
+                        if cx.is_cancel_requested() {
+                            return Err(RenderExecutionError::BeforeOperation(
+                                self.render_interruption_error(cx),
+                            ));
+                        }
+                        let decision = mux_recovery_decision(&error);
+                        if self.can_retry_render(attempts, decision) {
+                            tracing::debug!(
+                                op = op_name,
+                                attempt,
+                                max_attempts = attempts.limit,
+                                kind = ?decision.kind,
+                                error = %error,
+                                "render batch acquisition failed; retrying acquisition within logical attempt budget"
+                            );
+                            self.wait_before_render_retry_with_cx(cx, deadline, attempt)
+                                .await
+                                .map_err(RenderExecutionError::BeforeOperation)?;
+                            continue;
+                        }
+
+                        self.record_permanent_failure(decision);
+                        return Err(RenderExecutionError::BeforeOperation(
+                            MuxPoolError::Mux(error),
+                        ));
+                    }
+                }
+            };
+
+            // Recompute after acquisition so this client attempt gets only the
+            // unspent part of the one logical render deadline.
+            let remaining = match self.remaining_render_batch_time(cx, deadline) {
+                Ok(remaining) => remaining,
+                Err(error) => {
+                    drop(client);
+                    return Err(RenderExecutionError::BeforeOperation(error));
+                }
+            };
+            let result = client
+                .get_pane_render_changes_batch_with_cx_prevalidated(
+                    cx, pane_ids, depth, remaining,
+                )
+                .await;
+            match result {
+                Ok(value) => {
+                    self.return_client_with_cx(cx, client).await;
+                    return Ok(value);
+                }
+                Err(error) => {
+                    let decision = mux_recovery_decision(&error);
+                    let reuse_in_hand = matches!(
+                        decision.connection,
+                        MuxConnectionDisposition::Reuse
+                    ) && !client.is_connection_poisoned()
+                        && !cx.is_cancel_requested();
+                    let hand_off_to_fallback = depth > 1
+                        && attempts.has_remaining()
+                        && is_transport_failover_decision(decision);
+
+                    if hand_off_to_fallback {
+                        tracing::debug!(
+                            op = op_name,
+                            attempt,
+                            max_attempts = attempts.limit,
+                            kind = ?decision.kind,
+                            connection = ?decision.connection,
+                            error = %error,
+                            "pipelined render batch failed; handing next shared attempt to sequential fallback"
+                        );
+                        self.return_client_after_error(cx, client, decision).await;
+                        return Err(RenderExecutionError::Operation(MuxPoolError::Mux(
+                            error,
+                        )));
+                    }
+
+                    if self.can_retry_render(attempts, decision) {
+                        tracing::debug!(
+                            op = op_name,
+                            attempt,
+                            max_attempts = attempts.limit,
+                            kind = ?decision.kind,
+                            connection = ?decision.connection,
+                            error = %error,
+                            "render batch failed; retrying within shared logical attempt budget"
+                        );
+                        if reuse_in_hand {
+                            self.wait_before_render_retry_with_cx(cx, deadline, attempt)
+                                .await
+                                .map_err(RenderExecutionError::Operation)?;
+                            retained_client = Some((client, guard));
+                        } else {
+                            self.return_client_after_error(cx, client, decision).await;
+                            drop(guard);
+                            self.wait_before_render_retry_with_cx(cx, deadline, attempt)
+                                .await
+                                .map_err(RenderExecutionError::Operation)?;
+                        }
+                        continue;
+                    }
+
+                    self.record_permanent_failure(decision);
+                    self.return_client_after_error(cx, client, decision).await;
+                    return Err(RenderExecutionError::Operation(MuxPoolError::Mux(
+                        error,
+                    )));
+                }
+            }
+        }
+    }
+
+    async fn get_pane_render_changes_batch_within_deadline(
+        &self,
+        cx: &Cx,
+        pane_ids: &[u64],
+        depth: usize,
+        deadline: &Budget,
+    ) -> Result<Vec<GetPaneRenderChangesResponse>, MuxPoolError> {
+        let mut attempts = RenderAttemptState::new(self.render_attempt_limit(depth));
+        let pipeline_result = self
+            .execute_render_batch_with_recovery_with_cx(
+                cx,
+                "get_pane_render_changes_batch",
+                pane_ids,
+                depth,
+                deadline,
+                &mut attempts,
+            )
+            .await;
+
+        let result = if depth <= 1 {
+            pipeline_result.map_err(RenderExecutionError::into_inner)
+        } else {
+            match pipeline_result {
+                Ok(result) => Ok(result),
+                Err(RenderExecutionError::Operation(error))
+                    if attempts.has_remaining() && should_fallback_render_batch(&error) =>
+                {
+                    // Cancellation and deadline expiry are checked before the
+                    // fallback delay and again before attempt 2 is counted.
+                    self.wait_before_render_retry_with_cx(cx, deadline, attempts.started)
+                        .await?;
+                    tracing::debug!(
+                        error = %error,
+                        depth,
+                        attempt = attempts.started.saturating_add(1),
+                        max_attempts = attempts.limit,
+                        "pipelined render batch failed; falling back to sequential within shared deadline"
+                    );
+                    self.execute_render_batch_with_recovery_with_cx(
+                        cx,
+                        "get_pane_render_changes_batch_fallback",
+                        pane_ids,
+                        1,
+                        deadline,
+                        &mut attempts,
+                    )
+                    .await
+                    .map_err(RenderExecutionError::into_inner)
+                }
+                Err(error) => Err(error.into_inner()),
+            }
+        };
+
+        if result.is_ok() && attempts.recovery_started() {
+            self.recovery_successes.fetch_add(1, Ordering::Relaxed);
+        }
+        result
+    }
+
     /// Poll render changes for many panes using depth-limited pipelining.
     ///
-    /// A non-cancelled, recoverable mux failure may fall back to sequential
-    /// requests on a fresh connection. Pool, permanent, transient, and
-    /// cancellation errors are returned without a second execution path.
-    /// Pane IDs must be unique; duplicates fail before pool acquisition.
+    /// The ambient entry point delegates to the explicit-Cx implementation so
+    /// pipeline attempts, retries, and sequential fallback share one deadline.
     pub async fn get_pane_render_changes_batch(
         &self,
         pane_ids: Vec<u64>,
     ) -> Result<Vec<GetPaneRenderChangesResponse>, MuxPoolError> {
-        if pane_ids.is_empty() {
-            return Ok(Vec::new());
-        }
-        self.validate_render_batch_preflight(&pane_ids)?;
-
-        let depth = self.pipeline_depth.min(pane_ids.len()).max(1);
-        let timeout = self.pipeline_timeout;
-        let pane_ids_for_pipeline = pane_ids.clone();
-        let pipeline_result = self
-            .execute_with_recovery("get_pane_render_changes_batch", move |client| {
-                let pane_ids = pane_ids_for_pipeline.clone();
-                Box::pin(async move {
-                    Box::pin(client.get_pane_render_changes_batch_prevalidated(
-                        &pane_ids,
-                        depth,
-                        timeout,
-                    ))
-                    .await
-                })
-            })
-            .await;
-
-        if depth <= 1 {
-            return pipeline_result;
-        }
-
-        match pipeline_result {
-            Ok(result) => Ok(result),
-            Err(err) if should_fallback_render_batch(&err) => {
-                tracing::debug!(
-                    error = %err,
-                    depth,
-                    "pipelined render batch failed; falling back to sequential"
-                );
-                self.execute_with_recovery(
-                    "get_pane_render_changes_batch_fallback",
-                    move |client| {
-                        let pane_ids = pane_ids.clone();
-                        Box::pin(async move {
-                            Box::pin(client.get_pane_render_changes_batch_prevalidated(
-                                &pane_ids,
-                                1,
-                                timeout,
-                            ))
-                            .await
-                        })
-                    },
-                )
-                .await
-            }
-            Err(err) => Err(err),
-        }
+        let cx = Cx::current().unwrap_or_else(cx::for_request);
+        self.get_pane_render_changes_batch_with_cx(&cx, pane_ids)
+            .await
     }
 
     /// Poll render changes for many panes using depth-limited pipelining and explicit `Cx`.
     ///
-    /// A non-cancelled, recoverable mux failure may fall back to sequential
-    /// requests on a fresh connection. Pool, permanent, transient, and
-    /// cancellation errors are returned without a second execution path.
+    /// A canonical retryable mux failure may fall back to sequential requests.
+    /// Pool errors, cancellation, non-retryable remote errors, and an exhausted
+    /// logical deadline are returned without entering a second execution path.
     /// Pane IDs must be unique; duplicates fail before pool acquisition.
     pub async fn get_pane_render_changes_batch_with_cx(
         &self,
@@ -670,61 +1127,26 @@ impl MuxPool {
         if pane_ids.is_empty() {
             return Ok(Vec::new());
         }
+        // Start the one logical deadline before validation so preflight,
+        // acquisition, pipeline execution, retry delay, and compatibility
+        // fallback all spend from the same budget.
+        let deadline = cx.budget_for_timeout(self.pipeline_timeout);
         self.validate_render_batch_preflight(&pane_ids)?;
 
         let depth = self.pipeline_depth.min(pane_ids.len()).max(1);
-        let timeout = self.pipeline_timeout;
-        let pane_ids_for_pipeline = pane_ids.clone();
-        let pipeline_cx = cx.clone();
-        let pipeline_result = self
-            .execute_with_recovery_with_cx(cx, "get_pane_render_changes_batch", move |client| {
-                let pane_ids = pane_ids_for_pipeline.clone();
-                let pipeline_cx = pipeline_cx.clone();
-                Box::pin(async move {
-                    Box::pin(client.get_pane_render_changes_batch_with_cx_prevalidated(
-                        &pipeline_cx,
-                        &pane_ids,
-                        depth,
-                        timeout,
-                    ))
-                    .await
-                })
-            })
-            .await;
-
-        if depth <= 1 {
-            return pipeline_result;
-        }
-
-        match pipeline_result {
-            Ok(result) => Ok(result),
-            Err(err) if should_fallback_render_batch(&err) => {
-                tracing::debug!(
-                    error = %err,
-                    depth,
-                    "pipelined render batch failed; falling back to sequential"
-                );
-                let fallback_cx = cx.clone();
-                self.execute_with_recovery_with_cx(
-                    cx,
-                    "get_pane_render_changes_batch_fallback",
-                    move |client| {
-                        let pane_ids = pane_ids.clone();
-                        let fallback_cx = fallback_cx.clone();
-                        Box::pin(async move {
-                            Box::pin(client.get_pane_render_changes_batch_with_cx_prevalidated(
-                                &fallback_cx,
-                                &pane_ids,
-                                1,
-                                timeout,
-                            ))
-                            .await
-                        })
-                    },
-                )
-                .await
-            }
-            Err(err) => Err(err),
+        let outer_timeout = self.remaining_render_batch_time(cx, &deadline)?;
+        match crate::runtime_async::timeout_with_cx(
+            cx,
+            outer_timeout,
+            self.get_pane_render_changes_batch_within_deadline(
+                cx, &pane_ids, depth, &deadline,
+            ),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) if cx.is_cancel_requested() => Err(self.render_interruption_error(cx)),
+            Err(_) => Err(self.render_batch_timeout_error()),
         }
     }
 
@@ -734,11 +1156,8 @@ impl MuxPool {
         pane_id: u64,
         data: Vec<u8>,
     ) -> Result<UnitResponse, MuxPoolError> {
-        self.execute_with_recovery("write_to_pane", move |client| {
-            let data = data.clone();
-            Box::pin(client.write_to_pane(pane_id, data))
-        })
-        .await
+        let cx = Cx::current().unwrap_or_else(cx::for_request);
+        self.write_to_pane_with_cx(&cx, pane_id, data).await
     }
 
     /// Write raw bytes to a pane via a pooled connection using explicit `Cx`.
@@ -749,9 +1168,7 @@ impl MuxPool {
         data: Vec<u8>,
     ) -> Result<UnitResponse, MuxPoolError> {
         let op_cx = cx.clone();
-        self.execute_with_recovery_with_cx(cx, "write_to_pane", move |client| {
-            let data = data.clone();
-            let op_cx = op_cx.clone();
+        self.execute_once_with_cx(cx, "write_to_pane", move |client| {
             Box::pin(async move { client.write_to_pane_with_cx(&op_cx, pane_id, data).await })
         })
         .await
@@ -763,11 +1180,8 @@ impl MuxPool {
         pane_id: u64,
         data: String,
     ) -> Result<UnitResponse, MuxPoolError> {
-        self.execute_with_recovery("send_paste", move |client| {
-            let data = data.clone();
-            Box::pin(client.send_paste(pane_id, data))
-        })
-        .await
+        let cx = Cx::current().unwrap_or_else(cx::for_request);
+        self.send_paste_with_cx(&cx, pane_id, data).await
     }
 
     /// Send text via paste mode through a pooled connection using explicit `Cx`.
@@ -778,9 +1192,7 @@ impl MuxPool {
         data: String,
     ) -> Result<UnitResponse, MuxPoolError> {
         let op_cx = cx.clone();
-        self.execute_with_recovery_with_cx(cx, "send_paste", move |client| {
-            let data = data.clone();
-            let op_cx = op_cx.clone();
+        self.execute_once_with_cx(cx, "send_paste", move |client| {
             Box::pin(async move { client.send_paste_with_cx(&op_cx, pane_id, data).await })
         })
         .await
@@ -1161,8 +1573,8 @@ mod tests {
     }
 
     /// Spawn a mock mux server that returns an unexpected response for the first
-    /// SpawnV2 and SplitPane request. Later requests succeed so tests can prove
-    /// non-idempotent operations do not retry after an ambiguous failure.
+    /// request in each mutation family. Later requests succeed so tests can
+    /// prove ambiguous mutations do not replay after their invocation boundary.
     async fn spawn_mock_server_unexpected_non_idempotent_once(
         temp_dir: &tempfile::TempDir,
     ) -> PathBuf {
@@ -1173,6 +1585,8 @@ mod tests {
 
         let first_spawn_bad = Arc::new(AtomicBool::new(true));
         let first_split_bad = Arc::new(AtomicBool::new(true));
+        let first_write_bad = Arc::new(AtomicBool::new(true));
+        let first_paste_bad = Arc::new(AtomicBool::new(true));
 
         task::spawn(async move {
             loop {
@@ -1183,6 +1597,8 @@ mod tests {
 
                 let first_spawn_bad = Arc::clone(&first_spawn_bad);
                 let first_split_bad = Arc::clone(&first_split_bad);
+                let first_write_bad = Arc::clone(&first_write_bad);
+                let first_paste_bad = Arc::clone(&first_paste_bad);
                 task::spawn(async move {
                     let mut read_buf = Vec::new();
                     loop {
@@ -1232,6 +1648,28 @@ mod tests {
                                         })
                                     }
                                 }
+                                Pdu::WriteToPane(_) => {
+                                    if first_write_bad.swap(false, AtomicOrdering::SeqCst) {
+                                        Pdu::ListPanesResponse(ListPanesResponse {
+                                            tabs: Vec::new(),
+                                            tab_titles: Vec::new(),
+                                            window_titles: HashMap::new(),
+                                        })
+                                    } else {
+                                        Pdu::UnitResponse(UnitResponse {})
+                                    }
+                                }
+                                Pdu::SendPaste(_) => {
+                                    if first_paste_bad.swap(false, AtomicOrdering::SeqCst) {
+                                        Pdu::ListPanesResponse(ListPanesResponse {
+                                            tabs: Vec::new(),
+                                            tab_titles: Vec::new(),
+                                            window_titles: HashMap::new(),
+                                        })
+                                    } else {
+                                        Pdu::UnitResponse(UnitResponse {})
+                                    }
+                                }
                                 _ => continue,
                             };
                             responses.push((decoded.serial, response));
@@ -1277,17 +1715,27 @@ mod tests {
         }
     }
 
-    /// Spawn a mock mux server that returns an unexpected response for the first
-    /// `GetPaneRenderChanges` request across all connections.
+    /// Spawn a mock mux server that returns an unexpected response on the first
+    /// `GetPaneRenderChanges` request made by the first connection.
     async fn spawn_mock_server_unexpected_batch_render_once(
         temp_dir: &tempfile::TempDir,
+    ) -> PathBuf {
+        spawn_mock_server_unexpected_batch_render_connections(temp_dir, 1).await
+    }
+
+    /// Spawn a mock mux server that injects one unexpected render response on
+    /// each of the first `bad_connections` connections. This lets tests prove
+    /// that pipeline and sequential-fallback attempts consume one shared cap.
+    async fn spawn_mock_server_unexpected_batch_render_connections(
+        temp_dir: &tempfile::TempDir,
+        bad_connections: usize,
     ) -> PathBuf {
         let socket_path = temp_dir.path().join("mux-pool-test-batch-unexpected.sock");
         let listener = compat_unix::bind(&socket_path)
             .await
             .expect("bind mock mux listener");
 
-        let first_bad = Arc::new(AtomicBool::new(true));
+        let next_connection_ordinal = Arc::new(AtomicUsize::new(0));
 
         task::spawn(async move {
             loop {
@@ -1296,9 +1744,11 @@ mod tests {
                     Err(_) => break,
                 };
 
-                let first_bad = Arc::clone(&first_bad);
+                let connection_ordinal =
+                    next_connection_ordinal.fetch_add(1, AtomicOrdering::SeqCst);
                 task::spawn(async move {
                     let mut read_buf = Vec::new();
+                    let mut injected_bad_response = false;
                     loop {
                         let mut temp = vec![0u8; 4096];
                         let read = match unix_stream_read(&mut stream, &mut temp).await {
@@ -1322,7 +1772,10 @@ mod tests {
                                 }
                                 Pdu::SetClientId(_) => Pdu::UnitResponse(UnitResponse {}),
                                 Pdu::GetPaneRenderChanges(req) => {
-                                    if first_bad.swap(false, AtomicOrdering::SeqCst) {
+                                    if connection_ordinal < bad_connections
+                                        && !injected_bad_response
+                                    {
+                                        injected_bad_response = true;
                                         // Wrong response type: forces the mux pool batch path
                                         // into its sequential fallback branch.
                                         Pdu::UnitResponse(UnitResponse {})
@@ -1520,7 +1973,7 @@ mod tests {
     }
 
     #[test]
-    fn pool_connect_failure_increments_counter() {
+    fn pool_connect_failure_retries_acquisition_and_updates_counters() {
         run_async_test(async {
             let config = MuxPoolConfig {
                 pool: PoolConfig {
@@ -1544,30 +1997,45 @@ mod tests {
 
             let stats = pool.stats().await;
             assert_eq!(stats.connections_created, 0);
-            assert_eq!(stats.connections_failed, 1);
+            assert_eq!(
+                stats.connections_failed, 2,
+                "default policy should make two transient connection attempts"
+            );
+            assert_eq!(
+                stats.recovery_attempts, 1,
+                "counter advances only when the second acquisition begins"
+            );
+            assert_eq!(stats.recovery_successes, 0);
         });
     }
 
     #[test]
     fn render_batch_fallback_classification_is_exhaustive() {
-        for cancelled in [false, true] {
-            assert!(!classify_render_batch_fallback(None, cancelled));
-            assert!(!classify_render_batch_fallback(
-                Some(ProtocolErrorKind::Permanent),
-                cancelled,
-            ));
-            assert!(!classify_render_batch_fallback(
-                Some(ProtocolErrorKind::Transient),
-                cancelled,
-            ));
-            assert_eq!(
-                classify_render_batch_fallback(
-                    Some(ProtocolErrorKind::Recoverable),
-                    cancelled,
-                ),
-                !cancelled
-            );
-        }
+        let failover = MuxRecoveryDecision {
+            kind: ProtocolErrorKind::Recoverable,
+            retry: true,
+            connection: MuxConnectionDisposition::Discard,
+            cancelled: false,
+        };
+        let reusable_retry = MuxRecoveryDecision {
+            connection: MuxConnectionDisposition::Reuse,
+            ..failover
+        };
+        let cancelled = MuxRecoveryDecision {
+            retry: false,
+            cancelled: true,
+            ..failover
+        };
+        let no_retry = MuxRecoveryDecision {
+            retry: false,
+            ..failover
+        };
+
+        assert!(!classify_render_batch_fallback(None));
+        assert!(classify_render_batch_fallback(Some(failover)));
+        assert!(!classify_render_batch_fallback(Some(reusable_retry)));
+        assert!(!classify_render_batch_fallback(Some(cancelled)));
+        assert!(!classify_render_batch_fallback(Some(no_retry)));
 
         assert!(should_fallback_render_batch(&MuxPoolError::Mux(
             DirectMuxError::UnexpectedResponse {
@@ -1582,14 +2050,17 @@ mod tests {
             DirectMuxError::RemoteError("transient".to_string()),
         )));
         assert!(!should_fallback_render_batch(&MuxPoolError::Mux(
-            DirectMuxError::Io(std::io::Error::new(
-                std::io::ErrorKind::Interrupted,
-                "mux render batch cancelled: test",
-            )),
+            DirectMuxError::Cancelled {
+                phase: "render_batch",
+                detail: "test".to_string(),
+            },
         )));
         assert!(!should_fallback_render_batch(&MuxPoolError::Pool(
             PoolError::AcquireTimeout,
         )));
+        assert!(!should_fallback_render_batch(
+            &MuxPoolError::IndeterminateMutation(DirectMuxError::Disconnected),
+        ));
     }
 
     #[test]
@@ -1630,6 +2101,58 @@ mod tests {
             assert_eq!(stats.recovery_attempts, 1);
             assert_eq!(stats.recovery_successes, 1);
             assert_eq!(stats.connections_created, 2);
+        });
+    }
+
+    #[test]
+    fn remote_error_is_not_retried_and_reuses_aligned_connection() {
+        run_async_test(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let socket_path = spawn_mock_server(&temp_dir).await;
+            let pool = MuxPool::new(pool_config(socket_path, 2));
+            let cx = crate::cx::for_testing();
+
+            let client = DirectMuxClient::connect_with_cx(&cx, pool.mux_config.clone())
+                .await
+                .expect("seed aligned mux client");
+            pool.pool.put_with_cx(&cx, client).await;
+
+            let invocations = Arc::new(AtomicUsize::new(0));
+            let op_invocations = Arc::clone(&invocations);
+            let error = pool
+                .execute_with_recovery_with_cx(&cx, "synthetic_remote_error", move |_client| {
+                    let op_invocations = Arc::clone(&op_invocations);
+                    Box::pin(async move {
+                        op_invocations.fetch_add(1, AtomicOrdering::Relaxed);
+                        Err::<(), _>(DirectMuxError::RemoteError("request rejected".to_string()))
+                    })
+                })
+                .await
+                .expect_err("remote application error must be returned");
+            assert!(matches!(
+                error,
+                MuxPoolError::Mux(DirectMuxError::RemoteError(_))
+            ));
+            assert_eq!(
+                invocations.load(AtomicOrdering::Relaxed),
+                1,
+                "a framed remote error must never replay the operation"
+            );
+
+            let after_error = pool.stats_with_cx(&cx).await;
+            assert_eq!(after_error.recovery_attempts, 0);
+            assert_eq!(after_error.recovery_successes, 0);
+            assert_eq!(after_error.pool.idle_count, 1);
+
+            pool.list_panes_with_cx(&cx)
+                .await
+                .expect("aligned client should remain reusable");
+            let after_reuse = pool.stats_with_cx(&cx).await;
+            assert_eq!(
+                after_reuse.connections_created, 0,
+                "follow-up must reuse the seeded connection rather than reconnect"
+            );
+            assert_eq!(after_reuse.pool.total_acquired, 2);
         });
     }
 
@@ -1776,7 +2299,9 @@ mod tests {
             assert!(
                 matches!(
                     err,
-                    MuxPoolError::Mux(DirectMuxError::UnexpectedResponse { .. })
+                    MuxPoolError::IndeterminateMutation(
+                        DirectMuxError::UnexpectedResponse { .. }
+                    )
                 ),
                 "expected unexpected response without retry, got {err}"
             );
@@ -1785,6 +2310,51 @@ mod tests {
             assert_eq!(stats.recovery_attempts, 0);
             assert_eq!(stats.recovery_successes, 0);
             assert_eq!(stats.connections_created, 1);
+        });
+    }
+
+    #[test]
+    fn pool_spawn_v2_retries_only_transient_acquisition_before_operation_boundary() {
+        run_async_test(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let missing_socket = temp_dir.path().join("spawn-acquire-retry-missing.sock");
+            let config = MuxPoolConfig {
+                pool: PoolConfig {
+                    max_size: 1,
+                    idle_timeout: Duration::from_secs(60),
+                    acquire_timeout: Duration::from_millis(500),
+                },
+                mux: DirectMuxClientConfig::default().with_socket_path(missing_socket),
+                recovery: MuxRecoveryConfig {
+                    enabled: true,
+                    retry_policy: RetryPolicy::new(
+                        Duration::ZERO,
+                        Duration::ZERO,
+                        1.0,
+                        0.0,
+                        Some(3),
+                    ),
+                },
+                pipeline_depth: 32,
+                pipeline_timeout: Duration::from_secs(5),
+            };
+            let pool = MuxPool::new(config);
+
+            let error = pool
+                .spawn_v2(test_spawn_v2())
+                .await
+                .expect_err("all acquisition attempts should fail before SpawnV2 is sent");
+            assert!(matches!(
+                error,
+                MuxPoolError::Mux(DirectMuxError::SocketNotFound(_))
+            ));
+
+            let stats = pool.stats().await;
+            assert_eq!(stats.connections_failed, 3);
+            assert_eq!(stats.pool.total_acquired, 3);
+            assert_eq!(stats.recovery_attempts, 2);
+            assert_eq!(stats.recovery_successes, 0);
+            assert_eq!(stats.connections_created, 0);
         });
     }
 
@@ -1823,7 +2393,9 @@ mod tests {
             assert!(
                 matches!(
                     err,
-                    MuxPoolError::Mux(DirectMuxError::UnexpectedResponse { .. })
+                    MuxPoolError::IndeterminateMutation(
+                        DirectMuxError::UnexpectedResponse { .. }
+                    )
                 ),
                 "expected unexpected response without retry, got {err}"
             );
@@ -1832,6 +2404,90 @@ mod tests {
             assert_eq!(stats.recovery_attempts, 0);
             assert_eq!(stats.recovery_successes, 0);
             assert_eq!(stats.connections_created, 1);
+        });
+    }
+
+    #[test]
+    fn pane_input_mutations_do_not_replay_after_ambiguous_response() {
+        run_async_test(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let socket_path = spawn_mock_server_unexpected_non_idempotent_once(&temp_dir).await;
+            let config = MuxPoolConfig {
+                mux: DirectMuxClientConfig::default().with_socket_path(socket_path),
+                recovery: MuxRecoveryConfig {
+                    enabled: true,
+                    retry_policy: RetryPolicy::new(
+                        Duration::ZERO,
+                        Duration::ZERO,
+                        1.0,
+                        0.0,
+                        Some(3),
+                    ),
+                },
+                ..MuxPoolConfig::default()
+            };
+            let pool = MuxPool::new(config);
+
+            let write_error = pool
+                .write_to_pane(9, b"must-not-duplicate\n".to_vec())
+                .await
+                .expect_err("ambiguous write response must not be replayed");
+            assert!(matches!(
+                write_error,
+                MuxPoolError::IndeterminateMutation(
+                    DirectMuxError::UnexpectedResponse { .. }
+                )
+            ));
+
+            let paste_error = pool
+                .send_paste(9, "must-not-duplicate\n".to_string())
+                .await
+                .expect_err("ambiguous paste response must not be replayed");
+            assert!(matches!(
+                paste_error,
+                MuxPoolError::IndeterminateMutation(
+                    DirectMuxError::UnexpectedResponse { .. }
+                )
+            ));
+
+            let stats = pool.stats().await;
+            assert_eq!(stats.recovery_attempts, 0);
+            assert_eq!(stats.recovery_successes, 0);
+            assert_eq!(
+                stats.connections_created, 2,
+                "each mutation gets one connection and neither is replayed"
+            );
+        });
+    }
+
+    #[test]
+    fn post_invocation_mutation_cancellation_remains_typed_and_indeterminate() {
+        run_async_test(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let socket_path = spawn_mock_server(&temp_dir).await;
+            let pool = MuxPool::new(pool_config(socket_path, 1));
+            let cx = crate::cx::for_testing();
+
+            let error = pool
+                .execute_once_with_cx(&cx, "synthetic_cancelled_mutation", |_client| {
+                    Box::pin(async {
+                        Err::<(), _>(DirectMuxError::Cancelled {
+                            phase: "mutation_wait",
+                            detail: "synthetic cancellation after invocation".to_string(),
+                        })
+                    })
+                })
+                .await
+                .expect_err("post-invocation cancellation must remain non-replayable");
+            match error {
+                MuxPoolError::IndeterminateMutation(inner) => assert!(inner.is_cancelled()),
+                other => panic!("expected indeterminate typed cancellation, got {other}"),
+            }
+
+            let stats = pool.stats().await;
+            assert_eq!(stats.recovery_attempts, 0);
+            assert_eq!(stats.connections_created, 1);
+            assert_eq!(stats.pool.idle_count, 0);
         });
     }
 
@@ -1897,8 +2553,9 @@ mod tests {
             let stats = pool.stats().await;
             assert_eq!(stats.health_checks, 1);
             assert_eq!(stats.health_check_failures, 1);
-            assert_eq!(stats.recovery_attempts, 0);
+            assert_eq!(stats.recovery_attempts, 1);
             assert_eq!(stats.recovery_successes, 0);
+            assert_eq!(stats.connections_failed, 2);
         });
     }
 
@@ -2022,8 +2679,9 @@ mod tests {
             let stats = pool.stats().await;
             assert_eq!(stats.health_checks, 1);
             assert_eq!(stats.health_check_failures, 1);
-            assert_eq!(stats.recovery_attempts, 0);
+            assert_eq!(stats.recovery_attempts, 1);
             assert_eq!(stats.recovery_successes, 0);
+            assert_eq!(stats.connections_failed, 2);
         });
     }
 
@@ -2265,6 +2923,12 @@ mod tests {
         assert!(mux_err.to_string().contains("mux"));
         assert!(!mux_err.is_pool_timeout());
         assert!(mux_err.is_disconnected());
+
+        let mutation_err =
+            MuxPoolError::IndeterminateMutation(DirectMuxError::Disconnected);
+        assert!(mutation_err.to_string().contains("indeterminate"));
+        assert!(!mutation_err.is_pool_timeout());
+        assert!(mutation_err.is_disconnected());
     }
 
     #[test]
@@ -2327,6 +2991,25 @@ mod tests {
             Duration::from_millis(1),
             "zero timeout clamped to 1ms"
         );
+    }
+
+    #[test]
+    fn shared_render_deadline_accepts_decreasing_slices_and_fails_closed() {
+        let configured = Duration::from_secs(5);
+        let first = require_render_batch_remaining(Some(Duration::from_secs(4)), configured)
+            .expect("initial deadline slice");
+        let later = require_render_batch_remaining(Some(Duration::from_millis(750)), configured)
+            .expect("recomputed deadline slice");
+        assert!(later < first, "later attempt must receive less remaining time");
+
+        for exhausted in [None, Some(Duration::ZERO)] {
+            let error = require_render_batch_remaining(exhausted, configured)
+                .expect_err("an exhausted bounded render deadline must fail closed");
+            assert!(matches!(
+                error,
+                DirectMuxError::BatchTimeout { timeout_ms: 5_000 }
+            ));
+        }
     }
 
     #[test]
@@ -2832,6 +3515,49 @@ mod tests {
     }
 
     #[test]
+    fn expired_render_deadline_returns_batch_timeout_without_acquire_or_fallback() {
+        run_async_test(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let missing_socket = temp_dir.path().join("expired-render-deadline.sock");
+            let config = MuxPoolConfig {
+                mux: DirectMuxClientConfig::default().with_socket_path(missing_socket),
+                recovery: MuxRecoveryConfig {
+                    enabled: true,
+                    retry_policy: RetryPolicy::new(
+                        Duration::ZERO,
+                        Duration::ZERO,
+                        1.0,
+                        0.0,
+                        Some(3),
+                    ),
+                },
+                pipeline_depth: 4,
+                pipeline_timeout: Duration::from_secs(5),
+                ..MuxPoolConfig::default()
+            };
+            let pool = MuxPool::new(config);
+            let expired_budget = crate::cx::Budget::with_deadline_at_ns(0);
+            let cx = Cx::for_testing_with_budget(expired_budget);
+
+            let error = pool
+                .get_pane_render_changes_batch_with_cx(&cx, vec![1, 2, 3])
+                .await
+                .expect_err("expired logical deadline must fail before pipeline acquisition");
+            assert!(matches!(
+                error,
+                MuxPoolError::Mux(DirectMuxError::BatchTimeout { timeout_ms: 5_000 })
+            ));
+
+            let stats = pool.stats().await;
+            assert_eq!(stats.pool.total_acquired, 0);
+            assert_eq!(stats.connections_created, 0);
+            assert_eq!(stats.connections_failed, 0);
+            assert_eq!(stats.recovery_attempts, 0);
+            assert_eq!(stats.recovery_successes, 0);
+        });
+    }
+
+    #[test]
     fn pool_batch_render_pipeline_depth_one() {
         run_async_test(async {
             let temp_dir = tempfile::tempdir().expect("tempdir");
@@ -2935,13 +3661,97 @@ mod tests {
 
             let stats = pool.stats().await;
             assert_eq!(
-                stats.recovery_attempts, 0,
-                "sequential fallback should not consume recovery retries when recovery is disabled"
+                stats.recovery_attempts, 1,
+                "sequential fallback begins shared logical attempt 2"
             );
+            assert_eq!(stats.recovery_successes, 1);
             assert_eq!(
                 stats.connections_created, 2,
                 "fallback should create one failed pipeline connection and one sequential replacement"
             );
+            assert_eq!(stats.pool.total_acquired, 2);
+        });
+    }
+
+    #[test]
+    fn render_acquisition_failures_never_enter_sequential_fallback() {
+        run_async_test(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let missing_socket = temp_dir.path().join("render-acquire-missing.sock");
+            let config = MuxPoolConfig {
+                mux: DirectMuxClientConfig::default().with_socket_path(missing_socket),
+                recovery: MuxRecoveryConfig {
+                    enabled: true,
+                    retry_policy: RetryPolicy::new(
+                        Duration::ZERO,
+                        Duration::ZERO,
+                        1.0,
+                        0.0,
+                        Some(3),
+                    ),
+                },
+                pipeline_depth: 4,
+                pipeline_timeout: Duration::from_secs(5),
+                ..MuxPoolConfig::default()
+            };
+            let pool = MuxPool::new(config);
+
+            let error = pool
+                .get_pane_render_changes_batch(vec![10, 20, 30])
+                .await
+                .expect_err("failed acquisition must not enter sequential fallback");
+            assert!(matches!(
+                error,
+                MuxPoolError::Mux(DirectMuxError::SocketNotFound(_))
+            ));
+
+            let stats = pool.stats().await;
+            assert_eq!(stats.connections_failed, 3);
+            assert_eq!(stats.pool.total_acquired, 3);
+            assert_eq!(stats.recovery_attempts, 2);
+            assert_eq!(stats.recovery_successes, 0);
+            assert_eq!(stats.connections_created, 0);
+        });
+    }
+
+    #[test]
+    fn render_pipeline_and_fallback_share_configured_attempt_cap() {
+        run_async_test(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let socket_path =
+                spawn_mock_server_unexpected_batch_render_connections(&temp_dir, 2).await;
+            let config = MuxPoolConfig {
+                mux: DirectMuxClientConfig::default().with_socket_path(socket_path),
+                recovery: MuxRecoveryConfig {
+                    enabled: true,
+                    retry_policy: RetryPolicy::new(
+                        Duration::ZERO,
+                        Duration::ZERO,
+                        1.0,
+                        0.0,
+                        Some(3),
+                    ),
+                },
+                pipeline_depth: 4,
+                pipeline_timeout: Duration::from_secs(5),
+                ..MuxPoolConfig::default()
+            };
+            let pool = MuxPool::new(config);
+
+            let result = pool
+                .get_pane_render_changes_batch(vec![10, 20, 30])
+                .await
+                .expect("third and final shared attempt should succeed");
+            assert_eq!(
+                result.iter().map(|response| response.pane_id).collect::<Vec<_>>(),
+                vec![10, 20, 30]
+            );
+
+            let stats = pool.stats().await;
+            assert_eq!(stats.connections_created, 3);
+            assert_eq!(stats.pool.total_acquired, 3);
+            assert_eq!(stats.recovery_attempts, 2);
+            assert_eq!(stats.recovery_successes, 1);
         });
     }
 
@@ -3235,6 +4045,9 @@ mod tests {
                 MuxPoolError::Mux(mux_err) => assert!(mux_err.is_cancelled()),
                 other @ MuxPoolError::Pool(_) => {
                     panic!("expected mux cancellation error, got: {other}");
+                }
+                other @ MuxPoolError::IndeterminateMutation(_) => {
+                    panic!("idempotent op must not produce mutation ambiguity: {other}");
                 }
             }
 
@@ -3678,13 +4491,15 @@ mod tests {
 
             let stats = pool.stats().await;
             assert_eq!(
-                stats.recovery_attempts, 0,
-                "explicit-Cx sequential fallback should not consume recovery retries when recovery is disabled"
+                stats.recovery_attempts, 1,
+                "explicit-Cx fallback begins shared logical attempt 2"
             );
+            assert_eq!(stats.recovery_successes, 1);
             assert_eq!(
                 stats.connections_created, 2,
                 "explicit-Cx fallback should create one failed pipeline connection and one sequential replacement"
             );
+            assert_eq!(stats.pool.total_acquired, 2);
         });
     }
 

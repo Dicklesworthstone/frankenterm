@@ -9,7 +9,10 @@ use std::time::Duration;
 
 use crate::config as wa_config;
 use crate::cx::{self, Cx, RuntimeHandle};
-use crate::protocol_recovery::{ProtocolErrorKind, classify_mux_error};
+use crate::protocol_recovery::{
+    MuxConnectionDisposition, MuxRecoveryDecision, ProtocolErrorKind, classify_mux_error,
+    mux_recovery_decision,
+};
 #[cfg(test)]
 use crate::runtime_async::mpsc_reserve_send;
 #[cfg(test)]
@@ -203,6 +206,8 @@ pub enum DirectMuxError {
         remote: usize,
         remote_version: String,
     },
+    #[error("mux {phase} cancelled: {detail}")]
+    Cancelled { phase: &'static str, detail: String },
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -211,33 +216,41 @@ impl DirectMuxError {
     /// Whether this error represents an explicit capability-context cancellation.
     #[must_use]
     pub fn is_cancelled(&self) -> bool {
-        matches!(
-            self,
-            Self::Io(err)
-                if err.kind() == std::io::ErrorKind::Interrupted
-                    && {
-                        let text = err.to_string().to_ascii_lowercase();
-                        text.contains("cancelled") || text.contains("canceled")
-                    }
-        )
+        match self {
+            Self::Cancelled { .. } => true,
+            // Retain defensive recognition for cancellation errors produced
+            // by older callers that still encode the signal in Interrupted
+            // text. New internal construction uses the typed variant above.
+            Self::Io(err) if err.kind() == std::io::ErrorKind::Interrupted => {
+                let text = err.to_string().to_ascii_lowercase();
+                text.contains("cancelled") || text.contains("canceled")
+            }
+            _ => false,
+        }
     }
 
-    /// Classify an error into a retry/reconnect decision bucket.
+    /// Project the canonical recovery decision to its diagnostic bucket.
     ///
-    /// [`classify_mux_error`] is the single classification authority.  Keep
-    /// this inherent method as the ergonomic entry point for mux callers, but
-    /// do not duplicate the variant table here.
+    /// [`mux_recovery_decision`] is the single multi-axis authority, and
+    /// [`classify_mux_error`] is its thin kind projection. Keep this inherent
+    /// method as the ergonomic kind-only entry point for mux callers.
     #[must_use]
     pub fn protocol_error_kind(&self) -> ProtocolErrorKind {
         classify_mux_error(self)
     }
+
+    /// Return the canonical retry, connection, and cancellation decision.
+    #[must_use]
+    pub fn recovery_decision(&self) -> MuxRecoveryDecision {
+        mux_recovery_decision(self)
+    }
 }
 
-fn cancelled_mux_io(phase: &'static str, detail: impl std::fmt::Display) -> DirectMuxError {
-    DirectMuxError::Io(std::io::Error::new(
-        std::io::ErrorKind::Interrupted,
-        format!("mux {phase} cancelled: {detail}"),
-    ))
+fn cancelled_mux_error(phase: &'static str, detail: impl std::fmt::Display) -> DirectMuxError {
+    DirectMuxError::Cancelled {
+        phase,
+        detail: detail.to_string(),
+    }
 }
 
 fn classify_cx_timeout(
@@ -247,7 +260,7 @@ fn classify_cx_timeout(
     on_timeout: DirectMuxError,
 ) -> DirectMuxError {
     if cx.is_cancel_requested() {
-        cancelled_mux_io(phase, timeout_err)
+        cancelled_mux_error(phase, timeout_err)
     } else {
         on_timeout
     }
@@ -266,7 +279,7 @@ fn checkpoint_mux_cx(
             error = %err,
             "mux operation cancelled before transport boundary"
         );
-        cancelled_mux_io(phase, err)
+        cancelled_mux_error(phase, err)
     })
 }
 
@@ -907,6 +920,13 @@ impl DirectMuxClient {
 
     pub fn socket_path(&self) -> &Path {
         &self.socket_path
+    }
+
+    /// Whether this live client has crossed an ambiguous transport boundary
+    /// and may no longer be reused.
+    #[must_use]
+    pub(super) fn is_connection_poisoned(&self) -> bool {
+        self.connection_poisoned
     }
 
     /// Process-local, non-reusing identity for this exact transport instance.
@@ -2898,7 +2918,11 @@ impl DirectMuxClient {
                         error = %err,
                         "mux response read failed"
                     );
-                    return Err(DirectMuxError::Io(err));
+                    return Err(if cx.is_cancel_requested() {
+                        cancelled_mux_error("response_read_wait", err)
+                    } else {
+                        DirectMuxError::Io(err)
+                    });
                 }
                 Err(timeout_err) => {
                     tracing::warn!(
@@ -3105,9 +3129,13 @@ fn should_auto_fallback_to_always(
     resolved_mode: CompressionMode,
     err: &DirectMuxError,
 ) -> bool {
+    let decision = mux_recovery_decision(err);
     matches!(configured_mode, wa_config::VendoredCompressionMode::Auto)
         && matches!(resolved_mode, CompressionMode::Never)
-        && matches!(err.protocol_error_kind(), ProtocolErrorKind::Recoverable)
+        && matches!(decision.kind, ProtocolErrorKind::Recoverable)
+        && decision.retry
+        && !decision.cancelled
+        && matches!(decision.connection, MuxConnectionDisposition::Discard)
 }
 
 async fn unix_stream_read(stream: &mut UnixStream, buf: &mut [u8]) -> std::io::Result<usize> {
@@ -3116,10 +3144,10 @@ async fn unix_stream_read(stream: &mut UnixStream, buf: &mut [u8]) -> std::io::R
 
 /// ft-xbnl0.2.3 Cx-first sibling of [`unix_stream_read`].
 ///
-/// Pre-flight `cx.checkpoint()` folded into `io::ErrorKind::Interrupted`
-/// so a cancelled caller surfaces as an IO error rather than panicking
-/// or blocking on the underlying poll_read. Used from
-/// `read_next_pdu_with_cx` where the parent Cx is already in scope.
+/// Pre-flight `cx.checkpoint()` is folded into an internal
+/// `io::ErrorKind::Interrupted` so polling stops before the underlying read.
+/// `read_next_pdu_with_cx` translates that signal back into the structured
+/// `DirectMuxError::Cancelled` authority while the parent `Cx` is in scope.
 async fn unix_stream_read_with_cx(
     cx: &Cx,
     stream: &mut UnixStream,
@@ -3247,6 +3275,15 @@ async fn wait_for_cancel_change_with_cx(cx: &Cx, cancel_rx: &mut watch::Receiver
     cancel_rx.changed(cx).await.is_ok()
 }
 
+/// A subscription owns one client and cannot reconnect it. It may retry only
+/// when the canonical recovery authority permits both replay and reuse.
+fn subscription_can_retry_same_client(err: &DirectMuxError) -> bool {
+    let decision = mux_recovery_decision(err);
+    decision.retry
+        && !decision.cancelled
+        && matches!(decision.connection, MuxConnectionDisposition::Reuse)
+}
+
 async fn run_subscription_loop(
     cx: &Cx,
     mut client: DirectMuxClient,
@@ -3318,12 +3355,13 @@ async fn run_subscription_loop(
 
                 has_dirty
             }
-            Err(DirectMuxError::Disconnected) => {
-                pane_delta_try_emit_ended(&tx, pane_id, "mux socket disconnected");
-                break;
-            }
-            Err(DirectMuxError::ReadTimeout) => {
-                tracing::debug!(pane_id, "subscription poll timeout, retrying");
+            Err(err) if subscription_can_retry_same_client(&err) => {
+                tracing::debug!(
+                    pane_id,
+                    error_kind = ?err.protocol_error_kind(),
+                    error = %err,
+                    "subscription poll failed without invalidating its client; retrying"
+                );
                 false
             }
             Err(err) => {
@@ -3742,16 +3780,13 @@ mod tests {
         cx
     }
 
-    fn assert_cancelled_mux_io(err: &DirectMuxError) {
+    fn assert_cancelled_mux_error(err: &DirectMuxError) {
         match err {
-            DirectMuxError::Io(io_err) => {
-                assert_eq!(io_err.kind(), std::io::ErrorKind::Interrupted);
-                assert!(
-                    io_err.to_string().contains("cancelled"),
-                    "cancelled mux io error should mention cancellation: {io_err}"
-                );
+            DirectMuxError::Cancelled { phase, detail } => {
+                assert!(!phase.is_empty(), "cancelled mux phase must be retained");
+                assert!(!detail.is_empty(), "cancelled mux detail must be retained");
             }
-            other => panic!("expected cancelled io error, got: {other}"),
+            other => panic!("expected typed mux cancellation, got: {other}"),
         }
     }
 
@@ -4346,7 +4381,7 @@ mod tests {
                 .send_request_only_with_cx(&cancelled_cx, Pdu::ListPanes(ListPanes {}))
                 .await
                 .expect_err("pre-cancelled request write should fail before sending");
-            assert_cancelled_mux_io(&err);
+            assert_cancelled_mux_error(&err);
 
             drop(client);
             assert_eq!(
@@ -4445,7 +4480,7 @@ mod tests {
                 .await_response_with_cx(&cancelled_cx, serial)
                 .await
                 .expect_err("pre-cancelled response read should fail before blocking read");
-            assert_cancelled_mux_io(&err);
+            assert_cancelled_mux_error(&err);
 
             drop(client);
             assert_eq!(
@@ -4998,7 +5033,7 @@ mod tests {
                 )
                 .await
                 .expect_err("pre-transport cancellation must fail without poisoning");
-            assert_cancelled_mux_io(&cancel_error);
+            assert_cancelled_mux_error(&cancel_error);
             assert_eq!(client.serial, serial_before_cancel);
             assert!(client.outstanding_requests.is_empty());
             assert!(!client.connection_poisoned);
@@ -5250,7 +5285,11 @@ mod tests {
             &error,
             DirectMuxError::DuplicateRenderBatchPane { pane_id: 7 }
         ));
-        assert_eq!(error.protocol_error_kind(), ProtocolErrorKind::Permanent);
+        let decision = error.recovery_decision();
+        assert_eq!(decision.kind, ProtocolErrorKind::Permanent);
+        assert!(!decision.retry);
+        assert_eq!(decision.connection, MuxConnectionDisposition::Reuse);
+        assert!(!decision.cancelled);
         validate_render_batch_panes(&[7, 9, 11]).expect("unique pane IDs remain admissible");
     }
 
@@ -5965,7 +6004,7 @@ mod tests {
                 .send_next_with_cx(&cx)
                 .await
                 .expect_err("second request must cancel before its write boundary");
-            assert_cancelled_mux_io(&error);
+            assert_cancelled_mux_error(&error);
             assert!(!guard.transport_ambiguous);
             drop(guard);
 
@@ -7576,7 +7615,7 @@ mod tests {
                 .get_pane_render_changes_batch_with_cx(&cx, &[10, 20], 2, Duration::from_millis(40))
                 .await
                 .expect_err("batch with cx should surface cancellation");
-            assert_cancelled_mux_io(&err);
+            assert_cancelled_mux_error(&err);
             assert!(client.connection_poisoned);
             assert!(client.outstanding_requests.is_empty());
             assert!(client.pending_responses.is_empty());
@@ -7662,12 +7701,16 @@ mod tests {
             .validate()
             .expect_err("zero retention bound must fail closed");
         assert!(matches!(
-            err,
+            &err,
             DirectMuxError::InvalidLimit {
                 field: "max_pending_render_changes"
             }
         ));
-        assert_eq!(err.protocol_error_kind(), ProtocolErrorKind::Permanent);
+        let decision = err.recovery_decision();
+        assert_eq!(decision.kind, ProtocolErrorKind::Permanent);
+        assert!(!decision.retry);
+        assert_eq!(decision.connection, MuxConnectionDisposition::Reuse);
+        assert!(!decision.cancelled);
     }
 
     fn permutation_from_keys(keys: &[u32]) -> Vec<usize> {
@@ -8099,6 +8142,13 @@ mod tests {
             CompressionMode::Never,
             &permanent
         ));
+
+        let cancelled = cancelled_mux_error("connect_wait", "caller cancelled");
+        assert!(!should_auto_fallback_to_always(
+            crate::config::VendoredCompressionMode::Auto,
+            CompressionMode::Never,
+            &cancelled
+        ));
     }
 
     #[test]
@@ -8125,13 +8175,34 @@ mod tests {
     }
 
     #[test]
-    fn cancelled_mux_io_is_detected_without_changing_protocol_bucket() {
+    fn explicit_mux_cancellation_preserves_all_recovery_axes() {
+        let err = cancelled_mux_error("request_write_wait", "test cancel");
+        assert!(matches!(
+            &err,
+            DirectMuxError::Cancelled { phase, detail }
+                if *phase == "request_write_wait" && detail == "test cancel"
+        ));
+        assert!(err.is_cancelled());
+        assert_eq!(err.protocol_error_kind(), ProtocolErrorKind::Transient);
+        let decision = err.recovery_decision();
+        assert!(!decision.retry);
+        assert!(decision.cancelled);
+        assert!(matches!(
+            decision.connection,
+            MuxConnectionDisposition::Discard
+        ));
+    }
+
+    #[test]
+    fn legacy_cancelled_mux_io_is_detected_without_changing_kind_projection() {
         let err = DirectMuxError::Io(std::io::Error::new(
             std::io::ErrorKind::Interrupted,
             "mux request_write_wait cancelled: test cancel",
         ));
         assert!(err.is_cancelled());
         assert_eq!(err.protocol_error_kind(), ProtocolErrorKind::Transient);
+        assert!(!err.recovery_decision().retry);
+        assert!(err.recovery_decision().cancelled);
     }
 
     #[test]
@@ -8151,6 +8222,39 @@ mod tests {
             "generic interrupt",
         ));
         assert!(!err.is_cancelled());
+        assert!(err.recovery_decision().retry);
+        assert!(matches!(
+            err.recovery_decision().connection,
+            MuxConnectionDisposition::Discard
+        ));
+    }
+
+    #[test]
+    fn remote_error_is_not_replayed_and_preserves_connection_alignment() {
+        let err = DirectMuxError::RemoteError("application rejected request".to_string());
+        let decision = err.recovery_decision();
+        assert_eq!(decision.kind, ProtocolErrorKind::Transient);
+        assert!(!decision.retry);
+        assert!(!decision.cancelled);
+        assert!(matches!(
+            decision.connection,
+            MuxConnectionDisposition::Reuse
+        ));
+    }
+
+    #[test]
+    fn subscription_retries_only_replayable_errors_on_reusable_connections() {
+        for err in [
+            DirectMuxError::ReadTimeout,
+            DirectMuxError::Disconnected,
+            DirectMuxError::RemoteError("application rejected request".to_string()),
+            cancelled_mux_error("response_read_wait", "scope ended"),
+        ] {
+            assert!(
+                !subscription_can_retry_same_client(&err),
+                "subscription must terminate for {err:?}"
+            );
+        }
     }
 
     #[test]
@@ -8260,6 +8364,10 @@ mod tests {
                 remote: 1,
                 remote_version: "old".to_string(),
             },
+            DirectMuxError::Cancelled {
+                phase: "request_write_wait",
+                detail: "scope ended".to_string(),
+            },
         ];
         for err in &errors {
             let msg = err.to_string();
@@ -8342,7 +8450,7 @@ mod tests {
             let err = DirectMuxClient::connect_with_cx(&cx, config)
                 .await
                 .expect_err("pre-cancelled connect_with_cx should fail fast");
-            assert_cancelled_mux_io(&err);
+            assert_cancelled_mux_error(&err);
             assert!(
                 !server.await.expect("server task"),
                 "pre-cancelled connect should not open a socket connection"
@@ -8533,7 +8641,7 @@ mod tests {
                 .list_panes_with_cx(&cx)
                 .await
                 .expect_err("list_panes_with_cx should surface cancellation");
-            assert_cancelled_mux_io(&err);
+            assert_cancelled_mux_error(&err);
 
             drop(client);
             cancel.join().expect("cancel thread");
@@ -8794,7 +8902,7 @@ mod tests {
                 .send_paste_with_cx(&cx, 0, payload)
                 .await
                 .expect_err("send_paste_with_cx should surface cancellation");
-            assert_cancelled_mux_io(&err);
+            assert_cancelled_mux_error(&err);
 
             drop(client);
             cancel.join().expect("cancel thread");

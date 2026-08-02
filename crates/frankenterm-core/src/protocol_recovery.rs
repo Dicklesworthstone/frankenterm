@@ -4,8 +4,8 @@
 //! sync on the PDU stream), naively retrying on the *same* connection fails
 //! because the buffer state is inconsistent. This module provides:
 //!
-//! - **Error classification**: categorize `DirectMuxError` into Recoverable,
-//!   Transient, or Permanent — driving retry/reconnect decisions.
+//! - **Recovery decisions**: classify `DirectMuxError` while independently
+//!   deciding retry, connection reuse, and cancellation semantics.
 //! - **`RecoveryEngine`**: wraps operations with a [`CircuitBreaker`] and
 //!   retry logic for transparent recovery from protocol corruption.
 //! - **Frame corruption detection**: heuristics to detect when a PDU stream
@@ -115,11 +115,17 @@ pub struct ConnectionHealthTelemetrySnapshot {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProtocolErrorKind {
-    /// Connection state is corrupted — must drop connection and reconnect.
+    /// Protocol or connection state is corrupted.
+    ///
+    /// Consult [`MuxRecoveryDecision`] for retry and connection disposition;
+    /// this diagnostic category does not carry either policy by itself.
     Recoverable,
-    /// Temporary condition — retry after backoff.
+    /// Temporary or unstructured condition.
+    ///
+    /// Some transient errors are intentionally not replayed, and some can
+    /// safely reuse their connection. Consult [`MuxRecoveryDecision`].
     Transient,
-    /// Unrecoverable — do not retry.
+    /// The operation cannot be repaired by retrying it unchanged.
     Permanent,
 }
 
@@ -133,14 +139,44 @@ impl std::fmt::Display for ProtocolErrorKind {
     }
 }
 
+/// Whether a mux connection remains admissible after an operation error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MuxConnectionDisposition {
+    /// The error preserves framing and request/response alignment.
+    Reuse,
+    /// The connection is absent, ambiguous, corrupted, or otherwise unsafe.
+    Discard,
+}
+
+/// Canonical multi-axis recovery decision for a direct mux error.
+///
+/// `kind` is diagnostic classification. `retry` controls replay of the failed
+/// operation. `connection` controls whether the current connection may be
+/// used again. `cancelled` preserves structured caller-cancellation authority.
+/// Consumers must not infer any one axis from another.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[must_use]
+pub struct MuxRecoveryDecision {
+    /// Diagnostic category for telemetry and generic recovery machinery.
+    pub kind: ProtocolErrorKind,
+    /// Whether replaying the failed logical operation is admissible.
+    pub retry: bool,
+    /// Whether the connection involved in the failure may be reused.
+    pub connection: MuxConnectionDisposition,
+    /// Whether structured caller cancellation caused the failure.
+    pub cancelled: bool,
+}
+
 /// Classify an error message string into a recovery category.
 ///
 /// This is a compatibility heuristic for callers that no longer retain their
-/// typed error.  Typed mux callers must use `classify_mux_error`, whose
-/// exhaustive match is the canonical authority. Stable non-cancellation
-/// display forms emitted by `DirectMuxError` are kept aligned where the text
-/// retains the typed error kind. Explicit cancellation and arbitrary custom
-/// `io::Error` payloads cannot be reconstructed reliably from a string.
+/// typed error. Typed mux callers must use `mux_recovery_decision`, whose
+/// exhaustive match is the canonical authority. Stable display forms emitted
+/// by `DirectMuxError` are kept aligned where text retains the diagnostic kind.
+/// A cancellation display can project to `Transient`, but a string cannot
+/// preserve the independent `cancelled`, `retry`, or connection axes.
 #[must_use]
 pub fn classify_error_message(msg: &str) -> ProtocolErrorKind {
     let lower = msg.to_lowercase();
@@ -152,10 +188,23 @@ pub fn classify_error_message(msg: &str) -> ProtocolErrorKind {
     if lower.starts_with("remote error:") {
         return ProtocolErrorKind::Transient;
     }
+    if lower.starts_with("mux ")
+        && (lower.contains(" cancelled:") || lower.contains(" canceled:"))
+    {
+        return ProtocolErrorKind::Transient;
+    }
     if lower.starts_with("unexpected response:") || lower.starts_with("codec error:") {
         return ProtocolErrorKind::Recoverable;
     }
     if lower.starts_with("io error:") {
+        // Defensive parity for cancellation strings emitted before the typed
+        // `DirectMuxError::Cancelled` variant existed. This recovers only the
+        // diagnostic kind; text cannot recover the cancellation authority.
+        if lower.contains("mux ")
+            && (lower.contains(" cancelled:") || lower.contains(" canceled:"))
+        {
+            return ProtocolErrorKind::Transient;
+        }
         if lower.contains("broken pipe")
             || lower.contains("connection reset")
             || lower.contains("not connected")
@@ -235,31 +284,56 @@ pub fn classify_error_message(msg: &str) -> ProtocolErrorKind {
     ProtocolErrorKind::Recoverable
 }
 
-/// Canonical, exhaustive recovery classification for
+/// Canonical, exhaustive recovery authority for
 /// [`crate::vendored::DirectMuxError`].
 ///
-/// `Recoverable` means that the error variant itself establishes that the
-/// connection cannot be trusted and a caller may retry only after discarding
-/// it. `Transient` means that the variant alone does not establish protocol
-/// corruption; transport-side ambiguity may still require the owning client
-/// to poison the connection. `Permanent` means that replay cannot repair the
-/// failure. Explicit capability cancellation remains an orthogonal no-retry
-/// authority via `DirectMuxError::is_cancelled`.
-///
-/// This match intentionally has no wildcard. Adding a new `DirectMuxError`
-/// variant therefore fails compilation until its recovery disposition is
-/// chosen here.
+/// The four axes are deliberately explicit: diagnostic kind, operation
+/// replay, connection reuse, and cancellation. This match intentionally has no
+/// wildcard. Adding a new `DirectMuxError` variant therefore fails compilation
+/// until every recovery axis is chosen here.
 #[cfg(all(feature = "vendored", unix))]
 #[must_use]
-pub fn classify_mux_error(err: &crate::vendored::DirectMuxError) -> ProtocolErrorKind {
+pub fn mux_recovery_decision(err: &crate::vendored::DirectMuxError) -> MuxRecoveryDecision {
     use crate::vendored::DirectMuxError;
+    use MuxConnectionDisposition::{Discard, Reuse};
+
     match err {
         DirectMuxError::SocketPathMissing
         | DirectMuxError::ProxyUnsupported
         | DirectMuxError::IncompatibleCodec { .. }
-        | DirectMuxError::ConnectionIdExhausted
-        | DirectMuxError::InvalidLimit { .. }
-        | DirectMuxError::DuplicateRenderBatchPane { .. } => ProtocolErrorKind::Permanent,
+        | DirectMuxError::ConnectionIdExhausted => MuxRecoveryDecision {
+            kind: ProtocolErrorKind::Permanent,
+            retry: false,
+            connection: Discard,
+            cancelled: false,
+        },
+
+        // These failures are established by local validation before any wire
+        // state is touched. They cannot invalidate an already aligned client.
+        DirectMuxError::InvalidLimit { .. }
+        | DirectMuxError::DuplicateRenderBatchPane { .. } => MuxRecoveryDecision {
+            kind: ProtocolErrorKind::Permanent,
+            retry: false,
+            connection: Reuse,
+            cancelled: false,
+        },
+
+        DirectMuxError::Cancelled { .. } => MuxRecoveryDecision {
+            kind: ProtocolErrorKind::Transient,
+            retry: false,
+            connection: Discard,
+            cancelled: true,
+        },
+
+        // A structured server error is a completed, framed response. Its
+        // application semantics are unknown, so replay is forbidden while the
+        // still-aligned connection remains reusable.
+        DirectMuxError::RemoteError(_) => MuxRecoveryDecision {
+            kind: ProtocolErrorKind::Transient,
+            retry: false,
+            connection: Reuse,
+            cancelled: false,
+        },
 
         DirectMuxError::Disconnected
         | DirectMuxError::UnexpectedResponse { .. }
@@ -272,29 +346,84 @@ pub fn classify_mux_error(err: &crate::vendored::DirectMuxError) -> ProtocolErro
         | DirectMuxError::RetentionLimitExceeded { .. }
         | DirectMuxError::ResponseSerialNotOutstanding { .. }
         | DirectMuxError::RetainedConnectionMismatch { .. }
-        | DirectMuxError::RetainedStateAccounting { .. } => ProtocolErrorKind::Recoverable,
+        | DirectMuxError::RetainedStateAccounting { .. } => MuxRecoveryDecision {
+            kind: ProtocolErrorKind::Recoverable,
+            retry: true,
+            connection: Discard,
+            cancelled: false,
+        },
 
-        DirectMuxError::SocketNotFound(_)
-        | DirectMuxError::ConnectTimeout(_)
-        | DirectMuxError::RemoteError(_) => ProtocolErrorKind::Transient,
-
-        DirectMuxError::Io(io_err) => match io_err.kind() {
-            std::io::ErrorKind::BrokenPipe
-            | std::io::ErrorKind::ConnectionReset
-            | std::io::ErrorKind::NotConnected
-            | std::io::ErrorKind::ConnectionAborted
-            | std::io::ErrorKind::UnexpectedEof => ProtocolErrorKind::Recoverable,
-            std::io::ErrorKind::WouldBlock
-            | std::io::ErrorKind::Interrupted
-            | std::io::ErrorKind::TimedOut
-            | std::io::ErrorKind::ConnectionRefused
-            | std::io::ErrorKind::AddrNotAvailable => ProtocolErrorKind::Transient,
-            std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::InvalidInput => {
-                ProtocolErrorKind::Permanent
+        DirectMuxError::SocketNotFound(_) | DirectMuxError::ConnectTimeout(_) => {
+            MuxRecoveryDecision {
+                kind: ProtocolErrorKind::Transient,
+                retry: true,
+                connection: Discard,
+                cancelled: false,
             }
-            _ => ProtocolErrorKind::Recoverable,
+        }
+
+        DirectMuxError::Io(_) if err.is_cancelled() => MuxRecoveryDecision {
+            kind: ProtocolErrorKind::Transient,
+            retry: false,
+            connection: Discard,
+            cancelled: true,
+        },
+        DirectMuxError::Io(io_err) => {
+            let (kind, retry, connection) = match io_err.kind() {
+                std::io::ErrorKind::BrokenPipe
+                | std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::NotConnected
+                | std::io::ErrorKind::ConnectionAborted
+                | std::io::ErrorKind::UnexpectedEof => {
+                    (ProtocolErrorKind::Recoverable, true, Discard)
+                }
+                // `Io` has no operation-phase/progress proof. Even an
+                // interrupt or would-block can surface after request bytes
+                // were committed, so every transient I/O replay uses a fresh
+                // connection.
+                std::io::ErrorKind::WouldBlock
+                | std::io::ErrorKind::Interrupted
+                | std::io::ErrorKind::TimedOut
+                | std::io::ErrorKind::ConnectionRefused
+                | std::io::ErrorKind::AddrNotAvailable => {
+                    (ProtocolErrorKind::Transient, true, Discard)
+                }
+                std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::InvalidInput => {
+                    (ProtocolErrorKind::Permanent, false, Discard)
+                }
+                _ => (ProtocolErrorKind::Recoverable, true, Discard),
+            };
+            MuxRecoveryDecision {
+                kind,
+                retry,
+                connection,
+                cancelled: false,
+            }
+        }
+    }
+}
+
+/// Canonical recovery authority for the non-Unix vendored stub.
+#[cfg(all(feature = "vendored", not(unix)))]
+#[must_use]
+pub fn mux_recovery_decision(err: &crate::vendored::DirectMuxError) -> MuxRecoveryDecision {
+    use crate::vendored::DirectMuxError;
+
+    match err {
+        DirectMuxError::UnsupportedPlatform => MuxRecoveryDecision {
+            kind: ProtocolErrorKind::Permanent,
+            retry: false,
+            connection: MuxConnectionDisposition::Discard,
+            cancelled: false,
         },
     }
+}
+
+/// Diagnostic-kind projection of [`mux_recovery_decision`].
+#[cfg(feature = "vendored")]
+#[must_use]
+pub fn classify_mux_error(err: &crate::vendored::DirectMuxError) -> ProtocolErrorKind {
+    mux_recovery_decision(err).kind
 }
 
 /// Configuration for protocol error recovery.
@@ -1003,41 +1132,76 @@ mod tests {
 
     #[cfg(all(feature = "vendored", unix))]
     #[test]
-    fn direct_mux_error_classification_has_one_exhaustive_authority() {
+    fn direct_mux_recovery_decision_has_one_exhaustive_authority() {
         use crate::vendored::DirectMuxError;
+        use MuxConnectionDisposition::{Discard, Reuse};
+
+        let permanent_discard = MuxRecoveryDecision {
+            kind: ProtocolErrorKind::Permanent,
+            retry: false,
+            connection: Discard,
+            cancelled: false,
+        };
+        let permanent_reuse = MuxRecoveryDecision {
+            kind: ProtocolErrorKind::Permanent,
+            retry: false,
+            connection: Reuse,
+            cancelled: false,
+        };
+        let transient_retry = MuxRecoveryDecision {
+            kind: ProtocolErrorKind::Transient,
+            retry: true,
+            connection: Discard,
+            cancelled: false,
+        };
+        let recoverable_retry = MuxRecoveryDecision {
+            kind: ProtocolErrorKind::Recoverable,
+            retry: true,
+            connection: Discard,
+            cancelled: false,
+        };
+        let remote_no_replay = MuxRecoveryDecision {
+            kind: ProtocolErrorKind::Transient,
+            retry: false,
+            connection: Reuse,
+            cancelled: false,
+        };
+        let cancelled = MuxRecoveryDecision {
+            kind: ProtocolErrorKind::Transient,
+            retry: false,
+            connection: Discard,
+            cancelled: true,
+        };
 
         let cases = [
-            (DirectMuxError::SocketPathMissing, ProtocolErrorKind::Permanent),
+            (DirectMuxError::SocketPathMissing, permanent_discard),
             (
                 DirectMuxError::SocketNotFound(std::path::PathBuf::from(
                     "/tmp/incompatible socket path not found.sock",
                 )),
-                ProtocolErrorKind::Transient,
+                transient_retry,
             ),
-            (DirectMuxError::ProxyUnsupported, ProtocolErrorKind::Permanent),
+            (DirectMuxError::ProxyUnsupported, permanent_discard),
             (
                 DirectMuxError::ConnectTimeout(std::path::PathBuf::from(
                     "/tmp/incompatible socket path not found.sock",
                 )),
-                ProtocolErrorKind::Transient,
+                transient_retry,
             ),
-            (DirectMuxError::ReadTimeout, ProtocolErrorKind::Recoverable),
-            (DirectMuxError::WriteTimeout, ProtocolErrorKind::Recoverable),
-            (DirectMuxError::Disconnected, ProtocolErrorKind::Recoverable),
+            (DirectMuxError::ReadTimeout, recoverable_retry),
+            (DirectMuxError::WriteTimeout, recoverable_retry),
+            (DirectMuxError::Disconnected, recoverable_retry),
             (
                 DirectMuxError::FrameTooLarge { max_bytes: 1024 },
-                ProtocolErrorKind::Recoverable,
+                recoverable_retry,
             ),
-            (
-                DirectMuxError::ConnectionIdExhausted,
-                ProtocolErrorKind::Permanent,
-            ),
-            (DirectMuxError::SerialExhausted, ProtocolErrorKind::Recoverable),
+            (DirectMuxError::ConnectionIdExhausted, permanent_discard),
+            (DirectMuxError::SerialExhausted, recoverable_retry),
             (
                 DirectMuxError::InvalidLimit {
                     field: "max_pending_responses",
                 },
-                ProtocolErrorKind::Permanent,
+                permanent_reuse,
             ),
             (
                 DirectMuxError::RetentionLimitExceeded {
@@ -1047,50 +1211,50 @@ mod tests {
                     max_count: 1,
                     max_bytes: 16,
                 },
-                ProtocolErrorKind::Recoverable,
+                recoverable_retry,
             ),
             (
                 DirectMuxError::ResponseSerialNotOutstanding {
                     connection_id: 7,
                     serial: 9,
                 },
-                ProtocolErrorKind::Recoverable,
+                recoverable_retry,
             ),
             (
                 DirectMuxError::RetainedConnectionMismatch {
                     expected_connection_id: 8,
                     got_connection_id: 7,
                 },
-                ProtocolErrorKind::Recoverable,
+                recoverable_retry,
             ),
             (
                 DirectMuxError::RetainedStateAccounting {
                     resource: "pending mux responses",
                 },
-                ProtocolErrorKind::Recoverable,
+                recoverable_retry,
             ),
             (
                 DirectMuxError::Codec("codec version mismatch in payload".to_string()),
-                ProtocolErrorKind::Recoverable,
+                recoverable_retry,
             ),
             (
                 DirectMuxError::RemoteError("client is incompatible with pane".to_string()),
-                ProtocolErrorKind::Transient,
+                remote_no_replay,
             ),
             (
                 DirectMuxError::BatchTimeout { timeout_ms: 25 },
-                ProtocolErrorKind::Recoverable,
+                recoverable_retry,
             ),
             (
                 DirectMuxError::DuplicateRenderBatchPane { pane_id: 7 },
-                ProtocolErrorKind::Permanent,
+                permanent_reuse,
             ),
             (
                 DirectMuxError::UnexpectedResponse {
                     expected: "ListPanesResponse".to_string(),
                     got: "incompatible UnitResponse".to_string(),
                 },
-                ProtocolErrorKind::Recoverable,
+                recoverable_retry,
             ),
             (
                 DirectMuxError::IncompatibleCodec {
@@ -1098,28 +1262,45 @@ mod tests {
                     remote: 3,
                     remote_version: "old".to_string(),
                 },
-                ProtocolErrorKind::Permanent,
+                permanent_discard,
+            ),
+            (
+                DirectMuxError::Cancelled {
+                    phase: "request_write_wait",
+                    detail: "caller abandoned scope".to_string(),
+                },
+                cancelled,
             ),
             (
                 DirectMuxError::Io(std::io::Error::from(std::io::ErrorKind::BrokenPipe)),
-                ProtocolErrorKind::Recoverable,
+                recoverable_retry,
             ),
         ];
 
         for (error, expected) in cases {
             assert_eq!(
-                classify_mux_error(&error),
+                mux_recovery_decision(&error),
                 expected,
-                "canonical typed classification for {error:?}"
+                "canonical typed decision for {error:?}"
+            );
+            assert_eq!(
+                error.recovery_decision(),
+                expected,
+                "DirectMuxError decision method must delegate for {error:?}"
+            );
+            assert_eq!(
+                classify_mux_error(&error),
+                expected.kind,
+                "kind projection for {error:?}"
             );
             assert_eq!(
                 error.protocol_error_kind(),
-                expected,
-                "DirectMuxError method must delegate for {error:?}"
+                expected.kind,
+                "DirectMuxError kind method must delegate for {error:?}"
             );
             assert_eq!(
                 classify_error_message(&error.to_string()),
-                expected,
+                expected.kind,
                 "typed error display heuristic must agree for {error:?}"
             );
         }
@@ -1129,6 +1310,7 @@ mod tests {
     #[test]
     fn direct_mux_io_classification_covers_recovery_kinds_and_cancellation_signal() {
         use crate::vendored::DirectMuxError;
+        use MuxConnectionDisposition::Discard;
 
         for kind in [
             std::io::ErrorKind::BrokenPipe,
@@ -1139,8 +1321,15 @@ mod tests {
             std::io::ErrorKind::Other,
         ] {
             let error = DirectMuxError::Io(std::io::Error::from(kind));
-            assert_eq!(classify_mux_error(&error), ProtocolErrorKind::Recoverable);
-            assert_eq!(error.protocol_error_kind(), ProtocolErrorKind::Recoverable);
+            assert_eq!(
+                error.recovery_decision(),
+                MuxRecoveryDecision {
+                    kind: ProtocolErrorKind::Recoverable,
+                    retry: true,
+                    connection: Discard,
+                    cancelled: false,
+                }
+            );
             assert_eq!(
                 classify_error_message(&error.to_string()),
                 ProtocolErrorKind::Recoverable
@@ -1155,8 +1344,15 @@ mod tests {
             std::io::ErrorKind::AddrNotAvailable,
         ] {
             let error = DirectMuxError::Io(std::io::Error::from(kind));
-            assert_eq!(classify_mux_error(&error), ProtocolErrorKind::Transient);
-            assert_eq!(error.protocol_error_kind(), ProtocolErrorKind::Transient);
+            assert_eq!(
+                error.recovery_decision(),
+                MuxRecoveryDecision {
+                    kind: ProtocolErrorKind::Transient,
+                    retry: true,
+                    connection: Discard,
+                    cancelled: false,
+                }
+            );
             assert_eq!(
                 classify_error_message(&error.to_string()),
                 ProtocolErrorKind::Transient
@@ -1168,8 +1364,15 @@ mod tests {
             std::io::ErrorKind::InvalidInput,
         ] {
             let error = DirectMuxError::Io(std::io::Error::from(kind));
-            assert_eq!(classify_mux_error(&error), ProtocolErrorKind::Permanent);
-            assert_eq!(error.protocol_error_kind(), ProtocolErrorKind::Permanent);
+            assert_eq!(
+                error.recovery_decision(),
+                MuxRecoveryDecision {
+                    kind: ProtocolErrorKind::Permanent,
+                    retry: false,
+                    connection: Discard,
+                    cancelled: false,
+                }
+            );
             assert_eq!(
                 classify_error_message(&error.to_string()),
                 ProtocolErrorKind::Permanent
@@ -1181,7 +1384,20 @@ mod tests {
             "mux request_write_wait cancelled: caller abandoned scope",
         ));
         assert!(cancelled.is_cancelled());
-        assert_eq!(classify_mux_error(&cancelled), ProtocolErrorKind::Transient);
+        assert_eq!(
+            cancelled.recovery_decision(),
+            MuxRecoveryDecision {
+                kind: ProtocolErrorKind::Transient,
+                retry: false,
+                connection: Discard,
+                cancelled: true,
+            }
+        );
+        assert_eq!(
+            classify_error_message(&cancelled.to_string()),
+            ProtocolErrorKind::Transient,
+            "legacy cancellation text preserves only the kind projection"
+        );
     }
 
     #[test]

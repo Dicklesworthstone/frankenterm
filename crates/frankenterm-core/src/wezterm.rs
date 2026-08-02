@@ -1097,8 +1097,11 @@ pub struct WeztermClient {
     #[cfg(all(feature = "vendored", unix))]
     mux_circuit_breaker: Arc<Mutex<CircuitBreaker>>,
     /// Optional mux connection pool for direct socket communication.
-    /// When present, operations try the pool first; implicit-socket clients may
-    /// fall back to CLI, but explicit-socket clients keep failures hermetic.
+    /// When present, operations try the pool first. Implicit-socket clients may
+    /// use CLI failover only for canonically replayable transport failures;
+    /// pool admission, cancellation, remote rejection, and indeterminate
+    /// mutation errors surface directly. Explicit-socket clients keep every
+    /// failure hermetic.
     #[cfg(all(feature = "vendored", unix))]
     mux_pool: Option<Arc<crate::vendored::MuxPool>>,
     /// Time-windowed cache for CLI `list_panes` results.
@@ -1216,8 +1219,10 @@ impl WeztermClient {
     /// Attach a mux connection pool for direct socket communication.
     ///
     /// When a pool is attached, operations like `list_panes()` and `send_text()`
-    /// try the pool first. Implicit-socket clients may fall back to CLI
-    /// subprocess spawning on failure; explicit-socket clients do not.
+    /// try the pool first. Implicit-socket clients may use CLI failover for a
+    /// canonically replayable transport failure. Pool admission, cancellation,
+    /// remote rejection, and indeterminate mutation errors do not fail over;
+    /// explicit-socket clients never fail over.
     #[cfg(all(feature = "vendored", unix))]
     #[must_use]
     pub fn with_mux_pool(mut self, pool: Arc<crate::vendored::MuxPool>) -> Self {
@@ -1328,8 +1333,9 @@ impl WeztermClient {
     /// List all panes across all windows and tabs
     ///
     /// Returns a vector of `PaneInfo` structs with full metadata about each pane.
-    /// When a mux pool is configured, tries direct socket communication first
-    /// and falls back to CLI subprocess spawning on failure.
+    /// When a mux pool is configured, tries direct socket communication first.
+    /// An implicit-socket client uses CLI failover only for a canonically
+    /// replayable transport failure.
     pub async fn list_panes(&self) -> Result<Vec<PaneInfo>> {
         let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
         self.list_panes_with_cx(&cx).await
@@ -1340,12 +1346,11 @@ impl WeztermClient {
     ///
     /// Same semantics as [`list_panes`](Self::list_panes) with the
     /// mux-pool call rebound via `MuxPool::list_panes_with_cx(cx)`
-    /// (already Cx-first from prior ticks). The CLI fallback and
-    /// time-windowed cache are preserved — the cache is a std Mutex
-    /// (sync, no Cx needed), and `run_cli_with_retry` internal retry
-    /// sleeps remain ambient since threading Cx through the retry
-    /// helper is a larger structural refactor that would affect every
-    /// WeztermHandle async method.
+    /// (already Cx-first from prior ticks). Eligible transport failures retain
+    /// the CLI fallback and time-windowed cache — the cache is a std Mutex
+    /// (sync, no Cx needed), and `run_cli_with_retry` internal retry sleeps
+    /// remain ambient since threading Cx through the retry helper is a larger
+    /// structural refactor that would affect every WeztermHandle async method.
     ///
     /// Most callers (snapshot engine, watchdog, native-events,
     /// discovery loop) go through the mux-pool fast path, so the
@@ -1596,6 +1601,12 @@ impl WeztermClient {
                             }
                             Err(e) => {
                                 self.mux_circuit_record_failure(&e);
+                                if !self.mux_error_should_fallback_to_cli_for_client(&e) {
+                                    return Err(Self::mux_cancelled_error(
+                                        "get_text_with_cx",
+                                        e,
+                                    ));
+                                }
                                 tracing::debug!(
                                     error = %e,
                                     "mux pool get_text_with_cx: get_lines failed; falling back to CLI"
@@ -1874,8 +1885,9 @@ impl WeztermClient {
 
     /// Cx-first send_text (ft-xbnl0.2.3). Defaults to paste mode + newline.
     /// The mux-pool fast path uses `pool.send_paste_with_cx(cx)` /
-    /// `pool.write_to_pane_with_cx(cx)`; CLI fallback delegates to the
-    /// legacy [`send_text`](Self::send_text) path.
+    /// `pool.write_to_pane_with_cx(cx)`. CLI failover is limited to eligible
+    /// pre-mutation transport errors; an indeterminate mutation is surfaced
+    /// without replay.
     pub async fn send_text_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -2375,8 +2387,9 @@ impl WeztermClient {
 
     /// Internal implementation for send_text with paste mode option.
     ///
-    /// When a mux pool is available, uses direct socket communication
-    /// (paste mode or raw write) and falls back to CLI on failure.
+    /// When a mux pool is available, uses direct socket communication (paste
+    /// mode or raw write). CLI failover is limited to canonically replayable
+    /// pre-mutation transport failures.
     async fn send_text_impl(
         &self,
         pane_id: u64,
@@ -2391,10 +2404,11 @@ impl WeztermClient {
 
     /// Cx-first `send_text_impl` (ft-xbnl0.2.3). The mux-pool fast
     /// path uses `pool.write_to_pane_with_cx(cx)` /
-    /// `pool.send_paste_with_cx(cx)`. CLI fallback delegates to the
-    /// legacy `send_text_impl` since threading Cx through
-    /// `run_cli_with_pane_check` + `retry_with` would require a
-    /// wider refactor (same rationale as `list_panes_with_cx`).
+    /// `pool.send_paste_with_cx(cx)`. For an eligible pre-mutation transport
+    /// failure, CLI failover uses the legacy `run_cli_with_pane_check` helper;
+    /// threading Cx through that helper plus `retry_with` requires a wider
+    /// refactor. Pool admission, cancellation, and indeterminate mutation
+    /// errors surface without CLI replay.
     #[cfg(all(feature = "vendored", unix))]
     async fn send_text_impl_with_cx(
         &self,
@@ -2706,27 +2720,45 @@ impl WeztermClient {
     }
 
     #[cfg(all(feature = "vendored", unix))]
-    fn mux_error_is_circuit_breaker_trigger(err: &crate::vendored::MuxPoolError) -> bool {
+    fn mux_recovery_decision_requires_transport_failover(
+        decision: crate::protocol_recovery::MuxRecoveryDecision,
+    ) -> bool {
+        // `kind` is diagnostic only. Transport failover is admissible exactly
+        // when replay is allowed and the failed connection must be discarded;
+        // cancellation remains an overriding no-action authority.
+        !decision.cancelled
+            && decision.retry
+            && matches!(
+                decision.connection,
+                crate::protocol_recovery::MuxConnectionDisposition::Discard
+            )
+    }
+
+    #[cfg(all(feature = "vendored", unix))]
+    fn mux_error_requires_transport_failover(err: &crate::vendored::MuxPoolError) -> bool {
         match err {
-            crate::vendored::MuxPoolError::Pool(crate::pool::PoolError::Cancelled) => false,
-            crate::vendored::MuxPoolError::Pool(_) => true,
+            // Pool admission errors do not establish transport failure. In
+            // particular, falling back after `AcquireTimeout` would bypass the
+            // pool's bounded concurrency precisely when it is saturated.
+            // An indeterminate mutation may already have committed, so replay
+            // through the CLI is forbidden regardless of its inner error.
+            crate::vendored::MuxPoolError::Pool(_)
+            | crate::vendored::MuxPoolError::IndeterminateMutation(_) => false,
             crate::vendored::MuxPoolError::Mux(mux) => {
-                !matches!(mux, crate::vendored::DirectMuxError::RemoteError(_))
-                    && !mux.is_cancelled()
+                let decision = crate::protocol_recovery::mux_recovery_decision(mux);
+                Self::mux_recovery_decision_requires_transport_failover(decision)
             }
         }
     }
 
     #[cfg(all(feature = "vendored", unix))]
+    fn mux_error_is_circuit_breaker_trigger(err: &crate::vendored::MuxPoolError) -> bool {
+        Self::mux_error_requires_transport_failover(err)
+    }
+
+    #[cfg(all(feature = "vendored", unix))]
     fn mux_error_should_fallback_to_cli(err: &crate::vendored::MuxPoolError) -> bool {
-        match err {
-            crate::vendored::MuxPoolError::Pool(crate::pool::PoolError::Cancelled) => false,
-            crate::vendored::MuxPoolError::Pool(_) => true,
-            crate::vendored::MuxPoolError::Mux(mux) => {
-                !matches!(mux, crate::vendored::DirectMuxError::RemoteError(_))
-                    && !mux.is_cancelled()
-            }
-        }
+        Self::mux_error_requires_transport_failover(err)
     }
 
     #[cfg(all(feature = "vendored", unix))]
@@ -2746,7 +2778,10 @@ impl WeztermClient {
             crate::vendored::MuxPoolError::Pool(crate::pool::PoolError::Cancelled) => {
                 crate::Error::Cancelled(format!("wezterm mux {op} cancelled: {err}"))
             }
-            crate::vendored::MuxPoolError::Mux(mux) if mux.is_cancelled() => {
+            crate::vendored::MuxPoolError::Mux(mux)
+            | crate::vendored::MuxPoolError::IndeterminateMutation(mux)
+                if mux.is_cancelled() =>
+            {
                 crate::Error::Cancelled(format!("wezterm mux {op} cancelled: {err}"))
             }
             _ => WeztermError::CommandFailed(format!(
@@ -5771,10 +5806,32 @@ mod tests {
     }
 
     #[cfg(all(feature = "vendored", unix))]
+    fn assert_mux_transport_failover(
+        err: &crate::vendored::MuxPoolError,
+        expected: bool,
+    ) {
+        assert_eq!(
+            WeztermClient::mux_error_requires_transport_failover(err),
+            expected,
+            "canonical transport-failover predicate disagreed for {err:?}"
+        );
+        assert_eq!(
+            WeztermClient::mux_error_is_circuit_breaker_trigger(err),
+            expected,
+            "circuit-breaker consumer disagreed for {err:?}"
+        );
+        assert_eq!(
+            WeztermClient::mux_error_should_fallback_to_cli(err),
+            expected,
+            "CLI-fallback consumer disagreed for {err:?}"
+        );
+    }
+
+    #[cfg(all(feature = "vendored", unix))]
     #[test]
     fn mux_pool_cancelled_does_not_trigger_circuit_breaker() {
         let err = crate::vendored::MuxPoolError::Pool(crate::pool::PoolError::Cancelled);
-        assert!(!WeztermClient::mux_error_is_circuit_breaker_trigger(&err));
+        assert_mux_transport_failover(&err, false);
     }
 
     #[cfg(all(feature = "vendored", unix))]
@@ -5786,7 +5843,7 @@ mod tests {
                 "mux response_read_wait cancelled: test cancellation",
             ),
         ));
-        assert!(!WeztermClient::mux_error_is_circuit_breaker_trigger(&err));
+        assert_mux_transport_failover(&err, false);
     }
 
     #[cfg(all(feature = "vendored", unix))]
@@ -5795,14 +5852,14 @@ mod tests {
         let err = crate::vendored::MuxPoolError::Mux(crate::vendored::DirectMuxError::RemoteError(
             "invalid spawn domain".to_string(),
         ));
-        assert!(!WeztermClient::mux_error_is_circuit_breaker_trigger(&err));
+        assert_mux_transport_failover(&err, false);
     }
 
     #[cfg(all(feature = "vendored", unix))]
     #[test]
     fn mux_pool_cancelled_does_not_fallback_to_cli() {
         let err = crate::vendored::MuxPoolError::Pool(crate::pool::PoolError::Cancelled);
-        assert!(!WeztermClient::mux_error_should_fallback_to_cli(&err));
+        assert_mux_transport_failover(&err, false);
     }
 
     #[cfg(all(feature = "vendored", unix))]
@@ -5814,7 +5871,7 @@ mod tests {
                 "mux response_read_wait cancelled: test cancellation",
             ),
         ));
-        assert!(!WeztermClient::mux_error_should_fallback_to_cli(&err));
+        assert_mux_transport_failover(&err, false);
     }
 
     #[cfg(all(feature = "vendored", unix))]
@@ -5823,14 +5880,173 @@ mod tests {
         let err = crate::vendored::MuxPoolError::Mux(crate::vendored::DirectMuxError::RemoteError(
             "invalid spawn domain".to_string(),
         ));
-        assert!(!WeztermClient::mux_error_should_fallback_to_cli(&err));
+        assert_mux_transport_failover(&err, false);
     }
 
     #[cfg(all(feature = "vendored", unix))]
     #[test]
-    fn mux_acquire_timeout_still_falls_back_to_cli() {
-        let err = crate::vendored::MuxPoolError::Pool(crate::pool::PoolError::AcquireTimeout);
-        assert!(WeztermClient::mux_error_should_fallback_to_cli(&err));
+    fn mux_transport_failover_does_not_infer_one_recovery_axis_from_another() {
+        use crate::protocol_recovery::{
+            MuxConnectionDisposition, MuxRecoveryDecision, ProtocolErrorKind,
+        };
+
+        let cases = [
+            (
+                MuxRecoveryDecision {
+                    kind: ProtocolErrorKind::Permanent,
+                    retry: true,
+                    connection: MuxConnectionDisposition::Discard,
+                    cancelled: false,
+                },
+                true,
+            ),
+            (
+                MuxRecoveryDecision {
+                    kind: ProtocolErrorKind::Recoverable,
+                    retry: false,
+                    connection: MuxConnectionDisposition::Discard,
+                    cancelled: false,
+                },
+                false,
+            ),
+            (
+                MuxRecoveryDecision {
+                    kind: ProtocolErrorKind::Recoverable,
+                    retry: true,
+                    connection: MuxConnectionDisposition::Reuse,
+                    cancelled: false,
+                },
+                false,
+            ),
+            (
+                MuxRecoveryDecision {
+                    kind: ProtocolErrorKind::Recoverable,
+                    retry: true,
+                    connection: MuxConnectionDisposition::Discard,
+                    cancelled: true,
+                },
+                false,
+            ),
+        ];
+
+        for (decision, expected) in cases {
+            assert_eq!(
+                WeztermClient::mux_recovery_decision_requires_transport_failover(decision),
+                expected,
+                "transport failover inferred one recovery axis from another: {decision:?}"
+            );
+        }
+    }
+
+    #[cfg(all(feature = "vendored", unix))]
+    #[test]
+    fn mux_transport_failover_consumes_every_recovery_decision_axis() {
+        use crate::protocol_recovery::{MuxConnectionDisposition, ProtocolErrorKind};
+        use crate::vendored::DirectMuxError;
+
+        let cases = [
+            (
+                DirectMuxError::RemoteError("unstructured server rejection".to_string()),
+                ProtocolErrorKind::Transient,
+                false,
+                false,
+                false,
+                false,
+            ),
+            (
+                DirectMuxError::Io(std::io::Error::from(
+                    std::io::ErrorKind::PermissionDenied,
+                )),
+                ProtocolErrorKind::Permanent,
+                false,
+                true,
+                false,
+                false,
+            ),
+            (
+                DirectMuxError::Io(std::io::Error::from(std::io::ErrorKind::WouldBlock)),
+                ProtocolErrorKind::Transient,
+                true,
+                true,
+                false,
+                true,
+            ),
+            (
+                DirectMuxError::Disconnected,
+                ProtocolErrorKind::Recoverable,
+                true,
+                true,
+                false,
+                true,
+            ),
+            (
+                DirectMuxError::Cancelled {
+                    phase: "response_read_wait",
+                    detail: "test cancellation".to_string(),
+                },
+                ProtocolErrorKind::Transient,
+                false,
+                true,
+                true,
+                false,
+            ),
+        ];
+
+        for (error, kind, retry, discard, cancelled, should_fail_over) in cases {
+            let decision = crate::protocol_recovery::mux_recovery_decision(&error);
+            assert_eq!(decision.kind, kind, "kind disagreed for {error:?}");
+            assert_eq!(decision.retry, retry, "retry disagreed for {error:?}");
+            assert_eq!(
+                matches!(decision.connection, MuxConnectionDisposition::Discard),
+                discard,
+                "connection disposition disagreed for {error:?}"
+            );
+            assert_eq!(
+                decision.cancelled, cancelled,
+                "cancellation disagreed for {error:?}"
+            );
+
+            assert_mux_transport_failover(
+                &crate::vendored::MuxPoolError::Mux(error),
+                should_fail_over,
+            );
+        }
+    }
+
+    #[cfg(all(feature = "vendored", unix))]
+    #[test]
+    fn mux_pool_admission_errors_do_not_escape_bounded_concurrency() {
+        for pool_error in [
+            crate::pool::PoolError::AcquireTimeout,
+            crate::pool::PoolError::Closed,
+            crate::pool::PoolError::Cancelled,
+        ] {
+            assert_mux_transport_failover(
+                &crate::vendored::MuxPoolError::Pool(pool_error),
+                false,
+            );
+        }
+    }
+
+    #[cfg(all(feature = "vendored", unix))]
+    #[test]
+    fn indeterminate_mutation_never_replays_through_another_transport() {
+        for mux_error in [
+            crate::vendored::DirectMuxError::Disconnected,
+            crate::vendored::DirectMuxError::UnexpectedResponse {
+                expected: "UnitResponse".to_string(),
+                got: "unexpected".to_string(),
+            },
+            crate::vendored::DirectMuxError::Cancelled {
+                phase: "mutation_response_wait",
+                detail: "test cancellation".to_string(),
+            },
+        ] {
+            assert_mux_transport_failover(
+                &crate::vendored::MuxPoolError::IndeterminateMutation(mux_error),
+                false,
+            );
+        }
     }
 
     #[cfg(all(feature = "vendored", unix))]
@@ -5881,6 +6097,22 @@ mod tests {
         assert!(
             matches!(mapped, crate::Error::Cancelled(message) if message.contains("list_panes"))
         );
+    }
+
+    #[cfg(all(feature = "vendored", unix))]
+    #[test]
+    fn indeterminate_mutation_preserves_typed_cancellation() {
+        let err = crate::vendored::MuxPoolError::IndeterminateMutation(
+            crate::vendored::DirectMuxError::Cancelled {
+                phase: "mutation_response_wait",
+                detail: "test cancellation".to_string(),
+            },
+        );
+        let mapped = WeztermClient::mux_cancelled_error("send_text_with_cx", err);
+        assert!(matches!(
+            mapped,
+            crate::Error::Cancelled(message) if message.contains("send_text_with_cx")
+        ));
     }
 
     #[cfg(all(feature = "vendored", unix))]

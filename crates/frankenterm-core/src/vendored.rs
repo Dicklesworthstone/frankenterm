@@ -31,6 +31,27 @@ pub enum DirectMuxError {
 }
 
 #[cfg(all(feature = "vendored", not(unix)))]
+impl DirectMuxError {
+    /// Return the canonical recovery decision for the non-Unix stub error.
+    #[must_use]
+    pub fn recovery_decision(&self) -> crate::protocol_recovery::MuxRecoveryDecision {
+        crate::protocol_recovery::mux_recovery_decision(self)
+    }
+
+    /// Whether this error represents an explicit capability-context cancellation.
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        self.recovery_decision().cancelled
+    }
+
+    /// Project the canonical multi-axis recovery decision to its diagnostic kind.
+    #[must_use]
+    pub fn protocol_error_kind(&self) -> crate::protocol_recovery::ProtocolErrorKind {
+        crate::protocol_recovery::classify_mux_error(self)
+    }
+}
+
+#[cfg(all(feature = "vendored", not(unix)))]
 #[derive(Debug, Clone, Default)]
 pub struct DirectMuxClientConfig;
 
@@ -655,5 +676,24 @@ mod tests {
         let v = WeztermVersion::parse("  wezterm 20240203-110809-5046fc22  ");
         assert_eq!(v.raw, "wezterm 20240203-110809-5046fc22");
         assert_eq!(v.commit.as_deref(), Some("5046fc22"));
+    }
+
+    #[cfg(all(feature = "vendored", not(unix)))]
+    #[test]
+    fn unsupported_platform_uses_canonical_mux_recovery_authority() {
+        use crate::protocol_recovery::{MuxConnectionDisposition, ProtocolErrorKind};
+
+        let error = DirectMuxError::UnsupportedPlatform;
+        let decision = error.recovery_decision();
+        assert_eq!(decision.kind, ProtocolErrorKind::Permanent);
+        assert!(!decision.retry);
+        assert_eq!(decision.connection, MuxConnectionDisposition::Discard);
+        assert!(!decision.cancelled);
+        assert!(!error.is_cancelled());
+        assert_eq!(error.protocol_error_kind(), ProtocolErrorKind::Permanent);
+        assert_eq!(
+            crate::protocol_recovery::classify_mux_error(&error),
+            ProtocolErrorKind::Permanent
+        );
     }
 }

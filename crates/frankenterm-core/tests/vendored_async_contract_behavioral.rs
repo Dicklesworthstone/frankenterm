@@ -108,16 +108,13 @@ fn cancelled_test_cx(message: &'static str) -> Cx {
 }
 
 #[cfg(all(feature = "vendored", unix, feature = "asupersync-runtime"))]
-fn assert_cancelled_mux_io(err: &DirectMuxError) {
+fn assert_cancelled_mux_error(err: &DirectMuxError) {
     match err {
-        DirectMuxError::Io(io_err) => {
-            assert_eq!(io_err.kind(), std::io::ErrorKind::Interrupted);
-            assert!(
-                io_err.to_string().contains("cancelled"),
-                "cancelled mux io error should mention cancellation: {io_err}"
-            );
+        DirectMuxError::Cancelled { phase, detail } => {
+            assert!(!phase.is_empty(), "cancelled mux phase must be retained");
+            assert!(!detail.is_empty(), "cancelled mux detail must be retained");
         }
-        other => panic!("expected cancelled io error, got: {other}"),
+        other => panic!("expected typed mux cancellation, got: {other}"),
     }
 }
 
@@ -1159,7 +1156,7 @@ fn b23d_explicit_cx_public_connect_cancellation_contract() {
         let err = Box::pin(DirectMuxClient::connect_with_cx(&cancelled_cx, config))
             .await
             .expect_err("connect_with_cx should fail fast for a pre-cancelled context");
-        assert_cancelled_mux_io(&err);
+        assert_cancelled_mux_error(&err);
 
         let accepted = runtime_async::timeout(Duration::from_millis(500), server)
             .await
@@ -1277,7 +1274,7 @@ fn b23e_explicit_cx_public_list_panes_cancellation_contract() {
             .list_panes_with_cx(&cancelled_cx)
             .await
             .expect_err("list_panes_with_cx should fail fast for a pre-cancelled context");
-        assert_cancelled_mux_io(&err);
+        assert_cancelled_mux_error(&err);
 
         drop(client);
         let post_handshake_requests = runtime_async::timeout(Duration::from_millis(500), server)
@@ -1402,7 +1399,7 @@ fn b23f_explicit_cx_public_render_batch_cancellation_contract() {
         .expect_err(
             "get_pane_render_changes_batch_with_cx should fail fast for a pre-cancelled context",
         );
-        assert_cancelled_mux_io(&err);
+        assert_cancelled_mux_error(&err);
 
         drop(client);
         let post_handshake_batch_requests =
@@ -1522,7 +1519,7 @@ fn b23g_explicit_cx_public_get_lines_cancellation_contract() {
             .get_lines_with_cx(&cancelled_cx, 34, vec![0..3, 5..6])
             .await
             .expect_err("get_lines_with_cx should fail fast for a pre-cancelled context");
-        assert_cancelled_mux_io(&err);
+        assert_cancelled_mux_error(&err);
 
         drop(client);
         let post_handshake_requests = runtime_async::timeout(Duration::from_millis(500), server)
@@ -1641,7 +1638,7 @@ fn b23h_explicit_cx_public_write_to_pane_cancellation_contract() {
             .write_to_pane_with_cx(&cancelled_cx, 56, b"hello".to_vec())
             .await
             .expect_err("write_to_pane_with_cx should fail fast for a pre-cancelled context");
-        assert_cancelled_mux_io(&err);
+        assert_cancelled_mux_error(&err);
 
         drop(client);
         let post_handshake_requests = runtime_async::timeout(Duration::from_millis(500), server)
@@ -1762,7 +1759,7 @@ fn b23i_explicit_cx_public_single_render_cancellation_contract() {
             .expect_err(
                 "get_pane_render_changes_with_cx should fail fast for a pre-cancelled context",
             );
-        assert_cancelled_mux_io(&err);
+        assert_cancelled_mux_error(&err);
 
         drop(client);
         let post_handshake_requests = runtime_async::timeout(Duration::from_millis(500), server)
@@ -1881,7 +1878,7 @@ fn b23j_explicit_cx_public_send_paste_cancellation_contract() {
             .send_paste_with_cx(&cancelled_cx, 78, "paste me".to_string())
             .await
             .expect_err("send_paste_with_cx should fail fast for a pre-cancelled context");
-        assert_cancelled_mux_io(&err);
+        assert_cancelled_mux_error(&err);
 
         drop(client);
         let post_handshake_requests = runtime_async::timeout(Duration::from_millis(500), server)

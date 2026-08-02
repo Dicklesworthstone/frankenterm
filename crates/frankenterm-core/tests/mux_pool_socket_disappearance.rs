@@ -142,8 +142,9 @@ fn mux_pool_handles_socket_disappearance_with_structured_error() {
 
     // The post-fault op MUST fail with a structured error. The exact
     // variant is informational; what we pin is that there is no
-    // panic, no Ok success, and the error is a recognised
-    // MuxPoolError variant.
+    // panic, no Ok success, and the read-only operation reports either an
+    // acquisition/protocol error or a pool-admission error. It must never be
+    // classified as an indeterminate mutation.
     let post_result = runtime.block_on(async { Box::pin(pool.list_panes()).await });
 
     match post_result {
@@ -160,6 +161,9 @@ fn mux_pool_handles_socket_disappearance_with_structured_error() {
         Err(MuxPoolError::Pool(err)) => {
             eprintln!("ft-7v53r: pool-layer failure: {err}");
         }
+        Err(MuxPoolError::IndeterminateMutation(err)) => panic!(
+            "ft-7v53r: read-only list_panes unexpectedly reported an indeterminate mutation: {err}"
+        ),
     }
 
     // Stats must reflect the failure. At least one of the three
