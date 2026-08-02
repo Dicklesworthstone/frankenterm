@@ -24,7 +24,7 @@
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
@@ -81,6 +81,13 @@ pub enum PersistenceFailure {
     UnsupportedVersion { found: u32, current: u32 },
     #[error("persisted state is oversized: {actual} bytes exceeds {maximum}")]
     Oversized { actual: u64, maximum: u64 },
+    #[error(
+        "persisted state encoded-byte upper bound {projected_upper_bound} exceeds {maximum}"
+    )]
+    EncodedQuota {
+        projected_upper_bound: u64,
+        maximum: u64,
+    },
     #[error("persisted state is invalid: {reason}")]
     Invalid { reason: String },
     #[error("persisted state quota exceeded: {reason}")]
@@ -111,7 +118,9 @@ impl PersistenceFailure {
             Self::Io { .. } => PersistenceFailureCode::Io,
             Self::Corrupt { .. } => PersistenceFailureCode::Corrupt,
             Self::UnsupportedVersion { .. } => PersistenceFailureCode::UnsupportedVersion,
-            Self::Oversized { .. } => PersistenceFailureCode::Oversized,
+            Self::Oversized { .. } | Self::EncodedQuota { .. } => {
+                PersistenceFailureCode::Oversized
+            }
             Self::Invalid { .. } => PersistenceFailureCode::Invalid,
             Self::Quota { .. } => PersistenceFailureCode::Quota,
             Self::RevisionExhausted => PersistenceFailureCode::RevisionExhausted,
@@ -902,6 +911,12 @@ struct DiskSlot {
 #[serde(deny_unknown_fields)]
 struct DiskSlotV2 {
     payload: PersistedStateV2,
+    sha256: [u8; 32],
+}
+
+#[derive(Serialize)]
+struct BorrowedDiskSlot<'a> {
+    payload: &'a PersistedState,
     sha256: [u8; 32],
 }
 
@@ -2226,16 +2241,251 @@ fn validate_published_state(state: &PersistedState) -> Result<(), PersistenceFai
     Ok(())
 }
 
+#[derive(Default)]
+struct JsonLengthWriter {
+    bytes: u64,
+}
+
+impl Write for JsonLengthWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let added = u64::try_from(buf.len()).map_err(|_| {
+            io::Error::other("serialized JSON chunk length does not fit u64")
+        })?;
+        self.bytes = self.bytes.checked_add(added).ok_or_else(|| {
+            io::Error::other("serialized JSON length overflowed")
+        })?;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn encoded_json_len<T>(value: &T) -> Result<u64, PersistenceFailure>
+where
+    T: Serialize + ?Sized,
+{
+    let mut writer = JsonLengthWriter::default();
+    serde_json::to_writer(&mut writer, value)
+        .map_err(|_| PersistenceFailure::corrupt("could not count serialized JSON"))?;
+    Ok(writer.bytes)
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct JsonCollectionBudget {
+    item_bytes: u64,
+    item_count: usize,
+}
+
+impl JsonCollectionBudget {
+    fn insert(&mut self, item_bytes: u64) -> Result<(), PersistenceFailure> {
+        self.item_bytes = self
+            .item_bytes
+            .checked_add(item_bytes)
+            .ok_or_else(encoded_size_overflow)?;
+        self.item_count = self
+            .item_count
+            .checked_add(1)
+            .ok_or_else(encoded_size_overflow)?;
+        Ok(())
+    }
+
+    fn remove(&mut self, item_bytes: u64) -> Result<(), PersistenceFailure> {
+        self.item_bytes = self
+            .item_bytes
+            .checked_sub(item_bytes)
+            .ok_or_else(encoded_size_inconsistent)?;
+        self.item_count = self
+            .item_count
+            .checked_sub(1)
+            .ok_or_else(encoded_size_inconsistent)?;
+        Ok(())
+    }
+
+    fn replace(
+        &mut self,
+        old_item_bytes: u64,
+        new_item_bytes: u64,
+    ) -> Result<(), PersistenceFailure> {
+        self.remove(old_item_bytes)?;
+        self.insert(new_item_bytes)
+    }
+
+    fn contribution(self) -> Result<u64, PersistenceFailure> {
+        let separators = if self.item_count == 0 {
+            0
+        } else {
+            self.item_count
+                .checked_sub(1)
+                .ok_or_else(encoded_size_inconsistent)?
+        };
+        let separators = u64::try_from(separators).map_err(|_| encoded_size_overflow())?;
+        self.item_bytes
+            .checked_add(separators)
+            .ok_or_else(encoded_size_overflow)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct EncodedStateBudget {
+    empty_slot_bytes: u64,
+    window_states: JsonCollectionBudget,
+    domain_bindings: JsonCollectionBudget,
+    overlays: JsonCollectionBudget,
+    tombstones: JsonCollectionBudget,
+}
+
+impl EncodedStateBudget {
+    fn from_state(
+        state: &PersistedState,
+        published_revision: u64,
+    ) -> Result<Self, PersistenceFailure> {
+        Self::from_state_with_binding_width(state, published_revision, true)
+    }
+
+    fn from_state_with_physical_bindings(
+        state: &PersistedState,
+        published_revision: u64,
+    ) -> Result<Self, PersistenceFailure> {
+        Self::from_state_with_binding_width(state, published_revision, false)
+    }
+
+    fn from_state_with_binding_width(
+        state: &PersistedState,
+        published_revision: u64,
+        normalize_existing_bindings: bool,
+    ) -> Result<Self, PersistenceFailure> {
+        let empty = PersistedState {
+            store_revision: published_revision,
+            ..PersistedState::default()
+        };
+        let empty_slot_bytes = encoded_json_len(&BorrowedDiskSlot {
+            payload: &empty,
+            sha256: [u8::MAX; 32],
+        })?;
+        let mut budget = Self {
+            empty_slot_bytes,
+            window_states: JsonCollectionBudget::default(),
+            domain_bindings: JsonCollectionBudget::default(),
+            overlays: JsonCollectionBudget::default(),
+            tombstones: JsonCollectionBudget::default(),
+        };
+        for (workspace, window_state) in &state.window_states {
+            budget
+                .window_states
+                .insert(window_state_entry_len(workspace, window_state)?)?;
+        }
+        for binding in &state.domain_bindings {
+            let binding_bytes = if normalize_existing_bindings {
+                maximum_width_binding_len(binding.target_fingerprint)?
+            } else {
+                encoded_json_len(binding)?
+            };
+            budget.domain_bindings.insert(binding_bytes)?;
+        }
+        for overlay in &state.overlays {
+            budget.overlays.insert(encoded_json_len(overlay)?)?;
+        }
+        for tombstone in &state.tombstones {
+            budget.tombstones.insert(encoded_json_len(tombstone)?)?;
+        }
+        Ok(budget)
+    }
+
+    fn upper_bound(&self) -> Result<u64, PersistenceFailure> {
+        [
+            self.window_states,
+            self.domain_bindings,
+            self.overlays,
+            self.tombstones,
+        ]
+        .iter()
+        .try_fold(self.empty_slot_bytes, |total, collection| {
+            total
+                .checked_add(collection.contribution()?)
+                .ok_or_else(encoded_size_overflow)
+        })
+    }
+}
+
+fn encoded_size_overflow() -> PersistenceFailure {
+    PersistenceFailure::corrupt("encoded-size accounting overflowed")
+}
+
+fn encoded_size_inconsistent() -> PersistenceFailure {
+    PersistenceFailure::corrupt("encoded-size accounting became inconsistent")
+}
+
+fn window_state_entry_len(
+    workspace: &str,
+    state: &PersistedWindowState,
+) -> Result<u64, PersistenceFailure> {
+    let workspace_bytes = encoded_json_len(workspace)?;
+    let state_bytes = encoded_json_len(state)?;
+    workspace_bytes
+        .checked_add(1)
+        .and_then(|length| length.checked_add(state_bytes))
+        .ok_or_else(encoded_size_overflow)
+}
+
+fn maximum_width_binding_len(
+    fingerprint: PrivacySafeTargetFingerprint,
+) -> Result<u64, PersistenceFailure> {
+    encoded_json_len(&DomainBindingRecord {
+        target_fingerprint: fingerprint,
+        binding_id: DomainBindingId::from_bytes([u8::MAX; 16]),
+    })
+}
+
+struct PayloadHashWriter<'a> {
+    output: &'a mut Vec<u8>,
+    hasher: Sha256,
+}
+
+impl<'a> PayloadHashWriter<'a> {
+    fn new(output: &'a mut Vec<u8>) -> Self {
+        Self {
+            output,
+            hasher: Sha256::new(),
+        }
+    }
+
+    fn finish(self) -> [u8; 32] {
+        self.hasher.finalize().into()
+    }
+}
+
+impl Write for PayloadHashWriter<'_> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.output.extend_from_slice(buf);
+        self.hasher.update(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 fn encode_disk_slot(state: &PersistedState) -> Result<Vec<u8>, PersistenceFailure> {
     validate_published_state(state)?;
-    let payload = serde_json::to_vec(state)
-        .map_err(|_| PersistenceFailure::corrupt("could not serialize state payload"))?;
-    let sha256: [u8; 32] = Sha256::digest(&payload).into();
-    let encoded = serde_json::to_vec(&DiskSlot {
-        payload: state.clone(),
-        sha256,
-    })
-    .map_err(|_| PersistenceFailure::corrupt("could not serialize state slot"))?;
+    let mut encoded = Vec::new();
+    encoded.extend_from_slice(br#"{"payload":"#);
+    let sha256 = {
+        let mut writer = PayloadHashWriter::new(&mut encoded);
+        serde_json::to_writer(&mut writer, state)
+            .map_err(|_| PersistenceFailure::corrupt("could not serialize state payload"))?;
+        writer.finish()
+    };
+    encoded.extend_from_slice(br#","sha256":"#);
+    // Keep the on-disk representation byte-compatible with the derived
+    // `DiskSlot` schema while avoiding a deep state clone and a second
+    // materialized payload buffer. The spacing-free literal is verified by
+    // the serializer-oracle regression below.
+    serde_json::to_writer(&mut encoded, &sha256)
+        .map_err(|_| PersistenceFailure::corrupt("could not serialize state checksum"))?;
+    encoded.push(b'}');
     let actual = u64::try_from(encoded.len()).unwrap_or(u64::MAX);
     if actual > MAX_STATE_FILE_BYTES {
         return Err(PersistenceFailure::Oversized {
@@ -2917,6 +3167,291 @@ struct BatchPreflight {
     rejected_workspaces: BTreeMap<String, PersistenceFailure>,
     accepted_bindings: BTreeSet<PrivacySafeTargetFingerprint>,
     rejected_bindings: BTreeMap<PrivacySafeTargetFingerprint, PersistenceFailure>,
+    encoded_upper_bound: u64,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum ByteAdmissionKey {
+    Workspace(String),
+    Binding(PrivacySafeTargetFingerprint),
+    Overlay(LayoutWindowId),
+}
+
+#[derive(Clone, Debug)]
+struct OverlayBudgetMutation {
+    old_overlay_bytes: Option<u64>,
+    new_overlay_bytes: Option<u64>,
+    new_tombstone_bytes: Option<u64>,
+    old_tab_count: usize,
+    new_tab_count: usize,
+    old_is_live: bool,
+    new_is_live: bool,
+    adds_tombstone: bool,
+}
+
+#[derive(Clone, Debug)]
+enum ByteBudgetMutation {
+    Workspace {
+        old_entry_bytes: Option<u64>,
+        new_entry_bytes: u64,
+    },
+    Binding {
+        new_record_bytes: u64,
+    },
+    OverlayComponent {
+        window_ids: Vec<LayoutWindowId>,
+        mutations: Vec<OverlayBudgetMutation>,
+    },
+}
+
+#[derive(Clone, Debug)]
+struct ByteAdmissionCandidate {
+    key: ByteAdmissionKey,
+    admission_rank: u8,
+    mutation: ByteBudgetMutation,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct AdmissionCountBudget {
+    workspaces: usize,
+    bindings: usize,
+    live_overlays: usize,
+    tombstones: usize,
+    tabs: usize,
+}
+
+impl AdmissionCountBudget {
+    fn from_state(state: &PersistedState) -> Result<Self, PersistenceFailure> {
+        let tabs = state.overlays.iter().try_fold(0usize, |total, overlay| {
+            total
+                .checked_add(overlay.slots.len())
+                .ok_or_else(|| PersistenceFailure::quota("total overlay tab count overflowed"))
+        })?;
+        Ok(Self {
+            workspaces: state.window_states.len(),
+            bindings: state.domain_bindings.len(),
+            live_overlays: state.overlays.len(),
+            tombstones: state.tombstones.len(),
+            tabs,
+        })
+    }
+
+    fn apply_overlay_mutations(
+        &mut self,
+        mutations: &[OverlayBudgetMutation],
+    ) -> Result<(), PersistenceFailure> {
+        for mutation in mutations {
+            if mutation.old_is_live {
+                self.live_overlays = self
+                    .live_overlays
+                    .checked_sub(1)
+                    .ok_or_else(encoded_size_inconsistent)?;
+            }
+            if mutation.new_is_live {
+                self.live_overlays = self
+                    .live_overlays
+                    .checked_add(1)
+                    .ok_or_else(encoded_size_overflow)?;
+            }
+            self.tabs = self
+                .tabs
+                .checked_sub(mutation.old_tab_count)
+                .and_then(|tabs| tabs.checked_add(mutation.new_tab_count))
+                .ok_or_else(encoded_size_inconsistent)?;
+            if mutation.adds_tombstone {
+                self.tombstones = self
+                    .tombstones
+                    .checked_add(1)
+                    .ok_or_else(encoded_size_overflow)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn revert_overlay_mutations(
+        &mut self,
+        mutations: &[OverlayBudgetMutation],
+    ) -> Result<(), PersistenceFailure> {
+        for mutation in mutations.iter().rev() {
+            if mutation.new_is_live {
+                self.live_overlays = self
+                    .live_overlays
+                    .checked_sub(1)
+                    .ok_or_else(encoded_size_inconsistent)?;
+            }
+            if mutation.old_is_live {
+                self.live_overlays = self
+                    .live_overlays
+                    .checked_add(1)
+                    .ok_or_else(encoded_size_overflow)?;
+            }
+            self.tabs = self
+                .tabs
+                .checked_sub(mutation.new_tab_count)
+                .and_then(|tabs| tabs.checked_add(mutation.old_tab_count))
+                .ok_or_else(encoded_size_inconsistent)?;
+            if mutation.adds_tombstone {
+                self.tombstones = self
+                    .tombstones
+                    .checked_sub(1)
+                    .ok_or_else(encoded_size_inconsistent)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn apply_candidate(
+        &mut self,
+        mutation: &ByteBudgetMutation,
+    ) -> Result<(), PersistenceFailure> {
+        match mutation {
+            ByteBudgetMutation::Workspace {
+                old_entry_bytes: None,
+                ..
+            } => {
+                self.workspaces = self
+                    .workspaces
+                    .checked_add(1)
+                    .ok_or_else(encoded_size_overflow)?;
+            }
+            ByteBudgetMutation::Binding { .. } => {
+                self.bindings = self
+                    .bindings
+                    .checked_add(1)
+                    .ok_or_else(encoded_size_overflow)?;
+            }
+            ByteBudgetMutation::OverlayComponent { mutations, .. } => {
+                self.apply_overlay_mutations(mutations)?;
+            }
+            ByteBudgetMutation::Workspace {
+                old_entry_bytes: Some(_),
+                ..
+            } => {}
+        }
+        Ok(())
+    }
+
+    fn revert_candidate(
+        &mut self,
+        mutation: &ByteBudgetMutation,
+    ) -> Result<(), PersistenceFailure> {
+        match mutation {
+            ByteBudgetMutation::Workspace {
+                old_entry_bytes: None,
+                ..
+            } => {
+                self.workspaces = self
+                    .workspaces
+                    .checked_sub(1)
+                    .ok_or_else(encoded_size_inconsistent)?;
+            }
+            ByteBudgetMutation::Binding { .. } => {
+                self.bindings = self
+                    .bindings
+                    .checked_sub(1)
+                    .ok_or_else(encoded_size_inconsistent)?;
+            }
+            ByteBudgetMutation::OverlayComponent { mutations, .. } => {
+                self.revert_overlay_mutations(mutations)?;
+            }
+            ByteBudgetMutation::Workspace {
+                old_entry_bytes: Some(_),
+                ..
+            } => {}
+        }
+        Ok(())
+    }
+
+    fn quota_failure(self) -> Option<PersistenceFailure> {
+        if self.workspaces > MAX_WORKSPACES {
+            Some(PersistenceFailure::quota(format!(
+                "workspace count would exceed {MAX_WORKSPACES}"
+            )))
+        } else if self.bindings > MAX_DOMAIN_BINDINGS {
+            Some(PersistenceFailure::quota(format!(
+                "domain binding count would exceed {MAX_DOMAIN_BINDINGS}"
+            )))
+        } else if self.live_overlays > MAX_LAYOUT_OVERLAYS {
+            Some(PersistenceFailure::quota(format!(
+                "layout overlay count would exceed {MAX_LAYOUT_OVERLAYS}"
+            )))
+        } else if self.tombstones > MAX_OVERLAY_TOMBSTONES {
+            Some(PersistenceFailure::quota(format!(
+                "overlay tombstone count would exceed {MAX_OVERLAY_TOMBSTONES}"
+            )))
+        } else if self.tabs > MAX_TOTAL_OVERLAY_TABS {
+            Some(PersistenceFailure::quota(format!(
+                "total overlay tab count {} exceeds {MAX_TOTAL_OVERLAY_TABS}",
+                self.tabs
+            )))
+        } else {
+            None
+        }
+    }
+}
+
+impl ByteBudgetMutation {
+    fn apply(&self, budget: &mut EncodedStateBudget) -> Result<(), PersistenceFailure> {
+        match self {
+            Self::Workspace {
+                old_entry_bytes,
+                new_entry_bytes,
+            } => match old_entry_bytes {
+                Some(old_entry_bytes) => budget
+                    .window_states
+                    .replace(*old_entry_bytes, *new_entry_bytes),
+                None => budget.window_states.insert(*new_entry_bytes),
+            },
+            Self::Binding { new_record_bytes } => {
+                budget.domain_bindings.insert(*new_record_bytes)
+            }
+            Self::OverlayComponent { mutations, .. } => {
+                for mutation in mutations {
+                    if let Some(old_overlay_bytes) = mutation.old_overlay_bytes {
+                        budget.overlays.remove(old_overlay_bytes)?;
+                    }
+                    if let Some(new_overlay_bytes) = mutation.new_overlay_bytes {
+                        budget.overlays.insert(new_overlay_bytes)?;
+                    }
+                    if let Some(new_tombstone_bytes) = mutation.new_tombstone_bytes {
+                        budget.tombstones.insert(new_tombstone_bytes)?;
+                    }
+                }
+                Ok(())
+            }
+        }
+    }
+
+    fn revert(&self, budget: &mut EncodedStateBudget) -> Result<(), PersistenceFailure> {
+        match self {
+            Self::Workspace {
+                old_entry_bytes,
+                new_entry_bytes,
+            } => match old_entry_bytes {
+                Some(old_entry_bytes) => budget
+                    .window_states
+                    .replace(*new_entry_bytes, *old_entry_bytes),
+                None => budget.window_states.remove(*new_entry_bytes),
+            },
+            Self::Binding { new_record_bytes } => {
+                budget.domain_bindings.remove(*new_record_bytes)
+            }
+            Self::OverlayComponent { mutations, .. } => {
+                for mutation in mutations.iter().rev() {
+                    if let Some(new_tombstone_bytes) = mutation.new_tombstone_bytes {
+                        budget.tombstones.remove(new_tombstone_bytes)?;
+                    }
+                    if let Some(new_overlay_bytes) = mutation.new_overlay_bytes {
+                        budget.overlays.remove(new_overlay_bytes)?;
+                    }
+                    if let Some(old_overlay_bytes) = mutation.old_overlay_bytes {
+                        budget.overlays.insert(old_overlay_bytes)?;
+                    }
+                }
+                Ok(())
+            }
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -2990,75 +3525,29 @@ fn preflight_one_overlay_mutation(
     }
 }
 
-fn prospective_overlay_counts(
-    live_count: usize,
-    tombstone_count: usize,
-    total_tabs: usize,
-    current_live_tabs: usize,
-    current_is_live: bool,
-    mutation: &PendingOverlayMutation,
-) -> Result<(usize, usize, usize, bool), PersistenceFailure> {
-    let next_total_tabs = total_tabs
-        .checked_sub(current_live_tabs)
-        .and_then(|count| count.checked_add(mutation.live_tab_count()))
-        .ok_or_else(|| PersistenceFailure::quota("total overlay tab count overflowed"))?;
-    match &mutation.desired {
-        DesiredOverlayState::Live(_) => {
-            let next_live_count = if current_is_live {
-                live_count
-            } else {
-                live_count.checked_add(1).ok_or_else(|| {
-                    PersistenceFailure::quota("layout overlay count overflowed")
-                })?
-            };
-            Ok((
-                next_live_count,
-                tombstone_count,
-                next_total_tabs,
-                false,
-            ))
-        }
-        DesiredOverlayState::Deleted { .. } => {
-            let next_live_count = if current_is_live {
-                live_count.saturating_sub(1)
-            } else {
-                live_count
-            };
-            let next_tombstone_count = tombstone_count
-                .checked_add(1)
-                .ok_or_else(|| PersistenceFailure::quota("overlay tombstone count overflowed"))?;
-            Ok((
-                next_live_count,
-                next_tombstone_count,
-                next_total_tabs,
-                true,
-            ))
-        }
-    }
-}
-
-fn projected_overlay_tabs_are_unique(
-    state: &PersistedState,
+fn overlay_component_tabs_are_unique(
+    current_owners: &HashMap<StableTabSlot, LayoutWindowId>,
     batch: &PendingBatch,
-    apply_overlay_ids: &BTreeSet<LayoutWindowId>,
+    component: &[LayoutWindowId],
 ) -> bool {
-    let retained_slots = state
-        .overlays
-        .iter()
-        .filter(|overlay| !apply_overlay_ids.contains(&overlay.window_id))
-        .flat_map(|overlay| overlay.slots.iter().copied());
-    let replacement_slots = apply_overlay_ids.iter().flat_map(|window_id| {
-        match &batch.overlay_mutations[window_id].desired {
+    let component_ids = component.iter().copied().collect::<HashSet<_>>();
+    let mut replacement_owners = HashMap::new();
+    for window_id in component {
+        let slots = match &batch.overlay_mutations[window_id].desired {
             DesiredOverlayState::Live(overlay) => overlay.slots.as_slice(),
             DesiredOverlayState::Deleted { .. } => &[],
+        };
+        for slot in slots {
+            if current_owners
+                .get(slot)
+                .is_some_and(|owner| !component_ids.contains(owner))
+                || replacement_owners.insert(*slot, *window_id).is_some()
+            {
+                return false;
+            }
         }
-        .iter()
-        .copied()
-    });
-    let mut owned = HashSet::new();
-    retained_slots
-        .chain(replacement_slots)
-        .all(|slot| owned.insert(slot))
+    }
+    true
 }
 
 fn preflight_overlay_mutations(
@@ -3084,7 +3573,6 @@ fn preflight_overlay_mutations(
     let mut accepted_overlay_ids = BTreeSet::new();
     let mut apply_overlay_ids = BTreeSet::new();
     let mut rejected_overlay_mutations = BTreeMap::new();
-    let mut quota_candidates = Vec::new();
 
     for (window_id, mutation) in &batch.overlay_mutations {
         debug_assert_eq!(*window_id, mutation.window_id());
@@ -3114,7 +3602,8 @@ fn preflight_overlay_mutations(
                 accepted_overlay_ids.insert(*window_id);
             }
             Ok(true) => {
-                quota_candidates.push(*window_id);
+                accepted_overlay_ids.insert(*window_id);
+                apply_overlay_ids.insert(*window_id);
             }
             Err(failure) => {
                 rejected_overlay_mutations.insert(
@@ -3128,139 +3617,129 @@ fn preflight_overlay_mutations(
         }
     }
 
-    // Resource-reducing mutations are admitted before growth, independent of
-    // identity order. A same-batch close can therefore make room for a create,
-    // and a shrink can make room for a grow, without either lineage receiving
-    // topology authority before every CAS check above has completed.
-    quota_candidates.sort_by_key(|window_id| {
-        let mutation = &batch.overlay_mutations[window_id];
-        let current_live_tabs = live_by_id
-            .get(window_id)
-            .map_or(0, |overlay| overlay.slots.len());
-        let priority = match &mutation.desired {
-            DesiredOverlayState::Live(_)
-                if live_by_id.contains_key(window_id)
-                    && mutation.live_tab_count() <= current_live_tabs =>
-            {
-                0
-            }
-            DesiredOverlayState::Deleted { .. } => 1,
-            DesiredOverlayState::Live(_) => 2,
-        };
-        (priority, *window_id)
-    });
-
-    let mut live_count = state.overlays.len();
-    let mut tombstone_count = state.tombstones.len();
-    let mut total_tabs = state.overlays.iter().try_fold(0usize, |total, overlay| {
-        total
-            .checked_add(overlay.slots.len())
-            .ok_or_else(|| PersistenceFailure::quota("total overlay tab count overflowed"))
-    })?;
-    let mut new_tombstones = 0usize;
-
-    for window_id in quota_candidates {
-        let mutation = &batch.overlay_mutations[&window_id];
-        let current_live = live_by_id.get(&window_id).copied();
-        let current_live_tabs = current_live.map_or(0, |overlay| overlay.slots.len());
-        let prospective = prospective_overlay_counts(
-            live_count,
-            tombstone_count,
-            total_tabs,
-            current_live_tabs,
-            current_live.is_some(),
-            mutation,
-        );
-
-        let quota_failure = match prospective {
-            Err(failure) => Some(failure),
-            Ok((next_live_count, _, _, _)) if next_live_count > MAX_LAYOUT_OVERLAYS => {
-                Some(PersistenceFailure::quota(format!(
-                    "layout overlay count would exceed {MAX_LAYOUT_OVERLAYS}"
-                )))
-            }
-            Ok((_, next_tombstone_count, _, _))
-                if next_tombstone_count > MAX_OVERLAY_TOMBSTONES =>
-            {
-                Some(PersistenceFailure::quota(format!(
-                    "overlay tombstone count would exceed {MAX_OVERLAY_TOMBSTONES}"
-                )))
-            }
-            Ok((_, _, next_total_tabs, _)) if next_total_tabs > MAX_TOTAL_OVERLAY_TABS => {
-                Some(PersistenceFailure::quota(format!(
-                    "total overlay tab count {next_total_tabs} exceeds {MAX_TOTAL_OVERLAY_TABS}"
-                )))
-            }
-            Ok((next_live_count, next_tombstone_count, next_total_tabs, adds_tombstone)) => {
-                live_count = next_live_count;
-                tombstone_count = next_tombstone_count;
-                total_tabs = next_total_tabs;
-                if adds_tombstone {
-                    new_tombstones = new_tombstones.saturating_add(1);
-                }
-                accepted_overlay_ids.insert(window_id);
-                apply_overlay_ids.insert(window_id);
-                None
-            }
-        };
-        if let Some(failure) = quota_failure {
-            rejected_overlay_mutations.insert(
-                window_id,
-                RejectedOverlayMutation {
-                    mutation: mutation.clone(),
-                    failure,
-                },
-            );
-        }
-    }
-
-    if !projected_overlay_tabs_are_unique(state, batch, &apply_overlay_ids) {
-        let failure = PersistenceFailure::invalid(
-            "one stable tab identity would be owned by multiple layout windows",
-        );
-        for window_id in std::mem::take(&mut apply_overlay_ids) {
-            accepted_overlay_ids.remove(&window_id);
-            rejected_overlay_mutations.insert(
-                window_id,
-                RejectedOverlayMutation {
-                    mutation: batch.overlay_mutations[&window_id].clone(),
-                    failure: failure.clone(),
-                },
-            );
-        }
-        new_tombstones = 0;
-    }
-
     Ok(OverlayPreflight {
         accepted_overlay_ids,
         apply_overlay_ids,
         rejected_overlay_mutations,
-        new_tombstones,
+        new_tombstones: 0,
     })
 }
 
-fn preflight_batch(
+fn find_overlay_component(parent: &mut [usize], index: usize) -> usize {
+    let mut root = index;
+    while parent[root] != root {
+        root = parent[root];
+    }
+    let mut cursor = index;
+    while parent[cursor] != cursor {
+        let next = parent[cursor];
+        parent[cursor] = root;
+        cursor = next;
+    }
+    root
+}
+
+fn union_overlay_components(parent: &mut [usize], left: usize, right: usize) {
+    let left_root = find_overlay_component(parent, left);
+    let right_root = find_overlay_component(parent, right);
+    if left_root == right_root {
+        return;
+    }
+    let (root, child) = if left_root < right_root {
+        (left_root, right_root)
+    } else {
+        (right_root, left_root)
+    };
+    parent[child] = root;
+}
+
+fn overlay_admission_components(
     state: &PersistedState,
     batch: &PendingBatch,
-) -> Result<BatchPreflight, PersistenceFailure> {
-    let overlays = preflight_overlay_mutations(state, batch)?;
-    let mut accepted_workspaces = BTreeSet::new();
-    let mut rejected_workspaces = BTreeMap::new();
-    let mut prospective_workspace_count = state.window_states.len();
-    for workspace in batch.window_states.keys() {
-        if state.window_states.contains_key(workspace) {
-            accepted_workspaces.insert(workspace.clone());
-        } else if prospective_workspace_count < MAX_WORKSPACES {
-            prospective_workspace_count = prospective_workspace_count.saturating_add(1);
-            accepted_workspaces.insert(workspace.clone());
-        } else {
-            rejected_workspaces.insert(
-                workspace.clone(),
-                PersistenceFailure::quota(format!(
-                    "workspace count would exceed {MAX_WORKSPACES}"
-                )),
-            );
+    apply_overlay_ids: &BTreeSet<LayoutWindowId>,
+) -> Vec<Vec<LayoutWindowId>> {
+    let window_ids = apply_overlay_ids.iter().copied().collect::<Vec<_>>();
+    let index_by_window = window_ids
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(index, window_id)| (window_id, index))
+        .collect::<BTreeMap<_, _>>();
+    let live_by_window = state
+        .overlays
+        .iter()
+        .map(|overlay| (overlay.window_id, overlay))
+        .collect::<BTreeMap<_, _>>();
+    let mut parent = (0..window_ids.len()).collect::<Vec<_>>();
+    let mut first_delta_owner = HashMap::new();
+
+    for window_id in &window_ids {
+        let index = index_by_window[window_id];
+        let old_slots = live_by_window
+            .get(window_id)
+            .map_or(&[][..], |overlay| overlay.slots.as_slice())
+            .iter()
+            .copied()
+            .collect::<HashSet<_>>();
+        let new_slots = match &batch.overlay_mutations[window_id].desired {
+            DesiredOverlayState::Live(overlay) => overlay.slots.as_slice(),
+            DesiredOverlayState::Deleted { .. } => &[],
         }
+        .iter()
+        .copied()
+        .collect::<HashSet<_>>();
+
+        for slot in old_slots.symmetric_difference(&new_slots).copied() {
+            if let Some(previous) = first_delta_owner.insert(slot, index) {
+                union_overlay_components(&mut parent, previous, index);
+            }
+        }
+    }
+
+    let mut by_root = BTreeMap::<usize, Vec<LayoutWindowId>>::new();
+    for (index, window_id) in window_ids.into_iter().enumerate() {
+        let root = find_overlay_component(&mut parent, index);
+        by_root.entry(root).or_default().push(window_id);
+    }
+    let mut components = by_root.into_values().collect::<Vec<_>>();
+    components.sort_by_key(|component| component[0]);
+    components
+}
+
+fn build_byte_admission_candidates(
+    state: &PersistedState,
+    batch: &PendingBatch,
+    preflight: &BatchPreflight,
+    overlay_components: &[Vec<LayoutWindowId>],
+    published_revision: u64,
+    initial_budget: &EncodedStateBudget,
+) -> Result<Vec<ByteAdmissionCandidate>, PersistenceFailure> {
+    let mut candidates = Vec::new();
+    let initial_upper_bound = initial_budget.upper_bound()?;
+
+    for workspace in &preflight.accepted_workspaces {
+        let desired = &batch.window_states[workspace];
+        let current = state.window_states.get(workspace);
+        if current == Some(desired) {
+            continue;
+        }
+        let mutation = ByteBudgetMutation::Workspace {
+            old_entry_bytes: current
+                .map(|current| window_state_entry_len(workspace, current))
+                .transpose()?,
+            new_entry_bytes: window_state_entry_len(workspace, desired)?,
+        };
+        let mut projected = *initial_budget;
+        mutation.apply(&mut projected)?;
+        candidates.push(ByteAdmissionCandidate {
+            key: ByteAdmissionKey::Workspace(workspace.clone()),
+            admission_rank: if projected.upper_bound()? > initial_upper_bound {
+                2
+            } else {
+                0
+            },
+            mutation,
+        });
     }
 
     let existing_bindings = state
@@ -3268,32 +3747,711 @@ fn preflight_batch(
         .iter()
         .map(|record| record.target_fingerprint)
         .collect::<HashSet<_>>();
-    let mut accepted_bindings = BTreeSet::new();
-    let mut rejected_bindings = BTreeMap::new();
-    let mut prospective_binding_count = state.domain_bindings.len();
-    for fingerprint in &batch.ensure_bindings {
+    for fingerprint in &preflight.accepted_bindings {
         if existing_bindings.contains(fingerprint) {
-            accepted_bindings.insert(*fingerprint);
-        } else if prospective_binding_count < MAX_DOMAIN_BINDINGS {
-            prospective_binding_count = prospective_binding_count.saturating_add(1);
-            accepted_bindings.insert(*fingerprint);
+            continue;
+        }
+        let mutation = ByteBudgetMutation::Binding {
+            new_record_bytes: maximum_width_binding_len(*fingerprint)?,
+        };
+        let mut projected = *initial_budget;
+        mutation.apply(&mut projected)?;
+        candidates.push(ByteAdmissionCandidate {
+            key: ByteAdmissionKey::Binding(*fingerprint),
+            admission_rank: if projected.upper_bound()? > initial_upper_bound {
+                2
+            } else {
+                0
+            },
+            mutation,
+        });
+    }
+
+    let overlays_by_id = state
+        .overlays
+        .iter()
+        .map(|overlay| (overlay.window_id, overlay))
+        .collect::<BTreeMap<_, _>>();
+    for window_ids in overlay_components {
+        let mut mutations = Vec::with_capacity(window_ids.len());
+        for window_id in window_ids {
+            let old_overlay = overlays_by_id.get(window_id).copied();
+            let old_overlay_bytes = old_overlay.map(encoded_json_len).transpose()?;
+            let old_tab_count = old_overlay.map_or(0, |overlay| overlay.slots.len());
+            let (new_overlay_bytes, new_tombstone_bytes) =
+                match &batch.overlay_mutations[window_id].desired {
+                    DesiredOverlayState::Live(overlay) => {
+                        (Some(encoded_json_len(overlay)?), None)
+                    }
+                    DesiredOverlayState::Deleted {
+                        last_local_revision,
+                        ..
+                    } => {
+                        let tombstone = OverlayTombstone::new(
+                            *window_id,
+                            *last_local_revision,
+                            published_revision,
+                        )?;
+                        (None, Some(encoded_json_len(&tombstone)?))
+                    }
+                };
+            mutations.push(OverlayBudgetMutation {
+                old_overlay_bytes,
+                new_overlay_bytes,
+                new_tombstone_bytes,
+                old_tab_count,
+                new_tab_count: batch.overlay_mutations[window_id].live_tab_count(),
+                old_is_live: old_overlay.is_some(),
+                new_is_live: matches!(
+                    &batch.overlay_mutations[window_id].desired,
+                    DesiredOverlayState::Live(_)
+                ),
+                adds_tombstone: matches!(
+                    &batch.overlay_mutations[window_id].desired,
+                    DesiredOverlayState::Deleted { .. }
+                ),
+            });
+        }
+        let contains_delete = mutations.iter().any(|mutation| mutation.adds_tombstone);
+        let mutation = ByteBudgetMutation::OverlayComponent {
+            window_ids: window_ids.to_vec(),
+            mutations,
+        };
+        let mut projected = *initial_budget;
+        mutation.apply(&mut projected)?;
+        let admission_rank = if projected.upper_bound()? <= initial_upper_bound {
+            0
+        } else if contains_delete {
+            1
         } else {
-            rejected_bindings.insert(
-                *fingerprint,
-                PersistenceFailure::quota(format!(
-                    "domain binding count would exceed {MAX_DOMAIN_BINDINGS}"
-                )),
+            2
+        };
+        candidates.push(ByteAdmissionCandidate {
+            key: ByteAdmissionKey::Overlay(window_ids[0]),
+            admission_rank,
+            mutation,
+        });
+    }
+
+    Ok(candidates)
+}
+
+fn byte_quota_failure(
+    projected_upper_bound: u64,
+    maximum_bytes: u64,
+) -> PersistenceFailure {
+    PersistenceFailure::EncodedQuota {
+        projected_upper_bound,
+        maximum: maximum_bytes,
+    }
+}
+
+fn reject_overlay_admission_component(
+    window_ids: &[LayoutWindowId],
+    batch: &PendingBatch,
+    preflight: &mut BatchPreflight,
+    failure: PersistenceFailure,
+) {
+    for window_id in window_ids {
+        preflight.overlays.accepted_overlay_ids.remove(window_id);
+        preflight.overlays.apply_overlay_ids.remove(window_id);
+        preflight.overlays.rejected_overlay_mutations.insert(
+            *window_id,
+            RejectedOverlayMutation {
+                mutation: batch.overlay_mutations[window_id].clone(),
+                failure: failure.clone(),
+            },
+        );
+    }
+}
+
+fn reject_byte_admission_candidate(
+    candidate: &ByteAdmissionCandidate,
+    batch: &PendingBatch,
+    preflight: &mut BatchPreflight,
+    failure: PersistenceFailure,
+) {
+    match (&candidate.key, &candidate.mutation) {
+        (
+            ByteAdmissionKey::Workspace(workspace),
+            ByteBudgetMutation::Workspace { .. },
+        ) => {
+            preflight.accepted_workspaces.remove(workspace);
+            preflight
+                .rejected_workspaces
+                .insert(workspace.clone(), failure);
+        }
+        (
+            ByteAdmissionKey::Binding(fingerprint),
+            ByteBudgetMutation::Binding { .. },
+        ) => {
+            preflight.accepted_bindings.remove(fingerprint);
+            preflight.rejected_bindings.insert(*fingerprint, failure);
+        }
+        (
+            ByteAdmissionKey::Overlay(_),
+            ByteBudgetMutation::OverlayComponent { window_ids, .. },
+        ) => {
+            reject_overlay_admission_component(window_ids, batch, preflight, failure);
+        }
+        _ => unreachable!("byte-admission key and mutation kind must agree"),
+    }
+}
+
+fn partition_overlay_ownership_components(
+    state: &PersistedState,
+    batch: &PendingBatch,
+    preflight: &mut BatchPreflight,
+) -> Vec<Vec<LayoutWindowId>> {
+    let components =
+        overlay_admission_components(state, batch, &preflight.overlays.apply_overlay_ids);
+    let current_owners = state
+        .overlays
+        .iter()
+        .flat_map(|overlay| {
+            overlay
+                .slots
+                .iter()
+                .copied()
+                .map(move |slot| (slot, overlay.window_id))
+        })
+        .collect::<HashMap<_, _>>();
+    let mut valid_components = Vec::with_capacity(components.len());
+    for component in components {
+        if overlay_component_tabs_are_unique(&current_owners, batch, &component) {
+            valid_components.push(component);
+        } else {
+            reject_overlay_admission_component(
+                &component,
+                batch,
+                preflight,
+                PersistenceFailure::invalid(
+                    "one stable tab identity would be owned by multiple layout windows",
+                ),
             );
         }
     }
+    valid_components
+}
 
-    Ok(BatchPreflight {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct AdmissionProjection {
+    normalized_bytes: EncodedStateBudget,
+    physical_bytes: EncodedStateBudget,
+    counts: AdmissionCountBudget,
+}
+
+impl AdmissionProjection {
+    fn apply(&mut self, candidate: &ByteAdmissionCandidate) -> Result<(), PersistenceFailure> {
+        candidate.mutation.apply(&mut self.normalized_bytes)?;
+        candidate.mutation.apply(&mut self.physical_bytes)?;
+        self.counts.apply_candidate(&candidate.mutation)
+    }
+
+    fn revert(&mut self, candidate: &ByteAdmissionCandidate) -> Result<(), PersistenceFailure> {
+        candidate.mutation.revert(&mut self.normalized_bytes)?;
+        candidate.mutation.revert(&mut self.physical_bytes)?;
+        self.counts.revert_candidate(&candidate.mutation)
+    }
+}
+
+const VIOLATION_WORKSPACES: u8 = 1 << 0;
+const VIOLATION_BINDINGS: u8 = 1 << 1;
+const VIOLATION_LIVE_OVERLAYS: u8 = 1 << 2;
+const VIOLATION_TOMBSTONES: u8 = 1 << 3;
+const VIOLATION_TABS: u8 = 1 << 4;
+const VIOLATION_NORMALIZED_BYTES: u8 = 1 << 5;
+const VIOLATION_PHYSICAL_BYTES: u8 = 1 << 6;
+const ADMISSION_RESOURCE_BITS: [u8; 7] = [
+    VIOLATION_WORKSPACES,
+    VIOLATION_BINDINGS,
+    VIOLATION_LIVE_OVERLAYS,
+    VIOLATION_TOMBSTONES,
+    VIOLATION_TABS,
+    VIOLATION_NORMALIZED_BYTES,
+    VIOLATION_PHYSICAL_BYTES,
+];
+const ADMISSION_SUPPORT_MASKS: usize = 1 << ADMISSION_RESOURCE_BITS.len();
+
+fn admission_violation_mask(
+    base: AdmissionProjection,
+    projected: AdmissionProjection,
+    maximum_bytes: u64,
+    has_candidates: bool,
+) -> Result<u8, PersistenceFailure> {
+    let mut mask = 0u8;
+    if projected.counts.workspaces > MAX_WORKSPACES {
+        mask |= VIOLATION_WORKSPACES;
+    }
+    if projected.counts.bindings > MAX_DOMAIN_BINDINGS {
+        mask |= VIOLATION_BINDINGS;
+    }
+    if projected.counts.live_overlays > MAX_LAYOUT_OVERLAYS {
+        mask |= VIOLATION_LIVE_OVERLAYS;
+    }
+    if projected.counts.tombstones > MAX_OVERLAY_TOMBSTONES {
+        mask |= VIOLATION_TOMBSTONES;
+    }
+    if projected.counts.tabs > MAX_TOTAL_OVERLAY_TABS {
+        mask |= VIOLATION_TABS;
+    }
+
+    let normalized = projected.normalized_bytes.upper_bound()?;
+    if normalized > maximum_bytes {
+        let base_normalized = base.normalized_bytes.upper_bound()?;
+        if normalized > base_normalized {
+            mask |= VIOLATION_NORMALIZED_BYTES;
+        } else if has_candidates && projected.physical_bytes.upper_bound()? > maximum_bytes {
+            // Existing durable binding identifiers keep their exact physical
+            // widths here, while every newly allocated identifier and the
+            // checksum remain maximum-width. This escape admits a genuine
+            // reduction from conservative normalization debt only when the
+            // resulting file is proven below the physical byte limit. The
+            // candidate-free base remains admissible because it does not
+            // publish a new generation.
+            mask |= VIOLATION_PHYSICAL_BYTES;
+        }
+    }
+    Ok(mask)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct AdmissionDelta {
+    values: [i128; ADMISSION_RESOURCE_BITS.len()],
+}
+
+impl AdmissionDelta {
+    fn for_candidate(
+        base: AdmissionProjection,
+        candidate: &ByteAdmissionCandidate,
+    ) -> Result<Self, PersistenceFailure> {
+        let mut projected = base;
+        projected.apply(candidate)?;
+        let base_normalized = base.normalized_bytes.upper_bound()?;
+        let projected_normalized = projected.normalized_bytes.upper_bound()?;
+        let base_physical = base.physical_bytes.upper_bound()?;
+        let projected_physical = projected.physical_bytes.upper_bound()?;
+        Ok(Self {
+            values: [
+                signed_usize_delta(projected.counts.workspaces, base.counts.workspaces)?,
+                signed_usize_delta(projected.counts.bindings, base.counts.bindings)?,
+                signed_usize_delta(
+                    projected.counts.live_overlays,
+                    base.counts.live_overlays,
+                )?,
+                signed_usize_delta(projected.counts.tombstones, base.counts.tombstones)?,
+                signed_usize_delta(projected.counts.tabs, base.counts.tabs)?,
+                i128::from(projected_normalized) - i128::from(base_normalized),
+                i128::from(projected_physical) - i128::from(base_physical),
+            ],
+        })
+    }
+
+    fn positively_contributes(self, resource: usize) -> bool {
+        self.values[resource] > 0
+    }
+
+    fn positive_magnitude(self, resource: usize) -> u64 {
+        u64::try_from(self.values[resource].max(0)).unwrap_or(u64::MAX)
+    }
+
+    fn support_magnitude(self, resource: usize) -> u64 {
+        u64::try_from(self.values[resource].saturating_neg().max(0)).unwrap_or(u64::MAX)
+    }
+
+    fn support_count(self) -> u64 {
+        u64::try_from(self.values.iter().filter(|value| **value < 0).count())
+            .unwrap_or(u64::MAX)
+    }
+
+    fn support_mask(self) -> u8 {
+        self.values
+            .iter()
+            .enumerate()
+            .fold(0u8, |mask, (resource, value)| {
+                if *value < 0 {
+                    mask | ADMISSION_RESOURCE_BITS[resource]
+                } else {
+                    mask
+                }
+            })
+    }
+}
+
+fn signed_usize_delta(after: usize, before: usize) -> Result<i128, PersistenceFailure> {
+    let after = u64::try_from(after).map_err(|_| encoded_size_overflow())?;
+    let before = u64::try_from(before).map_err(|_| encoded_size_overflow())?;
+    Ok(i128::from(after) - i128::from(before))
+}
+
+type RemovalPriority = [u64; 17];
+type RemovalHeap = BinaryHeap<(RemovalPriority, usize)>;
+
+fn removal_priority(
+    violation_mask: u8,
+    candidate: &ByteAdmissionCandidate,
+    delta: AdmissionDelta,
+) -> RemovalPriority {
+    let mut priority = [0; 17];
+    let active_supports = u64::from((delta.support_mask() & violation_mask).count_ones());
+    priority[0] = u64::try_from(ADMISSION_RESOURCE_BITS.len())
+        .unwrap_or(u64::MAX)
+        .saturating_sub(active_supports);
+    priority[1] = u64::try_from(ADMISSION_RESOURCE_BITS.len())
+        .unwrap_or(u64::MAX)
+        .saturating_sub(delta.support_count());
+    let preferred_order = [5, 6, 4, 2, 3, 0, 1];
+    for (offset, resource) in preferred_order.into_iter().enumerate() {
+        priority[2 + offset] = u64::MAX.saturating_sub(delta.support_magnitude(resource));
+        priority[10 + offset] = delta.positive_magnitude(resource);
+    }
+    priority[9] = u64::from(candidate.admission_rank);
+    priority
+}
+
+fn select_compatible_candidate_subset(
+    base: AdmissionProjection,
+    candidates: &[ByteAdmissionCandidate],
+    pending: &[usize],
+    maximum_bytes: u64,
+    force_write: bool,
+) -> Result<(AdmissionProjection, Vec<usize>, usize), PersistenceFailure> {
+    let mut aggregate = base;
+    let mut remaining = vec![false; candidates.len()];
+    let mut remaining_count = pending.len();
+    for index in pending {
+        remaining[*index] = true;
+        aggregate.apply(&candidates[*index])?;
+    }
+
+    let deltas = candidates
+        .iter()
+        .map(|candidate| AdmissionDelta::for_candidate(base, candidate))
+        .collect::<Result<Vec<_>, _>>()?;
+    let initial_violation_mask = admission_violation_mask(
+        base,
+        aggregate,
+        maximum_bytes,
+        force_write || remaining_count != 0,
+    )?;
+    if initial_violation_mask == 0 {
+        return Ok((aggregate, Vec::new(), remaining_count));
+    }
+
+    // The central isolation contract is exact, not heuristic: when one
+    // lineage is the only reason an otherwise mutually enabling batch is
+    // inadmissible, identify that lineage directly. This linear leave-one-out
+    // pass prevents a small or mixed-sign poison from causing the bounded
+    // multi-conflict selector to dismantle the valid remainder.
+    let mut isolating_removal = None;
+    for index in pending {
+        let mut without_candidate = aggregate;
+        without_candidate.revert(&candidates[*index])?;
+        if admission_violation_mask(
+            base,
+            without_candidate,
+            maximum_bytes,
+            force_write || remaining_count > 1,
+        )? == 0
+        {
+            let choice = (
+                removal_priority(
+                    initial_violation_mask,
+                    &candidates[*index],
+                    deltas[*index],
+                ),
+                *index,
+            );
+            if isolating_removal
+                .as_ref()
+                .is_none_or(|current| choice > *current)
+            {
+                isolating_removal = Some(choice);
+            }
+        }
+    }
+    if let Some((_, index)) = isolating_removal {
+        aggregate.revert(&candidates[index])?;
+        return Ok((
+            aggregate,
+            vec![index],
+            remaining_count
+                .checked_sub(1)
+                .ok_or_else(encoded_size_inconsistent)?,
+        ));
+    }
+
+    // Seven resources and 128 possible supplier masks are fixed constants.
+    // Each candidate enters at most seven heaps, each stale entry is popped
+    // once, and each peel probes at most 7 * 128 heap heads. This keeps the
+    // peel phase O(C log C) in the number of candidate lineages and prevents
+    // alternating byte/count violations from triggering rescans. The exact
+    // backfill below has a separately retained quadratic worst case.
+    let mut relief_heaps: Vec<Vec<RemovalHeap>> =
+        (0..ADMISSION_RESOURCE_BITS.len())
+            .map(|_| {
+                (0..ADMISSION_SUPPORT_MASKS)
+                    .map(|_| BinaryHeap::new())
+                    .collect()
+            })
+            .collect();
+    for index in pending {
+        let support_bucket = usize::from(deltas[*index].support_mask());
+        for (resource, resource_heaps) in relief_heaps.iter_mut().enumerate() {
+            if deltas[*index].positively_contributes(resource) {
+                resource_heaps[support_bucket].push((
+                    removal_priority(
+                        ADMISSION_RESOURCE_BITS[resource],
+                        &candidates[*index],
+                        deltas[*index],
+                    ),
+                    *index,
+                ));
+            }
+        }
+    }
+
+    let mut removed = Vec::new();
+    loop {
+        let violation_mask = admission_violation_mask(
+            base,
+            aggregate,
+            maximum_bytes,
+            force_write || remaining_count != 0,
+        )?;
+        if violation_mask == 0 {
+            break;
+        }
+
+        let mut selected = None;
+        for (resource, resource_heaps) in relief_heaps.iter_mut().enumerate() {
+            if violation_mask & ADMISSION_RESOURCE_BITS[resource] == 0 {
+                continue;
+            }
+            for heap in resource_heaps {
+                while heap
+                    .peek()
+                    .is_some_and(|(_, index)| !remaining[*index])
+                {
+                    heap.pop();
+                }
+                if let Some((_, index)) = heap.peek() {
+                    let choice = (
+                        removal_priority(
+                            violation_mask,
+                            &candidates[*index],
+                            deltas[*index],
+                        ),
+                        *index,
+                    );
+                    if selected.as_ref().is_none_or(|current| choice > *current) {
+                        selected = Some(choice);
+                    }
+                }
+            }
+        }
+
+        let Some((_, index)) = selected else {
+            // Fixed base-relative deltas cannot always identify relief at an
+            // empty/nonempty JSON collection boundary, and the durable base
+            // may also carry conservative normalization debt. Reset to the
+            // candidate-free authority and let exact fixed-point backfill
+            // reconstruct every individually admissible lineage.
+            for index in pending {
+                if remaining[*index] {
+                    removed.push(*index);
+                    remaining[*index] = false;
+                }
+            }
+            remaining_count = 0;
+            aggregate = base;
+            break;
+        };
+        aggregate.revert(&candidates[index])?;
+        remaining[index] = false;
+        remaining_count = remaining_count
+            .checked_sub(1)
+            .ok_or_else(encoded_size_inconsistent)?;
+        removed.push(index);
+    }
+
+    // A removed lineage can become individually admissible after a later
+    // reducer is restored. Cycle in deterministic reverse-removal order until
+    // one complete pass makes no progress. That terminal pass is an exact
+    // proof that every returned rejection is individually inadmissible against
+    // the final projection. Aggregate-valid and single-poison batches return
+    // above without entering this loop; ordinary multi-conflict batches often
+    // need only one pass, while adversarial mixed-sign dependency chains can
+    // require repeated passes and remain a retained performance nonclaim.
+    let mut deferred = removed.into_iter().rev().collect::<VecDeque<_>>();
+    let mut rejections_since_progress = 0usize;
+    while let Some(index) = deferred.pop_front() {
+        debug_assert!(!remaining[index]);
+        let mut projected = aggregate;
+        projected.apply(&candidates[index])?;
+        if admission_violation_mask(base, projected, maximum_bytes, true)? == 0 {
+            aggregate = projected;
+            remaining[index] = true;
+            remaining_count = remaining_count
+                .checked_add(1)
+                .ok_or_else(encoded_size_overflow)?;
+            rejections_since_progress = 0;
+        } else {
+            deferred.push_back(index);
+            rejections_since_progress = rejections_since_progress
+                .checked_add(1)
+                .ok_or_else(encoded_size_overflow)?;
+            if rejections_since_progress == deferred.len() {
+                break;
+            }
+        }
+    }
+
+    let accepted_count = remaining_count;
+    let final_violation_mask = admission_violation_mask(
+        base,
+        aggregate,
+        maximum_bytes,
+        force_write || accepted_count != 0,
+    )?;
+    if final_violation_mask != 0 {
+        return Err(aggregate.counts.quota_failure().unwrap_or(
+            byte_quota_failure(aggregate.normalized_bytes.upper_bound()?, maximum_bytes),
+        ));
+    }
+
+    let mut removed = deferred.into_iter().collect::<Vec<_>>();
+    removed.sort_unstable();
+    Ok((aggregate, removed, accepted_count))
+}
+
+fn enforce_encoded_byte_admission(
+    state: &PersistedState,
+    batch: &PendingBatch,
+    preflight: &mut BatchPreflight,
+    force_write: bool,
+    maximum_bytes: u64,
+) -> Result<(), PersistenceFailure> {
+    let changing_workspace = preflight.accepted_workspaces.iter().any(|workspace| {
+        state.window_states.get(workspace) != Some(&batch.window_states[workspace])
+    });
+    let existing_bindings = state
+        .domain_bindings
+        .iter()
+        .map(|record| record.target_fingerprint)
+        .collect::<HashSet<_>>();
+    let changing_binding = preflight
+        .accepted_bindings
+        .iter()
+        .any(|fingerprint| !existing_bindings.contains(fingerprint));
+    let has_candidate_changes =
+        changing_workspace || changing_binding || !preflight.overlays.apply_overlay_ids.is_empty();
+    let published_revision = if force_write || has_candidate_changes {
+        state
+            .store_revision
+            .checked_add(1)
+            .ok_or(PersistenceFailure::RevisionExhausted)?
+    } else {
+        state.store_revision
+    };
+    let normalized_budget = EncodedStateBudget::from_state(state, published_revision)?;
+    let physical_budget =
+        EncodedStateBudget::from_state_with_physical_bindings(state, published_revision)?;
+    let overlay_components = partition_overlay_ownership_components(state, batch, preflight);
+    let mut candidates = build_byte_admission_candidates(
+        state,
+        batch,
+        preflight,
+        &overlay_components,
+        published_revision,
+        &normalized_budget,
+    )?;
+    candidates.sort_by(|left, right| {
+        (left.admission_rank, &left.key).cmp(&(right.admission_rank, &right.key))
+    });
+
+    let base_projection = AdmissionProjection {
+        normalized_bytes: normalized_budget,
+        physical_bytes: physical_budget,
+        counts: AdmissionCountBudget::from_state(state)?,
+    };
+    let pending = (0..candidates.len()).collect::<Vec<_>>();
+    let (projection, pending, _) = select_compatible_candidate_subset(
+        base_projection,
+        &candidates,
+        &pending,
+        maximum_bytes,
+        force_write,
+    )?;
+
+    for index in pending {
+        let candidate = &candidates[index];
+        let mut projected = projection;
+        projected.apply(candidate)?;
+        if admission_violation_mask(base_projection, projected, maximum_bytes, true)? == 0 {
+            return Err(PersistenceFailure::corrupt(
+                "byte-admission selector returned an admissible rejection",
+            ));
+        }
+        let failure = match projected.counts.quota_failure() {
+            Some(failure) => failure,
+            None => byte_quota_failure(projected.normalized_bytes.upper_bound()?, maximum_bytes),
+        };
+        reject_byte_admission_candidate(candidate, batch, preflight, failure);
+    }
+
+    preflight.overlays.new_tombstones = preflight
+        .overlays
+        .apply_overlay_ids
+        .iter()
+        .filter(|window_id| {
+            matches!(
+                &batch.overlay_mutations[window_id].desired,
+                DesiredOverlayState::Deleted { .. }
+            )
+        })
+        .count();
+    let encoded_upper_bound = projection.normalized_bytes.upper_bound()?;
+    preflight.encoded_upper_bound = encoded_upper_bound;
+    Ok(())
+}
+
+fn preflight_batch(
+    state: &PersistedState,
+    batch: &PendingBatch,
+    force_write: bool,
+) -> Result<BatchPreflight, PersistenceFailure> {
+    preflight_batch_with_byte_limit(state, batch, force_write, MAX_STATE_FILE_BYTES)
+}
+
+fn preflight_batch_with_byte_limit(
+    state: &PersistedState,
+    batch: &PendingBatch,
+    force_write: bool,
+    maximum_bytes: u64,
+) -> Result<BatchPreflight, PersistenceFailure> {
+    let overlays = preflight_overlay_mutations(state, batch)?;
+    let accepted_workspaces = batch.window_states.keys().cloned().collect();
+    let rejected_workspaces = BTreeMap::new();
+    let accepted_bindings = batch.ensure_bindings.clone();
+    let rejected_bindings = BTreeMap::new();
+
+    let mut preflight = BatchPreflight {
         overlays,
         accepted_workspaces,
         rejected_workspaces,
         accepted_bindings,
         rejected_bindings,
-    })
+        encoded_upper_bound: 0,
+    };
+    enforce_encoded_byte_admission(
+        state,
+        batch,
+        &mut preflight,
+        force_write,
+        maximum_bytes,
+    )?;
+    Ok(preflight)
 }
 
 fn apply_batch(
@@ -3592,6 +4750,20 @@ fn commit_batch(
     batch: &PendingBatch,
     interruption: WriteInterruption,
 ) -> Result<BatchCommit, PersistenceFailure> {
+    commit_batch_with_byte_limit(
+        primary_path,
+        batch,
+        interruption,
+        MAX_STATE_FILE_BYTES,
+    )
+}
+
+fn commit_batch_with_byte_limit(
+    primary_path: &Path,
+    batch: &PendingBatch,
+    interruption: WriteInterruption,
+    maximum_bytes: u64,
+) -> Result<BatchCommit, PersistenceFailure> {
     let lock = open_lock_file(primary_path)?;
     fs2::FileExt::lock_exclusive(&lock)
         .map_err(|error| PersistenceFailure::io("lock state for writing", error))?;
@@ -3601,7 +4773,12 @@ fn commit_batch(
     let requires_schema_upgrade = loaded.requires_schema_upgrade;
     let degraded_recovery = loaded.degraded_recovery;
     let mut state = loaded.state;
-    let preflight = preflight_batch(&state, batch)?;
+    let preflight = preflight_batch_with_byte_limit(
+        &state,
+        batch,
+        requires_schema_upgrade || degraded_recovery,
+        maximum_bytes,
+    )?;
     let reserved_retirement_revision = if preflight.overlays.new_tombstones == 0 {
         None
     } else {
@@ -3679,6 +4856,18 @@ fn commit_batch(
     canonicalize_state(&mut state);
     validate_state(&state)?;
     let encoded = encode_disk_slot(&state)?;
+    let actual_encoded_bytes = u64::try_from(encoded.len()).unwrap_or(u64::MAX);
+    if actual_encoded_bytes > maximum_bytes {
+        return Err(PersistenceFailure::Oversized {
+            actual: actual_encoded_bytes,
+            maximum: maximum_bytes,
+        });
+    }
+    if actual_encoded_bytes > preflight.encoded_upper_bound {
+        return Err(PersistenceFailure::corrupt(
+            "encoded state exceeded its admitted upper bound",
+        ));
+    }
     if let Some(evidence) = loaded.corrupt_evidence.as_ref() {
         quarantine_corrupt_evidence(evidence)?;
     }
@@ -5344,6 +6533,1375 @@ mod tests {
     }
 
     #[test]
+    fn encoded_byte_quota_rejects_one_workspace_without_poisoning_other_lineages() {
+        let state = PersistedState::default();
+        let valid_window = LayoutWindowId::from_bytes([0x44; 16]);
+        let valid_fingerprint = PrivacySafeTargetFingerprint::from_bytes([0x55; 32]);
+        let valid_workspace = "z-valid".to_string();
+        let valid_geometry = PersistedWindowState {
+            maximized: true,
+            fullscreen: false,
+        };
+        let valid_overlay = local_overlay(valid_window, 1, 0x66);
+
+        let mut valid_only = PendingBatch::default();
+        valid_only
+            .queue_window_state(valid_workspace.clone(), valid_geometry)
+            .expect("queue valid workspace");
+        valid_only.ensure_bindings.insert(valid_fingerprint);
+        valid_only
+            .queue_overlay_live(None, valid_overlay.clone())
+            .expect("queue valid overlay");
+        let exact_limit =
+            preflight_batch_with_byte_limit(&state, &valid_only, false, u64::MAX)
+                .expect("measure valid mixed batch")
+                .encoded_upper_bound;
+
+        let oversized_workspace = format!("a-{}", "x".repeat(MAX_WORKSPACE_BYTES - 2));
+        assert_eq!(oversized_workspace.len(), MAX_WORKSPACE_BYTES);
+        let mut mixed = valid_only;
+        mixed
+            .queue_window_state(
+                oversized_workspace.clone(),
+                PersistedWindowState {
+                    maximized: false,
+                    fullscreen: true,
+                },
+            )
+            .expect("queue independently valid long workspace");
+
+        let preflight =
+            preflight_batch_with_byte_limit(&state, &mixed, false, exact_limit)
+                .expect("partition byte-exhausting workspace");
+        assert_eq!(preflight.encoded_upper_bound, exact_limit);
+        assert!(preflight.accepted_workspaces.contains(&valid_workspace));
+        assert_eq!(
+            preflight.rejected_workspaces[&oversized_workspace].code(),
+            PersistenceFailureCode::Quota
+        );
+        assert!(preflight.accepted_bindings.contains(&valid_fingerprint));
+        assert!(
+            preflight
+                .overlays
+                .accepted_overlay_ids
+                .contains(&valid_window)
+        );
+        assert_eq!(
+            preflight.overlays.apply_overlay_ids,
+            BTreeSet::from([valid_window])
+        );
+    }
+
+    #[test]
+    fn encoded_byte_admission_accepts_exact_boundary_and_rejects_plus_one() {
+        let state = PersistedState::default();
+        let workspace = "boundary-\"-\\-☃".to_string();
+        let mut batch = PendingBatch::default();
+        batch
+            .queue_window_state(
+                workspace.clone(),
+                PersistedWindowState {
+                    maximized: true,
+                    fullscreen: true,
+                },
+            )
+            .expect("queue boundary workspace");
+        let exact_limit = preflight_batch_with_byte_limit(&state, &batch, false, u64::MAX)
+            .expect("measure exact boundary")
+            .encoded_upper_bound;
+
+        let exact = preflight_batch_with_byte_limit(&state, &batch, false, exact_limit)
+            .expect("exact byte boundary is admissible");
+        assert!(exact.accepted_workspaces.contains(&workspace));
+        assert_eq!(exact.encoded_upper_bound, exact_limit);
+
+        let below = preflight_batch_with_byte_limit(
+            &state,
+            &batch,
+            false,
+            exact_limit.checked_sub(1).expect("boundary is nonzero"),
+        )
+        .expect("one-byte-short budget yields a semantic rejection");
+        assert!(!below.accepted_workspaces.contains(&workspace));
+        assert_eq!(
+            below.rejected_workspaces[&workspace].code(),
+            PersistenceFailureCode::Oversized
+        );
+        assert!(below.encoded_upper_bound < exact_limit);
+    }
+
+    #[test]
+    fn aggregate_admission_preserves_mutually_enabling_byte_and_tab_reductions() {
+        let growing_window = LayoutWindowId::from_bytes([0; 16]);
+        let shrinking_window = LayoutWindowId::from_bytes([u8::MAX; 16]);
+        let mut state = PersistedState::default();
+        state.store_revision = 1;
+        state.overlays.push(
+            MixedDomainLayoutOverlay::new(
+                growing_window,
+                "x".repeat(MAX_WORKSPACE_BYTES),
+                1,
+                Vec::new(),
+                None,
+            )
+            .expect("large empty growing overlay"),
+        );
+        let shrinking_slots = local_slots(0xf0, MAX_TABS_PER_OVERLAY);
+        state.overlays.push(
+            MixedDomainLayoutOverlay::new(
+                shrinking_window,
+                "s",
+                1,
+                shrinking_slots.clone(),
+                shrinking_slots.first().copied(),
+            )
+            .expect("full shrinking overlay"),
+        );
+        for number in 1..=3 {
+            let slots = local_slots(
+                u8::try_from(number).expect("test window number fits u8"),
+                MAX_TABS_PER_OVERLAY,
+            );
+            state.overlays.push(
+                MixedDomainLayoutOverlay::new(
+                    window_id(number),
+                    "stable",
+                    1,
+                    slots.clone(),
+                    slots.first().copied(),
+                )
+                .expect("full stable overlay"),
+            );
+        }
+        canonicalize_state(&mut state);
+        validate_state(&state).expect("authority is at the aggregate tab cap");
+
+        let growth_slot = local_slot(0x7a);
+        let mut reduced_slots = shrinking_slots;
+        reduced_slots.pop();
+        let mut exchange = PendingBatch::default();
+        exchange
+            .queue_overlay_live(
+                Some(1),
+                MixedDomainLayoutOverlay::new(
+                    growing_window,
+                    "g",
+                    2,
+                    vec![growth_slot],
+                    Some(growth_slot),
+                )
+                .expect("byte-reducing one-tab growth"),
+            )
+            .expect("queue count growth");
+        exchange
+            .queue_overlay_live(
+                Some(1),
+                MixedDomainLayoutOverlay::new(
+                    shrinking_window,
+                    "x".repeat(MAX_WORKSPACE_BYTES),
+                    2,
+                    reduced_slots.clone(),
+                    reduced_slots.first().copied(),
+                )
+                .expect("byte-growing one-tab shrink"),
+            )
+            .expect("queue count shrink");
+
+        let exchange_limit =
+            preflight_batch_with_byte_limit(&state, &exchange, false, u64::MAX)
+                .expect("measure aggregate-valid exchange")
+                .encoded_upper_bound;
+        // This poison is deliberately much smaller than the byte-growing
+        // half of the valid exchange. A relief-only greedy selector would
+        // remove that required half first and lose both overlay mutations.
+        let unrelated_poison_workspace = "c".to_string();
+        let mut batch = exchange;
+        batch
+            .queue_window_state(
+                unrelated_poison_workspace.clone(),
+                PersistedWindowState {
+                    maximized: true,
+                    fullscreen: true,
+                },
+            )
+            .expect("queue unrelated byte poison");
+        let preflight = preflight_batch_with_byte_limit(&state, &batch, false, exchange_limit)
+            .expect("unrelated poison must not break the aggregate-valid exchange");
+        assert_eq!(
+            preflight.overlays.apply_overlay_ids,
+            BTreeSet::from([growing_window, shrinking_window])
+        );
+        assert!(preflight.overlays.rejected_overlay_mutations.is_empty());
+        assert_eq!(
+            preflight.rejected_workspaces[&unrelated_poison_workspace].code(),
+            PersistenceFailureCode::Oversized
+        );
+        assert_eq!(preflight.encoded_upper_bound, exchange_limit);
+        let mut projected = state;
+        apply_batch(&mut projected, &batch, &preflight, None)
+            .expect("apply aggregate-valid exchange");
+        validate_state(&projected).expect("aggregate exchange preserves every state quota");
+        assert_eq!(
+            projected
+                .overlays
+                .iter()
+                .map(|overlay| overlay.slots.len())
+                .sum::<usize>(),
+            MAX_TOTAL_OVERLAY_TABS
+        );
+    }
+
+    #[test]
+    fn byte_rejected_overlay_does_not_prevent_later_capacity_backfill() {
+        let oversized_window = window_id(0);
+        let backfill_window = window_id(1);
+        let mut state = PersistedState::default();
+        state.store_revision = 1;
+        state.overlays = (10..10 + MAX_LAYOUT_OVERLAYS - 1)
+            .map(|index| {
+                MixedDomainLayoutOverlay::new(
+                    window_id(u64::try_from(index).expect("overlay index fits u64")),
+                    "stable",
+                    1,
+                    Vec::new(),
+                    None,
+                )
+                .expect("valid empty overlay")
+            })
+            .collect();
+        canonicalize_state(&mut state);
+        validate_state(&state).expect("authority has one live-overlay slot available");
+
+        let backfill_overlay = MixedDomainLayoutOverlay::new(
+            backfill_window,
+            "backfill",
+            1,
+            Vec::new(),
+            None,
+        )
+        .expect("small backfill overlay");
+        let mut backfill_only = PendingBatch::default();
+        backfill_only
+            .queue_overlay_live(None, backfill_overlay.clone())
+            .expect("queue backfill overlay");
+        let exact_backfill_limit =
+            preflight_batch_with_byte_limit(&state, &backfill_only, false, u64::MAX)
+                .expect("measure one valid backfill")
+                .encoded_upper_bound;
+
+        let mut mixed = backfill_only;
+        mixed
+            .queue_overlay_live(
+                None,
+                MixedDomainLayoutOverlay::new(
+                    oversized_window,
+                    "x".repeat(MAX_WORKSPACE_BYTES),
+                    1,
+                    Vec::new(),
+                    None,
+                )
+                .expect("independently valid but byte-expensive overlay"),
+            )
+            .expect("queue byte-expensive overlay");
+        let preflight = preflight_batch_with_byte_limit(
+            &state,
+            &mixed,
+            false,
+            exact_backfill_limit,
+        )
+        .expect("backfill around rejected earlier candidate");
+
+        assert_eq!(
+            preflight.overlays.apply_overlay_ids,
+            BTreeSet::from([backfill_window])
+        );
+        assert!(
+            preflight
+                .overlays
+                .rejected_overlay_mutations
+                .contains_key(&oversized_window)
+        );
+        assert_eq!(preflight.encoded_upper_bound, exact_backfill_limit);
+    }
+
+    #[test]
+    fn byte_rejected_workspace_does_not_consume_the_last_cardinality_slot() {
+        let oversized_workspace = format!("a-{}", "x".repeat(MAX_WORKSPACE_BYTES - 2));
+        let backfill_workspace = "z-backfill".to_string();
+        let geometry = PersistedWindowState {
+            maximized: true,
+            fullscreen: false,
+        };
+        let mut state = PersistedState::default();
+        state.store_revision = 1;
+        state.window_states = (0..MAX_WORKSPACES - 1)
+            .map(|index| (format!("existing-{index:04}"), PersistedWindowState::default()))
+            .collect();
+        validate_state(&state).expect("authority has one workspace slot available");
+
+        let mut backfill_only = PendingBatch::default();
+        backfill_only
+            .queue_window_state(backfill_workspace.clone(), geometry)
+            .expect("queue small workspace backfill");
+        let exact_backfill_limit =
+            preflight_batch_with_byte_limit(&state, &backfill_only, false, u64::MAX)
+                .expect("measure workspace backfill")
+                .encoded_upper_bound;
+        let mut mixed = backfill_only;
+        mixed
+            .queue_window_state(
+                oversized_workspace.clone(),
+                PersistedWindowState {
+                    maximized: false,
+                    fullscreen: true,
+                },
+            )
+            .expect("queue byte-expensive workspace");
+
+        let preflight = preflight_batch_with_byte_limit(
+            &state,
+            &mixed,
+            false,
+            exact_backfill_limit,
+        )
+        .expect("backfill the cardinality slot after byte rejection");
+        assert!(preflight.accepted_workspaces.contains(&backfill_workspace));
+        assert!(!preflight.accepted_workspaces.contains(&oversized_workspace));
+        assert_eq!(
+            preflight.rejected_workspaces[&oversized_workspace].code(),
+            PersistenceFailureCode::Oversized
+        );
+        assert_eq!(preflight.encoded_upper_bound, exact_backfill_limit);
+    }
+
+    #[test]
+    fn byte_rejected_binding_does_not_consume_the_last_cardinality_slot() {
+        let oversized_fingerprint = {
+            let mut bytes = [u8::MAX; 32];
+            bytes[0] = 0;
+            PrivacySafeTargetFingerprint::from_bytes(bytes)
+        };
+        let backfill_fingerprint = {
+            let mut bytes = [0u8; 32];
+            bytes[0] = 1;
+            PrivacySafeTargetFingerprint::from_bytes(bytes)
+        };
+        assert!(oversized_fingerprint < backfill_fingerprint);
+        let mut state = PersistedState::default();
+        state.store_revision = 1;
+        state.domain_bindings = (10..10 + MAX_DOMAIN_BINDINGS - 1)
+            .map(|index| {
+                let index = u64::try_from(index).expect("binding index fits u64");
+                DomainBindingRecord {
+                    target_fingerprint: indexed_fingerprint(index),
+                    binding_id: indexed_binding_id(index),
+                }
+            })
+            .collect();
+        canonicalize_state(&mut state);
+        validate_state(&state).expect("authority has one binding slot available");
+
+        let mut backfill_only = PendingBatch::default();
+        backfill_only.ensure_bindings.insert(backfill_fingerprint);
+        let exact_backfill_limit =
+            preflight_batch_with_byte_limit(&state, &backfill_only, false, u64::MAX)
+                .expect("measure binding backfill")
+                .encoded_upper_bound;
+        let mut mixed = backfill_only;
+        mixed.ensure_bindings.insert(oversized_fingerprint);
+
+        let preflight = preflight_batch_with_byte_limit(
+            &state,
+            &mixed,
+            false,
+            exact_backfill_limit,
+        )
+        .expect("backfill the binding slot after byte rejection");
+        assert!(preflight.accepted_bindings.contains(&backfill_fingerprint));
+        assert!(!preflight.accepted_bindings.contains(&oversized_fingerprint));
+        assert_eq!(
+            preflight.rejected_bindings[&oversized_fingerprint].code(),
+            PersistenceFailureCode::Quota
+        );
+        assert_eq!(preflight.encoded_upper_bound, exact_backfill_limit);
+    }
+
+    #[test]
+    fn commit_and_ack_partition_an_oversized_workspace_without_losing_valid_work() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("window-state.json");
+        let valid_workspace = "z-valid".to_string();
+        let oversized_workspace = format!("a-{}", "x".repeat(MAX_WORKSPACE_BYTES - 2));
+        let geometry = PersistedWindowState {
+            maximized: true,
+            fullscreen: false,
+        };
+        let mut valid_only = PendingBatch::default();
+        valid_only
+            .queue_window_state(valid_workspace.clone(), geometry)
+            .expect("queue valid workspace");
+        let exact_limit = preflight_batch_with_byte_limit(
+            &PersistedState::default(),
+            &valid_only,
+            false,
+            u64::MAX,
+        )
+        .expect("measure valid commit")
+        .encoded_upper_bound;
+
+        let mut batch = valid_only;
+        batch
+            .queue_window_state(
+                oversized_workspace.clone(),
+                PersistedWindowState {
+                    maximized: false,
+                    fullscreen: true,
+                },
+            )
+            .expect("queue independently valid long workspace");
+        let committed = commit_batch_with_byte_limit(
+            &path,
+            &batch,
+            WriteInterruption::None,
+            exact_limit,
+        )
+        .expect("commit valid lineage and reject oversized lineage");
+
+        assert_eq!(committed.receipt.committed_updates, 1);
+        assert_eq!(committed.receipt.rejected_updates, 1);
+        assert!(committed.receipt.wrote_new_generation);
+        assert_eq!(
+            committed.rejected_workspaces[&oversized_workspace].code(),
+            PersistenceFailureCode::Oversized
+        );
+        let snapshot = load_snapshot_at(&path).expect("load partitioned commit");
+        assert_eq!(snapshot.window_states.get(&valid_workspace), Some(&geometry));
+        assert!(!snapshot.window_states.contains_key(&oversized_workspace));
+
+        let shared = CoordinatorShared {
+            primary_path: path,
+            pending: Mutex::new(CoordinatorPending {
+                batch: batch.clone(),
+                ..CoordinatorPending::default()
+            }),
+        };
+        let semantic_failure = acknowledge_committed_batch(&shared, &batch, &committed)
+            .expect("acknowledgement retains the typed rejection");
+        assert_eq!(
+            semantic_failure.failure.code(),
+            PersistenceFailureCode::Oversized
+        );
+        let pending = lock_pending(&shared.pending);
+        assert!(pending.batch.window_states.is_empty());
+        assert!(pending.batch.ensure_bindings.is_empty());
+        assert!(pending.batch.overlay_mutations.is_empty());
+        assert_eq!(pending.batch.overlay_tab_count, 0);
+    }
+
+    #[test]
+    fn byte_quota_rejects_an_ownership_transfer_component_atomically() {
+        let source_window = LayoutWindowId::from_bytes([0x10; 16]);
+        let destination_window = LayoutWindowId::from_bytes([0x20; 16]);
+        let transferred = local_slot(0x30);
+        let mut state = PersistedState::default();
+        state.store_revision = 1;
+        state.overlays.push(
+            MixedDomainLayoutOverlay::new(
+                source_window,
+                "source",
+                1,
+                vec![transferred],
+                Some(transferred),
+            )
+            .expect("source overlay"),
+        );
+        state.overlays.push(
+            MixedDomainLayoutOverlay::new(
+                destination_window,
+                "destination",
+                1,
+                Vec::new(),
+                None,
+            )
+            .expect("empty destination overlay"),
+        );
+        canonicalize_state(&mut state);
+        validate_state(&state).expect("valid transfer authority");
+        let unchanged_upper_bound = EncodedStateBudget::from_state(&state, 2)
+            .and_then(|budget| budget.upper_bound())
+            .expect("count unchanged next-generation authority");
+
+        let mut batch = PendingBatch::default();
+        batch
+            .queue_overlay_live(
+                Some(1),
+                MixedDomainLayoutOverlay::new(
+                    source_window,
+                    "source",
+                    2,
+                    Vec::new(),
+                    None,
+                )
+                .expect("source release"),
+            )
+            .expect("queue source release");
+        batch
+            .queue_overlay_live(
+                Some(1),
+                MixedDomainLayoutOverlay::new(
+                    destination_window,
+                    "x".repeat(MAX_WORKSPACE_BYTES),
+                    2,
+                    vec![transferred],
+                    Some(transferred),
+                )
+                .expect("large destination acquisition"),
+            )
+            .expect("queue destination acquisition");
+
+        let preflight = preflight_batch_with_byte_limit(
+            &state,
+            &batch,
+            false,
+            unchanged_upper_bound,
+        )
+        .expect("reject transfer component semantically");
+        assert!(preflight.overlays.apply_overlay_ids.is_empty());
+        assert!(preflight.overlays.accepted_overlay_ids.is_empty());
+        assert_eq!(preflight.overlays.rejected_overlay_mutations.len(), 2);
+        for window_id in [source_window, destination_window] {
+            assert_eq!(
+                preflight.overlays.rejected_overlay_mutations[&window_id]
+                    .failure
+                    .code(),
+                PersistenceFailureCode::Oversized
+            );
+        }
+    }
+
+    #[test]
+    fn byte_rejection_cannot_leave_growth_dependent_on_a_rejected_tab_shrink() {
+        let growing_window = LayoutWindowId::from_bytes([0; 16]);
+        let shrinking_window = LayoutWindowId::from_bytes([u8::MAX; 16]);
+        let mut state = PersistedState::default();
+        state.store_revision = 1;
+        state.overlays.push(
+            MixedDomainLayoutOverlay::new(
+                growing_window,
+                "default",
+                1,
+                Vec::new(),
+                None,
+            )
+            .expect("empty growing overlay"),
+        );
+        let shrinking_slots = local_slots(0xf0, MAX_TABS_PER_OVERLAY);
+        state.overlays.push(
+            MixedDomainLayoutOverlay::new(
+                shrinking_window,
+                "default",
+                1,
+                shrinking_slots.clone(),
+                shrinking_slots.first().copied(),
+            )
+            .expect("full shrinking overlay"),
+        );
+        for number in 1..=3 {
+            let slots = local_slots(
+                u8::try_from(number).expect("test window number fits u8"),
+                MAX_TABS_PER_OVERLAY,
+            );
+            state.overlays.push(
+                MixedDomainLayoutOverlay::new(
+                    window_id(number),
+                    "default",
+                    1,
+                    slots.clone(),
+                    slots.first().copied(),
+                )
+                .expect("full stable overlay"),
+            );
+        }
+        canonicalize_state(&mut state);
+        validate_state(&state).expect("authority is exactly at the aggregate tab cap");
+        let byte_limit = EncodedStateBudget::from_state(&state, 2)
+            .and_then(|budget| budget.upper_bound())
+            .expect("count unchanged next generation");
+
+        let growth_slot = local_slot(0x7a);
+        let mut reduced_slots = shrinking_slots;
+        reduced_slots.pop();
+        let mut batch = PendingBatch::default();
+        batch
+            .queue_overlay_live(
+                Some(1),
+                MixedDomainLayoutOverlay::new(
+                    growing_window,
+                    "default",
+                    2,
+                    vec![growth_slot],
+                    Some(growth_slot),
+                )
+                .expect("one-tab growth"),
+            )
+            .expect("queue growth");
+        batch
+            .queue_overlay_live(
+                Some(1),
+                MixedDomainLayoutOverlay::new(
+                    shrinking_window,
+                    "x".repeat(MAX_WORKSPACE_BYTES),
+                    2,
+                    reduced_slots.clone(),
+                    reduced_slots.first().copied(),
+                )
+                .expect("byte-growing one-tab shrink"),
+            )
+            .expect("queue shrink");
+
+        let preflight =
+            preflight_batch_with_byte_limit(&state, &batch, false, byte_limit)
+                .expect("partition mutually incompatible quota candidates");
+        assert!(preflight.overlays.apply_overlay_ids.is_empty());
+        assert_eq!(
+            preflight.overlays.rejected_overlay_mutations[&growing_window]
+                .failure
+                .code(),
+            PersistenceFailureCode::Quota
+        );
+        assert_eq!(
+            preflight.overlays.rejected_overlay_mutations[&shrinking_window]
+                .failure
+                .code(),
+            PersistenceFailureCode::Oversized
+        );
+    }
+
+    #[test]
+    fn conservative_binding_width_does_not_block_a_real_byte_reduction() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("window-state.json");
+        let workspace = "reduce".to_string();
+        let mut state = PersistedState::default();
+        state.store_revision = 1;
+        state
+            .window_states
+            .insert(workspace.clone(), PersistedWindowState::default());
+        state.domain_bindings.push(DomainBindingRecord {
+            target_fingerprint: PrivacySafeTargetFingerprint::from_bytes([0; 32]),
+            binding_id: DomainBindingId::from_bytes([0; 16]),
+        });
+        canonicalize_state(&mut state);
+        let reduced_state = PersistedWindowState {
+            maximized: false,
+            fullscreen: true,
+        };
+        let mut projected = state.clone();
+        projected.store_revision = 2;
+        projected
+            .window_states
+            .insert(workspace.clone(), reduced_state);
+        let physical_limit = EncodedStateBudget::from_state_with_physical_bindings(&projected, 2)
+            .and_then(|budget| budget.upper_bound())
+            .expect("count safe physical upper bound");
+        std::fs::write(
+            &path,
+            encode_disk_slot(&state).expect("encode initial conservative-debt state"),
+        )
+        .expect("write initial conservative-debt state");
+
+        let mut batch = PendingBatch::default();
+        batch
+            .queue_window_state(workspace.clone(), reduced_state)
+            .expect("queue byte-reducing workspace update");
+        let preflight =
+            preflight_batch_with_byte_limit(&state, &batch, false, physical_limit)
+                .expect("conservative overage must retain a real reduction");
+        assert!(preflight.accepted_workspaces.contains(&workspace));
+        assert!(preflight.encoded_upper_bound > physical_limit);
+        let committed = commit_batch_with_byte_limit(
+            &path,
+            &batch,
+            WriteInterruption::None,
+            physical_limit,
+        )
+        .expect("physical upper bound permits the reducing commit");
+        assert_eq!(committed.receipt.committed_updates, 1);
+        let loaded = load_snapshot_at(&path).expect("load reducing commit");
+        assert_eq!(loaded.window_states.get(&workspace), Some(&reduced_state));
+    }
+
+    #[test]
+    fn insufficient_reduction_from_conservative_physical_debt_is_semantic_rejection() {
+        let workspace = "reduce".to_string();
+        let mut state = PersistedState::default();
+        state.store_revision = 9;
+        state
+            .window_states
+            .insert(workspace.clone(), PersistedWindowState::default());
+        state.domain_bindings.push(DomainBindingRecord {
+            target_fingerprint: PrivacySafeTargetFingerprint::from_bytes([0; 32]),
+            binding_id: DomainBindingId::from_bytes([0; 16]),
+        });
+        canonicalize_state(&mut state);
+
+        let reduced_state = PersistedWindowState {
+            maximized: false,
+            fullscreen: true,
+        };
+        let mut projected = state.clone();
+        projected.store_revision = 10;
+        projected
+            .window_states
+            .insert(workspace.clone(), reduced_state);
+        let projected_physical =
+            EncodedStateBudget::from_state_with_physical_bindings(&projected, 10)
+                .and_then(|budget| budget.upper_bound())
+                .expect("count projected physical upper bound");
+        let maximum_bytes = projected_physical
+            .checked_sub(1)
+            .expect("physical upper bound is nonzero");
+        let mut next_base = state.clone();
+        next_base.store_revision = 10;
+        let next_base_actual = u64::try_from(
+            encode_disk_slot(&next_base)
+                .expect("encode next-generation baseline")
+                .len(),
+        )
+        .expect("encoded baseline length fits u64");
+        assert!(next_base_actual <= maximum_bytes);
+
+        let mut batch = PendingBatch::default();
+        batch
+            .queue_window_state(workspace.clone(), reduced_state)
+            .expect("queue insufficient reduction");
+        let preflight = preflight_batch_with_byte_limit(
+            &state,
+            &batch,
+            false,
+            maximum_bytes,
+        )
+        .expect("conservative debt must not become transaction corruption");
+        assert!(!preflight.accepted_workspaces.contains(&workspace));
+        assert_eq!(
+            preflight.rejected_workspaces[&workspace].code(),
+            PersistenceFailureCode::Oversized
+        );
+    }
+
+    #[test]
+    fn admission_projection_apply_then_revert_is_identity_for_every_mutation_kind() {
+        let window = window_id(0x4a);
+        let old_slot = local_slot(0x4a);
+        let old_overlay =
+            MixedDomainLayoutOverlay::new(window, "old", 1, vec![old_slot], Some(old_slot))
+                .expect("old overlay");
+        let mut state = PersistedState::default();
+        state.store_revision = 1;
+        state
+            .window_states
+            .insert("old".to_string(), PersistedWindowState::default());
+        state.domain_bindings.push(DomainBindingRecord {
+            target_fingerprint: PrivacySafeTargetFingerprint::from_bytes([0; 32]),
+            binding_id: DomainBindingId::from_bytes([0; 16]),
+        });
+        state.overlays.push(old_overlay.clone());
+        canonicalize_state(&mut state);
+
+        let base = AdmissionProjection {
+            normalized_bytes: EncodedStateBudget::from_state(&state, 2)
+                .expect("normalized base"),
+            physical_bytes: EncodedStateBudget::from_state_with_physical_bindings(&state, 2)
+                .expect("physical base"),
+            counts: AdmissionCountBudget::from_state(&state).expect("count base"),
+        };
+        let replacement_state = PersistedWindowState {
+            maximized: true,
+            fullscreen: true,
+        };
+        let replacement_slots = vec![local_slot(0x4b), local_slot(0x4c)];
+        let replacement_overlay = MixedDomainLayoutOverlay::new(
+            window,
+            "new",
+            2,
+            replacement_slots.clone(),
+            replacement_slots.first().copied(),
+        )
+        .expect("replacement overlay");
+        let tombstone = OverlayTombstone::new(window, 1, 2).expect("delete tombstone");
+        let candidates = [
+            ByteAdmissionCandidate {
+                key: ByteAdmissionKey::Workspace("old".to_string()),
+                admission_rank: 2,
+                mutation: ByteBudgetMutation::Workspace {
+                    old_entry_bytes: Some(
+                        window_state_entry_len("old", &PersistedWindowState::default())
+                            .expect("old workspace bytes"),
+                    ),
+                    new_entry_bytes: window_state_entry_len("old", &replacement_state)
+                        .expect("replacement workspace bytes"),
+                },
+            },
+            ByteAdmissionCandidate {
+                key: ByteAdmissionKey::Workspace("inserted".to_string()),
+                admission_rank: 2,
+                mutation: ByteBudgetMutation::Workspace {
+                    old_entry_bytes: None,
+                    new_entry_bytes: window_state_entry_len("inserted", &replacement_state)
+                        .expect("inserted workspace bytes"),
+                },
+            },
+            ByteAdmissionCandidate {
+                key: ByteAdmissionKey::Binding(
+                    PrivacySafeTargetFingerprint::from_bytes([1; 32]),
+                ),
+                admission_rank: 2,
+                mutation: ByteBudgetMutation::Binding {
+                    new_record_bytes: maximum_width_binding_len(
+                        PrivacySafeTargetFingerprint::from_bytes([1; 32]),
+                    )
+                    .expect("new binding bytes"),
+                },
+            },
+            ByteAdmissionCandidate {
+                key: ByteAdmissionKey::Overlay(window),
+                admission_rank: 2,
+                mutation: ByteBudgetMutation::OverlayComponent {
+                    window_ids: vec![window],
+                    mutations: vec![OverlayBudgetMutation {
+                        old_overlay_bytes: Some(
+                            encoded_json_len(&old_overlay).expect("old overlay bytes"),
+                        ),
+                        new_overlay_bytes: Some(
+                            encoded_json_len(&replacement_overlay)
+                                .expect("replacement overlay bytes"),
+                        ),
+                        new_tombstone_bytes: None,
+                        old_tab_count: 1,
+                        new_tab_count: 2,
+                        old_is_live: true,
+                        new_is_live: true,
+                        adds_tombstone: false,
+                    }],
+                },
+            },
+            ByteAdmissionCandidate {
+                key: ByteAdmissionKey::Overlay(window),
+                admission_rank: 1,
+                mutation: ByteBudgetMutation::OverlayComponent {
+                    window_ids: vec![window],
+                    mutations: vec![OverlayBudgetMutation {
+                        old_overlay_bytes: Some(
+                            encoded_json_len(&old_overlay).expect("deleted overlay bytes"),
+                        ),
+                        new_overlay_bytes: None,
+                        new_tombstone_bytes: Some(
+                            encoded_json_len(&tombstone).expect("tombstone bytes"),
+                        ),
+                        old_tab_count: 1,
+                        new_tab_count: 0,
+                        old_is_live: true,
+                        new_is_live: false,
+                        adds_tombstone: true,
+                    }],
+                },
+            },
+        ];
+
+        for candidate in &candidates {
+            let mut projected = base;
+            projected.apply(candidate).expect("apply candidate");
+            projected.revert(candidate).expect("revert candidate");
+            assert_eq!(projected, base, "failed for {:?}", candidate.key);
+        }
+    }
+
+    #[test]
+    fn selector_backfill_reaches_inclusion_maximal_fixed_point() {
+        let byte_budget = EncodedStateBudget {
+            empty_slot_bytes: 53,
+            window_states: JsonCollectionBudget::default(),
+            domain_bindings: JsonCollectionBudget::default(),
+            overlays: JsonCollectionBudget {
+                item_bytes: 40,
+                item_count: 4,
+            },
+            tombstones: JsonCollectionBudget::default(),
+        };
+        let base = AdmissionProjection {
+            normalized_bytes: byte_budget,
+            physical_bytes: byte_budget,
+            counts: AdmissionCountBudget {
+                workspaces: 0,
+                bindings: 0,
+                live_overlays: 4,
+                tombstones: 0,
+                tabs: MAX_TOTAL_OVERLAY_TABS,
+            },
+        };
+        let replacement = |number, old_bytes, new_bytes, old_tabs, new_tabs, rank| {
+            ByteAdmissionCandidate {
+                key: ByteAdmissionKey::Overlay(window_id(number)),
+                admission_rank: rank,
+                mutation: ByteBudgetMutation::OverlayComponent {
+                    window_ids: vec![window_id(number)],
+                    mutations: vec![OverlayBudgetMutation {
+                        old_overlay_bytes: Some(old_bytes),
+                        new_overlay_bytes: Some(new_bytes),
+                        new_tombstone_bytes: None,
+                        old_tab_count: old_tabs,
+                        new_tab_count: new_tabs,
+                        old_is_live: true,
+                        new_is_live: true,
+                        adds_tombstone: false,
+                    }],
+                },
+            }
+        };
+        let candidates = [
+            replacement(0x81, 10, 13, 2, 0, 2),
+            replacement(0x82, 10, 22, 3, 0, 2),
+            replacement(0x83, 10, 25, 0, 0, 2),
+            replacement(0x84, 10, 5, 0, 2, 0),
+        ];
+
+        let (selected, rejected, accepted_count) = select_compatible_candidate_subset(
+            base,
+            &candidates,
+            &[0, 1, 2, 3],
+            100,
+            false,
+        )
+        .expect("select an inclusion-maximal fixed point");
+
+        assert_eq!(accepted_count, 2);
+        assert_eq!(rejected, vec![1, 2]);
+        assert_eq!(
+            selected
+                .normalized_bytes
+                .upper_bound()
+                .expect("selected bytes"),
+            94
+        );
+        assert_eq!(selected.counts.tabs, MAX_TOTAL_OVERLAY_TABS);
+        for index in rejected {
+            let mut plus_rejected = selected;
+            plus_rejected
+                .apply(&candidates[index])
+                .expect("apply rejected candidate for invariant check");
+            assert_ne!(
+                admission_violation_mask(base, plus_rejected, 100, true)
+                    .expect("classify rejected candidate"),
+                0,
+                "candidate {index} remained individually admissible"
+            );
+        }
+    }
+
+    #[test]
+    fn selector_handles_separator_relief_hidden_from_base_relative_deltas() {
+        let byte_budget = EncodedStateBudget {
+            empty_slot_bytes: 100,
+            window_states: JsonCollectionBudget::default(),
+            domain_bindings: JsonCollectionBudget::default(),
+            overlays: JsonCollectionBudget {
+                item_bytes: 30,
+                item_count: 3,
+            },
+            tombstones: JsonCollectionBudget::default(),
+        };
+        let maximum_bytes = byte_budget.upper_bound().expect("base byte limit");
+        let base = AdmissionProjection {
+            normalized_bytes: byte_budget,
+            physical_bytes: byte_budget,
+            counts: AdmissionCountBudget {
+                workspaces: 0,
+                bindings: 0,
+                live_overlays: 3,
+                tombstones: 0,
+                tabs: 0,
+            },
+        };
+        let deletion = |number| ByteAdmissionCandidate {
+            key: ByteAdmissionKey::Overlay(window_id(number)),
+            admission_rank: 1,
+            mutation: ByteBudgetMutation::OverlayComponent {
+                window_ids: vec![window_id(number)],
+                mutations: vec![OverlayBudgetMutation {
+                    old_overlay_bytes: Some(10),
+                    new_overlay_bytes: None,
+                    new_tombstone_bytes: Some(11),
+                    old_tab_count: 0,
+                    new_tab_count: 0,
+                    old_is_live: true,
+                    new_is_live: false,
+                    adds_tombstone: true,
+                }],
+            },
+        };
+        let candidates = [deletion(0x91), deletion(0x92), deletion(0x93)];
+        for candidate in &candidates {
+            assert_eq!(
+                AdmissionDelta::for_candidate(base, candidate)
+                    .expect("compute base-relative delta")
+                    .values[5],
+                0
+            );
+        }
+
+        let (selected, rejected, accepted_count) = select_compatible_candidate_subset(
+            base,
+            &candidates,
+            &[0, 1, 2],
+            maximum_bytes,
+            false,
+        )
+        .expect("reconstruct exact separator-safe subset");
+
+        assert_eq!(accepted_count, 1);
+        assert_eq!(rejected.len(), 2);
+        assert_eq!(selected.counts.live_overlays, 2);
+        assert_eq!(selected.counts.tombstones, 1);
+        assert_eq!(
+            selected
+                .normalized_bytes
+                .upper_bound()
+                .expect("selected bytes"),
+            maximum_bytes
+        );
+        for index in rejected {
+            let mut plus_rejected = selected;
+            plus_rejected
+                .apply(&candidates[index])
+                .expect("apply rejected separator candidate");
+            assert_ne!(
+                admission_violation_mask(base, plus_rejected, maximum_bytes, true)
+                    .expect("classify separator rejection"),
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn forced_candidate_free_publication_checks_physical_byte_limit() {
+        let byte_budget = EncodedStateBudget {
+            empty_slot_bytes: 101,
+            window_states: JsonCollectionBudget::default(),
+            domain_bindings: JsonCollectionBudget::default(),
+            overlays: JsonCollectionBudget::default(),
+            tombstones: JsonCollectionBudget::default(),
+        };
+        let base = AdmissionProjection {
+            normalized_bytes: byte_budget,
+            physical_bytes: byte_budget,
+            counts: AdmissionCountBudget {
+                workspaces: 0,
+                bindings: 0,
+                live_overlays: 0,
+                tombstones: 0,
+                tabs: 0,
+            },
+        };
+
+        let unchanged = select_compatible_candidate_subset(base, &[], &[], 100, false)
+            .expect("candidate-free no-write base remains admissible");
+        assert_eq!(unchanged.0, base);
+
+        let failure = select_compatible_candidate_subset(base, &[], &[], 100, true)
+            .expect_err("forced publication must prove its physical byte bound");
+        assert_eq!(failure.code(), PersistenceFailureCode::Oversized);
+    }
+
+    #[test]
+    fn selector_preserves_active_resource_suppliers_when_peeling_unrelated_mixed_poison() {
+        let byte_budget = EncodedStateBudget {
+            empty_slot_bytes: 100,
+            window_states: JsonCollectionBudget::default(),
+            domain_bindings: JsonCollectionBudget::default(),
+            overlays: JsonCollectionBudget {
+                item_bytes: 300,
+                item_count: 3,
+            },
+            tombstones: JsonCollectionBudget::default(),
+        };
+        let maximum_bytes = byte_budget.upper_bound().expect("base byte limit");
+        let base = AdmissionProjection {
+            normalized_bytes: byte_budget,
+            physical_bytes: byte_budget,
+            counts: AdmissionCountBudget {
+                workspaces: 0,
+                bindings: 0,
+                live_overlays: MAX_LAYOUT_OVERLAYS,
+                tombstones: 0,
+                tabs: MAX_TOTAL_OVERLAY_TABS,
+            },
+        };
+        let candidates = [
+            ByteAdmissionCandidate {
+                key: ByteAdmissionKey::Overlay(window_id(0x51)),
+                admission_rank: 0,
+                mutation: ByteBudgetMutation::OverlayComponent {
+                    window_ids: vec![window_id(0x51)],
+                    mutations: vec![OverlayBudgetMutation {
+                        old_overlay_bytes: Some(100),
+                        new_overlay_bytes: Some(20),
+                        new_tombstone_bytes: None,
+                        old_tab_count: 0,
+                        new_tab_count: 1,
+                        old_is_live: true,
+                        new_is_live: true,
+                        adds_tombstone: false,
+                    }],
+                },
+            },
+            ByteAdmissionCandidate {
+                key: ByteAdmissionKey::Overlay(window_id(0x52)),
+                admission_rank: 2,
+                mutation: ByteBudgetMutation::OverlayComponent {
+                    window_ids: vec![window_id(0x52)],
+                    mutations: vec![OverlayBudgetMutation {
+                        old_overlay_bytes: Some(20),
+                        new_overlay_bytes: Some(90),
+                        new_tombstone_bytes: None,
+                        old_tab_count: 1,
+                        new_tab_count: 0,
+                        old_is_live: true,
+                        new_is_live: true,
+                        adds_tombstone: false,
+                    }],
+                },
+            },
+            ByteAdmissionCandidate {
+                key: ByteAdmissionKey::Overlay(window_id(0x53)),
+                admission_rank: 1,
+                mutation: ByteBudgetMutation::OverlayComponent {
+                    window_ids: vec![window_id(0x53), window_id(0x54)],
+                    mutations: vec![
+                        OverlayBudgetMutation {
+                            old_overlay_bytes: Some(50),
+                            new_overlay_bytes: None,
+                            new_tombstone_bytes: Some(30),
+                            old_tab_count: 0,
+                            new_tab_count: 0,
+                            old_is_live: true,
+                            new_is_live: false,
+                            adds_tombstone: true,
+                        },
+                        OverlayBudgetMutation {
+                            old_overlay_bytes: Some(50),
+                            new_overlay_bytes: Some(90),
+                            new_tombstone_bytes: None,
+                            old_tab_count: 0,
+                            new_tab_count: 1,
+                            old_is_live: true,
+                            new_is_live: true,
+                            adds_tombstone: false,
+                        },
+                    ],
+                },
+            },
+        ];
+
+        let (selected, rejected, accepted_count) = select_compatible_candidate_subset(
+            base,
+            &candidates,
+            &[0, 1, 2],
+            maximum_bytes,
+            false,
+        )
+        .expect("select mutually enabling exchange");
+        assert_eq!(rejected, vec![2]);
+        assert_eq!(accepted_count, 2);
+        assert_eq!(selected.counts.tabs, MAX_TOTAL_OVERLAY_TABS);
+        assert_eq!(selected.counts.live_overlays, MAX_LAYOUT_OVERLAYS);
+        assert!(
+            selected
+                .normalized_bytes
+                .upper_bound()
+                .expect("selected bytes")
+                <= maximum_bytes
+        );
+    }
+
+    #[test]
+    fn selector_preserves_larger_inactive_supplier_for_a_balanced_exchange() {
+        let byte_budget = EncodedStateBudget {
+            empty_slot_bytes: 100,
+            window_states: JsonCollectionBudget::default(),
+            domain_bindings: JsonCollectionBudget::default(),
+            overlays: JsonCollectionBudget {
+                item_bytes: 100,
+                item_count: 3,
+            },
+            tombstones: JsonCollectionBudget::default(),
+        };
+        let maximum_bytes = byte_budget.upper_bound().expect("base byte limit");
+        let base = AdmissionProjection {
+            normalized_bytes: byte_budget,
+            physical_bytes: byte_budget,
+            counts: AdmissionCountBudget {
+                workspaces: 0,
+                bindings: 0,
+                live_overlays: 3,
+                tombstones: 0,
+                tabs: MAX_TOTAL_OVERLAY_TABS,
+            },
+        };
+        let replacement = |number, old_bytes, new_bytes, old_tabs, new_tabs, rank| {
+            ByteAdmissionCandidate {
+                key: ByteAdmissionKey::Overlay(window_id(number)),
+                admission_rank: rank,
+                mutation: ByteBudgetMutation::OverlayComponent {
+                    window_ids: vec![window_id(number)],
+                    mutations: vec![OverlayBudgetMutation {
+                        old_overlay_bytes: Some(old_bytes),
+                        new_overlay_bytes: Some(new_bytes),
+                        new_tombstone_bytes: None,
+                        old_tab_count: old_tabs,
+                        new_tab_count: new_tabs,
+                        old_is_live: true,
+                        new_is_live: true,
+                        adds_tombstone: false,
+                    }],
+                },
+            }
+        };
+        let candidates = [
+            replacement(0x61, 20, 30, 10, 0, 2),
+            replacement(0x62, 30, 20, 0, 10, 0),
+            replacement(0x63, 40, 41, 1, 0, 2),
+        ];
+
+        let (selected, rejected, accepted_count) = select_compatible_candidate_subset(
+            base,
+            &candidates,
+            &[0, 1, 2],
+            maximum_bytes,
+            false,
+        )
+        .expect("select balanced exchange over smaller inactive supplier");
+        assert_eq!(rejected, vec![2]);
+        assert_eq!(accepted_count, 2);
+        assert_eq!(selected.counts.tabs, MAX_TOTAL_OVERLAY_TABS);
+        assert_eq!(
+            selected.normalized_bytes.upper_bound().expect("selected bytes"),
+            maximum_bytes
+        );
+    }
+
+    #[test]
+    fn selector_exactly_isolates_one_expensive_mixed_sign_lineage() {
+        let byte_budget = EncodedStateBudget {
+            empty_slot_bytes: 100,
+            window_states: JsonCollectionBudget::default(),
+            domain_bindings: JsonCollectionBudget::default(),
+            overlays: JsonCollectionBudget {
+                item_bytes: 1_400,
+                item_count: 4,
+            },
+            tombstones: JsonCollectionBudget::default(),
+        };
+        let maximum_bytes = byte_budget.upper_bound().expect("base byte limit");
+        let base = AdmissionProjection {
+            normalized_bytes: byte_budget,
+            physical_bytes: byte_budget,
+            counts: AdmissionCountBudget {
+                workspaces: 0,
+                bindings: 0,
+                live_overlays: 4,
+                tombstones: 0,
+                tabs: MAX_TOTAL_OVERLAY_TABS,
+            },
+        };
+        let candidates = [
+            ByteAdmissionCandidate {
+                key: ByteAdmissionKey::Overlay(window_id(0x71)),
+                admission_rank: 0,
+                mutation: ByteBudgetMutation::OverlayComponent {
+                    window_ids: vec![window_id(0x71)],
+                    mutations: vec![OverlayBudgetMutation {
+                        old_overlay_bytes: Some(1_100),
+                        new_overlay_bytes: Some(100),
+                        new_tombstone_bytes: None,
+                        old_tab_count: 0,
+                        new_tab_count: 1,
+                        old_is_live: true,
+                        new_is_live: true,
+                        adds_tombstone: false,
+                    }],
+                },
+            },
+            ByteAdmissionCandidate {
+                key: ByteAdmissionKey::Overlay(window_id(0x72)),
+                admission_rank: 1,
+                mutation: ByteBudgetMutation::OverlayComponent {
+                    window_ids: vec![window_id(0x72), window_id(0x73)],
+                    mutations: vec![
+                        OverlayBudgetMutation {
+                            old_overlay_bytes: Some(100),
+                            new_overlay_bytes: None,
+                            new_tombstone_bytes: Some(100),
+                            old_tab_count: 2,
+                            new_tab_count: 0,
+                            old_is_live: true,
+                            new_is_live: false,
+                            adds_tombstone: true,
+                        },
+                        OverlayBudgetMutation {
+                            old_overlay_bytes: Some(100),
+                            new_overlay_bytes: Some(1_200),
+                            new_tombstone_bytes: None,
+                            old_tab_count: 0,
+                            new_tab_count: 0,
+                            old_is_live: true,
+                            new_is_live: true,
+                            adds_tombstone: false,
+                        },
+                    ],
+                },
+            },
+            ByteAdmissionCandidate {
+                key: ByteAdmissionKey::Overlay(window_id(0x74)),
+                admission_rank: 2,
+                mutation: ByteBudgetMutation::OverlayComponent {
+                    window_ids: vec![window_id(0x74)],
+                    mutations: vec![OverlayBudgetMutation {
+                        old_overlay_bytes: Some(100),
+                        new_overlay_bytes: Some(1_000),
+                        new_tombstone_bytes: None,
+                        old_tab_count: 1,
+                        new_tab_count: 0,
+                        old_is_live: true,
+                        new_is_live: true,
+                        adds_tombstone: false,
+                    }],
+                },
+            },
+        ];
+
+        let (selected, rejected, accepted_count) = select_compatible_candidate_subset(
+            base,
+            &candidates,
+            &[0, 1, 2],
+            maximum_bytes,
+            false,
+        )
+        .expect("isolate one mixed-sign poison exactly");
+        assert_eq!(rejected, vec![1]);
+        assert_eq!(accepted_count, 2);
+        assert_eq!(selected.counts.tabs, MAX_TOTAL_OVERLAY_TABS);
+        assert_eq!(selected.counts.live_overlays, 4);
+        assert_eq!(selected.counts.tombstones, 0);
+        assert!(
+            selected
+                .normalized_bytes
+                .upper_bound()
+                .expect("selected bytes")
+                <= maximum_bytes
+        );
+    }
+
+    #[test]
     fn higher_id_delete_makes_room_for_lower_id_empty_create_at_live_cap() {
         let temp = tempfile::tempdir().expect("tempdir");
         let path = temp.path().join("window-state.json");
@@ -5770,7 +8328,8 @@ mod tests {
         batch.ensure_bindings.insert(first_fingerprint);
         batch.ensure_bindings.insert(second_fingerprint);
 
-        let preflight = preflight_batch(&state, &batch).expect("partition final capacity slots");
+        let preflight =
+            preflight_batch(&state, &batch, false).expect("partition final capacity slots");
         assert!(preflight.accepted_workspaces.contains("zz-first"));
         assert_eq!(
             preflight.rejected_workspaces["zz-second"].code(),
@@ -7986,6 +10545,124 @@ mod tests {
     }
 
     #[test]
+    fn streaming_disk_slot_encoder_matches_derived_serializer_oracle() {
+        let mut state = PersistedState::default();
+        state.store_revision = 19;
+        state.window_states.insert(
+            "quote-\"-slash-\\-snowman-☃".to_string(),
+            PersistedWindowState {
+                maximized: true,
+                fullscreen: false,
+            },
+        );
+        let binding_id = DomainBindingId::from_bytes([0x9a; 16]);
+        state.domain_bindings.push(DomainBindingRecord {
+            target_fingerprint: PrivacySafeTargetFingerprint::from_bytes([0x8b; 32]),
+            binding_id,
+        });
+        let slot = remote_slot(binding_id, 0x7c, 99, 101);
+        state.overlays.push(
+            MixedDomainLayoutOverlay::new(
+                LayoutWindowId::from_bytes([0x6d; 16]),
+                "quote-\"-slash-\\-snowman-☃",
+                1,
+                vec![slot],
+                Some(slot),
+            )
+            .expect("oracle overlay"),
+        );
+        state.tombstones.push(
+            OverlayTombstone::new(LayoutWindowId::from_bytes([0x5e; 16]), 4, 17)
+                .expect("oracle tombstone"),
+        );
+        canonicalize_state(&mut state);
+        validate_published_state(&state).expect("oracle state is publishable");
+
+        let payload = serde_json::to_vec(&state).expect("serialize oracle payload");
+        let sha256: [u8; 32] = Sha256::digest(&payload).into();
+        let oracle = serde_json::to_vec(&DiskSlot {
+            payload: state.clone(),
+            sha256,
+        })
+        .expect("serialize derived disk-slot oracle");
+        let encoded = encode_disk_slot(&state).expect("streaming disk-slot encode");
+
+        assert_eq!(encoded, oracle);
+        assert_eq!(
+            encoded_json_len(&BorrowedDiskSlot {
+                payload: &state,
+                sha256,
+            })
+            .expect("count borrowed slot"),
+            u64::try_from(encoded.len()).expect("encoded length fits u64")
+        );
+    }
+
+    #[test]
+    fn encoded_state_budget_matches_serde_with_maximum_checksum_width() {
+        let mut state = PersistedState::default();
+        state.store_revision = 9;
+        state.window_states.insert(
+            "escaped-\"-\\-☃".to_string(),
+            PersistedWindowState {
+                maximized: false,
+                fullscreen: true,
+            },
+        );
+        state.domain_bindings.push(DomainBindingRecord {
+            target_fingerprint: PrivacySafeTargetFingerprint::from_bytes([10; 32]),
+            binding_id: DomainBindingId::from_bytes([100; 16]),
+        });
+        let slots = local_slots(99, 3);
+        state.overlays.push(
+            MixedDomainLayoutOverlay::new(
+                LayoutWindowId::from_bytes([9; 16]),
+                "escaped-\"-\\-☃",
+                7,
+                slots.clone(),
+                slots.first().copied(),
+            )
+            .expect("budget overlay"),
+        );
+        state.tombstones.push(
+            OverlayTombstone::new(LayoutWindowId::from_bytes([255; 16]), 8, 9)
+                .expect("budget tombstone"),
+        );
+        canonicalize_state(&mut state);
+
+        let published_revision = 10;
+        let budget = EncodedStateBudget::from_state(&state, published_revision)
+            .expect("construct encoded budget");
+        let mut projected = state;
+        projected.store_revision = published_revision;
+        for binding in &mut projected.domain_bindings {
+            binding.binding_id = DomainBindingId::from_bytes([u8::MAX; 16]);
+        }
+        let oracle = encoded_json_len(&BorrowedDiskSlot {
+            payload: &projected,
+            sha256: [u8::MAX; 32],
+        })
+        .expect("count maximum-checksum oracle");
+
+        assert_eq!(budget.upper_bound().expect("budget upper bound"), oracle);
+    }
+
+    #[test]
+    fn maximum_width_binding_budget_bounds_numeric_byte_arrays() {
+        for byte in [0, 9, 10, 99, 100, 255] {
+            let fingerprint = PrivacySafeTargetFingerprint::from_bytes([byte; 32]);
+            let actual = encoded_json_len(&DomainBindingRecord {
+                target_fingerprint: fingerprint,
+                binding_id: DomainBindingId::from_bytes([byte; 16]),
+            })
+            .expect("count actual binding");
+            let maximum =
+                maximum_width_binding_len(fingerprint).expect("count maximum-width binding");
+            assert!(actual <= maximum, "byte pattern {byte} exceeded its bound");
+        }
+    }
+
+    #[test]
     fn corrupt_field_names_are_not_reflected_in_diagnostics() {
         let temp = tempfile::tempdir().expect("tempdir");
         let path = temp.path().join("window-state.json");
@@ -8014,6 +10691,99 @@ mod tests {
     }
 
     proptest! {
+        #[test]
+        fn streaming_encoder_and_upper_bound_hold_for_varied_valid_states(
+            workspace_seed in prop::collection::vec(any::<u8>(), 0..80),
+            mut tab_bytes in prop::collection::vec(any::<u8>(), 0..32),
+            binding_byte in any::<u8>(),
+            include_window in any::<bool>(),
+            include_binding in any::<bool>(),
+            include_overlay in any::<bool>(),
+            include_tombstone in any::<bool>(),
+            store_revision in 1u64..1_000_000,
+        ) {
+            let mut workspace = String::from("property-");
+            for byte in workspace_seed {
+                workspace.push_str(match byte % 5 {
+                    0 => "a",
+                    1 => "\"",
+                    2 => "\\",
+                    3 => "☃",
+                    _ => "z",
+                });
+            }
+            let mut state = PersistedState::default();
+            state.store_revision = store_revision;
+            if include_window {
+                state.window_states.insert(
+                    workspace.clone(),
+                    PersistedWindowState {
+                        maximized: binding_byte & 1 != 0,
+                        fullscreen: binding_byte & 2 != 0,
+                    },
+                );
+            }
+            if include_binding {
+                state.domain_bindings.push(DomainBindingRecord {
+                    target_fingerprint: PrivacySafeTargetFingerprint::from_bytes([
+                        binding_byte;
+                        32
+                    ]),
+                    binding_id: DomainBindingId::from_bytes([binding_byte; 16]),
+                });
+            }
+            tab_bytes.sort_unstable();
+            tab_bytes.dedup();
+            if include_overlay {
+                let slots = tab_bytes.iter().copied().map(local_slot).collect::<Vec<_>>();
+                state.overlays.push(
+                    MixedDomainLayoutOverlay::new(
+                        LayoutWindowId::from_bytes([0xc2; 16]),
+                        &workspace,
+                        1,
+                        slots.clone(),
+                        slots.first().copied(),
+                    )
+                    .expect("generated valid overlay"),
+                );
+            }
+            if include_tombstone {
+                state.tombstones.push(
+                    OverlayTombstone::new(
+                        LayoutWindowId::from_bytes([0xc3; 16]),
+                        1,
+                        store_revision,
+                    )
+                    .expect("generated valid tombstone"),
+                );
+            }
+            canonicalize_state(&mut state);
+            validate_published_state(&state).expect("generated state is publishable");
+
+            let payload = serde_json::to_vec(&state).expect("serialize property payload");
+            let sha256: [u8; 32] = Sha256::digest(&payload).into();
+            let oracle = serde_json::to_vec(&DiskSlot {
+                payload: state.clone(),
+                sha256,
+            })
+            .expect("serialize property oracle");
+            let encoded = encode_disk_slot(&state).expect("stream property state");
+            prop_assert_eq!(&encoded, &oracle);
+
+            let upper_bound = EncodedStateBudget::from_state(&state, store_revision)
+                .and_then(|budget| budget.upper_bound())
+                .expect("count property upper bound");
+            let physical_upper_bound =
+                EncodedStateBudget::from_state_with_physical_bindings(&state, store_revision)
+                    .and_then(|budget| budget.upper_bound())
+                    .expect("count property physical upper bound");
+            prop_assert!(
+                u64::try_from(encoded.len()).expect("encoded length fits u64")
+                    <= physical_upper_bound
+            );
+            prop_assert!(physical_upper_bound <= upper_bound);
+        }
+
         #[test]
         fn overlay_json_roundtrip_preserves_exact_order_and_active_identity(
             mut tab_bytes in prop::collection::vec(any::<u8>(), 0..64),
