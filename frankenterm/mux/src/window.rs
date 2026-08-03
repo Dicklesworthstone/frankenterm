@@ -122,21 +122,19 @@ pub enum WindowOrderSnapshotError {
     MissingActiveTab { window_id: WindowId },
 }
 
-pub(crate) struct PreparedWindowOrder {
+pub(crate) struct ValidatedWindowOrder {
     window_id: WindowId,
     prior_revision: WindowOrderRevision,
-    next_revision: WindowOrderRevision,
     ordered_tabs: Vec<Arc<Tab>>,
     active_index: usize,
 }
 
-impl fmt::Debug for PreparedWindowOrder {
+impl fmt::Debug for ValidatedWindowOrder {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
-            .debug_struct("PreparedWindowOrder")
+            .debug_struct("ValidatedWindowOrder")
             .field("window_id", &self.window_id)
             .field("prior_revision", &self.prior_revision)
-            .field("next_revision", &self.next_revision)
             .field(
                 "ordered_tab_ids",
                 &self
@@ -148,6 +146,11 @@ impl fmt::Debug for PreparedWindowOrder {
             .field("active_index", &self.active_index)
             .finish()
     }
+}
+
+pub(crate) struct PreparedWindowOrder {
+    validated: ValidatedWindowOrder,
+    next_revision: WindowOrderRevision,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
@@ -341,15 +344,18 @@ impl Window {
         })
     }
 
-    /// Fully stage one exact-permutation reorder without mutating the window.
+    /// Validate and stage one exact permutation without consuming revision
+    /// capacity or mutating the window.
     ///
     /// The returned value contains the same `Arc<Tab>` identities in their
-    /// requested order. Callers must retain exclusive access until commit.
-    pub(crate) fn prepare_exact_order(
+    /// requested order. Keeping capacity reservation separate preserves the
+    /// protocol outcome order: semantic malformation precedes revision
+    /// conflict, which precedes counter exhaustion.
+    pub(crate) fn validate_exact_order(
         &self,
         desired_tab_ids: &[TabId],
         desired_active_tab_id: Option<TabId>,
-    ) -> Result<PreparedWindowOrder, PrepareWindowOrderError> {
+    ) -> Result<ValidatedWindowOrder, PrepareWindowOrderError> {
         if self.tabs.len() > MAX_TABS_PER_ORDERED_WINDOW {
             return Err(WindowOrderSnapshotError::TooManyTabs {
                 window_id: self.id,
@@ -368,16 +374,9 @@ impl Window {
                     .tab_id(),
             )
         };
-        if desired_active_tab_id != current_active_tab_id {
-            return Err(PrepareWindowOrderError::ActiveTabChanged {
-                current_active_tab_id,
-                desired_active_tab_id,
-            });
-        }
-
         let mut current_by_id = HashMap::with_capacity(self.tabs.len());
         for tab in &self.tabs {
-            let replaced = current_by_id.insert(tab.tab_id(), Arc::clone(tab));
+            let replaced = current_by_id.insert(tab.tab_id(), (Arc::clone(tab), false));
             if replaced.is_some() {
                 return Err(WindowOrderSnapshotError::DuplicateTabId {
                     window_id: self.id,
@@ -386,24 +385,31 @@ impl Window {
                 .into());
             }
         }
-        let mut desired_ids = HashSet::with_capacity(desired_tab_ids.len());
         let mut ordered_tabs = Vec::with_capacity(desired_tab_ids.len());
         for &tab_id in desired_tab_ids {
-            if !desired_ids.insert(tab_id) {
-                return Err(PrepareWindowOrderError::DuplicateTabId { tab_id });
-            }
-            let Some(tab) = current_by_id.get(&tab_id) else {
+            let Some((tab, already_used)) = current_by_id.get_mut(&tab_id) else {
                 return Err(PrepareWindowOrderError::ForeignTabId { tab_id });
             };
+            if *already_used {
+                return Err(PrepareWindowOrderError::DuplicateTabId { tab_id });
+            }
+            *already_used = true;
             ordered_tabs.push(Arc::clone(tab));
         }
-        if let Some(tab) = self
-            .tabs
-            .iter()
-            .find(|tab| !desired_ids.contains(&tab.tab_id()))
-        {
+        if let Some(tab_id) = self.tabs.iter().map(|tab| tab.tab_id()).find(|tab_id| {
+            current_by_id
+                .get(tab_id)
+                .is_some_and(|(_, used)| !*used)
+        }) {
             return Err(PrepareWindowOrderError::MissingTabId {
-                tab_id: tab.tab_id(),
+                tab_id,
+            });
+        }
+
+        if desired_active_tab_id != current_active_tab_id {
+            return Err(PrepareWindowOrderError::ActiveTabChanged {
+                current_active_tab_id,
+                desired_active_tab_id,
             });
         }
 
@@ -414,12 +420,28 @@ impl Window {
                     .position(|tab_id| *tab_id == active_tab_id)
             })
             .unwrap_or(0);
-        Ok(PreparedWindowOrder {
+        Ok(ValidatedWindowOrder {
             window_id: self.id,
             prior_revision: self.order_revision,
-            next_revision: self.next_order_revision()?,
             ordered_tabs,
             active_index,
+        })
+    }
+
+    /// Consume counter capacity only after identity, membership, active-state,
+    /// and expected-revision validation have succeeded.
+    pub(crate) fn prepare_validated_order(
+        &self,
+        validated: ValidatedWindowOrder,
+    ) -> Result<PreparedWindowOrder, WindowOrderRevisionExhausted> {
+        assert_eq!(validated.window_id, self.id, "validated order changed windows");
+        assert_eq!(
+            validated.prior_revision, self.order_revision,
+            "validated order revision changed before preparation"
+        );
+        Ok(PreparedWindowOrder {
+            validated,
+            next_revision: self.next_order_revision()?,
         })
     }
 
@@ -432,14 +454,18 @@ impl Window {
         &mut self,
         prepared: PreparedWindowOrder,
     ) -> FrozenWindowOrder {
-        assert_eq!(prepared.window_id, self.id, "prepared order changed windows");
+        let PreparedWindowOrder {
+            validated,
+            next_revision,
+        } = prepared;
+        assert_eq!(validated.window_id, self.id, "prepared order changed windows");
         assert_eq!(
-            prepared.prior_revision, self.order_revision,
+            validated.prior_revision, self.order_revision,
             "prepared order revision changed before commit"
         );
-        self.tabs = prepared.ordered_tabs;
-        self.active = prepared.active_index;
-        self.order_revision = prepared.next_revision;
+        self.tabs = validated.ordered_tabs;
+        self.active = validated.active_index;
+        self.order_revision = next_revision;
         self.order_snapshot()
             .expect("a prevalidated exact order must remain snapshot-valid after commit")
     }
@@ -954,6 +980,9 @@ mod tests {
             if intent.session != self.session {
                 return ContractReply::Decision(ContractDecision::StaleIncarnation);
             }
+            if !self.windows.contains_key(&intent.window) {
+                return ContractReply::Decision(ContractDecision::StaleIncarnation);
+            }
             if let Some((prior_intent, prior_decision)) = self.receipts.get(&intent.mutation) {
                 return if prior_intent == &intent {
                     ContractReply::Replay(prior_decision.clone())
@@ -963,17 +992,18 @@ mod tests {
             }
 
             let decision = match self.windows.get(&intent.window) {
-                None => ContractDecision::StaleIncarnation,
+                None => unreachable!("window identity was validated before receipt lookup"),
                 Some(window) => {
                     let desired = intent.tabs.iter().copied().collect::<HashSet<_>>();
                     let current = window.tabs.iter().copied().collect::<HashSet<_>>();
                     let exact_permutation = desired.len() == intent.tabs.len()
                         && current.len() == window.tabs.len()
                         && desired == current;
-                    let active_is_valid = match intent.active {
-                        Some(active) => desired.contains(&active),
-                        None => intent.tabs.is_empty(),
-                    };
+                    let active_is_valid = intent.active == window.active
+                        && match intent.active {
+                            Some(active) => desired.contains(&active),
+                            None => intent.tabs.is_empty(),
+                        };
 
                     if !exact_permutation || !active_is_valid {
                         ContractDecision::Malformed
@@ -986,7 +1016,10 @@ mod tests {
                             self.topology_revision.checked_add(1),
                             window.revision.checked_add(1),
                         ) {
-                            (Some(topology_revision), Some(window_revision)) => {
+                            (Some(topology_revision), Some(window_revision))
+                                if topology_revision != u64::MAX
+                                    && window_revision != u64::MAX =>
+                            {
                                 ContractDecision::Applied {
                                     topology_revision,
                                     window_revision,
@@ -2288,9 +2321,12 @@ mod tests {
             .is_some_and(|tab| Arc::ptr_eq(tab, &active)));
 
         let desired = [third.tab_id(), first.tab_id(), active.tab_id()];
+        let validated = window
+            .validate_exact_order(&desired, Some(active.tab_id()))
+            .expect("validate exact permutation");
         let prepared = window
-            .prepare_exact_order(&desired, Some(active.tab_id()))
-            .expect("stage exact permutation");
+            .prepare_validated_order(validated)
+            .expect("reserve exact permutation revision");
         let committed = window.commit_prepared_order(prepared);
         assert_eq!(
             committed.order_revision().get(),
@@ -2347,9 +2383,12 @@ mod tests {
             active: Some(active.tab_id() as u64),
         });
 
+        let validated = window
+            .validate_exact_order(&desired, Some(active.tab_id()))
+            .expect("production reorder validates");
         let prepared = window
-            .prepare_exact_order(&desired, Some(active.tab_id()))
-            .expect("production reorder stages");
+            .prepare_validated_order(validated)
+            .expect("production reorder reserves revision");
         let frozen = window.commit_prepared_order(prepared);
         let ContractReply::Decision(ContractDecision::Applied {
             window_revision, ..
@@ -2392,16 +2431,16 @@ mod tests {
             .push(&added)
             .expect_err("fallible append must reject terminal order revision");
         assert!(push_error.to_string().contains("revision space is exhausted"));
-        let prepare_error = window
-            .prepare_exact_order(
+        let validated = window
+            .validate_exact_order(
                 &[active.tab_id(), first.tab_id()],
                 Some(active.tab_id()),
             )
+            .expect("terminal order revision does not outrank semantic validity");
+        let prepare_error = window
+            .prepare_validated_order(validated)
             .expect_err("terminal order revision must reject exact reorder");
-        assert_eq!(
-            prepare_error,
-            PrepareWindowOrderError::RevisionExhausted(WindowOrderRevisionExhausted)
-        );
+        assert_eq!(prepare_error, WindowOrderRevisionExhausted);
         assert_eq!(
             window.iter().map(Arc::as_ptr).collect::<Vec<_>>(),
             pointers_before

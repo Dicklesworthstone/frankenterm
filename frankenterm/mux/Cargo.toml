@@ -55,6 +55,7 @@ procinfo = { path = "../procinfo", default-features = false }
 promise.workspace = true
 rangeset.workspace = true
 serde = {workspace=true, features = ["rc", "derive"]}
+sha2.workspace = true
 serial2.workspace = true
 shell-words.workspace = true
 terminfo.workspace = true

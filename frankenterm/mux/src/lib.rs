@@ -83,8 +83,9 @@ use parking_lot::{
 use percent_encoding::percent_decode_str;
 use portable_pty::{CommandBuilder, ExitStatus, PtySize};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::convert::TryInto;
+use std::convert::{TryFrom, TryInto};
 use std::io::{Read, Write};
 #[cfg(windows)]
 use std::os::raw::c_int;
@@ -244,6 +245,10 @@ impl MuxTopologyAuthority {
             Ok((self.session_incarnation, self.revision))
         }
     }
+
+    const fn current_revision(&self) -> TopologyRevision {
+        self.revision
+    }
 }
 
 /// Maximum number of idempotency receipts retained by one mux incarnation.
@@ -256,6 +261,15 @@ pub const MAX_WINDOW_ORDER_RECEIPTS: usize = 4_096;
 /// This prevents the count bound from becoming a hidden 4096 x 4096 memory
 /// multiplier when every recent request targeted a very large window.
 pub const MAX_WINDOW_ORDER_RECEIPT_TAB_IDS: usize = 65_536;
+
+/// Canonical semantic version mixed into every v1 reorder digest.
+///
+/// This lives with mux authority so the wire codec and the mutation boundary
+/// cannot silently drift to different digest grammars.
+pub const WINDOW_REORDER_PROTOCOL_VERSION_V1: u16 = 1;
+/// Domain separator for the mux-authoritative v1 reorder digest.
+pub const WINDOW_REORDER_DIGEST_DOMAIN_V1: &[u8] =
+    b"frankenterm.window-reorder.v1\0";
 
 /// Idempotency identity unique within one client-owned random namespace.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -277,8 +291,7 @@ impl WindowOrderMutationId {
     }
 }
 
-/// Canonical digest of one frozen reorder request, validated by the protocol
-/// adapter before it crosses into mux authority.
+/// Canonical digest of one frozen reorder request, derived by mux authority.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct WindowReorderDigest([u8; 32]);
 
@@ -292,25 +305,92 @@ impl WindowReorderDigest {
     }
 }
 
-/// Mux-domain form of one already decoded and canonically digested reorder.
+/// Fixed-width fields in the canonical v1 reorder digest preimage.
 ///
-/// The codec crate depends on `mux`, so the server must map its wire types into
-/// this cycle-free form. `request_digest` is opaque here; the codec adapter is
-/// responsible for recomputing and validating it before calling the mux.
+/// `desired_tab_ids` is supplied separately as an exact-size iterator so the
+/// codec can hash its stable `u64` wire identities without allocating a second
+/// vector. The topology stream identity is intentionally absent: reconnect
+/// rotates streams while an exact idempotent retry must retain its digest.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WindowReorderDigestInputV1 {
+    pub protocol_version: u16,
+    pub domain_binding_id: [u8; 16],
+    pub session_incarnation: MuxSessionIncarnation,
+    pub window_id: u64,
+    pub expected_order_revision: u64,
+    pub desired_active_tab_id: Option<u64>,
+    pub mutation_id: WindowOrderMutationId,
+}
+
+/// Derive the single canonical digest shared by codec validation and mux
+/// mutation authority.
+#[must_use]
+pub fn canonical_window_reorder_digest_v1(
+    input: WindowReorderDigestInputV1,
+    desired_tab_ids: impl ExactSizeIterator<Item = u64>,
+) -> WindowReorderDigest {
+    let mut hasher = Sha256::new();
+    hasher.update(WINDOW_REORDER_DIGEST_DOMAIN_V1);
+    hasher.update(input.protocol_version.to_be_bytes());
+    hasher.update(input.domain_binding_id);
+    hasher.update(input.session_incarnation.as_bytes());
+    hasher.update(input.window_id.to_be_bytes());
+    hasher.update(input.expected_order_revision.to_be_bytes());
+    hasher.update(
+        u64::try_from(desired_tab_ids.len())
+            .unwrap_or(u64::MAX)
+            .to_be_bytes(),
+    );
+    for tab_id in desired_tab_ids {
+        hasher.update(tab_id.to_be_bytes());
+    }
+    match input.desired_active_tab_id {
+        None => hasher.update([0]),
+        Some(tab_id) => {
+            hasher.update([1]);
+            hasher.update(tab_id.to_be_bytes());
+        }
+    }
+    hasher.update(input.mutation_id.namespace);
+    hasher.update(input.mutation_id.sequence.to_be_bytes());
+    WindowReorderDigest::from_bytes(hasher.finalize().into())
+}
+
+/// Opaque mux-domain form of one decoded reorder request.
+///
+/// Callers provide semantic fields to [`ReorderWindowTabsRequest::try_new_v1`];
+/// mux authority validates their cycle-free representation and derives the
+/// digest itself. Private fields prevent a server adapter from pairing a
+/// mutation identity with unrelated digest bytes.
+///
+/// ```compile_fail
+/// use mux::{ReorderWindowTabsRequest, WindowReorderDigest};
+///
+/// fn forge(mut request: ReorderWindowTabsRequest) {
+///     request.request_digest = WindowReorderDigest::from_bytes([0xff; 32]);
+/// }
+/// ```
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ReorderWindowTabsRequest {
-    pub session_incarnation: MuxSessionIncarnation,
-    pub window_id: WindowId,
-    pub expected_order_revision: WindowOrderRevision,
-    pub desired_tab_ids: Vec<TabId>,
-    pub desired_active_tab_id: Option<TabId>,
-    pub mutation_id: WindowOrderMutationId,
-    pub request_digest: WindowReorderDigest,
+    protocol_version: u16,
+    domain_binding_id: [u8; 16],
+    session_incarnation: MuxSessionIncarnation,
+    window_id: WindowId,
+    expected_order_revision: WindowOrderRevision,
+    desired_tab_ids: Vec<TabId>,
+    desired_active_tab_id: Option<TabId>,
+    mutation_id: WindowOrderMutationId,
+    request_digest: WindowReorderDigest,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum WindowReorderMalformed {
+    UnsupportedProtocolVersion { actual: u16 },
+    InvalidDomainBindingIdentity,
+    InvalidSessionIncarnation,
     InvalidMutationIdentity,
+    WireIdDoesNotFitU64 { field: &'static str, value: usize },
+    ReservedWireId { field: &'static str, value: u64 },
     ExpectedRevisionExhausted,
     TooManyTabs { count: usize, max: usize },
     DuplicateTabId { tab_id: TabId },
@@ -323,6 +403,81 @@ pub enum WindowReorderMalformed {
         current_active_tab_id: Option<TabId>,
         desired_active_tab_id: Option<TabId>,
     },
+    DigestMismatch {
+        expected: WindowReorderDigest,
+        actual: WindowReorderDigest,
+    },
+}
+
+fn reorder_wire_id(
+    field: &'static str,
+    value: usize,
+) -> Result<u64, WindowReorderMalformed> {
+    let wire_value = u64::try_from(value)
+        .map_err(|_| WindowReorderMalformed::WireIdDoesNotFitU64 { field, value })?;
+    if wire_value == u64::MAX {
+        return Err(WindowReorderMalformed::ReservedWireId {
+            field,
+            value: wire_value,
+        });
+    }
+    Ok(wire_value)
+}
+
+impl ReorderWindowTabsRequest {
+    /// Validate and freeze one v1 reorder intent, deriving its digest inside
+    /// mux authority before the request can reach the receipt ledger.
+    pub fn try_new_v1(
+        domain_binding_id: [u8; 16],
+        session_incarnation: MuxSessionIncarnation,
+        window_id: WindowId,
+        expected_order_revision: WindowOrderRevision,
+        desired_tab_ids: Vec<TabId>,
+        desired_active_tab_id: Option<TabId>,
+        mutation_id: WindowOrderMutationId,
+    ) -> Result<Self, WindowReorderMalformed> {
+        let mut request = Self {
+            protocol_version: WINDOW_REORDER_PROTOCOL_VERSION_V1,
+            domain_binding_id,
+            session_incarnation,
+            window_id,
+            expected_order_revision,
+            desired_tab_ids,
+            desired_active_tab_id,
+            mutation_id,
+            request_digest: WindowReorderDigest::from_bytes([0; 32]),
+        };
+        request.request_digest = derive_reorder_window_tabs_digest(&request)?;
+        Ok(request)
+    }
+
+    pub const fn session_incarnation(&self) -> MuxSessionIncarnation {
+        self.session_incarnation
+    }
+
+    pub const fn window_id(&self) -> WindowId {
+        self.window_id
+    }
+
+    pub const fn expected_order_revision(&self) -> WindowOrderRevision {
+        self.expected_order_revision
+    }
+
+    pub fn desired_tab_ids(&self) -> &[TabId] {
+        &self.desired_tab_ids
+    }
+
+    pub const fn desired_active_tab_id(&self) -> Option<TabId> {
+        self.desired_active_tab_id
+    }
+
+    pub const fn mutation_id(&self) -> WindowOrderMutationId {
+        self.mutation_id
+    }
+
+    pub const fn request_digest(&self) -> WindowReorderDigest {
+        self.request_digest
+    }
 }
 
 /// Compact immutable identity state used in replies and retained receipts.
@@ -342,6 +497,17 @@ impl WindowOrderState {
             order_revision: window.order_revision(),
             ordered_tab_ids: Arc::from(window.ordered_tab_ids().collect::<Vec<_>>()),
             active_tab_id: window.active_tab_id(),
+        }
+    }
+
+    fn from_semantically_validated_window(window: &Window) -> Self {
+        Self {
+            window_id: window.window_id(),
+            order_revision: window.order_revision(),
+            ordered_tab_ids: Arc::from(
+                window.iter().map(|tab| tab.tab_id()).collect::<Vec<_>>(),
+            ),
+            active_tab_id: window.get_active().map(|tab| tab.tab_id()),
         }
     }
 }
@@ -388,9 +554,21 @@ pub enum ReorderWindowTabsResult {
     },
 }
 
-fn validate_reorder_window_tabs_request(
+fn derive_reorder_window_tabs_digest(
     request: &ReorderWindowTabsRequest,
-) -> Result<(), WindowReorderMalformed> {
+) -> Result<WindowReorderDigest, WindowReorderMalformed> {
+    if request.protocol_version != WINDOW_REORDER_PROTOCOL_VERSION_V1 {
+        return Err(WindowReorderMalformed::UnsupportedProtocolVersion {
+            actual: request.protocol_version,
+        });
+    }
+    if request.domain_binding_id == [0; 16] {
+        return Err(WindowReorderMalformed::InvalidDomainBindingIdentity);
+    }
+    if request.session_incarnation.as_bytes() == [0; 16] {
+        return Err(WindowReorderMalformed::InvalidSessionIncarnation);
+    }
+    let window_id = reorder_wire_id("window_id", request.window_id)?;
     if request.expected_order_revision.get() == u64::MAX {
         return Err(WindowReorderMalformed::ExpectedRevisionExhausted);
     }
@@ -400,22 +578,43 @@ fn validate_reorder_window_tabs_request(
             max: MAX_TABS_PER_ORDERED_WINDOW,
         });
     }
-    let mut desired = HashSet::with_capacity(request.desired_tab_ids.len());
     for &tab_id in &request.desired_tab_ids {
-        if !desired.insert(tab_id) {
-            return Err(WindowReorderMalformed::DuplicateTabId { tab_id });
-        }
+        reorder_wire_id("tab_id", tab_id)?;
     }
-    match (
-        request.desired_tab_ids.is_empty(),
-        request.desired_active_tab_id,
-    ) {
-        (false, None) => Err(WindowReorderMalformed::ActiveTabRequired),
-        (_, Some(tab_id)) if !desired.contains(&tab_id) => {
-            Err(WindowReorderMalformed::ActiveTabNotInDesiredOrder { tab_id })
-        }
-        _ => Ok(()),
+    let desired_active_tab_id = request
+        .desired_active_tab_id
+        .map(|tab_id| reorder_wire_id("active_tab_id", tab_id))
+        .transpose()?;
+    if !request.mutation_id.is_valid() {
+        return Err(WindowReorderMalformed::InvalidMutationIdentity);
     }
+    Ok(canonical_window_reorder_digest_v1(
+        WindowReorderDigestInputV1 {
+            protocol_version: request.protocol_version,
+            domain_binding_id: request.domain_binding_id,
+            session_incarnation: request.session_incarnation,
+            window_id,
+            expected_order_revision: request.expected_order_revision.get(),
+            desired_active_tab_id,
+            mutation_id: request.mutation_id,
+        },
+        request.desired_tab_ids.iter().map(|&tab_id| {
+            u64::try_from(tab_id).expect("validated reorder tab id must fit the wire width")
+        }),
+    ))
+}
+
+fn validate_reorder_window_tabs_request(
+    request: &ReorderWindowTabsRequest,
+) -> Result<(), WindowReorderMalformed> {
+    let expected = derive_reorder_window_tabs_digest(request)?;
+    if request.request_digest != expected {
+        return Err(WindowReorderMalformed::DigestMismatch {
+            expected,
+            actual: request.request_digest,
+        });
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug)]
@@ -6760,121 +6959,80 @@ impl Mux {
         &self,
         request: ReorderWindowTabsRequest,
     ) -> ReorderWindowTabsResult {
-        let current_session = self.topology.lock().session_incarnation;
-        if request.session_incarnation != current_session {
-            return ReorderWindowTabsResult::Decision(
-                WindowReorderTerminalOutcome::StaleIncarnation,
-            );
-        }
-        if !request.mutation_id.is_valid() {
+        if let Err(malformed) = validate_reorder_window_tabs_request(&request) {
             return ReorderWindowTabsResult::Decision(WindowReorderTerminalOutcome::Malformed(
-                WindowReorderMalformed::InvalidMutationIdentity,
+                malformed,
             ));
         }
-
-        let mut receipts = self.window_order_receipts.lock();
-        if let Some(replay_or_equivocation) =
-            receipts.lookup(request.mutation_id, request.request_digest)
-        {
-            return replay_or_equivocation;
-        }
-        if let Err(malformed) = validate_reorder_window_tabs_request(&request) {
-            let outcome = WindowReorderTerminalOutcome::Malformed(malformed);
-            receipts.retain(
-                request.mutation_id,
-                request.request_digest,
-                outcome.clone(),
-            );
-            return ReorderWindowTabsResult::Decision(outcome);
-        }
-
         let mut notification_queued = false;
         let outcome = {
             let mut windows = self.windows.write();
             let mut topology = self.topology.lock();
-            let topology_revision = match topology.snapshot() {
-                Ok((session_incarnation, revision))
-                    if session_incarnation == request.session_incarnation =>
-                {
-                    Some(revision)
-                }
-                Ok(_) => None,
-                Err(_) => {
-                    receipts.retain(
-                        request.mutation_id,
-                        request.request_digest,
-                        WindowReorderTerminalOutcome::Exhausted,
-                    );
-                    return ReorderWindowTabsResult::Decision(
-                        WindowReorderTerminalOutcome::Exhausted,
-                    );
-                }
-            };
-            let Some(topology_revision) = topology_revision else {
-                receipts.retain(
-                    request.mutation_id,
-                    request.request_digest,
-                    WindowReorderTerminalOutcome::StaleIncarnation,
-                );
+            if request.session_incarnation != topology.session_incarnation {
                 return ReorderWindowTabsResult::Decision(
                     WindowReorderTerminalOutcome::StaleIncarnation,
                 );
+            }
+            let Some(window) = windows.get_mut(&request.window_id) else {
+                return ReorderWindowTabsResult::Decision(
+                    WindowReorderTerminalOutcome::MissingWindow {
+                        window_id: request.window_id,
+                    },
+                );
             };
-            match windows.get_mut(&request.window_id) {
-                None => WindowReorderTerminalOutcome::MissingWindow {
-                    window_id: request.window_id,
-                },
-                Some(window)
-                    if window.order_revision() != request.expected_order_revision =>
-                {
-                    match window.order_snapshot() {
-                        Ok(window) => {
-                            WindowReorderTerminalOutcome::Conflict(WindowOrderCommit {
-                                topology_revision,
-                                window: WindowOrderState::from_frozen(&window),
-                            })
-                        }
-                        Err(_) => WindowReorderTerminalOutcome::Malformed(
-                            WindowReorderMalformed::InvalidCurrentState,
-                        ),
-                    }
+
+            let mut receipts = self.window_order_receipts.lock();
+            if let Some(replay_or_equivocation) =
+                receipts.lookup(request.mutation_id, request.request_digest)
+            {
+                return replay_or_equivocation;
+            }
+
+            let outcome = match window.validate_exact_order(
+                &request.desired_tab_ids,
+                request.desired_active_tab_id,
+            ) {
+                Err(PrepareWindowOrderError::RevisionExhausted(_)) => {
+                    WindowReorderTerminalOutcome::Exhausted
                 }
-                Some(window) => match window.prepare_exact_order(
-                    &request.desired_tab_ids,
-                    request.desired_active_tab_id,
-                ) {
-                    Err(PrepareWindowOrderError::RevisionExhausted(_)) => {
-                        WindowReorderTerminalOutcome::Exhausted
-                    }
-                    Err(PrepareWindowOrderError::InvalidCurrentState(_)) => {
-                        WindowReorderTerminalOutcome::Malformed(
-                            WindowReorderMalformed::InvalidCurrentState,
-                        )
-                    }
-                    Err(PrepareWindowOrderError::DuplicateTabId { tab_id }) => {
-                        WindowReorderTerminalOutcome::Malformed(
-                            WindowReorderMalformed::DuplicateTabId { tab_id },
-                        )
-                    }
-                    Err(PrepareWindowOrderError::MissingTabId { tab_id }) => {
-                        WindowReorderTerminalOutcome::Malformed(
-                            WindowReorderMalformed::MissingTabId { tab_id },
-                        )
-                    }
-                    Err(PrepareWindowOrderError::ForeignTabId { tab_id }) => {
-                        WindowReorderTerminalOutcome::Malformed(
-                            WindowReorderMalformed::ForeignTabId { tab_id },
-                        )
-                    }
-                    Err(PrepareWindowOrderError::ActiveTabChanged {
+                Err(PrepareWindowOrderError::InvalidCurrentState(_)) => {
+                    WindowReorderTerminalOutcome::Malformed(
+                        WindowReorderMalformed::InvalidCurrentState,
+                    )
+                }
+                Err(PrepareWindowOrderError::DuplicateTabId { tab_id }) => {
+                    WindowReorderTerminalOutcome::Malformed(
+                        WindowReorderMalformed::DuplicateTabId { tab_id },
+                    )
+                }
+                Err(PrepareWindowOrderError::MissingTabId { tab_id }) => {
+                    WindowReorderTerminalOutcome::Malformed(
+                        WindowReorderMalformed::MissingTabId { tab_id },
+                    )
+                }
+                Err(PrepareWindowOrderError::ForeignTabId { tab_id }) => {
+                    WindowReorderTerminalOutcome::Malformed(
+                        WindowReorderMalformed::ForeignTabId { tab_id },
+                    )
+                }
+                Err(PrepareWindowOrderError::ActiveTabChanged {
+                    current_active_tab_id,
+                    desired_active_tab_id,
+                }) => WindowReorderTerminalOutcome::Malformed(
+                    WindowReorderMalformed::ActiveTabChanged {
                         current_active_tab_id,
                         desired_active_tab_id,
-                    }) => WindowReorderTerminalOutcome::Malformed(
-                        WindowReorderMalformed::ActiveTabChanged {
-                            current_active_tab_id,
-                            desired_active_tab_id,
-                        },
-                    ),
+                    },
+                ),
+                Ok(_) if window.order_revision() != request.expected_order_revision =>
+                {
+                    WindowReorderTerminalOutcome::Conflict(WindowOrderCommit {
+                        topology_revision: topology.current_revision(),
+                        window: WindowOrderState::from_semantically_validated_window(window),
+                    })
+                }
+                Ok(validated) => match window.prepare_validated_order(validated) {
+                    Err(_) => WindowReorderTerminalOutcome::Exhausted,
                     Ok(prepared) => match topology.reserve_revision() {
                         Err(_) => WindowReorderTerminalOutcome::Exhausted,
                         Ok(topology_revision) => {
@@ -6899,15 +7057,14 @@ impl Mux {
                         }
                     },
                 },
-            }
+            };
+            receipts.retain(
+                request.mutation_id,
+                request.request_digest,
+                outcome.clone(),
+            );
+            outcome
         };
-
-        receipts.retain(
-            request.mutation_id,
-            request.request_digest,
-            outcome.clone(),
-        );
-        drop(receipts);
         if notification_queued {
             self.flush_window_notifications();
         }
@@ -8477,7 +8634,6 @@ mod tests {
         desired_tab_ids: Vec<TabId>,
         desired_active_tab_id: Option<TabId>,
         mutation_sequence: u64,
-        digest_marker: u8,
     ) -> ReorderWindowTabsRequest {
         let (session_incarnation, _) = mux
             .topology_snapshot_authority()
@@ -8487,15 +8643,34 @@ mod tests {
             .expect("test window snapshot validity")
             .expect("test window presence")
             .order_revision();
-        ReorderWindowTabsRequest {
+        test_window_reorder_request_for(
             session_incarnation,
             window_id,
             expected_order_revision,
             desired_tab_ids,
             desired_active_tab_id,
-            mutation_id: WindowOrderMutationId::new([0x73; 16], mutation_sequence),
-            request_digest: WindowReorderDigest::from_bytes([digest_marker; 32]),
-        }
+            mutation_sequence,
+        )
+    }
+
+    fn test_window_reorder_request_for(
+        session_incarnation: MuxSessionIncarnation,
+        window_id: WindowId,
+        expected_order_revision: WindowOrderRevision,
+        desired_tab_ids: Vec<TabId>,
+        desired_active_tab_id: Option<TabId>,
+        mutation_sequence: u64,
+    ) -> ReorderWindowTabsRequest {
+        ReorderWindowTabsRequest::try_new_v1(
+            [0x62; 16],
+            session_incarnation,
+            window_id,
+            expected_order_revision,
+            desired_tab_ids,
+            desired_active_tab_id,
+            WindowOrderMutationId::new([0x73; 16], mutation_sequence),
+        )
+        .expect("test reorder intent must be constructible")
     }
 
     fn register_test_pane(mux: &Arc<Mux>, pane_id: PaneId) -> Arc<dyn Pane> {
@@ -14153,6 +14328,110 @@ mod tests {
     }
 
     #[test]
+    fn reorder_request_derives_authority_without_mux_or_caller_digest() {
+        let session_incarnation = MuxSessionIncarnation::from_bytes([0x33; 16]);
+        let mutation_id = WindowOrderMutationId::new([0x44; 16], 9);
+        let request = ReorderWindowTabsRequest::try_new_v1(
+            [0x11; 16],
+            session_incarnation,
+            7,
+            WindowOrderRevision::new(5),
+            vec![9, 11, 13],
+            Some(11),
+            mutation_id,
+        )
+        .expect("bounded canonical intent constructs without a mux singleton");
+        let expected = canonical_window_reorder_digest_v1(
+            WindowReorderDigestInputV1 {
+                protocol_version: WINDOW_REORDER_PROTOCOL_VERSION_V1,
+                domain_binding_id: [0x11; 16],
+                session_incarnation,
+                window_id: 7,
+                expected_order_revision: 5,
+                desired_active_tab_id: Some(11),
+                mutation_id,
+            },
+            IntoIterator::into_iter([9_u64, 11, 13]),
+        );
+        assert_eq!(request.request_digest(), expected);
+
+        let changed = ReorderWindowTabsRequest::try_new_v1(
+            [0x11; 16],
+            session_incarnation,
+            7,
+            WindowOrderRevision::new(5),
+            vec![11, 9, 13],
+            Some(11),
+            mutation_id,
+        )
+        .expect("changed semantic intent remains structurally valid");
+        assert_ne!(changed.request_digest(), request.request_digest());
+        assert_eq!(
+            ReorderWindowTabsRequest::try_new_v1(
+                [0; 16],
+                session_incarnation,
+                7,
+                WindowOrderRevision::new(5),
+                vec![9],
+                Some(9),
+                mutation_id,
+            ),
+            Err(WindowReorderMalformed::InvalidDomainBindingIdentity)
+        );
+        assert_eq!(
+            ReorderWindowTabsRequest::try_new_v1(
+                [0x11; 16],
+                MuxSessionIncarnation::from_bytes([0; 16]),
+                7,
+                WindowOrderRevision::new(5),
+                vec![9],
+                Some(9),
+                mutation_id,
+            ),
+            Err(WindowReorderMalformed::InvalidSessionIncarnation)
+        );
+        assert_eq!(
+            ReorderWindowTabsRequest::try_new_v1(
+                [0x11; 16],
+                session_incarnation,
+                7,
+                WindowOrderRevision::new(u64::MAX),
+                vec![9],
+                Some(9),
+                mutation_id,
+            ),
+            Err(WindowReorderMalformed::ExpectedRevisionExhausted)
+        );
+
+        let maximum_tabs = (0..MAX_TABS_PER_ORDERED_WINDOW).collect::<Vec<_>>();
+        let maximum = ReorderWindowTabsRequest::try_new_v1(
+            [0x11; 16],
+            session_incarnation,
+            7,
+            WindowOrderRevision::new(5),
+            maximum_tabs.clone(),
+            Some(0),
+            WindowOrderMutationId::new([0x44; 16], 10),
+        )
+        .expect("q4096 wire representation remains bounded");
+        let maximum_expected = canonical_window_reorder_digest_v1(
+            WindowReorderDigestInputV1 {
+                protocol_version: WINDOW_REORDER_PROTOCOL_VERSION_V1,
+                domain_binding_id: [0x11; 16],
+                session_incarnation,
+                window_id: 7,
+                expected_order_revision: 5,
+                desired_active_tab_id: Some(0),
+                mutation_id: WindowOrderMutationId::new([0x44; 16], 10),
+            },
+            maximum_tabs
+                .iter()
+                .map(|tab_id| u64::try_from(*tab_id).expect("bounded test id fits u64")),
+        );
+        assert_eq!(maximum.request_digest(), maximum_expected);
+    }
+
+    #[test]
     fn reorder_window_tabs_applies_once_and_replays_without_republication() {
         let _guard = global_test_lock();
         Mux::shutdown();
@@ -14219,8 +14498,8 @@ mod tests {
             vec![third.tab_id(), first.tab_id(), active.tab_id()],
             Some(active.tab_id()),
             1,
-            0x11,
         );
+        let request_digest = request.request_digest();
         let first_result = mux.reorder_window_tabs(request.clone());
         let applied = match first_result {
             ReorderWindowTabsResult::Decision(WindowReorderTerminalOutcome::Applied(commit)) => {
@@ -14292,16 +14571,23 @@ mod tests {
             }
             other => panic!("expected exact applied replay, got {other:?}"),
         }
-        let mut equivocation = request;
-        equivocation.request_digest = WindowReorderDigest::from_bytes([0x22; 32]);
+        let equivocation = test_window_reorder_request_for(
+            request.session_incarnation(),
+            window_id,
+            order_before,
+            vec![first.tab_id(), third.tab_id(), active.tab_id()],
+            Some(active.tab_id()),
+            1,
+        );
+        let attempted_digest = equivocation.request_digest();
         assert!(matches!(
             mux.reorder_window_tabs(equivocation),
             ReorderWindowTabsResult::Equivocation {
                 retained_digest,
-                attempted_digest,
+                attempted_digest: actual_attempted_digest,
                 ..
-            } if retained_digest == WindowReorderDigest::from_bytes([0x11; 32])
-                && attempted_digest == WindowReorderDigest::from_bytes([0x22; 32])
+            } if retained_digest == request_digest
+                && actual_attempted_digest == attempted_digest
         ));
 
         let observed = observed.lock();
@@ -14316,7 +14602,7 @@ mod tests {
             MuxTopologyStamp::Revision(applied.topology_revision)
         );
         assert_eq!(*mutation_id, WindowOrderMutationId::new([0x73; 16], 1));
-        assert_eq!(*digest, WindowReorderDigest::from_bytes([0x11; 32]));
+        assert_eq!(*digest, request_digest);
         assert_eq!(
             frozen.ordered_tab_ids().collect::<Vec<_>>(),
             vec![third.tab_id(), first.tab_id(), active.tab_id()]
@@ -14372,16 +14658,93 @@ mod tests {
             .expect("valid initial topology")
             .1;
 
-        let mut conflict = test_window_reorder_request(
+        let session_incarnation = mux
+            .topology_snapshot_authority()
+            .expect("current mux authority")
+            .0;
+        let canonical = test_window_reorder_request(
             &mux,
             window_id,
             vec![third.tab_id(), first.tab_id(), active.tab_id()],
             Some(active.tab_id()),
-            10,
-            0x31,
+            9,
         );
-        conflict.expected_order_revision = WindowOrderRevision::new(
-            conflict.expected_order_revision.get().saturating_sub(1),
+        let mut forged = canonical;
+        forged.request_digest = WindowReorderDigest::from_bytes([0xff; 32]);
+        assert!(matches!(
+            mux.reorder_window_tabs(forged),
+            ReorderWindowTabsResult::Decision(WindowReorderTerminalOutcome::Malformed(
+                WindowReorderMalformed::DigestMismatch { .. }
+            ))
+        ));
+        assert_eq!(
+            mux.window_order_receipts.lock().receipts.len(),
+            0,
+            "forged internal requests must fail before receipt admission"
+        );
+
+        let duplicate_request = ReorderWindowTabsRequest::try_new_v1(
+                [0x62; 16],
+                session_incarnation,
+                window_id,
+                before.order_revision(),
+                vec![first.tab_id(), first.tab_id(), active.tab_id()],
+                Some(active.tab_id()),
+                WindowOrderMutationId::new([0x73; 16], 8),
+            )
+            .expect("bounded duplicate permutation reaches mux semantic authority");
+        assert!(matches!(
+            mux.reorder_window_tabs(duplicate_request),
+            ReorderWindowTabsResult::Decision(WindowReorderTerminalOutcome::Malformed(
+                WindowReorderMalformed::DuplicateTabId { tab_id }
+            )) if tab_id == first.tab_id()
+        ));
+        assert_eq!(
+            mux.window_order_receipts.lock().receipts.len(),
+            1,
+            "semantic malformed decisions are retained only after exact authority lookup"
+        );
+
+        let reused_semantic_identity = ReorderWindowTabsRequest::try_new_v1(
+            [0x62; 16],
+            session_incarnation,
+            window_id,
+            before.order_revision(),
+            vec![first.tab_id(), active.tab_id(), third.tab_id()],
+            Some(active.tab_id()),
+            WindowOrderMutationId::new([0x73; 16], 8),
+        )
+        .expect("same mutation identity can carry an alternate bounded payload");
+        assert!(matches!(
+            mux.reorder_window_tabs(reused_semantic_identity),
+            ReorderWindowTabsResult::Equivocation { mutation_id, .. }
+                if mutation_id == WindowOrderMutationId::new([0x73; 16], 8)
+        ));
+
+        let duplicate_with_stale_revision = ReorderWindowTabsRequest::try_new_v1(
+            [0x62; 16],
+            session_incarnation,
+            window_id,
+            WindowOrderRevision::new(before.order_revision().get().saturating_sub(1)),
+            vec![first.tab_id(), first.tab_id(), active.tab_id()],
+            Some(active.tab_id()),
+            WindowOrderMutationId::new([0x73; 16], 9),
+        )
+        .expect("multi-fault request remains wire-representable");
+        assert!(matches!(
+            mux.reorder_window_tabs(duplicate_with_stale_revision),
+            ReorderWindowTabsResult::Decision(WindowReorderTerminalOutcome::Malformed(
+                WindowReorderMalformed::DuplicateTabId { tab_id }
+            )) if tab_id == first.tab_id()
+        ));
+
+        let conflict = test_window_reorder_request_for(
+            session_incarnation,
+            window_id,
+            WindowOrderRevision::new(before.order_revision().get().saturating_sub(1)),
+            vec![third.tab_id(), first.tab_id(), active.tab_id()],
+            Some(active.tab_id()),
+            10,
         );
         match mux.reorder_window_tabs(conflict) {
             ReorderWindowTabsResult::Decision(WindowReorderTerminalOutcome::Conflict(commit)) => {
@@ -14392,13 +14755,6 @@ mod tests {
         }
 
         let cases = [
-            (
-                vec![first.tab_id(), first.tab_id(), active.tab_id()],
-                Some(active.tab_id()),
-                WindowReorderMalformed::DuplicateTabId {
-                    tab_id: first.tab_id(),
-                },
-            ),
             (
                 vec![first.tab_id(), active.tab_id()],
                 Some(active.tab_id()),
@@ -14431,7 +14787,6 @@ mod tests {
                 desired,
                 desired_active,
                 11 + offset as u64,
-                0x40 + offset as u8,
             );
             match mux.reorder_window_tabs(request) {
                 ReorderWindowTabsResult::Decision(WindowReorderTerminalOutcome::Malformed(
@@ -14440,36 +14795,43 @@ mod tests {
                 other => panic!("expected malformed zero-mutation result, got {other:?}"),
             }
         }
-        let mut missing_window = test_window_reorder_request(
-            &mux,
-            window_id,
-            vec![first.tab_id(), active.tab_id(), third.tab_id()],
+        let missing_window_id = usize::MAX - 1;
+        let missing_window = test_window_reorder_request_for(
+            session_incarnation,
+            missing_window_id,
+            before.order_revision(),
+            vec![first.tab_id(), first.tab_id(), active.tab_id()],
             Some(active.tab_id()),
             20,
-            0x51,
         );
-        missing_window.window_id = usize::MAX;
+        let receipt_count_before_identity_failures =
+            mux.window_order_receipts.lock().receipts.len();
         assert!(matches!(
             mux.reorder_window_tabs(missing_window),
             ReorderWindowTabsResult::Decision(
-                WindowReorderTerminalOutcome::MissingWindow { window_id: usize::MAX }
+                WindowReorderTerminalOutcome::MissingWindow { window_id }
+                    if window_id == missing_window_id
             )
         ));
-        let mut stale_session = test_window_reorder_request(
-            &mux,
+        let stale_session = test_window_reorder_request_for(
+            MuxSessionIncarnation::from_bytes([0x99; 16]),
             window_id,
-            vec![first.tab_id(), active.tab_id(), third.tab_id()],
+            before.order_revision(),
+            vec![first.tab_id(), first.tab_id(), active.tab_id()],
             Some(active.tab_id()),
             21,
-            0x52,
         );
-        stale_session.session_incarnation = MuxSessionIncarnation::from_bytes([0x99; 16]);
         assert!(matches!(
             mux.reorder_window_tabs(stale_session),
             ReorderWindowTabsResult::Decision(
                 WindowReorderTerminalOutcome::StaleIncarnation
             )
         ));
+        assert_eq!(
+            mux.window_order_receipts.lock().receipts.len(),
+            receipt_count_before_identity_failures,
+            "stale session and missing window precede receipt retention even with malformed permutations"
+        );
 
         let after = mux
             .window_order_snapshot(window_id)
@@ -14534,13 +14896,28 @@ mod tests {
         })
         .expect("subscribe to order events");
 
+        let stale_revision = test_window_reorder_request_for(
+            mux.topology_snapshot_authority()
+                .expect("current session remains available")
+                .0,
+            window_id,
+            WindowOrderRevision::new(before.order_revision().get() - 1),
+            vec![active.tab_id(), first.tab_id()],
+            Some(active.tab_id()),
+            29,
+        );
+        assert!(matches!(
+            mux.reorder_window_tabs(stale_revision),
+            ReorderWindowTabsResult::Decision(WindowReorderTerminalOutcome::Conflict(commit))
+                if commit.window.order_revision == before.order_revision()
+        ));
+
         let request = test_window_reorder_request(
             &mux,
             window_id,
             vec![active.tab_id(), first.tab_id()],
             Some(active.tab_id()),
             30,
-            0x61,
         );
         assert!(matches!(
             mux.reorder_window_tabs(request),
