@@ -29,6 +29,7 @@ use mux::{MuxSessionIncarnation, TopologyRevision};
 use portable_pty::CommandBuilder;
 use rangeset::*;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
 
 #[cfg(all(feature = "async-asupersync", not(feature = "async-smol")))]
 use asupersync::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
@@ -1478,6 +1479,7 @@ macro_rules! pdu {
                 serial: u64,
                 compression_mode: CompressionMode,
             ) -> Result<(), Error> {
+                self.validate_before_encode()?;
                 match self {
                     Pdu::Invalid{..} => bail!("attempted to serialize Pdu::Invalid"),
                     $(
@@ -1530,6 +1532,7 @@ macro_rules! pdu {
                 compression_mode: CompressionMode,
                 record_metrics: bool,
             ) -> Result<Vec<u8>, Error> {
+                self.validate_before_encode()?;
                 match self {
                     Pdu::Invalid{..} => bail!("attempted to serialize Pdu::Invalid"),
                     $(
@@ -1572,6 +1575,7 @@ macro_rules! pdu {
                 serial: u64,
                 compression_mode: CompressionMode,
             ) -> Result<usize, Error> {
+                self.validate_before_encode()?;
                 match self {
                     Pdu::Invalid{..} => bail!("attempted to measure Pdu::Invalid"),
                     $(
@@ -1594,6 +1598,7 @@ macro_rules! pdu {
                 serial: u64,
                 compression_mode: CompressionMode,
             ) -> Result<(), Error> {
+                self.validate_before_encode()?;
                 match self {
                     Pdu::Invalid{..} => bail!("attempted to serialize Pdu::Invalid"),
                     $(
@@ -1798,7 +1803,7 @@ macro_rules! pdu {
 /// The overall version of the codec.
 /// This must be bumped when backwards incompatible changes
 /// are made to the types and protocol.
-pub const CODEC_VERSION: usize = 50;
+pub const CODEC_VERSION: usize = 51;
 
 /// Lowest codec version this build can decode wire frames from.
 ///
@@ -1988,6 +1993,26 @@ pdu! {
     TopologyEvent: 83 => deserialize_topology_event,
     RenderApplicationUpdate: 84,
     RenderApplicationResult: 85,
+    ListPanesOrderedV1: 86 => deserialize_list_panes_ordered_v1,
+    ListPanesOrderedV1Response: 87 => deserialize_list_panes_ordered_v1_response,
+    ReorderWindowTabsV1: 88 => deserialize_reorder_window_tabs_v1,
+    ReorderWindowTabsV1Response: 89 => deserialize_reorder_window_tabs_v1_response,
+    WindowOrderEventV1: 90 => deserialize_window_order_event_v1,
+}
+
+impl Pdu {
+    #[inline]
+    fn validate_before_encode(&self) -> Result<(), Error> {
+        match self {
+            Self::ListPanesOrderedV1(value) => value.validate()?,
+            Self::ListPanesOrderedV1Response(value) => value.validate()?,
+            Self::ReorderWindowTabsV1(value) => value.validate()?,
+            Self::ReorderWindowTabsV1Response(value) => value.validate()?,
+            Self::WindowOrderEventV1(value) => value.validate()?,
+            _ => {}
+        }
+        Ok(())
+    }
 }
 
 /// Minimum consumed prefix reclaimed by a streaming PDU buffer compaction.
@@ -2249,6 +2274,7 @@ impl Pdu {
                 | Self::Resize(_)
                 | Self::SetPaneZoomed(_)
                 | Self::SpawnV2(_)
+                | Self::ReorderWindowTabsV1(_)
         )
     }
 
@@ -2421,6 +2447,49 @@ fn materialize_uncompressed_payload<'a>(
     Ok(std::borrow::Cow::Owned(decompressed))
 }
 
+fn materialize_exact_payload_with_limit<'a>(
+    data: &'a [u8],
+    is_compressed: bool,
+    payload_name: &'static str,
+    max_payload_bytes: usize,
+) -> Result<std::borrow::Cow<'a, [u8]>, Error> {
+    if max_payload_bytes > MAX_PDU_SIZE {
+        bail!(
+            "{payload_name} decompressed limit {max_payload_bytes} exceeds outer maximum {MAX_PDU_SIZE}"
+        );
+    }
+    if !is_compressed {
+        if data.len() > max_payload_bytes {
+            bail!(
+                "{payload_name} decompressed payload size {} exceeds maximum {}",
+                data.len(),
+                max_payload_bytes
+            );
+        }
+        return Ok(std::borrow::Cow::Borrowed(data));
+    }
+
+    let read_limit = u64::try_from(max_payload_bytes)
+        .with_context(|| format!("{payload_name} payload limit does not fit in u64"))?
+        .checked_add(1)
+        .with_context(|| format!("{payload_name} payload read limit overflow"))?;
+    let decoder = zstd::Decoder::with_buffer(data)?.single_frame();
+    let mut limited = decoder.take(read_limit);
+    let mut decompressed = Vec::with_capacity(data.len().min(max_payload_bytes));
+    limited.read_to_end(&mut decompressed)?;
+    if decompressed.len() > max_payload_bytes {
+        bail!(
+            "{payload_name} decompressed payload size exceeds maximum {}",
+            max_payload_bytes
+        );
+    }
+    let decoder = limited.into_inner();
+    if !decoder.finish().is_empty() {
+        bail!("{payload_name} payload has trailing compressed frame bytes");
+    }
+    Ok(std::borrow::Cow::Owned(decompressed))
+}
+
 /// Decode an authority-bearing schema that is closed for its current wire ID.
 ///
 /// Bytes after the outer frame remain valid input for the next PDU, but bytes
@@ -2432,7 +2501,34 @@ fn deserialize_exact_payload<T: serde::de::DeserializeOwned>(
     is_compressed: bool,
     payload_name: &'static str,
 ) -> Result<T, Error> {
+    deserialize_exact_payload_with_limit(data, is_compressed, payload_name, MAX_PDU_SIZE)
+}
+
+/// Exact-consumption decoder with a schema-specific decompressed byte limit.
+///
+/// The outer frame cap remains a defense in depth bound for every PDU. Closed
+/// authority schemas with a smaller semantic budget use this helper so a
+/// compressed body cannot allocate or deserialize past that tighter ceiling.
+fn deserialize_exact_payload_with_limit<T: serde::de::DeserializeOwned>(
+    data: &[u8],
+    is_compressed: bool,
+    payload_name: &'static str,
+    max_payload_bytes: usize,
+) -> Result<T, Error> {
+    if max_payload_bytes > MAX_PDU_SIZE {
+        bail!(
+            "{payload_name} decompressed limit {max_payload_bytes} exceeds outer maximum {MAX_PDU_SIZE}"
+        );
+    }
+
     if !is_compressed {
+        if data.len() > max_payload_bytes {
+            bail!(
+                "{payload_name} decompressed payload size {} exceeds maximum {}",
+                data.len(),
+                max_payload_bytes
+            );
+        }
         let mut reader = data;
         let decoded = bounded_varbincode::deserialize::<T, _>(&mut reader)?;
         if !reader.is_empty() {
@@ -2445,7 +2541,10 @@ fn deserialize_exact_payload<T: serde::de::DeserializeOwned>(
     // copy of a potentially 256 MiB coherent snapshot.  The extra byte in the
     // limit distinguishes a legal boundary-sized value from decompressed data
     // that crossed the cap.
-    let read_limit = max_pdu_read_limit()?;
+    let read_limit = u64::try_from(max_payload_bytes)
+        .with_context(|| format!("{payload_name} payload limit does not fit in u64"))?
+        .checked_add(1)
+        .with_context(|| format!("{payload_name} payload read limit overflow"))?;
     // `data` is already a `BufRead`; using it directly avoids allocating a
     // fresh zstd-sized `BufReader` for every compressed authority PDU.
     let decoder = zstd::Decoder::with_buffer(data)?.single_frame();
@@ -2462,10 +2561,13 @@ fn deserialize_exact_payload<T: serde::de::DeserializeOwned>(
     let decoded_bytes = read_limit
         .checked_sub(reader.limit())
         .context("counting decoded exact PDU payload bytes")?;
-    if decoded_bytes > u64::try_from(MAX_PDU_SIZE).context("MAX_PDU_SIZE does not fit in u64")? {
+    if decoded_bytes
+        > u64::try_from(max_payload_bytes)
+            .with_context(|| format!("{payload_name} payload limit does not fit in u64"))?
+    {
         bail!(
-            "decompressed PDU payload size exceeds maximum {}",
-            MAX_PDU_SIZE
+            "{payload_name} decompressed payload size exceeds maximum {}",
+            max_payload_bytes
         );
     }
 
@@ -2510,6 +2612,68 @@ fn deserialize_topology_event(
     is_compressed: bool,
 ) -> Result<TopologyEvent, Error> {
     deserialize_exact_payload(data, is_compressed, "TopologyEvent")
+}
+
+fn deserialize_list_panes_ordered_v1(
+    data: &[u8],
+    is_compressed: bool,
+) -> Result<ListPanesOrderedV1, Error> {
+    let request: ListPanesOrderedV1 =
+        deserialize_exact_payload(data, is_compressed, "ListPanesOrderedV1")?;
+    request.validate()?;
+    Ok(request)
+}
+
+fn deserialize_list_panes_ordered_v1_response(
+    data: &[u8],
+    is_compressed: bool,
+) -> Result<ListPanesOrderedV1Response, Error> {
+    let response: ListPanesOrderedV1Response =
+        deserialize_exact_payload(data, is_compressed, "ListPanesOrderedV1Response")?;
+    response.validate()?;
+    Ok(response)
+}
+
+fn deserialize_reorder_window_tabs_v1(
+    data: &[u8],
+    is_compressed: bool,
+) -> Result<ReorderWindowTabsV1, Error> {
+    let payload = materialize_exact_payload_with_limit(
+        data,
+        is_compressed,
+        "ReorderWindowTabsV1",
+        MAX_REORDER_WINDOW_TABS_DECOMPRESSED_BYTES,
+    )?;
+    let mut reader = payload.as_ref();
+    let request = bounded_varbincode::deserialize::<ReorderWindowTabsV1, _>(&mut reader)?;
+    if !reader.is_empty() {
+        bail!("ReorderWindowTabsV1 payload has trailing schema bytes");
+    }
+    request.validate()?;
+    Ok(request)
+}
+
+fn deserialize_reorder_window_tabs_v1_response(
+    data: &[u8],
+    is_compressed: bool,
+) -> Result<ReorderWindowTabsV1Response, Error> {
+    let response: ReorderWindowTabsV1Response = deserialize_exact_payload(
+        data,
+        is_compressed,
+        "ReorderWindowTabsV1Response",
+    )?;
+    response.validate()?;
+    Ok(response)
+}
+
+fn deserialize_window_order_event_v1(
+    data: &[u8],
+    is_compressed: bool,
+) -> Result<WindowOrderEventV1, Error> {
+    let event: WindowOrderEventV1 =
+        deserialize_exact_payload(data, is_compressed, "WindowOrderEventV1")?;
+    event.validate()?;
+    Ok(event)
 }
 
 fn deserialize_get_codec_version_response(
@@ -2580,14 +2744,25 @@ pub struct ListPanes {}
 /// server computes the intersection with [`Self::SERVER_SUPPORTED`] and must
 /// return [`ListPanesCoherentOutcome::Unsupported`] when the request's
 /// `required` set is not a subset of that intersection.
-#[derive(
-    Clone, Copy, Debug, Default, Deserialize, Eq, Hash, PartialEq, Serialize,
-)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, Hash, PartialEq, Serialize)]
 pub struct TopologyCapabilities(u64);
 
 impl TopologyCapabilities {
     pub const NONE: Self = Self(0);
     pub const FENCED_SNAPSHOT_V1: Self = Self(1 << 0);
+    /// The peer understands explicit ordered-window snapshots and events.
+    pub const ORDERED_WINDOW_STREAM_V1: Self = Self(1 << 1);
+    /// The peer understands idempotent per-window reorder compare-and-set.
+    ///
+    /// This capability is meaningful only together with
+    /// [`Self::ORDERED_WINDOW_STREAM_V1`].
+    pub const WINDOW_REORDER_CAS_V1: Self = Self(1 << 2);
+
+    /// Runtime-advertised capabilities.
+    ///
+    /// The v51 codec knows the two ordered-window bits, but neither may be
+    /// advertised until the mux authority, server dispatch, and client
+    /// reconciliation beads complete. Keep this mask intentionally unchanged.
     pub const SERVER_SUPPORTED: Self = Self::FENCED_SNAPSHOT_V1;
 
     pub const fn from_bits(bits: u64) -> Self {
@@ -2605,6 +2780,25 @@ impl TopologyCapabilities {
     pub const fn contains(self, required: Self) -> bool {
         self.0 & required.0 == required.0
     }
+
+    pub fn validate(self) -> Result<(), TopologyCapabilitiesError> {
+        if self.contains(Self::WINDOW_REORDER_CAS_V1)
+            && !self.contains(Self::ORDERED_WINDOW_STREAM_V1)
+        {
+            return Err(TopologyCapabilitiesError::ReorderCasWithoutOrderedStream {
+                bits: self.bits(),
+            });
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub enum TopologyCapabilitiesError {
+    #[error(
+        "topology capability bits {bits:#x} request WINDOW_REORDER_CAS_V1 without ORDERED_WINDOW_STREAM_V1"
+    )]
+    ReorderCasWithoutOrderedStream { bits: u64 },
 }
 
 /// Unpredictable identity of one connection-generation topology stream.
@@ -2765,6 +2959,977 @@ pub struct TopologyEvent {
     pub stream_id: TopologyStreamId,
     pub revision: TopologyRevision,
     pub event: TopologyEventKind,
+}
+
+/// Closed schema version carried by ordered-window PDU IDs 86-90.
+pub const ORDERED_WINDOW_PROTOCOL_VERSION: u16 = 1;
+/// Oldest negotiated codec dialect that may send ordered-window PDU IDs 86-90.
+pub const ORDERED_WINDOW_V1_MIN_CODEC_VERSION: usize = 51;
+
+#[must_use]
+pub const fn codec_version_supports_ordered_window_v1(codec_version: usize) -> bool {
+    codec_version >= ORDERED_WINDOW_V1_MIN_CODEC_VERSION
+}
+
+/// Hard v1 resource ceilings. Live implementations may negotiate smaller
+/// budgets, but no v1 sender or receiver may exceed these values.
+pub const MAX_ORDERED_WINDOWS_PER_SNAPSHOT: usize = 4_096;
+pub const MAX_ORDERED_TABS_PER_WINDOW: usize = 4_096;
+pub const MAX_ORDERED_TABS_PER_SNAPSHOT: usize = 16_384;
+pub const MAX_ORDERED_WINDOW_SECTION_BYTES: usize = 4 * 1024 * 1024;
+pub const MAX_REORDER_WINDOW_TABS_DECOMPRESSED_BYTES: usize = 512 * 1024;
+
+/// A single committed transition can freeze one affected window or both sides
+/// of one cross-window move. Publishing separate same-revision events would be
+/// ambiguous to revision-keyed consumers.
+pub const MAX_ORDERED_WINDOWS_PER_EVENT: usize = 2;
+
+/// Domain-separated canonical digest grammar for [`ReorderWindowTabsV1`].
+///
+/// Fields are appended in declaration order using fixed-width big-endian
+/// integers and raw fixed-size identity bytes. The topology stream ID is
+/// intentionally excluded: it rotates on reconnect, while an idempotent retry
+/// must retain the same request digest on the successor stream.
+pub const WINDOW_REORDER_DIGEST_DOMAIN_V1: &[u8] =
+    b"frankenterm.window-reorder.v1\0";
+
+macro_rules! stable_order_wire_id {
+    ($name:ident) => {
+        #[derive(
+            Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize,
+        )]
+        pub struct $name(u64);
+
+        impl $name {
+            pub const fn new(value: u64) -> Self {
+                Self(value)
+            }
+
+            pub const fn get(self) -> u64 {
+                self.0
+            }
+
+            /// Checked conversion for the current mux's process-local ID type.
+            /// Wire decoding itself remains architecture-independent `u64`.
+            pub fn try_into_usize(self) -> Result<usize, OrderedWindowProtocolError> {
+                usize::try_from(self.0).map_err(|_| {
+                    OrderedWindowProtocolError::WireIdDoesNotFitUsize {
+                        field: stringify!($name),
+                        value: self.0,
+                    }
+                })
+            }
+        }
+    };
+}
+
+stable_order_wire_id!(RemoteWindowId);
+stable_order_wire_id!(RemoteTabId);
+
+/// Per-window nonwrapping order/membership/active revision.
+#[derive(
+    Clone, Copy, Debug, Default, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize,
+)]
+pub struct WindowOrderRevision(u64);
+
+impl WindowOrderRevision {
+    pub const INITIAL: Self = Self(0);
+
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+/// Client-owned durable binding identity. It is routing and audit context, not
+/// proof of the server session reached by a connection.
+#[derive(
+    Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize,
+)]
+pub struct DomainBindingId([u8; 16]);
+
+impl DomainBindingId {
+    pub const fn from_bytes(bytes: [u8; 16]) -> Self {
+        Self(bytes)
+    }
+
+    pub const fn as_bytes(self) -> [u8; 16] {
+        self.0
+    }
+}
+
+/// Idempotency identity unique inside one random client mutation namespace.
+#[derive(
+    Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize,
+)]
+pub struct WindowOrderMutationId {
+    pub namespace: [u8; 16],
+    pub sequence: u64,
+}
+
+impl WindowOrderMutationId {
+    pub const fn new(namespace: [u8; 16], sequence: u64) -> Self {
+        Self {
+            namespace,
+            sequence,
+        }
+    }
+
+    fn validate(self) -> Result<(), OrderedWindowProtocolError> {
+        if self.namespace == [0; 16] {
+            return Err(OrderedWindowProtocolError::ReservedIdentity {
+                field: "mutation_namespace",
+            });
+        }
+        if self.sequence == 0 || self.sequence == u64::MAX {
+            return Err(OrderedWindowProtocolError::ReservedWireId {
+                field: "mutation_sequence",
+                value: self.sequence,
+            });
+        }
+        Ok(())
+    }
+}
+
+/// SHA-256 binding of one frozen reorder intent.
+#[derive(
+    Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize,
+)]
+pub struct WindowReorderDigest([u8; 32]);
+
+impl WindowReorderDigest {
+    pub const ZERO: Self = Self([0; 32]);
+
+    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    pub const fn as_bytes(self) -> [u8; 32] {
+        self.0
+    }
+}
+
+/// Complete authoritative state of one exact remote mux window.
+#[derive(Deserialize, Serialize, PartialEq, Eq, Debug, Clone)]
+pub struct OrderedWindowStateV1 {
+    pub window_id: RemoteWindowId,
+    pub order_revision: WindowOrderRevision,
+    #[serde(
+        serialize_with = "serialize_ordered_tab_ids",
+        deserialize_with = "deserialize_ordered_tab_ids"
+    )]
+    pub ordered_tab_ids: Vec<RemoteTabId>,
+    pub active_tab_id: Option<RemoteTabId>,
+}
+
+impl OrderedWindowStateV1 {
+    pub fn validate(&self) -> Result<(), OrderedWindowProtocolError> {
+        validate_ordered_windows_with_section_limit(
+            std::slice::from_ref(self),
+            false,
+            MAX_ORDERED_WINDOW_SECTION_BYTES,
+        )
+    }
+}
+
+/// One coherent pane plus ordered-window bootstrap at a shared topology
+/// revision. This is the PDU87 success body; flat PDU4/PDU82 vectors alone do
+/// not acquire ordering authority.
+#[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]
+pub struct OrderedPaneSnapshotV1 {
+    pub session_incarnation: MuxSessionIncarnation,
+    pub topology_revision: TopologyRevision,
+    pub panes: ListPanesResponse,
+    #[serde(
+        serialize_with = "serialize_ordered_window_section",
+        deserialize_with = "deserialize_ordered_window_section"
+    )]
+    pub ordered_windows: Vec<OrderedWindowStateV1>,
+}
+
+impl OrderedPaneSnapshotV1 {
+    pub fn validate(&self) -> Result<(), OrderedWindowProtocolError> {
+        validate_nonzero_identity(
+            "session_incarnation",
+            self.session_incarnation.as_bytes(),
+        )?;
+        validate_topology_revision(self.topology_revision)?;
+        validate_ordered_windows_with_section_limit(
+            &self.ordered_windows,
+            false,
+            MAX_ORDERED_WINDOW_SECTION_BYTES,
+        )
+    }
+}
+
+/// Negotiated request for a coherent pane and ordered-window bootstrap.
+#[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]
+pub struct ListPanesOrderedV1 {
+    pub protocol_version: u16,
+    pub supported: TopologyCapabilities,
+    pub required: TopologyCapabilities,
+}
+
+impl ListPanesOrderedV1 {
+    pub fn validate(&self) -> Result<(), OrderedWindowProtocolError> {
+        validate_protocol_version(self.protocol_version)?;
+        self.supported.validate()?;
+        self.required.validate()?;
+        let foundation = TopologyCapabilities::from_bits(
+            TopologyCapabilities::FENCED_SNAPSHOT_V1.bits()
+                | TopologyCapabilities::ORDERED_WINDOW_STREAM_V1.bits(),
+        );
+        if !self.supported.contains(self.required) {
+            return Err(OrderedWindowProtocolError::RequiredCapabilitiesNotOffered {
+                supported: self.supported.bits(),
+                required: self.required.bits(),
+            });
+        }
+        if !self.required.contains(foundation) {
+            return Err(OrderedWindowProtocolError::MissingRequiredCapabilities {
+                required: self.required.bits(),
+                missing: foundation.bits() & !self.required.bits(),
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Typed result of bounded coherent ordered-window snapshot construction.
+#[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]
+pub enum ListPanesOrderedV1Outcome {
+    Snapshot(OrderedPaneSnapshotV1),
+    Contended {
+        attempts: u8,
+        first_revision: TopologyRevision,
+        last_revision: TopologyRevision,
+    },
+    RevisionExhausted,
+    Unsupported {
+        supported: TopologyCapabilities,
+    },
+}
+
+impl ListPanesOrderedV1Outcome {
+    fn validate(&self) -> Result<(), OrderedWindowProtocolError> {
+        match self {
+            Self::Snapshot(snapshot) => snapshot.validate(),
+            Self::Contended {
+                attempts,
+                first_revision,
+                last_revision,
+            } => {
+                if *attempts == 0
+                    || first_revision.get() == u64::MAX
+                    || last_revision.get() == u64::MAX
+                    || first_revision > last_revision
+                {
+                    return Err(OrderedWindowProtocolError::InvalidContentionRange {
+                        attempts: *attempts,
+                        first_revision: first_revision.get(),
+                        last_revision: last_revision.get(),
+                    });
+                }
+                Ok(())
+            }
+            Self::RevisionExhausted => Ok(()),
+            Self::Unsupported { supported } => {
+                supported.validate()?;
+                Ok(())
+            }
+        }
+    }
+}
+
+#[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]
+pub struct ListPanesOrderedV1Response {
+    pub protocol_version: u16,
+    pub negotiated: TopologyCapabilities,
+    pub stream_id: TopologyStreamId,
+    pub outcome: ListPanesOrderedV1Outcome,
+}
+
+impl ListPanesOrderedV1Response {
+    pub fn validate(&self) -> Result<(), OrderedWindowProtocolError> {
+        validate_protocol_version(self.protocol_version)?;
+        self.negotiated.validate()?;
+        validate_nonzero_identity("stream_id", self.stream_id.as_bytes())?;
+        self.outcome.validate()?;
+        if matches!(&self.outcome, ListPanesOrderedV1Outcome::Snapshot(_)) {
+            let foundation = TopologyCapabilities::from_bits(
+                TopologyCapabilities::FENCED_SNAPSHOT_V1.bits()
+                    | TopologyCapabilities::ORDERED_WINDOW_STREAM_V1.bits(),
+            );
+            if !self.negotiated.contains(foundation) {
+                return Err(OrderedWindowProtocolError::MissingNegotiatedCapabilities {
+                    negotiated: self.negotiated.bits(),
+                    missing: foundation.bits() & !self.negotiated.bits(),
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
+/// One exact, bounded, idempotent pure-window reorder compare-and-set.
+#[derive(Deserialize, Serialize, PartialEq, Eq, Debug, Clone)]
+pub struct ReorderWindowTabsV1 {
+    pub protocol_version: u16,
+    pub domain_binding_id: DomainBindingId,
+    pub stream_id: TopologyStreamId,
+    pub session_incarnation: MuxSessionIncarnation,
+    pub window_id: RemoteWindowId,
+    pub expected_order_revision: WindowOrderRevision,
+    #[serde(
+        serialize_with = "serialize_ordered_tab_ids",
+        deserialize_with = "deserialize_ordered_tab_ids"
+    )]
+    pub desired_tab_ids: Vec<RemoteTabId>,
+    pub desired_active_tab_id: Option<RemoteTabId>,
+    pub mutation_id: WindowOrderMutationId,
+    pub digest: WindowReorderDigest,
+}
+
+impl ReorderWindowTabsV1 {
+    /// Recompute the canonical intent digest. `stream_id` is deliberately not
+    /// mixed so the same idempotent request survives a reconnect.
+    #[must_use]
+    pub fn canonical_digest(&self) -> WindowReorderDigest {
+        let mut hasher = Sha256::new();
+        hasher.update(WINDOW_REORDER_DIGEST_DOMAIN_V1);
+        hasher.update(self.protocol_version.to_be_bytes());
+        hasher.update(self.domain_binding_id.as_bytes());
+        hasher.update(self.session_incarnation.as_bytes());
+        hasher.update(self.window_id.get().to_be_bytes());
+        hasher.update(self.expected_order_revision.get().to_be_bytes());
+        hasher.update(
+            u64::try_from(self.desired_tab_ids.len())
+                .unwrap_or(u64::MAX)
+                .to_be_bytes(),
+        );
+        for tab_id in &self.desired_tab_ids {
+            hasher.update(tab_id.get().to_be_bytes());
+        }
+        match self.desired_active_tab_id {
+            None => hasher.update([0]),
+            Some(tab_id) => {
+                hasher.update([1]);
+                hasher.update(tab_id.get().to_be_bytes());
+            }
+        }
+        hasher.update(self.mutation_id.namespace);
+        hasher.update(self.mutation_id.sequence.to_be_bytes());
+        WindowReorderDigest::from_bytes(hasher.finalize().into())
+    }
+
+    /// Replace the digest with the canonical binding of the current frozen
+    /// fields. Useful while constructing a request before admission.
+    #[must_use]
+    pub fn with_computed_digest(mut self) -> Self {
+        self.digest = self.canonical_digest();
+        self
+    }
+
+    pub fn validate(&self) -> Result<(), OrderedWindowProtocolError> {
+        validate_protocol_version(self.protocol_version)?;
+        validate_nonzero_identity("domain_binding_id", self.domain_binding_id.as_bytes())?;
+        validate_nonzero_identity("stream_id", self.stream_id.as_bytes())?;
+        validate_nonzero_identity(
+            "session_incarnation",
+            self.session_incarnation.as_bytes(),
+        )?;
+        validate_remote_wire_id("window_id", self.window_id.get())?;
+        validate_window_order_revision(self.expected_order_revision)?;
+        self.mutation_id.validate()?;
+        validate_ordered_window_components(
+            self.window_id,
+            self.expected_order_revision,
+            &self.desired_tab_ids,
+            self.desired_active_tab_id,
+        )?;
+
+        let expected_digest = self.canonical_digest();
+        if self.digest != expected_digest {
+            return Err(OrderedWindowProtocolError::DigestMismatch {
+                expected: expected_digest,
+                actual: self.digest,
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Frozen window state and session-global topology stamp returned by an
+/// applied or conflicting reorder decision.
+#[derive(Deserialize, Serialize, PartialEq, Eq, Debug, Clone)]
+pub struct WindowOrderCommitV1 {
+    pub topology_revision: TopologyRevision,
+    pub window: OrderedWindowStateV1,
+}
+
+impl WindowOrderCommitV1 {
+    fn validate(&self) -> Result<(), OrderedWindowProtocolError> {
+        validate_topology_revision(self.topology_revision)?;
+        self.window.validate()
+    }
+}
+
+/// Replayable terminal decision retained by the bounded server receipt ledger.
+/// A replay cannot recursively contain another replay marker.
+#[derive(Deserialize, Serialize, PartialEq, Eq, Debug, Clone)]
+pub enum WindowReorderTerminalOutcomeV1 {
+    Applied(WindowOrderCommitV1),
+    Conflict(WindowOrderCommitV1),
+    StaleIncarnation,
+    Malformed,
+    Exhausted,
+}
+
+impl WindowReorderTerminalOutcomeV1 {
+    fn validate(&self) -> Result<(), OrderedWindowProtocolError> {
+        match self {
+            Self::Applied(commit) | Self::Conflict(commit) => commit.validate(),
+            Self::StaleIncarnation | Self::Malformed | Self::Exhausted => Ok(()),
+        }
+    }
+}
+
+/// Typed reorder result. `Replay` contains the exact terminal decision bound
+/// to the echoed mutation identity and request digest.
+#[derive(Deserialize, Serialize, PartialEq, Eq, Debug, Clone)]
+pub enum ReorderWindowTabsV1Outcome {
+    Applied(WindowOrderCommitV1),
+    Replay(WindowReorderTerminalOutcomeV1),
+    Conflict(WindowOrderCommitV1),
+    StaleIncarnation,
+    Malformed,
+    Exhausted,
+}
+
+impl ReorderWindowTabsV1Outcome {
+    fn validate(&self) -> Result<(), OrderedWindowProtocolError> {
+        match self {
+            Self::Applied(commit) | Self::Conflict(commit) => commit.validate(),
+            Self::Replay(outcome) => outcome.validate(),
+            Self::StaleIncarnation | Self::Malformed | Self::Exhausted => Ok(()),
+        }
+    }
+}
+
+#[derive(Deserialize, Serialize, PartialEq, Eq, Debug, Clone)]
+pub struct ReorderWindowTabsV1Response {
+    pub protocol_version: u16,
+    pub stream_id: TopologyStreamId,
+    pub session_incarnation: MuxSessionIncarnation,
+    pub mutation_id: WindowOrderMutationId,
+    pub request_digest: WindowReorderDigest,
+    pub outcome: ReorderWindowTabsV1Outcome,
+}
+
+impl ReorderWindowTabsV1Response {
+    pub fn validate(&self) -> Result<(), OrderedWindowProtocolError> {
+        validate_protocol_version(self.protocol_version)?;
+        validate_nonzero_identity("stream_id", self.stream_id.as_bytes())?;
+        validate_nonzero_identity(
+            "session_incarnation",
+            self.session_incarnation.as_bytes(),
+        )?;
+        self.mutation_id.validate()?;
+        self.outcome.validate()
+    }
+}
+
+/// One lossless connection-scoped order transition. Cross-window moves carry
+/// both frozen states under one topology revision in this single PDU.
+#[derive(Deserialize, Serialize, PartialEq, Eq, Debug, Clone)]
+pub struct WindowOrderEventV1 {
+    pub protocol_version: u16,
+    pub stream_id: TopologyStreamId,
+    pub session_incarnation: MuxSessionIncarnation,
+    pub topology_revision: TopologyRevision,
+    #[serde(
+        serialize_with = "serialize_ordered_window_section",
+        deserialize_with = "deserialize_ordered_window_section"
+    )]
+    pub windows: Vec<OrderedWindowStateV1>,
+}
+
+impl WindowOrderEventV1 {
+    pub fn validate(&self) -> Result<(), OrderedWindowProtocolError> {
+        validate_protocol_version(self.protocol_version)?;
+        validate_nonzero_identity("stream_id", self.stream_id.as_bytes())?;
+        validate_nonzero_identity(
+            "session_incarnation",
+            self.session_incarnation.as_bytes(),
+        )?;
+        validate_topology_revision(self.topology_revision)?;
+        if self.windows.len() > MAX_ORDERED_WINDOWS_PER_EVENT {
+            return Err(OrderedWindowProtocolError::TooManyEventWindows {
+                count: self.windows.len(),
+                max: MAX_ORDERED_WINDOWS_PER_EVENT,
+            });
+        }
+        validate_ordered_windows_with_section_limit(
+            &self.windows,
+            true,
+            MAX_ORDERED_WINDOW_SECTION_BYTES,
+        )
+    }
+}
+
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+pub enum OrderedWindowProtocolError {
+    #[error(
+        "ordered-window protocol version {actual} is unsupported; expected {expected}"
+    )]
+    UnsupportedProtocolVersion { actual: u16, expected: u16 },
+    #[error(transparent)]
+    InvalidCapabilities(#[from] TopologyCapabilitiesError),
+    #[error(
+        "ordered-window required capabilities {required:#x} are not a subset of offered capabilities {supported:#x}"
+    )]
+    RequiredCapabilitiesNotOffered { supported: u64, required: u64 },
+    #[error(
+        "ordered-window request is missing required capability bits {missing:#x} from {required:#x}"
+    )]
+    MissingRequiredCapabilities { required: u64, missing: u64 },
+    #[error(
+        "ordered-window snapshot negotiated bits {negotiated:#x} are missing authority bits {missing:#x}"
+    )]
+    MissingNegotiatedCapabilities { negotiated: u64, missing: u64 },
+    #[error("ordered-window identity {field} uses the reserved all-zero value")]
+    ReservedIdentity { field: &'static str },
+    #[error("ordered-window wire identity {field} uses reserved value {value}")]
+    ReservedWireId { field: &'static str, value: u64 },
+    #[error("ordered-window wire identity {field}={value} does not fit in usize")]
+    WireIdDoesNotFitUsize { field: &'static str, value: u64 },
+    #[error("ordered-window revision {field} uses the terminal u64::MAX sentinel")]
+    RevisionExhausted { field: &'static str },
+    #[error("ordered-window snapshot has {count} windows; maximum is {max}")]
+    TooManyWindows { count: usize, max: usize },
+    #[error("ordered-window event has {count} windows; maximum is {max}")]
+    TooManyEventWindows { count: usize, max: usize },
+    #[error("ordered-window event must contain at least one frozen window")]
+    EmptyWindowEvent,
+    #[error("window {window_id} has {count} tabs; maximum is {max}")]
+    TooManyTabs {
+        window_id: u64,
+        count: usize,
+        max: usize,
+    },
+    #[error("ordered-window snapshot has {count} total tabs; maximum is {max}")]
+    TooManyTotalTabs { count: usize, max: usize },
+    #[error("ordered-window count arithmetic overflowed before validation completed")]
+    CountOverflow,
+    #[error("ordered-window snapshot repeats window id {window_id}")]
+    DuplicateWindowId { window_id: u64 },
+    #[error("ordered-window snapshot repeats tab id {tab_id}")]
+    DuplicateTabId { tab_id: u64 },
+    #[error("non-empty window {window_id} has no authoritative active tab")]
+    ActiveTabRequired { window_id: u64 },
+    #[error("window {window_id} names non-member active tab {active_tab_id}")]
+    ActiveTabNotInWindow {
+        window_id: u64,
+        active_tab_id: u64,
+    },
+    #[error("encoded ordered-window section has {bytes} bytes; maximum is {max}")]
+    OrderSectionTooLarge { bytes: usize, max: usize },
+    #[error("ordered-window section could not be canonically measured")]
+    OrderSectionEncoding,
+    #[error(
+        "invalid ordered-window contention range attempts={attempts} first={first_revision} last={last_revision}"
+    )]
+    InvalidContentionRange {
+        attempts: u8,
+        first_revision: u64,
+        last_revision: u64,
+    },
+    #[error("reorder request digest mismatch: expected {expected:?}, received {actual:?}")]
+    DigestMismatch {
+        expected: WindowReorderDigest,
+        actual: WindowReorderDigest,
+    },
+}
+
+fn validate_protocol_version(version: u16) -> Result<(), OrderedWindowProtocolError> {
+    if version != ORDERED_WINDOW_PROTOCOL_VERSION {
+        return Err(OrderedWindowProtocolError::UnsupportedProtocolVersion {
+            actual: version,
+            expected: ORDERED_WINDOW_PROTOCOL_VERSION,
+        });
+    }
+    Ok(())
+}
+
+fn validate_nonzero_identity(
+    field: &'static str,
+    bytes: [u8; 16],
+) -> Result<(), OrderedWindowProtocolError> {
+    if bytes == [0; 16] {
+        return Err(OrderedWindowProtocolError::ReservedIdentity { field });
+    }
+    Ok(())
+}
+
+fn validate_remote_wire_id(
+    field: &'static str,
+    value: u64,
+) -> Result<(), OrderedWindowProtocolError> {
+    if value == 0 || value == u64::MAX {
+        return Err(OrderedWindowProtocolError::ReservedWireId { field, value });
+    }
+    Ok(())
+}
+
+fn validate_topology_revision(
+    revision: TopologyRevision,
+) -> Result<(), OrderedWindowProtocolError> {
+    if revision.get() == u64::MAX {
+        return Err(OrderedWindowProtocolError::RevisionExhausted {
+            field: "topology_revision",
+        });
+    }
+    Ok(())
+}
+
+fn validate_window_order_revision(
+    revision: WindowOrderRevision,
+) -> Result<(), OrderedWindowProtocolError> {
+    if revision.get() == u64::MAX {
+        return Err(OrderedWindowProtocolError::RevisionExhausted {
+            field: "window_order_revision",
+        });
+    }
+    Ok(())
+}
+
+fn encoded_ordered_window_section_len(
+    windows: &[OrderedWindowStateV1],
+) -> Result<usize, OrderedWindowProtocolError> {
+    #[derive(Default)]
+    struct CountingWriter {
+        bytes: usize,
+    }
+
+    impl std::io::Write for CountingWriter {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            self.bytes = self.bytes.checked_add(buffer.len()).ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "ordered-window encoded length overflow",
+                )
+            })?;
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let mut counter = CountingWriter::default();
+    let mut serializer = varbincode::Serializer::new(&mut counter);
+    windows
+        .serialize(&mut serializer)
+        .map_err(|_| OrderedWindowProtocolError::OrderSectionEncoding)?;
+    Ok(counter.bytes)
+}
+
+fn validate_ordered_windows_with_section_limit(
+    windows: &[OrderedWindowStateV1],
+    require_nonempty: bool,
+    max_section_bytes: usize,
+) -> Result<(), OrderedWindowProtocolError> {
+    if require_nonempty && windows.is_empty() {
+        return Err(OrderedWindowProtocolError::EmptyWindowEvent);
+    }
+    if windows.len() > MAX_ORDERED_WINDOWS_PER_SNAPSHOT {
+        return Err(OrderedWindowProtocolError::TooManyWindows {
+            count: windows.len(),
+            max: MAX_ORDERED_WINDOWS_PER_SNAPSHOT,
+        });
+    }
+
+    let mut window_ids = HashSet::with_capacity(windows.len());
+    let mut tab_ids = HashSet::new();
+    let mut total_tabs = 0_usize;
+    for window in windows {
+        if !window_ids.insert(window.window_id) {
+            return Err(OrderedWindowProtocolError::DuplicateWindowId {
+                window_id: window.window_id.get(),
+            });
+        }
+        let local_tabs = validate_ordered_window_components(
+            window.window_id,
+            window.order_revision,
+            &window.ordered_tab_ids,
+            window.active_tab_id,
+        )?;
+        total_tabs = total_tabs
+            .checked_add(window.ordered_tab_ids.len())
+            .ok_or(OrderedWindowProtocolError::CountOverflow)?;
+        if total_tabs > MAX_ORDERED_TABS_PER_SNAPSHOT {
+            return Err(OrderedWindowProtocolError::TooManyTotalTabs {
+                count: total_tabs,
+                max: MAX_ORDERED_TABS_PER_SNAPSHOT,
+            });
+        }
+
+        for tab_id in local_tabs {
+            if !tab_ids.insert(tab_id) {
+                return Err(OrderedWindowProtocolError::DuplicateTabId {
+                    tab_id: tab_id.get(),
+                });
+            }
+        }
+    }
+
+    let section_bytes = encoded_ordered_window_section_len(windows)?;
+    if section_bytes > max_section_bytes {
+        return Err(OrderedWindowProtocolError::OrderSectionTooLarge {
+            bytes: section_bytes,
+            max: max_section_bytes,
+        });
+    }
+    Ok(())
+}
+
+fn validate_ordered_window_components(
+    window_id: RemoteWindowId,
+    order_revision: WindowOrderRevision,
+    ordered_tab_ids: &[RemoteTabId],
+    active_tab_id: Option<RemoteTabId>,
+) -> Result<HashSet<RemoteTabId>, OrderedWindowProtocolError> {
+    validate_remote_wire_id("window_id", window_id.get())?;
+    validate_window_order_revision(order_revision)?;
+    if ordered_tab_ids.len() > MAX_ORDERED_TABS_PER_WINDOW {
+        return Err(OrderedWindowProtocolError::TooManyTabs {
+            window_id: window_id.get(),
+            count: ordered_tab_ids.len(),
+            max: MAX_ORDERED_TABS_PER_WINDOW,
+        });
+    }
+
+    let mut local_tabs = HashSet::with_capacity(ordered_tab_ids.len());
+    for tab_id in ordered_tab_ids {
+        validate_remote_wire_id("tab_id", tab_id.get())?;
+        if !local_tabs.insert(*tab_id) {
+            return Err(OrderedWindowProtocolError::DuplicateTabId {
+                tab_id: tab_id.get(),
+            });
+        }
+    }
+    if let Some(active_tab_id) = active_tab_id {
+        validate_remote_wire_id("active_tab_id", active_tab_id.get())?;
+    }
+    match (ordered_tab_ids.is_empty(), active_tab_id) {
+        (false, None) => {
+            return Err(OrderedWindowProtocolError::ActiveTabRequired {
+                window_id: window_id.get(),
+            });
+        }
+        (_, Some(active_tab_id)) if !local_tabs.contains(&active_tab_id) => {
+            return Err(OrderedWindowProtocolError::ActiveTabNotInWindow {
+                window_id: window_id.get(),
+                active_tab_id: active_tab_id.get(),
+            });
+        }
+        _ => {}
+    }
+    Ok(local_tabs)
+}
+
+fn serialize_bounded_vec<S, T, const MAX: usize>(
+    values: &[T],
+    serializer: S,
+    label: &'static str,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+    T: Serialize,
+{
+    if values.len() > MAX {
+        return Err(serde::ser::Error::custom(format_args!(
+            "{label} length {} exceeds maximum {MAX}",
+            values.len()
+        )));
+    }
+    values.serialize(serializer)
+}
+
+struct BoundedVecVisitor<T, const MAX: usize> {
+    label: &'static str,
+    marker: std::marker::PhantomData<T>,
+}
+
+impl<'de, T, const MAX: usize> serde::de::Visitor<'de> for BoundedVecVisitor<T, MAX>
+where
+    T: Deserialize<'de>,
+{
+    type Value = Vec<T>;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "at most {MAX} {}", self.label)
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: serde::de::SeqAccess<'de>,
+    {
+        let hinted = sequence.size_hint().unwrap_or(0);
+        if hinted > MAX {
+            return Err(serde::de::Error::custom(format_args!(
+                "{} length {hinted} exceeds maximum {MAX}",
+                self.label
+            )));
+        }
+        let mut values = Vec::new();
+        values.try_reserve(hinted).map_err(|error| {
+            serde::de::Error::custom(format_args!(
+                "allocating {} length {hinted} failed: {error}",
+                self.label
+            ))
+        })?;
+        while let Some(value) = sequence.next_element()? {
+            if values.len() == MAX {
+                return Err(serde::de::Error::custom(format_args!(
+                    "{} length exceeds maximum {MAX}",
+                    self.label
+                )));
+            }
+            values.push(value);
+        }
+        Ok(values)
+    }
+}
+
+fn deserialize_bounded_vec<'de, D, T, const MAX: usize>(
+    deserializer: D,
+    label: &'static str,
+) -> Result<Vec<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    deserializer.deserialize_seq(BoundedVecVisitor::<T, MAX> {
+        label,
+        marker: std::marker::PhantomData,
+    })
+}
+
+fn serialize_ordered_tab_ids<S>(
+    values: &[RemoteTabId],
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    serialize_bounded_vec::<S, _, MAX_ORDERED_TABS_PER_WINDOW>(
+        values,
+        serializer,
+        "ordered tab ids",
+    )
+}
+
+fn deserialize_ordered_tab_ids<'de, D>(deserializer: D) -> Result<Vec<RemoteTabId>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserialize_bounded_vec::<D, _, MAX_ORDERED_TABS_PER_WINDOW>(
+        deserializer,
+        "ordered tab ids",
+    )
+}
+
+fn serialize_ordered_windows<S>(
+    values: &[OrderedWindowStateV1],
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    serialize_bounded_vec::<S, _, MAX_ORDERED_WINDOWS_PER_SNAPSHOT>(
+        values,
+        serializer,
+        "ordered windows",
+    )
+}
+
+fn deserialize_ordered_windows<'de, D>(
+    deserializer: D,
+) -> Result<Vec<OrderedWindowStateV1>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserialize_bounded_vec::<D, _, MAX_ORDERED_WINDOWS_PER_SNAPSHOT>(
+        deserializer,
+        "ordered windows",
+    )
+}
+
+fn serialize_ordered_window_section<S>(
+    values: &[OrderedWindowStateV1],
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    validate_ordered_windows_with_section_limit(
+        values,
+        false,
+        MAX_ORDERED_WINDOW_SECTION_BYTES,
+    )
+    .map_err(serde::ser::Error::custom)?;
+
+    let mut section = Vec::new();
+    let mut section_serializer = varbincode::Serializer::new(&mut section);
+    serialize_ordered_windows(values, &mut section_serializer)
+        .map_err(serde::ser::Error::custom)?;
+    if section.len() > MAX_ORDERED_WINDOW_SECTION_BYTES {
+        return Err(serde::ser::Error::custom(format_args!(
+            "ordered-window section length {} exceeds maximum {}",
+            section.len(),
+            MAX_ORDERED_WINDOW_SECTION_BYTES
+        )));
+    }
+    section.serialize(serializer)
+}
+
+fn deserialize_ordered_window_section<'de, D>(
+    deserializer: D,
+) -> Result<Vec<OrderedWindowStateV1>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    struct OrderedWindowsWire(
+        #[serde(deserialize_with = "deserialize_ordered_windows")]
+        Vec<OrderedWindowStateV1>,
+    );
+
+    let section = deserialize_bounded_vec::<D, u8, MAX_ORDERED_WINDOW_SECTION_BYTES>(
+        deserializer,
+        "ordered-window section bytes",
+    )?;
+    let mut reader = section.as_slice();
+    let OrderedWindowsWire(windows) =
+        bounded_varbincode::deserialize::<OrderedWindowsWire, _>(&mut reader)
+            .map_err(serde::de::Error::custom)?;
+    if !reader.is_empty() {
+        return Err(serde::de::Error::custom(
+            "ordered-window section has trailing schema bytes",
+        ));
+    }
+    validate_ordered_windows_with_section_limit(
+        &windows,
+        false,
+        MAX_ORDERED_WINDOW_SECTION_BYTES,
+    )
+    .map_err(serde::de::Error::custom)?;
+    Ok(windows)
 }
 
 #[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]
@@ -5025,6 +6190,716 @@ mod test {
         assert_eq!(offered.bits(), (1_u64 << 63) | 1);
     }
 
+    fn ordered_window_foundation_capabilities() -> TopologyCapabilities {
+        TopologyCapabilities::from_bits(
+            TopologyCapabilities::FENCED_SNAPSHOT_V1.bits()
+                | TopologyCapabilities::ORDERED_WINDOW_STREAM_V1.bits(),
+        )
+    }
+
+    fn ordered_window_all_capabilities() -> TopologyCapabilities {
+        TopologyCapabilities::from_bits(
+            ordered_window_foundation_capabilities().bits()
+                | TopologyCapabilities::WINDOW_REORDER_CAS_V1.bits(),
+        )
+    }
+
+    fn sample_ordered_window() -> OrderedWindowStateV1 {
+        OrderedWindowStateV1 {
+            window_id: RemoteWindowId::new(u64::from(u32::MAX) + 17),
+            order_revision: WindowOrderRevision::new(7),
+            ordered_tab_ids: vec![
+                RemoteTabId::new(u64::from(u32::MAX) + 31),
+                RemoteTabId::new(u64::from(u32::MAX) + 37),
+                RemoteTabId::new(u64::from(u32::MAX) + 41),
+            ],
+            active_tab_id: Some(RemoteTabId::new(u64::from(u32::MAX) + 37)),
+        }
+    }
+
+    fn empty_pane_list() -> ListPanesResponse {
+        ListPanesResponse {
+            tabs: Vec::new(),
+            tab_titles: Vec::new(),
+            window_titles: HashMap::new(),
+        }
+    }
+
+    fn sample_reorder_window_tabs_v1() -> ReorderWindowTabsV1 {
+        let window = sample_ordered_window();
+        ReorderWindowTabsV1 {
+            protocol_version: ORDERED_WINDOW_PROTOCOL_VERSION,
+            domain_binding_id: DomainBindingId::from_bytes([0x11; 16]),
+            stream_id: TopologyStreamId::from_bytes([0x22; 16]),
+            session_incarnation: MuxSessionIncarnation::from_bytes([0x33; 16]),
+            window_id: window.window_id,
+            expected_order_revision: window.order_revision,
+            desired_tab_ids: window.ordered_tab_ids,
+            desired_active_tab_id: window.active_tab_id,
+            mutation_id: WindowOrderMutationId::new([0x44; 16], 9),
+            digest: WindowReorderDigest::ZERO,
+        }
+        .with_computed_digest()
+    }
+
+    fn encode_reorder_window_tabs_unchecked(
+        request: &ReorderWindowTabsV1,
+        serial: u64,
+    ) -> Vec<u8> {
+        let (payload, compressed) = serialize_with_mode(
+            &(
+                request.protocol_version,
+                request.domain_binding_id,
+                request.stream_id,
+                request.session_incarnation,
+                request.window_id,
+                request.expected_order_revision,
+                &request.desired_tab_ids,
+                request.desired_active_tab_id,
+                request.mutation_id,
+                request.digest,
+            ),
+            CompressionMode::Never,
+        )
+        .expect("unchecked reorder wire tuple should serialize");
+        assert!(!compressed);
+        let mut frame = Vec::new();
+        encode_raw(88, serial, &payload, false, &mut frame)
+            .expect("unchecked reorder wire tuple should frame");
+        frame
+    }
+
+    fn encode_window_order_event_unchecked(event: &WindowOrderEventV1, serial: u64) -> Vec<u8> {
+        let mut section = Vec::new();
+        let mut serializer = varbincode::Serializer::new(&mut section);
+        event
+            .windows
+            .serialize(&mut serializer)
+            .expect("unchecked ordered-window section should serialize");
+        let (payload, compressed) = serialize_with_mode(
+            &(
+                event.protocol_version,
+                event.stream_id,
+                event.session_incarnation,
+                event.topology_revision,
+                &section,
+            ),
+            CompressionMode::Never,
+        )
+        .expect("unchecked window-order event tuple should serialize");
+        assert!(!compressed);
+        let mut frame = Vec::new();
+        encode_raw(90, serial, &payload, false, &mut frame)
+            .expect("unchecked window-order event tuple should frame");
+        frame
+    }
+
+    fn sample_ordered_window_pdus() -> Vec<(u64, Pdu)> {
+        let reorder = sample_reorder_window_tabs_v1();
+        let window = sample_ordered_window();
+        let commit = WindowOrderCommitV1 {
+            topology_revision: TopologyRevision::new(12),
+            window: window.clone(),
+        };
+        vec![
+            (
+                86,
+                Pdu::ListPanesOrderedV1(ListPanesOrderedV1 {
+                    protocol_version: ORDERED_WINDOW_PROTOCOL_VERSION,
+                    supported: ordered_window_all_capabilities(),
+                    required: ordered_window_foundation_capabilities(),
+                }),
+            ),
+            (
+                87,
+                Pdu::ListPanesOrderedV1Response(ListPanesOrderedV1Response {
+                    protocol_version: ORDERED_WINDOW_PROTOCOL_VERSION,
+                    negotiated: ordered_window_foundation_capabilities(),
+                    stream_id: reorder.stream_id,
+                    outcome: ListPanesOrderedV1Outcome::Snapshot(OrderedPaneSnapshotV1 {
+                        session_incarnation: reorder.session_incarnation,
+                        topology_revision: TopologyRevision::new(11),
+                        panes: empty_pane_list(),
+                        ordered_windows: vec![window.clone()],
+                    }),
+                }),
+            ),
+            (88, Pdu::ReorderWindowTabsV1(reorder.clone())),
+            (
+                89,
+                Pdu::ReorderWindowTabsV1Response(ReorderWindowTabsV1Response {
+                    protocol_version: ORDERED_WINDOW_PROTOCOL_VERSION,
+                    stream_id: reorder.stream_id,
+                    session_incarnation: reorder.session_incarnation,
+                    mutation_id: reorder.mutation_id,
+                    request_digest: reorder.digest,
+                    outcome: ReorderWindowTabsV1Outcome::Applied(commit),
+                }),
+            ),
+            (
+                90,
+                Pdu::WindowOrderEventV1(WindowOrderEventV1 {
+                    protocol_version: ORDERED_WINDOW_PROTOCOL_VERSION,
+                    stream_id: reorder.stream_id,
+                    session_incarnation: reorder.session_incarnation,
+                    topology_revision: TopologyRevision::new(12),
+                    windows: vec![window],
+                }),
+            ),
+        ]
+    }
+
+    #[test]
+    fn ordered_window_v1_capabilities_are_known_but_not_advertised() {
+        assert_eq!(
+            TopologyCapabilities::ORDERED_WINDOW_STREAM_V1.bits(),
+            1 << 1
+        );
+        assert_eq!(
+            TopologyCapabilities::WINDOW_REORDER_CAS_V1.bits(),
+            1 << 2
+        );
+        assert_eq!(
+            TopologyCapabilities::SERVER_SUPPORTED,
+            TopologyCapabilities::FENCED_SNAPSHOT_V1,
+            "codec knowledge must not activate ordered-window runtime support"
+        );
+        assert!(ordered_window_all_capabilities().validate().is_ok());
+        assert_eq!(
+            TopologyCapabilities::WINDOW_REORDER_CAS_V1.validate(),
+            Err(TopologyCapabilitiesError::ReorderCasWithoutOrderedStream {
+                bits: 1 << 2,
+            })
+        );
+
+        let (payload, compressed) = serialize_with_mode(
+            &(
+                ORDERED_WINDOW_PROTOCOL_VERSION,
+                TopologyCapabilities::WINDOW_REORDER_CAS_V1.bits(),
+                TopologyCapabilities::WINDOW_REORDER_CAS_V1.bits(),
+            ),
+            CompressionMode::Never,
+        )
+        .expect("raw malformed capability tuple should serialize");
+        assert!(!compressed);
+        let mut frame = Vec::new();
+        encode_raw(86, 1, &payload, false, &mut frame)
+            .expect("malformed capability tuple should frame");
+        let error = Pdu::decode(frame.as_slice())
+            .expect_err("bit2 without bit1 must fail during wire decode");
+        assert!(
+            format!("{error:#}").contains("without ORDERED_WINDOW_STREAM_V1"),
+            "unexpected capability rejection: {error:#}"
+        );
+    }
+
+    #[test]
+    fn ordered_window_v1_pdus_freeze_ids_and_roundtrip_in_every_mode() {
+        assert_eq!(<ListPanesOrderedV1 as PduWireIdent>::IDENT, 86);
+        assert_eq!(<ListPanesOrderedV1Response as PduWireIdent>::IDENT, 87);
+        assert_eq!(<ReorderWindowTabsV1 as PduWireIdent>::IDENT, 88);
+        assert_eq!(<ReorderWindowTabsV1Response as PduWireIdent>::IDENT, 89);
+        assert_eq!(<WindowOrderEventV1 as PduWireIdent>::IDENT, 90);
+
+        for (expected_ident, pdu) in sample_ordered_window_pdus() {
+            for mode in [
+                CompressionMode::Auto,
+                CompressionMode::Never,
+                CompressionMode::Always,
+            ] {
+                let frame = pdu
+                    .encode_frame_with_mode(0x1234, mode)
+                    .expect("ordered-window PDU should encode");
+                assert_eq!(
+                    decode_raw(frame.as_slice())
+                        .expect("ordered-window raw frame should decode")
+                        .ident,
+                    expected_ident
+                );
+                let decoded = Pdu::decode(frame.as_slice())
+                    .expect("ordered-window PDU should validate and decode");
+                assert_eq!(decoded.serial, 0x1234);
+                assert_eq!(decoded.pdu, pdu);
+            }
+        }
+    }
+
+    #[test]
+    fn reorder_response_roundtrips_every_typed_terminal_outcome() {
+        let request = sample_reorder_window_tabs_v1();
+        let commit = WindowOrderCommitV1 {
+            topology_revision: TopologyRevision::new(12),
+            window: sample_ordered_window(),
+        };
+        let outcomes = vec![
+            ReorderWindowTabsV1Outcome::Applied(commit.clone()),
+            ReorderWindowTabsV1Outcome::Replay(
+                WindowReorderTerminalOutcomeV1::Applied(commit.clone()),
+            ),
+            ReorderWindowTabsV1Outcome::Replay(
+                WindowReorderTerminalOutcomeV1::Conflict(commit.clone()),
+            ),
+            ReorderWindowTabsV1Outcome::Replay(
+                WindowReorderTerminalOutcomeV1::StaleIncarnation,
+            ),
+            ReorderWindowTabsV1Outcome::Replay(
+                WindowReorderTerminalOutcomeV1::Malformed,
+            ),
+            ReorderWindowTabsV1Outcome::Replay(WindowReorderTerminalOutcomeV1::Exhausted),
+            ReorderWindowTabsV1Outcome::Conflict(commit),
+            ReorderWindowTabsV1Outcome::StaleIncarnation,
+            ReorderWindowTabsV1Outcome::Malformed,
+            ReorderWindowTabsV1Outcome::Exhausted,
+        ];
+
+        for (index, outcome) in outcomes.into_iter().enumerate() {
+            let pdu = Pdu::ReorderWindowTabsV1Response(ReorderWindowTabsV1Response {
+                protocol_version: ORDERED_WINDOW_PROTOCOL_VERSION,
+                stream_id: request.stream_id,
+                session_incarnation: request.session_incarnation,
+                mutation_id: request.mutation_id,
+                request_digest: request.digest,
+                outcome,
+            });
+            let frame = pdu
+                .encode_frame_with_mode(
+                    u64::try_from(index).expect("small outcome index fits u64"),
+                    CompressionMode::Never,
+                )
+                .expect("typed reorder outcome should encode");
+            assert_eq!(
+                Pdu::decode(frame.as_slice())
+                    .expect("typed reorder outcome should decode")
+                    .pdu,
+                pdu
+            );
+        }
+    }
+
+    #[test]
+    fn reorder_digest_has_a_golden_grammar_and_excludes_only_stream_id() {
+        let request = sample_reorder_window_tabs_v1();
+        assert_eq!(
+            request.digest.as_bytes(),
+            [
+                0x19, 0x77, 0xaf, 0x8b, 0x79, 0xde, 0xaf, 0x45,
+                0x80, 0x8f, 0xef, 0x59, 0x9b, 0xee, 0x58, 0xe4,
+                0xc7, 0xc2, 0xcd, 0xe0, 0x28, 0x6f, 0x2f, 0xdf,
+                0xd6, 0x12, 0x0a, 0x0d, 0x2c, 0x4d, 0xde, 0xf2,
+            ]
+        );
+
+        let mut successor_stream = request.clone();
+        successor_stream.stream_id = TopologyStreamId::from_bytes([0x99; 16]);
+        assert_eq!(successor_stream.canonical_digest(), request.digest);
+        successor_stream
+            .validate()
+            .expect("stream rotation must preserve idempotent digest validity");
+
+        let mut changed = request.clone();
+        changed.expected_order_revision = WindowOrderRevision::new(8);
+        assert_ne!(changed.canonical_digest(), request.digest);
+        changed = request.clone();
+        changed.desired_tab_ids.swap(0, 1);
+        assert_ne!(changed.canonical_digest(), request.digest);
+        changed = request.clone();
+        changed.desired_active_tab_id = changed.desired_tab_ids.first().copied();
+        assert_ne!(changed.canonical_digest(), request.digest);
+        changed = request.clone();
+        changed.mutation_id.sequence += 1;
+        assert_ne!(changed.canonical_digest(), request.digest);
+        changed = request.clone();
+        changed.session_incarnation = MuxSessionIncarnation::from_bytes([0x55; 16]);
+        assert_ne!(changed.canonical_digest(), request.digest);
+        changed = request.clone();
+        changed.domain_binding_id = DomainBindingId::from_bytes([0x66; 16]);
+        assert_ne!(changed.canonical_digest(), request.digest);
+        changed = request.clone();
+        changed.window_id = RemoteWindowId::new(request.window_id.get() + 1);
+        assert_ne!(changed.canonical_digest(), request.digest);
+        changed = request.clone();
+        changed.mutation_id.namespace = [0x77; 16];
+        assert_ne!(changed.canonical_digest(), request.digest);
+        changed = request;
+        changed.protocol_version += 1;
+        assert_ne!(changed.canonical_digest(), changed.digest);
+    }
+
+    #[test]
+    fn ordered_window_v1_rejects_zero_duplicate_and_impossible_identities() {
+        let valid = sample_reorder_window_tabs_v1();
+        let mut zero_window = valid.clone();
+        zero_window.window_id = RemoteWindowId::new(0);
+        zero_window = zero_window.with_computed_digest();
+
+        let mut duplicate_tab = valid.clone();
+        duplicate_tab.desired_tab_ids[1] = duplicate_tab.desired_tab_ids[0];
+        duplicate_tab.desired_active_tab_id = Some(duplicate_tab.desired_tab_ids[0]);
+        duplicate_tab = duplicate_tab.with_computed_digest();
+
+        let mut zero_tab = valid.clone();
+        zero_tab.desired_tab_ids[0] = RemoteTabId::new(0);
+        zero_tab = zero_tab.with_computed_digest();
+
+        let mut missing_active = valid.clone();
+        missing_active.desired_active_tab_id = None;
+        missing_active = missing_active.with_computed_digest();
+
+        let mut foreign_active = valid.clone();
+        foreign_active.desired_active_tab_id = Some(RemoteTabId::new(999_999));
+        foreign_active = foreign_active.with_computed_digest();
+
+        for (name, malformed) in [
+            ("zero window", zero_window),
+            ("duplicate tab", duplicate_tab),
+            ("zero tab", zero_tab),
+            ("missing active", missing_active),
+            ("foreign active", foreign_active),
+        ] {
+            assert!(
+                Pdu::ReorderWindowTabsV1(malformed.clone())
+                    .encode_frame_with_mode(7, CompressionMode::Never)
+                    .is_err(),
+                "{name} must fail before sender serialization"
+            );
+            let frame = encode_reorder_window_tabs_unchecked(&malformed, 7);
+            assert!(
+                Pdu::decode(frame.as_slice()).is_err(),
+                "{name} must fail closed during decode"
+            );
+        }
+
+        let mut digest_mismatch = valid;
+        digest_mismatch.digest = WindowReorderDigest::from_bytes([0xaa; 32]);
+        let frame = encode_reorder_window_tabs_unchecked(&digest_mismatch, 8);
+        let error = Pdu::decode(frame.as_slice())
+            .expect_err("digest mismatch must fail during decode");
+        assert!(format!("{error:#}").contains("digest mismatch"));
+
+        let first = sample_ordered_window();
+        let duplicate_window = WindowOrderEventV1 {
+            protocol_version: ORDERED_WINDOW_PROTOCOL_VERSION,
+            stream_id: TopologyStreamId::from_bytes([0x77; 16]),
+            session_incarnation: MuxSessionIncarnation::from_bytes([0x78; 16]),
+            topology_revision: TopologyRevision::new(9),
+            windows: vec![first.clone(), first.clone()],
+        };
+        assert!(
+            Pdu::WindowOrderEventV1(duplicate_window.clone())
+                .encode_frame_with_mode(9, CompressionMode::Never)
+                .is_err(),
+            "duplicate windows must fail sender validation"
+        );
+        let error = Pdu::decode(
+            encode_window_order_event_unchecked(&duplicate_window, 9).as_slice(),
+        )
+        .expect_err("duplicate windows must fail receiver validation");
+        assert!(format!("{error:#}").contains("repeats window id"));
+
+        let mut second = first.clone();
+        second.window_id = RemoteWindowId::new(first.window_id.get() + 1);
+        let duplicate_tab = WindowOrderEventV1 {
+            windows: vec![first, second],
+            ..duplicate_window
+        };
+        let error = Pdu::decode(
+            encode_window_order_event_unchecked(&duplicate_tab, 10).as_slice(),
+        )
+        .expect_err("a tab cannot appear in two ordered windows");
+        assert!(format!("{error:#}").contains("repeats tab id"));
+    }
+
+    #[test]
+    fn ordered_window_v1_exact_decoders_reject_trailing_and_truncated_bytes() {
+        for mode in [CompressionMode::Never, CompressionMode::Always] {
+            for (ident, pdu) in sample_ordered_window_pdus() {
+                let frame = match &pdu {
+                    Pdu::ListPanesOrderedV1(value) => {
+                        encode_authority_payload_with_trailing_schema_byte(
+                            ident, 1, value, mode,
+                        )
+                    }
+                    Pdu::ListPanesOrderedV1Response(value) => {
+                        encode_authority_payload_with_trailing_schema_byte(
+                            ident, 1, value, mode,
+                        )
+                    }
+                    Pdu::ReorderWindowTabsV1(value) => {
+                        encode_authority_payload_with_trailing_schema_byte(
+                            ident, 1, value, mode,
+                        )
+                    }
+                    Pdu::ReorderWindowTabsV1Response(value) => {
+                        encode_authority_payload_with_trailing_schema_byte(
+                            ident, 1, value, mode,
+                        )
+                    }
+                    Pdu::WindowOrderEventV1(value) => {
+                        encode_authority_payload_with_trailing_schema_byte(
+                            ident, 1, value, mode,
+                        )
+                    }
+                    _ => unreachable!("sample contains only ordered-window authority PDUs"),
+                };
+                let error = Pdu::decode(frame.as_slice())
+                    .expect_err("closed ordered-window schema must reject trailing bytes");
+                assert!(
+                    format!("{error:#}").contains("trailing schema bytes"),
+                    "unexpected PDU {ident} trailing-byte rejection under {mode:?}: {error:#}"
+                );
+            }
+        }
+
+        for (_, pdu) in sample_ordered_window_pdus() {
+            let mut frame = pdu
+                .encode_frame_with_mode(2, CompressionMode::Never)
+                .expect("valid ordered-window PDU should frame");
+            frame.pop().expect("sample frame is non-empty");
+            Pdu::decode(frame.as_slice())
+                .expect_err("truncated ordered-window frame must fail closed");
+        }
+    }
+
+    #[test]
+    fn ordered_window_v1_enforces_count_and_byte_limits() {
+        let mut max_request = sample_reorder_window_tabs_v1();
+        max_request.desired_tab_ids = (1..=MAX_ORDERED_TABS_PER_WINDOW)
+            .map(|id| RemoteTabId::new(u64::try_from(id).expect("bounded id fits u64")))
+            .collect();
+        max_request.desired_active_tab_id = max_request.desired_tab_ids.first().copied();
+        max_request = max_request.with_computed_digest();
+        let max_pdu = Pdu::ReorderWindowTabsV1(max_request.clone());
+        let max_frame = max_pdu
+            .encode_frame_with_mode(20, CompressionMode::Never)
+            .expect("exact per-window tab limit should encode");
+        assert_eq!(
+            Pdu::decode(max_frame.as_slice())
+                .expect("exact per-window tab limit should decode")
+                .pdu,
+            max_pdu
+        );
+
+        let mut over_request = max_request;
+        over_request
+            .desired_tab_ids
+            .push(RemoteTabId::new(50_000));
+        over_request = over_request.with_computed_digest();
+        let (payload, compressed) = serialize_with_mode(
+            &(
+                over_request.protocol_version,
+                over_request.domain_binding_id,
+                over_request.stream_id,
+                over_request.session_incarnation,
+                over_request.window_id,
+                over_request.expected_order_revision,
+                &over_request.desired_tab_ids,
+                over_request.desired_active_tab_id,
+                over_request.mutation_id,
+                over_request.digest,
+            ),
+            CompressionMode::Never,
+        )
+        .expect("hostile unbounded reorder tuple should serialize");
+        assert!(!compressed);
+        let mut frame = Vec::new();
+        encode_raw(88, 21, &payload, false, &mut frame)
+            .expect("hostile over-limit request should frame");
+        let error = Pdu::decode(frame.as_slice())
+            .expect_err("over-limit tab vector must fail before allocation");
+        assert!(format!("{error:#}").contains("exceeds maximum 4096"));
+
+        let windows_at_limit: Vec<_> = (1..=MAX_ORDERED_WINDOWS_PER_SNAPSHOT)
+            .map(|id| OrderedWindowStateV1 {
+                window_id: RemoteWindowId::new(
+                    u64::try_from(id).expect("bounded window id fits u64"),
+                ),
+                order_revision: WindowOrderRevision::INITIAL,
+                ordered_tab_ids: Vec::new(),
+                active_tab_id: None,
+            })
+            .collect();
+        let snapshot_at_limit = Pdu::ListPanesOrderedV1Response(
+            ListPanesOrderedV1Response {
+                protocol_version: ORDERED_WINDOW_PROTOCOL_VERSION,
+                negotiated: ordered_window_foundation_capabilities(),
+                stream_id: TopologyStreamId::from_bytes([0x71; 16]),
+                outcome: ListPanesOrderedV1Outcome::Snapshot(OrderedPaneSnapshotV1 {
+                    session_incarnation: MuxSessionIncarnation::from_bytes([0x72; 16]),
+                    topology_revision: TopologyRevision::new(1),
+                    panes: empty_pane_list(),
+                    ordered_windows: windows_at_limit.clone(),
+                }),
+            },
+        );
+        let frame = snapshot_at_limit
+            .encode_frame_with_mode(22, CompressionMode::Never)
+            .expect("exact ordered-window count limit should encode");
+        assert_eq!(
+            Pdu::decode(frame.as_slice())
+                .expect("exact ordered-window count limit should decode")
+                .pdu,
+            snapshot_at_limit
+        );
+
+        let mut windows_over_limit = windows_at_limit;
+        windows_over_limit.push(OrderedWindowStateV1 {
+            window_id: RemoteWindowId::new(50_000),
+            order_revision: WindowOrderRevision::INITIAL,
+            ordered_tab_ids: Vec::new(),
+            active_tab_id: None,
+        });
+        let mut section = Vec::new();
+        let mut section_serializer = varbincode::Serializer::new(&mut section);
+        windows_over_limit
+            .serialize(&mut section_serializer)
+            .expect("hostile unbounded ordered-window section should serialize");
+        let (payload, compressed) = serialize_with_mode(
+            &(
+                ORDERED_WINDOW_PROTOCOL_VERSION,
+                TopologyStreamId::from_bytes([0x71; 16]),
+                MuxSessionIncarnation::from_bytes([0x72; 16]),
+                TopologyRevision::new(2),
+                &section,
+            ),
+            CompressionMode::Never,
+        )
+        .expect("hostile unbounded window event tuple should serialize");
+        assert!(!compressed);
+        let mut frame = Vec::new();
+        encode_raw(90, 23, &payload, false, &mut frame)
+            .expect("hostile over-limit event should frame");
+        let error = Pdu::decode(frame.as_slice())
+            .expect_err("over-limit window vector must fail before allocation");
+        assert!(format!("{error:#}").contains("exceeds maximum 4096"));
+
+        let aggregate_at_limit: Vec<_> = (0..4)
+            .map(|window_offset| {
+                let first = window_offset * MAX_ORDERED_TABS_PER_WINDOW + 1;
+                let tabs: Vec<_> = (first..first + MAX_ORDERED_TABS_PER_WINDOW)
+                    .map(|id| {
+                        RemoteTabId::new(u64::try_from(id).expect("bounded tab id fits u64"))
+                    })
+                    .collect();
+                OrderedWindowStateV1 {
+                    window_id: RemoteWindowId::new(
+                        u64::try_from(window_offset + 1)
+                            .expect("bounded window id fits u64"),
+                    ),
+                    order_revision: WindowOrderRevision::new(1),
+                    active_tab_id: tabs.first().copied(),
+                    ordered_tab_ids: tabs,
+                }
+            })
+            .collect();
+        validate_ordered_windows_with_section_limit(
+            &aggregate_at_limit,
+            false,
+            MAX_ORDERED_WINDOW_SECTION_BYTES,
+        )
+        .expect("exact aggregate tab limit should validate");
+        let mut aggregate_over_limit = aggregate_at_limit;
+        aggregate_over_limit.push(OrderedWindowStateV1 {
+            window_id: RemoteWindowId::new(5),
+            order_revision: WindowOrderRevision::new(1),
+            ordered_tab_ids: vec![RemoteTabId::new(50_000)],
+            active_tab_id: Some(RemoteTabId::new(50_000)),
+        });
+        assert_eq!(
+            validate_ordered_windows_with_section_limit(
+                &aggregate_over_limit,
+                false,
+                MAX_ORDERED_WINDOW_SECTION_BYTES,
+            ),
+            Err(OrderedWindowProtocolError::TooManyTotalTabs {
+                count: MAX_ORDERED_TABS_PER_SNAPSHOT + 1,
+                max: MAX_ORDERED_TABS_PER_SNAPSHOT,
+            })
+        );
+
+        let one_window = [sample_ordered_window()];
+        let exact_section_bytes = encoded_ordered_window_section_len(&one_window)
+            .expect("sample order section should have a canonical length");
+        validate_ordered_windows_with_section_limit(
+            &one_window,
+            false,
+            exact_section_bytes,
+        )
+        .expect("exact injected section byte limit should validate");
+        assert_eq!(
+            validate_ordered_windows_with_section_limit(
+                &one_window,
+                false,
+                exact_section_bytes - 1,
+            ),
+            Err(OrderedWindowProtocolError::OrderSectionTooLarge {
+                bytes: exact_section_bytes,
+                max: exact_section_bytes - 1,
+            })
+        );
+
+        let oversized_payload = vec![0_u8; MAX_REORDER_WINDOW_TABS_DECOMPRESSED_BYTES + 1];
+        for (compressed_payload, is_compressed) in [
+            (oversized_payload.clone(), false),
+            (
+                zstd::stream::encode_all(
+                    oversized_payload.as_slice(),
+                    zstd::DEFAULT_COMPRESSION_LEVEL,
+                )
+                .expect("oversized zero payload should compress"),
+                true,
+            ),
+        ] {
+            let mut frame = Vec::new();
+            encode_raw(88, 24, &compressed_payload, is_compressed, &mut frame)
+                .expect("bounded compression-bomb fixture should frame");
+            let error = Pdu::decode(frame.as_slice())
+                .expect_err("reorder payload above 512 KiB must fail before decode");
+            assert!(
+                format!("{error:#}").contains("exceeds maximum 524288"),
+                "unexpected 512 KiB rejection: {error:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn codec_v51_keeps_v50_legacy_dialect_inert_and_compatible() {
+        assert_eq!(CODEC_VERSION, 51);
+        assert_eq!(CODEC_VERSION_MIN_SUPPORTED, 46);
+        assert_eq!(ORDERED_WINDOW_V1_MIN_CODEC_VERSION, 51);
+        assert!(!codec_version_supports_ordered_window_v1(50));
+        assert!(codec_version_supports_ordered_window_v1(51));
+        assert_eq!(
+            check_compat(51, 46, 50, 46).expect("v50 remains in the additive window"),
+            CompatDecision::Compatible { agreed: 50 }
+        );
+        assert_eq!(<ListPanesCoherent as PduWireIdent>::IDENT, 81);
+        assert_eq!(<RenderApplicationResult as PduWireIdent>::IDENT, 85);
+        assert_eq!(
+            TopologyCapabilities::SERVER_SUPPORTED.bits(),
+            TopologyCapabilities::FENCED_SNAPSHOT_V1.bits()
+        );
+
+        let legacy = Pdu::ListPanesCoherent(ListPanesCoherent {
+            supported: TopologyCapabilities::FENCED_SNAPSHOT_V1,
+            required: TopologyCapabilities::FENCED_SNAPSHOT_V1,
+        });
+        let frame = legacy
+            .encode_frame_with_mode(50, CompressionMode::Never)
+            .expect("v50 coherent snapshot request should retain its schema");
+        assert_eq!(
+            decode_raw(frame.as_slice())
+                .expect("v50 legacy frame should decode raw")
+                .ident,
+            81
+        );
+        assert_eq!(
+            Pdu::decode(frame.as_slice())
+                .expect("v51 decoder must retain v50 PDU81")
+                .pdu,
+            legacy
+        );
+    }
+
     fn encode_authority_payload_with_trailing_schema_byte<T: Serialize>(
         ident: u64,
         serial: u64,
@@ -5744,7 +7619,7 @@ mod test {
 
     #[test]
     fn codec_version_is_current() {
-        assert_eq!(CODEC_VERSION, 50);
+        assert_eq!(CODEC_VERSION, 51);
     }
 
     #[test]
@@ -5801,7 +7676,7 @@ mod test {
     #[test]
     fn check_compat_additive_window_keeps_min_supported() {
         assert_eq!(CODEC_VERSION_MIN_SUPPORTED, 46);
-        assert_eq!(CODEC_VERSION, 50);
+        assert_eq!(CODEC_VERSION, 51);
     }
 
     #[test]
