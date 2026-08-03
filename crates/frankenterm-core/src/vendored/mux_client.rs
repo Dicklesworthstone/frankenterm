@@ -3826,8 +3826,15 @@ fn decode_from_buffer(
     buffer: &mut StreamingPduBuffer,
     max_frame_bytes: usize,
 ) -> Result<Option<DecodedPdu>, DirectMuxError> {
-    codec::Pdu::stream_decode_with_frame_limit(buffer, max_frame_bytes)
-        .map_err(map_stream_decode_error)
+    codec::Pdu::stream_decode_with_frame_limit(buffer, max_frame_bytes).map_err(|error| {
+        if let Some(limit) = error.downcast_ref::<codec::StreamingPduFrameLimitExceeded>() {
+            DirectMuxError::FrameTooLarge {
+                max_bytes: limit.max_frame_bytes(),
+            }
+        } else {
+            DirectMuxError::Codec(error.to_string())
+        }
+    })
 }
 
 fn decode_from_buffer_with_retention_metadata(
@@ -3838,17 +3845,15 @@ fn decode_from_buffer_with_retention_metadata(
         buffer,
         max_frame_bytes,
     )
-    .map_err(map_stream_decode_error)
-}
-
-fn map_stream_decode_error(error: anyhow::Error) -> DirectMuxError {
-    if let Some(limit) = error.downcast_ref::<codec::StreamingPduFrameLimitExceeded>() {
-        DirectMuxError::FrameTooLarge {
-            max_bytes: limit.max_frame_bytes(),
+    .map_err(|error| {
+        if let Some(limit) = error.downcast_ref::<codec::StreamingPduFrameLimitExceeded>() {
+            DirectMuxError::FrameTooLarge {
+                max_bytes: limit.max_frame_bytes(),
+            }
+        } else {
+            DirectMuxError::Codec(error.to_string())
         }
-    } else {
-        DirectMuxError::Codec(error.to_string())
-    }
+    })
 }
 
 fn resolve_socket_path(config: &DirectMuxClientConfig) -> Result<PathBuf, DirectMuxError> {
