@@ -2180,6 +2180,30 @@ experiment. It is not converted into a flattering keep or a durable rejection.
 - **Primary retry condition:**
   > Add a global ordering identity only through a versioned durable schema, one authority shared by every producer, deterministic concurrent and multi-supervisor fixtures, and retained same-window performance evidence.
 
+### IS-N063 — Atomic API modernization may not silently raise the workspace MSRV
+
+- **Classification:** toolchain-contract rejection; explicit checked CAS retained
+- **Beads:** `ft-interactive-systems-performance-4tenz.2.13` and
+  `ft-interactive-systems-performance-4tenz.2.20`
+- **Rejected candidate:** replace the pinned toolchain's deprecated
+  `AtomicU64::fetch_update` calls with `AtomicU64::try_update` in recorder
+  counters and the mux handler-ID allocator.
+- **Negative evidence:** strict remote all-target Clippy job
+  `j-29959181985382549` rejected the recorder candidate because
+  `try_update` was stabilized in Rust 1.95 while the workspace contract is
+  Rust 1.85. Reverting only to `fetch_update` would satisfy that minimum but
+  retain a warning denied by the current pinned nightly. Neither choice is an
+  admissible workspace-wide fix.
+- **Decision:** commits `5b42730fb8747f458c2bd2b708666bf03d25e5c6`
+  and `ac067dff432be76f43173ff7c0d4eba31437a05d` use explicit
+  `compare_exchange_weak` retry loops with checked successor arithmetic. The
+  mux allocator remains sticky at exhaustion; recorder identity allocation
+  fails before reuse; diagnostic counters saturate; and deterministic
+  contention/exhaustion tests cover the boundary. This is a compatibility and
+  correctness repair, not target-hardware performance evidence.
+- **Primary retry condition:**
+  > Replace an atomic helper on a campaign hot path only after the candidate compiles warning-free at both the declared MSRV and pinned nightly, preserves exact overflow and memory-order semantics, and passes deterministic contention and exhaustion tests.
+
 ## Open hypothesis register
 
 These are not negative results. Each remains open until a retained same-window
