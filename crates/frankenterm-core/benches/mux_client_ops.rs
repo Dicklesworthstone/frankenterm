@@ -13,7 +13,7 @@ use frankenterm_core::runtime_async::CompatRuntime;
 
 use codec::{
     CODEC_VERSION, GetCodecVersionResponse, GetPaneRenderChangesResponse, ListPanesResponse, Pdu,
-    UnitResponse,
+    StreamingPduBuffer, UnitResponse,
 };
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use frankenterm_core::runtime_async::unix::AsyncWriteExt as CompatAsyncWriteExt;
@@ -134,7 +134,7 @@ async fn spawn_mock_mux_server(
             };
             let server_config = config;
             std::mem::drop(task::spawn(async move {
-                let mut read_buf = Vec::new();
+                let mut read_buf = StreamingPduBuffer::new();
                 let mut seqno = 0_usize;
                 loop {
                     let mut temp = vec![0_u8; 4096];

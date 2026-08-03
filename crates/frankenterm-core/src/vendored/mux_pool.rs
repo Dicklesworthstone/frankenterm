@@ -1340,7 +1340,7 @@ mod tests {
 
     use codec::{
         CODEC_VERSION, GetCodecVersionResponse, GetPaneRenderChangesResponse, ListPanesResponse,
-        Pdu, SpawnResponse, SpawnV2, SplitPane, UnitResponse,
+        Pdu, SpawnResponse, SpawnV2, SplitPane, StreamingPduBuffer, UnitResponse,
     };
 
     async fn unix_stream_read(
@@ -1378,7 +1378,7 @@ mod tests {
                 };
 
                 task::spawn(async move {
-                    let mut read_buf = Vec::new();
+                    let mut read_buf = StreamingPduBuffer::new();
                     loop {
                         let mut temp = vec![0u8; 4096];
                         let read = match unix_stream_read(&mut stream, &mut temp).await {
@@ -1478,7 +1478,7 @@ mod tests {
                 let connection_ordinal =
                     next_connection_ordinal.fetch_add(1, AtomicOrdering::Relaxed);
                 task::spawn(async move {
-                    let mut read_buf = Vec::new();
+                    let mut read_buf = StreamingPduBuffer::new();
                     loop {
                         let mut temp = vec![0u8; 4096];
                         let read = match unix_stream_read(&mut stream, &mut temp).await {
@@ -1593,7 +1593,7 @@ mod tests {
                 let first_write_bad = Arc::clone(&first_write_bad);
                 let first_paste_bad = Arc::clone(&first_paste_bad);
                 task::spawn(async move {
-                    let mut read_buf = Vec::new();
+                    let mut read_buf = StreamingPduBuffer::new();
                     loop {
                         let mut temp = vec![0u8; 4096];
                         let read = match unix_stream_read(&mut stream, &mut temp).await {
@@ -1740,7 +1740,7 @@ mod tests {
                 let connection_ordinal =
                     next_connection_ordinal.fetch_add(1, AtomicOrdering::SeqCst);
                 task::spawn(async move {
-                    let mut read_buf = Vec::new();
+                    let mut read_buf = StreamingPduBuffer::new();
                     let mut injected_bad_response = false;
                     loop {
                         let mut temp = vec![0u8; 4096];

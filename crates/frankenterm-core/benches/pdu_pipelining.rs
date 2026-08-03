@@ -12,7 +12,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use codec::{
-    CODEC_VERSION, GetCodecVersionResponse, GetPaneRenderChangesResponse, Pdu, UnitResponse,
+    CODEC_VERSION, GetCodecVersionResponse, GetPaneRenderChangesResponse, Pdu,
+    StreamingPduBuffer, UnitResponse,
 };
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use frankenterm_core::runtime_async::unix::AsyncWriteExt;
@@ -89,7 +90,7 @@ async fn setup_client(
             Ok(v) => v,
             Err(_) => return,
         };
-        let mut read_buf = Vec::new();
+        let mut read_buf = StreamingPduBuffer::new();
         loop {
             let mut temp = vec![0u8; 8192];
             let read = match io::read(&mut stream, &mut temp).await {

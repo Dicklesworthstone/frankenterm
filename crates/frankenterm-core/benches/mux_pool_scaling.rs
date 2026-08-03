@@ -13,7 +13,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use codec::{CODEC_VERSION, GetCodecVersionResponse, ListPanesResponse, Pdu, UnitResponse};
+use codec::{
+    CODEC_VERSION, GetCodecVersionResponse, ListPanesResponse, Pdu, StreamingPduBuffer,
+    UnitResponse,
+};
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 #[cfg(feature = "asupersync-runtime")]
 use frankenterm_core::cx;
@@ -76,7 +79,7 @@ async fn spawn_mock_server(temp_dir: &tempfile::TempDir, response_delay: Duratio
             };
 
             std::mem::drop(task::spawn(async move {
-                let mut read_buf = Vec::new();
+                let mut read_buf = StreamingPduBuffer::new();
                 loop {
                     let mut temp = vec![0u8; 4096];
                     let read = match io::read(&mut stream, &mut temp).await {

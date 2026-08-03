@@ -10,7 +10,8 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use codec::{
-    CODEC_VERSION, CompressionMode, GetCodecVersionResponse, Pdu, UnitResponse, WriteToPane,
+    CODEC_VERSION, CompressionMode, GetCodecVersionResponse, Pdu, StreamingPduBuffer,
+    UnitResponse, WriteToPane,
 };
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use frankenterm_core::config::VendoredCompressionMode;
@@ -98,7 +99,7 @@ fn frame_marked_compressed(bytes: &[u8]) -> Option<bool> {
 }
 
 async fn serve_handshake(stream: &mut unix::UnixStream, reject_uncompressed_first_frame: bool) {
-    let mut read_buf = Vec::new();
+    let mut read_buf = StreamingPduBuffer::new();
     let mut first_frame_checked = false;
 
     loop {
