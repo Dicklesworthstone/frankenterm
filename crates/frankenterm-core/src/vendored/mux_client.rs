@@ -339,6 +339,67 @@ struct RetentionLimit {
     max_bytes: usize,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct RetainedTotals {
+    count: usize,
+    bytes: usize,
+    count_check: usize,
+    bytes_check: usize,
+}
+
+impl Default for RetainedTotals {
+    fn default() -> Self {
+        Self {
+            count: 0,
+            bytes: 0,
+            count_check: !0,
+            bytes_check: !0,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RetainedRemovalPlan {
+    removed_count: usize,
+    next_count: usize,
+    next_bytes: usize,
+}
+
+impl RetainedTotals {
+    fn validate(self, resource: &'static str) -> Result<(), DirectMuxError> {
+        if self.count_check == !self.count && self.bytes_check == !self.bytes {
+            Ok(())
+        } else {
+            Err(DirectMuxError::RetainedStateAccounting { resource })
+        }
+    }
+
+    fn set(&mut self, count: usize, bytes: usize) {
+        self.count = count;
+        self.bytes = bytes;
+        self.count_check = !count;
+        self.bytes_check = !bytes;
+    }
+
+    fn after_remove(
+        self,
+        removed_count: usize,
+        removed_bytes: usize,
+        resource: &'static str,
+    ) -> Result<(usize, usize), DirectMuxError> {
+        self.validate(resource)?;
+        let count = self
+            .count
+            .checked_sub(removed_count)
+            .ok_or(DirectMuxError::RetainedStateAccounting { resource })?;
+        let bytes = self
+            .bytes
+            .checked_sub(removed_bytes)
+            .ok_or(DirectMuxError::RetainedStateAccounting { resource })?;
+        Ok((count, bytes))
+    }
+}
+
 #[derive(Debug)]
 struct RetainedRenderChange {
     pane_id: u64,
@@ -385,6 +446,403 @@ impl RetainedRenderChange {
     }
 }
 
+/// Per-pane FIFO with its common single retained change stored inline.
+///
+/// Most panes have at most one unsolicited delta waiting for their next poll.
+/// Keeping that head in the map value avoids a separate deque allocation for
+/// that case while the tail preserves deterministic FIFO order during bursts.
+#[derive(Debug)]
+struct PaneRenderChangeQueue {
+    head: RetainedRenderChange,
+    tail: VecDeque<RetainedRenderChange>,
+}
+
+impl PaneRenderChangeQueue {
+    fn new(head: RetainedRenderChange) -> Self {
+        Self {
+            head,
+            tail: VecDeque::new(),
+        }
+    }
+
+    fn push_back(&mut self, retained: RetainedRenderChange) {
+        self.tail.push_back(retained);
+    }
+
+    fn front(&self) -> &RetainedRenderChange {
+        &self.head
+    }
+
+    fn has_tail(&self) -> bool {
+        !self.tail.is_empty()
+    }
+
+    fn pop_front_with_tail(&mut self) -> Result<RetainedRenderChange, DirectMuxError> {
+        let next = self
+            .tail
+            .pop_front()
+            .ok_or(DirectMuxError::RetainedStateAccounting {
+                resource: PendingRenderChanges::RESOURCE,
+            })?;
+        Ok(std::mem::replace(&mut self.head, next))
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &RetainedRenderChange> {
+        std::iter::once(&self.head).chain(self.tail.iter())
+    }
+}
+
+#[derive(Debug, Default)]
+struct PendingRenderChanges {
+    by_pane: HashMap<u64, PaneRenderChangeQueue>,
+    totals: RetainedTotals,
+    #[cfg(test)]
+    take_operations: usize,
+    #[cfg(test)]
+    removal_plan_lookups: usize,
+    #[cfg(test)]
+    removal_plan_visits: usize,
+    #[cfg(test)]
+    removal_commit_operations: usize,
+}
+
+impl PendingRenderChanges {
+    const RESOURCE: &'static str = "pending unilateral render changes";
+
+    fn len(&self) -> usize {
+        self.totals.count
+    }
+
+    fn is_empty(&self) -> bool {
+        self.totals.count == 0
+    }
+
+    fn retained_bytes(&self) -> usize {
+        self.totals.bytes
+    }
+
+    fn validate(&self) -> Result<(), DirectMuxError> {
+        self.totals.validate(Self::RESOURCE)?;
+        if self.is_empty() == self.by_pane.is_empty() {
+            Ok(())
+        } else {
+            Err(DirectMuxError::RetainedStateAccounting {
+                resource: Self::RESOURCE,
+            })
+        }
+    }
+
+    fn admit_insert(
+        &self,
+        retained: &RetainedRenderChange,
+        limit: RetentionLimit,
+    ) -> Result<(usize, usize), DirectMuxError> {
+        self.validate()?;
+        checked_retention_after_insert(
+            Self::RESOURCE,
+            self.totals.count,
+            self.totals.bytes,
+            None,
+            retained.retained_bytes(),
+            limit,
+        )
+    }
+
+    fn commit_insert(&mut self, retained: RetainedRenderChange, next: (usize, usize)) {
+        match self.by_pane.entry(retained.pane_id) {
+            std::collections::hash_map::Entry::Vacant(bucket) => {
+                bucket.insert(PaneRenderChangeQueue::new(retained));
+            }
+            std::collections::hash_map::Entry::Occupied(mut bucket) => {
+                bucket.get_mut().push_back(retained);
+            }
+        }
+        self.totals.set(next.0, next.1);
+    }
+
+    fn take_for_pane(
+        &mut self,
+        pane_id: u64,
+    ) -> Result<Option<RetainedRenderChange>, DirectMuxError> {
+        self.validate()?;
+        #[cfg(test)]
+        {
+            self.take_operations += 1;
+        }
+        let mut bucket = match self.by_pane.entry(pane_id) {
+            std::collections::hash_map::Entry::Vacant(_) => return Ok(None),
+            std::collections::hash_map::Entry::Occupied(bucket) => bucket,
+        };
+        let retained = bucket.get().front();
+        if retained.pane_id != pane_id {
+            return Err(DirectMuxError::RetainedStateAccounting {
+                resource: Self::RESOURCE,
+            });
+        }
+        let next = self
+            .totals
+            .after_remove(1, retained.retained_bytes(), Self::RESOURCE)?;
+        let retained = if bucket.get().has_tail() {
+            bucket.get_mut().pop_front_with_tail()?
+        } else {
+            bucket.remove().head
+        };
+        self.totals.set(next.0, next.1);
+        Ok(Some(retained))
+    }
+
+    fn plan_remove_panes(
+        &mut self,
+        pane_ids: &HashSet<u64>,
+    ) -> Result<RetainedRemovalPlan, DirectMuxError> {
+        self.validate()?;
+        let mut removed_count = 0usize;
+        let mut removed_bytes = 0usize;
+        for pane_id in pane_ids {
+            #[cfg(test)]
+            {
+                self.removal_plan_lookups += 1;
+            }
+            let Some(queue) = self.by_pane.get(pane_id) else {
+                continue;
+            };
+            for retained in queue.iter() {
+                #[cfg(test)]
+                {
+                    self.removal_plan_visits += 1;
+                }
+                if retained.pane_id != *pane_id {
+                    return Err(DirectMuxError::RetainedStateAccounting {
+                        resource: Self::RESOURCE,
+                    });
+                }
+                removed_count = removed_count.checked_add(1).ok_or(
+                    DirectMuxError::RetainedStateAccounting {
+                        resource: Self::RESOURCE,
+                    },
+                )?;
+                removed_bytes = removed_bytes
+                    .checked_add(retained.retained_bytes())
+                    .ok_or(DirectMuxError::RetainedStateAccounting {
+                        resource: Self::RESOURCE,
+                    })?;
+            }
+        }
+        let next = self
+            .totals
+            .after_remove(removed_count, removed_bytes, Self::RESOURCE)?;
+        Ok(RetainedRemovalPlan {
+            removed_count,
+            next_count: next.0,
+            next_bytes: next.1,
+        })
+    }
+
+    fn commit_remove_panes(
+        &mut self,
+        pane_ids: &HashSet<u64>,
+        plan: RetainedRemovalPlan,
+    ) {
+        for pane_id in pane_ids {
+            #[cfg(test)]
+            {
+                self.removal_commit_operations += 1;
+            }
+            self.by_pane.remove(pane_id);
+        }
+        self.totals.set(plan.next_count, plan.next_bytes);
+    }
+
+    #[cfg(test)]
+    fn iter(&self) -> impl Iterator<Item = &RetainedRenderChange> {
+        self.by_pane.values().flat_map(PaneRenderChangeQueue::iter)
+    }
+
+    #[cfg(test)]
+    fn reset_operation_counts(&mut self) {
+        self.take_operations = 0;
+        self.removal_plan_lookups = 0;
+        self.removal_plan_visits = 0;
+        self.removal_commit_operations = 0;
+    }
+
+    #[cfg(test)]
+    fn operation_counts(&self) -> (usize, usize, usize, usize) {
+        (
+            self.take_operations,
+            self.removal_plan_lookups,
+            self.removal_plan_visits,
+            self.removal_commit_operations,
+        )
+    }
+}
+
+#[derive(Debug, Default)]
+struct RenderChangeSnapshots {
+    by_pane: HashMap<u64, RetainedRenderChange>,
+    totals: RetainedTotals,
+    #[cfg(test)]
+    removal_plan_lookups: usize,
+    #[cfg(test)]
+    removal_plan_visits: usize,
+    #[cfg(test)]
+    removal_commit_operations: usize,
+}
+
+impl RenderChangeSnapshots {
+    const RESOURCE: &'static str = "render change snapshots";
+
+    fn len(&self) -> usize {
+        self.by_pane.len()
+    }
+
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        self.by_pane.is_empty()
+    }
+
+    fn retained_bytes(&self) -> usize {
+        self.totals.bytes
+    }
+
+    fn get(&self, pane_id: &u64) -> Option<&RetainedRenderChange> {
+        self.by_pane.get(pane_id)
+    }
+
+    #[cfg(test)]
+    fn contains_key(&self, pane_id: &u64) -> bool {
+        self.by_pane.contains_key(pane_id)
+    }
+
+    fn validate(&self) -> Result<(), DirectMuxError> {
+        self.totals.validate(Self::RESOURCE)?;
+        if self.totals.count == self.by_pane.len() {
+            Ok(())
+        } else {
+            Err(DirectMuxError::RetainedStateAccounting {
+                resource: Self::RESOURCE,
+            })
+        }
+    }
+
+    fn admit_insert(
+        &self,
+        pane_id: u64,
+        retained: &RetainedRenderChange,
+        limit: RetentionLimit,
+    ) -> Result<(usize, usize), DirectMuxError> {
+        self.validate()?;
+        let replaced_bytes = self
+            .by_pane
+            .get(&pane_id)
+            .map(RetainedRenderChange::retained_bytes);
+        checked_retention_after_insert(
+            Self::RESOURCE,
+            self.totals.count,
+            self.totals.bytes,
+            replaced_bytes,
+            retained.retained_bytes(),
+            limit,
+        )
+    }
+
+    fn commit_insert(
+        &mut self,
+        pane_id: u64,
+        retained: RetainedRenderChange,
+        next: (usize, usize),
+    ) {
+        self.by_pane.insert(pane_id, retained);
+        self.totals.set(next.0, next.1);
+    }
+
+    fn plan_remove_panes(
+        &mut self,
+        pane_ids: &HashSet<u64>,
+    ) -> Result<RetainedRemovalPlan, DirectMuxError> {
+        self.validate()?;
+        let mut removed_count = 0usize;
+        let mut removed_bytes = 0usize;
+        for pane_id in pane_ids {
+            #[cfg(test)]
+            {
+                self.removal_plan_lookups += 1;
+            }
+            let Some(retained) = self.by_pane.get(pane_id) else {
+                continue;
+            };
+            #[cfg(test)]
+            {
+                self.removal_plan_visits += 1;
+            }
+            if retained.pane_id != *pane_id {
+                return Err(DirectMuxError::RetainedStateAccounting {
+                    resource: Self::RESOURCE,
+                });
+            }
+            removed_count = removed_count.checked_add(1).ok_or(
+                DirectMuxError::RetainedStateAccounting {
+                    resource: Self::RESOURCE,
+                },
+            )?;
+            removed_bytes = removed_bytes
+                .checked_add(retained.retained_bytes())
+                .ok_or(DirectMuxError::RetainedStateAccounting {
+                    resource: Self::RESOURCE,
+                })?;
+        }
+        let next = self
+            .totals
+            .after_remove(removed_count, removed_bytes, Self::RESOURCE)?;
+        Ok(RetainedRemovalPlan {
+            removed_count,
+            next_count: next.0,
+            next_bytes: next.1,
+        })
+    }
+
+    fn commit_remove_panes(
+        &mut self,
+        pane_ids: &HashSet<u64>,
+        plan: RetainedRemovalPlan,
+    ) {
+        for pane_id in pane_ids {
+            #[cfg(test)]
+            {
+                self.removal_commit_operations += 1;
+            }
+            self.by_pane.remove(pane_id);
+        }
+        self.totals.set(plan.next_count, plan.next_bytes);
+    }
+
+    #[cfg(test)]
+    fn keys(&self) -> impl Iterator<Item = &u64> {
+        self.by_pane.keys()
+    }
+
+    #[cfg(test)]
+    fn values(&self) -> impl Iterator<Item = &RetainedRenderChange> {
+        self.by_pane.values()
+    }
+
+    #[cfg(test)]
+    fn reset_operation_counts(&mut self) {
+        self.removal_plan_lookups = 0;
+        self.removal_plan_visits = 0;
+        self.removal_commit_operations = 0;
+    }
+
+    #[cfg(test)]
+    fn operation_counts(&self) -> (usize, usize, usize) {
+        (
+            self.removal_plan_lookups,
+            self.removal_plan_visits,
+            self.removal_commit_operations,
+        )
+    }
+}
+
 pub struct DirectMuxClient {
     connection_id: u64,
     stream: UnixStream,
@@ -394,10 +852,8 @@ pub struct DirectMuxClient {
     outstanding_requests: HashSet<u64>,
     pending_responses: HashMap<u64, RetainedMuxPdu>,
     pending_response_bytes: usize,
-    pending_render_changes: VecDeque<RetainedRenderChange>,
-    pending_render_change_bytes: usize,
-    render_change_snapshots: HashMap<u64, RetainedRenderChange>,
-    render_change_snapshot_bytes: usize,
+    pending_render_changes: PendingRenderChanges,
+    render_change_snapshots: RenderChangeSnapshots,
     config: DirectMuxClientConfig,
     compression_mode: CompressionMode,
     connection_poisoned: bool,
@@ -415,7 +871,7 @@ impl std::fmt::Debug for DirectMuxClient {
             .field("pending_render_changes", &self.pending_render_changes.len())
             .field(
                 "pending_render_change_bytes",
-                &self.pending_render_change_bytes,
+                &self.pending_render_changes.retained_bytes(),
             )
             .field(
                 "render_change_snapshots",
@@ -423,7 +879,7 @@ impl std::fmt::Debug for DirectMuxClient {
             )
             .field(
                 "render_change_snapshot_bytes",
-                &self.render_change_snapshot_bytes,
+                &self.render_change_snapshots.retained_bytes(),
             )
             .field("compression_mode", &self.compression_mode)
             .field("connection_poisoned", &self.connection_poisoned)
@@ -913,10 +1369,8 @@ impl DirectMuxClient {
             outstanding_requests: HashSet::new(),
             pending_responses: HashMap::new(),
             pending_response_bytes: 0,
-            pending_render_changes: VecDeque::new(),
-            pending_render_change_bytes: 0,
-            render_change_snapshots: HashMap::new(),
-            render_change_snapshot_bytes: 0,
+            pending_render_changes: PendingRenderChanges::default(),
+            render_change_snapshots: RenderChangeSnapshots::default(),
             connection_poisoned: false,
             config,
         };
@@ -2043,9 +2497,9 @@ impl DirectMuxClient {
             pending_response_count = self.pending_responses.len(),
             pending_response_bytes = self.pending_response_bytes,
             pending_render_change_count = self.pending_render_changes.len(),
-            pending_render_change_bytes = self.pending_render_change_bytes,
+            pending_render_change_bytes = self.pending_render_changes.retained_bytes(),
             render_snapshot_count = self.render_change_snapshots.len(),
-            render_snapshot_bytes = self.render_change_snapshot_bytes,
+            render_snapshot_bytes = self.render_change_snapshots.retained_bytes(),
             read_buffer_bytes = self.read_buf.len(),
             socket_shutdown_succeeded = shutdown_error.is_none(),
             socket_shutdown_error = ?shutdown_error,
@@ -2056,10 +2510,8 @@ impl DirectMuxClient {
         self.outstanding_requests = HashSet::new();
         self.pending_responses = HashMap::new();
         self.pending_response_bytes = 0;
-        self.pending_render_changes = VecDeque::new();
-        self.pending_render_change_bytes = 0;
-        self.render_change_snapshots = HashMap::new();
-        self.render_change_snapshot_bytes = 0;
+        self.pending_render_changes = PendingRenderChanges::default();
+        self.render_change_snapshots = RenderChangeSnapshots::default();
         self.read_buf = StreamingPduBuffer::new();
     }
 
@@ -2535,37 +2987,26 @@ impl DirectMuxClient {
         )?;
         let pending = RetainedRenderChange::encode(self.connection_id, payload)?;
 
-        let (_, next_pending_bytes) = checked_retention_after_insert(
-            "pending unilateral render changes",
-            self.pending_render_changes.len(),
-            self.pending_render_change_bytes,
-            None,
-            pending.retained_bytes(),
+        let next_pending = self.pending_render_changes.admit_insert(
+            &pending,
             RetentionLimit {
                 max_count: self.config.max_pending_render_changes,
                 max_bytes: self.config.max_pending_render_change_bytes,
             },
         )?;
-        let replaced_snapshot_bytes = self
-            .render_change_snapshots
-            .get(&pane_id)
-            .map(RetainedRenderChange::retained_bytes);
-        let (_, next_snapshot_bytes) = checked_retention_after_insert(
-            "render change snapshots",
-            self.render_change_snapshots.len(),
-            self.render_change_snapshot_bytes,
-            replaced_snapshot_bytes,
-            snapshot.retained_bytes(),
+        let next_snapshot = self.render_change_snapshots.admit_insert(
+            pane_id,
+            &snapshot,
             RetentionLimit {
                 max_count: self.config.max_render_change_snapshots,
                 max_bytes: self.config.max_render_change_snapshot_bytes,
             },
         )?;
 
-        self.render_change_snapshots.insert(pane_id, snapshot);
-        self.render_change_snapshot_bytes = next_snapshot_bytes;
-        self.pending_render_changes.push_back(pending);
-        self.pending_render_change_bytes = next_pending_bytes;
+        self.render_change_snapshots
+            .commit_insert(pane_id, snapshot, next_snapshot);
+        self.pending_render_changes
+            .commit_insert(pending, next_pending);
         Ok(())
     }
 
@@ -2573,24 +3014,9 @@ impl DirectMuxClient {
         &mut self,
         pane_id: u64,
     ) -> Result<Option<GetPaneRenderChangesResponse>, DirectMuxError> {
-        let idx = self
-            .pending_render_changes
-            .iter()
-            .position(|payload| payload.pane_id == pane_id);
-        let Some(idx) = idx else {
+        let Some(retained) = self.pending_render_changes.take_for_pane(pane_id)? else {
             return Ok(None);
         };
-        let retained = self.pending_render_changes.remove(idx).ok_or(
-            DirectMuxError::RetainedStateAccounting {
-                resource: "pending unilateral render changes",
-            },
-        )?;
-        self.pending_render_change_bytes = self
-            .pending_render_change_bytes
-            .checked_sub(retained.retained_bytes())
-            .ok_or(DirectMuxError::RetainedStateAccounting {
-                resource: "pending unilateral render changes",
-            })?;
         retained.decode(self.connection_id).map(Some)
     }
 
@@ -2603,23 +3029,16 @@ impl DirectMuxClient {
             self.connection_id,
             Self::idle_render_snapshot(payload),
         )?;
-        let replaced_bytes = self
-            .render_change_snapshots
-            .get(&pane_id)
-            .map(RetainedRenderChange::retained_bytes);
-        let (_, next_bytes) = checked_retention_after_insert(
-            "render change snapshots",
-            self.render_change_snapshots.len(),
-            self.render_change_snapshot_bytes,
-            replaced_bytes,
-            snapshot.retained_bytes(),
+        let next = self.render_change_snapshots.admit_insert(
+            pane_id,
+            &snapshot,
             RetentionLimit {
                 max_count: self.config.max_render_change_snapshots,
                 max_bytes: self.config.max_render_change_snapshot_bytes,
             },
         )?;
-        self.render_change_snapshots.insert(pane_id, snapshot);
-        self.render_change_snapshot_bytes = next_bytes;
+        self.render_change_snapshots
+            .commit_insert(pane_id, snapshot, next);
         Ok(())
     }
 
@@ -2627,80 +3046,17 @@ impl DirectMuxClient {
         &mut self,
         pane_id: u64,
     ) -> Result<(usize, bool), DirectMuxError> {
-        let (snapshot_total_bytes, next_snapshot_bytes) = self
-            .render_change_snapshots
-            .iter()
-            .try_fold((0usize, 0usize), |state, (retained_pane_id, snapshot)| {
-                let total_bytes = state.0.checked_add(snapshot.retained_bytes()).ok_or(
-                    DirectMuxError::RetainedStateAccounting {
-                        resource: "render change snapshots",
-                    },
-                )?;
-                let survivor_bytes = if *retained_pane_id == pane_id {
-                    state.1
-                } else {
-                    state.1.checked_add(snapshot.retained_bytes()).ok_or(
-                        DirectMuxError::RetainedStateAccounting {
-                            resource: "render change snapshots",
-                        },
-                    )?
-                };
-                Ok::<(usize, usize), DirectMuxError>((total_bytes, survivor_bytes))
-            })?;
-        if snapshot_total_bytes != self.render_change_snapshot_bytes {
-            return Err(DirectMuxError::RetainedStateAccounting {
-                resource: "render change snapshots",
-            });
-        }
-        let snapshot_removed = self.render_change_snapshots.contains_key(&pane_id);
-        let (pending_total_bytes, pending_survivor_count, next_pending_bytes) = self
-            .pending_render_changes
-            .iter()
-            .try_fold((0usize, 0usize, 0usize), |state, retained| {
-                let total_bytes = state.0.checked_add(retained.retained_bytes()).ok_or(
-                    DirectMuxError::RetainedStateAccounting {
-                        resource: "pending unilateral render changes",
-                    },
-                )?;
-                if retained.pane_id == pane_id {
-                    Ok::<(usize, usize, usize), DirectMuxError>((total_bytes, state.1, state.2))
-                } else {
-                    Ok((
-                        total_bytes,
-                        state.1.checked_add(1).ok_or(
-                            DirectMuxError::RetainedStateAccounting {
-                                resource: "pending unilateral render changes",
-                            },
-                        )?,
-                        state.2.checked_add(retained.retained_bytes()).ok_or(
-                            DirectMuxError::RetainedStateAccounting {
-                                resource: "pending unilateral render changes",
-                            },
-                        )?,
-                    ))
-                }
-            })?;
-        if pending_total_bytes != self.pending_render_change_bytes {
-            return Err(DirectMuxError::RetainedStateAccounting {
-                resource: "pending unilateral render changes",
-            });
-        }
-        let pending_removed = self
-            .pending_render_changes
-            .len()
-            .checked_sub(pending_survivor_count)
-            .ok_or(DirectMuxError::RetainedStateAccounting {
-                resource: "pending unilateral render changes",
-            })?;
-
-        if snapshot_removed {
-            self.render_change_snapshots.remove(&pane_id);
-        }
-        self.render_change_snapshot_bytes = next_snapshot_bytes;
+        let targets = HashSet::from([pane_id]);
+        let snapshot_plan = self.render_change_snapshots.plan_remove_panes(&targets)?;
+        let pending_plan = self.pending_render_changes.plan_remove_panes(&targets)?;
+        self.render_change_snapshots
+            .commit_remove_panes(&targets, snapshot_plan);
         self.pending_render_changes
-            .retain(|retained| retained.pane_id != pane_id);
-        self.pending_render_change_bytes = next_pending_bytes;
-        Ok((pending_removed, snapshot_removed))
+            .commit_remove_panes(&targets, pending_plan);
+        Ok((
+            pending_plan.removed_count,
+            snapshot_plan.removed_count != 0,
+        ))
     }
 
     fn invalidate_render_state_for_panes(
@@ -2712,92 +3068,13 @@ impl DirectMuxClient {
         }
 
         let targets = pane_ids.iter().copied().collect::<HashSet<_>>();
-        let (snapshot_total_bytes, snapshot_survivor_count, next_snapshot_bytes) = self
-            .render_change_snapshots
-            .iter()
-            .try_fold((0usize, 0usize, 0usize), |state, (pane_id, retained)| {
-                let total_bytes = state.0.checked_add(retained.retained_bytes()).ok_or(
-                    DirectMuxError::RetainedStateAccounting {
-                        resource: "render change snapshots",
-                    },
-                )?;
-                if targets.contains(pane_id) {
-                    Ok::<(usize, usize, usize), DirectMuxError>((total_bytes, state.1, state.2))
-                } else {
-                    Ok((
-                        total_bytes,
-                        state.1.checked_add(1).ok_or(
-                            DirectMuxError::RetainedStateAccounting {
-                                resource: "render change snapshots",
-                            },
-                        )?,
-                        state.2.checked_add(retained.retained_bytes()).ok_or(
-                            DirectMuxError::RetainedStateAccounting {
-                                resource: "render change snapshots",
-                            },
-                        )?,
-                    ))
-                }
-            })?;
-        if snapshot_total_bytes != self.render_change_snapshot_bytes {
-            return Err(DirectMuxError::RetainedStateAccounting {
-                resource: "render change snapshots",
-            });
-        }
-        let (pending_total_bytes, pending_survivor_count, next_pending_bytes) = self
-            .pending_render_changes
-            .iter()
-            .try_fold((0usize, 0usize, 0usize), |state, retained| {
-                let total_bytes = state.0.checked_add(retained.retained_bytes()).ok_or(
-                    DirectMuxError::RetainedStateAccounting {
-                        resource: "pending unilateral render changes",
-                    },
-                )?;
-                if targets.contains(&retained.pane_id) {
-                    Ok::<(usize, usize, usize), DirectMuxError>((total_bytes, state.1, state.2))
-                } else {
-                    Ok((
-                        total_bytes,
-                        state.1.checked_add(1).ok_or(
-                            DirectMuxError::RetainedStateAccounting {
-                                resource: "pending unilateral render changes",
-                            },
-                        )?,
-                        state.2.checked_add(retained.retained_bytes()).ok_or(
-                            DirectMuxError::RetainedStateAccounting {
-                                resource: "pending unilateral render changes",
-                            },
-                        )?,
-                    ))
-                }
-            })?;
-        if pending_total_bytes != self.pending_render_change_bytes {
-            return Err(DirectMuxError::RetainedStateAccounting {
-                resource: "pending unilateral render changes",
-            });
-        }
-        let snapshots_removed = self
-            .render_change_snapshots
-            .len()
-            .checked_sub(snapshot_survivor_count)
-            .ok_or(DirectMuxError::RetainedStateAccounting {
-                resource: "render change snapshots",
-            })?;
-        let pending_removed = self
-            .pending_render_changes
-            .len()
-            .checked_sub(pending_survivor_count)
-            .ok_or(DirectMuxError::RetainedStateAccounting {
-                resource: "pending unilateral render changes",
-            })?;
-
+        let snapshot_plan = self.render_change_snapshots.plan_remove_panes(&targets)?;
+        let pending_plan = self.pending_render_changes.plan_remove_panes(&targets)?;
         self.render_change_snapshots
-            .retain(|pane_id, _| !targets.contains(pane_id));
-        self.render_change_snapshot_bytes = next_snapshot_bytes;
+            .commit_remove_panes(&targets, snapshot_plan);
         self.pending_render_changes
-            .retain(|retained| !targets.contains(&retained.pane_id));
-        self.pending_render_change_bytes = next_pending_bytes;
-        Ok((pending_removed, snapshots_removed))
+            .commit_remove_panes(&targets, pending_plan);
+        Ok((pending_plan.removed_count, snapshot_plan.removed_count))
     }
 
     fn idle_render_snapshot(
@@ -3736,6 +4013,54 @@ mod tests {
             input_serial: None,
             seqno,
         }
+    }
+
+    fn admit_pending_test_render_change(
+        pending: &mut PendingRenderChanges,
+        pane_id: mux::pane::PaneId,
+        seqno: usize,
+        title: &str,
+    ) {
+        let retained = RetainedRenderChange::encode(
+            41,
+            test_render_change(pane_id, seqno, title),
+        )
+        .expect("encode pending render-change fixture");
+        let next = pending
+            .admit_insert(
+                &retained,
+                RetentionLimit {
+                    max_count: DEFAULT_MAX_PENDING_RENDER_CHANGES,
+                    max_bytes: DEFAULT_MAX_PENDING_RENDER_CHANGE_BYTES,
+                },
+            )
+            .expect("admit pending render-change fixture");
+        pending.commit_insert(retained, next);
+    }
+
+    fn admit_snapshot_test_render_change(
+        snapshots: &mut RenderChangeSnapshots,
+        pane_id: mux::pane::PaneId,
+        seqno: usize,
+        title: &str,
+    ) {
+        let pane_id_u64 = u64::try_from(pane_id).expect("bounded pane id must fit u64");
+        let retained = RetainedRenderChange::encode(
+            41,
+            test_render_change(pane_id, seqno, title),
+        )
+        .expect("encode render-change snapshot fixture");
+        let next = snapshots
+            .admit_insert(
+                pane_id_u64,
+                &retained,
+                RetentionLimit {
+                    max_count: DEFAULT_MAX_RENDER_CHANGE_SNAPSHOTS,
+                    max_bytes: DEFAULT_MAX_RENDER_CHANGE_SNAPSHOT_BYTES,
+                },
+            )
+            .expect("admit render-change snapshot fixture");
+        snapshots.commit_insert(pane_id_u64, retained, next);
     }
 
     fn assert_render_retention_members(
@@ -4826,9 +5151,9 @@ mod tests {
                 .stash_unilateral_pdu(Pdu::PaneRemoved(codec::PaneRemoved { pane_id: 27 }))
                 .expect("pane removal must invalidate retained render state");
             assert!(!client.render_change_snapshots.contains_key(&27));
-            assert_eq!(client.render_change_snapshot_bytes, 0);
+            assert_eq!(client.render_change_snapshots.retained_bytes(), 0);
             assert!(client.pending_render_changes.is_empty());
-            assert_eq!(client.pending_render_change_bytes, 0);
+            assert_eq!(client.pending_render_changes.retained_bytes(), 0);
 
             let stale_cache_error = client
                 .resolve_render_change_response(
@@ -4857,7 +5182,7 @@ mod tests {
             assert_eq!(replacement.seqno, 1);
             assert_eq!(replacement.title, "replacement-pane");
             assert!(client.render_change_snapshots.contains_key(&27));
-            assert!(client.render_change_snapshot_bytes > 0);
+            assert!(client.render_change_snapshots.retained_bytes() > 0);
 
             client
                 .stash_unilateral_pdu(Pdu::GetPaneRenderChangesResponse(test_render_change(
@@ -4881,8 +5206,8 @@ mod tests {
             ));
             assert!(!client.render_change_snapshots.contains_key(&27));
             assert!(client.pending_render_changes.is_empty());
-            assert_eq!(client.pending_render_change_bytes, 0);
-            assert_eq!(client.render_change_snapshot_bytes, 0);
+            assert_eq!(client.pending_render_changes.retained_bytes(), 0);
+            assert_eq!(client.render_change_snapshots.retained_bytes(), 0);
 
             let recovered = client
                 .resolve_render_change_response(
@@ -4916,8 +5241,8 @@ mod tests {
             assert!(matches!(dead, DirectMuxError::RemoteError(_)));
             assert!(!client.render_change_snapshots.contains_key(&27));
             assert!(client.pending_render_changes.is_empty());
-            assert_eq!(client.pending_render_change_bytes, 0);
-            assert_eq!(client.render_change_snapshot_bytes, 0);
+            assert_eq!(client.pending_render_changes.retained_bytes(), 0);
+            assert_eq!(client.render_change_snapshots.retained_bytes(), 0);
 
             client
                 .resolve_render_change_response(
@@ -4953,8 +5278,8 @@ mod tests {
             assert!(!client.render_change_snapshots.contains_key(&27));
             assert!(!client.render_change_snapshots.contains_key(&99));
             assert!(client.pending_render_changes.is_empty());
-            assert_eq!(client.pending_render_change_bytes, 0);
-            assert_eq!(client.render_change_snapshot_bytes, 0);
+            assert_eq!(client.pending_render_changes.retained_bytes(), 0);
+            assert_eq!(client.render_change_snapshots.retained_bytes(), 0);
             client
                 .resolve_render_change_response(
                     27,
@@ -4988,9 +5313,9 @@ mod tests {
                 DirectMuxError::UnexpectedResponse { .. }
             ));
             assert!(client.pending_render_changes.is_empty());
-            assert_eq!(client.pending_render_change_bytes, 0);
+            assert_eq!(client.pending_render_changes.retained_bytes(), 0);
             assert!(client.render_change_snapshots.is_empty());
-            assert_eq!(client.render_change_snapshot_bytes, 0);
+            assert_eq!(client.render_change_snapshots.retained_bytes(), 0);
             assert!(!client.connection_poisoned);
             client
                 .resolve_render_change_response(
@@ -5009,8 +5334,8 @@ mod tests {
                     28, 2, "queued-pane",
                 )))
                 .expect("first bounded unilateral render change");
-            let pending_bytes = client.pending_render_change_bytes;
-            let snapshot_bytes = client.render_change_snapshot_bytes;
+            let pending_bytes = client.pending_render_changes.retained_bytes();
+            let snapshot_bytes = client.render_change_snapshots.retained_bytes();
             let limit_error = client
                 .stash_unilateral_pdu(Pdu::GetPaneRenderChangesResponse(test_render_change(
                     29,
@@ -5026,9 +5351,10 @@ mod tests {
                 }
             ));
             assert_eq!(client.pending_render_changes.len(), 1);
-            assert_eq!(client.pending_render_change_bytes, pending_bytes);
+            assert_eq!(client.pending_render_changes.retained_bytes(), pending_bytes);
             assert_eq!(
-                client.render_change_snapshot_bytes, snapshot_bytes,
+                client.render_change_snapshots.retained_bytes(),
+                snapshot_bytes,
                 "failed queue admission must not partially publish a snapshot"
             );
             assert!(!client.render_change_snapshots.contains_key(&29));
@@ -5037,7 +5363,7 @@ mod tests {
                 .stash_unilateral_pdu(Pdu::PaneRemoved(codec::PaneRemoved { pane_id: 28 }))
                 .expect("pane removal must release queued retention");
             assert!(client.pending_render_changes.is_empty());
-            assert_eq!(client.pending_render_change_bytes, 0);
+            assert_eq!(client.pending_render_changes.retained_bytes(), 0);
             assert!(!client.render_change_snapshots.contains_key(&28));
 
             let serial_before_duplicate = client.serial;
@@ -5437,9 +5763,9 @@ mod tests {
             assert!(client.pending_responses.is_empty());
             assert_eq!(client.pending_response_bytes, 0);
             assert!(client.pending_render_changes.is_empty());
-            assert_eq!(client.pending_render_change_bytes, 0);
+            assert_eq!(client.pending_render_changes.retained_bytes(), 0);
             assert_eq!(client.render_change_snapshots.len(), 6);
-            assert!(client.render_change_snapshot_bytes > 0);
+            assert!(client.render_change_snapshots.retained_bytes() > 0);
 
             drop(client);
             server.await.expect("server task");
@@ -5551,9 +5877,9 @@ mod tests {
             assert!(client.pending_responses.is_empty());
             assert_eq!(client.pending_response_bytes, 0);
             assert!(client.pending_render_changes.is_empty());
-            assert_eq!(client.pending_render_change_bytes, 0);
+            assert_eq!(client.pending_render_changes.retained_bytes(), 0);
             assert_eq!(client.render_change_snapshots.len(), 3);
-            assert!(client.render_change_snapshot_bytes > 0);
+            assert!(client.render_change_snapshots.retained_bytes() > 0);
 
             drop(client);
             server.await.expect("server task");
@@ -5803,17 +6129,24 @@ mod tests {
                 );
                 assert_eq!(client.pending_render_changes.len(), 1, "{case:?}");
                 assert_eq!(
-                    client.pending_render_changes[0].pane_id, 999,
+                    client
+                        .pending_render_changes
+                        .iter()
+                        .next()
+                        .map(|retained| retained.pane_id),
+                    Some(999),
                     "{case:?}"
                 );
                 assert_eq!(
-                    client.pending_render_change_bytes, unrelated_pending_bytes,
+                    client.pending_render_changes.retained_bytes(),
+                    unrelated_pending_bytes,
                     "{case:?}"
                 );
                 assert_eq!(client.render_change_snapshots.len(), 1, "{case:?}");
                 assert!(client.render_change_snapshots.contains_key(&999), "{case:?}");
                 assert_eq!(
-                    client.render_change_snapshot_bytes, unrelated_snapshot_bytes,
+                    client.render_change_snapshots.retained_bytes(),
+                    unrelated_snapshot_bytes,
                     "{case:?}"
                 );
                 assert!(!client.connection_poisoned, "{case:?}");
@@ -5920,7 +6253,7 @@ mod tests {
             assert!(matches!(ambient_error, DirectMuxError::RemoteError(_)));
             assert!(!client.render_change_snapshots.contains_key(&27));
             assert!(client.pending_render_changes.is_empty());
-            assert_eq!(client.pending_render_change_bytes, 0);
+            assert_eq!(client.pending_render_changes.retained_bytes(), 0);
             assert!(!client.connection_poisoned);
             let ambient_reuse = client
                 .get_pane_render_changes(27)
@@ -5942,7 +6275,7 @@ mod tests {
             assert!(matches!(cx_error, DirectMuxError::RemoteError(_)));
             assert!(!client.render_change_snapshots.contains_key(&27));
             assert!(client.pending_render_changes.is_empty());
-            assert_eq!(client.pending_render_change_bytes, 0);
+            assert_eq!(client.pending_render_changes.retained_bytes(), 0);
             assert!(!client.connection_poisoned);
             let cx_reuse = client
                 .get_pane_render_changes_with_cx(&cx, 27)
@@ -6142,7 +6475,7 @@ mod tests {
             assert!(client.connection_poisoned);
             assert!(client.outstanding_requests.is_empty());
             assert!(client.render_change_snapshots.is_empty());
-            assert_eq!(client.render_change_snapshot_bytes, 0);
+            assert_eq!(client.render_change_snapshots.retained_bytes(), 0);
             assert!(matches!(
                 client.list_panes().await,
                 Err(DirectMuxError::Disconnected)
@@ -6365,7 +6698,7 @@ mod tests {
             assert_eq!(client.pending_render_changes.len(), 3);
             assert_eq!(client.render_change_snapshots.len(), 3);
             assert_eq!(
-                client.pending_render_change_bytes,
+                client.pending_render_changes.retained_bytes(),
                 client
                     .pending_render_changes
                     .iter()
@@ -6373,7 +6706,7 @@ mod tests {
                     .sum::<usize>()
             );
             assert_eq!(
-                client.render_change_snapshot_bytes,
+                client.render_change_snapshots.retained_bytes(),
                 client
                     .render_change_snapshots
                     .values()
@@ -6390,12 +6723,12 @@ mod tests {
                 .iter()
                 .map(|retained| retained.pane_id)
                 .collect::<Vec<_>>();
-            let correct_snapshot_bytes = client.render_change_snapshot_bytes;
-            let correct_pending_bytes = client.pending_render_change_bytes;
+            let correct_snapshot_bytes = client.render_change_snapshots.retained_bytes();
+            let correct_pending_bytes = client.pending_render_changes.retained_bytes();
             assert!(correct_snapshot_bytes > 0);
             assert!(correct_pending_bytes > 0);
 
-            client.pending_render_change_bytes = correct_pending_bytes + 1;
+            client.pending_render_changes.totals.bytes = correct_pending_bytes + 1;
             let error = client
                 .invalidate_render_state_for_pane(11)
                 .expect_err("single invalidation must reject pending-byte overcount");
@@ -6406,10 +6739,16 @@ mod tests {
                 }
             ));
             assert_render_retention_members(&client, &snapshot_keys, &pending_panes);
-            assert_eq!(client.pending_render_change_bytes, correct_pending_bytes + 1);
-            client.pending_render_change_bytes = correct_pending_bytes;
+            assert_eq!(
+                client.pending_render_changes.retained_bytes(),
+                correct_pending_bytes + 1
+            );
+            client
+                .pending_render_changes
+                .totals
+                .set(pending_panes.len(), correct_pending_bytes);
 
-            client.pending_render_change_bytes = correct_pending_bytes - 1;
+            client.pending_render_changes.totals.bytes = correct_pending_bytes - 1;
             let error = client
                 .invalidate_render_state_for_pane(11)
                 .expect_err("single invalidation must reject pending-byte undercount");
@@ -6420,10 +6759,16 @@ mod tests {
                 }
             ));
             assert_render_retention_members(&client, &snapshot_keys, &pending_panes);
-            assert_eq!(client.pending_render_change_bytes, correct_pending_bytes - 1);
-            client.pending_render_change_bytes = correct_pending_bytes;
+            assert_eq!(
+                client.pending_render_changes.retained_bytes(),
+                correct_pending_bytes - 1
+            );
+            client
+                .pending_render_changes
+                .totals
+                .set(pending_panes.len(), correct_pending_bytes);
 
-            client.render_change_snapshot_bytes = correct_snapshot_bytes + 1;
+            client.render_change_snapshots.totals.bytes = correct_snapshot_bytes + 1;
             let error = client
                 .invalidate_render_state_for_pane(11)
                 .expect_err("single invalidation must reject snapshot-byte overcount");
@@ -6434,10 +6779,16 @@ mod tests {
                 }
             ));
             assert_render_retention_members(&client, &snapshot_keys, &pending_panes);
-            assert_eq!(client.render_change_snapshot_bytes, correct_snapshot_bytes + 1);
-            client.render_change_snapshot_bytes = correct_snapshot_bytes;
+            assert_eq!(
+                client.render_change_snapshots.retained_bytes(),
+                correct_snapshot_bytes + 1
+            );
+            client
+                .render_change_snapshots
+                .totals
+                .set(snapshot_keys.len(), correct_snapshot_bytes);
 
-            client.render_change_snapshot_bytes = correct_snapshot_bytes - 1;
+            client.render_change_snapshots.totals.bytes = correct_snapshot_bytes - 1;
             let error = client
                 .invalidate_render_state_for_pane(11)
                 .expect_err("single invalidation must reject snapshot-byte undercount");
@@ -6448,10 +6799,16 @@ mod tests {
                 }
             ));
             assert_render_retention_members(&client, &snapshot_keys, &pending_panes);
-            assert_eq!(client.render_change_snapshot_bytes, correct_snapshot_bytes - 1);
-            client.render_change_snapshot_bytes = correct_snapshot_bytes;
+            assert_eq!(
+                client.render_change_snapshots.retained_bytes(),
+                correct_snapshot_bytes - 1
+            );
+            client
+                .render_change_snapshots
+                .totals
+                .set(snapshot_keys.len(), correct_snapshot_bytes);
 
-            client.pending_render_change_bytes = correct_pending_bytes + 1;
+            client.pending_render_changes.totals.bytes = correct_pending_bytes + 1;
             let error = client
                 .invalidate_render_state_for_panes(&[11, 22])
                 .expect_err("bulk invalidation must reject pending-byte overcount");
@@ -6462,10 +6819,16 @@ mod tests {
                 }
             ));
             assert_render_retention_members(&client, &snapshot_keys, &pending_panes);
-            assert_eq!(client.pending_render_change_bytes, correct_pending_bytes + 1);
-            client.pending_render_change_bytes = correct_pending_bytes;
+            assert_eq!(
+                client.pending_render_changes.retained_bytes(),
+                correct_pending_bytes + 1
+            );
+            client
+                .pending_render_changes
+                .totals
+                .set(pending_panes.len(), correct_pending_bytes);
 
-            client.pending_render_change_bytes = correct_pending_bytes - 1;
+            client.pending_render_changes.totals.bytes = correct_pending_bytes - 1;
             let error = client
                 .invalidate_render_state_for_panes(&[11, 22])
                 .expect_err("bulk invalidation must reject pending-byte undercount");
@@ -6476,10 +6839,16 @@ mod tests {
                 }
             ));
             assert_render_retention_members(&client, &snapshot_keys, &pending_panes);
-            assert_eq!(client.pending_render_change_bytes, correct_pending_bytes - 1);
-            client.pending_render_change_bytes = correct_pending_bytes;
+            assert_eq!(
+                client.pending_render_changes.retained_bytes(),
+                correct_pending_bytes - 1
+            );
+            client
+                .pending_render_changes
+                .totals
+                .set(pending_panes.len(), correct_pending_bytes);
 
-            client.render_change_snapshot_bytes = correct_snapshot_bytes + 1;
+            client.render_change_snapshots.totals.bytes = correct_snapshot_bytes + 1;
             let error = client
                 .invalidate_render_state_for_panes(&[11, 22])
                 .expect_err("bulk invalidation must reject snapshot-byte overcount");
@@ -6490,9 +6859,12 @@ mod tests {
                 }
             ));
             assert_render_retention_members(&client, &snapshot_keys, &pending_panes);
-            assert_eq!(client.render_change_snapshot_bytes, correct_snapshot_bytes + 1);
+            assert_eq!(
+                client.render_change_snapshots.retained_bytes(),
+                correct_snapshot_bytes + 1
+            );
 
-            client.render_change_snapshot_bytes = correct_snapshot_bytes - 1;
+            client.render_change_snapshots.totals.bytes = correct_snapshot_bytes - 1;
             let error = client
                 .invalidate_render_state_for_panes(&[11, 22])
                 .expect_err("bulk invalidation must reject snapshot-byte undercount");
@@ -6503,9 +6875,12 @@ mod tests {
                 }
             ));
             assert_render_retention_members(&client, &snapshot_keys, &pending_panes);
-            assert_eq!(client.render_change_snapshot_bytes, correct_snapshot_bytes - 1);
+            assert_eq!(
+                client.render_change_snapshots.retained_bytes(),
+                correct_snapshot_bytes - 1
+            );
 
-            client.render_change_snapshot_bytes = correct_snapshot_bytes + 1;
+            client.render_change_snapshots.totals.bytes = correct_snapshot_bytes + 1;
 
             let error = client
                 .get_pane_render_changes_batch(&[11, 22], 2, Duration::from_secs(1))
@@ -6522,9 +6897,9 @@ mod tests {
             assert!(client.pending_responses.is_empty());
             assert_eq!(client.pending_response_bytes, 0);
             assert!(client.pending_render_changes.is_empty());
-            assert_eq!(client.pending_render_change_bytes, 0);
+            assert_eq!(client.pending_render_changes.retained_bytes(), 0);
             assert!(client.render_change_snapshots.is_empty());
-            assert_eq!(client.render_change_snapshot_bytes, 0);
+            assert_eq!(client.render_change_snapshots.retained_bytes(), 0);
             assert!(client.read_buf.is_empty());
 
             let peer_read = timeout(Duration::from_secs(1), server)
@@ -6610,9 +6985,9 @@ mod tests {
             assert!(client.pending_responses.is_empty());
             assert_eq!(client.pending_response_bytes, 0);
             assert!(client.pending_render_changes.is_empty());
-            assert_eq!(client.pending_render_change_bytes, 0);
+            assert_eq!(client.pending_render_changes.retained_bytes(), 0);
             assert!(client.render_change_snapshots.is_empty());
-            assert_eq!(client.render_change_snapshot_bytes, 0);
+            assert_eq!(client.render_change_snapshots.retained_bytes(), 0);
             assert!(client.read_buf.is_empty());
             assert_eq!(client.serial, serial_before + 1);
             let poisoned_serial = client.serial;
@@ -7380,9 +7755,9 @@ mod tests {
             assert!(client.pending_responses.is_empty());
             assert_eq!(client.pending_response_bytes, 0);
             assert!(client.pending_render_changes.is_empty());
-            assert_eq!(client.pending_render_change_bytes, 0);
+            assert_eq!(client.pending_render_changes.retained_bytes(), 0);
             assert!(client.render_change_snapshots.is_empty());
-            assert_eq!(client.render_change_snapshot_bytes, 0);
+            assert_eq!(client.render_change_snapshots.retained_bytes(), 0);
             assert!(client.read_buf.is_empty());
             let reuse_error = client
                 .list_panes()
@@ -7513,9 +7888,9 @@ mod tests {
             assert!(client.pending_responses.is_empty());
             assert_eq!(client.pending_response_bytes, 0);
             assert!(client.pending_render_changes.is_empty());
-            assert_eq!(client.pending_render_change_bytes, 0);
+            assert_eq!(client.pending_render_changes.retained_bytes(), 0);
             assert!(client.render_change_snapshots.is_empty());
-            assert_eq!(client.render_change_snapshot_bytes, 0);
+            assert_eq!(client.render_change_snapshots.retained_bytes(), 0);
             assert!(client.read_buf.is_empty());
             let reuse_error = client
                 .list_panes()
@@ -7654,9 +8029,9 @@ mod tests {
             assert!(client.pending_responses.is_empty());
             assert_eq!(client.pending_response_bytes, 0);
             assert!(client.pending_render_changes.is_empty());
-            assert_eq!(client.pending_render_change_bytes, 0);
+            assert_eq!(client.pending_render_changes.retained_bytes(), 0);
             assert!(client.render_change_snapshots.is_empty());
-            assert_eq!(client.render_change_snapshot_bytes, 0);
+            assert_eq!(client.render_change_snapshots.retained_bytes(), 0);
             assert!(client.read_buf.is_empty());
             let reuse_error = client
                 .list_panes()
@@ -7744,6 +8119,190 @@ mod tests {
         assert!(!decision.retry);
         assert_eq!(decision.connection, MuxConnectionDisposition::Reuse);
         assert!(!decision.cancelled);
+    }
+
+    #[test]
+    fn pending_render_sideband_index_uses_one_keyed_take_per_response() {
+        for depth in [
+            32usize,
+            DEFAULT_MAX_OUTSTANDING_REQUESTS,
+            DEFAULT_MAX_PENDING_RENDER_CHANGES,
+        ] {
+            let mut pending = PendingRenderChanges::default();
+            for pane_id in 1..=depth {
+                admit_pending_test_render_change(
+                    &mut pending,
+                    pane_id,
+                    pane_id,
+                    "indexed-sideband",
+                );
+            }
+
+            pending.reset_operation_counts();
+            for pane_id in (1..=depth).rev() {
+                let retained = pending
+                    .take_for_pane(
+                        u64::try_from(pane_id).expect("bounded pane id must fit u64"),
+                    )
+                    .expect("keyed sideband take must preserve accounting")
+                    .expect("seeded pane must retain one sideband");
+                let decoded = retained
+                    .decode(41)
+                    .expect("retained sideband must preserve connection identity");
+                assert_eq!(decoded.pane_id, pane_id);
+                assert_eq!(decoded.seqno, pane_id);
+            }
+
+            assert!(pending.is_empty());
+            assert_eq!(pending.retained_bytes(), 0);
+            assert_eq!(
+                pending.operation_counts(),
+                (depth, 0, 0, 0),
+                "depth {depth} must perform exactly one keyed take per response"
+            );
+        }
+    }
+
+    #[test]
+    fn pending_render_sideband_index_preserves_interleaved_per_pane_fifo() {
+        let mut pending = PendingRenderChanges::default();
+        for (pane_id, seqno, title) in [
+            (7usize, 1usize, "pane-seven-1"),
+            (9, 10, "pane-nine-10"),
+            (7, 2, "pane-seven-2"),
+            (9, 11, "pane-nine-11"),
+            (7, 3, "pane-seven-3"),
+        ] {
+            admit_pending_test_render_change(&mut pending, pane_id, seqno, title);
+        }
+
+        pending.reset_operation_counts();
+        for (pane_id, expected) in [(7u64, 1usize), (7, 2), (7, 3), (9, 10), (9, 11)] {
+            let decoded = pending
+                .take_for_pane(pane_id)
+                .expect("keyed FIFO take must preserve accounting")
+                .expect("seeded pane must retain the next sideband")
+                .decode(41)
+                .expect("retained sideband must preserve connection identity");
+            assert_eq!(
+                u64::try_from(decoded.pane_id).expect("bounded pane id must fit u64"),
+                pane_id
+            );
+            assert_eq!(decoded.seqno, expected);
+        }
+
+        assert!(pending.is_empty());
+        assert_eq!(pending.retained_bytes(), 0);
+        assert_eq!(pending.operation_counts(), (5, 0, 0, 0));
+    }
+
+    #[test]
+    fn targeted_render_invalidation_work_is_independent_of_unrelated_depth() {
+        for depth in [
+            32usize,
+            DEFAULT_MAX_OUTSTANDING_REQUESTS,
+            DEFAULT_MAX_PENDING_RENDER_CHANGES,
+        ] {
+            let mut pending = PendingRenderChanges::default();
+            let mut snapshots = RenderChangeSnapshots::default();
+            for pane_id in 1..=depth {
+                admit_pending_test_render_change(
+                    &mut pending,
+                    pane_id,
+                    pane_id,
+                    "targeted-invalidation",
+                );
+                admit_snapshot_test_render_change(
+                    &mut snapshots,
+                    pane_id,
+                    pane_id,
+                    "targeted-invalidation",
+                );
+            }
+
+            let targets = HashSet::from([
+                1u64,
+                u64::try_from(depth / 2).expect("bounded pane id must fit u64"),
+                u64::try_from(depth).expect("bounded pane id must fit u64"),
+            ]);
+            pending.reset_operation_counts();
+            snapshots.reset_operation_counts();
+
+            let snapshot_plan = snapshots
+                .plan_remove_panes(&targets)
+                .expect("snapshot invalidation plan must preserve accounting");
+            let pending_plan = pending
+                .plan_remove_panes(&targets)
+                .expect("pending invalidation plan must preserve accounting");
+            assert_eq!(snapshot_plan.removed_count, targets.len());
+            assert_eq!(pending_plan.removed_count, targets.len());
+            snapshots.commit_remove_panes(&targets, snapshot_plan);
+            pending.commit_remove_panes(&targets, pending_plan);
+
+            assert_eq!(pending.len(), depth - targets.len());
+            assert_eq!(snapshots.len(), depth - targets.len());
+            assert_eq!(
+                pending.retained_bytes(),
+                pending
+                    .iter()
+                    .map(RetainedRenderChange::retained_bytes)
+                    .sum::<usize>()
+            );
+            assert_eq!(
+                snapshots.retained_bytes(),
+                snapshots
+                    .values()
+                    .map(RetainedRenderChange::retained_bytes)
+                    .sum::<usize>()
+            );
+            assert_eq!(
+                pending.operation_counts(),
+                (0, targets.len(), targets.len(), targets.len()),
+                "depth {depth} must not add work for unrelated pending panes"
+            );
+            assert_eq!(
+                snapshots.operation_counts(),
+                (targets.len(), targets.len(), targets.len()),
+                "depth {depth} must not add work for unrelated snapshots"
+            );
+        }
+    }
+
+    #[test]
+    fn indexed_render_retention_rejects_count_corruption_before_mutation() {
+        let mut pending = PendingRenderChanges::default();
+        let mut snapshots = RenderChangeSnapshots::default();
+        admit_pending_test_render_change(&mut pending, 7, 1, "count-corruption");
+        admit_snapshot_test_render_change(&mut snapshots, 7, 1, "count-corruption");
+        let pending_bytes = pending.retained_bytes();
+        let snapshot_bytes = snapshots.retained_bytes();
+
+        pending.totals.count += 1;
+        let pending_error = pending
+            .take_for_pane(7)
+            .expect_err("count corruption must fail before removing a pending sideband");
+        assert!(matches!(
+            pending_error,
+            DirectMuxError::RetainedStateAccounting {
+                resource: "pending unilateral render changes"
+            }
+        ));
+        assert_eq!(pending.by_pane.len(), 1);
+        assert_eq!(pending.retained_bytes(), pending_bytes);
+        pending.totals.set(1, pending_bytes);
+
+        snapshots.totals.count += 1;
+        let snapshot_error = snapshots
+            .plan_remove_panes(&HashSet::from([7]))
+            .expect_err("count corruption must fail before removing a render snapshot");
+        assert!(matches!(
+            snapshot_error,
+            DirectMuxError::RetainedStateAccounting {
+                resource: "render change snapshots"
+            }
+        ));
+        assert_eq!(snapshots.by_pane.len(), 1);
+        assert_eq!(snapshots.retained_bytes(), snapshot_bytes);
     }
 
     #[test]
