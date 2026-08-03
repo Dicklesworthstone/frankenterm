@@ -8382,7 +8382,7 @@ mod tests {
 
     #[test]
     fn decode_empty_buffer_returns_none() {
-        let mut buf = Vec::new();
+        let mut buf = StreamingPduBuffer::new();
         let result = decode_from_buffer(&mut buf, 4096).expect("should not error");
         assert!(result.is_none());
     }
@@ -8397,7 +8397,7 @@ mod tests {
             if cut >= buf.len() {
                 continue;
             }
-            let mut truncated = buf[..cut].to_vec();
+            let mut truncated = StreamingPduBuffer::from(buf[..cut].to_vec());
             let _ = decode_from_buffer(&mut truncated, 4096);
             // If it didn't panic, the test passes
         }
@@ -9973,7 +9973,9 @@ mod tests {
     #[test]
     fn decode_garbage_frame_returns_error_or_none() {
         // Intentionally invalid RPC frame: random bytes that don't form a valid PDU.
-        let mut buf = vec![0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x00, 0x00, 0x10, 0xFF, 0xFF];
+        let mut buf = StreamingPduBuffer::from(vec![
+            0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x00, 0x00, 0x10, 0xFF, 0xFF,
+        ]);
         let result = decode_from_buffer(&mut buf, 4096);
         // Should either error (codec parse failure) or return None (incomplete).
         // Must NOT panic.
@@ -9991,6 +9993,7 @@ mod tests {
         let pdu = Pdu::Ping(codec::Ping {});
         pdu.encode(&mut buf, 7).expect("encode");
         buf.extend_from_slice(&[0xFF, 0xFE, 0xFD]);
+        let mut buf = StreamingPduBuffer::from(buf);
 
         // First decode should succeed and consume the valid portion.
         let decoded = decode_from_buffer(&mut buf, 4096)
@@ -10026,6 +10029,7 @@ mod tests {
         for (pdu, serial) in &pdus {
             let mut buf = Vec::new();
             pdu.encode(&mut buf, *serial).expect("encode");
+            let mut buf = StreamingPduBuffer::from(buf);
 
             let decoded = decode_from_buffer(&mut buf, 4096)
                 .expect("should not error")
