@@ -6988,6 +6988,26 @@ mod tests {
         )
     }
 
+    fn client_with_bootstrap_rpc_queue() -> (Client, Receiver<ReaderMessage>) {
+        let (sender, receiver) = unbounded();
+        (
+            Client {
+                sender,
+                local_domain_id: None,
+                incarnation: Arc::new(ClientIncarnation),
+                connection_generation: Arc::new(AtomicU64::new(
+                    INITIAL_CONNECTION_GENERATION,
+                )),
+                rpc_transport: Arc::new(RpcTransportState::new()),
+                client_id: ClientId::new(),
+                client_domain_config: ClientDomainConfig::Unix(UnixDomain::default()),
+                is_reconnectable: false,
+                is_local: true,
+            },
+            receiver,
+        )
+    }
+
     fn pending_readiness_scope_for_test() -> (
         RpcGenerationScope,
         Receiver<ReaderMessage>,
@@ -9759,6 +9779,83 @@ mod tests {
         );
     }
 
+    #[test]
+    fn topology_fence_version_gate_rejects_before_identity_topology_or_readiness() {
+        let (client, receiver) = client_with_bootstrap_rpc_queue();
+        let ui = ConnectionUI::new_headless();
+        let rejected_codec_version = TOPOLOGY_FENCE_MIN_CODEC_VERSION - 1;
+
+        let (result, transcript) = asupersync_block_on(async {
+            let verify = client.verify_version_compat(&ui);
+            let peer = async {
+                let first = receiver
+                    .recv()
+                    .await
+                    .expect("version gate must issue one bootstrap RPC");
+                let ReaderMessage::SendPdu {
+                    binding,
+                    pdu,
+                    promise,
+                } = first
+                else {
+                    panic!("version gate must begin with GetCodecVersion");
+                };
+                assert_eq!(binding.request, "GetCodecVersion");
+                assert!(matches!(pdu.as_ref(), Pdu::GetCodecVersion(_)));
+                promise
+                    .send(Ok(Pdu::GetCodecVersionResponse(
+                        GetCodecVersionResponse {
+                            codec_vers: rejected_codec_version,
+                            version_string: "pre-topology-fence-peer".to_string(),
+                            executable_path: PathBuf::from("/test/old-ft"),
+                            config_file_path: None,
+                            min_supported: codec::CODEC_VERSION_MIN_SUPPORTED,
+                        },
+                    )))
+                    .await
+                    .expect("version response consumer must remain live");
+
+                let second = receiver
+                    .recv()
+                    .await
+                    .expect("rejected bootstrap must abort its exact generation");
+                assert!(matches!(
+                    second,
+                    ReaderMessage::AbortGeneration {
+                        generation,
+                        reason:
+                            "standalone mux RPC bootstrap failed, timed out, or was cancelled",
+                    } if generation == binding.generation
+                ));
+                assert!(
+                    matches!(receiver.try_recv(), Err(async_channel::TryRecvError::Empty)),
+                    "version rejection must not enqueue SetClientId, topology, or readiness work"
+                );
+                ["GetCodecVersion", "AbortGeneration"]
+            };
+            futures::future::join(verify, peer).await
+        });
+
+        let error = result.expect_err("a codec-v48 peer must fail the topology-fence gate");
+        let rejection = error
+            .downcast_ref::<MissingTopologyFenceProtocolError>()
+            .expect("version gate must retain its typed rejection");
+        assert_eq!(rejection.remote_codec_version, rejected_codec_version);
+        assert_eq!(
+            rejection.minimum_codec_version,
+            TOPOLOGY_FENCE_MIN_CODEC_VERSION
+        );
+        assert_eq!(transcript, ["GetCodecVersion", "AbortGeneration"]);
+        assert_eq!(
+            client
+                .rpc_transport
+                .ready_generation
+                .load(AtomicOrdering::Acquire),
+            0,
+            "a rejected mixed-version attachment must never publish readiness"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn verify_version_compat_reaches_set_client_id_over_real_stream_ft_kuxho_4() {
@@ -10840,6 +10937,142 @@ mod tests {
             } if observed_generation == generation && observed_authority == authority
         ));
         assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn delivered_snapshot_cancellation_never_prunes_or_double_settles_pending_state() {
+        let stream_id = TopologyStreamId::from_bytes([0x64; 16]);
+        let session_incarnation = MuxSessionIncarnation::from_bytes([0xb4; 16]);
+        let authority = TopologyFenceAuthority {
+            stream_id,
+            session_incarnation,
+            snapshot_revision: TopologyRevision::new(17),
+        };
+        let (mut pending, probe) = pending_replies_for_test();
+        let generation = pending.generation;
+        let (completion_tx, completion_rx) = bounded(1);
+        let serial = pending
+            .admit_named_expect(
+                completion_tx,
+                "ListPanesCoherent",
+                Some(test_wire_ident::<ListPanesCoherentResponse>()),
+            )
+            .expect("admit coherent topology request")
+            .expect("assign coherent topology serial");
+        pending
+            .map
+            .get_mut(&serial)
+            .expect("coherent topology request must remain pending")
+            .effect = PendingRpcEffect::CoherentTopologyFence;
+
+        let mut topology = ClientTopologyCoordinator::default();
+        topology
+            .begin_fence(serial)
+            .expect("coherent topology fence should begin");
+        let response = coherent_snapshot_response(stream_id, session_incarnation, 17);
+        let frame = response
+            .encode_frame_with_mode(serial.get(), CompressionMode::Never)
+            .expect("encode coherent response transcript");
+        let decoded = Pdu::decode(std::io::Cursor::new(frame))
+            .expect("decode coherent response transcript");
+        assert_eq!(decoded.serial, serial.get());
+        assert!(matches!(
+            topology
+                .on_response(serial, &decoded.pdu)
+                .expect("decoded response must await its exact consumer"),
+            ClientTopologyResponseAction::AwaitCommit
+        ));
+        assert_eq!(
+            pending
+                .complete(serial, decoded.pdu)
+                .expect("decoded coherent response must settle its pending RPC"),
+            ReplyCompletion {
+                disposition: ReplyDisposition::Delivered,
+            }
+        );
+        assert!(matches!(
+            completion_rx
+                .try_recv()
+                .expect("consumer must observe the delivered coherent response"),
+            Ok(Pdu::ListPanesCoherentResponse(_))
+        ));
+
+        assert!(matches!(
+            topology
+                .on_unilateral(stamped_title_event(
+                    stream_id,
+                    authority.snapshot_revision.get(),
+                    "must-survive-until-terminal-rejection",
+                ))
+                .expect("post-response event must remain retained until a decision"),
+            ClientTopologyUnilateralAction::Buffered
+        ));
+        let ClientTopologyPhase::AwaitingCommit(awaiting) = &topology.phase else {
+            panic!("delivered snapshot must still await its exact consumer commit");
+        };
+        assert!(
+            awaiting
+                .events
+                .events
+                .contains_key(&authority.snapshot_revision),
+            "consumer cancellation must not pre-prune a snapshot-covered event"
+        );
+        assert_eq!(
+            pending
+                .rpc_transport
+                .ready_generation
+                .load(AtomicOrdering::Acquire),
+            0,
+            "delivering a snapshot is not readiness authority"
+        );
+
+        let (decision_tx, decision_rx) = unbounded();
+        drop(TopologySnapshotDecisionGuard::new(
+            decision_tx,
+            generation,
+            authority,
+        ));
+        let rejection = decision_rx
+            .try_recv()
+            .expect("cancelled consumer must reject one exact delivered authority");
+        let ReaderMessage::RejectTopologySnapshot {
+            generation: rejected_generation,
+            authority: rejected_authority,
+            promise,
+        } = rejection
+        else {
+            panic!("cancelled delivered snapshot must enqueue a rejection");
+        };
+        assert_eq!(rejected_generation, generation);
+        assert_eq!(rejected_authority, authority);
+        topology
+            .reject(rejected_authority)
+            .expect("reader must accept the exact cancellation authority");
+        let _ = promise.try_send(Ok(()));
+        assert!(decision_rx.try_recv().is_err());
+        assert!(matches!(topology.phase, ClientTopologyPhase::Closed));
+        assert!(
+            topology
+                .on_unilateral(stamped_title_event(stream_id, 18, "too-late"))
+                .expect_err("terminal rejection must forbid every later topology frame")
+                .to_string()
+                .contains("closed")
+        );
+
+        assert!(pending.map.is_empty());
+        assert_eq!(probe.pending(), 0.0);
+        assert_eq!(RpcMetricProbe::counter(&probe.admitted), 1);
+        assert_eq!(RpcMetricProbe::counter(&probe.delivered), 1);
+        assert_eq!(RpcMetricProbe::counter(&probe.abandoned), 0);
+        assert_eq!(RpcMetricProbe::counter(&probe.transport_failed_live), 0);
+        assert_eq!(
+            RpcMetricProbe::counter(&probe.transport_cleared_abandoned),
+            0
+        );
+        pending.fail_all("terminal cancellation after coherent response delivery");
+        drop(pending);
+        probe.assert_balanced();
+        assert_eq!(RpcMetricProbe::counter(&probe.delivered), 1);
     }
 
     #[test]
