@@ -14951,7 +14951,7 @@ mod tests {
             ledger.retain(
                 mutation_id,
                 WindowReorderDigest::from_bytes([sequence as u8; 32]),
-                WindowReorderTerminalOutcome::MissingWindow { window_id: 7 },
+                WindowReorderTerminalOutcome::Exhausted,
             );
         }
         assert_eq!(ledger.receipts.len(), MAX_WINDOW_ORDER_RECEIPTS);

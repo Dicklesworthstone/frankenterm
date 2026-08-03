@@ -148,6 +148,7 @@ impl fmt::Debug for ValidatedWindowOrder {
     }
 }
 
+#[derive(Debug)]
 pub(crate) struct PreparedWindowOrder {
     validated: ValidatedWindowOrder,
     next_revision: WindowOrderRevision,
