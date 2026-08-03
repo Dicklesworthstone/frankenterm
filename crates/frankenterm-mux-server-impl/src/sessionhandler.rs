@@ -2850,11 +2850,20 @@ impl SessionHandler {
                      coordinator was activated for this connection"
                 )));
             }
+            Pdu::ListPanesOrderedV1(_) | Pdu::ReorderWindowTabsV1(_) => {
+                send_response(Err(anyhow!(
+                    "ordered window-tab protocol request received before its live capability \
+                     was activated for this connection"
+                )));
+            }
             Pdu::Invalid { .. } => send_response(Err(anyhow!("invalid PDU {:?}", decoded.pdu))),
             Pdu::Pong { .. }
             | Pdu::ListPanesResponse { .. }
             | Pdu::ListPanesCoherentResponse { .. }
             | Pdu::ListPanesTabStacksResponse { .. }
+            | Pdu::ListPanesOrderedV1Response { .. }
+            | Pdu::ReorderWindowTabsV1Response { .. }
+            | Pdu::WindowOrderEventV1 { .. }
             | Pdu::SetClipboard { .. }
             | Pdu::NotifyAlert { .. }
             | Pdu::SpawnResponse { .. }
@@ -4796,6 +4805,36 @@ mod tests {
                     "error should mention invalid PDU, got: {reason}"
                 );
             }
+            other => panic!("expected ErrorResponse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ordered_window_request_fails_closed_until_live_capability_activation() {
+        let (sender, captured) = capturing_sender();
+        let mut handler = SessionHandler::new(sender);
+        let required = TopologyCapabilities::from_bits(
+            TopologyCapabilities::FENCED_SNAPSHOT_V1.bits()
+                | TopologyCapabilities::ORDERED_WINDOW_STREAM_V1.bits(),
+        );
+
+        handler.process_one(DecodedPdu {
+            serial: 201,
+            pdu: Pdu::ListPanesOrderedV1(codec::ListPanesOrderedV1 {
+                protocol_version: codec::ORDERED_WINDOW_PROTOCOL_VERSION,
+                supported: required,
+                required,
+            }),
+        });
+
+        let response = take_response(&captured);
+        assert_eq!(response.serial, 201);
+        match response.pdu {
+            Pdu::ErrorResponse(ErrorResponse { reason }) => assert!(
+                reason.contains("before its live capability was activated"),
+                "ordered-window request must retain the fail-closed activation reason, got: \
+                 {reason}"
+            ),
             other => panic!("expected ErrorResponse, got {other:?}"),
         }
     }

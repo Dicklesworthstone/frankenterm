@@ -903,7 +903,36 @@ struct Decoded {
     is_compressed: bool,
 }
 
-fn buffered_frame_len(buffer: &[u8]) -> anyhow::Result<Option<usize>> {
+/// A complete or still-arriving frame declared a size above a caller's cap.
+///
+/// The declared length belongs to the first frame only; bytes already
+/// coalesced from later frames are deliberately excluded.
+#[derive(Debug, Error, PartialEq, Eq)]
+#[error(
+    "buffered PDU frame declares {declared_frame_bytes} bytes, exceeding caller limit \
+     {max_frame_bytes}"
+)]
+pub struct StreamingPduFrameLimitExceeded {
+    declared_frame_bytes: usize,
+    max_frame_bytes: usize,
+}
+
+impl StreamingPduFrameLimitExceeded {
+    #[must_use]
+    pub const fn declared_frame_bytes(&self) -> usize {
+        self.declared_frame_bytes
+    }
+
+    #[must_use]
+    pub const fn max_frame_bytes(&self) -> usize {
+        self.max_frame_bytes
+    }
+}
+
+fn buffered_frame_len_with_limit(
+    buffer: &[u8],
+    max_frame_bytes: usize,
+) -> anyhow::Result<Option<usize>> {
     let mut slice = buffer;
     let tagged_len = match leb128::read::unsigned(&mut slice) {
         Ok(len) => len,
@@ -926,14 +955,22 @@ fn buffered_frame_len(buffer: &[u8]) -> anyhow::Result<Option<usize>> {
         .try_into()
         .map_err(|_| anyhow::anyhow!("buffered PDU length {raw_len} does not fit in usize"))?;
 
-    // [ft-phz7x] Reject oversize headers BEFORE the caller's read loop
-    // accumulates an attacker-advertised payload into memory. decode_raw
-    // already enforces MAX_PDU_SIZE at lib.rs:395-403, but stream_decode's
-    // first check short-circuits to "need more bytes" while buffer.len() <
-    // total_len — so callers like try_read_and_decode would keep extending
-    // the buffer 4 KiB at a time until they reach the advertised length.
-    // A 10 GiB tagged_len would OOM the process long before the inner
-    // MAX_PDU_SIZE check fires. Mirror the inner cap here.
+    let prefix_len = buffer.len().saturating_sub(slice.len());
+    let total_len = prefix_len
+        .checked_add(payload_len)
+        .context("buffered PDU length overflow")?;
+
+    if total_len > max_frame_bytes {
+        return Err(StreamingPduFrameLimitExceeded {
+            declared_frame_bytes: total_len,
+            max_frame_bytes,
+        }
+        .into());
+    }
+
+    // [ft-phz7x] Reject oversize headers BEFORE an unlimited caller's read
+    // loop accumulates an attacker-advertised payload. A tighter caller limit
+    // is checked first so it retains its typed authority and recovery class.
     if payload_len > MAX_PDU_SIZE {
         anyhow::bail!(
             "buffered PDU payload size {} exceeds maximum {} — refusing to accumulate",
@@ -942,16 +979,16 @@ fn buffered_frame_len(buffer: &[u8]) -> anyhow::Result<Option<usize>> {
         );
     }
 
-    let prefix_len = buffer.len().saturating_sub(slice.len());
-    let total_len = prefix_len
-        .checked_add(payload_len)
-        .context("buffered PDU length overflow")?;
-
     if buffer.len() < total_len {
         return Ok(None);
     }
 
     Ok(Some(total_len))
+}
+
+#[cfg(test)]
+fn buffered_frame_len(buffer: &[u8]) -> anyhow::Result<Option<usize>> {
+    buffered_frame_len_with_limit(buffer, usize::MAX)
 }
 
 fn reserve_next_payload_chunk(
@@ -1361,6 +1398,36 @@ pub struct DecodedPdu {
     pub pdu: Pdu,
 }
 
+/// A decoded PDU bound to optional logical-retention admission metadata.
+///
+/// Private fields prevent callers from pairing a charge with a different
+/// decoded value. The charge is the conservative size of an uncompressed
+/// serial-zero frame containing the complete decoded payload bytes, including
+/// compatible additive tails. It is not a measurement of Rust heap capacity,
+/// allocator overhead, or process RSS.
+#[derive(Debug)]
+pub struct DecodedPduWithRetentionMetadata {
+    decoded: DecodedPdu,
+    retained_frame_bytes: Option<usize>,
+}
+
+impl DecodedPduWithRetentionMetadata {
+    #[must_use]
+    pub const fn decoded(&self) -> &DecodedPdu {
+        &self.decoded
+    }
+
+    #[must_use]
+    pub const fn retained_frame_bytes(&self) -> Option<usize> {
+        self.retained_frame_bytes
+    }
+
+    #[must_use]
+    pub fn into_parts(self) -> (DecodedPdu, Option<usize>) {
+        (self.decoded, self.retained_frame_bytes)
+    }
+}
+
 /// If the serialized size is larger than this, then we'll consider compressing it
 const COMPRESS_THRESH: usize = 32;
 
@@ -1434,6 +1501,52 @@ fn deserialize<T: serde::de::DeserializeOwned, R: std::io::Read>(
     }
 }
 
+fn deserialize_with_retention_payload_len<T: serde::de::DeserializeOwned>(
+    data: &[u8],
+    is_compressed: bool,
+) -> Result<(T, usize), Error> {
+    if !is_compressed {
+        let decoded = deserialize(data, false)?;
+        return Ok((decoded, data.len()));
+    }
+
+    // Count decompressed bytes through the original typed decode. Draining the
+    // same bounded reader validates the complete compressed payload and counts
+    // compatible additive tails without allocating a second full payload.
+    let read_limit = max_pdu_read_limit()?;
+    let decoder = zstd::Decoder::with_buffer(data)?;
+    let recommended_output_size = zstd::Decoder::<&[u8]>::recommended_output_size()
+        .max(MIN_EXACT_ZSTD_DECODE_BUFFER_SIZE);
+    let output_buffer_size = data
+        .len()
+        .clamp(MIN_EXACT_ZSTD_DECODE_BUFFER_SIZE, recommended_output_size);
+    let mut reader = BufReader::with_capacity(output_buffer_size, decoder).take(read_limit);
+    let decoded = bounded_varbincode::deserialize::<T, _>(&mut reader)?;
+    std::io::copy(&mut reader, &mut std::io::sink())
+        .context("draining retention-metadata PDU payload")?;
+    let decompressed_bytes = read_limit
+        .checked_sub(reader.limit())
+        .context("counting retention-metadata PDU payload bytes")?;
+    if decompressed_bytes
+        > u64::try_from(MAX_PDU_SIZE).context("MAX_PDU_SIZE does not fit in u64")?
+    {
+        bail!(
+            "retention-metadata PDU decompressed payload size exceeds maximum {}",
+            MAX_PDU_SIZE
+        );
+    }
+
+    let buffered_decoder = reader.into_inner();
+    debug_assert!(buffered_decoder.buffer().is_empty());
+    let decoder = buffered_decoder.into_inner();
+    if !decoder.finish().is_empty() {
+        bail!("retention-metadata PDU has trailing compressed bytes");
+    }
+    let decompressed_bytes = usize::try_from(decompressed_bytes)
+        .context("retention-metadata PDU payload length does not fit in usize")?;
+    Ok((decoded, decompressed_bytes))
+}
+
 macro_rules! deserialize_pdu_payload {
     ($data:expr, $is_compressed:expr) => {
         deserialize($data, $is_compressed)
@@ -1441,6 +1554,43 @@ macro_rules! deserialize_pdu_payload {
     ($data:expr, $is_compressed:expr, $decoder:path) => {
         $decoder($data, $is_compressed)
     };
+}
+
+macro_rules! deserialize_pdu_payload_with_retention_metadata {
+    (
+        GetPaneRenderChangesResponse,
+        $vers:expr,
+        $data:expr,
+        $is_compressed:expr,
+        $collect_metadata:expr
+    ) => {{
+        if $collect_metadata {
+            let (payload, decompressed_bytes) =
+                deserialize_with_retention_payload_len($data, $is_compressed)?;
+            let retained_frame_bytes = encoded_frame_len(
+                <GetPaneRenderChangesResponse as PduWireIdent>::IDENT,
+                0,
+                decompressed_bytes,
+                false,
+            )?;
+            (payload, Some(retained_frame_bytes))
+        } else {
+            (deserialize($data, $is_compressed)?, None)
+        }
+    }};
+    (
+        $name:ident,
+        $vers:expr,
+        $data:expr,
+        $is_compressed:expr,
+        $collect_metadata:expr
+        $(, $decoder:path)?
+    ) => {{
+        (
+            deserialize_pdu_payload!($data, $is_compressed $(, $decoder)?)?,
+            None,
+        )
+    }};
 }
 
 /// Stable numeric wire identity generated for each concrete PDU payload type.
@@ -1642,6 +1792,14 @@ macro_rules! pdu {
                 Self::decode_impl(r, true)
             }
 
+            /// Decode one frame and bind any available logical-retention
+            /// admission metadata to the decoded value.
+            pub fn decode_with_retention_metadata<R: std::io::Read>(
+                r: R,
+            ) -> Result<DecodedPduWithRetentionMetadata, Error> {
+                Self::decode_impl_with_retention_metadata(r, true, true)
+            }
+
             /// Decode a frame previously produced by
             /// [`Self::encode_retained_frame`] without recording a duplicate
             /// inbound wire-size sample.
@@ -1653,6 +1811,14 @@ macro_rules! pdu {
                 r: R,
                 record_metrics: bool,
             ) -> Result<DecodedPdu, Error> {
+                Ok(Self::decode_impl_with_retention_metadata(r, record_metrics, false)?.decoded)
+            }
+
+            fn decode_impl_with_retention_metadata<R: std::io::Read>(
+                r: R,
+                record_metrics: bool,
+                collect_metadata: bool,
+            ) -> Result<DecodedPduWithRetentionMetadata, Error> {
                 let decoded =
                     decode_raw_impl(r, record_metrics).context("decoding a PDU")?;
                 match decoded.ident {
@@ -1662,13 +1828,21 @@ macro_rules! pdu {
                                 metrics::histogram!("pdu.size", "pdu" => stringify!($name)).record(decoded.data.len() as f64);
                                 metrics::histogram!("pdu.size.rate", "pdu" => stringify!($name)).record(decoded.data.len() as f64);
                             }
-                            Ok(DecodedPdu {
-                                serial: decoded.serial,
-                                pdu: Pdu::$name(deserialize_pdu_payload!(
+                            let (payload, retained_frame_bytes) =
+                                deserialize_pdu_payload_with_retention_metadata!(
+                                    $name,
+                                    $vers,
                                     decoded.data.as_slice(),
-                                    decoded.is_compressed
+                                    decoded.is_compressed,
+                                    collect_metadata
                                     $(, $decoder)?
-                                )?)
+                                );
+                            Ok(DecodedPduWithRetentionMetadata {
+                                decoded: DecodedPdu {
+                                    serial: decoded.serial,
+                                    pdu: Pdu::$name(payload),
+                                },
+                                retained_frame_bytes,
                             })
                         }
                     ,)*
@@ -1677,9 +1851,12 @@ macro_rules! pdu {
                             metrics::histogram!("pdu.size", "pdu" => "??").record(decoded.data.len() as f64);
                             metrics::histogram!("pdu.size.rate", "pdu" => "??").record(decoded.data.len() as f64);
                         }
-                        Ok(DecodedPdu {
-                            serial: decoded.serial,
-                            pdu: Pdu::Invalid{ident:decoded.ident}
+                        Ok(DecodedPduWithRetentionMetadata {
+                            decoded: DecodedPdu {
+                                serial: decoded.serial,
+                                pdu: Pdu::Invalid{ident:decoded.ident},
+                            },
+                            retained_frame_bytes: None,
                         })
                     }
                 }
@@ -2281,7 +2458,49 @@ impl Pdu {
     pub fn stream_decode(
         buffer: &mut StreamingPduBuffer,
     ) -> anyhow::Result<Option<DecodedPdu>> {
-        let Some(frame_len) = buffered_frame_len(buffer.as_slice())? else {
+        Ok(
+            Self::stream_decode_with_options(buffer, usize::MAX, false)?
+                .map(|decoded| decoded.into_parts().0),
+        )
+    }
+
+    /// Decode one streaming frame while enforcing a cap on that frame's
+    /// declared size. Coalesced bytes belonging to later frames do not count
+    /// against the first frame.
+    pub fn stream_decode_with_frame_limit(
+        buffer: &mut StreamingPduBuffer,
+        max_frame_bytes: usize,
+    ) -> anyhow::Result<Option<DecodedPdu>> {
+        Ok(
+            Self::stream_decode_with_options(buffer, max_frame_bytes, false)?
+                .map(|decoded| decoded.into_parts().0),
+        )
+    }
+
+    /// Decode one streaming frame and bind logical-retention metadata to it.
+    pub fn stream_decode_with_retention_metadata(
+        buffer: &mut StreamingPduBuffer,
+    ) -> anyhow::Result<Option<DecodedPduWithRetentionMetadata>> {
+        Self::stream_decode_with_options(buffer, usize::MAX, true)
+    }
+
+    /// Decode one streaming frame with both identity-bound retention metadata
+    /// and a cap on that frame's declared size.
+    pub fn stream_decode_with_retention_metadata_and_frame_limit(
+        buffer: &mut StreamingPduBuffer,
+        max_frame_bytes: usize,
+    ) -> anyhow::Result<Option<DecodedPduWithRetentionMetadata>> {
+        Self::stream_decode_with_options(buffer, max_frame_bytes, true)
+    }
+
+    fn stream_decode_with_options(
+        buffer: &mut StreamingPduBuffer,
+        max_frame_bytes: usize,
+        collect_retention_metadata: bool,
+    ) -> anyhow::Result<Option<DecodedPduWithRetentionMetadata>> {
+        let Some(frame_len) =
+            buffered_frame_len_with_limit(buffer.as_slice(), max_frame_bytes)?
+        else {
             return Ok(None);
         };
 
@@ -2290,7 +2509,11 @@ impl Pdu {
             .get(..frame_len)
             .context("stream_decode frame length beyond buffer")?;
         let mut cursor = Cursor::new(frame);
-        let decoded = match Self::decode(&mut cursor) {
+        let decoded = match Self::decode_impl_with_retention_metadata(
+            &mut cursor,
+            true,
+            collect_retention_metadata,
+        ) {
             Ok(decoded) => {
                 let consumed = cursor.position() as usize;
                 if consumed != frame_len {
@@ -8657,6 +8880,33 @@ mod test {
         }
     }
 
+    fn sample_retention_metadata_render_change() -> GetPaneRenderChangesResponse {
+        GetPaneRenderChangesResponse {
+            pane_id: 7,
+            mouse_grabbed: false,
+            alt_screen_active: false,
+            cursor_position: StableCursorPosition::default(),
+            dimensions: RenderableDimensions {
+                cols: 120,
+                viewport_rows: 72,
+                scrollback_rows: 2_048,
+                physical_top: 0,
+                scrollback_top: 0,
+                dpi: 96,
+                pixel_width: 1_920,
+                pixel_height: 1_080,
+                reverse_video: false,
+            },
+            tiered_scrollback_status: None,
+            dirty_lines: vec![0..2, 9..10],
+            title: "retention-metadata-".repeat(256),
+            working_dir: None,
+            bonus_lines: SerializedLines::default(),
+            input_serial: None,
+            seqno: 17,
+        }
+    }
+
     #[test]
     fn input_serial_ordering() {
         let a = InputSerial::empty();
@@ -8786,6 +9036,231 @@ mod test {
             .expect("stream_decode should succeed");
         assert_eq!(stream_decoded.serial, 0x55);
         assert_eq!(stream_decoded.pdu, pdu);
+    }
+
+    #[test]
+    fn render_retention_metadata_matches_canonical_frame_in_both_compression_modes() {
+        let pdu = Pdu::GetPaneRenderChangesResponse(
+            sample_retention_metadata_render_change(),
+        );
+        let expected_retained_bytes = pdu
+            .encode_retained_frame(0)
+            .expect("encode canonical retained render frame")
+            .len();
+
+        for mode in [CompressionMode::Never, CompressionMode::Always] {
+            let frame = pdu
+                .encode_frame_with_mode(0, mode)
+                .expect("encode render frame");
+            let mut buffer = StreamingPduBuffer::from(frame);
+            let decoded = Pdu::stream_decode_with_retention_metadata(&mut buffer)
+                .expect("decode render frame with retention metadata")
+                .expect("complete render frame");
+            assert_eq!(decoded.decoded().serial, 0);
+            assert_eq!(&decoded.decoded().pdu, &pdu);
+            assert_eq!(
+                decoded.retained_frame_bytes(),
+                Some(expected_retained_bytes),
+                "mode={mode:?}"
+            );
+            assert!(buffer.is_empty());
+        }
+
+        let ping = Pdu::Ping(Ping {});
+        let mut buffer = StreamingPduBuffer::from(
+            ping.encode_frame(9).expect("encode non-render frame"),
+        );
+        let decoded = Pdu::stream_decode_with_retention_metadata(&mut buffer)
+            .expect("decode non-render frame")
+            .expect("complete non-render frame");
+        assert_eq!(decoded.decoded().serial, 9);
+        assert_eq!(decoded.retained_frame_bytes(), None);
+    }
+
+    #[test]
+    fn render_retention_metadata_conservatively_charges_additive_payload_tails() {
+        let payload = sample_retention_metadata_render_change();
+        let (known_payload, compressed) =
+            serialize_with_mode(&payload, CompressionMode::Never)
+                .expect("serialize known render schema");
+        assert!(!compressed);
+        let known_frame_bytes = encoded_frame_len(
+            <GetPaneRenderChangesResponse as PduWireIdent>::IDENT,
+            0,
+            known_payload.len(),
+            false,
+        )
+        .expect("measure known render frame");
+        let additive_tail = b"future-additive-render-fields";
+
+        let mut payload_with_tail = known_payload.clone();
+        payload_with_tail.extend_from_slice(additive_tail);
+        let expected_bytes = encoded_frame_len(
+            <GetPaneRenderChangesResponse as PduWireIdent>::IDENT,
+            0,
+            payload_with_tail.len(),
+            false,
+        )
+        .expect("measure additive render frame");
+        assert!(expected_bytes > known_frame_bytes);
+
+        let compressed_with_tail = zstd::stream::encode_all(
+            payload_with_tail.as_slice(),
+            zstd::DEFAULT_COMPRESSION_LEVEL,
+        )
+        .expect("compress render payload with additive tail");
+        let mut concatenated_compressed = zstd::stream::encode_all(
+            known_payload.as_slice(),
+            zstd::DEFAULT_COMPRESSION_LEVEL,
+        )
+        .expect("compress known render payload");
+        concatenated_compressed.extend_from_slice(
+            &zstd::stream::encode_all(
+                additive_tail.as_slice(),
+                zstd::DEFAULT_COMPRESSION_LEVEL,
+            )
+            .expect("compress additive render tail as a second frame"),
+        );
+
+        for (encoded_payload, is_compressed, case) in [
+            (payload_with_tail, false, "uncompressed"),
+            (compressed_with_tail, true, "compressed"),
+            (
+                concatenated_compressed,
+                true,
+                "concatenated-compressed",
+            ),
+        ] {
+            let frame = encode_raw_as_vec(
+                <GetPaneRenderChangesResponse as PduWireIdent>::IDENT,
+                0,
+                &encoded_payload,
+                is_compressed,
+            )
+            .expect("encode additive render frame");
+            let mut buffer = StreamingPduBuffer::from(frame);
+            let decoded = Pdu::stream_decode_with_retention_metadata(&mut buffer)
+                .unwrap_or_else(|error| panic!("{case} charged decode failed: {error:#}"))
+                .unwrap_or_else(|| panic!("{case} charged frame was incomplete"));
+            assert_eq!(
+                &decoded.decoded().pdu,
+                &Pdu::GetPaneRenderChangesResponse(payload.clone()),
+                "case={case}"
+            );
+            assert_eq!(
+                decoded.retained_frame_bytes(),
+                Some(expected_bytes),
+                "case={case}"
+            );
+            assert!(buffer.is_empty(), "case={case}");
+        }
+    }
+
+    #[test]
+    fn charged_stream_decode_rejects_invalid_compressed_tail_without_consuming_prefix() {
+        let payload = sample_retention_metadata_render_change();
+        let (known_payload, compressed) =
+            serialize_with_mode(&payload, CompressionMode::Never)
+                .expect("serialize known render schema");
+        assert!(!compressed);
+        let mut encoded_payload = zstd::stream::encode_all(
+            known_payload.as_slice(),
+            zstd::DEFAULT_COMPRESSION_LEVEL,
+        )
+        .expect("compress known render payload");
+        encoded_payload.extend_from_slice(&[0xde, 0xad, 0xbe, 0xef]);
+        let frame = encode_raw_as_vec(
+            <GetPaneRenderChangesResponse as PduWireIdent>::IDENT,
+            0,
+            &encoded_payload,
+            true,
+        )
+        .expect("encode corrupt compressed render frame");
+        let mut buffer = StreamingPduBuffer::from(frame.clone());
+
+        Pdu::stream_decode_with_retention_metadata(&mut buffer)
+            .expect_err("invalid compressed tail must fail charged decode");
+        assert_eq!(buffer.as_slice(), frame.as_slice());
+    }
+
+    #[test]
+    fn per_frame_limit_accepts_coalesced_render_and_following_frame() {
+        let render = Pdu::GetPaneRenderChangesResponse(
+            sample_retention_metadata_render_change(),
+        );
+        let render_frame = render
+            .encode_frame_with_mode(0, CompressionMode::Never)
+            .expect("encode render frame");
+        let ping = Pdu::Ping(Ping {});
+        let ping_frame = ping.encode_frame(41).expect("encode following ping");
+        let max_frame_bytes = render_frame.len().max(ping_frame.len());
+        let aggregate_bytes = render_frame
+            .len()
+            .checked_add(ping_frame.len())
+            .expect("small coalesced frames must add");
+        assert!(aggregate_bytes > max_frame_bytes);
+        let mut coalesced = render_frame;
+        coalesced.extend_from_slice(&ping_frame);
+        let mut buffer = StreamingPduBuffer::from(coalesced);
+
+        let first = Pdu::stream_decode_with_retention_metadata_and_frame_limit(
+            &mut buffer,
+            max_frame_bytes,
+        )
+        .expect("decode first coalesced frame")
+        .expect("complete first frame");
+        assert_eq!(&first.decoded().pdu, &render);
+        assert!(first.retained_frame_bytes().is_some());
+        assert_eq!(buffer.as_slice(), ping_frame.as_slice());
+
+        let second = Pdu::stream_decode_with_frame_limit(&mut buffer, max_frame_bytes)
+            .expect("decode second coalesced frame")
+            .expect("complete second frame");
+        assert_eq!(second.serial, 41);
+        assert_eq!(second.pdu, ping);
+        assert!(buffer.is_empty());
+    }
+
+    #[test]
+    fn per_frame_limit_rejects_declared_oversize_from_header_without_consumption() {
+        let frame = Pdu::Ping(Ping {})
+            .encode_frame(7)
+            .expect("encode bounded ping frame");
+        let mut suffix = frame.as_slice();
+        leb128::read::unsigned(&mut suffix).expect("decode frame length prefix");
+        let prefix_len = frame.len() - suffix.len();
+        let header = frame[..prefix_len].to_vec();
+        let max_frame_bytes = frame.len() - 1;
+        let mut buffer = StreamingPduBuffer::from(header.clone());
+
+        let error = Pdu::stream_decode_with_frame_limit(&mut buffer, max_frame_bytes)
+            .expect_err("oversized declared frame must fail from its header");
+        let limit = error
+            .downcast_ref::<StreamingPduFrameLimitExceeded>()
+            .expect("typed streaming frame limit error");
+        assert_eq!(limit.declared_frame_bytes(), frame.len());
+        assert_eq!(limit.max_frame_bytes(), max_frame_bytes);
+        assert_eq!(buffer.as_slice(), header.as_slice());
+
+        let hostile_body_bytes = MAX_PDU_SIZE + 1;
+        let mut hostile_header = Vec::new();
+        leb128::write::unsigned(
+            &mut hostile_header,
+            u64::try_from(hostile_body_bytes).expect("hostile fixture length fits u64"),
+        )
+        .expect("encode hostile declared length");
+        let mut hostile_buffer = StreamingPduBuffer::from(hostile_header.clone());
+        let error = Pdu::stream_decode_with_frame_limit(&mut hostile_buffer, 4 * 1024 * 1024)
+            .expect_err("caller cap must classify a declaration above both limits");
+        let limit = error
+            .downcast_ref::<StreamingPduFrameLimitExceeded>()
+            .expect("caller limit remains the typed first authority");
+        assert_eq!(
+            limit.declared_frame_bytes(),
+            hostile_header.len() + hostile_body_bytes
+        );
+        assert_eq!(limit.max_frame_bytes(), 4 * 1024 * 1024);
+        assert_eq!(hostile_buffer.as_slice(), hostile_header.as_slice());
     }
 
     fn sample_render_application_update() -> RenderApplicationUpdate {
