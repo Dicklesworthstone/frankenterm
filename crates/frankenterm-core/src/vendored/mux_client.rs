@@ -431,6 +431,71 @@ impl std::fmt::Debug for DirectMuxClient {
     }
 }
 
+/// Bounded serial-to-output-slot ownership for one pipelined request set.
+///
+/// Response arrival order is deliberately not represented: caller order lives
+/// in the separately indexed output vector.  This map owns only correlation,
+/// so a reversed completion burst performs one keyed removal per response
+/// rather than repeatedly searching and shifting a depth-sized deque.
+struct InFlightRequestSlots {
+    by_serial: HashMap<u64, usize>,
+    #[cfg(test)]
+    insert_operations: usize,
+    #[cfg(test)]
+    take_operations: usize,
+}
+
+impl InFlightRequestSlots {
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            by_serial: HashMap::with_capacity(capacity),
+            #[cfg(test)]
+            insert_operations: 0,
+            #[cfg(test)]
+            take_operations: 0,
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.by_serial.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.by_serial.is_empty()
+    }
+
+    fn insert(&mut self, serial: u64, request_idx: usize) -> Result<(), DirectMuxError> {
+        #[cfg(test)]
+        {
+            self.insert_operations += 1;
+        }
+        match self.by_serial.entry(serial) {
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert(request_idx);
+                Ok(())
+            }
+            std::collections::hash_map::Entry::Occupied(_) => {
+                Err(DirectMuxError::RetainedStateAccounting {
+                    resource: "in-flight mux request serials",
+                })
+            }
+        }
+    }
+
+    fn take(&mut self, serial: u64) -> Option<usize> {
+        #[cfg(test)]
+        {
+            self.take_operations += 1;
+        }
+        self.by_serial.remove(&serial)
+    }
+
+    #[cfg(test)]
+    fn operation_counts(&self) -> (usize, usize) {
+        (self.insert_operations, self.take_operations)
+    }
+}
+
 /// Owns the mutable client borrow while a render batch is in progress.
 ///
 /// The timeout wrappers are allowed to drop their inner future.  Keeping the
@@ -440,8 +505,7 @@ impl std::fmt::Debug for DirectMuxClient {
 struct RenderBatchGuard<'a> {
     client: &'a mut DirectMuxClient,
     pane_ids: &'a [u64],
-    in_flight: VecDeque<(usize, u64)>,
-    owned_serials: HashSet<u64>,
+    in_flight: InFlightRequestSlots,
     outputs: Vec<Option<GetPaneRenderChangesResponse>>,
     next_request_idx: usize,
     settled_count: usize,
@@ -462,8 +526,7 @@ impl<'a> RenderBatchGuard<'a> {
         Self {
             client,
             pane_ids,
-            in_flight: VecDeque::with_capacity(depth),
-            owned_serials: HashSet::with_capacity(depth),
+            in_flight: InFlightRequestSlots::with_capacity(depth),
             outputs: std::iter::repeat_with(|| None)
                 .take(pane_ids.len())
                 .collect(),
@@ -481,29 +544,13 @@ impl<'a> RenderBatchGuard<'a> {
         self.first_error.is_none() && self.next_request_idx < self.pane_ids.len()
     }
 
-    fn ensure_request_tracking_aligned(&self) -> Result<(), DirectMuxError> {
-        if self.owned_serials.len() == self.in_flight.len() {
-            Ok(())
-        } else {
-            Err(DirectMuxError::RetainedStateAccounting {
-                resource: "render batch owned/in-flight request tracking",
-            })
-        }
-    }
-
     fn record_issued(&mut self, request_idx: usize, serial: u64) -> Result<(), DirectMuxError> {
-        if !self.owned_serials.insert(serial) {
-            return Err(DirectMuxError::RetainedStateAccounting {
-                resource: "render batch request serials",
-            });
-        }
-        self.in_flight.push_back((request_idx, serial));
+        self.in_flight.insert(serial, request_idx)?;
         self.next_request_idx = request_idx.checked_add(1).ok_or(
             DirectMuxError::RetainedStateAccounting {
                 resource: "render batch request index",
             },
         )?;
-        self.ensure_request_tracking_aligned()?;
         Ok(())
     }
 
@@ -563,7 +610,7 @@ impl<'a> RenderBatchGuard<'a> {
                 pane_id,
                 issued_count = self.next_request_idx,
                 settled_count = self.settled_count.saturating_add(1),
-                remaining_count = self.owned_serials.len(),
+                remaining_count = self.in_flight.len(),
                 explicit_cx = self.explicit_cx,
                 error_kind = ?error.protocol_error_kind(),
                 error = %error,
@@ -581,18 +628,13 @@ impl<'a> RenderBatchGuard<'a> {
             return Ok(false);
         }
 
-        let Some(response_idx) = take_in_flight_slot(&mut self.in_flight, decoded.serial) else {
+        let Some(response_idx) = self.in_flight.take(decoded.serial) else {
             self.client
                 .stash_pending_response(decoded.serial, decoded.pdu)?;
             return Ok(false);
         };
 
         self.client.complete_response_serial(decoded.serial)?;
-        if !self.owned_serials.remove(&decoded.serial) {
-            return Err(DirectMuxError::RetainedStateAccounting {
-                resource: "render batch completed serials",
-            });
-        }
         if self
             .outputs
             .get(response_idx)
@@ -638,8 +680,7 @@ impl<'a> RenderBatchGuard<'a> {
                 resource: "render batch settled response count",
             },
         )?;
-        self.ensure_request_tracking_aligned()?;
-        if self.owned_serials.is_empty() {
+        if self.in_flight.is_empty() {
             self.transport_ambiguous = false;
         }
         Ok(true)
@@ -693,7 +734,7 @@ impl<'a> RenderBatchGuard<'a> {
     }
 
     fn finish(mut self) -> Result<Vec<GetPaneRenderChangesResponse>, DirectMuxError> {
-        if !self.in_flight.is_empty() || !self.owned_serials.is_empty() {
+        if !self.in_flight.is_empty() {
             self.transport_ambiguous = true;
             return Err(DirectMuxError::RetainedStateAccounting {
                 resource: "render batch completion",
@@ -1863,7 +1904,7 @@ impl DirectMuxClient {
 
         let total = requests.len();
         let mut requests = requests.into_iter().enumerate();
-        let mut in_flight: VecDeque<(usize, u64)> = VecDeque::with_capacity(max_pipeline_depth);
+        let mut in_flight = InFlightRequestSlots::with_capacity(max_pipeline_depth);
         let mut responses: Vec<Option<Pdu>> = std::iter::repeat_with(|| None).take(total).collect();
 
         while in_flight.len() < max_pipeline_depth {
@@ -1871,7 +1912,7 @@ impl DirectMuxClient {
                 break;
             };
             let serial = self.send_request_only(request).await?;
-            in_flight.push_back((request_idx, serial));
+            in_flight.insert(serial, request_idx)?;
         }
 
         while !in_flight.is_empty() {
@@ -1880,12 +1921,12 @@ impl DirectMuxClient {
                 self.stash_unilateral_pdu(decoded.pdu)?;
                 continue;
             }
-            if let Some(response_idx) = take_in_flight_slot(&mut in_flight, decoded.serial) {
+            if let Some(response_idx) = in_flight.take(decoded.serial) {
                 self.complete_response_serial(decoded.serial)?;
                 responses[response_idx] = Some(Self::response_from_pdu(decoded.pdu)?);
                 if let Some((request_idx, request)) = requests.next() {
                     let serial = self.send_request_only(request).await?;
-                    in_flight.push_back((request_idx, serial));
+                    in_flight.insert(serial, request_idx)?;
                 }
             } else {
                 self.stash_pending_response(decoded.serial, decoded.pdu)?;
@@ -1938,7 +1979,7 @@ impl DirectMuxClient {
 
         let total = requests.len();
         let mut requests = requests.into_iter().enumerate();
-        let mut in_flight: VecDeque<(usize, u64)> = VecDeque::with_capacity(max_pipeline_depth);
+        let mut in_flight = InFlightRequestSlots::with_capacity(max_pipeline_depth);
         let mut responses: Vec<Option<Pdu>> = std::iter::repeat_with(|| None).take(total).collect();
 
         while in_flight.len() < max_pipeline_depth {
@@ -1946,7 +1987,7 @@ impl DirectMuxClient {
                 break;
             };
             let serial = self.send_request_only_with_cx(cx, request).await?;
-            in_flight.push_back((request_idx, serial));
+            in_flight.insert(serial, request_idx)?;
         }
 
         while !in_flight.is_empty() {
@@ -1955,12 +1996,12 @@ impl DirectMuxClient {
                 self.stash_unilateral_pdu(decoded.pdu)?;
                 continue;
             }
-            if let Some(response_idx) = take_in_flight_slot(&mut in_flight, decoded.serial) {
+            if let Some(response_idx) = in_flight.take(decoded.serial) {
                 self.complete_response_serial(decoded.serial)?;
                 responses[response_idx] = Some(Self::response_from_pdu(decoded.pdu)?);
                 if let Some((request_idx, request)) = requests.next() {
                     let serial = self.send_request_only_with_cx(cx, request).await?;
-                    in_flight.push_back((request_idx, serial));
+                    in_flight.insert(serial, request_idx)?;
                 }
             } else {
                 self.stash_pending_response(decoded.serial, decoded.pdu)?;
@@ -3042,13 +3083,6 @@ pub(super) fn validate_render_batch_panes(pane_ids: &[u64]) -> Result<(), Direct
         }
     }
     Ok(())
-}
-
-fn take_in_flight_slot(in_flight: &mut VecDeque<(usize, u64)>, serial: u64) -> Option<usize> {
-    let pos = in_flight
-        .iter()
-        .position(|(_, expected)| *expected == serial)?;
-    in_flight.remove(pos).map(|(idx, _)| idx)
 }
 
 fn decode_from_buffer(
@@ -5993,7 +6027,6 @@ mod tests {
                 .expect("read first response");
             assert!(guard.handle_decoded(decoded).expect("settle first response"));
             assert!(!guard.transport_ambiguous);
-            assert!(guard.owned_serials.is_empty());
             assert!(guard.in_flight.is_empty());
 
             cx.cancel_with(
@@ -7713,6 +7746,59 @@ mod tests {
         assert!(!decision.cancelled);
     }
 
+    #[test]
+    fn in_flight_serial_index_uses_one_keyed_take_per_reversed_response() {
+        for depth in [32usize, DEFAULT_MAX_OUTSTANDING_REQUESTS, 4_096] {
+            let mut slots = InFlightRequestSlots::with_capacity(depth);
+            for request_idx in 0..depth {
+                let serial = u64::try_from(request_idx)
+                    .expect("bounded request index must fit u64")
+                    + 1;
+                slots
+                    .insert(serial, request_idx)
+                    .expect("fixture serials must be unique");
+            }
+
+            for request_idx in (0..depth).rev() {
+                let serial = u64::try_from(request_idx)
+                    .expect("bounded response index must fit u64")
+                    + 1;
+                assert_eq!(
+                    slots.take(serial),
+                    Some(request_idx),
+                    "reversed completion must resolve the exact caller-order slot"
+                );
+            }
+
+            assert!(slots.is_empty());
+            assert_eq!(
+                slots.operation_counts(),
+                (depth, depth),
+                "depth {depth} must perform one keyed insert and one keyed take per request"
+            );
+        }
+    }
+
+    #[test]
+    fn duplicate_in_flight_serial_fails_before_overwriting_ownership() {
+        let mut slots = InFlightRequestSlots::with_capacity(2);
+        slots
+            .insert(17, 3)
+            .expect("first serial owner must be admitted");
+        let error = slots
+            .insert(17, 9)
+            .expect_err("duplicate serial ownership must fail closed");
+        assert!(matches!(
+            error,
+            DirectMuxError::RetainedStateAccounting {
+                resource: "in-flight mux request serials"
+            }
+        ));
+        assert_eq!(slots.len(), 1);
+        assert_eq!(slots.take(17), Some(3));
+        assert!(slots.is_empty());
+    }
+
     fn permutation_from_keys(keys: &[u32]) -> Vec<usize> {
         let mut with_index = keys
             .iter()
@@ -7764,26 +7850,31 @@ mod tests {
         response_order: &[usize],
     ) -> (Vec<Option<u64>>, usize) {
         let depth = max_pipeline_depth.max(1);
-        let mut in_flight: VecDeque<(usize, u64)> = VecDeque::new();
+        let mut in_flight = InFlightRequestSlots::with_capacity(depth);
         let mut delivered: Vec<Option<u64>> = vec![None; total_requests];
         let mut next_request = 0usize;
         let mut peak = 0usize;
 
         while next_request < total_requests && in_flight.len() < depth {
             let serial = (next_request + 1) as u64;
-            in_flight.push_back((next_request, serial));
+            in_flight
+                .insert(serial, next_request)
+                .expect("new simulated serial must be unique");
             next_request += 1;
             peak = peak.max(in_flight.len());
         }
 
         for &response_idx in response_order {
             let serial = (response_idx + 1) as u64;
-            let slot = take_in_flight_slot(&mut in_flight, serial)
+            let slot = in_flight
+                .take(serial)
                 .expect("response serial must correspond to an in-flight request");
             delivered[slot] = Some(serial);
             if next_request < total_requests {
                 let serial = (next_request + 1) as u64;
-                in_flight.push_back((next_request, serial));
+                in_flight
+                    .insert(serial, next_request)
+                    .expect("successor simulated serial must be unique");
                 next_request += 1;
                 peak = peak.max(in_flight.len());
             }
