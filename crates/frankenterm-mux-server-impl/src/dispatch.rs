@@ -7157,6 +7157,162 @@ mod tests {
     }
 
     #[test]
+    fn ordered_fence_transport_flushes_pdu87_before_first_pdu90_byte() {
+        let (coordinator, item_rx, terminal_rx, session_incarnation, stream_id) =
+            bound_topology_coordinator();
+        let request = ordered_snapshot_request(true);
+        coordinator
+            .begin_ordered_fence_with_server_capabilities(
+                87,
+                &request,
+                ordered_window_capabilities(true),
+            )
+            .expect("begin future-enabled ordered topology fence");
+
+        let mux = Arc::new(Mux::new(None));
+        let _guard = ScopedMux::install(&mux);
+        let tab = Arc::new(mux::tab::Tab::new(&TerminalSize::default()));
+        mux.add_tab_no_panes(&tab)
+            .expect("register test tab for frozen ordered state");
+        let window = mux.new_empty_window(None, None);
+        let window_id = *window;
+        mux.add_tab_to_window(&tab, window_id)
+            .expect("attach test tab to ordered window");
+        drop(window);
+        let frozen = mux
+            .window_order_snapshot(window_id)
+            .expect("test ordered window must be valid")
+            .expect("test ordered window must exist");
+
+        assert!(coordinator.on_notification(
+            &mux,
+            topology_envelope(
+                1,
+                MuxNotification::WindowOrderChanged {
+                    mutation_id: mux::WindowOrderMutationId::new([0xa1; 16], 1),
+                    request_digest: mux::WindowReorderDigest::from_bytes([0xa2; 32]),
+                    window: frozen,
+                },
+            ),
+        ));
+        coordinator
+            .queue_response(
+                DecodedPdu {
+                    serial: 87,
+                    pdu: Pdu::ListPanesOrderedV1Response(ordered_snapshot_response(
+                        &request,
+                        stream_id,
+                        session_incarnation,
+                        TopologyRevision::INITIAL,
+                    )),
+                },
+                PduDeliveryClass::Control,
+            )
+            .expect("publish the ordered snapshot and its contiguous successor");
+
+        let first = item_rx.try_recv().expect("queued PDU87 control response");
+        let Item::WritePdu(first) = first else {
+            panic!("ordered fence must publish PDU87 as a write item");
+        };
+        let mut deferred_item = None;
+        let mut first_pending = prepare_pending_outbound_batch(
+            first,
+            &item_rx,
+            &mut deferred_item,
+            CompressionMode::Never,
+            &coordinator.terminal,
+        )
+        .expect("prepare PDU87 while preserving its PDU90 class boundary");
+        assert!(
+            matches!(
+                deferred_item.as_ref(),
+                Some(Item::WritePdu(WritePayload::Encoded(_)))
+            ),
+            "the first PDU90 must be encoded once and deferred behind the PDU87 control batch"
+        );
+        assert!(item_rx.is_empty());
+
+        let mut stream = ChunkedDispatchStream {
+            max_write_size: Some(17),
+            ..ChunkedDispatchStream::default()
+        };
+        loop {
+            match promise::spawn::block_on(service_pending_outbound(
+                &mut stream,
+                &mut first_pending,
+                None,
+                &coordinator.terminal,
+            ))
+            .expect("PDU87 transport service must succeed")
+            {
+                OutboundService::Progress => {}
+                OutboundService::Complete => break,
+                other => panic!("unexpected PDU87 transport outcome: {other:?}"),
+            }
+        }
+        let pdu87_end = stream.bytes.len();
+        assert_eq!(
+            stream.flush_offsets,
+            [pdu87_end],
+            "PDU87 must be completely written and flushed before any PDU90 byte"
+        );
+        let mut first_cursor = Cursor::new(stream.bytes.as_slice());
+        let first_wire = Pdu::decode(&mut first_cursor).expect("decode flushed PDU87 frame");
+        assert_eq!(first_wire.serial, 87);
+        assert!(matches!(
+            first_wire.pdu,
+            Pdu::ListPanesOrderedV1Response(_)
+        ));
+        assert_eq!(first_cursor.position() as usize, pdu87_end);
+        drop(first_pending);
+
+        let Item::WritePdu(second) = deferred_item
+            .take()
+            .expect("PDU90 must remain deferred until the PDU87 flush completes")
+        else {
+            panic!("deferred ordered event must remain a write item");
+        };
+        let mut second_pending = prepare_pending_outbound_batch(
+            second,
+            &item_rx,
+            &mut deferred_item,
+            CompressionMode::Never,
+            &coordinator.terminal,
+        )
+        .expect("prepare the deferred PDU90 after the PDU87 flush");
+        loop {
+            match promise::spawn::block_on(service_pending_outbound(
+                &mut stream,
+                &mut second_pending,
+                None,
+                &coordinator.terminal,
+            ))
+            .expect("PDU90 transport service must succeed")
+            {
+                OutboundService::Progress => {}
+                OutboundService::Complete => break,
+                other => panic!("unexpected PDU90 transport outcome: {other:?}"),
+            }
+        }
+        assert_eq!(
+            stream.flush_offsets,
+            [pdu87_end, stream.bytes.len()],
+            "PDU90 must occupy a distinct transport flush epoch after PDU87"
+        );
+        let mut second_cursor = Cursor::new(&stream.bytes[pdu87_end..]);
+        let second_wire = Pdu::decode(&mut second_cursor).expect("decode flushed PDU90 frame");
+        assert_eq!(second_wire.serial, 0);
+        assert!(matches!(second_wire.pdu, Pdu::WindowOrderEventV1(_)));
+        assert_eq!(
+            second_cursor.position() as usize,
+            stream.bytes.len() - pdu87_end
+        );
+        assert!(deferred_item.is_none());
+        assert!(item_rx.is_empty());
+        assert!(terminal_rx.is_empty());
+    }
+
+    #[test]
     fn ordered_fence_rejects_cross_wired_pane_order_projection_before_authority() {
         let (coordinator, item_rx, terminal_rx, session_incarnation, stream_id) =
             bound_topology_coordinator();
@@ -9134,6 +9290,7 @@ mod tests {
         readable: AtomicBool,
         bytes: Vec<u8>,
         write_sizes: Vec<usize>,
+        flush_offsets: Vec<usize>,
         max_write_size: Option<usize>,
         fail_flush: bool,
     }
@@ -9344,6 +9501,8 @@ mod tests {
             if self.fail_flush {
                 Poll::Ready(Err(io::Error::other("simulated outbound flush failure")))
             } else {
+                let this = self.get_mut();
+                this.flush_offsets.push(this.bytes.len());
                 Poll::Ready(Ok(()))
             }
         }
