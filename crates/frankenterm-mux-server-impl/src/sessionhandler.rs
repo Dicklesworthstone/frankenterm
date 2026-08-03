@@ -4724,10 +4724,7 @@ mod tests {
         response
             .validate_for_request(&request)
             .expect("future-enabled PDU87 must echo the durable binding");
-        let codec::ListPanesOrderedV1Outcome::Snapshot(snapshot) = response.outcome else {
-            panic!("future-enabled ordered bootstrap must return a snapshot");
-        };
-        assert_eq!(snapshot.session_incarnation, mux.session_incarnation());
+        let _snapshot = expect_current_ordered_snapshot(&mux, response.outcome);
         assert_eq!(response.domain_binding_id, request.domain_binding_id);
     }
 
