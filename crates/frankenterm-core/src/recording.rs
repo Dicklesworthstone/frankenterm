@@ -1108,6 +1108,31 @@ pub struct IngressSequence {
     next: AtomicU64,
 }
 
+/// Terminal failure from a recorder sequence allocator.
+///
+/// `u64::MAX` is reserved as the sticky exhausted state.  Returning an error
+/// instead of saturating or wrapping prevents a long-running recorder from
+/// minting a duplicate identity that still looks valid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum RecordingSequenceError {
+    /// The pane-local ingress identity space has no usable values left.
+    #[error("recorder ingress sequence space is exhausted; start a new recorder identity")]
+    IngressExhausted,
+    /// The process-wide merge identity space has no usable values left.
+    #[error("recorder global sequence space is exhausted; start a new recorder identity")]
+    GlobalExhausted,
+}
+
+fn allocate_recording_sequence(
+    next: &AtomicU64,
+    exhausted: RecordingSequenceError,
+) -> std::result::Result<u64, RecordingSequenceError> {
+    next.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |candidate| {
+        candidate.checked_add(1)
+    })
+        .map_err(|_| exhausted)
+}
+
 impl IngressSequence {
     /// Create a new sequence counter starting at 0.
     #[must_use]
@@ -1118,8 +1143,11 @@ impl IngressSequence {
     }
 
     /// Advance and return the next sequence number.
-    pub fn next(&self) -> u64 {
-        self.next.fetch_add(1, Ordering::Relaxed)
+    ///
+    /// `u64::MAX - 1` is the last usable value.  The following allocation
+    /// leaves `u64::MAX` as a sticky reserved sentinel and fails closed.
+    pub fn next(&self) -> std::result::Result<u64, RecordingSequenceError> {
+        allocate_recording_sequence(&self.next, RecordingSequenceError::IngressExhausted)
     }
 }
 
@@ -1145,8 +1173,11 @@ impl GlobalSequence {
     }
 
     /// Advance and return the next global sequence number.
-    pub fn next(&self) -> u64 {
-        self.next.fetch_add(1, Ordering::Relaxed)
+    ///
+    /// `u64::MAX - 1` is the last usable value.  The following allocation
+    /// leaves `u64::MAX` as a sticky reserved sentinel and fails closed.
+    pub fn next(&self) -> std::result::Result<u64, RecordingSequenceError> {
+        allocate_recording_sequence(&self.next, RecordingSequenceError::GlobalExhausted)
     }
 }
 
@@ -2403,9 +2434,25 @@ mod tests {
     #[test]
     fn ingress_sequence_monotonic() {
         let seq = IngressSequence::new();
-        assert_eq!(seq.next(), 0);
-        assert_eq!(seq.next(), 1);
-        assert_eq!(seq.next(), 2);
+        assert_eq!(seq.next().expect("sequence 0"), 0);
+        assert_eq!(seq.next().expect("sequence 1"), 1);
+        assert_eq!(seq.next().expect("sequence 2"), 2);
+    }
+
+    #[test]
+    fn ingress_sequence_reserves_max_and_exhaustion_is_sticky() {
+        let seq = IngressSequence {
+            next: AtomicU64::new(u64::MAX - 1),
+        };
+        assert_eq!(seq.next(), Ok(u64::MAX - 1));
+        assert_eq!(
+            seq.next(),
+            Err(RecordingSequenceError::IngressExhausted)
+        );
+        assert_eq!(
+            seq.next(),
+            Err(RecordingSequenceError::IngressExhausted)
+        );
     }
 
     #[test]
@@ -2794,21 +2841,57 @@ mod tests {
     #[test]
     fn global_sequence_monotonic() {
         let seq = GlobalSequence::new();
-        assert_eq!(seq.next(), 0);
-        assert_eq!(seq.next(), 1);
-        assert_eq!(seq.next(), 2);
+        assert_eq!(seq.next().expect("sequence 0"), 0);
+        assert_eq!(seq.next().expect("sequence 1"), 1);
+        assert_eq!(seq.next().expect("sequence 2"), 2);
+    }
+
+    #[test]
+    fn global_sequence_reserves_max_under_concurrent_exhaustion() {
+        let seq = Arc::new(GlobalSequence {
+            next: AtomicU64::new(u64::MAX - 1),
+        });
+        let first = Arc::clone(&seq);
+        let second = Arc::clone(&seq);
+        let first = std::thread::spawn(move || first.next());
+        let second = std::thread::spawn(move || second.next());
+        let results = [
+            first.join().expect("first allocator thread"),
+            second.join().expect("second allocator thread"),
+        ];
+
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| **result == Ok(u64::MAX - 1))
+                .count(),
+            1
+        );
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| {
+                    **result == Err(RecordingSequenceError::GlobalExhausted)
+                })
+                .count(),
+            1
+        );
+        assert_eq!(
+            seq.next(),
+            Err(RecordingSequenceError::GlobalExhausted)
+        );
     }
 
     #[test]
     fn global_sequence_default() {
         let seq = GlobalSequence::default();
-        assert_eq!(seq.next(), 0);
+        assert_eq!(seq.next().expect("sequence 0"), 0);
     }
 
     #[test]
     fn ingress_sequence_default() {
         let seq = IngressSequence::default();
-        assert_eq!(seq.next(), 0);
+        assert_eq!(seq.next().expect("sequence 0"), 0);
     }
 
     // --- RecordingOptions ---
@@ -3420,9 +3503,9 @@ mod tests {
     #[test]
     fn global_sequence_monotonic_batch3() {
         let seq = GlobalSequence::new();
-        let mut prev = seq.next();
+        let mut prev = seq.next().expect("initial sequence");
         for _ in 0..100 {
-            let current = seq.next();
+            let current = seq.next().expect("sequence remains available");
             assert!(
                 current > prev,
                 "sequence should be strictly monotonic: {} > {}",
@@ -3436,9 +3519,9 @@ mod tests {
     #[test]
     fn global_sequence_default_batch3() {
         let seq = GlobalSequence::default();
-        let first = seq.next();
+        let first = seq.next().expect("first sequence");
         assert_eq!(first, 0, "default sequence should start at 0");
-        let second = seq.next();
+        let second = seq.next().expect("second sequence");
         assert_eq!(second, 1);
     }
 

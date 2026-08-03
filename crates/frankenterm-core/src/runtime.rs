@@ -161,7 +161,7 @@ fn record_authorized_replay_egress(
     captured: &CapturedSegment,
     durable_sequence: u64,
     persistence_guard: &CapturePersistenceGuard,
-) {
+) -> std::result::Result<(), crate::recording::RecordingSequenceError> {
     debug_assert_eq!(
         captured.pane_id,
         persistence_guard.stamp().global_pane_id(),
@@ -172,6 +172,7 @@ fn record_authorized_replay_egress(
         CapturedSegmentKind::Gap { reason } => Some(reason.clone()),
         CapturedSegmentKind::Delta => None,
     };
+    let global_sequence = adapter.global_sequence().next()?;
     let event = crate::recording::EgressEvent {
         pane_id: captured.pane_id,
         text: captured.content.clone(),
@@ -182,9 +183,10 @@ fn record_authorized_replay_egress(
         redaction: crate::recording::RecorderRedactionLevel::None,
         occurred_at_ms: u64::try_from(captured.captured_at).unwrap_or(0),
         sequence: durable_sequence,
-        global_sequence: adapter.global_sequence().next(),
+        global_sequence,
     };
     adapter.capture_egress_event(&event);
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -6429,12 +6431,18 @@ impl ObservationRuntime {
                             decision.finish(Ok(persisted.segment.seq));
                         }
                         if let Some(ref adapter) = replay_capture {
-                            record_authorized_replay_egress(
+                            if let Err(error) = record_authorized_replay_egress(
                                 adapter,
                                 &bounded_segment,
                                 persisted.segment.seq,
                                 &persistence_guard,
-                            );
+                            ) {
+                                warn!(
+                                    pane_id,
+                                    error = %error,
+                                    "Replay capture sequence exhausted; refusing a duplicate recorder identity"
+                                );
+                            }
                         }
 
                         // Track metrics
@@ -9974,7 +9982,8 @@ mod tests {
             captured_at: 1_700_000_000_000,
         };
 
-        record_authorized_replay_egress(&adapter, &captured, 7, &persistence_guard);
+        record_authorized_replay_egress(&adapter, &captured, 7, &persistence_guard)
+            .expect("replay sequence is available");
 
         let events = sink.recorder_events();
         assert_eq!(events.len(), 1);

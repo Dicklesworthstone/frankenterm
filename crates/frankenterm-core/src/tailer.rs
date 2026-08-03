@@ -1949,18 +1949,25 @@ where
                                 EgressEvent, RecorderRedactionLevel, RecorderSegmentKind,
                                 RecorderTextEncoding, epoch_ms_now,
                             };
-                            tap.on_egress(EgressEvent {
-                                pane_id,
-                                text: segment.content.clone(),
-                                segment_kind: RecorderSegmentKind::Gap,
-                                is_gap: true,
-                                gap_reason: Some("backpressure_overflow".to_string()),
-                                encoding: RecorderTextEncoding::Utf8,
-                                redaction: RecorderRedactionLevel::None,
-                                occurred_at_ms: epoch_ms_now(),
-                                sequence: segment.seq,
-                                global_sequence: global_sequence.next(),
-                            });
+                            match global_sequence.next() {
+                                Ok(global_sequence) => tap.on_egress(EgressEvent {
+                                    pane_id,
+                                    text: segment.content.clone(),
+                                    segment_kind: RecorderSegmentKind::Gap,
+                                    is_gap: true,
+                                    gap_reason: Some("backpressure_overflow".to_string()),
+                                    encoding: RecorderTextEncoding::Utf8,
+                                    redaction: RecorderRedactionLevel::None,
+                                    occurred_at_ms: epoch_ms_now(),
+                                    sequence: segment.seq,
+                                    global_sequence,
+                                }),
+                                Err(error) => tracing::warn!(
+                                    pane_id,
+                                    error = %error,
+                                    "Egress tap sequence exhausted; refusing a duplicate recorder identity"
+                                ),
+                            }
                         }
                         let event = match CaptureEvent::from_producer(segment, &producer_guard) {
                             Ok(event) => event,
@@ -2080,18 +2087,25 @@ where
                             }
                             crate::ingest::CapturedSegmentKind::Delta => None,
                         };
-                        tap.on_egress(EgressEvent {
-                            pane_id,
-                            text: segment.content.clone(),
-                            segment_kind,
-                            is_gap,
-                            gap_reason,
-                            encoding: RecorderTextEncoding::Utf8,
-                            redaction: RecorderRedactionLevel::None,
-                            occurred_at_ms: epoch_ms_now(),
-                            sequence: segment.seq,
-                            global_sequence: global_sequence.next(),
-                        });
+                        match global_sequence.next() {
+                            Ok(global_sequence) => tap.on_egress(EgressEvent {
+                                pane_id,
+                                text: segment.content.clone(),
+                                segment_kind,
+                                is_gap,
+                                gap_reason,
+                                encoding: RecorderTextEncoding::Utf8,
+                                redaction: RecorderRedactionLevel::None,
+                                occurred_at_ms: epoch_ms_now(),
+                                sequence: segment.seq,
+                                global_sequence,
+                            }),
+                            Err(error) => tracing::warn!(
+                                pane_id,
+                                error = %error,
+                                "Egress tap sequence exhausted; refusing a duplicate recorder identity"
+                            ),
+                        }
                     }
                     let event = match CaptureEvent::from_producer(segment, &producer_guard) {
                         Ok(event) => event,

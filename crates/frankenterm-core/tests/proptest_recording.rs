@@ -674,9 +674,9 @@ proptest! {
     #[test]
     fn ingress_sequence_monotonic(count in 1usize..500) {
         let seq = IngressSequence::new();
-        let mut prev = seq.next();
+        let mut prev = seq.next().expect("generated sequence range is bounded");
         for _ in 1..count {
-            let curr = seq.next();
+            let curr = seq.next().expect("generated sequence range is bounded");
             prop_assert!(curr > prev, "sequence not monotonic: {} <= {}", curr, prev);
             prev = curr;
         }
@@ -693,7 +693,7 @@ proptest! {
     #[test]
     fn ingress_sequence_starts_at_zero(_dummy in Just(())) {
         let seq = IngressSequence::new();
-        let first = seq.next();
+        let first = seq.next().expect("first sequence is available");
         prop_assert_eq!(first, 0u64, "first sequence should be 0");
     }
 }
@@ -708,7 +708,7 @@ proptest! {
     #[test]
     fn ingress_sequence_default_starts_at_zero(_dummy in Just(())) {
         let seq = IngressSequence::default();
-        let first = seq.next();
+        let first = seq.next().expect("first sequence is available");
         prop_assert_eq!(first, 0u64, "default sequence should start at 0");
     }
 }
@@ -723,9 +723,9 @@ proptest! {
     #[test]
     fn global_sequence_monotonic(count in 1usize..500) {
         let seq = GlobalSequence::new();
-        let mut prev = seq.next();
+        let mut prev = seq.next().expect("generated sequence range is bounded");
         for _ in 1..count {
-            let curr = seq.next();
+            let curr = seq.next().expect("generated sequence range is bounded");
             prop_assert!(curr > prev, "global sequence not monotonic: {} <= {}", curr, prev);
             prev = curr;
         }
@@ -743,8 +743,16 @@ proptest! {
     fn global_sequence_starts_at_zero(_dummy in Just(())) {
         let seq_new = GlobalSequence::new();
         let seq_def = GlobalSequence::default();
-        prop_assert_eq!(seq_new.next(), 0u64, "new() should start at 0");
-        prop_assert_eq!(seq_def.next(), 0u64, "default() should start at 0");
+        prop_assert_eq!(
+            seq_new.next().expect("first sequence is available"),
+            0u64,
+            "new() should start at 0"
+        );
+        prop_assert_eq!(
+            seq_def.next().expect("first sequence is available"),
+            0u64,
+            "default() should start at 0"
+        );
     }
 }
 
