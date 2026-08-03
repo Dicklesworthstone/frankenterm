@@ -1898,6 +1898,9 @@ pub enum PduEncodedBodyLimit {
 
 impl PduEncodedBodyLimit {
     /// Largest encoded body accepted for this schema and compression flag.
+    // The pinned compiler does not yet permit `Ord::min` in this const
+    // context. Keep the branch const-evaluable until that toolchain advances.
+    #[allow(clippy::manual_min_max)]
     #[must_use]
     pub const fn maximum_encoded_payload_bytes(self, is_compressed: bool) -> usize {
         match self {
@@ -2053,6 +2056,12 @@ macro_rules! pdu_capability_use {
 }
 
 macro_rules! pdu_encoded_body_limit {
+    ($_name:ident, requires_reorder) => {
+        PduEncodedBodyLimit::SchemaDecompressedWithZstdBound {
+            max_decompressed_bytes: MAX_REORDER_WINDOW_TABS_DECOMPRESSED_BYTES,
+            max_zstd_encoded_bytes: MAX_REORDER_WINDOW_TABS_ZSTD_ENCODED_BYTES,
+        }
+    };
     (GetPaneRenderDeliveryV1, requires_exact_render) => {
         PduEncodedBodyLimit::SchemaDecompressedWithZstdBound {
             max_decompressed_bytes: MAX_EXACT_RENDER_REQUEST_DECOMPRESSED_BYTES,
@@ -3950,6 +3959,11 @@ pub const MAX_ORDERED_TABS_PER_WINDOW: usize = 4_096;
 pub const MAX_ORDERED_TABS_PER_SNAPSHOT: usize = 16_384;
 pub const MAX_ORDERED_WINDOW_SECTION_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_REORDER_WINDOW_TABS_DECOMPRESSED_BYTES: usize = 512 * 1024;
+/// Frozen zstd `compressBound` result for either compact reorder PDU body.
+/// At 512 KiB the small-input term is zero, leaving `input + input / 256`.
+pub const MAX_REORDER_WINDOW_TABS_ZSTD_ENCODED_BYTES: usize =
+    MAX_REORDER_WINDOW_TABS_DECOMPRESSED_BYTES
+        + (MAX_REORDER_WINDOW_TABS_DECOMPRESSED_BYTES >> 8);
 
 /// A single committed transition can freeze one affected window or both sides
 /// of one cross-window move. Publishing separate same-revision events would be
@@ -12996,6 +13010,30 @@ mod test {
                 bits: 1 << 2,
             })
         );
+        let reorder_body_limit = PduEncodedBodyLimit::SchemaDecompressedWithZstdBound {
+            max_decompressed_bytes: MAX_REORDER_WINDOW_TABS_DECOMPRESSED_BYTES,
+            max_zstd_encoded_bytes: MAX_REORDER_WINDOW_TABS_ZSTD_ENCODED_BYTES,
+        };
+        for ident in [88, 89] {
+            let spec = Pdu::wire_spec_for_ident(ident)
+                .expect("reorder request and response IDs must be assigned");
+            assert_eq!(spec.encoded_body_limit, reorder_body_limit);
+            assert_eq!(
+                spec.encoded_body_limit
+                    .maximum_encoded_payload_bytes(false),
+                MAX_REORDER_WINDOW_TABS_DECOMPRESSED_BYTES,
+            );
+            assert_eq!(
+                spec.encoded_body_limit
+                    .maximum_encoded_payload_bytes(true),
+                MAX_REORDER_WINDOW_TABS_ZSTD_ENCODED_BYTES,
+            );
+        }
+        assert_eq!(
+            MAX_REORDER_WINDOW_TABS_ZSTD_ENCODED_BYTES,
+            zstd::zstd_safe::compress_bound(MAX_REORDER_WINDOW_TABS_DECOMPRESSED_BYTES),
+            "frozen reorder ceiling must continue to admit the pinned zstd encoder bound",
+        );
 
         let (payload, compressed) = serialize_with_mode(
             &(
@@ -13575,6 +13613,24 @@ mod test {
                 error = error,
             );
         }
+
+        let oversized_compressed_body =
+            vec![0_u8; MAX_REORDER_WINDOW_TABS_ZSTD_ENCODED_BYTES + 1];
+        let mut oversized_compressed_frame = Vec::new();
+        encode_raw(
+            88,
+            25,
+            &oversized_compressed_body,
+            true,
+            &mut oversized_compressed_frame,
+        )
+        .expect("hostile compressed-body header fixture should frame");
+        let error = Pdu::decode(oversized_compressed_frame.as_slice())
+            .expect_err("compressed reorder body above zstd bound must fail at header admission");
+        assert!(
+            format!("{error:#}").contains(&MAX_REORDER_WINDOW_TABS_ZSTD_ENCODED_BYTES.to_string()),
+            "unexpected compressed header rejection: {error:#}",
+        );
     }
 
     #[test]
