@@ -119,7 +119,8 @@ impl GuiFrontEnd {
                 MuxNotification::WindowTitleChanged { .. } => {}
                 MuxNotification::TabResized(_) => {}
                 MuxNotification::TabAddedToWindow { .. } => {}
-                MuxNotification::WindowInvalidated(_) => {}
+                MuxNotification::WindowInvalidated(_)
+                | MuxNotification::WindowOrderChanged { .. } => {}
                 MuxNotification::PaneOutput(_) => {}
                 MuxNotification::SynchronizedOutput { .. } => {}
                 MuxNotification::PaneAdded(_) => {}

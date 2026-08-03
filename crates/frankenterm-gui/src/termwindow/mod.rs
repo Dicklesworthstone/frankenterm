@@ -3975,7 +3975,8 @@ impl TermWindow {
                 MuxNotification::SynchronizedOutput { pane_id, event } => {
                     self.mux_synchronized_output_event(pane_id, event);
                 }
-                MuxNotification::WindowInvalidated(_) => {
+                MuxNotification::WindowInvalidated(_)
+                | MuxNotification::WindowOrderChanged { .. } => {
                     self.record_idle_event(idle_detector::IdleEvent::OsPaintRequest);
                     window.invalidate();
                     self.update_title_post_status();
@@ -4250,6 +4251,11 @@ impl TermWindow {
             | MuxNotification::WindowTitleChanged { window_id, .. }
             | MuxNotification::WindowInvalidated(window_id) => {
                 if window_id != mux_window_id {
+                    return true;
+                }
+            }
+            MuxNotification::WindowOrderChanged { ref window, .. } => {
+                if window.window_id() != mux_window_id {
                     return true;
                 }
             }

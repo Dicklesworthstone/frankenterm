@@ -2033,6 +2033,14 @@ pub fn notification_effects(notification: &MuxNotification) -> NotificationEffec
             topology: NotificationTopologyEffect::WindowLayout(*window_id),
             ..effects(state_contract())
         },
+        MuxNotification::WindowOrderChanged { window, .. } => {
+            let window_id = window.window_id();
+            NotificationEffects {
+                state_keys: [Some(NotificationStateKey::WindowLayout(window_id)), None],
+                topology: NotificationTopologyEffect::WindowLayout(window_id),
+                ..effects(state_contract())
+            }
+        }
         MuxNotification::WindowWorkspaceChanged { window_id, .. } => NotificationEffects {
             state_keys: [
                 Some(NotificationStateKey::WindowWorkspace(*window_id)),
@@ -3259,6 +3267,29 @@ mod tests {
         assert_eq!(
             lifecycle.admission,
             NotificationAdmissionContract::PostMutationJournalThenTopologyResync
+        );
+
+        let ordered_window = mux::window::Window::new(None, None);
+        let ordered_window_id = ordered_window.window_id();
+        let order_notification = MuxNotification::WindowOrderChanged {
+            mutation_id: mux::WindowOrderMutationId::new([0x51; 16], 1),
+            request_digest: mux::WindowReorderDigest::from_bytes([0x61; 32]),
+            window: ordered_window
+                .order_snapshot()
+                .expect("empty test window has a valid frozen order"),
+        };
+        let order = notification_effects(&order_notification);
+        assert_eq!(
+            order.state_keys,
+            [
+                Some(NotificationStateKey::WindowLayout(ordered_window_id)),
+                None,
+            ]
+        );
+        assert_eq!(
+            order.topology,
+            NotificationTopologyEffect::WindowLayout(ordered_window_id),
+            "frozen reorders use their embedded exact window identity"
         );
 
         let bell_notification = MuxNotification::Alert {
