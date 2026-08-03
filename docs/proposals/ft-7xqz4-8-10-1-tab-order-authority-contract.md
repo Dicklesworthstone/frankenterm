@@ -257,10 +257,11 @@ The typed result is one of:
 If a replay-ledger entry has expired, a retried request is evaluated normally.
 Its old expected revision therefore conflicts rather than applying twice.
 The first implementation expires the oldest terminal receipt by commit/decision
-insertion order before inserting receipt 4,097. Pending operations are
-separately bounded and are never silently evicted while in flight. The client
-uses the same oldest-terminal-first rule at its 1,024-receipt bound. There is
-no silent last-write-wins path.
+insertion order before inserting receipt 4,097. Server and client Pending
+operations are independently bounded from their respective terminal ledgers
+and are never silently evicted while in flight. The client uses the same
+oldest-terminal-first rule at its 1,024-receipt bound. There is no silent
+last-write-wins path.
 
 ## 7. Transition semantics
 
@@ -417,7 +418,9 @@ transition table.
   stream integration, codec properties, and malformed/boundary tests.
 - `.8.10.3` owns server revision state, CAS, tombstones, replay receipts, and
   durability.
-- `.8.10.4` owns exact-object client reconciliation.
+- `.8.10.4` owns exact-object client reconciliation; child `.8.10.4.3` owns
+  the reconnect-stable mutation namespace plus its independently bounded
+  Pending and 1,024-terminal client receipt ledgers.
 - `.8.10.5` owns crash-consistent mixed overlays.
 - `.8.10.6` owns optimistic GUI publication and focus-safe reconciliation.
 - `.8.10.7` owns topology snapshot schema migration and restore.

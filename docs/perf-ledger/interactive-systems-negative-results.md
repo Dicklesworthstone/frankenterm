@@ -2271,6 +2271,93 @@ experiment. It is not converted into a flattering keep or a durable rejection.
 - **Primary retry condition:**
   > Optimize identical-order CAS only through an explicit versioned outcome whose server, ordinary client, reconnect, event, revision, replay, equivocation, receipt-budget, and mixed-version semantics pass deterministic tests and whose retained same-window A/B shows a material target-class benefit without weakening tab-order convergence.
 
+### IS-N066 — Removing only the aggregate tab-ID cap does not fix receipt retention
+
+- **Classification:** boundedness shortcut and false-contract-fix rejection;
+  no candidate code retained
+- **Beads:** `ft-interactive-swarm-product-convergence-7xqz4.8.10.3.4`
+  and `ft-interactive-swarm-product-convergence-7xqz4.8.10.3.5`
+- **Rejected candidate:** delete `MAX_WINDOW_ORDER_RECEIPT_TAB_IDS` while
+  retaining one copied tab-ID vector per outcome and retained
+  `FrozenWindowOrder` graphs.
+- **Negative evidence:** the current 65,536-ID guard retains 4,096 q1
+  outcomes but only 16 q4096 outcomes, contradicting the accepted count-based
+  server replay contract. Deleting only that guard would make 4,096 distinct
+  q4096 ID vectors consume 128 MiB before receipt metadata and duplicated
+  projections, while retained frozen orders can additionally pin Tab, pane,
+  terminal, and scrollback graphs. It restores the count but not the memory,
+  sharing, accounting, or latency contract.
+- **Decision:** replace the guard only together with a fixed 4,096-terminal
+  coordinator, shared compact immutable order state, graph-free retained
+  notifications, and separate Pending bounds. Do not claim bounded memory or
+  target performance from deleting the guard.
+- **Primary retry condition:**
+  > Retry aggregate-cap removal only when q1/q20/q50/q200/q4096 tests prove count-independent 4,096/4,097 eviction, one shared order allocation across receipt/event/response owners, zero retained live-terminal graphs, exact unique/logical byte accounting, and isolated allocator-active/RSS evidence.
+
+### IS-N067 — Dual FIFO queues with stale tombstones are not bounded O(1) eviction
+
+- **Classification:** data-structure boundedness rejection; no candidate code
+  retained
+- **Bead:** `ft-interactive-swarm-product-convergence-7xqz4.8.10.3.4`
+- **Rejected candidate:** maintain global and per-namespace `VecDeque` order,
+  remove from only one queue on eviction, and lazily skip stale entries in the
+  other queue.
+- **Negative evidence:** namespace-local churn can create stale global entries
+  faster than the global head reaches them, so metadata grows without the
+  terminal-receipt count growing. Eager `VecDeque::remove` instead makes
+  eviction O(n). Sharding maps without one global terminal sequencer also
+  cannot identify deterministic terminal receipt 4,097.
+- **Decision:** use one preallocated terminal-slot set with intrusive O(1)
+  links for every contract-authorized ordering relation, one global insertion
+  sequencer, and exact map/list/free-slot invariants. Pending decisions remain
+  outside terminal eviction.
+- **Primary retry condition:**
+  > Retry a multi-order receipt queue only when deterministic adversarial churn proves every metadata structure remains bounded, global oldest-terminal eviction is exact at 4,097, every unlink is O(1), Pending entries are never evicted, and map/list/free-slot invariants survive cancellation and teardown.
+
+### IS-N068 — Client-chosen namespaces cannot provide server-side fairness
+
+- **Classification:** unauthenticated quota-authority rejection; no candidate
+  code retained
+- **Beads:** `ft-interactive-swarm-product-convergence-7xqz4.8.10.3.4`
+  and `ft-interactive-swarm-product-convergence-7xqz4.8.10.4`
+- **Rejected candidate:** evict server receipts within a client-provided
+  mutation namespace at receipt 1,025 and describe that limit as fair sharing.
+- **Negative evidence:** a client can rotate arbitrary namespace IDs and evade
+  such a server quota unless one namespace is registered and authenticated to
+  the immutable connection binding. The accepted v1 contract instead gives
+  the server one 4,096-terminal session FIFO and makes the 1,024-terminal
+  bound a client-side property of one live mutation namespace. Applying 1,024
+  on the server would silently shorten promised replay for a single namespace.
+- **Decision:** keep server eviction global and count-based. Bound old client
+  namespaces and their Pending intents in client authority. Any future
+  server-side fairness policy requires a versioned authenticated registration
+  contract rather than trusting request bytes.
+- **Primary retry condition:**
+  > Reconsider server namespace fairness only when a versioned protocol registers a bounded namespace lifecycle to authenticated `DomainBindingId` authority, defines reconnect and rotation semantics, preserves or explicitly renegotiates replay guarantees, and passes malicious-rotation plus mixed-version tests.
+
+### IS-N069 — Core-count-sized reorder workers do not remove the mux critical path
+
+- **Classification:** topology-blind parallelism rejection; no candidate code
+  retained
+- **Beads:** `ft-interactive-swarm-product-convergence-7xqz4.8.10.3.2`
+  and `ft-interactive-swarm-product-convergence-7xqz4.8.10.3.4`
+- **Rejected candidate:** offload every large permutation to a worker count
+  derived directly from Apple-silicon or Threadripper logical CPU count while
+  retaining the global window-registry, topology, and receipt critical
+  sections.
+- **Negative evidence:** PDU88 currently enters the mux main thread and holds
+  global authority across O(q) validation, freezing, and receipt work.
+  Additional workers cannot make disjoint windows progress through those
+  locks; they can multiply q4096 scratch memory, cache traffic, migrations,
+  and wakeups. A 64-core/128-thread host does not turn one serialized commit
+  lane into 128 independent authorities.
+- **Decision:** first add bounded window-local logical mutation lanes, short
+  scalar commit sections, Pending count and tab-weight backpressure, and
+  per-stage probes. Tune a persistent worker pool from same-window evidence,
+  not reported CPU count.
+- **Primary retry condition:**
+  > Reconsider worker-count scaling only after disjoint-window barriers prove q-sized preparation is outside global locks, same-window and cross-window mutation lanes remain correct, aggregate scratch is bounded, and isolated M4, M5, and Threadripper sweeps show improved p95/p99 without worse keypress tails, RSS, or energy.
+
 ## Open hypothesis register
 
 These are not negative results. Each remains open until a retained same-window
