@@ -24,7 +24,8 @@ use std::time::{Duration, Instant};
 
 #[cfg(all(feature = "vendored", unix, feature = "asupersync-runtime"))]
 use codec::{
-    CODEC_VERSION, GetCodecVersionResponse, GetPaneRenderChangesResponse, Pdu, UnitResponse,
+    CODEC_VERSION, GetCodecVersionResponse, GetPaneRenderChangesResponse, Pdu,
+    StreamingPduBuffer, UnitResponse,
 };
 #[cfg(all(feature = "vendored", unix, feature = "asupersync-runtime"))]
 use frankenterm_core::runtime_async::unix::AsyncWriteExt;
@@ -954,7 +955,7 @@ fn b23b_explicit_cx_public_list_panes_timeout_contract() {
 
         let server = runtime_async::task::spawn(async move {
             let (mut stream, _) = listener.accept().await.expect("accept");
-            let mut read_buf = Vec::new();
+            let mut read_buf = StreamingPduBuffer::new();
 
             loop {
                 let mut temp = vec![0u8; 4096];
@@ -1053,7 +1054,7 @@ fn b23c_explicit_cx_public_send_paste_write_timeout_contract() {
 
         let server = runtime_async::task::spawn(async move {
             let (mut stream, _) = listener.accept().await.expect("accept");
-            let mut read_buf = Vec::new();
+            let mut read_buf = StreamingPduBuffer::new();
 
             loop {
                 let mut temp = vec![0u8; 4096];
@@ -1207,7 +1208,7 @@ fn b23e_explicit_cx_public_list_panes_cancellation_contract() {
 
         let server = runtime_async::task::spawn(async move {
             let (mut stream, _) = listener.accept().await.expect("accept");
-            let mut read_buf = Vec::new();
+            let mut read_buf = StreamingPduBuffer::new();
             let mut post_handshake_requests = 0usize;
             let mut handshake_complete = false;
 
@@ -1325,7 +1326,7 @@ fn b23f_explicit_cx_public_render_batch_cancellation_contract() {
 
         let server = runtime_async::task::spawn(async move {
             let (mut stream, _) = listener.accept().await.expect("accept");
-            let mut read_buf = Vec::new();
+            let mut read_buf = StreamingPduBuffer::new();
             let mut post_handshake_batch_requests = 0usize;
             let mut handshake_complete = false;
 
@@ -1451,7 +1452,7 @@ fn b23g_explicit_cx_public_get_lines_cancellation_contract() {
 
         let server = runtime_async::task::spawn(async move {
             let (mut stream, _) = listener.accept().await.expect("accept");
-            let mut read_buf = Vec::new();
+            let mut read_buf = StreamingPduBuffer::new();
             let mut post_handshake_requests = 0usize;
             let mut handshake_complete = false;
 
@@ -1569,7 +1570,7 @@ fn b23h_explicit_cx_public_write_to_pane_cancellation_contract() {
 
         let server = runtime_async::task::spawn(async move {
             let (mut stream, _) = listener.accept().await.expect("accept");
-            let mut read_buf = Vec::new();
+            let mut read_buf = StreamingPduBuffer::new();
             let mut post_handshake_requests = 0usize;
             let mut handshake_complete = false;
 
@@ -1691,7 +1692,7 @@ fn b23i_explicit_cx_public_single_render_cancellation_contract() {
 
         let server = runtime_async::task::spawn(async move {
             let (mut stream, _) = listener.accept().await.expect("accept");
-            let mut read_buf = Vec::new();
+            let mut read_buf = StreamingPduBuffer::new();
             let mut post_handshake_requests = 0usize;
             let mut handshake_complete = false;
 
@@ -1812,7 +1813,7 @@ fn b23j_explicit_cx_public_send_paste_cancellation_contract() {
 
         let server = runtime_async::task::spawn(async move {
             let (mut stream, _) = listener.accept().await.expect("accept");
-            let mut read_buf = Vec::new();
+            let mut read_buf = StreamingPduBuffer::new();
             let mut post_handshake_requests = 0usize;
             let mut handshake_complete = false;
 
@@ -1932,7 +1933,7 @@ fn b23k_explicit_cx_public_render_batch_timeout_contract() {
 
         let server = runtime_async::task::spawn(async move {
             let (mut stream, _) = listener.accept().await.expect("accept");
-            let mut read_buf = Vec::new();
+            let mut read_buf = StreamingPduBuffer::new();
             let mut batch_requests_seen = 0usize;
 
             loop {
@@ -2082,7 +2083,7 @@ fn b23l_explicit_cx_public_subscription_cancel_shutdown_contract() {
         let server = runtime_async::task::spawn(async move {
             let mut closed_tx = Some(closed_tx);
             let (mut stream, _) = listener.accept().await.expect("accept");
-            let mut read_buf = Vec::new();
+            let mut read_buf = StreamingPduBuffer::new();
 
             loop {
                 let mut temp = vec![0u8; 4096];
@@ -2254,7 +2255,7 @@ fn b23p_explicit_cx_public_subscription_startup_cancellation_contract() {
         let server = runtime_async::task::spawn(async move {
             let mut closed_tx = Some(closed_tx);
             let (mut stream, _) = listener.accept().await.expect("accept");
-            let mut read_buf = Vec::new();
+            let mut read_buf = StreamingPduBuffer::new();
 
             loop {
                 let mut temp = vec![0u8; 4096];
@@ -2409,7 +2410,7 @@ fn b23m_explicit_cx_public_single_render_read_timeout_contract() {
 
         let server = runtime_async::task::spawn(async move {
             let (mut stream, _) = listener.accept().await.expect("accept");
-            let mut read_buf = Vec::new();
+            let mut read_buf = StreamingPduBuffer::new();
 
             loop {
                 let mut temp = vec![0u8; 4096];
@@ -2509,7 +2510,7 @@ fn b23n_explicit_cx_public_get_lines_read_timeout_contract() {
 
         let server = runtime_async::task::spawn(async move {
             let (mut stream, _) = listener.accept().await.expect("accept");
-            let mut read_buf = Vec::new();
+            let mut read_buf = StreamingPduBuffer::new();
 
             loop {
                 let mut temp = vec![0u8; 4096];
@@ -2612,7 +2613,7 @@ fn b23o_explicit_cx_public_write_to_pane_read_timeout_contract() {
 
         let server = runtime_async::task::spawn(async move {
             let (mut stream, _) = listener.accept().await.expect("accept");
-            let mut read_buf = Vec::new();
+            let mut read_buf = StreamingPduBuffer::new();
 
             loop {
                 let mut temp = vec![0u8; 4096];
@@ -2714,7 +2715,7 @@ fn b23q_explicit_cx_public_mux_pool_list_panes_cancellation_contract() {
 
         let server = runtime_async::task::spawn(async move {
             let (mut stream, _) = listener.accept().await.expect("accept");
-            let mut read_buf = Vec::new();
+            let mut read_buf = StreamingPduBuffer::new();
             let mut list_panes_requests = 0usize;
             let mut handshake_complete = false;
 
@@ -2840,7 +2841,7 @@ fn b23r_explicit_cx_public_mux_pool_render_batch_cancellation_contract() {
 
         let server = runtime_async::task::spawn(async move {
             let (mut stream, _) = listener.accept().await.expect("accept");
-            let mut read_buf = Vec::new();
+            let mut read_buf = StreamingPduBuffer::new();
             let mut render_batch_requests = 0usize;
             let mut handshake_complete = false;
 
@@ -2974,7 +2975,7 @@ fn b23s_explicit_cx_public_mux_pool_list_panes_read_timeout_contract() {
 
         let server = runtime_async::task::spawn(async move {
             let (mut stream, _) = listener.accept().await.expect("accept");
-            let mut read_buf = Vec::new();
+            let mut read_buf = StreamingPduBuffer::new();
             let mut list_panes_requests = 0usize;
             let mut handshake_complete = false;
 
@@ -3107,7 +3108,7 @@ fn b23t_explicit_cx_public_mux_pool_single_render_read_timeout_contract() {
 
         let server = runtime_async::task::spawn(async move {
             let (mut stream, _) = listener.accept().await.expect("accept");
-            let mut read_buf = Vec::new();
+            let mut read_buf = StreamingPduBuffer::new();
             let mut render_requests = 0usize;
             let mut handshake_complete = false;
 
@@ -3242,7 +3243,7 @@ fn b23u_explicit_cx_public_mux_pool_health_check_cancellation_contract() {
 
         let server = runtime_async::task::spawn(async move {
             let (mut stream, _) = listener.accept().await.expect("accept");
-            let mut read_buf = Vec::new();
+            let mut read_buf = StreamingPduBuffer::new();
             let mut list_panes_requests = 0usize;
             let mut handshake_complete = false;
 
@@ -3363,7 +3364,7 @@ fn b23v_explicit_cx_public_mux_pool_health_check_read_timeout_contract() {
 
         let server = runtime_async::task::spawn(async move {
             let (mut stream, _) = listener.accept().await.expect("accept");
-            let mut read_buf = Vec::new();
+            let mut read_buf = StreamingPduBuffer::new();
             let mut list_panes_requests = 0usize;
             let mut handshake_complete = false;
 
@@ -3492,7 +3493,7 @@ fn b23w_explicit_cx_public_mux_pool_get_lines_cancellation_contract() {
 
         let server = runtime_async::task::spawn(async move {
             let (mut stream, _) = listener.accept().await.expect("accept");
-            let mut read_buf = Vec::new();
+            let mut read_buf = StreamingPduBuffer::new();
             let mut get_lines_requests = 0usize;
             let mut handshake_complete = false;
 
@@ -3620,7 +3621,7 @@ fn b23x_explicit_cx_public_mux_pool_write_to_pane_cancellation_contract() {
 
         let server = runtime_async::task::spawn(async move {
             let (mut stream, _) = listener.accept().await.expect("accept");
-            let mut read_buf = Vec::new();
+            let mut read_buf = StreamingPduBuffer::new();
             let mut write_requests = 0usize;
             let mut handshake_complete = false;
 
@@ -3747,7 +3748,7 @@ fn b23y_explicit_cx_public_mux_pool_send_paste_cancellation_contract() {
 
         let server = runtime_async::task::spawn(async move {
             let (mut stream, _) = listener.accept().await.expect("accept");
-            let mut read_buf = Vec::new();
+            let mut read_buf = StreamingPduBuffer::new();
             let mut send_paste_requests = 0usize;
             let mut handshake_complete = false;
 
