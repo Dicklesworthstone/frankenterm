@@ -271,3 +271,8 @@ ubs_*.txt
 /docs/attestations/0.0.0-smoke*.sigstore
 /docs/attestations/0.0.0-smoke*.canonical.json
 .ntm-marching-orders.md
+
+# === multi-repo ephemeral cleanup 2026-08-03 ===
+# Stray out-of-tree rustc outputs (normal builds live under target/).
+/librust_out.rlib
+*.rlib
