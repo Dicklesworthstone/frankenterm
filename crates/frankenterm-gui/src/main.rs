@@ -113,6 +113,7 @@ pub use termwindow::{ICON_DATA, TermWindow, set_window_class, set_window_positio
 // ---------------------------------------------------------------------------
 
 const FT_MACOS_BACKEND_ENV: &str = "FT_MACOS_BACKEND";
+const FT_ATOMIC_COMPONENT_MARKER: &str = env!("FT_ATOMIC_COMPONENT_MARKER");
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct GuiMacosBackendSelection {
@@ -1134,6 +1135,10 @@ fn terminate_with_error(err: anyhow::Error) -> ! {
 fn main() {
     #[cfg(feature = "dhat-heap")]
     let _profiler = dhat::Profiler::new_heap();
+
+    // Retain the static build fence through LTO/strip so packaging can verify
+    // identity without executing the GUI or creating a window.
+    std::hint::black_box(FT_ATOMIC_COMPONENT_MARKER);
 
     config::designate_this_as_the_main_thread();
     config::assign_error_callback(mux::connui::show_configuration_error_message);

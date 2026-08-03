@@ -1,0 +1,271 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://frankenterm.dev/schemas/ft-atomic-component-manifest/v1.json",
+  "title": "FrankenTerm Atomic Component Manifest v1",
+  "description": "Offline-verifiable exact inventory binding one source/build identity to every packaged executable, asset, schema, default, font, and attestation file.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "$schema",
+    "schema_version",
+    "manifest_id",
+    "identity",
+    "contracts",
+    "files",
+    "inputs",
+    "inventory",
+    "verification"
+  ],
+  "properties": {
+    "$schema": {
+      "const": "https://frankenterm.dev/schemas/ft-atomic-component-manifest/v1.json"
+    },
+    "schema_version": {
+      "const": "ft.atomic_component_manifest.v1"
+    },
+    "manifest_id": {
+      "$ref": "#/$defs/prefixedSha256"
+    },
+    "identity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "build_id",
+        "source_revision",
+        "version",
+        "target",
+        "profile",
+        "feature_contract"
+      ],
+      "properties": {
+        "build_id": {
+          "$ref": "#/$defs/sha256"
+        },
+        "source_revision": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{40}$"
+        },
+        "version": {
+          "$ref": "#/$defs/token"
+        },
+        "target": {
+          "$ref": "#/$defs/token"
+        },
+        "profile": {
+          "$ref": "#/$defs/token"
+        },
+        "feature_contract": {
+          "$ref": "#/$defs/token"
+        }
+      }
+    },
+    "contracts": {
+      "type": "object",
+      "propertyNames": {
+        "$ref": "#/$defs/role"
+      },
+      "additionalProperties": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 4096,
+        "pattern": "^[^\\u0000-\\u001f]+$"
+      },
+      "maxProperties": 256
+    },
+    "files": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 100000,
+      "items": {
+        "$ref": "#/$defs/file"
+      }
+    },
+    "inputs": {
+      "type": "array",
+      "maxItems": 10000,
+      "items": {
+        "$ref": "#/$defs/input"
+      }
+    },
+    "inventory": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "mode",
+        "file_count",
+        "total_bytes"
+      ],
+      "properties": {
+        "mode": {
+          "const": "exact"
+        },
+        "file_count": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 100000
+        },
+        "total_bytes": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "verification": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "algorithm",
+        "offline",
+        "path_policy"
+      ],
+      "properties": {
+        "algorithm": {
+          "const": "sha256"
+        },
+        "offline": {
+          "const": true
+        },
+        "path_policy": {
+          "const": "relative_utf8_no_symlink_v1"
+        }
+      }
+    }
+  },
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "prefixedSha256": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "token": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 255,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._+\\-]*$"
+    },
+    "role": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 4096,
+      "pattern": "^[a-z0-9][a-z0-9._/\\-]*$"
+    },
+    "path": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 4096,
+      "pattern": "^(?!/)(?!.*(?:^|/)\\.{1,2}(?:/|$))(?!.*//)(?!.*\\\\)[^\\u0000]+$"
+    },
+    "kind": {
+      "enum": [
+        "archive",
+        "asset",
+        "attestation",
+        "checksum",
+        "config",
+        "executable",
+        "font",
+        "metadata",
+        "schema",
+        "signature",
+        "verifier"
+      ]
+    },
+    "file": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "bytes",
+        "executable",
+        "kind",
+        "path",
+        "role",
+        "sha256"
+      ],
+      "properties": {
+        "bytes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "executable": {
+          "type": "boolean"
+        },
+        "kind": {
+          "$ref": "#/$defs/kind"
+        },
+        "path": {
+          "$ref": "#/$defs/path"
+        },
+        "role": {
+          "$ref": "#/$defs/role"
+        },
+        "sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "component": {
+          "$ref": "#/$defs/token"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "required": [
+              "component"
+            ]
+          },
+          "then": {
+            "properties": {
+              "kind": {
+                "const": "executable"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "executable"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "then": {
+            "required": [
+              "component"
+            ]
+          }
+        }
+      ]
+    },
+    "input": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "bytes",
+        "path",
+        "role",
+        "sha256"
+      ],
+      "properties": {
+        "bytes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "path": {
+          "$ref": "#/$defs/path"
+        },
+        "role": {
+          "$ref": "#/$defs/role"
+        },
+        "sha256": {
+          "$ref": "#/$defs/sha256"
+        }
+      }
+    }
+  }
+}

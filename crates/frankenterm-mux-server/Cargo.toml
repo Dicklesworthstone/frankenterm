@@ -8,6 +8,7 @@ authors.workspace = true
 license-file.workspace = true
 repository.workspace = true
 publish = false
+build = "build.rs"
 
 [[bin]]
 name = "frankenterm-mux-server"

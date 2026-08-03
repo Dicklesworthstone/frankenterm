@@ -119,6 +119,41 @@ jobs:
           "C:\Strawberry\perl\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
           "PERL=C:\Strawberry\perl\bin\perl.exe" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
+      - name: Freeze atomic component identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          SOURCE_REVISION="$(git rev-parse HEAD)"
+          VERSION="$(awk '
+            /^\[workspace.package\]$/ { in_workspace_package = 1; next }
+            in_workspace_package && /^version = / {
+              gsub(/^version = "/, "")
+              gsub(/".*/, "")
+              print
+              exit
+            }
+          ' Cargo.toml)"
+          RELEASE_TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          if [[ "${RELEASE_TAG#v}" != "$VERSION" ]]; then
+            echo "release tag $RELEASE_TAG does not match workspace version $VERSION" >&2
+            exit 1
+          fi
+          FEATURE_CONTRACT="workspace-default-members-default-features-v1"
+          BUILD_ID="$(bash scripts/atomic-component-manifest.sh derive-build-id \
+            --source-revision "$SOURCE_REVISION" \
+            --version "$VERSION" \
+            --target "${{ matrix.target }}" \
+            --profile release \
+            --feature-contract "$FEATURE_CONTRACT")"
+          {
+            echo "FT_ATOMIC_BUILD_IDENTITY=$BUILD_ID"
+            echo "FT_ATOMIC_SOURCE_REVISION=$SOURCE_REVISION"
+            echo "FT_ATOMIC_BUILD_VERSION=$VERSION"
+            echo "FT_ATOMIC_BUILD_TARGET=${{ matrix.target }}"
+            echo "FT_ATOMIC_BUILD_PROFILE=release"
+            echo "FT_ATOMIC_FEATURE_CONTRACT=$FEATURE_CONTRACT"
+          } >> "$GITHUB_ENV"
+
       - name: Build release binary
         env:
           SOURCE_DATE_EPOCH: "0"
@@ -213,18 +248,68 @@ jobs:
       - name: Create tarball (Unix)
         if: runner.os != 'Windows'
         run: |
-          mkdir -p dist
-          cd target/${{ matrix.target }}/release
-          tar -cJf ../../../dist/${{ matrix.asset }}.tar.xz ${{ matrix.artifact }}
-          cd ../../../dist
+          set -euo pipefail
+          mkdir -p dist target/atomic-release-staging
+          STAGING="target/atomic-release-staging/${{ matrix.asset }}"
+          mkdir "$STAGING"
+          cp "target/${{ matrix.target }}/release/${{ matrix.artifact }}" "$STAGING/ft"
+          cp scripts/atomic-component-manifest.sh "$STAGING/verify-components.sh"
+          chmod 0755 "$STAGING/ft" "$STAGING/verify-components.sh"
+
+          extract_numeric_rust_const() {
+            local source_file="$1"
+            local const_name="$2"
+            local value
+            value=$(sed -n "s/^pub const ${const_name}: [^=]*= \([0-9][0-9]*\);/\1/p" "$source_file" | head -n 1)
+            [[ "$value" =~ ^[0-9]+$ ]] || return 1
+            printf '%s\n' "$value"
+          }
+          CODEC_VERSION=$(extract_numeric_rust_const frankenterm/codec/src/lib.rs CODEC_VERSION)
+          CODEC_MIN_SUPPORTED=$(extract_numeric_rust_const frankenterm/codec/src/lib.rs CODEC_VERSION_MIN_SUPPORTED)
+          RENDER_PROTOCOL_VERSION=$(extract_numeric_rust_const frankenterm/codec/src/lib.rs RENDER_APPLICATION_PROTOCOL_VERSION)
+          CORE_WIRE_PROTOCOL_VERSION=$(extract_numeric_rust_const crates/frankenterm-core/src/wire_protocol.rs PROTOCOL_VERSION)
+          STORAGE_SCHEMA_VERSION=$(extract_numeric_rust_const crates/frankenterm-core/src/storage/schema_ddl.rs SCHEMA_VERSION)
+
+          MANIFEST="$STAGING/${{ matrix.asset }}.component-manifest.json"
+          bash scripts/atomic-component-manifest.sh generate \
+            --root "$STAGING" \
+            --source-root . \
+            --output "$MANIFEST" \
+            --build-id "$FT_ATOMIC_BUILD_IDENTITY" \
+            --source-revision "$FT_ATOMIC_SOURCE_REVISION" \
+            --version "$FT_ATOMIC_BUILD_VERSION" \
+            --target "$FT_ATOMIC_BUILD_TARGET" \
+            --profile "$FT_ATOMIC_BUILD_PROFILE" \
+            --feature-contract "$FT_ATOMIC_FEATURE_CONTRACT" \
+            --entry executable:cli:ft:ft \
+            --entry verifier:offline-verifier:verify-components.sh \
+            --source-match verify-components.sh=scripts/atomic-component-manifest.sh \
+            --input workspace.manifest=Cargo.toml \
+            --input protocol.codec=frankenterm/codec/src/lib.rs \
+            --input protocol.core-wire=crates/frankenterm-core/src/wire_protocol.rs \
+            --input schema.storage=crates/frankenterm-core/src/storage/schema_ddl.rs \
+            --input schema.atomic=docs/json-schema/ft-atomic-component-manifest.json \
+            --input schema.attestations=docs/attestations/schema.json \
+            --input attestations.manifest=docs/attestations/manifest.json \
+            --input default.toml=crates/frankenterm-gui/frankenterm.toml \
+            --input default.lua=crates/frankenterm-gui/frankenterm.lua \
+            --input font.payload=crates/frankenterm/assets/Pragmasevka_NF.zip.zst \
+            --contract codec.version="$CODEC_VERSION" \
+            --contract codec.min-supported="$CODEC_MIN_SUPPORTED" \
+            --contract render-application.version="$RENDER_PROTOCOL_VERSION" \
+            --contract core-wire.version="$CORE_WIRE_PROTOCOL_VERSION" \
+            --contract storage.schema="$STORAGE_SCHEMA_VERSION"
+          bash "$STAGING/verify-components.sh" verify \
+            --root "$STAGING" \
+            --manifest "$MANIFEST"
+
+          tar -C "$STAGING" -cJf "dist/${{ matrix.asset }}.tar.xz" \
+            ft verify-components.sh "${{ matrix.asset }}.component-manifest.json"
+          cd dist
           shasum -a 256 "${{ matrix.asset }}.tar.xz" > "${{ matrix.asset }}.tar.xz.sha256"
 
       - name: Bundle + checksum macOS .app
         if: runner.os == 'macOS'
-        # Secondary darwin asset: mirror the attestation steps' philosophy and
-        # don't let a GUI-bundle failure block the primary ft CLI release. The
-        # red step still surfaces in the Actions UI for the maintainer.
-        continue-on-error: true
         run: |
           # The darwin build above produced the full default-members set
           # (frankenterm-gui + frankenterm-mux-server + ft) under
@@ -245,12 +330,16 @@ jobs:
           # tool can't fail the whole release. brew is preinstalled on runners.
           command -v zstd >/dev/null 2>&1 || HOMEBREW_NO_AUTO_UPDATE=1 brew install zstd
           mkdir -p dist
-          CARGO_TARGET_DIR="target/${{ matrix.target }}" \
-            scripts/create-macos-bundle.sh --skip-build --output dist-app
+          CARGO_TARGET_DIR=target SOURCE_DATE_EPOCH=0 \
+            scripts/create-macos-bundle.sh \
+              --skip-build \
+              --target "${{ matrix.target }}" \
+              --output dist-app
           cd dist-app
           # COPYFILE_DISABLE stops bsdtar from emitting ._* AppleDouble sidecars.
           COPYFILE_DISABLE=1 tar -cJf \
-            "../dist/FrankenTerm-darwin-arm64.app.tar.xz" FrankenTerm.app
+            "../dist/FrankenTerm-darwin-arm64.app.tar.xz" \
+            FrankenTerm.app FrankenTerm.app.component-manifest.json
           cd ../dist
           shasum -a 256 "FrankenTerm-darwin-arm64.app.tar.xz" \
             > "FrankenTerm-darwin-arm64.app.tar.xz.sha256"
@@ -309,20 +398,6 @@ jobs:
           echo '```' >> "$GITHUB_STEP_SUMMARY"
           cat SHA256SUMS >> "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Generate build provenance attestations
-        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4.1.1
-        with:
-          # Attest every file a downloader might trust: the binary archives AND the
-          # checksum artifacts that key archive verification. Without attesting
-          # SHA256SUMS + *.sha256, an attacker who compromises the release step
-          # (but not the attestation step) could re-point the manifest at a
-          # different archive that still has its original valid attestation.
-          subject-path: |
-            dist/*.tar.xz
-            dist/*.zip
-            dist/*.sha256
-            dist/SHA256SUMS
 
       # ── Refresh per-release perf/atlas-packing artifact (ft-gtcm9.5) ──────────
       # Re-runs the atlas_packing_attestation example so the JSON snapshot at
@@ -443,6 +518,70 @@ jobs:
             "docs/attestations/schema.json" \
             "docs/attestations/SIGNING.md" \
             dist/
+
+      - name: Generate and verify exact release inventory
+        env:
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          SOURCE_REVISION="$(git rev-parse HEAD)"
+          FEATURE_CONTRACT="release-index-v1"
+          BUILD_ID="$(bash scripts/atomic-component-manifest.sh derive-build-id \
+            --source-revision "$SOURCE_REVISION" \
+            --version "$RELEASE_VERSION" \
+            --target multi-platform-release \
+            --profile release \
+            --feature-contract "$FEATURE_CONTRACT")"
+          cp scripts/atomic-component-manifest.sh dist/verify-release-components.sh
+          chmod 0755 dist/verify-release-components.sh
+
+          manifest_args=()
+          while IFS= read -r -d '' path; do
+            relative="${path#dist/}"
+            case "$relative" in
+              *.tar.xz|*.zip) kind=archive ;;
+              *.sha256|SHA256SUMS) kind=checksum ;;
+              *.sigstore) kind=signature ;;
+              *.json) kind=attestation ;;
+              verify-release-components.sh) kind=verifier ;;
+              *) kind=metadata ;;
+            esac
+            manifest_args+=(--entry "$kind:release-file:$relative")
+          done < <(find dist -type f -print0 | LC_ALL=C sort -z)
+          if [[ ${#manifest_args[@]} -eq 0 ]]; then
+            echo "release inventory is unexpectedly empty" >&2
+            exit 1
+          fi
+
+          MANIFEST="dist/FrankenTerm-${RELEASE_VERSION}.component-manifest.json"
+          bash scripts/atomic-component-manifest.sh generate \
+            --root dist \
+            --source-root . \
+            --output "$MANIFEST" \
+            --build-id "$BUILD_ID" \
+            --source-revision "$SOURCE_REVISION" \
+            --version "$RELEASE_VERSION" \
+            --target multi-platform-release \
+            --profile release \
+            --feature-contract "$FEATURE_CONTRACT" \
+            "${manifest_args[@]}" \
+            --source-match verify-release-components.sh=scripts/atomic-component-manifest.sh \
+            --input workspace.manifest=Cargo.toml \
+            --input schema.atomic=docs/json-schema/ft-atomic-component-manifest.json \
+            --input schema.attestations=docs/attestations/schema.json \
+            --input attestations.manifest=docs/attestations/manifest.json \
+            --contract release.version="$RELEASE_VERSION"
+          bash dist/verify-release-components.sh verify \
+            --root dist \
+            --manifest "$MANIFEST"
+
+      - name: Generate build provenance attestations
+        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4.1.1
+        with:
+          # Attest every file a downloader might trust, including the exact
+          # offline release inventory and its verifier. The manifest itself
+          # covers all archives, checksum files, and shipped attestations.
+          subject-path: dist/*
 
       - uses: softprops/action-gh-release@v3.0.1
         with:

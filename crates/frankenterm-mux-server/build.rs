@@ -1,15 +1,6 @@
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
-
-    // Pass the target triple to the binary via cfg
-    let target = std::env::var("TARGET").unwrap_or_else(|_| "unknown".to_string());
-    println!("cargo:rustc-env=FRANKENTERM_TARGET_TRIPLE={target}");
-    emit_atomic_component_marker("frankenterm-gui");
-
-    #[cfg(target_os = "macos")]
-    {
-        // Future: copy Info.plist for macOS app bundle support.
-    }
+    emit_atomic_component_marker("frankenterm-mux-server");
 }
 
 fn emit_atomic_component_marker(component: &str) {

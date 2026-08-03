@@ -25,6 +25,7 @@ use wezterm_gui_subcommands::*;
 /// signal handler installed, so SIGTERM triggered the default
 /// "terminate immediately" action and skipped cleanup.
 static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
+const FT_ATOMIC_COMPONENT_MARKER: &str = env!("FT_ATOMIC_COMPONENT_MARKER");
 
 /// [ft-gqbpk] Shared shutdown-flag handle. Tests use this to assert
 /// the signal handler writes the expected state; production code
@@ -180,6 +181,9 @@ impl From<DispatchIoBackendArg> for frankenterm_mux_server_impl::dispatch::Dispa
 }
 
 fn main() {
+    // Retain the static build fence through LTO/strip.  Package verification
+    // can therefore reject stale mux servers without starting one.
+    std::hint::black_box(FT_ATOMIC_COMPONENT_MARKER);
     if let Err(err) = run() {
         wezterm_blob_leases::clear_storage();
         log::error!("{:#}", err);

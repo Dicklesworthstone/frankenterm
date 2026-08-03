@@ -95,6 +95,7 @@ mod build_meta {
     pub const RUSTC_VERSION: &str = env!("FT_RUSTC_VERSION");
     pub const TARGET: &str = env!("FT_TARGET");
     pub const FEATURES: &str = env!("FT_FEATURES");
+    pub const ATOMIC_COMPONENT_MARKER: &str = env!("FT_ATOMIC_COMPONENT_MARKER");
 
     /// Short version line: `0.1.0 (abc123def)`
     pub fn short_version() -> String {
@@ -110,7 +111,8 @@ commit:   {}{}
 built:    {}
 rustc:    {}
 target:   {}
-features: {}",
+features: {}
+atomic-component: {}",
             frankenterm_core::VERSION,
             GIT_HASH,
             GIT_DIRTY,
@@ -118,6 +120,7 @@ features: {}",
             RUSTC_VERSION,
             TARGET,
             FEATURES,
+            ATOMIC_COMPONENT_MARKER,
         )
     }
 }
@@ -31506,6 +31509,11 @@ fn send_backup_notification(
 
 fn main() {
     use frankenterm_core::runtime_async::CompatRuntime;
+
+    // Keep the exact compile-time package identity discoverable by the static
+    // package verifier even under LTO/strip.  This does not launch or probe any
+    // peer and has no observable output outside `ft version --full`.
+    std::hint::black_box(build_meta::ATOMIC_COMPONENT_MARKER);
 
     let runtime_role = sniff_runtime_process_role_from_args();
     let runtime_spec = runtime_bootstrap_spec_for_role(runtime_role);
