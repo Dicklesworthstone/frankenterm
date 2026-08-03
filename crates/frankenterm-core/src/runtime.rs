@@ -1194,8 +1194,10 @@ impl PendingCaptureResyncs {
             .get(&pane_id)
             .copied()
             .map(CaptureResyncRequirement::Exact)
-            .or((self.storage_audit.contains(&pane_id) || requires_storage_resync)
-                .then_some(CaptureResyncRequirement::StorageAudit))
+            .or_else(|| {
+                (self.storage_audit.contains(&pane_id) || requires_storage_resync)
+                    .then_some(CaptureResyncRequirement::StorageAudit)
+            })
     }
 
     fn acknowledge(&mut self, pane_id: u64) {
@@ -4865,7 +4867,6 @@ impl ObservationRuntime {
                                     pane_id,
                                     PendingCaptureResyncBinding { binding, queued_at },
                                 );
-                                continue;
                             }
                             PendingCaptureResyncDisposition::RetireSuperseded {
                                 committed,
@@ -4901,7 +4902,6 @@ impl ObservationRuntime {
                                         .entry(pane_id)
                                         .or_insert_with(Instant::now);
                                 }
-                                continue;
                             }
                             PendingCaptureResyncDisposition::Publish(sequence) => {
                                 pending_resyncs.acknowledge(pane_id);

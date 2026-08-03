@@ -347,11 +347,7 @@ impl CaptureLease {
         }
 
         let counter = self.counter(stage);
-        counter
-            .try_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
-                current.checked_add(1)
-            })
-            .map_err(|_| CaptureAuthorityError::InflightCounterExhausted { stage })?;
+        try_increment_inflight(counter, stage)?;
 
         let guard = CaptureInflightGuard {
             inner: Arc::clone(&self.inner),
@@ -431,6 +427,46 @@ impl CaptureLease {
     }
 }
 
+fn try_increment_inflight(
+    counter: &AtomicUsize,
+    stage: CaptureGuardStage,
+) -> Result<(), CaptureAuthorityError> {
+    let mut current = counter.load(Ordering::SeqCst);
+    loop {
+        let next = current
+            .checked_add(1)
+            .ok_or(CaptureAuthorityError::InflightCounterExhausted { stage })?;
+        match counter.compare_exchange_weak(
+            current,
+            next,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        ) {
+            Ok(_) => return Ok(()),
+            Err(actual) => current = actual,
+        }
+    }
+}
+
+fn decrement_inflight_exactly_once(counter: &AtomicUsize) -> usize {
+    let mut current = counter.load(Ordering::SeqCst);
+    loop {
+        let next = current
+            .checked_sub(1)
+            .ok_or(current)
+            .expect("capture in-flight guard released exactly once");
+        match counter.compare_exchange_weak(
+            current,
+            next,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        ) {
+            Ok(previous) => return previous,
+            Err(actual) => current = actual,
+        }
+    }
+}
+
 struct CaptureInflightGuard {
     inner: Arc<CaptureLeaseInner>,
     stage: CaptureGuardStage,
@@ -457,11 +493,7 @@ fn release_inflight(inner: &CaptureLeaseInner, stage: CaptureGuardStage) {
         CaptureGuardStage::Producer => &inner.producer_inflight,
         CaptureGuardStage::Persistence => &inner.persistence_inflight,
     };
-    let previous = counter
-        .try_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
-            current.checked_sub(1)
-        })
-        .expect("capture in-flight guard released exactly once");
+    let previous = decrement_inflight_exactly_once(counter);
     if previous == 1
         && inner.state.load(Ordering::SeqCst) != LEASE_ADMITTING
         && inner.producer_inflight.load(Ordering::SeqCst) == 0
@@ -508,13 +540,7 @@ impl CapturePersistenceGuard {
         &self,
     ) -> Result<CapturePersistenceHold, CaptureAuthorityError> {
         let counter = &self.0.inner.persistence_inflight;
-        counter
-            .try_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
-                current.checked_add(1)
-            })
-            .map_err(|_| CaptureAuthorityError::InflightCounterExhausted {
-                stage: CaptureGuardStage::Persistence,
-            })?;
+        try_increment_inflight(counter, CaptureGuardStage::Persistence)?;
 
         Ok(CapturePersistenceHold {
             _guard: CaptureInflightGuard {
@@ -852,7 +878,7 @@ impl CaptureAuthority {
             let pane = state
                 .panes
                 .get(&stamp.global_pane_id())
-                .ok_or(CaptureAuthorityError::PaneNotActive {
+                .ok_or_else(|| CaptureAuthorityError::PaneNotActive {
                     global_pane_id: stamp.global_pane_id(),
                 })?;
             if pane.identity.pane_incarnation() != stamp.pane_incarnation() {

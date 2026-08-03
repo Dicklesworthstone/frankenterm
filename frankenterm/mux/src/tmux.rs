@@ -847,11 +847,24 @@ impl TmuxPaneOutputLane {
     }
 
     fn schedule(&self, pane_id: TmuxPaneId) -> Result<(), TmuxPaneOutputGap> {
-        self.active
-            .try_update(Ordering::AcqRel, Ordering::Acquire, |active| {
-                (active < self.capacity).then_some(active + 1)
-            })
-            .map_err(|_| TmuxPaneOutputGap::DrainLaneCapacity)?;
+        let mut active = self.active.load(Ordering::Acquire);
+        loop {
+            if active >= self.capacity {
+                return Err(TmuxPaneOutputGap::DrainLaneCapacity);
+            }
+            let Some(next) = active.checked_add(1) else {
+                return Err(TmuxPaneOutputGap::DrainLaneCapacity);
+            };
+            match self.active.compare_exchange_weak(
+                active,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(observed) => active = observed,
+            }
+        }
         match self.ready.try_send(pane_id) {
             Ok(()) => Ok(()),
             Err(TrySendError::Full(_)) => {
@@ -862,6 +875,22 @@ impl TmuxPaneOutputLane {
                 self.active.fetch_sub(1, Ordering::AcqRel);
                 Err(TmuxPaneOutputGap::DrainLaneClosed)
             }
+        }
+    }
+}
+
+fn alloc_nonwrapping_atomic_u64(counter: &AtomicU64) -> Option<u64> {
+    let mut current = counter.load(Ordering::Acquire);
+    loop {
+        let next = current.checked_add(1)?;
+        match counter.compare_exchange_weak(
+            current,
+            next,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(allocated) => return Some(allocated),
+            Err(observed) => current = observed,
         }
     }
 }
@@ -4133,16 +4162,12 @@ impl TmuxDomainState {
     }
 
     fn alloc_io_generation(&self) -> anyhow::Result<u64> {
-        self.next_io_generation
-            .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-                current.checked_add(1)
-            })
-            .map_err(|_| {
-                anyhow::anyhow!(
-                    "tmux domain {} exhausted its nonwrapping I/O generation space",
-                    self.domain_id
-                )
-            })
+        alloc_nonwrapping_atomic_u64(&self.next_io_generation).ok_or_else(|| {
+            anyhow::anyhow!(
+                "tmux domain {} exhausted its nonwrapping I/O generation space",
+                self.domain_id
+            )
+        })
     }
 
     fn io_deadlines(&self) -> TmuxIoDeadlines {
@@ -4676,11 +4701,8 @@ impl TmuxDomainState {
     }
 
     fn alloc_split_request_id(&self) -> anyhow::Result<u64> {
-        self.next_split_request_id
-            .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-                current.checked_add(1)
-            })
-            .map_err(|_| anyhow::anyhow!("tmux split request id space exhausted"))
+        alloc_nonwrapping_atomic_u64(&self.next_split_request_id)
+            .ok_or_else(|| anyhow::anyhow!("tmux split request id space exhausted"))
     }
 
     /// All queue handles, including PTY writers and child killers, share the
@@ -6133,6 +6155,86 @@ mod tests {
 
     fn new_tmux_domain(pane_id: PaneId) -> TmuxDomain {
         TmuxDomain::new(pane_id).expect("start tmux test domain I/O supervisor")
+    }
+
+    #[test]
+    fn nonwrapping_atomic_u64_allocator_exhausts_without_mutation() {
+        let counter = AtomicU64::new(u64::MAX - 1);
+
+        assert_eq!(alloc_nonwrapping_atomic_u64(&counter), Some(u64::MAX - 1));
+        assert_eq!(counter.load(Ordering::Acquire), u64::MAX);
+        assert_eq!(alloc_nonwrapping_atomic_u64(&counter), None);
+        assert_eq!(counter.load(Ordering::Acquire), u64::MAX);
+    }
+
+    #[test]
+    fn nonwrapping_atomic_u64_allocator_is_unique_under_contention() {
+        const WORKERS: usize = 8;
+        const ALLOCATIONS_PER_WORKER: usize = 256;
+
+        let counter = Arc::new(AtomicU64::new(1));
+        let workers = (0..WORKERS)
+            .map(|_| {
+                let counter = Arc::clone(&counter);
+                std::thread::spawn(move || {
+                    (0..ALLOCATIONS_PER_WORKER)
+                        .map(|_| {
+                            alloc_nonwrapping_atomic_u64(&counter)
+                                .expect("test allocation space must remain available")
+                        })
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let mut allocated = workers
+            .into_iter()
+            .flat_map(|worker| worker.join().expect("allocation worker must not panic"))
+            .collect::<Vec<_>>();
+        allocated.sort_unstable();
+
+        let allocation_count = u64::try_from(WORKERS * ALLOCATIONS_PER_WORKER)
+            .expect("test allocation count must fit u64");
+        assert_eq!(allocated, (1..=allocation_count).collect::<Vec<_>>());
+        assert_eq!(counter.load(Ordering::Acquire), allocation_count + 1);
+    }
+
+    #[test]
+    fn pane_output_lane_rejection_rolls_back_only_its_reservation() {
+        let active = Arc::new(AtomicUsize::new(1));
+        let (ready, _receiver) = bounded(1);
+        ready.try_send(41).expect("fill the bounded lane");
+        let lane = TmuxPaneOutputLane {
+            ready,
+            active: Arc::clone(&active),
+            capacity: 2,
+        };
+
+        assert_eq!(lane.schedule(42), Err(TmuxPaneOutputGap::DrainLaneCapacity));
+        assert_eq!(active.load(Ordering::Acquire), 1);
+
+        let active = Arc::new(AtomicUsize::new(0));
+        let (ready, receiver) = bounded(1);
+        drop(receiver);
+        let lane = TmuxPaneOutputLane {
+            ready,
+            active: Arc::clone(&active),
+            capacity: 1,
+        };
+
+        assert_eq!(lane.schedule(43), Err(TmuxPaneOutputGap::DrainLaneClosed));
+        assert_eq!(active.load(Ordering::Acquire), 0);
+
+        let active = Arc::new(AtomicUsize::new(usize::MAX));
+        let (ready, _receiver) = bounded(1);
+        let lane = TmuxPaneOutputLane {
+            ready,
+            active: Arc::clone(&active),
+            capacity: usize::MAX,
+        };
+
+        assert_eq!(lane.schedule(44), Err(TmuxPaneOutputGap::DrainLaneCapacity));
+        assert_eq!(active.load(Ordering::Acquire), usize::MAX);
     }
 
     #[test]
