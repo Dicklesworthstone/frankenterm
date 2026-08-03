@@ -2341,17 +2341,17 @@ impl OrderedWindowConnectionAuthority {
         let established = self.established.ok_or_else(|| {
             anyhow!("ordered-window stream has not been established by a successful PDU87")
         })?;
-        if request.stream_id != established.stream_id {
-            return Err(anyhow!(
-                "ordered-window reorder targets a stale or foreign topology stream"
-            ));
-        }
         if !established
             .negotiated
             .contains(TopologyCapabilities::WINDOW_REORDER_CAS_V1)
         {
             return Err(anyhow!(
                 "ordered-window reorder capability is not established on this stream"
+            ));
+        }
+        if request.stream_id != established.stream_id {
+            return Err(anyhow!(
+                "ordered-window reorder targets a stale or foreign topology stream"
             ));
         }
         Ok(established)
@@ -2392,10 +2392,12 @@ impl OrderedWindowConnectionAuthority {
             mux::ReorderWindowTabsResult::Decision(
                 mux::WindowReorderTerminalOutcome::Applied(_)
                     | mux::WindowReorderTerminalOutcome::Conflict(_)
+                    | mux::WindowReorderTerminalOutcome::Malformed(_)
                     | mux::WindowReorderTerminalOutcome::Exhausted
             ) | mux::ReorderWindowTabsResult::Replay(
                 mux::WindowReorderTerminalOutcome::Applied(_)
                     | mux::WindowReorderTerminalOutcome::Conflict(_)
+                    | mux::WindowReorderTerminalOutcome::Malformed(_)
                     | mux::WindowReorderTerminalOutcome::Exhausted
             )
         );
@@ -5899,6 +5901,25 @@ mod tests {
             1,
             vec![second_tab.tab_id(), first_tab.tab_id()],
         );
+        let capability_only_authority = Mutex::new(OrderedWindowConnectionAuthority::default());
+        capability_only_authority
+            .lock()
+            .unwrap()
+            .establish(
+                stream_id,
+                session_incarnation,
+                ordered_window_capabilities(false),
+            )
+            .expect("ordered snapshot foundation establishes without reorder capability");
+        let mut foreign_stream_without_capability = request.clone();
+        foreign_stream_without_capability.stream_id =
+            TopologyStreamId::from_bytes([0x87; 16]);
+        let error = capability_only_authority
+            .lock()
+            .unwrap()
+            .admit_reorder_transport(&foreign_stream_without_capability)
+            .expect_err("missing capability must outrank foreign stream identity");
+        assert!(format!("{error:#}").contains("capability is not established"));
 
         let applied =
             process_reorder_window_tabs_request(&mux, &request, &connection_authority, None)
@@ -6077,36 +6098,50 @@ mod tests {
                 .lock()
                 .unwrap()
                 .domain_binding_id,
-            None,
-            "a semantic-malformed first request must not pin connection binding authority"
+            Some(poison_domain),
+            "a retained semantic-malformed decision must preserve its replay binding"
         );
 
-        let authoritative_domain = codec::DomainBindingId::from_bytes([0xd4; 16]);
-        let valid_after_malformed = reorder_request_for_snapshot(
+        let foreign_after_malformed = codec::DomainBindingId::from_bytes([0xd4; 16]);
+        let valid_foreign_request = reorder_request_for_snapshot(
             &after_replay,
             session_incarnation,
             stream_id,
-            authoritative_domain,
+            foreign_after_malformed,
             7,
             vec![first_tab.tab_id(), second_tab.tab_id()],
         );
-        let valid_response = process_reorder_window_tabs_request(
+        let foreign_response = process_reorder_window_tabs_request(
             &mux,
-            &valid_after_malformed,
+            &valid_foreign_request,
             &unpoisoned_authority,
             None,
         )
-        .expect("valid successor request must not inherit a poisoned binding");
+        .expect("foreign binding receives a typed non-mutating response");
+        assert_eq!(
+            foreign_response.outcome,
+            codec::ReorderWindowTabsV1Outcome::Malformed
+        );
+
+        let replay_malformed = process_reorder_window_tabs_request(
+            &mux,
+            &malformed_first,
+            &unpoisoned_authority,
+            None,
+        )
+        .expect("exact semantic-malformed retry must remain replayable");
         assert!(matches!(
-            valid_response.outcome,
-            codec::ReorderWindowTabsV1Outcome::Applied(_)
+            replay_malformed.outcome,
+            codec::ReorderWindowTabsV1Outcome::Replay(
+                codec::WindowReorderTerminalOutcomeV1::Malformed
+            )
         ));
         assert_eq!(
             unpoisoned_authority
                 .lock()
                 .unwrap()
                 .domain_binding_id,
-            Some(authoritative_domain)
+            Some(poison_domain)
         );
     }
 
