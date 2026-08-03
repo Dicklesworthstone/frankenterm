@@ -3676,6 +3676,70 @@ fn commit_rpc_transport_ready(
 enum NotReconnectableError {
     #[error("Client was destroyed")]
     ClientWasDestroyed,
+    #[error(
+        "inactive ordered-window PDU {ident} reached the ordinary mux client with serial \
+         {serial}, encoded_payload_len={encoded_payload_len}, compressed={compressed}; \
+         retire this transport without reconnecting"
+    )]
+    InactiveOrderedWindowPdu {
+        ident: u64,
+        serial: u64,
+        encoded_payload_len: usize,
+        compressed: bool,
+    },
+}
+
+/// Reject the complete frozen ordered-window wire family while its ordinary
+/// client implementation remains deliberately inactive.
+///
+/// This predicate is called from the codec's frame-header selector, before
+/// request correlation chooses a body disposition and before the codec reads
+/// or allocates the body. Keep all five identities explicit: response-shaped
+/// frames are not authorized merely because a pending caller can name them.
+#[inline]
+fn reject_inactive_ordered_window_pdu_header(
+    header: &PduFrameHeader,
+) -> Result<(), NotReconnectableError> {
+    let ident = header.ident();
+    let inactive = ident == <ListPanesOrderedV1 as PduWireIdent>::IDENT
+        || ident == <ListPanesOrderedV1Response as PduWireIdent>::IDENT
+        || ident == <ReorderWindowTabsV1 as PduWireIdent>::IDENT
+        || ident == <ReorderWindowTabsV1Response as PduWireIdent>::IDENT
+        || ident == <WindowOrderEventV1 as PduWireIdent>::IDENT;
+    if !inactive {
+        return Ok(());
+    }
+
+    Err(inactive_ordered_window_pdu_error(header))
+}
+
+#[cold]
+fn inactive_ordered_window_pdu_error(header: &PduFrameHeader) -> NotReconnectableError {
+    metrics::counter!("mux.client.protocol.inactive_ordered_window_pdu.total").increment(1);
+    NotReconnectableError::InactiveOrderedWindowPdu {
+        ident: header.ident(),
+        serial: header.serial(),
+        encoded_payload_len: header.encoded_payload_len(),
+        compressed: header.is_compressed(),
+    }
+}
+
+/// Apply ordinary-client header policy in the order required for fail-closed
+/// feature gating: inactive families win before legacy serial correlation.
+#[inline]
+fn validate_ordinary_mux_inbound_header(
+    header: &PduFrameHeader,
+    highest_issued: u64,
+) -> anyhow::Result<()> {
+    reject_inactive_ordered_window_pdu_header(header)?;
+    if header.serial() > highest_issued {
+        return Err(anyhow::Error::new(CorruptResponse::SerialAboveCeiling {
+            serial: header.serial(),
+            max_serial: highest_issued,
+        })
+        .context("decoding a PDU"));
+    }
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -4860,10 +4924,20 @@ async fn client_thread_async(
                     let inbound = rpc_transport
                         .complete_before_terminal(async {
                             let mut selected_effect = None;
+                            let highest_issued = pending.highest_issued();
+                            // The codec's optional serial ceiling is checked
+                            // before it reads the PDU identity. Pass `None` so
+                            // the selector can classify the dormant 86-90
+                            // family for every serial, then reapply the same
+                            // legacy ceiling in `validate_ordinary_mux_inbound_header`.
                             let decoded = Pdu::decode_async_with_selector(
                                 &mut reader,
-                                Some(pending.highest_issued()),
+                                None,
                                 |header| {
+                                    validate_ordinary_mux_inbound_header(
+                                        header,
+                                        highest_issued,
+                                    )?;
                                     let Some(serial) = NonZeroU64::new(header.serial()) else {
                                         return Ok(PduBodyDisposition::Materialize);
                                     };
@@ -6948,6 +7022,53 @@ mod tests {
                 .expect("initial test generation is nonzero"),
             rpc_transport,
         )
+    }
+
+    fn push_test_unsigned_leb128(mut value: u64, output: &mut Vec<u8>) {
+        loop {
+            let mut byte =
+                u8::try_from(value & 0x7f).expect("masked test LEB128 byte must fit in u8");
+            value >>= 7;
+            if value != 0 {
+                byte |= 0x80;
+            }
+            output.push(byte);
+            if value == 0 {
+                return;
+            }
+        }
+    }
+
+    /// Build an intentionally schema-opaque frame. Ordered-window rejection
+    /// must happen from this header alone, so none of these payload bytes may
+    /// be interpreted, decompressed, or allocated by the PDU body decoder.
+    fn test_opaque_frame(
+        ident: u64,
+        serial: u64,
+        compressed: bool,
+        payload: &[u8],
+    ) -> (Vec<u8>, usize) {
+        let mut encoded_serial = Vec::new();
+        push_test_unsigned_leb128(serial, &mut encoded_serial);
+        let mut encoded_ident = Vec::new();
+        push_test_unsigned_leb128(ident, &mut encoded_ident);
+        let body_len = encoded_serial
+            .len()
+            .checked_add(encoded_ident.len())
+            .and_then(|len| len.checked_add(payload.len()))
+            .expect("test frame length must not overflow");
+        let mut tagged_len = u64::try_from(body_len).expect("test frame length must fit u64");
+        if compressed {
+            tagged_len |= 1_u64 << 63;
+        }
+
+        let mut frame = Vec::new();
+        push_test_unsigned_leb128(tagged_len, &mut frame);
+        frame.extend_from_slice(&encoded_serial);
+        frame.extend_from_slice(&encoded_ident);
+        let header_len = frame.len();
+        frame.extend_from_slice(payload);
+        (frame, header_len)
     }
 
     #[test]
@@ -9041,6 +9162,392 @@ mod tests {
         );
         assert_eq!(probe.pending(), 0.0);
         probe.assert_balanced();
+    }
+
+    #[test]
+    fn inactive_ordered_window_family_is_rejected_from_every_header_shape_before_body() {
+        let ordered_idents = [
+            <ListPanesOrderedV1 as PduWireIdent>::IDENT,
+            <ListPanesOrderedV1Response as PduWireIdent>::IDENT,
+            <ReorderWindowTabsV1 as PduWireIdent>::IDENT,
+            <ReorderWindowTabsV1Response as PduWireIdent>::IDENT,
+            <WindowOrderEventV1 as PduWireIdent>::IDENT,
+        ];
+        assert_eq!(ordered_idents, [86, 87, 88, 89, 90]);
+
+        let payload = [0xa5; 257];
+        for ident in ordered_idents {
+            for serial in [0, 1, 127, u64::MAX] {
+                for compressed in [false, true] {
+                    let (wire, header_len) =
+                        test_opaque_frame(ident, serial, compressed, &payload);
+                    let mut reader = std::io::Cursor::new(wire);
+                    let mut downstream_selector_reached = false;
+                    let error = asupersync_block_on(Pdu::decode_async_with_selector(
+                        &mut reader,
+                        None,
+                        |header| {
+                            validate_ordinary_mux_inbound_header(header, u64::MAX)?;
+                            downstream_selector_reached = true;
+                            Ok(PduBodyDisposition::Materialize)
+                        },
+                    ))
+                    .expect_err("inactive ordered-window header must fail closed");
+
+                    assert!(
+                        !downstream_selector_reached,
+                        "ordered-window rejection must precede downstream correlation"
+                    );
+                    assert_eq!(
+                        usize::try_from(reader.position()).expect("cursor position fits usize"),
+                        header_len,
+                        "ordered-window rejection must leave the complete body unread"
+                    );
+                    assert_eq!(
+                        error.downcast_ref::<NotReconnectableError>(),
+                        Some(&NotReconnectableError::InactiveOrderedWindowPdu {
+                            ident,
+                            serial,
+                            encoded_payload_len: payload.len(),
+                            compressed,
+                        })
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn inactive_ordered_window_header_predicate_preserves_adjacent_legacy_controls() {
+        let payload = [0x5a; 31];
+        for ident in [
+            <RenderApplicationResult as PduWireIdent>::IDENT,
+            <WindowOrderEventV1 as PduWireIdent>::IDENT + 1,
+        ] {
+            for compressed in [false, true] {
+                let (wire, header_len) = test_opaque_frame(ident, 7, compressed, &payload);
+                let mut reader = std::io::Cursor::new(wire);
+                let mut downstream_selector_reached = false;
+                let error = asupersync_block_on(Pdu::decode_async_with_selector(
+                    &mut reader,
+                    None,
+                    |header| {
+                        reject_inactive_ordered_window_pdu_header(header)?;
+                        downstream_selector_reached = true;
+                        Err(anyhow!("legacy control reached downstream selector"))
+                    },
+                ))
+                .expect_err("the test selector deliberately stops before the opaque body");
+
+                assert!(downstream_selector_reached);
+                assert!(error
+                    .downcast_ref::<NotReconnectableError>()
+                    .is_none());
+                assert_eq!(
+                    usize::try_from(reader.position()).expect("cursor position fits usize"),
+                    header_len,
+                    "the control selector deliberately leaves its body unread"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn inactive_ordered_window_rejection_precedes_serial_ceiling_for_every_serial() {
+        let highest_issued = 1;
+        let payload = [0x7e; 19];
+        for (ident, ordered_window) in [
+            (<WindowOrderEventV1 as PduWireIdent>::IDENT, true),
+            (<RenderApplicationResult as PduWireIdent>::IDENT, false),
+        ] {
+            let (wire, header_len) = test_opaque_frame(ident, u64::MAX, false, &payload);
+            let mut reader = std::io::Cursor::new(wire);
+            let error = asupersync_block_on(Pdu::decode_async_with_selector(
+                &mut reader,
+                None,
+                |header| {
+                    validate_ordinary_mux_inbound_header(header, highest_issued)?;
+                    Ok(PduBodyDisposition::Materialize)
+                },
+            ))
+            .expect_err("both hostile controls must fail before body admission");
+
+            if ordered_window {
+                assert!(matches!(
+                    error.downcast_ref::<NotReconnectableError>(),
+                    Some(NotReconnectableError::InactiveOrderedWindowPdu {
+                        ident: observed_ident,
+                        serial: u64::MAX,
+                        ..
+                    }) if *observed_ident == ident
+                ));
+            } else {
+                assert!(matches!(
+                    error.downcast_ref::<CorruptResponse>(),
+                    Some(CorruptResponse::SerialAboveCeiling {
+                        serial: u64::MAX,
+                        max_serial: 1,
+                    })
+                ));
+            }
+            assert_eq!(
+                usize::try_from(reader.position()).expect("cursor position fits usize"),
+                header_len,
+                "neither rejection may read its body"
+            );
+        }
+    }
+
+    #[test]
+    fn inactive_ordered_window_rejection_wins_before_pending_response_correlation() {
+        let ordered_response_ident = <ListPanesOrderedV1Response as PduWireIdent>::IDENT;
+        for expected_response_ident in [NonZeroU64::new(ordered_response_ident), None] {
+            let (mut pending, probe) = pending_replies_for_test();
+            let (completion_tx, completion_rx) = bounded(1);
+            let serial = pending
+                .admit_named_expect(
+                    completion_tx,
+                    "inactive-ordered-window-probe",
+                    expected_response_ident,
+                )
+                .expect("admit response-correlation probe")
+                .expect("assign response-correlation probe serial");
+            pending
+                .set_stage(serial, RpcRetirementStage::AwaitingResponse)
+                .expect("mark probe as awaiting its response");
+
+            let payload = [0xcc; 4_096];
+            let (wire, header_len) =
+                test_opaque_frame(ordered_response_ident, serial.get(), false, &payload);
+            let mut reader = std::io::Cursor::new(wire);
+            let highest_issued = pending.highest_issued();
+            let error = asupersync_block_on(Pdu::decode_async_with_selector(
+                &mut reader,
+                None,
+                |header| {
+                    validate_ordinary_mux_inbound_header(header, highest_issued)?;
+                    let correlated_serial = NonZeroU64::new(header.serial())
+                        .expect("the response-shaped probe serial is nonzero");
+                    let disposition =
+                        pending.response_body_disposition(correlated_serial, header)?;
+                    Ok(match disposition {
+                        PendingResponseBodyDisposition::Materialize(_) => {
+                            PduBodyDisposition::Materialize
+                        }
+                        PendingResponseBodyDisposition::DiscardKnownTombstone => {
+                            PduBodyDisposition::Discard
+                        }
+                    })
+                },
+            ))
+            .expect_err("inactive response-shaped PDU must fail before correlation");
+
+            assert!(matches!(
+                error.downcast_ref::<NotReconnectableError>(),
+                Some(NotReconnectableError::InactiveOrderedWindowPdu {
+                    ident,
+                    serial: observed_serial,
+                    encoded_payload_len,
+                    compressed: false,
+                }) if *ident == ordered_response_ident
+                    && *observed_serial == serial.get()
+                    && *encoded_payload_len == payload.len()
+            ));
+            assert_eq!(
+                pending.map[&serial].stage,
+                RpcRetirementStage::AwaitingResponse,
+                "inactive-family rejection must precede the ResponseMatch boundary"
+            );
+            assert_eq!(RpcMetricProbe::counter(&probe.unexpected_response_ident), 0);
+            assert_eq!(
+                usize::try_from(reader.position()).expect("cursor position fits usize"),
+                header_len,
+                "inactive response rejection must not consume the body"
+            );
+
+            pending.fail_after_decode_error(&error);
+            assert!(completion_rx
+                .try_recv()
+                .expect("terminal teardown must retire the pending caller")
+                .is_err());
+            probe.assert_balanced();
+        }
+    }
+
+    #[test]
+    fn contextual_inactive_ordered_window_error_remains_no_reconnect_typed() {
+        let rejection = NotReconnectableError::InactiveOrderedWindowPdu {
+            ident: <WindowOrderEventV1 as PduWireIdent>::IDENT,
+            serial: 0,
+            encoded_payload_len: 23,
+            compressed: true,
+        };
+        let contextual = anyhow::Error::new(rejection.clone())
+            .context("decoding an inbound mux frame")
+            .context("ordinary mux client reader terminated");
+
+        assert_eq!(
+            contextual.downcast_ref::<NotReconnectableError>(),
+            Some(&rejection),
+            "the reconnect loop must retain its typed no-reconnect classification through context"
+        );
+    }
+
+    #[cfg(unix)]
+    fn assert_inactive_ordered_window_transport_rejection(
+        ident: u64,
+        use_request_serial: bool,
+        compressed: bool,
+    ) {
+        let _watchdog = hang_watchdog(12, "inactive ordered-window transport gate", 95);
+        let (client_stream, mut server_stream) =
+            UnixStream::pair().expect("create ordered-window gate socket pair");
+        server_stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("bound ordered-window gate server reads");
+        server_stream
+            .set_write_timeout(Some(Duration::from_secs(10)))
+            .expect("bound ordered-window gate server writes");
+
+        let rpc_transport = Arc::new(RpcTransportState::new());
+        rpc_transport.mark_current_generation_ready_for_test();
+        let generation = rpc_transport
+            .active_generation()
+            .expect("ordered-window gate transport starts live");
+        rpc_transport
+            .bind_render_connection_identity(generation, TEST_RENDER_CONNECTION_IDENTITY)
+            .expect("test transport should bind its pre-rejection topology identity");
+        let connection_generation = Arc::new(AtomicU64::new(INITIAL_CONNECTION_GENERATION));
+        let dispatch_authority = ClientDispatchAuthority::new(
+            None,
+            Weak::new(),
+            Arc::new(ClientIncarnation),
+            Arc::clone(&connection_generation),
+            Arc::clone(&rpc_transport),
+        );
+        let (sender, receiver) = unbounded();
+        let (completion_tx, completion_rx) = bounded(1);
+        let attempt_id = rpc_transport
+            .allocate_attempt("inactive-ordered-window-transport-probe")
+            .expect("test transport should allocate its probe attempt");
+        sender
+            .try_send(ReaderMessage::SendPdu {
+                binding: RpcBinding {
+                    generation,
+                    attempt_id,
+                    request: "inactive-ordered-window-transport-probe",
+                    expected_response_ident: NonZeroU64::new(ident),
+                },
+                pdu: Box::new(Pdu::Ping(Ping {})),
+                promise: completion_tx,
+            })
+            .expect("queue ordered-window transport probe");
+
+        let unix_domain = UnixDomain {
+            name: "inactive-ordered-window-gate".to_string(),
+            no_serve_automatically: true,
+            read_timeout: Duration::from_secs(10),
+            write_timeout: Duration::from_secs(10),
+            ..Default::default()
+        };
+        let reconnectable = Reconnectable::new(
+            ClientDomainConfig::Unix(unix_domain),
+            Some(Box::new(client_stream)),
+        );
+        let reader = std::thread::Builder::new()
+            .name("inactive-ordered-window-gate-reader".to_string())
+            .spawn(move || {
+                let (result, _reconnectable, _receiver) =
+                    client_thread(reconnectable, receiver, dispatch_authority);
+                result
+            })
+            .expect("spawn ordered-window gate reader");
+
+        let request = Pdu::decode(&mut server_stream)
+            .expect("server should receive the probe before its hostile response");
+        assert!(matches!(request.pdu, Pdu::Ping(_)));
+        assert_ne!(request.serial, 0);
+        let response_serial = if use_request_serial { request.serial } else { 0 };
+        let payload = [0x3c; 8_192];
+        let (frame, _) = test_opaque_frame(ident, response_serial, compressed, &payload);
+        Write::write_all(&mut server_stream, &frame)
+            .expect("write hostile ordered-window frame");
+        Write::flush(&mut server_stream).expect("flush hostile ordered-window frame");
+
+        let reader_error = reader
+            .join()
+            .expect("ordered-window gate reader thread should not panic")
+            .expect_err("inactive ordered-window frame must terminate its reader");
+        assert_eq!(
+            reader_error.downcast_ref::<NotReconnectableError>(),
+            Some(&NotReconnectableError::InactiveOrderedWindowPdu {
+                ident,
+                serial: response_serial,
+                encoded_payload_len: payload.len(),
+                compressed,
+            })
+        );
+
+        let caller_error = completion_rx
+            .try_recv()
+            .expect("ordered-window gate must wake its pending caller")
+            .expect_err("pending caller must lose authority with the transport");
+        assert!(matches!(
+            caller_error.downcast_ref::<RpcTransportError>(),
+            Some(RpcTransportError::Retired {
+                request: "inactive-ordered-window-transport-probe",
+                stage: RpcRetirementStage::AwaitingResponse,
+                certainty: RpcDeliveryCertainty::OutcomeUnknown,
+                reason,
+                ..
+            }) if reason.contains("inactive ordered-window PDU")
+        ));
+        assert_eq!(
+            rpc_transport
+                .ready_generation
+                .load(AtomicOrdering::Acquire),
+            0,
+            "protocol rejection must revoke readiness"
+        );
+        assert_eq!(
+            rpc_transport.active_generation(),
+            None,
+            "protocol rejection must close RPC admission"
+        );
+        assert_eq!(
+            rpc_transport.render_connection_identity(generation),
+            None,
+            "protocol rejection must revoke topology/render authority before any mutation"
+        );
+        assert_eq!(
+            connection_generation.load(AtomicOrdering::Acquire),
+            INITIAL_CONNECTION_GENERATION,
+            "the reader alone must neither dial nor publish a successor transport"
+        );
+        assert!(matches!(
+            rpc_transport.lifecycle.lock().phase,
+            RpcTransportPhase::Reconnecting { retired, .. } if retired == generation
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn serial_zero_window_order_event_retires_ordinary_transport_without_body_admission() {
+        assert_inactive_ordered_window_transport_rejection(
+            <WindowOrderEventV1 as PduWireIdent>::IDENT,
+            false,
+            true,
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn correlated_ordered_snapshot_response_retires_ordinary_transport_before_match() {
+        assert_inactive_ordered_window_transport_rejection(
+            <ListPanesOrderedV1Response as PduWireIdent>::IDENT,
+            true,
+            false,
+        );
     }
 
     #[test]
