@@ -33,6 +33,564 @@ use url::Url;
 use wezterm_term::StableRowIndex;
 use wezterm_term::terminal::Alert;
 
+/// Checked, cycle-breaking conversions between the ordered-window wire schema
+/// and mux authority.
+///
+/// The live PDU handlers remain intentionally dormant.  Keeping these helpers
+/// together makes the eventual activation point explicit: connection-scoped
+/// stream/domain authorization happens before the inbound conversion, and a
+/// fully converted outbound value is validated before it is enqueued.
+#[allow(dead_code)]
+mod ordered_window_adapter {
+    #[derive(Debug, Eq, PartialEq)]
+    pub(super) enum OrderedWindowAdapterError {
+        LimitContractMismatch {
+            mux_max_tabs_per_window: usize,
+            codec_max_tabs_per_window: usize,
+        },
+        CodecContract(codec::OrderedWindowProtocolError),
+        ReservedWireId {
+            field: &'static str,
+            value: u64,
+        },
+        MuxIdDoesNotFitU64 {
+            field: &'static str,
+            value: usize,
+        },
+        RevisionExhausted {
+            field: &'static str,
+        },
+    }
+
+    impl std::fmt::Display for OrderedWindowAdapterError {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                Self::LimitContractMismatch {
+                    mux_max_tabs_per_window,
+                    codec_max_tabs_per_window,
+                } => write!(
+                    formatter,
+                    "ordered-window tab limit mismatch: mux={mux_max_tabs_per_window}, \
+                     codec={codec_max_tabs_per_window}"
+                ),
+                Self::CodecContract(error) => std::fmt::Display::fmt(error, formatter),
+                Self::ReservedWireId { field, value } => {
+                    write!(formatter, "ordered-window {field} uses reserved value {value}")
+                }
+                Self::MuxIdDoesNotFitU64 { field, value } => write!(
+                    formatter,
+                    "mux ordered-window {field}={value} does not fit the u64 wire width"
+                ),
+                Self::RevisionExhausted { field } => write!(
+                    formatter,
+                    "ordered-window {field} uses the terminal u64::MAX sentinel"
+                ),
+            }
+        }
+    }
+
+    impl std::error::Error for OrderedWindowAdapterError {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            match self {
+                Self::CodecContract(error) => Some(error),
+                _ => None,
+            }
+        }
+    }
+
+    impl From<codec::OrderedWindowProtocolError> for OrderedWindowAdapterError {
+        fn from(error: codec::OrderedWindowProtocolError) -> Self {
+            Self::CodecContract(error)
+        }
+    }
+
+    /// Enforce the shared count boundary at the server seam before either
+    /// ordered-window capability is ever advertised.
+    pub(super) fn verify_limit_contract() -> Result<(), OrderedWindowAdapterError> {
+        let mux_max_tabs_per_window = mux::window::MAX_TABS_PER_ORDERED_WINDOW;
+        let codec_max_tabs_per_window = codec::MAX_ORDERED_TABS_PER_WINDOW;
+        if mux_max_tabs_per_window != codec_max_tabs_per_window {
+            return Err(OrderedWindowAdapterError::LimitContractMismatch {
+                mux_max_tabs_per_window,
+                codec_max_tabs_per_window,
+            });
+        }
+        Ok(())
+    }
+
+    fn mux_id_to_wire(
+        field: &'static str,
+        value: usize,
+    ) -> Result<u64, OrderedWindowAdapterError> {
+        let wire_value = u64::try_from(value)
+            .map_err(|_| OrderedWindowAdapterError::MuxIdDoesNotFitU64 { field, value })?;
+        if wire_value == u64::MAX {
+            return Err(OrderedWindowAdapterError::ReservedWireId {
+                field,
+                value: wire_value,
+            });
+        }
+        Ok(wire_value)
+    }
+
+    fn remote_window_id_to_mux(
+        window_id: codec::RemoteWindowId,
+    ) -> Result<mux::window::WindowId, OrderedWindowAdapterError> {
+        if window_id.get() == u64::MAX {
+            return Err(OrderedWindowAdapterError::ReservedWireId {
+                field: "window_id",
+                value: window_id.get(),
+            });
+        }
+        window_id.try_into_usize().map_err(Into::into)
+    }
+
+    fn remote_tab_id_to_mux(
+        tab_id: codec::RemoteTabId,
+    ) -> Result<mux::tab::TabId, OrderedWindowAdapterError> {
+        if tab_id.get() == u64::MAX {
+            return Err(OrderedWindowAdapterError::ReservedWireId {
+                field: "tab_id",
+                value: tab_id.get(),
+            });
+        }
+        tab_id.try_into_usize().map_err(Into::into)
+    }
+
+    fn mux_window_id_to_remote(
+        window_id: mux::window::WindowId,
+    ) -> Result<codec::RemoteWindowId, OrderedWindowAdapterError> {
+        Ok(codec::RemoteWindowId::new(mux_id_to_wire(
+            "window_id",
+            window_id,
+        )?))
+    }
+
+    fn mux_tab_id_to_remote(
+        tab_id: mux::tab::TabId,
+    ) -> Result<codec::RemoteTabId, OrderedWindowAdapterError> {
+        Ok(codec::RemoteTabId::new(mux_id_to_wire(
+            "tab_id", tab_id,
+        )?))
+    }
+
+    fn codec_revision_to_mux(
+        revision: codec::WindowOrderRevision,
+    ) -> Result<mux::window::WindowOrderRevision, OrderedWindowAdapterError> {
+        if revision.get() == u64::MAX {
+            return Err(OrderedWindowAdapterError::RevisionExhausted {
+                field: "window_order_revision",
+            });
+        }
+        Ok(mux::window::WindowOrderRevision::new(revision.get()))
+    }
+
+    fn mux_revision_to_codec(
+        revision: mux::window::WindowOrderRevision,
+    ) -> Result<codec::WindowOrderRevision, OrderedWindowAdapterError> {
+        if revision.get() == u64::MAX {
+            return Err(OrderedWindowAdapterError::RevisionExhausted {
+                field: "window_order_revision",
+            });
+        }
+        Ok(codec::WindowOrderRevision::new(revision.get()))
+    }
+
+    fn checked_topology_revision(
+        revision: mux::TopologyRevision,
+    ) -> Result<mux::TopologyRevision, OrderedWindowAdapterError> {
+        if revision.get() == u64::MAX {
+            return Err(OrderedWindowAdapterError::RevisionExhausted {
+                field: "topology_revision",
+            });
+        }
+        Ok(revision)
+    }
+
+    /// Validate the complete untrusted wire request, including its canonical
+    /// digest, before narrowing any identifier or constructing mux authority.
+    ///
+    /// The caller must separately bind `domain_binding_id` and `stream_id` to
+    /// the established connection generation; neither identity exists in the
+    /// cycle-free mux request type.
+    pub(super) fn codec_reorder_request_to_mux(
+        request: &codec::ReorderWindowTabsV1,
+    ) -> Result<mux::ReorderWindowTabsRequest, OrderedWindowAdapterError> {
+        verify_limit_contract()?;
+        request.validate()?;
+
+        let desired_tab_ids = request
+            .desired_tab_ids
+            .iter()
+            .copied()
+            .map(remote_tab_id_to_mux)
+            .collect::<Result<Vec<_>, _>>()?;
+        let desired_active_tab_id = request
+            .desired_active_tab_id
+            .map(remote_tab_id_to_mux)
+            .transpose()?;
+
+        Ok(mux::ReorderWindowTabsRequest {
+            session_incarnation: request.session_incarnation,
+            window_id: remote_window_id_to_mux(request.window_id)?,
+            expected_order_revision: codec_revision_to_mux(request.expected_order_revision)?,
+            desired_tab_ids,
+            desired_active_tab_id,
+            mutation_id: mux::WindowOrderMutationId::new(
+                request.mutation_id.namespace,
+                request.mutation_id.sequence,
+            ),
+            request_digest: mux::WindowReorderDigest::from_bytes(request.digest.as_bytes()),
+        })
+    }
+
+    fn mux_order_components_to_codec(
+        window_id: mux::window::WindowId,
+        order_revision: mux::window::WindowOrderRevision,
+        ordered_tab_ids: impl std::iter::ExactSizeIterator<Item = mux::tab::TabId>,
+        active_tab_id: Option<mux::tab::TabId>,
+    ) -> Result<codec::OrderedWindowStateV1, OrderedWindowAdapterError> {
+        verify_limit_contract()?;
+        let window_id = mux_window_id_to_remote(window_id)?;
+        let tab_count = ordered_tab_ids.len();
+        if tab_count > codec::MAX_ORDERED_TABS_PER_WINDOW {
+            return Err(codec::OrderedWindowProtocolError::TooManyTabs {
+                window_id: window_id.get(),
+                count: tab_count,
+                max: codec::MAX_ORDERED_TABS_PER_WINDOW,
+            }
+            .into());
+        }
+        let state = codec::OrderedWindowStateV1 {
+            window_id,
+            order_revision: mux_revision_to_codec(order_revision)?,
+            ordered_tab_ids: ordered_tab_ids
+                .map(mux_tab_id_to_remote)
+                .collect::<Result<Vec<_>, _>>()?,
+            active_tab_id: active_tab_id.map(mux_tab_id_to_remote).transpose()?,
+        };
+        state.validate()?;
+        Ok(state)
+    }
+
+    pub(super) fn mux_frozen_window_order_to_codec(
+        window: &mux::window::FrozenWindowOrder,
+    ) -> Result<codec::OrderedWindowStateV1, OrderedWindowAdapterError> {
+        mux_order_components_to_codec(
+            window.window_id(),
+            window.order_revision(),
+            window.ordered_tab_ids(),
+            window.active_tab_id(),
+        )
+    }
+
+    pub(super) fn mux_window_order_state_to_codec(
+        window: &mux::WindowOrderState,
+    ) -> Result<codec::OrderedWindowStateV1, OrderedWindowAdapterError> {
+        mux_order_components_to_codec(
+            window.window_id,
+            window.order_revision,
+            window.ordered_tab_ids.iter().copied(),
+            window.active_tab_id,
+        )
+    }
+
+    fn mux_commit_to_codec(
+        commit: &mux::WindowOrderCommit,
+    ) -> Result<codec::WindowOrderCommitV1, OrderedWindowAdapterError> {
+        Ok(codec::WindowOrderCommitV1 {
+            topology_revision: checked_topology_revision(commit.topology_revision)?,
+            window: mux_window_order_state_to_codec(&commit.window)?,
+        })
+    }
+
+    fn mux_terminal_outcome_to_codec(
+        outcome: &mux::WindowReorderTerminalOutcome,
+    ) -> Result<codec::WindowReorderTerminalOutcomeV1, OrderedWindowAdapterError> {
+        Ok(match outcome {
+            mux::WindowReorderTerminalOutcome::Applied(commit) => {
+                codec::WindowReorderTerminalOutcomeV1::Applied(mux_commit_to_codec(commit)?)
+            }
+            mux::WindowReorderTerminalOutcome::Conflict(commit) => {
+                codec::WindowReorderTerminalOutcomeV1::Conflict(mux_commit_to_codec(commit)?)
+            }
+            mux::WindowReorderTerminalOutcome::StaleIncarnation
+            | mux::WindowReorderTerminalOutcome::MissingWindow { .. } => {
+                codec::WindowReorderTerminalOutcomeV1::StaleIncarnation
+            }
+            mux::WindowReorderTerminalOutcome::Malformed(_) => {
+                codec::WindowReorderTerminalOutcomeV1::Malformed
+            }
+            mux::WindowReorderTerminalOutcome::Exhausted => {
+                codec::WindowReorderTerminalOutcomeV1::Exhausted
+            }
+        })
+    }
+
+    /// Collapse mux-only diagnostics into the closed v1 wire vocabulary while
+    /// preserving applied/conflict commits and exact replay classification.
+    pub(super) fn mux_reorder_result_to_codec(
+        result: &mux::ReorderWindowTabsResult,
+    ) -> Result<codec::ReorderWindowTabsV1Outcome, OrderedWindowAdapterError> {
+        Ok(match result {
+            mux::ReorderWindowTabsResult::Decision(
+                mux::WindowReorderTerminalOutcome::Applied(commit),
+            ) => codec::ReorderWindowTabsV1Outcome::Applied(mux_commit_to_codec(commit)?),
+            mux::ReorderWindowTabsResult::Decision(
+                mux::WindowReorderTerminalOutcome::Conflict(commit),
+            ) => codec::ReorderWindowTabsV1Outcome::Conflict(mux_commit_to_codec(commit)?),
+            mux::ReorderWindowTabsResult::Decision(
+                mux::WindowReorderTerminalOutcome::StaleIncarnation
+                | mux::WindowReorderTerminalOutcome::MissingWindow { .. },
+            ) => codec::ReorderWindowTabsV1Outcome::StaleIncarnation,
+            mux::ReorderWindowTabsResult::Decision(
+                mux::WindowReorderTerminalOutcome::Malformed(_),
+            )
+            | mux::ReorderWindowTabsResult::Equivocation { .. } => {
+                codec::ReorderWindowTabsV1Outcome::Malformed
+            }
+            mux::ReorderWindowTabsResult::Decision(
+                mux::WindowReorderTerminalOutcome::Exhausted,
+            ) => codec::ReorderWindowTabsV1Outcome::Exhausted,
+            mux::ReorderWindowTabsResult::Replay(outcome) => {
+                codec::ReorderWindowTabsV1Outcome::Replay(mux_terminal_outcome_to_codec(outcome)?)
+            }
+        })
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::sync::Arc;
+
+        fn sample_codec_request() -> codec::ReorderWindowTabsV1 {
+            codec::ReorderWindowTabsV1 {
+                protocol_version: codec::ORDERED_WINDOW_PROTOCOL_VERSION,
+                domain_binding_id: codec::DomainBindingId::from_bytes([0x11; 16]),
+                stream_id: codec::TopologyStreamId::from_bytes([0x22; 16]),
+                session_incarnation: mux::MuxSessionIncarnation::from_bytes([0x33; 16]),
+                window_id: codec::RemoteWindowId::new(0),
+                expected_order_revision: codec::WindowOrderRevision::new(7),
+                desired_tab_ids: vec![codec::RemoteTabId::new(0), codec::RemoteTabId::new(9)],
+                desired_active_tab_id: Some(codec::RemoteTabId::new(9)),
+                mutation_id: codec::WindowOrderMutationId::new([0x44; 16], 5),
+                digest: codec::WindowReorderDigest::ZERO,
+            }
+            .with_computed_digest()
+        }
+
+        fn sample_mux_commit() -> mux::WindowOrderCommit {
+            mux::WindowOrderCommit {
+                topology_revision: mux::TopologyRevision::new(12),
+                window: mux::WindowOrderState {
+                    window_id: 0,
+                    order_revision: mux::window::WindowOrderRevision::new(8),
+                    ordered_tab_ids: Arc::from([0, 9]),
+                    active_tab_id: Some(9),
+                },
+            }
+        }
+
+        #[test]
+        fn identifier_conversions_admit_zero_and_reject_reserved_max() {
+            assert_eq!(verify_limit_contract(), Ok(()));
+            assert_eq!(
+                remote_window_id_to_mux(codec::RemoteWindowId::new(0)),
+                Ok(0)
+            );
+            assert_eq!(
+                remote_tab_id_to_mux(codec::RemoteTabId::new(0)),
+                Ok(0)
+            );
+            assert_eq!(
+                mux_window_id_to_remote(0),
+                Ok(codec::RemoteWindowId::new(0))
+            );
+            assert_eq!(
+                mux_tab_id_to_remote(0),
+                Ok(codec::RemoteTabId::new(0))
+            );
+            assert_eq!(
+                remote_window_id_to_mux(codec::RemoteWindowId::new(u64::MAX)),
+                Err(OrderedWindowAdapterError::ReservedWireId {
+                    field: "window_id",
+                    value: u64::MAX,
+                })
+            );
+            assert_eq!(
+                remote_tab_id_to_mux(codec::RemoteTabId::new(u64::MAX)),
+                Err(OrderedWindowAdapterError::ReservedWireId {
+                    field: "tab_id",
+                    value: u64::MAX,
+                })
+            );
+            #[cfg(target_pointer_width = "64")]
+            assert_eq!(
+                mux_window_id_to_remote(usize::MAX),
+                Err(OrderedWindowAdapterError::ReservedWireId {
+                    field: "window_id",
+                    value: u64::MAX,
+                })
+            );
+        }
+
+        #[cfg(target_pointer_width = "32")]
+        #[test]
+        fn identifier_conversion_rejects_wire_values_wider_than_mux_ids() {
+            let value = u64::from(u32::MAX) + 1;
+            assert_eq!(
+                remote_tab_id_to_mux(codec::RemoteTabId::new(value)),
+                Err(OrderedWindowAdapterError::CodecContract(
+                    codec::OrderedWindowProtocolError::WireIdDoesNotFitUsize {
+                        field: "RemoteTabId",
+                        value,
+                    }
+                ))
+            );
+        }
+
+        #[test]
+        fn reorder_request_conversion_validates_digest_before_narrowing() {
+            let request = sample_codec_request();
+            let converted = codec_reorder_request_to_mux(&request)
+                .expect("canonical bounded request should cross the adapter");
+            assert_eq!(converted.session_incarnation, request.session_incarnation);
+            assert_eq!(converted.window_id, 0);
+            assert_eq!(converted.expected_order_revision.get(), 7);
+            assert_eq!(converted.desired_tab_ids, vec![0, 9]);
+            assert_eq!(converted.desired_active_tab_id, Some(9));
+            assert_eq!(converted.mutation_id.namespace, [0x44; 16]);
+            assert_eq!(converted.mutation_id.sequence, 5);
+            assert_eq!(
+                converted.request_digest.as_bytes(),
+                request.digest.as_bytes()
+            );
+
+            let mut forged = request;
+            forged.digest = codec::WindowReorderDigest::from_bytes([0xff; 32]);
+            assert!(matches!(
+                codec_reorder_request_to_mux(&forged),
+                Err(OrderedWindowAdapterError::CodecContract(
+                    codec::OrderedWindowProtocolError::DigestMismatch { .. }
+                ))
+            ));
+        }
+
+        #[test]
+        fn mux_window_state_conversion_is_checked_before_wire_use() {
+            let commit = sample_mux_commit();
+            let converted = mux_window_order_state_to_codec(&commit.window)
+                .expect("valid mux authority should have a wire representation");
+            assert_eq!(converted.window_id, codec::RemoteWindowId::new(0));
+            assert_eq!(converted.order_revision.get(), 8);
+            assert_eq!(
+                converted.ordered_tab_ids,
+                vec![codec::RemoteTabId::new(0), codec::RemoteTabId::new(9)]
+            );
+            assert_eq!(converted.active_tab_id, Some(codec::RemoteTabId::new(9)));
+            assert_eq!(converted.validate(), Ok(()));
+
+            let duplicate = mux::WindowOrderState {
+                ordered_tab_ids: Arc::from([9, 9]),
+                ..commit.window.clone()
+            };
+            assert!(matches!(
+                mux_window_order_state_to_codec(&duplicate),
+                Err(OrderedWindowAdapterError::CodecContract(
+                    codec::OrderedWindowProtocolError::DuplicateTabId { tab_id: 9 }
+                ))
+            ));
+
+            let oversized_count = codec::MAX_ORDERED_TABS_PER_WINDOW + 1;
+            let oversized = mux::WindowOrderState {
+                ordered_tab_ids: Arc::from(vec![0; oversized_count]),
+                ..commit.window.clone()
+            };
+            assert_eq!(
+                mux_window_order_state_to_codec(&oversized),
+                Err(OrderedWindowAdapterError::CodecContract(
+                    codec::OrderedWindowProtocolError::TooManyTabs {
+                        window_id: 0,
+                        count: oversized_count,
+                        max: codec::MAX_ORDERED_TABS_PER_WINDOW,
+                    }
+                ))
+            );
+
+            let exhausted = mux::WindowOrderState {
+                order_revision: mux::window::WindowOrderRevision::new(u64::MAX),
+                ..commit.window
+            };
+            assert_eq!(
+                mux_window_order_state_to_codec(&exhausted),
+                Err(OrderedWindowAdapterError::RevisionExhausted {
+                    field: "window_order_revision",
+                })
+            );
+        }
+
+        #[test]
+        fn mux_reorder_results_map_to_the_closed_wire_vocabulary() {
+            let commit = sample_mux_commit();
+            let applied = mux_reorder_result_to_codec(&mux::ReorderWindowTabsResult::Decision(
+                mux::WindowReorderTerminalOutcome::Applied(commit.clone()),
+            ))
+            .expect("valid applied commit should convert");
+            assert!(matches!(
+                applied,
+                codec::ReorderWindowTabsV1Outcome::Applied(codec::WindowOrderCommitV1 {
+                    topology_revision,
+                    ..
+                }) if topology_revision == mux::TopologyRevision::new(12)
+            ));
+
+            let replay = mux_reorder_result_to_codec(&mux::ReorderWindowTabsResult::Replay(
+                mux::WindowReorderTerminalOutcome::Conflict(commit),
+            ))
+            .expect("valid replayed conflict should convert");
+            assert!(matches!(
+                replay,
+                codec::ReorderWindowTabsV1Outcome::Replay(
+                    codec::WindowReorderTerminalOutcomeV1::Conflict(_)
+                )
+            ));
+
+            let missing = mux_reorder_result_to_codec(&mux::ReorderWindowTabsResult::Decision(
+                mux::WindowReorderTerminalOutcome::MissingWindow { window_id: 71 },
+            ))
+            .expect("missing windows collapse to stale incarnation on v1 wire");
+            assert_eq!(
+                missing,
+                codec::ReorderWindowTabsV1Outcome::StaleIncarnation
+            );
+
+            let malformed = mux_reorder_result_to_codec(
+                &mux::ReorderWindowTabsResult::Equivocation {
+                    mutation_id: mux::WindowOrderMutationId::new([0x55; 16], 2),
+                    retained_digest: mux::WindowReorderDigest::from_bytes([0x66; 32]),
+                    attempted_digest: mux::WindowReorderDigest::from_bytes([0x77; 32]),
+                },
+            )
+            .expect("equivocation has a finite malformed wire outcome");
+            assert_eq!(malformed, codec::ReorderWindowTabsV1Outcome::Malformed);
+        }
+
+        #[test]
+        fn topology_revision_sentinel_never_crosses_the_adapter() {
+            let mut commit = sample_mux_commit();
+            commit.topology_revision = mux::TopologyRevision::new(u64::MAX);
+            assert_eq!(
+                mux_reorder_result_to_codec(&mux::ReorderWindowTabsResult::Decision(
+                    mux::WindowReorderTerminalOutcome::Applied(commit),
+                )),
+                Err(OrderedWindowAdapterError::RevisionExhausted {
+                    field: "topology_revision",
+                })
+            );
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct PduSender {
     func: Arc<dyn Fn(DecodedPdu, PduDeliveryClass) -> anyhow::Result<()> + Send + Sync>,
