@@ -1269,11 +1269,25 @@ fn session_mux(authority: &SessionAuthority) -> anyhow::Result<CurrentSession> {
     authority.acquire()
 }
 
-fn collect_list_panes_snapshot(mux: &Mux) -> anyhow::Result<ListPanesResponse> {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ListPanesSnapshotStage {
+    WindowsEnumerated,
+    TabTreeCaptured,
+    TitlesCaptured,
+}
+
+fn ignore_list_panes_snapshot_stage(_: ListPanesSnapshotStage) {}
+
+fn collect_list_panes_snapshot_with_stage_observer(
+    mux: &Mux,
+    observer: &mut impl FnMut(ListPanesSnapshotStage),
+) -> anyhow::Result<ListPanesResponse> {
     let mut tabs = Vec::new();
     let mut tab_titles = Vec::new();
     let mut window_titles = HashMap::new();
-    for window_id in mux.iter_windows() {
+    let window_ids = mux.iter_windows();
+    observer(ListPanesSnapshotStage::WindowsEnumerated);
+    for window_id in window_ids {
         let window_snapshot = mux.get_window(window_id).map(|window| {
             (
                 window.get_title().to_string(),
@@ -1291,9 +1305,11 @@ fn collect_list_panes_snapshot(mux: &Mux) -> anyhow::Result<ListPanesResponse> {
         window_titles.insert(window_id, window_title);
         for tab in window_tabs {
             tabs.push(tab.codec_pane_tree_in_window(window_id, &workspace)?);
+            observer(ListPanesSnapshotStage::TabTreeCaptured);
             tab_titles.push(tab.get_title());
         }
     }
+    observer(ListPanesSnapshotStage::TitlesCaptured);
     log::trace!(
         "ListPanes snapshot has {} tab trees, {} tab titles, and {} windows",
         tabs.len(),
@@ -1307,10 +1323,27 @@ fn collect_list_panes_snapshot(mux: &Mux) -> anyhow::Result<ListPanesResponse> {
     })
 }
 
+fn collect_list_panes_snapshot(mux: &Mux) -> anyhow::Result<ListPanesResponse> {
+    collect_list_panes_snapshot_with_stage_observer(
+        mux,
+        &mut ignore_list_panes_snapshot_stage,
+    )
+}
+
 const COHERENT_SNAPSHOT_ATTEMPTS: u8 = 3;
 
 fn collect_coherent_list_panes_snapshot(
     mux: &Mux,
+) -> anyhow::Result<ListPanesCoherentOutcome> {
+    collect_coherent_list_panes_snapshot_with_stage_observer(
+        mux,
+        &mut ignore_list_panes_snapshot_stage,
+    )
+}
+
+fn collect_coherent_list_panes_snapshot_with_stage_observer(
+    mux: &Mux,
+    observer: &mut impl FnMut(ListPanesSnapshotStage),
 ) -> anyhow::Result<ListPanesCoherentOutcome> {
     let mut first_revision = None;
     let mut last_revision = None;
@@ -1336,7 +1369,7 @@ fn collect_coherent_list_panes_snapshot(
             return Ok(ListPanesCoherentOutcome::RevisionExhausted);
         }
 
-        let panes = collect_list_panes_snapshot(mux)?;
+        let panes = collect_list_panes_snapshot_with_stage_observer(mux, observer)?;
 
         let (after_session, after_revision) = match mux.topology_snapshot_authority() {
             Ok(authority) => authority,
@@ -3398,6 +3431,78 @@ mod tests {
         }
     }
 
+    struct NoSleepSnapshotBarrier {
+        collector_arrived: Barrier,
+        mutation_finished: Barrier,
+        observations: AtomicUsize,
+    }
+
+    impl NoSleepSnapshotBarrier {
+        fn shared() -> Arc<Self> {
+            Arc::new(Self {
+                collector_arrived: Barrier::new(2),
+                mutation_finished: Barrier::new(2),
+                observations: AtomicUsize::new(0),
+            })
+        }
+
+        fn collector_arrive(&self) {
+            if self.observations.fetch_add(1, Ordering::AcqRel) == 0 {
+                self.collector_arrived.wait();
+                self.mutation_finished.wait();
+            }
+        }
+
+        fn mutate<R>(&self, mutation: impl FnOnce() -> R) -> R {
+            self.collector_arrived.wait();
+            let result = mutation();
+            self.mutation_finished.wait();
+            result
+        }
+
+        fn observations(&self) -> usize {
+            self.observations.load(Ordering::Acquire)
+        }
+    }
+
+    fn register_snapshot_tab(mux: &Arc<Mux>, pane: Arc<dyn Pane>) -> Arc<mux::tab::Tab> {
+        let tab = Arc::new(mux::tab::Tab::new(&test_tab_size()));
+        tab.assign_pane(&pane);
+        mux.add_tab_and_active_pane(&tab)
+            .expect("register snapshot-stage tab and active pane");
+        tab
+    }
+
+    fn attach_snapshot_tab_to_new_window(
+        mux: &Arc<Mux>,
+        tab: &Arc<mux::tab::Tab>,
+    ) -> mux::window::WindowId {
+        let window = mux.new_empty_window(None, None);
+        let window_id = *window;
+        mux.add_tab_to_window(tab, window_id)
+            .expect("attach snapshot-stage tab to its window");
+        drop(window);
+        window_id
+    }
+
+    fn expect_current_coherent_snapshot(
+        mux: &Mux,
+        outcome: ListPanesCoherentOutcome,
+    ) -> CoherentPaneSnapshot {
+        let ListPanesCoherentOutcome::Snapshot(snapshot) = outcome else {
+            panic!("expected one stable coherent snapshot, got {outcome:?}");
+        };
+        let current_authority = mux
+            .topology_snapshot_authority()
+            .expect("snapshot-stage mux topology authority remains live");
+        assert_eq!(
+            (snapshot.session_incarnation, snapshot.snapshot_revision),
+            current_authority,
+            "a successful retry must carry the exact post-mutation authority"
+        );
+        snapshot
+    }
+
     fn install_tab_with_window(
         tab: &Arc<mux::tab::Tab>,
         extra_panes: &[Arc<dyn Pane>],
@@ -4260,6 +4365,262 @@ mod tests {
         assert!(snapshot.panes.tabs.is_empty());
         assert!(snapshot.panes.tab_titles.is_empty());
         assert!(snapshot.panes.window_titles.is_empty());
+    }
+
+    #[test]
+    fn coherent_snapshot_retries_window_enumeration_cut_without_partial_topology() {
+        let _lock = crate::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let mux = Arc::new(Mux::new(None));
+        let first_tab = register_snapshot_tab(
+            &mux,
+            Arc::new(FakePane::new_with_id(7_101, None)),
+        );
+        let second_tab = register_snapshot_tab(
+            &mux,
+            Arc::new(FakePane::new_with_id(7_102, None)),
+        );
+        let first_window_id = attach_snapshot_tab_to_new_window(&mux, &first_tab);
+        let barrier = NoSleepSnapshotBarrier::shared();
+        let barrier_for_mutator = Arc::clone(&barrier);
+        let mux_for_mutator = Arc::clone(&mux);
+        let second_tab_for_mutator = Arc::clone(&second_tab);
+        let mutator = thread::spawn(move || {
+            barrier_for_mutator.mutate(|| {
+                let window = mux_for_mutator.new_empty_window(None, None);
+                let window_id = *window;
+                let attach_result =
+                    mux_for_mutator.add_tab_to_window(&second_tab_for_mutator, window_id);
+                drop(window);
+                (window_id, attach_result)
+            })
+        });
+
+        let barrier_for_collector = Arc::clone(&barrier);
+        let mut completed_attempts = 0usize;
+        let outcome = collect_coherent_list_panes_snapshot_with_stage_observer(
+            &mux,
+            &mut |stage| match stage {
+                ListPanesSnapshotStage::WindowsEnumerated => {
+                    barrier_for_collector.collector_arrive();
+                }
+                ListPanesSnapshotStage::TitlesCaptured => completed_attempts += 1,
+                ListPanesSnapshotStage::TabTreeCaptured => {}
+            },
+        );
+        let mutator_result = mutator
+            .join()
+            .expect("window-enumeration mutator must finish without panic");
+        let (second_window_id, attach_result) = mutator_result;
+        attach_result.expect("concurrent successor window must retain its tab");
+        let snapshot = expect_current_coherent_snapshot(
+            &mux,
+            outcome.expect("window-enumeration retry must remain collectable"),
+        );
+
+        assert_eq!(completed_attempts, 2, "the first cut must be retried once");
+        assert_eq!(barrier.observations(), 2);
+        assert_eq!(snapshot.panes.tabs.len(), 2);
+        assert_eq!(snapshot.panes.tab_titles.len(), 2);
+        assert_eq!(snapshot.panes.window_titles.len(), 2);
+        let snapshot_pairs = snapshot
+            .panes
+            .tabs
+            .iter()
+            .filter_map(mux::tab::PaneNode::window_and_tab_ids)
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            snapshot_pairs,
+            HashSet::from([
+                (first_window_id, first_tab.tab_id()),
+                (second_window_id, second_tab.tab_id()),
+            ]),
+            "the accepted retry must contain both complete window/tab generations"
+        );
+    }
+
+    #[test]
+    fn coherent_snapshot_retries_tab_tree_cut_without_mismatched_titles() {
+        let _lock = crate::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let mux = Arc::new(Mux::new(None));
+        let first_tab = register_snapshot_tab(
+            &mux,
+            Arc::new(FakePane::new_with_id(7_201, None)),
+        );
+        let second_tab = register_snapshot_tab(
+            &mux,
+            Arc::new(FakePane::new_with_id(7_202, None)),
+        );
+        let window_id = attach_snapshot_tab_to_new_window(&mux, &first_tab);
+        let barrier = NoSleepSnapshotBarrier::shared();
+        let barrier_for_mutator = Arc::clone(&barrier);
+        let mux_for_mutator = Arc::clone(&mux);
+        let second_tab_for_mutator = Arc::clone(&second_tab);
+        let mutator = thread::spawn(move || {
+            barrier_for_mutator.mutate(|| {
+                mux_for_mutator.add_tab_to_window(&second_tab_for_mutator, window_id)
+            })
+        });
+
+        let barrier_for_collector = Arc::clone(&barrier);
+        let mut completed_attempts = 0usize;
+        let outcome = collect_coherent_list_panes_snapshot_with_stage_observer(
+            &mux,
+            &mut |stage| match stage {
+                ListPanesSnapshotStage::TabTreeCaptured => {
+                    barrier_for_collector.collector_arrive();
+                }
+                ListPanesSnapshotStage::TitlesCaptured => completed_attempts += 1,
+                ListPanesSnapshotStage::WindowsEnumerated => {}
+            },
+        );
+        let attach_result = mutator
+            .join()
+            .expect("tab-tree mutator must finish without panic");
+        attach_result.expect("concurrent successor tab must attach exactly once");
+        let snapshot = expect_current_coherent_snapshot(
+            &mux,
+            outcome.expect("tab-tree retry must remain collectable"),
+        );
+
+        assert_eq!(completed_attempts, 2, "the first cut must be retried once");
+        assert_eq!(barrier.observations(), 3);
+        assert_eq!(snapshot.panes.tabs.len(), 2);
+        assert_eq!(snapshot.panes.tab_titles.len(), snapshot.panes.tabs.len());
+        let snapshot_tab_ids = snapshot
+            .panes
+            .tabs
+            .iter()
+            .filter_map(mux::tab::PaneNode::window_and_tab_ids)
+            .map(|(observed_window_id, tab_id)| {
+                assert_eq!(observed_window_id, window_id);
+                tab_id
+            })
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            snapshot_tab_ids,
+            HashSet::from([first_tab.tab_id(), second_tab.tab_id()]),
+            "the accepted retry must align both pane trees with both tab titles"
+        );
+    }
+
+    #[test]
+    fn coherent_snapshot_retries_pane_callback_cut_without_stale_window_title() {
+        let _lock = crate::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let mux = Arc::new(Mux::new(None));
+        let barrier = NoSleepSnapshotBarrier::shared();
+        let armed = Arc::new(AtomicUsize::new(0));
+        let barrier_for_probe = Arc::clone(&barrier);
+        let armed_for_probe = Arc::clone(&armed);
+        let probe: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+            if armed_for_probe.load(Ordering::Acquire) != 0 {
+                barrier_for_probe.collector_arrive();
+            }
+        });
+        let tab = register_snapshot_tab(
+            &mux,
+            Arc::new(FakePane::new_with_callback_probe(7_301, probe)),
+        );
+        let window_id = attach_snapshot_tab_to_new_window(&mux, &tab);
+        assert!(mux.set_window_title(window_id, "before-pane-callback-cut"));
+        let barrier_for_mutator = Arc::clone(&barrier);
+        let mux_for_mutator = Arc::clone(&mux);
+        let mutator = thread::spawn(move || {
+            barrier_for_mutator.mutate(|| {
+                mux_for_mutator.set_window_title(window_id, "after-pane-callback-cut")
+            })
+        });
+
+        armed.store(1, Ordering::Release);
+        let mut completed_attempts = 0usize;
+        let outcome = collect_coherent_list_panes_snapshot_with_stage_observer(
+            &mux,
+            &mut |stage| {
+                if stage == ListPanesSnapshotStage::TitlesCaptured {
+                    completed_attempts += 1;
+                }
+            },
+        );
+        armed.store(0, Ordering::Release);
+        let title_changed = mutator
+            .join()
+            .expect("pane-callback mutator must finish without panic");
+        assert!(title_changed, "the pane callback cut must mutate topology");
+        let snapshot = expect_current_coherent_snapshot(
+            &mux,
+            outcome.expect("pane-callback retry must remain collectable"),
+        );
+
+        assert_eq!(completed_attempts, 2, "the first cut must be retried once");
+        assert!(barrier.observations() >= 2);
+        assert_eq!(
+            snapshot
+                .panes
+                .window_titles
+                .get(&window_id)
+                .map(String::as_str),
+            Some("after-pane-callback-cut"),
+            "the stale pre-callback title from the rejected attempt must not escape"
+        );
+    }
+
+    #[test]
+    fn coherent_snapshot_retries_title_capture_cut_before_final_revision_validation() {
+        let _lock = crate::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let mux = Arc::new(Mux::new(None));
+        let tab = register_snapshot_tab(
+            &mux,
+            Arc::new(FakePane::new_with_id(7_401, None)),
+        );
+        let window_id = attach_snapshot_tab_to_new_window(&mux, &tab);
+        assert!(mux.set_window_title(window_id, "before-title-capture-cut"));
+        let barrier = NoSleepSnapshotBarrier::shared();
+        let barrier_for_mutator = Arc::clone(&barrier);
+        let mux_for_mutator = Arc::clone(&mux);
+        let mutator = thread::spawn(move || {
+            barrier_for_mutator.mutate(|| {
+                mux_for_mutator.set_window_title(window_id, "after-title-capture-cut")
+            })
+        });
+
+        let barrier_for_collector = Arc::clone(&barrier);
+        let mut completed_attempts = 0usize;
+        let outcome = collect_coherent_list_panes_snapshot_with_stage_observer(
+            &mux,
+            &mut |stage| {
+                if stage == ListPanesSnapshotStage::TitlesCaptured {
+                    completed_attempts += 1;
+                    barrier_for_collector.collector_arrive();
+                }
+            },
+        );
+        let title_changed = mutator
+            .join()
+            .expect("title-capture mutator must finish without panic");
+        assert!(title_changed, "the title capture cut must mutate topology");
+        let snapshot = expect_current_coherent_snapshot(
+            &mux,
+            outcome.expect("title-capture retry must remain collectable"),
+        );
+
+        assert_eq!(completed_attempts, 2, "the first cut must be retried once");
+        assert_eq!(barrier.observations(), 2);
+        assert_eq!(
+            snapshot
+                .panes
+                .window_titles
+                .get(&window_id)
+                .map(String::as_str),
+            Some("after-title-capture-cut"),
+            "final revision validation must reject the already-captured stale title"
+        );
     }
 
     #[test]
