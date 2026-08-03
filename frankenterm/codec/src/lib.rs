@@ -8161,7 +8161,7 @@ mod test {
                 81..=83 => 49,
                 84..=85 => 50,
                 86..=90 => 51,
-                ident => panic!("unexpected assigned PDU ID {ident}"),
+                ident => panic!("unexpected assigned PDU ID {}", ident),
             };
             assert_eq!(
                 spec.min_codec_version, expected,
