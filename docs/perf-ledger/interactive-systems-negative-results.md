@@ -2127,6 +2127,38 @@ experiment. It is not converted into a flattering keep or a durable rejection.
 - **Primary retry condition:**
   > Reconsider end-to-end request accounting only with one non-duplicated lineage capability whose admission, response, cancellation, teardown, reconnect, and serial-reuse transitions have a single linearization point and deterministic exact-once proofs.
 
+### IS-N061 — A validated trace schema is not production latency evidence
+
+- **Classification:** evidence-contract boundary; producer wiring and retained
+  target measurement required
+- **Bead:** `ft-interactive-systems-performance-4tenz.2.1`
+- **Structural contracts retained:** `28f2729d4e38512beacf30050a5535c321235244`
+  freezes Trace Contract v2, and
+  `edf8e36b257cb8e9ff85276edee9852b738611db` rejects same-clock start
+  regression and executes the committed Draft 2020-12 schema against positive
+  and negative fixtures.
+- **Rejected candidate:** treat successful DTO validation, schema conformance,
+  synthetic K0-K13/R0-R25 completeness, or fixture round trips as evidence that
+  production mux, terminal, renderer, display, or photon producers emit those
+  stages with acceptable latency.
+- **Rejected inference:** `InputSerial` remains dispatch acknowledgement and is
+  not the trace ID, application echo, or photon authority. Wall-clock metadata
+  and uncalibrated cross-host monotonic clocks remain non-subtractable. A
+  complete software trace cannot promote display or photon claims without the
+  contract's detector and calibration authority, and a schema-valid synthetic
+  trace proves neither live producer wiring nor Apple-silicon, AMD, LAN, aged-
+  session, or observer-effect performance.
+- **Required correction:** wire each frozen stage at its named production
+  boundary, retain sampling-loss and generation receipts, calibrate any
+  cross-clock or photon measurement under the declared authority, and capture
+  same-window target-class artifacts with correctness and observer-effect
+  controls.
+- **Decision:** keep the portable, fail-closed evidence contract while rejecting
+  every live latency, hardware, scale, and user-visible responsiveness claim
+  from contract or fixture proof alone.
+- **Primary retry condition:**
+  > Promote a latency claim only after exact-revision production producers emit the required complete loss-accounted trace on the declared target and workload, every interval uses one exact clock domain or retained calibration authority, and the corresponding correctness, visual, resource, and observer-effect gates pass.
+
 ## Open hypothesis register
 
 These are not negative results. Each remains open until a retained same-window
