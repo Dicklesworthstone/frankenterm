@@ -8939,7 +8939,8 @@ mod test {
             Pdu::decode(current_frame.as_slice()).expect("v50 must decode the v2 PDU 85 schema");
         assert_eq!(decoded.serial, 20);
         assert_eq!(decoded.pdu, Pdu::RenderApplicationResult(result));
-        assert_eq!(RENDER_APPLICATION_V2_MIN_CODEC_VERSION, CODEC_VERSION);
+        assert_eq!(RENDER_APPLICATION_V2_MIN_CODEC_VERSION, 50);
+        assert!(RENDER_APPLICATION_V2_MIN_CODEC_VERSION < CODEC_VERSION);
     }
 
     #[test]
