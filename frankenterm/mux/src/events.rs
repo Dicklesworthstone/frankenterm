@@ -444,7 +444,7 @@ impl EventBus {
 
     fn next_handler_id(&self) -> Result<HandlerId, HandlerRegistrationError> {
         self.next_id
-            .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                 current.checked_add(1)
             })
             .map_err(|_| HandlerRegistrationError::IdExhausted)
