@@ -61,6 +61,11 @@ mod ordered_window_adapter {
         RevisionExhausted {
             field: &'static str,
         },
+        MuxRequestRejected(mux::WindowReorderMalformed),
+        DigestAuthorityMismatch {
+            wire: [u8; 32],
+            mux: [u8; 32],
+        },
     }
 
     impl std::fmt::Display for OrderedWindowAdapterError {
@@ -85,6 +90,13 @@ mod ordered_window_adapter {
                 Self::RevisionExhausted { field } => write!(
                     formatter,
                     "ordered-window {field} uses the terminal u64::MAX sentinel"
+                ),
+                Self::MuxRequestRejected(error) => {
+                    write!(formatter, "mux rejected ordered-window request: {error:?}")
+                }
+                Self::DigestAuthorityMismatch { wire, mux } => write!(
+                    formatter,
+                    "ordered-window digest authority mismatch: wire={wire:02x?}, mux={mux:02x?}"
                 ),
             }
         }
@@ -212,8 +224,9 @@ mod ordered_window_adapter {
     /// digest, before narrowing any identifier or constructing mux authority.
     ///
     /// The caller must separately bind `domain_binding_id` and `stream_id` to
-    /// the established connection generation; neither identity exists in the
-    /// cycle-free mux request type.
+    /// the established connection generation. The stable domain binding is
+    /// included in mux digest authority; the reconnect-rotating stream is
+    /// deliberately excluded.
     pub(super) fn codec_reorder_request_to_mux(
         request: &codec::ReorderWindowTabsV1,
     ) -> Result<mux::ReorderWindowTabsRequest, OrderedWindowAdapterError> {
@@ -231,18 +244,28 @@ mod ordered_window_adapter {
             .map(remote_tab_id_to_mux)
             .transpose()?;
 
-        Ok(mux::ReorderWindowTabsRequest {
-            session_incarnation: request.session_incarnation,
-            window_id: remote_window_id_to_mux(request.window_id)?,
-            expected_order_revision: codec_revision_to_mux(request.expected_order_revision)?,
+        let mux_request = mux::ReorderWindowTabsRequest::try_new_v1(
+            request.domain_binding_id.as_bytes(),
+            request.session_incarnation,
+            remote_window_id_to_mux(request.window_id)?,
+            codec_revision_to_mux(request.expected_order_revision)?,
             desired_tab_ids,
             desired_active_tab_id,
-            mutation_id: mux::WindowOrderMutationId::new(
+            mux::WindowOrderMutationId::new(
                 request.mutation_id.namespace,
                 request.mutation_id.sequence,
             ),
-            request_digest: mux::WindowReorderDigest::from_bytes(request.digest.as_bytes()),
-        })
+        )
+        .map_err(OrderedWindowAdapterError::MuxRequestRejected)?;
+        let mux_digest = mux_request.request_digest().as_bytes();
+        let wire_digest = request.digest.as_bytes();
+        if mux_digest != wire_digest {
+            return Err(OrderedWindowAdapterError::DigestAuthorityMismatch {
+                wire: wire_digest,
+                mux: mux_digest,
+            });
+        }
+        Ok(mux_request)
     }
 
     fn mux_order_components_to_codec(
@@ -455,15 +478,15 @@ mod ordered_window_adapter {
             let request = sample_codec_request();
             let converted = codec_reorder_request_to_mux(&request)
                 .expect("canonical bounded request should cross the adapter");
-            assert_eq!(converted.session_incarnation, request.session_incarnation);
-            assert_eq!(converted.window_id, 0);
-            assert_eq!(converted.expected_order_revision.get(), 7);
-            assert_eq!(converted.desired_tab_ids, vec![0, 9]);
-            assert_eq!(converted.desired_active_tab_id, Some(9));
-            assert_eq!(converted.mutation_id.namespace, [0x44; 16]);
-            assert_eq!(converted.mutation_id.sequence, 5);
+            assert_eq!(converted.session_incarnation(), request.session_incarnation);
+            assert_eq!(converted.window_id(), 0);
+            assert_eq!(converted.expected_order_revision().get(), 7);
+            assert_eq!(converted.desired_tab_ids(), [0, 9]);
+            assert_eq!(converted.desired_active_tab_id(), Some(9));
+            assert_eq!(converted.mutation_id().namespace, [0x44; 16]);
+            assert_eq!(converted.mutation_id().sequence, 5);
             assert_eq!(
-                converted.request_digest.as_bytes(),
+                converted.request_digest().as_bytes(),
                 request.digest.as_bytes()
             );
 
@@ -2305,10 +2328,10 @@ impl OrderedWindowConnectionAuthority {
         Ok(())
     }
 
-    fn authorize_reorder(
-        &mut self,
+    fn admit_reorder_transport(
+        &self,
         request: &codec::ReorderWindowTabsV1,
-    ) -> anyhow::Result<ReorderAuthorization> {
+    ) -> anyhow::Result<EstablishedOrderedWindowAuthority> {
         let established = self.established.ok_or_else(|| {
             anyhow!("ordered-window stream has not been established by a successful PDU87")
         })?;
@@ -2325,7 +2348,20 @@ impl OrderedWindowConnectionAuthority {
                 "ordered-window reorder capability is not established on this stream"
             ));
         }
-        if request.session_incarnation != established.session_incarnation {
+        Ok(established)
+    }
+
+    fn authorize_reorder_identity(
+        &self,
+        request: &codec::ReorderWindowTabsV1,
+        admitted: EstablishedOrderedWindowAuthority,
+    ) -> anyhow::Result<ReorderAuthorization> {
+        if self.established != Some(admitted) {
+            return Err(anyhow!(
+                "ordered-window authority changed during reorder admission"
+            ));
+        }
+        if request.session_incarnation != admitted.session_incarnation {
             return Ok(ReorderAuthorization::Terminal(
                 codec::ReorderWindowTabsV1Outcome::StaleIncarnation,
             ));
@@ -2336,14 +2372,29 @@ impl OrderedWindowConnectionAuthority {
                     codec::ReorderWindowTabsV1Outcome::Malformed,
                 ))
             }
-            Some(_) => Ok(ReorderAuthorization::Proceed),
-            None => {
-                // DomainBindingId is client-owned routing/audit context. The
-                // first completely validated request pins it to this exact
-                // connection; later requests cannot silently cross bindings.
-                self.domain_binding_id = Some(request.domain_binding_id);
-                Ok(ReorderAuthorization::Proceed)
-            }
+            Some(_) | None => Ok(ReorderAuthorization::Proceed),
+        }
+    }
+
+    fn retain_authoritative_domain_binding(
+        &mut self,
+        request: &codec::ReorderWindowTabsV1,
+        result: &mux::ReorderWindowTabsResult,
+    ) {
+        let authoritative = matches!(
+            result,
+            mux::ReorderWindowTabsResult::Decision(
+                mux::WindowReorderTerminalOutcome::Applied(_)
+                    | mux::WindowReorderTerminalOutcome::Conflict(_)
+                    | mux::WindowReorderTerminalOutcome::Exhausted
+            ) | mux::ReorderWindowTabsResult::Replay(
+                mux::WindowReorderTerminalOutcome::Applied(_)
+                    | mux::WindowReorderTerminalOutcome::Conflict(_)
+                    | mux::WindowReorderTerminalOutcome::Exhausted
+            )
+        );
+        if authoritative && self.domain_binding_id.is_none() {
+            self.domain_binding_id = Some(request.domain_binding_id);
         }
     }
 }
@@ -2398,12 +2449,17 @@ fn process_reorder_window_tabs_request(
     connection_authority: &Mutex<OrderedWindowConnectionAuthority>,
     client_id: Option<&Arc<ClientId>>,
 ) -> anyhow::Result<codec::ReorderWindowTabsV1Response> {
+    let admitted = connection_authority
+        .lock()
+        .map_err(|_| anyhow!("ordered-window connection authority lock is poisoned"))?
+        .admit_reorder_transport(request)?;
     let mux_request = ordered_window_adapter::codec_reorder_request_to_mux(request)
         .context("validating and converting PDU88 before mux mutation")?;
+    let authoritative_request_digest = mux_request.request_digest();
     let authorization = connection_authority
         .lock()
         .map_err(|_| anyhow!("ordered-window connection authority lock is poisoned"))?
-        .authorize_reorder(request)?;
+        .authorize_reorder_identity(request, admitted)?;
     let outcome = match authorization {
         ReorderAuthorization::Proceed => {
             let result = mux.reorder_window_tabs(mux_request);
@@ -2424,6 +2480,10 @@ fn process_reorder_window_tabs_request(
             {
                 let _ = mux.client_had_input_if_same(client_id);
             }
+            connection_authority
+                .lock()
+                .map_err(|_| anyhow!("ordered-window connection authority lock is poisoned"))?
+                .retain_authoritative_domain_binding(request, &result);
             ordered_window_adapter::mux_reorder_result_to_codec(&result)
                 .context("converting mux reorder decision for PDU89")?
         }
@@ -2434,7 +2494,9 @@ fn process_reorder_window_tabs_request(
         stream_id: request.stream_id,
         session_incarnation: request.session_incarnation,
         mutation_id: request.mutation_id,
-        request_digest: request.digest,
+        request_digest: codec::WindowReorderDigest::from_bytes(
+            authoritative_request_digest.as_bytes(),
+        ),
         outcome,
     };
     response
@@ -5947,6 +6009,73 @@ mod tests {
                 .expect("forged-digest rejection preserves topology")
                 .1,
             topology_after_replay
+        );
+
+        let unpoisoned_authority = Mutex::new(OrderedWindowConnectionAuthority::default());
+        unpoisoned_authority
+            .lock()
+            .unwrap()
+            .establish(
+                stream_id,
+                session_incarnation,
+                ordered_window_capabilities(true),
+            )
+            .expect("isolated future authority establishes");
+        let poison_domain = codec::DomainBindingId::from_bytes([0xd3; 16]);
+        let malformed_first = reorder_request_for_snapshot(
+            &after_replay,
+            session_incarnation,
+            stream_id,
+            poison_domain,
+            6,
+            vec![first_tab.tab_id(), first_tab.tab_id()],
+        );
+        let malformed_response = process_reorder_window_tabs_request(
+            &mux,
+            &malformed_first,
+            &unpoisoned_authority,
+            None,
+        )
+        .expect("semantic malformed request receives a typed response");
+        assert_eq!(
+            malformed_response.outcome,
+            codec::ReorderWindowTabsV1Outcome::Malformed
+        );
+        assert_eq!(
+            unpoisoned_authority
+                .lock()
+                .unwrap()
+                .domain_binding_id,
+            None,
+            "a semantic-malformed first request must not pin connection binding authority"
+        );
+
+        let authoritative_domain = codec::DomainBindingId::from_bytes([0xd4; 16]);
+        let valid_after_malformed = reorder_request_for_snapshot(
+            &after_replay,
+            session_incarnation,
+            stream_id,
+            authoritative_domain,
+            7,
+            vec![first_tab.tab_id(), second_tab.tab_id()],
+        );
+        let valid_response = process_reorder_window_tabs_request(
+            &mux,
+            &valid_after_malformed,
+            &unpoisoned_authority,
+            None,
+        )
+        .expect("valid successor request must not inherit a poisoned binding");
+        assert!(matches!(
+            valid_response.outcome,
+            codec::ReorderWindowTabsV1Outcome::Applied(_)
+        ));
+        assert_eq!(
+            unpoisoned_authority
+                .lock()
+                .unwrap()
+                .domain_binding_id,
+            Some(authoritative_domain)
         );
     }
 
