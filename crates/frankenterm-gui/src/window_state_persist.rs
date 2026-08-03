@@ -310,7 +310,39 @@ impl StableLocalTabId {
     }
 }
 
-/// Provenance-bound identity of one tab occupying a mixed GUI layout.
+/// Provenance-bound identity of one tab, independent of its current window.
+///
+/// A remote tab keeps this identity when the server atomically moves it to a
+/// different window.  The parent window is routing/placement state carried by
+/// [`StableTabSlot`], not part of equality or ownership authority here.
+#[derive(
+    Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize,
+)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum StableTabIdentity {
+    Remote {
+        binding_id: DomainBindingId,
+        session_id: StableMuxSessionId,
+        remote_tab_id: u64,
+    },
+    Local {
+        session_id: StableLocalSessionId,
+        tab_id: StableLocalTabId,
+    },
+}
+
+/// Server-scoped tab authority used to reject the same incarnation/tab pair
+/// being aliased through two client bindings.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct RemoteTabAuthority {
+    session_id: StableMuxSessionId,
+    remote_tab_id: u64,
+}
+
+/// Provenance-bound placement of one tab occupying a mixed GUI layout.
+///
+/// The serialized remote window remains available for routing, while
+/// [`Self::identity`] deliberately excludes that mutable parent.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum StableTabSlot {
@@ -351,6 +383,40 @@ impl StableTabSlot {
     pub const fn remote_binding(self) -> Option<DomainBindingId> {
         match self {
             Self::Remote { binding_id, .. } => Some(binding_id),
+            Self::Local { .. } => None,
+        }
+    }
+
+    /// Stable ownership/reconciliation key for this placement.
+    #[must_use]
+    pub const fn identity(self) -> StableTabIdentity {
+        match self {
+            Self::Remote {
+                binding_id,
+                session_id,
+                remote_tab_id,
+                ..
+            } => StableTabIdentity::Remote {
+                binding_id,
+                session_id,
+                remote_tab_id,
+            },
+            Self::Local { session_id, tab_id } => {
+                StableTabIdentity::Local { session_id, tab_id }
+            }
+        }
+    }
+
+    const fn remote_authority(self) -> Option<RemoteTabAuthority> {
+        match self {
+            Self::Remote {
+                session_id,
+                remote_tab_id,
+                ..
+            } => Some(RemoteTabAuthority {
+                session_id,
+                remote_tab_id,
+            }),
             Self::Local { .. } => None,
         }
     }
@@ -733,12 +799,15 @@ pub fn reconcile_overlay(
         )));
     }
 
-    let live_set = live.iter().copied().collect::<HashSet<_>>();
-    if live_set.len() != live.len() {
-        return Err(PersistenceFailure::invalid(
-            "live layout contains duplicate stable tab identities",
-        ));
+    let mut live_by_identity = HashMap::with_capacity(live.len());
+    for slot in live {
+        if live_by_identity.insert(slot.identity(), *slot).is_some() {
+            return Err(PersistenceFailure::invalid(
+                "live layout contains duplicate stable tab identities",
+            ));
+        }
     }
+    validate_remote_binding_aliases(live, "live layout")?;
     if live.iter().any(|slot| {
         slot.remote_binding()
             .is_some_and(|binding| unavailable_bindings.contains(&binding))
@@ -760,20 +829,21 @@ pub fn reconcile_overlay(
     let mut dropped_closed_or_stale = 0usize;
 
     for slot in &overlay.slots {
-        let is_live = live_set.contains(slot);
+        let identity = slot.identity();
+        let live_placement = live_by_identity.get(&identity).copied();
         let unavailable = slot
             .remote_binding()
             .is_some_and(|binding| unavailable_bindings.contains(&binding));
-        if is_live || unavailable {
-            if seen.insert(*slot) {
+        if live_placement.is_some() || unavailable {
+            if seen.insert(identity) {
                 if ordered_slots.len() == MAX_TABS_PER_OVERLAY {
                     return Err(PersistenceFailure::quota(format!(
                         "reconciled tab count would exceed {MAX_TABS_PER_OVERLAY}"
                     )));
                 }
-                ordered_slots.push(*slot);
+                ordered_slots.push(live_placement.unwrap_or(*slot));
             }
-            if unavailable && !is_live {
+            if unavailable && live_placement.is_none() {
                 retained_unavailable += 1;
             }
         } else {
@@ -783,7 +853,7 @@ pub fn reconcile_overlay(
 
     let mut appended_new = 0usize;
     for slot in live {
-        if seen.insert(*slot) {
+        if seen.insert(slot.identity()) {
             if ordered_slots.len() == MAX_TABS_PER_OVERLAY {
                 return Err(PersistenceFailure::quota(format!(
                     "reconciled tab count would exceed {MAX_TABS_PER_OVERLAY}"
@@ -795,7 +865,9 @@ pub fn reconcile_overlay(
     }
 
     let active_live_slot = match overlay.active {
-        Some(active) if live_set.contains(&active) => Some(active),
+        Some(active) if live_by_identity.contains_key(&active.identity()) => {
+            live_by_identity.get(&active.identity()).copied()
+        }
         Some(active) => {
             let active_index = overlay
                 .slots
@@ -808,17 +880,22 @@ pub fn reconcile_overlay(
                 })?;
             overlay.slots[active_index + 1..]
                 .iter()
-                .find(|candidate| live_set.contains(candidate))
+                .find_map(|candidate| live_by_identity.get(&candidate.identity()))
                 .or_else(|| {
                     overlay.slots[..active_index]
                         .iter()
                         .rev()
-                        .find(|candidate| live_set.contains(candidate))
+                        .find_map(|candidate| live_by_identity.get(&candidate.identity()))
                 })
                 .copied()
                 .or_else(|| {
                     live.iter()
-                        .find(|candidate| !overlay.slots.contains(candidate))
+                        .find(|candidate| {
+                            !overlay
+                                .slots
+                                .iter()
+                                .any(|persisted| persisted.identity() == candidate.identity())
+                        })
                         .copied()
                 })
         }
@@ -828,10 +905,12 @@ pub fn reconcile_overlay(
     let live_slots = ordered_slots
         .iter()
         .copied()
-        .filter(|slot| live_set.contains(slot))
+        .filter(|slot| live_by_identity.contains_key(&slot.identity()))
         .collect::<Vec<_>>();
     debug_assert!(
-        active_live_slot.is_none() || active_live_slot.is_some_and(|slot| live_set.contains(&slot))
+        active_live_slot.is_none()
+            || active_live_slot
+                .is_some_and(|slot| live_by_identity.contains_key(&slot.identity()))
     );
 
     Ok(ReconciledOverlay {
@@ -2065,6 +2144,29 @@ fn validate_tombstone(tombstone: &OverlayTombstone) -> Result<(), PersistenceFai
     Ok(())
 }
 
+fn validate_remote_binding_aliases(
+    slots: &[StableTabSlot],
+    context: &'static str,
+) -> Result<(), PersistenceFailure> {
+    let mut bindings_by_authority = HashMap::new();
+    for slot in slots {
+        let (Some(authority), Some(binding)) =
+            (slot.remote_authority(), slot.remote_binding())
+        else {
+            continue;
+        };
+        if bindings_by_authority
+            .insert(authority, binding)
+            .is_some_and(|prior| prior != binding)
+        {
+            return Err(PersistenceFailure::invalid(format!(
+                "{context} aliases one remote session/tab identity through multiple bindings"
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn validate_overlay(overlay: &MixedDomainLayoutOverlay) -> Result<(), PersistenceFailure> {
     validate_workspace(&overlay.workspace)?;
     if overlay.local_revision == 0 {
@@ -2079,14 +2181,19 @@ fn validate_overlay(overlay: &MixedDomainLayoutOverlay) -> Result<(), Persistenc
             MAX_TABS_PER_OVERLAY
         )));
     }
-    let identities = overlay.slots.iter().copied().collect::<HashSet<_>>();
+    let identities = overlay
+        .slots
+        .iter()
+        .map(|slot| slot.identity())
+        .collect::<HashSet<_>>();
     if identities.len() != overlay.slots.len() {
         return Err(PersistenceFailure::invalid(
             "overlay contains duplicate stable tab identities",
         ));
     }
+    validate_remote_binding_aliases(&overlay.slots, "overlay")?;
     match overlay.active {
-        Some(active) if identities.contains(&active) => {}
+        Some(active) if overlay.slots.contains(&active) => {}
         Some(_) => {
             return Err(PersistenceFailure::invalid(
                 "overlay active identity is not a member",
@@ -2155,6 +2262,7 @@ fn validate_state(state: &PersistedState) -> Result<(), PersistenceFailure> {
     }
     let mut overlay_ids = HashSet::with_capacity(state.overlays.len());
     let mut globally_owned_tabs = HashSet::new();
+    let mut global_remote_bindings = HashMap::new();
     let mut total_tabs = 0usize;
     for overlay in &state.overlays {
         validate_overlay(overlay)?;
@@ -2172,9 +2280,19 @@ fn validate_state(state: &PersistedState) -> Result<(), PersistenceFailure> {
             )));
         }
         for slot in &overlay.slots {
-            if !globally_owned_tabs.insert(*slot) {
+            if !globally_owned_tabs.insert(slot.identity()) {
                 return Err(PersistenceFailure::invalid(
                     "one stable tab identity is owned by multiple layout windows",
+                ));
+            }
+            if let (Some(authority), Some(binding_id)) =
+                (slot.remote_authority(), slot.remote_binding())
+                && global_remote_bindings
+                    .insert(authority, binding_id)
+                    .is_some_and(|prior| prior != binding_id)
+            {
+                return Err(PersistenceFailure::invalid(
+                    "one remote session/tab identity is aliased through multiple bindings",
                 ));
             }
             if let Some(binding_id) = slot.remote_binding()
@@ -3528,22 +3646,35 @@ fn preflight_one_overlay_mutation(
 }
 
 fn overlay_component_tabs_are_unique(
-    current_owners: &HashMap<StableTabSlot, LayoutWindowId>,
+    current_owners: &HashMap<StableTabIdentity, LayoutWindowId>,
+    current_remote_owners: &HashMap<RemoteTabAuthority, LayoutWindowId>,
     batch: &PendingBatch,
     component: &[LayoutWindowId],
 ) -> bool {
     let component_ids = component.iter().copied().collect::<HashSet<_>>();
     let mut replacement_owners = HashMap::new();
+    let mut replacement_remote_owners = HashMap::new();
     for window_id in component {
         let slots = match &batch.overlay_mutations[window_id].desired {
             DesiredOverlayState::Live(overlay) => overlay.slots.as_slice(),
             DesiredOverlayState::Deleted { .. } => &[],
         };
         for slot in slots {
+            let identity = slot.identity();
             if current_owners
-                .get(slot)
+                .get(&identity)
                 .is_some_and(|owner| !component_ids.contains(owner))
-                || replacement_owners.insert(*slot, *window_id).is_some()
+                || replacement_owners.insert(identity, *window_id).is_some()
+            {
+                return false;
+            }
+            if let Some(authority) = slot.remote_authority()
+                && (current_remote_owners
+                    .get(&authority)
+                    .is_some_and(|owner| !component_ids.contains(owner))
+                    || replacement_remote_owners
+                        .insert(authority, *window_id)
+                        .is_some())
             {
                 return false;
             }
@@ -3681,6 +3812,7 @@ fn overlay_admission_components(
         .collect::<BTreeMap<_, _>>();
     let mut parent = (0..window_ids.len()).collect::<Vec<_>>();
     let mut first_delta_owner = HashMap::new();
+    let mut first_remote_delta_owner = HashMap::new();
 
     for window_id in &window_ids {
         let index = index_by_window[window_id];
@@ -3688,18 +3820,40 @@ fn overlay_admission_components(
             .get(window_id)
             .map_or(&[][..], |overlay| overlay.slots.as_slice())
             .iter()
-            .copied()
+            .map(|slot| slot.identity())
             .collect::<HashSet<_>>();
         let new_slots = match &batch.overlay_mutations[window_id].desired {
             DesiredOverlayState::Live(overlay) => overlay.slots.as_slice(),
             DesiredOverlayState::Deleted { .. } => &[],
         }
         .iter()
-        .copied()
+        .map(|slot| slot.identity())
         .collect::<HashSet<_>>();
 
-        for slot in old_slots.symmetric_difference(&new_slots).copied() {
-            if let Some(previous) = first_delta_owner.insert(slot, index) {
+        for identity in old_slots.symmetric_difference(&new_slots).copied() {
+            if let Some(previous) = first_delta_owner.insert(identity, index) {
+                union_overlay_components(&mut parent, previous, index);
+            }
+        }
+
+        let old_remote_tabs = live_by_window
+            .get(window_id)
+            .map_or(&[][..], |overlay| overlay.slots.as_slice())
+            .iter()
+            .filter_map(|slot| slot.remote_authority())
+            .collect::<HashSet<_>>();
+        let new_remote_tabs = match &batch.overlay_mutations[window_id].desired {
+            DesiredOverlayState::Live(overlay) => overlay.slots.as_slice(),
+            DesiredOverlayState::Deleted { .. } => &[],
+        }
+        .iter()
+        .filter_map(|slot| slot.remote_authority())
+        .collect::<HashSet<_>>();
+        for authority in old_remote_tabs
+            .symmetric_difference(&new_remote_tabs)
+            .copied()
+        {
+            if let Some(previous) = first_remote_delta_owner.insert(authority, index) {
                 union_overlay_components(&mut parent, previous, index);
             }
         }
@@ -3938,8 +4092,17 @@ fn partition_overlay_ownership_components(
             overlay
                 .slots
                 .iter()
-                .copied()
-                .map(move |slot| (slot, overlay.window_id))
+                .map(move |slot| (slot.identity(), overlay.window_id))
+        })
+        .collect::<HashMap<_, _>>();
+    let current_remote_owners = state
+        .overlays
+        .iter()
+        .flat_map(|overlay| {
+            overlay.slots.iter().filter_map(move |slot| {
+                slot.remote_authority()
+                    .map(|authority| (authority, overlay.window_id))
+            })
         })
         .collect::<HashMap<_, _>>();
     let mut valid_components = Vec::with_capacity(components.len());
@@ -3966,7 +4129,12 @@ fn partition_overlay_ownership_components(
             continue;
         }
 
-        if !overlay_component_tabs_are_unique(&current_owners, batch, &component) {
+        if !overlay_component_tabs_are_unique(
+            &current_owners,
+            &current_remote_owners,
+            batch,
+            &component,
+        ) {
             reject_overlay_admission_component(
                 &component,
                 batch,
@@ -10442,6 +10610,80 @@ mod tests {
     }
 
     #[test]
+    fn one_batch_transfers_remote_identity_while_updating_window_placement() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("window-state.json");
+        let (_, binding) = ensure_binding_for_test(&path, 0x93);
+        let source_window = window_id(11_080);
+        let destination_window = window_id(11_081);
+        let source_placement = remote_slot(binding, 0x94, 10, 55);
+        let destination_placement = remote_slot(binding, 0x94, 20, 55);
+        assert_eq!(source_placement.identity(), destination_placement.identity());
+
+        let mut initial = PendingBatch::default();
+        initial
+            .queue_overlay_live(
+                None,
+                MixedDomainLayoutOverlay::new(
+                    source_window,
+                    "default",
+                    1,
+                    vec![source_placement],
+                    Some(source_placement),
+                )
+                .expect("source remote owner"),
+            )
+            .expect("queue source remote owner");
+        commit_for_test(&path, &initial, WriteInterruption::None)
+            .expect("commit source remote owner");
+
+        let mut transfer = PendingBatch::default();
+        transfer
+            .queue_overlay_live(
+                Some(1),
+                MixedDomainLayoutOverlay::new(
+                    source_window,
+                    "default",
+                    2,
+                    Vec::new(),
+                    None,
+                )
+                .expect("empty source after remote transfer"),
+            )
+            .expect("queue remote source removal");
+        transfer
+            .queue_overlay_live(
+                None,
+                MixedDomainLayoutOverlay::new(
+                    destination_window,
+                    "default",
+                    1,
+                    vec![destination_placement],
+                    Some(destination_placement),
+                )
+                .expect("destination remote owner"),
+            )
+            .expect("queue destination remote ownership");
+        let committed = commit_for_test(&path, &transfer, WriteInterruption::None)
+            .expect("commit atomic remote ownership transfer");
+        assert_eq!(committed.receipt.rejected_updates, 0);
+
+        let snapshot = load_snapshot_at(&path).expect("load remote ownership transfer");
+        assert!(snapshot
+            .overlay(source_window)
+            .expect("source overlay retained")
+            .slots()
+            .is_empty());
+        assert_eq!(
+            snapshot
+                .overlay(destination_window)
+                .expect("destination remote overlay")
+                .slots(),
+            &[destination_placement]
+        );
+    }
+
+    #[test]
     fn unresolved_same_batch_binding_request_cannot_authorize_a_guessed_remote_id() {
         let temp = tempfile::tempdir().expect("tempdir");
         let path = temp.path().join("window-state.json");
@@ -10799,6 +11041,93 @@ mod tests {
     }
 
     #[test]
+    fn remote_window_move_preserves_persisted_order_active_identity_and_routing() {
+        let binding = DomainBindingId::from_bytes([0x68; 16]);
+        let left = remote_slot(binding, 1, 10, 1);
+        let moved_before = remote_slot(binding, 1, 10, 2);
+        let moved_after = remote_slot(binding, 1, 99, 2);
+        let right = remote_slot(binding, 1, 10, 3);
+        assert_eq!(moved_before.identity(), moved_after.identity());
+        assert_ne!(moved_before, moved_after);
+
+        let overlay = MixedDomainLayoutOverlay::new(
+            LayoutWindowId::from_bytes([0x69; 16]),
+            "default",
+            1,
+            vec![left, moved_before, right],
+            Some(moved_before),
+        )
+        .expect("overlay before remote move");
+        let reconciled =
+            reconcile_overlay(&overlay, &[right, moved_after, left], &BTreeSet::new())
+                .expect("moved placement reconciles by stable tab identity");
+
+        assert_eq!(reconciled.ordered_slots, vec![left, moved_after, right]);
+        assert_eq!(reconciled.live_slots, vec![left, moved_after, right]);
+        assert_eq!(reconciled.active_live_slot, Some(moved_after));
+        assert_eq!(reconciled.dropped_closed_or_stale, 0);
+        assert_eq!(reconciled.appended_new, 0);
+
+        let encoded = serde_json::to_vec(&moved_after).expect("encode moved placement");
+        let decoded: StableTabSlot =
+            serde_json::from_slice(&encoded).expect("decode moved placement");
+        assert_eq!(decoded, moved_after);
+        assert_eq!(decoded.identity(), moved_before.identity());
+        let StableTabSlot::Remote {
+            remote_window_id, ..
+        } = decoded
+        else {
+            panic!("remote placement roundtrip changed slot kind");
+        };
+        assert_eq!(remote_window_id, 99);
+    }
+
+    #[test]
+    fn duplicate_remote_placements_and_cross_binding_aliases_fail_closed() {
+        let first_binding = DomainBindingId::from_bytes([0x6a; 16]);
+        let second_binding = DomainBindingId::from_bytes([0x6b; 16]);
+        let first_placement = remote_slot(first_binding, 7, 1, 44);
+        let second_placement = remote_slot(first_binding, 7, 2, 44);
+
+        let duplicate_overlay = MixedDomainLayoutOverlay::new(
+            LayoutWindowId::from_bytes([0x6c; 16]),
+            "default",
+            1,
+            vec![first_placement, second_placement],
+            Some(first_placement),
+        )
+        .expect_err("one stable tab cannot occupy two windows");
+        assert_eq!(duplicate_overlay.code(), PersistenceFailureCode::Invalid);
+
+        let valid_overlay = MixedDomainLayoutOverlay::new(
+            LayoutWindowId::from_bytes([0x6d; 16]),
+            "default",
+            1,
+            vec![first_placement],
+            Some(first_placement),
+        )
+        .expect("single placement overlay");
+        let duplicate_live = reconcile_overlay(
+            &valid_overlay,
+            &[first_placement, second_placement],
+            &BTreeSet::new(),
+        )
+        .expect_err("live topology cannot publish two placements for one tab");
+        assert_eq!(duplicate_live.code(), PersistenceFailureCode::Invalid);
+
+        let aliased = remote_slot(second_binding, 7, 3, 44);
+        let alias_failure = MixedDomainLayoutOverlay::new(
+            LayoutWindowId::from_bytes([0x6e; 16]),
+            "default",
+            1,
+            vec![first_placement, aliased],
+            Some(first_placement),
+        )
+        .expect_err("one server tab cannot be aliased through two bindings");
+        assert_eq!(alias_failure.code(), PersistenceFailureCode::Invalid);
+    }
+
+    #[test]
     fn live_remote_slot_cannot_come_from_an_unavailable_binding() {
         let unavailable = DomainBindingId::from_bytes([0x74; 16]);
         let slot = remote_slot(unavailable, 1, 1, 1);
@@ -10845,14 +11174,15 @@ mod tests {
         );
         assert_eq!(disconnected.active_live_slot, Some(right));
 
+        let moved_active = remote_slot(unavailable, 2, 42, 2);
         let reappeared =
-            reconcile_overlay(&overlay, &[right, missing_active, left], &BTreeSet::new())
-                .expect("reconcile reappeared binding");
+            reconcile_overlay(&overlay, &[right, moved_active, left], &BTreeSet::new())
+                .expect("reconcile reappeared binding after remote-window move");
         assert_eq!(
             reappeared.ordered_slots,
-            vec![left, missing_active, right]
+            vec![left, moved_active, right]
         );
-        assert_eq!(reappeared.active_live_slot, Some(missing_active));
+        assert_eq!(reappeared.active_live_slot, Some(moved_active));
         assert_eq!(reappeared.retained_unavailable, 0);
         assert_eq!(reappeared.appended_new, 0);
     }
