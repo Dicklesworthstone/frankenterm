@@ -18,7 +18,7 @@ use std::path::PathBuf;
 
 use codec::{
     CompressionMode, DecodedPdu, ErrorResponse, GetCodecVersion, GetCodecVersionResponse,
-    GetTlsCreds, ListPanes, Pdu, Ping, Pong, UnitResponse, CODEC_VERSION,
+    GetTlsCreds, ListPanes, Pdu, Ping, Pong, StreamingPduBuffer, UnitResponse, CODEC_VERSION,
     CODEC_VERSION_MIN_SUPPORTED,
 };
 
@@ -314,8 +314,9 @@ where
         assert_eq!(decoded.serial, serial, "{label}: decoded serial drifted");
         assert_eq!(decoded.pdu, expected, "{label}: decoded PDU drifted");
 
-        let mut streaming = encoded.clone();
-        streaming.extend_from_slice(b"NEXT");
+        let mut streaming_bytes = encoded.clone();
+        streaming_bytes.extend_from_slice(b"NEXT");
+        let mut streaming = StreamingPduBuffer::from(streaming_bytes);
         let streamed = Pdu::stream_decode(&mut streaming)
             .unwrap_or_else(|err| {
                 panic!(
@@ -334,7 +335,7 @@ where
         assert_eq!(streamed.serial, serial, "{label}: streamed serial drifted");
         assert_eq!(streamed.pdu, make_pdu(), "{label}: streamed PDU drifted");
         assert_eq!(
-            streaming, b"NEXT",
+            streaming.as_slice(), b"NEXT",
             "{label}: stream_decode must leave trailing bytes for the next frame"
         );
     }
@@ -483,7 +484,7 @@ fn conformance_boundary_payload_one_over_max_is_rejected_without_allocation() {
 
 #[test]
 fn conformance_truncated_empty_buffer_returns_none() {
-    let mut buf: Vec<u8> = Vec::new();
+    let mut buf = StreamingPduBuffer::new();
     let result = Pdu::stream_decode(&mut buf).expect("empty buffer is not an error");
     assert!(result.is_none(), "empty buffer must decode to None");
     assert!(buf.is_empty(), "buffer must be untouched");
@@ -497,10 +498,14 @@ fn conformance_truncated_empty_buffer_returns_none() {
 fn conformance_truncated_mid_leb128_length_returns_none() {
     // 0x80 = continuation bit set, value so far = 0. Decoder needs at least
     // one more byte to complete the leb128.
-    let mut buf = vec![0x80u8];
+    let mut buf = StreamingPduBuffer::from(vec![0x80u8]);
     let result = Pdu::stream_decode(&mut buf).expect("partial leb128 is not fatal on a stream");
     assert!(result.is_none(), "partial leb128 must decode to None");
-    assert_eq!(buf, vec![0x80], "buffer must be preserved for more bytes");
+    assert_eq!(
+        buf.as_slice(),
+        &[0x80],
+        "buffer must be preserved for more bytes"
+    );
 }
 
 // -----------------------------------------------------------------------------
@@ -511,10 +516,10 @@ fn conformance_truncated_mid_leb128_length_returns_none() {
 fn conformance_truncated_length_without_payload_returns_none() {
     // tagged_len=10, but only the length byte is present. stream_decode
     // should hold the bytes and wait for more.
-    let mut buf = vec![10u8];
+    let mut buf = StreamingPduBuffer::from(vec![10u8]);
     let result = Pdu::stream_decode(&mut buf).expect("truncated frame must not error on stream");
     assert!(result.is_none(), "truncated body must decode to None");
-    assert_eq!(buf, vec![10u8], "buffer must be preserved");
+    assert_eq!(buf.as_slice(), &[10u8], "buffer must be preserved");
 }
 
 // -----------------------------------------------------------------------------
@@ -531,8 +536,9 @@ fn conformance_trailing_garbage_leaves_remainder_in_buffer() {
 
     // Append arbitrary bytes after the valid frame.
     wire.extend_from_slice(b"GARBAGE");
+    let mut stream = StreamingPduBuffer::from(wire);
 
-    let decoded = Pdu::stream_decode(&mut wire)
+    let decoded = Pdu::stream_decode(&mut stream)
         .expect("valid prefix must decode even with trailing bytes")
         .expect("stream_decode returned None despite valid frame");
     assert_eq!(
@@ -543,7 +549,7 @@ fn conformance_trailing_garbage_leaves_remainder_in_buffer() {
         }
     );
     assert_eq!(
-        wire, b"GARBAGE",
+        stream.as_slice(), b"GARBAGE",
         "stream_decode must consume exactly {consumed_len} bytes and leave the rest"
     );
 }
@@ -557,16 +563,17 @@ fn conformance_two_back_to_back_pdus_decode_cleanly() {
     let mut wire = Vec::new();
     Pdu::Ping(Ping {}).encode(&mut wire, 11).unwrap();
     Pdu::Ping(Ping {}).encode(&mut wire, 22).unwrap();
+    let mut stream = StreamingPduBuffer::from(wire);
 
-    let first = Pdu::stream_decode(&mut wire).unwrap().expect("first frame");
+    let first = Pdu::stream_decode(&mut stream).unwrap().expect("first frame");
     assert_eq!(first.serial, 11);
-    let second = Pdu::stream_decode(&mut wire)
+    let second = Pdu::stream_decode(&mut stream)
         .unwrap()
         .expect("second frame");
     assert_eq!(second.serial, 22);
-    assert!(wire.is_empty(), "both frames must be fully consumed");
+    assert!(stream.is_empty(), "both frames must be fully consumed");
 
-    let third = Pdu::stream_decode(&mut wire).unwrap();
+    let third = Pdu::stream_decode(&mut stream).unwrap();
     assert!(third.is_none(), "empty buffer after two PDUs must be None");
 }
 
@@ -614,7 +621,7 @@ fn conformance_mixed_mux_pdu_roundtrip_preserves_order_under_all_compression_mod
         ),
     ];
 
-    let mut stream = Vec::new();
+    let mut stream_bytes = Vec::new();
     for (label, serial, mode, pdu) in &cases {
         let mut frame = Vec::new();
         pdu.encode_with_mode(&mut frame, *serial, *mode)
@@ -637,8 +644,9 @@ fn conformance_mixed_mux_pdu_roundtrip_preserves_order_under_all_compression_mod
         assert_eq!(decoded.serial, *serial, "{label}: direct serial");
         assert_eq!(&decoded.pdu, pdu, "{label}: direct pdu");
 
-        stream.extend(frame);
+        stream_bytes.extend(frame);
     }
+    let mut stream = StreamingPduBuffer::from(stream_bytes);
 
     for (idx, (label, serial, _mode, pdu)) in cases.iter().enumerate() {
         let decoded = Pdu::stream_decode(&mut stream)
@@ -704,10 +712,10 @@ fn conformance_mux_pdu_roundtrip_decodes_one_byte_chunks_in_order() {
         expected.push((serial, pdu));
     }
 
-    let mut buffer = Vec::new();
+    let mut buffer = StreamingPduBuffer::new();
     let mut actual = Vec::new();
     for byte in wire {
-        buffer.push(byte);
+        buffer.extend_from_slice(&[byte]);
         while let Some(decoded) =
             Pdu::stream_decode(&mut buffer).expect("stream_decode one-byte chunk")
         {
@@ -764,10 +772,11 @@ fn conformance_stream_decode_preserves_malformed_complete_frame() {
     // Same impossible arithmetic as above, but through the streaming API. A
     // malformed complete frame must surface an error without consuming bytes so
     // callers can log or quarantine the offending wire image.
-    let mut wire = frame_verbatim(&[0x80, 0x00], &[0x81, 0x00], &[0xE3, 0x00], &[]);
+    let wire = frame_verbatim(&[0x80, 0x00], &[0x81, 0x00], &[0xE3, 0x00], &[]);
     let original = wire.clone();
+    let mut stream = StreamingPduBuffer::from(wire);
 
-    let err = Pdu::stream_decode(&mut wire)
+    let err = Pdu::stream_decode(&mut stream)
         .expect_err("stream_decode must reject malformed complete frame");
     let msg = format!("{err:#}");
     // The streaming framer (`buffered_frame_len`) trusts the non-canonical
@@ -787,7 +796,7 @@ fn conformance_stream_decode_preserves_malformed_complete_frame() {
         msg = msg,
     );
     assert_eq!(
-        wire, original,
+        stream.as_slice(), original.as_slice(),
         "stream_decode must preserve bytes when a complete frame is malformed"
     );
 }
@@ -800,7 +809,8 @@ fn conformance_stream_decode_preserves_malformed_complete_frame() {
 fn conformance_unknown_ident_zero_data_yields_invalid_variant() {
     // tagged_len = enc_len(serial=7) + enc_len(ident=99) = 1 + 1 = 2, data_len = 0.
     let wire = frame(2, 7, 99, &[]);
-    let decoded = Pdu::stream_decode(&mut wire.clone())
+    let mut stream = StreamingPduBuffer::from(wire);
+    let decoded = Pdu::stream_decode(&mut stream)
         .unwrap()
         .expect("unknown ident is still a well-formed frame");
     assert_eq!(
@@ -826,12 +836,12 @@ fn conformance_stream_decode_is_whole_frame_or_nothing() {
         .expect("encode Ping");
 
     let total_len = encoded.len();
-    let mut growing = Vec::with_capacity(total_len);
+    let mut growing = StreamingPduBuffer::with_capacity(total_len);
     for (i, &b) in encoded.iter().enumerate() {
-        growing.push(b);
+        growing.extend_from_slice(&[b]);
         if i + 1 < total_len {
             // Every proper prefix must decode to None without consuming the buffer.
-            let before = growing.clone();
+            let before = growing.as_slice().to_vec();
             let result = Pdu::stream_decode(&mut growing).expect("partial prefix is not an error");
             assert!(
                 result.is_none(),
@@ -840,7 +850,7 @@ fn conformance_stream_decode_is_whole_frame_or_nothing() {
                 total_len
             );
             assert_eq!(
-                growing, before,
+                growing.as_slice(), before.as_slice(),
                 "stream_decode must not mutate the buffer on a partial read"
             );
         }

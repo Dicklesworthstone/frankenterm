@@ -1,6 +1,6 @@
 #![no_main]
 
-use codec::Pdu;
+use codec::{Pdu, StreamingPduBuffer};
 use libfuzzer_sys::fuzz_target;
 use std::io::{self, Read};
 
@@ -61,7 +61,7 @@ fuzz_target!(|data: &[u8]| {
         .min(rest.len());
     let (initial, scripted_reads) = rest.split_at(initial_len);
 
-    let mut buffer = initial.to_vec();
+    let mut buffer = StreamingPduBuffer::from(initial.to_vec());
     let mut reader = ChunkedWouldBlockReader::new(scripted_reads);
 
     for _ in 0..MAX_READ_STEPS {

@@ -12,7 +12,7 @@
 //! `bounded_varbincode` and clamps the `SeqAccess`/`MapAccess` size_hint
 //! so visitor preallocation stays bounded regardless of attacker input.
 
-use codec::Pdu;
+use codec::{Pdu, StreamingPduBuffer};
 
 /// The exact 17-byte crasher from libFuzzer. Inlined (not loaded from the
 /// artifact file) so the regression is self-contained and survives
@@ -47,7 +47,7 @@ fn oom_crasher_5c320deb_rejected_without_allocation() {
     // decoder would not panic here, it would just allocate gigabytes and
     // hang. If this test ever regresses we want it to fail fast: the
     // decoder MUST return a typed error, not succeed and not hang.
-    let mut buf = OOM_CRASHER.to_vec();
+    let mut buf = StreamingPduBuffer::from(OOM_CRASHER.to_vec());
 
     match Pdu::stream_decode(&mut buf) {
         Ok(None) => {
@@ -92,7 +92,7 @@ fn oom_crasher_5c320deb_rejected_without_allocation() {
 fn oom_crasher_5c320deb_completes_quickly() {
     use std::time::Instant;
 
-    let mut buf = OOM_CRASHER.to_vec();
+    let mut buf = StreamingPduBuffer::from(OOM_CRASHER.to_vec());
     let started = Instant::now();
     let _ = Pdu::stream_decode(&mut buf);
     let elapsed = started.elapsed();
@@ -107,7 +107,7 @@ fn oom_crasher_5c320deb_completes_quickly() {
 
 #[test]
 fn asan_crasher_22974e1f_completes_without_allocator_blowup() {
-    let mut buf = ASAN_ALLOCATION_TOO_BIG_CRASHER.to_vec();
+    let mut buf = StreamingPduBuffer::from(ASAN_ALLOCATION_TOO_BIG_CRASHER.to_vec());
     let mut saw_progress = false;
 
     for _ in 0..8 {

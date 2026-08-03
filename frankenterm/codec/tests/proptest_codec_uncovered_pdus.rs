@@ -28,7 +28,7 @@
 use codec::{
     CompressionMode, ErrorResponse, MovePaneToNewTab, Pdu, Ping, Pong, Resize, SendPaste,
     SetClipboard, SetPaneZoomed, SetWindowWorkspace, SpawnResponse, SpawnV2, SplitPane,
-    UnitResponse, WriteToPane,
+    StreamingPduBuffer, UnitResponse, WriteToPane,
 };
 use config::keyassignment::SpawnTabDomain;
 use frankenterm_term::ClipboardSelection;
@@ -83,7 +83,7 @@ fn assert_pdu_roundtrip_with_mode(serial: u64, pdu: &Pdu, mode: CompressionMode)
     assert_eq!(decoded.serial, serial);
     assert_eq!(decoded.pdu, *pdu);
 
-    let mut streaming = encoded.clone();
+    let mut streaming = StreamingPduBuffer::from(encoded.clone());
     let streamed = Pdu::stream_decode(&mut streaming).unwrap().unwrap();
     assert_eq!(streamed.serial, serial);
     assert_eq!(streamed.pdu, *pdu);
@@ -274,13 +274,14 @@ fn assert_stream_decode_preserves_trailing_bytes(
     prop_assert_eq!(direct.serial, serial);
     prop_assert_eq!(direct.pdu, pdu.to_pdu());
 
-    let mut framed = encoded;
-    framed.extend_from_slice(trailing);
+    let mut framed_bytes = encoded;
+    framed_bytes.extend_from_slice(trailing);
+    let mut framed = StreamingPduBuffer::from(framed_bytes);
 
     let streamed = Pdu::stream_decode(&mut framed).unwrap().unwrap();
     prop_assert_eq!(streamed.serial, serial);
     prop_assert_eq!(streamed.pdu, pdu.to_pdu());
-    prop_assert_eq!(framed, trailing);
+    prop_assert_eq!(framed.as_slice(), trailing);
     Ok(())
 }
 
@@ -340,8 +341,8 @@ fn assert_frame_header_and_prefix_contract(
     }
 
     for split in 0..encoded.len() {
-        let mut partial = encoded[..split].to_vec();
-        let before = partial.clone();
+        let before = encoded[..split].to_vec();
+        let mut partial = StreamingPduBuffer::from(before.clone());
         let decoded = Pdu::stream_decode(&mut partial)
             .map_err(|err| TestCaseError::fail(format!("stream_decode prefix failed: {err}")))?;
         prop_assert!(
@@ -349,14 +350,14 @@ fn assert_frame_header_and_prefix_contract(
             "strict prefix of length {split} decoded as a complete frame"
         );
         prop_assert_eq!(
-            partial,
-            before,
+            partial.as_slice(),
+            before.as_slice(),
             "strict prefix of length {} must remain buffered unchanged",
             split
         );
     }
 
-    let mut complete = encoded;
+    let mut complete = StreamingPduBuffer::from(encoded);
     let decoded = Pdu::stream_decode(&mut complete)
         .map_err(|err| TestCaseError::fail(format!("stream_decode complete failed: {err}")))?
         .ok_or_else(|| TestCaseError::fail("complete frame did not decode"))?;
@@ -531,9 +532,10 @@ proptest! {
                 expected.push((serial, decoded_pdu));
             }
         }
+        let mut stream = StreamingPduBuffer::from(wire);
 
         for (idx, (serial, pdu)) in expected.into_iter().enumerate() {
-            let decoded = Pdu::stream_decode(&mut wire)
+            let decoded = Pdu::stream_decode(&mut stream)
                 .expect("stream_decode")
                 .unwrap_or_else(|| panic!("missing decoded frame at index {}", idx));
             prop_assert_eq!(decoded.serial, serial);
@@ -541,9 +543,9 @@ proptest! {
         }
 
         prop_assert!(
-            wire.is_empty(),
+            stream.is_empty(),
             "stream_decode left {} bytes after all generated frames",
-            wire.len()
+            stream.len()
         );
     }
 
@@ -571,7 +573,7 @@ proptest! {
             expected.push((serial, decoded_pdu));
         }
 
-        let mut buffer = Vec::new();
+        let mut buffer = StreamingPduBuffer::new();
         let mut actual = Vec::new();
         let mut offset = 0usize;
         let mut chunk_iter = chunk_sizes.iter().copied().cycle();
@@ -644,22 +646,23 @@ proptest! {
         let mut mutated = retag_frame_len(&encoded, compressed_bit | mutated_raw_len)?;
         mutated.extend_from_slice(&suffix);
         let before = mutated.clone();
+        let mut buffer = StreamingPduBuffer::from(mutated);
 
-        match Pdu::stream_decode(&mut mutated) {
+        match Pdu::stream_decode(&mut buffer) {
             Ok(Some(_decoded)) => {
                 prop_assert!(
-                    mutated.len() < before.len(),
+                    buffer.len() < before.len(),
                     "successful decode must consume at least one framed byte"
                 );
             }
             Ok(None) => prop_assert_eq!(
-                mutated,
-                before,
+                buffer.as_slice(),
+                before.as_slice(),
                 "incomplete mutated-length frame must leave buffered bytes unchanged"
             ),
             Err(_) => prop_assert_eq!(
-                mutated,
-                before,
+                buffer.as_slice(),
+                before.as_slice(),
                 "malformed mutated-length frame must leave buffered bytes unchanged"
             ),
         }
@@ -729,7 +732,7 @@ proptest! {
             .encode_with_mode(&mut wire, response_serial, response_mode)
             .expect("encode SpawnResponse");
 
-        let mut buffer = Vec::new();
+        let mut buffer = StreamingPduBuffer::new();
         let mut actual = Vec::new();
         let mut offset = 0usize;
         let mut chunk_iter = chunk_sizes.iter().copied().cycle();

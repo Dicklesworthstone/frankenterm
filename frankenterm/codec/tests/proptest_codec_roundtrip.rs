@@ -961,7 +961,7 @@ fn assert_pdu_roundtrip(serial: u64, pdu: Pdu) {
     assert_eq!(decoded.serial, serial);
     assert_eq!(decoded.pdu, pdu);
 
-    let mut streaming = encoded.clone();
+    let mut streaming = codec::StreamingPduBuffer::from(encoded.clone());
     let streamed = Pdu::stream_decode(&mut streaming).unwrap().unwrap();
     assert_eq!(streamed.serial, serial);
     assert_eq!(streamed.pdu, pdu);

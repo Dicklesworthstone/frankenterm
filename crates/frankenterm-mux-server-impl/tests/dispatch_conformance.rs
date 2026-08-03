@@ -12,7 +12,7 @@
 
 use asupersync::io::{AsyncRead, AsyncWrite, ReadBuf};
 use async_channel::TryRecvError;
-use codec::{CompressionMode, DecodedPdu, Pdu, Ping};
+use codec::{CompressionMode, DecodedPdu, Pdu, Ping, StreamingPduBuffer};
 use frankenterm_mux_server_impl::dispatch::{
     self, DispatchIoPreference, DispatchRuntimeConfig, DispatchStream, DispatchStreamKind,
 };
@@ -202,7 +202,7 @@ fn encoded_mixed_compression_ping_series(n: u64) -> (Vec<u8>, Vec<u64>) {
 
 fn try_decode_all(bytes: &[u8]) -> Result<Vec<DecodedPdu>, String> {
     let mut out = Vec::new();
-    let mut buffer = bytes.to_vec();
+    let mut buffer = StreamingPduBuffer::from(bytes.to_vec());
     while let Some(decoded) =
         Pdu::stream_decode(&mut buffer).map_err(|err| format!("stream_decode frame: {err:#}"))?
     {
@@ -212,7 +212,7 @@ fn try_decode_all(bytes: &[u8]) -> Result<Vec<DecodedPdu>, String> {
         return Err(format!(
             "dispatch conformance output ended with {} trailing undecoded byte(s): {:02x?}",
             buffer.len(),
-            buffer
+            buffer.as_slice()
         ));
     }
     Ok(out)

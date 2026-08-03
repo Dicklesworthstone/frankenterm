@@ -4,8 +4,8 @@ use std::io::{self, Read};
 use codec::{
     CreateFloatingPane, CycleStack, DecodedPdu, ListPanesTabStackEntry, ListPanesTabStacks,
     ListPanesTabStacksResponse, MoveFloatingPane, Pdu, Ping, RemoveFloatingPane, SelectStackPane,
-    SetClipboard, SetLayoutCycle, SetPalette, SetPaneZoomed, SwapToLayout, ToggleFloatingPane,
-    UnitResponse, UpdatePaneConstraints,
+    SetClipboard, SetLayoutCycle, SetPalette, SetPaneZoomed, StreamingPduBuffer, SwapToLayout,
+    ToggleFloatingPane, UnitResponse, UpdatePaneConstraints,
 };
 use frankenterm_term::color::ColorPalette;
 use frankenterm_term::ClipboardSelection;
@@ -51,7 +51,7 @@ impl Read for ScriptedReader {
 #[test]
 fn stream_decode_unknown_ident_consumes_frame() {
     // len=2, serial=1, ident=99 (unknown), no payload
-    let mut buffer = vec![2, 1, 99];
+    let mut buffer = StreamingPduBuffer::from(vec![2, 1, 99]);
     let decoded = Pdu::stream_decode(&mut buffer).unwrap().unwrap();
     assert_eq!(
         decoded,
@@ -65,27 +65,28 @@ fn stream_decode_unknown_ident_consumes_frame() {
 
 #[test]
 fn stream_decode_partial_frame_preserves_buffer() {
-    let mut buffer = vec![2];
+    let mut buffer = StreamingPduBuffer::from(vec![2]);
     let decoded = Pdu::stream_decode(&mut buffer).unwrap();
     assert!(decoded.is_none());
-    assert_eq!(buffer, vec![2]);
+    assert_eq!(buffer.as_slice(), &[2]);
 }
 
 #[test]
 fn stream_decode_overflow_length_returns_error_and_preserves_buffer() {
     // Overflowing leb128 length.
-    let mut buffer = vec![0x80; 10];
-    buffer.push(0x02);
-    let before = buffer.clone();
+    let mut bytes = vec![0x80; 10];
+    bytes.push(0x02);
+    let before = bytes.clone();
+    let mut buffer = StreamingPduBuffer::from(bytes);
 
     assert!(Pdu::stream_decode(&mut buffer).is_err());
-    assert_eq!(buffer, before);
+    assert_eq!(buffer.as_slice(), before.as_slice());
 }
 
 #[test]
 fn try_read_and_decode_would_block_without_data_returns_none() {
     let mut reader = ScriptedReader::new(vec![ReadStep::WouldBlock]);
-    let mut read_buffer = Vec::new();
+    let mut read_buffer = StreamingPduBuffer::new();
     let decoded = Pdu::try_read_and_decode(&mut reader, &mut read_buffer).unwrap();
     assert!(decoded.is_none());
     assert!(read_buffer.is_empty());
@@ -97,11 +98,11 @@ fn try_read_and_decode_would_block_preserves_partial_buffer() {
     Pdu::Ping(Ping {}).encode(&mut encoded, 7).unwrap();
 
     let mut reader = ScriptedReader::new(vec![ReadStep::WouldBlock]);
-    let mut read_buffer = vec![encoded[0]];
+    let mut read_buffer = StreamingPduBuffer::from(vec![encoded[0]]);
     let decoded = Pdu::try_read_and_decode(&mut reader, &mut read_buffer).unwrap();
 
     assert!(decoded.is_none());
-    assert_eq!(read_buffer, vec![encoded[0]]);
+    assert_eq!(read_buffer.as_slice(), &[encoded[0]]);
 }
 
 #[test]
@@ -113,7 +114,7 @@ fn try_read_and_decode_handles_incremental_reads() {
         ReadStep::Data(vec![encoded[0]]),
         ReadStep::Data(encoded[1..].to_vec()),
     ]);
-    let mut read_buffer = Vec::new();
+    let mut read_buffer = StreamingPduBuffer::new();
 
     let decoded = Pdu::try_read_and_decode(&mut reader, &mut read_buffer)
         .unwrap()
@@ -173,7 +174,7 @@ fn stream_decode_create_floating_pane() {
     let mut encoded = Vec::new();
     pdu.encode(&mut encoded, 500).unwrap();
 
-    let mut buffer = encoded.clone();
+    let mut buffer = StreamingPduBuffer::from(encoded.clone());
     let decoded = Pdu::stream_decode(&mut buffer).unwrap().unwrap();
     assert_eq!(decoded.serial, 500);
     assert_eq!(decoded.pdu, pdu);
@@ -192,7 +193,7 @@ fn stream_decode_swap_to_layout() {
     let mut encoded = Vec::new();
     pdu.encode(&mut encoded, 501).unwrap();
 
-    let mut buffer = encoded;
+    let mut buffer = StreamingPduBuffer::from(encoded);
     let decoded = Pdu::stream_decode(&mut buffer).unwrap().unwrap();
     assert_eq!(decoded.serial, 501);
     assert_eq!(decoded.pdu, pdu);
@@ -210,7 +211,7 @@ fn stream_decode_update_pane_constraints() {
     let mut encoded = Vec::new();
     pdu.encode(&mut encoded, 502).unwrap();
 
-    let mut buffer = encoded;
+    let mut buffer = StreamingPduBuffer::from(encoded);
     let decoded = Pdu::stream_decode(&mut buffer).unwrap().unwrap();
     assert_eq!(decoded.pdu, pdu);
 }
@@ -229,7 +230,7 @@ fn stream_decode_list_panes_tab_stacks_response() {
     let mut encoded = Vec::new();
     pdu.encode(&mut encoded, 503).unwrap();
 
-    let mut buffer = encoded;
+    let mut buffer = StreamingPduBuffer::from(encoded);
     let decoded = Pdu::stream_decode(&mut buffer).unwrap().unwrap();
     assert_eq!(decoded.serial, 503);
     assert_eq!(decoded.pdu, pdu);
@@ -256,7 +257,7 @@ fn incremental_read_floating_pane_pdu() {
     // Feed one byte at a time to test incremental decode
     let steps: Vec<ReadStep> = encoded.iter().map(|&b| ReadStep::Data(vec![b])).collect();
     let mut reader = ScriptedReader::new(steps);
-    let mut read_buffer = Vec::new();
+    let mut read_buffer = StreamingPduBuffer::new();
 
     let decoded = Pdu::try_read_and_decode(&mut reader, &mut read_buffer)
         .unwrap()
@@ -412,7 +413,7 @@ fn cycle_stack_forward_and_backward_roundtrip() {
         let mut encoded = Vec::new();
         pdu.encode(&mut encoded, 800).unwrap();
 
-        let mut buffer = encoded;
+        let mut buffer = StreamingPduBuffer::from(encoded);
         let decoded = Pdu::stream_decode(&mut buffer).unwrap().unwrap();
         assert_eq!(decoded.pdu, pdu);
     }

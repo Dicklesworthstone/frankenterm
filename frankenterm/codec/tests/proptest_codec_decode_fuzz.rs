@@ -21,7 +21,7 @@
 //!   (3) `stream_decode` over random buffers — exercises the partial-
 //!       frame path that the mux uses on every read from a socket.
 
-use codec::{CompressionMode, ErrorResponse, Pdu};
+use codec::{CompressionMode, ErrorResponse, Pdu, StreamingPduBuffer};
 use proptest::prelude::*;
 
 const COMPRESSED_MASK: u64 = 1 << 63;
@@ -144,7 +144,7 @@ proptest! {
     fn stream_decode_random_bytes_never_panics(
         bytes in proptest::collection::vec(any::<u8>(), 0..2048),
     ) {
-        let mut buf = bytes;
+        let mut buf = StreamingPduBuffer::from(bytes);
         let original_len = buf.len();
         match Pdu::stream_decode(&mut buf) {
             Ok(Some(decoded)) => {

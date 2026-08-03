@@ -17,8 +17,8 @@ use codec::{
     ErrorResponse, GetCodecVersion, GetCodecVersionResponse, KillPane, LivenessResponse,
     PaneFocused, PaneRemoved, Pdu, Ping, Pong, RenameWorkspace, Resize, SendPaste,
     SetActiveWorkspace, SetFocusedPane, SetPaneZoomed, SetWindowWorkspace, TabAddedToWindow,
-    TabResized, TabTitleChanged, UnitResponse, WindowTitleChanged, WindowWorkspaceChanged,
-    WriteToPane,
+    StreamingPduBuffer, TabResized, TabTitleChanged, UnitResponse, WindowTitleChanged,
+    WindowWorkspaceChanged, WriteToPane,
 };
 use frankenterm_term::TerminalSize;
 use libfuzzer_sys::arbitrary::{Arbitrary, Unstructured};
@@ -391,7 +391,7 @@ fuzz_target!(|case: FuzzCase| {
 
     // stream_decode on a buffer containing exactly one frame must also work
     // and must consume all bytes.
-    let mut stream_buf = encoded.clone();
+    let mut stream_buf = StreamingPduBuffer::from(encoded.clone());
     let streamed = Pdu::stream_decode(&mut stream_buf)
         .expect("stream_decode errored on a well-formed frame")
         .expect("stream_decode returned None for a complete frame");

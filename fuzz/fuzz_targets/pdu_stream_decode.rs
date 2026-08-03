@@ -1,6 +1,6 @@
 #![no_main]
 
-use codec::Pdu;
+use codec::{Pdu, StreamingPduBuffer};
 use libfuzzer_sys::fuzz_target;
 
 const MAX_INPUT_LEN: usize = 64 * 1024;
@@ -68,7 +68,7 @@ fn exercise_synthesized_boundary_frame(data: &[u8]) {
     };
 
     let direct = Pdu::decode(frame.as_slice());
-    let mut stream_buffer = frame.clone();
+    let mut stream_buffer = StreamingPduBuffer::from(frame.clone());
     let stream = Pdu::stream_decode(&mut stream_buffer);
 
     if should_reject_oversize {
@@ -81,7 +81,8 @@ fn exercise_synthesized_boundary_frame(data: &[u8]) {
             "stream_decode accepted oversized synthetic PDU frame"
         );
         assert_eq!(
-            stream_buffer, frame,
+            stream_buffer.as_slice(),
+            frame.as_slice(),
             "oversized stream frame should be rejected before consuming bytes"
         );
         return;
@@ -107,10 +108,10 @@ fuzz_target!(|data: &[u8]| {
 
     exercise_synthesized_boundary_frame(data);
 
-    let mut buffer = data.to_vec();
+    let mut buffer = StreamingPduBuffer::from(data.to_vec());
 
     for _ in 0..MAX_DECODE_STEPS {
-        let before = buffer.clone();
+        let before = buffer.as_slice().to_vec();
         let before_len = buffer.len();
 
         match Pdu::stream_decode(&mut buffer) {
