@@ -36,10 +36,11 @@ use wezterm_term::terminal::Alert;
 /// Checked, cycle-breaking conversions between the ordered-window wire schema
 /// and mux authority.
 ///
-/// The live PDU handlers remain intentionally dormant.  Keeping these helpers
-/// together makes the eventual activation point explicit: connection-scoped
-/// stream/domain authorization happens before the inbound conversion, and a
-/// fully converted outbound value is validated before it is enqueued.
+/// The PDU handlers are source-wired, but runtime capability advertisement and
+/// dispatch remain intentionally dormant. Keeping these helpers together makes
+/// the eventual activation point explicit: connection-scoped stream/domain
+/// authorization happens before mux mutation, and a fully converted outbound
+/// value is validated before it is enqueued.
 #[allow(dead_code)]
 mod ordered_window_adapter {
     #[derive(Debug, Eq, PartialEq)]
@@ -1989,6 +1990,459 @@ fn collect_coherent_list_panes_snapshot_with_stage_observer(
     })
 }
 
+/// One callback-free window capture used to derive both halves of PDU87.
+///
+/// `order` retains the exact `Arc<Tab>` identities captured while the mux
+/// window guard was held. Pane trees and ordered-window records are derived
+/// from those same identities only after the guard is dropped, so no pane
+/// callback can re-enter the mux window map through this capture.
+struct FrozenOrderedSnapshotWindow {
+    title: String,
+    workspace: String,
+    order: mux::window::FrozenWindowOrder,
+}
+
+fn checked_ordered_snapshot_window_count(
+    window_count: usize,
+) -> Result<(), codec::OrderedWindowProtocolError> {
+    if window_count > codec::MAX_ORDERED_WINDOWS_PER_SNAPSHOT {
+        return Err(codec::OrderedWindowProtocolError::TooManyWindows {
+            count: window_count,
+            max: codec::MAX_ORDERED_WINDOWS_PER_SNAPSHOT,
+        });
+    }
+    Ok(())
+}
+
+fn checked_ordered_snapshot_tab_total(
+    prior: usize,
+    additional: usize,
+) -> Result<usize, codec::OrderedWindowProtocolError> {
+    let total = prior
+        .checked_add(additional)
+        .ok_or(codec::OrderedWindowProtocolError::CountOverflow)?;
+    if total > codec::MAX_ORDERED_TABS_PER_SNAPSHOT {
+        return Err(codec::OrderedWindowProtocolError::TooManyTotalTabs {
+            count: total,
+            max: codec::MAX_ORDERED_TABS_PER_SNAPSHOT,
+        });
+    }
+    Ok(total)
+}
+
+fn validate_ordered_snapshot_projection(
+    snapshot: &codec::OrderedPaneSnapshotV1,
+) -> anyhow::Result<()> {
+    let mut total_tabs = 0usize;
+    let mut prior_window_id = None;
+    for window in &snapshot.ordered_windows {
+        if prior_window_id.is_some_and(|prior| prior >= window.window_id) {
+            return Err(anyhow!(
+                "PDU87 ordered windows are not in strictly increasing window-id order"
+            ));
+        }
+        prior_window_id = Some(window.window_id);
+        let window_id = window
+            .window_id
+            .try_into_usize()
+            .context("narrowing PDU87 window identity for pane projection validation")?;
+        if !snapshot.panes.window_titles.contains_key(&window_id) {
+            return Err(anyhow!(
+                "PDU87 ordered window {} has no matching pane-list window title",
+                window.window_id.get()
+            ));
+        }
+        total_tabs = checked_ordered_snapshot_tab_total(
+            total_tabs,
+            window.ordered_tab_ids.len(),
+        )?;
+    }
+    if snapshot.panes.window_titles.len() != snapshot.ordered_windows.len() {
+        return Err(anyhow!(
+            "PDU87 pane/order window cardinality mismatch: pane_titles={}, ordered_windows={}",
+            snapshot.panes.window_titles.len(),
+            snapshot.ordered_windows.len()
+        ));
+    }
+    if snapshot.panes.tabs.len() != total_tabs
+        || snapshot.panes.tab_titles.len() != total_tabs
+    {
+        return Err(anyhow!(
+            "PDU87 pane/order tab cardinality mismatch: pane_trees={}, tab_titles={}, ordered_tabs={total_tabs}",
+            snapshot.panes.tabs.len(),
+            snapshot.panes.tab_titles.len()
+        ));
+    }
+
+    let mut pane_index = 0usize;
+    let mut pane_trees = snapshot.panes.tabs.iter();
+    for window in &snapshot.ordered_windows {
+        let window_id = window
+            .window_id
+            .try_into_usize()
+            .context("narrowing PDU87 window identity for pane projection validation")?;
+        for tab_id in &window.ordered_tab_ids {
+            let expected = (
+                window_id,
+                tab_id
+                    .try_into_usize()
+                    .context("narrowing PDU87 tab identity for pane projection validation")?,
+            );
+            let tree = pane_trees.next().ok_or_else(|| {
+                anyhow!("PDU87 pane tree vector ended before ordered tab {pane_index}")
+            })?;
+            match tree.window_and_tab_ids() {
+                Some(actual) if actual == expected => {}
+                Some(actual) => {
+                    return Err(anyhow!(
+                        "PDU87 pane tree {pane_index} identifies window/tab {actual:?}, expected {expected:?}"
+                    ));
+                }
+                None if matches!(tree, mux::tab::PaneNode::Empty) => {
+                    // Empty tabs carry no PaneEntry in the legacy pane tree.
+                    // Their position remains bound by the parallel exact
+                    // ordered-tab vector and cardinality checks above.
+                }
+                None => {
+                    return Err(anyhow!(
+                        "PDU87 pane tree {pane_index} has structure but no window/tab identity"
+                    ));
+                }
+            }
+            pane_index += 1;
+        }
+    }
+    Ok(())
+}
+
+fn collect_ordered_list_panes_snapshot(
+    mux: &Mux,
+) -> anyhow::Result<codec::ListPanesOrderedV1Outcome> {
+    collect_ordered_list_panes_snapshot_with_stage_observer(
+        mux,
+        &mut ignore_list_panes_snapshot_stage,
+    )
+}
+
+fn collect_ordered_list_panes_snapshot_with_stage_observer(
+    mux: &Mux,
+    observer: &mut impl FnMut(ListPanesSnapshotStage),
+) -> anyhow::Result<codec::ListPanesOrderedV1Outcome> {
+    let mut first_revision = None;
+    let mut last_revision = None;
+
+    for attempt in 1..=COHERENT_SNAPSHOT_ATTEMPTS {
+        let (before_session, before_revision) = match mux.topology_snapshot_authority() {
+            Ok(authority) => authority,
+            Err(_) => return Ok(codec::ListPanesOrderedV1Outcome::RevisionExhausted),
+        };
+        if before_revision.get() == u64::MAX {
+            return Ok(codec::ListPanesOrderedV1Outcome::RevisionExhausted);
+        }
+
+        let mut window_ids = mux.iter_windows();
+        window_ids.sort_unstable();
+        checked_ordered_snapshot_window_count(window_ids.len())?;
+        observer(ListPanesSnapshotStage::WindowsEnumerated);
+
+        let mut frozen_windows = Vec::with_capacity(window_ids.len());
+        let mut total_tabs = 0usize;
+        for window_id in window_ids {
+            let frozen = mux.get_window(window_id).map(|window| {
+                let order = window.order_snapshot()?;
+                Ok::<_, mux::window::WindowOrderSnapshotError>(FrozenOrderedSnapshotWindow {
+                    title: window.get_title().to_string(),
+                    workspace: window.get_workspace().to_string(),
+                    order,
+                })
+            });
+            let Some(frozen) = frozen else {
+                // A concurrent removal advances the topology revision. The
+                // final authority read rejects this partial attempt.
+                continue;
+            };
+            let frozen = frozen.with_context(|| {
+                format!("freezing ordered state for mux window {window_id}")
+            })?;
+            total_tabs = checked_ordered_snapshot_tab_total(
+                total_tabs,
+                frozen.order.ordered_tabs().len(),
+            )?;
+            frozen_windows.push(frozen);
+        }
+
+        let mut ordered_windows = Vec::with_capacity(frozen_windows.len());
+        for frozen in &frozen_windows {
+            ordered_windows.push(
+                ordered_window_adapter::mux_frozen_window_order_to_codec(&frozen.order)
+                    .context("converting frozen mux window order for PDU87")?,
+            );
+        }
+
+        let mut tabs = Vec::with_capacity(total_tabs);
+        let mut tab_titles = Vec::with_capacity(total_tabs);
+        let mut window_titles = HashMap::with_capacity(frozen_windows.len());
+        for frozen in &frozen_windows {
+            let window_id = frozen.order.window_id();
+            window_titles.insert(window_id, frozen.title.clone());
+            for tab in frozen.order.ordered_tabs() {
+                tabs.push(tab.codec_pane_tree_in_window(window_id, &frozen.workspace)?);
+                observer(ListPanesSnapshotStage::TabTreeCaptured);
+                tab_titles.push(tab.get_title());
+            }
+        }
+        observer(ListPanesSnapshotStage::TitlesCaptured);
+
+        let (after_session, after_revision) = match mux.topology_snapshot_authority() {
+            Ok(authority) => authority,
+            Err(_) => return Ok(codec::ListPanesOrderedV1Outcome::RevisionExhausted),
+        };
+        if after_revision.get() == u64::MAX {
+            return Ok(codec::ListPanesOrderedV1Outcome::RevisionExhausted);
+        }
+        if before_session != after_session {
+            return Err(anyhow!(
+                "mux session incarnation changed while constructing an ordered pane snapshot"
+            ));
+        }
+        if before_revision == after_revision {
+            let snapshot = codec::OrderedPaneSnapshotV1 {
+                session_incarnation: after_session,
+                topology_revision: after_revision,
+                panes: ListPanesResponse {
+                    tabs,
+                    tab_titles,
+                    window_titles,
+                },
+                ordered_windows,
+            };
+            snapshot
+                .validate()
+                .context("validating complete ordered pane snapshot before PDU87")?;
+            validate_ordered_snapshot_projection(&snapshot)
+                .context("validating PDU87 pane/order projection coherence")?;
+            metrics::histogram!("mux.server.ordered_snapshot.attempts").record(attempt as f64);
+            metrics::counter!(
+                "mux.server.ordered_snapshot.total",
+                "outcome" => "snapshot"
+            )
+            .increment(1);
+            return Ok(codec::ListPanesOrderedV1Outcome::Snapshot(snapshot));
+        }
+
+        first_revision.get_or_insert(before_revision);
+        last_revision = Some(after_revision);
+        metrics::counter!(
+            "mux.server.ordered_snapshot.total",
+            "outcome" => "retry"
+        )
+        .increment(1);
+    }
+
+    metrics::histogram!("mux.server.ordered_snapshot.attempts")
+        .record(COHERENT_SNAPSHOT_ATTEMPTS as f64);
+    metrics::counter!(
+        "mux.server.ordered_snapshot.total",
+        "outcome" => "contended"
+    )
+    .increment(1);
+    Ok(codec::ListPanesOrderedV1Outcome::Contended {
+        attempts: COHERENT_SNAPSHOT_ATTEMPTS,
+        first_revision: first_revision
+            .expect("an ordered contended snapshot records its first observed revision"),
+        last_revision: last_revision
+            .expect("an ordered contended snapshot records its last observed revision"),
+    })
+}
+
+const fn ordered_snapshot_foundation() -> TopologyCapabilities {
+    TopologyCapabilities::from_bits(
+        TopologyCapabilities::FENCED_SNAPSHOT_V1.bits()
+            | TopologyCapabilities::ORDERED_WINDOW_STREAM_V1.bits(),
+    )
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct EstablishedOrderedWindowAuthority {
+    stream_id: TopologyStreamId,
+    session_incarnation: mux::MuxSessionIncarnation,
+    negotiated: TopologyCapabilities,
+}
+
+#[derive(Debug, Default)]
+struct OrderedWindowConnectionAuthority {
+    // Defense-in-depth admission at the handler seam. This is not the
+    // gap-free subscription/fence authority: dispatch must bind the ordered
+    // snapshot to its retained-event queue before runtime capability bits can
+    // be advertised.
+    established: Option<EstablishedOrderedWindowAuthority>,
+    domain_binding_id: Option<codec::DomainBindingId>,
+}
+
+enum ReorderAuthorization {
+    Proceed,
+    Terminal(codec::ReorderWindowTabsV1Outcome),
+}
+
+impl OrderedWindowConnectionAuthority {
+    fn establish(
+        &mut self,
+        stream_id: TopologyStreamId,
+        session_incarnation: mux::MuxSessionIncarnation,
+        negotiated: TopologyCapabilities,
+    ) -> anyhow::Result<()> {
+        let foundation = ordered_snapshot_foundation();
+        if !negotiated.contains(foundation) {
+            return Err(anyhow!(
+                "cannot establish ordered-window authority without fenced and ordered-stream capabilities"
+            ));
+        }
+        self.established = Some(EstablishedOrderedWindowAuthority {
+            stream_id,
+            session_incarnation,
+            negotiated,
+        });
+        Ok(())
+    }
+
+    fn authorize_reorder(
+        &mut self,
+        request: &codec::ReorderWindowTabsV1,
+    ) -> anyhow::Result<ReorderAuthorization> {
+        let established = self.established.ok_or_else(|| {
+            anyhow!("ordered-window stream has not been established by a successful PDU87")
+        })?;
+        if request.stream_id != established.stream_id {
+            return Err(anyhow!(
+                "ordered-window reorder targets a stale or foreign topology stream"
+            ));
+        }
+        if !established
+            .negotiated
+            .contains(TopologyCapabilities::WINDOW_REORDER_CAS_V1)
+        {
+            return Err(anyhow!(
+                "ordered-window reorder capability is not established on this stream"
+            ));
+        }
+        if request.session_incarnation != established.session_incarnation {
+            return Ok(ReorderAuthorization::Terminal(
+                codec::ReorderWindowTabsV1Outcome::StaleIncarnation,
+            ));
+        }
+        match self.domain_binding_id {
+            Some(domain_binding_id) if domain_binding_id != request.domain_binding_id => {
+                Ok(ReorderAuthorization::Terminal(
+                    codec::ReorderWindowTabsV1Outcome::Malformed,
+                ))
+            }
+            Some(_) => Ok(ReorderAuthorization::Proceed),
+            None => {
+                // DomainBindingId is client-owned routing/audit context. The
+                // first completely validated request pins it to this exact
+                // connection; later requests cannot silently cross bindings.
+                self.domain_binding_id = Some(request.domain_binding_id);
+                Ok(ReorderAuthorization::Proceed)
+            }
+        }
+    }
+}
+
+fn process_list_panes_ordered_request(
+    mux: &Mux,
+    stream_id: TopologyStreamId,
+    runtime_supported: TopologyCapabilities,
+    request: &codec::ListPanesOrderedV1,
+    connection_authority: &Mutex<OrderedWindowConnectionAuthority>,
+) -> anyhow::Result<codec::ListPanesOrderedV1Response> {
+    request
+        .validate()
+        .context("validating PDU86 ordered snapshot request")?;
+    runtime_supported
+        .validate()
+        .context("validating runtime ordered-window capability mask")?;
+    let negotiated = request.supported.intersection(runtime_supported);
+    let outcome = if negotiated.contains(ordered_snapshot_foundation())
+        && negotiated.contains(request.required)
+    {
+        collect_ordered_list_panes_snapshot(mux)?
+    } else {
+        codec::ListPanesOrderedV1Outcome::Unsupported {
+            supported: runtime_supported,
+        }
+    };
+    let response = codec::ListPanesOrderedV1Response {
+        protocol_version: codec::ORDERED_WINDOW_PROTOCOL_VERSION,
+        negotiated,
+        stream_id,
+        outcome,
+    };
+    response
+        .validate()
+        .context("validating complete PDU87 before enqueue")?;
+
+    if let codec::ListPanesOrderedV1Outcome::Snapshot(snapshot) = &response.outcome {
+        validate_ordered_snapshot_projection(snapshot)
+            .context("revalidating complete PDU87 pane/order projection before enqueue")?;
+        connection_authority
+            .lock()
+            .map_err(|_| anyhow!("ordered-window connection authority lock is poisoned"))?
+            .establish(stream_id, snapshot.session_incarnation, negotiated)?;
+    }
+    Ok(response)
+}
+
+fn process_reorder_window_tabs_request(
+    mux: &Mux,
+    request: &codec::ReorderWindowTabsV1,
+    connection_authority: &Mutex<OrderedWindowConnectionAuthority>,
+    client_id: Option<&Arc<ClientId>>,
+) -> anyhow::Result<codec::ReorderWindowTabsV1Response> {
+    let mux_request = ordered_window_adapter::codec_reorder_request_to_mux(request)
+        .context("validating and converting PDU88 before mux mutation")?;
+    let authorization = connection_authority
+        .lock()
+        .map_err(|_| anyhow!("ordered-window connection authority lock is poisoned"))?
+        .authorize_reorder(request)?;
+    let outcome = match authorization {
+        ReorderAuthorization::Proceed => {
+            let result = mux.reorder_window_tabs(mux_request);
+            let counts_as_client_activity = matches!(
+                &result,
+                mux::ReorderWindowTabsResult::Decision(
+                    mux::WindowReorderTerminalOutcome::Applied(_)
+                        | mux::WindowReorderTerminalOutcome::Conflict(_)
+                        | mux::WindowReorderTerminalOutcome::Exhausted
+                ) | mux::ReorderWindowTabsResult::Replay(
+                    mux::WindowReorderTerminalOutcome::Applied(_)
+                        | mux::WindowReorderTerminalOutcome::Conflict(_)
+                        | mux::WindowReorderTerminalOutcome::Exhausted
+                )
+            );
+            if counts_as_client_activity
+                && let Some(client_id) = client_id
+            {
+                let _ = mux.client_had_input_if_same(client_id);
+            }
+            ordered_window_adapter::mux_reorder_result_to_codec(&result)
+                .context("converting mux reorder decision for PDU89")?
+        }
+        ReorderAuthorization::Terminal(outcome) => outcome,
+    };
+    let response = codec::ReorderWindowTabsV1Response {
+        protocol_version: codec::ORDERED_WINDOW_PROTOCOL_VERSION,
+        stream_id: request.stream_id,
+        session_incarnation: request.session_incarnation,
+        mutation_id: request.mutation_id,
+        request_digest: request.digest,
+        outcome,
+    };
+    response
+        .validate()
+        .context("validating complete PDU89 before enqueue")?;
+    Ok(response)
+}
+
 fn with_current_pane<R>(
     authority: &SessionAuthority,
     registration: &PaneRegistrationHandle,
@@ -2014,6 +2468,7 @@ pub struct SessionHandler {
     to_write_tx: PduSender,
     owner: SessionOwner,
     topology_stream_id: TopologyStreamId,
+    ordered_window_authority: Arc<Mutex<OrderedWindowConnectionAuthority>>,
     per_pane: HashMap<PaneId, TrackedPane>,
     client_id: Option<Arc<ClientId>>,
     #[cfg(test)]
@@ -2055,6 +2510,9 @@ impl SessionHandler {
             to_write_tx,
             owner,
             topology_stream_id,
+            ordered_window_authority: Arc::new(Mutex::new(
+                OrderedWindowConnectionAuthority::default(),
+            )),
             per_pane: HashMap::new(),
             client_id: None,
             #[cfg(test)]
@@ -2202,7 +2660,12 @@ impl SessionHandler {
         let serial = decoded.serial;
 
         if let Some(client_id) = &self.client_id {
-            if decoded.pdu.is_user_input() {
+            if decoded.pdu.is_user_input()
+                && !matches!(&decoded.pdu, Pdu::ReorderWindowTabsV1(_))
+            {
+                // PDU88 is marked only inside its handler, after the exact
+                // stream/session/capability/domain checks. An unauthorized
+                // reorder must not mutate even client-activity bookkeeping.
                 match self.owner.authority().acquire() {
                     Ok(mux) => {
                         #[cfg(not(test))]
@@ -2454,6 +2917,47 @@ impl SessionHandler {
                                     outcome,
                                 },
                             ))
+                        },
+                        send_response,
+                    );
+                })
+                .detach();
+            }
+            Pdu::ListPanesOrderedV1(request) => {
+                let stream_id = self.topology_stream_id;
+                let ordered_window_authority = Arc::clone(&self.ordered_window_authority);
+                spawn_into_main_thread(async move {
+                    catch(
+                        move || {
+                            let mux = session_mux(&authority)?;
+                            let response = process_list_panes_ordered_request(
+                                &mux,
+                                stream_id,
+                                TopologyCapabilities::SERVER_SUPPORTED,
+                                &request,
+                                &ordered_window_authority,
+                            )?;
+                            Ok(Pdu::ListPanesOrderedV1Response(response))
+                        },
+                        send_response,
+                    );
+                })
+                .detach();
+            }
+            Pdu::ReorderWindowTabsV1(request) => {
+                let ordered_window_authority = Arc::clone(&self.ordered_window_authority);
+                let client_id = self.client_id.clone();
+                spawn_into_main_thread(async move {
+                    catch(
+                        move || {
+                            let mux = session_mux(&authority)?;
+                            let response = process_reorder_window_tabs_request(
+                                &mux,
+                                &request,
+                                &ordered_window_authority,
+                                client_id.as_ref(),
+                            )?;
+                            Ok(Pdu::ReorderWindowTabsV1Response(response))
                         },
                         send_response,
                     );
@@ -3408,12 +3912,6 @@ impl SessionHandler {
                      coordinator was activated for this connection"
                 )));
             }
-            Pdu::ListPanesOrderedV1(_) | Pdu::ReorderWindowTabsV1(_) => {
-                send_response(Err(anyhow!(
-                    "ordered window-tab protocol request received before its live capability \
-                     was activated for this connection"
-                )));
-            }
             Pdu::GetPaneRenderDeliveryV1(_) => {
                 send_response(Err(anyhow!(
                     "exact render-delivery request received before its live retention and \
@@ -4077,6 +4575,76 @@ mod tests {
         snapshot
     }
 
+    fn ordered_window_capabilities(include_reorder: bool) -> TopologyCapabilities {
+        let mut bits = ordered_snapshot_foundation().bits();
+        if include_reorder {
+            bits |= TopologyCapabilities::WINDOW_REORDER_CAS_V1.bits();
+        }
+        TopologyCapabilities::from_bits(bits)
+    }
+
+    fn ordered_snapshot_request(include_reorder: bool) -> codec::ListPanesOrderedV1 {
+        let capabilities = ordered_window_capabilities(include_reorder);
+        codec::ListPanesOrderedV1 {
+            protocol_version: codec::ORDERED_WINDOW_PROTOCOL_VERSION,
+            supported: capabilities,
+            required: capabilities,
+        }
+    }
+
+    fn expect_current_ordered_snapshot(
+        mux: &Mux,
+        outcome: codec::ListPanesOrderedV1Outcome,
+    ) -> codec::OrderedPaneSnapshotV1 {
+        let codec::ListPanesOrderedV1Outcome::Snapshot(snapshot) = outcome else {
+            panic!("expected one stable ordered snapshot, got {outcome:?}");
+        };
+        let current_authority = mux
+            .topology_snapshot_authority()
+            .expect("ordered snapshot mux topology authority remains live");
+        assert_eq!(
+            (snapshot.session_incarnation, snapshot.topology_revision),
+            current_authority,
+            "an accepted ordered snapshot must carry the exact current mux authority"
+        );
+        snapshot
+    }
+
+    fn reorder_request_for_snapshot(
+        snapshot: &mux::window::FrozenWindowOrder,
+        session_incarnation: mux::MuxSessionIncarnation,
+        stream_id: TopologyStreamId,
+        domain_binding_id: codec::DomainBindingId,
+        mutation_sequence: u64,
+        desired_tab_ids: Vec<mux::tab::TabId>,
+    ) -> codec::ReorderWindowTabsV1 {
+        let window_id = u64::try_from(snapshot.window_id()).expect("test window id fits u64");
+        let desired_tab_ids = desired_tab_ids
+            .into_iter()
+            .map(|tab_id| {
+                codec::RemoteTabId::new(u64::try_from(tab_id).expect("test tab id fits u64"))
+            })
+            .collect();
+        let desired_active_tab_id = snapshot.active_tab_id().map(|tab_id| {
+            codec::RemoteTabId::new(u64::try_from(tab_id).expect("test active tab id fits u64"))
+        });
+        codec::ReorderWindowTabsV1 {
+            protocol_version: codec::ORDERED_WINDOW_PROTOCOL_VERSION,
+            domain_binding_id,
+            stream_id,
+            session_incarnation,
+            window_id: codec::RemoteWindowId::new(window_id),
+            expected_order_revision: codec::WindowOrderRevision::new(
+                snapshot.order_revision().get(),
+            ),
+            desired_tab_ids,
+            desired_active_tab_id,
+            mutation_id: codec::WindowOrderMutationId::new([0x9d; 16], mutation_sequence),
+            digest: codec::WindowReorderDigest::ZERO,
+        }
+        .with_computed_digest()
+    }
+
     fn install_tab_with_window(
         tab: &Arc<mux::tab::Tab>,
         extra_panes: &[Arc<dyn Pane>],
@@ -4115,6 +4683,9 @@ mod tests {
         assert!(handler.client_id.is_none());
         assert!(handler.proxy_client_id.is_none());
         assert!(handler.per_pane.is_empty());
+        let ordered = handler.ordered_window_authority.lock().unwrap();
+        assert!(ordered.established.is_none());
+        assert!(ordered.domain_binding_id.is_none());
     }
 
     #[test]
@@ -4942,6 +5513,444 @@ mod tests {
     }
 
     #[test]
+    fn ordered_snapshot_count_preflight_accepts_exact_limits_and_rejects_overflow() {
+        assert_eq!(
+            checked_ordered_snapshot_window_count(codec::MAX_ORDERED_WINDOWS_PER_SNAPSHOT),
+            Ok(())
+        );
+        assert!(matches!(
+            checked_ordered_snapshot_window_count(
+                codec::MAX_ORDERED_WINDOWS_PER_SNAPSHOT + 1
+            ),
+            Err(codec::OrderedWindowProtocolError::TooManyWindows { count, max })
+                if count == codec::MAX_ORDERED_WINDOWS_PER_SNAPSHOT + 1
+                    && max == codec::MAX_ORDERED_WINDOWS_PER_SNAPSHOT
+        ));
+        assert_eq!(
+            checked_ordered_snapshot_tab_total(
+                codec::MAX_ORDERED_TABS_PER_SNAPSHOT - 1,
+                1,
+            ),
+            Ok(codec::MAX_ORDERED_TABS_PER_SNAPSHOT)
+        );
+        assert!(matches!(
+            checked_ordered_snapshot_tab_total(
+                codec::MAX_ORDERED_TABS_PER_SNAPSHOT - 1,
+                2,
+            ),
+            Err(codec::OrderedWindowProtocolError::TooManyTotalTabs { count, max })
+                if count == codec::MAX_ORDERED_TABS_PER_SNAPSHOT + 1
+                    && max == codec::MAX_ORDERED_TABS_PER_SNAPSHOT
+        ));
+        assert_eq!(
+            checked_ordered_snapshot_tab_total(usize::MAX, 1),
+            Err(codec::OrderedWindowProtocolError::CountOverflow)
+        );
+    }
+
+    #[test]
+    fn ordered_snapshot_derives_panes_and_order_from_same_sorted_frozen_windows() {
+        let _lock = crate::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let mux = Arc::new(Mux::new(None));
+        let first_tab = register_snapshot_tab(
+            &mux,
+            Arc::new(FakePane::new_with_id(7_501, None)),
+        );
+        let second_tab = register_snapshot_tab(
+            &mux,
+            Arc::new(FakePane::new_with_id(7_502, None)),
+        );
+        let first_window_id = attach_snapshot_tab_to_new_window(&mux, &first_tab);
+        let second_window_id = attach_snapshot_tab_to_new_window(&mux, &second_tab);
+        assert!(mux.set_window_title(first_window_id, "first-ordered-window"));
+        assert!(mux.set_window_title(second_window_id, "second-ordered-window"));
+
+        let snapshot = expect_current_ordered_snapshot(
+            &mux,
+            collect_ordered_list_panes_snapshot(&mux)
+                .expect("stable mux must yield an ordered pane snapshot"),
+        );
+        snapshot
+            .validate()
+            .expect("complete ordered snapshot must satisfy the outbound contract");
+        let expected_window_ids = {
+            let mut ids = vec![first_window_id, second_window_id];
+            ids.sort_unstable();
+            ids.into_iter()
+                .map(|window_id| {
+                    codec::RemoteWindowId::new(
+                        u64::try_from(window_id).expect("test window id fits u64"),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            snapshot
+                .ordered_windows
+                .iter()
+                .map(|window| window.window_id)
+                .collect::<Vec<_>>(),
+            expected_window_ids,
+            "cross-window enumeration must be deterministic"
+        );
+        let pane_pairs = snapshot
+            .panes
+            .tabs
+            .iter()
+            .map(|tree| {
+                tree.window_and_tab_ids()
+                    .expect("test pane tree carries its window and tab identity")
+            })
+            .collect::<Vec<_>>();
+        let ordered_pairs = snapshot
+            .ordered_windows
+            .iter()
+            .flat_map(|window| {
+                let window_id = usize::try_from(window.window_id.get())
+                    .expect("test window id narrows to usize");
+                window.ordered_tab_ids.iter().map(move |tab_id| {
+                    (
+                        window_id,
+                        usize::try_from(tab_id.get()).expect("test tab id narrows to usize"),
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(pane_pairs, ordered_pairs);
+        assert_eq!(snapshot.panes.tab_titles.len(), ordered_pairs.len());
+        for window in &snapshot.ordered_windows {
+            assert_eq!(window.ordered_tab_ids.as_slice(), &[window.active_tab_id.unwrap()]);
+        }
+
+        let mut missing_tree = snapshot.clone();
+        missing_tree.panes.tabs.pop();
+        assert!(
+            format!(
+                "{:#}",
+                validate_ordered_snapshot_projection(&missing_tree)
+                    .expect_err("a missing pane tree must fail complete PDU87 validation")
+            )
+            .contains("tab cardinality mismatch")
+        );
+
+        let mut cross_wired = snapshot;
+        cross_wired.panes.tabs.swap(0, 1);
+        assert!(
+            format!(
+                "{:#}",
+                validate_ordered_snapshot_projection(&cross_wired)
+                    .expect_err("cross-wired pane and order vectors must fail PDU87 validation")
+            )
+            .contains("pane tree 0 identifies")
+        );
+    }
+
+    #[test]
+    fn ordered_snapshot_retries_a_tab_tree_cut_without_mixed_order_authority() {
+        let _lock = crate::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let mux = Arc::new(Mux::new(None));
+        let first_tab = register_snapshot_tab(
+            &mux,
+            Arc::new(FakePane::new_with_id(7_601, None)),
+        );
+        let second_tab = register_snapshot_tab(
+            &mux,
+            Arc::new(FakePane::new_with_id(7_602, None)),
+        );
+        let window_id = attach_snapshot_tab_to_new_window(&mux, &first_tab);
+        let barrier = NoSleepSnapshotBarrier::shared();
+        let barrier_for_mutator = Arc::clone(&barrier);
+        let mux_for_mutator = Arc::clone(&mux);
+        let second_tab_for_mutator = Arc::clone(&second_tab);
+        let mutator = thread::spawn(move || {
+            barrier_for_mutator.mutate(|| {
+                mux_for_mutator.add_tab_to_window(&second_tab_for_mutator, window_id)
+            })
+        });
+
+        let barrier_for_collector = Arc::clone(&barrier);
+        let mut completed_attempts = 0usize;
+        let outcome = collect_ordered_list_panes_snapshot_with_stage_observer(
+            &mux,
+            &mut |stage| match stage {
+                ListPanesSnapshotStage::TabTreeCaptured => {
+                    barrier_for_collector.collector_arrive();
+                }
+                ListPanesSnapshotStage::TitlesCaptured => completed_attempts += 1,
+                ListPanesSnapshotStage::WindowsEnumerated => {}
+            },
+        );
+        mutator
+            .join()
+            .expect("ordered snapshot mutator must not panic")
+            .expect("successor tab must attach exactly once");
+        let snapshot = expect_current_ordered_snapshot(
+            &mux,
+            outcome.expect("ordered snapshot retry must remain collectable"),
+        );
+
+        assert_eq!(completed_attempts, 2, "the stale first attempt must be retried");
+        assert_eq!(snapshot.ordered_windows.len(), 1);
+        assert_eq!(snapshot.ordered_windows[0].ordered_tab_ids.len(), 2);
+        assert_eq!(snapshot.panes.tabs.len(), 2);
+        let pane_tab_ids = snapshot
+            .panes
+            .tabs
+            .iter()
+            .map(|tree| {
+                tree.window_and_tab_ids()
+                    .expect("accepted pane tree has window/tab identity")
+                    .1
+            })
+            .collect::<Vec<_>>();
+        let ordered_tab_ids = snapshot.ordered_windows[0]
+            .ordered_tab_ids
+            .iter()
+            .map(|tab_id| usize::try_from(tab_id.get()).expect("test tab id narrows"))
+            .collect::<Vec<_>>();
+        assert_eq!(pane_tab_ids, ordered_tab_ids);
+    }
+
+    #[test]
+    fn pdu86_remains_dormant_under_runtime_capabilities_and_preserves_serial() {
+        let _lock = crate::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let executor = SimpleExecutor::new();
+        let mux = Arc::new(Mux::new(None));
+        let stream_id = TopologyStreamId::from_bytes([0x86; 16]);
+        let (sender, captured) = capturing_sender();
+        let mut handler = SessionHandler::new_for_session_with_topology_stream(
+            sender,
+            SessionOwner::new(mux),
+            stream_id,
+        );
+
+        handler.process_one(DecodedPdu {
+            serial: 186,
+            pdu: Pdu::ListPanesOrderedV1(ordered_snapshot_request(true)),
+        });
+        tick_until_response(&executor, &captured, 1);
+
+        let response = take_response(&captured);
+        assert_eq!(response.serial, 186);
+        let Pdu::ListPanesOrderedV1Response(response) = response.pdu else {
+            panic!("expected a typed PDU87 response");
+        };
+        response
+            .validate()
+            .expect("dormant unsupported PDU87 must still be wire-valid");
+        assert_eq!(response.stream_id, stream_id);
+        assert!(matches!(
+            response.outcome,
+            codec::ListPanesOrderedV1Outcome::Unsupported {
+                supported: TopologyCapabilities::SERVER_SUPPORTED
+            }
+        ));
+        assert!(
+            handler
+                .ordered_window_authority
+                .lock()
+                .unwrap()
+                .established
+                .is_none(),
+            "an unsupported negotiation must not mint reorder authority"
+        );
+    }
+
+    #[test]
+    fn future_enabled_reorder_maps_apply_and_replay_then_rejects_foreign_authority() {
+        let _lock = crate::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let mux = Arc::new(Mux::new(None));
+        let first_tab = register_snapshot_tab(
+            &mux,
+            Arc::new(FakePane::new_with_id(7_701, None)),
+        );
+        let second_tab = register_snapshot_tab(
+            &mux,
+            Arc::new(FakePane::new_with_id(7_702, None)),
+        );
+        let window_id = attach_snapshot_tab_to_new_window(&mux, &first_tab);
+        mux.add_tab_to_window(&second_tab, window_id)
+            .expect("second test tab attaches to reorder window");
+        let before = mux
+            .window_order_snapshot(window_id)
+            .expect("test window snapshot is well formed")
+            .expect("test window exists");
+        let (session_incarnation, before_topology_revision) = mux
+            .topology_snapshot_authority()
+            .expect("test mux topology authority remains live");
+        let stream_id = TopologyStreamId::from_bytes([0x88; 16]);
+        let domain_binding_id = codec::DomainBindingId::from_bytes([0xd1; 16]);
+        let connection_authority = Mutex::new(OrderedWindowConnectionAuthority::default());
+        connection_authority
+            .lock()
+            .unwrap()
+            .establish(
+                stream_id,
+                session_incarnation,
+                ordered_window_capabilities(true),
+            )
+            .expect("future ordered capabilities establish in the isolated handler seam");
+        let request = reorder_request_for_snapshot(
+            &before,
+            session_incarnation,
+            stream_id,
+            domain_binding_id,
+            1,
+            vec![second_tab.tab_id(), first_tab.tab_id()],
+        );
+
+        let applied =
+            process_reorder_window_tabs_request(&mux, &request, &connection_authority, None)
+                .expect("authorized exact permutation must yield PDU89");
+        applied
+            .validate()
+            .expect("applied PDU89 must satisfy the complete outbound contract");
+        let codec::ReorderWindowTabsV1Outcome::Applied(commit) = &applied.outcome else {
+            panic!("expected applied reorder, got {:?}", applied.outcome);
+        };
+        assert!(commit.topology_revision > before_topology_revision);
+        assert_eq!(
+            commit
+                .window
+                .ordered_tab_ids
+                .iter()
+                .map(|tab_id| usize::try_from(tab_id.get()).unwrap())
+                .collect::<Vec<_>>(),
+            vec![second_tab.tab_id(), first_tab.tab_id()]
+        );
+        let replay =
+            process_reorder_window_tabs_request(&mux, &request, &connection_authority, None)
+                .expect("exact retry must map to a replay PDU89");
+        assert!(matches!(
+            replay.outcome,
+            codec::ReorderWindowTabsV1Outcome::Replay(
+                codec::WindowReorderTerminalOutcomeV1::Applied(_)
+            )
+        ));
+
+        let after_replay = mux
+            .window_order_snapshot(window_id)
+            .expect("post-replay window remains valid")
+            .expect("post-replay window remains present");
+        let topology_after_replay = mux
+            .topology_snapshot_authority()
+            .expect("post-replay topology remains live")
+            .1;
+        let foreign_domain_request = reorder_request_for_snapshot(
+            &after_replay,
+            session_incarnation,
+            stream_id,
+            codec::DomainBindingId::from_bytes([0xd2; 16]),
+            2,
+            after_replay.ordered_tab_ids().collect(),
+        );
+        let foreign_domain = process_reorder_window_tabs_request(
+            &mux,
+            &foreign_domain_request,
+            &connection_authority,
+            None,
+        )
+        .expect("foreign domain receives a typed non-mutating decision");
+        assert_eq!(
+            foreign_domain.outcome,
+            codec::ReorderWindowTabsV1Outcome::Malformed
+        );
+        assert_eq!(
+            mux.topology_snapshot_authority()
+                .expect("foreign-domain rejection preserves topology")
+                .1,
+            topology_after_replay
+        );
+        assert_eq!(
+            mux.window_order_snapshot(window_id)
+                .expect("foreign-domain rejection preserves valid order")
+                .expect("foreign-domain rejection preserves window")
+                .order_revision(),
+            after_replay.order_revision()
+        );
+
+        let mut stale_session_request = reorder_request_for_snapshot(
+            &after_replay,
+            mux::MuxSessionIncarnation::from_bytes([0xee; 16]),
+            stream_id,
+            domain_binding_id,
+            3,
+            after_replay.ordered_tab_ids().collect(),
+        );
+        stale_session_request = stale_session_request.with_computed_digest();
+        let stale_session = process_reorder_window_tabs_request(
+            &mux,
+            &stale_session_request,
+            &connection_authority,
+            None,
+        )
+        .expect("stale session receives a typed non-mutating decision");
+        assert_eq!(
+            stale_session.outcome,
+            codec::ReorderWindowTabsV1Outcome::StaleIncarnation
+        );
+        assert_eq!(
+            mux.topology_snapshot_authority()
+                .expect("stale-session rejection preserves topology")
+                .1,
+            topology_after_replay
+        );
+
+        let mut foreign_stream_request = foreign_domain_request;
+        foreign_stream_request.domain_binding_id = domain_binding_id;
+        foreign_stream_request.stream_id = TopologyStreamId::from_bytes([0x89; 16]);
+        foreign_stream_request.mutation_id =
+            codec::WindowOrderMutationId::new([0x9d; 16], 4);
+        foreign_stream_request = foreign_stream_request.with_computed_digest();
+        let error = process_reorder_window_tabs_request(
+            &mux,
+            &foreign_stream_request,
+            &connection_authority,
+            None,
+        )
+        .expect_err("foreign stream must fail before mux mutation");
+        assert!(format!("{error:#}").contains("stale or foreign topology stream"));
+        assert_eq!(
+            mux.topology_snapshot_authority()
+                .expect("foreign-stream rejection preserves topology")
+                .1,
+            topology_after_replay
+        );
+
+        let mut forged_digest_request = reorder_request_for_snapshot(
+            &after_replay,
+            session_incarnation,
+            stream_id,
+            domain_binding_id,
+            5,
+            after_replay.ordered_tab_ids().collect(),
+        );
+        forged_digest_request.digest = codec::WindowReorderDigest::ZERO;
+        let error = process_reorder_window_tabs_request(
+            &mux,
+            &forged_digest_request,
+            &connection_authority,
+            None,
+        )
+        .expect_err("forged digest must fail before mux mutation");
+        assert!(format!("{error:#}").contains("digest"));
+        assert_eq!(
+            mux.topology_snapshot_authority()
+                .expect("forged-digest rejection preserves topology")
+                .1,
+            topology_after_replay
+        );
+    }
+
+    #[test]
     fn coherent_snapshot_retries_window_enumeration_cut_without_partial_topology() {
         let _lock = crate::GLOBAL_STATE_TEST_LOCK
             .lock()
@@ -5375,7 +6384,11 @@ mod tests {
     }
 
     #[test]
-    fn ordered_window_request_fails_closed_until_live_capability_activation() {
+    fn ordered_window_request_returns_typed_unsupported_until_live_capability_activation() {
+        let _lock = crate::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let executor = SimpleExecutor::new();
         let (sender, captured) = capturing_sender();
         let mut handler = SessionHandler::new(sender);
         let required = TopologyCapabilities::from_bits(
@@ -5391,16 +6404,23 @@ mod tests {
                 required,
             }),
         });
+        tick_until_response(&executor, &captured, 1);
 
         let response = take_response(&captured);
         assert_eq!(response.serial, 201);
         match response.pdu {
-            Pdu::ErrorResponse(ErrorResponse { reason }) => assert!(
-                reason.contains("before its live capability was activated"),
-                "ordered-window request must retain the fail-closed activation reason, got: \
-                 {reason}"
-            ),
-            other => panic!("expected ErrorResponse, got {other:?}"),
+            Pdu::ListPanesOrderedV1Response(response) => {
+                response
+                    .validate()
+                    .expect("dormant ordered response must be completely valid");
+                assert!(matches!(
+                    response.outcome,
+                    codec::ListPanesOrderedV1Outcome::Unsupported {
+                        supported: TopologyCapabilities::SERVER_SUPPORTED
+                    }
+                ));
+            }
+            other => panic!("expected typed PDU87 Unsupported, got {other:?}"),
         }
     }
 
