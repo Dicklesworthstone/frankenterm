@@ -69,6 +69,21 @@ const DORMANT_OUTBOUND_PROTOCOL_FAILURE: &str =
 const TOPOLOGY_FENCE_MAX_EVENTS: usize = 4096;
 const TOPOLOGY_FENCE_MAX_RETAINED_BYTES: usize = 4 * 1024 * 1024;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TopologyRetentionLimits {
+    max_events: usize,
+    max_retained_bytes: usize,
+}
+
+impl Default for TopologyRetentionLimits {
+    fn default() -> Self {
+        Self {
+            max_events: TOPOLOGY_FENCE_MAX_EVENTS,
+            max_retained_bytes: TOPOLOGY_FENCE_MAX_RETAINED_BYTES,
+        }
+    }
+}
+
 /// Whether this server-produced family is deliberately dormant on the
 /// ordinary mux transport.
 ///
@@ -1220,25 +1235,42 @@ struct TopologyEventBuffer {
 }
 
 impl TopologyEventBuffer {
-    fn insert(&mut self, event: RetainedTopologyEvent) -> anyhow::Result<()> {
-        if self.events.contains_key(&event.revision) {
-            anyhow::bail!(
-                "duplicate mux topology revision {}",
-                event.revision.get()
-            );
+    /// Validate duplicate/count admission while the coordinator state lock is
+    /// still held and before the candidate acquires an outbound reservation.
+    /// `insert` repeats this check so transfer paths cannot bypass it.
+    fn preflight_insert(
+        &self,
+        revision: TopologyRevision,
+        limits: TopologyRetentionLimits,
+    ) -> anyhow::Result<usize> {
+        if self.events.contains_key(&revision) {
+            anyhow::bail!("duplicate mux topology revision {}", revision.get());
         }
         let next_len = self
             .events
             .len()
             .checked_add(1)
             .context("counting retained mux topology events")?;
+        if next_len > limits.max_events {
+            anyhow::bail!(
+                "mux topology fence buffer would retain {next_len} events; maximum is {}",
+                limits.max_events
+            );
+        }
+        Ok(next_len)
+    }
+
+    fn insert(
+        &mut self,
+        event: RetainedTopologyEvent,
+        limits: TopologyRetentionLimits,
+    ) -> anyhow::Result<()> {
+        let next_len = self.preflight_insert(event.revision, limits)?;
         let next_bytes = self
             .retained_bytes
             .checked_add(event.retained_bytes)
             .context("counting retained mux topology bytes")?;
-        if next_len > TOPOLOGY_FENCE_MAX_EVENTS
-            || next_bytes > TOPOLOGY_FENCE_MAX_RETAINED_BYTES
-        {
+        if next_bytes > limits.max_retained_bytes {
             anyhow::bail!(
                 "mux topology fence buffer would retain {next_len} events and {next_bytes} bytes"
             );
@@ -1332,6 +1364,7 @@ struct TopologyStreamCoordinator {
     terminal: DispatchTerminal,
     outbound_budget: Arc<OutboundBudget>,
     stream_id: TopologyStreamId,
+    retention_limits: TopologyRetentionLimits,
     state: ParkingMutex<TopologyStreamState>,
 }
 
@@ -1341,11 +1374,26 @@ impl TopologyStreamCoordinator {
         terminal: DispatchTerminal,
         stream_id: TopologyStreamId,
     ) -> Self {
+        Self::new_with_retention_limits(
+            item_tx,
+            terminal,
+            stream_id,
+            TopologyRetentionLimits::default(),
+        )
+    }
+
+    fn new_with_retention_limits(
+        item_tx: Sender<Item>,
+        terminal: DispatchTerminal,
+        stream_id: TopologyStreamId,
+        retention_limits: TopologyRetentionLimits,
+    ) -> Self {
         Self {
             item_tx,
             terminal,
             outbound_budget: Arc::new(OutboundBudget::default()),
             stream_id,
+            retention_limits,
             state: ParkingMutex::new(TopologyStreamState::default()),
         }
     }
@@ -1661,9 +1709,12 @@ impl TopologyStreamCoordinator {
                 };
                 for event in in_flight.buffer.take_all() {
                     if event.revision > snapshot_revision {
-                        established.buffer.insert(event).inspect_err(|_| {
-                            self.terminal.trip(TOPOLOGY_BUFFER_OVERFLOW);
-                        })?;
+                        established
+                            .buffer
+                            .insert(event, self.retention_limits)
+                            .inspect_err(|_| {
+                                self.terminal.trip(TOPOLOGY_BUFFER_OVERFLOW);
+                            })?;
                     } else {
                         metrics::counter!(
                             "mux.dispatch.topology_fence.events.total",
@@ -1838,17 +1889,54 @@ impl TopologyStreamCoordinator {
         notification: MuxNotification,
         revision: TopologyRevision,
     ) -> bool {
-        {
-            let state = self.state.lock();
-            if state.subscription.is_some()
-                && matches!(&state.phase, TopologyStreamPhase::Legacy)
+        let mut state = self.state.lock();
+        if let Some(subscription) = state.subscription {
+            // The subscription baseline is the causal cut at which this
+            // connection became visible. A notification whose revision was
+            // reserved before or at that cut may arrive after binding, but it
+            // is already represented by the baseline and must never leak as a
+            // legacy predecessor or enter a later fence buffer.
+            if revision <= subscription.baseline_revision {
+                return true;
+            }
+        } else {
+            if let Err(err) = state
+                .prebind
+                .preflight_insert(revision, self.retention_limits)
             {
-                // Keep the coordinator lock through enqueue. Otherwise this
-                // callback can observe Legacy, lose the lock to begin_fence,
-                // and append an unstamped notification after the fence has
-                // begun. Whichever side acquires this lock first now defines
-                // whether the event is a predecessor legacy frame or a
-                // retained stamped successor.
+                log::error!("failed to preflight pre-bind mux topology event: {err:#}");
+                self.terminal.trip(TOPOLOGY_BUFFER_OVERFLOW);
+                return false;
+            }
+            let event = match retained_topology_event(
+                notification,
+                revision,
+                &self.terminal,
+                &self.outbound_budget,
+            ) {
+                Ok(event) => event,
+                Err(err) => {
+                    log::error!("failed to retain pre-bind mux topology event: {err:#}");
+                    self.terminal.trip(TOPOLOGY_BUFFER_OVERFLOW);
+                    return false;
+                }
+            };
+            if let Err(err) = state.prebind.insert(event, self.retention_limits) {
+                log::error!("failed to retain pre-bind mux topology event: {err:#}");
+                self.terminal.trip(TOPOLOGY_BUFFER_OVERFLOW);
+                return false;
+            }
+            return true;
+        }
+
+        // Keep the coordinator lock through phase classification and any
+        // enqueue. Otherwise this callback can observe Legacy, lose the lock
+        // to begin_fence, and append an unstamped notification after the fence
+        // has begun. Whichever side acquires this lock first defines whether
+        // the event is a predecessor legacy frame or a retained successor.
+        let phase = &mut state.phase;
+        match phase {
+            TopologyStreamPhase::Legacy => {
                 let event = match retained_topology_event(
                     notification,
                     revision,
@@ -1862,42 +1950,6 @@ impl TopologyStreamCoordinator {
                         return false;
                     }
                 };
-                return queue_reserved_notification(
-                    &self.item_tx,
-                    &self.terminal,
-                    event.notification,
-                    event.reservation,
-                );
-            }
-        }
-
-        let event = match retained_topology_event(
-            notification,
-            revision,
-            &self.terminal,
-            &self.outbound_budget,
-        ) {
-            Ok(event) => event,
-            Err(err) => {
-                log::error!("failed to retain mux topology event: {err:#}");
-                self.terminal.trip(TOPOLOGY_PROTOCOL_FAILURE);
-                return false;
-            }
-        };
-
-        let mut state = self.state.lock();
-        if state.subscription.is_none() {
-            if let Err(err) = state.prebind.insert(event) {
-                log::error!("failed to retain pre-bind mux topology event: {err:#}");
-                self.terminal.trip(TOPOLOGY_BUFFER_OVERFLOW);
-                return false;
-            }
-            return true;
-        }
-
-        let phase = &mut state.phase;
-        match phase {
-            TopologyStreamPhase::Legacy => {
                 queue_reserved_notification(
                     &self.item_tx,
                     &self.terminal,
@@ -1906,7 +1958,30 @@ impl TopologyStreamCoordinator {
                 )
             }
             TopologyStreamPhase::Fencing(in_flight) => {
-                if let Err(err) = in_flight.buffer.insert(event) {
+                if let Err(err) = in_flight
+                    .buffer
+                    .preflight_insert(revision, self.retention_limits)
+                {
+                    log::error!(
+                        "failed to preflight in-flight mux topology event: {err:#}"
+                    );
+                    self.terminal.trip(TOPOLOGY_BUFFER_OVERFLOW);
+                    return false;
+                }
+                let event = match retained_topology_event(
+                    notification,
+                    revision,
+                    &self.terminal,
+                    &self.outbound_budget,
+                ) {
+                    Ok(event) => event,
+                    Err(err) => {
+                        log::error!("failed to retain in-flight mux topology event: {err:#}");
+                        self.terminal.trip(TOPOLOGY_BUFFER_OVERFLOW);
+                        return false;
+                    }
+                };
+                if let Err(err) = in_flight.buffer.insert(event, self.retention_limits) {
                     log::error!("failed to retain in-flight mux topology event: {err:#}");
                     self.terminal.trip(TOPOLOGY_BUFFER_OVERFLOW);
                     false
@@ -1915,18 +1990,33 @@ impl TopologyStreamCoordinator {
                 }
             }
             TopologyStreamPhase::Established(established) => {
-                if event.revision <= established.snapshot_revision {
+                if revision <= established.snapshot_revision {
                     return true;
                 }
                 let Some(next_revision) = established.next_revision else {
                     self.terminal.trip(TOPOLOGY_PROTOCOL_FAILURE);
                     return false;
                 };
-                if event.revision < next_revision {
+                if revision < next_revision {
                     self.terminal.trip(TOPOLOGY_PROTOCOL_FAILURE);
                     return false;
                 }
-                if event.revision == next_revision {
+                if revision == next_revision {
+                    let event = match retained_topology_event(
+                        notification,
+                        revision,
+                        &self.terminal,
+                        &self.outbound_budget,
+                    ) {
+                        Ok(event) => event,
+                        Err(err) => {
+                            log::error!(
+                                "failed to retain contiguous mux topology event: {err:#}"
+                            );
+                            self.terminal.trip(TOPOLOGY_BUFFER_OVERFLOW);
+                            return false;
+                        }
+                    };
                     if let Err(err) = self.queue_stamped_event(event) {
                         log::error!("failed to enqueue contiguous mux topology event: {err:#}");
                         self.terminal.trip(TOPOLOGY_PROTOCOL_FAILURE);
@@ -1941,11 +2031,37 @@ impl TopologyStreamCoordinator {
                         self.terminal.trip(TOPOLOGY_PROTOCOL_FAILURE);
                         return false;
                     }
-                } else if let Err(err) = established.buffer.insert(event) {
-                    log::error!("failed to retain gapped mux topology event: {err:#}");
-                    self.terminal.trip(TOPOLOGY_BUFFER_OVERFLOW);
-                    return false;
                 } else {
+                    if let Err(err) = established
+                        .buffer
+                        .preflight_insert(revision, self.retention_limits)
+                    {
+                        log::error!(
+                            "failed to preflight gapped mux topology event: {err:#}"
+                        );
+                        self.terminal.trip(TOPOLOGY_BUFFER_OVERFLOW);
+                        return false;
+                    }
+                    let event = match retained_topology_event(
+                        notification,
+                        revision,
+                        &self.terminal,
+                        &self.outbound_budget,
+                    ) {
+                        Ok(event) => event,
+                        Err(err) => {
+                            log::error!(
+                                "failed to retain gapped mux topology event: {err:#}"
+                            );
+                            self.terminal.trip(TOPOLOGY_BUFFER_OVERFLOW);
+                            return false;
+                        }
+                    };
+                    if let Err(err) = established.buffer.insert(event, self.retention_limits) {
+                        log::error!("failed to retain gapped mux topology event: {err:#}");
+                        self.terminal.trip(TOPOLOGY_BUFFER_OVERFLOW);
+                        return false;
+                    }
                     metrics::counter!(
                         "mux.dispatch.topology_fence.events.total",
                         "outcome" => "gap_buffered"
@@ -1969,6 +2085,13 @@ fn retained_topology_event(
     outbound_budget: &Arc<OutboundBudget>,
 ) -> anyhow::Result<RetainedTopologyEvent> {
     let dynamic_bytes = match &notification {
+        MuxNotification::WindowOrderChanged { window, .. } => {
+            // `FrozenWindowOrder` shares one exact Arc slice across delayed
+            // subscribers. Charge the slice payload held live by this
+            // connection; Arc allocator metadata is a fixed per-event
+            // residual bounded independently by the event-count ceiling.
+            std::mem::size_of_val(window.ordered_tabs())
+        }
         MuxNotification::WindowWorkspaceChanged { workspace, .. } => workspace.capacity(),
         MuxNotification::TabTitleChanged { title, .. }
         | MuxNotification::WindowTitleChanged { title, .. } => title.capacity(),
@@ -2026,6 +2149,14 @@ fn into_topology_event_kind(notification: MuxNotification) -> anyhow::Result<Top
         }
         MuxNotification::WindowInvalidated(window_id) => {
             TopologyEventKind::WindowInvalidated { window_id }
+        }
+        // Ordered-window PDU90 remains dormant until capability activation.
+        // Preserve causal convergence for fenced legacy clients by degrading
+        // the frozen transition to the existing coherent-resync trigger.
+        MuxNotification::WindowOrderChanged { window, .. } => {
+            TopologyEventKind::WindowInvalidated {
+                window_id: window.window_id(),
+            }
         }
         MuxNotification::WindowWorkspaceChanged {
             window_id,
@@ -3959,6 +4090,20 @@ where
                         MuxNotification::WindowRemoved(_window_id)
                         | MuxNotification::WindowCreated(_window_id)
                         | MuxNotification::WindowInvalidated(_window_id) => {}
+                        MuxNotification::WindowOrderChanged { window, .. } => {
+                            // PDU90 is intentionally dormant. `TabResized` is
+                            // the established legacy resync trigger and its
+                            // client handler deliberately ignores the id.
+                            pending_outbound = Some(prepare_unilateral_pdu(
+                                Pdu::TabResized(codec::TabResized {
+                                    tab_id: window.active_tab_id().unwrap_or(0),
+                                }),
+                                reservation,
+                                &item_rx,
+                                &mut deferred_item,
+                                &terminal,
+                            )?);
+                        }
                         MuxNotification::WindowWorkspaceChanged {
                             window_id,
                             workspace,
@@ -4522,7 +4667,7 @@ mod tests {
 
         let mut buffer = TopologyEventBuffer::default();
         buffer
-            .insert(retained)
+            .insert(retained, TopologyRetentionLimits::default())
             .expect("one roughly 2.1 MiB title should fit the retained-byte budget");
         let retained = buffer
             .remove(TopologyRevision::new(4))
@@ -5813,6 +5958,162 @@ mod tests {
             assert_eq!(event.revision, TopologyRevision::new(expected_revision));
         }
         assert!(item_rx.is_empty());
+    }
+
+    #[test]
+    fn bound_subscription_discards_delayed_events_at_or_before_its_baseline() {
+        let (item_tx, item_rx) = bounded(DISPATCH_ITEM_QUEUE_TOTAL_CAPACITY);
+        let (terminal, terminal_rx) = DispatchTerminal::channel();
+        let stream_id = TopologyStreamId::from_bytes([0x5d; 16]);
+        let session_incarnation = MuxSessionIncarnation::from_bytes([0xc6; 16]);
+        let coordinator = TopologyStreamCoordinator::new(item_tx, terminal, stream_id);
+        coordinator
+            .bind_subscription(session_incarnation, TopologyRevision::new(5))
+            .expect("bind topology subscription at revision five");
+        let mux = Mux::new(None);
+
+        for revision in [4, 5] {
+            assert!(coordinator.on_notification(
+                &mux,
+                topology_envelope(
+                    revision,
+                    MuxNotification::PaneAdded(
+                        usize::try_from(revision).expect("small revision fits pane id"),
+                    ),
+                ),
+            ));
+        }
+        assert!(
+            item_rx.is_empty(),
+            "a delayed predecessor represented by the bound baseline must not reach the wire"
+        );
+        assert_outbound_live_counters_zero(&coordinator);
+
+        assert!(coordinator.on_notification(
+            &mux,
+            topology_envelope(6, MuxNotification::PaneAdded(6)),
+        ));
+        let Item::Notif(ReservedNotification {
+            notification: MuxNotification::PaneAdded(6),
+            ..
+        }) = item_rx
+            .try_recv()
+            .expect("the first post-baseline revision must retain legacy delivery")
+        else {
+            panic!("expected the first post-baseline legacy notification");
+        };
+        assert!(item_rx.is_empty());
+        assert!(terminal_rx.is_empty());
+        assert_outbound_live_counters_zero(&coordinator);
+    }
+
+    #[test]
+    fn topology_fence_event_count_overflow_is_terminal_and_emits_no_transcript() {
+        const FENCE_SERIAL: u64 = 300;
+        const TINY_EVENT_LIMIT: usize = 2;
+
+        let (item_tx, item_rx) = bounded(DISPATCH_ITEM_QUEUE_TOTAL_CAPACITY);
+        let (terminal, terminal_rx) = DispatchTerminal::channel();
+        let stream_id = TopologyStreamId::from_bytes([0x6d; 16]);
+        let session_incarnation = MuxSessionIncarnation::from_bytes([0xd6; 16]);
+        let coordinator = TopologyStreamCoordinator::new_with_retention_limits(
+            item_tx,
+            terminal,
+            stream_id,
+            TopologyRetentionLimits {
+                max_events: TINY_EVENT_LIMIT,
+                max_retained_bytes: usize::MAX,
+            },
+        );
+        coordinator
+            .bind_subscription(session_incarnation, TopologyRevision::INITIAL)
+            .expect("bind count-limited topology subscription");
+        coordinator
+            .begin_fence(FENCE_SERIAL, &fenced_snapshot_request())
+            .expect("begin count-limited coherent topology fence");
+        let mux = Mux::new(None);
+
+        for revision in 1..=TINY_EVENT_LIMIT {
+            assert!(coordinator.on_notification(
+                &mux,
+                topology_envelope(
+                    u64::try_from(revision).expect("tiny revision fits u64"),
+                    MuxNotification::PaneAdded(revision),
+                ),
+            ));
+        }
+        let expected_retained_bytes = RETAINED_TOPOLOGY_EVENT_ACCOUNTED_FIXED_BYTES
+            .checked_mul(TINY_EVENT_LIMIT)
+            .expect("tiny retained-event accounting fits usize");
+        let retained = coordinator.outbound_budget.snapshot();
+        assert_eq!(retained.total_slots, TINY_EVENT_LIMIT);
+        assert_eq!(retained.bulk_slots, TINY_EVENT_LIMIT);
+        assert_eq!(retained.topology_bytes, expected_retained_bytes);
+        assert_eq!(retained.peak_topology_bytes, expected_retained_bytes);
+        assert!(
+            item_rx.is_empty(),
+            "in-fence events must remain quarantined before the count limit trips"
+        );
+
+        assert!(!coordinator.on_notification(
+            &mux,
+            topology_envelope(3, MuxNotification::PaneAdded(3)),
+        ));
+        assert_eq!(
+            terminal_rx
+                .try_recv()
+                .expect("the first count overflow must publish one terminal reason"),
+            TOPOLOGY_BUFFER_OVERFLOW
+        );
+        assert!(
+            terminal_rx.is_empty(),
+            "one semantic loss must publish exactly one terminal reason"
+        );
+        assert!(
+            item_rx.is_empty(),
+            "count overflow must emit no partial snapshot or topology transcript"
+        );
+        {
+            let state = coordinator.state.lock();
+            assert!(matches!(&state.phase, TopologyStreamPhase::Exhausted));
+            assert!(state.prebind.events.is_empty());
+            assert_eq!(state.prebind.retained_bytes, 0);
+        }
+
+        assert!(
+            coordinator
+                .queue_response(
+                    DecodedPdu {
+                        serial: FENCE_SERIAL,
+                        pdu: Pdu::ListPanesCoherentResponse(coherent_snapshot_response(
+                            stream_id,
+                            session_incarnation,
+                            TopologyRevision::INITIAL,
+                        )),
+                    },
+                    PduDeliveryClass::Control,
+                )
+                .is_err(),
+            "the retired fence request must not publish a response after count overflow"
+        );
+        assert!(!coordinator.on_notification(
+            &mux,
+            topology_envelope(4, MuxNotification::PaneAdded(4)),
+        ));
+        assert!(
+            coordinator
+                .begin_fence(FENCE_SERIAL, &fenced_snapshot_request())
+                .is_err(),
+            "the retired request serial must not reopen the terminal fence"
+        );
+        assert!(terminal_rx.is_empty());
+        assert!(item_rx.is_empty());
+        assert_outbound_live_counters_zero(&coordinator);
+        assert_eq!(
+            coordinator.outbound_budget.snapshot().peak_topology_bytes,
+            expected_retained_bytes,
+            "count overflow must release live reservations without rewriting the exact high-water mark"
+        );
     }
 
     #[test]
