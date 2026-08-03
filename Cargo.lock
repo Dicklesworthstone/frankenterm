@@ -1400,6 +1400,7 @@ dependencies = [
  "rangeset",
  "serde",
  "serde_json",
+ "sha2",
  "smol",
  "termwiz 0.24.0",
  "thiserror 2.0.18",
