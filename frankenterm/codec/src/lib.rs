@@ -5187,11 +5187,13 @@ mod test {
         let next_outer = Pdu::Ping(Ping {});
 
         for (authority_index, (authority_name, authority)) in
-            authority_pdus.into_iter().enumerate()
+            IntoIterator::into_iter(authority_pdus).enumerate()
         {
-            for (mode_index, mode) in [CompressionMode::Never, CompressionMode::Always]
-                .into_iter()
-                .enumerate()
+            for (mode_index, mode) in IntoIterator::into_iter([
+                CompressionMode::Never,
+                CompressionMode::Always,
+            ])
+            .enumerate()
             {
                 let first_serial = 11_u64
                     + u64::try_from(authority_index * 2 + mode_index)
