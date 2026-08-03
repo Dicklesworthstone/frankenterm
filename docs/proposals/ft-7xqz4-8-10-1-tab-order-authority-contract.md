@@ -68,6 +68,21 @@ created.
 `DomainBindingId` answers “which client connection binding is this?” It does
 not prove which server session was reached.
 
+Before a connection may submit a reorder, the client carries its required,
+nonzero binding ID on the ordered-snapshot request and the server echoes that
+exact value on the correlated snapshot response. A successful snapshot freezes
+the binding together with that connection generation's stream, session, and
+negotiated capabilities; later reorder traffic cannot create, replace, or
+learn a binding by trust on first use. This associates routing/audit context
+with a peer already admitted by the transport's authentication and integrity
+policy. The ID is still not a credential, a secret, a proof of client
+ownership, or proof of server identity.
+
+Repeated establishment is idempotent only for the exact same stream, session,
+binding, and capability set. Any non-identical re-establishment attempt
+permanently revokes ordered-window authority for that connection generation;
+it cannot return to an unestablished state and accept a replacement binding.
+
 ### 3.2 `MuxSessionIncarnation`
 
 A server-owned, unpredictable 128-bit identifier for one live mux-session
@@ -154,6 +169,7 @@ transition.
 Each server snapshot contains:
 
 ```text
+echoed DomainBindingId
 MuxSessionIncarnation
 TopologyStreamId
 TopologyRevision
@@ -189,6 +205,7 @@ A pure-window reorder intent contains:
 ```text
 protocol/schema version
 DomainBindingId (routing and audit context)
+TopologyStreamId (connection-generation causal fence)
 MuxSessionIncarnation
 RemoteWindowKey
 expected WindowOrderRevision
@@ -207,13 +224,23 @@ authority and need not be echoed over the wire.
 
 Validation order is:
 
-1. negotiated capability and size/count bounds;
-2. exact session and window incarnation;
-3. idempotency lookup;
-4. duplicate/foreign/missing tab and active-membership validation;
-5. expected window revision;
-6. counter capacity; and
-7. one atomic commit.
+1. registered dialect, negotiated capability, and size/count bounds;
+2. canonical representation and payload digest;
+3. exact connection-generation topology stream;
+4. exact mux-session incarnation;
+5. exact immutable `DomainBindingId` established by the correlated full
+   snapshot;
+6. exact window identity;
+7. idempotency lookup;
+8. duplicate/foreign/missing tab and active-membership validation;
+9. expected window revision;
+10. counter capacity; and
+11. one atomic commit.
+
+A stale session outranks a foreign binding. A foreign binding is a typed,
+non-retained `Malformed` result before window or receipt lookup: it can neither
+seed nor observe another binding's replay ledger. A correctly bound semantic
+`Malformed` decision is retained and exact retries return `Replay(Malformed)`.
 
 The typed result is one of:
 

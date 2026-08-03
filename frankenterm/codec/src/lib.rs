@@ -2562,7 +2562,7 @@ macro_rules! pdu {
 /// The overall version of the codec.
 /// This must be bumped when backwards incompatible changes
 /// are made to the types and protocol.
-pub const CODEC_VERSION: usize = 52;
+pub const CODEC_VERSION: usize = 53;
 
 /// Lowest codec version this build can decode wire frames from.
 ///
@@ -2751,15 +2751,15 @@ pdu! {
         => deserialize_topology_event;
     RenderApplicationUpdate: 84, 50, server_unilateral, requires_fenced;
     RenderApplicationResult: 85, 50, client_request, requires_fenced;
-    ListPanesOrderedV1: 86, 51, client_request, negotiates_ordered
+    ListPanesOrderedV1: 86, 53, client_request, negotiates_ordered
         => deserialize_list_panes_ordered_v1;
-    ListPanesOrderedV1Response: 87, 51, server_reply, negotiates_ordered
+    ListPanesOrderedV1Response: 87, 53, server_reply, negotiates_ordered
         => deserialize_list_panes_ordered_v1_response;
-    ReorderWindowTabsV1: 88, 51, client_request, requires_reorder
+    ReorderWindowTabsV1: 88, 53, client_request, requires_reorder
         => deserialize_reorder_window_tabs_v1;
-    ReorderWindowTabsV1Response: 89, 51, server_reply, requires_reorder
+    ReorderWindowTabsV1Response: 89, 53, server_reply, requires_reorder
         => deserialize_reorder_window_tabs_v1_response;
-    WindowOrderEventV1: 90, 51, server_unilateral, requires_ordered
+    WindowOrderEventV1: 90, 53, server_unilateral, requires_ordered
         => deserialize_window_order_event_v1;
     GetPaneRenderDeliveryV1: 91, 52, client_request, requires_exact_render
         => deserialize_get_pane_render_delivery_v1;
@@ -3728,7 +3728,7 @@ impl TopologyCapabilities {
 
     /// Runtime-advertised capabilities.
     ///
-    /// The v52 codec knows the ordered-window and exact-render bits, but none
+    /// The v53 codec knows the ordered-window and exact-render bits, but none
     /// may be advertised until their mux authority, server dispatch, and client
     /// reconciliation beads complete. Keep this mask intentionally unchanged.
     pub const SERVER_SUPPORTED: Self = Self::FENCED_SNAPSHOT_V1;
@@ -3945,7 +3945,7 @@ pub struct TopologyEvent {
 /// Closed schema version carried by ordered-window PDU IDs 86-90.
 pub const ORDERED_WINDOW_PROTOCOL_VERSION: u16 = mux::WINDOW_REORDER_PROTOCOL_VERSION_V1;
 /// Oldest negotiated codec dialect that may send ordered-window PDU IDs 86-90.
-pub const ORDERED_WINDOW_V1_MIN_CODEC_VERSION: usize = 51;
+pub const ORDERED_WINDOW_V1_MIN_CODEC_VERSION: usize = 53;
 
 #[must_use]
 pub const fn codec_version_supports_ordered_window_v1(codec_version: usize) -> bool {
@@ -4154,6 +4154,7 @@ impl OrderedPaneSnapshotV1 {
 #[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]
 pub struct ListPanesOrderedV1 {
     pub protocol_version: u16,
+    pub domain_binding_id: DomainBindingId,
     pub supported: TopologyCapabilities,
     pub required: TopologyCapabilities,
 }
@@ -4161,6 +4162,7 @@ pub struct ListPanesOrderedV1 {
 impl ListPanesOrderedV1 {
     pub fn validate(&self) -> Result<(), OrderedWindowProtocolError> {
         validate_protocol_version(self.protocol_version)?;
+        validate_nonzero_identity("domain_binding_id", self.domain_binding_id.as_bytes())?;
         self.supported.validate()?;
         self.required.validate()?;
         let foundation = TopologyCapabilities::from_bits(
@@ -4232,6 +4234,7 @@ impl ListPanesOrderedV1Outcome {
 #[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]
 pub struct ListPanesOrderedV1Response {
     pub protocol_version: u16,
+    pub domain_binding_id: DomainBindingId,
     pub negotiated: TopologyCapabilities,
     pub stream_id: TopologyStreamId,
     pub outcome: ListPanesOrderedV1Outcome,
@@ -4240,6 +4243,7 @@ pub struct ListPanesOrderedV1Response {
 impl ListPanesOrderedV1Response {
     pub fn validate(&self) -> Result<(), OrderedWindowProtocolError> {
         validate_protocol_version(self.protocol_version)?;
+        validate_nonzero_identity("domain_binding_id", self.domain_binding_id.as_bytes())?;
         self.negotiated.validate()?;
         validate_nonzero_identity("stream_id", self.stream_id.as_bytes())?;
         self.outcome.validate()?;
@@ -4254,6 +4258,40 @@ impl ListPanesOrderedV1Response {
                     missing: foundation.bits() & !self.negotiated.bits(),
                 });
             }
+        }
+        Ok(())
+    }
+
+    /// Validate PDU87 against the exact PDU86 that established its connection
+    /// generation. The binding echo prevents overlapping or retried snapshots
+    /// from installing authority for a different durable client binding.
+    pub fn validate_for_request(
+        &self,
+        request: &ListPanesOrderedV1,
+    ) -> Result<(), OrderedWindowProtocolError> {
+        request.validate()?;
+        self.validate()?;
+        if self.domain_binding_id != request.domain_binding_id {
+            return Err(OrderedWindowProtocolError::DomainBindingEchoMismatch {
+                expected: request.domain_binding_id,
+                actual: self.domain_binding_id,
+            });
+        }
+        if !request.supported.contains(self.negotiated) {
+            return Err(
+                OrderedWindowProtocolError::NegotiatedCapabilitiesNotOffered {
+                    supported: request.supported.bits(),
+                    negotiated: self.negotiated.bits(),
+                },
+            );
+        }
+        if matches!(&self.outcome, ListPanesOrderedV1Outcome::Snapshot(_))
+            && !self.negotiated.contains(request.required)
+        {
+            return Err(OrderedWindowProtocolError::MissingNegotiatedCapabilities {
+                negotiated: self.negotiated.bits(),
+                missing: request.required.bits() & !self.negotiated.bits(),
+            });
         }
         Ok(())
     }
@@ -4476,6 +4514,17 @@ pub enum OrderedWindowProtocolError {
         "ordered-window snapshot negotiated bits {negotiated:#x} are missing authority bits {missing:#x}"
     )]
     MissingNegotiatedCapabilities { negotiated: u64, missing: u64 },
+    #[error(
+        "ordered-window PDU87 binding {actual:?} does not echo PDU86 binding {expected:?}"
+    )]
+    DomainBindingEchoMismatch {
+        expected: DomainBindingId,
+        actual: DomainBindingId,
+    },
+    #[error(
+        "ordered-window negotiated capabilities {negotiated:#x} are not a subset of offered capabilities {supported:#x}"
+    )]
+    NegotiatedCapabilitiesNotOffered { supported: u64, negotiated: u64 },
     #[error("ordered-window identity {field} uses the reserved all-zero value")]
     ReservedIdentity { field: &'static str },
     #[error("ordered-window wire identity {field} uses reserved value {value}")]
@@ -10349,6 +10398,7 @@ mod test {
                 86,
                 Pdu::ListPanesOrderedV1(ListPanesOrderedV1 {
                     protocol_version: ORDERED_WINDOW_PROTOCOL_VERSION,
+                    domain_binding_id: reorder.domain_binding_id,
                     supported: ordered_window_all_capabilities(),
                     required: ordered_window_foundation_capabilities(),
                 }),
@@ -10357,6 +10407,7 @@ mod test {
                 87,
                 Pdu::ListPanesOrderedV1Response(ListPanesOrderedV1Response {
                     protocol_version: ORDERED_WINDOW_PROTOCOL_VERSION,
+                    domain_binding_id: reorder.domain_binding_id,
                     negotiated: ordered_window_foundation_capabilities(),
                     stream_id: reorder.stream_id,
                     outcome: ListPanesOrderedV1Outcome::Snapshot(OrderedPaneSnapshotV1 {
@@ -10713,6 +10764,7 @@ mod test {
                         .downcast_ref::<PduEncodedBodyLimitExceeded>()
                         .is_none(),
                     "exact boundary was rejected as oversized: {exact_error:#}",
+                    exact_error = exact_error,
                 );
 
                 let plus = limit.checked_add(1).expect("exact body limit has headroom");
@@ -12435,6 +12487,7 @@ mod test {
                     "exact render metadata UTF-8 bytes length 65537 exceeds maximum 65536"
                 ),
             "unexpected schema-specific title bound: {title_error}",
+            title_error = title_error,
         );
 
         let mut hostile_row_prefix = Vec::new();
@@ -12455,6 +12508,7 @@ mod test {
                     "exact render row UTF-8 bytes length 1000001 exceeds maximum 1000000"
                 ),
             "unexpected schema-specific row bound: {row_error}",
+            row_error = row_error,
         );
         let exact_row = ExactRenderRowTextV1::try_from_string(
             "x".repeat(MAX_EXACT_RENDER_ROW_TEXT_BYTES),
@@ -12934,6 +12988,8 @@ mod test {
                     format!("{error:#}")
                         .contains(&format!("exceeds maximum {maximum}")),
                     "unexpected PDU {ident} decompressed-cap rejection: {error:#}",
+                    ident = ident,
+                    error = error,
                 );
             }
         }
@@ -12962,6 +13018,7 @@ mod test {
                     .expect("incomplete request fragment must remain decodable")
                     .is_none(),
                 "split {split} unexpectedly completed the request",
+                split = split,
             );
             buffer.extend_from_slice(&request_frame[split..]);
             assert_eq!(
@@ -13044,6 +13101,7 @@ mod test {
         let (payload, compressed) = serialize_with_mode(
             &(
                 ORDERED_WINDOW_PROTOCOL_VERSION,
+                DomainBindingId::from_bytes([0x10; 16]),
                 TopologyCapabilities::WINDOW_REORDER_CAS_V1.bits(),
                 TopologyCapabilities::WINDOW_REORDER_CAS_V1.bits(),
             ),
@@ -13061,6 +13119,63 @@ mod test {
             "unexpected capability rejection: {error:#}",
             error = error,
         );
+    }
+
+    #[test]
+    fn ordered_snapshot_binding_is_nonzero_and_response_is_request_correlated() {
+        let mut samples = sample_ordered_window_pdus();
+        let (_, Pdu::ListPanesOrderedV1(request)) = samples.remove(0) else {
+            panic!("first ordered-window sample must be PDU86");
+        };
+        let (_, Pdu::ListPanesOrderedV1Response(response)) = samples.remove(0) else {
+            panic!("second ordered-window sample must be PDU87");
+        };
+        response
+            .validate_for_request(&request)
+            .expect("sample PDU87 must echo and satisfy its exact PDU86");
+
+        let mut zero_request_binding = request.clone();
+        zero_request_binding.domain_binding_id = DomainBindingId::from_bytes([0; 16]);
+        assert!(matches!(
+            zero_request_binding.validate(),
+            Err(OrderedWindowProtocolError::ReservedIdentity {
+                field: "domain_binding_id"
+            })
+        ));
+
+        let mut zero_response_binding = response.clone();
+        zero_response_binding.domain_binding_id = DomainBindingId::from_bytes([0; 16]);
+        assert!(matches!(
+            zero_response_binding.validate(),
+            Err(OrderedWindowProtocolError::ReservedIdentity {
+                field: "domain_binding_id"
+            })
+        ));
+
+        let mut wrong_binding_echo = response.clone();
+        wrong_binding_echo.domain_binding_id = DomainBindingId::from_bytes([0x66; 16]);
+        assert!(matches!(
+            wrong_binding_echo.validate_for_request(&request),
+            Err(OrderedWindowProtocolError::DomainBindingEchoMismatch { .. })
+        ));
+
+        let foundation = ordered_window_foundation_capabilities();
+        let mut foundation_only_request = request.clone();
+        foundation_only_request.supported = foundation;
+        foundation_only_request.required = foundation;
+        let mut unoffered_response = response.clone();
+        unoffered_response.negotiated = ordered_window_all_capabilities();
+        assert!(matches!(
+            unoffered_response.validate_for_request(&foundation_only_request),
+            Err(OrderedWindowProtocolError::NegotiatedCapabilitiesNotOffered { .. })
+        ));
+
+        let mut reorder_required = request;
+        reorder_required.required = ordered_window_all_capabilities();
+        assert!(matches!(
+            response.validate_for_request(&reorder_required),
+            Err(OrderedWindowProtocolError::MissingNegotiatedCapabilities { .. })
+        ));
     }
 
     #[test]
@@ -13486,6 +13601,7 @@ mod test {
         let snapshot_at_limit = Pdu::ListPanesOrderedV1Response(
             ListPanesOrderedV1Response {
                 protocol_version: ORDERED_WINDOW_PROTOCOL_VERSION,
+                domain_binding_id: DomainBindingId::from_bytes([0x70; 16]),
                 negotiated: ordered_window_foundation_capabilities(),
                 stream_id: TopologyStreamId::from_bytes([0x71; 16]),
                 outcome: ListPanesOrderedV1Outcome::Snapshot(OrderedPaneSnapshotV1 {
@@ -13642,21 +13758,24 @@ mod test {
         assert!(
             format!("{error:#}").contains(&MAX_REORDER_WINDOW_TABS_ZSTD_ENCODED_BYTES.to_string()),
             "unexpected compressed header rejection: {error:#}",
+            error = error,
         );
     }
 
     #[test]
-    fn codec_v52_keeps_v51_legacy_dialect_inert_and_compatible() {
-        assert_eq!(CODEC_VERSION, 52);
+    fn codec_v53_requires_bound_ordered_schema_but_keeps_v52_compatible() {
+        assert_eq!(CODEC_VERSION, 53);
         assert_eq!(CODEC_VERSION_MIN_SUPPORTED, 46);
-        assert_eq!(ORDERED_WINDOW_V1_MIN_CODEC_VERSION, 51);
+        assert_eq!(ORDERED_WINDOW_V1_MIN_CODEC_VERSION, 53);
         assert!(!codec_version_supports_ordered_window_v1(50));
-        assert!(codec_version_supports_ordered_window_v1(51));
+        assert!(!codec_version_supports_ordered_window_v1(51));
+        assert!(!codec_version_supports_ordered_window_v1(52));
+        assert!(codec_version_supports_ordered_window_v1(53));
         assert!(!codec_version_supports_exact_render_delivery_v1(51));
         assert!(codec_version_supports_exact_render_delivery_v1(52));
         assert_eq!(
-            check_compat(52, 46, 51, 46).expect("v51 remains in the additive window"),
-            CompatDecision::Compatible { agreed: 51 }
+            check_compat(53, 46, 52, 46).expect("v52 remains in the additive window"),
+            CompatDecision::Compatible { agreed: 52 }
         );
         assert_eq!(<ListPanesCoherent as PduWireIdent>::IDENT, 81);
         assert_eq!(<RenderApplicationResult as PduWireIdent>::IDENT, 85);
@@ -13667,6 +13786,10 @@ mod test {
         assert_eq!(
             <GetPaneRenderDeliveryV1Response as PduWireIdent>::WIRE_SPEC.min_codec_version,
             52
+        );
+        assert_eq!(
+            <ListPanesOrderedV1 as PduWireIdent>::WIRE_SPEC.min_codec_version,
+            53
         );
         assert_eq!(
             TopologyCapabilities::SERVER_SUPPORTED.bits(),
@@ -13688,7 +13811,7 @@ mod test {
         );
         assert_eq!(
             Pdu::decode(frame.as_slice())
-                .expect("v51 decoder must retain v50 PDU81")
+                .expect("v53 decoder must retain v50 PDU81")
                 .pdu,
             legacy
         );
@@ -14413,7 +14536,7 @@ mod test {
 
     #[test]
     fn codec_version_is_current() {
-        assert_eq!(CODEC_VERSION, 52);
+        assert_eq!(CODEC_VERSION, 53);
     }
 
     #[test]
@@ -14464,7 +14587,7 @@ mod test {
                 79..=80 => 48,
                 81..=83 => 49,
                 84..=85 => 50,
-                86..=90 => 51,
+                86..=90 => 53,
                 91..=92 => 52,
                 ident => panic!("unexpected assigned PDU ID {}", ident),
             };
@@ -14663,7 +14786,7 @@ mod test {
     #[test]
     fn check_compat_additive_window_keeps_min_supported() {
         assert_eq!(CODEC_VERSION_MIN_SUPPORTED, 46);
-        assert_eq!(CODEC_VERSION, 52);
+        assert_eq!(CODEC_VERSION, 53);
     }
 
     #[test]

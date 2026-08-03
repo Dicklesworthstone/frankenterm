@@ -2403,7 +2403,7 @@ mod tests {
                         Err::<(), _>(DirectMuxError::OutboundPduRequiresCodec {
                             pdu: "ReorderWindowTabsV1",
                             agreed: 50,
-                            required: 51,
+                            required: 53,
                         })
                     })
                 })
@@ -2414,7 +2414,7 @@ mod tests {
                 MuxPoolError::Mux(DirectMuxError::OutboundPduRequiresCodec {
                     pdu: "ReorderWindowTabsV1",
                     agreed: 50,
-                    required: 51,
+                    required: 53,
                 })
             ));
 

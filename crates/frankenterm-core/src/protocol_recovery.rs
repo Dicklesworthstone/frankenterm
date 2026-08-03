@@ -1384,7 +1384,7 @@ mod tests {
                 DirectMuxError::OutboundPduRequiresCodec {
                     pdu: "ListPanesOrderedV1",
                     agreed: 50,
-                    required: 51,
+                    required: 53,
                 },
                 permanent_reuse,
             ),
@@ -1413,7 +1413,7 @@ mod tests {
                 DirectMuxError::InboundPduRequiresCodec {
                     pdu: "WindowOrderEventV1",
                     agreed: 50,
-                    required: 51,
+                    required: 53,
                 },
                 permanent_discard,
             ),

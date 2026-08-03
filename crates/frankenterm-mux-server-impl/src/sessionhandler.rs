@@ -2295,7 +2295,16 @@ const fn ordered_snapshot_foundation() -> TopologyCapabilities {
 struct EstablishedOrderedWindowAuthority {
     stream_id: TopologyStreamId,
     session_incarnation: mux::MuxSessionIncarnation,
+    domain_binding_id: codec::DomainBindingId,
     negotiated: TopologyCapabilities,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum OrderedWindowAuthorityState {
+    #[default]
+    Unestablished,
+    Established(EstablishedOrderedWindowAuthority),
+    Revoked,
 }
 
 #[derive(Debug, Default)]
@@ -2304,8 +2313,7 @@ struct OrderedWindowConnectionAuthority {
     // gap-free subscription/fence authority: dispatch must bind the ordered
     // snapshot to its retained-event queue before runtime capability bits can
     // be advertised.
-    established: Option<EstablishedOrderedWindowAuthority>,
-    domain_binding_id: Option<codec::DomainBindingId>,
+    state: OrderedWindowAuthorityState,
 }
 
 enum ReorderAuthorization {
@@ -2318,6 +2326,7 @@ impl OrderedWindowConnectionAuthority {
         &mut self,
         stream_id: TopologyStreamId,
         session_incarnation: mux::MuxSessionIncarnation,
+        domain_binding_id: codec::DomainBindingId,
         negotiated: TopologyCapabilities,
     ) -> anyhow::Result<()> {
         let foundation = ordered_snapshot_foundation();
@@ -2326,21 +2335,48 @@ impl OrderedWindowConnectionAuthority {
                 "cannot establish ordered-window authority without fenced and ordered-stream capabilities"
             ));
         }
-        self.established = Some(EstablishedOrderedWindowAuthority {
+        let candidate = EstablishedOrderedWindowAuthority {
             stream_id,
             session_incarnation,
+            domain_binding_id,
             negotiated,
-        });
-        Ok(())
+        };
+        match self.state {
+            OrderedWindowAuthorityState::Unestablished => {
+                self.state = OrderedWindowAuthorityState::Established(candidate);
+                Ok(())
+            }
+            OrderedWindowAuthorityState::Established(established)
+                if established == candidate => Ok(()),
+            OrderedWindowAuthorityState::Established(established) => {
+                self.state = OrderedWindowAuthorityState::Revoked;
+                Err(anyhow!(
+                    "ordered-window authority changed from {established:?} to {candidate:?}; connection authority revoked"
+                ))
+            }
+            OrderedWindowAuthorityState::Revoked => Err(anyhow!(
+                "ordered-window connection authority has been permanently revoked"
+            )),
+        }
     }
 
     fn admit_reorder_transport(
         &self,
         request: &codec::ReorderWindowTabsV1,
     ) -> anyhow::Result<EstablishedOrderedWindowAuthority> {
-        let established = self.established.ok_or_else(|| {
-            anyhow!("ordered-window stream has not been established by a successful PDU87")
-        })?;
+        let established = match self.state {
+            OrderedWindowAuthorityState::Established(established) => established,
+            OrderedWindowAuthorityState::Unestablished => {
+                return Err(anyhow!(
+                    "ordered-window stream has not been established by a successful PDU87"
+                ));
+            }
+            OrderedWindowAuthorityState::Revoked => {
+                return Err(anyhow!(
+                    "ordered-window connection authority has been permanently revoked"
+                ));
+            }
+        };
         if !established
             .negotiated
             .contains(TopologyCapabilities::WINDOW_REORDER_CAS_V1)
@@ -2362,7 +2398,7 @@ impl OrderedWindowConnectionAuthority {
         request: &codec::ReorderWindowTabsV1,
         admitted: EstablishedOrderedWindowAuthority,
     ) -> anyhow::Result<ReorderAuthorization> {
-        if self.established != Some(admitted) {
+        if self.state != OrderedWindowAuthorityState::Established(admitted) {
             return Err(anyhow!(
                 "ordered-window authority changed during reorder admission"
             ));
@@ -2372,38 +2408,12 @@ impl OrderedWindowConnectionAuthority {
                 codec::ReorderWindowTabsV1Outcome::StaleIncarnation,
             ));
         }
-        match self.domain_binding_id {
-            Some(domain_binding_id) if domain_binding_id != request.domain_binding_id => {
-                Ok(ReorderAuthorization::Terminal(
-                    codec::ReorderWindowTabsV1Outcome::Malformed,
-                ))
-            }
-            Some(_) | None => Ok(ReorderAuthorization::Proceed),
+        if request.domain_binding_id != admitted.domain_binding_id {
+            return Ok(ReorderAuthorization::Terminal(
+                codec::ReorderWindowTabsV1Outcome::Malformed,
+            ));
         }
-    }
-
-    fn retain_authoritative_domain_binding(
-        &mut self,
-        request: &codec::ReorderWindowTabsV1,
-        result: &mux::ReorderWindowTabsResult,
-    ) {
-        let authoritative = matches!(
-            result,
-            mux::ReorderWindowTabsResult::Decision(
-                mux::WindowReorderTerminalOutcome::Applied(_)
-                    | mux::WindowReorderTerminalOutcome::Conflict(_)
-                    | mux::WindowReorderTerminalOutcome::Malformed(_)
-                    | mux::WindowReorderTerminalOutcome::Exhausted
-            ) | mux::ReorderWindowTabsResult::Replay(
-                mux::WindowReorderTerminalOutcome::Applied(_)
-                    | mux::WindowReorderTerminalOutcome::Conflict(_)
-                    | mux::WindowReorderTerminalOutcome::Malformed(_)
-                    | mux::WindowReorderTerminalOutcome::Exhausted
-            )
-        );
-        if authoritative && self.domain_binding_id.is_none() {
-            self.domain_binding_id = Some(request.domain_binding_id);
-        }
+        Ok(ReorderAuthorization::Proceed)
     }
 }
 
@@ -2432,13 +2442,14 @@ fn process_list_panes_ordered_request(
     };
     let response = codec::ListPanesOrderedV1Response {
         protocol_version: codec::ORDERED_WINDOW_PROTOCOL_VERSION,
+        domain_binding_id: request.domain_binding_id,
         negotiated,
         stream_id,
         outcome,
     };
     response
-        .validate()
-        .context("validating complete PDU87 before enqueue")?;
+        .validate_for_request(request)
+        .context("validating complete request-correlated PDU87 before enqueue")?;
 
     if let codec::ListPanesOrderedV1Outcome::Snapshot(snapshot) = &response.outcome {
         validate_ordered_snapshot_projection(snapshot)
@@ -2446,7 +2457,12 @@ fn process_list_panes_ordered_request(
         connection_authority
             .lock()
             .map_err(|_| anyhow!("ordered-window connection authority lock is poisoned"))?
-            .establish(stream_id, snapshot.session_incarnation, negotiated)?;
+            .establish(
+                stream_id,
+                snapshot.session_incarnation,
+                request.domain_binding_id,
+                negotiated,
+            )?;
     }
     Ok(response)
 }
@@ -2488,10 +2504,6 @@ fn process_reorder_window_tabs_request(
             {
                 let _ = mux.client_had_input_if_same(client_id);
             }
-            connection_authority
-                .lock()
-                .map_err(|_| anyhow!("ordered-window connection authority lock is poisoned"))?
-                .retain_authoritative_domain_binding(request, &result);
             ordered_window_adapter::mux_reorder_result_to_codec(&result)
                 .context("converting mux reorder decision for PDU89")?
         }
@@ -4657,6 +4669,7 @@ mod tests {
         let capabilities = ordered_window_capabilities(include_reorder);
         codec::ListPanesOrderedV1 {
             protocol_version: codec::ORDERED_WINDOW_PROTOCOL_VERSION,
+            domain_binding_id: codec::DomainBindingId::from_bytes([0xd1; 16]),
             supported: capabilities,
             required: capabilities,
         }
@@ -4754,8 +4767,88 @@ mod tests {
         assert!(handler.proxy_client_id.is_none());
         assert!(handler.per_pane.is_empty());
         let ordered = handler.ordered_window_authority.lock().unwrap();
-        assert!(ordered.established.is_none());
-        assert!(ordered.domain_binding_id.is_none());
+        assert_eq!(ordered.state, OrderedWindowAuthorityState::Unestablished);
+    }
+
+    #[test]
+    fn ordered_window_authority_is_exactly_idempotent_and_revokes_on_rebinding() {
+        let stream_id = TopologyStreamId::from_bytes([0x81; 16]);
+        let session_incarnation = mux::MuxSessionIncarnation::from_bytes([0x82; 16]);
+        let domain_binding_id = codec::DomainBindingId::from_bytes([0x83; 16]);
+        let negotiated = ordered_window_capabilities(true);
+        let mut authority = OrderedWindowConnectionAuthority::default();
+
+        authority
+            .establish(
+                stream_id,
+                session_incarnation,
+                domain_binding_id,
+                negotiated,
+            )
+            .expect("first complete PDU86/87 authority must establish");
+        authority
+            .establish(
+                stream_id,
+                session_incarnation,
+                domain_binding_id,
+                negotiated,
+            )
+            .expect("an exact repeated PDU86/87 authority is idempotent");
+
+        let error = authority
+            .establish(
+                stream_id,
+                session_incarnation,
+                codec::DomainBindingId::from_bytes([0x84; 16]),
+                negotiated,
+            )
+            .expect_err("a different durable binding must never replace live authority");
+        assert!(format!("{error:#}").contains("authority revoked"));
+        assert_eq!(authority.state, OrderedWindowAuthorityState::Revoked);
+        authority
+            .establish(
+                stream_id,
+                session_incarnation,
+                domain_binding_id,
+                negotiated,
+            )
+            .expect_err("revocation must be sticky for the rest of the connection");
+        assert_eq!(authority.state, OrderedWindowAuthorityState::Revoked);
+    }
+
+    #[test]
+    fn successful_pdu86_pdu87_snapshot_freezes_binding_before_reorder() {
+        let _lock = crate::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let mux = Arc::new(Mux::new(None));
+        let stream_id = TopologyStreamId::from_bytes([0x85; 16]);
+        let request = ordered_snapshot_request(true);
+        let connection_authority = Mutex::new(OrderedWindowConnectionAuthority::default());
+
+        let response = process_list_panes_ordered_request(
+            &mux,
+            stream_id,
+            ordered_window_capabilities(true),
+            &request,
+            &connection_authority,
+        )
+        .expect("future-enabled PDU86 must produce one request-correlated PDU87");
+        response
+            .validate_for_request(&request)
+            .expect("future-enabled PDU87 must echo the durable binding");
+        let codec::ListPanesOrderedV1Outcome::Snapshot(snapshot) = response.outcome else {
+            panic!("future-enabled ordered bootstrap must return a snapshot");
+        };
+        assert_eq!(
+            connection_authority.lock().unwrap().state,
+            OrderedWindowAuthorityState::Established(EstablishedOrderedWindowAuthority {
+                stream_id,
+                session_incarnation: snapshot.session_incarnation,
+                domain_binding_id: request.domain_binding_id,
+                negotiated: ordered_window_capabilities(true),
+            })
+        );
     }
 
     #[test]
@@ -5825,9 +5918,10 @@ mod tests {
             stream_id,
         );
 
+        let request = ordered_snapshot_request(true);
         handler.process_one(DecodedPdu {
             serial: 186,
-            pdu: Pdu::ListPanesOrderedV1(ordered_snapshot_request(true)),
+            pdu: Pdu::ListPanesOrderedV1(request.clone()),
         });
         tick_until_response(&executor, &captured, 1);
 
@@ -5837,8 +5931,8 @@ mod tests {
             panic!("expected a typed PDU87 response");
         };
         response
-            .validate()
-            .expect("dormant unsupported PDU87 must still be wire-valid");
+            .validate_for_request(&request)
+            .expect("dormant unsupported PDU87 must remain request-correlated");
         assert_eq!(response.stream_id, stream_id);
         assert!(matches!(
             response.outcome,
@@ -5846,13 +5940,13 @@ mod tests {
                 supported: TopologyCapabilities::SERVER_SUPPORTED
             }
         ));
-        assert!(
+        assert_eq!(
             handler
                 .ordered_window_authority
                 .lock()
                 .unwrap()
-                .established
-                .is_none(),
+                .state,
+            OrderedWindowAuthorityState::Unestablished,
             "an unsupported negotiation must not mint reorder authority"
         );
     }
@@ -5890,6 +5984,7 @@ mod tests {
             .establish(
                 stream_id,
                 session_incarnation,
+                domain_binding_id,
                 ordered_window_capabilities(true),
             )
             .expect("future ordered capabilities establish in the isolated handler seam");
@@ -5908,6 +6003,7 @@ mod tests {
             .establish(
                 stream_id,
                 session_incarnation,
+                domain_binding_id,
                 ordered_window_capabilities(false),
             )
             .expect("ordered snapshot foundation establishes without reorder capability");
@@ -5995,7 +6091,7 @@ mod tests {
             &after_replay,
             mux::MuxSessionIncarnation::from_bytes([0xee; 16]),
             stream_id,
-            domain_binding_id,
+            codec::DomainBindingId::from_bytes([0xd2; 16]),
             3,
             after_replay.ordered_tab_ids().collect(),
         );
@@ -6009,7 +6105,8 @@ mod tests {
         .expect("stale session receives a typed non-mutating decision");
         assert_eq!(
             stale_session.outcome,
-            codec::ReorderWindowTabsV1Outcome::StaleIncarnation
+            codec::ReorderWindowTabsV1Outcome::StaleIncarnation,
+            "stale session authority must outrank a foreign established binding",
         );
         assert_eq!(
             mux.topology_snapshot_authority()
@@ -6063,70 +6160,99 @@ mod tests {
             topology_after_replay
         );
 
-        let unpoisoned_authority = Mutex::new(OrderedWindowConnectionAuthority::default());
-        unpoisoned_authority
+        let bound_domain = codec::DomainBindingId::from_bytes([0xd3; 16]);
+        let immutable_authority = Mutex::new(OrderedWindowConnectionAuthority::default());
+        immutable_authority
             .lock()
             .unwrap()
             .establish(
                 stream_id,
                 session_incarnation,
+                bound_domain,
                 ordered_window_capabilities(true),
             )
-            .expect("isolated future authority establishes");
-        let poison_domain = codec::DomainBindingId::from_bytes([0xd3; 16]);
-        let malformed_first = reorder_request_for_snapshot(
+            .expect("isolated bound future authority establishes");
+        let foreign_domain = codec::DomainBindingId::from_bytes([0xd4; 16]);
+        let foreign_malformed_first = reorder_request_for_snapshot(
             &after_replay,
             session_incarnation,
             stream_id,
-            poison_domain,
+            foreign_domain,
             6,
             vec![first_tab.tab_id(), first_tab.tab_id()],
         );
-        let malformed_response = process_reorder_window_tabs_request(
+        let foreign_malformed_response = process_reorder_window_tabs_request(
             &mux,
-            &malformed_first,
-            &unpoisoned_authority,
+            &foreign_malformed_first,
+            &immutable_authority,
             None,
         )
-        .expect("semantic malformed request receives a typed response");
+        .expect("foreign malformed request receives a typed non-mutating response");
         assert_eq!(
-            malformed_response.outcome,
+            foreign_malformed_response.outcome,
             codec::ReorderWindowTabsV1Outcome::Malformed
         );
         assert_eq!(
-            unpoisoned_authority
-                .lock()
-                .unwrap()
-                .domain_binding_id,
-            Some(poison_domain),
-            "a retained semantic-malformed decision must preserve its replay binding"
+            immutable_authority.lock().unwrap().state,
+            OrderedWindowAuthorityState::Established(EstablishedOrderedWindowAuthority {
+                stream_id,
+                session_incarnation,
+                domain_binding_id: bound_domain,
+                negotiated: ordered_window_capabilities(true),
+            }),
+            "PDU88 traffic must never replace the binding frozen by PDU86/87",
         );
 
-        let foreign_after_malformed = codec::DomainBindingId::from_bytes([0xd4; 16]);
-        let valid_foreign_request = reorder_request_for_snapshot(
+        let correct_binding_reuses_unseeded_mutation = reorder_request_for_snapshot(
             &after_replay,
             session_incarnation,
             stream_id,
-            foreign_after_malformed,
-            7,
+            bound_domain,
+            6,
             vec![first_tab.tab_id(), second_tab.tab_id()],
         );
-        let foreign_response = process_reorder_window_tabs_request(
+        let correctly_bound_applied = process_reorder_window_tabs_request(
             &mux,
-            &valid_foreign_request,
-            &unpoisoned_authority,
+            &correct_binding_reuses_unseeded_mutation,
+            &immutable_authority,
             None,
         )
-        .expect("foreign binding receives a typed non-mutating response");
-        assert_eq!(
-            foreign_response.outcome,
-            codec::ReorderWindowTabsV1Outcome::Malformed
+        .expect("foreign binding rejection must not seed the mux receipt ledger");
+        assert!(
+            matches!(
+                correctly_bound_applied.outcome,
+                codec::ReorderWindowTabsV1Outcome::Applied(_)
+            ),
+            "the correct binding must remain free to use the same unseeded mutation identity",
         );
 
+        let after_correct_binding = mux
+            .window_order_snapshot(window_id)
+            .expect("post-binding test window remains valid")
+            .expect("post-binding test window remains present");
+        let bound_malformed = reorder_request_for_snapshot(
+            &after_correct_binding,
+            session_incarnation,
+            stream_id,
+            bound_domain,
+            7,
+            vec![first_tab.tab_id(), first_tab.tab_id()],
+        );
+        let bound_malformed_response = process_reorder_window_tabs_request(
+            &mux,
+            &bound_malformed,
+            &immutable_authority,
+            None,
+        )
+        .expect("correctly bound semantic malformed request receives a typed response");
+        assert_eq!(
+            bound_malformed_response.outcome,
+            codec::ReorderWindowTabsV1Outcome::Malformed
+        );
         let replay_malformed = process_reorder_window_tabs_request(
             &mux,
-            &malformed_first,
-            &unpoisoned_authority,
+            &bound_malformed,
+            &immutable_authority,
             None,
         )
         .expect("exact semantic-malformed retry must remain replayable");
@@ -6136,13 +6262,6 @@ mod tests {
                 codec::WindowReorderTerminalOutcomeV1::Malformed
             )
         ));
-        assert_eq!(
-            unpoisoned_authority
-                .lock()
-                .unwrap()
-                .domain_binding_id,
-            Some(poison_domain)
-        );
     }
 
     #[test]
@@ -6591,13 +6710,15 @@ mod tests {
                 | TopologyCapabilities::ORDERED_WINDOW_STREAM_V1.bits(),
         );
 
+        let request = codec::ListPanesOrderedV1 {
+            protocol_version: codec::ORDERED_WINDOW_PROTOCOL_VERSION,
+            domain_binding_id: codec::DomainBindingId::from_bytes([0xd1; 16]),
+            supported: required,
+            required,
+        };
         handler.process_one(DecodedPdu {
             serial: 201,
-            pdu: Pdu::ListPanesOrderedV1(codec::ListPanesOrderedV1 {
-                protocol_version: codec::ORDERED_WINDOW_PROTOCOL_VERSION,
-                supported: required,
-                required,
-            }),
+            pdu: Pdu::ListPanesOrderedV1(request.clone()),
         });
         tick_until_response(&executor, &captured, 1);
 
@@ -6606,8 +6727,8 @@ mod tests {
         match response.pdu {
             Pdu::ListPanesOrderedV1Response(response) => {
                 response
-                    .validate()
-                    .expect("dormant ordered response must be completely valid");
+                    .validate_for_request(&request)
+                    .expect("dormant ordered response must remain request-correlated");
                 assert!(matches!(
                     response.outcome,
                     codec::ListPanesOrderedV1Outcome::Unsupported {

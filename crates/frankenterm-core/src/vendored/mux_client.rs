@@ -5462,6 +5462,7 @@ mod tests {
         );
         Pdu::ListPanesOrderedV1(codec::ListPanesOrderedV1 {
             protocol_version: codec::ORDERED_WINDOW_PROTOCOL_VERSION,
+            domain_binding_id: codec::DomainBindingId::from_bytes([0x11; 16]),
             supported: TopologyCapabilities::from_bits(
                 foundation.bits() | TopologyCapabilities::WINDOW_REORDER_CAS_V1.bits(),
             ),
@@ -5487,6 +5488,7 @@ mod tests {
     fn unsupported_ordered_window_response() -> Pdu {
         Pdu::ListPanesOrderedV1Response(codec::ListPanesOrderedV1Response {
             protocol_version: codec::ORDERED_WINDOW_PROTOCOL_VERSION,
+            domain_binding_id: codec::DomainBindingId::from_bytes([0x11; 16]),
             negotiated: TopologyCapabilities::NONE,
             stream_id: codec::TopologyStreamId::from_bytes([0x44; 16]),
             outcome: codec::ListPanesOrderedV1Outcome::Unsupported {
@@ -13415,8 +13417,10 @@ mod tests {
             for (case_idx, explicit_cx, remote_max, expected_dialect_rejection) in [
                 (0, false, 50, true),
                 (1, true, 50, true),
-                (2, false, 51, false),
-                (3, true, 51, false),
+                (2, false, 52, true),
+                (3, true, 52, true),
+                (4, false, 53, false),
+                (5, true, 53, false),
             ] {
                 let temp_dir = tempfile::tempdir().expect("tempdir");
                 let socket_path = temp_dir
@@ -13486,7 +13490,11 @@ mod tests {
                         direct_error,
                         DirectMuxError::OutboundPduRequiresCodec {
                             agreed: 50,
-                            required: 51,
+                            required: 53,
+                            ..
+                        } | DirectMuxError::OutboundPduRequiresCodec {
+                            agreed: 52,
+                            required: 53,
                             ..
                         }
                     ));
@@ -13537,10 +13545,10 @@ mod tests {
             for (case_idx, explicit_cx, remote_max, correlated_reply) in [
                 (0, false, 50, false),
                 (1, true, 50, false),
-                (2, false, 51, false),
-                (3, true, 51, false),
-                (4, false, 51, true),
-                (5, true, 51, true),
+                (2, false, 52, false),
+                (3, true, 52, false),
+                (4, false, 53, true),
+                (5, true, 53, true),
             ] {
                 let temp_dir = tempfile::tempdir().expect("tempdir");
                 let socket_path = temp_dir
@@ -13602,12 +13610,11 @@ mod tests {
                         .await
                         .expect_err("forbidden ordered-window PDU must fail")
                 };
-                if remote_max == 50 {
+                if remote_max < 53 {
                     assert!(matches!(
                         error,
                         DirectMuxError::InboundPduRequiresCodec {
-                            agreed: 50,
-                            required: 51,
+                            required: 53,
                             ..
                         }
                     ));
