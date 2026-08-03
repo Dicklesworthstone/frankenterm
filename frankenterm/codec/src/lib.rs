@@ -2027,11 +2027,37 @@ pub struct StreamingPduBufferStats {
 /// Only the initialized unread suffix is exposed. There is deliberately no
 /// mutable slice or `DerefMut` escape hatch that could mutate already-consumed
 /// storage or invalidate the checked head.
-#[derive(Clone, Debug, Default)]
+#[derive(Default)]
 pub struct StreamingPduBuffer {
     storage: Vec<u8>,
     head: usize,
     stats: StreamingPduBufferStats,
+}
+
+impl Clone for StreamingPduBuffer {
+    fn clone(&self) -> Self {
+        let storage = self.as_slice().to_vec();
+        let mut stats = self.stats;
+        stats.peak_capacity = stats.peak_capacity.max(storage.capacity());
+        Self {
+            storage,
+            head: 0,
+            stats,
+        }
+    }
+}
+
+impl std::fmt::Debug for StreamingPduBuffer {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("StreamingPduBuffer")
+            .field("unread_len", &self.len())
+            .field("consumed_prefix_len", &self.consumed_prefix_len())
+            .field("retained_len", &self.retained_len())
+            .field("capacity", &self.capacity())
+            .field("stats", &self.stats)
+            .finish()
+    }
 }
 
 impl StreamingPduBuffer {
@@ -5574,6 +5600,27 @@ mod test {
         assert_eq!(decoded2.pdu, Pdu::Pong(Pong {}));
         assert_eq!(decoded2.serial, 2);
         assert!(buffer.is_empty());
+    }
+
+    #[test]
+    fn stream_buffer_clone_retains_only_logical_unread_bytes() {
+        let mut encoded = Vec::new();
+        Pdu::Ping(Ping {}).encode(&mut encoded, 1).unwrap();
+        Pdu::Pong(Pong {}).encode(&mut encoded, 2).unwrap();
+        let mut buffer = StreamingPduBuffer::from(encoded);
+        Pdu::stream_decode(&mut buffer)
+            .expect("decode clone fixture prefix")
+            .expect("clone fixture prefix must be complete");
+        assert!(buffer.consumed_prefix_len() > 0);
+
+        let cloned = buffer.clone();
+        assert_eq!(cloned.as_slice(), buffer.as_slice());
+        assert_eq!(cloned.consumed_prefix_len(), 0);
+        assert_eq!(cloned.retained_len(), cloned.len());
+        assert!(
+            !format!("{cloned:?}").contains("storage"),
+            "stream-buffer diagnostics must not expose backing wire bytes"
+        );
     }
 
     #[test]
