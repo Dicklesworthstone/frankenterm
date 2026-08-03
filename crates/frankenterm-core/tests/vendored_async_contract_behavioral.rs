@@ -999,8 +999,7 @@ fn b23b_explicit_cx_public_list_panes_timeout_contract() {
         let mut client = Box::pin(DirectMuxClient::connect_with_cx(&cx, config))
             .await
             .expect("connect_with_cx");
-        let err = client
-            .list_panes_with_cx(&cx)
+        let err = Box::pin(client.list_panes_with_cx(&cx))
             .await
             .expect_err("list_panes_with_cx should time out when the peer stalls");
         assert!(
@@ -1103,8 +1102,7 @@ fn b23c_explicit_cx_public_send_paste_write_timeout_contract() {
             .expect("connect_with_cx");
 
         let payload = "x".repeat(32 * 1024 * 1024);
-        let err = client
-            .send_paste_with_cx(&cx, 0, payload)
+        let err = Box::pin(client.send_paste_with_cx(&cx, 0, payload))
             .await
             .expect_err("send_paste_with_cx should time out when the peer stops reading");
         assert!(
@@ -1270,8 +1268,7 @@ fn b23e_explicit_cx_public_list_panes_cancellation_contract() {
             .recv_timeout(Duration::from_secs(2))
             .expect("server should complete handshake");
 
-        let err = client
-            .list_panes_with_cx(&cancelled_cx)
+        let err = Box::pin(client.list_panes_with_cx(&cancelled_cx))
             .await
             .expect_err("list_panes_with_cx should fail fast for a pre-cancelled context");
         assert_cancelled_mux_error(&err);
@@ -1515,8 +1512,7 @@ fn b23g_explicit_cx_public_get_lines_cancellation_contract() {
             .recv_timeout(Duration::from_secs(2))
             .expect("server should complete handshake");
 
-        let err = client
-            .get_lines_with_cx(&cancelled_cx, 34, vec![0..3, 5..6])
+        let err = Box::pin(client.get_lines_with_cx(&cancelled_cx, 34, vec![0..3, 5..6]))
             .await
             .expect_err("get_lines_with_cx should fail fast for a pre-cancelled context");
         assert_cancelled_mux_error(&err);
@@ -1634,8 +1630,11 @@ fn b23h_explicit_cx_public_write_to_pane_cancellation_contract() {
             .recv_timeout(Duration::from_secs(2))
             .expect("server should complete handshake");
 
-        let err = client
-            .write_to_pane_with_cx(&cancelled_cx, 56, b"hello".to_vec())
+        let err = Box::pin(client.write_to_pane_with_cx(
+            &cancelled_cx,
+            56,
+            b"hello".to_vec(),
+        ))
             .await
             .expect_err("write_to_pane_with_cx should fail fast for a pre-cancelled context");
         assert_cancelled_mux_error(&err);
@@ -1874,8 +1873,11 @@ fn b23j_explicit_cx_public_send_paste_cancellation_contract() {
             .recv_timeout(Duration::from_secs(2))
             .expect("server should complete handshake");
 
-        let err = client
-            .send_paste_with_cx(&cancelled_cx, 78, "paste me".to_string())
+        let err = Box::pin(client.send_paste_with_cx(
+            &cancelled_cx,
+            78,
+            "paste me".to_string(),
+        ))
             .await
             .expect_err("send_paste_with_cx should fail fast for a pre-cancelled context");
         assert_cancelled_mux_error(&err);
@@ -2552,8 +2554,11 @@ fn b23n_explicit_cx_public_get_lines_read_timeout_contract() {
         let mut client = Box::pin(DirectMuxClient::connect_with_cx(&cx, config))
             .await
             .expect("connect_with_cx");
-        let err = client
-            .get_lines_with_cx(&cx, 88, std::iter::once(0isize..1isize).collect())
+        let err = Box::pin(client.get_lines_with_cx(
+            &cx,
+            88,
+            std::iter::once(0isize..1isize).collect(),
+        ))
             .await
             .expect_err("get_lines_with_cx should time out when the peer stalls");
         assert!(
@@ -2655,8 +2660,7 @@ fn b23o_explicit_cx_public_write_to_pane_read_timeout_contract() {
             .expect("connect_with_cx");
 
         let payload = b"timeout-me".to_vec();
-        let err = client
-            .write_to_pane_with_cx(&cx, 0, payload)
+        let err = Box::pin(client.write_to_pane_with_cx(&cx, 0, payload))
             .await
             .expect_err("write_to_pane_with_cx should time out when the peer stalls");
         assert!(
