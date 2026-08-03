@@ -9140,8 +9140,8 @@ mod test {
             .expect("encode additive render frame");
             let mut buffer = StreamingPduBuffer::from(frame);
             let decoded = Pdu::stream_decode_with_retention_metadata(&mut buffer)
-                .unwrap_or_else(|error| panic!("{case} charged decode failed: {error:#}"))
-                .unwrap_or_else(|| panic!("{case} charged frame was incomplete"));
+                .unwrap_or_else(|error| panic!("{} charged decode failed: {:#}", case, error))
+                .unwrap_or_else(|| panic!("{} charged frame was incomplete", case));
             assert_eq!(
                 &decoded.decoded().pdu,
                 &Pdu::GetPaneRenderChangesResponse(payload.clone()),
@@ -9152,7 +9152,7 @@ mod test {
                 Some(expected_bytes),
                 "case={case}"
             );
-            assert!(buffer.is_empty(), "case={case}");
+            assert!(buffer.is_empty(), "case={}", case);
         }
     }
 
