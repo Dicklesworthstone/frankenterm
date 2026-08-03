@@ -2204,6 +2204,43 @@ experiment. It is not converted into a flattering keep or a durable rejection.
 - **Primary retry condition:**
   > Replace an atomic helper on a campaign hot path only after the candidate compiles warning-free at both the declared MSRV and pinned nightly, preserves exact overflow and memory-order semantics, and passes deterministic contention and exhaustion tests.
 
+### IS-N064 — Version-window overlap without exhaustive PDU admission is unsafe
+
+- **Classification:** unguarded rolling-interop rejection; exhaustive static
+  registry and DirectMux generation-bound gates retained
+- **Bead:** `ft-interactive-systems-performance-4tenz.5.5.3.5.12`
+- **Rejected candidate:** replace DirectMux's strict codec-version equality
+  check with `check_compat`, accept an overlapping window, and then continue
+  emitting PDUs through call sites that do not retain the agreed dialect or
+  enforce direction, serial role, and established capabilities.
+- **Rejected inference:** overlap arithmetic establishes only that a common
+  dialect exists. It does not make an unguarded v51 PDU legal on an agreed-v50
+  connection, prevent a newer unilateral server family from reaching an older
+  client, bind capability state to the current connection generation, or stop
+  serial allocation and socket writes before a permanent incompatibility is
+  discovered. The earlier partial client change was therefore rejected. The
+  retained DirectMux retry activates overlap only together with generation-
+  bound dialect, direction, role, and capability gates; it is not authority to
+  activate overlap in the ordinary client, server, or any other transport.
+- **Historical ambiguity retained:** commit `5bb3372e26` assigned PDU 75/76
+  while `CODEC_VERSION` still reported 46. Version 47 is the first unambiguous
+  dialect containing those identifiers, so the exhaustive registry assigns
+  both a conservative minimum of 47. Static call-site inspection found the
+  request/reply implementation in server dispatch but no production ordinary-
+  client or DirectMux emitter, so this conservative floor does not disable a
+  current production request path.
+- **Structural correction retained:** the codec's single `pdu!` declaration
+  now requires every future variant to declare its minimum dialect, exact
+  producer/serial-role authority tuples, and capability use. Unknown IDs and
+  historical gaps have no specification. The ordered-window and reorder-CAS
+  capability bits remain deliberately absent from `SERVER_SUPPORTED`.
+- **Decision:** retain the exhaustive policy registry, impossible-window
+  rejection, and the paired DirectMux gates. Do not claim system-wide rolling
+  interop, connection safety, or latency improvement from either codec metadata
+  or a single transport implementation alone.
+- **Primary retry condition:**
+  > Activate overlap only after ordinary client, DirectMux, server dispatch, and pooling retain generation-bound dialect and capability state; reject every outbound PDU before serial allocation and first write; reject inbound above-dialect or wrong-authority frames fail-closed; clear state on reconnect; classify permanent incompatibility as non-retryable; and pass exact current/previous, current/current-plus-one, legacy-sentinel, disjoint-window, capability-disabled, and no-write barriers on one retained revision.
+
 ## Open hypothesis register
 
 These are not negative results. Each remains open until a retained same-window

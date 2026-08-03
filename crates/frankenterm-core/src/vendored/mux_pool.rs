@@ -609,7 +609,9 @@ impl MuxPool {
         };
 
         // Acquiring a connection may be retried, but once this boundary is
-        // crossed the non-idempotent operation is invoked exactly once.
+        // crossed the non-idempotent operation is invoked exactly once. The
+        // sole determinate exception is a typed outbound rejection that proves
+        // no serial allocation, encode, or write boundary was reached.
         if let Err(error) = Self::checkpoint_cx(cx) {
             drop(client);
             return Err(error);
@@ -624,6 +626,7 @@ impl MuxPool {
                 Ok(value)
             }
             Err(err) => {
+                let proven_pre_write_rejection = err.is_proven_pre_write_rejection();
                 let decision = mux_recovery_decision(&err);
                 self.record_permanent_failure(decision);
                 tracing::debug!(
@@ -631,11 +634,16 @@ impl MuxPool {
                     cancelled = decision.cancelled,
                     kind = ?decision.kind,
                     connection = ?decision.connection,
+                    proven_pre_write_rejection,
                     error = %err,
                     "non-idempotent mux pool op failed without replay"
                 );
                 self.return_client_after_error(cx, client, decision).await;
-                Err(MuxPoolError::IndeterminateMutation(err))
+                if proven_pre_write_rejection {
+                    Err(MuxPoolError::Mux(err))
+                } else {
+                    Err(MuxPoolError::IndeterminateMutation(err))
+                }
             }
         }
     }
@@ -2348,6 +2356,52 @@ mod tests {
             assert_eq!(stats.recovery_attempts, 2);
             assert_eq!(stats.recovery_successes, 0);
             assert_eq!(stats.connections_created, 0);
+        });
+    }
+
+    #[test]
+    fn proven_pre_write_mutation_rejection_is_determinate_and_reuses_client() {
+        run_async_test(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let socket_path = spawn_mock_server(&temp_dir).await;
+            let pool = MuxPool::new(pool_config(socket_path, 1));
+            let cx = crate::cx::for_testing();
+
+            let error = pool
+                .execute_once_with_cx(&cx, "synthetic_pre_write_rejection", |_client| {
+                    Box::pin(async {
+                        Err::<(), _>(DirectMuxError::OutboundPduRequiresCodec {
+                            pdu: "ReorderWindowTabsV1",
+                            agreed: 50,
+                            required: 51,
+                        })
+                    })
+                })
+                .await
+                .expect_err("proven pre-write rejection must remain determinate");
+            assert!(matches!(
+                error,
+                MuxPoolError::Mux(DirectMuxError::OutboundPduRequiresCodec {
+                    pdu: "ReorderWindowTabsV1",
+                    agreed: 50,
+                    required: 51,
+                })
+            ));
+
+            let stats = pool.stats().await;
+            assert_eq!(stats.recovery_attempts, 0);
+            assert_eq!(stats.recovery_successes, 0);
+            assert_eq!(stats.permanent_failures, 1);
+            assert_eq!(stats.connections_created, 1);
+            assert_eq!(stats.pool.idle_count, 1);
+
+            pool.list_panes_with_cx(&cx)
+                .await
+                .expect("aligned connection must remain reusable after pre-write rejection");
+            let reused = pool.stats().await;
+            assert_eq!(reused.connections_created, 1);
+            assert_eq!(reused.permanent_failures, 1);
+            assert_eq!(reused.pool.idle_count, 1);
         });
     }
 

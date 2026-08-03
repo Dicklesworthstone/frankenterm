@@ -20,13 +20,14 @@ use crate::runtime_async::task;
 use crate::runtime_async::unix::{self as compat_unix, AsyncWriteExt, UnixStream};
 use crate::runtime_async::{io, mpsc, mpsc_try_reserve_send, timeout, watch};
 use codec::{
-    AdjustPaneSize, CODEC_VERSION, CompressionMode, CreateFloatingPane, CycleStack, DecodedPdu,
-    GetCodecVersion, GetCodecVersionResponse, GetLines, GetLinesResponse, GetPaneRenderChanges,
-    GetPaneRenderChangesResponse, GetSemanticZones, GetSemanticZonesResponse, ListPanes,
-    ListPanesResponse, MoveFloatingPane, Pdu, RemoveFloatingPane, Resize, SelectStackPane,
+    AdjustPaneSize, CODEC_VERSION, CODEC_VERSION_MIN_SUPPORTED, CompatDecision, CompressionMode,
+    CreateFloatingPane, CycleStack, DecodedPdu, GetCodecVersion, GetCodecVersionResponse,
+    GetLines, GetLinesResponse, GetPaneRenderChanges, GetPaneRenderChangesResponse,
+    GetSemanticZones, GetSemanticZonesResponse, ListPanes, ListPanesResponse, MoveFloatingPane,
+    Pdu, PduCapabilityUse, PduProducer, PduWireRole, RemoveFloatingPane, Resize, SelectStackPane,
     SendPaste, SetClientId, SetFloatingPaneZ, SetLayoutCycle, SpawnResponse, SpawnV2, SplitPane,
-    StreamingPduBuffer, SwapToLayout, ToggleFloatingPane, UnitResponse, UpdatePaneConstraints,
-    WriteToPane,
+    StreamingPduBuffer, SwapToLayout, ToggleFloatingPane, TopologyCapabilities, UnitResponse,
+    UpdatePaneConstraints, WriteToPane,
 };
 use config as wezterm_config;
 use frankenterm_term::TerminalSize;
@@ -205,11 +206,62 @@ pub enum DirectMuxError {
     DuplicateRenderBatchPane { pane_id: u64 },
     #[error("unexpected response: expected {expected}, got {got}")]
     UnexpectedResponse { expected: String, got: String },
-    #[error("codec version mismatch: local {local} != remote {remote} (version {remote_version})")]
+    #[error(
+        "codec version mismatch: local={local} (min {local_min}), remote={remote} (min \
+         {remote_min}, version {remote_version}); the compatibility windows do not overlap"
+    )]
     IncompatibleCodec {
         local: usize,
+        local_min: usize,
         remote: usize,
+        remote_min: usize,
         remote_version: String,
+    },
+    #[error("outbound PDU {pdu} is forbidden during direct mux phase {phase}")]
+    OutboundPduInvalidForPhase {
+        pdu: &'static str,
+        phase: &'static str,
+    },
+    #[error("outbound PDU {pdu} is not client-produced")]
+    OutboundPduDirectionViolation { pdu: &'static str },
+    #[error(
+        "outbound PDU {pdu} requires codec {required}, above negotiated codec {agreed}"
+    )]
+    OutboundPduRequiresCodec {
+        pdu: &'static str,
+        agreed: usize,
+        required: usize,
+    },
+    #[error(
+        "outbound PDU {pdu} requires capabilities 0x{required:x}, but only 0x{negotiated:x} \
+         was negotiated"
+    )]
+    OutboundCapabilityNotNegotiated {
+        pdu: &'static str,
+        negotiated: u64,
+        required: u64,
+    },
+    #[error("inbound PDU {pdu} is forbidden during direct mux phase {phase}")]
+    InboundPduInvalidForPhase {
+        pdu: &'static str,
+        phase: &'static str,
+    },
+    #[error("inbound PDU {pdu} is not server-produced")]
+    InboundPduDirectionViolation { pdu: &'static str },
+    #[error("inbound PDU {pdu} requires codec {required}, above negotiated codec {agreed}")]
+    InboundPduRequiresCodec {
+        pdu: &'static str,
+        agreed: usize,
+        required: usize,
+    },
+    #[error(
+        "inbound PDU {pdu} requires capabilities 0x{required:x}, but only 0x{negotiated:x} \
+         was negotiated"
+    )]
+    InboundCapabilityNotNegotiated {
+        pdu: &'static str,
+        negotiated: u64,
+        required: u64,
     },
     #[error("mux {phase} cancelled: {detail}")]
     Cancelled { phase: &'static str, detail: String },
@@ -247,6 +299,23 @@ impl DirectMuxError {
     /// Return the canonical retry, connection, and cancellation decision.
     pub fn recovery_decision(&self) -> MuxRecoveryDecision {
         mux_recovery_decision(self)
+    }
+
+    /// Whether this error proves that no request serial was allocated and no
+    /// encode or write boundary was entered.
+    ///
+    /// MuxPool uses this narrow predicate for mutation calls. General recovery
+    /// axes are insufficient: an error can be permanent while the attempted
+    /// mutation is still indeterminate.
+    #[must_use]
+    pub(super) const fn is_proven_pre_write_rejection(&self) -> bool {
+        matches!(
+            self,
+            Self::OutboundPduInvalidForPhase { .. }
+                | Self::OutboundPduDirectionViolation { .. }
+                | Self::OutboundPduRequiresCodec { .. }
+                | Self::OutboundCapabilityNotNegotiated { .. }
+        )
     }
 }
 
@@ -871,8 +940,65 @@ impl RenderChangeSnapshots {
     }
 }
 
+/// Codec window retained for one exact DirectMux transport generation.
+///
+/// The connection identity is deliberately part of the record. A compatible
+/// dialect learned on one socket is not authority for its pool successor.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct NegotiatedCodec {
+    connection_id: u64,
+    local_max: usize,
+    local_min: usize,
+    remote_max: usize,
+    remote_min: usize,
+    agreed: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SessionAuthority {
+    codec: NegotiatedCodec,
+    locally_activated_capabilities: TopologyCapabilities,
+    negotiated_capabilities: TopologyCapabilities,
+}
+
+/// Ordered connection setup and feature authority for one DirectMux socket.
+///
+/// Ordered-window and render-application capabilities intentionally remain
+/// inactive. The codec knows their wire shapes, but no DirectMux producer or
+/// consumer may use them until the corresponding live authority is wired.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DirectMuxProtocolState {
+    AwaitingCodec { connection_id: u64 },
+    AwaitingRegistration { codec: NegotiatedCodec },
+    Ready(SessionAuthority),
+    Poisoned { connection_id: u64 },
+}
+
+impl DirectMuxProtocolState {
+    const fn connection_id(self) -> u64 {
+        match self {
+            Self::AwaitingCodec { connection_id } | Self::Poisoned { connection_id } => {
+                connection_id
+            }
+            Self::AwaitingRegistration { codec } | Self::Ready(SessionAuthority { codec, .. }) => {
+                codec.connection_id
+            }
+        }
+    }
+
+    const fn phase_name(self) -> &'static str {
+        match self {
+            Self::AwaitingCodec { .. } => "awaiting_codec",
+            Self::AwaitingRegistration { .. } => "awaiting_registration",
+            Self::Ready(_) => "ready",
+            Self::Poisoned { .. } => "poisoned",
+        }
+    }
+}
+
 pub struct DirectMuxClient {
     connection_id: u64,
+    protocol_state: DirectMuxProtocolState,
     stream: UnixStream,
     socket_path: PathBuf,
     read_buf: StreamingPduBuffer,
@@ -893,6 +1019,7 @@ impl std::fmt::Debug for DirectMuxClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DirectMuxClient")
             .field("connection_id", &self.connection_id)
+            .field("protocol_state", &self.protocol_state)
             .field("socket_path", &self.socket_path)
             .field("serial", &self.serial)
             .field("outstanding_requests", &self.outstanding_requests.len())
@@ -939,6 +1066,7 @@ struct InFlightRequestSlots {
 /// safe admission overestimate. It is not an exact heap/RSS measurement for
 /// the decoded Rust value; target-host memory claims still require allocator
 /// and RSS evidence.
+#[derive(Debug)]
 struct TypedRenderSideband {
     payload: GetPaneRenderChangesResponse,
     retained_frame_bytes: usize,
@@ -1581,11 +1709,11 @@ impl Drop for RenderBatchGuard<'_> {
         }
         if self.transport_ambiguous {
             self.client
-                .poison_render_connection("ambiguous render batch abandonment", self.explicit_cx);
+                .poison_connection("ambiguous render batch abandonment", self.explicit_cx);
         } else if self.batch_progressed
             && self.invalidate_target_render_state().is_err()
         {
-            self.client.poison_render_connection(
+            self.client.poison_connection(
                 "render batch abandonment cleanup accounting failure",
                 self.explicit_cx,
             );
@@ -1687,6 +1815,7 @@ impl DirectMuxClient {
 
         let mut client = Self {
             connection_id,
+            protocol_state: DirectMuxProtocolState::AwaitingCodec { connection_id },
             stream,
             compression_mode,
             socket_path,
@@ -2442,13 +2571,35 @@ impl DirectMuxClient {
             .await?;
         match response {
             Pdu::GetCodecVersionResponse(payload) => {
-                if payload.codec_vers != CODEC_VERSION {
-                    return Err(DirectMuxError::IncompatibleCodec {
-                        local: CODEC_VERSION,
-                        remote: payload.codec_vers,
-                        remote_version: payload.version_string.clone(),
-                    });
-                }
+                let remote_min = if payload.min_supported == 0 {
+                    payload.codec_vers
+                } else {
+                    payload.min_supported
+                };
+                let CompatDecision::Compatible { agreed } = codec::check_compat(
+                    CODEC_VERSION,
+                    CODEC_VERSION_MIN_SUPPORTED,
+                    payload.codec_vers,
+                    remote_min,
+                )
+                .map_err(|_| DirectMuxError::IncompatibleCodec {
+                    local: CODEC_VERSION,
+                    local_min: CODEC_VERSION_MIN_SUPPORTED,
+                    remote: payload.codec_vers,
+                    remote_min,
+                    remote_version: payload.version_string.clone(),
+                })?;
+                let negotiated = NegotiatedCodec {
+                    connection_id: self.connection_id,
+                    local_max: CODEC_VERSION,
+                    local_min: CODEC_VERSION_MIN_SUPPORTED,
+                    remote_max: payload.codec_vers,
+                    remote_min,
+                    agreed,
+                };
+                self.protocol_state = DirectMuxProtocolState::AwaitingRegistration {
+                    codec: negotiated,
+                };
                 Ok(payload)
             }
             other => Err(DirectMuxError::UnexpectedResponse {
@@ -2459,6 +2610,12 @@ impl DirectMuxClient {
     }
 
     async fn register_client_with_cx(&mut self, cx: &Cx) -> Result<UnitResponse, DirectMuxError> {
+        let DirectMuxProtocolState::AwaitingRegistration { codec } = self.protocol_state else {
+            return Err(DirectMuxError::OutboundPduInvalidForPhase {
+                pdu: "SetClientId",
+                phase: self.protocol_state.phase_name(),
+            });
+        };
         let client_id = ClientId::new();
         let response = self
             .send_request_with_cx(
@@ -2470,7 +2627,14 @@ impl DirectMuxClient {
             )
             .await?;
         match response {
-            Pdu::UnitResponse(payload) => Ok(payload),
+            Pdu::UnitResponse(payload) => {
+                self.protocol_state = DirectMuxProtocolState::Ready(SessionAuthority {
+                    codec,
+                    locally_activated_capabilities: TopologyCapabilities::NONE,
+                    negotiated_capabilities: TopologyCapabilities::NONE,
+                });
+                Ok(payload)
+            }
             other => Err(DirectMuxError::UnexpectedResponse {
                 expected: "UnitResponse".to_string(),
                 got: other.pdu_name().to_string(),
@@ -2666,6 +2830,10 @@ impl DirectMuxClient {
         if requests.is_empty() {
             return Ok(Vec::new());
         }
+        self.ensure_connection_usable()?;
+        for request in &requests {
+            self.authorize_outbound_pdu(request)?;
+        }
         self.ensure_outstanding_request_slots(requests.len().min(max_pipeline_depth))?;
 
         tracing::trace!(
@@ -2739,6 +2907,10 @@ impl DirectMuxClient {
     ) -> Result<Vec<Pdu>, DirectMuxError> {
         if requests.is_empty() {
             return Ok(Vec::new());
+        }
+        self.ensure_connection_usable()?;
+        for request in &requests {
+            self.authorize_outbound_pdu(request)?;
         }
         self.ensure_outstanding_request_slots(requests.len().min(max_pipeline_depth))?;
 
@@ -2815,7 +2987,246 @@ impl DirectMuxClient {
         }
     }
 
-    fn poison_render_connection(&mut self, reason: &'static str, explicit_cx: bool) {
+    fn validate_protocol_state_connection(&self) -> Result<(), DirectMuxError> {
+        let state_connection_id = self.protocol_state.connection_id();
+        if state_connection_id == self.connection_id {
+            Ok(())
+        } else {
+            Err(DirectMuxError::RetainedConnectionMismatch {
+                expected_connection_id: self.connection_id,
+                got_connection_id: state_connection_id,
+            })
+        }
+    }
+
+    fn authorize_outbound_pdu(&self, pdu: &Pdu) -> Result<(), DirectMuxError> {
+        self.validate_protocol_state_connection()?;
+        let pdu_name = pdu.pdu_name();
+        match self.protocol_state {
+            DirectMuxProtocolState::AwaitingCodec { .. } => {
+                if !matches!(pdu, Pdu::GetCodecVersion(_)) {
+                    return Err(DirectMuxError::OutboundPduInvalidForPhase {
+                        pdu: pdu_name,
+                        phase: self.protocol_state.phase_name(),
+                    });
+                }
+                Self::authorize_outbound_wire(
+                    pdu,
+                    CODEC_VERSION,
+                    TopologyCapabilities::NONE,
+                    TopologyCapabilities::NONE,
+                )
+            }
+            DirectMuxProtocolState::AwaitingRegistration { codec } => {
+                if !matches!(pdu, Pdu::SetClientId(_)) {
+                    return Err(DirectMuxError::OutboundPduInvalidForPhase {
+                        pdu: pdu_name,
+                        phase: self.protocol_state.phase_name(),
+                    });
+                }
+                Self::authorize_outbound_wire(
+                    pdu,
+                    codec.agreed,
+                    TopologyCapabilities::NONE,
+                    TopologyCapabilities::NONE,
+                )
+            }
+            DirectMuxProtocolState::Ready(authority) => {
+                if matches!(pdu, Pdu::GetCodecVersion(_) | Pdu::SetClientId(_)) {
+                    return Err(DirectMuxError::OutboundPduInvalidForPhase {
+                        pdu: pdu_name,
+                        phase: self.protocol_state.phase_name(),
+                    });
+                }
+                if matches!(
+                    pdu,
+                    Pdu::RenderApplicationResultV1(_) | Pdu::RenderApplicationResult(_)
+                ) {
+                    return Err(DirectMuxError::OutboundPduInvalidForPhase {
+                        pdu: pdu_name,
+                        phase: "ready_render_application_inactive",
+                    });
+                }
+                Self::authorize_outbound_wire(
+                    pdu,
+                    authority.codec.agreed,
+                    authority.locally_activated_capabilities,
+                    authority.negotiated_capabilities,
+                )
+            }
+            DirectMuxProtocolState::Poisoned { .. } => {
+                Err(DirectMuxError::OutboundPduInvalidForPhase {
+                    pdu: pdu_name,
+                    phase: self.protocol_state.phase_name(),
+                })
+            }
+        }
+    }
+
+    fn authorize_outbound_wire(
+        pdu: &Pdu,
+        agreed_codec: usize,
+        locally_activated_capabilities: TopologyCapabilities,
+        negotiated_capabilities: TopologyCapabilities,
+    ) -> Result<(), DirectMuxError> {
+        let pdu_name = pdu.pdu_name();
+        let Some(spec) = pdu.wire_spec() else {
+            return Err(DirectMuxError::OutboundPduDirectionViolation { pdu: pdu_name });
+        };
+        if !spec.authorizes(PduProducer::Client, PduWireRole::Request) {
+            return Err(DirectMuxError::OutboundPduDirectionViolation { pdu: pdu_name });
+        }
+        if spec.min_codec_version > agreed_codec {
+            return Err(DirectMuxError::OutboundPduRequiresCodec {
+                pdu: pdu_name,
+                agreed: agreed_codec,
+                required: spec.min_codec_version,
+            });
+        }
+        let available = match spec.capability {
+            PduCapabilityUse::None => return Ok(()),
+            PduCapabilityUse::Negotiates(_) => locally_activated_capabilities,
+            PduCapabilityUse::Requires(_) => negotiated_capabilities,
+        };
+        let required = match spec.capability {
+            PduCapabilityUse::None => TopologyCapabilities::NONE,
+            PduCapabilityUse::Negotiates(required) | PduCapabilityUse::Requires(required) => {
+                required
+            }
+        };
+        if available.contains(required) {
+            Ok(())
+        } else {
+            Err(DirectMuxError::OutboundCapabilityNotNegotiated {
+                pdu: pdu_name,
+                negotiated: available.bits(),
+                required: required.bits(),
+            })
+        }
+    }
+
+    fn authorize_inbound_pdu(&self, decoded: &DecodedPdu) -> Result<(), DirectMuxError> {
+        self.validate_protocol_state_connection()?;
+        let pdu_name = decoded.pdu.pdu_name();
+        let role = if decoded.serial == 0 {
+            PduWireRole::Unilateral
+        } else {
+            PduWireRole::CorrelatedReply
+        };
+        match self.protocol_state {
+            DirectMuxProtocolState::AwaitingCodec { .. } => {
+                if !matches!(
+                    &decoded.pdu,
+                    Pdu::GetCodecVersionResponse(_) | Pdu::ErrorResponse(_)
+                ) {
+                    return Err(DirectMuxError::InboundPduInvalidForPhase {
+                        pdu: pdu_name,
+                        phase: self.protocol_state.phase_name(),
+                    });
+                }
+                Self::authorize_inbound_wire(
+                    &decoded.pdu,
+                    role,
+                    CODEC_VERSION,
+                    TopologyCapabilities::NONE,
+                    TopologyCapabilities::NONE,
+                )
+            }
+            DirectMuxProtocolState::AwaitingRegistration { codec } => {
+                if !matches!(&decoded.pdu, Pdu::UnitResponse(_) | Pdu::ErrorResponse(_)) {
+                    return Err(DirectMuxError::InboundPduInvalidForPhase {
+                        pdu: pdu_name,
+                        phase: self.protocol_state.phase_name(),
+                    });
+                }
+                Self::authorize_inbound_wire(
+                    &decoded.pdu,
+                    role,
+                    codec.agreed,
+                    TopologyCapabilities::NONE,
+                    TopologyCapabilities::NONE,
+                )
+            }
+            DirectMuxProtocolState::Ready(authority) => {
+                if matches!(&decoded.pdu, Pdu::GetCodecVersionResponse(_)) {
+                    return Err(DirectMuxError::InboundPduInvalidForPhase {
+                        pdu: pdu_name,
+                        phase: self.protocol_state.phase_name(),
+                    });
+                }
+                if matches!(
+                    &decoded.pdu,
+                    Pdu::RenderApplicationUpdateV1(_) | Pdu::RenderApplicationUpdate(_)
+                ) {
+                    return Err(DirectMuxError::InboundPduInvalidForPhase {
+                        pdu: pdu_name,
+                        phase: "ready_render_application_inactive",
+                    });
+                }
+                Self::authorize_inbound_wire(
+                    &decoded.pdu,
+                    role,
+                    authority.codec.agreed,
+                    authority.locally_activated_capabilities,
+                    authority.negotiated_capabilities,
+                )
+            }
+            DirectMuxProtocolState::Poisoned { .. } => {
+                Err(DirectMuxError::InboundPduInvalidForPhase {
+                    pdu: pdu_name,
+                    phase: self.protocol_state.phase_name(),
+                })
+            }
+        }
+    }
+
+    fn authorize_inbound_wire(
+        pdu: &Pdu,
+        role: PduWireRole,
+        agreed_codec: usize,
+        locally_activated_capabilities: TopologyCapabilities,
+        negotiated_capabilities: TopologyCapabilities,
+    ) -> Result<(), DirectMuxError> {
+        let pdu_name = pdu.pdu_name();
+        let Some(spec) = pdu.wire_spec() else {
+            return Err(DirectMuxError::InboundPduDirectionViolation { pdu: pdu_name });
+        };
+        if !spec.authorizes(PduProducer::Server, role) {
+            return Err(DirectMuxError::InboundPduDirectionViolation { pdu: pdu_name });
+        }
+        if spec.min_codec_version > agreed_codec {
+            return Err(DirectMuxError::InboundPduRequiresCodec {
+                pdu: pdu_name,
+                agreed: agreed_codec,
+                required: spec.min_codec_version,
+            });
+        }
+        let available = match spec.capability {
+            PduCapabilityUse::None => return Ok(()),
+            PduCapabilityUse::Negotiates(_) => locally_activated_capabilities,
+            PduCapabilityUse::Requires(_) => negotiated_capabilities,
+        };
+        let required = match spec.capability {
+            PduCapabilityUse::None => TopologyCapabilities::NONE,
+            PduCapabilityUse::Negotiates(required) | PduCapabilityUse::Requires(required) => {
+                required
+            }
+        };
+        if available.contains(required) {
+            Ok(())
+        } else {
+            Err(DirectMuxError::InboundCapabilityNotNegotiated {
+                pdu: pdu_name,
+                negotiated: available.bits(),
+                required: required.bits(),
+            })
+        }
+    }
+
+    fn poison_connection(&mut self, reason: &'static str, explicit_cx: bool) {
+        if self.connection_poisoned {
+            return;
+        }
         let shutdown_error = self.stream.shutdown(std::net::Shutdown::Both).err();
         tracing::warn!(
             connection_id = self.connection_id,
@@ -2831,10 +3242,14 @@ impl DirectMuxClient {
             read_buffer_bytes = self.read_buf.len(),
             socket_shutdown_succeeded = shutdown_error.is_none(),
             socket_shutdown_error = ?shutdown_error,
-            phase = "render_connection_poison",
+            protocol_phase = self.protocol_state.phase_name(),
+            phase = "connection_poison",
             "poisoning direct mux connection and clearing retained state"
         );
         self.connection_poisoned = true;
+        self.protocol_state = DirectMuxProtocolState::Poisoned {
+            connection_id: self.connection_id,
+        };
         self.outstanding_requests = HashSet::new();
         self.pending_responses = HashMap::new();
         self.pending_response_bytes = 0;
@@ -2936,6 +3351,7 @@ impl DirectMuxClient {
         write_boundary_entered: Option<&mut bool>,
     ) -> Result<u64, DirectMuxError> {
         self.ensure_connection_usable()?;
+        self.authorize_outbound_pdu(&pdu)?;
         self.ensure_outstanding_request_capacity()?;
         let serial = next_request_serial(&mut self.serial)?;
         let pdu_name = pdu.pdu_name();
@@ -3010,6 +3426,7 @@ impl DirectMuxClient {
         write_boundary_entered: Option<&mut bool>,
     ) -> Result<u64, DirectMuxError> {
         self.ensure_connection_usable()?;
+        self.authorize_outbound_pdu(&pdu)?;
         checkpoint_mux_cx(cx, self.connection_id, "request_start")?;
         self.ensure_outstanding_request_capacity()?;
         let serial = next_request_serial(&mut self.serial)?;
@@ -3178,7 +3595,7 @@ impl DirectMuxClient {
             Ok(response) => self.resolve_render_change_response(pane_id, response),
             Err(error @ DirectMuxError::RemoteError(_)) => {
                 if let Err(cleanup_error) = self.invalidate_render_state_for_pane(pane_id) {
-                    self.poison_render_connection(
+                    self.poison_connection(
                         "single render remote-error cleanup accounting failure",
                         explicit_cx,
                     );
@@ -3187,7 +3604,7 @@ impl DirectMuxClient {
                 Err(error)
             }
             Err(error) => {
-                self.poison_render_connection(
+                self.poison_connection(
                     "single render response settlement failure",
                     explicit_cx,
                 );
@@ -3203,7 +3620,7 @@ impl DirectMuxClient {
                     | DirectMuxError::RetainedStateAccounting { .. }
             )
         ) {
-            self.poison_render_connection(
+            self.poison_connection(
                 "single render response retention failure",
                 explicit_cx,
             );
@@ -3611,6 +4028,10 @@ impl DirectMuxClient {
             )?
             {
                 let decoded_ref = decoded.decoded();
+                if let Err(error) = self.authorize_inbound_pdu(decoded_ref) {
+                    self.poison_connection("inbound PDU authority violation", false);
+                    return Err(error);
+                }
                 self.validate_response_serial(decoded_ref.serial)?;
                 tracing::trace!(
                     connection_id = self.connection_id,
@@ -3678,6 +4099,10 @@ impl DirectMuxClient {
             )?
             {
                 let decoded_ref = decoded.decoded();
+                if let Err(error) = self.authorize_inbound_pdu(decoded_ref) {
+                    self.poison_connection("inbound PDU authority violation", true);
+                    return Err(error);
+                }
                 self.validate_response_serial(decoded_ref.serial)?;
                 tracing::trace!(
                     connection_id = self.connection_id,
@@ -4624,6 +5049,118 @@ mod tests {
             .map_err(|err| std::io::Error::other(err.to_string()))?;
         stream.write_all(&out).await?;
         stream.flush().await
+    }
+
+    async fn accept_direct_mux_handshake(
+        listener: compat_unix::UnixListener,
+        remote_max: usize,
+        remote_min: usize,
+    ) -> compat_unix::UnixStream {
+        let (mut stream, _) = listener.accept().await.expect("accept direct mux client");
+        let mut read_buf = StreamingPduBuffer::new();
+        let mut codec_response_sent = false;
+        let mut registration_response_sent = false;
+
+        while !registration_response_sent {
+            let mut temp = vec![0u8; 4096];
+            let read = unix_stream_read(&mut stream, &mut temp)
+                .await
+                .expect("read direct mux handshake");
+            assert!(read > 0, "direct mux client disconnected during handshake");
+            read_buf.extend_from_slice(&temp[..read]);
+
+            while let Some(decoded) = codec::Pdu::stream_decode(&mut read_buf)
+                .expect("decode direct mux handshake")
+            {
+                match decoded.pdu {
+                    Pdu::GetCodecVersion(_) => {
+                        assert!(!codec_response_sent, "duplicate codec-version request");
+                        assert_eq!(decoded.serial, 1);
+                        codec_response_sent = true;
+                        write_response_pdu(
+                            &mut stream,
+                            &Pdu::GetCodecVersionResponse(GetCodecVersionResponse {
+                                codec_vers: remote_max,
+                                version_string: format!("test-codec-{remote_max}-{remote_min}"),
+                                executable_path: PathBuf::from("/bin/frankenterm-mux-server"),
+                                config_file_path: None,
+                                min_supported: remote_min,
+                            }),
+                            decoded.serial,
+                        )
+                        .await
+                        .expect("write codec-version response");
+                    }
+                    Pdu::SetClientId(_) => {
+                        assert!(codec_response_sent, "registration preceded codec agreement");
+                        assert!(!registration_response_sent, "duplicate registration request");
+                        assert_eq!(decoded.serial, 2);
+                        registration_response_sent = true;
+                        write_response_pdu(
+                            &mut stream,
+                            &Pdu::UnitResponse(UnitResponse {}),
+                            decoded.serial,
+                        )
+                        .await
+                        .expect("write registration response");
+                    }
+                    other => panic!(
+                        "unexpected PDU {} during direct mux handshake",
+                        other.pdu_name()
+                    ),
+                }
+            }
+        }
+
+        stream
+    }
+
+    fn empty_list_panes_response() -> Pdu {
+        Pdu::ListPanesResponse(ListPanesResponse {
+            tabs: Vec::new(),
+            tab_titles: Vec::new(),
+            window_titles: HashMap::new(),
+        })
+    }
+
+    fn ordered_window_request() -> Pdu {
+        let foundation = TopologyCapabilities::from_bits(
+            TopologyCapabilities::FENCED_SNAPSHOT_V1.bits()
+                | TopologyCapabilities::ORDERED_WINDOW_STREAM_V1.bits(),
+        );
+        Pdu::ListPanesOrderedV1(codec::ListPanesOrderedV1 {
+            protocol_version: codec::ORDERED_WINDOW_PROTOCOL_VERSION,
+            supported: TopologyCapabilities::from_bits(
+                foundation.bits() | TopologyCapabilities::WINDOW_REORDER_CAS_V1.bits(),
+            ),
+            required: foundation,
+        })
+    }
+
+    fn ordered_window_event() -> Pdu {
+        Pdu::WindowOrderEventV1(codec::WindowOrderEventV1 {
+            protocol_version: codec::ORDERED_WINDOW_PROTOCOL_VERSION,
+            stream_id: codec::TopologyStreamId::from_bytes([0x22; 16]),
+            session_incarnation: mux::MuxSessionIncarnation::from_bytes([0x33; 16]),
+            topology_revision: mux::TopologyRevision::new(2),
+            windows: vec![codec::OrderedWindowStateV1 {
+                window_id: codec::RemoteWindowId::new(7),
+                order_revision: codec::WindowOrderRevision::new(1),
+                ordered_tab_ids: vec![codec::RemoteTabId::new(11)],
+                active_tab_id: Some(codec::RemoteTabId::new(11)),
+            }],
+        })
+    }
+
+    fn unsupported_ordered_window_response() -> Pdu {
+        Pdu::ListPanesOrderedV1Response(codec::ListPanesOrderedV1Response {
+            protocol_version: codec::ORDERED_WINDOW_PROTOCOL_VERSION,
+            negotiated: TopologyCapabilities::NONE,
+            stream_id: codec::TopologyStreamId::from_bytes([0x44; 16]),
+            outcome: codec::ListPanesOrderedV1Outcome::Unsupported {
+                supported: TopologyCapabilities::NONE,
+            },
+        })
     }
 
     fn cancelled_test_cx(message: &'static str) -> Cx {
@@ -7876,7 +8413,7 @@ mod tests {
             assert!(guard.send_next_with_cx(&cx).await.expect("issue first"));
             let decoded = guard
                 .client
-                .read_next_pdu_with_cx(&cx)
+                .read_next_pdu_with_retention_metadata_with_cx(&cx)
                 .await
                 .expect("read first response");
             assert!(guard.handle_decoded(decoded).expect("settle first response"));
@@ -10350,7 +10887,9 @@ mod tests {
 
         let permanent = DirectMuxError::IncompatibleCodec {
             local: CODEC_VERSION,
-            remote: CODEC_VERSION - 1,
+            local_min: CODEC_VERSION_MIN_SUPPORTED,
+            remote: CODEC_VERSION_MIN_SUPPORTED - 1,
+            remote_min: CODEC_VERSION_MIN_SUPPORTED - 1,
             remote_version: "test".to_string(),
         };
         assert!(!should_auto_fallback_to_always(
@@ -10579,7 +11118,9 @@ mod tests {
             },
             DirectMuxError::IncompatibleCodec {
                 local: 2,
+                local_min: 2,
                 remote: 1,
+                remote_min: 1,
                 remote_version: "old".to_string(),
             },
             DirectMuxError::Cancelled {
@@ -12255,6 +12796,382 @@ mod tests {
     }
 
     #[test]
+    fn codec_overlap_is_retained_per_connection_for_ambient_and_explicit_cx() {
+        run_async_test(async {
+            let mut prior_connection_id = None;
+            for (case_idx, explicit_cx, remote_max, remote_min, expected_agreed) in [
+                (0, false, 50, 46, 50),
+                (1, true, 50, 46, 50),
+                (2, false, 52, 51, 51),
+                (3, true, 52, 51, 51),
+                (4, false, 50, 0, 50),
+                (5, true, 50, 0, 50),
+            ] {
+                let temp_dir = tempfile::tempdir().expect("tempdir");
+                let socket_path = temp_dir
+                    .path()
+                    .join(format!("mux-codec-overlap-{case_idx}.sock"));
+                let listener = compat_unix::bind(&socket_path).await.expect("bind");
+                let server = task::spawn(accept_direct_mux_handshake(
+                    listener,
+                    remote_max,
+                    remote_min,
+                ));
+
+                let config = direct_mux_client_config(socket_path);
+                let client = if explicit_cx {
+                    let cx = crate::cx::for_testing();
+                    DirectMuxClient::connect_with_cx(&cx, config)
+                        .await
+                        .expect("explicit-Cx overlap must connect")
+                } else {
+                    DirectMuxClient::connect(config)
+                        .await
+                        .expect("ambient overlap must connect")
+                };
+
+                let DirectMuxProtocolState::Ready(SessionAuthority { codec, .. }) =
+                    client.protocol_state
+                else {
+                    panic!("connected client did not retain ready session authority");
+                };
+                assert_eq!(codec.connection_id, client.connection_id);
+                assert_eq!(codec.local_max, CODEC_VERSION);
+                assert_eq!(codec.local_min, CODEC_VERSION_MIN_SUPPORTED);
+                assert_eq!(codec.remote_max, remote_max);
+                assert_eq!(
+                    codec.remote_min,
+                    if remote_min == 0 {
+                        remote_max
+                    } else {
+                        remote_min
+                    }
+                );
+                assert_eq!(codec.agreed, expected_agreed);
+                if let Some(prior_connection_id) = prior_connection_id {
+                    assert_ne!(
+                        client.connection_id, prior_connection_id,
+                        "reconnect must mint fresh connection-scoped authority"
+                    );
+                }
+                prior_connection_id = Some(client.connection_id);
+
+                drop(client);
+                drop(server.await.expect("server task"));
+            }
+        });
+    }
+
+    #[test]
+    fn impossible_or_disjoint_codec_windows_fail_before_registration() {
+        run_async_test(async {
+            for (case_idx, explicit_cx, remote_max, remote_min) in [
+                (0, false, 50, 51),
+                (1, true, 50, 51),
+                (2, false, 52, 52),
+                (3, true, 52, 52),
+            ] {
+                let temp_dir = tempfile::tempdir().expect("tempdir");
+                let socket_path = temp_dir
+                    .path()
+                    .join(format!("mux-codec-no-registration-{case_idx}.sock"));
+                let listener = compat_unix::bind(&socket_path).await.expect("bind");
+                let server = task::spawn(async move {
+                    let (mut stream, _) = listener.accept().await.expect("accept");
+                    let mut read_buf = StreamingPduBuffer::new();
+                    let mut saw_registration = false;
+                    let mut sent_codec_response = false;
+                    loop {
+                        let mut temp = vec![0u8; 4096];
+                        let read = unix_stream_read(&mut stream, &mut temp)
+                            .await
+                            .expect("read codec rejection handshake");
+                        if read == 0 {
+                            return saw_registration;
+                        }
+                        read_buf.extend_from_slice(&temp[..read]);
+                        while let Some(decoded) = codec::Pdu::stream_decode(&mut read_buf)
+                            .expect("decode codec rejection handshake")
+                        {
+                            match decoded.pdu {
+                                Pdu::GetCodecVersion(_) => {
+                                    assert!(!sent_codec_response);
+                                    sent_codec_response = true;
+                                    write_response_pdu(
+                                        &mut stream,
+                                        &Pdu::GetCodecVersionResponse(GetCodecVersionResponse {
+                                            codec_vers: remote_max,
+                                            version_string: "rejected-codec-window".to_string(),
+                                            executable_path: PathBuf::from(
+                                                "/bin/frankenterm-mux-server",
+                                            ),
+                                            config_file_path: None,
+                                            min_supported: remote_min,
+                                        }),
+                                        decoded.serial,
+                                    )
+                                    .await
+                                    .expect("write rejected codec response");
+                                }
+                                Pdu::SetClientId(_) => saw_registration = true,
+                                _ => {}
+                            }
+                        }
+                    }
+                });
+
+                let config = direct_mux_client_config(socket_path);
+                let error = if explicit_cx {
+                    let cx = crate::cx::for_testing();
+                    DirectMuxClient::connect_with_cx(&cx, config)
+                        .await
+                        .expect_err("invalid codec window must fail")
+                } else {
+                    DirectMuxClient::connect(config)
+                        .await
+                        .expect_err("invalid codec window must fail")
+                };
+                assert!(matches!(error, DirectMuxError::IncompatibleCodec { .. }));
+                assert!(
+                    !server.await.expect("server task"),
+                    "client must reject an invalid codec window before SetClientId"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn ordered_window_outbound_gate_precedes_serial_encode_and_batch_prefix() {
+        run_async_test(async {
+            for (case_idx, explicit_cx, remote_max, expected_dialect_rejection) in [
+                (0, false, 50, true),
+                (1, true, 50, true),
+                (2, false, 51, false),
+                (3, true, 51, false),
+            ] {
+                let temp_dir = tempfile::tempdir().expect("tempdir");
+                let socket_path = temp_dir
+                    .path()
+                    .join(format!("mux-ordered-outbound-gate-{case_idx}.sock"));
+                let listener = compat_unix::bind(&socket_path).await.expect("bind");
+                let server = task::spawn(async move {
+                    let mut stream =
+                        accept_direct_mux_handshake(listener, remote_max, 46).await;
+                    let mut read_buf = StreamingPduBuffer::new();
+                    loop {
+                        let mut temp = vec![0u8; 4096];
+                        let read = unix_stream_read(&mut stream, &mut temp)
+                            .await
+                            .expect("read post-gate request");
+                        assert!(read > 0, "client disconnected before negative control");
+                        read_buf.extend_from_slice(&temp[..read]);
+                        while let Some(decoded) = codec::Pdu::stream_decode(&mut read_buf)
+                            .expect("decode post-gate request")
+                        {
+                            assert!(
+                                matches!(decoded.pdu, Pdu::ListPanes(_)),
+                                "a rejected ordered-window request or batch prefix reached the wire"
+                            );
+                            assert_eq!(
+                                decoded.serial, 3,
+                                "rejected requests must not consume a serial"
+                            );
+                            write_response_pdu(
+                                &mut stream,
+                                &empty_list_panes_response(),
+                                decoded.serial,
+                            )
+                            .await
+                            .expect("write negative-control response");
+                            return decoded.serial;
+                        }
+                    }
+                });
+
+                let config = direct_mux_client_config(socket_path);
+                let cx = crate::cx::for_testing();
+                let mut client = if explicit_cx {
+                    DirectMuxClient::connect_with_cx(&cx, config)
+                        .await
+                        .expect("connect explicit-Cx gate client")
+                } else {
+                    DirectMuxClient::connect(config)
+                        .await
+                        .expect("connect ambient gate client")
+                };
+                assert_eq!(client.serial, 2);
+
+                let direct_error = if explicit_cx {
+                    client
+                        .send_request_only_with_cx(&cx, ordered_window_request())
+                        .await
+                        .expect_err("inactive ordered-window request must be rejected")
+                } else {
+                    client
+                        .send_request_only(ordered_window_request())
+                        .await
+                        .expect_err("inactive ordered-window request must be rejected")
+                };
+                if expected_dialect_rejection {
+                    assert!(matches!(
+                        direct_error,
+                        DirectMuxError::OutboundPduRequiresCodec {
+                            agreed: 50,
+                            required: 51,
+                            ..
+                        }
+                    ));
+                } else {
+                    assert!(matches!(
+                        direct_error,
+                        DirectMuxError::OutboundCapabilityNotNegotiated { .. }
+                    ));
+                }
+                assert_eq!(client.serial, 2);
+                assert!(client.outstanding_requests.is_empty());
+
+                let batch_requests = vec![Pdu::ListPanes(ListPanes {}), ordered_window_request()];
+                let batch_error = if explicit_cx {
+                    client
+                        .batch_with_cx(&cx, batch_requests, 2, Duration::from_secs(1))
+                        .await
+                        .expect_err("whole batch must be preflighted")
+                } else {
+                    client
+                        .batch(batch_requests, 2, Duration::from_secs(1))
+                        .await
+                        .expect_err("whole batch must be preflighted")
+                };
+                assert_eq!(
+                    batch_error.protocol_error_kind(),
+                    ProtocolErrorKind::Permanent
+                );
+                assert_eq!(client.serial, 2);
+                assert!(client.outstanding_requests.is_empty());
+
+                if explicit_cx {
+                    client
+                        .list_panes_with_cx(&cx)
+                        .await
+                        .expect("explicit-Cx negative control");
+                } else {
+                    client.list_panes().await.expect("ambient negative control");
+                }
+                assert_eq!(server.await.expect("server task"), 3);
+            }
+        });
+    }
+
+    #[test]
+    fn ordered_window_inbound_gate_precedes_correlation_and_poisons_both_readers() {
+        run_async_test(async {
+            for (case_idx, explicit_cx, remote_max, correlated_reply) in [
+                (0, false, 50, false),
+                (1, true, 50, false),
+                (2, false, 51, false),
+                (3, true, 51, false),
+                (4, false, 51, true),
+                (5, true, 51, true),
+            ] {
+                let temp_dir = tempfile::tempdir().expect("tempdir");
+                let socket_path = temp_dir
+                    .path()
+                    .join(format!("mux-ordered-inbound-gate-{case_idx}.sock"));
+                let listener = compat_unix::bind(&socket_path).await.expect("bind");
+                let server = task::spawn(async move {
+                    let mut stream =
+                        accept_direct_mux_handshake(listener, remote_max, 46).await;
+                    let mut read_buf = StreamingPduBuffer::new();
+                    loop {
+                        let mut temp = vec![0u8; 4096];
+                        let read = unix_stream_read(&mut stream, &mut temp)
+                            .await
+                            .expect("read request preceding forbidden inbound PDU");
+                        assert!(read > 0);
+                        read_buf.extend_from_slice(&temp[..read]);
+                        while let Some(decoded) = codec::Pdu::stream_decode(&mut read_buf)
+                            .expect("decode request preceding forbidden inbound PDU")
+                        {
+                            assert!(matches!(decoded.pdu, Pdu::ListPanes(_)));
+                            let (forbidden, serial) = if correlated_reply {
+                                (unsupported_ordered_window_response(), 999)
+                            } else {
+                                (ordered_window_event(), 0)
+                            };
+                            write_response_pdu(&mut stream, &forbidden, serial)
+                                .await
+                                .expect("write forbidden inbound PDU");
+                            let mut eof_probe = [0u8; 1];
+                            let peer_read = unix_stream_read(&mut stream, &mut eof_probe)
+                                .await
+                                .expect("read poisoned connection EOF");
+                            assert_eq!(peer_read, 0);
+                            return;
+                        }
+                    }
+                });
+
+                let config = direct_mux_client_config(socket_path);
+                let cx = crate::cx::for_testing();
+                let mut client = if explicit_cx {
+                    DirectMuxClient::connect_with_cx(&cx, config)
+                        .await
+                        .expect("connect explicit-Cx inbound-gate client")
+                } else {
+                    DirectMuxClient::connect(config)
+                        .await
+                        .expect("connect ambient inbound-gate client")
+                };
+                let error = if explicit_cx {
+                    client
+                        .list_panes_with_cx(&cx)
+                        .await
+                        .expect_err("forbidden ordered-window PDU must fail")
+                } else {
+                    client
+                        .list_panes()
+                        .await
+                        .expect_err("forbidden ordered-window PDU must fail")
+                };
+                if remote_max == 50 {
+                    assert!(matches!(
+                        error,
+                        DirectMuxError::InboundPduRequiresCodec {
+                            agreed: 50,
+                            required: 51,
+                            ..
+                        }
+                    ));
+                } else {
+                    assert!(matches!(
+                        error,
+                        DirectMuxError::InboundCapabilityNotNegotiated { .. }
+                    ));
+                }
+                assert!(client.connection_poisoned);
+                assert!(matches!(
+                    client.protocol_state,
+                    DirectMuxProtocolState::Poisoned { .. }
+                ));
+                assert!(client.outstanding_requests.is_empty());
+                assert!(client.pending_responses.is_empty());
+                assert_eq!(client.pending_response_bytes, 0);
+                assert!(client.pending_render_changes.is_empty());
+                assert!(client.render_change_snapshots.is_empty());
+                assert!(client.read_buf.is_empty());
+
+                let subsequent = if explicit_cx {
+                    client.list_panes_with_cx(&cx).await
+                } else {
+                    client.list_panes().await
+                };
+                assert!(matches!(subsequent, Err(DirectMuxError::Disconnected)));
+                server.await.expect("server task");
+            }
+        });
+    }
+
+    #[test]
     fn incompatible_codec_version_rejected() {
         run_async_test(async {
             let temp_dir = tempfile::tempdir().expect("tempdir");
@@ -12276,7 +13193,7 @@ mod tests {
                         version_string: "incompatible-wezterm".to_string(),
                         executable_path: PathBuf::from("/bin/wezterm"),
                         config_file_path: None,
-                        min_supported: codec::CODEC_VERSION_MIN_SUPPORTED,
+                        min_supported: CODEC_VERSION + 1,
                     });
                     let mut out = Vec::new();
                     response.encode(&mut out, decoded.serial).expect("encode");
@@ -12287,9 +13204,17 @@ mod tests {
             let config = DirectMuxClientConfig::default().with_socket_path(socket_path);
             let err = DirectMuxClient::connect(config).await.unwrap_err();
             match err {
-                DirectMuxError::IncompatibleCodec { local, remote, .. } => {
+                DirectMuxError::IncompatibleCodec {
+                    local,
+                    local_min,
+                    remote,
+                    remote_min,
+                    ..
+                } => {
                     assert_eq!(local, CODEC_VERSION);
+                    assert_eq!(local_min, CODEC_VERSION_MIN_SUPPORTED);
                     assert_eq!(remote, CODEC_VERSION + 999);
+                    assert_eq!(remote_min, CODEC_VERSION + 1);
                 }
                 other => panic!("expected IncompatibleCodec, got: {other}"),
             }
@@ -12318,7 +13243,7 @@ mod tests {
                         version_string: "incompatible-wezterm-with-cx".to_string(),
                         executable_path: PathBuf::from("/bin/wezterm"),
                         config_file_path: None,
-                        min_supported: codec::CODEC_VERSION_MIN_SUPPORTED,
+                        min_supported: CODEC_VERSION + 1,
                     });
                     let mut out = Vec::new();
                     response.encode(&mut out, decoded.serial).expect("encode");
@@ -12331,9 +13256,17 @@ mod tests {
                 .await
                 .unwrap_err();
             match err {
-                DirectMuxError::IncompatibleCodec { local, remote, .. } => {
+                DirectMuxError::IncompatibleCodec {
+                    local,
+                    local_min,
+                    remote,
+                    remote_min,
+                    ..
+                } => {
                     assert_eq!(local, CODEC_VERSION);
+                    assert_eq!(local_min, CODEC_VERSION_MIN_SUPPORTED);
                     assert_eq!(remote, CODEC_VERSION + 999);
+                    assert_eq!(remote_min, CODEC_VERSION + 1);
                 }
                 other => panic!("expected IncompatibleCodec, got: {other}"),
             }

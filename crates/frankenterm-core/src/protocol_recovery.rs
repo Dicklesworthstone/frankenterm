@@ -237,6 +237,13 @@ pub fn classify_error_message(msg: &str) -> ProtocolErrorKind {
     if lower.starts_with("connect to mux socket timed out:") {
         return ProtocolErrorKind::Transient;
     }
+    if lower.starts_with("outbound pdu ") || lower.starts_with("inbound pdu ") {
+        // Direct-mux phase, direction, dialect, and capability gates are
+        // deterministic protocol-policy failures. Typed recovery retains the
+        // independent connection-disposition axis; display-only callers can
+        // recover only the shared permanent diagnostic kind.
+        return ProtocolErrorKind::Permanent;
+    }
 
     if lower.contains("codec version mismatch")
         || lower.contains("incompatible")
@@ -300,6 +307,10 @@ pub fn mux_recovery_decision(err: &crate::vendored::DirectMuxError) -> MuxRecove
         DirectMuxError::SocketPathMissing
         | DirectMuxError::ProxyUnsupported
         | DirectMuxError::IncompatibleCodec { .. }
+        | DirectMuxError::InboundPduInvalidForPhase { .. }
+        | DirectMuxError::InboundPduDirectionViolation { .. }
+        | DirectMuxError::InboundPduRequiresCodec { .. }
+        | DirectMuxError::InboundCapabilityNotNegotiated { .. }
         | DirectMuxError::ConnectionIdExhausted => MuxRecoveryDecision {
             kind: ProtocolErrorKind::Permanent,
             retry: false,
@@ -310,7 +321,11 @@ pub fn mux_recovery_decision(err: &crate::vendored::DirectMuxError) -> MuxRecove
         // These failures are established by local validation before any wire
         // state is touched. They cannot invalidate an already aligned client.
         DirectMuxError::InvalidLimit { .. }
-        | DirectMuxError::DuplicateRenderBatchPane { .. } => MuxRecoveryDecision {
+        | DirectMuxError::DuplicateRenderBatchPane { .. }
+        | DirectMuxError::OutboundPduInvalidForPhase { .. }
+        | DirectMuxError::OutboundPduDirectionViolation { .. }
+        | DirectMuxError::OutboundPduRequiresCodec { .. }
+        | DirectMuxError::OutboundCapabilityNotNegotiated { .. } => MuxRecoveryDecision {
             kind: ProtocolErrorKind::Permanent,
             retry: false,
             connection: Reuse,
@@ -1258,8 +1273,68 @@ mod tests {
             (
                 DirectMuxError::IncompatibleCodec {
                     local: 4,
+                    local_min: 4,
                     remote: 3,
+                    remote_min: 3,
                     remote_version: "old".to_string(),
+                },
+                permanent_discard,
+            ),
+            (
+                DirectMuxError::OutboundPduInvalidForPhase {
+                    pdu: "ListPanes",
+                    phase: "awaiting_codec",
+                },
+                permanent_reuse,
+            ),
+            (
+                DirectMuxError::OutboundPduDirectionViolation {
+                    pdu: "ListPanesResponse",
+                },
+                permanent_reuse,
+            ),
+            (
+                DirectMuxError::OutboundPduRequiresCodec {
+                    pdu: "ListPanesOrderedV1",
+                    agreed: 50,
+                    required: 51,
+                },
+                permanent_reuse,
+            ),
+            (
+                DirectMuxError::OutboundCapabilityNotNegotiated {
+                    pdu: "ReorderWindowTabsV1",
+                    negotiated: 0b001,
+                    required: 0b111,
+                },
+                permanent_reuse,
+            ),
+            (
+                DirectMuxError::InboundPduInvalidForPhase {
+                    pdu: "WindowOrderEventV1",
+                    phase: "awaiting_codec",
+                },
+                permanent_discard,
+            ),
+            (
+                DirectMuxError::InboundPduDirectionViolation {
+                    pdu: "ListPanesOrderedV1",
+                },
+                permanent_discard,
+            ),
+            (
+                DirectMuxError::InboundPduRequiresCodec {
+                    pdu: "WindowOrderEventV1",
+                    agreed: 50,
+                    required: 51,
+                },
+                permanent_discard,
+            ),
+            (
+                DirectMuxError::InboundCapabilityNotNegotiated {
+                    pdu: "WindowOrderEventV1",
+                    negotiated: 0b001,
+                    required: 0b011,
                 },
                 permanent_discard,
             ),

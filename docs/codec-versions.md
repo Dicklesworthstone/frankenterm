@@ -23,6 +23,22 @@ PDU may advance only `CODEC_VERSION`; a breaking change must advance the
 minimum in the same commit. Adding a field to an existing varbincode PDU is not
 additive because old payloads end at EOF and do not synthesize a missing field.
 
+Every assigned identifier in the codec's `pdu!` declaration must also declare
+its minimum dialect, exact producer/serial-role authorities, and topology-
+capability use. The generated `PduWireSpec` registry is the source of truth for
+transport admission; variant names such as `Response` are not direction
+authority. Unknown identifiers and the historical gaps 5-7, 15-19, and 21 have
+no specification and must fail closed after handshake.
+
+`GetCodecVersionResponse` now carries `min_supported`. Its dual-schema decoder
+maps a canonical legacy response to the sentinel zero; handshake code must
+conservatively clamp that sentinel to the peer's `codec_vers`. `check_compat`
+rejects impossible `min_supported > codec_vers` windows rather than repairing
+peer input. Computing an overlap does not by itself activate rolling interop:
+each connection generation must retain the agreed dialect and gate every PDU
+before serial allocation and the first write, while inbound frames are checked
+against the same dialect, producer/role, and established capabilities.
+
 **Operator note:** rows marked additive are rolling-upgrade safe only when the
 new PDU or behavior is guarded by the negotiated version/capability. Rows
 marked breaking require the maintenance-window procedure in
@@ -36,5 +52,5 @@ marked breaking require the maintenance-window procedure in
 | 50      | 2026-07-30 | additive | adds authoritative render-application-v2 PDUs 84/85 while permanently retaining v1 schemas at 79/80, preventing numeric generation aliasing across reconnect, restart, and route failover. Also gives PDU 27 an explicit canonical legacy/current decoder after real old-frame testing disproved the prior `serde(default)`-at-EOF assumption. See ft-interactive-systems-performance-4tenz.5.5.4. |
 | 49      | 2026-07-30 | additive | adds negotiated coherent `ListPanesCoherent` / `ListPanesCoherentResponse` and stamped `TopologyEvent` PDUs (81/82/83), with exact stream/session identity and typed contention, exhaustion, and unsupported-capability outcomes for ft-interactive-systems-performance-4tenz.5.5.14.1.2.3.2. |
 | 48      | 2026-07-30 | additive | adds fail-closed `RenderApplicationUpdate` / `RenderApplicationResult` PDUs (79/80) with exact generation, scheduler, ledger, base/result-state, complete atomic surface components, hard resource bounds, original-deadline-bounded retry/resync, and typed ACK/NACK authority for ft-interactive-systems-performance-4tenz.5.5.5. |
-| 47      | 2026-06-07 | additive | adds `GetSemanticZones` / `GetSemanticZonesResponse` PDUs (77/78) carrying live SemanticZone coordinates, zone text, and retained OSC 133 exit status for ft-7h5da.2.1 robot DOM queries. |
+| 47      | 2026-06-07 | additive | adds `GetSemanticZones` / `GetSemanticZonesResponse` PDUs (77/78) carrying live SemanticZone coordinates, zone text, and retained OSC 133 exit status for ft-7h5da.2.1 robot DOM queries. PDU 75/76 were historically added by `5bb3372e26` while the constant still reported v46; the exhaustive registry therefore assigns them a conservative minimum dialect of 47, the first unambiguous version containing them. |
 | 46      | 2026-02-10 | initial  | starting value at fork import from wezterm @ `05343b387085842b434d267f91b6b0ec157e4331`. See `frankenterm/PROVENANCE.md`. |
