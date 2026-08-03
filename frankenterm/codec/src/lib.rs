@@ -5842,7 +5842,7 @@ fn accumulate_and_hash_exact_render_row(
     usage: &mut ExactRenderDeliveryResourceUsage,
     hasher: &mut Sha256,
     row: &ExactRenderRowV1,
-) -> Result<(), ExactRenderDeliveryProtocolError> {
+) -> Result<u64, ExactRenderDeliveryProtocolError> {
     let text_bytes = u64::try_from(row.text.len()).map_err(|_| {
         ExactRenderDeliveryProtocolError::ArithmeticOverflow {
             field: "row_text_bytes",
@@ -5857,7 +5857,7 @@ fn accumulate_and_hash_exact_render_row(
     hasher.update([u8::from(row.wrapped)]);
     hasher.update(text_bytes.to_be_bytes());
     hasher.update(row.text.as_bytes());
-    Ok(())
+    Ok(text_bytes)
 }
 
 fn serialize_exact_render_rows<S>(
@@ -6444,10 +6444,12 @@ impl ExactRenderSnapshotManifestV1 {
         self.validated_retained_text_bytes().map(|_| ())
     }
 
-    /// Validate totals and prove that at least one legal v1 chunk plan can
-    /// carry the declared immutable rows. The projection bytes are retained
-    /// with the snapshot and repeated in every `FullChunk` response, so they
-    /// consume both the snapshot and per-chunk text envelopes.
+    /// Validate totals and the aggregate lower bounds for a legal v1 chunk
+    /// plan. The projection bytes are retained with the snapshot and repeated
+    /// in every `FullChunk` response, so they consume both the snapshot and
+    /// per-chunk text envelopes. Exact feasibility for the immutable,
+    /// indivisible row sequence is checked by [`Self::computed_content_digest`]
+    /// once those rows are available.
     fn validated_retained_text_bytes(
         &self,
     ) -> Result<u64, ExactRenderDeliveryProtocolError> {
@@ -6555,6 +6557,13 @@ impl ExactRenderSnapshotManifestV1 {
             rows: row_count,
             ..ExactRenderDeliveryResourceUsage::default()
         };
+        let projection_text_bytes = self.projection.text_bytes()?;
+        let chunk_text_capacity = MAX_EXACT_RENDER_DELIVERY_TEXT_BYTES_U64
+            .checked_sub(projection_text_bytes)
+            .ok_or(ExactRenderDeliveryProtocolError::SnapshotChunkCountInvalid)?;
+        let mut minimum_chunk_count = 0_u64;
+        let mut current_chunk_rows = 0_u64;
+        let mut current_chunk_text_bytes = 0_u64;
         let mut expected = self.projection.first_stable_row;
         for row in rows {
             #[cfg(test)]
@@ -6565,10 +6574,42 @@ impl ExactRenderSnapshotManifestV1 {
                     actual: row.stable_row,
                 });
             }
-            accumulate_and_hash_exact_render_row(&mut usage, &mut hasher, row)?;
+            let row_text_bytes =
+                accumulate_and_hash_exact_render_row(&mut usage, &mut hasher, row)?;
             if usage.text_bytes > self.total_text_bytes {
                 return Err(ExactRenderDeliveryProtocolError::SnapshotTotalsInvalid);
             }
+
+            if row_text_bytes > chunk_text_capacity {
+                return Err(ExactRenderDeliveryProtocolError::SnapshotChunkCountInvalid);
+            }
+            let combined_text_bytes = current_chunk_text_bytes
+                .checked_add(row_text_bytes)
+                .ok_or(ExactRenderDeliveryProtocolError::ArithmeticOverflow {
+                    field: "snapshot_chunk_text_bytes",
+                })?;
+            if current_chunk_rows != 0
+                && (current_chunk_rows == MAX_EXACT_RENDER_DELIVERY_ROWS_U64
+                    || combined_text_bytes > chunk_text_capacity)
+            {
+                minimum_chunk_count = minimum_chunk_count.checked_add(1).ok_or(
+                    ExactRenderDeliveryProtocolError::ArithmeticOverflow {
+                        field: "snapshot_minimum_chunk_count",
+                    },
+                )?;
+                current_chunk_rows = 0;
+                current_chunk_text_bytes = 0;
+            }
+            current_chunk_rows = current_chunk_rows.checked_add(1).ok_or(
+                ExactRenderDeliveryProtocolError::ArithmeticOverflow {
+                    field: "snapshot_chunk_rows",
+                },
+            )?;
+            current_chunk_text_bytes = current_chunk_text_bytes
+                .checked_add(row_text_bytes)
+                .ok_or(ExactRenderDeliveryProtocolError::ArithmeticOverflow {
+                    field: "snapshot_chunk_text_bytes",
+                })?;
             expected = expected.checked_add(1).ok_or(
                 ExactRenderDeliveryProtocolError::ArithmeticOverflow {
                     field: "snapshot_stable_row",
@@ -6577,6 +6618,21 @@ impl ExactRenderSnapshotManifestV1 {
         }
         if usage.text_bytes != self.total_text_bytes {
             return Err(ExactRenderDeliveryProtocolError::SnapshotTotalsInvalid);
+        }
+        if current_chunk_rows != 0 {
+            minimum_chunk_count = minimum_chunk_count.checked_add(1).ok_or(
+                ExactRenderDeliveryProtocolError::ArithmeticOverflow {
+                    field: "snapshot_minimum_chunk_count",
+                },
+            )?;
+        }
+        // Greedily taking the longest legal contiguous prefix minimizes the
+        // number of chunks for non-negative, indivisible row sizes. Any such
+        // chunk can be split until every row is its own chunk, so the aggregate
+        // `chunk_count <= total_rows` check plus this lower bound proves that
+        // exactly the declared number of chunks is attainable.
+        if minimum_chunk_count > self.chunk_count {
+            return Err(ExactRenderDeliveryProtocolError::SnapshotChunkCountInvalid);
         }
         Ok(ExactRenderDigest::from_bytes(hasher.finalize().into()))
     }
@@ -11945,6 +12001,102 @@ mod test {
     }
 
     #[test]
+    fn exact_render_manifest_proves_contiguous_row_partition_feasibility() {
+        let (_, mut template, _, _) = sample_exact_render_manifest_and_chunks();
+        template.projection.first_stable_row = -3;
+        template.projection.row_count = 3;
+        template.projection.dimensions.scrollback_rows = 3;
+        template.projection.dimensions.scrollback_top = -3;
+        template.projection.title = ExactRenderTitleV1::try_from_string(
+            "t".repeat(MAX_EXACT_RENDER_PROJECTION_TITLE_BYTES),
+        )
+        .expect("maximum-size title must be representable");
+        template.projection.working_dir = Some(
+            ExactRenderWorkingDirectoryV1::try_from_string(
+                "w".repeat(MAX_EXACT_RENDER_PROJECTION_WORKING_DIR_BYTES),
+            )
+            .expect("maximum-size working directory must be representable"),
+        );
+
+        let projection_text_bytes = template
+            .projection
+            .text_bytes()
+            .expect("maximum projection text must measure");
+        let chunk_text_capacity = MAX_EXACT_RENDER_DELIVERY_TEXT_BYTES_U64
+            .checked_sub(projection_text_bytes)
+            .expect("projection must leave row-text capacity");
+        assert_eq!(
+            projection_text_bytes,
+            MAX_EXACT_RENDER_PROJECTION_TITLE_BYTES_U64
+                + MAX_EXACT_RENDER_PROJECTION_WORKING_DIR_BYTES_U64,
+        );
+
+        let rows_with_lengths = |lengths: [usize; 3]| {
+            [-3_i64, -2, -1]
+                .into_iter()
+                .zip(lengths)
+                .map(|(stable_row, length)| ExactRenderRowV1 {
+                    stable_row,
+                    text: ExactRenderRowTextV1::try_from_string("r".repeat(length))
+                        .expect("test row length must fit the row schema"),
+                    wrapped: false,
+                })
+                .collect::<Vec<_>>()
+        };
+        let manifest_for = |rows: &[ExactRenderRowV1], chunk_count| {
+            let mut manifest = template.clone();
+            manifest.total_rows = u64::try_from(rows.len()).expect("test row count fits u64");
+            manifest.total_text_bytes = exact_render_rows_usage(rows)
+                .expect("test row text must measure")
+                .text_bytes;
+            manifest.chunk_count = chunk_count;
+            manifest
+        };
+
+        let three_maximum_rows = rows_with_lengths([MAX_EXACT_RENDER_ROW_TEXT_BYTES; 3]);
+        let two_chunk_counterexample = manifest_for(&three_maximum_rows, 2);
+        two_chunk_counterexample
+            .validate()
+            .expect("aggregate chunk capacities alone admit this counterexample");
+        assert_eq!(
+            two_chunk_counterexample.with_computed_content_digest(&three_maximum_rows),
+            Err(ExactRenderDeliveryProtocolError::SnapshotChunkCountInvalid),
+            "three indivisible one-million-byte rows cannot fit two contiguous chunks",
+        );
+        manifest_for(&three_maximum_rows, 3)
+            .with_computed_content_digest(&three_maximum_rows)
+            .expect("one legal chunk per maximum-size row must remain representable");
+
+        let exact_second_row = usize::try_from(chunk_text_capacity)
+            .expect("chunk text capacity fits usize")
+            .checked_sub(MAX_EXACT_RENDER_ROW_TEXT_BYTES)
+            .expect("one maximum row fits the chunk text capacity");
+        let exact_boundary_rows = rows_with_lengths([
+            MAX_EXACT_RENDER_ROW_TEXT_BYTES,
+            exact_second_row,
+            MAX_EXACT_RENDER_ROW_TEXT_BYTES,
+        ]);
+        manifest_for(&exact_boundary_rows, 2)
+            .with_computed_content_digest(&exact_boundary_rows)
+            .expect("an exact-capacity first chunk plus one final row must be feasible");
+
+        let one_byte_over_rows = rows_with_lengths([
+            MAX_EXACT_RENDER_ROW_TEXT_BYTES,
+            exact_second_row + 1,
+            MAX_EXACT_RENDER_ROW_TEXT_BYTES,
+        ]);
+        let one_byte_over_manifest = manifest_for(&one_byte_over_rows, 2);
+        one_byte_over_manifest
+            .validate()
+            .expect("aggregate capacities still admit the one-byte partition counterexample");
+        assert_eq!(
+            one_byte_over_manifest.with_computed_content_digest(&one_byte_over_rows),
+            Err(ExactRenderDeliveryProtocolError::SnapshotChunkCountInvalid),
+            "one byte over both adjacent split points requires a third chunk",
+        );
+    }
+
+    #[test]
     fn exact_render_delta_rechecks_text_limit_after_projection_metadata() {
         let mut delta = sample_exact_render_delta(101);
         delta.rows[0].text = ExactRenderRowTextV1::try_from_string(
@@ -12972,7 +13124,7 @@ mod test {
     }
 
     #[test]
-    fn ordered_window_v1_accepts_zero_mux_ids_and_rejects_reserved_or_duplicate_ids() {
+    fn ordered_window_v1_accepts_boundary_mux_ids_and_rejects_reserved_or_duplicate_ids() {
         let valid = sample_reorder_window_tabs_v1();
         assert_eq!(RemoteWindowId::new(0).try_into_usize(), Ok(0));
         assert_eq!(RemoteTabId::new(0).try_into_usize(), Ok(0));
@@ -13005,6 +13157,25 @@ mod test {
                 pdu,
             );
         }
+
+        let mut maximum_live_ids = valid.clone();
+        maximum_live_ids.window_id = RemoteWindowId::new(u64::MAX - 1);
+        maximum_live_ids.desired_tab_ids[0] = RemoteTabId::new(u64::MAX - 1);
+        maximum_live_ids.desired_active_tab_id = Some(RemoteTabId::new(u64::MAX - 1));
+        maximum_live_ids = maximum_live_ids.with_computed_digest();
+        maximum_live_ids
+            .validate()
+            .expect("u64::MAX - 1 window, tab, and active identities must validate");
+        let maximum_live_pdu = Pdu::ReorderWindowTabsV1(maximum_live_ids);
+        let maximum_live_frame = maximum_live_pdu
+            .encode_frame_with_mode(6, CompressionMode::Never)
+            .expect("u64::MAX - 1 mux identities must encode");
+        assert_eq!(
+            Pdu::decode(maximum_live_frame.as_slice())
+                .expect("u64::MAX - 1 mux identities must decode")
+                .pdu,
+            maximum_live_pdu,
+        );
 
         let mut reserved_window = valid.clone();
         reserved_window.window_id = RemoteWindowId::new(u64::MAX);
