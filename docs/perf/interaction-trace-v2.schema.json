@@ -1,0 +1,239 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://frankenterm.dev/schemas/interaction-trace-v2.schema.json",
+  "title": "FrankenTerm interaction trace v2",
+  "description": "Content-free K0-K13 or R0-R25 trace. Wall time is metadata only; different clock domains are never subtraction authority.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "trace_id", "path", "events"],
+  "properties": {
+    "schema_version": {"const": "ft.interaction-trace.v2"},
+    "trace_id": {"$ref": "#/$defs/trace_id"},
+    "path": {"enum": ["keypress", "resize_zoom"]},
+    "events": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 256,
+      "items": {"$ref": "#/$defs/event"}
+    }
+  },
+  "$defs": {
+    "u64": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+    "nonzero_u64": {"type": "integer", "minimum": 1, "maximum": 18446744073709551615},
+    "usable_sequence": {"type": "integer", "minimum": 1, "maximum": 18446744073709551614},
+    "run_id": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["epoch_nonce_hi", "epoch_nonce_lo"],
+      "properties": {
+        "epoch_nonce_hi": {"$ref": "#/$defs/u64"},
+        "epoch_nonce_lo": {"$ref": "#/$defs/u64"}
+      },
+      "not": {
+        "properties": {
+          "epoch_nonce_hi": {"const": 0},
+          "epoch_nonce_lo": {"const": 0}
+        },
+        "required": ["epoch_nonce_hi", "epoch_nonce_lo"]
+      }
+    },
+    "trace_id": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["run_id", "sequence"],
+      "properties": {
+        "run_id": {"$ref": "#/$defs/run_id"},
+        "sequence": {"$ref": "#/$defs/usable_sequence"}
+      }
+    },
+    "keypress_stage": {
+      "enum": [
+        "K0.key_appkit_receipt",
+        "K1.gui_key_mapping_complete",
+        "K2.client_rpc_enqueue",
+        "K3.client_encode_socket_flush",
+        "K4.server_readable_decode",
+        "K5.server_dispatch_mux_wait",
+        "K6.terminal_lock_pty_write_flush",
+        "K7.pty_echo_parser_apply",
+        "K8.server_delta_compute",
+        "K9.client_receive_decode_apply",
+        "K10.local_mux_gui_invalidation",
+        "K11.paint_shape_atlas",
+        "K12.gpu_submit_drawable_request",
+        "K13.display_completion"
+      ]
+    },
+    "resize_stage": {
+      "enum": [
+        "R0.native_event_receipt",
+        "R1.gui_return",
+        "R2.intent_enqueue",
+        "R3.mux_resize_dispatch",
+        "R4.pane_resize_apply",
+        "R5.intent_supersession",
+        "R6.worker_create",
+        "R7.worker_start",
+        "R8.terminal_lock_wait",
+        "R9.terminal_lock_hold",
+        "R10.viewport_reflow",
+        "R11.near_reflow",
+        "R12.cold_reflow",
+        "R13.first_coherent_viewport",
+        "R14.worker_join",
+        "R15.gui_invalidation",
+        "R16.paint",
+        "R17.text_shaping",
+        "R18.glyph_raster",
+        "R19.glyph_atlas",
+        "R20.line_quad_reuse_rebuild",
+        "R21.gpu_bind",
+        "R22.gpu_upload",
+        "R23.gpu_submit",
+        "R24.drawable_present_request",
+        "R25.display_completion"
+      ]
+    },
+    "stage": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["path", "stage"],
+          "properties": {"path": {"const": "keypress"}, "stage": {"$ref": "#/$defs/keypress_stage"}}
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["path", "stage"],
+          "properties": {"path": {"const": "resize_zoom"}, "stage": {"$ref": "#/$defs/resize_stage"}}
+        }
+      ]
+    },
+    "producer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["host_id", "process_id", "process_generation", "thread_id", "connection_generation"],
+      "properties": {
+        "host_id": {"$ref": "#/$defs/nonzero_u64"},
+        "process_id": {"type": "integer", "minimum": 1, "maximum": 4294967295},
+        "process_generation": {"$ref": "#/$defs/nonzero_u64"},
+        "thread_id": {"$ref": "#/$defs/nonzero_u64"},
+        "connection_generation": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/nonzero_u64"}]}
+      }
+    },
+    "topology": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["window_id", "tab_id", "pane_id"],
+      "properties": {
+        "window_id": {"$ref": "#/$defs/nonzero_u64"},
+        "tab_id": {"$ref": "#/$defs/nonzero_u64"},
+        "pane_id": {"$ref": "#/$defs/nonzero_u64"}
+      }
+    },
+    "clock_domain": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["host_id", "process_generation", "clock_id"],
+      "properties": {
+        "host_id": {"$ref": "#/$defs/nonzero_u64"},
+        "process_generation": {"$ref": "#/$defs/nonzero_u64"},
+        "clock_id": {"$ref": "#/$defs/nonzero_u64"}
+      }
+    },
+    "timestamp": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["clock_domain", "monotonic_ns", "wall_time_unix_ns"],
+      "properties": {
+        "clock_domain": {"$ref": "#/$defs/clock_domain"},
+        "monotonic_ns": {"$ref": "#/$defs/u64"},
+        "wall_time_unix_ns": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/u64"}]}
+      }
+    },
+    "correlation": {
+      "oneOf": [
+        {
+          "type": "object", "additionalProperties": false,
+          "required": ["quality", "protocol_token", "protocol_generation"],
+          "properties": {"quality": {"const": "exact_protocol"}, "protocol_token": {"$ref": "#/$defs/nonzero_u64"}, "protocol_generation": {"$ref": "#/$defs/nonzero_u64"}}
+        },
+        {
+          "type": "object", "additionalProperties": false,
+          "required": ["quality", "fixture_token", "expected_terminal_generation"],
+          "properties": {"quality": {"const": "exact_echo_fixture"}, "fixture_token": {"$ref": "#/$defs/nonzero_u64"}, "expected_terminal_generation": {"$ref": "#/$defs/nonzero_u64"}}
+        },
+        {
+          "type": "object", "additionalProperties": false,
+          "required": ["quality", "candidate_window_ns"],
+          "properties": {"quality": {"const": "causal_candidate"}, "candidate_window_ns": {"$ref": "#/$defs/nonzero_u64"}}
+        },
+        {
+          "type": "object", "additionalProperties": false,
+          "required": ["quality"],
+          "properties": {"quality": {"const": "uncorrelated"}}
+        }
+      ]
+    },
+    "counters": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["queue_depth", "oldest_queue_age_ns", "work_units", "bytes", "rows", "allocation_count", "allocated_bytes", "copy_count", "copied_bytes", "rpc_count", "delta_count", "dirty_rows", "full_viewport_clones", "cursor_row_duplicates", "paint_count", "frame_count"],
+      "properties": {
+        "queue_depth": {"$ref": "#/$defs/u64"}, "oldest_queue_age_ns": {"$ref": "#/$defs/u64"},
+        "work_units": {"$ref": "#/$defs/u64"}, "bytes": {"$ref": "#/$defs/u64"}, "rows": {"$ref": "#/$defs/u64"},
+        "allocation_count": {"$ref": "#/$defs/u64"}, "allocated_bytes": {"$ref": "#/$defs/u64"},
+        "copy_count": {"$ref": "#/$defs/u64"}, "copied_bytes": {"$ref": "#/$defs/u64"},
+        "rpc_count": {"$ref": "#/$defs/u64"}, "delta_count": {"$ref": "#/$defs/u64"}, "dirty_rows": {"$ref": "#/$defs/u64"},
+        "full_viewport_clones": {"$ref": "#/$defs/u64"}, "cursor_row_duplicates": {"$ref": "#/$defs/u64"},
+        "paint_count": {"$ref": "#/$defs/u64"}, "frame_count": {"$ref": "#/$defs/u64"}
+      }
+    },
+    "generations": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["terminal_generation", "snapshot_generation", "frame_generation"],
+      "properties": {
+        "terminal_generation": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/nonzero_u64"}]},
+        "snapshot_generation": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/nonzero_u64"}]},
+        "frame_generation": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/nonzero_u64"}]}
+      }
+    },
+    "sampling_loss": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["dropped_events", "overwritten_events"],
+      "properties": {"dropped_events": {"$ref": "#/$defs/u64"}, "overwritten_events": {"$ref": "#/$defs/u64"}}
+    },
+    "physical_detector": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["detector_id", "calibration_id"],
+      "properties": {"detector_id": {"$ref": "#/$defs/nonzero_u64"}, "calibration_id": {"$ref": "#/$defs/nonzero_u64"}}
+    },
+    "event": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "trace_id", "event_ordinal", "span_id", "parent_span_id", "stage", "producer", "topology", "started_at", "completed_at", "correlation", "counters", "generations", "sampling_loss", "observation_boundary", "physical_detector"],
+      "properties": {
+        "schema_version": {"const": "ft.interaction-trace.v2"},
+        "trace_id": {"$ref": "#/$defs/trace_id"},
+        "event_ordinal": {"$ref": "#/$defs/u64"},
+        "span_id": {"$ref": "#/$defs/nonzero_u64"},
+        "parent_span_id": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/nonzero_u64"}]},
+        "stage": {"$ref": "#/$defs/stage"},
+        "producer": {"$ref": "#/$defs/producer"},
+        "topology": {"$ref": "#/$defs/topology"},
+        "started_at": {"$ref": "#/$defs/timestamp"},
+        "completed_at": {"$ref": "#/$defs/timestamp"},
+        "correlation": {"$ref": "#/$defs/correlation"},
+        "counters": {"$ref": "#/$defs/counters"},
+        "generations": {"$ref": "#/$defs/generations"},
+        "sampling_loss": {"$ref": "#/$defs/sampling_loss"},
+        "observation_boundary": {"enum": ["internal_state", "software_present", "metal_drawable", "display_presented", "photon"]},
+        "physical_detector": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/physical_detector"}]}
+      }
+    }
+  }
+}

@@ -1,0 +1,6 @@
+{
+  "schema_version": "ft.interaction-trace.v1",
+  "trace_id": {"run_id": {"epoch_nonce_hi": 65261, "epoch_nonce_lo": 48879}, "sequence": 1},
+  "path": "keypress",
+  "events": []
+}

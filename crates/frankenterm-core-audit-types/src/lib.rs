@@ -77,6 +77,7 @@ pub mod canary_rehearsal;
 pub mod cutover_evidence;
 pub mod forensic_export;
 pub mod input_to_photon;
+pub mod interaction_trace_v2;
 pub mod migration_rehearsal;
 // [ft-nsoxc / ft-8nqx0 Phase 5] Reasoning-contract types consumed by
 // `frankenterm-core-ars`. Moved here so ARS depends on this leaf crate

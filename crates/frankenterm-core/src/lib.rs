@@ -713,6 +713,8 @@ pub use frankenterm_core_audit_types::traceability_verification;
 pub use frankenterm_core_audit_types::product_journey_catalog;
 // Contract-only native resize/zoom scenario vocabulary and semantic validator.
 pub use frankenterm_core_audit_types::renderer_scenario_catalog;
+// Content-free, fail-closed K0-K13 / R0-R25 interaction trace contract.
+pub use frankenterm_core_audit_types::interaction_trace_v2;
 pub mod trauma_guard;
 pub mod treap;
 pub mod trie;
