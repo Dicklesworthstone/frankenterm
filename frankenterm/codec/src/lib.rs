@@ -6389,7 +6389,8 @@ mod test {
             .expect_err("bit2 without bit1 must fail during wire decode");
         assert!(
             format!("{error:#}").contains("without ORDERED_WINDOW_STREAM_V1"),
-            "unexpected capability rejection: {error:#}"
+            "unexpected capability rejection: {error:#}",
+            error = error,
         );
     }
 
@@ -6560,12 +6561,14 @@ mod test {
                 Pdu::ReorderWindowTabsV1(malformed.clone())
                     .encode_frame_with_mode(7, CompressionMode::Never)
                     .is_err(),
-                "{name} must fail before sender serialization"
+                "{} must fail before sender serialization",
+                name,
             );
             let frame = encode_reorder_window_tabs_unchecked(&malformed, 7);
             assert!(
                 Pdu::decode(frame.as_slice()).is_err(),
-                "{name} must fail closed during decode"
+                "{} must fail closed during decode",
+                name,
             );
         }
 
@@ -6645,7 +6648,10 @@ mod test {
                     .expect_err("closed ordered-window schema must reject trailing bytes");
                 assert!(
                     format!("{error:#}").contains("trailing schema bytes"),
-                    "unexpected PDU {ident} trailing-byte rejection under {mode:?}: {error:#}"
+                    "unexpected PDU {} trailing-byte rejection under {:?}: {:#}",
+                    ident,
+                    mode,
+                    error,
                 );
             }
         }
@@ -6856,7 +6862,8 @@ mod test {
                 .expect_err("reorder payload above 512 KiB must fail before decode");
             assert!(
                 format!("{error:#}").contains("exceeds maximum 524288"),
-                "unexpected 512 KiB rejection: {error:#}"
+                "unexpected 512 KiB rejection: {error:#}",
+                error = error,
             );
         }
     }
