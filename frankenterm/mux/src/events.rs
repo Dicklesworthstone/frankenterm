@@ -17,7 +17,9 @@
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant, SystemTime};
+use uuid::Uuid;
 
 // ---------------------------------------------------------------------------
 // Event types
@@ -122,30 +124,213 @@ pub enum EventPayload {
 // Event
 // ---------------------------------------------------------------------------
 
+/// Identity of one process-local monotonic clock epoch.
+///
+/// The random epoch distinguishes process restarts even when the operating
+/// system reuses a PID. The PID makes an inherited clock fail closed after a
+/// `fork` rather than silently treating the child as the same clock domain.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct EventClockDomain {
+    process_epoch: Uuid,
+    process_id: u32,
+}
+
+impl EventClockDomain {
+    /// Construct a non-ambient clock-domain identity.
+    #[must_use]
+    pub fn new(process_epoch: Uuid, process_id: u32) -> Option<Self> {
+        if process_epoch.is_nil() {
+            return None;
+        }
+        Some(Self {
+            process_epoch,
+            process_id,
+        })
+    }
+
+    /// Random process-epoch component of this clock domain.
+    #[must_use]
+    pub fn process_epoch(self) -> Uuid {
+        self.process_epoch
+    }
+
+    /// Operating-system process ID captured with the epoch.
+    #[must_use]
+    pub fn process_id(self) -> u32 {
+        self.process_id
+    }
+}
+
+/// Timestamp from one explicit process-local monotonic clock domain.
+///
+/// Only `monotonic_ns` participates in ordering or duration arithmetic.
+/// Wall time is optional diagnostic metadata and is never reclassified as a
+/// monotonic value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct EventTimestamp {
+    pub clock_domain: EventClockDomain,
+    pub monotonic_ns: u64,
+    pub wall_time_unix_ns: Option<u64>,
+}
+
+impl EventTimestamp {
+    /// Construct a timestamp from an already-authoritative clock reading.
+    #[must_use]
+    pub fn from_parts(
+        clock_domain: EventClockDomain,
+        monotonic_ns: u64,
+        wall_time_unix_ns: Option<u64>,
+    ) -> Self {
+        Self {
+            clock_domain,
+            monotonic_ns,
+            wall_time_unix_ns,
+        }
+    }
+
+    /// Compute a duration only when both timestamps share a clock domain.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EventClockError::ClockDomainMismatch`] across process epochs
+    /// and [`EventClockError::TimestampRegression`] when `self` precedes
+    /// `earlier` in the same domain.
+    pub fn duration_since(self, earlier: Self) -> Result<Duration, EventClockError> {
+        if self.clock_domain != earlier.clock_domain {
+            return Err(EventClockError::ClockDomainMismatch {
+                earlier: earlier.clock_domain,
+                later: self.clock_domain,
+            });
+        }
+        self.monotonic_ns
+            .checked_sub(earlier.monotonic_ns)
+            .map(Duration::from_nanos)
+            .ok_or(EventClockError::TimestampRegression {
+                earlier_ns: earlier.monotonic_ns,
+                later_ns: self.monotonic_ns,
+            })
+    }
+}
+
+/// Failure to produce or compare authoritative event timestamps.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum EventClockError {
+    /// The monotonic source was sampled before this clock's origin.
+    #[error("mux event monotonic clock regressed before its process origin")]
+    MonotonicSourceRegression,
+    /// Nanoseconds since the process epoch no longer fit the wire-sized field.
+    #[error("mux event monotonic timestamp exhausted after {elapsed_ns} nanoseconds")]
+    TimestampExhausted { elapsed_ns: u128 },
+    /// The process-local clock was inherited by a different process.
+    #[error("mux event clock belongs to process {expected}, not process {actual}")]
+    ProcessIdentityChanged { expected: u32, actual: u32 },
+    /// Duration arithmetic crossed a process restart or fork boundary.
+    #[error(
+        "mux event timestamps belong to different process clock domains: earlier={earlier:?}, later={later:?}"
+    )]
+    ClockDomainMismatch {
+        earlier: EventClockDomain,
+        later: EventClockDomain,
+    },
+    /// A later observation carried a smaller monotonic timestamp.
+    #[error("mux event monotonic timestamp regressed from {earlier_ns} to {later_ns}")]
+    TimestampRegression { earlier_ns: u64, later_ns: u64 },
+}
+
+#[derive(Debug)]
+struct EventClock {
+    domain: EventClockDomain,
+    origin: Instant,
+}
+
+impl EventClock {
+    fn process() -> &'static Self {
+        static CLOCK: OnceLock<EventClock> = OnceLock::new();
+        CLOCK.get_or_init(|| Self {
+            domain: EventClockDomain {
+                process_epoch: Uuid::new_v4(),
+                process_id: std::process::id(),
+            },
+            origin: Instant::now(),
+        })
+    }
+
+    fn now(&self) -> Result<EventTimestamp, EventClockError> {
+        self.timestamp_at(Instant::now(), SystemTime::now(), std::process::id())
+    }
+
+    fn timestamp_at(
+        &self,
+        monotonic_now: Instant,
+        wall_now: SystemTime,
+        process_id: u32,
+    ) -> Result<EventTimestamp, EventClockError> {
+        if process_id != self.domain.process_id {
+            return Err(EventClockError::ProcessIdentityChanged {
+                expected: self.domain.process_id,
+                actual: process_id,
+            });
+        }
+        let elapsed = monotonic_now
+            .checked_duration_since(self.origin)
+            .ok_or(EventClockError::MonotonicSourceRegression)?;
+        self.timestamp_from_elapsed(elapsed, wall_now)
+    }
+
+    fn timestamp_from_elapsed(
+        &self,
+        elapsed: Duration,
+        wall_now: SystemTime,
+    ) -> Result<EventTimestamp, EventClockError> {
+        let elapsed_ns = elapsed.as_nanos();
+        let monotonic_ns = u64::try_from(elapsed_ns)
+            .map_err(|_| EventClockError::TimestampExhausted { elapsed_ns })?;
+        let wall_time_unix_ns = wall_now
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .ok()
+            .and_then(|duration| u64::try_from(duration.as_nanos()).ok());
+        Ok(EventTimestamp::from_parts(
+            self.domain,
+            monotonic_ns,
+            wall_time_unix_ns,
+        ))
+    }
+}
+
 /// A typed event flowing through the bus.
 #[derive(Clone, Debug)]
 pub struct Event {
     pub event_type: EventType,
     pub payload: EventPayload,
-    pub timestamp_ns: u64,
+    pub timestamp: EventTimestamp,
 }
 
 impl Event {
     /// Create a new event with the current timestamp.
-    pub fn new(event_type: EventType, payload: EventPayload) -> Self {
-        Self {
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`EventClockError`] if the process clock was inherited by a
+    /// different process, regressed, or exhausted its `u64` nanosecond field.
+    pub fn new(event_type: EventType, payload: EventPayload) -> Result<Self, EventClockError> {
+        Ok(Self {
             event_type,
             payload,
-            timestamp_ns: coarse_nanos(),
-        }
+            timestamp: EventClock::process().now()?,
+        })
     }
 
     /// Create an event with an explicit timestamp (useful for testing).
-    pub fn with_timestamp(event_type: EventType, payload: EventPayload, timestamp_ns: u64) -> Self {
+    #[must_use]
+    pub fn with_timestamp(
+        event_type: EventType,
+        payload: EventPayload,
+        timestamp: EventTimestamp,
+    ) -> Self {
         Self {
             event_type,
             payload,
-            timestamp_ns,
+            timestamp,
         }
     }
 }
@@ -349,20 +534,6 @@ fn handler_matches_event_type(record: &HandlerRecord, event_type: &EventType) ->
 }
 
 // ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-/// Fast monotonic timestamp in nanoseconds (not wall-clock).
-fn coarse_nanos() -> u64 {
-    // Duration since an arbitrary epoch.  `Instant::now().elapsed()` is always
-    // zero, so we use UNIX_EPOCH difference via SystemTime instead.
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0)
-}
-
-// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -370,8 +541,16 @@ fn coarse_nanos() -> u64 {
 mod tests {
     use super::*;
 
+    fn test_timestamp(monotonic_ns: u64) -> EventTimestamp {
+        EventTimestamp::from_parts(
+            EventClockDomain::new(Uuid::from_u128(1), 7).expect("fixture clock domain is non-nil"),
+            monotonic_ns,
+            None,
+        )
+    }
+
     fn make_event(event_type: EventType) -> Event {
-        Event::with_timestamp(event_type, EventPayload::Empty, 0)
+        Event::with_timestamp(event_type, EventPayload::Empty, test_timestamp(0))
     }
 
     #[test]
@@ -755,9 +934,130 @@ mod tests {
 
     #[test]
     fn event_with_timestamp_preserves_value() {
-        let event = Event::with_timestamp(EventType::PaneOutput, EventPayload::Empty, 42);
-        assert_eq!(event.timestamp_ns, 42);
+        let timestamp = test_timestamp(42);
+        let event = Event::with_timestamp(EventType::PaneOutput, EventPayload::Empty, timestamp);
+        assert_eq!(event.timestamp, timestamp);
         assert_eq!(event.event_type, EventType::PaneOutput);
+    }
+
+    #[test]
+    fn event_clock_domain_requires_a_non_nil_process_epoch() {
+        assert_eq!(EventClockDomain::new(Uuid::nil(), 7), None);
+        let epoch = Uuid::from_u128(1);
+        let domain = EventClockDomain::new(epoch, 7).expect("fixture clock domain is non-nil");
+        assert_eq!(domain.process_epoch(), epoch);
+        assert_eq!(domain.process_id(), 7);
+    }
+
+    #[test]
+    fn process_clock_samples_share_a_domain_and_never_regress() {
+        let clock = EventClock::process();
+        let first = clock.now().expect("first process-clock sample");
+        let second = clock.now().expect("second process-clock sample");
+
+        assert_eq!(first.clock_domain, clock.domain);
+        assert_eq!(second.clock_domain, clock.domain);
+        assert!(second.duration_since(first).is_ok());
+    }
+
+    #[test]
+    fn event_clock_rejects_source_regression_and_process_change() {
+        let origin = Instant::now();
+        let domain = EventClockDomain::new(Uuid::from_u128(2), 7)
+            .expect("fixture clock domain is non-nil");
+        let clock = EventClock { domain, origin };
+        let before_origin = origin
+            .checked_sub(Duration::from_nanos(1))
+            .expect("fixture instant supports a one-nanosecond subtraction");
+
+        assert_eq!(
+            clock.timestamp_at(before_origin, SystemTime::UNIX_EPOCH, 7),
+            Err(EventClockError::MonotonicSourceRegression)
+        );
+        assert_eq!(
+            clock.timestamp_at(origin, SystemTime::UNIX_EPOCH, 8),
+            Err(EventClockError::ProcessIdentityChanged {
+                expected: 7,
+                actual: 8,
+            })
+        );
+    }
+
+    #[test]
+    fn event_clock_reserves_overflow_as_typed_exhaustion() {
+        let clock = EventClock {
+            domain: EventClockDomain::new(Uuid::from_u128(3), 7)
+                .expect("fixture clock domain is non-nil"),
+            origin: Instant::now(),
+        };
+        let elapsed = Duration::from_secs(u64::MAX);
+
+        assert_eq!(
+            clock.timestamp_from_elapsed(elapsed, SystemTime::UNIX_EPOCH),
+            Err(EventClockError::TimestampExhausted {
+                elapsed_ns: elapsed.as_nanos(),
+            })
+        );
+    }
+
+    #[test]
+    fn wall_time_is_optional_metadata_and_never_orders_events() {
+        let clock = EventClock {
+            domain: EventClockDomain::new(Uuid::from_u128(4), 7)
+                .expect("fixture clock domain is non-nil"),
+            origin: Instant::now(),
+        };
+        let pre_epoch = SystemTime::UNIX_EPOCH
+            .checked_sub(Duration::from_secs(1))
+            .expect("fixture wall clock supports a one-second subtraction");
+        let before = clock
+            .timestamp_from_elapsed(Duration::from_nanos(1), pre_epoch)
+            .expect("monotonic fixture is representable");
+        let after = clock
+            .timestamp_from_elapsed(
+                Duration::from_nanos(2),
+                SystemTime::UNIX_EPOCH + Duration::from_nanos(5),
+            )
+            .expect("monotonic fixture is representable");
+
+        assert_eq!(before.wall_time_unix_ns, None);
+        assert_eq!(after.wall_time_unix_ns, Some(5));
+        assert_eq!(after.duration_since(before), Ok(Duration::from_nanos(1)));
+    }
+
+    #[test]
+    fn timestamps_from_different_process_epochs_are_incomparable() {
+        let earlier = EventTimestamp::from_parts(
+            EventClockDomain::new(Uuid::from_u128(5), 7)
+                .expect("fixture clock domain is non-nil"),
+            100,
+            None,
+        );
+        let later = EventTimestamp::from_parts(
+            EventClockDomain::new(Uuid::from_u128(6), 7)
+                .expect("fixture clock domain is non-nil"),
+            200,
+            None,
+        );
+
+        assert!(matches!(
+            later.duration_since(earlier),
+            Err(EventClockError::ClockDomainMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn same_domain_timestamp_regression_is_rejected() {
+        let later = test_timestamp(99);
+        let earlier = test_timestamp(100);
+
+        assert_eq!(
+            later.duration_since(earlier),
+            Err(EventClockError::TimestampRegression {
+                earlier_ns: 100,
+                later_ns: 99,
+            })
+        );
     }
 
     #[test]
@@ -1135,11 +1435,15 @@ mod tests {
             }
         }
 
-        /// Event::new produces a non-zero timestamp.
+        /// Event::new binds each sample to the process clock domain.
         #[test]
         fn prop_event_new_has_timestamp(_dummy in 0..1_u8) {
-            let event = Event::new(EventType::PaneOutput, EventPayload::Empty);
-            prop_assert!(event.timestamp_ns > 0);
+            let event = Event::new(EventType::PaneOutput, EventPayload::Empty)
+                .expect("process clock should produce a timestamp");
+            prop_assert_eq!(
+                event.timestamp.clock_domain,
+                EventClock::process().domain,
+            );
         }
 
         /// handler_count_for is consistent with handler_count.
@@ -1218,7 +1522,7 @@ mod tests {
                         let actions = bus.fire(&Event::with_timestamp(
                             EventType::PaneOutput,
                             EventPayload::Empty,
-                            0,
+                            test_timestamp(0),
                         ));
                         fire_count.fetch_add(actions.len(), Ordering::Relaxed);
                     }
@@ -1282,7 +1586,7 @@ mod tests {
                     let actions = bus.fire(&Event::with_timestamp(
                         EventType::PaneOutput,
                         EventPayload::Empty,
-                        0,
+                        test_timestamp(0),
                     ));
                     total_actions.fetch_add(actions.len(), Ordering::Relaxed);
                 }
@@ -1388,7 +1692,7 @@ mod tests {
                 bus1.fire(&Event::with_timestamp(
                     EventType::UpdateStatus,
                     EventPayload::Status { pane_id: 0 },
-                    0,
+                    test_timestamp(0),
                 ));
             }
         });
@@ -1404,7 +1708,7 @@ mod tests {
                         pane_id: 1,
                         text: Arc::from("data"),
                     },
-                    0,
+                    test_timestamp(0),
                 ));
             }
         });
@@ -1421,7 +1725,7 @@ mod tests {
                         rows: 24,
                         cols: 80,
                     },
-                    0,
+                    test_timestamp(0),
                 ));
             }
         });
@@ -1457,7 +1761,7 @@ mod tests {
         let event = Event::with_timestamp(
             EventType::UpdateStatus,
             EventPayload::Status { pane_id: 0 },
-            0,
+            test_timestamp(0),
         );
 
         for _ in 0..n_events {

@@ -9,7 +9,8 @@ use frankenterm_term::color::ColorPalette;
 use frankenterm_term::{Terminal, TerminalConfiguration, TerminalSize};
 use mux::domain::DomainId;
 use mux::events::{
-    Event, EventAction, EventBus, EventPayload, EventType, HandlerFn, HandlerPriority,
+    Event, EventAction, EventBus, EventClockDomain, EventPayload, EventTimestamp, EventType,
+    HandlerFn, HandlerPriority,
 };
 use mux::localpane::LocalPane;
 use mux::pane::{Pane, PaneId};
@@ -17,11 +18,21 @@ use portable_pty::{Child, ChildKiller, ExitStatus, MasterPty, PtySize};
 use std::hint::black_box;
 use std::io::{Cursor, Read, Result as IoResult, Write};
 use std::sync::Arc;
+use uuid::Uuid;
 
 // Keep below LocalPane's disruptor ring capacity (1024). The staged-contention
 // bench intentionally holds the terminal lock, so filling the ring would enter
 // the production blocking fallback and deadlock the harness.
 const PANE_IO_BATCH_COUNT: usize = 256;
+
+fn bench_timestamp(monotonic_ns: u64) -> EventTimestamp {
+    EventTimestamp::from_parts(
+        EventClockDomain::new(Uuid::from_u128(1), 1)
+            .expect("benchmark clock domain is non-nil"),
+        monotonic_ns,
+        None,
+    )
+}
 
 /// Benchmark: fire a single native handler (no filter).
 fn bench_fire_single_native(c: &mut Criterion) {
@@ -30,7 +41,11 @@ fn bench_fire_single_native(c: &mut Criterion) {
     bus.register(HandlerPriority::Native, None, handler)
         .expect("handler registration should succeed");
 
-    let event = Event::with_timestamp(EventType::PaneOutput, EventPayload::Empty, 0);
+    let event = Event::with_timestamp(
+        EventType::PaneOutput,
+        EventPayload::Empty,
+        bench_timestamp(0),
+    );
 
     c.bench_function("fire_single_native", |b| {
         b.iter(|| bus.fire(black_box(&event)));
@@ -50,7 +65,11 @@ fn bench_fire_10_native_handlers(c: &mut Criterion) {
             .expect("handler registration should succeed");
     }
 
-    let event = Event::with_timestamp(EventType::PaneOutput, EventPayload::Empty, 0);
+    let event = Event::with_timestamp(
+        EventType::PaneOutput,
+        EventPayload::Empty,
+        bench_timestamp(0),
+    );
 
     c.bench_function("fire_10_native_handlers", |b| {
         b.iter(|| bus.fire(black_box(&event)));
@@ -75,7 +94,11 @@ fn bench_fire_mixed_priorities(c: &mut Criterion) {
             .expect("handler registration should succeed");
     }
 
-    let event = Event::with_timestamp(EventType::PaneOutput, EventPayload::Empty, 0);
+    let event = Event::with_timestamp(
+        EventType::PaneOutput,
+        EventPayload::Empty,
+        bench_timestamp(0),
+    );
 
     c.bench_function("fire_mixed_9_handlers", |b| {
         b.iter(|| bus.fire(black_box(&event)));
@@ -104,7 +127,11 @@ fn bench_fire_filtered(c: &mut Criterion) {
     )
     .expect("handler registration should succeed");
 
-    let event = Event::with_timestamp(EventType::PaneOutput, EventPayload::Empty, 0);
+    let event = Event::with_timestamp(
+        EventType::PaneOutput,
+        EventPayload::Empty,
+        bench_timestamp(0),
+    );
 
     c.bench_function("fire_1_of_10_filtered", |b| {
         b.iter(|| bus.fire(black_box(&event)));
@@ -152,7 +179,7 @@ fn bench_fire_pane_text_payload(c: &mut Criterion) {
             pane_id: 42,
             text: text.clone(),
         },
-        0,
+        bench_timestamp(0),
     );
 
     c.bench_function("fire_pane_text_payload", |b| {
@@ -177,7 +204,7 @@ fn bench_update_status_60hz(c: &mut Criterion) {
     let event = Event::with_timestamp(
         EventType::UpdateStatus,
         EventPayload::Status { pane_id: 0 },
-        0,
+        bench_timestamp(0),
     );
 
     c.bench_function("update_status_3_handlers", |b| {
