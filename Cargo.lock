@@ -7295,6 +7295,7 @@ dependencies = [
  "rangeset",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
  "serial2",
  "shell-words",
  "terminfo",
