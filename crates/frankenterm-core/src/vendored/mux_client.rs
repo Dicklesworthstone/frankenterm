@@ -3828,7 +3828,7 @@ mod tests {
 
             task::spawn(async move {
                 let (mut stream, _) = listener.accept().await.expect("accept");
-                let mut read_buf = Vec::new();
+                let mut read_buf = StreamingPduBuffer::new();
                 let mut responses: HashMap<u64, Pdu> = HashMap::new();
                 loop {
                     let mut temp = vec![0u8; 4096];
@@ -3892,7 +3892,7 @@ mod tests {
 
             task::spawn(async move {
                 let (mut stream, _) = listener.accept().await.expect("accept");
-                let mut read_buf = Vec::new();
+                let mut read_buf = StreamingPduBuffer::new();
                 let mut responses: HashMap<u64, Pdu> = HashMap::new();
                 loop {
                     let mut temp = vec![0u8; 4096];
@@ -3961,7 +3961,7 @@ mod tests {
 
             let server = task::spawn(async move {
                 let (mut stream, _) = listener.accept().await.expect("accept");
-                let mut read_buf = Vec::new();
+                let mut read_buf = StreamingPduBuffer::new();
                 let mut saw_render = None;
                 let mut saw_lines = None;
                 let mut saw_write = None;
@@ -4126,7 +4126,7 @@ mod tests {
 
             let server = task::spawn(async move {
                 let (mut stream, _) = listener.accept().await.expect("accept");
-                let mut read_buf = Vec::new();
+                let mut read_buf = StreamingPduBuffer::new();
                 let mut saw_create: Option<(usize, usize, FloatingPaneRect)> = None;
 
                 loop {
@@ -4215,7 +4215,7 @@ mod tests {
 
             let server = task::spawn(async move {
                 let (mut stream, _) = listener.accept().await.expect("accept");
-                let mut read_buf = Vec::new();
+                let mut read_buf = StreamingPduBuffer::new();
                 let mut list_panes_seen = 0u32;
 
                 loop {
@@ -4306,7 +4306,7 @@ mod tests {
 
             let server = task::spawn(async move {
                 let (mut stream, _) = listener.accept().await.expect("accept");
-                let mut read_buf = Vec::new();
+                let mut read_buf = StreamingPduBuffer::new();
                 let mut post_handshake_requests = 0usize;
                 let mut handshake_complete = false;
 
@@ -4406,7 +4406,7 @@ mod tests {
 
             let server = task::spawn(async move {
                 let (mut stream, _) = listener.accept().await.expect("accept");
-                let mut read_buf = Vec::new();
+                let mut read_buf = StreamingPduBuffer::new();
                 let mut list_panes_requests = 0usize;
 
                 loop {
@@ -4502,7 +4502,7 @@ mod tests {
 
             let server = task::spawn(async move {
                 let (mut stream, _) = listener.accept().await.expect("accept");
-                let mut read_buf = Vec::new();
+                let mut read_buf = StreamingPduBuffer::new();
 
                 loop {
                     let mut temp = vec![0u8; 4096];
@@ -4573,7 +4573,7 @@ mod tests {
 
             let server = task::spawn(async move {
                 let (mut stream, _) = listener.accept().await.expect("accept");
-                let mut read_buf = Vec::new();
+                let mut read_buf = StreamingPduBuffer::new();
 
                 loop {
                     let mut temp = vec![0u8; 4096];
@@ -4679,7 +4679,7 @@ mod tests {
 
             let server = task::spawn(async move {
                 let (mut stream, _) = listener.accept().await.expect("accept");
-                let mut read_buf = Vec::new();
+                let mut read_buf = StreamingPduBuffer::new();
                 let mut render_requests = 0usize;
 
                 loop {
@@ -5057,7 +5057,7 @@ mod tests {
 
             let server = task::spawn(async move {
                 let (mut stream, _) = listener.accept().await.expect("accept");
-                let mut read_buf = Vec::new();
+                let mut read_buf = StreamingPduBuffer::new();
                 let mut unexpected_requests = 0usize;
 
                 loop {
@@ -5188,7 +5188,7 @@ mod tests {
 
             let server = task::spawn(async move {
                 let (mut stream, _) = listener.accept().await.expect("accept");
-                let mut read_buf = Vec::new();
+                let mut read_buf = StreamingPduBuffer::new();
                 let mut captured_frame: Option<(u64, Vec<u8>)> = None;
 
                 loop {
@@ -5202,7 +5202,7 @@ mod tests {
                     read_buf.extend_from_slice(&temp[..read]);
 
                     loop {
-                        let before_decode = read_buf.clone();
+                        let before_decode = read_buf.as_slice().to_vec();
                         let decoded = match codec::Pdu::stream_decode(&mut read_buf) {
                             Ok(Some(decoded)) => decoded,
                             Ok(None) => break,
@@ -5304,7 +5304,7 @@ mod tests {
 
             let server = task::spawn(async move {
                 let (mut stream, _) = listener.accept().await.expect("accept");
-                let mut read_buf = Vec::new();
+                let mut read_buf = StreamingPduBuffer::new();
                 let mut batch_requests: Vec<(u64, usize)> = Vec::new();
                 let mut responses_sent = 0usize;
 
@@ -5424,7 +5424,7 @@ mod tests {
 
             let server = task::spawn(async move {
                 let (mut stream, _) = listener.accept().await.expect("accept");
-                let mut read_buf = Vec::new();
+                let mut read_buf = StreamingPduBuffer::new();
                 let mut batch_requests: Vec<(u64, usize)> = Vec::new();
 
                 loop {
@@ -5557,7 +5557,7 @@ mod tests {
 
                 let server = task::spawn(async move {
                     let (mut stream, _) = listener.accept().await.expect("accept");
-                    let mut read_buf = Vec::new();
+                    let mut read_buf = StreamingPduBuffer::new();
                     let mut initial_requests: Vec<(u64, usize)> = Vec::new();
                     let mut initial_batch_answered = false;
 
@@ -5818,7 +5818,7 @@ mod tests {
 
             let server = task::spawn(async move {
                 let (mut stream, _) = listener.accept().await.expect("accept");
-                let mut read_buf = Vec::new();
+                let mut read_buf = StreamingPduBuffer::new();
                 let mut render_request_count = 0usize;
 
                 loop {
@@ -5933,7 +5933,7 @@ mod tests {
 
             let server = task::spawn(async move {
                 let (mut stream, _) = listener.accept().await.expect("accept");
-                let mut read_buf = Vec::new();
+                let mut read_buf = StreamingPduBuffer::new();
                 let mut render_request_count = 0usize;
                 loop {
                     let mut temp = vec![0u8; 4096];
@@ -6034,7 +6034,7 @@ mod tests {
 
             let server = task::spawn(async move {
                 let (mut stream, _) = listener.accept().await.expect("accept");
-                let mut read_buf = Vec::new();
+                let mut read_buf = StreamingPduBuffer::new();
                 loop {
                     let mut temp = vec![0u8; 4096];
                     let read = unix_stream_read(&mut stream, &mut temp)
@@ -6137,7 +6137,7 @@ mod tests {
 
             let server = task::spawn(async move {
                 let (mut stream, _) = listener.accept().await.expect("accept");
-                let mut read_buf = Vec::new();
+                let mut read_buf = StreamingPduBuffer::new();
                 loop {
                     let mut temp = vec![0u8; 4096];
                     let read = unix_stream_read(&mut stream, &mut temp)
@@ -6243,7 +6243,7 @@ mod tests {
 
             let server = task::spawn(async move {
                 let (mut stream, _) = listener.accept().await.expect("accept");
-                let mut read_buf = Vec::new();
+                let mut read_buf = StreamingPduBuffer::new();
                 let mut render_serials = Vec::new();
                 loop {
                     let mut temp = vec![0u8; 4096];
@@ -6514,7 +6514,7 @@ mod tests {
 
             let server = task::spawn(async move {
                 let (mut stream, _) = listener.accept().await.expect("accept");
-                let mut read_buf = Vec::new();
+                let mut read_buf = StreamingPduBuffer::new();
                 loop {
                     let mut temp = vec![0u8; 4096];
                     let read = unix_stream_read(&mut stream, &mut temp)
@@ -6605,7 +6605,7 @@ mod tests {
 
             let server = task::spawn(async move {
                 let (mut stream, _) = listener.accept().await.expect("accept");
-                let mut read_buf = Vec::new();
+                let mut read_buf = StreamingPduBuffer::new();
                 loop {
                     let mut temp = vec![0u8; 4096];
                     let read = unix_stream_read(&mut stream, &mut temp)
@@ -6686,7 +6686,7 @@ mod tests {
 
             let server = task::spawn(async move {
                 let (mut stream, _) = listener.accept().await.expect("accept");
-                let mut read_buf = Vec::new();
+                let mut read_buf = StreamingPduBuffer::new();
 
                 loop {
                     let mut temp = vec![0u8; 4096];
@@ -6785,7 +6785,7 @@ mod tests {
 
             let server = task::spawn(async move {
                 let (mut stream, _) = listener.accept().await.expect("accept");
-                let mut read_buf = Vec::new();
+                let mut read_buf = StreamingPduBuffer::new();
 
                 loop {
                     let mut temp = vec![0u8; 4096];
@@ -6887,7 +6887,7 @@ mod tests {
 
             let server = task::spawn(async move {
                 let (mut stream, _) = listener.accept().await.expect("accept");
-                let mut read_buf = Vec::new();
+                let mut read_buf = StreamingPduBuffer::new();
                 let mut render_serials = Vec::with_capacity(expected_requests);
 
                 loop {
@@ -7005,7 +7005,7 @@ mod tests {
 
             let server = task::spawn(async move {
                 let (mut stream, _) = listener.accept().await.expect("accept");
-                let mut read_buf = Vec::new();
+                let mut read_buf = StreamingPduBuffer::new();
                 let mut list_serials = Vec::new();
 
                 loop {
@@ -7155,7 +7155,7 @@ mod tests {
                 for _ in 0..expected_clients {
                     let (mut stream, _) = listener.accept().await.expect("accept");
                     handlers.push(task::spawn(async move {
-                        let mut read_buf = Vec::new();
+                        let mut read_buf = StreamingPduBuffer::new();
                         loop {
                             let mut temp = vec![0u8; 4096];
                             let read = unix_stream_read(&mut stream, &mut temp)
@@ -7241,7 +7241,7 @@ mod tests {
 
             let server = task::spawn(async move {
                 let (mut stream, _) = listener.accept().await.expect("accept");
-                let mut read_buf = Vec::new();
+                let mut read_buf = StreamingPduBuffer::new();
                 let mut responded_once = false;
 
                 loop {
@@ -7374,7 +7374,7 @@ mod tests {
 
             let server = task::spawn(async move {
                 let (mut stream, _) = listener.accept().await.expect("accept");
-                let mut read_buf = Vec::new();
+                let mut read_buf = StreamingPduBuffer::new();
                 let mut responded_once = false;
 
                 loop {
@@ -7508,7 +7508,7 @@ mod tests {
 
             let server = task::spawn(async move {
                 let (mut stream, _) = listener.accept().await.expect("accept");
-                let mut read_buf = Vec::new();
+                let mut read_buf = StreamingPduBuffer::new();
                 let mut responded_once = false;
 
                 loop {
@@ -8276,7 +8276,7 @@ mod tests {
                 for attempt in 0..2 {
                     let (mut stream, _) = listener.accept().await.expect("accept");
                     let reject_uncompressed = attempt == 0;
-                    let mut read_buf = Vec::new();
+                    let mut read_buf = StreamingPduBuffer::new();
                     let mut first_frame_checked = false;
 
                     loop {
@@ -8290,7 +8290,9 @@ mod tests {
                         read_buf.extend_from_slice(&temp[..read]);
 
                         if !first_frame_checked {
-                            if let Some(is_compressed) = frame_marked_compressed(&read_buf) {
+                            if let Some(is_compressed) =
+                                frame_marked_compressed(read_buf.as_slice())
+                            {
                                 first_frame_checked = true;
                                 if reject_uncompressed && !is_compressed {
                                     break;
@@ -8571,7 +8573,7 @@ mod tests {
                     server_ready_tx.send(()).expect("send server ready signal");
 
                     let (mut stream, _) = listener.accept().await.expect("accept");
-                    let mut read_buf = Vec::new();
+                    let mut read_buf = StreamingPduBuffer::new();
 
                     loop {
                         let mut temp = vec![0u8; 4096];
@@ -8665,7 +8667,7 @@ mod tests {
                     server_ready_tx.send(()).expect("send server ready signal");
 
                     let (mut stream, _) = listener.accept().await.expect("accept");
-                    let mut read_buf = Vec::new();
+                    let mut read_buf = StreamingPduBuffer::new();
 
                     loop {
                         let mut temp = vec![0u8; 4096];
@@ -8749,7 +8751,7 @@ mod tests {
                     server_ready_tx.send(()).expect("send server ready signal");
 
                     let (mut stream, _) = listener.accept().await.expect("accept");
-                    let mut read_buf = Vec::new();
+                    let mut read_buf = StreamingPduBuffer::new();
 
                     loop {
                         let mut temp = vec![0u8; 4096];
@@ -8836,7 +8838,7 @@ mod tests {
                     server_ready_tx.send(()).expect("send server ready signal");
 
                     let (mut stream, _) = listener.accept().await.expect("accept");
-                    let mut read_buf = Vec::new();
+                    let mut read_buf = StreamingPduBuffer::new();
 
                     loop {
                         let mut temp = vec![0u8; 4096];
@@ -8926,7 +8928,7 @@ mod tests {
                     server_ready_tx.send(()).expect("send server ready signal");
 
                     let (mut stream, _) = listener.accept().await.expect("accept");
-                    let mut read_buf = Vec::new();
+                    let mut read_buf = StreamingPduBuffer::new();
 
                     loop {
                         let mut temp = vec![0u8; 4096];
@@ -9008,7 +9010,7 @@ mod tests {
                     server_ready_tx.send(()).expect("send server ready signal");
 
                     let (mut stream, _) = listener.accept().await.expect("accept");
-                    let mut read_buf = Vec::new();
+                    let mut read_buf = StreamingPduBuffer::new();
 
                     loop {
                         let mut temp = vec![0u8; 4096];
@@ -9091,7 +9093,7 @@ mod tests {
                     server_ready_tx.send(()).expect("send server ready signal");
 
                     let (mut stream, _) = listener.accept().await.expect("accept");
-                    let mut read_buf = Vec::new();
+                    let mut read_buf = StreamingPduBuffer::new();
 
                     loop {
                         let mut temp = vec![0u8; 4096];
@@ -9175,7 +9177,7 @@ mod tests {
                     server_ready_tx.send(()).expect("send server ready signal");
 
                     let (mut stream, _) = listener.accept().await.expect("accept");
-                    let mut read_buf = Vec::new();
+                    let mut read_buf = StreamingPduBuffer::new();
 
                     loop {
                         let mut temp = vec![0u8; 4096];
@@ -9258,7 +9260,7 @@ mod tests {
                     server_ready_tx.send(()).expect("send server ready signal");
 
                     let (mut stream, _) = listener.accept().await.expect("accept");
-                    let mut read_buf = Vec::new();
+                    let mut read_buf = StreamingPduBuffer::new();
 
                     loop {
                         let mut temp = vec![0u8; 4096];
@@ -9360,7 +9362,7 @@ mod tests {
                     server_ready_tx.send(()).expect("send server ready signal");
 
                     let (mut stream, _) = listener.accept().await.expect("accept");
-                    let mut read_buf = Vec::new();
+                    let mut read_buf = StreamingPduBuffer::new();
 
                     loop {
                         let mut temp = vec![0u8; 4096];
@@ -9497,7 +9499,7 @@ mod tests {
                     server_ready_tx.send(()).expect("send server ready signal");
 
                     let (mut stream, _) = listener.accept().await.expect("accept");
-                    let mut read_buf = Vec::new();
+                    let mut read_buf = StreamingPduBuffer::new();
 
                     loop {
                         let mut temp = vec![0u8; 4096];
@@ -9603,7 +9605,7 @@ mod tests {
                     server_ready_tx.send(()).expect("send server ready signal");
 
                     let (mut stream, _) = listener.accept().await.expect("accept");
-                    let mut read_buf = Vec::new();
+                    let mut read_buf = StreamingPduBuffer::new();
 
                     loop {
                         let mut temp = vec![0u8; 4096];
@@ -9745,7 +9747,7 @@ mod tests {
                     server_ready_tx.send(()).expect("send server ready signal");
 
                     let (mut stream, _) = listener.accept().await.expect("accept");
-                    let mut read_buf = Vec::new();
+                    let mut read_buf = StreamingPduBuffer::new();
 
                     loop {
                         let mut temp = vec![0u8; 4096];
@@ -9864,7 +9866,7 @@ mod tests {
                     server_ready_tx.send(()).expect("send server ready signal");
 
                     let (mut stream, _) = listener.accept().await.expect("accept");
-                    let mut read_buf = Vec::new();
+                    let mut read_buf = StreamingPduBuffer::new();
 
                     loop {
                         let mut temp = vec![0u8; 4096];
@@ -10041,7 +10043,7 @@ mod tests {
 
             task::spawn(async move {
                 let (mut stream, _) = listener.accept().await.expect("accept");
-                let mut read_buf = Vec::new();
+                let mut read_buf = StreamingPduBuffer::new();
                 let mut temp = vec![0u8; 4096];
                 let read = unix_stream_read(&mut stream, &mut temp)
                     .await
@@ -10084,7 +10086,7 @@ mod tests {
 
             task::spawn(async move {
                 let (mut stream, _) = listener.accept().await.expect("accept");
-                let mut read_buf = Vec::new();
+                let mut read_buf = StreamingPduBuffer::new();
                 let mut temp = vec![0u8; 4096];
                 let read = unix_stream_read(&mut stream, &mut temp)
                     .await
@@ -10379,7 +10381,7 @@ mod tests {
 
             task::spawn(async move {
                 let (mut stream, _) = listener.accept().await.expect("accept");
-                let mut read_buf = Vec::new();
+                let mut read_buf = StreamingPduBuffer::new();
                 let mut emitted_output = false;
 
                 loop {
@@ -10504,7 +10506,7 @@ mod tests {
                 &cx,
                 |_child_cx| async move {
                     let (mut stream, _) = listener.accept().await.expect("accept");
-                    let mut read_buf = Vec::new();
+                    let mut read_buf = StreamingPduBuffer::new();
                     let mut emitted_output = false;
 
                     loop {
@@ -10625,7 +10627,7 @@ mod tests {
 
             task::spawn(async move {
                 let (mut stream, _) = listener.accept().await.expect("accept");
-                let mut read_buf = Vec::new();
+                let mut read_buf = StreamingPduBuffer::new();
                 let mut emitted_output = false;
 
                 loop {
@@ -10754,7 +10756,7 @@ mod tests {
                 |_child_cx| async move {
                     let mut closed_tx = Some(closed_tx);
                     let (mut stream, _) = listener.accept().await.expect("accept");
-                    let mut read_buf = Vec::new();
+                    let mut read_buf = StreamingPduBuffer::new();
 
                     loop {
                         let mut temp = vec![0u8; 4096];
@@ -10886,7 +10888,7 @@ mod tests {
                         let (mut stream, _) = listener.accept().await.expect("accept");
                         let observed_panes = Arc::clone(&observed_panes);
                         task::spawn(async move {
-                            let mut read_buf = Vec::new();
+                            let mut read_buf = StreamingPduBuffer::new();
                             let mut emitted_output = false;
 
                             loop {
@@ -11045,7 +11047,7 @@ mod tests {
 
             task::spawn(async move {
                 let (mut stream, _) = listener.accept().await.expect("accept");
-                let mut read_buf = Vec::new();
+                let mut read_buf = StreamingPduBuffer::new();
                 let mut render_requests = 0usize;
 
                 loop {
@@ -11163,7 +11165,7 @@ mod tests {
 
             task::spawn(async move {
                 let (mut stream, _) = listener.accept().await.expect("accept");
-                let mut read_buf = Vec::new();
+                let mut read_buf = StreamingPduBuffer::new();
                 let mut render_requests = 0usize;
 
                 loop {
@@ -11282,7 +11284,7 @@ mod tests {
             task::spawn(async move {
                 let mut closed_tx = Some(closed_tx);
                 let (mut stream, _) = listener.accept().await.expect("accept");
-                let mut read_buf = Vec::new();
+                let mut read_buf = StreamingPduBuffer::new();
 
                 loop {
                     let mut temp = vec![0u8; 4096];
@@ -11418,7 +11420,7 @@ mod tests {
                 |_child_cx| async move {
                     let mut closed_tx = Some(closed_tx);
                     let (mut stream, _) = listener.accept().await.expect("accept");
-                    let mut read_buf = Vec::new();
+                    let mut read_buf = StreamingPduBuffer::new();
 
                     loop {
                         let mut temp = vec![0u8; 4096];
@@ -11551,7 +11553,7 @@ mod tests {
             task::spawn(async move {
                 let mut closed_tx = Some(closed_tx);
                 let (mut stream, _) = listener.accept().await.expect("accept");
-                let mut read_buf = Vec::new();
+                let mut read_buf = StreamingPduBuffer::new();
 
                 loop {
                     let mut temp = vec![0u8; 4096];
@@ -11697,7 +11699,7 @@ mod tests {
                 |_child_cx| async move {
                     let mut closed_tx = Some(closed_tx);
                     let (mut stream, _) = listener.accept().await.expect("accept");
-                    let mut read_buf = Vec::new();
+                    let mut read_buf = StreamingPduBuffer::new();
 
                     loop {
                         let mut temp = vec![0u8; 4096];
@@ -11835,7 +11837,7 @@ mod tests {
             task::spawn(async move {
                 let mut closed_tx = Some(closed_tx);
                 let (mut stream, _) = listener.accept().await.expect("accept");
-                let mut read_buf = Vec::new();
+                let mut read_buf = StreamingPduBuffer::new();
 
                 loop {
                     let mut temp = vec![0u8; 4096];
@@ -11958,7 +11960,7 @@ mod tests {
             // with empty dirty_lines (no deltas to emit).
             task::spawn(async move {
                 let (mut stream, _) = listener.accept().await.expect("accept");
-                let mut read_buf = Vec::new();
+                let mut read_buf = StreamingPduBuffer::new();
                 loop {
                     let mut temp = vec![0u8; 4096];
                     let read = match unix_stream_read(&mut stream, &mut temp).await {
