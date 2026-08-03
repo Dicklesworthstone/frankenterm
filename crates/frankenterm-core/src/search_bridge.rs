@@ -6,6 +6,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::task::Poll;
 use std::time::{Duration, Instant};
 
 use crate::runtime_async::notify::Notify;
@@ -121,10 +122,37 @@ impl BridgeCancellationToken {
 
     /// Await cancellation.
     pub async fn cancelled(&self) {
+        self.cancelled_after_initial_check(|| {}).await;
+    }
+
+    /// Wait after one initial predicate observation while closing the
+    /// check-to-registration race around edge-triggered `notify_waiters`.
+    ///
+    /// The hook is normally a zero-sized no-op. Keeping it explicit lets the
+    /// unit test deterministically commit cancellation at the historical lost
+    /// wake boundary without sleeps or scheduler timing assumptions.
+    async fn cancelled_after_initial_check(&self, after_initial_check: impl FnOnce()) {
         if self.is_cancelled() {
             return;
         }
-        self.state.notify.notified().await;
+        let mut notified = std::pin::pin!(self.state.notify.notified());
+        let mut after_initial_check = Some(after_initial_check);
+        std::future::poll_fn(|task_cx| {
+            if self.is_cancelled() {
+                return Poll::Ready(());
+            }
+            if let Some(after_initial_check) = after_initial_check.take() {
+                after_initial_check();
+            }
+
+            let notified_result = std::future::Future::poll(notified.as_mut(), task_cx);
+            if notified_result.is_ready() || self.is_cancelled() {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        })
+        .await;
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`cancelled`].
@@ -147,7 +175,7 @@ impl BridgeCancellationToken {
         // The cx-aware yield branch polls the cx at tick boundaries
         // so a cancelled cx wakes this future without depending on
         // the bridge's own notify path.
-        let notified = self.state.notify.notified();
+        let bridge_cancelled = self.cancelled();
         let cx_wait = async {
             loop {
                 if cx.checkpoint().is_err() {
@@ -158,7 +186,7 @@ impl BridgeCancellationToken {
         };
 
         crate::runtime_async::select! {
-            () = notified => BridgeWaitOutcome::BridgeCancelled,
+            () = bridge_cancelled => BridgeWaitOutcome::BridgeCancelled,
             () = cx_wait => BridgeWaitOutcome::CxCancelled,
         }
     }
@@ -870,14 +898,50 @@ mod tests {
                 token_clone.cancelled().await;
                 true
             });
-            // Give the waiter a moment to register
-            crate::runtime_async::sleep(Duration::from_millis(10)).await;
             token.cancel();
             let result = crate::runtime_async::timeout(Duration::from_millis(200), waiter)
                 .await
                 .expect("should not timeout")
                 .expect("task should not panic");
             assert!(result);
+        });
+    }
+
+    #[test]
+    fn test_cancellation_token_closes_check_to_registration_race() {
+        let token = BridgeCancellationToken::new();
+        run_async(async {
+            token
+                .cancelled_after_initial_check(|| token.cancel())
+                .await;
+        });
+        assert!(token.is_cancelled());
+    }
+
+    #[test]
+    fn test_cancellation_token_wakes_multiple_racing_waiters() {
+        let token = BridgeCancellationToken::new();
+        let first_token = token.clone();
+        let second_token = token.clone();
+        run_async(async {
+            let first = crate::runtime_async::task::spawn(async move {
+                first_token.cancelled().await;
+                1_u8
+            });
+            let second = crate::runtime_async::task::spawn(async move {
+                second_token.cancelled().await;
+                2_u8
+            });
+
+            token.cancel();
+            let results = crate::runtime_async::timeout(Duration::from_millis(200), async {
+                let first = first.await.expect("first waiter must not panic");
+                let second = second.await.expect("second waiter must not panic");
+                (first, second)
+            })
+            .await
+            .expect("all racing waiters must observe sticky cancellation");
+            assert_eq!(results, (1, 2));
         });
     }
 
