@@ -335,7 +335,7 @@ impl DirectMuxError {
     /// cancellation transient, while the attempted mutation is nevertheless
     /// known not to have crossed the write boundary.
     #[must_use]
-    pub(super) const fn is_proven_pre_write_rejection(&self) -> bool {
+    pub(super) fn is_proven_pre_write_rejection(&self) -> bool {
         matches!(
             self,
             Self::OutboundPduInvalidForPhase { .. }
@@ -353,7 +353,7 @@ impl DirectMuxError {
     /// Timeout/cancellation races after a write begins use distinct
     /// `*_in_progress` phases and therefore never enter this set.
     #[must_use]
-    pub(crate) const fn is_pre_transport_cancellation(&self) -> bool {
+    pub(crate) fn is_pre_transport_cancellation(&self) -> bool {
         matches!(
             self,
             Self::Cancelled {
