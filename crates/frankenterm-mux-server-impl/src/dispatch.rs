@@ -5622,6 +5622,243 @@ mod tests {
     }
 
     #[test]
+    fn terminal_queue_loss_retires_pending_deferred_fence_before_wire_transcript() {
+        const FENCE_SERIAL: u64 = 301;
+
+        // Two slots are enough to create the production pending/deferred
+        // boundary and then deterministically reject the fenced response.  A
+        // smaller test-only capacity avoids timing, sleeping, or a 4K-item
+        // fixture while exercising the same bounded channel and admission
+        // gates as the connection loop.
+        let (item_tx, item_rx) = bounded(2);
+        let (terminal, terminal_rx) = DispatchTerminal::channel();
+        let stream_id = TopologyStreamId::from_bytes([0x7d; 16]);
+        let session_incarnation = MuxSessionIncarnation::from_bytes([0xd7; 16]);
+        let coordinator = TopologyStreamCoordinator::new(item_tx, terminal, stream_id);
+        coordinator
+            .bind_subscription(session_incarnation, TopologyRevision::INITIAL)
+            .expect("bind terminal-transcript topology subscription");
+        let mux = Mux::new(None);
+
+        // Model the exact state the production loop can hold while a newly
+        // readable request preempts outbound progress: one legacy topology
+        // frame is pending and the following control response is deferred at
+        // the topology/non-topology accounting boundary.
+        assert!(coordinator.on_notification(
+            &mux,
+            topology_envelope(1, MuxNotification::PaneRemoved(1)),
+        ));
+        coordinator
+            .queue_response(
+                DecodedPdu {
+                    serial: 201,
+                    pdu: Pdu::Pong(Pong {}),
+                },
+                PduDeliveryClass::Control,
+            )
+            .expect("queue the control successor before the fence request");
+        let Item::Notif(ReservedNotification {
+            notification: MuxNotification::PaneRemoved(pane_id),
+            reservation,
+        }) = item_rx
+            .try_recv()
+            .expect("take the admitted legacy topology predecessor")
+        else {
+            panic!("the first admitted item must be the legacy topology notification");
+        };
+        let mut deferred_item = None;
+        let mut pending = prepare_unilateral_pdu(
+            Pdu::PaneRemoved(codec::PaneRemoved { pane_id }),
+            reservation,
+            &item_rx,
+            &mut deferred_item,
+            &coordinator.terminal,
+        )
+        .expect("prepare the production pending/deferred boundary");
+        let Some(Item::WritePdu(WritePayload::Encoded(deferred_frame))) =
+            deferred_item.as_ref()
+        else {
+            panic!("the control successor must remain one exact deferred frame");
+        };
+
+        let mut pending_cursor = Cursor::new(pending.bytes.as_slice());
+        assert!(matches!(
+            Pdu::decode(&mut pending_cursor).expect("decode pending topology predecessor"),
+            DecodedPdu {
+                serial: 0,
+                pdu: Pdu::PaneRemoved(codec::PaneRemoved { pane_id: 1 }),
+            }
+        ));
+        assert_eq!(pending_cursor.position() as usize, pending.bytes.len());
+        let mut deferred_cursor = Cursor::new(deferred_frame.bytes.as_slice());
+        assert_eq!(
+            Pdu::decode(&mut deferred_cursor).expect("decode deferred control successor"),
+            DecodedPdu {
+                serial: 201,
+                pdu: Pdu::Pong(Pong {}),
+            }
+        );
+        assert_eq!(
+            deferred_cursor.position() as usize,
+            deferred_frame.bytes.len()
+        );
+        assert!(item_rx.is_empty());
+
+        coordinator
+            .begin_fence(FENCE_SERIAL, &fenced_snapshot_request())
+            .expect("admit the coherent topology request while output is pending");
+        assert!(coordinator.on_notification(
+            &mux,
+            topology_envelope(2, MuxNotification::PaneAdded(2)),
+        ));
+        assert!(
+            item_rx.is_empty(),
+            "the in-fence successor must remain quarantined"
+        );
+
+        for serial in [302, 303] {
+            coordinator
+                .queue_response(
+                    DecodedPdu {
+                        serial,
+                        pdu: Pdu::Pong(Pong {}),
+                    },
+                    PduDeliveryClass::Control,
+                )
+                .expect("fill one exact tiny-queue slot before semantic loss");
+        }
+        let queued_before_loss = item_rx.len();
+        let error = coordinator
+            .queue_response(
+                DecodedPdu {
+                    serial: FENCE_SERIAL,
+                    pdu: Pdu::ListPanesCoherentResponse(coherent_snapshot_response(
+                        stream_id,
+                        session_incarnation,
+                        TopologyRevision::INITIAL,
+                    )),
+                },
+                PduDeliveryClass::Control,
+            )
+            .expect_err("the first rejected fenced response must terminate the connection");
+        assert!(
+            format!("{error:#}").contains("mux dispatch item queue is full"),
+            "the terminal transcript must retain its first semantic-loss cause: {error:#}"
+        );
+        assert_eq!(
+            terminal_rx
+                .try_recv()
+                .expect("the first queue loss must publish one terminal reason"),
+            RESPONSE_QUEUE_FAILURE
+        );
+        assert!(terminal_rx.is_empty());
+        assert_eq!(
+            item_rx.len(),
+            queued_before_loss,
+            "the rejected snapshot must not displace or append a frame"
+        );
+        {
+            let state = coordinator.state.lock();
+            assert!(
+                matches!(&state.phase, TopologyStreamPhase::Exhausted),
+                "the rejected fence response must retire the in-flight request instead of establishing readiness-equivalent topology authority"
+            );
+            assert_eq!(state.prebind.retained_bytes, 0);
+            assert!(state.prebind.events.is_empty());
+        }
+
+        assert!(
+            coordinator
+                .queue_response(
+                    DecodedPdu {
+                        serial: 304,
+                        pdu: Pdu::Pong(Pong {}),
+                    },
+                    PduDeliveryClass::Control,
+                )
+                .is_err(),
+            "no later response may be admitted after the first semantic loss"
+        );
+        assert!(!coordinator.on_notification(
+            &mux,
+            topology_envelope(3, MuxNotification::PaneAdded(3)),
+        ));
+        assert!(
+            coordinator
+                .begin_fence(FENCE_SERIAL, &fenced_snapshot_request())
+                .is_err(),
+            "the retired request serial must not reopen a topology fence"
+        );
+        assert!(terminal_rx.is_empty());
+        assert_eq!(item_rx.len(), queued_before_loss);
+
+        // Both already-owned outbound stages consult the same terminal gate.
+        // Decode their would-be frames above, then prove that neither stage
+        // can add even one byte to the actual connection transcript.
+        let mut stream = RecordingDispatchStream::default();
+        assert_eq!(
+            promise::spawn::block_on(service_pending_outbound(
+                &mut stream,
+                &mut pending,
+                None,
+                &coordinator.terminal,
+            ))
+            .expect("terminal pending service must return an explicit outcome"),
+            OutboundService::Terminal
+        );
+        assert_eq!(pending.offset, 0);
+        assert!(stream.bytes.is_empty());
+        assert_eq!(stream.flush_calls.load(Ordering::Relaxed), 0);
+        drop(pending);
+
+        let Some(Item::WritePdu(deferred_payload)) = deferred_item.take() else {
+            panic!("the exact deferred control frame must still be owned");
+        };
+        let mut retired_batch = prepare_pending_outbound_batch(
+            deferred_payload,
+            &item_rx,
+            &mut deferred_item,
+            CompressionMode::Never,
+            &coordinator.terminal,
+        )
+        .expect("already-admitted control frames remain decodable for retirement");
+        assert!(deferred_item.is_none());
+        assert!(item_rx.is_empty());
+        let mut retired_cursor = Cursor::new(retired_batch.bytes.as_slice());
+        for expected_serial in [201, 302, 303] {
+            assert_eq!(
+                Pdu::decode(&mut retired_cursor)
+                    .expect("decode one already-admitted retired control frame"),
+                DecodedPdu {
+                    serial: expected_serial,
+                    pdu: Pdu::Pong(Pong {}),
+                }
+            );
+        }
+        assert_eq!(
+            retired_cursor.position() as usize,
+            retired_batch.bytes.len(),
+            "the retired decoded transcript must contain exactly the three pre-loss controls"
+        );
+        assert_eq!(
+            promise::spawn::block_on(service_pending_outbound(
+                &mut stream,
+                &mut retired_batch,
+                None,
+                &coordinator.terminal,
+            ))
+            .expect("terminal deferred service must return an explicit outcome"),
+            OutboundService::Terminal
+        );
+        assert_eq!(retired_batch.offset, 0);
+        assert!(stream.bytes.is_empty());
+        assert_eq!(stream.flush_calls.load(Ordering::Relaxed), 0);
+        drop(retired_batch);
+
+        assert_outbound_live_counters_zero(&coordinator);
+    }
+
+    #[test]
     fn established_topology_stream_holds_a_gap_until_its_missing_revision_arrives() {
         let (coordinator, item_rx, _terminal_rx, session_incarnation, stream_id) =
             bound_topology_coordinator();
