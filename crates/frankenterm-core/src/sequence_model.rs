@@ -308,7 +308,7 @@ impl SequenceAssigner {
             }
         }
 
-        let mut transaction = SequenceAssignmentTransaction {
+        let transaction = SequenceAssignmentTransaction {
             frontiers: &mut frontiers,
             pane_id,
             previous_global: global_sequence,
