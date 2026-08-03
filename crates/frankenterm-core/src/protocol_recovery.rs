@@ -193,7 +193,10 @@ pub fn classify_error_message(msg: &str) -> ProtocolErrorKind {
     {
         return ProtocolErrorKind::Transient;
     }
-    if lower.starts_with("unexpected response:") || lower.starts_with("codec error:") {
+    if lower.starts_with("unexpected response:")
+        || lower.starts_with("unexpected aligned response:")
+        || lower.starts_with("codec error:")
+    {
         return ProtocolErrorKind::Recoverable;
     }
     if lower.starts_with("io error:") {
@@ -304,6 +307,26 @@ pub fn mux_recovery_decision(err: &crate::vendored::DirectMuxError) -> MuxRecove
     use MuxConnectionDisposition::{Discard, Reuse};
 
     match err {
+        DirectMuxError::InFlightScopeAbandoned(source) => {
+            let source_decision = mux_recovery_decision(source);
+            MuxRecoveryDecision {
+                kind: source_decision.kind,
+                retry: false,
+                connection: Discard,
+                cancelled: source_decision.cancelled,
+            }
+        }
+
+        DirectMuxError::ProvenPreWriteRejection(source) => {
+            let source_decision = mux_recovery_decision(source);
+            MuxRecoveryDecision {
+                kind: source_decision.kind,
+                retry: false,
+                connection: Reuse,
+                cancelled: source_decision.cancelled,
+            }
+        }
+
         DirectMuxError::SocketPathMissing
         | DirectMuxError::ProxyUnsupported
         | DirectMuxError::IncompatibleCodec { .. }
@@ -332,6 +355,20 @@ pub fn mux_recovery_decision(err: &crate::vendored::DirectMuxError) -> MuxRecove
             cancelled: false,
         },
 
+        // These checkpoints are statically before request bytes can enter the
+        // transport. Caller cancellation therefore forbids replay of the
+        // cancelled operation but preserves the still-aligned connection.
+        DirectMuxError::Cancelled { .. } if err.is_pre_transport_cancellation() => {
+            MuxRecoveryDecision {
+                kind: ProtocolErrorKind::Transient,
+                retry: false,
+                connection: Reuse,
+                cancelled: true,
+            }
+        }
+
+        // Cancellation while a write/read/batch is in progress cannot prove
+        // how much framed state the peer observed. Fail the transport closed.
         DirectMuxError::Cancelled { .. } => MuxRecoveryDecision {
             kind: ProtocolErrorKind::Transient,
             retry: false,
@@ -344,6 +381,16 @@ pub fn mux_recovery_decision(err: &crate::vendored::DirectMuxError) -> MuxRecove
         // still-aligned connection remains reusable.
         DirectMuxError::RemoteError(_) => MuxRecoveryDecision {
             kind: ProtocolErrorKind::Transient,
+            retry: false,
+            connection: Reuse,
+            cancelled: false,
+        },
+
+        // The frame was valid and fully correlated before the operation found
+        // an unexpected PDU or pane identity. The operation failed, but the
+        // wire stream remains aligned and must not be needlessly discarded.
+        DirectMuxError::AlignedUnexpectedResponse { .. } => MuxRecoveryDecision {
+            kind: ProtocolErrorKind::Recoverable,
             retry: false,
             connection: Reuse,
             cancelled: false,
@@ -1174,16 +1221,28 @@ mod tests {
             connection: Discard,
             cancelled: false,
         };
+        let recoverable_no_replay = MuxRecoveryDecision {
+            kind: ProtocolErrorKind::Recoverable,
+            retry: false,
+            connection: Reuse,
+            cancelled: false,
+        };
         let remote_no_replay = MuxRecoveryDecision {
             kind: ProtocolErrorKind::Transient,
             retry: false,
             connection: Reuse,
             cancelled: false,
         };
-        let cancelled = MuxRecoveryDecision {
+        let cancelled_discard = MuxRecoveryDecision {
             kind: ProtocolErrorKind::Transient,
             retry: false,
             connection: Discard,
+            cancelled: true,
+        };
+        let cancelled_reuse = MuxRecoveryDecision {
+            kind: ProtocolErrorKind::Transient,
+            retry: false,
+            connection: Reuse,
             cancelled: true,
         };
 
@@ -1228,6 +1287,27 @@ mod tests {
                 recoverable_retry,
             ),
             (
+                DirectMuxError::ProvenPreWriteRejection(Box::new(
+                    DirectMuxError::RetentionLimitExceeded {
+                        resource: "outstanding mux requests",
+                        requested_count: 2,
+                        requested_bytes: 16,
+                        max_count: 1,
+                        max_bytes: 8,
+                    },
+                )),
+                recoverable_no_replay,
+            ),
+            (
+                DirectMuxError::InFlightScopeAbandoned(Box::new(
+                    DirectMuxError::Cancelled {
+                        phase: "request_write_wait",
+                        detail: "later batch admission cancelled".to_string(),
+                    },
+                )),
+                cancelled_discard,
+            ),
+            (
                 DirectMuxError::ResponseSerialNotOutstanding {
                     connection_id: 7,
                     serial: 9,
@@ -1269,6 +1349,13 @@ mod tests {
                     got: "incompatible UnitResponse".to_string(),
                 },
                 recoverable_retry,
+            ),
+            (
+                DirectMuxError::AlignedUnexpectedResponse {
+                    expected: "ListPanesResponse".to_string(),
+                    got: "UnitResponse".to_string(),
+                },
+                recoverable_no_replay,
             ),
             (
                 DirectMuxError::IncompatibleCodec {
@@ -1343,7 +1430,14 @@ mod tests {
                     phase: "request_write_wait",
                     detail: "caller abandoned scope".to_string(),
                 },
-                cancelled,
+                cancelled_reuse,
+            ),
+            (
+                DirectMuxError::Cancelled {
+                    phase: "request_write_in_progress",
+                    detail: "caller abandoned scope".to_string(),
+                },
+                cancelled_discard,
             ),
             (
                 DirectMuxError::Io(std::io::Error::from(std::io::ErrorKind::BrokenPipe)),

@@ -611,7 +611,8 @@ impl MuxPool {
         // Acquiring a connection may be retried, but once this boundary is
         // crossed the non-idempotent operation is invoked exactly once. The
         // sole determinate exception is a typed outbound rejection that proves
-        // no serial allocation, encode, or write boundary was reached.
+        // no socket write boundary was reached and no bytes reached the peer.
+        // A local serial may have been consumed and encoding attempted.
         if let Err(error) = Self::checkpoint_cx(cx) {
             drop(client);
             return Err(error);
@@ -1511,7 +1512,7 @@ mod tests {
                                 Pdu::SetClientId(_) => Pdu::UnitResponse(UnitResponse {}),
                                 Pdu::ListPanes(_) => {
                                     if first_bad.swap(false, AtomicOrdering::SeqCst) {
-                                        // Wrong response type: triggers UnexpectedResponse.
+                                        // Wrong but correlated response type: stream stays aligned.
                                         Pdu::UnitResponse(UnitResponse {})
                                     } else {
                                         Pdu::ListPanesResponse(ListPanesResponse {
@@ -1725,8 +1726,7 @@ mod tests {
     }
 
     /// Spawn a mock mux server that injects one unexpected render response on
-    /// each of the first `bad_connections` connections. This lets tests prove
-    /// that pipeline and sequential-fallback attempts consume one shared cap.
+    /// each of the first `bad_connections` connections.
     async fn spawn_mock_server_unexpected_batch_render_connections(
         temp_dir: &tempfile::TempDir,
         bad_connections: usize,
@@ -2045,6 +2045,12 @@ mod tests {
             },
         )));
         assert!(!should_fallback_render_batch(&MuxPoolError::Mux(
+            DirectMuxError::AlignedUnexpectedResponse {
+                expected: "expected".to_string(),
+                got: "correlated but unexpected".to_string(),
+            },
+        )));
+        assert!(!should_fallback_render_batch(&MuxPoolError::Mux(
             DirectMuxError::DuplicateRenderBatchPane { pane_id: 7 },
         )));
         assert!(!should_fallback_render_batch(&MuxPoolError::Mux(
@@ -2065,7 +2071,7 @@ mod tests {
     }
 
     #[test]
-    fn pool_recovers_from_unexpected_response_by_reconnecting() {
+    fn pool_aligned_list_error_reuses_connection_without_replay() {
         run_async_test(async {
             let temp_dir = tempfile::tempdir().expect("tempdir");
             let socket_path = spawn_mock_server_unexpected_list_panes_once(&temp_dir).await;
@@ -2092,16 +2098,26 @@ mod tests {
             };
 
             let pool = MuxPool::new(config);
+            let error = pool
+                .list_panes()
+                .await
+                .expect_err("aligned semantic failure must not replay");
+            assert!(matches!(
+                error,
+                MuxPoolError::Mux(DirectMuxError::AlignedUnexpectedResponse { .. })
+            ));
+
             let resp = pool
                 .list_panes()
                 .await
-                .expect("list_panes should recover after reconnect");
+                .expect("follow-up should reuse the aligned connection");
             assert!(resp.tabs.is_empty());
 
             let stats = pool.stats().await;
-            assert_eq!(stats.recovery_attempts, 1);
-            assert_eq!(stats.recovery_successes, 1);
-            assert_eq!(stats.connections_created, 2);
+            assert_eq!(stats.recovery_attempts, 0);
+            assert_eq!(stats.recovery_successes, 0);
+            assert_eq!(stats.connections_created, 1);
+            assert_eq!(stats.pool.idle_count, 1);
         });
     }
 
@@ -2158,7 +2174,7 @@ mod tests {
     }
 
     #[test]
-    fn discarded_pool_connection_cannot_leak_render_cache_into_successor() {
+    fn aligned_pool_error_reuses_connection_without_losing_render_cache() {
         run_async_test(async {
             let temp_dir = tempfile::tempdir().expect("tempdir");
             let socket_path = spawn_mock_server_unexpected_list_panes_once(&temp_dir).await;
@@ -2197,34 +2213,37 @@ mod tests {
                 .list_panes()
                 .await
                 .expect_err("first connection must receive the injected bad response");
-            assert!(matches!(error, DirectMuxError::UnexpectedResponse { .. }));
-            drop(predecessor);
+            assert!(matches!(
+                error,
+                DirectMuxError::AlignedUnexpectedResponse { .. }
+            ));
+            pool.return_client(predecessor).await;
             drop(predecessor_guard);
 
             let (mut successor, successor_guard) =
                 pool.acquire_client().await.expect("acquire successor");
             let successor_id = successor.connection_id();
-            assert_ne!(
+            assert_eq!(
                 predecessor_id, successor_id,
-                "replacement transport must have a distinct non-reusing identity"
+                "fully correlated wrong-PDU failure must preserve the aligned transport"
             );
-            let replacement_render = successor
+            let reused_render = successor
                 .get_pane_render_changes(77)
                 .await
-                .expect("same pane ID with reset sequence must bootstrap on successor");
-            assert_eq!(replacement_render.seqno, 1);
-            assert!(replacement_render.title.starts_with("connection-2-"));
+                .expect("same-socket render state remains usable after aligned failure");
+            assert_eq!(reused_render.seqno, 99);
+            assert!(reused_render.title.starts_with("connection-1-"));
 
             pool.return_client(successor).await;
             drop(successor_guard);
             let stats = pool.stats().await;
-            assert_eq!(stats.connections_created, 2);
+            assert_eq!(stats.connections_created, 1);
             assert_eq!(stats.pool.idle_count, 1);
         });
     }
 
     #[test]
-    fn pool_list_panes_with_cx_recovers_from_unexpected_response_by_reconnecting() {
+    fn pool_aligned_list_error_does_not_replay_and_reuses_connection() {
         run_async_test(async {
             let temp_dir = tempfile::tempdir().expect("tempdir");
             let socket_path = spawn_mock_server_unexpected_list_panes_once(&temp_dir).await;
@@ -2252,16 +2271,26 @@ mod tests {
             };
 
             let pool = MuxPool::new(config);
+            let error = pool
+                .list_panes_with_cx(&cx)
+                .await
+                .expect_err("aligned semantic failure must not replay the operation");
+            assert!(matches!(
+                error,
+                MuxPoolError::Mux(DirectMuxError::AlignedUnexpectedResponse { .. })
+            ));
+
             let resp = pool
                 .list_panes_with_cx(&cx)
                 .await
-                .expect("list_panes_with_cx should recover after reconnect");
+                .expect("follow-up should reuse the still-aligned connection");
             assert!(resp.tabs.is_empty());
 
             let stats = pool.stats().await;
-            assert_eq!(stats.recovery_attempts, 1);
-            assert_eq!(stats.recovery_successes, 1);
-            assert_eq!(stats.connections_created, 2);
+            assert_eq!(stats.recovery_attempts, 0);
+            assert_eq!(stats.recovery_successes, 0);
+            assert_eq!(stats.connections_created, 1);
+            assert_eq!(stats.pool.idle_count, 1);
         });
     }
 
@@ -2301,7 +2330,7 @@ mod tests {
                 matches!(
                     err,
                     MuxPoolError::IndeterminateMutation(
-                        DirectMuxError::UnexpectedResponse { .. }
+                        DirectMuxError::AlignedUnexpectedResponse { .. }
                     )
                 ),
                 "expected unexpected response without retry, got {err}"
@@ -2311,6 +2340,7 @@ mod tests {
             assert_eq!(stats.recovery_attempts, 0);
             assert_eq!(stats.recovery_successes, 0);
             assert_eq!(stats.connections_created, 1);
+            assert_eq!(stats.pool.idle_count, 1);
         });
     }
 
@@ -2441,7 +2471,7 @@ mod tests {
                 matches!(
                     err,
                     MuxPoolError::IndeterminateMutation(
-                        DirectMuxError::UnexpectedResponse { .. }
+                        DirectMuxError::AlignedUnexpectedResponse { .. }
                     )
                 ),
                 "expected unexpected response without retry, got {err}"
@@ -2451,6 +2481,7 @@ mod tests {
             assert_eq!(stats.recovery_attempts, 0);
             assert_eq!(stats.recovery_successes, 0);
             assert_eq!(stats.connections_created, 1);
+            assert_eq!(stats.pool.idle_count, 1);
         });
     }
 
@@ -2482,7 +2513,7 @@ mod tests {
             assert!(matches!(
                 write_error,
                 MuxPoolError::IndeterminateMutation(
-                    DirectMuxError::UnexpectedResponse { .. }
+                    DirectMuxError::AlignedUnexpectedResponse { .. }
                 )
             ));
 
@@ -2493,17 +2524,19 @@ mod tests {
             assert!(matches!(
                 paste_error,
                 MuxPoolError::IndeterminateMutation(
-                    DirectMuxError::UnexpectedResponse { .. }
+                    DirectMuxError::AlignedUnexpectedResponse { .. }
                 )
             ));
+
+            pool.send_paste(9, "new logical mutation\n".to_string())
+                .await
+                .expect("a new mutation may reuse the fully aligned connection");
 
             let stats = pool.stats().await;
             assert_eq!(stats.recovery_attempts, 0);
             assert_eq!(stats.recovery_successes, 0);
-            assert_eq!(
-                stats.connections_created, 2,
-                "each mutation gets one connection and neither is replayed"
-            );
+            assert_eq!(stats.connections_created, 1);
+            assert_eq!(stats.pool.idle_count, 1);
         });
     }
 
@@ -2607,7 +2640,7 @@ mod tests {
     }
 
     #[test]
-    fn pool_health_check_recovers_from_unexpected_response() {
+    fn pool_health_check_reports_aligned_error_without_replay() {
         run_async_test(async {
             let temp_dir = tempfile::tempdir().expect("tempdir");
             let socket_path = spawn_mock_server_unexpected_list_panes_once(&temp_dir).await;
@@ -2634,19 +2667,25 @@ mod tests {
             };
             let pool = MuxPool::new(config);
 
+            let error = pool
+                .health_check()
+                .await
+                .expect_err("aligned health-check error must not replay");
+            assert!(matches!(
+                error,
+                MuxPoolError::Mux(DirectMuxError::AlignedUnexpectedResponse { .. })
+            ));
             pool.health_check()
                 .await
-                .expect("health_check should recover after reconnect");
+                .expect("next health check should reuse the aligned connection");
 
             let stats = pool.stats().await;
-            assert_eq!(stats.health_checks, 1);
-            assert_eq!(stats.health_check_failures, 0);
-            assert_eq!(stats.recovery_attempts, 1);
-            assert_eq!(stats.recovery_successes, 1);
-            assert_eq!(
-                stats.connections_created, 2,
-                "health_check should reconnect exactly once after the recoverable failure"
-            );
+            assert_eq!(stats.health_checks, 2);
+            assert_eq!(stats.health_check_failures, 1);
+            assert_eq!(stats.recovery_attempts, 0);
+            assert_eq!(stats.recovery_successes, 0);
+            assert_eq!(stats.connections_created, 1);
+            assert_eq!(stats.pool.idle_count, 1);
         });
     }
 
@@ -2682,7 +2721,10 @@ mod tests {
                 .health_check()
                 .await
                 .expect_err("health_check should fail without recovery");
-            assert!(matches!(err, MuxPoolError::Mux(_)));
+            assert!(matches!(
+                err,
+                MuxPoolError::Mux(DirectMuxError::AlignedUnexpectedResponse { .. })
+            ));
 
             let stats = pool.stats().await;
             assert_eq!(stats.health_checks, 1);
@@ -2693,6 +2735,7 @@ mod tests {
                 stats.connections_created, 1,
                 "health_check should not reconnect when recovery is disabled"
             );
+            assert_eq!(stats.pool.idle_count, 1);
         });
     }
 
@@ -2733,7 +2776,7 @@ mod tests {
     }
 
     #[test]
-    fn pool_health_check_with_cx_recovers_from_unexpected_response() {
+    fn pool_health_check_with_cx_reports_aligned_error_without_replay() {
         run_async_test(async {
             let temp_dir = tempfile::tempdir().expect("tempdir");
             let socket_path = spawn_mock_server_unexpected_list_panes_once(&temp_dir).await;
@@ -2761,19 +2804,25 @@ mod tests {
             };
             let pool = MuxPool::new(config);
 
+            let error = pool
+                .health_check_with_cx(&cx)
+                .await
+                .expect_err("aligned Cx health-check error must not replay");
+            assert!(matches!(
+                error,
+                MuxPoolError::Mux(DirectMuxError::AlignedUnexpectedResponse { .. })
+            ));
             pool.health_check_with_cx(&cx)
                 .await
-                .expect("health_check_with_cx should recover after reconnect");
+                .expect("next Cx health check should reuse the aligned connection");
 
             let stats = pool.stats().await;
-            assert_eq!(stats.health_checks, 1);
-            assert_eq!(stats.health_check_failures, 0);
-            assert_eq!(stats.recovery_attempts, 1);
-            assert_eq!(stats.recovery_successes, 1);
-            assert_eq!(
-                stats.connections_created, 2,
-                "health_check_with_cx should reconnect exactly once after the recoverable failure"
-            );
+            assert_eq!(stats.health_checks, 2);
+            assert_eq!(stats.health_check_failures, 1);
+            assert_eq!(stats.recovery_attempts, 0);
+            assert_eq!(stats.recovery_successes, 0);
+            assert_eq!(stats.connections_created, 1);
+            assert_eq!(stats.pool.idle_count, 1);
         });
     }
 
@@ -2810,7 +2859,10 @@ mod tests {
                 .health_check_with_cx(&cx)
                 .await
                 .expect_err("health_check_with_cx should fail without recovery");
-            assert!(matches!(err, MuxPoolError::Mux(_)));
+            assert!(matches!(
+                err,
+                MuxPoolError::Mux(DirectMuxError::AlignedUnexpectedResponse { .. })
+            ));
 
             let stats = pool.stats().await;
             assert_eq!(stats.health_checks, 1);
@@ -2821,6 +2873,7 @@ mod tests {
                 stats.connections_created, 1,
                 "health_check_with_cx should not reconnect when recovery is disabled"
             );
+            assert_eq!(stats.pool.idle_count, 1);
         });
     }
 
@@ -3702,7 +3755,7 @@ mod tests {
                 .expect_err("one configured attempt must not enter fallback");
             assert!(matches!(
                 error,
-                MuxPoolError::Mux(DirectMuxError::UnexpectedResponse { .. })
+                MuxPoolError::Mux(DirectMuxError::AlignedUnexpectedResponse { .. })
             ));
 
             let stats = pool.stats().await;
@@ -3713,6 +3766,7 @@ mod tests {
                 "one configured attempt creates only the failed pipeline connection"
             );
             assert_eq!(stats.pool.total_acquired, 1);
+            assert_eq!(stats.pool.idle_count, 1);
         });
     }
 
@@ -3758,11 +3812,10 @@ mod tests {
     }
 
     #[test]
-    fn render_pipeline_and_fallback_share_configured_attempt_cap() {
+    fn aligned_render_error_never_enters_pipeline_fallback() {
         run_async_test(async {
             let temp_dir = tempfile::tempdir().expect("tempdir");
-            let socket_path =
-                spawn_mock_server_unexpected_batch_render_connections(&temp_dir, 2).await;
+            let socket_path = spawn_mock_server_unexpected_batch_render_once(&temp_dir).await;
             let config = MuxPoolConfig {
                 mux: DirectMuxClientConfig::default().with_socket_path(socket_path),
                 recovery: MuxRecoveryConfig {
@@ -3781,20 +3834,21 @@ mod tests {
             };
             let pool = MuxPool::new(config);
 
-            let result = pool
+            let error = pool
                 .get_pane_render_changes_batch(vec![10, 20, 30])
                 .await
-                .expect("third and final shared attempt should succeed");
-            assert_eq!(
-                result.iter().map(|response| response.pane_id).collect::<Vec<_>>(),
-                vec![10, 20, 30]
-            );
+                .expect_err("aligned semantic error must not replay or enter fallback");
+            assert!(matches!(
+                error,
+                MuxPoolError::Mux(DirectMuxError::AlignedUnexpectedResponse { .. })
+            ));
 
             let stats = pool.stats().await;
-            assert_eq!(stats.connections_created, 3);
-            assert_eq!(stats.pool.total_acquired, 3);
-            assert_eq!(stats.recovery_attempts, 2);
-            assert_eq!(stats.recovery_successes, 1);
+            assert_eq!(stats.connections_created, 1);
+            assert_eq!(stats.pool.total_acquired, 1);
+            assert_eq!(stats.recovery_attempts, 0);
+            assert_eq!(stats.recovery_successes, 0);
+            assert_eq!(stats.pool.idle_count, 1);
         });
     }
 
@@ -3838,11 +3892,12 @@ mod tests {
                 };
                 assert!(matches!(
                     error,
-                    MuxPoolError::Mux(DirectMuxError::UnexpectedResponse { .. })
+                    MuxPoolError::Mux(DirectMuxError::AlignedUnexpectedResponse { .. })
                 ));
                 let stats = pool.stats().await;
                 assert_eq!(stats.connections_created, 1);
                 assert_eq!(stats.recovery_attempts, 0);
+                assert_eq!(stats.pool.idle_count, 1);
             }
         });
     }
@@ -3879,13 +3934,18 @@ mod tests {
                 .list_panes()
                 .await
                 .expect_err("should fail without recovery");
-            assert!(matches!(err, MuxPoolError::Mux(_)));
+            assert!(matches!(
+                err,
+                MuxPoolError::Mux(DirectMuxError::AlignedUnexpectedResponse { .. })
+            ));
 
             let stats = pool.stats().await;
             assert_eq!(
                 stats.recovery_attempts, 0,
                 "no retries when recovery disabled"
             );
+            assert_eq!(stats.connections_created, 1);
+            assert_eq!(stats.pool.idle_count, 1);
         });
     }
 
@@ -3922,7 +3982,10 @@ mod tests {
                 .list_panes_with_cx(&cx)
                 .await
                 .expect_err("list_panes_with_cx should fail without recovery");
-            assert!(matches!(err, MuxPoolError::Mux(_)));
+            assert!(matches!(
+                err,
+                MuxPoolError::Mux(DirectMuxError::AlignedUnexpectedResponse { .. })
+            ));
 
             let stats = pool.stats().await;
             assert_eq!(
@@ -3933,6 +3996,7 @@ mod tests {
                 stats.connections_created, 1,
                 "explicit-Cx path should not reconnect when recovery is disabled"
             );
+            assert_eq!(stats.pool.idle_count, 1);
         });
     }
 
@@ -4528,7 +4592,7 @@ mod tests {
                 .expect_err("one configured explicit-Cx attempt must not enter fallback");
             assert!(matches!(
                 error,
-                MuxPoolError::Mux(DirectMuxError::UnexpectedResponse { .. })
+                MuxPoolError::Mux(DirectMuxError::AlignedUnexpectedResponse { .. })
             ));
 
             let stats = pool.stats().await;
@@ -4539,6 +4603,7 @@ mod tests {
                 "one configured explicit-Cx attempt creates only the failed pipeline connection"
             );
             assert_eq!(stats.pool.total_acquired, 1);
+            assert_eq!(stats.pool.idle_count, 1);
         });
     }
 

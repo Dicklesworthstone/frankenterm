@@ -206,6 +206,17 @@ pub enum DirectMuxError {
     DuplicateRenderBatchPane { pane_id: u64 },
     #[error("unexpected response: expected {expected}, got {got}")]
     UnexpectedResponse { expected: String, got: String },
+    #[error("unexpected aligned response: expected {expected}, got {got}")]
+    AlignedUnexpectedResponse { expected: String, got: String },
+    /// A local validation/admission failure proven to occur before the write
+    /// boundary. The nested error retains its diagnostic kind while this
+    /// wrapper carries the transport-alignment proof.
+    #[error(transparent)]
+    ProvenPreWriteRejection(Box<DirectMuxError>),
+    /// A nested operation error that cannot retain its otherwise narrow reuse
+    /// classification because the enclosing batch still owns earlier writes.
+    #[error(transparent)]
+    InFlightScopeAbandoned(Box<DirectMuxError>),
     #[error(
         "codec version mismatch: local={local} (min {local_min}), remote={remote} (min \
          {remote_min}, version {remote_version}); the compatibility windows do not overlap"
@@ -270,11 +281,22 @@ pub enum DirectMuxError {
 }
 
 impl DirectMuxError {
+    fn proven_pre_write_rejection(error: Self) -> Self {
+        debug_assert!(!matches!(&error, Self::ProvenPreWriteRejection(_)));
+        Self::ProvenPreWriteRejection(Box::new(error))
+    }
+
+    fn in_flight_scope_abandoned(error: Self) -> Self {
+        debug_assert!(!matches!(&error, Self::InFlightScopeAbandoned(_)));
+        Self::InFlightScopeAbandoned(Box::new(error))
+    }
+
     /// Whether this error represents an explicit capability-context cancellation.
     #[must_use]
     pub fn is_cancelled(&self) -> bool {
         match self {
             Self::Cancelled { .. } => true,
+            Self::InFlightScopeAbandoned(source) => source.is_cancelled(),
             // Retain defensive recognition for cancellation errors produced
             // by older callers that still encode the signal in Interrupted
             // text. New internal construction uses the typed variant above.
@@ -301,12 +323,17 @@ impl DirectMuxError {
         mux_recovery_decision(self)
     }
 
-    /// Whether this error proves that no request serial was allocated and no
-    /// encode or write boundary was entered.
+    /// Whether this error proves that no socket write boundary was entered and
+    /// no request bytes could have reached the peer.
+    ///
+    /// This is a transport-alignment proof, not a promise that local work was
+    /// untouched: a request serial may already have been consumed and outbound
+    /// encoding may already have been attempted.
     ///
     /// MuxPool uses this narrow predicate for mutation calls. General recovery
-    /// axes are insufficient: an error can be permanent while the attempted
-    /// mutation is still indeterminate.
+    /// axes are insufficient: a policy rejection can be permanent, or a
+    /// cancellation transient, while the attempted mutation is nevertheless
+    /// known not to have crossed the write boundary.
     #[must_use]
     pub(super) const fn is_proven_pre_write_rejection(&self) -> bool {
         matches!(
@@ -315,6 +342,27 @@ impl DirectMuxError {
                 | Self::OutboundPduDirectionViolation { .. }
                 | Self::OutboundPduRequiresCodec { .. }
                 | Self::OutboundCapabilityNotNegotiated { .. }
+                | Self::ProvenPreWriteRejection(_)
+        )
+            || self.is_pre_transport_cancellation()
+    }
+
+    /// Whether a typed cancellation was observed at a checkpoint that is
+    /// statically before request bytes can be handed to the transport.
+    ///
+    /// Timeout/cancellation races after a write begins use distinct
+    /// `*_in_progress` phases and therefore never enter this set.
+    #[must_use]
+    pub(crate) const fn is_pre_transport_cancellation(&self) -> bool {
+        matches!(
+            self,
+            Self::Cancelled {
+                phase: "request_start"
+                    | "request_write_wait"
+                    | "batch_wait"
+                    | "render_batch_wait",
+                ..
+            }
         )
     }
 }
@@ -1012,12 +1060,15 @@ pub struct DirectMuxClient {
     compression_mode: CompressionMode,
     connection_poisoned: bool,
     #[cfg(test)]
+    poison_transition_count: usize,
+    #[cfg(test)]
     render_retention_codec_stats: RenderRetentionCodecStats,
 }
 
 impl std::fmt::Debug for DirectMuxClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("DirectMuxClient")
+        let mut debug = f.debug_struct("DirectMuxClient");
+        debug
             .field("connection_id", &self.connection_id)
             .field("protocol_state", &self.protocol_state)
             .field("socket_path", &self.socket_path)
@@ -1039,8 +1090,10 @@ impl std::fmt::Debug for DirectMuxClient {
                 &self.render_change_snapshots.retained_bytes(),
             )
             .field("compression_mode", &self.compression_mode)
-            .field("connection_poisoned", &self.connection_poisoned)
-            .finish_non_exhaustive()
+            .field("connection_poisoned", &self.connection_poisoned);
+        #[cfg(test)]
+        debug.field("poison_transition_count", &self.poison_transition_count);
+        debug.finish_non_exhaustive()
     }
 }
 
@@ -1563,7 +1616,7 @@ impl<'a> RenderBatchGuard<'a> {
             Err(error)
                 if matches!(
                     &error,
-                    DirectMuxError::UnexpectedResponse { .. }
+                    DirectMuxError::AlignedUnexpectedResponse { .. }
                         | DirectMuxError::RemoteError(_)
                 ) =>
             {
@@ -1640,19 +1693,57 @@ impl<'a> RenderBatchGuard<'a> {
         Ok(())
     }
 
+    fn fail_finish<T>(
+        &mut self,
+        error: DirectMuxError,
+        reason: &'static str,
+    ) -> Result<T, DirectMuxError> {
+        let sidebands_drained = matches!(self.local_sidebands.is_empty(), Ok(true));
+        let scope_ambiguous = self.transport_ambiguous
+            || !self.in_flight.is_empty()
+            || !self.in_flight_panes.is_empty()
+            || !sidebands_drained;
+        let error = if scope_ambiguous {
+            // A locally pre-write error is reusable only when this whole batch
+            // owns no earlier writes. Never let its narrow classification hide
+            // abandoned in-flight serials from the guard's Drop authority.
+            DirectMuxError::in_flight_scope_abandoned(error)
+        } else {
+            error
+        };
+        self.client
+            .apply_error_disposition(&error, reason, self.explicit_cx);
+        self.disarmed = true;
+        Err(error)
+    }
+
     fn finish(mut self) -> Result<Vec<GetPaneRenderChangesResponse>, DirectMuxError> {
+        let local_sidebands_empty = match self.local_sidebands.is_empty() {
+            Ok(empty) => empty,
+            Err(error) => {
+                return self.fail_finish(error, "render batch sideband accounting failure");
+            }
+        };
         if !self.in_flight.is_empty()
             || !self.in_flight_panes.is_empty()
-            || !self.local_sidebands.is_empty()?
+            || !local_sidebands_empty
         {
             self.transport_ambiguous = true;
-            return Err(DirectMuxError::RetainedStateAccounting {
-                resource: "render batch completion",
-            });
+            return self.fail_finish(
+                DirectMuxError::RetainedStateAccounting {
+                    resource: "render batch completion",
+                },
+                "incomplete render batch settlement",
+            );
         }
 
         if let Some(error) = self.first_error.take() {
-            self.invalidate_target_render_state()?;
+            if let Err(cleanup_error) = self.invalidate_target_render_state() {
+                return self.fail_finish(
+                    cleanup_error,
+                    "render batch semantic-error cleanup failure",
+                );
+            }
             tracing::trace!(
                 connection_id = self.client.connection_id,
                 request_count = self.pane_ids.len(),
@@ -1661,8 +1752,7 @@ impl<'a> RenderBatchGuard<'a> {
                 phase = "render_batch_drained_error",
                 "mux render batch drained all issued requests before returning semantic error"
             );
-            self.disarmed = true;
-            return Err(error);
+            return self.fail_finish(error, "drained render batch semantic failure");
         }
 
         let mut ordered = Vec::with_capacity(self.outputs.len());
@@ -1672,21 +1762,30 @@ impl<'a> RenderBatchGuard<'a> {
         {
             let Some(payload) = output else {
                 self.transport_ambiguous = true;
-                return Err(DirectMuxError::RetainedStateAccounting {
-                    resource: "render batch missing response",
-                });
+                return self.fail_finish(
+                    DirectMuxError::RetainedStateAccounting {
+                        resource: "render batch missing response",
+                    },
+                    "render batch output accounting failure",
+                );
             };
             let Some(expected_pane_id) = self.pane_ids.get(request_idx).copied() else {
                 self.transport_ambiguous = true;
-                return Err(DirectMuxError::RetainedStateAccounting {
-                    resource: "render batch output pane index",
-                });
+                return self.fail_finish(
+                    DirectMuxError::RetainedStateAccounting {
+                        resource: "render batch output pane index",
+                    },
+                    "render batch output index failure",
+                );
             };
             if payload.pane_id as u64 != expected_pane_id {
                 self.transport_ambiguous = true;
-                return Err(DirectMuxError::RetainedStateAccounting {
-                    resource: "render batch output pane identity",
-                });
+                return self.fail_finish(
+                    DirectMuxError::RetainedStateAccounting {
+                        resource: "render batch output pane identity",
+                    },
+                    "render batch output identity failure",
+                );
             }
             ordered.push(payload);
         }
@@ -1828,6 +1927,8 @@ impl DirectMuxClient {
             render_change_snapshots: RenderChangeSnapshots::default(),
             connection_poisoned: false,
             #[cfg(test)]
+            poison_transition_count: 0,
+            #[cfg(test)]
             render_retention_codec_stats: RenderRetentionCodecStats::default(),
             config,
         };
@@ -1842,6 +1943,7 @@ impl DirectMuxClient {
                 explicit_cx = true,
                 "direct mux codec verification failed"
             );
+            client.apply_error_disposition(&err, "codec-version handshake failure", true);
             return Err(err);
         }
         if let Err(err) = client.register_client_with_cx(cx).await {
@@ -1854,6 +1956,7 @@ impl DirectMuxClient {
                 explicit_cx = true,
                 "direct mux client registration failed"
             );
+            client.apply_error_disposition(&err, "client registration failure", true);
             return Err(err);
         }
         tracing::debug!(
@@ -1896,10 +1999,7 @@ impl DirectMuxClient {
         let response = self.send_request(Pdu::ListPanes(ListPanes {})).await?;
         match response {
             Pdu::ListPanesResponse(payload) => Ok(payload),
-            other => Err(DirectMuxError::UnexpectedResponse {
-                expected: "ListPanesResponse".to_string(),
-                got: other.pdu_name().to_string(),
-            }),
+            other => self.unexpected_response("ListPanesResponse", &other, false),
         }
     }
 
@@ -1913,10 +2013,7 @@ impl DirectMuxClient {
             .await?;
         match response {
             Pdu::ListPanesResponse(payload) => Ok(payload),
-            other => Err(DirectMuxError::UnexpectedResponse {
-                expected: "ListPanesResponse".to_string(),
-                got: other.pdu_name().to_string(),
-            }),
+            other => self.unexpected_response("ListPanesResponse", &other, true),
         }
     }
 
@@ -1935,10 +2032,7 @@ impl DirectMuxClient {
         let response = self.send_request_with_cx(cx, Pdu::SpawnV2(spawn)).await?;
         match response {
             Pdu::SpawnResponse(payload) => Ok(payload),
-            other => Err(DirectMuxError::UnexpectedResponse {
-                expected: "SpawnResponse".to_string(),
-                got: other.pdu_name().to_string(),
-            }),
+            other => self.unexpected_response("SpawnResponse", &other, true),
         }
     }
 
@@ -1957,10 +2051,7 @@ impl DirectMuxClient {
         let response = self.send_request_with_cx(cx, Pdu::SplitPane(split)).await?;
         match response {
             Pdu::SpawnResponse(payload) => Ok(payload),
-            other => Err(DirectMuxError::UnexpectedResponse {
-                expected: "SpawnResponse".to_string(),
-                got: other.pdu_name().to_string(),
-            }),
+            other => self.unexpected_response("SpawnResponse", &other, true),
         }
     }
 
@@ -2010,10 +2101,7 @@ impl DirectMuxClient {
             .await?;
         match response {
             Pdu::GetLinesResponse(payload) => Ok(payload),
-            other => Err(DirectMuxError::UnexpectedResponse {
-                expected: "GetLinesResponse".to_string(),
-                got: other.pdu_name().to_string(),
-            }),
+            other => self.unexpected_response("GetLinesResponse", &other, false),
         }
     }
 
@@ -2035,10 +2123,7 @@ impl DirectMuxClient {
             .await?;
         match response {
             Pdu::GetLinesResponse(payload) => Ok(payload),
-            other => Err(DirectMuxError::UnexpectedResponse {
-                expected: "GetLinesResponse".to_string(),
-                got: other.pdu_name().to_string(),
-            }),
+            other => self.unexpected_response("GetLinesResponse", &other, true),
         }
     }
 
@@ -2067,10 +2152,7 @@ impl DirectMuxClient {
             .await?;
         match response {
             Pdu::GetSemanticZonesResponse(payload) => Ok(payload),
-            other => Err(DirectMuxError::UnexpectedResponse {
-                expected: "GetSemanticZonesResponse".to_string(),
-                got: other.pdu_name().to_string(),
-            }),
+            other => self.unexpected_response("GetSemanticZonesResponse", &other, true),
         }
     }
 
@@ -2088,10 +2170,7 @@ impl DirectMuxClient {
             .await?;
         match response {
             Pdu::UnitResponse(payload) => Ok(payload),
-            other => Err(DirectMuxError::UnexpectedResponse {
-                expected: "UnitResponse".to_string(),
-                got: other.pdu_name().to_string(),
-            }),
+            other => self.unexpected_response("UnitResponse", &other, false),
         }
     }
 
@@ -2113,10 +2192,7 @@ impl DirectMuxClient {
             .await?;
         match response {
             Pdu::UnitResponse(payload) => Ok(payload),
-            other => Err(DirectMuxError::UnexpectedResponse {
-                expected: "UnitResponse".to_string(),
-                got: other.pdu_name().to_string(),
-            }),
+            other => self.unexpected_response("UnitResponse", &other, true),
         }
     }
 
@@ -2134,10 +2210,7 @@ impl DirectMuxClient {
             .await?;
         match response {
             Pdu::UnitResponse(payload) => Ok(payload),
-            other => Err(DirectMuxError::UnexpectedResponse {
-                expected: "UnitResponse".to_string(),
-                got: other.pdu_name().to_string(),
-            }),
+            other => self.unexpected_response("UnitResponse", &other, false),
         }
     }
 
@@ -2206,10 +2279,7 @@ impl DirectMuxClient {
     async fn expect_unit_response(&mut self, request: Pdu) -> Result<UnitResponse, DirectMuxError> {
         match self.send_request(request).await? {
             Pdu::UnitResponse(payload) => Ok(payload),
-            other => Err(DirectMuxError::UnexpectedResponse {
-                expected: "UnitResponse".to_string(),
-                got: other.pdu_name().to_string(),
-            }),
+            other => self.unexpected_response("UnitResponse", &other, false),
         }
     }
 
@@ -2361,10 +2431,7 @@ impl DirectMuxClient {
             .await?;
         match response {
             Pdu::UnitResponse(payload) => Ok(payload),
-            other => Err(DirectMuxError::UnexpectedResponse {
-                expected: "UnitResponse".to_string(),
-                got: other.pdu_name().to_string(),
-            }),
+            other => self.unexpected_response("UnitResponse", &other, true),
         }
     }
 
@@ -2375,10 +2442,7 @@ impl DirectMuxClient {
     ) -> Result<UnitResponse, DirectMuxError> {
         match self.send_request_with_cx(cx, request).await? {
             Pdu::UnitResponse(payload) => Ok(payload),
-            other => Err(DirectMuxError::UnexpectedResponse {
-                expected: "UnitResponse".to_string(),
-                got: other.pdu_name().to_string(),
-            }),
+            other => self.unexpected_response("UnitResponse", &other, true),
         }
     }
 
@@ -2576,7 +2640,7 @@ impl DirectMuxClient {
                 } else {
                     payload.min_supported
                 };
-                let CompatDecision::Compatible { agreed } = codec::check_compat(
+                let compatibility = codec::check_compat(
                     CODEC_VERSION,
                     CODEC_VERSION_MIN_SUPPORTED,
                     payload.codec_vers,
@@ -2588,7 +2652,12 @@ impl DirectMuxClient {
                     remote: payload.codec_vers,
                     remote_min,
                     remote_version: payload.version_string.clone(),
-                })?;
+                });
+                let CompatDecision::Compatible { agreed } = self.settle_transport_result(
+                    compatibility,
+                    "codec compatibility failure",
+                    true,
+                )?;
                 let negotiated = NegotiatedCodec {
                     connection_id: self.connection_id,
                     local_max: CODEC_VERSION,
@@ -2602,10 +2671,7 @@ impl DirectMuxClient {
                 };
                 Ok(payload)
             }
-            other => Err(DirectMuxError::UnexpectedResponse {
-                expected: "GetCodecVersionResponse".to_string(),
-                got: other.pdu_name().to_string(),
-            }),
+            other => self.unexpected_response("GetCodecVersionResponse", &other, true),
         }
     }
 
@@ -2635,10 +2701,7 @@ impl DirectMuxClient {
                 });
                 Ok(payload)
             }
-            other => Err(DirectMuxError::UnexpectedResponse {
-                expected: "UnitResponse".to_string(),
-                got: other.pdu_name().to_string(),
-            }),
+            other => self.unexpected_response("UnitResponse", &other, true),
         }
     }
 
@@ -2678,9 +2741,21 @@ impl DirectMuxClient {
             return Ok(Vec::new());
         }
         debug_assert!(validate_render_batch_panes(pane_ids).is_ok());
-        self.ensure_connection_usable()?;
+        let usable = self.ensure_connection_usable();
+        self.settle_transport_result(
+            usable,
+            "render batch rejected by poisoned transport",
+            false,
+        )?;
         let depth = max_pipeline_depth.max(1).min(pane_ids.len());
-        self.ensure_outstanding_request_slots(depth)?;
+        let capacity = self
+            .ensure_outstanding_request_slots(depth)
+            .map_err(DirectMuxError::proven_pre_write_rejection);
+        self.settle_transport_result(
+            capacity,
+            "render batch outstanding-request admission failure",
+            false,
+        )?;
         let timeout_ms = duration_to_ms_u64(pipeline_timeout);
         tracing::trace!(
             connection_id = self.connection_id,
@@ -2693,11 +2768,14 @@ impl DirectMuxClient {
         let mut guard = RenderBatchGuard::new(self, pane_ids, depth, false);
         let result = Box::pin(timeout(pipeline_timeout, guard.run(depth))).await;
         match result {
-            Ok(inner) => {
-                inner?;
-                guard.finish()
+            Ok(Ok(())) => guard.finish(),
+            Ok(Err(error)) => guard.fail_finish(error, "render batch execution failure"),
+            Err(_) => {
+                drop(guard);
+                let error = DirectMuxError::BatchTimeout { timeout_ms };
+                self.apply_error_disposition(&error, "render batch timeout", false);
+                Err(error)
             }
-            Err(_) => Err(DirectMuxError::BatchTimeout { timeout_ms }),
         }
     }
 
@@ -2737,10 +2815,23 @@ impl DirectMuxClient {
             return Ok(Vec::new());
         }
         debug_assert!(validate_render_batch_panes(pane_ids).is_ok());
-        self.ensure_connection_usable()?;
-        checkpoint_mux_cx(cx, self.connection_id, "render_batch_wait")?;
+        let usable = self.ensure_connection_usable();
+        self.settle_transport_result(
+            usable,
+            "render batch rejected by poisoned transport",
+            true,
+        )?;
+        let checkpoint = checkpoint_mux_cx(cx, self.connection_id, "render_batch_wait");
+        self.settle_transport_result(checkpoint, "render batch preflight cancellation", true)?;
         let depth = max_pipeline_depth.max(1).min(pane_ids.len());
-        self.ensure_outstanding_request_slots(depth)?;
+        let capacity = self
+            .ensure_outstanding_request_slots(depth)
+            .map_err(DirectMuxError::proven_pre_write_rejection);
+        self.settle_transport_result(
+            capacity,
+            "render batch outstanding-request admission failure",
+            true,
+        )?;
         let timeout_ms = duration_to_ms_u64(pipeline_timeout);
         tracing::trace!(
             connection_id = self.connection_id,
@@ -2758,16 +2849,19 @@ impl DirectMuxClient {
         )
         .await;
         match result {
-            Ok(inner) => {
-                inner?;
-                guard.finish()
+            Ok(Ok(())) => guard.finish(),
+            Ok(Err(error)) => guard.fail_finish(error, "render batch execution failure"),
+            Err(timeout_err) => {
+                drop(guard);
+                let error = classify_cx_timeout(
+                    cx,
+                    "render_batch_in_progress",
+                    timeout_err,
+                    DirectMuxError::BatchTimeout { timeout_ms },
+                );
+                self.apply_error_disposition(&error, "render batch interruption", true);
+                Err(error)
             }
-            Err(timeout_err) => Err(classify_cx_timeout(
-                cx,
-                "render_batch_wait",
-                timeout_err,
-                DirectMuxError::BatchTimeout { timeout_ms },
-            )),
         }
     }
 
@@ -2783,12 +2877,16 @@ impl DirectMuxClient {
         pipeline_timeout: Duration,
     ) -> Result<Vec<Pdu>, DirectMuxError> {
         let timeout_ms = duration_to_ms_u64(pipeline_timeout);
-        Box::pin(timeout(
+        let result = Box::pin(timeout(
             pipeline_timeout,
             self.batch_inner(requests, max_pipeline_depth.max(1)),
         ))
-        .await
-        .map_err(|_| DirectMuxError::BatchTimeout { timeout_ms })?
+        .await;
+        let result = match result {
+            Ok(inner) => inner,
+            Err(_) => Err(DirectMuxError::BatchTimeout { timeout_ms }),
+        };
+        self.settle_transport_result(result, "request batch failure", false)
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`batch`].
@@ -2805,21 +2903,39 @@ impl DirectMuxClient {
         pipeline_timeout: Duration,
     ) -> Result<Vec<Pdu>, DirectMuxError> {
         let timeout_ms = duration_to_ms_u64(pipeline_timeout);
-        checkpoint_mux_cx(cx, self.connection_id, "batch_wait")?;
-        crate::runtime_async::timeout_with_cx(
+        let checkpoint = checkpoint_mux_cx(cx, self.connection_id, "batch_wait");
+        self.settle_transport_result(checkpoint, "request batch preflight cancellation", true)?;
+        let result = crate::runtime_async::timeout_with_cx(
             cx,
             pipeline_timeout,
             self.batch_inner_with_cx(cx, requests, max_pipeline_depth.max(1)),
         )
-        .await
-        .map_err(|timeout_err| {
-            classify_cx_timeout(
+        .await;
+        let result = match result {
+            Ok(inner) => inner,
+            Err(timeout_err) => Err(classify_cx_timeout(
                 cx,
-                "batch_wait",
+                "batch_in_progress",
                 timeout_err,
                 DirectMuxError::BatchTimeout { timeout_ms },
-            )
-        })?
+            )),
+        };
+        self.settle_transport_result(result, "request batch failure", true)
+    }
+
+    fn fail_batch_scope<T>(
+        &mut self,
+        error: DirectMuxError,
+        owns_in_flight: bool,
+        explicit_cx: bool,
+    ) -> Result<T, DirectMuxError> {
+        let error = if owns_in_flight {
+            DirectMuxError::in_flight_scope_abandoned(error)
+        } else {
+            error
+        };
+        self.apply_error_disposition(&error, "request batch failure", explicit_cx);
+        Err(error)
     }
 
     async fn batch_inner(
@@ -2834,7 +2950,8 @@ impl DirectMuxClient {
         for request in &requests {
             self.authorize_outbound_pdu(request)?;
         }
-        self.ensure_outstanding_request_slots(requests.len().min(max_pipeline_depth))?;
+        self.ensure_outstanding_request_slots(requests.len().min(max_pipeline_depth))
+            .map_err(DirectMuxError::proven_pre_write_rejection)?;
 
         tracing::trace!(
             connection_id = self.connection_id,
@@ -2861,8 +2978,15 @@ impl DirectMuxClient {
             let Some((request_idx, request)) = requests.next() else {
                 break;
             };
-            let serial = self.send_request_only(request).await?;
-            in_flight.insert(serial, request_idx)?;
+            let serial = match self.send_request_only(request).await {
+                Ok(serial) => serial,
+                Err(error) => {
+                    return self.fail_batch_scope(error, !in_flight.is_empty(), false);
+                }
+            };
+            if let Err(error) = in_flight.insert(serial, request_idx) {
+                return self.fail_batch_scope(error, true, false);
+            }
         }
 
         while !in_flight.is_empty() {
@@ -2873,10 +2997,23 @@ impl DirectMuxClient {
             }
             if let Some(response_idx) = in_flight.take(decoded.serial) {
                 self.complete_response_serial(decoded.serial)?;
-                responses[response_idx] = Some(Self::response_from_pdu(decoded.pdu)?);
+                let response = match Self::response_from_pdu(decoded.pdu) {
+                    Ok(response) => response,
+                    Err(error) => {
+                        return self.fail_batch_scope(error, !in_flight.is_empty(), false);
+                    }
+                };
+                responses[response_idx] = Some(response);
                 if let Some((request_idx, request)) = requests.next() {
-                    let serial = self.send_request_only(request).await?;
-                    in_flight.insert(serial, request_idx)?;
+                    let serial = match self.send_request_only(request).await {
+                        Ok(serial) => serial,
+                        Err(error) => {
+                            return self.fail_batch_scope(error, !in_flight.is_empty(), false);
+                        }
+                    };
+                    if let Err(error) = in_flight.insert(serial, request_idx) {
+                        return self.fail_batch_scope(error, true, false);
+                    }
                 }
             } else {
                 self.stash_pending_response(decoded.serial, decoded.pdu)?;
@@ -2912,7 +3049,8 @@ impl DirectMuxClient {
         for request in &requests {
             self.authorize_outbound_pdu(request)?;
         }
-        self.ensure_outstanding_request_slots(requests.len().min(max_pipeline_depth))?;
+        self.ensure_outstanding_request_slots(requests.len().min(max_pipeline_depth))
+            .map_err(DirectMuxError::proven_pre_write_rejection)?;
 
         tracing::trace!(
             connection_id = self.connection_id,
@@ -2940,8 +3078,15 @@ impl DirectMuxClient {
             let Some((request_idx, request)) = requests.next() else {
                 break;
             };
-            let serial = self.send_request_only_with_cx(cx, request).await?;
-            in_flight.insert(serial, request_idx)?;
+            let serial = match self.send_request_only_with_cx(cx, request).await {
+                Ok(serial) => serial,
+                Err(error) => {
+                    return self.fail_batch_scope(error, !in_flight.is_empty(), true);
+                }
+            };
+            if let Err(error) = in_flight.insert(serial, request_idx) {
+                return self.fail_batch_scope(error, true, true);
+            }
         }
 
         while !in_flight.is_empty() {
@@ -2952,10 +3097,23 @@ impl DirectMuxClient {
             }
             if let Some(response_idx) = in_flight.take(decoded.serial) {
                 self.complete_response_serial(decoded.serial)?;
-                responses[response_idx] = Some(Self::response_from_pdu(decoded.pdu)?);
+                let response = match Self::response_from_pdu(decoded.pdu) {
+                    Ok(response) => response,
+                    Err(error) => {
+                        return self.fail_batch_scope(error, !in_flight.is_empty(), true);
+                    }
+                };
+                responses[response_idx] = Some(response);
                 if let Some((request_idx, request)) = requests.next() {
-                    let serial = self.send_request_only_with_cx(cx, request).await?;
-                    in_flight.insert(serial, request_idx)?;
+                    let serial = match self.send_request_only_with_cx(cx, request).await {
+                        Ok(serial) => serial,
+                        Err(error) => {
+                            return self.fail_batch_scope(error, !in_flight.is_empty(), true);
+                        }
+                    };
+                    if let Err(error) = in_flight.insert(serial, request_idx) {
+                        return self.fail_batch_scope(error, true, true);
+                    }
                 }
             } else {
                 self.stash_pending_response(decoded.serial, decoded.pdu)?;
@@ -3227,6 +3385,10 @@ impl DirectMuxClient {
         if self.connection_poisoned {
             return;
         }
+        #[cfg(test)]
+        {
+            self.poison_transition_count += 1;
+        }
         let shutdown_error = self.stream.shutdown(std::net::Shutdown::Both).err();
         tracing::warn!(
             connection_id = self.connection_id,
@@ -3256,6 +3418,53 @@ impl DirectMuxClient {
         self.pending_render_changes = PendingRenderChanges::default();
         self.render_change_snapshots = RenderChangeSnapshots::default();
         self.read_buf = StreamingPduBuffer::new();
+    }
+
+    /// Apply the canonical recovery disposition before an operation error
+    /// escapes a live DirectMux transport.
+    ///
+    /// This is deliberately idempotent through [`Self::poison_connection`].
+    /// Nested protocol helpers may each defend their own return boundary, but
+    /// one transport generation makes at most one healthy-to-poisoned
+    /// transition. Reuse-class failures are left completely untouched.
+    fn apply_error_disposition(
+        &mut self,
+        error: &DirectMuxError,
+        reason: &'static str,
+        explicit_cx: bool,
+    ) {
+        if matches!(
+            mux_recovery_decision(error).connection,
+            MuxConnectionDisposition::Discard
+        ) {
+            self.poison_connection(reason, explicit_cx);
+        }
+    }
+
+    fn settle_transport_result<T>(
+        &mut self,
+        result: Result<T, DirectMuxError>,
+        reason: &'static str,
+        explicit_cx: bool,
+    ) -> Result<T, DirectMuxError> {
+        if let Err(error) = &result {
+            self.apply_error_disposition(error, reason, explicit_cx);
+        }
+        result
+    }
+
+    fn unexpected_response<T>(
+        &mut self,
+        expected: impl Into<String>,
+        got: &Pdu,
+        explicit_cx: bool,
+    ) -> Result<T, DirectMuxError> {
+        let error = DirectMuxError::AlignedUnexpectedResponse {
+            expected: expected.into(),
+            got: got.pdu_name().to_string(),
+        };
+        self.apply_error_disposition(&error, "unexpected correlated response", explicit_cx);
+        Err(error)
     }
 
     fn ensure_outstanding_request_slots(&self, additional: usize) -> Result<(), DirectMuxError> {
@@ -3350,10 +3559,20 @@ impl DirectMuxClient {
         pdu: Pdu,
         write_boundary_entered: Option<&mut bool>,
     ) -> Result<u64, DirectMuxError> {
-        self.ensure_connection_usable()?;
-        self.authorize_outbound_pdu(&pdu)?;
-        self.ensure_outstanding_request_capacity()?;
-        let serial = next_request_serial(&mut self.serial)?;
+        let usable = self.ensure_connection_usable();
+        self.settle_transport_result(usable, "request rejected by poisoned transport", false)?;
+        let authorized = self.authorize_outbound_pdu(&pdu);
+        self.settle_transport_result(authorized, "outbound PDU authority rejection", false)?;
+        let capacity = self
+            .ensure_outstanding_request_capacity()
+            .map_err(DirectMuxError::proven_pre_write_rejection);
+        self.settle_transport_result(capacity, "outstanding request admission failure", false)?;
+        let serial_result = next_request_serial(&mut self.serial);
+        let serial = self.settle_transport_result(
+            serial_result,
+            "request serial allocation failure",
+            false,
+        )?;
         let pdu_name = pdu.pdu_name();
         let mut buf = Vec::new();
         tracing::trace!(
@@ -3364,8 +3583,11 @@ impl DirectMuxClient {
             compression_mode = ?self.compression_mode,
             "encoding mux request"
         );
-        pdu.encode_with_mode(&mut buf, serial, self.compression_mode)
-            .map_err(|err| DirectMuxError::Codec(err.to_string()))?;
+        let encoded = pdu
+            .encode_with_mode(&mut buf, serial, self.compression_mode)
+            .map_err(|err| DirectMuxError::Codec(err.to_string()))
+            .map_err(DirectMuxError::proven_pre_write_rejection);
+        self.settle_transport_result(encoded, "outbound PDU encoding failure", false)?;
         let encoded_len = buf.len();
         if let Some(write_boundary_entered) = write_boundary_entered {
             *write_boundary_entered = true;
@@ -3391,7 +3613,9 @@ impl DirectMuxClient {
                     error = %err,
                     "mux request write failed"
                 );
-                return Err(DirectMuxError::Io(err));
+                let error = DirectMuxError::Io(err);
+                self.apply_error_disposition(&error, "request write I/O failure", false);
+                return Err(error);
             }
             Err(_) => {
                 tracing::warn!(
@@ -3403,10 +3627,17 @@ impl DirectMuxClient {
                     phase = "write_timeout",
                     "mux request write timed out"
                 );
-                return Err(DirectMuxError::WriteTimeout);
+                let error = DirectMuxError::WriteTimeout;
+                self.apply_error_disposition(&error, "request write timeout", false);
+                return Err(error);
             }
         }
-        self.mark_request_outstanding(serial)?;
+        let tracked = self.mark_request_outstanding(serial);
+        self.settle_transport_result(
+            tracked,
+            "post-write request correlation accounting failure",
+            false,
+        )?;
         Ok(serial)
     }
 
@@ -3425,11 +3656,26 @@ impl DirectMuxClient {
         pdu: Pdu,
         write_boundary_entered: Option<&mut bool>,
     ) -> Result<u64, DirectMuxError> {
-        self.ensure_connection_usable()?;
-        self.authorize_outbound_pdu(&pdu)?;
-        checkpoint_mux_cx(cx, self.connection_id, "request_start")?;
-        self.ensure_outstanding_request_capacity()?;
-        let serial = next_request_serial(&mut self.serial)?;
+        let usable = self.ensure_connection_usable();
+        self.settle_transport_result(
+            usable,
+            "request rejected by poisoned transport",
+            true,
+        )?;
+        let authorized = self.authorize_outbound_pdu(&pdu);
+        self.settle_transport_result(authorized, "outbound PDU authority rejection", true)?;
+        let checkpoint = checkpoint_mux_cx(cx, self.connection_id, "request_start");
+        self.settle_transport_result(checkpoint, "request-start cancellation", true)?;
+        let capacity = self
+            .ensure_outstanding_request_capacity()
+            .map_err(DirectMuxError::proven_pre_write_rejection);
+        self.settle_transport_result(capacity, "outstanding request admission failure", true)?;
+        let serial_result = next_request_serial(&mut self.serial);
+        let serial = self.settle_transport_result(
+            serial_result,
+            "request serial allocation failure",
+            true,
+        )?;
         let pdu_name = pdu.pdu_name();
         let mut buf = Vec::new();
         tracing::trace!(
@@ -3441,10 +3687,14 @@ impl DirectMuxClient {
             compression_mode = ?self.compression_mode,
             "encoding mux request"
         );
-        pdu.encode_with_mode(&mut buf, serial, self.compression_mode)
-            .map_err(|err| DirectMuxError::Codec(err.to_string()))?;
+        let encoded = pdu
+            .encode_with_mode(&mut buf, serial, self.compression_mode)
+            .map_err(|err| DirectMuxError::Codec(err.to_string()))
+            .map_err(DirectMuxError::proven_pre_write_rejection);
+        self.settle_transport_result(encoded, "outbound PDU encoding failure", true)?;
         let encoded_len = buf.len();
-        checkpoint_mux_cx(cx, self.connection_id, "request_write_wait")?;
+        let checkpoint = checkpoint_mux_cx(cx, self.connection_id, "request_write_wait");
+        self.settle_transport_result(checkpoint, "pre-write cancellation", true)?;
         if let Some(write_boundary_entered) = write_boundary_entered {
             *write_boundary_entered = true;
         }
@@ -3483,7 +3733,9 @@ impl DirectMuxClient {
                     error = %err,
                     "mux request write failed"
                 );
-                return Err(DirectMuxError::Io(err));
+                let error = DirectMuxError::Io(err);
+                self.apply_error_disposition(&error, "request write I/O failure", true);
+                return Err(error);
             }
             Err(timeout_err) => {
                 tracing::warn!(
@@ -3496,21 +3748,39 @@ impl DirectMuxClient {
                     phase = "write_timeout",
                     "mux request write timed out"
                 );
-                return Err(classify_cx_timeout(
+                let error = classify_cx_timeout(
                     cx,
-                    "request_write_wait",
+                    "request_write_in_progress",
                     timeout_err,
                     DirectMuxError::WriteTimeout,
-                ));
+                );
+                self.apply_error_disposition(&error, "request write interruption", true);
+                return Err(error);
             }
         }
-        self.mark_request_outstanding(serial)?;
+        let tracked = self.mark_request_outstanding(serial);
+        self.settle_transport_result(
+            tracked,
+            "post-write request correlation accounting failure",
+            true,
+        )?;
         Ok(serial)
     }
 
     async fn await_response(&mut self, serial: u64) -> Result<Pdu, DirectMuxError> {
-        self.validate_response_serial(serial)?;
-        if let Some(pending) = self.take_pending_response(serial)? {
+        let correlated = self.validate_response_serial(serial);
+        self.settle_transport_result(
+            correlated,
+            "response waiter correlation violation",
+            false,
+        )?;
+        let pending = self.take_pending_response(serial);
+        let pending = self.settle_transport_result(
+            pending,
+            "pending response retention failure",
+            false,
+        )?;
+        if let Some(pending) = pending {
             tracing::trace!(
                 connection_id = self.connection_id,
                 request_serial = serial,
@@ -3522,11 +3792,21 @@ impl DirectMuxClient {
         loop {
             let decoded = self.read_next_pdu().await?;
             if decoded.serial == serial {
-                self.complete_response_serial(serial)?;
+                let completed = self.complete_response_serial(serial);
+                self.settle_transport_result(
+                    completed,
+                    "response completion accounting failure",
+                    false,
+                )?;
                 return Self::response_from_pdu(decoded.pdu);
             }
             if decoded.serial == 0 {
-                self.stash_unilateral_pdu(decoded.pdu)?;
+                let stashed = self.stash_unilateral_pdu(decoded.pdu);
+                self.settle_transport_result(
+                    stashed,
+                    "unilateral PDU retention failure",
+                    false,
+                )?;
                 continue;
             }
             tracing::trace!(
@@ -3536,7 +3816,12 @@ impl DirectMuxClient {
                 phase = "response_out_of_order",
                 "stashing out-of-order mux response"
             );
-            self.stash_pending_response(decoded.serial, decoded.pdu)?;
+            let stashed = self.stash_pending_response(decoded.serial, decoded.pdu);
+            self.settle_transport_result(
+                stashed,
+                "out-of-order response retention failure",
+                false,
+            )?;
         }
     }
 
@@ -3545,8 +3830,19 @@ impl DirectMuxClient {
         cx: &Cx,
         serial: u64,
     ) -> Result<Pdu, DirectMuxError> {
-        self.validate_response_serial(serial)?;
-        if let Some(pending) = self.take_pending_response(serial)? {
+        let correlated = self.validate_response_serial(serial);
+        self.settle_transport_result(
+            correlated,
+            "response waiter correlation violation",
+            true,
+        )?;
+        let pending = self.take_pending_response(serial);
+        let pending = self.settle_transport_result(
+            pending,
+            "pending response retention failure",
+            true,
+        )?;
+        if let Some(pending) = pending {
             tracing::trace!(
                 connection_id = self.connection_id,
                 request_serial = serial,
@@ -3559,11 +3855,21 @@ impl DirectMuxClient {
         loop {
             let decoded = self.read_next_pdu_with_cx(cx).await?;
             if decoded.serial == serial {
-                self.complete_response_serial(serial)?;
+                let completed = self.complete_response_serial(serial);
+                self.settle_transport_result(
+                    completed,
+                    "response completion accounting failure",
+                    true,
+                )?;
                 return Self::response_from_pdu(decoded.pdu);
             }
             if decoded.serial == 0 {
-                self.stash_unilateral_pdu(decoded.pdu)?;
+                let stashed = self.stash_unilateral_pdu(decoded.pdu);
+                self.settle_transport_result(
+                    stashed,
+                    "unilateral PDU retention failure",
+                    true,
+                )?;
                 continue;
             }
             tracing::trace!(
@@ -3574,7 +3880,12 @@ impl DirectMuxClient {
                 phase = "response_out_of_order",
                 "stashing out-of-order mux response"
             );
-            self.stash_pending_response(decoded.serial, decoded.pdu)?;
+            let stashed = self.stash_pending_response(decoded.serial, decoded.pdu);
+            self.settle_transport_result(
+                stashed,
+                "out-of-order response retention failure",
+                true,
+            )?;
         }
     }
 
@@ -3611,21 +3922,11 @@ impl DirectMuxClient {
                 return Err(error);
             }
         };
-        if matches!(
-            &result,
-            Err(
-                DirectMuxError::RetentionLimitExceeded { .. }
-                    | DirectMuxError::Codec(_)
-                    | DirectMuxError::RetainedConnectionMismatch { .. }
-                    | DirectMuxError::RetainedStateAccounting { .. }
-            )
-        ) {
-            self.poison_connection(
-                "single render response retention failure",
-                explicit_cx,
-            );
-        }
-        result
+        self.settle_transport_result(
+            result,
+            "single render response settlement failure",
+            explicit_cx,
+        )
     }
 
     fn resolve_render_change_response(
@@ -3666,7 +3967,7 @@ impl DirectMuxClient {
                 }
                 if payload.pane_id as u64 != pane_id {
                     self.invalidate_render_state_for_pane(pane_id)?;
-                    return Err(DirectMuxError::UnexpectedResponse {
+                    return Err(DirectMuxError::AlignedUnexpectedResponse {
                         expected: format!("GetPaneRenderChangesResponse for pane {pane_id}"),
                         got: format!(
                             "GetPaneRenderChangesResponse for pane {}",
@@ -3680,7 +3981,7 @@ impl DirectMuxClient {
             Pdu::LivenessResponse(liveness) => {
                 if liveness.pane_id as u64 != pane_id {
                     self.invalidate_render_state_for_pane(pane_id)?;
-                    return Err(DirectMuxError::UnexpectedResponse {
+                    return Err(DirectMuxError::AlignedUnexpectedResponse {
                         expected: format!("LivenessResponse for pane {pane_id}"),
                         got: format!("LivenessResponse for pane {}", liveness.pane_id),
                     });
@@ -3718,7 +4019,7 @@ impl DirectMuxClient {
                     return Ok(payload);
                 }
                 self.invalidate_render_state_for_pane(pane_id)?;
-                Err(DirectMuxError::UnexpectedResponse {
+                Err(DirectMuxError::AlignedUnexpectedResponse {
                     expected: format!(
                         "GetPaneRenderChangesResponse or cached render snapshot for pane {pane_id}"
                     ),
@@ -3727,7 +4028,7 @@ impl DirectMuxClient {
             }
             other => {
                 self.invalidate_render_state_for_pane(pane_id)?;
-                Err(DirectMuxError::UnexpectedResponse {
+                Err(DirectMuxError::AlignedUnexpectedResponse {
                     expected: "LivenessResponse or GetPaneRenderChangesResponse".to_string(),
                     got: other.pdu_name().to_string(),
                 })
@@ -4022,17 +4323,31 @@ impl DirectMuxClient {
         &mut self,
     ) -> Result<codec::DecodedPduWithRetentionMetadata, DirectMuxError> {
         loop {
-            if let Some(decoded) = decode_from_buffer_with_retention_metadata(
+            let decoded_result = decode_from_buffer_with_retention_metadata(
                 &mut self.read_buf,
                 self.config.max_frame_bytes,
-            )?
-            {
+            );
+            let decoded_result = self.settle_transport_result(
+                decoded_result,
+                "inbound frame decode failure",
+                false,
+            )?;
+            if let Some(decoded) = decoded_result {
                 let decoded_ref = decoded.decoded();
                 if let Err(error) = self.authorize_inbound_pdu(decoded_ref) {
-                    self.poison_connection("inbound PDU authority violation", false);
+                    self.apply_error_disposition(
+                        &error,
+                        "inbound PDU authority violation",
+                        false,
+                    );
                     return Err(error);
                 }
-                self.validate_response_serial(decoded_ref.serial)?;
+                let correlated = self.validate_response_serial(decoded_ref.serial);
+                self.settle_transport_result(
+                    correlated,
+                    "inbound response correlation violation",
+                    false,
+                )?;
                 tracing::trace!(
                     connection_id = self.connection_id,
                     response_serial = decoded_ref.serial,
@@ -4058,7 +4373,9 @@ impl DirectMuxClient {
                         error = %err,
                         "mux response read failed"
                     );
-                    return Err(DirectMuxError::Io(err));
+                    let error = DirectMuxError::Io(err);
+                    self.apply_error_disposition(&error, "response read I/O failure", false);
+                    return Err(error);
                 }
                 Err(_) => {
                     tracing::warn!(
@@ -4067,7 +4384,9 @@ impl DirectMuxClient {
                         phase = "read_timeout",
                         "mux response read timed out"
                     );
-                    return Err(DirectMuxError::ReadTimeout);
+                    let error = DirectMuxError::ReadTimeout;
+                    self.apply_error_disposition(&error, "response read timeout", false);
+                    return Err(error);
                 }
             };
             if read == 0 {
@@ -4076,7 +4395,9 @@ impl DirectMuxClient {
                     phase = "read_eof",
                     "mux socket disconnected during response read"
                 );
-                return Err(DirectMuxError::Disconnected);
+                let error = DirectMuxError::Disconnected;
+                self.apply_error_disposition(&error, "response read EOF", false);
+                return Err(error);
             }
             self.read_buf.extend_from_slice(&temp[..read]);
         }
@@ -4093,17 +4414,31 @@ impl DirectMuxClient {
         cx: &Cx,
     ) -> Result<codec::DecodedPduWithRetentionMetadata, DirectMuxError> {
         loop {
-            if let Some(decoded) = decode_from_buffer_with_retention_metadata(
+            let decoded_result = decode_from_buffer_with_retention_metadata(
                 &mut self.read_buf,
                 self.config.max_frame_bytes,
-            )?
-            {
+            );
+            let decoded_result = self.settle_transport_result(
+                decoded_result,
+                "inbound frame decode failure",
+                true,
+            )?;
+            if let Some(decoded) = decoded_result {
                 let decoded_ref = decoded.decoded();
                 if let Err(error) = self.authorize_inbound_pdu(decoded_ref) {
-                    self.poison_connection("inbound PDU authority violation", true);
+                    self.apply_error_disposition(
+                        &error,
+                        "inbound PDU authority violation",
+                        true,
+                    );
                     return Err(error);
                 }
-                self.validate_response_serial(decoded_ref.serial)?;
+                let correlated = self.validate_response_serial(decoded_ref.serial);
+                self.settle_transport_result(
+                    correlated,
+                    "inbound response correlation violation",
+                    true,
+                )?;
                 tracing::trace!(
                     connection_id = self.connection_id,
                     response_serial = decoded_ref.serial,
@@ -4115,7 +4450,8 @@ impl DirectMuxClient {
                 return Ok(decoded);
             }
 
-            checkpoint_mux_cx(cx, self.connection_id, "response_read_wait")?;
+            let checkpoint = checkpoint_mux_cx(cx, self.connection_id, "response_read_wait");
+            self.settle_transport_result(checkpoint, "response read cancellation", true)?;
             let mut temp = vec![0u8; 4096];
             let read = match crate::runtime_async::timeout_with_cx(
                 cx,
@@ -4133,11 +4469,13 @@ impl DirectMuxClient {
                         error = %err,
                         "mux response read failed"
                     );
-                    return Err(if cx.is_cancel_requested() {
+                    let error = if cx.is_cancel_requested() {
                         cancelled_mux_error("response_read_wait", err)
                     } else {
                         DirectMuxError::Io(err)
-                    });
+                    };
+                    self.apply_error_disposition(&error, "response read interruption", true);
+                    return Err(error);
                 }
                 Err(timeout_err) => {
                     tracing::warn!(
@@ -4147,12 +4485,14 @@ impl DirectMuxClient {
                         phase = "read_timeout",
                         "mux response read timed out"
                     );
-                    return Err(classify_cx_timeout(
+                    let error = classify_cx_timeout(
                         cx,
                         "response_read_wait",
                         timeout_err,
                         DirectMuxError::ReadTimeout,
-                    ));
+                    );
+                    self.apply_error_disposition(&error, "response read timeout", true);
+                    return Err(error);
                 }
             };
             if read == 0 {
@@ -4162,7 +4502,9 @@ impl DirectMuxClient {
                     phase = "read_eof",
                     "mux socket disconnected during response read"
                 );
-                return Err(DirectMuxError::Disconnected);
+                let error = DirectMuxError::Disconnected;
+                self.apply_error_disposition(&error, "response read EOF", true);
+                return Err(error);
             }
             self.read_buf.extend_from_slice(&temp[..read]);
         }
@@ -5171,7 +5513,12 @@ mod tests {
     }
 
     fn assert_cancelled_mux_error(err: &DirectMuxError) {
-        match err {
+        assert!(err.is_cancelled(), "typed cancellation bit must be retained");
+        let source = match err {
+            DirectMuxError::InFlightScopeAbandoned(source) => source.as_ref(),
+            other => other,
+        };
+        match source {
             DirectMuxError::Cancelled { phase, detail } => {
                 assert!(!phase.is_empty(), "cancelled mux phase must be retained");
                 assert!(!detail.is_empty(), "cancelled mux detail must be retained");
@@ -5717,7 +6064,7 @@ mod tests {
     }
 
     #[test]
-    fn send_request_only_with_precancelled_cx_fails_before_writing_frame() {
+    fn proven_prewrite_rejections_preserve_alignment_for_next_request() {
         run_async_test(async {
             let cx = crate::cx::for_testing();
             let cancelled_cx = cancelled_test_cx("pre-cancelled request write");
@@ -5784,6 +6131,13 @@ mod tests {
                             }
                             Pdu::ListPanes(_) => {
                                 post_handshake_requests += 1;
+                                write_response_pdu(
+                                    &mut stream,
+                                    &empty_list_panes_response(),
+                                    decoded.serial,
+                                )
+                                .await
+                                .expect("write list panes response");
                             }
                             _ => {}
                         }
@@ -5801,17 +6155,63 @@ mod tests {
                 .recv_timeout(Duration::from_secs(2))
                 .expect("server should complete handshake");
 
+            let original_limit = client.config.max_outstanding_requests;
+            client.config.max_outstanding_requests = 0;
+            let admission_error = client
+                .send_request_only(Pdu::ListPanes(ListPanes {}))
+                .await
+                .expect_err("local admission limit should reject before sending");
+            assert!(matches!(
+                &admission_error,
+                DirectMuxError::ProvenPreWriteRejection(source)
+                    if matches!(
+                        source.as_ref(),
+                        DirectMuxError::RetentionLimitExceeded {
+                            resource: "outstanding mux requests",
+                            ..
+                        }
+                    )
+            ));
+            assert!(!client.connection_poisoned);
+            assert_eq!(client.poison_transition_count, 0);
+            client.config.max_outstanding_requests = original_limit;
+
             let err = client
                 .send_request_only_with_cx(&cancelled_cx, Pdu::ListPanes(ListPanes {}))
                 .await
                 .expect_err("pre-cancelled request write should fail before sending");
             assert_cancelled_mux_error(&err);
+            assert!(!client.connection_poisoned);
+            assert_eq!(client.poison_transition_count, 0);
+
+            let panes = client
+                .list_panes()
+                .await
+                .expect("aligned client should serve a valid request after local rejections");
+            assert!(panes.tabs.is_empty());
+
+            client.outstanding_requests.insert(9_001);
+            let mid_batch_error = client
+                .fail_batch_scope::<()>(
+                    cancelled_mux_error("request_write_wait", "later batch admission cancelled"),
+                    true,
+                    true,
+                )
+                .expect_err("a pre-write rejection cannot reuse across earlier in-flight work");
+            assert_cancelled_mux_error(&mid_batch_error);
+            assert!(matches!(
+                mid_batch_error.recovery_decision().connection,
+                MuxConnectionDisposition::Discard
+            ));
+            assert!(client.connection_poisoned);
+            assert_eq!(client.poison_transition_count, 1);
+            assert!(client.outstanding_requests.is_empty());
 
             drop(client);
             assert_eq!(
                 server.await.expect("server task"),
-                0,
-                "pre-cancelled request should not emit a post-handshake request frame"
+                1,
+                "only the valid request after both rejections may reach the wire"
             );
         });
     }
@@ -5905,6 +6305,8 @@ mod tests {
                 .await
                 .expect_err("pre-cancelled response read should fail before blocking read");
             assert_cancelled_mux_error(&err);
+            assert!(client.connection_poisoned);
+            assert_eq!(client.poison_transition_count, 1);
 
             drop(client);
             assert_eq!(
@@ -5976,10 +6378,12 @@ mod tests {
                 .expect_err("get_lines should reject wrong response type");
             assert!(matches!(
                 &err,
-                DirectMuxError::UnexpectedResponse { expected, got }
+                DirectMuxError::AlignedUnexpectedResponse { expected, got }
                     if expected == "GetLinesResponse" && got == "UnitResponse"
             ));
             assert_eq!(err.protocol_error_kind(), ProtocolErrorKind::Recoverable);
+            assert!(!client.connection_poisoned);
+            assert_eq!(client.poison_transition_count, 0);
 
             drop(client);
             server.await.expect("server task");
@@ -6231,7 +6635,7 @@ mod tests {
                 .expect_err("reused pane ID must not inherit the removed pane snapshot");
             assert!(matches!(
                 stale_cache_error,
-                DirectMuxError::UnexpectedResponse { .. }
+                DirectMuxError::AlignedUnexpectedResponse { .. }
             ));
 
             let replacement = client
@@ -6267,7 +6671,7 @@ mod tests {
                 .expect_err("wrong-pane liveness must fail closed");
             assert!(matches!(
                 wrong_liveness,
-                DirectMuxError::UnexpectedResponse { .. }
+                DirectMuxError::AlignedUnexpectedResponse { .. }
             ));
             assert!(!client.render_change_snapshots.contains_key(&27));
             assert!(client.pending_render_changes.is_empty());
@@ -6338,7 +6742,7 @@ mod tests {
                 .expect_err("legacy correlated payload must retain pane identity");
             assert!(matches!(
                 legacy_mismatch,
-                DirectMuxError::UnexpectedResponse { .. }
+                DirectMuxError::AlignedUnexpectedResponse { .. }
             ));
             assert!(!client.render_change_snapshots.contains_key(&27));
             assert!(!client.render_change_snapshots.contains_key(&99));
@@ -6366,7 +6770,7 @@ mod tests {
                 .expect("stage a second target before batch-level error cleanup");
             let batch_targets = [27, 28];
             let mut guard = RenderBatchGuard::new(&mut client, &batch_targets, 2, false);
-            guard.first_error = Some(DirectMuxError::UnexpectedResponse {
+            guard.first_error = Some(DirectMuxError::AlignedUnexpectedResponse {
                 expected: "valid render batch correlation".to_string(),
                 got: "synthetic correlated mismatch".to_string(),
             });
@@ -6375,7 +6779,7 @@ mod tests {
                 .expect_err("failed batches must clean every target pane");
             assert!(matches!(
                 batch_error,
-                DirectMuxError::UnexpectedResponse { .. }
+                DirectMuxError::AlignedUnexpectedResponse { .. }
             ));
             assert!(client.pending_render_changes.is_empty());
             assert_eq!(client.pending_render_changes.retained_bytes(), 0);
@@ -6462,6 +6866,36 @@ mod tests {
             assert_eq!(client.serial, serial_before_cancel);
             assert!(client.outstanding_requests.is_empty());
             assert!(!client.connection_poisoned);
+            assert_eq!(client.poison_transition_count, 0);
+
+            client.outstanding_requests.insert(9_002);
+            let ambiguous_targets = [27];
+            let mut ambiguous_guard =
+                RenderBatchGuard::new(&mut client, &ambiguous_targets, 1, true);
+            ambiguous_guard
+                .in_flight
+                .insert(9_002, 0)
+                .expect("stage synthetic in-flight render request");
+            assert!(ambiguous_guard.in_flight_panes.insert(27));
+            ambiguous_guard.transport_ambiguous = true;
+            let mid_batch_error = ambiguous_guard
+                .fail_finish::<()>(
+                    cancelled_mux_error(
+                        "request_write_wait",
+                        "later render admission cancelled",
+                    ),
+                    "synthetic mid-batch pre-write cancellation",
+                )
+                .expect_err("earlier in-flight render work must override local reuse");
+            assert_cancelled_mux_error(&mid_batch_error);
+            assert!(matches!(
+                mid_batch_error.recovery_decision().connection,
+                MuxConnectionDisposition::Discard
+            ));
+            drop(ambiguous_guard);
+            assert!(client.connection_poisoned);
+            assert_eq!(client.poison_transition_count, 1);
+            assert!(client.outstanding_requests.is_empty());
 
             drop(client);
             server.await.expect("server task");
@@ -6547,7 +6981,7 @@ mod tests {
                 .expect_err("render changes with cx should reject wrong response type");
             assert!(matches!(
                 &render_err,
-                DirectMuxError::UnexpectedResponse { expected, got }
+                DirectMuxError::AlignedUnexpectedResponse { expected, got }
                     if expected == "LivenessResponse or GetPaneRenderChangesResponse" && got == "UnitResponse"
             ));
             assert_eq!(
@@ -6561,7 +6995,7 @@ mod tests {
                 .expect_err("get_lines_with_cx should reject wrong response type");
             assert!(matches!(
                 &lines_err,
-                DirectMuxError::UnexpectedResponse { expected, got }
+                DirectMuxError::AlignedUnexpectedResponse { expected, got }
                     if expected == "GetLinesResponse" && got == "UnitResponse"
             ));
             assert_eq!(
@@ -6575,7 +7009,7 @@ mod tests {
                 .expect_err("write_to_pane_with_cx should reject wrong response type");
             assert!(matches!(
                 &write_err,
-                DirectMuxError::UnexpectedResponse { expected, got }
+                DirectMuxError::AlignedUnexpectedResponse { expected, got }
                     if expected == "UnitResponse" && got == "ListPanesResponse"
             ));
             assert_eq!(
@@ -6589,13 +7023,15 @@ mod tests {
                 .expect_err("send_paste_with_cx should reject wrong response type");
             assert!(matches!(
                 &paste_err,
-                DirectMuxError::UnexpectedResponse { expected, got }
+                DirectMuxError::AlignedUnexpectedResponse { expected, got }
                     if expected == "UnitResponse" && got == "ListPanesResponse"
             ));
             assert_eq!(
                 paste_err.protocol_error_kind(),
                 ProtocolErrorKind::Recoverable
             );
+            assert!(!client.connection_poisoned);
+            assert_eq!(client.poison_transition_count, 0);
 
             drop(client);
             server.await.expect("server task");
@@ -7243,7 +7679,7 @@ mod tests {
                     assert!(matches!(error, DirectMuxError::RemoteError(_)), "{case:?}");
                 } else {
                     assert!(
-                        matches!(error, DirectMuxError::UnexpectedResponse { .. }),
+                        matches!(error, DirectMuxError::AlignedUnexpectedResponse { .. }),
                         "{case:?}"
                     );
                 }
@@ -7282,6 +7718,7 @@ mod tests {
                 assert!(client.render_change_snapshots.is_empty(), "{case:?}");
                 assert_eq!(client.render_change_snapshots.retained_bytes(), 0, "{case:?}");
                 assert!(!client.connection_poisoned, "{case:?}");
+                assert_eq!(client.poison_transition_count, 0, "{case:?}");
 
                 let reused = client
                     .get_pane_render_changes(77)
@@ -7688,6 +8125,7 @@ mod tests {
                 } if requested_bytes == aggregate_bytes && max_bytes == byte_limit
             ));
             assert!(client.connection_poisoned);
+            assert_eq!(client.poison_transition_count, 1);
             assert!(client.outstanding_requests.is_empty());
             assert!(client.pending_render_changes.is_empty());
             assert_eq!(client.pending_render_changes.retained_bytes(), 0);
@@ -8162,7 +8600,7 @@ mod tests {
                     }
                     _ => {
                         assert!(
-                            matches!(error, DirectMuxError::UnexpectedResponse { .. }),
+                            matches!(error, DirectMuxError::AlignedUnexpectedResponse { .. }),
                             "{case:?}"
                         );
                     }
@@ -8208,6 +8646,7 @@ mod tests {
                     "{case:?}"
                 );
                 assert!(!client.connection_poisoned, "{case:?}");
+                assert_eq!(client.poison_transition_count, 0, "{case:?}");
 
                 let preserved_response = client
                     .await_response(unrelated_response_serial)
@@ -8433,6 +8872,7 @@ mod tests {
             drop(guard);
 
             assert!(!client.connection_poisoned);
+            assert_eq!(client.poison_transition_count, 0);
             assert!(client.outstanding_requests.is_empty());
             assert!(!client.render_change_snapshots.contains_key(&11));
             let reuse_cx = crate::cx::for_testing();
@@ -8531,6 +8971,7 @@ mod tests {
                 }
             ));
             assert!(client.connection_poisoned);
+            assert_eq!(client.poison_transition_count, 1);
             assert!(client.outstanding_requests.is_empty());
             assert!(client.render_change_snapshots.is_empty());
             assert_eq!(client.render_change_snapshots.retained_bytes(), 0);
@@ -10014,6 +10455,7 @@ mod tests {
                 .expect_err("batch with cx should surface cancellation");
             assert_cancelled_mux_error(&err);
             assert!(client.connection_poisoned);
+            assert_eq!(client.poison_transition_count, 1);
             assert!(client.outstanding_requests.is_empty());
             assert!(client.pending_responses.is_empty());
             assert_eq!(client.pending_response_bytes, 0);
@@ -10930,22 +11372,29 @@ mod tests {
     }
 
     #[test]
-    fn explicit_mux_cancellation_preserves_all_recovery_axes() {
-        let err = cancelled_mux_error("request_write_wait", "test cancel");
-        assert!(matches!(
-            &err,
-            DirectMuxError::Cancelled { phase, detail }
-                if *phase == "request_write_wait" && detail == "test cancel"
-        ));
-        assert!(err.is_cancelled());
-        assert_eq!(err.protocol_error_kind(), ProtocolErrorKind::Transient);
-        let decision = err.recovery_decision();
-        assert!(!decision.retry);
-        assert!(decision.cancelled);
-        assert!(matches!(
-            decision.connection,
-            MuxConnectionDisposition::Discard
-        ));
+    fn explicit_mux_cancellation_distinguishes_prewrite_and_in_progress_axes() {
+        for (phase, expected_connection) in [
+            ("request_write_wait", MuxConnectionDisposition::Reuse),
+            (
+                "request_write_in_progress",
+                MuxConnectionDisposition::Discard,
+            ),
+        ] {
+            let err = cancelled_mux_error(phase, "test cancel");
+            assert!(matches!(
+                &err,
+                DirectMuxError::Cancelled {
+                    phase: actual_phase,
+                    detail,
+                } if *actual_phase == phase && detail == "test cancel"
+            ));
+            assert!(err.is_cancelled());
+            assert_eq!(err.protocol_error_kind(), ProtocolErrorKind::Transient);
+            let decision = err.recovery_decision();
+            assert!(!decision.retry);
+            assert!(decision.cancelled);
+            assert_eq!(decision.connection, expected_connection);
+        }
     }
 
     #[test]
@@ -11401,6 +11850,8 @@ mod tests {
                 .await
                 .expect_err("list_panes_with_cx should surface cancellation");
             assert_cancelled_mux_error(&err);
+            assert!(client.connection_poisoned);
+            assert_eq!(client.poison_transition_count, 1);
 
             drop(client);
             cancel.join().expect("cancel thread");
@@ -11485,6 +11936,10 @@ mod tests {
                 .await
                 .expect_err("send_paste should time out when peer stops reading");
             assert!(matches!(err, DirectMuxError::WriteTimeout));
+            assert!(client.connection_poisoned);
+            assert_eq!(client.poison_transition_count, 1);
+            client.poison_connection("idempotent poison test", false);
+            assert_eq!(client.poison_transition_count, 1);
 
             drop(client);
             server.join().expect("server thread");
@@ -11572,6 +12027,8 @@ mod tests {
                 .await
                 .expect_err("send_paste_with_cx should time out when peer stops reading");
             assert!(matches!(err, DirectMuxError::WriteTimeout));
+            assert!(client.connection_poisoned);
+            assert_eq!(client.poison_transition_count, 1);
 
             drop(client);
             server.join().expect("server thread");
@@ -11662,6 +12119,8 @@ mod tests {
                 .await
                 .expect_err("send_paste_with_cx should surface cancellation");
             assert_cancelled_mux_error(&err);
+            assert!(client.connection_poisoned);
+            assert_eq!(client.poison_transition_count, 1);
 
             drop(client);
             cancel.join().expect("cancel thread");
@@ -11744,6 +12203,8 @@ mod tests {
                 .await
                 .expect_err("list_panes should time out when server stalls");
             assert!(matches!(err, DirectMuxError::ReadTimeout));
+            assert!(client.connection_poisoned);
+            assert_eq!(client.poison_transition_count, 1);
 
             drop(client);
             server.join().expect("server thread");
@@ -11828,6 +12289,8 @@ mod tests {
                 .await
                 .expect_err("list_panes_with_cx should time out when server stalls");
             assert!(matches!(err, DirectMuxError::ReadTimeout));
+            assert!(client.connection_poisoned);
+            assert_eq!(client.poison_transition_count, 1);
 
             drop(client);
             server.join().expect("server thread");
@@ -11909,6 +12372,8 @@ mod tests {
                 .await
                 .expect_err("list_panes should fail when server closes without responding");
             assert!(matches!(err, DirectMuxError::Disconnected));
+            assert!(client.connection_poisoned);
+            assert_eq!(client.poison_transition_count, 1);
 
             drop(client);
             server.join().expect("server thread");
@@ -11995,6 +12460,8 @@ mod tests {
                 .await
                 .expect_err("list_panes_with_cx should fail when server closes without responding");
             assert!(matches!(err, DirectMuxError::Disconnected));
+            assert!(client.connection_poisoned);
+            assert_eq!(client.poison_transition_count, 1);
 
             drop(client);
             server.join().expect("server thread");
@@ -12097,6 +12564,8 @@ mod tests {
                 .await
                 .expect("list_panes should succeed with split response frame");
             assert!(panes.tabs.is_empty());
+            assert!(!client.connection_poisoned);
+            assert_eq!(client.poison_transition_count, 0);
 
             drop(client);
             server.join().expect("server thread");
@@ -12233,6 +12702,8 @@ mod tests {
             assert_eq!(render.pane_id, 12);
             assert_eq!(render.seqno, 7);
             assert_eq!(render.dimensions.cols, 80);
+            assert!(!client.connection_poisoned);
+            assert_eq!(client.poison_transition_count, 0);
 
             drop(client);
             server.join().expect("server thread");
@@ -12339,6 +12810,8 @@ mod tests {
                 .await
                 .expect("list_panes_with_cx should succeed with split response frame");
             assert!(panes.tabs.is_empty());
+            assert!(!client.connection_poisoned);
+            assert_eq!(client.poison_transition_count, 0);
 
             drop(client);
             server.join().expect("server thread");
@@ -12481,6 +12954,8 @@ mod tests {
             assert_eq!(render.pane_id, 27);
             assert_eq!(render.seqno, 9);
             assert_eq!(render.dimensions.viewport_rows, 24);
+            assert!(!client.connection_poisoned);
+            assert_eq!(client.poison_transition_count, 0);
 
             drop(client);
             server.join().expect("server thread");
@@ -12599,6 +13074,8 @@ mod tests {
                 DirectMuxError::FrameTooLarge { max_bytes } if max_bytes == max_frame_bytes
             ));
             assert_eq!(err.protocol_error_kind(), ProtocolErrorKind::Recoverable);
+            assert!(client.connection_poisoned);
+            assert_eq!(client.poison_transition_count, 1);
 
             drop(client);
             server.join().expect("server thread");
@@ -12721,6 +13198,8 @@ mod tests {
                 DirectMuxError::FrameTooLarge { max_bytes } if max_bytes == max_frame_bytes
             ));
             assert_eq!(err.protocol_error_kind(), ProtocolErrorKind::Recoverable);
+            assert!(client.connection_poisoned);
+            assert_eq!(client.poison_transition_count, 1);
 
             drop(client);
             server.join().expect("server thread");
