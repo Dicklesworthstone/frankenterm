@@ -32,7 +32,8 @@ use crate::recording::{
     EgressEvent, EgressTap, GlobalSequence, IngressEvent, IngressOutcome, IngressTap,
     RECORDER_EVENT_SCHEMA_VERSION_V1, RecorderControlMarkerType, RecorderEvent,
     RecorderEventCausality, RecorderEventPayload, RecorderEventSource, RecorderLifecyclePhase,
-    RecorderRedactionLevel, RecorderTextEncoding, captured_kind_to_segment, epoch_ms_now,
+    RecorderRedactionLevel, RecorderTextEncoding, RecordingSequenceError,
+    captured_kind_to_segment, epoch_ms_now,
 };
 use crate::redactor::{REDACTED_MARKER, Redactor};
 
@@ -407,13 +408,32 @@ impl CaptureAdapter {
         boundary: &'static str,
         error: ReplayCaptureSequenceError,
     ) {
+        self.record_sequence_failure(boundary, error);
+    }
+
+    /// Record exhaustion of the adapter's upstream cross-pane sequence at a
+    /// runtime boundary that cannot return it.
+    ///
+    /// Global and pane-local failures intentionally share one saturating
+    /// counter and one warning gate. Once either identity space is exhausted,
+    /// every later attempt still fails closed without turning a hot capture
+    /// loop into an unbounded log stream.
+    pub(crate) fn record_global_sequence_error(
+        &self,
+        boundary: &'static str,
+        error: RecordingSequenceError,
+    ) {
+        self.record_sequence_failure(boundary, error);
+    }
+
+    fn record_sequence_failure(&self, boundary: &'static str, error: impl std::fmt::Display) {
         saturating_increment(&self.sequence_error_count);
         if !self.sequence_error_warned.swap(true, Ordering::AcqRel) {
             tracing::warn!(
                 target: "ft.replay.capture",
                 boundary,
                 error = %error,
-                "Replay capture boundary failed closed on an unsafe pane sequence"
+                "Replay capture boundary failed closed on an unsafe sequence"
             );
         }
     }
@@ -1707,6 +1727,36 @@ mod tests {
         assert!(
             adapter.sequence_error_warned.load(Ordering::Acquire),
             "the first void-boundary failure must publish its one warning"
+        );
+    }
+
+    #[test]
+    fn global_sequence_failure_observability_saturates_and_warns_once() {
+        let (_sink, adapter) = make_adapter();
+        adapter
+            .sequence_error_count
+            .store(u64::MAX - 1, Ordering::Relaxed);
+        assert!(!adapter.sequence_error_warned.load(Ordering::Acquire));
+
+        adapter.record_global_sequence_error(
+            "runtime.authorized_egress",
+            RecordingSequenceError::GlobalExhausted,
+        );
+        assert_eq!(adapter.sequence_error_count(), u64::MAX);
+        assert!(adapter.sequence_error_warned.load(Ordering::Acquire));
+
+        adapter.record_global_sequence_error(
+            "runtime.authorized_egress",
+            RecordingSequenceError::GlobalExhausted,
+        );
+        assert_eq!(
+            adapter.sequence_error_count(),
+            u64::MAX,
+            "repeated terminal failures must not wrap the diagnostic counter"
+        );
+        assert!(
+            adapter.sequence_error_warned.load(Ordering::Acquire),
+            "the shared warning gate remains closed after its first warning"
         );
     }
 

@@ -6468,11 +6468,11 @@ impl ObservationRuntime {
                                 match error {
                                     AuthorizedReplayEgressSequenceError::Pane(error) => adapter
                                         .record_sequence_error("runtime.authorized_egress", error),
-                                    AuthorizedReplayEgressSequenceError::Global(error) => warn!(
-                                        pane_id,
-                                        error = %error,
-                                        "Replay capture global sequence exhausted; refusing a duplicate recorder identity"
-                                    ),
+                                    AuthorizedReplayEgressSequenceError::Global(error) => adapter
+                                        .record_global_sequence_error(
+                                            "runtime.authorized_egress",
+                                            error,
+                                        ),
                                 }
                             }
                         }
