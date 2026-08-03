@@ -34,7 +34,11 @@ fn bench_capture_overhead_per_event(c: &mut Criterion) {
     let segment = sample_segment();
 
     group.bench_function("capture_overhead_per_event", |b| {
-        b.iter(|| adapter.capture_egress(black_box(&segment)));
+        b.iter(|| {
+            adapter
+                .capture_egress(black_box(&segment))
+                .expect("benchmark sequence space must remain available")
+        });
     });
 
     group.finish();

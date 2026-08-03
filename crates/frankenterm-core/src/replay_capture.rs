@@ -240,13 +240,17 @@ impl CaptureConfig {
 /// Runtime capture adapter that converts pipeline events into
 /// [`RecorderEvent`] records with deterministic ordering metadata.
 ///
-/// The adapter maintains per-pane sequence counters and a global sequence
-/// counter for cross-pane merge ordering. Events are emitted to a
-/// [`CaptureSink`] which can buffer, persist, or discard them.
+/// The adapter maintains per-pane sequence frontiers for recorder identity.
+/// It also exposes the upstream [`GlobalSequence`] used to populate
+/// [`EgressEvent`] metadata. `RecorderEvent` v1 and [`RecorderMergeKey`] do not
+/// contain that global field, so the capture sink orders v1 records by its
+/// documented merge key rather than persisting the upstream global value.
+/// Events are emitted to a [`CaptureSink`] which can buffer, persist, or
+/// discard them.
 pub struct CaptureAdapter {
     /// Sink receiving captured events.
     sink: Arc<dyn CaptureSink>,
-    /// Global (cross-pane) monotonic sequence counter.
+    /// Upstream cross-pane sequence counter for `EgressEvent` construction.
     global_seq: Arc<GlobalSequence>,
     /// Per-pane sequence counters for recorder events.
     pane_sequences: Mutex<HashMap<u64, AtomicU64>>,
@@ -260,9 +264,9 @@ pub struct CaptureAdapter {
     redaction: CaptureRedactionRuntime,
     /// Total events captured (monotonic counter for diagnostics).
     total_captured: AtomicU64,
-    /// Sequence failures absorbed by void observer-trait boundaries.
+    /// Sequence failures absorbed by void observer/runtime boundaries.
     sequence_error_count: AtomicU64,
-    /// Ensures void observer boundaries warn at most once per adapter.
+    /// Ensures void boundaries warn at most once per adapter.
     sequence_error_warned: AtomicBool,
 }
 
@@ -315,8 +319,8 @@ impl CaptureAdapter {
         self.total_captured.load(Ordering::Relaxed)
     }
 
-    /// Return sequence failures absorbed by void `EgressTap`/`IngressTap`
-    /// boundaries. The counter saturates at `u64::MAX`.
+    /// Return sequence failures absorbed by void observer/runtime boundaries.
+    /// The counter saturates at `u64::MAX`.
     #[must_use]
     pub fn sequence_error_count(&self) -> u64 {
         self.sequence_error_count.load(Ordering::Relaxed)
@@ -341,9 +345,8 @@ impl CaptureAdapter {
     /// Poison recovery is safe in this code path because:
     ///   * the protected `HashMap<u64, AtomicU64>` is structurally consistent
     ///     even if a panic interrupts another caller — `entry().or_insert_with`
-    ///     is atomic w.r.t. the mutex (no torn allocation), and `AtomicU64`
-    ///     is itself internally atomic so any in-flight `fetch_add` is either
-    ///     fully observed or not started; and
+    ///     is atomic w.r.t. the mutex (no torn allocation), and every frontier
+    ///     transition occurs while this mutex is held; and
     ///   * the only invariant the lock enforces is single-writer access to the
     ///     map's internal hashing structure, which `PoisonError::into_inner`
     ///     restores intact.
@@ -410,7 +413,7 @@ impl CaptureAdapter {
                 target: "ft.replay.capture",
                 boundary,
                 error = %error,
-                "Replay capture observer failed closed after pane sequence exhaustion"
+                "Replay capture boundary failed closed on an unsafe pane sequence"
             );
         }
     }
@@ -498,7 +501,13 @@ impl CaptureAdapter {
     /// Capture an egress event from an [`EgressEvent`] (pre-built metadata).
     ///
     /// This path is used when the upstream already has an EgressEvent struct
-    /// (e.g., from an existing EgressTap implementation).
+    /// (e.g., from an existing EgressTap implementation). The authoritative
+    /// `EgressEvent::sequence` is preserved and advances the pane frontier.
+    /// `EgressEvent::global_sequence` is intentionally not represented:
+    /// `RecorderEvent` v1 has no global-sequence field and
+    /// [`RecorderMergeKey`] defines a different five-part total order. Adding
+    /// it would require a versioned recorder schema change rather than silently
+    /// changing v1 identity or merge semantics here.
     pub fn capture_egress_event(
         &self,
         egress: &EgressEvent,
@@ -507,11 +516,11 @@ impl CaptureAdapter {
             return Ok(());
         }
 
+        let sequence = self.reconcile_supplied_pane_seq(egress.pane_id, egress.sequence)?;
         let recorded_at_ms = epoch_ms_now();
         let Some(redacted) = self.redaction.apply(&egress.text, egress.redaction) else {
             return Ok(());
         };
-        let sequence = self.reconcile_supplied_pane_seq(egress.pane_id, egress.sequence)?;
 
         let payload = RecorderEventPayload::EgressOutput {
             text: redacted.text,
@@ -1330,6 +1339,39 @@ mod tests {
         result.expect("test capture sequence must remain available");
     }
 
+    fn seed_pane_frontier(adapter: &CaptureAdapter, pane_id: u64, next: u64) {
+        adapter
+            .pane_sequences
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(pane_id, AtomicU64::new(next));
+    }
+
+    fn pane_frontier(adapter: &CaptureAdapter, pane_id: u64) -> u64 {
+        adapter
+            .pane_sequences
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&pane_id)
+            .expect("pane frontier must exist")
+            .load(Ordering::Relaxed)
+    }
+
+    fn make_egress_event(pane_id: u64, sequence: u64, global_sequence: u64) -> EgressEvent {
+        EgressEvent {
+            pane_id,
+            text: format!("pane-{pane_id}-sequence-{sequence}"),
+            segment_kind: RecorderSegmentKind::Delta,
+            is_gap: false,
+            gap_reason: None,
+            encoding: RecorderTextEncoding::Utf8,
+            redaction: RecorderRedactionLevel::None,
+            occurred_at_ms: 1_700_000_000_000,
+            sequence,
+            global_sequence,
+        }
+    }
+
     // --- Basic egress capture ---
 
     #[test]
@@ -1443,6 +1485,269 @@ mod tests {
         // Pane 2: seq 0, 1
         assert_eq!(events[1].sequence, 0);
         assert_eq!(events[3].sequence, 1);
+    }
+
+    #[test]
+    fn pane_sequence_reserves_max_as_a_sticky_sentinel() {
+        let (sink, adapter) = make_adapter();
+        let pane_id = 91;
+        seed_pane_frontier(&adapter, pane_id, u64::MAX - 1);
+
+        expect_capture(adapter.capture_lifecycle(
+            pane_id,
+            RecorderLifecyclePhase::PaneOpened,
+            None,
+            json!({}),
+        ));
+        assert_eq!(sink.recorder_events()[0].sequence, u64::MAX - 1);
+        assert_eq!(pane_frontier(&adapter, pane_id), u64::MAX);
+        assert_eq!(adapter.total_captured(), 1);
+
+        for _ in 0..2 {
+            let error = adapter
+                .capture_control(pane_id, RecorderControlMarkerType::Resize, json!({}))
+                .expect_err("the terminal sentinel must remain sticky");
+            assert_eq!(
+                error,
+                ReplayCaptureSequenceError::PaneExhausted { pane_id }
+            );
+            assert_eq!(sink.len(), 1, "an exhausted capture must not reach the sink");
+            assert_eq!(
+                adapter.total_captured(),
+                1,
+                "an exhausted capture must not mutate diagnostics"
+            );
+            assert_eq!(pane_frontier(&adapter, pane_id), u64::MAX);
+        }
+    }
+
+    #[test]
+    fn concurrent_pane_exhaustion_emits_max_minus_one_exactly_once() {
+        const THREADS: usize = 16;
+
+        let sink = Arc::new(CollectingCaptureSink::new());
+        let adapter = Arc::new(CaptureAdapter::new(
+            sink.clone(),
+            CaptureConfig::default(),
+        ));
+        let pane_id = 92;
+        seed_pane_frontier(&adapter, pane_id, u64::MAX - 1);
+        let barrier = Arc::new(std::sync::Barrier::new(THREADS));
+
+        let handles: Vec<_> = (0..THREADS)
+            .map(|_| {
+                let adapter = Arc::clone(&adapter);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    adapter.capture_lifecycle(
+                        pane_id,
+                        RecorderLifecyclePhase::PaneOpened,
+                        None,
+                        json!({}),
+                    )
+                })
+            })
+            .collect();
+
+        let results: Vec<_> = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("capture thread must not panic"))
+            .collect();
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| {
+                    **result == Err(ReplayCaptureSequenceError::PaneExhausted { pane_id })
+                })
+                .count(),
+            THREADS - 1
+        );
+
+        let events = sink.recorder_events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].sequence, u64::MAX - 1);
+        assert_eq!(adapter.total_captured(), 1);
+        assert_eq!(pane_frontier(&adapter, pane_id), u64::MAX);
+    }
+
+    #[test]
+    fn supplied_durable_sequence_advances_frontier_and_rejects_reuse() {
+        let (sink, adapter) = make_adapter();
+        let pane_id = 93;
+
+        expect_capture(adapter.capture_egress_event(&make_egress_event(pane_id, 7, 41)));
+        expect_capture(adapter.capture_lifecycle(
+            pane_id,
+            RecorderLifecyclePhase::CaptureStarted,
+            None,
+            json!({}),
+        ));
+
+        let events = sink.recorder_events();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].sequence, 7);
+        assert_eq!(events[1].sequence, 8);
+        assert_eq!(pane_frontier(&adapter, pane_id), 9);
+
+        let error = adapter
+            .capture_egress_event(&make_egress_event(pane_id, 7, 42))
+            .expect_err("a supplied durable identity must never be reused");
+        assert_eq!(
+            error,
+            ReplayCaptureSequenceError::RegressingSuppliedSequence {
+                pane_id,
+                supplied: 7,
+                next_admissible: 9,
+            }
+        );
+        assert_eq!(sink.len(), 2, "rejected reuse must not invoke the sink");
+        assert_eq!(adapter.total_captured(), 2);
+        assert_eq!(pane_frontier(&adapter, pane_id), 9);
+
+        let reserved_pane = 94;
+        let error = adapter
+            .capture_egress_event(&make_egress_event(reserved_pane, u64::MAX, 43))
+            .expect_err("u64::MAX is not an event identity");
+        assert_eq!(
+            error,
+            ReplayCaptureSequenceError::ReservedSuppliedSequence {
+                pane_id: reserved_pane
+            }
+        );
+        assert_eq!(sink.len(), 2);
+        assert_eq!(adapter.total_captured(), 2);
+        assert!(
+            !adapter
+                .pane_sequences
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains_key(&reserved_pane),
+            "reserved identity rejection must not create pane state"
+        );
+    }
+
+    #[test]
+    fn supplied_max_minus_one_is_last_usable_identity() {
+        let (sink, adapter) = make_adapter();
+        let pane_id = 95;
+
+        expect_capture(adapter.capture_egress_event(&make_egress_event(
+            pane_id,
+            u64::MAX - 1,
+            51,
+        )));
+        assert_eq!(sink.recorder_events()[0].sequence, u64::MAX - 1);
+        assert_eq!(pane_frontier(&adapter, pane_id), u64::MAX);
+
+        let error = adapter
+            .capture_lifecycle(
+                pane_id,
+                RecorderLifecyclePhase::CaptureStopped,
+                None,
+                json!({}),
+            )
+            .expect_err("the supplied last identity must exhaust the pane");
+        assert_eq!(
+            error,
+            ReplayCaptureSequenceError::PaneExhausted { pane_id }
+        );
+        assert_eq!(sink.len(), 1);
+        assert_eq!(adapter.total_captured(), 1);
+    }
+
+    #[test]
+    fn recorder_v1_intentionally_omits_egress_global_sequence() {
+        let (left_sink, left) = make_adapter();
+        let (right_sink, right) = make_adapter();
+        let pane_id = 96;
+
+        expect_capture(left.capture_egress_event(&make_egress_event(pane_id, 3, 10)));
+        expect_capture(right.capture_egress_event(&make_egress_event(pane_id, 3, 999)));
+
+        let left_event = &left_sink.recorder_events()[0];
+        let right_event = &right_sink.recorder_events()[0];
+        assert_eq!(left_event.sequence, 3);
+        assert_eq!(right_event.sequence, 3);
+        assert_eq!(
+            left_event.event_id, right_event.event_id,
+            "RecorderEvent v1 identity intentionally excludes EgressEvent.global_sequence"
+        );
+    }
+
+    #[test]
+    fn total_captured_saturates_without_regression() {
+        let (sink, adapter) = make_adapter();
+        adapter.total_captured.store(u64::MAX - 1, Ordering::Relaxed);
+
+        expect_capture(adapter.capture_egress(&make_segment(1, "last-count", 0)));
+        assert_eq!(adapter.total_captured(), u64::MAX);
+        expect_capture(adapter.capture_egress(&make_segment(2, "saturated-count", 0)));
+        assert_eq!(adapter.total_captured(), u64::MAX);
+        assert_eq!(sink.len(), 2, "counter saturation must not drop valid events");
+    }
+
+    #[test]
+    fn egress_tap_failure_is_bounded_and_never_reaches_sink() {
+        let sink = Arc::new(CollectingCaptureSink::new());
+        let adapter = CaptureAdapter::new(sink.clone(), CaptureConfig::default());
+        let pane_id = 97;
+        seed_pane_frontier(&adapter, pane_id, u64::MAX);
+        adapter
+            .sequence_error_count
+            .store(u64::MAX - 1, Ordering::Relaxed);
+
+        EgressTap::on_egress(&adapter, make_egress_event(pane_id, 0, 1));
+        EgressTap::on_egress(&adapter, make_egress_event(pane_id, 1, 2));
+
+        assert!(sink.is_empty());
+        assert_eq!(adapter.total_captured(), 0);
+        assert_eq!(adapter.sequence_error_count(), u64::MAX);
+        assert!(
+            adapter.sequence_error_warned.load(Ordering::Acquire),
+            "the first void-boundary failure must publish its one warning"
+        );
+    }
+
+    #[test]
+    fn ingress_tap_stops_after_the_first_sequence_error() {
+        let sink = Arc::new(CollectingCaptureSink::new());
+        let adapter = CaptureAdapter::new(sink.clone(), CaptureConfig::default());
+        let pane_id = 98;
+        seed_pane_frontier(&adapter, pane_id, u64::MAX - 1);
+
+        let ingress = || IngressEvent {
+            pane_id,
+            text: "bounded tap".to_string(),
+            source: RecorderEventSource::OperatorAction,
+            ingress_kind: RecorderIngressKind::SendText,
+            redaction: RecorderRedactionLevel::None,
+            occurred_at_ms: 1_700_000_000_000,
+            outcome: IngressOutcome::Allowed,
+            workflow_id: None,
+        };
+
+        IngressTap::on_ingress(&adapter, ingress());
+        let events = sink.recorder_events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].sequence, u64::MAX - 1);
+        assert!(matches!(
+            events[0].payload,
+            RecorderEventPayload::IngressText { .. }
+        ));
+        assert_eq!(adapter.sequence_error_count(), 1);
+        assert_eq!(adapter.total_captured(), 1);
+
+        IngressTap::on_ingress(&adapter, ingress());
+        assert_eq!(
+            sink.len(),
+            1,
+            "the tap must not invoke either sink path after ingress admission fails"
+        );
+        assert_eq!(adapter.sequence_error_count(), 2);
+        assert_eq!(adapter.total_captured(), 1);
+        assert_eq!(pane_frontier(&adapter, pane_id), u64::MAX);
     }
 
     // --- Merge key ---
@@ -1973,7 +2278,7 @@ mod tests {
         let (sink, adapter) = make_adapter();
         let mut seg = make_segment(1, "neg", 0);
         seg.captured_at = -1;
-        adapter.capture_egress(&seg);
+        expect_capture(adapter.capture_egress(&seg));
 
         let evt = &sink.recorder_events()[0];
         // Should be a recent timestamp, not negative or zero
@@ -1986,17 +2291,26 @@ mod tests {
     fn test_mixed_event_types_share_pane_sequence() {
         let (sink, adapter) = make_adapter();
         // All events for pane 1 share one sequence counter
-        adapter.capture_egress(&make_segment(1, "e1", 0));
-        adapter.capture_lifecycle(1, RecorderLifecyclePhase::PaneOpened, None, json!({}));
-        adapter.capture_control(1, RecorderControlMarkerType::Resize, json!({}));
-        adapter.capture_ingress(
+        expect_capture(adapter.capture_egress(&make_segment(1, "e1", 0)));
+        expect_capture(adapter.capture_lifecycle(
+            1,
+            RecorderLifecyclePhase::PaneOpened,
+            None,
+            json!({}),
+        ));
+        expect_capture(adapter.capture_control(
+            1,
+            RecorderControlMarkerType::Resize,
+            json!({}),
+        ));
+        expect_capture(adapter.capture_ingress(
             1,
             "i1".into(),
             RecorderIngressKind::SendText,
             RecorderEventSource::OperatorAction,
             None,
             RecorderEventCausality::default(),
-        );
+        ));
 
         let events = sink.recorder_events();
         assert_eq!(events.len(), 4);
@@ -2011,7 +2325,7 @@ mod tests {
     #[test]
     fn test_collecting_sink_clear() {
         let (sink, adapter) = make_adapter();
-        adapter.capture_egress(&make_segment(1, "x", 0));
+        expect_capture(adapter.capture_egress(&make_segment(1, "x", 0)));
         assert_eq!(sink.len(), 1);
         sink.clear();
         assert!(sink.is_empty());
@@ -2020,7 +2334,7 @@ mod tests {
     #[test]
     fn test_collecting_sink_events_returns_clone() {
         let (sink, adapter) = make_adapter();
-        adapter.capture_egress(&make_segment(1, "x", 0));
+        expect_capture(adapter.capture_egress(&make_segment(1, "x", 0)));
         let events1 = sink.events();
         let events2 = sink.events();
         assert_eq!(events1.len(), events2.len());
@@ -2053,7 +2367,7 @@ mod tests {
         );
 
         assert!(sink.is_empty(), "read helpers recover from poison");
-        adapter.capture_egress(&make_segment(1, "after-poison", 0));
+        expect_capture(adapter.capture_egress(&make_segment(1, "after-poison", 0)));
 
         assert_eq!(sink.len(), 1);
         assert_eq!(sink.recorder_events().len(), 1);
@@ -2068,8 +2382,8 @@ mod tests {
     #[test]
     fn test_merge_keys_sortable_across_panes() {
         let (sink, adapter) = make_adapter();
-        adapter.capture_egress(&make_segment(2, "pane2", 0));
-        adapter.capture_egress(&make_segment(1, "pane1", 0));
+        expect_capture(adapter.capture_egress(&make_segment(2, "pane2", 0)));
+        expect_capture(adapter.capture_egress(&make_segment(1, "pane1", 0)));
 
         let events = sink.events();
         let mut keys: Vec<_> = events.iter().map(|(_, mk)| mk.clone()).collect();
@@ -2085,8 +2399,13 @@ mod tests {
     fn test_merge_key_stream_kind_ordering() {
         let (sink, adapter) = make_adapter();
         // Egress (rank 3) then Lifecycle (rank 0)
-        adapter.capture_egress(&make_segment(1, "e", 0));
-        adapter.capture_lifecycle(1, RecorderLifecyclePhase::PaneOpened, None, json!({}));
+        expect_capture(adapter.capture_egress(&make_segment(1, "e", 0)));
+        expect_capture(adapter.capture_lifecycle(
+            1,
+            RecorderLifecyclePhase::PaneOpened,
+            None,
+            json!({}),
+        ));
 
         let events = sink.events();
         let mut kinds: Vec<_> = events.iter().map(|(_, mk)| mk.stream_kind).collect();
@@ -2102,7 +2421,7 @@ mod tests {
     #[test]
     fn test_default_source_is_wezterm_mux() {
         let (sink, adapter) = make_adapter();
-        adapter.capture_egress(&make_segment(1, "x", 0));
+        expect_capture(adapter.capture_egress(&make_segment(1, "x", 0)));
         assert_eq!(
             sink.recorder_events()[0].source,
             RecorderEventSource::WeztermMux
@@ -2114,7 +2433,7 @@ mod tests {
     #[test]
     fn test_captured_event_passes_schema_validation() {
         let (sink, adapter) = make_adapter();
-        adapter.capture_egress(&make_segment(1, "validate me", 0));
+        expect_capture(adapter.capture_egress(&make_segment(1, "validate me", 0)));
 
         let evt = &sink.recorder_events()[0];
         let json_str = serde_json::to_string(evt).unwrap();
@@ -2125,14 +2444,14 @@ mod tests {
     #[test]
     fn test_ingress_event_passes_schema_validation() {
         let (sink, adapter) = make_adapter();
-        adapter.capture_ingress(
+        expect_capture(adapter.capture_ingress(
             1,
             "cmd".into(),
             RecorderIngressKind::SendText,
             RecorderEventSource::OperatorAction,
             None,
             RecorderEventCausality::default(),
-        );
+        ));
 
         let evt = &sink.recorder_events()[0];
         let json_str = serde_json::to_string(evt).unwrap();
@@ -2148,7 +2467,7 @@ mod tests {
     #[test]
     fn test_unicode_content_captured_correctly() {
         let (sink, adapter) = make_adapter();
-        adapter.capture_egress(&make_segment(1, "日本語テスト 🎉", 0));
+        expect_capture(adapter.capture_egress(&make_segment(1, "日本語テスト 🎉", 0)));
 
         let evt = &sink.recorder_events()[0];
         match &evt.payload {
@@ -2165,7 +2484,7 @@ mod tests {
     fn test_large_content_captured() {
         let (sink, adapter) = make_adapter();
         let large = "x".repeat(1_000_000);
-        adapter.capture_egress(&make_segment(1, &large, 0));
+        expect_capture(adapter.capture_egress(&make_segment(1, &large, 0)));
 
         assert_eq!(sink.len(), 1);
         match &sink.recorder_events()[0].payload {
@@ -2183,7 +2502,11 @@ mod tests {
         let (sink, adapter) = make_adapter();
         for i in 0..10u64 {
             let pane_id = i % 3;
-            adapter.capture_egress(&make_segment(pane_id, &format!("msg{i}"), i));
+            expect_capture(adapter.capture_egress(&make_segment(
+                pane_id,
+                &format!("msg{i}"),
+                i,
+            )));
         }
         assert_eq!(sink.len(), 10);
     }
@@ -2209,7 +2532,7 @@ mod tests {
         ));
 
         // Baseline: the recorder works pre-poison.
-        adapter.capture_egress(&make_segment(7, "before-poison", 0));
+        expect_capture(adapter.capture_egress(&make_segment(7, "before-poison", 0)));
         assert_eq!(sink.len(), 1);
 
         // Poison the pane_sequences Mutex from a separate thread.
@@ -2230,7 +2553,7 @@ mod tests {
         // Contract: capture_egress must still emit after poison. The
         // pre-fix `.lock().unwrap()` would abort this thread on the
         // next next_pane_seq call.
-        adapter.capture_egress(&make_segment(7, "after-poison", 1));
+        expect_capture(adapter.capture_egress(&make_segment(7, "after-poison", 1)));
         assert_eq!(
             sink.len(),
             2,
@@ -2240,7 +2563,7 @@ mod tests {
         // Fresh pane id forces a HashMap entry insert through the
         // recovered lock guard. Confirms the recovered HashMap is
         // structurally usable, not just readable.
-        adapter.capture_egress(&make_segment(99, "fresh-pane-after-poison", 0));
+        expect_capture(adapter.capture_egress(&make_segment(99, "fresh-pane-after-poison", 0)));
         assert_eq!(sink.len(), 3);
     }
 
@@ -2277,11 +2600,11 @@ mod tests {
         let baseline = replay_capture_policy_decision_drop_count();
 
         let (sink, adapter) = make_adapter();
-        adapter.capture_decision(
+        expect_capture(adapter.capture_decision(
             RecorderEventSource::WorkflowEngine,
             Some("corr-zkthg-001".into()),
             make_decision(123),
-        );
+        ));
 
         let events = sink.recorder_events();
         assert_eq!(events.len(), 1);
@@ -2334,6 +2657,15 @@ mod tests {
         assert_eq!(replay_capture_policy_decision_drop_count(), 1);
         record_replay_capture_policy_decision_drop();
         assert_eq!(replay_capture_policy_decision_drop_count(), 2);
+
+        REPLAY_CAPTURE_POLICY_DECISION_DROP_COUNT.store(u64::MAX - 1, Ordering::Relaxed);
+        record_replay_capture_policy_decision_drop();
+        record_replay_capture_policy_decision_drop();
+        assert_eq!(
+            replay_capture_policy_decision_drop_count(),
+            u64::MAX,
+            "the adjacent replay diagnostic must saturate rather than wrap"
+        );
 
         reset_replay_capture_policy_decision_drop_count_for_test();
         assert_eq!(replay_capture_policy_decision_drop_count(), 0);
@@ -2426,11 +2758,11 @@ mod tests {
             },
         );
 
-        adapter.capture_egress(&make_segment(
+        expect_capture(adapter.capture_egress(&make_segment(
             42,
             "safe prefix codex-secret-1234 safe suffix",
             0,
-        ));
+        )));
 
         let events = sink.recorder_events();
         assert_eq!(events.len(), 1);
