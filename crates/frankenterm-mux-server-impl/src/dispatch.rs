@@ -64,8 +64,62 @@ const OUTBOUND_BUDGET_OVERFLOW: &str =
     "mux outbound delivery exceeded its retained topology or slot bound";
 const TOPOLOGY_REVISION_EXHAUSTED: &str =
     "mux topology revision authority is exhausted";
+const DORMANT_OUTBOUND_PROTOCOL_FAILURE: &str =
+    "mux server attempted to emit a protocol family without live activation authority";
 const TOPOLOGY_FENCE_MAX_EVENTS: usize = 4096;
 const TOPOLOGY_FENCE_MAX_RETAINED_BYTES: usize = 4 * 1024 * 1024;
+
+/// Whether this server-produced family is deliberately dormant on the
+/// ordinary mux transport.
+///
+/// PDU 76 and 78 are replies to same-family client requests, while PDU 82 and
+/// the only live post-v46 unilateral family (PDU 83) are fenced by the PDU 81
+/// topology negotiation.  Those request-implied authorities do not require
+/// the server to guess the client's otherwise-unobservable codec window.
+///
+/// In contrast, render-application delivery has no live ordinary-server
+/// coordinator and ordered-window support is intentionally absent from
+/// `TopologyCapabilities::SERVER_SUPPORTED`.  Keep every server-produced PDU
+/// in those dormant families fail-closed until its own activation work lands.
+fn is_dormant_server_wire_spec(spec: &codec::PduWireSpec) -> bool {
+    let ident = spec.ident;
+    ident == <codec::RenderApplicationUpdateV1 as codec::PduWireIdent>::IDENT
+        || ident == <codec::RenderApplicationUpdate as codec::PduWireIdent>::IDENT
+        || ident == <codec::ListPanesOrderedV1Response as codec::PduWireIdent>::IDENT
+        || ident == <codec::ReorderWindowTabsV1Response as codec::PduWireIdent>::IDENT
+        || ident == <codec::WindowOrderEventV1 as codec::PduWireIdent>::IDENT
+}
+
+/// Final connection-terminal guard against accidentally activating a frozen
+/// server-produced protocol family through a generic response or notification
+/// queue.  Callers invoke this before queue allocation; the encoder invokes it
+/// again as a defense in depth for any already-typed internal item.
+fn reject_dormant_server_emission(
+    pdu: &Pdu,
+    serial: u64,
+    terminal: &DispatchTerminal,
+) -> anyhow::Result<()> {
+    let Some(spec) = pdu.wire_spec() else {
+        return Ok(());
+    };
+    if !is_dormant_server_wire_spec(spec) {
+        return Ok(());
+    }
+
+    metrics::counter!(
+        "mux.dispatch.protocol_error",
+        "reason" => "dormant_server_emission",
+        "pdu" => spec.name,
+    )
+    .increment(1);
+    terminal.trip(DORMANT_OUTBOUND_PROTOCOL_FAILURE);
+    anyhow::bail!(
+        "mux server PDU {} (ident {}, serial {}) has no live family-specific emission authority",
+        spec.name,
+        spec.ident,
+        serial,
+    )
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum OutboundClass {
@@ -967,6 +1021,7 @@ fn queue_response_pdu(
     serial: u64,
     delivery_class: PduDeliveryClass,
 ) -> anyhow::Result<()> {
+    reject_dormant_server_emission(&pdu, serial, terminal)?;
     // Avoid even the outbound Box allocation on an already-dead connection;
     // `admit` below remains the authoritative race-closing check.
     if terminal.is_tripped() {
@@ -1022,6 +1077,7 @@ fn queue_reserved_pdu(
     decoded: Box<DecodedPdu>,
     reservation: OutboundReservation,
 ) -> anyhow::Result<()> {
+    reject_dormant_server_emission(&decoded.pdu, decoded.serial, terminal)?;
     let item = Item::WritePdu(WritePayload::Typed(ReservedDecodedPdu {
         decoded,
         reservation,
@@ -2014,6 +2070,7 @@ fn prepare_unilateral_pdu(
     deferred_item: &mut Option<Item>,
     terminal: &DispatchTerminal,
 ) -> anyhow::Result<PendingOutboundBatch> {
+    reject_dormant_server_emission(&pdu, 0, terminal)?;
     prepare_pending_outbound_batch(
         WritePayload::Typed(ReservedDecodedPdu {
             decoded: Box::new(DecodedPdu { pdu, serial: 0 }),
@@ -2391,6 +2448,11 @@ fn encode_write_payload(
     match payload {
         WritePayload::Encoded(frame) => Ok(frame),
         WritePayload::Typed(mut typed) => {
+            reject_dormant_server_emission(
+                &typed.decoded.pdu,
+                typed.decoded.serial,
+                terminal,
+            )?;
             let bytes = typed
                 .decoded
                 .pdu
@@ -8563,6 +8625,116 @@ mod tests {
         assert!(
             matches!(item_rx.try_recv(), Ok(Item::Readable)),
             "terminal response failure must not displace the older queued item"
+        );
+    }
+
+    #[test]
+    fn dormant_server_emission_registry_is_exact_and_leaves_request_implied_families_live() {
+        let dormant = Pdu::all_wire_specs()
+            .iter()
+            .filter(|spec| is_dormant_server_wire_spec(spec))
+            .map(|spec| spec.ident)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            dormant,
+            [79, 84, 87, 89, 90],
+            "only the unactivated render and ordered-window server families may be frozen"
+        );
+        for ident in &dormant {
+            let spec = Pdu::wire_spec_for_ident(*ident)
+                .expect("every dormant server family must retain a wire specification");
+            let role = if matches!(*ident, 87 | 89) {
+                codec::PduWireRole::CorrelatedReply
+            } else {
+                codec::PduWireRole::Unilateral
+            };
+            assert!(spec.authorizes(codec::PduProducer::Server, role));
+            assert!(!spec.authorizes(
+                codec::PduProducer::Client,
+                codec::PduWireRole::Request
+            ));
+        }
+
+        for ident in [76, 78, 82, 83] {
+            let spec = Pdu::wire_spec_for_ident(ident)
+                .expect("every request-implied post-v46 server family must remain registered");
+            assert!(
+                !is_dormant_server_wire_spec(spec),
+                "request-implied or negotiated server PDU {ident} must not be frozen"
+            );
+        }
+
+        assert_eq!(
+            TopologyCapabilities::SERVER_SUPPORTED,
+            TopologyCapabilities::FENCED_SNAPSHOT_V1
+        );
+        assert!(!TopologyCapabilities::SERVER_SUPPORTED
+            .contains(TopologyCapabilities::ORDERED_WINDOW_STREAM_V1));
+        assert!(!TopologyCapabilities::SERVER_SUPPORTED
+            .contains(TopologyCapabilities::WINDOW_REORDER_CAS_V1));
+    }
+
+    fn dormant_window_order_event() -> Pdu {
+        Pdu::WindowOrderEventV1(codec::WindowOrderEventV1 {
+            protocol_version: codec::ORDERED_WINDOW_PROTOCOL_VERSION,
+            stream_id: TopologyStreamId::from_bytes([0x31; 16]),
+            session_incarnation: MuxSessionIncarnation::from_bytes([0x52; 16]),
+            topology_revision: TopologyRevision::new(1),
+            // Deliberately invalid if it ever reaches codec validation.  The
+            // dormant-family authority must reject from the typed identity
+            // before the payload is validated or encoded.
+            windows: Vec::new(),
+        })
+    }
+
+    #[test]
+    fn dormant_server_emission_trips_before_queue_allocation() {
+        let (item_tx, item_rx) = bounded(1);
+        let (terminal, terminal_rx) = DispatchTerminal::channel();
+        let budget = Arc::new(OutboundBudget::default());
+
+        let error = queue_response_pdu(
+            &item_tx,
+            &terminal,
+            &budget,
+            dormant_window_order_event(),
+            0,
+            PduDeliveryClass::Bulk,
+        )
+        .expect_err("a dormant ordered-window event must fail before enqueue");
+        let message = format!("{error:#}");
+        assert!(message.contains("WindowOrderEventV1"), "{message}");
+        assert!(message.contains("ident 90"), "{message}");
+        assert!(message.contains("serial 0"), "{message}");
+        assert!(matches!(item_rx.try_recv(), Err(TryRecvError::Empty)));
+        assert_eq!(budget.snapshot(), OutboundBudgetState::default());
+        assert_eq!(
+            terminal_rx.try_recv().ok(),
+            Some(DORMANT_OUTBOUND_PROTOCOL_FAILURE)
+        );
+    }
+
+    #[test]
+    fn dormant_server_emission_defense_precedes_codec_validation() {
+        let (terminal, terminal_rx) = DispatchTerminal::channel();
+        let error = encode_write_payload(
+            test_write_payload(Box::new(DecodedPdu {
+                pdu: dormant_window_order_event(),
+                serial: 0,
+            })),
+            codec::CompressionMode::Auto,
+            &terminal,
+        )
+        .expect_err("the final typed-write chokepoint must retain the dormant-family guard");
+        let message = format!("{error:#}");
+        assert!(message.contains("WindowOrderEventV1"), "{message}");
+        assert!(
+            !message.contains("ordered-window event must contain at least one frozen window"),
+            "codec payload validation ran before wire authority: {message}"
+        );
+        assert_eq!(
+            terminal_rx.try_recv().ok(),
+            Some(DORMANT_OUTBOUND_PROTOCOL_FAILURE)
         );
     }
 
