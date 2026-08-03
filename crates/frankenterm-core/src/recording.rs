@@ -547,8 +547,8 @@ impl Recorder {
         let bytes_written = frame.payload.len() as u64;
 
         self.writer.write_frame(frame)?;
-        self.frames_written += 1;
-        self.bytes_written += bytes_written;
+        self.frames_written = self.frames_written.saturating_add(1);
+        self.bytes_written = self.bytes_written.saturating_add(bytes_written);
         Ok(())
     }
 
@@ -565,7 +565,7 @@ impl Recorder {
         // rejected by the u32 guard (or a downstream IO error) inflates the
         // stat by content that never made it into the recording.
         self.record_output(segment.captured_at, is_gap, payload)?;
-        self.bytes_raw += raw_len;
+        self.bytes_raw = self.bytes_raw.saturating_add(raw_len);
         Ok(())
     }
 
@@ -590,8 +590,8 @@ impl Recorder {
         let bytes_written = frame.payload.len() as u64;
 
         self.writer.write_frame(frame)?;
-        self.frames_written += 1;
-        self.bytes_written += bytes_written;
+        self.frames_written = self.frames_written.saturating_add(1);
+        self.bytes_written = self.bytes_written.saturating_add(bytes_written);
         Ok(())
     }
 
@@ -771,7 +771,7 @@ impl RecordingManager {
         // rejected by the WAR frame size guard (or a downstream IO error)
         // would otherwise inflate the stat with content that never landed.
         recorder.record_output(segment.captured_at, is_gap, &payload)?;
-        recorder.bytes_raw += content_len;
+        recorder.bytes_raw = recorder.bytes_raw.saturating_add(content_len);
         Ok(())
     }
 
@@ -1051,6 +1051,12 @@ pub fn action_to_ingress_kind(
 /// the cheap fix.
 static RECORDING_CLOCK_ANOMALY_COUNT: AtomicU64 = AtomicU64::new(0);
 
+fn saturating_atomic_increment(counter: &AtomicU64) {
+    let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+        Some(count.saturating_add(1))
+    });
+}
+
 /// br-ft-crpvd: cumulative count of recording clock-before-1970
 /// anomalies. See [`RECORDING_CLOCK_ANOMALY_COUNT`].
 #[must_use]
@@ -1086,7 +1092,7 @@ fn epoch_ms_now_from(now: std::time::SystemTime) -> u64 {
     match now.duration_since(std::time::UNIX_EPOCH) {
         Ok(ts) => ts.as_millis() as u64,
         Err(err) => {
-            RECORDING_CLOCK_ANOMALY_COUNT.fetch_add(1, Ordering::Relaxed);
+            saturating_atomic_increment(&RECORDING_CLOCK_ANOMALY_COUNT);
             tracing::warn!(
                 target: "ft.recording.clock",
                 event = "recording_clock_anomaly",
@@ -2065,6 +2071,32 @@ mod tests {
     }
 
     #[test]
+    fn recorder_stats_saturate_instead_of_wrapping() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("saturated-stats.war");
+        let mut recorder = Recorder::new(42, &path, 10).unwrap();
+        recorder.start(0);
+        recorder.frames_written = u64::MAX;
+        recorder.bytes_raw = u64::MAX;
+        recorder.bytes_written = u64::MAX;
+
+        recorder
+            .record_segment(&CapturedSegment {
+                pane_id: 42,
+                seq: 0,
+                content: "x".to_string(),
+                kind: CapturedSegmentKind::Delta,
+                captured_at: 1,
+            })
+            .unwrap();
+
+        let stats = recorder.stats();
+        assert_eq!(stats.frames_written, u64::MAX);
+        assert_eq!(stats.bytes_raw, u64::MAX);
+        assert_eq!(stats.bytes_written, u64::MAX);
+    }
+
+    #[test]
     fn recorder_file_io_roundtrip() {
         use crate::replay::Recording;
 
@@ -2492,6 +2524,13 @@ mod tests {
         // Second call bumps again — every event observable.
         let _ = super::epoch_ms_now_from(pre);
         assert_eq!(super::recording_clock_anomaly_count(), 2);
+    }
+
+    #[test]
+    fn recording_clock_anomaly_counter_saturates() {
+        let counter = AtomicU64::new(u64::MAX);
+        super::saturating_atomic_increment(&counter);
+        assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
     }
 
     #[test]
