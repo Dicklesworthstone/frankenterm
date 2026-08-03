@@ -1133,7 +1133,7 @@ fn allocate_recording_sequence(
     next: &AtomicU64,
     exhausted: RecordingSequenceError,
 ) -> std::result::Result<u64, RecordingSequenceError> {
-    next.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |candidate| {
+    next.try_update(Ordering::Relaxed, Ordering::Relaxed, |candidate| {
         candidate.checked_add(1)
     })
         .map_err(|_| exhausted)
