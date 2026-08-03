@@ -443,11 +443,21 @@ impl EventBus {
     }
 
     fn next_handler_id(&self) -> Result<HandlerId, HandlerRegistrationError> {
-        self.next_id
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-                current.checked_add(1)
-            })
-            .map_err(|_| HandlerRegistrationError::IdExhausted)
+        let mut current = self.next_id.load(Ordering::Relaxed);
+        loop {
+            let next = current
+                .checked_add(1)
+                .ok_or(HandlerRegistrationError::IdExhausted)?;
+            match self.next_id.compare_exchange_weak(
+                current,
+                next,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return Ok(current),
+                Err(observed) => current = observed,
+            }
+        }
     }
 
     /// Remove a previously registered handler.
