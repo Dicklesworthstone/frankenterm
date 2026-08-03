@@ -1907,9 +1907,17 @@ impl PduEncodedBodyLimit {
                 max_zstd_encoded_bytes,
             } => {
                 if is_compressed {
-                    max_zstd_encoded_bytes.min(MAX_PDU_SIZE)
+                    if max_zstd_encoded_bytes < MAX_PDU_SIZE {
+                        max_zstd_encoded_bytes
+                    } else {
+                        MAX_PDU_SIZE
+                    }
                 } else {
-                    max_decompressed_bytes.min(MAX_PDU_SIZE)
+                    if max_decompressed_bytes < MAX_PDU_SIZE {
+                        max_decompressed_bytes
+                    } else {
+                        MAX_PDU_SIZE
+                    }
                 }
             }
         }
@@ -3926,7 +3934,7 @@ pub struct TopologyEvent {
 }
 
 /// Closed schema version carried by ordered-window PDU IDs 86-90.
-pub const ORDERED_WINDOW_PROTOCOL_VERSION: u16 = 1;
+pub const ORDERED_WINDOW_PROTOCOL_VERSION: u16 = mux::WINDOW_REORDER_PROTOCOL_VERSION_V1;
 /// Oldest negotiated codec dialect that may send ordered-window PDU IDs 86-90.
 pub const ORDERED_WINDOW_V1_MIN_CODEC_VERSION: usize = 51;
 
@@ -3954,8 +3962,7 @@ pub const MAX_ORDERED_WINDOWS_PER_EVENT: usize = 2;
 /// integers and raw fixed-size identity bytes. The topology stream ID is
 /// intentionally excluded: it rotates on reconnect, while an idempotent retry
 /// must retain the same request digest on the successor stream.
-pub const WINDOW_REORDER_DIGEST_DOMAIN_V1: &[u8] =
-    b"frankenterm.window-reorder.v1\0";
+pub const WINDOW_REORDER_DIGEST_DOMAIN_V1: &[u8] = mux::WINDOW_REORDER_DIGEST_DOMAIN_V1;
 
 macro_rules! stable_order_wire_id {
     ($name:ident) => {
@@ -4262,31 +4269,22 @@ impl ReorderWindowTabsV1 {
     /// mixed so the same idempotent request survives a reconnect.
     #[must_use]
     pub fn canonical_digest(&self) -> WindowReorderDigest {
-        let mut hasher = Sha256::new();
-        hasher.update(WINDOW_REORDER_DIGEST_DOMAIN_V1);
-        hasher.update(self.protocol_version.to_be_bytes());
-        hasher.update(self.domain_binding_id.as_bytes());
-        hasher.update(self.session_incarnation.as_bytes());
-        hasher.update(self.window_id.get().to_be_bytes());
-        hasher.update(self.expected_order_revision.get().to_be_bytes());
-        hasher.update(
-            u64::try_from(self.desired_tab_ids.len())
-                .unwrap_or(u64::MAX)
-                .to_be_bytes(),
+        let digest = mux::canonical_window_reorder_digest_v1(
+            mux::WindowReorderDigestInputV1 {
+                protocol_version: self.protocol_version,
+                domain_binding_id: self.domain_binding_id.as_bytes(),
+                session_incarnation: self.session_incarnation,
+                window_id: self.window_id.get(),
+                expected_order_revision: self.expected_order_revision.get(),
+                desired_active_tab_id: self.desired_active_tab_id.map(RemoteTabId::get),
+                mutation_id: mux::WindowOrderMutationId::new(
+                    self.mutation_id.namespace,
+                    self.mutation_id.sequence,
+                ),
+            },
+            self.desired_tab_ids.iter().map(|tab_id| tab_id.get()),
         );
-        for tab_id in &self.desired_tab_ids {
-            hasher.update(tab_id.get().to_be_bytes());
-        }
-        match self.desired_active_tab_id {
-            None => hasher.update([0]),
-            Some(tab_id) => {
-                hasher.update([1]);
-                hasher.update(tab_id.get().to_be_bytes());
-            }
-        }
-        hasher.update(self.mutation_id.namespace);
-        hasher.update(self.mutation_id.sequence.to_be_bytes());
-        WindowReorderDigest::from_bytes(hasher.finalize().into())
+        WindowReorderDigest::from_bytes(digest.as_bytes())
     }
 
     /// Replace the digest with the canonical binding of the current frozen
@@ -4308,7 +4306,7 @@ impl ReorderWindowTabsV1 {
         validate_remote_wire_id("window_id", self.window_id.get())?;
         validate_window_order_revision(self.expected_order_revision)?;
         self.mutation_id.validate()?;
-        validate_ordered_window_components(
+        validate_reorder_window_representation(
             self.window_id,
             self.expected_order_revision,
             &self.desired_tab_ids,
@@ -4660,6 +4658,36 @@ fn validate_ordered_windows_with_section_limit(
             bytes: section_bytes,
             max: max_section_bytes,
         });
+    }
+    Ok(())
+}
+
+/// Validate only the closed wire representation of a reorder intent.
+///
+/// Duplicate, foreign, missing, and active-membership checks require the
+/// exact authoritative mux window. Deferring those semantic checks preserves
+/// the protocol outcome order: session/window identity and retained-receipt
+/// classification must precede permutation malformation.
+fn validate_reorder_window_representation(
+    window_id: RemoteWindowId,
+    expected_order_revision: WindowOrderRevision,
+    desired_tab_ids: &[RemoteTabId],
+    desired_active_tab_id: Option<RemoteTabId>,
+) -> Result<(), OrderedWindowProtocolError> {
+    validate_remote_wire_id("window_id", window_id.get())?;
+    validate_window_order_revision(expected_order_revision)?;
+    if desired_tab_ids.len() > MAX_ORDERED_TABS_PER_WINDOW {
+        return Err(OrderedWindowProtocolError::TooManyTabs {
+            window_id: window_id.get(),
+            count: desired_tab_ids.len(),
+            max: MAX_ORDERED_TABS_PER_WINDOW,
+        });
+    }
+    for tab_id in desired_tab_ids {
+        validate_remote_wire_id("tab_id", tab_id.get())?;
+    }
+    if let Some(active_tab_id) = desired_active_tab_id {
+        validate_remote_wire_id("active_tab_id", active_tab_id.get())?;
     }
     Ok(())
 }
@@ -13124,7 +13152,7 @@ mod test {
     }
 
     #[test]
-    fn ordered_window_v1_accepts_boundary_mux_ids_and_rejects_reserved_or_duplicate_ids() {
+    fn ordered_window_v1_separates_wire_admission_from_mux_permutation_semantics() {
         let valid = sample_reorder_window_tabs_v1();
         assert_eq!(RemoteWindowId::new(0).try_into_usize(), Ok(0));
         assert_eq!(RemoteTabId::new(0).try_into_usize(), Ok(0));
@@ -13209,16 +13237,34 @@ mod test {
         foreign_active.desired_active_tab_id = Some(RemoteTabId::new(999_999));
         foreign_active = foreign_active.with_computed_digest();
 
-        for (name, malformed) in [
+        for (name, mux_semantic_decision) in [
             ("duplicate tab", duplicate_tab),
+            ("missing active", missing_active),
+            ("foreign active", foreign_active),
+        ] {
+            let pdu = Pdu::ReorderWindowTabsV1(mux_semantic_decision);
+            let frame = pdu
+                .encode_frame_with_mode(7, CompressionMode::Never)
+                .unwrap_or_else(|error| {
+                    panic!("{name} must reach authoritative mux classification: {error:#}")
+                });
+            assert_eq!(
+                Pdu::decode(frame.as_slice())
+                    .unwrap_or_else(|error| {
+                        panic!("{name} must survive bounded wire admission: {error:#}")
+                    })
+                    .pdu,
+                pdu,
+            );
+        }
+
+        for (name, malformed) in [
             ("reserved window", reserved_window),
             ("reserved tab", reserved_tab),
             ("zero binding identity", zero_binding),
             ("zero stream identity", zero_stream),
             ("zero session identity", zero_session),
             ("zero mutation namespace", zero_mutation_namespace),
-            ("missing active", missing_active),
-            ("foreign active", foreign_active),
         ] {
             assert!(
                 Pdu::ReorderWindowTabsV1(malformed.clone())

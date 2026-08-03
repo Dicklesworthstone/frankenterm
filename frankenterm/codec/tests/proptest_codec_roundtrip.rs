@@ -4,17 +4,19 @@ use codec::{
     ErrorResponse, GetClientList, GetClientListResponse, GetCodecVersion, GetCodecVersionResponse,
     GetImageCell, GetImageCellResponse, GetLines, GetLinesResponse, GetPaneDirection,
     GetPaneDirectionResponse, GetPaneRenderChanges, GetPaneRenderChangesResponse,
-    GetPaneRenderableDimensions, GetPaneRenderableDimensionsResponse, GetTlsCreds,
+    DomainBindingId, GetPaneRenderableDimensions, GetPaneRenderableDimensionsResponse, GetTlsCreds,
     GetTlsCredsResponse, InputSerial, KillPane, ListPanes, ListPanesResponse,
     ListPanesTabStackEntry, ListPanesTabStacks, ListPanesTabStacksResponse, LivenessResponse,
     MoveFloatingPane, MovePaneToNewTabResponse, NotifyAlert, PaneFocused, PaneRemoved, Pdu, Ping,
-    Pong, RemoveFloatingPane, RenameWorkspace, Resize, SearchScrollbackRequest,
+    Pong, RemoteTabId, RemoteWindowId, RemoveFloatingPane, RenameWorkspace,
+    ReorderWindowTabsV1, Resize, SearchScrollbackRequest,
     SearchScrollbackResponse, SelectStackPane, SendKeyDown, SendKeyUp, SendMouseEvent, SendPaste,
     SerializedLines, SetActiveWorkspace, SetClientId, SetClipboard, SetFloatingPaneZ,
     SetFocusedPane, SetLayoutCycle, SetPalette, SetPaneZoomed, SetWindowWorkspace, SpawnResponse,
     SpawnV2, SplitPane, SwapToLayout, TabAddedToWindow, TabResized, TabTitleChanged,
-    ToggleFloatingPane, UnitResponse, UpdatePaneConstraints, WindowTitleChanged,
-    WindowWorkspaceChanged, WriteToPane,
+    ToggleFloatingPane, TopologyStreamId, UnitResponse, UpdatePaneConstraints,
+    WindowOrderMutationId, WindowOrderRevision, WindowReorderDigest, WindowTitleChanged,
+    WindowWorkspaceChanged, WriteToPane, ORDERED_WINDOW_PROTOCOL_VERSION,
 };
 use config::keyassignment::{PaneDirection, ScrollbackEraseMode, SpawnTabDomain};
 use frankenterm_term::color::ColorPalette;
@@ -25,8 +27,10 @@ use frankenterm_term::{
 use mux::client::{ClientId, ClientInfo};
 use mux::renderable::{PaneTieredScrollbackStatus, RenderableDimensions, StableCursorPosition};
 use mux::tab::{FloatingPaneRect, SplitDirection, SplitRequest, SplitSize, TabStackId};
+use mux::MuxSessionIncarnation;
 use proptest::prelude::*;
 use std::collections::HashMap;
+use std::convert::TryFrom;
 use std::path::PathBuf;
 use std::sync::Arc;
 use termwiz::image::ImageData;
@@ -953,6 +957,61 @@ fn arb_rich_get_pane_render_changes_response() -> impl Strategy<Value = GetPaneR
         )
 }
 
+fn arb_nonzero_identity() -> impl Strategy<Value = [u8; 16]> {
+    any::<[u8; 16]>().prop_filter("identity must be nonzero", |identity| *identity != [0; 16])
+}
+
+fn arb_reorder_window_tabs_v1() -> impl Strategy<Value = ReorderWindowTabsV1> {
+    (
+        arb_nonzero_identity(),
+        arb_nonzero_identity(),
+        arb_nonzero_identity(),
+        0u64..=4_096,
+        0u64..u64::MAX,
+        proptest::collection::btree_set(0u64..=4_096, 0..=32),
+        arb_nonzero_identity(),
+        1u64..u64::MAX,
+    )
+        .prop_map(
+            |(
+                domain_binding_id,
+                stream_id,
+                session_incarnation,
+                window_id,
+                expected_order_revision,
+                desired_tab_ids,
+                mutation_namespace,
+                mutation_sequence,
+            )| {
+                let desired_tab_ids = desired_tab_ids
+                    .into_iter()
+                    .map(RemoteTabId::new)
+                    .collect::<Vec<_>>();
+                let desired_active_tab_id = desired_tab_ids.first().copied();
+                ReorderWindowTabsV1 {
+                    protocol_version: ORDERED_WINDOW_PROTOCOL_VERSION,
+                    domain_binding_id: DomainBindingId::from_bytes(domain_binding_id),
+                    stream_id: TopologyStreamId::from_bytes(stream_id),
+                    session_incarnation: MuxSessionIncarnation::from_bytes(
+                        session_incarnation,
+                    ),
+                    window_id: RemoteWindowId::new(window_id),
+                    expected_order_revision: WindowOrderRevision::new(
+                        expected_order_revision,
+                    ),
+                    desired_tab_ids,
+                    desired_active_tab_id,
+                    mutation_id: WindowOrderMutationId::new(
+                        mutation_namespace,
+                        mutation_sequence,
+                    ),
+                    digest: WindowReorderDigest::ZERO,
+                }
+                .with_computed_digest()
+            },
+        )
+}
+
 fn assert_pdu_roundtrip(serial: u64, pdu: Pdu) {
     let mut encoded = Vec::new();
     pdu.encode(&mut encoded, serial).unwrap();
@@ -970,6 +1029,59 @@ fn assert_pdu_roundtrip(serial: u64, pdu: Pdu) {
 
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(128))]
+
+    #[test]
+    fn reorder_digest_matches_mux_authority_for_bounded_intents(
+        request in arb_reorder_window_tabs_v1(),
+        serial in any::<u64>(),
+    ) {
+        prop_assert_eq!(request.validate(), Ok(()));
+        let mux_request = mux::ReorderWindowTabsRequest::try_new_v1(
+            request.domain_binding_id.as_bytes(),
+            request.session_incarnation,
+            usize::try_from(request.window_id.get()).unwrap(),
+            mux::window::WindowOrderRevision::new(request.expected_order_revision.get()),
+            request
+                .desired_tab_ids
+                .iter()
+                .map(|tab_id| usize::try_from(tab_id.get()).unwrap())
+                .collect(),
+            request
+                .desired_active_tab_id
+                .map(|tab_id| usize::try_from(tab_id.get()).unwrap()),
+            mux::WindowOrderMutationId::new(
+                request.mutation_id.namespace,
+                request.mutation_id.sequence,
+            ),
+        )
+        .unwrap();
+        prop_assert_eq!(
+            mux_request.request_digest().as_bytes(),
+            request.digest.as_bytes(),
+        );
+
+        let mut successor_stream = request.clone();
+        successor_stream.stream_id = TopologyStreamId::from_bytes([0xa5; 16]);
+        prop_assert_eq!(successor_stream.canonical_digest(), request.digest);
+
+        let mut changed_window = request.clone();
+        changed_window.window_id = RemoteWindowId::new(if request.window_id.get() == 4_096 {
+            0
+        } else {
+            request.window_id.get() + 1
+        });
+        prop_assert_ne!(changed_window.canonical_digest(), request.digest);
+
+        let mut changed_mutation = request.clone();
+        changed_mutation.mutation_id.sequence = if request.mutation_id.sequence == 1 {
+            2
+        } else {
+            request.mutation_id.sequence - 1
+        };
+        prop_assert_ne!(changed_mutation.canonical_digest(), request.digest);
+
+        assert_pdu_roundtrip(serial, Pdu::ReorderWindowTabsV1(request));
+    }
 
     #[test]
     fn create_floating_pane_json_and_pdu_roundtrip(
