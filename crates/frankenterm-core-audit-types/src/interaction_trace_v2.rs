@@ -6,7 +6,7 @@
 //! that a display callback measures photons, or that clocks on different
 //! hosts can be subtracted.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
@@ -463,6 +463,7 @@ impl InteractionTraceV2 {
         let expected = InteractionTraceStage::expected(self.path);
         let mut spans = BTreeSet::new();
         let mut seen_stages = BTreeSet::new();
+        let mut last_start_by_clock = BTreeMap::new();
 
         for (index, event) in self.events.iter().enumerate() {
             validate_schema(&event.schema_version)?;
@@ -501,6 +502,17 @@ impl InteractionTraceV2 {
                 return Err(TraceContractError::DuplicateStage { stage: event.stage });
             }
             validate_event(event, &spans)?;
+            if let Some(previous_start_ns) = last_start_by_clock
+                .insert(event.started_at.clock_domain, event.started_at.monotonic_ns)
+                && event.started_at.monotonic_ns < previous_start_ns
+            {
+                return Err(TraceContractError::CrossEventClockRegression {
+                    clock_domain: event.started_at.clock_domain,
+                    previous_start_ns,
+                    actual_start_ns: event.started_at.monotonic_ns,
+                    event_ordinal: event.event_ordinal,
+                });
+            }
             spans.insert(event.span_id);
         }
         Ok(())
@@ -1115,6 +1127,12 @@ pub enum TraceContractError {
         to: InteractionTraceClockDomain,
     },
     ClockRegression { start_ns: u64, end_ns: u64 },
+    CrossEventClockRegression {
+        clock_domain: InteractionTraceClockDomain,
+        previous_start_ns: u64,
+        actual_start_ns: u64,
+        event_ordinal: u64,
+    },
     InvalidCorrelationAuthority,
     InvalidGeneration { field: &'static str },
     GenerationMissing {
@@ -1152,6 +1170,7 @@ impl std::error::Error for TraceContractError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use jsonschema::{Draft, Validator};
 
     const GOOD_FIXTURE: &str = include_str!(
         "../../../fixtures/perf/interaction-trace-v2/good-keypress-v2.json"
@@ -1465,6 +1484,22 @@ mod tests {
     }
 
     #[test]
+    fn same_clock_cross_event_start_regression_fails_closed() {
+        let mut trace = keypress_trace(1);
+        trace.events[2].started_at.monotonic_ns = 50;
+        trace.events[2].completed_at.monotonic_ns = 60;
+        assert_eq!(
+            trace.validate_structure(),
+            Err(TraceContractError::CrossEventClockRegression {
+                clock_domain: trace.events[2].started_at.clock_domain,
+                previous_start_ns: 100,
+                actual_start_ns: 50,
+                event_ordinal: 2,
+            })
+        );
+    }
+
+    #[test]
     fn schema_round_trip_and_current_fixture_are_exact() {
         let trace: InteractionTraceV2 =
             serde_json::from_str(GOOD_FIXTURE).expect("current fixture decodes");
@@ -1483,6 +1518,52 @@ mod tests {
             schema["properties"]["schema_version"]["const"].as_str(),
             Some(INTERACTION_TRACE_V2_SCHEMA_VERSION)
         );
+    }
+
+    #[test]
+    fn json_schema_accepts_typed_traces_and_rejects_negative_fixtures() {
+        let schema: serde_json::Value =
+            serde_json::from_str(JSON_SCHEMA).expect("JSON schema parses");
+        let validator = Validator::options()
+            .with_draft(Draft::Draft202012)
+            .build(&schema)
+            .expect("interaction trace v2 schema compiles");
+
+        for (label, value) in [
+            (
+                "committed keypress fixture",
+                serde_json::from_str(GOOD_FIXTURE).expect("keypress fixture parses"),
+            ),
+            (
+                "typed keypress roundtrip",
+                serde_json::to_value(keypress_trace(1)).expect("keypress trace serializes"),
+            ),
+            (
+                "typed resize roundtrip",
+                serde_json::to_value(resize_trace(2)).expect("resize trace serializes"),
+            ),
+        ] {
+            let errors = validator
+                .iter_errors(&value)
+                .map(|error| format!("{error} at {}", error.instance_path()))
+                .collect::<Vec<_>>();
+            assert!(
+                errors.is_empty(),
+                "{label} failed schema validation: {errors:?}"
+            );
+        }
+
+        for (label, fixture) in [
+            ("old schema", OLD_FIXTURE),
+            ("raw-content fields", PRIVACY_BAD_FIXTURE),
+        ] {
+            let value: serde_json::Value =
+                serde_json::from_str(fixture).expect("negative fixture parses as JSON");
+            assert!(
+                !validator.is_valid(&value),
+                "{label} fixture unexpectedly passed"
+            );
+        }
     }
 
     #[test]

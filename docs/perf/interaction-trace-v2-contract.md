@@ -72,6 +72,12 @@ helper accepts only the exact same clock-domain tuple. In particular:
   authority, with its retained error bound. This v2 contract intentionally has
   no method that performs that subtraction.
 
+Within one trace, stage start timestamps sharing the exact same clock domain
+must also be nondecreasing by event ordinal. Overlapping stage intervals remain
+legal; the validator intentionally compares start to prior start, not start to
+prior completion. This catches a regressing producer clock without falsely
+rejecting concurrent resize/render work.
+
 ## Causality and claim boundaries
 
 Each receipt carries one closed correlation class:
@@ -140,7 +146,9 @@ The retained corpus is `fixtures/perf/interaction-trace-v2/`:
 Inline tests additionally cover sequence exhaustion, duplicate/regressing IDs,
 process restart, missing stages, cross-clock arithmetic, clock regression,
 round trip, sampling loss, metric-map completeness, and submit-versus-photon
-authority.
+authority. A Draft 2020-12 validator compiles the committed JSON schema,
+accepts the committed keypress fixture plus typed keypress and resize
+roundtrips, and rejects the retained old-version and raw-content fixtures.
 
 ## Non-claims and downstream work
 
