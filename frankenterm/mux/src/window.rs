@@ -2,17 +2,181 @@ use crate::pane::CloseReason;
 use crate::tab::{TabStackEntry, TabStackError, TabStackId, TabStackState};
 use crate::{Mux, MuxNotification, Pane, Tab, TabId, DEFAULT_WORKSPACE};
 use config::GuiPosition;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::fmt;
 use std::sync::Arc;
+use thiserror::Error;
 
 static WIN_ID: ::std::sync::atomic::AtomicUsize = ::std::sync::atomic::AtomicUsize::new(0);
 pub type WindowId = usize;
+
+/// Maximum tab count represented by the v1 ordered-window authority.
+///
+/// `codec` depends on `mux`, so this foundational crate cannot import the
+/// corresponding wire constant. Keep this value equal to
+/// `codec::MAX_ORDERED_TABS_PER_WINDOW`; the server adapter must reject a
+/// disagreement before advertising the protocol capability.
+pub const MAX_TABS_PER_ORDERED_WINDOW: usize = 4_096;
+
+/// Per-window revision of membership, order, and active-tab identity.
+///
+/// `u64::MAX` is a terminal sentinel and is never a valid published revision.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct WindowOrderRevision(u64);
+
+impl WindowOrderRevision {
+    pub const INITIAL: Self = Self(0);
+
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+
+    fn checked_successor(self) -> Result<Self, WindowOrderRevisionExhausted> {
+        let next = self.0.checked_add(1).ok_or(WindowOrderRevisionExhausted)?;
+        if next == u64::MAX {
+            return Err(WindowOrderRevisionExhausted);
+        }
+        Ok(Self(next))
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+#[error(
+    "window order revision space is exhausted; refusing to wrap, saturate, reset, or reuse a revision"
+)]
+pub struct WindowOrderRevisionExhausted;
+
+/// Immutable, pointer-preserving state of one exact mux window.
+///
+/// Cloning this value clones only `Arc`s. It never reconstructs a `Tab`, pane,
+/// or tab stack and is therefore safe to retain in a delayed notification.
+#[derive(Clone)]
+pub struct FrozenWindowOrder {
+    window_id: WindowId,
+    order_revision: WindowOrderRevision,
+    ordered_tabs: Arc<[Arc<Tab>]>,
+    active_tab: Option<Arc<Tab>>,
+}
+
+impl FrozenWindowOrder {
+    pub const fn window_id(&self) -> WindowId {
+        self.window_id
+    }
+
+    pub const fn order_revision(&self) -> WindowOrderRevision {
+        self.order_revision
+    }
+
+    pub fn ordered_tabs(&self) -> &[Arc<Tab>] {
+        &self.ordered_tabs
+    }
+
+    pub fn ordered_tab_ids(&self) -> impl ExactSizeIterator<Item = TabId> + '_ {
+        self.ordered_tabs.iter().map(|tab| tab.tab_id())
+    }
+
+    pub fn active_tab(&self) -> Option<&Arc<Tab>> {
+        self.active_tab.as_ref()
+    }
+
+    pub fn active_tab_id(&self) -> Option<TabId> {
+        self.active_tab.as_ref().map(|tab| tab.tab_id())
+    }
+}
+
+impl fmt::Debug for FrozenWindowOrder {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("FrozenWindowOrder")
+            .field("window_id", &self.window_id)
+            .field("order_revision", &self.order_revision)
+            .field(
+                "ordered_tab_ids",
+                &self.ordered_tab_ids().collect::<Vec<_>>(),
+            )
+            .field("active_tab_id", &self.active_tab_id())
+            .finish()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub enum WindowOrderSnapshotError {
+    #[error(
+        "window {window_id} has {count} tabs, exceeding ordered-window limit {max}"
+    )]
+    TooManyTabs {
+        window_id: WindowId,
+        count: usize,
+        max: usize,
+    },
+    #[error("window {window_id} contains duplicate tab id {tab_id}")]
+    DuplicateTabId {
+        window_id: WindowId,
+        tab_id: TabId,
+    },
+    #[error("non-empty window {window_id} has no valid active tab")]
+    MissingActiveTab { window_id: WindowId },
+}
+
+pub(crate) struct PreparedWindowOrder {
+    window_id: WindowId,
+    prior_revision: WindowOrderRevision,
+    next_revision: WindowOrderRevision,
+    ordered_tabs: Vec<Arc<Tab>>,
+    active_index: usize,
+}
+
+impl fmt::Debug for PreparedWindowOrder {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparedWindowOrder")
+            .field("window_id", &self.window_id)
+            .field("prior_revision", &self.prior_revision)
+            .field("next_revision", &self.next_revision)
+            .field(
+                "ordered_tab_ids",
+                &self
+                    .ordered_tabs
+                    .iter()
+                    .map(|tab| tab.tab_id())
+                    .collect::<Vec<_>>(),
+            )
+            .field("active_index", &self.active_index)
+            .finish()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub enum PrepareWindowOrderError {
+    #[error(transparent)]
+    RevisionExhausted(#[from] WindowOrderRevisionExhausted),
+    #[error(transparent)]
+    InvalidCurrentState(#[from] WindowOrderSnapshotError),
+    #[error("desired order contains duplicate tab id {tab_id}")]
+    DuplicateTabId { tab_id: TabId },
+    #[error("desired order is missing current tab id {tab_id}")]
+    MissingTabId { tab_id: TabId },
+    #[error("desired order contains non-member tab id {tab_id}")]
+    ForeignTabId { tab_id: TabId },
+    #[error(
+        "desired active tab {desired_active_tab_id:?} does not preserve current active tab {current_active_tab_id:?}"
+    )]
+    ActiveTabChanged {
+        current_active_tab_id: Option<TabId>,
+        desired_active_tab_id: Option<TabId>,
+    },
+}
 
 pub struct Window {
     id: WindowId,
     owner: std::sync::Weak<Mux>,
     tabs: Vec<Arc<Tab>>,
     active: usize,
+    order_revision: WindowOrderRevision,
     last_active: Option<TabId>,
     tab_stacks: TabStackState,
     workspace: String,
@@ -47,6 +211,7 @@ impl Window {
             owner,
             tabs: vec![],
             active: 0,
+            order_revision: WindowOrderRevision::INITIAL,
             last_active: None,
             tab_stacks: TabStackState::default(),
             title: String::new(),
@@ -109,6 +274,169 @@ impl Window {
         self.id
     }
 
+    pub const fn order_revision(&self) -> WindowOrderRevision {
+        self.order_revision
+    }
+
+    fn next_order_revision(&self) -> Result<WindowOrderRevision, WindowOrderRevisionExhausted> {
+        self.order_revision.checked_successor()
+    }
+
+    fn next_order_revision_or_panic(&self) -> WindowOrderRevision {
+        self.next_order_revision().unwrap_or_else(|err| {
+            panic!("window {} cannot mutate ordered state: {err}", self.id)
+        })
+    }
+
+    /// Freeze the exact ordered `Arc<Tab>` identities and active identity.
+    ///
+    /// This performs no pane callbacks or I/O and never consults a mutable
+    /// global. A malformed legacy window fails closed rather than publishing
+    /// an ambiguous ordered snapshot.
+    pub fn order_snapshot(&self) -> Result<FrozenWindowOrder, WindowOrderSnapshotError> {
+        if self.tabs.len() > MAX_TABS_PER_ORDERED_WINDOW {
+            return Err(WindowOrderSnapshotError::TooManyTabs {
+                window_id: self.id,
+                count: self.tabs.len(),
+                max: MAX_TABS_PER_ORDERED_WINDOW,
+            });
+        }
+        let mut seen = HashSet::with_capacity(self.tabs.len());
+        for tab in &self.tabs {
+            if !seen.insert(tab.tab_id()) {
+                return Err(WindowOrderSnapshotError::DuplicateTabId {
+                    window_id: self.id,
+                    tab_id: tab.tab_id(),
+                });
+            }
+        }
+        let active_tab = if self.tabs.is_empty() {
+            None
+        } else {
+            Some(
+                self.tabs
+                    .get(self.active)
+                    .cloned()
+                    .ok_or(WindowOrderSnapshotError::MissingActiveTab { window_id: self.id })?,
+            )
+        };
+        Ok(FrozenWindowOrder {
+            window_id: self.id,
+            order_revision: self.order_revision,
+            ordered_tabs: Arc::from(self.tabs.clone()),
+            active_tab,
+        })
+    }
+
+    /// Fully stage one exact-permutation reorder without mutating the window.
+    ///
+    /// The returned value contains the same `Arc<Tab>` identities in their
+    /// requested order. Callers must retain exclusive access until commit.
+    pub(crate) fn prepare_exact_order(
+        &self,
+        desired_tab_ids: &[TabId],
+        desired_active_tab_id: Option<TabId>,
+    ) -> Result<PreparedWindowOrder, PrepareWindowOrderError> {
+        if self.tabs.len() > MAX_TABS_PER_ORDERED_WINDOW {
+            return Err(WindowOrderSnapshotError::TooManyTabs {
+                window_id: self.id,
+                count: self.tabs.len(),
+                max: MAX_TABS_PER_ORDERED_WINDOW,
+            }
+            .into());
+        }
+        let current_active_tab_id = if self.tabs.is_empty() {
+            None
+        } else {
+            Some(
+                self.tabs
+                    .get(self.active)
+                    .ok_or(WindowOrderSnapshotError::MissingActiveTab { window_id: self.id })?
+                    .tab_id(),
+            )
+        };
+        if desired_active_tab_id != current_active_tab_id {
+            return Err(PrepareWindowOrderError::ActiveTabChanged {
+                current_active_tab_id,
+                desired_active_tab_id,
+            });
+        }
+
+        let mut current_by_id = HashMap::with_capacity(self.tabs.len());
+        for tab in &self.tabs {
+            let replaced = current_by_id.insert(tab.tab_id(), Arc::clone(tab));
+            if replaced.is_some() {
+                return Err(WindowOrderSnapshotError::DuplicateTabId {
+                    window_id: self.id,
+                    tab_id: tab.tab_id(),
+                }
+                .into());
+            }
+        }
+        let mut desired_ids = HashSet::with_capacity(desired_tab_ids.len());
+        let mut ordered_tabs = Vec::with_capacity(desired_tab_ids.len());
+        for &tab_id in desired_tab_ids {
+            if !desired_ids.insert(tab_id) {
+                return Err(PrepareWindowOrderError::DuplicateTabId { tab_id });
+            }
+            let Some(tab) = current_by_id.get(&tab_id) else {
+                return Err(PrepareWindowOrderError::ForeignTabId { tab_id });
+            };
+            ordered_tabs.push(Arc::clone(tab));
+        }
+        if let Some(tab) = self
+            .tabs
+            .iter()
+            .find(|tab| !desired_ids.contains(&tab.tab_id()))
+        {
+            return Err(PrepareWindowOrderError::MissingTabId {
+                tab_id: tab.tab_id(),
+            });
+        }
+
+        let active_index = desired_active_tab_id
+            .and_then(|active_tab_id| {
+                desired_tab_ids
+                    .iter()
+                    .position(|tab_id| *tab_id == active_tab_id)
+            })
+            .unwrap_or(0);
+        Ok(PreparedWindowOrder {
+            window_id: self.id,
+            prior_revision: self.order_revision,
+            next_revision: self.next_order_revision()?,
+            ordered_tabs,
+            active_index,
+        })
+    }
+
+    /// Commit a prevalidated order while preserving tabs, panes, active
+    /// identity, last-active identity, and tab-stack state.
+    ///
+    /// This intentionally does not notify. The owning mux transaction must
+    /// reserve one global topology revision and publish one frozen event.
+    pub(crate) fn commit_prepared_order(
+        &mut self,
+        prepared: PreparedWindowOrder,
+    ) -> FrozenWindowOrder {
+        assert_eq!(prepared.window_id, self.id, "prepared order changed windows");
+        assert_eq!(
+            prepared.prior_revision, self.order_revision,
+            "prepared order revision changed before commit"
+        );
+        self.tabs = prepared.ordered_tabs;
+        self.active = prepared.active_index;
+        self.order_revision = prepared.next_revision;
+        self.order_snapshot()
+            .expect("a prevalidated exact order must remain snapshot-valid after commit")
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_order_revision_for_test(&mut self, revision: WindowOrderRevision) {
+        assert_ne!(revision.get(), u64::MAX);
+        self.order_revision = revision;
+    }
+
     fn check_that_tab_isnt_already_in_window(&self, tab: &Arc<Tab>) {
         for t in &self.tabs {
             assert_ne!(t.tab_id(), tab.tab_id(), "tab already added to this window");
@@ -130,12 +458,20 @@ impl Window {
             self.id,
             self.tabs.len(),
         );
+        anyhow::ensure!(
+            self.tabs.len() < MAX_TABS_PER_ORDERED_WINDOW,
+            "cannot insert tab in window {}: ordered-window limit {} reached",
+            self.id,
+            MAX_TABS_PER_ORDERED_WINDOW,
+        );
         self.check_that_tab_isnt_already_in_window(tab);
+        let next_revision = self.next_order_revision()?;
         let prior_active_index = (self.active < self.tabs.len()).then_some(self.active);
         self.tabs.insert(index, Arc::clone(tab));
         self.active = prior_active_index
             .map(|active| if index <= active { active + 1 } else { active })
             .unwrap_or(0);
+        self.order_revision = next_revision;
         self.invalidate();
         Ok(())
     }
@@ -167,6 +503,7 @@ impl Window {
             return Ok(true);
         }
 
+        let next_revision = self.next_order_revision()?;
         let prior_active_index = (self.active < self.tabs.len()).then_some(self.active);
         let tab = self.tabs.remove(source_index);
         let active_after_removal = prior_active_index.map(|active| {
@@ -187,14 +524,14 @@ impl Window {
         });
         self.tabs.insert(destination_index, tab);
         self.active = active_after_removal.unwrap_or(0);
+        self.order_revision = next_revision;
         self.invalidate();
         Ok(true)
     }
 
     pub fn push(&mut self, tab: &Arc<Tab>) {
-        self.check_that_tab_isnt_already_in_window(tab);
-        self.tabs.push(Arc::clone(tab));
-        self.invalidate();
+        self.insert(self.tabs.len(), tab)
+            .unwrap_or_else(|err| panic!("cannot append tab to window {}: {err:#}", self.id));
     }
 
     pub fn is_empty(&self) -> bool {
@@ -228,6 +565,12 @@ impl Window {
     }
 
     pub fn remove_by_idx(&mut self, idx: usize) -> Arc<Tab> {
+        assert!(
+            idx < self.tabs.len(),
+            "cannot remove tab index {idx} from window {} with {} tabs",
+            self.id,
+            self.tabs.len()
+        );
         let active = self.get_active().map(Arc::clone);
         self.do_remove_idx(idx, active)
     }
@@ -257,17 +600,18 @@ impl Window {
             .as_ref()
             .and_then(|tab| tab.get_active_pane_callback_free());
         let old_active_idx = self.active;
-        let mut removed_ids = HashSet::new();
-        self.tabs.retain(|tab| {
-            let remove = removals.contains(&(Arc::as_ptr(tab) as usize));
-            if remove {
-                removed_ids.insert(tab.tab_id());
-            }
-            !remove
-        });
+        let removed_ids = self
+            .tabs
+            .iter()
+            .filter(|tab| removals.contains(&(Arc::as_ptr(tab) as usize)))
+            .map(|tab| tab.tab_id())
+            .collect::<HashSet<_>>();
         if removed_ids.is_empty() {
             return false;
         }
+        let next_revision = self.next_order_revision_or_panic();
+        self.tabs
+            .retain(|tab| !removals.contains(&(Arc::as_ptr(tab) as usize)));
 
         for &tab_id in &removed_ids {
             self.tab_stacks.remove_tab(tab_id);
@@ -303,11 +647,13 @@ impl Window {
                 self.enqueue_focus_lost(pane);
             }
         }
+        self.order_revision = next_revision;
         self.invalidate();
         true
     }
 
     fn do_remove_idx(&mut self, idx: usize, active: Option<Arc<Tab>>) -> Arc<Tab> {
+        let next_revision = self.next_order_revision_or_panic();
         let prior_active_pane = active
             .as_ref()
             .and_then(|tab| tab.get_active_pane_callback_free());
@@ -359,6 +705,7 @@ impl Window {
                 self.enqueue_focus_lost(pane);
             }
         }
+        self.order_revision = next_revision;
         self.invalidate();
         tab
     }
@@ -404,25 +751,44 @@ impl Window {
     /// save the current tabid and then make `idx` the active
     /// tab position.
     pub fn save_and_then_set_active(&mut self, idx: usize) {
+        assert!(idx < self.tabs.len());
         if idx == self.get_active_idx() {
             return;
         }
+        let next_revision = self.next_order_revision_or_panic();
         self.save_last_active();
-        self.set_active_without_saving(idx);
+        self.set_active_without_saving_at_revision(idx, next_revision);
     }
 
     /// Make `idx` the active tab position.
     /// The saved tab id is not changed.
     pub fn set_active_without_saving(&mut self, idx: usize) {
         assert!(idx < self.tabs.len());
-        if self.active != idx {
-            if let Some(tab) = self.tabs.get(self.active).map(Arc::clone) {
-                if let Some(pane) = tab.get_active_pane_callback_free() {
-                    self.enqueue_focus_lost(pane);
-                }
+        if self.active == idx {
+            return;
+        }
+        let next_revision = self.next_order_revision_or_panic();
+        self.set_active_without_saving_at_revision(idx, next_revision);
+    }
+
+    fn set_active_without_saving_at_revision(
+        &mut self,
+        idx: usize,
+        next_revision: WindowOrderRevision,
+    ) {
+        debug_assert!(idx < self.tabs.len());
+        debug_assert_eq!(
+            self.order_revision.checked_successor(),
+            Ok(next_revision),
+            "active-tab revision must be reserved from current state"
+        );
+        if let Some(tab) = self.tabs.get(self.active).map(Arc::clone) {
+            if let Some(pane) = tab.get_active_pane_callback_free() {
+                self.enqueue_focus_lost(pane);
             }
         }
         self.active = idx;
+        self.order_revision = next_revision;
         self.invalidate();
     }
 
@@ -452,6 +818,9 @@ impl Window {
     }
 
     pub fn cycle_tab_stack(&mut self, stack_id: TabStackId, delta: isize) -> Option<TabId> {
+        // Check terminal revision authority before mutating the stack's
+        // visible cursor. `&mut self` makes the subsequent reservation stable.
+        self.next_order_revision_or_panic();
         let tab_id = self.tab_stacks.cycle_visible(stack_id, delta)?;
         let idx = self.idx_by_id(tab_id)?;
         self.save_and_then_set_active(idx);
@@ -1860,5 +2229,201 @@ mod tests {
             Err(TabStackError::MissingTab(missing_id))
         );
         assert!(window.tab_stack_entries().is_empty());
+    }
+
+    #[test]
+    fn frozen_order_and_prepared_commit_preserve_exact_identity_and_stack_state() {
+        let first = test_tab();
+        let active = test_tab();
+        let third = test_tab();
+        let stack_id = TabStackId(101);
+        let mut window = Window::new(None, None);
+        for tab in [&first, &active, &third] {
+            window.push(tab);
+        }
+        window.set_active_without_saving(1);
+        window
+            .create_tab_stack(
+                stack_id,
+                vec![first.tab_id(), active.tab_id(), third.tab_id()],
+            )
+            .expect("create stack before exact reorder");
+        let stack_before = window.tab_stack_entries();
+        let revision_before = window.order_revision();
+
+        let before = window.order_snapshot().expect("valid frozen order");
+        assert_eq!(before.order_revision(), revision_before);
+        assert_eq!(
+            before.ordered_tabs().iter().map(Arc::as_ptr).collect::<Vec<_>>(),
+            vec![
+                Arc::as_ptr(&first),
+                Arc::as_ptr(&active),
+                Arc::as_ptr(&third),
+            ]
+        );
+        assert!(before
+            .active_tab()
+            .is_some_and(|tab| Arc::ptr_eq(tab, &active)));
+
+        let desired = [third.tab_id(), first.tab_id(), active.tab_id()];
+        let prepared = window
+            .prepare_exact_order(&desired, Some(active.tab_id()))
+            .expect("stage exact permutation");
+        let committed = window.commit_prepared_order(prepared);
+        assert_eq!(
+            committed.order_revision().get(),
+            revision_before.get() + 1
+        );
+        assert_eq!(
+            committed
+                .ordered_tabs()
+                .iter()
+                .map(Arc::as_ptr)
+                .collect::<Vec<_>>(),
+            vec![
+                Arc::as_ptr(&third),
+                Arc::as_ptr(&first),
+                Arc::as_ptr(&active),
+            ]
+        );
+        assert!(committed
+            .active_tab()
+            .is_some_and(|tab| Arc::ptr_eq(tab, &active)));
+        assert_eq!(window.tab_stack_entries(), stack_before);
+    }
+
+    #[test]
+    fn production_exact_reorder_matches_contract_model() {
+        let first = test_tab();
+        let active = test_tab();
+        let third = test_tab();
+        let mut window = Window::new(None, None);
+        for tab in [&first, &active, &third] {
+            window.push(tab);
+        }
+        window.set_active_without_saving(1);
+        let revision_before = window.order_revision();
+        let desired = vec![third.tab_id(), active.tab_id(), first.tab_id()];
+        let mut model = TabOrderContractModel::new(
+            0x5151,
+            17,
+            [(
+                window.window_id() as u64,
+                ContractWindow {
+                    revision: revision_before.get(),
+                    tabs: window.iter().map(|tab| tab.tab_id() as u64).collect(),
+                    active: Some(active.tab_id() as u64),
+                },
+            )],
+        );
+        let model_reply = model.apply_reorder(ReorderIntent {
+            session: 0x5151,
+            mutation: 0x6161,
+            window: window.window_id() as u64,
+            expected_revision: revision_before.get(),
+            tabs: desired.iter().map(|tab_id| *tab_id as u64).collect(),
+            active: Some(active.tab_id() as u64),
+        });
+
+        let prepared = window
+            .prepare_exact_order(&desired, Some(active.tab_id()))
+            .expect("production reorder stages");
+        let frozen = window.commit_prepared_order(prepared);
+        let ContractReply::Decision(ContractDecision::Applied {
+            window_revision, ..
+        }) = model_reply
+        else {
+            panic!("contract model must apply the same exact permutation");
+        };
+        assert_eq!(frozen.order_revision().get(), window_revision);
+        assert_eq!(
+            frozen
+                .ordered_tab_ids()
+                .map(|tab_id| tab_id as u64)
+                .collect::<Vec<_>>(),
+            model.windows[&(window.window_id() as u64)].tabs
+        );
+        assert_eq!(
+            frozen.active_tab_id().map(|tab_id| tab_id as u64),
+            model.windows[&(window.window_id() as u64)].active
+        );
+    }
+
+    #[test]
+    fn exhausted_window_revision_rejects_before_any_order_mutation() {
+        let first = test_tab();
+        let active = test_tab();
+        let added = test_tab();
+        let mut window = Window::new(None, None);
+        window.push(&first);
+        window.push(&active);
+        window.set_active_without_saving(1);
+        window.set_order_revision_for_test(WindowOrderRevision::new(u64::MAX - 1));
+        let pointers_before = window.iter().map(Arc::as_ptr).collect::<Vec<_>>();
+        let active_before = window.get_active().map(Arc::as_ptr);
+
+        let insert_error = window
+            .insert(window.len(), &added)
+            .expect_err("terminal order revision must reject membership change");
+        assert!(insert_error.to_string().contains("revision space is exhausted"));
+        let prepare_error = window
+            .prepare_exact_order(
+                &[active.tab_id(), first.tab_id()],
+                Some(active.tab_id()),
+            )
+            .expect_err("terminal order revision must reject exact reorder");
+        assert_eq!(
+            prepare_error,
+            PrepareWindowOrderError::RevisionExhausted(WindowOrderRevisionExhausted)
+        );
+        assert_eq!(
+            window.iter().map(Arc::as_ptr).collect::<Vec<_>>(),
+            pointers_before
+        );
+        assert_eq!(window.get_active().map(Arc::as_ptr), active_before);
+        assert_eq!(window.order_revision().get(), u64::MAX - 1);
+    }
+
+    #[test]
+    fn every_legacy_order_state_mutator_advances_exactly_once() {
+        let first = test_tab();
+        let second = test_tab();
+        let third = test_tab();
+        let mut window = Window::new(None, None);
+
+        window.push(&first);
+        assert_eq!(window.order_revision().get(), 1);
+        window.insert(1, &second).expect("insert second tab");
+        assert_eq!(window.order_revision().get(), 2);
+        window.push(&third);
+        assert_eq!(window.order_revision().get(), 3);
+
+        window
+            .reorder_tab_if_same(&first, 0, 2)
+            .expect("valid legacy exact reorder");
+        assert_eq!(window.order_revision().get(), 4);
+        window
+            .reorder_tab_if_same(&first, 2, 2)
+            .expect("same-index reorder is a no-op");
+        assert_eq!(window.order_revision().get(), 4);
+
+        window.set_active_without_saving(0);
+        assert_eq!(window.order_revision().get(), 5);
+        window.set_active_without_saving(0);
+        assert_eq!(window.order_revision().get(), 5);
+
+        window.remove_by_id(third.tab_id());
+        assert_eq!(window.order_revision().get(), 6);
+        window.remove_by_id(third.tab_id());
+        assert_eq!(window.order_revision().get(), 6);
+
+        let removals = std::iter::once(Arc::as_ptr(&first) as usize).collect::<HashSet<_>>();
+        assert!(window.remove_tabs_by_exact_identity_set(&removals));
+        assert_eq!(window.order_revision().get(), 7);
+        assert!(!window.remove_tabs_by_exact_identity_set(&removals));
+        assert_eq!(window.order_revision().get(), 7);
+        assert!(window
+            .get_active()
+            .is_some_and(|tab| Arc::ptr_eq(tab, &second)));
     }
 }

@@ -62,7 +62,10 @@ use crate::pane::{CachePolicy, CloseReason, Pane, PaneId};
 use crate::ssh_agent::AgentProxy;
 use crate::tab::{SplitRequest, Tab, TabId};
 use crate::tmux::TmuxDomain;
-use crate::window::{Window, WindowId};
+use crate::window::{
+    FrozenWindowOrder, PrepareWindowOrderError, Window, WindowId, WindowOrderRevision,
+    WindowOrderSnapshotError, MAX_TABS_PER_ORDERED_WINDOW,
+};
 use anyhow::{anyhow, Context, Error};
 use config::keyassignment::SpawnTabDomain;
 use config::{configuration, ExitBehavior, GuiPosition};
@@ -243,6 +246,178 @@ impl MuxTopologyAuthority {
     }
 }
 
+/// Maximum number of idempotency receipts retained by one mux incarnation.
+///
+/// The ledger is insertion-ordered rather than access-ordered: adversarial
+/// retries cannot keep old identities resident forever by touching them.
+pub const MAX_WINDOW_ORDER_RECEIPTS: usize = 4_096;
+/// Aggregate compact tab identities retained across reorder receipts.
+///
+/// This prevents the count bound from becoming a hidden 4096 x 4096 memory
+/// multiplier when every recent request targeted a very large window.
+pub const MAX_WINDOW_ORDER_RECEIPT_TAB_IDS: usize = 65_536;
+
+/// Idempotency identity unique within one client-owned random namespace.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct WindowOrderMutationId {
+    pub namespace: [u8; 16],
+    pub sequence: u64,
+}
+
+impl WindowOrderMutationId {
+    pub const fn new(namespace: [u8; 16], sequence: u64) -> Self {
+        Self {
+            namespace,
+            sequence,
+        }
+    }
+
+    fn is_valid(self) -> bool {
+        self.namespace != [0; 16] && self.sequence != 0 && self.sequence != u64::MAX
+    }
+}
+
+/// Canonical digest of one frozen reorder request, validated by the protocol
+/// adapter before it crosses into mux authority.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct WindowReorderDigest([u8; 32]);
+
+impl WindowReorderDigest {
+    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    pub const fn as_bytes(self) -> [u8; 32] {
+        self.0
+    }
+}
+
+/// Mux-domain form of one already decoded and canonically digested reorder.
+///
+/// The codec crate depends on `mux`, so the server must map its wire types into
+/// this cycle-free form. `request_digest` is opaque here; the codec adapter is
+/// responsible for recomputing and validating it before calling the mux.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReorderWindowTabsRequest {
+    pub session_incarnation: MuxSessionIncarnation,
+    pub window_id: WindowId,
+    pub expected_order_revision: WindowOrderRevision,
+    pub desired_tab_ids: Vec<TabId>,
+    pub desired_active_tab_id: Option<TabId>,
+    pub mutation_id: WindowOrderMutationId,
+    pub request_digest: WindowReorderDigest,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WindowReorderMalformed {
+    InvalidMutationIdentity,
+    ExpectedRevisionExhausted,
+    TooManyTabs { count: usize, max: usize },
+    DuplicateTabId { tab_id: TabId },
+    ActiveTabRequired,
+    ActiveTabNotInDesiredOrder { tab_id: TabId },
+    InvalidCurrentState,
+    MissingTabId { tab_id: TabId },
+    ForeignTabId { tab_id: TabId },
+    ActiveTabChanged {
+        current_active_tab_id: Option<TabId>,
+        desired_active_tab_id: Option<TabId>,
+    },
+}
+
+/// Compact immutable identity state used in replies and retained receipts.
+/// Unlike [`FrozenWindowOrder`], this never keeps a live tab or pane alive.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WindowOrderState {
+    pub window_id: WindowId,
+    pub order_revision: WindowOrderRevision,
+    pub ordered_tab_ids: Arc<[TabId]>,
+    pub active_tab_id: Option<TabId>,
+}
+
+impl WindowOrderState {
+    fn from_frozen(window: &FrozenWindowOrder) -> Self {
+        Self {
+            window_id: window.window_id(),
+            order_revision: window.order_revision(),
+            ordered_tab_ids: Arc::from(window.ordered_tab_ids().collect::<Vec<_>>()),
+            active_tab_id: window.active_tab_id(),
+        }
+    }
+}
+
+/// Frozen result of an applied or conflicting compare-and-set decision.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WindowOrderCommit {
+    pub topology_revision: TopologyRevision,
+    pub window: WindowOrderState,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum WindowReorderTerminalOutcome {
+    Applied(WindowOrderCommit),
+    Conflict(WindowOrderCommit),
+    StaleIncarnation,
+    MissingWindow { window_id: WindowId },
+    Malformed(WindowReorderMalformed),
+    Exhausted,
+}
+
+impl WindowReorderTerminalOutcome {
+    fn retained_tab_id_count(&self) -> usize {
+        match self {
+            Self::Applied(commit) | Self::Conflict(commit) => commit.window.ordered_tab_ids.len(),
+            Self::StaleIncarnation
+            | Self::MissingWindow { .. }
+            | Self::Malformed(_)
+            | Self::Exhausted => 0,
+        }
+    }
+}
+
+/// Exact retry and same-identity/different-digest equivocation are distinct
+/// from a first terminal decision.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ReorderWindowTabsResult {
+    Decision(WindowReorderTerminalOutcome),
+    Replay(WindowReorderTerminalOutcome),
+    Equivocation {
+        mutation_id: WindowOrderMutationId,
+        retained_digest: WindowReorderDigest,
+        attempted_digest: WindowReorderDigest,
+    },
+}
+
+fn validate_reorder_window_tabs_request(
+    request: &ReorderWindowTabsRequest,
+) -> Result<(), WindowReorderMalformed> {
+    if request.expected_order_revision.get() == u64::MAX {
+        return Err(WindowReorderMalformed::ExpectedRevisionExhausted);
+    }
+    if request.desired_tab_ids.len() > MAX_TABS_PER_ORDERED_WINDOW {
+        return Err(WindowReorderMalformed::TooManyTabs {
+            count: request.desired_tab_ids.len(),
+            max: MAX_TABS_PER_ORDERED_WINDOW,
+        });
+    }
+    let mut desired = HashSet::with_capacity(request.desired_tab_ids.len());
+    for &tab_id in &request.desired_tab_ids {
+        if !desired.insert(tab_id) {
+            return Err(WindowReorderMalformed::DuplicateTabId { tab_id });
+        }
+    }
+    match (
+        request.desired_tab_ids.is_empty(),
+        request.desired_active_tab_id,
+    ) {
+        (false, None) => Err(WindowReorderMalformed::ActiveTabRequired),
+        (_, Some(tab_id)) if !desired.contains(&tab_id) => {
+            Err(WindowReorderMalformed::ActiveTabNotInDesiredOrder { tab_id })
+        }
+        _ => Ok(()),
+    }
+}
+
 #[derive(Clone, Debug)]
 pub enum MuxNotification {
     PaneOutput(PaneId),
@@ -255,6 +430,15 @@ pub enum MuxNotification {
     WindowCreated(WindowId),
     WindowRemoved(WindowId),
     WindowInvalidated(WindowId),
+    /// One frozen, pointer-preserving pure-window reorder. The enclosing
+    /// envelope carries the single topology revision reserved by the same
+    /// transaction; delayed subscribers must consume this state directly and
+    /// must not re-read a potentially newer window.
+    WindowOrderChanged {
+        mutation_id: WindowOrderMutationId,
+        request_digest: WindowReorderDigest,
+        window: FrozenWindowOrder,
+    },
     /// Workspace payload frozen at the same mutation point as its topology
     /// revision; delayed subscribers must never re-read a later window state.
     WindowWorkspaceChanged {
@@ -307,6 +491,7 @@ impl MuxNotification {
                 | Self::WindowCreated(_)
                 | Self::WindowRemoved(_)
                 | Self::WindowInvalidated(_)
+                | Self::WindowOrderChanged { .. }
                 | Self::WindowWorkspaceChanged { .. }
                 | Self::Empty
                 | Self::TabAddedToWindow { .. }
@@ -2915,6 +3100,80 @@ struct PendingWindowNotifications {
     owner: Weak<Mux>,
 }
 
+#[derive(Clone)]
+struct WindowOrderReceipt {
+    request_digest: WindowReorderDigest,
+    outcome: WindowReorderTerminalOutcome,
+    retained_tab_ids: usize,
+}
+
+struct WindowOrderReceiptLedger {
+    receipts: HashMap<WindowOrderMutationId, WindowOrderReceipt>,
+    insertion_order: VecDeque<WindowOrderMutationId>,
+    retained_tab_ids: usize,
+}
+
+impl WindowOrderReceiptLedger {
+    fn new() -> Self {
+        Self {
+            receipts: HashMap::new(),
+            insertion_order: VecDeque::new(),
+            retained_tab_ids: 0,
+        }
+    }
+
+    fn lookup(
+        &self,
+        mutation_id: WindowOrderMutationId,
+        request_digest: WindowReorderDigest,
+    ) -> Option<ReorderWindowTabsResult> {
+        let receipt = self.receipts.get(&mutation_id)?;
+        Some(if receipt.request_digest == request_digest {
+            ReorderWindowTabsResult::Replay(receipt.outcome.clone())
+        } else {
+            ReorderWindowTabsResult::Equivocation {
+                mutation_id,
+                retained_digest: receipt.request_digest,
+                attempted_digest: request_digest,
+            }
+        })
+    }
+
+    fn retain(
+        &mut self,
+        mutation_id: WindowOrderMutationId,
+        request_digest: WindowReorderDigest,
+        outcome: WindowReorderTerminalOutcome,
+    ) {
+        debug_assert!(!self.receipts.contains_key(&mutation_id));
+        let retained_tab_ids = outcome.retained_tab_id_count();
+        debug_assert!(retained_tab_ids <= MAX_TABS_PER_ORDERED_WINDOW);
+        while self.receipts.len() == MAX_WINDOW_ORDER_RECEIPTS
+            || self.retained_tab_ids + retained_tab_ids > MAX_WINDOW_ORDER_RECEIPT_TAB_IDS
+        {
+            let expired = self
+                .insertion_order
+                .pop_front()
+                .expect("an over-budget window-order receipt ledger has an insertion record");
+            let removed = self
+                .receipts
+                .remove(&expired)
+                .expect("a retained insertion identity has one receipt");
+            self.retained_tab_ids -= removed.retained_tab_ids;
+        }
+        self.receipts.insert(
+            mutation_id,
+            WindowOrderReceipt {
+                request_digest,
+                outcome,
+                retained_tab_ids,
+            },
+        );
+        self.insertion_order.push_back(mutation_id);
+        self.retained_tab_ids += retained_tab_ids;
+    }
+}
+
 enum PendingWindowAction {
     Notification {
         envelope: MuxNotificationEnvelope,
@@ -2965,6 +3224,7 @@ pub struct Mux {
     windows: RwLock<HashMap<WindowId, Window>>,
     provisional_windows: Mutex<HashSet<WindowId>>,
     pending_window_notifications: Mutex<PendingWindowNotifications>,
+    window_order_receipts: Mutex<WindowOrderReceiptLedger>,
     activity_count: Arc<AtomicUsize>,
     activity_prune_state: Arc<ActivityPruneState>,
     default_domain: RwLock<Option<Arc<dyn Domain>>>,
@@ -3660,6 +3920,7 @@ impl Mux {
             windows: RwLock::new(HashMap::new()),
             provisional_windows: Mutex::new(HashSet::new()),
             pending_window_notifications: Mutex::new(PendingWindowNotifications::default()),
+            window_order_receipts: Mutex::new(WindowOrderReceiptLedger::new()),
             activity_count: Arc::new(AtomicUsize::new(0)),
             activity_prune_state: Arc::new(ActivityPruneState::default()),
             default_domain: RwLock::new(default_domain),
@@ -4365,6 +4626,16 @@ impl Mux {
         activity: Option<Activity>,
     ) {
         let envelope = self.envelope_notification(notification);
+        self.queue_window_notification_envelope(envelope, activity);
+    }
+
+    /// Queue an envelope whose topology revision was reserved by the same
+    /// transaction that froze its payload.
+    fn queue_window_notification_envelope(
+        &self,
+        envelope: MuxNotificationEnvelope,
+        activity: Option<Activity>,
+    ) {
         let mut pending = self.pending_window_notifications.lock();
         assert!(
             std::ptr::eq(pending.owner.as_ptr(), self as *const Self),
@@ -6466,6 +6737,183 @@ impl Mux {
         changed
     }
 
+    /// Freeze one window's exact ordered tab pointers and active identity.
+    pub fn window_order_snapshot(
+        &self,
+        window_id: WindowId,
+    ) -> Result<Option<FrozenWindowOrder>, WindowOrderSnapshotError> {
+        let windows = self.windows.read();
+        windows
+            .get(&window_id)
+            .map(Window::order_snapshot)
+            .transpose()
+    }
+
+    /// Atomically compare-and-set one complete same-window tab permutation.
+    ///
+    /// All request, membership, active-identity, window-revision, and global
+    /// topology-revision checks finish before the ordered vector changes. A
+    /// successful transaction queues exactly one frozen topology event while
+    /// the window lock is still held, then invokes subscribers only after all
+    /// mux locks and the idempotency ledger have been released.
+    pub fn reorder_window_tabs(
+        &self,
+        request: ReorderWindowTabsRequest,
+    ) -> ReorderWindowTabsResult {
+        let current_session = self.topology.lock().session_incarnation;
+        if request.session_incarnation != current_session {
+            return ReorderWindowTabsResult::Decision(
+                WindowReorderTerminalOutcome::StaleIncarnation,
+            );
+        }
+        if !request.mutation_id.is_valid() {
+            return ReorderWindowTabsResult::Decision(WindowReorderTerminalOutcome::Malformed(
+                WindowReorderMalformed::InvalidMutationIdentity,
+            ));
+        }
+
+        let mut receipts = self.window_order_receipts.lock();
+        if let Some(replay_or_equivocation) =
+            receipts.lookup(request.mutation_id, request.request_digest)
+        {
+            return replay_or_equivocation;
+        }
+        if let Err(malformed) = validate_reorder_window_tabs_request(&request) {
+            let outcome = WindowReorderTerminalOutcome::Malformed(malformed);
+            receipts.retain(
+                request.mutation_id,
+                request.request_digest,
+                outcome.clone(),
+            );
+            return ReorderWindowTabsResult::Decision(outcome);
+        }
+
+        let mut notification_queued = false;
+        let outcome = {
+            let mut windows = self.windows.write();
+            let mut topology = self.topology.lock();
+            let topology_revision = match topology.snapshot() {
+                Ok((session_incarnation, revision))
+                    if session_incarnation == request.session_incarnation =>
+                {
+                    Some(revision)
+                }
+                Ok(_) => None,
+                Err(_) => {
+                    receipts.retain(
+                        request.mutation_id,
+                        request.request_digest,
+                        WindowReorderTerminalOutcome::Exhausted,
+                    );
+                    return ReorderWindowTabsResult::Decision(
+                        WindowReorderTerminalOutcome::Exhausted,
+                    );
+                }
+            };
+            let Some(topology_revision) = topology_revision else {
+                receipts.retain(
+                    request.mutation_id,
+                    request.request_digest,
+                    WindowReorderTerminalOutcome::StaleIncarnation,
+                );
+                return ReorderWindowTabsResult::Decision(
+                    WindowReorderTerminalOutcome::StaleIncarnation,
+                );
+            };
+            match windows.get_mut(&request.window_id) {
+                None => WindowReorderTerminalOutcome::MissingWindow {
+                    window_id: request.window_id,
+                },
+                Some(window)
+                    if window.order_revision() != request.expected_order_revision =>
+                {
+                    match window.order_snapshot() {
+                        Ok(window) => {
+                            WindowReorderTerminalOutcome::Conflict(WindowOrderCommit {
+                                topology_revision,
+                                window: WindowOrderState::from_frozen(&window),
+                            })
+                        }
+                        Err(_) => WindowReorderTerminalOutcome::Malformed(
+                            WindowReorderMalformed::InvalidCurrentState,
+                        ),
+                    }
+                }
+                Some(window) => match window.prepare_exact_order(
+                    &request.desired_tab_ids,
+                    request.desired_active_tab_id,
+                ) {
+                    Err(PrepareWindowOrderError::RevisionExhausted(_)) => {
+                        WindowReorderTerminalOutcome::Exhausted
+                    }
+                    Err(PrepareWindowOrderError::InvalidCurrentState(_)) => {
+                        WindowReorderTerminalOutcome::Malformed(
+                            WindowReorderMalformed::InvalidCurrentState,
+                        )
+                    }
+                    Err(PrepareWindowOrderError::DuplicateTabId { tab_id }) => {
+                        WindowReorderTerminalOutcome::Malformed(
+                            WindowReorderMalformed::DuplicateTabId { tab_id },
+                        )
+                    }
+                    Err(PrepareWindowOrderError::MissingTabId { tab_id }) => {
+                        WindowReorderTerminalOutcome::Malformed(
+                            WindowReorderMalformed::MissingTabId { tab_id },
+                        )
+                    }
+                    Err(PrepareWindowOrderError::ForeignTabId { tab_id }) => {
+                        WindowReorderTerminalOutcome::Malformed(
+                            WindowReorderMalformed::ForeignTabId { tab_id },
+                        )
+                    }
+                    Err(PrepareWindowOrderError::ActiveTabChanged {
+                        current_active_tab_id,
+                        desired_active_tab_id,
+                    }) => WindowReorderTerminalOutcome::Malformed(
+                        WindowReorderMalformed::ActiveTabChanged {
+                            current_active_tab_id,
+                            desired_active_tab_id,
+                        },
+                    ),
+                    Ok(prepared) => match topology.reserve_revision() {
+                        Err(_) => WindowReorderTerminalOutcome::Exhausted,
+                        Ok(topology_revision) => {
+                            let window = window.commit_prepared_order(prepared);
+                            let commit = WindowOrderCommit {
+                                topology_revision,
+                                window: WindowOrderState::from_frozen(&window),
+                            };
+                            self.queue_window_notification_envelope(
+                                MuxNotificationEnvelope {
+                                    notification: MuxNotification::WindowOrderChanged {
+                                        mutation_id: request.mutation_id,
+                                        request_digest: request.request_digest,
+                                        window,
+                                    },
+                                    topology: MuxTopologyStamp::Revision(topology_revision),
+                                },
+                                None,
+                            );
+                            notification_queued = true;
+                            WindowReorderTerminalOutcome::Applied(commit)
+                        }
+                    },
+                },
+            }
+        };
+
+        receipts.retain(
+            request.mutation_id,
+            request.request_digest,
+            outcome.clone(),
+        );
+        drop(receipts);
+        if notification_queued {
+            self.flush_window_notifications();
+        }
+        ReorderWindowTabsResult::Decision(outcome)
+    }
+
     pub fn get_active_tab_for_window(&self, window_id: WindowId) -> Option<Arc<Tab>> {
         let window = self.get_window(window_id)?;
         window.get_active().map(Arc::clone)
@@ -8005,6 +8453,33 @@ mod tests {
             pixel_width: 800,
             pixel_height: 600,
             dpi: 96,
+        }
+    }
+
+    fn test_window_reorder_request(
+        mux: &Mux,
+        window_id: WindowId,
+        desired_tab_ids: Vec<TabId>,
+        desired_active_tab_id: Option<TabId>,
+        mutation_sequence: u64,
+        digest_marker: u8,
+    ) -> ReorderWindowTabsRequest {
+        let (session_incarnation, _) = mux
+            .topology_snapshot_authority()
+            .expect("test mux topology authority");
+        let expected_order_revision = mux
+            .window_order_snapshot(window_id)
+            .expect("test window snapshot validity")
+            .expect("test window presence")
+            .order_revision();
+        ReorderWindowTabsRequest {
+            session_incarnation,
+            window_id,
+            expected_order_revision,
+            desired_tab_ids,
+            desired_active_tab_id,
+            mutation_id: WindowOrderMutationId::new([0x73; 16], mutation_sequence),
+            request_digest: WindowReorderDigest::from_bytes([digest_marker; 32]),
         }
     }
 
@@ -13660,6 +14135,442 @@ mod tests {
 
         drop(window_builder);
         Mux::shutdown();
+    }
+
+    #[test]
+    fn reorder_window_tabs_applies_once_and_replays_without_republication() {
+        let _guard = global_test_lock();
+        Mux::shutdown();
+
+        let mux = Arc::new(Mux::new(None));
+        Mux::set_mux(&mux);
+        let window_builder = mux.new_empty_window(Some("authoritative-order".to_string()), None);
+        let window_id = *window_builder;
+        let first = Arc::new(Tab::new(&test_size()));
+        let active = Arc::new(Tab::new(&test_size()));
+        let third = Arc::new(Tab::new(&test_size()));
+        let stack_id = crate::tab::TabStackId(113);
+        for tab in [&first, &active, &third] {
+            mux.add_tab_no_panes(tab).expect("register exact tab");
+            mux.add_tab_to_window(tab, window_id)
+                .expect("attach exact tab");
+        }
+        {
+            let mut window = mux.get_window_mut(window_id).expect("test window");
+            window.set_active_without_saving(1);
+            window
+                .create_tab_stack(
+                    stack_id,
+                    vec![first.tab_id(), active.tab_id(), third.tab_id()],
+                )
+                .expect("create stack before authoritative reorder");
+        }
+        let stack_before = mux
+            .get_window(window_id)
+            .expect("test window")
+            .tab_stack_entries();
+        let (_, topology_before) = mux
+            .topology_snapshot_authority()
+            .expect("topology before reorder");
+        let order_before = mux
+            .window_order_snapshot(window_id)
+            .expect("valid order before reorder")
+            .expect("window before reorder")
+            .order_revision();
+
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let observed_for_subscriber = Arc::clone(&observed);
+        mux.subscribe_with_topology(move |envelope| {
+            if let MuxNotification::WindowOrderChanged {
+                mutation_id,
+                request_digest,
+                window,
+            } = envelope.notification
+            {
+                observed_for_subscriber.lock().push((
+                    envelope.topology,
+                    mutation_id,
+                    request_digest,
+                    window,
+                ));
+            }
+            true
+        })
+        .expect("subscribe to frozen order event");
+
+        let request = test_window_reorder_request(
+            &mux,
+            window_id,
+            vec![third.tab_id(), first.tab_id(), active.tab_id()],
+            Some(active.tab_id()),
+            1,
+            0x11,
+        );
+        let first_result = mux.reorder_window_tabs(request.clone());
+        let applied = match first_result {
+            ReorderWindowTabsResult::Decision(WindowReorderTerminalOutcome::Applied(commit)) => {
+                commit
+            }
+            other => panic!("expected first authoritative apply, got {other:?}"),
+        };
+        assert_eq!(
+            applied.topology_revision.get(),
+            topology_before.get() + 1,
+            "one logical reorder reserves one global topology revision"
+        );
+        assert_eq!(
+            applied.window.order_revision.get(),
+            order_before.get() + 1,
+            "one logical reorder reserves one window order revision"
+        );
+        assert_eq!(
+            applied.window.ordered_tab_ids.as_ref(),
+            [third.tab_id(), first.tab_id(), active.tab_id()]
+        );
+        assert_eq!(applied.window.active_tab_id, Some(active.tab_id()));
+        let live_applied = mux
+            .window_order_snapshot(window_id)
+            .expect("valid applied order")
+            .expect("applied window");
+        assert_eq!(
+            live_applied
+                .ordered_tabs()
+                .iter()
+                .map(Arc::as_ptr)
+                .collect::<Vec<_>>(),
+            vec![
+                Arc::as_ptr(&third),
+                Arc::as_ptr(&first),
+                Arc::as_ptr(&active),
+            ]
+        );
+        assert!(live_applied
+            .active_tab()
+            .is_some_and(|tab| Arc::ptr_eq(tab, &active)));
+        assert_eq!(
+            mux.get_window(window_id)
+                .expect("reordered window")
+                .tab_stack_entries(),
+            stack_before,
+            "exact permutation must not reconstruct or detach tab stacks"
+        );
+
+        mux.move_tab_between_windows(third.tab_id(), window_id, Some(2))
+            .expect("a later legacy mutation should not rewrite the frozen receipt");
+        assert_eq!(
+            mux.window_order_snapshot(window_id)
+                .expect("valid later order")
+                .expect("later window")
+                .ordered_tab_ids()
+                .collect::<Vec<_>>(),
+            vec![first.tab_id(), active.tab_id(), third.tab_id()]
+        );
+
+        let replay = mux.reorder_window_tabs(request.clone());
+        match replay {
+            ReorderWindowTabsResult::Replay(WindowReorderTerminalOutcome::Applied(commit)) => {
+                assert_eq!(commit.topology_revision, applied.topology_revision);
+                assert_eq!(
+                    commit.window.order_revision,
+                    applied.window.order_revision
+                );
+            }
+            other => panic!("expected exact applied replay, got {other:?}"),
+        }
+        let mut equivocation = request;
+        equivocation.request_digest = WindowReorderDigest::from_bytes([0x22; 32]);
+        assert!(matches!(
+            mux.reorder_window_tabs(equivocation),
+            ReorderWindowTabsResult::Equivocation {
+                retained_digest,
+                attempted_digest,
+                ..
+            } if retained_digest == WindowReorderDigest::from_bytes([0x11; 32])
+                && attempted_digest == WindowReorderDigest::from_bytes([0x22; 32])
+        ));
+
+        let observed = observed.lock();
+        assert_eq!(
+            observed.len(),
+            1,
+            "apply, exact replay, and equivocation must publish one event total"
+        );
+        let (stamp, mutation_id, digest, frozen) = &observed[0];
+        assert_eq!(
+            *stamp,
+            MuxTopologyStamp::Revision(applied.topology_revision)
+        );
+        assert_eq!(*mutation_id, WindowOrderMutationId::new([0x73; 16], 1));
+        assert_eq!(*digest, WindowReorderDigest::from_bytes([0x11; 32]));
+        assert_eq!(
+            frozen.ordered_tab_ids().collect::<Vec<_>>(),
+            vec![third.tab_id(), first.tab_id(), active.tab_id()]
+        );
+        drop(observed);
+        drop(window_builder);
+        Mux::shutdown();
+    }
+
+    #[test]
+    fn reorder_window_tabs_conflict_and_malformed_inputs_are_zero_mutation() {
+        let _guard = global_test_lock();
+        Mux::shutdown();
+
+        let mux = Arc::new(Mux::new(None));
+        Mux::set_mux(&mux);
+        let window_builder = mux.new_empty_window(Some("order-conflicts".to_string()), None);
+        let other_builder = mux.new_empty_window(Some("order-conflicts".to_string()), None);
+        let window_id = *window_builder;
+        let other_window_id = *other_builder;
+        let first = Arc::new(Tab::new(&test_size()));
+        let active = Arc::new(Tab::new(&test_size()));
+        let third = Arc::new(Tab::new(&test_size()));
+        let foreign = Arc::new(Tab::new(&test_size()));
+        for tab in [&first, &active, &third, &foreign] {
+            mux.add_tab_no_panes(tab).expect("register exact tab");
+        }
+        for tab in [&first, &active, &third] {
+            mux.add_tab_to_window(tab, window_id)
+                .expect("attach exact local member");
+        }
+        mux.add_tab_to_window(&foreign, other_window_id)
+            .expect("attach exact foreign member");
+        mux.get_window_mut(window_id)
+            .expect("test window")
+            .set_active_without_saving(1);
+
+        let notifications = Arc::new(AtomicUsize::new(0));
+        let notifications_for_subscriber = Arc::clone(&notifications);
+        mux.subscribe(move |notification| {
+            if matches!(notification, MuxNotification::WindowOrderChanged { .. }) {
+                notifications_for_subscriber.fetch_add(1, Ordering::SeqCst);
+            }
+            true
+        })
+        .expect("subscribe to order events");
+        let before = mux
+            .window_order_snapshot(window_id)
+            .expect("valid initial order")
+            .expect("initial window");
+        let topology_before = mux
+            .topology_snapshot_authority()
+            .expect("valid initial topology")
+            .1;
+
+        let mut conflict = test_window_reorder_request(
+            &mux,
+            window_id,
+            vec![third.tab_id(), first.tab_id(), active.tab_id()],
+            Some(active.tab_id()),
+            10,
+            0x31,
+        );
+        conflict.expected_order_revision = WindowOrderRevision::new(
+            conflict.expected_order_revision.get().saturating_sub(1),
+        );
+        match mux.reorder_window_tabs(conflict) {
+            ReorderWindowTabsResult::Decision(WindowReorderTerminalOutcome::Conflict(commit)) => {
+                assert_eq!(commit.topology_revision, topology_before);
+                assert_eq!(commit.window.order_revision, before.order_revision());
+            }
+            other => panic!("expected stale-revision conflict, got {other:?}"),
+        }
+
+        let cases = [
+            (
+                vec![first.tab_id(), first.tab_id(), active.tab_id()],
+                Some(active.tab_id()),
+                WindowReorderMalformed::DuplicateTabId {
+                    tab_id: first.tab_id(),
+                },
+            ),
+            (
+                vec![first.tab_id(), active.tab_id()],
+                Some(active.tab_id()),
+                WindowReorderMalformed::MissingTabId {
+                    tab_id: third.tab_id(),
+                },
+            ),
+            (
+                vec![first.tab_id(), active.tab_id(), foreign.tab_id()],
+                Some(active.tab_id()),
+                WindowReorderMalformed::ForeignTabId {
+                    tab_id: foreign.tab_id(),
+                },
+            ),
+            (
+                vec![first.tab_id(), active.tab_id(), third.tab_id()],
+                Some(first.tab_id()),
+                WindowReorderMalformed::ActiveTabChanged {
+                    current_active_tab_id: Some(active.tab_id()),
+                    desired_active_tab_id: Some(first.tab_id()),
+                },
+            ),
+        ];
+        for (offset, (desired, desired_active, expected)) in
+            IntoIterator::into_iter(cases).enumerate()
+        {
+            let request = test_window_reorder_request(
+                &mux,
+                window_id,
+                desired,
+                desired_active,
+                11 + offset as u64,
+                0x40 + offset as u8,
+            );
+            match mux.reorder_window_tabs(request) {
+                ReorderWindowTabsResult::Decision(WindowReorderTerminalOutcome::Malformed(
+                    actual,
+                )) => assert_eq!(actual, expected),
+                other => panic!("expected malformed zero-mutation result, got {other:?}"),
+            }
+        }
+        let mut missing_window = test_window_reorder_request(
+            &mux,
+            window_id,
+            vec![first.tab_id(), active.tab_id(), third.tab_id()],
+            Some(active.tab_id()),
+            20,
+            0x51,
+        );
+        missing_window.window_id = usize::MAX;
+        assert!(matches!(
+            mux.reorder_window_tabs(missing_window),
+            ReorderWindowTabsResult::Decision(
+                WindowReorderTerminalOutcome::MissingWindow { window_id: usize::MAX }
+            )
+        ));
+        let mut stale_session = test_window_reorder_request(
+            &mux,
+            window_id,
+            vec![first.tab_id(), active.tab_id(), third.tab_id()],
+            Some(active.tab_id()),
+            21,
+            0x52,
+        );
+        stale_session.session_incarnation = MuxSessionIncarnation::from_bytes([0x99; 16]);
+        assert!(matches!(
+            mux.reorder_window_tabs(stale_session),
+            ReorderWindowTabsResult::Decision(
+                WindowReorderTerminalOutcome::StaleIncarnation
+            )
+        ));
+
+        let after = mux
+            .window_order_snapshot(window_id)
+            .expect("valid final order")
+            .expect("final window");
+        assert_eq!(after.order_revision(), before.order_revision());
+        assert_eq!(
+            after.ordered_tabs().iter().map(Arc::as_ptr).collect::<Vec<_>>(),
+            before
+                .ordered_tabs()
+                .iter()
+                .map(Arc::as_ptr)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(after.active_tab().map(Arc::as_ptr), before.active_tab().map(Arc::as_ptr));
+        assert_eq!(
+            mux.topology_snapshot_authority()
+                .expect("topology after rejected requests")
+                .1,
+            topology_before
+        );
+        assert_eq!(notifications.load(Ordering::SeqCst), 0);
+
+        drop(other_builder);
+        drop(window_builder);
+        Mux::shutdown();
+    }
+
+    #[test]
+    fn reorder_window_tabs_revision_exhaustion_is_zero_mutation() {
+        let _guard = global_test_lock();
+        Mux::shutdown();
+
+        let mux = Arc::new(Mux::new(None));
+        Mux::set_mux(&mux);
+        let window_builder = mux.new_empty_window(Some("order-exhaustion".to_string()), None);
+        let window_id = *window_builder;
+        let first = Arc::new(Tab::new(&test_size()));
+        let active = Arc::new(Tab::new(&test_size()));
+        for tab in [&first, &active] {
+            mux.add_tab_no_panes(tab).expect("register exact tab");
+            mux.add_tab_to_window(tab, window_id)
+                .expect("attach exact tab");
+        }
+        mux.get_window_mut(window_id)
+            .expect("test window")
+            .set_active_without_saving(1);
+        mux.get_window_mut(window_id)
+            .expect("test window")
+            .set_order_revision_for_test(WindowOrderRevision::new(u64::MAX - 1));
+        let before = mux
+            .window_order_snapshot(window_id)
+            .expect("valid terminal-revision snapshot")
+            .expect("test window snapshot");
+        let notifications = Arc::new(AtomicUsize::new(0));
+        let notifications_for_subscriber = Arc::clone(&notifications);
+        mux.subscribe(move |notification| {
+            if matches!(notification, MuxNotification::WindowOrderChanged { .. }) {
+                notifications_for_subscriber.fetch_add(1, Ordering::SeqCst);
+            }
+            true
+        })
+        .expect("subscribe to order events");
+
+        let request = test_window_reorder_request(
+            &mux,
+            window_id,
+            vec![active.tab_id(), first.tab_id()],
+            Some(active.tab_id()),
+            30,
+            0x61,
+        );
+        assert!(matches!(
+            mux.reorder_window_tabs(request),
+            ReorderWindowTabsResult::Decision(WindowReorderTerminalOutcome::Exhausted)
+        ));
+        let after = mux
+            .window_order_snapshot(window_id)
+            .expect("valid order after exhaustion")
+            .expect("test window after exhaustion");
+        assert_eq!(after.order_revision(), before.order_revision());
+        assert_eq!(
+            after.ordered_tabs().iter().map(Arc::as_ptr).collect::<Vec<_>>(),
+            before
+                .ordered_tabs()
+                .iter()
+                .map(Arc::as_ptr)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(after.active_tab().map(Arc::as_ptr), before.active_tab().map(Arc::as_ptr));
+        assert_eq!(notifications.load(Ordering::SeqCst), 0);
+
+        drop(window_builder);
+        Mux::shutdown();
+    }
+
+    #[test]
+    fn window_order_receipt_ledger_is_bounded_and_insertion_ordered() {
+        let mut ledger = WindowOrderReceiptLedger::new();
+        for sequence in 1..=MAX_WINDOW_ORDER_RECEIPTS as u64 + 1 {
+            let mutation_id = WindowOrderMutationId::new([0x81; 16], sequence);
+            ledger.retain(
+                mutation_id,
+                WindowReorderDigest::from_bytes([sequence as u8; 32]),
+                WindowReorderTerminalOutcome::MissingWindow { window_id: 7 },
+            );
+        }
+        assert_eq!(ledger.receipts.len(), MAX_WINDOW_ORDER_RECEIPTS);
+        assert_eq!(ledger.insertion_order.len(), MAX_WINDOW_ORDER_RECEIPTS);
+        assert!(!ledger
+            .receipts
+            .contains_key(&WindowOrderMutationId::new([0x81; 16], 1)));
+        assert!(ledger.receipts.contains_key(&WindowOrderMutationId::new(
+            [0x81; 16],
+            MAX_WINDOW_ORDER_RECEIPTS as u64 + 1,
+        )));
     }
 
     #[test]
