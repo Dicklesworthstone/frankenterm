@@ -3503,8 +3503,9 @@ fn dispatch_client_request(
     Ok(())
 }
 
-enum ClientDecodeOutcome {
-    Decoded(anyhow::Result<DecodedPdu>),
+#[derive(Debug)]
+enum ClientDecodeError {
+    Decode(anyhow::Error),
     Terminal(&'static str),
     TerminalChannelClosed,
 }
@@ -3512,7 +3513,7 @@ enum ClientDecodeOutcome {
 async fn decode_client_pdu_or_terminal<T>(
     stream: &mut T,
     terminal_rx: &Receiver<&'static str>,
-) -> ClientDecodeOutcome
+) -> Result<DecodedPdu, ClientDecodeError>
 where
     T: DispatchStream,
 {
@@ -3521,9 +3522,9 @@ where
     pin_mut!(terminal_event);
     pin_mut!(decode);
     match select(terminal_event, decode).await {
-        Either::Left((Ok(reason), _)) => ClientDecodeOutcome::Terminal(reason),
-        Either::Left((Err(_), _)) => ClientDecodeOutcome::TerminalChannelClosed,
-        Either::Right((result, _)) => ClientDecodeOutcome::Decoded(result),
+        Either::Left((Ok(reason), _)) => Err(ClientDecodeError::Terminal(reason)),
+        Either::Left((Err(_), _)) => Err(ClientDecodeError::TerminalChannelClosed),
+        Either::Right((result, _)) => result.map_err(ClientDecodeError::Decode),
     }
 }
 
@@ -3734,19 +3735,15 @@ where
                     )
                     .await
                     {
-                        ClientDecodeOutcome::Terminal(reason) => {
+                        Err(ClientDecodeError::Terminal(reason)) => {
                             return Err(anyhow::anyhow!("mux dispatch terminated: {reason}"));
                         }
-                        ClientDecodeOutcome::TerminalChannelClosed => {
+                        Err(ClientDecodeError::TerminalChannelClosed) => {
                             return Err(anyhow::anyhow!(
                                 "mux dispatch terminal channel closed unexpectedly"
                             ));
                         }
-                        ClientDecodeOutcome::Decoded(result) => result,
-                    };
-                    let decoded = match decoded {
-                        Ok(data) => data,
-                        Err(err) => {
+                        Err(ClientDecodeError::Decode(err)) => {
                             if !admit_request_dispatch(&terminal) {
                                 let reason = terminal_rx.try_recv().ok().unwrap_or(
                                     "mux dispatch connection entered terminal state",
@@ -3761,6 +3758,7 @@ where
                             }
                             return Err(err).context("reading Pdu from client");
                         }
+                        Ok(data) => data,
                     };
                     // This short admission is the request-dispatch
                     // linearization point. The wrapper releases it before the
@@ -5502,7 +5500,7 @@ mod tests {
         assert!(polls_before_terminal > 0);
 
         terminal.trip(OUTBOUND_BUDGET_OVERFLOW);
-        let Poll::Ready(ClientDecodeOutcome::Terminal(reason)) =
+        let Poll::Ready(Err(ClientDecodeError::Terminal(reason))) =
             decode.as_mut().poll(&mut cx)
         else {
             panic!("terminal event must cancel a partial client frame decode");
