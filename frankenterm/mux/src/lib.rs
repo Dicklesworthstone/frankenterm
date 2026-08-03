@@ -7003,7 +7003,7 @@ impl Mux {
                 window.idx_by_id(tab_id).is_none(),
                 "add_tab_to_window: window {window_id} already contains tab id {tab_id}"
             );
-            window.push(tab);
+            window.insert(window.len(), tab)?;
             self.queue_window_notification(MuxNotification::TabAddedToWindow { tab_id, window_id });
         }
         self.recompute_pane_count();
@@ -7119,6 +7119,21 @@ impl Mux {
                     "move_tab_between_windows: destination window {dst_window} already contains \
                      tab id {tab_id}"
                 );
+                // `remove_tab_if_same` and `insert` are individually
+                // fail-before-mutation, but a cross-window transfer must
+                // preflight both revisions and destination capacity before
+                // detaching the source. The write guard keeps those checks
+                // stable through the two infallible commit steps.
+                source.next_order_revision().with_context(|| {
+                    format!(
+                        "move_tab_between_windows: source window {src_window} order revision is exhausted"
+                    )
+                })?;
+                destination.ensure_tab_insert_available().with_context(|| {
+                    format!(
+                        "move_tab_between_windows: destination window {dst_window} cannot accept tab {tab_id}"
+                    )
+                })?;
             }
 
             let changed = if src_window == dst_window && source_index == pos {
@@ -14755,6 +14770,68 @@ mod tests {
 
         drop(destination);
         drop(source);
+        drop(destination_builder);
+        drop(source_builder);
+        Mux::shutdown();
+    }
+
+    #[test]
+    fn exhausted_destination_rejects_attach_and_cross_window_move_before_detach() {
+        let _guard = global_test_lock();
+        Mux::shutdown();
+
+        let mux = Arc::new(Mux::new(None));
+        Mux::set_mux(&mux);
+        let source_builder = mux.new_empty_window(Some("move-exhaustion".to_string()), None);
+        let source_id = *source_builder;
+        let destination_builder =
+            mux.new_empty_window(Some("move-exhaustion".to_string()), None);
+        let destination_id = *destination_builder;
+        let source_tab = Arc::new(Tab::new(&test_size()));
+        let destination_tab = Arc::new(Tab::new(&test_size()));
+        let unattached_tab = Arc::new(Tab::new(&test_size()));
+        for tab in [&source_tab, &destination_tab, &unattached_tab] {
+            mux.add_tab_no_panes(tab).expect("register exact tab");
+        }
+        mux.add_tab_to_window(&source_tab, source_id)
+            .expect("attach source tab");
+        mux.add_tab_to_window(&destination_tab, destination_id)
+            .expect("attach destination tab");
+        mux.get_window_mut(destination_id)
+            .expect("destination window")
+            .set_order_revision_for_test(WindowOrderRevision::new(u64::MAX - 1));
+
+        let attach_error = mux
+            .add_tab_to_window(&unattached_tab, destination_id)
+            .expect_err("an exhausted destination must reject a new attachment");
+        assert!(
+            format!("{attach_error:#}").contains("revision space is exhausted"),
+            "unexpected exhausted-attachment error: {attach_error:#}"
+        );
+        let move_error = mux
+            .move_tab_between_windows(source_tab.tab_id(), destination_id, None)
+            .expect_err("an exhausted destination must reject before source detach");
+        assert!(
+            format!("{move_error:#}").contains("destination window"),
+            "unexpected exhausted-move error: {move_error:#}"
+        );
+
+        let source = mux.get_window(source_id).expect("source window survives");
+        let destination = mux
+            .get_window(destination_id)
+            .expect("destination window survives");
+        assert_eq!(source.len(), 1);
+        assert!(source
+            .get_active()
+            .is_some_and(|tab| Arc::ptr_eq(tab, &source_tab)));
+        assert_eq!(destination.len(), 1);
+        assert!(destination
+            .get_active()
+            .is_some_and(|tab| Arc::ptr_eq(tab, &destination_tab)));
+        assert_eq!(destination.order_revision().get(), u64::MAX - 1);
+        drop(destination);
+        drop(source);
+        assert!(mux.window_containing_tab(unattached_tab.tab_id()).is_none());
         drop(destination_builder);
         drop(source_builder);
         Mux::shutdown();

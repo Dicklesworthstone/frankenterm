@@ -278,8 +278,21 @@ impl Window {
         self.order_revision
     }
 
-    fn next_order_revision(&self) -> Result<WindowOrderRevision, WindowOrderRevisionExhausted> {
+    pub(crate) fn next_order_revision(
+        &self,
+    ) -> Result<WindowOrderRevision, WindowOrderRevisionExhausted> {
         self.order_revision.checked_successor()
+    }
+
+    pub(crate) fn ensure_tab_insert_available(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.tabs.len() < MAX_TABS_PER_ORDERED_WINDOW,
+            "cannot insert tab in window {}: ordered-window limit {} reached",
+            self.id,
+            MAX_TABS_PER_ORDERED_WINDOW,
+        );
+        self.next_order_revision()?;
+        Ok(())
     }
 
     fn next_order_revision_or_panic(&self) -> WindowOrderRevision {
@@ -458,12 +471,7 @@ impl Window {
             self.id,
             self.tabs.len(),
         );
-        anyhow::ensure!(
-            self.tabs.len() < MAX_TABS_PER_ORDERED_WINDOW,
-            "cannot insert tab in window {}: ordered-window limit {} reached",
-            self.id,
-            MAX_TABS_PER_ORDERED_WINDOW,
-        );
+        self.ensure_tab_insert_available()?;
         self.check_that_tab_isnt_already_in_window(tab);
         let next_revision = self.next_order_revision()?;
         let prior_active_index = (self.active < self.tabs.len()).then_some(self.active);
