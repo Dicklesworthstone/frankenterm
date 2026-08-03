@@ -9546,7 +9546,6 @@ pub struct GetImageCellResponse {
 #[cfg(test)]
 mod test {
     use super::*;
-    use sha2::Digest as _;
 
     fn declared_pdu_frame_header(
         ident: u64,
@@ -12075,8 +12074,9 @@ mod test {
 
         let rows_with_lengths = |lengths: [usize; 3]| {
             [-3_i64, -2, -1]
-                .into_iter()
-                .zip(lengths)
+                .iter()
+                .copied()
+                .zip(lengths.iter().copied())
                 .map(|(stable_row, length)| ExactRenderRowV1 {
                     stable_row,
                     text: ExactRenderRowTextV1::try_from_string("r".repeat(length))
@@ -12813,7 +12813,9 @@ mod test {
                     format!("{error:#}").contains(&format!(
                         "{name} payload has trailing schema bytes"
                     )),
-                    "unexpected trailing-byte rejection for {name}: {error:#}",
+                    "unexpected trailing-byte rejection for {}: {:#}",
+                    name,
+                    error,
                 );
             }
         }
@@ -12842,7 +12844,9 @@ mod test {
                 .expect_err("compressed suffix after exact render schema must fail closed");
             assert!(
                 format!("{error:#}").contains("trailing compressed frame bytes"),
-                "unexpected compressed-suffix rejection for {name}: {error:#}",
+                "unexpected compressed-suffix rejection for {}: {:#}",
+                name,
+                error,
             );
         }
 
@@ -12899,7 +12903,9 @@ mod test {
                 format!("{error:#}").contains(&format!(
                     "{name} payload is not canonical varbincode"
                 )),
-                "unexpected noncanonical authority rejection for {name}: {error:#}",
+                "unexpected noncanonical authority rejection for {}: {:#}",
+                name,
+                error,
             );
         }
 
@@ -13284,12 +13290,18 @@ mod test {
             let frame = pdu
                 .encode_frame_with_mode(7, CompressionMode::Never)
                 .unwrap_or_else(|error| {
-                    panic!("{name} must reach authoritative mux classification: {error:#}")
+                    panic!(
+                        "{} must reach authoritative mux classification: {:#}",
+                        name, error
+                    )
                 });
             assert_eq!(
                 Pdu::decode(frame.as_slice())
                     .unwrap_or_else(|error| {
-                        panic!("{name} must survive bounded wire admission: {error:#}")
+                        panic!(
+                            "{} must survive bounded wire admission: {:#}",
+                            name, error
+                        )
                     })
                     .pdu,
                 pdu,
