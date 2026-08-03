@@ -1,28 +1,35 @@
-//! Deterministic sequence assignment and correlation model for replayable causality.
+//! Candidate sequence-assignment and correlation model for replay tests.
 //!
-//! This module defines the ordering and correlation rules that make flight-recorder
-//! replay deterministic across panes. It bridges the per-pane sequence counters
-//! (from `IngressSequence` / `EgressEvent::sequence`) with the process-wide
-//! `GlobalSequence` and adds correlation metadata for causal reconstruction.
+//! [`SequenceAssigner`] and [`ReplayOrder`] model a process-wide interleaving for
+//! fixtures, property tests, and prospective recorder designs. They are not wired
+//! into the production Recorder v1 capture path and their `global_sequence` is not
+//! persisted in [`crate::recording::RecorderEvent`]. Production Recorder v1 merge
+//! and replay code uses [`crate::event_id::RecorderMergeKey`], whose five fields
+//! are all retained in the event record. Do not treat this module's model order as
+//! live flight-recorder authority or as evidence of terminal-side causality.
 //!
-//! # Ordering Contract
+//! # Model Ordering Contract
 //!
-//! Events are replay-ordered by `(global_sequence, pane_id, sequence)` — a
+//! Values explicitly assigned by this model are ordered by
+//! `(global_sequence, pane_id, sequence)` — a
 //! lexicographic triple that is:
 //! - **Total**: every event has a unique position.
 //! - **Stable**: repeated sorts produce identical order.
 //! - **Deterministic**: independent of wall-clock skew between panes.
 //!
 //! Within a single pane, `sequence` is strictly monotonic. Across panes,
-//! `global_sequence` provides a total interleaving that reflects the order
-//! events were *observed* by the recorder process, not the order they
-//! occurred in the terminal (which may involve non-trivial latency).
+//! `global_sequence` provides a total interleaving that reflects calls made to
+//! one [`SequenceAssigner`]. Because production capture does not call that
+//! assigner, this statement applies only to model values. Even there it records
+//! assignment order, not the order events occurred in the terminal.
 //!
 //! # Clock Skew Handling
 //!
 //! `occurred_at_ms` reflects the producer's wall clock and may be non-monotonic
 //! or skewed relative to other panes. The sequence model treats timestamps as
-//! *advisory metadata* — ordering for replay uses sequence numbers exclusively.
+//! *advisory metadata* — ordering within this model uses sequence numbers
+//! exclusively. Recorder v1's separate production merge contract is documented
+//! by [`crate::event_id::RecorderMergeKey`].
 //! A [`ClockSkewDetector`] flags anomalies for diagnostic purposes without
 //! altering the replay order.
 //!
@@ -82,7 +89,7 @@ static SEQUENCE_MODEL_LOCK_POISONED_COUNT: AtomicU64 = AtomicU64::new(0);
 /// events. Non-zero values mean a prior thread panicked while
 /// holding one of the model's internal locks; the model continued
 /// (fail-soft) after recovering. Hot-path counter for the
-/// flight-recorder replay sequencer.
+/// sequence-model utility.
 #[must_use]
 pub fn sequence_model_lock_poisoned_count() -> u64 {
     SEQUENCE_MODEL_LOCK_POISONED_COUNT.load(Ordering::Relaxed)
@@ -221,6 +228,9 @@ impl Drop for SequenceAssignmentTransaction<'_> {
 
 /// Assigns per-pane and global sequence numbers as one atomic pair.
 ///
+/// This is a model/test utility, not the production Recorder v1 sequencer.
+/// Callers must not infer that its process-wide frontier is persisted.
+///
 /// Thread-safe: one short critical section checks both frontiers and advances
 /// both or neither. Serializing the pair is necessary because independent
 /// atomic operations cannot roll back one frontier safely after the other is
@@ -242,11 +252,11 @@ impl SequenceAssigner {
 
     /// Assign the next `(pane_sequence, global_sequence)` pair for `pane_id`.
     ///
-    /// Both counters are strictly monotonic. The global sequence provides a
-    /// total ordering across all panes; the pane sequence orders events within
-    /// a single pane. `u64::MAX - 1` is the last usable value. Once either
-    /// frontier reaches the reserved `u64::MAX` sentinel, assignment fails and
-    /// neither frontier advances.
+    /// Both counters are strictly monotonic within this assigner. Its global
+    /// sequence provides a total ordering across calls; the pane sequence
+    /// orders calls for a single pane. `u64::MAX - 1` is the last usable value.
+    /// Once either frontier reaches the reserved `u64::MAX` sentinel,
+    /// assignment fails and neither frontier advances.
     ///
     /// # Errors
     ///
@@ -379,10 +389,11 @@ impl Default for SequenceAssigner {
 // Replay ordering
 // ---------------------------------------------------------------------------
 
-/// A replay-ordering key for deterministic event replay.
+/// A model replay-ordering key for deterministic fixtures and experiments.
 ///
-/// Events are sorted by this key to produce a stable, total order
-/// regardless of wall-clock timestamps.
+/// Values explicitly supplied with this key sort into a stable, total order
+/// regardless of wall-clock timestamps. Recorder v1 does not persist this key;
+/// its production ordering authority is [`crate::event_id::RecorderMergeKey`].
 ///
 /// Ordering: `global_sequence` → `pane_id` → `sequence` (lexicographic).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -419,7 +430,7 @@ impl ReplayOrder {
     }
 }
 
-/// Merge multiple per-pane event streams into a single deterministic replay stream.
+/// Merge multiple model streams into one deterministic model replay stream.
 ///
 /// Each input stream must be sorted by pane-local sequence. The output is sorted
 /// by [`ReplayOrder`] — lexicographic `(global_sequence, pane_id, sequence)`.
