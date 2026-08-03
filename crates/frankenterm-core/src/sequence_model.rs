@@ -42,17 +42,17 @@
 //! let assigner = SequenceAssigner::new();
 //!
 //! // Assign sequences for pane 0
-//! let (pane_seq, global_seq) = assigner.assign(0);
+//! let (pane_seq, global_seq) = assigner.assign(0).expect("sequence space available");
 //! assert_eq!(pane_seq, 0);
 //! assert_eq!(global_seq, 0);
 //!
 //! // Assign for pane 1 — global advances, pane starts fresh
-//! let (pane_seq, global_seq) = assigner.assign(1);
+//! let (pane_seq, global_seq) = assigner.assign(1).expect("sequence space available");
 //! assert_eq!(pane_seq, 0);
 //! assert_eq!(global_seq, 1);
 //!
 //! // Assign again for pane 0 — both advance
-//! let (pane_seq, global_seq) = assigner.assign(0);
+//! let (pane_seq, global_seq) = assigner.assign(0).expect("sequence space available");
 //! assert_eq!(pane_seq, 1);
 //! assert_eq!(global_seq, 2);
 //! ```
@@ -68,7 +68,7 @@ use serde::{Deserialize, Serialize};
 // =============================================================================
 //
 // Pre-fix the 17 production lock-sites on the sequence model's
-// internal Mutexes (pane_sequences, last_event_per_pane,
+// internal Mutexes (frontiers, last_event_per_pane,
 // active_batches, last_ts, anomalies, ...) already used
 // `unwrap_or_else(std::sync::PoisonError::into_inner)` — fail-soft
 // recovery from poison was correct, but invisible. Operators had
@@ -99,25 +99,84 @@ pub fn reset_sequence_model_lock_poisoned_count_for_test() {
 /// and bump the `SEQUENCE_MODEL_LOCK_POISONED_COUNT` observability
 /// counter on recovery. [ft-rln0q]
 fn record_poison_and_recover<T>(poison: std::sync::PoisonError<T>) -> T {
-    SEQUENCE_MODEL_LOCK_POISONED_COUNT.fetch_add(1, Ordering::Relaxed);
+    saturating_increment(&SEQUENCE_MODEL_LOCK_POISONED_COUNT);
     poison.into_inner()
+}
+
+fn saturating_increment(counter: &AtomicU64) {
+    let mut count = counter.load(Ordering::Relaxed);
+    while count != u64::MAX {
+        match counter.compare_exchange_weak(
+            count,
+            count + 1,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => break,
+            Err(observed) => count = observed,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Sequence assignment
 // ---------------------------------------------------------------------------
 
-/// Assigns per-pane and global sequence numbers atomically.
+/// Typed reason why a sequence pair could not be assigned.
 ///
-/// Thread-safe: the global counter uses `AtomicU64` (lock-free) and per-pane
-/// counters are behind a `Mutex<HashMap>` that is held only long enough to
-/// fetch-and-increment.
+/// `u64::MAX` is reserved as an exhausted sentinel for both frontiers and is
+/// never returned as a usable sequence number.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SequenceExhaustion {
+    /// The process-wide sequence space is exhausted.
+    Global,
+    /// The sequence space for one pane is exhausted.
+    Pane {
+        /// Pane whose local sequence space is exhausted.
+        pane_id: u64,
+    },
+    /// Both the process-wide and pane-local sequence spaces are exhausted.
+    GlobalAndPane {
+        /// Pane whose local sequence space is exhausted.
+        pane_id: u64,
+    },
+}
+
+impl std::fmt::Display for SequenceExhaustion {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Global => formatter.write_str("global sequence space exhausted"),
+            Self::Pane { pane_id } => {
+                write!(formatter, "sequence space exhausted for pane {pane_id}")
+            }
+            Self::GlobalAndPane { pane_id } => write!(
+                formatter,
+                "global and pane-local sequence spaces exhausted for pane {pane_id}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for SequenceExhaustion {}
+
+#[derive(Debug, Default)]
+struct SequenceFrontiers {
+    /// Next process-wide sequence, or `u64::MAX` after exhaustion.
+    global: u64,
+    /// Next sequence per pane, or `u64::MAX` after exhaustion.
+    panes: HashMap<u64, u64>,
+}
+
+/// Assigns per-pane and global sequence numbers as one atomic pair.
+///
+/// Thread-safe: one short critical section checks both frontiers and advances
+/// both or neither. Serializing the pair is necessary because independent
+/// atomic operations cannot roll back one frontier safely after the other is
+/// found exhausted by a concurrent caller.
 #[derive(Debug)]
 pub struct SequenceAssigner {
-    /// Process-wide monotonic counter.
-    global: AtomicU64,
-    /// Per-pane monotonic counters.
-    pane_sequences: Mutex<HashMap<u64, u64>>,
+    /// Process-wide and per-pane next-sequence frontiers.
+    frontiers: Mutex<SequenceFrontiers>,
 }
 
 impl SequenceAssigner {
@@ -125,8 +184,7 @@ impl SequenceAssigner {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            global: AtomicU64::new(0),
-            pane_sequences: Mutex::new(HashMap::new()),
+            frontiers: Mutex::new(SequenceFrontiers::default()),
         }
     }
 
@@ -134,32 +192,46 @@ impl SequenceAssigner {
     ///
     /// Both counters are strictly monotonic. The global sequence provides a
     /// total ordering across all panes; the pane sequence orders events within
-    /// a single pane.
-    pub fn assign(&self, pane_id: u64) -> (u64, u64) {
-        let pane_seq = {
-            let mut map = self
-                .pane_sequences
-                .lock()
-                .unwrap_or_else(record_poison_and_recover);
-            let entry = map.entry(pane_id).or_insert(0);
-            let seq = *entry;
-            *entry += 1;
-            seq
-        };
-        let global_seq = self.global.fetch_add(1, Ordering::Relaxed);
-        (pane_seq, global_seq)
+    /// a single pane. `u64::MAX - 1` is the last usable value. Once either
+    /// frontier reaches the reserved `u64::MAX` sentinel, assignment fails and
+    /// neither frontier advances.
+    pub fn assign(&self, pane_id: u64) -> Result<(u64, u64), SequenceExhaustion> {
+        let mut frontiers = self
+            .frontiers
+            .lock()
+            .unwrap_or_else(record_poison_and_recover);
+        let pane_sequence = frontiers.panes.get(&pane_id).copied().unwrap_or(0);
+        let global_sequence = frontiers.global;
+
+        match (
+            global_sequence == u64::MAX,
+            pane_sequence == u64::MAX,
+        ) {
+            (true, true) => return Err(SequenceExhaustion::GlobalAndPane { pane_id }),
+            (true, false) => return Err(SequenceExhaustion::Global),
+            (false, true) => return Err(SequenceExhaustion::Pane { pane_id }),
+            (false, false) => {}
+        }
+
+        frontiers.global = global_sequence + 1;
+        frontiers.panes.insert(pane_id, pane_sequence + 1);
+        Ok((pane_sequence, global_sequence))
     }
 
     /// Return the current global sequence value without advancing it.
     pub fn current_global(&self) -> u64 {
-        self.global.load(Ordering::Relaxed)
+        self.frontiers
+            .lock()
+            .unwrap_or_else(record_poison_and_recover)
+            .global
     }
 
     /// Return the current per-pane sequence for a given pane (0 if unseen).
     pub fn current_pane(&self, pane_id: u64) -> u64 {
-        self.pane_sequences
+        self.frontiers
             .lock()
             .unwrap_or_else(record_poison_and_recover)
+            .panes
             .get(&pane_id)
             .copied()
             .unwrap_or(0)
@@ -167,20 +239,26 @@ impl SequenceAssigner {
 
     /// Return the number of distinct panes that have been assigned sequences.
     pub fn pane_count(&self) -> usize {
-        self.pane_sequences
+        self.frontiers
             .lock()
             .unwrap_or_else(record_poison_and_recover)
+            .panes
             .len()
     }
 
     /// Reset per-pane counter for a specific pane (e.g., pane closed and reopened).
     ///
     /// The global counter is never reset — it is process-lifetime monotonic.
+    /// An exhausted pane retains its `u64::MAX` sentinel so a reset cannot
+    /// silently restart plausible sequence IDs for the same pane key.
     pub fn reset_pane(&self, pane_id: u64) {
-        self.pane_sequences
+        let mut frontiers = self
+            .frontiers
             .lock()
-            .unwrap_or_else(record_poison_and_recover)
-            .remove(&pane_id);
+            .unwrap_or_else(record_poison_and_recover);
+        if frontiers.panes.get(&pane_id) != Some(&u64::MAX) {
+            frontiers.panes.remove(&pane_id);
+        }
     }
 }
 
@@ -613,6 +691,15 @@ pub enum ReplayOrderViolation {
 mod tests {
     use super::*;
 
+    fn assigner_at(global: u64, panes: &[(u64, u64)]) -> SequenceAssigner {
+        SequenceAssigner {
+            frontiers: Mutex::new(SequenceFrontiers {
+                global,
+                panes: panes.iter().copied().collect(),
+            }),
+        }
+    }
+
     // -- SequenceAssigner tests --
 
     #[test]
@@ -627,7 +714,7 @@ mod tests {
     fn assign_single_pane_monotonic() {
         let assigner = SequenceAssigner::new();
         for i in 0..10 {
-            let (pane_seq, global_seq) = assigner.assign(0);
+            let (pane_seq, global_seq) = assigner.assign(0).unwrap();
             assert_eq!(pane_seq, i);
             assert_eq!(global_seq, i);
         }
@@ -637,11 +724,11 @@ mod tests {
     fn assign_multiple_panes_interleaved() {
         let assigner = SequenceAssigner::new();
 
-        let (p0_s0, g0) = assigner.assign(0);
-        let (p1_s0, g1) = assigner.assign(1);
-        let (p0_s1, g2) = assigner.assign(0);
-        let (p1_s1, g3) = assigner.assign(1);
-        let (p2_s0, g4) = assigner.assign(2);
+        let (p0_s0, g0) = assigner.assign(0).unwrap();
+        let (p1_s0, g1) = assigner.assign(1).unwrap();
+        let (p0_s1, g2) = assigner.assign(0).unwrap();
+        let (p1_s1, g3) = assigner.assign(1).unwrap();
+        let (p2_s0, g4) = assigner.assign(2).unwrap();
 
         // Per-pane sequences start at 0 independently
         assert_eq!(p0_s0, 0);
@@ -661,18 +748,171 @@ mod tests {
     }
 
     #[test]
+    fn pane_exhaustion_does_not_advance_global_frontier() {
+        let pane_id = 7;
+        let assigner = assigner_at(41, &[(pane_id, u64::MAX - 1)]);
+
+        assert_eq!(assigner.assign(pane_id), Ok((u64::MAX - 1, 41)));
+        assert_eq!(assigner.current_pane(pane_id), u64::MAX);
+        assert_eq!(assigner.current_global(), 42);
+
+        assert_eq!(
+            assigner.assign(pane_id),
+            Err(SequenceExhaustion::Pane { pane_id })
+        );
+        assert_eq!(assigner.current_pane(pane_id), u64::MAX);
+        assert_eq!(assigner.current_global(), 42);
+
+        assert_eq!(assigner.assign(8), Ok((0, 42)));
+    }
+
+    #[test]
+    fn global_exhaustion_does_not_advance_pane_frontier() {
+        let pane_id = 7;
+        let assigner = assigner_at(u64::MAX - 1, &[(pane_id, 12)]);
+
+        assert_eq!(assigner.assign(pane_id), Ok((12, u64::MAX - 1)));
+        assert_eq!(assigner.current_pane(pane_id), 13);
+        assert_eq!(assigner.current_global(), u64::MAX);
+
+        assert_eq!(assigner.assign(pane_id), Err(SequenceExhaustion::Global));
+        assert_eq!(assigner.current_pane(pane_id), 13);
+        assert_eq!(assigner.current_global(), u64::MAX);
+
+        assert_eq!(assigner.assign(8), Err(SequenceExhaustion::Global));
+        assert_eq!(assigner.current_pane(8), 0);
+        assert_eq!(assigner.pane_count(), 1);
+    }
+
+    #[test]
+    fn simultaneous_exhaustion_is_typed_and_sticky() {
+        let pane_id = 7;
+        let assigner = assigner_at(u64::MAX, &[(pane_id, u64::MAX)]);
+
+        assert_eq!(
+            assigner.assign(pane_id),
+            Err(SequenceExhaustion::GlobalAndPane { pane_id })
+        );
+        assert_eq!(assigner.current_pane(pane_id), u64::MAX);
+        assert_eq!(assigner.current_global(), u64::MAX);
+    }
+
+    #[test]
+    fn reset_pane_preserves_exhaustion_sentinel() {
+        let pane_id = 7;
+        let assigner = assigner_at(41, &[(pane_id, u64::MAX)]);
+
+        assigner.reset_pane(pane_id);
+
+        assert_eq!(assigner.current_pane(pane_id), u64::MAX);
+        assert_eq!(
+            assigner.assign(pane_id),
+            Err(SequenceExhaustion::Pane { pane_id })
+        );
+        assert_eq!(assigner.current_global(), 41);
+    }
+
+    #[test]
+    fn concurrent_pane_boundary_allocates_last_pair_once() {
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        const THREADS: usize = 32;
+        let pane_id = 7;
+        let assigner = Arc::new(assigner_at(41, &[(pane_id, u64::MAX - 1)]));
+        let barrier = Arc::new(Barrier::new(THREADS));
+        let mut handles = Vec::with_capacity(THREADS);
+
+        for _ in 0..THREADS {
+            let assigner = Arc::clone(&assigner);
+            let barrier = Arc::clone(&barrier);
+            handles.push(thread::spawn(move || {
+                barrier.wait();
+                assigner.assign(pane_id)
+            }));
+        }
+
+        let mut successes = Vec::new();
+        let mut exhausted = 0;
+        for handle in handles {
+            match handle.join().unwrap() {
+                Ok(pair) => successes.push(pair),
+                Err(error) => {
+                    assert_eq!(error, SequenceExhaustion::Pane { pane_id });
+                    exhausted += 1;
+                }
+            }
+        }
+
+        assert_eq!(successes, vec![(u64::MAX - 1, 41)]);
+        assert_eq!(exhausted, THREADS - 1);
+        assert_eq!(assigner.current_pane(pane_id), u64::MAX);
+        assert_eq!(assigner.current_global(), 42);
+    }
+
+    #[test]
+    fn concurrent_global_boundary_advances_only_winning_pane() {
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        const THREADS: usize = 32;
+        let assigner = Arc::new(assigner_at(u64::MAX - 1, &[]));
+        let barrier = Arc::new(Barrier::new(THREADS));
+        let mut handles = Vec::with_capacity(THREADS);
+
+        for pane_id in 0..THREADS as u64 {
+            let assigner = Arc::clone(&assigner);
+            let barrier = Arc::clone(&barrier);
+            handles.push(thread::spawn(move || {
+                barrier.wait();
+                (pane_id, assigner.assign(pane_id))
+            }));
+        }
+
+        let mut winner = None;
+        for handle in handles {
+            let (pane_id, result) = handle.join().unwrap();
+            match result {
+                Ok(pair) => {
+                    assert!(winner.replace((pane_id, pair)).is_none());
+                }
+                Err(error) => {
+                    assert_eq!(error, SequenceExhaustion::Global);
+                    assert_eq!(assigner.current_pane(pane_id), 0);
+                }
+            }
+        }
+
+        let (winning_pane, pair) = winner.expect("one caller owns the last global sequence");
+        assert_eq!(pair, (0, u64::MAX - 1));
+        assert_eq!(assigner.current_pane(winning_pane), 1);
+        assert_eq!(assigner.current_global(), u64::MAX);
+        assert_eq!(assigner.pane_count(), 1);
+    }
+
+    #[test]
+    fn poison_counter_increment_saturates() {
+        let counter = AtomicU64::new(u64::MAX - 1);
+
+        saturating_increment(&counter);
+        saturating_increment(&counter);
+
+        assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
+    }
+
+    #[test]
     fn reset_pane_restarts_at_zero() {
         let assigner = SequenceAssigner::new();
 
-        assigner.assign(0);
-        assigner.assign(0);
+        assigner.assign(0).unwrap();
+        assigner.assign(0).unwrap();
         assert_eq!(assigner.current_pane(0), 2);
 
         assigner.reset_pane(0);
         assert_eq!(assigner.current_pane(0), 0);
 
         // After reset, pane starts fresh but global continues
-        let (pane_seq, global_seq) = assigner.assign(0);
+        let (pane_seq, global_seq) = assigner.assign(0).unwrap();
         assert_eq!(pane_seq, 0);
         assert_eq!(global_seq, 2); // global never resets
     }
@@ -690,7 +930,7 @@ mod tests {
             handles.push(thread::spawn(move || {
                 let mut seqs = Vec::new();
                 for _ in 0..100 {
-                    seqs.push(a.assign(pane_id));
+                    seqs.push(a.assign(pane_id).unwrap());
                 }
                 seqs
             }));
@@ -1109,11 +1349,11 @@ mod tests {
 
         let mut orders = Vec::new();
         for _ in 0..10 {
-            let (pane_seq, global_seq) = assigner.assign(0);
+            let (pane_seq, global_seq) = assigner.assign(0).unwrap();
             orders.push(ReplayOrder::new(global_seq, 0, pane_seq));
         }
         for _ in 0..10 {
-            let (pane_seq, global_seq) = assigner.assign(1);
+            let (pane_seq, global_seq) = assigner.assign(1).unwrap();
             orders.push(ReplayOrder::new(global_seq, 1, pane_seq));
         }
 
@@ -1137,7 +1377,7 @@ mod tests {
         // Interleave 3 panes
         for _ in 0..20 {
             for pane_id in 0..3 {
-                let (pane_seq, global_seq) = assigner.assign(pane_id);
+                let (pane_seq, global_seq) = assigner.assign(pane_id).unwrap();
                 orders.push(ReplayOrder::new(global_seq, pane_id, pane_seq));
             }
         }
@@ -1160,9 +1400,9 @@ mod tests {
         let mut pane1 = Vec::new();
 
         for _ in 0..5 {
-            let (ps, gs) = assigner.assign(0);
+            let (ps, gs) = assigner.assign(0).unwrap();
             pane0.push(ReplayOrder::new(gs, 0, ps));
-            let (ps, gs) = assigner.assign(1);
+            let (ps, gs) = assigner.assign(1).unwrap();
             pane1.push(ReplayOrder::new(gs, 1, ps));
         }
 
@@ -1179,9 +1419,9 @@ mod tests {
         let mut s0 = Vec::new();
         let mut s1 = Vec::new();
         for _ in 0..5 {
-            let (ps, gs) = assigner2.assign(0);
+            let (ps, gs) = assigner2.assign(0).unwrap();
             s0.push(ReplayOrder::new(gs, 0, ps));
-            let (ps, gs) = assigner2.assign(1);
+            let (ps, gs) = assigner2.assign(1).unwrap();
             s1.push(ReplayOrder::new(gs, 1, ps));
         }
 

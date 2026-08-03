@@ -57,7 +57,9 @@ proptest! {
 
         for _ in 0..n_assigns {
             for &pid in &pane_ids {
-                let (pane_seq, _) = assigner.assign(pid);
+                let (pane_seq, _) = assigner
+                    .assign(pid)
+                    .expect("bounded property case cannot exhaust sequence space");
                 let expected = expected_pane_seq.get_mut(&pid).unwrap();
                 prop_assert_eq!(
                     pane_seq, *expected,
@@ -87,7 +89,9 @@ proptest! {
 
         for _ in 0..n_assigns {
             for &pid in &pane_ids {
-                let (_, global_seq) = assigner.assign(pid);
+                let (_, global_seq) = assigner
+                    .assign(pid)
+                    .expect("bounded property case cannot exhaust sequence space");
                 if let Some(prev) = last_global {
                     prop_assert!(
                         global_seq > prev,
@@ -110,7 +114,9 @@ proptest! {
 
         for _ in 0..n_assigns {
             for &pid in &pane_ids {
-                assigner.assign(pid);
+                assigner
+                    .assign(pid)
+                    .expect("bounded property case cannot exhaust sequence space");
             }
         }
 
@@ -136,7 +142,9 @@ proptest! {
 
         for _ in 0..n_assigns {
             for &pid in &pane_ids {
-                let (_, g) = assigner.assign(pid);
+                let (_, g) = assigner
+                    .assign(pid)
+                    .expect("bounded property case cannot exhaust sequence space");
                 prop_assert!(globals.insert(g), "duplicate global seq {}", g);
             }
         }
@@ -157,7 +165,9 @@ proptest! {
     ) {
         let assigner = SequenceAssigner::new();
         for &pid in &pane_ids {
-            assigner.assign(pid);
+            assigner
+                .assign(pid)
+                .expect("bounded property case cannot exhaust sequence space");
         }
         prop_assert_eq!(assigner.pane_count(), pane_ids.len());
     }
@@ -180,8 +190,12 @@ proptest! {
 
         // Assign some events to panes 0 and 1
         for _ in 0..n_before {
-            assigner.assign(0);
-            assigner.assign(1);
+            assigner
+                .assign(0)
+                .expect("bounded property case cannot exhaust sequence space");
+            assigner
+                .assign(1)
+                .expect("bounded property case cannot exhaust sequence space");
         }
 
         let global_before_reset = assigner.current_global();
@@ -197,13 +211,17 @@ proptest! {
         prop_assert_eq!(assigner.current_pane(1), pane1_before);
 
         // Global continues from where it was
-        let (pane_seq, global_seq) = assigner.assign(0);
+        let (pane_seq, global_seq) = assigner
+            .assign(0)
+            .expect("bounded property case cannot exhaust sequence space");
         prop_assert_eq!(pane_seq, 0);
         prop_assert_eq!(global_seq, global_before_reset);
 
         // More assigns continue monotonically
         for i in 1..n_after {
-            let (ps, gs) = assigner.assign(0);
+            let (ps, gs) = assigner
+                .assign(0)
+                .expect("bounded property case cannot exhaust sequence space");
             prop_assert_eq!(ps, i as u64);
             prop_assert!(gs > global_before_reset);
         }
@@ -304,7 +322,9 @@ proptest! {
         for pane_id in 0..n_panes as u64 {
             let mut stream = Vec::new();
             for _ in 0..n_events {
-                let (ps, gs) = assigner.assign(pane_id);
+                let (ps, gs) = assigner
+                    .assign(pane_id)
+                    .expect("bounded property case cannot exhaust sequence space");
                 stream.push(ReplayOrder::new(gs, pane_id, ps));
             }
             streams.push(stream);
@@ -332,7 +352,9 @@ proptest! {
         for pane_id in 0..n_panes as u64 {
             let mut stream = Vec::new();
             for _ in 0..n_events {
-                let (ps, gs) = assigner.assign(pane_id);
+                let (ps, gs) = assigner
+                    .assign(pane_id)
+                    .expect("bounded property case cannot exhaust sequence space");
                 stream.push(ReplayOrder::new(gs, pane_id, ps));
             }
             streams.push(stream);
@@ -361,7 +383,9 @@ proptest! {
 
         for _ in 0..n_assigns {
             for &pid in &pane_ids {
-                let (ps, gs) = assigner.assign(pid);
+                let (ps, gs) = assigner
+                    .assign(pid)
+                    .expect("bounded property case cannot exhaust sequence space");
                 orders.push(ReplayOrder::new(gs, pid, ps));
             }
         }

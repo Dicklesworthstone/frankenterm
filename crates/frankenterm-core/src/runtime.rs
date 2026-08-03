@@ -156,12 +156,20 @@ async fn persist_captured_segment_for_runtime(
     .await
 }
 
+#[derive(Debug, thiserror::Error)]
+enum AuthorizedReplayEgressSequenceError {
+    #[error(transparent)]
+    Global(#[from] crate::recording::RecordingSequenceError),
+    #[error(transparent)]
+    Pane(#[from] crate::replay_capture::ReplayCaptureSequenceError),
+}
+
 fn record_authorized_replay_egress(
     adapter: &crate::replay_capture::CaptureAdapter,
     captured: &CapturedSegment,
     durable_sequence: u64,
     persistence_guard: &CapturePersistenceGuard,
-) -> std::result::Result<(), crate::recording::RecordingSequenceError> {
+) -> std::result::Result<(), AuthorizedReplayEgressSequenceError> {
     debug_assert_eq!(
         captured.pane_id,
         persistence_guard.stamp().global_pane_id(),
@@ -185,7 +193,7 @@ fn record_authorized_replay_egress(
         sequence: durable_sequence,
         global_sequence,
     };
-    adapter.capture_egress_event(&event);
+    adapter.capture_egress_event(&event)?;
     Ok(())
 }
 
@@ -4318,7 +4326,7 @@ impl ObservationRuntime {
                         // Handle new panes
                         for (pane_id, entry) in new_entries {
                             if let Some(ref adapter) = replay_capture {
-                                adapter.capture_lifecycle(
+                                if let Err(error) = adapter.capture_lifecycle(
                                     pane_id,
                                     crate::recording::RecorderLifecyclePhase::PaneOpened,
                                     None,
@@ -4327,7 +4335,12 @@ impl ObservationRuntime {
                                         "title": entry.info.title.clone(),
                                         "cwd": entry.info.cwd.clone(),
                                     }),
-                                );
+                                ) {
+                                    adapter.record_sequence_error(
+                                        "runtime.pane_opened",
+                                        error,
+                                    );
+                                }
                             }
 
                             if let Some(reason) = entry.observation.ignore_reason() {
@@ -4348,18 +4361,28 @@ impl ObservationRuntime {
                             // predecessor producer/persistence guards drain.
 
                             if let Some(ref adapter) = replay_capture {
-                                adapter.capture_lifecycle(
+                                if let Err(error) = adapter.capture_lifecycle(
                                     *pane_id,
                                     crate::recording::RecorderLifecyclePhase::CaptureStopped,
                                     Some("pane_closed".to_string()),
                                     serde_json::json!({}),
-                                );
-                                adapter.capture_lifecycle(
+                                ) {
+                                    adapter.record_sequence_error(
+                                        "runtime.capture_stopped",
+                                        error,
+                                    );
+                                }
+                                if let Err(error) = adapter.capture_lifecycle(
                                     *pane_id,
                                     crate::recording::RecorderLifecyclePhase::PaneClosed,
                                     Some("pane_closed".to_string()),
                                     serde_json::json!({}),
-                                );
+                                ) {
+                                    adapter.record_sequence_error(
+                                        "runtime.pane_closed",
+                                        error,
+                                    );
+                                }
                             }
 
                             debug!(pane_id = pane_id, "Stopped observing pane (closed)");
@@ -4429,12 +4452,17 @@ impl ObservationRuntime {
                                 "Prepared durable pane identity; capture baseline remains post-drain"
                             );
                             if let Some(ref adapter) = replay_capture {
-                                adapter.capture_lifecycle(
+                                if let Err(error) = adapter.capture_lifecycle(
                                     pane_id,
                                     crate::recording::RecorderLifecyclePhase::CaptureStarted,
                                     None,
                                     serde_json::json!({ "reason": reason }),
-                                );
+                                ) {
+                                    adapter.record_sequence_error(
+                                        "runtime.capture_started",
+                                        error,
+                                    );
+                                }
                             }
                         }
 
@@ -6437,11 +6465,15 @@ impl ObservationRuntime {
                                 persisted.segment.seq,
                                 &persistence_guard,
                             ) {
-                                warn!(
-                                    pane_id,
-                                    error = %error,
-                                    "Replay capture sequence exhausted; refusing a duplicate recorder identity"
-                                );
+                                match error {
+                                    AuthorizedReplayEgressSequenceError::Pane(error) => adapter
+                                        .record_sequence_error("runtime.authorized_egress", error),
+                                    AuthorizedReplayEgressSequenceError::Global(error) => warn!(
+                                        pane_id,
+                                        error = %error,
+                                        "Replay capture global sequence exhausted; refusing a duplicate recorder identity"
+                                    ),
+                                }
                             }
                         }
 

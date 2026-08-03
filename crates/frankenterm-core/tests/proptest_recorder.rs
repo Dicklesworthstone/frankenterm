@@ -127,7 +127,9 @@ proptest! {
         let mut ids = HashSet::new();
 
         for &pane_id in &pane_ids {
-            let (seq, _) = assigner.assign(pane_id);
+            let (seq, _) = assigner
+                .assign(pane_id)
+                .expect("bounded property case cannot exhaust sequence space");
             let ts = base_ts + seq * 10 + pane_id;
             let event = make_event_for_prop(
                 pane_id,
@@ -168,7 +170,9 @@ proptest! {
 
         for round in 0..events_per_pane {
             for pane_id in 0..num_panes {
-                let (seq, _) = assigner.assign(pane_id);
+                let (seq, _) = assigner
+                    .assign(pane_id)
+                    .expect("bounded property case cannot exhaust sequence space");
                 let ts = base_ts + (round as u64) * 100 + pane_id;
                 let event = make_event_for_prop(
                     pane_id,
@@ -225,7 +229,9 @@ proptest! {
 
         for round in 0..events_per_pane {
             for pane_id in 0..num_panes {
-                let (seq, _) = assigner.assign(pane_id);
+                let (seq, _) = assigner
+                    .assign(pane_id)
+                    .expect("bounded property case cannot exhaust sequence space");
                 let ts = base_ts + (round as u64) * 100 + pane_id;
                 let event = make_event_for_prop(
                     pane_id,
@@ -272,7 +278,9 @@ proptest! {
         let mut orders = Vec::new();
 
         for &pane_id in &pane_schedule {
-            let (pane_seq, global_seq) = assigner.assign(pane_id);
+            let (pane_seq, global_seq) = assigner
+                .assign(pane_id)
+                .expect("bounded property case cannot exhaust sequence space");
             orders.push(ReplayOrder::new(global_seq, pane_id, pane_seq));
         }
 
@@ -387,7 +395,9 @@ proptest! {
 
         for round in 0..events_per_pane {
             for pane_id in 0..num_panes {
-                let (seq, _) = assigner.assign(pane_id);
+                let (seq, _) = assigner
+                    .assign(pane_id)
+                    .expect("bounded property case cannot exhaust sequence space");
                 let ts = base_ts + (round as u64) * 100 + pane_id;
                 let event = make_event_for_prop(
                     pane_id,
@@ -461,7 +471,9 @@ proptest! {
         let mut prev_global: Option<u64> = None;
 
         for &pane_id in &pane_schedule {
-            let (_pane_seq, global_seq) = assigner.assign(pane_id);
+            let (_pane_seq, global_seq) = assigner
+                .assign(pane_id)
+                .expect("bounded property case cannot exhaust sequence space");
             if let Some(prev) = prev_global {
                 prop_assert!(global_seq > prev,
                     "global sequence not strictly increasing: {} -> {}", prev, global_seq);
@@ -479,7 +491,9 @@ proptest! {
         let mut per_pane_last: std::collections::HashMap<u64, u64> = std::collections::HashMap::new();
 
         for &pane_id in &pane_schedule {
-            let (pane_seq, _global_seq) = assigner.assign(pane_id);
+            let (pane_seq, _global_seq) = assigner
+                .assign(pane_id)
+                .expect("bounded property case cannot exhaust sequence space");
             if let Some(&prev) = per_pane_last.get(&pane_id) {
                 prop_assert!(pane_seq > prev,
                     "per-pane sequence not strictly increasing for pane {}: {} -> {}",
@@ -964,7 +978,9 @@ proptest! {
     #[test]
     fn sequence_assigner_starts_at_zero(pane_id in arb_pane_id()) {
         let assigner = SequenceAssigner::new();
-        let (pane_seq, _global) = assigner.assign(pane_id);
+        let (pane_seq, _global) = assigner
+            .assign(pane_id)
+            .expect("bounded property case cannot exhaust sequence space");
         prop_assert_eq!(pane_seq, 0, "first pane_seq should be 0, got {}", pane_seq);
     }
 
@@ -978,10 +994,14 @@ proptest! {
         let assigner = SequenceAssigner::new();
         // Assign n to pane p1
         for _ in 0..n {
-            assigner.assign(p1);
+            assigner
+                .assign(p1)
+                .expect("bounded property case cannot exhaust sequence space");
         }
         // First assignment to p2 should still be 0 (independent counter)
-        let (pane_seq, _) = assigner.assign(p2);
+        let (pane_seq, _) = assigner
+            .assign(p2)
+            .expect("bounded property case cannot exhaust sequence space");
         prop_assert_eq!(pane_seq, 0,
             "first seq for pane {} should be 0 after {} assigns to pane {}", p2, n, p1);
     }
@@ -993,7 +1013,9 @@ proptest! {
     ) {
         let assigner = SequenceAssigner::new();
         for &pane_id in &schedule {
-            let (pane_seq, global_seq) = assigner.assign(pane_id);
+            let (pane_seq, global_seq) = assigner
+                .assign(pane_id)
+                .expect("bounded property case cannot exhaust sequence space");
             prop_assert!(global_seq >= pane_seq,
                 "global {} < pane {} for pane_id {}", global_seq, pane_seq, pane_id);
         }

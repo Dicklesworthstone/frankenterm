@@ -8200,11 +8200,19 @@ where
                 None,
                 crate::recording::epoch_ms_now(),
             );
-            adapter.capture_decision(
+            if let Err(error) = adapter.capture_decision(
                 crate::recording::actor_to_source(actor),
                 workflow_id.map(String::from),
                 decision_event,
-            );
+            ) {
+                return InjectionResult::Error {
+                    decision,
+                    error: format!("replay capture rejected policy decision: {error}"),
+                    pane_id,
+                    action,
+                    audit_action_id: None,
+                };
+            }
         }
 
         let mut result = match &decision {
@@ -8557,11 +8565,21 @@ where
                 None,
                 crate::recording::epoch_ms_now(),
             );
-            adapter.capture_decision(
+            if let Err(error) = adapter.capture_decision(
                 crate::recording::actor_to_source(actor),
                 workflow_id.map(String::from),
                 decision_event,
-            );
+            ) {
+                return Box::pin(async move {
+                    InjectionResult::Error {
+                        decision,
+                        error: format!("replay capture rejected policy decision: {error}"),
+                        pane_id,
+                        action,
+                        audit_action_id: None,
+                    }
+                });
+            }
         }
         let client = self.client.clone();
         let storage = self.storage.clone();
@@ -8849,11 +8867,19 @@ where
                 None,
                 crate::recording::epoch_ms_now(),
             );
-            adapter.capture_decision(
+            if let Err(error) = adapter.capture_decision(
                 crate::recording::actor_to_source(actor),
                 workflow_id.map(String::from),
                 decision_event,
-            );
+            ) {
+                return InjectionResult::Error {
+                    decision,
+                    error: format!("replay capture rejected policy decision: {error}"),
+                    pane_id,
+                    action,
+                    audit_action_id: None,
+                };
+            }
         }
 
         // Build the injection result

@@ -1485,11 +1485,18 @@ impl WorkflowRunner {
                     None,
                     crate::recording::epoch_ms_now(),
                 );
-                adapter.capture_decision(
+                if let Err(error) = adapter.capture_decision(
                     crate::recording::RecorderEventSource::WorkflowEngine,
                     Some(execution_id.to_string()),
                     decision_event,
-                );
+                ) {
+                    return WorkflowExecutionResult::Error {
+                        execution_id: Some(execution_id.to_string()),
+                        error: format!(
+                            "replay capture rejected workflow step decision: {error}"
+                        ),
+                    };
+                }
             }
 
             // Build result data, enriching with plan information if available (wa-upg.2.3)

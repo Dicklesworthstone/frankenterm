@@ -52,6 +52,60 @@ use crate::redactor::{REDACTED_MARKER, Redactor};
 // ft-jyywz (audit_chain_export_dropped_count), shipped at dc5b42a8c.
 static REPLAY_CAPTURE_POLICY_DECISION_DROP_COUNT: AtomicU64 = AtomicU64::new(0);
 
+/// Failure to reserve a collision-free per-pane identity for replay capture.
+///
+/// `u64::MAX` is permanently reserved as the terminal sentinel. Once a pane
+/// reaches that frontier, capture remains failed closed for that pane rather
+/// than wrapping to zero and reusing plausible recorder identities.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum ReplayCaptureSequenceError {
+    /// The pane emitted its final usable identity (`u64::MAX - 1`) already.
+    #[error(
+        "replay capture sequence exhausted for pane {pane_id}; u64::MAX is the sticky terminal sentinel"
+    )]
+    PaneExhausted {
+        /// Pane whose replay identity space is exhausted.
+        pane_id: u64,
+    },
+    /// An upstream durable identity attempted to use the reserved sentinel.
+    #[error(
+        "replay capture rejected reserved sequence u64::MAX for pane {pane_id}; the sentinel cannot identify an event"
+    )]
+    ReservedSuppliedSequence {
+        /// Pane associated with the rejected identity.
+        pane_id: u64,
+    },
+    /// An upstream durable identity would collide with an admitted event.
+    #[error(
+        "replay capture rejected regressing sequence {supplied} for pane {pane_id}; next admissible sequence is {next_admissible}"
+    )]
+    RegressingSuppliedSequence {
+        /// Pane associated with the rejected identity.
+        pane_id: u64,
+        /// Durable identity supplied by the upstream persistence path.
+        supplied: u64,
+        /// Lowest identity that could be admitted without reuse.
+        next_admissible: u64,
+    },
+}
+
+/// Increment an operator-facing counter without ever allowing it to regress.
+#[inline]
+fn saturating_increment(counter: &AtomicU64) {
+    let mut current = counter.load(Ordering::Relaxed);
+    while current != u64::MAX {
+        match counter.compare_exchange_weak(
+            current,
+            current + 1,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return,
+            Err(observed) => current = observed,
+        }
+    }
+}
+
 /// Cumulative count of `PolicyDecision` capture events that recorded a
 /// `Value::Null` payload due to `serde_json::to_value` serialization
 /// failure since process load. The capture path always increments
@@ -73,7 +127,7 @@ pub fn reset_replay_capture_policy_decision_drop_count_for_test() {
 
 #[inline]
 fn record_replay_capture_policy_decision_drop() {
-    REPLAY_CAPTURE_POLICY_DECISION_DROP_COUNT.fetch_add(1, Ordering::Relaxed);
+    saturating_increment(&REPLAY_CAPTURE_POLICY_DECISION_DROP_COUNT);
 }
 
 // ---------------------------------------------------------------------------
@@ -206,6 +260,10 @@ pub struct CaptureAdapter {
     redaction: CaptureRedactionRuntime,
     /// Total events captured (monotonic counter for diagnostics).
     total_captured: AtomicU64,
+    /// Sequence failures absorbed by void observer-trait boundaries.
+    sequence_error_count: AtomicU64,
+    /// Ensures void observer boundaries warn at most once per adapter.
+    sequence_error_warned: AtomicBool,
 }
 
 impl CaptureAdapter {
@@ -225,6 +283,8 @@ impl CaptureAdapter {
             default_source: config.default_source,
             redaction,
             total_captured: AtomicU64::new(0),
+            sequence_error_count: AtomicU64::new(0),
+            sequence_error_warned: AtomicBool::new(false),
         }
     }
 
@@ -255,6 +315,13 @@ impl CaptureAdapter {
         self.total_captured.load(Ordering::Relaxed)
     }
 
+    /// Return sequence failures absorbed by void `EgressTap`/`IngressTap`
+    /// boundaries. The counter saturates at `u64::MAX`.
+    #[must_use]
+    pub fn sequence_error_count(&self) -> u64 {
+        self.sequence_error_count.load(Ordering::Relaxed)
+    }
+
     /// Return a reference to the global sequence counter.
     pub fn global_sequence(&self) -> &GlobalSequence {
         &self.global_seq
@@ -283,13 +350,74 @@ impl CaptureAdapter {
     ///
     /// We therefore recover from poison and continue rather than aborting the
     /// recorder.
-    fn next_pane_seq(&self, pane_id: u64) -> u64 {
+    fn next_pane_seq(&self, pane_id: u64) -> Result<u64, ReplayCaptureSequenceError> {
         let mut map = self
             .pane_sequences
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let counter = map.entry(pane_id).or_insert_with(|| AtomicU64::new(0));
-        counter.fetch_add(1, Ordering::Relaxed)
+        let next = counter.load(Ordering::Relaxed);
+        if next == u64::MAX {
+            return Err(ReplayCaptureSequenceError::PaneExhausted { pane_id });
+        }
+        counter.store(next + 1, Ordering::Relaxed);
+        Ok(next)
+    }
+
+    /// Admit an authoritative upstream identity and advance the local pane
+    /// frontier so later locally allocated lifecycle/control events cannot
+    /// collide with it.
+    fn reconcile_supplied_pane_seq(
+        &self,
+        pane_id: u64,
+        supplied: u64,
+    ) -> Result<u64, ReplayCaptureSequenceError> {
+        if supplied == u64::MAX {
+            return Err(ReplayCaptureSequenceError::ReservedSuppliedSequence { pane_id });
+        }
+
+        let mut map = self
+            .pane_sequences
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let counter = map.entry(pane_id).or_insert_with(|| AtomicU64::new(0));
+        let next_admissible = counter.load(Ordering::Relaxed);
+        if supplied < next_admissible {
+            return Err(ReplayCaptureSequenceError::RegressingSuppliedSequence {
+                pane_id,
+                supplied,
+                next_admissible,
+            });
+        }
+
+        counter.store(supplied + 1, Ordering::Relaxed);
+        Ok(supplied)
+    }
+
+    /// Record a sequence failure at an observer trait that cannot return it.
+    ///
+    /// The count saturates and the warning is emitted at most once per adapter,
+    /// keeping a permanently exhausted hot pane from producing an unbounded
+    /// log stream.
+    pub(crate) fn record_sequence_error(
+        &self,
+        boundary: &'static str,
+        error: ReplayCaptureSequenceError,
+    ) {
+        saturating_increment(&self.sequence_error_count);
+        if !self.sequence_error_warned.swap(true, Ordering::AcqRel) {
+            tracing::warn!(
+                target: "ft.replay.capture",
+                boundary,
+                error = %error,
+                "Replay capture observer failed closed after pane sequence exhaustion"
+            );
+        }
+    }
+
+    #[inline]
+    fn record_capture_success(&self) {
+        saturating_increment(&self.total_captured);
     }
 
     // -----------------------------------------------------------------------
@@ -301,9 +429,12 @@ impl CaptureAdapter {
     /// Converts the segment into a [`RecorderEvent`] with
     /// [`RecorderEventPayload::EgressOutput`], assigns a deterministic event ID,
     /// and emits to the sink.
-    pub fn capture_egress(&self, segment: &CapturedSegment) {
+    pub fn capture_egress(
+        &self,
+        segment: &CapturedSegment,
+    ) -> Result<(), ReplayCaptureSequenceError> {
         if !self.is_enabled() {
-            return;
+            return Ok(());
         }
 
         let (segment_kind, is_gap) = captured_kind_to_segment(&segment.kind);
@@ -317,9 +448,9 @@ impl CaptureAdapter {
             .redaction
             .apply(&segment.content, RecorderRedactionLevel::None)
         else {
-            return;
+            return Ok(());
         };
-        let sequence = self.next_pane_seq(segment.pane_id);
+        let sequence = self.next_pane_seq(segment.pane_id)?;
 
         let payload = RecorderEventPayload::EgressOutput {
             text: redacted.text,
@@ -359,24 +490,28 @@ impl CaptureAdapter {
             event_id: event.event_id.clone(),
         };
 
-        self.total_captured.fetch_add(1, Ordering::Relaxed);
+        self.record_capture_success();
         self.sink.on_event(event, merge_key);
+        Ok(())
     }
 
     /// Capture an egress event from an [`EgressEvent`] (pre-built metadata).
     ///
     /// This path is used when the upstream already has an EgressEvent struct
     /// (e.g., from an existing EgressTap implementation).
-    pub fn capture_egress_event(&self, egress: &EgressEvent) {
+    pub fn capture_egress_event(
+        &self,
+        egress: &EgressEvent,
+    ) -> Result<(), ReplayCaptureSequenceError> {
         if !self.is_enabled() {
-            return;
+            return Ok(());
         }
 
         let recorded_at_ms = epoch_ms_now();
         let Some(redacted) = self.redaction.apply(&egress.text, egress.redaction) else {
-            return;
+            return Ok(());
         };
-        let sequence = self.next_pane_seq(egress.pane_id);
+        let sequence = self.reconcile_supplied_pane_seq(egress.pane_id, egress.sequence)?;
 
         let payload = RecorderEventPayload::EgressOutput {
             text: redacted.text,
@@ -415,8 +550,9 @@ impl CaptureAdapter {
             event_id: event.event_id.clone(),
         };
 
-        self.total_captured.fetch_add(1, Ordering::Relaxed);
+        self.record_capture_success();
         self.sink.on_event(event, merge_key);
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -430,14 +566,14 @@ impl CaptureAdapter {
         phase: RecorderLifecyclePhase,
         reason: Option<String>,
         details: serde_json::Value,
-    ) {
+    ) -> Result<(), ReplayCaptureSequenceError> {
         if !self.is_enabled() {
-            return;
+            return Ok(());
         }
 
         let occurred_at_ms = epoch_ms_now();
         let recorded_at_ms = occurred_at_ms;
-        let sequence = self.next_pane_seq(pane_id);
+        let sequence = self.next_pane_seq(pane_id)?;
 
         let payload = RecorderEventPayload::LifecycleMarker {
             lifecycle_phase: phase,
@@ -474,8 +610,9 @@ impl CaptureAdapter {
             event_id: event.event_id.clone(),
         };
 
-        self.total_captured.fetch_add(1, Ordering::Relaxed);
+        self.record_capture_success();
         self.sink.on_event(event, merge_key);
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -488,14 +625,14 @@ impl CaptureAdapter {
         pane_id: u64,
         marker_type: crate::recording::RecorderControlMarkerType,
         details: serde_json::Value,
-    ) {
+    ) -> Result<(), ReplayCaptureSequenceError> {
         if !self.is_enabled() {
-            return;
+            return Ok(());
         }
 
         let occurred_at_ms = epoch_ms_now();
         let recorded_at_ms = occurred_at_ms;
-        let sequence = self.next_pane_seq(pane_id);
+        let sequence = self.next_pane_seq(pane_id)?;
 
         let payload = RecorderEventPayload::ControlMarker {
             control_marker_type: marker_type,
@@ -531,8 +668,9 @@ impl CaptureAdapter {
             event_id: event.event_id.clone(),
         };
 
-        self.total_captured.fetch_add(1, Ordering::Relaxed);
+        self.record_capture_success();
         self.sink.on_event(event, merge_key);
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -548,17 +686,17 @@ impl CaptureAdapter {
         source: RecorderEventSource,
         workflow_id: Option<String>,
         causality: RecorderEventCausality,
-    ) {
+    ) -> Result<(), ReplayCaptureSequenceError> {
         if !self.is_enabled() {
-            return;
+            return Ok(());
         }
 
         let occurred_at_ms = epoch_ms_now();
         let recorded_at_ms = occurred_at_ms;
         let Some(redacted) = self.redaction.apply(&text, RecorderRedactionLevel::None) else {
-            return;
+            return Ok(());
         };
-        let sequence = self.next_pane_seq(pane_id);
+        let sequence = self.next_pane_seq(pane_id)?;
 
         let payload = RecorderEventPayload::IngressText {
             text: redacted.text,
@@ -592,8 +730,9 @@ impl CaptureAdapter {
             event_id: event.event_id.clone(),
         };
 
-        self.total_captured.fetch_add(1, Ordering::Relaxed);
+        self.record_capture_success();
         self.sink.on_event(event, merge_key);
+        Ok(())
     }
 
     /// Capture a decision event (policy evaluation, workflow step, etc.).
@@ -605,15 +744,15 @@ impl CaptureAdapter {
         source: RecorderEventSource,
         correlation_id: Option<String>,
         decision: DecisionEvent,
-    ) {
+    ) -> Result<(), ReplayCaptureSequenceError> {
         if !self.is_enabled() {
-            return;
+            return Ok(());
         }
 
         let pane_id = decision.pane_id;
         let occurred_at_ms = decision.timestamp_ms;
         let recorded_at_ms = epoch_ms_now();
-        let sequence = self.next_pane_seq(pane_id);
+        let sequence = self.next_pane_seq(pane_id)?;
 
         // br-ft-zkthg HIGH-tier: replay determinism requires that a
         // silently-null payload be observable. Bump the drop counter
@@ -669,8 +808,9 @@ impl CaptureAdapter {
             event_id: event.event_id.clone(),
         };
 
-        self.total_captured.fetch_add(1, Ordering::Relaxed);
+        self.record_capture_success();
         self.sink.on_event(event, merge_key);
+        Ok(())
     }
 }
 
@@ -680,7 +820,9 @@ impl CaptureAdapter {
 
 impl EgressTap for CaptureAdapter {
     fn on_egress(&self, event: EgressEvent) {
-        self.capture_egress_event(&event);
+        if let Err(error) = self.capture_egress_event(&event) {
+            self.record_sequence_error("EgressTap::on_egress", error);
+        }
     }
 }
 
@@ -690,7 +832,7 @@ impl EgressTap for CaptureAdapter {
 
 impl IngressTap for CaptureAdapter {
     fn on_ingress(&self, event: IngressEvent) {
-        self.capture_ingress(
+        if let Err(error) = self.capture_ingress(
             event.pane_id,
             event.text.clone(),
             event.ingress_kind,
@@ -701,7 +843,10 @@ impl IngressTap for CaptureAdapter {
                 trigger_event_id: None,
                 root_event_id: None,
             },
-        );
+        ) {
+            self.record_sequence_error("IngressTap::on_ingress", error);
+            return;
+        }
 
         use crate::recording::RecorderControlMarkerType;
         let (marker_type, details) = match event.outcome {
@@ -737,7 +882,9 @@ impl IngressTap for CaptureAdapter {
             ),
         };
 
-        self.capture_control(event.pane_id, marker_type, details);
+        if let Err(error) = self.capture_control(event.pane_id, marker_type, details) {
+            self.record_sequence_error("IngressTap::on_ingress", error);
+        }
     }
 }
 
@@ -1179,13 +1326,17 @@ mod tests {
         }
     }
 
+    fn expect_capture(result: Result<(), ReplayCaptureSequenceError>) {
+        result.expect("test capture sequence must remain available");
+    }
+
     // --- Basic egress capture ---
 
     #[test]
     fn test_capture_egress_delta_produces_recorder_event() {
         let (sink, adapter) = make_adapter();
         let seg = make_segment(42, "hello world", 0);
-        adapter.capture_egress(&seg);
+        expect_capture(adapter.capture_egress(&seg));
 
         assert_eq!(sink.len(), 1);
         let events = sink.recorder_events();
@@ -1212,7 +1363,7 @@ mod tests {
     fn test_capture_egress_gap_produces_gap_event() {
         let (sink, adapter) = make_adapter();
         let seg = make_gap_segment(42, "stream_overflow", 0);
-        adapter.capture_egress(&seg);
+        expect_capture(adapter.capture_egress(&seg));
 
         assert_eq!(sink.len(), 1);
         let evt = &sink.recorder_events()[0];
@@ -1233,7 +1384,7 @@ mod tests {
     fn test_capture_egress_assigns_deterministic_event_id() {
         let (sink, adapter) = make_adapter();
         let seg = make_segment(1, "deterministic", 0);
-        adapter.capture_egress(&seg);
+        expect_capture(adapter.capture_egress(&seg));
 
         let evt = &sink.recorder_events()[0];
         assert!(!evt.event_id.is_empty());
@@ -1243,8 +1394,8 @@ mod tests {
     #[test]
     fn test_event_id_differs_for_different_content() {
         let (sink, adapter) = make_adapter();
-        adapter.capture_egress(&make_segment(1, "aaa", 0));
-        adapter.capture_egress(&make_segment(1, "bbb", 1));
+        expect_capture(adapter.capture_egress(&make_segment(1, "aaa", 0)));
+        expect_capture(adapter.capture_egress(&make_segment(1, "bbb", 1)));
 
         let events = sink.recorder_events();
         assert_ne!(events[0].event_id, events[1].event_id);
@@ -1254,8 +1405,8 @@ mod tests {
     fn test_event_id_same_content_same_pane_different_sequence() {
         let (sink, adapter) = make_adapter();
         // Same content but different sequence → different event_id
-        adapter.capture_egress(&make_segment(1, "same", 0));
-        adapter.capture_egress(&make_segment(1, "same", 1));
+        expect_capture(adapter.capture_egress(&make_segment(1, "same", 0)));
+        expect_capture(adapter.capture_egress(&make_segment(1, "same", 1)));
 
         let events = sink.recorder_events();
         // sequence is assigned by adapter (internal counter), so IDs differ
@@ -1268,7 +1419,7 @@ mod tests {
     fn test_per_pane_sequences_are_monotonic() {
         let (sink, adapter) = make_adapter();
         for i in 0..5 {
-            adapter.capture_egress(&make_segment(1, &format!("msg{i}"), i));
+            expect_capture(adapter.capture_egress(&make_segment(1, &format!("msg{i}"), i)));
         }
 
         let events = sink.recorder_events();
@@ -1280,10 +1431,10 @@ mod tests {
     #[test]
     fn test_different_panes_have_independent_sequences() {
         let (sink, adapter) = make_adapter();
-        adapter.capture_egress(&make_segment(1, "p1a", 0));
-        adapter.capture_egress(&make_segment(2, "p2a", 0));
-        adapter.capture_egress(&make_segment(1, "p1b", 1));
-        adapter.capture_egress(&make_segment(2, "p2b", 1));
+        expect_capture(adapter.capture_egress(&make_segment(1, "p1a", 0)));
+        expect_capture(adapter.capture_egress(&make_segment(2, "p2a", 0)));
+        expect_capture(adapter.capture_egress(&make_segment(1, "p1b", 1)));
+        expect_capture(adapter.capture_egress(&make_segment(2, "p2b", 1)));
 
         let events = sink.recorder_events();
         // Pane 1: seq 0, 1
@@ -1299,7 +1450,7 @@ mod tests {
     #[test]
     fn test_merge_key_has_correct_stream_kind() {
         let (sink, adapter) = make_adapter();
-        adapter.capture_egress(&make_segment(1, "test", 0));
+        expect_capture(adapter.capture_egress(&make_segment(1, "test", 0)));
 
         let (_, mk) = &sink.events()[0];
         assert_eq!(mk.stream_kind, StreamKind::Egress);
@@ -1308,7 +1459,7 @@ mod tests {
     #[test]
     fn test_merge_key_matches_event_fields() {
         let (sink, adapter) = make_adapter();
-        adapter.capture_egress(&make_segment(1, "test", 0));
+        expect_capture(adapter.capture_egress(&make_segment(1, "test", 0)));
 
         let (evt, mk) = &sink.events()[0];
         assert_eq!(mk.pane_id, evt.pane_id);
@@ -1322,12 +1473,12 @@ mod tests {
     #[test]
     fn test_capture_lifecycle_pane_opened() {
         let (sink, adapter) = make_adapter();
-        adapter.capture_lifecycle(
+        expect_capture(adapter.capture_lifecycle(
             10,
             RecorderLifecyclePhase::PaneOpened,
             None,
             json!({"title": "bash"}),
-        );
+        ));
 
         assert_eq!(sink.len(), 1);
         let evt = &sink.recorder_events()[0];
@@ -1348,12 +1499,12 @@ mod tests {
     #[test]
     fn test_capture_lifecycle_pane_closed_with_reason() {
         let (sink, adapter) = make_adapter();
-        adapter.capture_lifecycle(
+        expect_capture(adapter.capture_lifecycle(
             10,
             RecorderLifecyclePhase::PaneClosed,
             Some("user_exit".into()),
             json!({}),
-        );
+        ));
 
         let evt = &sink.recorder_events()[0];
         match &evt.payload {
@@ -1372,7 +1523,12 @@ mod tests {
     #[test]
     fn test_lifecycle_has_lifecycle_stream_kind() {
         let (sink, adapter) = make_adapter();
-        adapter.capture_lifecycle(1, RecorderLifecyclePhase::CaptureStarted, None, json!({}));
+        expect_capture(adapter.capture_lifecycle(
+            1,
+            RecorderLifecyclePhase::CaptureStarted,
+            None,
+            json!({}),
+        ));
 
         let (_, mk) = &sink.events()[0];
         assert_eq!(mk.stream_kind, StreamKind::Lifecycle);
@@ -1381,8 +1537,18 @@ mod tests {
     #[test]
     fn test_capture_started_and_stopped() {
         let (sink, adapter) = make_adapter();
-        adapter.capture_lifecycle(0, RecorderLifecyclePhase::CaptureStarted, None, json!({}));
-        adapter.capture_lifecycle(0, RecorderLifecyclePhase::CaptureStopped, None, json!({}));
+        expect_capture(adapter.capture_lifecycle(
+            0,
+            RecorderLifecyclePhase::CaptureStarted,
+            None,
+            json!({}),
+        ));
+        expect_capture(adapter.capture_lifecycle(
+            0,
+            RecorderLifecyclePhase::CaptureStopped,
+            None,
+            json!({}),
+        ));
         assert_eq!(sink.len(), 2);
     }
 
@@ -1391,11 +1557,11 @@ mod tests {
     #[test]
     fn test_capture_control_resize() {
         let (sink, adapter) = make_adapter();
-        adapter.capture_control(
+        expect_capture(adapter.capture_control(
             5,
             RecorderControlMarkerType::Resize,
             json!({"cols": 120, "rows": 40}),
-        );
+        ));
 
         assert_eq!(sink.len(), 1);
         let evt = &sink.recorder_events()[0];
@@ -1415,11 +1581,11 @@ mod tests {
     #[test]
     fn test_capture_control_prompt_boundary() {
         let (sink, adapter) = make_adapter();
-        adapter.capture_control(
+        expect_capture(adapter.capture_control(
             5,
             RecorderControlMarkerType::PromptBoundary,
             json!({"cwd": "/home/user"}),
-        );
+        ));
 
         let evt = &sink.recorder_events()[0];
         match &evt.payload {
@@ -1439,7 +1605,11 @@ mod tests {
     #[test]
     fn test_control_has_control_stream_kind() {
         let (sink, adapter) = make_adapter();
-        adapter.capture_control(1, RecorderControlMarkerType::Resize, json!({}));
+        expect_capture(adapter.capture_control(
+            1,
+            RecorderControlMarkerType::Resize,
+            json!({}),
+        ));
 
         let (_, mk) = &sink.events()[0];
         assert_eq!(mk.stream_kind, StreamKind::Control);
@@ -1450,7 +1620,7 @@ mod tests {
     #[test]
     fn test_capture_ingress_send_text() {
         let (sink, adapter) = make_adapter();
-        adapter.capture_ingress(
+        expect_capture(adapter.capture_ingress(
             7,
             "ls -la\n".into(),
             RecorderIngressKind::SendText,
@@ -1461,7 +1631,7 @@ mod tests {
                 trigger_event_id: None,
                 root_event_id: None,
             },
-        );
+        ));
 
         assert_eq!(sink.len(), 1);
         let evt = &sink.recorder_events()[0];
@@ -1481,7 +1651,7 @@ mod tests {
     #[test]
     fn test_capture_ingress_workflow_action() {
         let (sink, adapter) = make_adapter();
-        adapter.capture_ingress(
+        expect_capture(adapter.capture_ingress(
             7,
             "approve".into(),
             RecorderIngressKind::WorkflowAction,
@@ -1492,7 +1662,7 @@ mod tests {
                 trigger_event_id: None,
                 root_event_id: None,
             },
-        );
+        ));
 
         let evt = &sink.recorder_events()[0];
         assert_eq!(evt.workflow_id, Some("wf-001".into()));
@@ -1502,14 +1672,14 @@ mod tests {
     #[test]
     fn test_ingress_has_ingress_stream_kind() {
         let (sink, adapter) = make_adapter();
-        adapter.capture_ingress(
+        expect_capture(adapter.capture_ingress(
             1,
             "x".into(),
             RecorderIngressKind::SendText,
             RecorderEventSource::OperatorAction,
             None,
             RecorderEventCausality::default(),
-        );
+        ));
 
         let (_, mk) = &sink.events()[0];
         assert_eq!(mk.stream_kind, StreamKind::Ingress);
@@ -1521,39 +1691,48 @@ mod tests {
     fn test_disabled_adapter_captures_nothing() {
         let (sink, adapter) = make_adapter();
         adapter.set_enabled(false);
-        adapter.capture_egress(&make_segment(1, "should be dropped", 0));
-        adapter.capture_lifecycle(1, RecorderLifecyclePhase::PaneOpened, None, json!({}));
-        adapter.capture_control(1, RecorderControlMarkerType::Resize, json!({}));
-        adapter.capture_ingress(
+        expect_capture(adapter.capture_egress(&make_segment(1, "should be dropped", 0)));
+        expect_capture(adapter.capture_lifecycle(
+            1,
+            RecorderLifecyclePhase::PaneOpened,
+            None,
+            json!({}),
+        ));
+        expect_capture(adapter.capture_control(
+            1,
+            RecorderControlMarkerType::Resize,
+            json!({}),
+        ));
+        expect_capture(adapter.capture_ingress(
             1,
             "x".into(),
             RecorderIngressKind::SendText,
             RecorderEventSource::OperatorAction,
             None,
             RecorderEventCausality::default(),
-        );
+        ));
         assert!(sink.is_empty());
     }
 
     #[test]
     fn test_toggle_enabled_at_runtime() {
         let (sink, adapter) = make_adapter();
-        adapter.capture_egress(&make_segment(1, "first", 0));
+        expect_capture(adapter.capture_egress(&make_segment(1, "first", 0)));
         assert_eq!(sink.len(), 1);
 
         adapter.set_enabled(false);
-        adapter.capture_egress(&make_segment(1, "dropped", 1));
+        expect_capture(adapter.capture_egress(&make_segment(1, "dropped", 1)));
         assert_eq!(sink.len(), 1);
 
         adapter.set_enabled(true);
-        adapter.capture_egress(&make_segment(1, "third", 2));
+        expect_capture(adapter.capture_egress(&make_segment(1, "third", 2)));
         assert_eq!(sink.len(), 2);
     }
 
     #[test]
     fn test_disabled_constructor_captures_nothing() {
         let adapter = CaptureAdapter::disabled();
-        adapter.capture_egress(&make_segment(1, "nope", 0));
+        expect_capture(adapter.capture_egress(&make_segment(1, "nope", 0)));
         assert_eq!(adapter.total_captured(), 0);
     }
 
@@ -1563,11 +1742,20 @@ mod tests {
     fn test_total_captured_increments() {
         let (_sink, adapter) = make_adapter();
         assert_eq!(adapter.total_captured(), 0);
-        adapter.capture_egress(&make_segment(1, "a", 0));
+        expect_capture(adapter.capture_egress(&make_segment(1, "a", 0)));
         assert_eq!(adapter.total_captured(), 1);
-        adapter.capture_lifecycle(1, RecorderLifecyclePhase::PaneOpened, None, json!({}));
+        expect_capture(adapter.capture_lifecycle(
+            1,
+            RecorderLifecyclePhase::PaneOpened,
+            None,
+            json!({}),
+        ));
         assert_eq!(adapter.total_captured(), 2);
-        adapter.capture_control(1, RecorderControlMarkerType::Resize, json!({}));
+        expect_capture(adapter.capture_control(
+            1,
+            RecorderControlMarkerType::Resize,
+            json!({}),
+        ));
         assert_eq!(adapter.total_captured(), 3);
     }
 
@@ -1576,17 +1764,26 @@ mod tests {
     #[test]
     fn test_all_events_have_correct_schema_version() {
         let (sink, adapter) = make_adapter();
-        adapter.capture_egress(&make_segment(1, "x", 0));
-        adapter.capture_lifecycle(1, RecorderLifecyclePhase::PaneOpened, None, json!({}));
-        adapter.capture_control(1, RecorderControlMarkerType::Resize, json!({}));
-        adapter.capture_ingress(
+        expect_capture(adapter.capture_egress(&make_segment(1, "x", 0)));
+        expect_capture(adapter.capture_lifecycle(
+            1,
+            RecorderLifecyclePhase::PaneOpened,
+            None,
+            json!({}),
+        ));
+        expect_capture(adapter.capture_control(
+            1,
+            RecorderControlMarkerType::Resize,
+            json!({}),
+        ));
+        expect_capture(adapter.capture_ingress(
             1,
             "y".into(),
             RecorderIngressKind::SendText,
             RecorderEventSource::OperatorAction,
             None,
             RecorderEventCausality::default(),
-        );
+        ));
 
         for evt in sink.recorder_events() {
             assert_eq!(evt.schema_version, "ft.recorder.event.v1");
@@ -1598,7 +1795,7 @@ mod tests {
     #[test]
     fn test_egress_has_empty_causality_by_default() {
         let (sink, adapter) = make_adapter();
-        adapter.capture_egress(&make_segment(1, "x", 0));
+        expect_capture(adapter.capture_egress(&make_segment(1, "x", 0)));
 
         let evt = &sink.recorder_events()[0];
         assert!(evt.causality.parent_event_id.is_none());
@@ -1609,7 +1806,7 @@ mod tests {
     #[test]
     fn test_ingress_preserves_causality_chain() {
         let (sink, adapter) = make_adapter();
-        adapter.capture_ingress(
+        expect_capture(adapter.capture_ingress(
             1,
             "cmd".into(),
             RecorderIngressKind::SendText,
@@ -1620,7 +1817,7 @@ mod tests {
                 trigger_event_id: Some("t1".into()),
                 root_event_id: Some("r1".into()),
             },
-        );
+        ));
 
         let evt = &sink.recorder_events()[0];
         assert_eq!(evt.causality.parent_event_id.as_deref(), Some("p1"));
@@ -1633,7 +1830,7 @@ mod tests {
     #[test]
     fn test_empty_text_egress_captured() {
         let (sink, adapter) = make_adapter();
-        adapter.capture_egress(&make_segment(1, "", 0));
+        expect_capture(adapter.capture_egress(&make_segment(1, "", 0)));
         assert_eq!(sink.len(), 1);
         match &sink.recorder_events()[0].payload {
             RecorderEventPayload::EgressOutput { text, .. } => {
@@ -1646,14 +1843,14 @@ mod tests {
     #[test]
     fn test_empty_text_ingress_captured() {
         let (sink, adapter) = make_adapter();
-        adapter.capture_ingress(
+        expect_capture(adapter.capture_ingress(
             1,
             String::new(),
             RecorderIngressKind::SendText,
             RecorderEventSource::OperatorAction,
             None,
             RecorderEventCausality::default(),
-        );
+        ));
         assert_eq!(sink.len(), 1);
     }
 
@@ -1662,7 +1859,7 @@ mod tests {
     #[test]
     fn test_captured_event_serializes_to_valid_json() {
         let (sink, adapter) = make_adapter();
-        adapter.capture_egress(&make_segment(1, "hello", 0));
+        expect_capture(adapter.capture_egress(&make_segment(1, "hello", 0)));
 
         let evt = &sink.recorder_events()[0];
         let json_str = serde_json::to_string(evt).unwrap();
@@ -1678,7 +1875,12 @@ mod tests {
     #[test]
     fn test_lifecycle_event_serializes_to_valid_json() {
         let (sink, adapter) = make_adapter();
-        adapter.capture_lifecycle(1, RecorderLifecyclePhase::PaneOpened, None, json!({}));
+        expect_capture(adapter.capture_lifecycle(
+            1,
+            RecorderLifecyclePhase::PaneOpened,
+            None,
+            json!({}),
+        ));
 
         let evt = &sink.recorder_events()[0];
         let json_str = serde_json::to_string(evt).unwrap();
@@ -1689,7 +1891,11 @@ mod tests {
     #[test]
     fn test_control_event_serializes_to_valid_json() {
         let (sink, adapter) = make_adapter();
-        adapter.capture_control(1, RecorderControlMarkerType::Resize, json!({"cols": 80}));
+        expect_capture(adapter.capture_control(
+            1,
+            RecorderControlMarkerType::Resize,
+            json!({"cols": 80}),
+        ));
 
         let evt = &sink.recorder_events()[0];
         let json_str = serde_json::to_string(evt).unwrap();

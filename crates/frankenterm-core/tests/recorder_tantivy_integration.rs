@@ -328,7 +328,9 @@ fn full_pipeline_cold_start_with_invariant_check() {
         let assigner = SequenceAssigner::new();
         let mut events = Vec::new();
         for i in 0u64..5 {
-            let (seq, _) = assigner.assign(1);
+            let (seq, _) = assigner
+                .assign(1)
+                .expect("bounded integration test cannot exhaust sequence space");
             let mut e = make_ingress(&format!("placeholder-{i}"), 1, seq, &format!("cmd-{i}"));
             e.event_id = generate_event_id_v1(&e);
             events.push(e);
@@ -1430,7 +1432,9 @@ fn large_scale_multi_pane_end_to_end() {
         let mut all_events = Vec::new();
         for round in 0..events_per_pane {
             for pane_id in 0..num_panes {
-                let (seq, _) = assigner.assign(pane_id);
+                let (seq, _) = assigner
+                    .assign(pane_id)
+                    .expect("bounded integration test cannot exhaust sequence space");
                 let mut event = make_ingress(
                     "placeholder",
                     pane_id,
@@ -1632,7 +1636,9 @@ fn deterministic_ids_unique_after_roundtrip() {
         let mut events = Vec::new();
         for pane_id in 0..3u64 {
             for _ in 0..10 {
-                let (seq, _) = assigner.assign(pane_id);
+                let (seq, _) = assigner
+                    .assign(pane_id)
+                    .expect("bounded integration test cannot exhaust sequence space");
                 events.push(make_event_with_det_id(
                     pane_id,
                     seq,
