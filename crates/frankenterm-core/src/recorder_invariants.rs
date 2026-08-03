@@ -36,6 +36,9 @@ pub enum ViolationSeverity {
 /// Category of invariant violation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ViolationKind {
+    /// `u64::MAX` is the reserved exhausted-sequence sentinel and is never a
+    /// valid recorder event identity.
+    ReservedSequence,
     /// Sequence number not monotonically increasing within a domain.
     SequenceRegression,
     /// Sequence number skipped without an explicit gap marker.
@@ -295,64 +298,97 @@ impl InvariantChecker {
             }
 
             // -- Per-domain sequence checks --
-            let seen = domain_seen_sequences.entry(domain).or_default();
-
-            if !seen.insert(event.sequence) {
+            let sequence_is_reserved = event.sequence == u64::MAX;
+            if sequence_is_reserved {
                 violations.push(Violation {
-                    kind: ViolationKind::DuplicateSequence,
-                    severity: ViolationSeverity::Error,
+                    kind: ViolationKind::ReservedSequence,
+                    severity: ViolationSeverity::Critical,
                     event_id: event.event_id.clone(),
                     pane_id: event.pane_id,
                     message: format!(
-                        "Duplicate sequence {} in domain ({}, {:?}) at index {}",
-                        event.sequence, event.pane_id, stream_kind, idx
+                        "Reserved exhausted sequence {} in domain ({}, {:?}) at index {}",
+                        u64::MAX,
+                        event.pane_id,
+                        stream_kind,
+                        idx
                     ),
                     event_index: idx,
                 });
             }
 
-            if let Some(&last_seq) = domain_sequences.get(&domain) {
-                if event.sequence < last_seq {
+            if !sequence_is_reserved {
+                let seen = domain_seen_sequences.entry(domain).or_default();
+
+                if !seen.insert(event.sequence) {
                     violations.push(Violation {
-                        kind: ViolationKind::SequenceRegression,
-                        severity: ViolationSeverity::Critical,
+                        kind: ViolationKind::DuplicateSequence,
+                        severity: ViolationSeverity::Error,
                         event_id: event.event_id.clone(),
                         pane_id: event.pane_id,
                         message: format!(
-                            "Sequence regression in ({}, {:?}): {} < {} at index {}",
-                            event.pane_id, stream_kind, event.sequence, last_seq, idx
+                            "Duplicate sequence {} in domain ({}, {:?}) at index {}",
+                            event.sequence, event.pane_id, stream_kind, idx
                         ),
                         event_index: idx,
                     });
-                } else if event.sequence > last_seq + 1 {
-                    let gap = event.sequence - last_seq - 1;
-                    // Check if there's an explicit gap marker
-                    let has_gap_marker = matches!(
-                        &event.payload,
-                        RecorderEventPayload::EgressOutput { is_gap: true, .. }
-                    );
+                }
 
-                    if !has_gap_marker && gap > 0 {
-                        let severity = if gap > self.config.max_sequence_gap {
-                            ViolationSeverity::Error
-                        } else {
-                            ViolationSeverity::Warning
-                        };
+                if let Some(&last_seq) = domain_sequences.get(&domain) {
+                    if event.sequence < last_seq {
                         violations.push(Violation {
-                            kind: ViolationKind::SequenceGap,
-                            severity,
+                            kind: ViolationKind::SequenceRegression,
+                            severity: ViolationSeverity::Critical,
                             event_id: event.event_id.clone(),
                             pane_id: event.pane_id,
                             message: format!(
-                                "Sequence gap of {} in ({}, {:?}): {} → {} at index {}",
-                                gap, event.pane_id, stream_kind, last_seq, event.sequence, idx
+                                "Sequence regression in ({}, {:?}): {} < {} at index {}",
+                                event.pane_id, stream_kind, event.sequence, last_seq, idx
                             ),
                             event_index: idx,
                         });
+                    } else {
+                        // This subtraction is defined because the regression
+                        // branch above proved `event.sequence >= last_seq`.
+                        // Computing the advance avoids the former
+                        // `last_seq + 1` overflow when the retained frontier
+                        // was at the end of the usable sequence space.
+                        let advance = event.sequence - last_seq;
+                        if advance > 1 {
+                            let gap = advance - 1;
+                            // Check if there's an explicit gap marker
+                            let has_gap_marker = matches!(
+                                &event.payload,
+                                RecorderEventPayload::EgressOutput { is_gap: true, .. }
+                            );
+
+                            if !has_gap_marker {
+                                let severity = if gap > self.config.max_sequence_gap {
+                                    ViolationSeverity::Error
+                                } else {
+                                    ViolationSeverity::Warning
+                                };
+                                violations.push(Violation {
+                                    kind: ViolationKind::SequenceGap,
+                                    severity,
+                                    event_id: event.event_id.clone(),
+                                    pane_id: event.pane_id,
+                                    message: format!(
+                                        "Sequence gap of {} in ({}, {:?}): {} → {} at index {}",
+                                        gap,
+                                        event.pane_id,
+                                        stream_kind,
+                                        last_seq,
+                                        event.sequence,
+                                        idx
+                                    ),
+                                    event_index: idx,
+                                });
+                            }
+                        }
                     }
                 }
+                domain_sequences.insert(domain, event.sequence);
             }
-            domain_sequences.insert(domain, event.sequence);
 
             // -- Clock anomaly check --
             let clock_result =
@@ -661,6 +697,53 @@ mod tests {
         let report = checker.check(&events);
         assert!(!report.passed);
         assert_eq!(report.count_by_kind(ViolationKind::DuplicateSequence), 1);
+    }
+
+    #[test]
+    fn reserved_max_sequence_fails_closed_without_poisoning_the_domain_frontier() {
+        let config = InvariantCheckerConfig {
+            check_merge_order: false,
+            ..Default::default()
+        };
+        let checker = InvariantChecker::with_config(config);
+        let events = vec![
+            make_event("reserved", 1, u64::MAX, 1000, "invalid"),
+            make_event("restart", 1, 0, 1001, "valid"),
+        ];
+
+        let report = checker.check(&events);
+
+        assert!(!report.passed);
+        assert!(report.has_critical());
+        assert_eq!(report.count_by_kind(ViolationKind::ReservedSequence), 1);
+        assert_eq!(
+            report.count_by_kind(ViolationKind::SequenceRegression),
+            0,
+            "the invalid reserved sentinel must not become the domain frontier"
+        );
+        assert_eq!(report.count_by_kind(ViolationKind::SequenceGap), 0);
+    }
+
+    #[test]
+    fn last_usable_sequence_is_valid_but_reserved_max_is_not() {
+        let config = InvariantCheckerConfig {
+            check_merge_order: false,
+            ..Default::default()
+        };
+        let checker = InvariantChecker::with_config(config);
+        let events = vec![
+            make_event("last-usable", 1, u64::MAX - 1, 1000, "valid"),
+            make_event("reserved", 1, u64::MAX, 1001, "invalid"),
+        ];
+
+        let report = checker.check(&events);
+
+        assert_eq!(report.count_by_kind(ViolationKind::ReservedSequence), 1);
+        assert_eq!(report.count_by_kind(ViolationKind::SequenceGap), 0);
+        assert_eq!(
+            report.count_by_kind(ViolationKind::SequenceRegression),
+            0
+        );
     }
 
     #[test]
@@ -1434,8 +1517,9 @@ mod tests {
     }
 
     #[test]
-    fn violation_kind_all_twelve_distinct() {
+    fn violation_kind_all_thirteen_distinct() {
         let kinds = [
+            ViolationKind::ReservedSequence,
             ViolationKind::SequenceRegression,
             ViolationKind::SequenceGap,
             ViolationKind::DuplicateSequence,
@@ -1464,6 +1548,7 @@ mod tests {
     fn violation_kind_hash_in_set() {
         use std::collections::HashSet;
         let mut set = HashSet::new();
+        set.insert(ViolationKind::ReservedSequence);
         set.insert(ViolationKind::SequenceRegression);
         set.insert(ViolationKind::SequenceGap);
         set.insert(ViolationKind::DuplicateSequence);
@@ -1476,7 +1561,7 @@ mod tests {
         set.insert(ViolationKind::MergeOrderViolation);
         set.insert(ViolationKind::EmptyEventId);
         set.insert(ViolationKind::SchemaVersionMismatch);
-        assert_eq!(set.len(), 12);
+        assert_eq!(set.len(), 13);
     }
 
     #[test]
