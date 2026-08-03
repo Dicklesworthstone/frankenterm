@@ -98,6 +98,12 @@ fn empty_causality() -> RecorderEventCausality {
     }
 }
 
+fn assign_sequence(assigner: &SequenceAssigner, pane_id: u64) -> (u64, u64) {
+    assigner
+        .assign(pane_id)
+        .expect("bounded integration test cannot exhaust sequence space")
+}
+
 // ---------------------------------------------------------------------------
 // Integration tests: full pipeline
 // ---------------------------------------------------------------------------
@@ -111,7 +117,7 @@ fn single_pane_sequential_events_pass_all_invariants() {
     let pane_id = 0u64;
 
     for i in 0u64..20 {
-        let (pane_seq, _global_seq) = assigner.assign(pane_id);
+        let (pane_seq, _global_seq) = assign_sequence(&assigner, pane_id);
         let text = format!("command-{}", i);
         let mut event = build_event(
             pane_id,
@@ -143,7 +149,7 @@ fn multi_pane_interleaved_events_pass_invariants() {
 
     for round in 0u64..10 {
         for pane_id in 0u64..5 {
-            let (pane_seq, _global_seq) = assigner.assign(pane_id);
+            let (pane_seq, _global_seq) = assign_sequence(&assigner, pane_id);
             let ts = 1000 + round * 50 + pane_id;
             let text = format!("pane-{}-cmd-{}", pane_id, round);
             let mut event = build_event(
@@ -179,7 +185,7 @@ fn deterministic_event_ids_are_unique() {
     let mut ids = std::collections::HashSet::new();
     for pane_id in 0u64..10 {
         for _ in 0..50 {
-            let (pane_seq, _) = assigner.assign(pane_id);
+            let (pane_seq, _) = assign_sequence(&assigner, pane_id);
             let ts = 1000 + pane_seq * 10 + pane_id;
             let event = build_event(
                 pane_id,
@@ -201,7 +207,7 @@ fn deterministic_event_ids_are_unique() {
 #[test]
 fn deterministic_event_ids_are_stable_across_regeneration() {
     let assigner = SequenceAssigner::new();
-    let (pane_seq, _) = assigner.assign(0);
+    let (pane_seq, _) = assign_sequence(&assigner, 0);
 
     let event = build_event(
         0,
@@ -241,7 +247,7 @@ fn correlation_tracker_builds_valid_causal_chains() {
     let mut events = Vec::new();
 
     // First event: no parent
-    let (seq0, _) = assigner.assign(pane_id);
+    let (seq0, _) = assign_sequence(&assigner, pane_id);
     let e0 = build_event(
         pane_id,
         seq0,
@@ -256,7 +262,7 @@ fn correlation_tracker_builds_valid_causal_chains() {
     events.push(e0_final);
 
     // Second event: parent = first
-    let (seq1, _) = assigner.assign(pane_id);
+    let (seq1, _) = assign_sequence(&assigner, pane_id);
     let e1 = build_event(
         pane_id,
         seq1,
@@ -271,7 +277,7 @@ fn correlation_tracker_builds_valid_causal_chains() {
     events.push(e1_final);
 
     // Third event: parent = second, trigger = first (response)
-    let (seq2, _) = assigner.assign(pane_id);
+    let (seq2, _) = assign_sequence(&assigner, pane_id);
     let e2 = build_event(
         pane_id,
         seq2,
@@ -316,7 +322,7 @@ fn replay_order_matches_merge_key_ordering() {
     // Generate events across multiple panes
     for round in 0u64..5 {
         for pane_id in 0u64..3 {
-            let (pane_seq, global_seq) = assigner.assign(pane_id);
+            let (pane_seq, global_seq) = assign_sequence(&assigner, pane_id);
             let ts = 1000 + round * 30 + pane_id * 10;
             let event = build_event(
                 pane_id,
@@ -373,7 +379,7 @@ fn replay_determinism_after_shuffle_and_resort() {
     let mut events = Vec::new();
     for pane_id in 0u64..4 {
         for _ in 0..10 {
-            let (pane_seq, _) = assigner.assign(pane_id);
+            let (pane_seq, _) = assign_sequence(&assigner, pane_id);
             let ts = 1000 + pane_seq * 10 + pane_id;
             let event = build_event(
                 pane_id,
@@ -408,7 +414,7 @@ fn mixed_event_types_across_streams_pass_invariants() {
     let mut events = Vec::new();
 
     // Lifecycle: capture started
-    let (seq, _) = assigner.assign(pane_id);
+    let (seq, _) = assign_sequence(&assigner, pane_id);
     events.push(build_event(
         pane_id,
         seq,
@@ -418,7 +424,7 @@ fn mixed_event_types_across_streams_pass_invariants() {
     ));
 
     // Ingress: command sent
-    let (seq, _) = assigner.assign(pane_id);
+    let (seq, _) = assign_sequence(&assigner, pane_id);
     events.push(build_event(
         pane_id,
         seq,
@@ -428,7 +434,7 @@ fn mixed_event_types_across_streams_pass_invariants() {
     ));
 
     // Egress: output received
-    let (seq, _) = assigner.assign(pane_id);
+    let (seq, _) = assign_sequence(&assigner, pane_id);
     events.push(build_event(
         pane_id,
         seq,
@@ -438,7 +444,7 @@ fn mixed_event_types_across_streams_pass_invariants() {
     ));
 
     // Control: prompt boundary
-    let (seq, _) = assigner.assign(pane_id);
+    let (seq, _) = assign_sequence(&assigner, pane_id);
     events.push(build_event(
         pane_id,
         seq,
@@ -452,7 +458,7 @@ fn mixed_event_types_across_streams_pass_invariants() {
     ));
 
     // Lifecycle: capture stopped
-    let (seq, _) = assigner.assign(pane_id);
+    let (seq, _) = assign_sequence(&assigner, pane_id);
     events.push(build_event(
         pane_id,
         seq,
@@ -489,7 +495,7 @@ fn batch_correlation_chain_passes_invariants() {
     tracker.start_batch(pane_id, "batch-001".into());
 
     for i in 0u64..5 {
-        let (pane_seq, _) = assigner.assign(pane_id);
+        let (pane_seq, _) = assign_sequence(&assigner, pane_id);
         let ts = 1000 + i * 10;
         let mut event = build_event(
             pane_id,
@@ -508,7 +514,7 @@ fn batch_correlation_chain_passes_invariants() {
     tracker.end_batch(pane_id);
 
     // Post-batch event has no batch_id
-    let (pane_seq, _) = assigner.assign(pane_id);
+    let (pane_seq, _) = assign_sequence(&assigner, pane_id);
     let mut event = build_event(
         pane_id,
         pane_seq,
@@ -579,7 +585,7 @@ fn large_scale_correctness_500_events_10_panes() {
 
     for round in 0u64..50 {
         for pane_id in 0u64..10 {
-            let (pane_seq, _) = assigner.assign(pane_id);
+            let (pane_seq, _) = assign_sequence(&assigner, pane_id);
             let ts = 1000 + round * 100 + pane_id;
             let mut event = build_event(
                 pane_id,
@@ -633,7 +639,7 @@ fn cross_pane_trigger_response_chain_passes() {
     let mut events = Vec::new();
 
     // Pane 0: root event
-    let (seq0, _) = assigner.assign(0);
+    let (seq0, _) = assign_sequence(&assigner, 0);
     let root = build_event(
         0,
         seq0,
@@ -647,7 +653,7 @@ fn cross_pane_trigger_response_chain_passes() {
     events.push(root_final);
 
     // Pane 1: triggered by pane 0's root event
-    let (seq1, _) = assigner.assign(1);
+    let (seq1, _) = assign_sequence(&assigner, 1);
     let resp = build_event(1, seq1, 1010, egress_payload("response"), empty_causality());
     let ctx1 = tracker.build_context(
         1,
@@ -660,7 +666,7 @@ fn cross_pane_trigger_response_chain_passes() {
     events.push(resp_final);
 
     // Pane 2: triggered by pane 1, root = pane 0
-    let (seq2, _) = assigner.assign(2);
+    let (seq2, _) = assign_sequence(&assigner, 2);
     let e2 = build_event(2, seq2, 1020, ingress_payload("cascade"), empty_causality());
     let ctx2 = tracker.build_context(2, &e2.event_id, Some(&resp.event_id), Some(&root.event_id));
     let mut e2_final = e2.clone();
@@ -687,7 +693,7 @@ fn intentionally_corrupted_pipeline_detected() {
     let mut events = Vec::new();
 
     // Valid first event
-    let (seq0, _) = assigner.assign(0);
+    let (seq0, _) = assign_sequence(&assigner, 0);
     events.push(build_event(
         0,
         seq0,
@@ -736,7 +742,7 @@ fn sequence_assigner_replay_order_is_valid() {
     let mut orders = Vec::new();
     for _ in 0..100 {
         for pane_id in 0u64..5 {
-            let (pane_seq, global_seq) = assigner.assign(pane_id);
+            let (pane_seq, global_seq) = assign_sequence(&assigner, pane_id);
             orders.push(ReplayOrder::new(global_seq, pane_id, pane_seq));
         }
     }
@@ -752,7 +758,7 @@ fn clock_regression_flagged_as_warning_not_failure() {
     let mut events = Vec::new();
 
     // Normal timestamp
-    let (seq0, _) = assigner.assign(0);
+    let (seq0, _) = assign_sequence(&assigner, 0);
     events.push(build_event(
         0,
         seq0,
@@ -762,7 +768,7 @@ fn clock_regression_flagged_as_warning_not_failure() {
     ));
 
     // Clock regression: timestamp goes backwards
-    let (seq1, _) = assigner.assign(0);
+    let (seq1, _) = assign_sequence(&assigner, 0);
     events.push(build_event(
         0,
         seq1,
@@ -790,7 +796,7 @@ fn pane_reset_produces_valid_new_sequence() {
 
     // Assign some sequences for pane 0
     for _ in 0..5 {
-        assigner.assign(0);
+        assign_sequence(&assigner, 0);
     }
     assert_eq!(assigner.current_pane(0), 5);
 
@@ -798,7 +804,7 @@ fn pane_reset_produces_valid_new_sequence() {
     assigner.reset_pane(0);
 
     // New sequence starts at 0 again
-    let (pane_seq, _) = assigner.assign(0);
+    let (pane_seq, _) = assign_sequence(&assigner, 0);
     assert_eq!(pane_seq, 0);
 
     // Global sequence continues monotonically
@@ -812,7 +818,7 @@ fn serde_roundtrip_preserves_invariant_compliance() {
     let mut events = Vec::new();
     for pane_id in 0u64..3 {
         for _ in 0..5 {
-            let (pane_seq, _) = assigner.assign(pane_id);
+            let (pane_seq, _) = assign_sequence(&assigner, pane_id);
             let ts = 1000 + pane_seq * 10 + pane_id;
             events.push(build_event(
                 pane_id,
