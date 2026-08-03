@@ -1052,7 +1052,7 @@ pub fn action_to_ingress_kind(
 static RECORDING_CLOCK_ANOMALY_COUNT: AtomicU64 = AtomicU64::new(0);
 
 fn saturating_atomic_increment(counter: &AtomicU64) {
-    let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+    let _ = counter.try_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
         Some(count.saturating_add(1))
     });
 }
