@@ -4261,6 +4261,26 @@ mod tests {
         .expect("test topology notification should fit its connection budget")
     }
 
+    fn assert_outbound_live_counters_zero(coordinator: &TopologyStreamCoordinator) {
+        let released = coordinator.outbound_budget.snapshot();
+        assert_eq!(
+            released.topology_bytes, 0,
+            "terminal topology cleanup must release every live retained byte"
+        );
+        assert_eq!(
+            released.total_slots, 0,
+            "terminal topology cleanup must release every live outbound slot"
+        );
+        assert_eq!(
+            released.bulk_slots, 0,
+            "terminal topology cleanup must release every live bulk/topology slot"
+        );
+        assert!(
+            released.peak_topology_bytes <= TOPOLOGY_FENCE_MAX_RETAINED_BYTES,
+            "the historical topology high-water mark must remain within the connection cap"
+        );
+    }
+
     #[test]
     fn retained_workspace_event_uses_its_mutation_point_payload() {
         let coordinator = idle_topology_coordinator();
@@ -5847,6 +5867,7 @@ mod tests {
             assert_eq!(state.prebind.retained_bytes, 0);
             assert!(state.prebind.events.is_empty());
         }
+        assert_outbound_live_counters_zero(&coordinator);
         assert!(
             coordinator
                 .begin_fence(99, &fenced_snapshot_request())
@@ -6021,6 +6042,16 @@ mod tests {
             assert_eq!(state.prebind.retained_bytes, 0);
             assert!(state.prebind.events.is_empty());
         }
+        assert_outbound_live_counters_zero(&coordinator);
+        assert!(!coordinator.on_notification(
+            &mux,
+            topology_envelope(3, MuxNotification::PaneAdded(3)),
+        ));
+        assert!(
+            terminal_rx.is_empty(),
+            "post-overflow prebind ingress must not publish a second terminal reason"
+        );
+        assert_outbound_live_counters_zero(&coordinator);
         assert!(
             coordinator
                 .bind_subscription(
@@ -6084,10 +6115,22 @@ mod tests {
             OUTBOUND_BUDGET_OVERFLOW
         );
         assert!(item_rx.is_empty());
-        let state = coordinator.state.lock();
-        assert!(matches!(&state.phase, TopologyStreamPhase::Exhausted));
-        assert_eq!(state.prebind.retained_bytes, 0);
-        assert!(state.prebind.events.is_empty());
+        {
+            let state = coordinator.state.lock();
+            assert!(matches!(&state.phase, TopologyStreamPhase::Exhausted));
+            assert_eq!(state.prebind.retained_bytes, 0);
+            assert!(state.prebind.events.is_empty());
+        }
+        assert_outbound_live_counters_zero(&coordinator);
+        assert!(!coordinator.on_notification(
+            &mux,
+            topology_envelope(5, MuxNotification::PaneAdded(5)),
+        ));
+        assert!(
+            terminal_rx.is_empty(),
+            "post-overflow established-gap ingress must not publish a second terminal reason"
+        );
+        assert_outbound_live_counters_zero(&coordinator);
     }
 
     #[test]
@@ -6151,6 +6194,76 @@ mod tests {
         assert!(matches!(&state.phase, TopologyStreamPhase::Exhausted));
         assert_eq!(state.prebind.retained_bytes, 0);
         assert!(state.prebind.events.is_empty());
+    }
+
+    #[test]
+    fn topology_ingress_linearizes_before_terminal_and_rejects_every_later_event() {
+        let (item_tx, item_rx) = bounded(DISPATCH_ITEM_QUEUE_TOTAL_CAPACITY);
+        let (terminal, terminal_rx) = DispatchTerminal::channel();
+        let coordinator = Arc::new(TopologyStreamCoordinator::new(
+            item_tx,
+            terminal,
+            TopologyStreamId::from_bytes([0x6d; 16]),
+        ));
+
+        let tripper_ready = Arc::new(std::sync::Barrier::new(2));
+        let (ingress_result_tx, ingress_result_rx) =
+            std::sync::mpsc::sync_channel::<bool>(1);
+        let tripper_terminal = coordinator.terminal.clone();
+        let tripper_ready_thread = Arc::clone(&tripper_ready);
+        let tripper = std::thread::spawn(move || {
+            tripper_ready_thread.wait();
+            assert!(
+                ingress_result_rx
+                    .recv()
+                    .expect("ingress result sender must remain connected"),
+                "the topology event must win the selected linearization order"
+            );
+            tripper_terminal.trip(TOPOLOGY_PROTOCOL_FAILURE);
+        });
+        tripper_ready.wait();
+
+        let mux = Mux::new(None);
+        let accepted = coordinator.on_notification(
+            &mux,
+            topology_envelope(1, MuxNotification::PaneAdded(1)),
+        );
+        ingress_result_tx
+            .send(accepted)
+            .expect("terminal tripper must remain connected");
+        tripper.join().expect("terminal tripper thread should join");
+
+        assert!(accepted, "topology ingress selected to linearize first must succeed");
+        assert_eq!(
+            terminal_rx
+                .try_recv()
+                .expect("post-ingress terminal reason must publish"),
+            TOPOLOGY_PROTOCOL_FAILURE
+        );
+        let retained = coordinator.outbound_budget.snapshot();
+        assert_eq!(retained.total_slots, 1);
+        assert_eq!(retained.bulk_slots, 1);
+        assert_eq!(
+            retained.topology_bytes,
+            RETAINED_TOPOLOGY_EVENT_ACCOUNTED_FIXED_BYTES
+        );
+        assert!(item_rx.is_empty());
+
+        assert!(!coordinator.on_notification(
+            &mux,
+            topology_envelope(2, MuxNotification::PaneAdded(2)),
+        ));
+        assert!(
+            terminal_rx.is_empty(),
+            "later topology ingress must not publish a second terminal reason"
+        );
+        assert!(item_rx.is_empty());
+        let state = coordinator.state.lock();
+        assert!(matches!(&state.phase, TopologyStreamPhase::Exhausted));
+        assert_eq!(state.prebind.retained_bytes, 0);
+        assert!(state.prebind.events.is_empty());
+        drop(state);
+        assert_outbound_live_counters_zero(&coordinator);
     }
 
     #[test]

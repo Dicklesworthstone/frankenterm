@@ -4910,68 +4910,121 @@ mod test {
     }
 
     #[test]
-    fn exact_authority_decode_leaves_the_next_outer_frame_buffered() {
-        let request = Pdu::ListPanesCoherent(ListPanesCoherent {
-            supported: TopologyCapabilities::FENCED_SNAPSHOT_V1,
-            required: TopologyCapabilities::FENCED_SNAPSHOT_V1,
-        });
-        let event = Pdu::TopologyEvent(TopologyEvent {
-            stream_id: TopologyStreamId::from_bytes([0x63; 16]),
-            revision: TopologyRevision::new(8),
-            event: TopologyEventKind::PaneAdded { pane_id: 9 },
-        });
-        let first_frame = request
-            .encode_frame_with_mode(11, CompressionMode::Never)
-            .expect("encode first authority frame");
-        let second_frame = event
-            .encode_frame_with_mode(12, CompressionMode::Always)
-            .expect("encode second authority frame");
-        let mut concatenated = first_frame.clone();
-        concatenated.extend_from_slice(&second_frame);
+    fn every_exact_authority_decode_preserves_the_next_outer_frame() {
+        let stream_id = TopologyStreamId::from_bytes([0x63; 16]);
+        let authority_pdus = [
+            (
+                "ListPanesCoherent",
+                Pdu::ListPanesCoherent(ListPanesCoherent {
+                    supported: TopologyCapabilities::FENCED_SNAPSHOT_V1,
+                    required: TopologyCapabilities::FENCED_SNAPSHOT_V1,
+                }),
+            ),
+            (
+                "ListPanesCoherentResponse",
+                Pdu::ListPanesCoherentResponse(ListPanesCoherentResponse {
+                    negotiated: TopologyCapabilities::FENCED_SNAPSHOT_V1,
+                    stream_id,
+                    outcome: ListPanesCoherentOutcome::Unsupported {
+                        supported: TopologyCapabilities::NONE,
+                    },
+                }),
+            ),
+            (
+                "TopologyEvent",
+                Pdu::TopologyEvent(TopologyEvent {
+                    stream_id,
+                    revision: TopologyRevision::new(8),
+                    event: TopologyEventKind::PaneAdded { pane_id: 9 },
+                }),
+            ),
+        ];
+        let next_outer = Pdu::Ping(Ping {});
 
-        let mut sync_reader = Cursor::new(concatenated.clone());
-        let decoded = Pdu::decode(&mut sync_reader).expect("sync decode first authority frame");
-        assert_eq!(decoded.serial, 11);
-        assert_eq!(decoded.pdu, request);
-        let decoded = Pdu::decode(&mut sync_reader).expect("sync decode second authority frame");
-        assert_eq!(decoded.serial, 12);
-        assert_eq!(decoded.pdu, event);
-        assert_eq!(
-            usize::try_from(sync_reader.position()).expect("cursor position should fit usize"),
-            concatenated.len()
-        );
+        for (authority_index, (authority_name, authority)) in
+            authority_pdus.into_iter().enumerate()
+        {
+            for (mode_index, mode) in [CompressionMode::Never, CompressionMode::Always]
+                .into_iter()
+                .enumerate()
+            {
+                let first_serial = 11_u64
+                    + u64::try_from(authority_index * 2 + mode_index)
+                        .expect("small authority case index must fit u64");
+                let next_serial = first_serial + 100;
+                let first_frame = authority
+                    .encode_frame_with_mode(first_serial, mode)
+                    .expect("encode first authority frame");
+                let next_frame = next_outer
+                    .encode_frame_with_mode(next_serial, CompressionMode::Never)
+                    .expect("encode next outer frame");
+                let mut concatenated = first_frame.clone();
+                concatenated.extend_from_slice(&next_frame);
 
-        let (decoded_first, decoded_second) = runtime::block_on(async {
-            let mut reader = runtime::Cursor::new(concatenated.clone());
-            let first = Pdu::decode_async(&mut reader, None)
-                .await
-                .expect("async decode first authority frame");
-            let second = Pdu::decode_async(&mut reader, None)
-                .await
-                .expect("async decode second authority frame");
-            (first, second)
-        });
-        assert_eq!(decoded_first.serial, 11);
-        assert_eq!(decoded_first.pdu, request);
-        assert_eq!(decoded_second.serial, 12);
-        assert_eq!(decoded_second.pdu, event);
+                let mut sync_reader = Cursor::new(concatenated.clone());
+                let decoded = Pdu::decode(&mut sync_reader)
+                    .expect("sync decode first authority frame");
+                assert_eq!(decoded.serial, first_serial);
+                assert_eq!(
+                    decoded.pdu, authority,
+                    "sync {authority_name} under {mode:?}"
+                );
+                assert_eq!(
+                    usize::try_from(sync_reader.position())
+                        .expect("sync cursor position should fit usize"),
+                    first_frame.len(),
+                    "sync {authority_name} under {mode:?} must stop at its outer boundary"
+                );
+                let decoded = Pdu::decode(&mut sync_reader)
+                    .expect("sync decode preserved next outer frame");
+                assert_eq!(decoded.serial, next_serial);
+                assert_eq!(decoded.pdu, next_outer);
+                assert_eq!(
+                    usize::try_from(sync_reader.position())
+                        .expect("sync cursor position should fit usize"),
+                    concatenated.len()
+                );
 
-        let mut buffered = first_frame;
-        buffered.extend_from_slice(&second_frame);
+                let (decoded_first, decoded_second) = runtime::block_on(async {
+                    let mut reader = runtime::Cursor::new(concatenated.clone());
+                    let first = Pdu::decode_async(&mut reader, None)
+                        .await
+                        .expect("async decode first authority frame");
+                    let second = Pdu::decode_async(&mut reader, None)
+                        .await
+                        .expect("async decode preserved next outer frame");
+                    (first, second)
+                });
+                assert_eq!(decoded_first.serial, first_serial);
+                assert_eq!(
+                    decoded_first.pdu, authority,
+                    "async {authority_name} under {mode:?}"
+                );
+                assert_eq!(decoded_second.serial, next_serial);
+                assert_eq!(decoded_second.pdu, next_outer);
 
-        let decoded = Pdu::stream_decode(&mut buffered)
-            .expect("decode first authority frame")
-            .expect("first authority frame should be complete");
-        assert_eq!(decoded.serial, 11);
-        assert_eq!(decoded.pdu, request);
-        assert_eq!(buffered, second_frame);
+                let mut buffered = concatenated;
+                let decoded = Pdu::stream_decode(&mut buffered)
+                    .expect("stream decode first authority frame")
+                    .expect("first authority frame should be complete");
+                assert_eq!(decoded.serial, first_serial);
+                assert_eq!(
+                    decoded.pdu, authority,
+                    "stream {authority_name} under {mode:?}"
+                );
+                assert_eq!(
+                    buffered, next_frame,
+                    "stream {authority_name} under {mode:?} must preserve the exact next frame"
+                );
 
-        let decoded = Pdu::stream_decode(&mut buffered)
-            .expect("decode second authority frame")
-            .expect("second authority frame should remain complete");
-        assert_eq!(decoded.serial, 12);
-        assert_eq!(decoded.pdu, event);
-        assert!(buffered.is_empty());
+                let decoded = Pdu::stream_decode(&mut buffered)
+                    .expect("stream decode preserved next outer frame")
+                    .expect("next outer frame should remain complete");
+                assert_eq!(decoded.serial, next_serial);
+                assert_eq!(decoded.pdu, next_outer);
+                assert!(buffered.is_empty());
+            }
+        }
     }
 
     #[test]
