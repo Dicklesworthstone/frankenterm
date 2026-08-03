@@ -167,6 +167,46 @@ struct SequenceFrontiers {
     panes: HashMap<u64, u64>,
 }
 
+/// Rolls back a partially written assignment if unwinding starts before commit.
+///
+/// `SequenceAssigner` deliberately recovers poisoned locks. That makes panic
+/// atomicity part of the pair-or-neither contract: a panic between the pane and
+/// global writes must not expose a half-advanced pair to the next caller.
+struct SequenceAssignmentTransaction<'a> {
+    frontiers: &'a mut SequenceFrontiers,
+    pane_id: u64,
+    previous_global: u64,
+    previous_pane: Option<u64>,
+    committed: bool,
+}
+
+impl SequenceAssignmentTransaction<'_> {
+    fn commit(mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for SequenceAssignmentTransaction<'_> {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+
+        self.frontiers.global = self.previous_global;
+        if let Some(previous_pane) = self.previous_pane {
+            if let Some(sequence) = self.frontiers.panes.get_mut(&self.pane_id) {
+                *sequence = previous_pane;
+            } else {
+                // Capacity for this key was already present or reserved before
+                // the transaction began, so rollback cannot allocate here.
+                self.frontiers.panes.insert(self.pane_id, previous_pane);
+            }
+        } else {
+            self.frontiers.panes.remove(&self.pane_id);
+        }
+    }
+}
+
 /// Assigns per-pane and global sequence numbers as one atomic pair.
 ///
 /// Thread-safe: one short critical section checks both frontiers and advances
@@ -196,11 +236,23 @@ impl SequenceAssigner {
     /// frontier reaches the reserved `u64::MAX` sentinel, assignment fails and
     /// neither frontier advances.
     pub fn assign(&self, pane_id: u64) -> Result<(u64, u64), SequenceExhaustion> {
+        self.assign_with_commit_hook(pane_id, || {})
+    }
+
+    fn assign_with_commit_hook<F>(
+        &self,
+        pane_id: u64,
+        before_global_commit: F,
+    ) -> Result<(u64, u64), SequenceExhaustion>
+    where
+        F: FnOnce(),
+    {
         let mut frontiers = self
             .frontiers
             .lock()
             .unwrap_or_else(record_poison_and_recover);
-        let pane_sequence = frontiers.panes.get(&pane_id).copied().unwrap_or(0);
+        let previous_pane = frontiers.panes.get(&pane_id).copied();
+        let pane_sequence = previous_pane.unwrap_or(0);
         let global_sequence = frontiers.global;
 
         match (
@@ -213,8 +265,29 @@ impl SequenceAssigner {
             (false, false) => {}
         }
 
-        frontiers.global = global_sequence + 1;
-        frontiers.panes.insert(pane_id, pane_sequence + 1);
+        if previous_pane.is_none() {
+            frontiers
+                .panes
+                .try_reserve(1)
+                .unwrap_or_else(|error| {
+                    panic!("reserve sequence frontier for pane {pane_id}: {error}");
+                });
+        }
+
+        let mut transaction = SequenceAssignmentTransaction {
+            frontiers: &mut frontiers,
+            pane_id,
+            previous_global: global_sequence,
+            previous_pane,
+            committed: false,
+        };
+        transaction
+            .frontiers
+            .panes
+            .insert(pane_id, pane_sequence + 1);
+        before_global_commit();
+        transaction.frontiers.global = global_sequence + 1;
+        transaction.commit();
         Ok((pane_sequence, global_sequence))
     }
 
@@ -888,6 +961,28 @@ mod tests {
         assert_eq!(assigner.current_pane(winning_pane), 1);
         assert_eq!(assigner.current_global(), u64::MAX);
         assert_eq!(assigner.pane_count(), 1);
+    }
+
+    #[test]
+    fn poisoned_mid_commit_rolls_back_pair_before_recovery() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let pane_id = 7;
+        let assigner = Arc::new(assigner_at(41, &[(pane_id, 12)]));
+        let thread_assigner = Arc::clone(&assigner);
+
+        let panic_result = thread::spawn(move || {
+            thread_assigner.assign_with_commit_hook(pane_id, || {
+                panic!("inject panic between pane and global commits");
+            })
+        })
+        .join();
+
+        assert!(panic_result.is_err());
+        assert_eq!(assigner.assign(pane_id), Ok((12, 41)));
+        assert_eq!(assigner.current_pane(pane_id), 13);
+        assert_eq!(assigner.current_global(), 42);
     }
 
     #[test]
