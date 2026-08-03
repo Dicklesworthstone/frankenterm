@@ -1426,14 +1426,28 @@ impl ClientDomain {
                 })?;
 
                 if let Some(local_window_id) = inner.remote_to_local_window(remote_window_id) {
-                    if let Some(mut window) = mux.get_window_mut(local_window_id) {
-                        log::debug!(
-                            "domain: {} adding tab to existing local window {}",
-                            inner.local_domain_id,
-                            local_window_id
-                        );
-                        if window.idx_by_id(tab.tab_id()).is_none() {
-                            window.push(&tab);
+                    let needs_attach = mux
+                        .get_window(local_window_id)
+                        .map(|window| {
+                            window
+                                .iter()
+                                .all(|candidate| !Arc::ptr_eq(candidate, &tab))
+                        });
+                    if let Some(needs_attach) = needs_attach {
+                        if needs_attach {
+                            log::debug!(
+                                "domain: {} adding tab to existing local window {}",
+                                inner.local_domain_id,
+                                local_window_id
+                            );
+                            mux.add_tab_to_window(&tab, local_window_id)
+                                .with_context(|| {
+                                    format!(
+                                        "attach remote tab {} to existing local window {}",
+                                        tab.tab_id(),
+                                        local_window_id
+                                    )
+                                })?;
                         }
                         continue;
                     }
@@ -2449,6 +2463,71 @@ mod tests {
 
         let other_window_id = *mux.new_empty_window(Some("ops".to_string()), None);
         assert!(!mux.window_has_panes_in_domain(other_window_id, local_domain_id));
+    }
+
+    #[test]
+    fn existing_remote_window_mapping_attaches_through_mux_authority_once() {
+        let scope = MuxTestScope::enter();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+
+        let local_domain_id = alloc_domain_id();
+        let inner = test_client_inner(local_domain_id);
+        let local_window_id = *mux.new_empty_window(Some("ops".to_string()), None);
+        inner.record_remote_to_local_window_mapping(41, local_window_id);
+        let observed_additions = Arc::new(Mutex::new(Vec::new()));
+        let observed_additions_for_subscriber = Arc::clone(&observed_additions);
+        mux.subscribe(move |notification| {
+            if let MuxNotification::TabAddedToWindow { tab_id, window_id } = notification
+                && window_id == local_window_id
+            {
+                lock_or_recover(
+                    &observed_additions_for_subscriber,
+                    "observed_tab_additions",
+                )
+                .push(tab_id);
+            }
+            true
+        })
+        .expect("subscribe to canonical tab attachment events");
+
+        ClientDomain::process_pane_list(
+            &mux,
+            Arc::clone(&inner),
+            sample_remote_tab_listing(),
+            None,
+        )
+        .expect("existing remote window mapping should attach through mux authority");
+        let local_tab_id = inner
+            .remote_to_local_tab_id(51)
+            .expect("remote tab should map locally");
+        assert_eq!(
+            *lock_or_recover(&observed_additions, "observed_tab_additions"),
+            vec![local_tab_id],
+        );
+
+        ClientDomain::process_pane_list(
+            &mux,
+            Arc::clone(&inner),
+            sample_remote_tab_listing(),
+            None,
+        )
+        .expect("stable remote topology should not reattach its exact tab");
+        assert_eq!(
+            *lock_or_recover(&observed_additions, "observed_tab_additions"),
+            vec![local_tab_id],
+            "stable resync must not publish a duplicate tab attachment",
+        );
+        let local_tab = mux
+            .get_tab(local_tab_id)
+            .expect("mapped tab should remain registered");
+        let attached_exactly_once = mux
+            .get_window(local_window_id)
+            .expect("mapped window should remain registered")
+            .iter()
+            .filter(|candidate| Arc::ptr_eq(candidate, &local_tab))
+            .count();
+        assert_eq!(attached_exactly_once, 1);
     }
 
     #[test]

@@ -450,10 +450,16 @@ impl Window {
         self.order_revision = revision;
     }
 
-    fn check_that_tab_isnt_already_in_window(&self, tab: &Arc<Tab>) {
-        for t in &self.tabs {
-            assert_ne!(t.tab_id(), tab.tab_id(), "tab already added to this window");
-        }
+    fn ensure_tab_isnt_already_in_window(&self, tab: &Arc<Tab>) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.tabs
+                .iter()
+                .all(|existing| existing.tab_id() != tab.tab_id()),
+            "tab {} is already attached to window {}",
+            tab.tab_id(),
+            self.id,
+        );
+        Ok(())
     }
 
     fn invalidate(&mut self) {
@@ -472,7 +478,7 @@ impl Window {
             self.tabs.len(),
         );
         self.ensure_tab_insert_available()?;
-        self.check_that_tab_isnt_already_in_window(tab);
+        self.ensure_tab_isnt_already_in_window(tab)?;
         let next_revision = self.next_order_revision()?;
         let prior_active_index = (self.active < self.tabs.len()).then_some(self.active);
         self.tabs.insert(index, Arc::clone(tab));
@@ -537,9 +543,8 @@ impl Window {
         Ok(true)
     }
 
-    pub fn push(&mut self, tab: &Arc<Tab>) {
+    pub fn push(&mut self, tab: &Arc<Tab>) -> anyhow::Result<()> {
         self.insert(self.tabs.len(), tab)
-            .unwrap_or_else(|err| panic!("cannot append tab to window {}: {err:#}", self.id));
     }
 
     pub fn is_empty(&self) -> bool {
@@ -1991,9 +1996,9 @@ mod tests {
         let after_active = test_tab();
 
         let mut window = Window::new(None, None);
-        window.push(&first);
-        window.push(&active);
-        window.push(&third);
+        window.push(&first).expect("append first tab");
+        window.push(&active).expect("append active tab");
+        window.push(&third).expect("append third tab");
         window.set_active_without_saving(1);
 
         window
@@ -2022,6 +2027,15 @@ mod tests {
 
         let prior_order = window.iter().map(Arc::as_ptr).collect::<Vec<_>>();
         let prior_active_index = window.get_active_idx();
+        let prior_revision = window.order_revision();
+        let duplicate_error = window
+            .push(&active)
+            .expect_err("duplicate append must fail without panicking");
+        assert!(duplicate_error.to_string().contains("already attached"));
+        assert_eq!(window.iter().map(Arc::as_ptr).collect::<Vec<_>>(), prior_order);
+        assert_eq!(window.get_active_idx(), prior_active_index);
+        assert_eq!(window.order_revision(), prior_revision);
+
         let rejected = test_tab();
         let error = window
             .insert(window.len() + 1, &rejected)
@@ -2054,9 +2068,9 @@ mod tests {
         let stack_id = TabStackId(41);
 
         let mut window = Window::new(None, None);
-        window.push(&first);
-        window.push(&active);
-        window.push(&third);
+        window.push(&first).expect("append first tab");
+        window.push(&active).expect("append active tab");
+        window.push(&third).expect("append third tab");
         window.set_active_without_saving(1);
         window
             .create_tab_stack(
@@ -2134,9 +2148,9 @@ mod tests {
         let third_id = third.tab_id();
 
         let mut window = Window::new(None, None);
-        window.push(&first);
-        window.push(&second);
-        window.push(&third);
+        window.push(&first).expect("append first tab");
+        window.push(&second).expect("append second tab");
+        window.push(&third).expect("append third tab");
 
         window
             .create_tab_stack(TabStackId(1), vec![first_id, second_id, third_id])
@@ -2164,9 +2178,9 @@ mod tests {
         let third_id = third.tab_id();
 
         let mut window = Window::new(None, None);
-        window.push(&first);
-        window.push(&second);
-        window.push(&third);
+        window.push(&first).expect("append first tab");
+        window.push(&second).expect("append second tab");
+        window.push(&third).expect("append third tab");
 
         window
             .create_tab_stack(TabStackId(7), vec![first_id, second_id, third_id])
@@ -2202,9 +2216,9 @@ mod tests {
         let second_id = second.tab_id();
 
         let mut window = Window::new(None, None);
-        window.push(&first);
-        window.push(&second);
-        window.push(&third);
+        window.push(&first).expect("append first tab");
+        window.push(&second).expect("append second tab");
+        window.push(&third).expect("append third tab");
         window.save_and_then_set_active(1);
         window.save_and_then_set_active(2);
         assert_eq!(window.last_active, Some(second_id));
@@ -2230,7 +2244,7 @@ mod tests {
         let missing_id = missing.tab_id();
 
         let mut window = Window::new(None, None);
-        window.push(&first);
+        window.push(&first).expect("append first tab");
 
         assert_eq!(
             window.create_tab_stack(TabStackId(9), vec![first_id, missing_id]),
@@ -2247,7 +2261,7 @@ mod tests {
         let stack_id = TabStackId(101);
         let mut window = Window::new(None, None);
         for tab in [&first, &active, &third] {
-            window.push(tab);
+            window.push(tab).expect("append exact tab");
         }
         window.set_active_without_saving(1);
         window
@@ -2307,7 +2321,7 @@ mod tests {
         let third = test_tab();
         let mut window = Window::new(None, None);
         for tab in [&first, &active, &third] {
-            window.push(tab);
+            window.push(tab).expect("append exact tab");
         }
         window.set_active_without_saving(1);
         let revision_before = window.order_revision();
@@ -2363,8 +2377,8 @@ mod tests {
         let active = test_tab();
         let added = test_tab();
         let mut window = Window::new(None, None);
-        window.push(&first);
-        window.push(&active);
+        window.push(&first).expect("append first tab");
+        window.push(&active).expect("append active tab");
         window.set_active_without_saving(1);
         window.set_order_revision_for_test(WindowOrderRevision::new(u64::MAX - 1));
         let pointers_before = window.iter().map(Arc::as_ptr).collect::<Vec<_>>();
@@ -2374,6 +2388,10 @@ mod tests {
             .insert(window.len(), &added)
             .expect_err("terminal order revision must reject membership change");
         assert!(insert_error.to_string().contains("revision space is exhausted"));
+        let push_error = window
+            .push(&added)
+            .expect_err("fallible append must reject terminal order revision");
+        assert!(push_error.to_string().contains("revision space is exhausted"));
         let prepare_error = window
             .prepare_exact_order(
                 &[active.tab_id(), first.tab_id()],
@@ -2399,11 +2417,11 @@ mod tests {
         let third = test_tab();
         let mut window = Window::new(None, None);
 
-        window.push(&first);
+        window.push(&first).expect("append first tab");
         assert_eq!(window.order_revision().get(), 1);
         window.insert(1, &second).expect("insert second tab");
         assert_eq!(window.order_revision().get(), 2);
-        window.push(&third);
+        window.push(&third).expect("append third tab");
         assert_eq!(window.order_revision().get(), 3);
 
         window

@@ -14876,7 +14876,8 @@ mod tests {
         // choose a HashMap-order-dependent source or mutate either parent.
         mux.get_window_mut(dst_window_id)
             .expect("destination should remain registered")
-            .push(&tab);
+            .push(&tab)
+            .expect("seed destination before same-window rejection");
         let move_error = mux
             .move_tab_between_windows(tab.tab_id(), dst_window_id, None)
             .expect_err("move must reject ambiguous multi-parent topology");
