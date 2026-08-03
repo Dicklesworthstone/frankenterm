@@ -29,11 +29,10 @@ pub use crate::replay_decision_graph::{DecisionEvent, DecisionType};
 use crate::event_id::{RecorderMergeKey, StreamKind, generate_event_id_v1};
 use crate::ingest::CapturedSegment;
 use crate::recording::{
-    EgressEvent, EgressTap, GlobalSequence, IngressEvent, IngressOutcome, IngressTap,
+    EgressEvent, EgressTap, IngressEvent, IngressOutcome, IngressTap,
     RECORDER_EVENT_SCHEMA_VERSION_V1, RecorderControlMarkerType, RecorderEvent,
     RecorderEventCausality, RecorderEventPayload, RecorderEventSource, RecorderLifecyclePhase,
-    RecorderRedactionLevel, RecorderTextEncoding, RecordingSequenceError,
-    captured_kind_to_segment, epoch_ms_now,
+    RecorderRedactionLevel, RecorderTextEncoding, captured_kind_to_segment, epoch_ms_now,
 };
 use crate::redactor::{REDACTED_MARKER, Redactor};
 
@@ -242,17 +241,14 @@ impl CaptureConfig {
 /// [`RecorderEvent`] records with deterministic ordering metadata.
 ///
 /// The adapter maintains per-pane sequence frontiers for recorder identity.
-/// It also exposes the upstream [`GlobalSequence`] used to populate
-/// [`EgressEvent`] metadata. `RecorderEvent` v1 and [`RecorderMergeKey`] do not
-/// contain that global field, so the capture sink orders v1 records by its
-/// documented merge key rather than persisting the upstream global value.
+/// Cross-pane order is the documented [`RecorderMergeKey`]; the adapter does
+/// not allocate a separate transient identity that RecorderEvent v1 cannot
+/// persist.
 /// Events are emitted to a [`CaptureSink`] which can buffer, persist, or
 /// discard them.
 pub struct CaptureAdapter {
     /// Sink receiving captured events.
     sink: Arc<dyn CaptureSink>,
-    /// Upstream cross-pane sequence counter for `EgressEvent` construction.
-    global_seq: Arc<GlobalSequence>,
     /// Per-pane sequence counters for recorder events.
     pane_sequences: Mutex<HashMap<u64, AtomicU64>>,
     /// Runtime enable/disable flag.
@@ -281,7 +277,6 @@ impl CaptureAdapter {
             .unwrap_or_else(|err| panic!("invalid CaptureRedactionPolicy: {err}"));
         Self {
             sink,
-            global_seq: Arc::new(GlobalSequence::new()),
             pane_sequences: Mutex::new(HashMap::new()),
             enabled: AtomicBool::new(config.enabled),
             session_id: config.session_id,
@@ -325,16 +320,6 @@ impl CaptureAdapter {
     #[must_use]
     pub fn sequence_error_count(&self) -> u64 {
         self.sequence_error_count.load(Ordering::Relaxed)
-    }
-
-    /// Return a reference to the global sequence counter.
-    pub fn global_sequence(&self) -> &GlobalSequence {
-        &self.global_seq
-    }
-
-    /// Return a clone of the shared global sequence counter.
-    pub fn global_sequence_handle(&self) -> Arc<GlobalSequence> {
-        Arc::clone(&self.global_seq)
     }
 
     /// Get or create a per-pane sequence counter, returning the next value.
@@ -408,32 +393,13 @@ impl CaptureAdapter {
         boundary: &'static str,
         error: ReplayCaptureSequenceError,
     ) {
-        self.record_sequence_failure(boundary, error);
-    }
-
-    /// Record exhaustion of the adapter's upstream cross-pane sequence at a
-    /// runtime boundary that cannot return it.
-    ///
-    /// Global and pane-local failures intentionally share one saturating
-    /// counter and one warning gate. Once either identity space is exhausted,
-    /// every later attempt still fails closed without turning a hot capture
-    /// loop into an unbounded log stream.
-    pub(crate) fn record_global_sequence_error(
-        &self,
-        boundary: &'static str,
-        error: RecordingSequenceError,
-    ) {
-        self.record_sequence_failure(boundary, error);
-    }
-
-    fn record_sequence_failure(&self, boundary: &'static str, error: impl std::fmt::Display) {
         saturating_increment(&self.sequence_error_count);
         if !self.sequence_error_warned.swap(true, Ordering::AcqRel) {
             tracing::warn!(
                 target: "ft.replay.capture",
                 boundary,
                 error = %error,
-                "Replay capture boundary failed closed on an unsafe sequence"
+                "Replay capture boundary failed closed on an unsafe pane sequence"
             );
         }
     }
@@ -523,11 +489,6 @@ impl CaptureAdapter {
     /// This path is used when the upstream already has an EgressEvent struct
     /// (e.g., from an existing EgressTap implementation). The authoritative
     /// `EgressEvent::sequence` is preserved and advances the pane frontier.
-    /// `EgressEvent::global_sequence` is intentionally not represented:
-    /// `RecorderEvent` v1 has no global-sequence field and
-    /// [`RecorderMergeKey`] defines a different five-part total order. Adding
-    /// it would require a versioned recorder schema change rather than silently
-    /// changing v1 identity or merge semantics here.
     pub fn capture_egress_event(
         &self,
         egress: &EgressEvent,
@@ -1377,7 +1338,7 @@ mod tests {
             .load(Ordering::Relaxed)
     }
 
-    fn make_egress_event(pane_id: u64, sequence: u64, global_sequence: u64) -> EgressEvent {
+    fn make_egress_event(pane_id: u64, sequence: u64) -> EgressEvent {
         EgressEvent {
             pane_id,
             text: format!("pane-{pane_id}-sequence-{sequence}"),
@@ -1388,7 +1349,6 @@ mod tests {
             redaction: RecorderRedactionLevel::None,
             occurred_at_ms: 1_700_000_000_000,
             sequence,
-            global_sequence,
         }
     }
 
@@ -1597,7 +1557,7 @@ mod tests {
         let (sink, adapter) = make_adapter();
         let pane_id = 93;
 
-        expect_capture(adapter.capture_egress_event(&make_egress_event(pane_id, 7, 41)));
+        expect_capture(adapter.capture_egress_event(&make_egress_event(pane_id, 7)));
         expect_capture(adapter.capture_lifecycle(
             pane_id,
             RecorderLifecyclePhase::CaptureStarted,
@@ -1612,7 +1572,7 @@ mod tests {
         assert_eq!(pane_frontier(&adapter, pane_id), 9);
 
         let error = adapter
-            .capture_egress_event(&make_egress_event(pane_id, 7, 42))
+            .capture_egress_event(&make_egress_event(pane_id, 7))
             .expect_err("a supplied durable identity must never be reused");
         assert_eq!(
             error,
@@ -1628,7 +1588,7 @@ mod tests {
 
         let reserved_pane = 94;
         let error = adapter
-            .capture_egress_event(&make_egress_event(reserved_pane, u64::MAX, 43))
+            .capture_egress_event(&make_egress_event(reserved_pane, u64::MAX))
             .expect_err("u64::MAX is not an event identity");
         assert_eq!(
             error,
@@ -1656,7 +1616,6 @@ mod tests {
         expect_capture(adapter.capture_egress_event(&make_egress_event(
             pane_id,
             u64::MAX - 1,
-            51,
         )));
         assert_eq!(sink.recorder_events()[0].sequence, u64::MAX - 1);
         assert_eq!(pane_frontier(&adapter, pane_id), u64::MAX);
@@ -1678,13 +1637,13 @@ mod tests {
     }
 
     #[test]
-    fn recorder_v1_intentionally_omits_egress_global_sequence() {
+    fn independent_capture_adapters_produce_the_same_v1_identity() {
         let (left_sink, left) = make_adapter();
         let (right_sink, right) = make_adapter();
         let pane_id = 96;
 
-        expect_capture(left.capture_egress_event(&make_egress_event(pane_id, 3, 10)));
-        expect_capture(right.capture_egress_event(&make_egress_event(pane_id, 3, 999)));
+        expect_capture(left.capture_egress_event(&make_egress_event(pane_id, 3)));
+        expect_capture(right.capture_egress_event(&make_egress_event(pane_id, 3)));
 
         let left_event = &left_sink.recorder_events()[0];
         let right_event = &right_sink.recorder_events()[0];
@@ -1692,7 +1651,7 @@ mod tests {
         assert_eq!(right_event.sequence, 3);
         assert_eq!(
             left_event.event_id, right_event.event_id,
-            "RecorderEvent v1 identity intentionally excludes EgressEvent.global_sequence"
+            "independent observers must derive identity only from RecorderEvent v1 fields"
         );
     }
 
@@ -1718,8 +1677,8 @@ mod tests {
             .sequence_error_count
             .store(u64::MAX - 1, Ordering::Relaxed);
 
-        EgressTap::on_egress(&adapter, make_egress_event(pane_id, 0, 1));
-        EgressTap::on_egress(&adapter, make_egress_event(pane_id, 1, 2));
+        EgressTap::on_egress(&adapter, make_egress_event(pane_id, 0));
+        EgressTap::on_egress(&adapter, make_egress_event(pane_id, 1));
 
         assert!(sink.is_empty());
         assert_eq!(adapter.total_captured(), 0);
@@ -1727,36 +1686,6 @@ mod tests {
         assert!(
             adapter.sequence_error_warned.load(Ordering::Acquire),
             "the first void-boundary failure must publish its one warning"
-        );
-    }
-
-    #[test]
-    fn global_sequence_failure_observability_saturates_and_warns_once() {
-        let (_sink, adapter) = make_adapter();
-        adapter
-            .sequence_error_count
-            .store(u64::MAX - 1, Ordering::Relaxed);
-        assert!(!adapter.sequence_error_warned.load(Ordering::Acquire));
-
-        adapter.record_global_sequence_error(
-            "runtime.authorized_egress",
-            RecordingSequenceError::GlobalExhausted,
-        );
-        assert_eq!(adapter.sequence_error_count(), u64::MAX);
-        assert!(adapter.sequence_error_warned.load(Ordering::Acquire));
-
-        adapter.record_global_sequence_error(
-            "runtime.authorized_egress",
-            RecordingSequenceError::GlobalExhausted,
-        );
-        assert_eq!(
-            adapter.sequence_error_count(),
-            u64::MAX,
-            "repeated terminal failures must not wrap the diagnostic counter"
-        );
-        assert!(
-            adapter.sequence_error_warned.load(Ordering::Acquire),
-            "the shared warning gate remains closed after its first warning"
         );
     }
 
@@ -2276,7 +2205,6 @@ mod tests {
             redaction: RecorderRedactionLevel::None,
             occurred_at_ms: 1700000000000,
             sequence: 0,
-            global_sequence: 0,
         };
 
         // Use the EgressTap trait

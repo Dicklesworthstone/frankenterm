@@ -2159,6 +2159,27 @@ experiment. It is not converted into a flattering keep or a durable rejection.
 - **Primary retry condition:**
   > Promote a latency claim only after exact-revision production producers emit the required complete loss-accounted trace on the declared target and workload, every interval uses one exact clock domain or retained calibration authority, and the corresponding correctness, visual, resource, and observer-effect gates pass.
 
+### IS-N062 — A discarded atomic counter is not global replay order
+
+- **Classification:** false-authority and hot-path-work rejection; structural
+  correction retained without a latency claim
+- **Bead:** `ft-interactive-systems-performance-4tenz.2.13.1`
+- **Rejected candidate:** allocate `EgressEvent.global_sequence` from a relaxed
+  atomic for every normal and overflow-gap capture, then discard it when the
+  event becomes RecorderEvent v1.
+- **Rejected inference:** each `TailerSupervisor` and `CaptureAdapter` created
+  its own counter at zero, the sharing setter had no callers, and neither
+  RecorderEvent v1, `event_id.v1`, nor `RecorderMergeKey` represented the
+  value. The counter therefore supplied neither process-wide authority nor
+  durable replay order while adding shared atomic work to the capture path.
+- **Decision:** remove the transient counter, field, setter, and allocations;
+  retain authoritative per-pane sequence exhaustion and Recorder v1's
+  five-part merge key. This is a structural optimization only: no keypress,
+  resize, zoom, Apple-silicon, AMD, or aged-session latency improvement is
+  claimed without campaign measurement.
+- **Primary retry condition:**
+  > Add a global ordering identity only through a versioned durable schema, one authority shared by every producer, deterministic concurrent and multi-supervisor fixtures, and retained same-window performance evidence.
+
 ## Open hypothesis register
 
 These are not negative results. Each remains open until a retained same-window

@@ -713,48 +713,9 @@ proptest! {
     }
 }
 
-// =============================================================================
-// 26. GlobalSequence monotonicity
-// =============================================================================
-
-proptest! {
-    #![proptest_config(ProptestConfig::with_cases(100))]
-
-    #[test]
-    fn global_sequence_monotonic(count in 1usize..500) {
-        let seq = GlobalSequence::new();
-        let mut prev = seq.next().expect("generated sequence range is bounded");
-        for _ in 1..count {
-            let curr = seq.next().expect("generated sequence range is bounded");
-            prop_assert!(curr > prev, "global sequence not monotonic: {} <= {}", curr, prev);
-            prev = curr;
-        }
-    }
-}
-
-// =============================================================================
-// 27. GlobalSequence starts at zero, default same as new
-// =============================================================================
-
-proptest! {
-    #![proptest_config(ProptestConfig::with_cases(10))]
-
-    #[test]
-    fn global_sequence_starts_at_zero(_dummy in Just(())) {
-        let seq_new = GlobalSequence::new();
-        let seq_def = GlobalSequence::default();
-        prop_assert_eq!(
-            seq_new.next().expect("first sequence is available"),
-            0u64,
-            "new() should start at 0"
-        );
-        prop_assert_eq!(
-            seq_def.next().expect("first sequence is available"),
-            0u64,
-            "default() should start at 0"
-        );
-    }
-}
+// Cases 26-27 were removed with the transient `GlobalSequence`. Recorder v1
+// cross-pane order is `RecorderMergeKey`; testing an unpersisted counter would
+// preserve the discarded hot-path work instead of the canonical contract.
 
 // =============================================================================
 // 28. actor_to_source covers all ActorKind variants

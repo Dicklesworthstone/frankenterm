@@ -156,20 +156,12 @@ async fn persist_captured_segment_for_runtime(
     .await
 }
 
-#[derive(Debug, thiserror::Error)]
-enum AuthorizedReplayEgressSequenceError {
-    #[error(transparent)]
-    Global(#[from] crate::recording::RecordingSequenceError),
-    #[error(transparent)]
-    Pane(#[from] crate::replay_capture::ReplayCaptureSequenceError),
-}
-
 fn record_authorized_replay_egress(
     adapter: &crate::replay_capture::CaptureAdapter,
     captured: &CapturedSegment,
     durable_sequence: u64,
     persistence_guard: &CapturePersistenceGuard,
-) -> std::result::Result<(), AuthorizedReplayEgressSequenceError> {
+) -> std::result::Result<(), crate::replay_capture::ReplayCaptureSequenceError> {
     debug_assert_eq!(
         captured.pane_id,
         persistence_guard.stamp().global_pane_id(),
@@ -180,7 +172,6 @@ fn record_authorized_replay_egress(
         CapturedSegmentKind::Gap { reason } => Some(reason.clone()),
         CapturedSegmentKind::Delta => None,
     };
-    let global_sequence = adapter.global_sequence().next()?;
     let event = crate::recording::EgressEvent {
         pane_id: captured.pane_id,
         text: captured.content.clone(),
@@ -191,10 +182,8 @@ fn record_authorized_replay_egress(
         redaction: crate::recording::RecorderRedactionLevel::None,
         occurred_at_ms: u64::try_from(captured.captured_at).unwrap_or(0),
         sequence: durable_sequence,
-        global_sequence,
     };
-    adapter.capture_egress_event(&event)?;
-    Ok(())
+    adapter.capture_egress_event(&event)
 }
 
 #[derive(Debug, Clone)]
@@ -6465,15 +6454,7 @@ impl ObservationRuntime {
                                 persisted.segment.seq,
                                 &persistence_guard,
                             ) {
-                                match error {
-                                    AuthorizedReplayEgressSequenceError::Pane(error) => adapter
-                                        .record_sequence_error("runtime.authorized_egress", error),
-                                    AuthorizedReplayEgressSequenceError::Global(error) => adapter
-                                        .record_global_sequence_error(
-                                            "runtime.authorized_egress",
-                                            error,
-                                        ),
-                                }
+                                adapter.record_sequence_error("runtime.authorized_egress", error);
                             }
                         }
 

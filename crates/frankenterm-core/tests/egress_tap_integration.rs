@@ -292,6 +292,91 @@ fn egress_tap_multi_pane() {
 }
 
 #[test]
+fn independent_supervisors_emit_deterministic_pane_local_sequences() {
+    run_async_test(async {
+        let (left_tx, mut left_rx) = mpsc::channel::<CaptureEvent>(8);
+        let (right_tx, mut right_rx) = mpsc::channel::<CaptureEvent>(8);
+        let left_cursors = Arc::new(RwLock::new(HashMap::<u64, PaneCursor>::new()));
+        let right_cursors = Arc::new(RwLock::new(HashMap::<u64, PaneCursor>::new()));
+        let left_registry = Arc::new(RwLock::new(PaneRegistry::new()));
+        let right_registry = Arc::new(RwLock::new(PaneRegistry::new()));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let source = Arc::new(FakePaneSource::new());
+        let left_pane = 101;
+        let right_pane = 202;
+
+        source.set_text(left_pane, "left supervisor output").await;
+        source
+            .set_text(right_pane, "right supervisor output")
+            .await;
+        left_cursors
+            .write()
+            .await
+            .insert(left_pane, PaneCursor::new(left_pane));
+        right_cursors
+            .write()
+            .await
+            .insert(right_pane, PaneCursor::new(right_pane));
+
+        let left_tap = Arc::new(TestEgressTap::new());
+        let right_tap = Arc::new(TestEgressTap::new());
+        let mut left = TailerSupervisor::new(
+            fast_config(),
+            left_tx,
+            Arc::clone(&left_cursors),
+            left_registry,
+            Arc::clone(&shutdown),
+            Arc::clone(&source),
+        );
+        let mut right = TailerSupervisor::new(
+            fast_config(),
+            right_tx,
+            Arc::clone(&right_cursors),
+            right_registry,
+            shutdown,
+            source,
+        );
+        left.set_egress_tap(left_tap.clone());
+        right.set_egress_tap(right_tap.clone());
+        left.sync_tailers(&pane_map(&[left_pane]));
+        right.sync_tailers(&pane_map(&[right_pane]));
+
+        // Both independent supervisors contribute poll futures to the same
+        // task set, so completion order is intentionally unconstrained.
+        let mut poll_tasks = TailerPollTaskSet::new();
+        left.spawn_ready(&mut poll_tasks);
+        right.spawn_ready(&mut poll_tasks);
+        while let Some((pane_id, outcome)) = poll_tasks.join_next().await {
+            if pane_id == left_pane {
+                left.handle_poll_result(pane_id, outcome);
+            } else {
+                assert_eq!(pane_id, right_pane);
+                right.handle_poll_result(pane_id, outcome);
+            }
+        }
+        while left_rx.try_recv().is_ok() {}
+        while right_rx.try_recv().is_ok() {}
+
+        let left_events = left_tap.events();
+        let right_events = right_tap.events();
+        assert_eq!(left_events.len(), 1);
+        assert_eq!(right_events.len(), 1);
+        assert_eq!((left_events[0].pane_id, left_events[0].sequence), (101, 0));
+        assert_eq!(
+            (right_events[0].pane_id, right_events[0].sequence),
+            (202, 0)
+        );
+
+        let mut canonical = vec![
+            (left_events[0].pane_id, left_events[0].sequence),
+            (right_events[0].pane_id, right_events[0].sequence),
+        ];
+        canonical.sort_unstable();
+        assert_eq!(canonical, vec![(101, 0), (202, 0)]);
+    });
+}
+
+#[test]
 fn egress_tap_not_set_still_works() {
     run_async_test(async {
         let (tx, mut rx) = mpsc::channel::<CaptureEvent>(16);

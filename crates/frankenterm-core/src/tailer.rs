@@ -1156,8 +1156,6 @@ where
     /// Optional standalone egress tap. Runtime-wide replay capture is emitted
     /// after the common persistence authority gate instead.
     egress_tap: Option<crate::recording::SharedEgressTap>,
-    /// Process-wide ordering paired with the optional standalone egress tap.
-    global_sequence: Arc<crate::recording::GlobalSequence>,
 }
 
 /// Minimal task-set abstraction for polling tasks.
@@ -1309,7 +1307,6 @@ where
             standalone_capture_authority: CaptureAuthority::new(),
             standalone_capture_bindings: HashMap::new(),
             egress_tap: None,
-            global_sequence: Arc::new(crate::recording::GlobalSequence::new()),
         }
     }
 
@@ -1348,18 +1345,12 @@ where
             standalone_capture_authority: CaptureAuthority::new(),
             standalone_capture_bindings: HashMap::new(),
             egress_tap: None,
-            global_sequence: Arc::new(crate::recording::GlobalSequence::new()),
         }
     }
 
     /// Set the optional egress observer used by a standalone supervisor.
     pub fn set_egress_tap(&mut self, tap: crate::recording::SharedEgressTap) {
         self.egress_tap = Some(tap);
-    }
-
-    /// Share a process-wide sequence with the standalone egress observer.
-    pub fn set_global_sequence(&mut self, sequence: Arc<crate::recording::GlobalSequence>) {
-        self.global_sequence = sequence;
     }
 
     /// Number of active tailers.
@@ -1899,7 +1890,6 @@ where
             let send_timeout = self.config.send_timeout;
             let capture_timeout = self.config.capture_timeout;
             let egress_tap = self.egress_tap.clone();
-            let global_sequence = Arc::clone(&self.global_sequence);
 
             task_set.spawn_poll_task(async move {
                 let _permit = permit; // Hold permit for the duration of the task
@@ -1949,25 +1939,17 @@ where
                                 EgressEvent, RecorderRedactionLevel, RecorderSegmentKind,
                                 RecorderTextEncoding, epoch_ms_now,
                             };
-                            match global_sequence.next() {
-                                Ok(global_sequence) => tap.on_egress(EgressEvent {
-                                    pane_id,
-                                    text: segment.content.clone(),
-                                    segment_kind: RecorderSegmentKind::Gap,
-                                    is_gap: true,
-                                    gap_reason: Some("backpressure_overflow".to_string()),
-                                    encoding: RecorderTextEncoding::Utf8,
-                                    redaction: RecorderRedactionLevel::None,
-                                    occurred_at_ms: epoch_ms_now(),
-                                    sequence: segment.seq,
-                                    global_sequence,
-                                }),
-                                Err(error) => tracing::warn!(
-                                    pane_id,
-                                    error = %error,
-                                    "Egress tap sequence exhausted; refusing a duplicate recorder identity"
-                                ),
-                            }
+                            tap.on_egress(EgressEvent {
+                                pane_id,
+                                text: segment.content.clone(),
+                                segment_kind: RecorderSegmentKind::Gap,
+                                is_gap: true,
+                                gap_reason: Some("backpressure_overflow".to_string()),
+                                encoding: RecorderTextEncoding::Utf8,
+                                redaction: RecorderRedactionLevel::None,
+                                occurred_at_ms: epoch_ms_now(),
+                                sequence: segment.seq,
+                            });
                         }
                         let event = match CaptureEvent::from_producer(segment, &producer_guard) {
                             Ok(event) => event,
@@ -2087,25 +2069,17 @@ where
                             }
                             crate::ingest::CapturedSegmentKind::Delta => None,
                         };
-                        match global_sequence.next() {
-                            Ok(global_sequence) => tap.on_egress(EgressEvent {
-                                pane_id,
-                                text: segment.content.clone(),
-                                segment_kind,
-                                is_gap,
-                                gap_reason,
-                                encoding: RecorderTextEncoding::Utf8,
-                                redaction: RecorderRedactionLevel::None,
-                                occurred_at_ms: epoch_ms_now(),
-                                sequence: segment.seq,
-                                global_sequence,
-                            }),
-                            Err(error) => tracing::warn!(
-                                pane_id,
-                                error = %error,
-                                "Egress tap sequence exhausted; refusing a duplicate recorder identity"
-                            ),
-                        }
+                        tap.on_egress(EgressEvent {
+                            pane_id,
+                            text: segment.content.clone(),
+                            segment_kind,
+                            is_gap,
+                            gap_reason,
+                            encoding: RecorderTextEncoding::Utf8,
+                            redaction: RecorderRedactionLevel::None,
+                            occurred_at_ms: epoch_ms_now(),
+                            sequence: segment.seq,
+                        });
                     }
                     let event = match CaptureEvent::from_producer(segment, &producer_guard) {
                         Ok(event) => event,

@@ -27,6 +27,10 @@ This document defines:
 - Sequence discontinuities are detected and recorded as explicit gaps in `persist_captured_segment`.
 - Ingress has a monotonic counter (`IngressSequence`) in `crates/frankenterm-core/src/recording.rs`.
 - Recorder schema already carries `event_id`, `sequence`, `correlation_id`, and `causality` fields.
+- Recorder v1 deliberately has no `global_sequence` field. Cross-pane order is
+  the canonical merge key below (or a durable append-log offset when present),
+  not a transient producer-local counter. Adding another ordering identity
+  requires a versioned schema and one authority shared by every producer.
 
 ## Canonical Ordering Model
 

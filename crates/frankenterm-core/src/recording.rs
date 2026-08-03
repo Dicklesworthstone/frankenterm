@@ -1124,9 +1124,6 @@ pub enum RecordingSequenceError {
     /// The pane-local ingress identity space has no usable values left.
     #[error("recorder ingress sequence space is exhausted; start a new recorder identity")]
     IngressExhausted,
-    /// The process-wide merge identity space has no usable values left.
-    #[error("recorder global sequence space is exhausted; start a new recorder identity")]
-    GlobalExhausted,
 }
 
 fn allocate_recording_sequence(
@@ -1158,36 +1155,6 @@ impl IngressSequence {
 }
 
 impl Default for IngressSequence {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-/// Process-wide monotonic sequence counter for cross-pane merge ordering.
-#[derive(Debug)]
-pub struct GlobalSequence {
-    next: AtomicU64,
-}
-
-impl GlobalSequence {
-    /// Create a new global sequence counter starting at 0.
-    #[must_use]
-    pub fn new() -> Self {
-        Self {
-            next: AtomicU64::new(0),
-        }
-    }
-
-    /// Advance and return the next global sequence number.
-    ///
-    /// `u64::MAX - 1` is the last usable value.  The following allocation
-    /// leaves `u64::MAX` as a sticky reserved sentinel and fails closed.
-    pub fn next(&self) -> std::result::Result<u64, RecordingSequenceError> {
-        allocate_recording_sequence(&self.next, RecordingSequenceError::GlobalExhausted)
-    }
-}
-
-impl Default for GlobalSequence {
     fn default() -> Self {
         Self::new()
     }
@@ -1272,8 +1239,6 @@ pub struct EgressEvent {
     pub occurred_at_ms: u64,
     /// Per-pane monotonic sequence number.
     pub sequence: u64,
-    /// Process-wide monotonic sequence used to merge inter-pane streams.
-    pub global_sequence: u64,
 }
 
 /// Observer interface for egress event capture.
@@ -2875,58 +2840,6 @@ mod tests {
         assert!(is_gap);
     }
 
-    // --- GlobalSequence ---
-
-    #[test]
-    fn global_sequence_monotonic() {
-        let seq = GlobalSequence::new();
-        assert_eq!(seq.next().expect("sequence 0"), 0);
-        assert_eq!(seq.next().expect("sequence 1"), 1);
-        assert_eq!(seq.next().expect("sequence 2"), 2);
-    }
-
-    #[test]
-    fn global_sequence_reserves_max_under_concurrent_exhaustion() {
-        let seq = Arc::new(GlobalSequence {
-            next: AtomicU64::new(u64::MAX - 1),
-        });
-        let first = Arc::clone(&seq);
-        let second = Arc::clone(&seq);
-        let first = std::thread::spawn(move || first.next());
-        let second = std::thread::spawn(move || second.next());
-        let results = [
-            first.join().expect("first allocator thread"),
-            second.join().expect("second allocator thread"),
-        ];
-
-        assert_eq!(
-            results
-                .iter()
-                .filter(|result| **result == Ok(u64::MAX - 1))
-                .count(),
-            1
-        );
-        assert_eq!(
-            results
-                .iter()
-                .filter(|result| {
-                    **result == Err(RecordingSequenceError::GlobalExhausted)
-                })
-                .count(),
-            1
-        );
-        assert_eq!(
-            seq.next(),
-            Err(RecordingSequenceError::GlobalExhausted)
-        );
-    }
-
-    #[test]
-    fn global_sequence_default() {
-        let seq = GlobalSequence::default();
-        assert_eq!(seq.next().expect("sequence 0"), 0);
-    }
-
     #[test]
     fn ingress_sequence_default() {
         let seq = IngressSequence::default();
@@ -2958,7 +2871,6 @@ mod tests {
             redaction: RecorderRedactionLevel::None,
             occurred_at_ms: 0,
             sequence: 0,
-            global_sequence: 0,
         });
     }
 
@@ -2976,7 +2888,6 @@ mod tests {
             redaction: RecorderRedactionLevel::None,
             occurred_at_ms: 100,
             sequence: 0,
-            global_sequence: 0,
         });
         tap.on_egress(EgressEvent {
             pane_id: 2,
@@ -2988,7 +2899,6 @@ mod tests {
             redaction: RecorderRedactionLevel::None,
             occurred_at_ms: 200,
             sequence: 1,
-            global_sequence: 1,
         });
         assert_eq!(tap.len(), 2);
         let events = tap.events();
@@ -3540,31 +3450,6 @@ mod tests {
     }
 
     #[test]
-    fn global_sequence_monotonic_batch3() {
-        let seq = GlobalSequence::new();
-        let mut prev = seq.next().expect("initial sequence");
-        for _ in 0..100 {
-            let current = seq.next().expect("sequence remains available");
-            assert!(
-                current > prev,
-                "sequence should be strictly monotonic: {} > {}",
-                current,
-                prev
-            );
-            prev = current;
-        }
-    }
-
-    #[test]
-    fn global_sequence_default_batch3() {
-        let seq = GlobalSequence::default();
-        let first = seq.next().expect("first sequence");
-        assert_eq!(first, 0, "default sequence should start at 0");
-        let second = seq.next().expect("second sequence");
-        assert_eq!(second, 1);
-    }
-
-    #[test]
     fn captured_kind_to_segment_all_variants() {
         // Delta variant
         let (kind, is_gap) = captured_kind_to_segment(&CapturedSegmentKind::Delta);
@@ -3597,7 +3482,6 @@ mod tests {
                 redaction: RecorderRedactionLevel::None,
                 occurred_at_ms: i * 100,
                 sequence: i,
-                global_sequence: i,
             });
         }
 
@@ -3635,7 +3519,6 @@ mod tests {
                 redaction: RecorderRedactionLevel::None,
                 occurred_at_ms: 0,
                 sequence: 0,
-                global_sequence: 0,
             });
         }
     }
