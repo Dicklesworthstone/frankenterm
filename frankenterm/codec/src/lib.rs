@@ -41,7 +41,7 @@ use smol::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::convert::{TryFrom, TryInto};
 use std::io::{BufReader, Cursor, Read};
-use std::ops::Range;
+use std::ops::{Deref, Range};
 use std::path::PathBuf;
 use std::sync::Arc;
 use termwiz::hyperlink::Hyperlink;
@@ -1990,6 +1990,224 @@ pdu! {
     RenderApplicationResult: 85,
 }
 
+/// Minimum consumed prefix reclaimed by a streaming PDU buffer compaction.
+///
+/// Compaction also requires the consumed prefix to be at least as large as the
+/// unread suffix. Therefore every moved byte can be charged to at least one
+/// byte consumed since the preceding compaction, giving amortized linear byte
+/// movement while avoiding tiny-prefix memmoves.
+const STREAM_BUFFER_MIN_COMPACTION_PREFIX: usize = 64 * 1024;
+
+/// Cumulative work counters for one [`StreamingPduBuffer`].
+///
+/// These counters describe buffer mechanics only. They are useful for
+/// deterministic complexity tests and do not constitute target-host latency or
+/// allocator evidence.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct StreamingPduBufferStats {
+    /// Number of suffix-preserving prefix compactions.
+    pub compactions: u64,
+    /// Total unread bytes moved by those compactions.
+    pub compacted_bytes: u64,
+    /// Number of append operations that grew the backing allocation.
+    pub growth_events: u64,
+    /// Largest backing allocation capacity observed by this buffer.
+    pub peak_capacity: usize,
+}
+
+/// Owned accumulation buffer for incrementally decoded mux PDUs.
+///
+/// Successful frame consumption advances a checked head in O(1); it does not
+/// memmove the unread suffix. The consumed prefix is reclaimed only when an
+/// append needs tail capacity, at least 64 KiB has been consumed, and the
+/// consumed prefix is no smaller than the unread suffix. That policy bounds
+/// compaction to amortized linear byte movement. Complete malformed frames and
+/// incomplete frames leave the logical unread bytes unchanged.
+///
+/// Only the initialized unread suffix is exposed. There is deliberately no
+/// mutable slice or `DerefMut` escape hatch that could mutate already-consumed
+/// storage or invalidate the checked head.
+#[derive(Clone, Debug, Default)]
+pub struct StreamingPduBuffer {
+    storage: Vec<u8>,
+    head: usize,
+    stats: StreamingPduBufferStats,
+}
+
+impl StreamingPduBuffer {
+    /// Construct an empty streaming buffer.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            storage: Vec::new(),
+            head: 0,
+            stats: StreamingPduBufferStats {
+                compactions: 0,
+                compacted_bytes: 0,
+                growth_events: 0,
+                peak_capacity: 0,
+            },
+        }
+    }
+
+    /// Construct an empty streaming buffer with retained allocation capacity.
+    #[must_use]
+    pub fn with_capacity(capacity: usize) -> Self {
+        let storage = Vec::with_capacity(capacity);
+        Self {
+            stats: StreamingPduBufferStats {
+                peak_capacity: storage.capacity(),
+                ..StreamingPduBufferStats::default()
+            },
+            storage,
+            head: 0,
+        }
+    }
+
+    /// Number of initialized unread bytes.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.storage.len() - self.head
+    }
+
+    /// Whether no unread bytes remain.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.head == self.storage.len()
+    }
+
+    /// Current backing allocation capacity, including reusable consumed space.
+    #[must_use]
+    pub fn capacity(&self) -> usize {
+        self.storage.capacity()
+    }
+
+    /// Initialized bytes retained in the backing vector, including the
+    /// consumed prefix that may be reclaimed by a later append.
+    #[must_use]
+    pub fn retained_len(&self) -> usize {
+        self.storage.len()
+    }
+
+    /// Length of the initialized, already-consumed prefix.
+    #[must_use]
+    pub fn consumed_prefix_len(&self) -> usize {
+        self.head
+    }
+
+    /// Exact initialized unread bytes.
+    #[must_use]
+    pub fn as_slice(&self) -> &[u8] {
+        &self.storage[self.head..]
+    }
+
+    /// Cumulative buffer-mechanics counters.
+    #[must_use]
+    pub const fn stats(&self) -> StreamingPduBufferStats {
+        self.stats
+    }
+
+    /// Append initialized bytes to the unread suffix.
+    pub fn extend_from_slice(&mut self, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        self.prepare_for_append(bytes.len());
+        let capacity_before = self.storage.capacity();
+        self.storage.extend_from_slice(bytes);
+        let capacity_after = self.storage.capacity();
+        if capacity_after > capacity_before {
+            self.stats.growth_events = self.stats.growth_events.saturating_add(1);
+        }
+        self.stats.peak_capacity = self.stats.peak_capacity.max(capacity_after);
+    }
+
+    /// Discard every unread and consumed byte while retaining allocation.
+    pub fn clear(&mut self) {
+        self.storage.clear();
+        self.head = 0;
+    }
+
+    /// Return the logical unread bytes in one compact vector.
+    #[must_use]
+    pub fn into_unread_bytes(mut self) -> Vec<u8> {
+        if self.head == 0 {
+            return self.storage;
+        }
+        let unread = self.len();
+        self.storage.copy_within(self.head.., 0);
+        self.storage.truncate(unread);
+        self.storage
+    }
+
+    fn consume_prefix(&mut self, consumed: usize) -> anyhow::Result<()> {
+        if consumed > self.len() {
+            anyhow::bail!(
+                "streaming PDU buffer cannot consume {consumed} bytes from {} unread bytes",
+                self.len()
+            );
+        }
+        self.head = self
+            .head
+            .checked_add(consumed)
+            .context("streaming PDU buffer head overflow")?;
+        if self.head == self.storage.len() {
+            self.storage.clear();
+            self.head = 0;
+        }
+        Ok(())
+    }
+
+    fn prepare_for_append(&mut self, additional: usize) {
+        if self.is_empty() {
+            self.storage.clear();
+            self.head = 0;
+            return;
+        }
+
+        let tail_capacity = self.storage.capacity() - self.storage.len();
+        if tail_capacity >= additional {
+            return;
+        }
+
+        let unread = self.len();
+        if self.head < STREAM_BUFFER_MIN_COMPACTION_PREFIX || self.head < unread {
+            return;
+        }
+
+        self.storage.copy_within(self.head.., 0);
+        self.storage.truncate(unread);
+        self.head = 0;
+        self.stats.compactions = self.stats.compactions.saturating_add(1);
+        self.stats.compacted_bytes = self
+            .stats
+            .compacted_bytes
+            .saturating_add(u64::try_from(unread).unwrap_or(u64::MAX));
+    }
+}
+
+impl From<Vec<u8>> for StreamingPduBuffer {
+    fn from(storage: Vec<u8>) -> Self {
+        let peak_capacity = storage.capacity();
+        Self {
+            storage,
+            head: 0,
+            stats: StreamingPduBufferStats {
+                peak_capacity,
+                ..StreamingPduBufferStats::default()
+            },
+        }
+    }
+}
+
+impl Deref for StreamingPduBuffer {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        self.as_slice()
+    }
+}
+
 impl Pdu {
     /// Returns true if this type of Pdu represents action taken
     /// directly by a user, rather than background traffic on
@@ -2008,12 +2226,15 @@ impl Pdu {
         )
     }
 
-    pub fn stream_decode(buffer: &mut Vec<u8>) -> anyhow::Result<Option<DecodedPdu>> {
-        let Some(frame_len) = buffered_frame_len(buffer)? else {
+    pub fn stream_decode(
+        buffer: &mut StreamingPduBuffer,
+    ) -> anyhow::Result<Option<DecodedPdu>> {
+        let Some(frame_len) = buffered_frame_len(buffer.as_slice())? else {
             return Ok(None);
         };
 
         let frame = buffer
+            .as_slice()
             .get(..frame_len)
             .context("stream_decode frame length beyond buffer")?;
         let mut cursor = Cursor::new(frame);
@@ -2035,15 +2256,13 @@ impl Pdu {
             }
         };
 
-        let remain = buffer.len() - frame_len;
-        buffer.copy_within(frame_len.., 0);
-        buffer.truncate(remain);
+        buffer.consume_prefix(frame_len)?;
         Ok(Some(decoded))
     }
 
     pub fn try_read_and_decode<R: std::io::Read>(
         r: &mut R,
-        buffer: &mut Vec<u8>,
+        buffer: &mut StreamingPduBuffer,
     ) -> anyhow::Result<Option<DecodedPdu>> {
         loop {
             if let Some(decoded) =
@@ -4193,7 +4412,7 @@ mod test {
         assert_eq!(encoded.len(), 6);
 
         let mut cursor = Cursor::new(encoded.as_slice());
-        let mut read_buffer = Vec::new();
+        let mut read_buffer = StreamingPduBuffer::new();
 
         assert_eq!(
             Pdu::try_read_and_decode(&mut cursor, &mut read_buffer).unwrap(),
@@ -5003,7 +5222,7 @@ mod test {
                 assert_eq!(decoded_second.serial, next_serial);
                 assert_eq!(decoded_second.pdu, next_outer);
 
-                let mut buffered = concatenated;
+                let mut buffered = StreamingPduBuffer::from(concatenated);
                 let decoded = Pdu::stream_decode(&mut buffered)
                     .expect("stream decode first authority frame")
                     .expect("first authority frame should be complete");
@@ -5013,7 +5232,7 @@ mod test {
                     "stream {authority_name} under {mode:?}"
                 );
                 assert_eq!(
-                    buffered, next_frame,
+                    buffered.as_slice(), next_frame.as_slice(),
                     "stream {authority_name} under {mode:?} must preserve the exact next frame"
                 );
 
@@ -5228,7 +5447,7 @@ mod test {
 
     #[test]
     fn stream_decode_empty_buffer() {
-        let mut buffer = Vec::new();
+        let mut buffer = StreamingPduBuffer::new();
         let result = Pdu::stream_decode(&mut buffer).unwrap();
         assert!(result.is_none());
     }
@@ -5236,25 +5455,26 @@ mod test {
     #[test]
     fn stream_decode_partial_frame() {
         // Just the length byte, no payload
-        let mut buffer = vec![2u8];
+        let mut buffer = StreamingPduBuffer::from(vec![2u8]);
         let result = Pdu::stream_decode(&mut buffer).unwrap();
         assert!(result.is_none());
         // Buffer should be preserved for future reads
-        assert_eq!(buffer, vec![2u8]);
+        assert_eq!(buffer.as_slice(), &[2u8]);
     }
 
     #[test]
     fn stream_decode_rejects_complete_frame_with_truncated_inner_body() {
-        let mut buffer = Vec::new();
+        let mut encoded = Vec::new();
         // tagged_len counts the complete outer frame: serial + ident + one
         // payload byte. The payload byte starts an ErrorResponse string body
         // that advertises five bytes, so the outer frame is complete but the
         // inner varbincode body is malformed.
-        leb128::write::unsigned(&mut buffer, 3).unwrap();
-        leb128::write::unsigned(&mut buffer, 1).unwrap();
-        leb128::write::unsigned(&mut buffer, 0).unwrap();
-        buffer.push(5);
-        let original = buffer.clone();
+        leb128::write::unsigned(&mut encoded, 3).unwrap();
+        leb128::write::unsigned(&mut encoded, 1).unwrap();
+        leb128::write::unsigned(&mut encoded, 0).unwrap();
+        encoded.push(5);
+        let original = encoded.clone();
+        let mut buffer = StreamingPduBuffer::from(encoded);
 
         let err = Pdu::stream_decode(&mut buffer)
             .expect_err("complete malformed frame must not be treated as partial");
@@ -5263,21 +5483,22 @@ mod test {
             "malformed complete frame should return a useful error"
         );
         assert_eq!(
-            buffer, original,
+            buffer.as_slice(), original.as_slice(),
             "malformed complete frame must remain available for quarantine"
         );
     }
 
     #[test]
     fn stream_decode_does_not_read_header_leb128_past_declared_frame() {
-        let mut buffer = Vec::new();
+        let mut encoded = Vec::new();
         // The declared frame body is one byte long and contains only the start
         // of a multi-byte serial leb128. Bytes after that body are a separate
         // frame and must not be borrowed to finish this malformed header.
-        leb128::write::unsigned(&mut buffer, 1).unwrap();
-        buffer.push(0x80);
-        Pdu::Ping(Ping {}).encode(&mut buffer, 7).unwrap();
-        let original = buffer.clone();
+        leb128::write::unsigned(&mut encoded, 1).unwrap();
+        encoded.push(0x80);
+        Pdu::Ping(Ping {}).encode(&mut encoded, 7).unwrap();
+        let original = encoded.clone();
+        let mut buffer = StreamingPduBuffer::from(encoded);
 
         let err = Pdu::stream_decode(&mut buffer)
             .expect_err("malformed first frame must fail inside its declared bounds");
@@ -5293,7 +5514,7 @@ mod test {
             message = message,
         );
         assert_eq!(
-            buffer, original,
+            buffer.as_slice(), original.as_slice(),
             "malformed frame must remain available for quarantine"
         );
     }
@@ -5311,14 +5532,14 @@ mod test {
         let prefix = encoded
             .get(..split)
             .context("split prefix must stay inside encoded frame")?;
-        let mut partial = prefix.to_vec();
+        let mut partial = StreamingPduBuffer::from(prefix.to_vec());
         let result = Pdu::stream_decode(&mut partial).context("partial compressed decode")?;
         assert!(
             result.is_none(),
             "partial compressed frame should not decode"
         );
         assert_eq!(
-            partial, prefix,
+            partial.as_slice(), prefix,
             "partial compressed bytes should remain buffered"
         );
 
@@ -5341,25 +5562,109 @@ mod test {
         Pdu::Ping(Ping {}).encode(&mut encoded, 1).unwrap();
         Pdu::Pong(Pong {}).encode(&mut encoded, 2).unwrap();
         let total_len = encoded.len();
+        let mut buffer = StreamingPduBuffer::from(encoded);
 
-        let decoded = Pdu::stream_decode(&mut encoded).unwrap().unwrap();
+        let decoded = Pdu::stream_decode(&mut buffer).unwrap().unwrap();
         assert_eq!(decoded.pdu, Pdu::Ping(Ping {}));
         assert_eq!(decoded.serial, 1);
         // Buffer should still contain the Pong frame
-        assert!(encoded.len() < total_len);
+        assert!(buffer.len() < total_len);
 
-        let decoded2 = Pdu::stream_decode(&mut encoded).unwrap().unwrap();
+        let decoded2 = Pdu::stream_decode(&mut buffer).unwrap().unwrap();
         assert_eq!(decoded2.pdu, Pdu::Pong(Pong {}));
         assert_eq!(decoded2.serial, 2);
-        assert!(encoded.is_empty());
+        assert!(buffer.is_empty());
+    }
+
+    #[test]
+    fn stream_decode_tiny_frame_bursts_advance_without_prefix_compaction() {
+        for frame_count in [32usize, 256, 4_096] {
+            let mut encoded = Vec::new();
+            for _ in 0..frame_count {
+                Pdu::Ping(Ping {})
+                    .encode(&mut encoded, 1)
+                    .expect("encode tiny burst frame");
+            }
+            encoded.shrink_to_fit();
+            let initial_capacity = encoded.capacity();
+            let mut buffer = StreamingPduBuffer::from(encoded);
+
+            for decoded_count in 0..frame_count {
+                let decoded = Pdu::stream_decode(&mut buffer)
+                    .expect("decode tiny burst frame")
+                    .expect("tiny burst frame must be complete");
+                assert_eq!(decoded.serial, 1);
+                assert_eq!(decoded.pdu, Pdu::Ping(Ping {}));
+                if decoded_count + 1 != frame_count {
+                    assert!(buffer.consumed_prefix_len() > 0);
+                }
+            }
+
+            assert!(buffer.is_empty());
+            assert_eq!(buffer.capacity(), initial_capacity);
+            assert_eq!(
+                buffer.stats(),
+                StreamingPduBufferStats {
+                    peak_capacity: initial_capacity,
+                    ..StreamingPduBufferStats::default()
+                },
+                "decoding {frame_count} coalesced tiny frames must not memmove or grow the buffer"
+            );
+        }
+    }
+
+    #[test]
+    fn stream_buffer_compacts_once_after_consumed_prefix_dominates_suffix() {
+        const TOTAL_FRAMES: usize = 35_000;
+        const CONSUMED_FRAMES: usize = 25_000;
+
+        let mut encoded = Vec::new();
+        for _ in 0..TOTAL_FRAMES {
+            Pdu::Ping(Ping {})
+                .encode(&mut encoded, 1)
+                .expect("encode compaction fixture frame");
+        }
+        encoded.shrink_to_fit();
+        let mut buffer = StreamingPduBuffer::from(encoded);
+
+        for _ in 0..CONSUMED_FRAMES {
+            Pdu::stream_decode(&mut buffer)
+                .expect("decode compaction fixture frame")
+                .expect("compaction fixture frame must be complete");
+        }
+        assert!(
+            buffer.consumed_prefix_len() >= STREAM_BUFFER_MIN_COMPACTION_PREFIX,
+            "fixture must cross the minimum compaction prefix"
+        );
+        assert!(buffer.consumed_prefix_len() >= buffer.len());
+        let unread_before_append = buffer.as_slice().to_vec();
+
+        let mut appended_frame = Vec::new();
+        Pdu::Pong(Pong {})
+            .encode(&mut appended_frame, 2)
+            .expect("encode post-compaction successor frame");
+        buffer.extend_from_slice(&appended_frame);
+
+        let stats = buffer.stats();
+        assert_eq!(stats.compactions, 1);
+        assert_eq!(
+            stats.compacted_bytes,
+            u64::try_from(unread_before_append.len()).expect("fixture length fits u64")
+        );
+        assert_eq!(buffer.consumed_prefix_len(), 0);
+        assert_eq!(
+            buffer.as_slice(),
+            [unread_before_append.as_slice(), appended_frame.as_slice()].concat(),
+            "one amortized compaction must preserve every unread byte and its appended successor"
+        );
     }
 
     #[test]
     fn stream_decode_rejects_oversized_container_lengths_before_allocation() {
-        let mut buffer = vec![
+        let mut buffer = StreamingPduBuffer::from(vec![
             0x0E, 0x44, 0x04, 0x00, 0x04, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0x71, 0x71, 0x71, 0x30,
             0x71, 0x71, 0xFE,
-        ];
+        ]);
         let err = Pdu::stream_decode(&mut buffer).expect_err("crafted input should be rejected");
         let message = err.to_string();
         assert!(
@@ -6544,7 +6849,7 @@ mod test {
         assert_eq!(decoded.pdu, pdu);
 
         // Also verify stream_decode works (which is what the mux_pool mock server uses)
-        let mut buf = encoded.clone();
+        let mut buf = StreamingPduBuffer::from(encoded.clone());
         let stream_decoded = Pdu::stream_decode(&mut buf)
             .unwrap()
             .expect("stream_decode should succeed");
