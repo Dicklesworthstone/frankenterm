@@ -1052,9 +1052,21 @@ pub fn action_to_ingress_kind(
 static RECORDING_CLOCK_ANOMALY_COUNT: AtomicU64 = AtomicU64::new(0);
 
 fn saturating_atomic_increment(counter: &AtomicU64) {
-    let _ = counter.try_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
-        Some(count.saturating_add(1))
-    });
+    let mut observed = counter.load(Ordering::Relaxed);
+    loop {
+        let Some(next) = observed.checked_add(1) else {
+            return;
+        };
+        match counter.compare_exchange_weak(
+            observed,
+            next,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return,
+            Err(current) => observed = current,
+        }
+    }
 }
 
 /// br-ft-crpvd: cumulative count of recording clock-before-1970
@@ -1130,10 +1142,19 @@ fn allocate_recording_sequence(
     next: &AtomicU64,
     exhausted: RecordingSequenceError,
 ) -> std::result::Result<u64, RecordingSequenceError> {
-    next.try_update(Ordering::Relaxed, Ordering::Relaxed, |candidate| {
-        candidate.checked_add(1)
-    })
-        .map_err(|_| exhausted)
+    let mut candidate = next.load(Ordering::Relaxed);
+    loop {
+        let successor = candidate.checked_add(1).ok_or(exhausted)?;
+        match next.compare_exchange_weak(
+            candidate,
+            successor,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return Ok(candidate),
+            Err(observed) => candidate = observed,
+        }
+    }
 }
 
 impl IngressSequence {
@@ -2453,6 +2474,33 @@ mod tests {
     }
 
     #[test]
+    fn ingress_sequence_allocations_are_unique_under_contention() {
+        const THREAD_COUNT: usize = 8;
+        const ALLOCATIONS_PER_THREAD: u64 = 64;
+
+        let sequence = Arc::new(IngressSequence::new());
+        let mut workers = Vec::with_capacity(THREAD_COUNT);
+        for _ in 0..THREAD_COUNT {
+            let sequence = Arc::clone(&sequence);
+            workers.push(std::thread::spawn(move || {
+                (0..ALLOCATIONS_PER_THREAD)
+                    .map(|_| sequence.next().expect("sequence space must remain available"))
+                    .collect::<Vec<_>>()
+            }));
+        }
+
+        let mut allocated = Vec::new();
+        for worker in workers {
+            allocated.extend(worker.join().expect("sequence worker must not panic"));
+        }
+        allocated.sort_unstable();
+
+        let thread_count = u64::try_from(THREAD_COUNT).expect("thread count fits u64");
+        let expected: Vec<u64> = (0..thread_count * ALLOCATIONS_PER_THREAD).collect();
+        assert_eq!(allocated, expected);
+    }
+
+    #[test]
     fn epoch_ms_now_reasonable() {
         let ms = epoch_ms_now();
         assert!(ms > 1_735_689_600_000);
@@ -2493,7 +2541,9 @@ mod tests {
 
     #[test]
     fn recording_clock_anomaly_counter_saturates() {
-        let counter = AtomicU64::new(u64::MAX);
+        let counter = AtomicU64::new(u64::MAX - 1);
+        super::saturating_atomic_increment(&counter);
+        assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
         super::saturating_atomic_increment(&counter);
         assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
     }

@@ -15,7 +15,7 @@ use frankenterm_core::recording::{
     EgressEvent, EgressNoopTap, EgressTap, RecorderSegmentKind, SharedEgressTap,
     captured_kind_to_segment,
 };
-use frankenterm_core::runtime_async::{CompatRuntime, RuntimeBuilder, RwLock, mpsc, sleep};
+use frankenterm_core::runtime_async::{CompatRuntime, RuntimeBuilder, RwLock, mpsc};
 use frankenterm_core::tailer::{CaptureEvent, TailerConfig, TailerPollTaskSet, TailerSupervisor};
 use frankenterm_core::wezterm::{PaneInfo, PaneTextSource};
 
@@ -30,9 +30,6 @@ impl TestEgressTap {
     }
     fn events(&self) -> Vec<EgressEvent> {
         self.events.lock().unwrap().clone()
-    }
-    fn len(&self) -> usize {
-        self.events.lock().unwrap().len()
     }
 }
 
@@ -103,7 +100,10 @@ fn test_pane_info(pane_id: u64) -> PaneInfo {
 
 fn fast_config() -> TailerConfig {
     TailerConfig {
-        min_interval: Duration::from_millis(10),
+        // A zero interval is the deterministic readiness driver for these
+        // tests. It avoids wall-clock sleeps while leaving production cadence
+        // behavior to TailerSupervisor's dedicated timing tests.
+        min_interval: Duration::ZERO,
         max_interval: Duration::from_millis(100),
         backoff_multiplier: 1.5,
         max_concurrent: 4,
@@ -160,17 +160,19 @@ fn egress_tap_fires_on_delta_capture() {
         }
         while rx.try_recv().is_ok() {}
 
-        if tap.len() >= 1 {
-            let e = &tap.events()[0];
-            assert_eq!(e.pane_id, 1);
-            assert!(!e.text.is_empty());
-            assert!(e.occurred_at_ms > 0);
-        }
+        let first = tap.events();
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].pane_id, 1);
+        assert_eq!(first[0].sequence, 0);
+        assert_eq!(first[0].segment_kind, RecorderSegmentKind::Delta);
+        assert_eq!(first[0].text, "$ prompt\nline1\nline2\n");
+        assert!(!first[0].is_gap);
+        assert_eq!(first[0].gap_reason, None);
+        assert!(first[0].occurred_at_ms > 0);
 
         source
             .set_text(1, "$ prompt\nline1\nline2\nnew output\n")
             .await;
-        sleep(Duration::from_millis(20)).await;
 
         let mut poll_tasks = TailerPollTaskSet::new();
         tailer.spawn_ready(&mut poll_tasks);
@@ -180,14 +182,14 @@ fn egress_tap_fires_on_delta_capture() {
         while rx.try_recv().is_ok() {}
 
         let all = tap.events();
-        if all.len() >= 2 {
-            let last = &all[all.len() - 1];
-            assert_eq!(last.pane_id, 1);
-            assert!(
-                last.segment_kind == RecorderSegmentKind::Delta
-                    || last.segment_kind == RecorderSegmentKind::Gap
-            );
-        }
+        assert_eq!(all.len(), 2);
+        let last = &all[1];
+        assert_eq!(last.pane_id, 1);
+        assert_eq!(last.sequence, 1);
+        assert_eq!(last.segment_kind, RecorderSegmentKind::Delta);
+        assert_eq!(last.text, "new output\n");
+        assert!(!last.is_gap);
+        assert_eq!(last.gap_reason, None);
     });
 }
 
@@ -227,7 +229,6 @@ fn egress_tap_captures_gap_segments() {
         source
             .set_text(1, "completely different text that shares no overlap")
             .await;
-        sleep(Duration::from_millis(20)).await;
 
         let mut poll_tasks = TailerPollTaskSet::new();
         tailer.spawn_ready(&mut poll_tasks);
@@ -236,11 +237,19 @@ fn egress_tap_captures_gap_segments() {
         }
         while rx.try_recv().is_ok() {}
 
-        for gap in tap.events().iter().filter(|e| e.is_gap) {
-            assert_eq!(gap.pane_id, 1);
-            assert!(gap.gap_reason.is_some());
-            assert_eq!(gap.segment_kind, RecorderSegmentKind::Gap);
-        }
+        let events = tap.events();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].sequence, 0);
+        let gap = &events[1];
+        assert_eq!(gap.pane_id, 1);
+        assert_eq!(gap.sequence, 1);
+        assert!(gap.is_gap);
+        assert_eq!(gap.gap_reason.as_deref(), Some("overlap_not_found"));
+        assert_eq!(gap.segment_kind, RecorderSegmentKind::Gap);
+        assert_eq!(
+            gap.text,
+            "completely different text that shares no overlap"
+        );
     });
 }
 
@@ -285,9 +294,15 @@ fn egress_tap_multi_pane() {
         }
         while rx.try_recv().is_ok() {}
 
-        for ev in &tap.events() {
-            assert!(ev.pane_id == 10 || ev.pane_id == 20);
-        }
+        let mut events = tap.events();
+        events.sort_by_key(|event| event.pane_id);
+        assert_eq!(events.len(), 2);
+        assert_eq!((events[0].pane_id, events[0].sequence), (10, 0));
+        assert_eq!((events[1].pane_id, events[1].sequence), (20, 0));
+        assert_eq!(events[0].text, "pane ten content");
+        assert_eq!(events[1].text, "pane twenty content");
+        assert_eq!(events[0].segment_kind, RecorderSegmentKind::Delta);
+        assert_eq!(events[1].segment_kind, RecorderSegmentKind::Delta);
     });
 }
 
@@ -410,9 +425,7 @@ fn egress_tap_not_set_still_works() {
         while rx.try_recv().is_ok() {
             count += 1;
         }
-        // Primary assertion: no panic without a tap set.
-        // Capture may or may not produce events depending on scheduler state.
-        let _ = count;
+        assert_eq!(count, 1, "capture must proceed when no observer is installed");
     });
 }
 
@@ -446,7 +459,6 @@ fn egress_monotonic_sequence() {
             source
                 .set_text(1, &format!("aaaa\nbbbb\ncccc\ndddd\neeee\nout-{i}\n"))
                 .await;
-            sleep(Duration::from_millis(20)).await;
             let mut poll_tasks = TailerPollTaskSet::new();
             tailer.spawn_ready(&mut poll_tasks);
             while let Some((pid, out)) = poll_tasks.join_next().await {
@@ -456,16 +468,8 @@ fn egress_monotonic_sequence() {
         }
 
         let all = tap.events();
-        if all.len() >= 2 {
-            for w in all.windows(2) {
-                assert!(
-                    w[1].sequence >= w[0].sequence,
-                    "monotonic: {} >= {}",
-                    w[1].sequence,
-                    w[0].sequence
-                );
-            }
-        }
+        let sequences: Vec<u64> = all.iter().map(|event| event.sequence).collect();
+        assert_eq!(sequences, vec![0, 1, 2]);
     });
 }
 
