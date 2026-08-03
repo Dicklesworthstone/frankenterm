@@ -6,6 +6,16 @@ use varbincode::error::{Error, Result};
 
 const MAX_CONTAINER_ITEMS: usize = 1_000_000;
 
+/// Zero-wire serde newtype names used by the exact-render schema to select a
+/// tighter raw byte-buffer admission limit before allocation. The names are
+/// serializer metadata only: varbincode does not write newtype names.
+pub(crate) const EXACT_RENDER_ROW_UTF8_V1_NEWTYPE: &str =
+    "frankenterm.codec.ExactRenderRowUtf8V1";
+pub(crate) const EXACT_RENDER_METADATA_UTF8_V1_NEWTYPE: &str =
+    "frankenterm.codec.ExactRenderMetadataUtf8V1";
+pub(crate) const EXACT_RENDER_ROW_UTF8_V1_MAX_BYTES: usize = 1_000_000;
+pub(crate) const EXACT_RENDER_METADATA_UTF8_V1_MAX_BYTES: usize = 65_536;
+
 /// Hard byte budget for any single varbincode container or byte-buffer
 /// allocation. Attacker-controlled leb128 lengths get clamped by this cap
 /// before they reach `vec![0u8; len]` in [`Deserializer::read_vec`] or the
@@ -24,11 +34,46 @@ pub fn deserialize<T: serde::de::DeserializeOwned, R: Read>(reader: &mut R) -> R
 
 pub struct Deserializer<'a, R: Read> {
     reader: &'a mut R,
+    byte_buffer_admission: ByteBufferAdmission,
+}
+
+#[derive(Clone, Copy)]
+struct ByteBufferAdmission {
+    label: &'static str,
+    maximum: usize,
+}
+
+impl ByteBufferAdmission {
+    const GLOBAL: Self = Self {
+        label: "byte buffer",
+        maximum: MAX_CONTAINER_BYTES,
+    };
+
+    const EXACT_RENDER_ROW_UTF8: Self = Self {
+        label: "exact render row UTF-8 bytes",
+        maximum: EXACT_RENDER_ROW_UTF8_V1_MAX_BYTES,
+    };
+
+    const EXACT_RENDER_METADATA_UTF8: Self = Self {
+        label: "exact render metadata UTF-8 bytes",
+        maximum: EXACT_RENDER_METADATA_UTF8_V1_MAX_BYTES,
+    };
+
+    const fn restricted_by(self, requested: Self) -> Self {
+        if requested.maximum < self.maximum {
+            requested
+        } else {
+            self
+        }
+    }
 }
 
 impl<'a, R: Read> Deserializer<'a, R> {
     pub fn new(reader: &'a mut R) -> Self {
-        Self { reader }
+        Self {
+            reader,
+            byte_buffer_admission: ByteBufferAdmission::GLOBAL,
+        }
     }
 
     fn read_signed(&mut self) -> Result<i64> {
@@ -57,16 +102,19 @@ impl<'a, R: Read> Deserializer<'a, R> {
     }
 
     fn read_vec(&mut self) -> Result<Vec<u8>> {
-        let len = self.read_len_prefix("byte buffer")?;
-        if len > MAX_CONTAINER_BYTES {
+        let admission = self.byte_buffer_admission;
+        let len = self.read_len_prefix(admission.label)?;
+        if len > admission.maximum {
             return Err(Error::custom(format!(
-                "byte buffer length {len} exceeds maximum {MAX_CONTAINER_BYTES}"
+                "{} length {len} exceeds maximum {}",
+                admission.label, admission.maximum,
             )));
         }
         let mut result = Vec::new();
         result.try_reserve_exact(len).map_err(|err| {
             Error::custom(format!(
-                "byte buffer length {len} could not be allocated safely: {err}"
+                "{} length {len} could not be allocated safely: {err}",
+                admission.label,
             ))
         })?;
         result.resize(len, 0);
@@ -295,11 +343,24 @@ impl<'de, 'a, 'b, R: Read> serde::Deserializer<'de> for &'a mut Deserializer<'b,
         Err(Error::DeserializeIdentifierNotSupported)
     }
 
-    fn deserialize_newtype_struct<V>(self, _name: &str, visitor: V) -> Result<V::Value>
+    fn deserialize_newtype_struct<V>(self, name: &str, visitor: V) -> Result<V::Value>
     where
         V: de::Visitor<'de>,
     {
-        visitor.visit_newtype_struct(self)
+        let requested = if name == EXACT_RENDER_ROW_UTF8_V1_NEWTYPE {
+            Some(ByteBufferAdmission::EXACT_RENDER_ROW_UTF8)
+        } else if name == EXACT_RENDER_METADATA_UTF8_V1_NEWTYPE {
+            Some(ByteBufferAdmission::EXACT_RENDER_METADATA_UTF8)
+        } else {
+            None
+        };
+        let prior = self.byte_buffer_admission;
+        if let Some(requested) = requested {
+            self.byte_buffer_admission = prior.restricted_by(requested);
+        }
+        let result = visitor.visit_newtype_struct(&mut *self);
+        self.byte_buffer_admission = prior;
+        result
     }
 
     fn deserialize_unit_struct<V>(self, _name: &'static str, visitor: V) -> Result<V::Value>

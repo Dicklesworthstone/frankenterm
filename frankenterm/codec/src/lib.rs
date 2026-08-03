@@ -929,6 +929,79 @@ impl StreamingPduFrameLimitExceeded {
     }
 }
 
+/// A validated frame header declared more encoded body bytes than its wire
+/// schema permits.
+///
+/// This is checked after the serial and PDU identifier are decoded but before
+/// the body reader reserves or materializes any payload storage. Unknown and
+/// legacy identifiers retain [`MAX_PDU_SIZE`]; closed authority schemas may
+/// publish a tighter limit in [`PDU_WIRE_SPECS`].
+#[derive(Debug, Error, PartialEq, Eq)]
+#[error(
+    "PDU encoded payload size {declared_payload_bytes} exceeds maximum \
+     {max_payload_bytes} (serial={serial} ident={ident} compressed={is_compressed})"
+)]
+pub struct PduEncodedBodyLimitExceeded {
+    declared_payload_bytes: usize,
+    max_payload_bytes: usize,
+    serial: u64,
+    ident: u64,
+    is_compressed: bool,
+}
+
+impl PduEncodedBodyLimitExceeded {
+    #[must_use]
+    pub const fn declared_payload_bytes(&self) -> usize {
+        self.declared_payload_bytes
+    }
+
+    #[must_use]
+    pub const fn max_payload_bytes(&self) -> usize {
+        self.max_payload_bytes
+    }
+
+    #[must_use]
+    pub const fn serial(&self) -> u64 {
+        self.serial
+    }
+
+    #[must_use]
+    pub const fn ident(&self) -> u64 {
+        self.ident
+    }
+
+    #[must_use]
+    pub const fn is_compressed(&self) -> bool {
+        self.is_compressed
+    }
+}
+
+fn read_buffered_header_u64(
+    input: &mut &[u8],
+    frame_complete: bool,
+    field_context: &'static str,
+) -> anyhow::Result<Option<(u64, usize)>> {
+    let before = input.len();
+    match leb128::read::unsigned(input) {
+        Ok(value) => Ok(Some((value, before.saturating_sub(input.len())))),
+        Err(leb128::read::Error::IoError(err))
+            if !frame_complete
+                && matches!(
+                    err.kind(),
+                    std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::WouldBlock
+                ) =>
+        {
+            Ok(None)
+        }
+        Err(leb128::read::Error::IoError(err)) => Err(anyhow::Error::new(err)
+            .context("reading leb128")
+            .context(field_context)),
+        Err(leb128::read::Error::Overflow) => {
+            Err(anyhow::anyhow!("leb128 is too large").context(field_context))
+        }
+    }
+}
+
 fn buffered_frame_len_with_limit(
     buffer: &[u8],
     max_frame_bytes: usize,
@@ -950,14 +1023,15 @@ fn buffered_frame_len_with_limit(
         Err(leb128::read::Error::Overflow) => anyhow::bail!("buffered PDU length leb128 overflow"),
     };
 
+    let is_compressed = (tagged_len & COMPRESSED_MASK) != 0;
     let raw_len = tagged_len & !COMPRESSED_MASK;
-    let payload_len: usize = raw_len
+    let frame_body_len: usize = raw_len
         .try_into()
         .map_err(|_| anyhow::anyhow!("buffered PDU length {raw_len} does not fit in usize"))?;
 
     let prefix_len = buffer.len().saturating_sub(slice.len());
     let total_len = prefix_len
-        .checked_add(payload_len)
+        .checked_add(frame_body_len)
         .context("buffered PDU length overflow")?;
 
     if total_len > max_frame_bytes {
@@ -971,15 +1045,42 @@ fn buffered_frame_len_with_limit(
     // [ft-phz7x] Reject oversize headers BEFORE an unlimited caller's read
     // loop accumulates an attacker-advertised payload. A tighter caller limit
     // is checked first so it retains its typed authority and recovery class.
-    if payload_len > MAX_PDU_SIZE {
+    if frame_body_len > MAX_PDU_SIZE {
         anyhow::bail!(
             "buffered PDU payload size {} exceeds maximum {} — refusing to accumulate",
-            payload_len,
+            frame_body_len,
             MAX_PDU_SIZE,
         );
     }
 
-    if buffer.len() < total_len {
+    // Parse only inside the first frame's declared bounds. Coalesced bytes from
+    // a successor must never complete a truncated serial or identifier.
+    let frame_complete = buffer.len() >= total_len;
+    let available_end = buffer.len().min(total_len);
+    let mut header = buffer
+        .get(prefix_len..available_end)
+        .context("buffered PDU header range is invalid")?;
+    let Some((serial, serial_len)) =
+        read_buffered_header_u64(&mut header, frame_complete, "reading PDU serial")?
+    else {
+        return Ok(None);
+    };
+    let Some((ident, ident_len)) =
+        read_buffered_header_u64(&mut header, frame_complete, "reading PDU ident")?
+    else {
+        return Ok(None);
+    };
+    let data_len = decoded_payload_len(
+        "buffered PDU",
+        raw_len,
+        serial,
+        serial_len,
+        ident,
+        ident_len,
+    )?;
+    validate_encoded_body_admission(data_len, serial, ident, is_compressed)?;
+
+    if !frame_complete {
         return Ok(None);
     }
 
@@ -1111,6 +1212,18 @@ impl PduFrameHeader {
     pub const fn is_compressed(&self) -> bool {
         self.is_compressed
     }
+
+    /// Registry-derived ceiling already applied to this header before it was
+    /// exposed to a body selector.
+    #[must_use]
+    pub fn maximum_encoded_payload_bytes(&self) -> usize {
+        Pdu::wire_spec_for_ident(self.ident)
+            .map(|spec| {
+                spec.encoded_body_limit
+                    .maximum_encoded_payload_bytes(self.is_compressed)
+            })
+            .unwrap_or(MAX_PDU_SIZE)
+    }
 }
 
 /// Non-content accounting for one successfully discarded frame body.
@@ -1208,6 +1321,31 @@ fn decoded_payload_len(
     }
 }
 
+fn validate_encoded_body_admission(
+    data_len: usize,
+    serial: u64,
+    ident: u64,
+    is_compressed: bool,
+) -> anyhow::Result<()> {
+    let max_payload_bytes = Pdu::wire_spec_for_ident(ident)
+        .map(|spec| {
+            spec.encoded_body_limit
+                .maximum_encoded_payload_bytes(is_compressed)
+        })
+        .unwrap_or(MAX_PDU_SIZE);
+    if data_len > max_payload_bytes {
+        return Err(PduEncodedBodyLimitExceeded {
+            declared_payload_bytes: data_len,
+            max_payload_bytes,
+            serial,
+            ident,
+            is_compressed,
+        }
+        .into());
+    }
+    Ok(())
+}
+
 /// Validate and consume only a frame header, leaving its payload unread.
 async fn decode_raw_header_async<R: Unpin + AsyncRead + std::fmt::Debug>(
     r: &mut R,
@@ -1241,16 +1379,7 @@ async fn decode_raw_header_async<R: Unpin + AsyncRead + std::fmt::Debug>(
         ident_len,
     )?;
 
-    if data_len > MAX_PDU_SIZE {
-        anyhow::bail!(
-            "decode_raw_async: PDU payload size {} exceeds maximum {} \
-            (serial={} ident={})",
-            data_len,
-            MAX_PDU_SIZE,
-            serial,
-            ident
-        );
-    }
+    validate_encoded_body_admission(data_len, serial, ident, is_compressed)?;
 
     if is_compressed {
         metrics::histogram!("pdu.decode.compressed.size").record(data_len as f64);
@@ -1365,15 +1494,7 @@ fn decode_raw_impl<R: std::io::Read>(mut r: R, record_metrics: bool) -> anyhow::
     let (ident, ident_len) = read_u64_with_len(&mut r).context("reading PDU ident")?;
     let data_len = decoded_payload_len("decode_raw", len, serial, serial_len, ident, ident_len)?;
 
-    if data_len > MAX_PDU_SIZE {
-        anyhow::bail!(
-            "PDU payload size {} exceeds maximum {} (serial={} ident={})",
-            data_len,
-            MAX_PDU_SIZE,
-            serial,
-            ident
-        );
-    }
+    validate_encoded_body_admission(data_len, serial, ident, is_compressed)?;
 
     if record_metrics {
         if is_compressed {
@@ -1446,45 +1567,137 @@ fn serialize<T: serde::Serialize>(t: &T) -> Result<(Vec<u8>, bool), Error> {
     serialize_with_mode(t, CompressionMode::Auto)
 }
 
-fn serialize_with_mode<T: serde::Serialize>(
-    t: &T,
-    compression_mode: CompressionMode,
-) -> Result<(Vec<u8>, bool), Error> {
-    // Serialize once into `uncompressed`. If we end up needing compression,
-    // we feed THIS buffer through zstd directly via `encode_all` instead of
-    // re-running the serializer through a streaming zstd encoder. ft-gbpoy.
+struct SerializedPayload {
+    data: Vec<u8>,
+    is_compressed: bool,
+    uncompressed_len: usize,
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static TEST_SERIALIZE_INVOCATIONS: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
+    static TEST_EXACT_RENDER_VALIDATION_ROW_VISITS: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
+}
+
+#[cfg(test)]
+fn reset_test_serialize_invocations() {
+    TEST_SERIALIZE_INVOCATIONS.set(0);
+}
+
+#[cfg(test)]
+fn test_serialize_invocations() -> usize {
+    TEST_SERIALIZE_INVOCATIONS.get()
+}
+
+#[cfg(test)]
+fn record_test_serialize_invocation() {
+    TEST_SERIALIZE_INVOCATIONS.set(TEST_SERIALIZE_INVOCATIONS.get().saturating_add(1));
+}
+
+#[cfg(test)]
+fn reset_test_exact_render_validation_row_visits() {
+    TEST_EXACT_RENDER_VALIDATION_ROW_VISITS.set(0);
+}
+
+#[cfg(test)]
+fn test_exact_render_validation_row_visits() -> usize {
+    TEST_EXACT_RENDER_VALIDATION_ROW_VISITS.get()
+}
+
+#[cfg(test)]
+fn record_test_exact_render_validation_row_visit() {
+    TEST_EXACT_RENDER_VALIDATION_ROW_VISITS.set(
+        TEST_EXACT_RENDER_VALIDATION_ROW_VISITS
+            .get()
+            .saturating_add(1),
+    );
+}
+
+fn serialize_uncompressed<T: serde::Serialize>(t: &T) -> Result<Vec<u8>, Error> {
+    #[cfg(test)]
+    record_test_serialize_invocation();
     let mut uncompressed = Vec::with_capacity(64);
     let mut encode = varbincode::Serializer::new(&mut uncompressed);
     t.serialize(&mut encode)?;
+    Ok(uncompressed)
+}
 
-    if compression_mode == CompressionMode::Never {
-        return Ok((uncompressed, false));
+fn finish_serialized_payload(
+    uncompressed: Vec<u8>,
+    compression_mode: CompressionMode,
+) -> Result<SerializedPayload, Error> {
+    let uncompressed_len = uncompressed.len();
+    if compression_mode == CompressionMode::Never
+        || (compression_mode == CompressionMode::Auto && uncompressed_len <= COMPRESS_THRESH)
+    {
+        return Ok(SerializedPayload {
+            data: uncompressed,
+            is_compressed: false,
+            uncompressed_len,
+        });
     }
 
-    if compression_mode == CompressionMode::Auto && uncompressed.len() <= COMPRESS_THRESH {
-        return Ok((uncompressed, false));
-    }
-    // It's a little heavy; compress the already-serialized buffer.
-    // Replaces the previous "serialize a second time through zstd::Encoder"
-    // pattern, which doubled serializer work above the threshold (ft-gbpoy).
+    // Compress the one canonical serialization; never run serde a second time.
     let compressed =
         zstd::stream::encode_all(uncompressed.as_slice(), zstd::DEFAULT_COMPRESSION_LEVEL)?;
 
     log::debug!(
         "serialized+compress len {} vs {}",
         compressed.len(),
-        uncompressed.len()
+        uncompressed_len
     );
 
-    if compression_mode == CompressionMode::Always {
-        return Ok((compressed, true));
-    }
-
-    if compressed.len() < uncompressed.len() {
-        Ok((compressed, true))
+    if compression_mode == CompressionMode::Always || compressed.len() < uncompressed_len {
+        Ok(SerializedPayload {
+            data: compressed,
+            is_compressed: true,
+            uncompressed_len,
+        })
     } else {
-        Ok((uncompressed, false))
+        Ok(SerializedPayload {
+            data: uncompressed,
+            is_compressed: false,
+            uncompressed_len,
+        })
     }
+}
+
+fn serialize_pdu_payload<T: serde::Serialize>(
+    value: &T,
+    wire_spec: &PduWireSpec,
+    serial: u64,
+    compression_mode: CompressionMode,
+) -> Result<SerializedPayload, Error> {
+    let uncompressed = serialize_uncompressed(value)?;
+    // This is the real serialization length, checked before zstd work or frame
+    // allocation. Exact-render structural validation has already run once.
+    validate_encoded_body_admission(uncompressed.len(), serial, wire_spec.ident, false)?;
+    let serialized = finish_serialized_payload(uncompressed, compression_mode)?;
+    if !serialized.is_compressed {
+        debug_assert_eq!(serialized.uncompressed_len, serialized.data.len());
+    }
+    if serialized.is_compressed {
+        validate_encoded_body_admission(
+            serialized.data.len(),
+            serial,
+            wire_spec.ident,
+            true,
+        )?;
+    }
+    Ok(serialized)
+}
+
+fn serialize_with_mode<T: serde::Serialize>(
+    t: &T,
+    compression_mode: CompressionMode,
+) -> Result<(Vec<u8>, bool), Error> {
+    let serialized =
+        finish_serialized_payload(serialize_uncompressed(t)?, compression_mode)?;
+    Ok((serialized.data, serialized.is_compressed))
 }
 
 fn deserialize<T: serde::de::DeserializeOwned, R: std::io::Read>(
@@ -1666,6 +1879,43 @@ pub struct PduWireAuthority {
     pub role: PduWireRole,
 }
 
+/// Encoded-body admission policy applied before a decoder allocates body
+/// storage.
+///
+/// `SchemaDecompressedWithZstdBound` admits an uncompressed body up to the
+/// schema ceiling. For a compressed body it admits the worst-case output size
+/// of FrankenTerm's single-frame zstd encoder for a legal schema payload. This
+/// permits bounded compression overhead without reopening the global 256 MiB
+/// allocation envelope to a small authority PDU.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PduEncodedBodyLimit {
+    GlobalMaximum,
+    SchemaDecompressedWithZstdBound {
+        max_decompressed_bytes: usize,
+        max_zstd_encoded_bytes: usize,
+    },
+}
+
+impl PduEncodedBodyLimit {
+    /// Largest encoded body accepted for this schema and compression flag.
+    #[must_use]
+    pub const fn maximum_encoded_payload_bytes(self, is_compressed: bool) -> usize {
+        match self {
+            Self::GlobalMaximum => MAX_PDU_SIZE,
+            Self::SchemaDecompressedWithZstdBound {
+                max_decompressed_bytes,
+                max_zstd_encoded_bytes,
+            } => {
+                if is_compressed {
+                    max_zstd_encoded_bytes.min(MAX_PDU_SIZE)
+                } else {
+                    max_decompressed_bytes.min(MAX_PDU_SIZE)
+                }
+            }
+        }
+    }
+}
+
 /// Exhaustive static admission policy for one assigned PDU identifier.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PduWireSpec {
@@ -1675,6 +1925,7 @@ pub struct PduWireSpec {
     pub producer: PduProducer,
     pub capability: PduCapabilityUse,
     pub authorities: &'static [PduWireAuthority],
+    pub encoded_body_limit: PduEncodedBodyLimit,
 }
 
 impl PduWireSpec {
@@ -1785,6 +2036,30 @@ macro_rules! pdu_capability_use {
                 | TopologyCapabilities::WINDOW_REORDER_CAS_V1.bits(),
         ))
     };
+    (requires_exact_render) => {
+        PduCapabilityUse::Requires(TopologyCapabilities::from_bits(
+            TopologyCapabilities::FENCED_SNAPSHOT_V1.bits()
+                | TopologyCapabilities::EXACT_RENDER_DELIVERY_V1.bits(),
+        ))
+    };
+}
+
+macro_rules! pdu_encoded_body_limit {
+    (GetPaneRenderDeliveryV1, requires_exact_render) => {
+        PduEncodedBodyLimit::SchemaDecompressedWithZstdBound {
+            max_decompressed_bytes: MAX_EXACT_RENDER_REQUEST_DECOMPRESSED_BYTES,
+            max_zstd_encoded_bytes: MAX_EXACT_RENDER_REQUEST_ZSTD_ENCODED_BYTES,
+        }
+    };
+    ($_name:ident, requires_exact_render) => {
+        PduEncodedBodyLimit::SchemaDecompressedWithZstdBound {
+            max_decompressed_bytes: MAX_EXACT_RENDER_DELIVERY_DECOMPRESSED_BYTES,
+            max_zstd_encoded_bytes: MAX_EXACT_RENDER_DELIVERY_ZSTD_ENCODED_BYTES,
+        }
+    };
+    ($_name:ident, $_other:ident) => {
+        PduEncodedBodyLimit::GlobalMaximum
+    };
 }
 
 macro_rules! pdu {
@@ -1812,6 +2087,7 @@ macro_rules! pdu {
                     producer: pdu_producer!($authority_policy),
                     capability: pdu_capability_use!($capability_policy),
                     authorities: pdu_authorities!($authority_policy),
+                    encoded_body_limit: pdu_encoded_body_limit!($name, $capability_policy),
                 };
             }
         )*
@@ -1839,9 +2115,19 @@ macro_rules! pdu {
                     Pdu::Invalid{..} => bail!("attempted to serialize Pdu::Invalid"),
                     $(
                         Pdu::$name(s) => {
-                            let (data, is_compressed) =
-                                serialize_with_mode(s, compression_mode)?;
-                            let encoded_size = encode_raw($vers, serial, &data, is_compressed, w)?;
+                            let serialized = serialize_pdu_payload(
+                                s,
+                                &<$name as PduWireIdent>::WIRE_SPEC,
+                                serial,
+                                compression_mode,
+                            )?;
+                            let encoded_size = encode_raw(
+                                $vers,
+                                serial,
+                                &serialized.data,
+                                serialized.is_compressed,
+                                w,
+                            )?;
                             log::debug!("encode {} size={encoded_size}", stringify!($name));
                             metrics::histogram!("pdu.size", "pdu" => stringify!($name)).record(encoded_size as f64);
                             metrics::histogram!("pdu.size.rate", "pdu" => stringify!($name)).record(encoded_size as f64);
@@ -1892,14 +2178,18 @@ macro_rules! pdu {
                     Pdu::Invalid{..} => bail!("attempted to serialize Pdu::Invalid"),
                     $(
                         Pdu::$name(s) => {
-                            let (data, is_compressed) =
-                                serialize_with_mode(s, compression_mode)?;
+                            let serialized = serialize_pdu_payload(
+                                s,
+                                &<$name as PduWireIdent>::WIRE_SPEC,
+                                serial,
+                                compression_mode,
+                            )?;
                             let frame =
                                 encode_raw_as_vec_impl(
                                     $vers,
                                     serial,
-                                    &data,
-                                    is_compressed,
+                                    &serialized.data,
+                                    serialized.is_compressed,
                                     record_metrics,
                                 )?;
                             log::debug!(
@@ -1935,9 +2225,18 @@ macro_rules! pdu {
                     Pdu::Invalid{..} => bail!("attempted to measure Pdu::Invalid"),
                     $(
                         Pdu::$name(s) => {
-                            let (data, is_compressed) =
-                                serialize_with_mode(s, compression_mode)?;
-                            encoded_frame_len($vers, serial, data.len(), is_compressed)
+                            let serialized = serialize_pdu_payload(
+                                s,
+                                &<$name as PduWireIdent>::WIRE_SPEC,
+                                serial,
+                                compression_mode,
+                            )?;
+                            encoded_frame_len(
+                                $vers,
+                                serial,
+                                serialized.data.len(),
+                                serialized.is_compressed,
+                            )
                         }
                     ,)*
                 }
@@ -1958,9 +2257,19 @@ macro_rules! pdu {
                     Pdu::Invalid{..} => bail!("attempted to serialize Pdu::Invalid"),
                     $(
                         Pdu::$name(s) => {
-                            let (data, is_compressed) =
-                                serialize_with_mode(s, compression_mode)?;
-                            let encoded_size = encode_raw_async($vers, serial, &data, is_compressed, w).await?;
+                            let serialized = serialize_pdu_payload(
+                                s,
+                                &<$name as PduWireIdent>::WIRE_SPEC,
+                                serial,
+                                compression_mode,
+                            )?;
+                            let encoded_size = encode_raw_async(
+                                $vers,
+                                serial,
+                                &serialized.data,
+                                serialized.is_compressed,
+                                w,
+                            ).await?;
                             log::debug!("encode_async {} size={encoded_size}", stringify!($name));
                             metrics::histogram!("pdu.size", "pdu" => stringify!($name)).record(encoded_size as f64);
                             metrics::histogram!("pdu.size.rate", "pdu" => stringify!($name)).record(encoded_size as f64);
@@ -2236,7 +2545,7 @@ macro_rules! pdu {
 /// The overall version of the codec.
 /// This must be bumped when backwards incompatible changes
 /// are made to the types and protocol.
-pub const CODEC_VERSION: usize = 51;
+pub const CODEC_VERSION: usize = 52;
 
 /// Lowest codec version this build can decode wire frames from.
 ///
@@ -2435,6 +2744,10 @@ pdu! {
         => deserialize_reorder_window_tabs_v1_response;
     WindowOrderEventV1: 90, 51, server_unilateral, requires_ordered
         => deserialize_window_order_event_v1;
+    GetPaneRenderDeliveryV1: 91, 52, client_request, requires_exact_render
+        => deserialize_get_pane_render_delivery_v1;
+    GetPaneRenderDeliveryV1Response: 92, 52, server_reply, requires_exact_render
+        => deserialize_get_pane_render_delivery_v1_response;
 }
 
 impl Pdu {
@@ -2446,6 +2759,8 @@ impl Pdu {
             Self::ReorderWindowTabsV1(value) => value.validate()?,
             Self::ReorderWindowTabsV1Response(value) => value.validate()?,
             Self::WindowOrderEventV1(value) => value.validate()?,
+            Self::GetPaneRenderDeliveryV1(value) => value.validate()?,
+            Self::GetPaneRenderDeliveryV1Response(value) => value.validate()?,
             _ => {}
         }
         Ok(())
@@ -2831,6 +3146,14 @@ impl Pdu {
 
     pub fn pane_id(&self) -> Option<PaneId> {
         match self {
+            Pdu::GetPaneRenderDeliveryV1(GetPaneRenderDeliveryV1 {
+                identity: ExactRenderDeliveryRequestIdentity { pane_id, .. },
+                ..
+            })
+            | Pdu::GetPaneRenderDeliveryV1Response(GetPaneRenderDeliveryV1Response {
+                request_identity: ExactRenderDeliveryRequestIdentity { pane_id, .. },
+                ..
+            }) => pane_id.try_into_mux().ok(),
             Pdu::GetPaneRenderChangesResponse(GetPaneRenderChangesResponse { pane_id, .. })
             | Pdu::GetSemanticZonesResponse(GetSemanticZonesResponse { pane_id, .. })
             | Pdu::RenderApplicationUpdate(RenderApplicationUpdate {
@@ -3149,6 +3472,148 @@ fn deserialize_reorder_window_tabs_v1_response(
     Ok(response)
 }
 
+fn deserialize_get_pane_render_delivery_v1(
+    data: &[u8],
+    is_compressed: bool,
+) -> Result<GetPaneRenderDeliveryV1, Error> {
+    let payload = materialize_exact_payload_with_limit(
+        data,
+        is_compressed,
+        "GetPaneRenderDeliveryV1",
+        MAX_EXACT_RENDER_REQUEST_DECOMPRESSED_BYTES,
+    )?;
+    let mut reader = payload.as_ref();
+    let request = bounded_varbincode::deserialize::<GetPaneRenderDeliveryV1, _>(&mut reader)?;
+    if !reader.is_empty() {
+        bail!("GetPaneRenderDeliveryV1 payload has trailing schema bytes");
+    }
+    ensure_exact_render_canonical_payload(
+        &request,
+        payload.as_ref(),
+        "GetPaneRenderDeliveryV1",
+    )?;
+    request.validate()?;
+    Ok(request)
+}
+
+fn deserialize_get_pane_render_delivery_v1_response(
+    data: &[u8],
+    is_compressed: bool,
+) -> Result<GetPaneRenderDeliveryV1Response, Error> {
+    let payload = materialize_exact_payload_with_limit(
+        data,
+        is_compressed,
+        "GetPaneRenderDeliveryV1Response",
+        MAX_EXACT_RENDER_DELIVERY_DECOMPRESSED_BYTES,
+    )?;
+    let mut reader = payload.as_ref();
+    let response =
+        bounded_varbincode::deserialize::<GetPaneRenderDeliveryV1Response, _>(&mut reader)?;
+    if !reader.is_empty() {
+        bail!("GetPaneRenderDeliveryV1Response payload has trailing schema bytes");
+    }
+    ensure_exact_render_canonical_payload(
+        &response,
+        payload.as_ref(),
+        "GetPaneRenderDeliveryV1Response",
+    )?;
+    response.validate_with_decompressed_bytes(
+        u64::try_from(payload.len()).context("exact render response length does not fit u64")?,
+    )?;
+    Ok(response)
+}
+
+fn ensure_exact_render_canonical_payload<T: Serialize>(
+    value: &T,
+    payload: &[u8],
+    payload_name: &'static str,
+) -> Result<(), Error> {
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum Mismatch {
+        Byte { offset: usize },
+        CanonicalLonger { payload_bytes: usize },
+    }
+
+    struct ComparingWriter<'a> {
+        payload: &'a [u8],
+        offset: usize,
+        mismatch: Option<Mismatch>,
+    }
+
+    impl std::io::Write for ComparingWriter<'_> {
+        fn write(&mut self, canonical: &[u8]) -> std::io::Result<usize> {
+            let Some(end) = self.offset.checked_add(canonical.len()) else {
+                self.mismatch = Some(Mismatch::CanonicalLonger {
+                    payload_bytes: self.payload.len(),
+                });
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "canonical exact-render payload length overflow",
+                ));
+            };
+            if end > self.payload.len() {
+                self.mismatch = Some(Mismatch::CanonicalLonger {
+                    payload_bytes: self.payload.len(),
+                });
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "canonical exact-render payload is longer than received payload",
+                ));
+            }
+            if let Some(relative) = canonical
+                .iter()
+                .zip(&self.payload[self.offset..end])
+                .position(|(canonical, received)| canonical != received)
+            {
+                self.mismatch = Some(Mismatch::Byte {
+                    offset: self.offset + relative,
+                });
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "canonical exact-render payload byte mismatch",
+                ));
+            }
+            self.offset = end;
+            Ok(canonical.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let mut writer = ComparingWriter {
+        payload,
+        offset: 0,
+        mismatch: None,
+    };
+    let serialization = {
+        let mut serializer = varbincode::Serializer::new(&mut writer);
+        value.serialize(&mut serializer)
+    };
+    match writer.mismatch {
+        Some(Mismatch::Byte { offset }) => {
+            bail!("{payload_name} payload is not canonical varbincode: byte mismatch at offset {offset}");
+        }
+        Some(Mismatch::CanonicalLonger { payload_bytes }) => {
+            bail!(
+                "{payload_name} payload is not canonical varbincode: canonical serialization is longer than the {payload_bytes}-byte payload"
+            );
+        }
+        None => {
+            serialization?;
+        }
+    }
+    if writer.offset != payload.len() {
+        bail!(
+            "{payload_name} payload is not canonical varbincode: canonical serialization is {} bytes shorter than the {}-byte payload",
+            payload.len() - writer.offset,
+            payload.len(),
+        );
+    }
+    Ok(())
+}
+
 fn deserialize_window_order_event_v1(
     data: &[u8],
     is_compressed: bool,
@@ -3240,11 +3705,14 @@ impl TopologyCapabilities {
     /// This capability is meaningful only together with
     /// [`Self::ORDERED_WINDOW_STREAM_V1`].
     pub const WINDOW_REORDER_CAS_V1: Self = Self(1 << 2);
+    /// The peer understands exact generation-bound render delivery, typed
+    /// settlement, and bounded immutable snapshot continuation.
+    pub const EXACT_RENDER_DELIVERY_V1: Self = Self(1 << 3);
 
     /// Runtime-advertised capabilities.
     ///
-    /// The v51 codec knows the two ordered-window bits, but neither may be
-    /// advertised until the mux authority, server dispatch, and client
+    /// The v52 codec knows the ordered-window and exact-render bits, but none
+    /// may be advertised until their mux authority, server dispatch, and client
     /// reconciliation beads complete. Keep this mask intentionally unchanged.
     pub const SERVER_SUPPORTED: Self = Self::FENCED_SNAPSHOT_V1;
 
@@ -3272,6 +3740,15 @@ impl TopologyCapabilities {
                 bits: self.bits(),
             });
         }
+        if self.contains(Self::EXACT_RENDER_DELIVERY_V1)
+            && !self.contains(Self::FENCED_SNAPSHOT_V1)
+        {
+            return Err(
+                TopologyCapabilitiesError::ExactRenderDeliveryWithoutFencedSnapshot {
+                    bits: self.bits(),
+                },
+            );
+        }
         Ok(())
     }
 }
@@ -3282,6 +3759,10 @@ pub enum TopologyCapabilitiesError {
         "topology capability bits {bits:#x} request WINDOW_REORDER_CAS_V1 without ORDERED_WINDOW_STREAM_V1"
     )]
     ReorderCasWithoutOrderedStream { bits: u64 },
+    #[error(
+        "topology capability bits {bits:#x} request EXACT_RENDER_DELIVERY_V1 without FENCED_SNAPSHOT_V1"
+    )]
+    ExactRenderDeliveryWithoutFencedSnapshot { bits: u64 },
 }
 
 /// Unpredictable identity of one connection-generation topology stream.
@@ -4061,7 +4542,10 @@ fn validate_remote_wire_id(
     field: &'static str,
     value: u64,
 ) -> Result<(), OrderedWindowProtocolError> {
-    if value == 0 || value == u64::MAX {
+    // Live mux WindowId/TabId allocators begin at zero. Absence belongs in an
+    // enclosing Option; only the nonrepresentable/exhausted sentinel is
+    // reserved on this fixed-width wire surface.
+    if value == u64::MAX {
         return Err(OrderedWindowProtocolError::ReservedWireId { field, value });
     }
     Ok(())
@@ -4413,6 +4897,2960 @@ where
     )
     .map_err(serde::de::Error::custom)?;
     Ok(windows)
+}
+
+/// Closed schema version carried by exact render-delivery PDU IDs 91/92.
+pub const EXACT_RENDER_DELIVERY_PROTOCOL_VERSION: u16 = 1;
+/// Oldest negotiated codec dialect that may carry PDU IDs 91/92.
+pub const EXACT_RENDER_DELIVERY_V1_MIN_CODEC_VERSION: usize = 52;
+
+#[must_use]
+pub const fn codec_version_supports_exact_render_delivery_v1(codec_version: usize) -> bool {
+    codec_version >= EXACT_RENDER_DELIVERY_V1_MIN_CODEC_VERSION
+}
+
+/// Hard v1 resource ceilings. A receiver may advertise lower limits, but no
+/// encoded or decoded v1 value may exceed these protocol maxima.
+pub const MAX_EXACT_RENDER_DELIVERY_DECOMPRESSED_BYTES: usize = 4 * 1024 * 1024;
+/// PDU 91 is a compact request/control schema and must not inherit the much
+/// larger response allocation envelope. This conservative ceiling leaves
+/// implementation headroom for the closed v1 body while bounding pre-body
+/// work; schema growth still requires a new PDU identifier.
+pub const MAX_EXACT_RENDER_REQUEST_DECOMPRESSED_BYTES: usize = 64 * 1024;
+/// Frozen zstd `compressBound` result for the request ceiling. For inputs below
+/// 128 KiB zstd adds its small-input term in addition to `input + input / 256`.
+pub const MAX_EXACT_RENDER_REQUEST_ZSTD_ENCODED_BYTES: usize =
+    MAX_EXACT_RENDER_REQUEST_DECOMPRESSED_BYTES
+        + (MAX_EXACT_RENDER_REQUEST_DECOMPRESSED_BYTES >> 8)
+        + ((128 * 1024 - MAX_EXACT_RENDER_REQUEST_DECOMPRESSED_BYTES) >> 11);
+/// Largest single-frame zstd encoding emitted for a legal v1 payload under the
+/// pinned zstd `compressBound` grammar. At 4 MiB the small-input term is zero,
+/// leaving `input + input / 256`. Keeping this a frozen constant removes an FFI
+/// call from every compressed exact-render header admission; a test pins it to
+/// the linked zstd implementation.
+pub const MAX_EXACT_RENDER_DELIVERY_ZSTD_ENCODED_BYTES: usize =
+    MAX_EXACT_RENDER_DELIVERY_DECOMPRESSED_BYTES
+        + (MAX_EXACT_RENDER_DELIVERY_DECOMPRESSED_BYTES >> 8);
+/// Smallest reply envelope a receiver may advertise. Exact delivery must
+/// always leave room for every zero-content terminal outcome, including a
+/// typed `LimitsExceeded` response; permitting a one-byte envelope would make
+/// the failure protocol itself impossible to encode.
+pub const MIN_EXACT_RENDER_DELIVERY_DECOMPRESSED_BYTES: u64 = 4 * 1024;
+pub const MAX_EXACT_RENDER_DELIVERY_TEXT_BYTES: usize = 2 * 1024 * 1024;
+/// Per-row UTF-8 ceiling. This remains at or below the bounded varbincode
+/// item ceiling; its zero-wire newtype marker selects this raw allocation cap
+/// before the bounded decoder materializes the byte buffer.
+pub const MAX_EXACT_RENDER_ROW_TEXT_BYTES: usize =
+    bounded_varbincode::EXACT_RENDER_ROW_UTF8_V1_MAX_BYTES;
+pub const MAX_EXACT_RENDER_DELIVERY_ROWS: usize = 16_384;
+pub const MAX_EXACT_RENDER_DELIVERY_PATCHES: usize = 4_096;
+const MAX_EXACT_RENDER_DELIVERY_DECOMPRESSED_BYTES_U64: u64 = 4 * 1024 * 1024;
+const MAX_EXACT_RENDER_DELIVERY_TEXT_BYTES_U64: u64 = 2 * 1024 * 1024;
+const MAX_EXACT_RENDER_DELIVERY_ROWS_U64: u64 = 16_384;
+const MAX_EXACT_RENDER_DELIVERY_PATCHES_U64: u64 = 4_096;
+pub const MAX_EXACT_RENDER_SNAPSHOT_TEXT_BYTES: u64 = 1024 * 1024 * 1024;
+pub const MAX_EXACT_RENDER_SNAPSHOT_ROWS: u64 = 10_000_000;
+pub const MAX_EXACT_RENDER_SNAPSHOT_CHUNKS: u64 = 4_096;
+pub const MAX_EXACT_RENDER_BATCH_MEMBERS: u64 = 4_096;
+pub const MAX_EXACT_RENDER_BATCH_DECOMPRESSED_BYTES: u64 = 64 * 1024 * 1024;
+pub const MAX_EXACT_RENDER_BATCH_TEXT_BYTES: u64 = 64 * 1024 * 1024;
+pub const MAX_EXACT_RENDER_BATCH_ROWS: u64 = 262_144;
+/// Per-coordinator retained immutable-snapshot ceilings. These are independent
+/// of the much smaller bytes/rows physically present in a batch of manifest or
+/// chunk responses: every distinct manifest reserves its complete backing
+/// snapshot exactly once.
+pub const MAX_EXACT_RENDER_BACKING_DISTINCT_SNAPSHOTS: u64 =
+    MAX_EXACT_RENDER_BATCH_MEMBERS;
+pub const MAX_EXACT_RENDER_BACKING_TEXT_BYTES: u64 =
+    MAX_EXACT_RENDER_SNAPSHOT_TEXT_BYTES;
+pub const MAX_EXACT_RENDER_BACKING_ROWS: u64 = MAX_EXACT_RENDER_SNAPSHOT_ROWS;
+pub const MAX_EXACT_RENDER_BACKING_CHUNKS: u64 = MAX_EXACT_RENDER_SNAPSHOT_CHUNKS;
+pub const MAX_EXACT_RENDER_PROJECTION_TITLE_BYTES: usize =
+    bounded_varbincode::EXACT_RENDER_METADATA_UTF8_V1_MAX_BYTES;
+pub const MAX_EXACT_RENDER_PROJECTION_WORKING_DIR_BYTES: usize =
+    bounded_varbincode::EXACT_RENDER_METADATA_UTF8_V1_MAX_BYTES;
+const MAX_EXACT_RENDER_PROJECTION_TITLE_BYTES_U64: u64 = 64 * 1024;
+const MAX_EXACT_RENDER_PROJECTION_WORKING_DIR_BYTES_U64: u64 = 64 * 1024;
+pub const MAX_EXACT_RENDER_PROJECTION_VIEWPORT_CELLS: u64 = 4 * 1024 * 1024;
+
+const EXACT_RENDER_DELTA_DIGEST_DOMAIN_V1: &[u8] =
+    b"frankenterm.exact-render-delta.v1\0";
+const EXACT_RENDER_SNAPSHOT_DIGEST_DOMAIN_V1: &[u8] =
+    b"frankenterm.exact-render-snapshot.v1\0";
+const EXACT_RENDER_SNAPSHOT_MANIFEST_DIGEST_DOMAIN_V1: &[u8] =
+    b"frankenterm.exact-render-snapshot-manifest.v1\0";
+const EXACT_RENDER_SNAPSHOT_CHUNK_DIGEST_DOMAIN_V1: &[u8] =
+    b"frankenterm.exact-render-snapshot-chunk.v1\0";
+/// Domain-separated canonical digest grammar for one complete exact-render
+/// request body. This binds retry identity to intent without conflating the
+/// independently useful request sequence with its contents.
+pub const EXACT_RENDER_REQUEST_DIGEST_DOMAIN_V1: &[u8] =
+    b"frankenterm.exact-render-request.v1\0";
+
+macro_rules! exact_render_nonzero_wire_id {
+    ($name:ident, $field:literal) => {
+        #[derive(
+            Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize,
+        )]
+        pub struct $name(u64);
+
+        impl $name {
+            pub fn try_new(value: u64) -> Result<Self, ExactRenderDeliveryProtocolError> {
+                let identity = Self(value);
+                identity.validate()?;
+                Ok(identity)
+            }
+
+            #[must_use]
+            pub const fn get(self) -> u64 {
+                self.0
+            }
+
+            pub fn checked_next(self) -> Result<Self, ExactRenderDeliveryProtocolError> {
+                self.validate()?;
+                self.0.checked_add(1).map(Self).ok_or(
+                    ExactRenderDeliveryProtocolError::AuthorityExhausted { field: $field },
+                )
+            }
+
+            fn validate(self) -> Result<(), ExactRenderDeliveryProtocolError> {
+                if self.0 == 0 {
+                    return Err(ExactRenderDeliveryProtocolError::ReservedNumericIdentity {
+                        field: $field,
+                        value: self.0,
+                    });
+                }
+                Ok(())
+            }
+        }
+    };
+}
+
+exact_render_nonzero_wire_id!(ExactRenderPaneGeneration, "pane_generation");
+exact_render_nonzero_wire_id!(ExactRenderDeliveryGeneration, "delivery_generation");
+exact_render_nonzero_wire_id!(ExactRenderDeliverySequence, "delivery_sequence");
+exact_render_nonzero_wire_id!(ExactRenderRequestSequence, "request_sequence");
+
+/// Architecture-independent exact-delivery pane identity. Pane zero is valid:
+/// the mux allocator starts at zero, so absence must be represented by an
+/// enclosing enum/option rather than a numeric sentinel.
+#[derive(
+    Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize,
+)]
+pub struct ExactRenderPaneId(u64);
+
+impl ExactRenderPaneId {
+    #[must_use]
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    pub fn try_from_mux(pane_id: PaneId) -> Result<Self, ExactRenderDeliveryProtocolError> {
+        let pane_id = u64::try_from(pane_id)
+            .map_err(|_| ExactRenderDeliveryProtocolError::PaneIdOutOfRange)?;
+        Ok(Self(pane_id))
+    }
+
+    pub fn try_into_mux(self) -> Result<PaneId, ExactRenderDeliveryProtocolError> {
+        PaneId::try_from(self.0)
+            .map_err(|_| ExactRenderDeliveryProtocolError::PaneIdOutOfRange)
+    }
+
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+/// Explicit delivery baseline. Terminal mutation sequence is deliberately not
+/// part of this identity and cannot establish continuity.
+#[derive(
+    Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize,
+)]
+pub struct ExactRenderDeliveryCursor {
+    pub pane_generation: ExactRenderPaneGeneration,
+    pub delivery_generation: ExactRenderDeliveryGeneration,
+    pub sequence: ExactRenderDeliverySequence,
+}
+
+impl ExactRenderDeliveryCursor {
+    pub fn validate(self) -> Result<(), ExactRenderDeliveryProtocolError> {
+        self.pane_generation.validate()?;
+        self.delivery_generation.validate()?;
+        self.sequence.validate()
+    }
+
+    pub fn checked_next(self) -> Result<Self, ExactRenderDeliveryProtocolError> {
+        self.validate()?;
+        Ok(Self {
+            sequence: self.sequence.checked_next()?,
+            ..self
+        })
+    }
+}
+
+/// Client state before applying the response to this request.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+pub enum ExactRenderAppliedBaseline {
+    Uninitialized,
+    Applied(ExactRenderDeliveryCursor),
+}
+
+impl ExactRenderAppliedBaseline {
+    fn validate(self) -> Result<(), ExactRenderDeliveryProtocolError> {
+        if let Self::Applied(cursor) = self {
+            cursor.validate()?;
+        }
+        Ok(())
+    }
+}
+
+/// SHA-256 identity of one exact delivery unit or immutable snapshot.
+#[derive(
+    Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize,
+)]
+pub struct ExactRenderDigest([u8; 32]);
+
+impl ExactRenderDigest {
+    pub const ZERO: Self = Self([0; 32]);
+
+    #[must_use]
+    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    #[must_use]
+    pub const fn as_bytes(self) -> [u8; 32] {
+        self.0
+    }
+
+    fn validate(self, field: &'static str) -> Result<(), ExactRenderDeliveryProtocolError> {
+        if self == Self::ZERO {
+            return Err(ExactRenderDeliveryProtocolError::ReservedDigest { field });
+        }
+        Ok(())
+    }
+}
+
+fn validate_exact_render_connection_identity(
+    identity: RenderConnectionIdentity,
+) -> Result<(), ExactRenderDeliveryProtocolError> {
+    if identity.stream_id.as_bytes() == [0; 16]
+        || identity.session_incarnation.as_bytes() == [0; 16]
+    {
+        return Err(ExactRenderDeliveryProtocolError::ReservedConnectionIdentity);
+    }
+    Ok(())
+}
+
+/// Stable retry identity for one client request inside one connection.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+pub struct ExactRenderDeliveryRequestIdentity {
+    pub connection_identity: RenderConnectionIdentity,
+    pub pane_id: ExactRenderPaneId,
+    pub request_sequence: ExactRenderRequestSequence,
+}
+
+impl ExactRenderDeliveryRequestIdentity {
+    pub fn validate(self) -> Result<(), ExactRenderDeliveryProtocolError> {
+        validate_exact_render_connection_identity(self.connection_identity)?;
+        self.pane_id.try_into_mux()?;
+        self.request_sequence.validate()
+    }
+}
+
+/// Exact result token retained until an application/persistence settlement.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+pub struct ExactRenderDeliveryToken {
+    pub connection_identity: RenderConnectionIdentity,
+    pub pane_id: ExactRenderPaneId,
+    pub resulting_baseline: ExactRenderDeliveryCursor,
+    pub content_digest: ExactRenderDigest,
+}
+
+impl ExactRenderDeliveryToken {
+    pub fn validate(self) -> Result<(), ExactRenderDeliveryProtocolError> {
+        validate_exact_render_connection_identity(self.connection_identity)?;
+        self.pane_id.try_into_mux()?;
+        self.resulting_baseline.validate()?;
+        self.content_digest.validate("content_digest")
+    }
+}
+
+/// Per-request receive limits. These values are authority, not hints: a server
+/// must return `LimitsExceeded` instead of constructing a larger reply.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ExactRenderReceiverCaps {
+    pub max_decompressed_bytes: u64,
+    pub max_text_bytes: u64,
+    pub max_rows: u64,
+    /// Complete retained snapshot text, including row bytes plus title and
+    /// working-directory projection metadata.
+    pub max_snapshot_text_bytes: u64,
+    pub max_snapshot_rows: u64,
+    pub max_snapshot_chunks: u64,
+}
+
+impl ExactRenderReceiverCaps {
+    #[must_use]
+    pub const fn protocol_maximum() -> Self {
+        Self {
+            max_decompressed_bytes: MAX_EXACT_RENDER_DELIVERY_DECOMPRESSED_BYTES_U64,
+            max_text_bytes: MAX_EXACT_RENDER_DELIVERY_TEXT_BYTES_U64,
+            max_rows: MAX_EXACT_RENDER_DELIVERY_ROWS_U64,
+            max_snapshot_text_bytes: MAX_EXACT_RENDER_SNAPSHOT_TEXT_BYTES,
+            max_snapshot_rows: MAX_EXACT_RENDER_SNAPSHOT_ROWS,
+            max_snapshot_chunks: MAX_EXACT_RENDER_SNAPSHOT_CHUNKS,
+        }
+    }
+
+    pub fn validate(self) -> Result<(), ExactRenderDeliveryProtocolError> {
+        validate_exact_render_cap_with_minimum(
+            "max_decompressed_bytes",
+            self.max_decompressed_bytes,
+            MIN_EXACT_RENDER_DELIVERY_DECOMPRESSED_BYTES,
+            MAX_EXACT_RENDER_DELIVERY_DECOMPRESSED_BYTES_U64,
+        )?;
+        validate_exact_render_cap(
+            "max_text_bytes",
+            self.max_text_bytes,
+            MAX_EXACT_RENDER_DELIVERY_TEXT_BYTES_U64,
+        )?;
+        validate_exact_render_cap(
+            "max_rows",
+            self.max_rows,
+            MAX_EXACT_RENDER_DELIVERY_ROWS_U64,
+        )?;
+        validate_exact_render_cap(
+            "max_snapshot_text_bytes",
+            self.max_snapshot_text_bytes,
+            MAX_EXACT_RENDER_SNAPSHOT_TEXT_BYTES,
+        )?;
+        validate_exact_render_cap(
+            "max_snapshot_rows",
+            self.max_snapshot_rows,
+            MAX_EXACT_RENDER_SNAPSHOT_ROWS,
+        )?;
+        validate_exact_render_cap(
+            "max_snapshot_chunks",
+            self.max_snapshot_chunks,
+            MAX_EXACT_RENDER_SNAPSHOT_CHUNKS,
+        )?;
+        if self.max_text_bytes > self.max_decompressed_bytes {
+            return Err(ExactRenderDeliveryProtocolError::InconsistentReceiverCaps {
+                smaller: "max_decompressed_bytes",
+                smaller_value: self.max_decompressed_bytes,
+                larger: "max_text_bytes",
+                larger_value: self.max_text_bytes,
+            });
+        }
+        if self.max_snapshot_chunks > self.max_snapshot_rows {
+            return Err(ExactRenderDeliveryProtocolError::InconsistentReceiverCaps {
+                smaller: "max_snapshot_rows",
+                smaller_value: self.max_snapshot_rows,
+                larger: "max_snapshot_chunks",
+                larger_value: self.max_snapshot_chunks,
+            });
+        }
+        Ok(())
+    }
+}
+
+fn validate_exact_render_cap(
+    resource: &'static str,
+    requested: u64,
+    protocol_maximum: u64,
+) -> Result<(), ExactRenderDeliveryProtocolError> {
+    validate_exact_render_cap_with_minimum(resource, requested, 1, protocol_maximum)
+}
+
+fn validate_exact_render_cap_with_minimum(
+    resource: &'static str,
+    requested: u64,
+    protocol_minimum: u64,
+    protocol_maximum: u64,
+) -> Result<(), ExactRenderDeliveryProtocolError> {
+    if requested < protocol_minimum || requested > protocol_maximum {
+        return Err(ExactRenderDeliveryProtocolError::InvalidReceiverCap {
+            resource,
+            requested,
+            protocol_minimum,
+            protocol_maximum,
+        });
+    }
+    Ok(())
+}
+
+/// UTF-8 wire bytes with a schema-specific preallocation ceiling. Encoding as
+/// a bounded byte sequence keeps hostile length prefixes from reaching the
+/// global varbincode String allocation cap before exact-delivery validation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExactRenderUtf8V1<const MAX: usize>(Vec<u8>);
+
+impl<const MAX: usize> ExactRenderUtf8V1<MAX> {
+    pub fn try_from_string(value: String) -> Result<Self, ExactRenderDeliveryProtocolError> {
+        if value.len() > MAX {
+            return Err(ExactRenderDeliveryProtocolError::ResourceLimitExceeded {
+                resource: "exact_render_utf8_bytes",
+                requested: u64::try_from(value.len()).unwrap_or(u64::MAX),
+                limit: u64::try_from(MAX).unwrap_or(u64::MAX),
+            });
+        }
+        Ok(Self(value.into_bytes()))
+    }
+
+    pub fn try_from_str(value: &str) -> Result<Self, ExactRenderDeliveryProtocolError> {
+        if value.len() > MAX {
+            return Err(ExactRenderDeliveryProtocolError::ResourceLimitExceeded {
+                resource: "exact_render_utf8_bytes",
+                requested: u64::try_from(value.len()).unwrap_or(u64::MAX),
+                limit: u64::try_from(MAX).unwrap_or(u64::MAX),
+            });
+        }
+        Ok(Self(value.as_bytes().to_vec()))
+    }
+
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+fn exact_render_utf8_wire_schema<const MAX: usize>() -> Option<(&'static str, &'static str)> {
+    if MAX == MAX_EXACT_RENDER_ROW_TEXT_BYTES {
+        Some((
+            bounded_varbincode::EXACT_RENDER_ROW_UTF8_V1_NEWTYPE,
+            "exact render row UTF-8 bytes",
+        ))
+    } else if MAX == MAX_EXACT_RENDER_PROJECTION_TITLE_BYTES {
+        Some((
+            bounded_varbincode::EXACT_RENDER_METADATA_UTF8_V1_NEWTYPE,
+            "exact render metadata UTF-8 bytes",
+        ))
+    } else {
+        None
+    }
+}
+
+struct ExactRenderUtf8WireBytes<'a>(&'a [u8]);
+
+impl Serialize for ExactRenderUtf8WireBytes<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_bytes(self.0)
+    }
+}
+
+struct ExactRenderUtf8BytesVisitor<const MAX: usize> {
+    label: &'static str,
+}
+
+impl<'de, const MAX: usize> serde::de::Visitor<'de> for ExactRenderUtf8BytesVisitor<MAX> {
+    type Value = Vec<u8>;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "at most {MAX} bytes of valid UTF-8")
+    }
+
+    fn visit_bytes<E>(self, value: &[u8]) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        if value.len() > MAX {
+            return Err(E::custom(format_args!(
+                "{} length {} exceeds maximum {MAX}",
+                self.label,
+                value.len(),
+            )));
+        }
+        std::str::from_utf8(value).map_err(E::custom)?;
+        Ok(value.to_vec())
+    }
+
+    fn visit_borrowed_bytes<E>(self, value: &'de [u8]) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        self.visit_bytes(value)
+    }
+
+    fn visit_byte_buf<E>(self, value: Vec<u8>) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        if value.len() > MAX {
+            return Err(E::custom(format_args!(
+                "{} length {} exceeds maximum {MAX}",
+                self.label,
+                value.len(),
+            )));
+        }
+        std::str::from_utf8(&value).map_err(E::custom)?;
+        Ok(value)
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: serde::de::SeqAccess<'de>,
+    {
+        let hinted = sequence.size_hint().unwrap_or(0);
+        if hinted > MAX {
+            return Err(serde::de::Error::custom(format_args!(
+                "{} length {hinted} exceeds maximum {MAX}",
+                self.label,
+            )));
+        }
+        let mut value = Vec::<u8>::new();
+        value.try_reserve(hinted).map_err(|error| {
+            serde::de::Error::custom(format_args!(
+                "allocating {} length {hinted} failed: {error}",
+                self.label,
+            ))
+        })?;
+        while let Some(byte) = sequence.next_element()? {
+            if value.len() == MAX {
+                return Err(serde::de::Error::custom(format_args!(
+                    "{} length exceeds maximum {MAX}",
+                    self.label,
+                )));
+            }
+            value.push(byte);
+        }
+        std::str::from_utf8(&value).map_err(serde::de::Error::custom)?;
+        Ok(value)
+    }
+}
+
+struct ExactRenderUtf8NewtypeVisitor<const MAX: usize> {
+    label: &'static str,
+}
+
+impl<'de, const MAX: usize> serde::de::Visitor<'de> for ExactRenderUtf8NewtypeVisitor<MAX> {
+    type Value = Vec<u8>;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a bounded exact-render UTF-8 newtype")
+    }
+
+    fn visit_newtype_struct<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_byte_buf(ExactRenderUtf8BytesVisitor::<MAX> {
+            label: self.label,
+        })
+    }
+}
+
+impl<const MAX: usize> Serialize for ExactRenderUtf8V1<MAX> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let Some((newtype_name, _)) = exact_render_utf8_wire_schema::<MAX>() else {
+            return Err(serde::ser::Error::custom(format_args!(
+                "unsupported exact render UTF-8 schema maximum {MAX}",
+            )));
+        };
+        serializer.serialize_newtype_struct(
+            newtype_name,
+            &ExactRenderUtf8WireBytes(self.as_bytes()),
+        )
+    }
+}
+
+impl<'de, const MAX: usize> Deserialize<'de> for ExactRenderUtf8V1<MAX> {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let Some((newtype_name, label)) = exact_render_utf8_wire_schema::<MAX>() else {
+            return Err(serde::de::Error::custom(format_args!(
+                "unsupported exact render UTF-8 schema maximum {MAX}",
+            )));
+        };
+        deserializer
+            .deserialize_newtype_struct(
+                newtype_name,
+                ExactRenderUtf8NewtypeVisitor::<MAX> { label },
+            )
+            .map(Self)
+    }
+}
+
+pub type ExactRenderRowTextV1 =
+    ExactRenderUtf8V1<MAX_EXACT_RENDER_ROW_TEXT_BYTES>;
+pub type ExactRenderTitleV1 =
+    ExactRenderUtf8V1<MAX_EXACT_RENDER_PROJECTION_TITLE_BYTES>;
+pub type ExactRenderWorkingDirectoryV1 =
+    ExactRenderUtf8V1<MAX_EXACT_RENDER_PROJECTION_WORKING_DIR_BYTES>;
+
+/// Canonical physical-row projection. `wrapped=true` means the following row
+/// is part of the same logical line; consumers must not synthesize a newline.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ExactRenderRowV1 {
+    pub stable_row: i64,
+    pub text: ExactRenderRowTextV1,
+    pub wrapped: bool,
+}
+
+/// Architecture-independent wire counterpart of [`StableCursorPosition`].
+/// The mux-native type uses `usize`/`isize`; freezing those widths directly
+/// into a new exact-delivery digest would make otherwise identical 32- and
+/// 64-bit peers compute different authority.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum ExactRenderCursorShapeV1 {
+    Default,
+    BlinkingBlock,
+    SteadyBlock,
+    BlinkingUnderline,
+    SteadyUnderline,
+    BlinkingBar,
+    SteadyBar,
+}
+
+impl ExactRenderCursorShapeV1 {
+    const fn digest_tag(self) -> u8 {
+        match self {
+            Self::Default => 0,
+            Self::BlinkingBlock => 1,
+            Self::SteadyBlock => 2,
+            Self::BlinkingUnderline => 3,
+            Self::SteadyUnderline => 4,
+            Self::BlinkingBar => 5,
+            Self::SteadyBar => 6,
+        }
+    }
+}
+
+impl From<termwiz::surface::CursorShape> for ExactRenderCursorShapeV1 {
+    fn from(shape: termwiz::surface::CursorShape) -> Self {
+        match shape {
+            termwiz::surface::CursorShape::Default => Self::Default,
+            termwiz::surface::CursorShape::BlinkingBlock => Self::BlinkingBlock,
+            termwiz::surface::CursorShape::SteadyBlock => Self::SteadyBlock,
+            termwiz::surface::CursorShape::BlinkingUnderline => Self::BlinkingUnderline,
+            termwiz::surface::CursorShape::SteadyUnderline => Self::SteadyUnderline,
+            termwiz::surface::CursorShape::BlinkingBar => Self::BlinkingBar,
+            termwiz::surface::CursorShape::SteadyBar => Self::SteadyBar,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum ExactRenderCursorVisibilityV1 {
+    Hidden,
+    Visible,
+}
+
+impl ExactRenderCursorVisibilityV1 {
+    const fn digest_tag(self) -> u8 {
+        match self {
+            Self::Hidden => 0,
+            Self::Visible => 1,
+        }
+    }
+}
+
+impl From<termwiz::surface::CursorVisibility> for ExactRenderCursorVisibilityV1 {
+    fn from(visibility: termwiz::surface::CursorVisibility) -> Self {
+        match visibility {
+            termwiz::surface::CursorVisibility::Hidden => Self::Hidden,
+            termwiz::surface::CursorVisibility::Visible => Self::Visible,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ExactRenderCursorPositionV1 {
+    pub x: u64,
+    pub y: i64,
+    pub shape: ExactRenderCursorShapeV1,
+    pub visibility: ExactRenderCursorVisibilityV1,
+}
+
+impl ExactRenderCursorPositionV1 {
+    pub fn try_from_stable(
+        cursor: StableCursorPosition,
+    ) -> Result<Self, ExactRenderDeliveryProtocolError> {
+        Ok(Self {
+            x: u64::try_from(cursor.x).map_err(|_| {
+                ExactRenderDeliveryProtocolError::ArithmeticOverflow {
+                    field: "projection_cursor_x",
+                }
+            })?,
+            y: i64::try_from(cursor.y).map_err(|_| {
+                ExactRenderDeliveryProtocolError::ArithmeticOverflow {
+                    field: "projection_cursor_y",
+                }
+            })?,
+            shape: cursor.shape.into(),
+            visibility: cursor.visibility.into(),
+        })
+    }
+}
+
+/// Architecture-independent wire counterpart of [`RenderableDimensions`].
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ExactRenderDimensionsV1 {
+    pub cols: u64,
+    pub viewport_rows: u64,
+    pub scrollback_rows: u64,
+    pub physical_top: i64,
+    pub scrollback_top: i64,
+    pub dpi: u32,
+    pub pixel_width: u64,
+    pub pixel_height: u64,
+    pub reverse_video: bool,
+}
+
+impl ExactRenderDimensionsV1 {
+    pub fn try_from_renderable(
+        dimensions: RenderableDimensions,
+    ) -> Result<Self, ExactRenderDeliveryProtocolError> {
+        Ok(Self {
+            cols: u64::try_from(dimensions.cols).map_err(|_| {
+                ExactRenderDeliveryProtocolError::ArithmeticOverflow {
+                    field: "projection_cols",
+                }
+            })?,
+            viewport_rows: u64::try_from(dimensions.viewport_rows).map_err(|_| {
+                ExactRenderDeliveryProtocolError::ArithmeticOverflow {
+                    field: "projection_viewport_rows",
+                }
+            })?,
+            scrollback_rows: u64::try_from(dimensions.scrollback_rows).map_err(|_| {
+                ExactRenderDeliveryProtocolError::ArithmeticOverflow {
+                    field: "projection_scrollback_rows",
+                }
+            })?,
+            physical_top: i64::try_from(dimensions.physical_top).map_err(|_| {
+                ExactRenderDeliveryProtocolError::ArithmeticOverflow {
+                    field: "projection_physical_top",
+                }
+            })?,
+            scrollback_top: i64::try_from(dimensions.scrollback_top).map_err(|_| {
+                ExactRenderDeliveryProtocolError::ArithmeticOverflow {
+                    field: "projection_scrollback_top",
+                }
+            })?,
+            dpi: dimensions.dpi,
+            pixel_width: u64::try_from(dimensions.pixel_width).map_err(|_| {
+                ExactRenderDeliveryProtocolError::ArithmeticOverflow {
+                    field: "projection_pixel_width",
+                }
+            })?,
+            pixel_height: u64::try_from(dimensions.pixel_height).map_err(|_| {
+                ExactRenderDeliveryProtocolError::ArithmeticOverflow {
+                    field: "projection_pixel_height",
+                }
+            })?,
+            reverse_video: dimensions.reverse_video,
+        })
+    }
+}
+
+/// Complete persisted-text projection metadata bound to a delta or immutable
+/// full snapshot. These fields are part of the content digest so resize,
+/// reflow, scrollback, cursor, mouse-capture, title, working-directory, DPI and
+/// reverse-video changes converge even when the row text itself is unchanged.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ExactRenderProjectionV1 {
+    pub first_stable_row: i64,
+    pub row_count: u64,
+    pub alt_screen_active: bool,
+    pub mouse_grabbed: bool,
+    pub cursor_position: ExactRenderCursorPositionV1,
+    pub dimensions: ExactRenderDimensionsV1,
+    pub title: ExactRenderTitleV1,
+    /// Canonical working-directory URL bytes. Keeping the wire value as UTF-8
+    /// avoids architecture- or parser-version-dependent URL normalization.
+    pub working_dir: Option<ExactRenderWorkingDirectoryV1>,
+}
+
+impl ExactRenderProjectionV1 {
+    fn validate(&self) -> Result<(), ExactRenderDeliveryProtocolError> {
+        if self.row_count > MAX_EXACT_RENDER_SNAPSHOT_ROWS {
+            return Err(ExactRenderDeliveryProtocolError::ResourceLimitExceeded {
+                resource: "projection_rows",
+                requested: self.row_count,
+                limit: MAX_EXACT_RENDER_SNAPSHOT_ROWS,
+            });
+        }
+        checked_stable_row_offset(self.first_stable_row, self.row_count, "projection_end")?;
+
+        let dimensions = self.dimensions;
+        let viewport_end = dimensions
+            .physical_top
+            .checked_add(i64::try_from(dimensions.viewport_rows).map_err(|_| {
+                ExactRenderDeliveryProtocolError::ArithmeticOverflow {
+                    field: "projection_viewport_end",
+                }
+            })?)
+            .ok_or(ExactRenderDeliveryProtocolError::ArithmeticOverflow {
+                field: "projection_viewport_end",
+            })?;
+        let history_rows = dimensions.physical_top.checked_sub(dimensions.scrollback_top).ok_or(
+            ExactRenderDeliveryProtocolError::ArithmeticOverflow {
+                field: "projection_history_rows",
+            },
+        )?;
+        let viewport_cells = dimensions.cols.checked_mul(dimensions.viewport_rows).ok_or(
+            ExactRenderDeliveryProtocolError::ArithmeticOverflow {
+                field: "projection_viewport_cells",
+            },
+        )?;
+        if dimensions.cols == 0
+            || dimensions.viewport_rows == 0
+            || viewport_cells > MAX_EXACT_RENDER_PROJECTION_VIEWPORT_CELLS
+            || dimensions.scrollback_rows != self.row_count
+            || dimensions.scrollback_top != self.first_stable_row
+            || dimensions.scrollback_rows < dimensions.viewport_rows
+            || history_rows < 0
+            || u64::try_from(history_rows)
+                .ok()
+                .and_then(|history| history.checked_add(dimensions.viewport_rows))
+                != Some(dimensions.scrollback_rows)
+            || self.cursor_position.x > dimensions.cols
+            || self.cursor_position.y < dimensions.physical_top
+            || self.cursor_position.y >= viewport_end
+        {
+            return Err(ExactRenderDeliveryProtocolError::ProjectionMetadataInvalid);
+        }
+
+        let title_bytes = u64::try_from(self.title.len()).map_err(|_| {
+            ExactRenderDeliveryProtocolError::ArithmeticOverflow {
+                field: "projection_title_bytes",
+            }
+        })?;
+        if title_bytes > MAX_EXACT_RENDER_PROJECTION_TITLE_BYTES_U64 {
+            return Err(ExactRenderDeliveryProtocolError::ResourceLimitExceeded {
+                resource: "projection_title_bytes",
+                requested: title_bytes,
+                limit: MAX_EXACT_RENDER_PROJECTION_TITLE_BYTES_U64,
+            });
+        }
+        if let Some(working_dir) = &self.working_dir {
+            let working_dir_bytes = u64::try_from(working_dir.len()).map_err(|_| {
+                ExactRenderDeliveryProtocolError::ArithmeticOverflow {
+                    field: "projection_working_dir_bytes",
+                }
+            })?;
+            if working_dir.is_empty() {
+                return Err(ExactRenderDeliveryProtocolError::ProjectionMetadataInvalid);
+            }
+            if working_dir_bytes > MAX_EXACT_RENDER_PROJECTION_WORKING_DIR_BYTES_U64 {
+                return Err(ExactRenderDeliveryProtocolError::ResourceLimitExceeded {
+                    resource: "projection_working_dir_bytes",
+                    requested: working_dir_bytes,
+                    limit: MAX_EXACT_RENDER_PROJECTION_WORKING_DIR_BYTES_U64,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn text_bytes(&self) -> Result<u64, ExactRenderDeliveryProtocolError> {
+        let title_bytes = u64::try_from(self.title.len()).map_err(|_| {
+            ExactRenderDeliveryProtocolError::ArithmeticOverflow {
+                field: "projection_title_bytes",
+            }
+        })?;
+        let working_dir_bytes = match &self.working_dir {
+            Some(working_dir) => u64::try_from(working_dir.len()).map_err(|_| {
+                ExactRenderDeliveryProtocolError::ArithmeticOverflow {
+                    field: "projection_working_dir_bytes",
+                }
+            })?,
+            None => 0,
+        };
+        title_bytes.checked_add(working_dir_bytes).ok_or(
+            ExactRenderDeliveryProtocolError::ArithmeticOverflow {
+                field: "projection_text_bytes",
+            },
+        )
+    }
+}
+
+fn checked_stable_row_offset(
+    first: i64,
+    offset: u64,
+    field: &'static str,
+) -> Result<i64, ExactRenderDeliveryProtocolError> {
+    let offset = i64::try_from(offset)
+        .map_err(|_| ExactRenderDeliveryProtocolError::ArithmeticOverflow { field })?;
+    first
+        .checked_add(offset)
+        .ok_or(ExactRenderDeliveryProtocolError::ArithmeticOverflow { field })
+}
+
+/// Resources physically represented by one response on the wire. Full
+/// immutable-snapshot retention is intentionally accounted by
+/// [`ExactRenderBackingReservationUsage`] instead.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ExactRenderDeliveryResourceUsage {
+    pub decompressed_bytes: u64,
+    pub text_bytes: u64,
+    pub rows: u64,
+}
+
+fn exact_render_rows_usage(
+    rows: &[ExactRenderRowV1],
+) -> Result<ExactRenderDeliveryResourceUsage, ExactRenderDeliveryProtocolError> {
+    let mut usage = ExactRenderDeliveryResourceUsage {
+        rows: u64::try_from(rows.len()).map_err(|_| {
+            ExactRenderDeliveryProtocolError::ArithmeticOverflow { field: "row_count" }
+        })?,
+        ..ExactRenderDeliveryResourceUsage::default()
+    };
+    for row in rows {
+        accumulate_exact_render_row_usage(&mut usage, row)?;
+    }
+    Ok(usage)
+}
+
+fn accumulate_exact_render_row_usage(
+    usage: &mut ExactRenderDeliveryResourceUsage,
+    row: &ExactRenderRowV1,
+) -> Result<(), ExactRenderDeliveryProtocolError> {
+    usage.text_bytes = usage
+        .text_bytes
+        .checked_add(u64::try_from(row.text.len()).map_err(|_| {
+            ExactRenderDeliveryProtocolError::ArithmeticOverflow {
+                field: "row_text_bytes",
+            }
+        })?)
+        .ok_or(ExactRenderDeliveryProtocolError::ArithmeticOverflow {
+            field: "row_text_bytes",
+        })?;
+    Ok(())
+}
+
+fn accumulate_and_hash_exact_render_row(
+    usage: &mut ExactRenderDeliveryResourceUsage,
+    hasher: &mut Sha256,
+    row: &ExactRenderRowV1,
+) -> Result<(), ExactRenderDeliveryProtocolError> {
+    let text_bytes = u64::try_from(row.text.len()).map_err(|_| {
+        ExactRenderDeliveryProtocolError::ArithmeticOverflow {
+            field: "row_text_bytes",
+        }
+    })?;
+    usage.text_bytes = usage.text_bytes.checked_add(text_bytes).ok_or(
+        ExactRenderDeliveryProtocolError::ArithmeticOverflow {
+            field: "row_text_bytes",
+        },
+    )?;
+    hasher.update(row.stable_row.to_be_bytes());
+    hasher.update([u8::from(row.wrapped)]);
+    hasher.update(text_bytes.to_be_bytes());
+    hasher.update(row.text.as_bytes());
+    Ok(())
+}
+
+fn serialize_exact_render_rows<S>(
+    values: &[ExactRenderRowV1],
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    serialize_bounded_vec::<S, _, MAX_EXACT_RENDER_DELIVERY_ROWS>(
+        values,
+        serializer,
+        "exact render rows",
+    )
+}
+
+fn deserialize_exact_render_rows<'de, D>(
+    deserializer: D,
+) -> Result<Vec<ExactRenderRowV1>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserialize_bounded_vec::<D, _, MAX_EXACT_RENDER_DELIVERY_ROWS>(
+        deserializer,
+        "exact render rows",
+    )
+}
+
+/// Requested delivery policy. Force-full is an explicit operation and cannot
+/// be satisfied by a delta, even when the server retains a usable baseline.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum ExactRenderDeliveryMode {
+    Incremental,
+    ForceFull,
+}
+
+impl ExactRenderDeliveryMode {
+    const fn digest_tag(self) -> u8 {
+        match self {
+            Self::Incremental => 0,
+            Self::ForceFull => 1,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum ExactRenderDeliveryNackReason {
+    BaseMismatch,
+    GenerationMismatch,
+    SnapshotCorrupt,
+    BoundedResourceRejected,
+    PersistenceFailure,
+}
+
+impl ExactRenderDeliveryNackReason {
+    const fn digest_tag(self) -> u8 {
+        match self {
+            Self::BaseMismatch => 0,
+            Self::GenerationMismatch => 1,
+            Self::SnapshotCorrupt => 2,
+            Self::BoundedResourceRejected => 3,
+            Self::PersistenceFailure => 4,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum ExactRenderDeliverySettlementOutcome {
+    Applied,
+    Nack {
+        reason: ExactRenderDeliveryNackReason,
+        observed_baseline: ExactRenderAppliedBaseline,
+    },
+}
+
+/// Settlement of a prior exact result. An ACK is valid only after complete
+/// application/persistence and advances to the token's resulting baseline.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ExactRenderDeliverySettlement {
+    pub delivery: ExactRenderDeliveryToken,
+    pub outcome: ExactRenderDeliverySettlementOutcome,
+}
+
+impl ExactRenderDeliverySettlement {
+    fn validate(self) -> Result<(), ExactRenderDeliveryProtocolError> {
+        self.delivery.validate()?;
+        if let ExactRenderDeliverySettlementOutcome::Nack {
+            observed_baseline,
+            ..
+        } = self.outcome
+        {
+            observed_baseline.validate()?;
+        }
+        Ok(())
+    }
+}
+
+/// Cursor for the next immutable full-snapshot chunk.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ExactRenderSnapshotContinuationV1 {
+    pub snapshot: ExactRenderDeliveryToken,
+    pub manifest_digest: ExactRenderDigest,
+    pub source_version: u64,
+    pub next_chunk_ordinal: u64,
+    pub next_row_ordinal: u64,
+    pub next_text_byte: u64,
+}
+
+impl ExactRenderSnapshotContinuationV1 {
+    fn validate(self) -> Result<(), ExactRenderDeliveryProtocolError> {
+        self.snapshot.validate()?;
+        self.manifest_digest.validate("snapshot_manifest_digest")?;
+        if self.next_chunk_ordinal >= MAX_EXACT_RENDER_SNAPSHOT_CHUNKS {
+            return Err(ExactRenderDeliveryProtocolError::ResourceLimitExceeded {
+                resource: "snapshot_chunk_ordinal",
+                requested: self.next_chunk_ordinal,
+                limit: MAX_EXACT_RENDER_SNAPSHOT_CHUNKS - 1,
+            });
+        }
+        if self.next_row_ordinal > MAX_EXACT_RENDER_SNAPSHOT_ROWS {
+            return Err(ExactRenderDeliveryProtocolError::ResourceLimitExceeded {
+                resource: "snapshot_row_ordinal",
+                requested: self.next_row_ordinal,
+                limit: MAX_EXACT_RENDER_SNAPSHOT_ROWS,
+            });
+        }
+        if self.next_text_byte > MAX_EXACT_RENDER_SNAPSHOT_TEXT_BYTES {
+            return Err(ExactRenderDeliveryProtocolError::ResourceLimitExceeded {
+                resource: "snapshot_text_offset",
+                requested: self.next_text_byte,
+                limit: MAX_EXACT_RENDER_SNAPSHOT_TEXT_BYTES,
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Correlated client request for one exact delta or one force-full snapshot
+/// manifest/chunk. The optional settlement always describes an earlier result.
+///
+/// A server retry ledger must index [`Self::identity`] and retain
+/// [`Self::request_digest`] with that entry; the pair is the complete retry
+/// authority. Before inserting a miss, the ledger must reject an already-seen
+/// identity carrying a different digest as request equivocation. It is never an
+/// alias or a second executable request, and neither body may receive the
+/// other's cached outcome.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct GetPaneRenderDeliveryV1 {
+    pub protocol_version: u16,
+    pub identity: ExactRenderDeliveryRequestIdentity,
+    pub request_digest: ExactRenderDigest,
+    pub applied_baseline: ExactRenderAppliedBaseline,
+    pub settlement: Option<ExactRenderDeliverySettlement>,
+    pub mode: ExactRenderDeliveryMode,
+    pub receiver_caps: ExactRenderReceiverCaps,
+    pub continuation: Option<ExactRenderSnapshotContinuationV1>,
+}
+
+impl GetPaneRenderDeliveryV1 {
+    /// Architecture-independent SHA-256 over every request field except the
+    /// digest slot itself. The preimage is the domain followed by declaration
+    /// order using fixed-width big-endian integers, raw identity/digest bytes,
+    /// and explicit one-byte option/enum tags.
+    pub fn canonical_request_digest(
+        &self,
+    ) -> Result<ExactRenderDigest, ExactRenderDeliveryProtocolError> {
+        let mut hasher = Sha256::new();
+        hasher.update(EXACT_RENDER_REQUEST_DIGEST_DOMAIN_V1);
+        hasher.update(self.protocol_version.to_be_bytes());
+        hash_exact_render_request_identity(&mut hasher, self.identity);
+        hash_exact_render_applied_baseline(&mut hasher, self.applied_baseline);
+        match self.settlement {
+            Some(settlement) => {
+                hasher.update([1]);
+                hash_exact_render_token(&mut hasher, settlement.delivery)?;
+                match settlement.outcome {
+                    ExactRenderDeliverySettlementOutcome::Applied => hasher.update([0]),
+                    ExactRenderDeliverySettlementOutcome::Nack {
+                        reason,
+                        observed_baseline,
+                    } => {
+                        hasher.update([1, reason.digest_tag()]);
+                        hash_exact_render_applied_baseline(&mut hasher, observed_baseline);
+                    }
+                }
+            }
+            None => hasher.update([0]),
+        }
+        hasher.update([self.mode.digest_tag()]);
+        hasher.update(self.receiver_caps.max_decompressed_bytes.to_be_bytes());
+        hasher.update(self.receiver_caps.max_text_bytes.to_be_bytes());
+        hasher.update(self.receiver_caps.max_rows.to_be_bytes());
+        hasher.update(self.receiver_caps.max_snapshot_text_bytes.to_be_bytes());
+        hasher.update(self.receiver_caps.max_snapshot_rows.to_be_bytes());
+        hasher.update(self.receiver_caps.max_snapshot_chunks.to_be_bytes());
+        match self.continuation {
+            Some(continuation) => {
+                hasher.update([1]);
+                hash_exact_render_token(&mut hasher, continuation.snapshot)?;
+                hasher.update(continuation.manifest_digest.as_bytes());
+                hasher.update(continuation.source_version.to_be_bytes());
+                hasher.update(continuation.next_chunk_ordinal.to_be_bytes());
+                hasher.update(continuation.next_row_ordinal.to_be_bytes());
+                hasher.update(continuation.next_text_byte.to_be_bytes());
+            }
+            None => hasher.update([0]),
+        }
+        Ok(ExactRenderDigest::from_bytes(hasher.finalize().into()))
+    }
+
+    pub fn with_computed_request_digest(
+        mut self,
+    ) -> Result<Self, ExactRenderDeliveryProtocolError> {
+        let digest = self.canonical_request_digest()?;
+        digest.validate("request_digest")?;
+        self.request_digest = digest;
+        Ok(self)
+    }
+
+    pub fn validate(&self) -> Result<(), ExactRenderDeliveryProtocolError> {
+        validate_exact_render_protocol_version(self.protocol_version)?;
+        self.identity.validate()?;
+        self.applied_baseline.validate()?;
+        self.receiver_caps.validate()?;
+        if self.mode == ExactRenderDeliveryMode::Incremental
+            && self.applied_baseline == ExactRenderAppliedBaseline::Uninitialized
+        {
+            return Err(ExactRenderDeliveryProtocolError::IncrementalRequiresBaseline);
+        }
+
+        if let Some(settlement) = self.settlement {
+            settlement.validate()?;
+            if settlement.delivery.connection_identity != self.identity.connection_identity
+                || settlement.delivery.pane_id != self.identity.pane_id
+            {
+                return Err(ExactRenderDeliveryProtocolError::SettlementIdentityMismatch);
+            }
+            match settlement.outcome {
+                ExactRenderDeliverySettlementOutcome::Applied
+                    if self.applied_baseline
+                        != ExactRenderAppliedBaseline::Applied(
+                            settlement.delivery.resulting_baseline,
+                        ) =>
+                {
+                    return Err(ExactRenderDeliveryProtocolError::SettlementBaselineMismatch);
+                }
+                ExactRenderDeliverySettlementOutcome::Nack {
+                    observed_baseline,
+                    ..
+                } if observed_baseline != self.applied_baseline => {
+                    return Err(ExactRenderDeliveryProtocolError::SettlementBaselineMismatch);
+                }
+                ExactRenderDeliverySettlementOutcome::Applied
+                | ExactRenderDeliverySettlementOutcome::Nack { .. } => {}
+            }
+        }
+
+        if let Some(continuation) = self.continuation {
+            continuation.validate()?;
+            if self.mode != ExactRenderDeliveryMode::ForceFull {
+                return Err(ExactRenderDeliveryProtocolError::ContinuationRequiresForceFull);
+            }
+            if continuation.snapshot.connection_identity != self.identity.connection_identity
+                || continuation.snapshot.pane_id != self.identity.pane_id
+            {
+                return Err(ExactRenderDeliveryProtocolError::ContinuationIdentityMismatch);
+            }
+            if self.settlement.is_some() {
+                return Err(ExactRenderDeliveryProtocolError::SettlementWithContinuation);
+            }
+        }
+        self.request_digest.validate("request_digest")?;
+        let expected = self.canonical_request_digest()?;
+        if self.request_digest != expected {
+            return Err(ExactRenderDeliveryProtocolError::RequestDigestMismatch {
+                expected,
+                actual: self.request_digest,
+            });
+        }
+        Ok(())
+    }
+}
+
+/// One replacement operation over the prior projection. Replacement rows are
+/// stored in the delta's single flat bounded row vector; the offsets below
+/// prevent nested hostile length prefixes from multiplying allocations.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ExactRenderRowPatchV1 {
+    pub start_stable_row: i64,
+    pub removed_rows: u64,
+    pub replacement_start: u64,
+    pub replacement_count: u64,
+}
+
+fn serialize_exact_render_patches<S>(
+    values: &[ExactRenderRowPatchV1],
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    serialize_bounded_vec::<S, _, MAX_EXACT_RENDER_DELIVERY_PATCHES>(
+        values,
+        serializer,
+        "exact render patches",
+    )
+}
+
+fn deserialize_exact_render_patches<'de, D>(
+    deserializer: D,
+) -> Result<Vec<ExactRenderRowPatchV1>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserialize_bounded_vec::<D, _, MAX_EXACT_RENDER_DELIVERY_PATCHES>(
+        deserializer,
+        "exact render patches",
+    )
+}
+
+/// Bounded exact change from one delivery baseline to another. `source_version`
+/// records the sampled terminal mutation sequence for diagnosis only. It may
+/// jump or repeat and never participates in delivery-continuity validation.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ExactRenderDeltaV1 {
+    pub delivery: ExactRenderDeliveryToken,
+    pub base: ExactRenderDeliveryCursor,
+    pub source_version: u64,
+    pub resulting_projection: ExactRenderProjectionV1,
+    #[serde(
+        serialize_with = "serialize_exact_render_patches",
+        deserialize_with = "deserialize_exact_render_patches"
+    )]
+    pub patches: Vec<ExactRenderRowPatchV1>,
+    #[serde(
+        serialize_with = "serialize_exact_render_rows",
+        deserialize_with = "deserialize_exact_render_rows"
+    )]
+    pub rows: Vec<ExactRenderRowV1>,
+}
+
+impl ExactRenderDeltaV1 {
+    pub fn validate(&self) -> Result<(), ExactRenderDeliveryProtocolError> {
+        self.validated_resource_usage().map(|_| ())
+    }
+
+    fn validated_resource_usage(
+        &self,
+    ) -> Result<ExactRenderDeliveryResourceUsage, ExactRenderDeliveryProtocolError> {
+        self.delivery.validate()?;
+        self.base.validate()?;
+        self.resulting_projection.validate()?;
+        let result = self.delivery.resulting_baseline;
+        if self.base.pane_generation != result.pane_generation
+            || self.base.delivery_generation != result.delivery_generation
+        {
+            return Err(ExactRenderDeliveryProtocolError::DeliveryGenerationMismatch);
+        }
+        if self.base.sequence >= result.sequence {
+            return Err(ExactRenderDeliveryProtocolError::NonAdvancingDelta);
+        }
+        if self.patches.len() > MAX_EXACT_RENDER_DELIVERY_PATCHES {
+            return Err(ExactRenderDeliveryProtocolError::ResourceLimitExceeded {
+                resource: "reply_patches",
+                requested: u64::try_from(self.patches.len()).unwrap_or(u64::MAX),
+                limit: MAX_EXACT_RENDER_DELIVERY_PATCHES_U64,
+            });
+        }
+        if self.rows.len() > MAX_EXACT_RENDER_DELIVERY_ROWS {
+            return Err(ExactRenderDeliveryProtocolError::ResourceLimitExceeded {
+                resource: "reply_rows",
+                requested: u64::try_from(self.rows.len()).unwrap_or(u64::MAX),
+                limit: MAX_EXACT_RENDER_DELIVERY_ROWS_U64,
+            });
+        }
+
+        let row_count = u64::try_from(self.rows.len()).map_err(|_| {
+            ExactRenderDeliveryProtocolError::ArithmeticOverflow {
+                field: "delta_row_count",
+            }
+        })?;
+        let mut replacement_cursor = 0_u64;
+        let mut prior_patch_start = None;
+        let mut prior_removed_end = None;
+        let mut prior_replacement_end = None;
+        let projection_end = checked_stable_row_offset(
+            self.resulting_projection.first_stable_row,
+            self.resulting_projection.row_count,
+            "resulting_projection_end",
+        )?;
+        let mut hasher = Sha256::new();
+        hasher.update(EXACT_RENDER_DELTA_DIGEST_DOMAIN_V1);
+        hash_exact_render_token_context(&mut hasher, self.delivery)?;
+        hash_exact_render_cursor(&mut hasher, self.base);
+        hasher.update(self.source_version.to_be_bytes());
+        hash_exact_render_projection(&mut hasher, &self.resulting_projection)?;
+        hasher.update(
+            u64::try_from(self.patches.len())
+                .map_err(|_| ExactRenderDeliveryProtocolError::ArithmeticOverflow {
+                    field: "patch_count",
+                })?
+                .to_be_bytes(),
+        );
+        for patch in &self.patches {
+            hasher.update(patch.start_stable_row.to_be_bytes());
+            hasher.update(patch.removed_rows.to_be_bytes());
+            hasher.update(patch.replacement_start.to_be_bytes());
+            hasher.update(patch.replacement_count.to_be_bytes());
+            if patch.removed_rows == 0 && patch.replacement_count == 0 {
+                return Err(ExactRenderDeliveryProtocolError::EmptyRowPatch);
+            }
+            if patch.replacement_start != replacement_cursor {
+                return Err(ExactRenderDeliveryProtocolError::PatchRowsNotPartitioned {
+                    expected_start: replacement_cursor,
+                    actual_start: patch.replacement_start,
+                });
+            }
+            let replacement_end = patch
+                .replacement_start
+                .checked_add(patch.replacement_count)
+                .ok_or(ExactRenderDeliveryProtocolError::ArithmeticOverflow {
+                    field: "patch_replacement_end",
+                })?;
+            if replacement_end > row_count {
+                return Err(ExactRenderDeliveryProtocolError::PatchReplacementOutOfRange {
+                    end: replacement_end,
+                    row_count,
+                });
+            }
+            if prior_patch_start.is_some_and(|prior| patch.start_stable_row <= prior) {
+                return Err(ExactRenderDeliveryProtocolError::PatchOrderInvalid);
+            }
+            if prior_removed_end.is_some_and(|prior| patch.start_stable_row < prior) {
+                return Err(ExactRenderDeliveryProtocolError::PatchOrderInvalid);
+            }
+            if prior_replacement_end.is_some_and(|prior| patch.start_stable_row < prior) {
+                return Err(ExactRenderDeliveryProtocolError::PatchOrderInvalid);
+            }
+            let removed_end = checked_stable_row_offset(
+                patch.start_stable_row,
+                patch.removed_rows,
+                "patch_removed_end",
+            )?;
+            let replacement_stable_end = checked_stable_row_offset(
+                patch.start_stable_row,
+                patch.replacement_count,
+                "patch_replacement_stable_end",
+            )?;
+            if patch.replacement_count != 0
+                && (patch.start_stable_row < self.resulting_projection.first_stable_row
+                    || replacement_stable_end > projection_end)
+            {
+                return Err(ExactRenderDeliveryProtocolError::PatchProjectionOutOfRange);
+            }
+            replacement_cursor = replacement_end;
+            prior_patch_start = Some(patch.start_stable_row);
+            prior_removed_end = Some(removed_end);
+            prior_replacement_end = Some(replacement_stable_end);
+        }
+        if replacement_cursor != row_count {
+            return Err(ExactRenderDeliveryProtocolError::PatchRowsNotPartitioned {
+                expected_start: row_count,
+                actual_start: replacement_cursor,
+            });
+        }
+        hasher.update(row_count.to_be_bytes());
+        let mut usage = ExactRenderDeliveryResourceUsage {
+            rows: row_count,
+            ..ExactRenderDeliveryResourceUsage::default()
+        };
+        for patch in &self.patches {
+            let replacement_start = usize::try_from(patch.replacement_start).map_err(|_| {
+                ExactRenderDeliveryProtocolError::ArithmeticOverflow {
+                    field: "patch_replacement_start",
+                }
+            })?;
+            let replacement_end = patch
+                .replacement_start
+                .checked_add(patch.replacement_count)
+                .ok_or(ExactRenderDeliveryProtocolError::ArithmeticOverflow {
+                    field: "patch_replacement_end",
+                })?;
+            let replacement_end = usize::try_from(replacement_end).map_err(|_| {
+                ExactRenderDeliveryProtocolError::ArithmeticOverflow {
+                    field: "patch_replacement_end",
+                }
+            })?;
+            let mut expected = patch.start_stable_row;
+            for row in &self.rows[replacement_start..replacement_end] {
+                #[cfg(test)]
+                record_test_exact_render_validation_row_visit();
+                if row.stable_row != expected {
+                    return Err(ExactRenderDeliveryProtocolError::UnexpectedStableRow {
+                        expected,
+                        actual: row.stable_row,
+                    });
+                }
+                accumulate_and_hash_exact_render_row(&mut usage, &mut hasher, row)?;
+                if usage.text_bytes > MAX_EXACT_RENDER_DELIVERY_TEXT_BYTES_U64 {
+                    return Err(ExactRenderDeliveryProtocolError::ResourceLimitExceeded {
+                        resource: "reply_text_bytes",
+                        requested: usage.text_bytes,
+                        limit: MAX_EXACT_RENDER_DELIVERY_TEXT_BYTES_U64,
+                    });
+                }
+                expected = expected.checked_add(1).ok_or(
+                    ExactRenderDeliveryProtocolError::ArithmeticOverflow {
+                        field: "stable_row",
+                    },
+                )?;
+            }
+        }
+        usage.text_bytes = usage
+            .text_bytes
+            .checked_add(self.resulting_projection.text_bytes()?)
+            .ok_or(ExactRenderDeliveryProtocolError::ArithmeticOverflow {
+                field: "reply_text_bytes",
+            })?;
+        if usage.text_bytes > MAX_EXACT_RENDER_DELIVERY_TEXT_BYTES_U64 {
+            return Err(ExactRenderDeliveryProtocolError::ResourceLimitExceeded {
+                resource: "reply_text_bytes",
+                requested: usage.text_bytes,
+                limit: MAX_EXACT_RENDER_DELIVERY_TEXT_BYTES_U64,
+            });
+        }
+        let expected_digest = ExactRenderDigest::from_bytes(hasher.finalize().into());
+        if self.delivery.content_digest != expected_digest {
+            return Err(ExactRenderDeliveryProtocolError::DigestMismatch {
+                field: "delta_content_digest",
+            });
+        }
+        Ok(usage)
+    }
+
+    pub fn canonical_digest(&self) -> Result<ExactRenderDigest, ExactRenderDeliveryProtocolError> {
+        let mut hasher = Sha256::new();
+        hasher.update(EXACT_RENDER_DELTA_DIGEST_DOMAIN_V1);
+        hash_exact_render_token_context(&mut hasher, self.delivery)?;
+        hash_exact_render_cursor(&mut hasher, self.base);
+        hasher.update(self.source_version.to_be_bytes());
+        hash_exact_render_projection(&mut hasher, &self.resulting_projection)?;
+        hasher.update(
+            u64::try_from(self.patches.len())
+                .map_err(|_| ExactRenderDeliveryProtocolError::ArithmeticOverflow {
+                    field: "patch_count",
+                })?
+                .to_be_bytes(),
+        );
+        for patch in &self.patches {
+            hasher.update(patch.start_stable_row.to_be_bytes());
+            hasher.update(patch.removed_rows.to_be_bytes());
+            hasher.update(patch.replacement_start.to_be_bytes());
+            hasher.update(patch.replacement_count.to_be_bytes());
+        }
+        hash_exact_render_rows(&mut hasher, &self.rows)?;
+        Ok(ExactRenderDigest::from_bytes(hasher.finalize().into()))
+    }
+
+    pub fn with_computed_digest(
+        mut self,
+    ) -> Result<Self, ExactRenderDeliveryProtocolError> {
+        self.delivery.content_digest = self.canonical_digest()?;
+        Ok(self)
+    }
+}
+
+/// Immutable full-snapshot manifest. The content digest is independent of
+/// chunk boundaries; changing chunk size cannot change snapshot identity.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ExactRenderSnapshotManifestV1 {
+    pub snapshot: ExactRenderDeliveryToken,
+    pub source_version: u64,
+    pub projection: ExactRenderProjectionV1,
+    pub total_rows: u64,
+    /// UTF-8 bytes in rows only. Retention and receiver-cap accounting add the
+    /// projection title and working directory exactly once.
+    pub total_text_bytes: u64,
+    pub chunk_count: u64,
+}
+
+impl ExactRenderSnapshotManifestV1 {
+    pub fn validate(&self) -> Result<(), ExactRenderDeliveryProtocolError> {
+        self.snapshot.validate()?;
+        self.validated_retained_text_bytes().map(|_| ())
+    }
+
+    /// Validate totals and prove that at least one legal v1 chunk plan can
+    /// carry the declared immutable rows. The projection bytes are retained
+    /// with the snapshot and repeated in every `FullChunk` response, so they
+    /// consume both the snapshot and per-chunk text envelopes.
+    fn validated_retained_text_bytes(
+        &self,
+    ) -> Result<u64, ExactRenderDeliveryProtocolError> {
+        self.projection.validate()?;
+        let projection_text_bytes = self.projection.text_bytes()?;
+        let retained_text_bytes = self
+            .total_text_bytes
+            .checked_add(projection_text_bytes)
+            .ok_or(ExactRenderDeliveryProtocolError::ArithmeticOverflow {
+                field: "snapshot_retained_text_bytes",
+            })?;
+        if self.total_rows != self.projection.row_count
+            || self.total_rows > MAX_EXACT_RENDER_SNAPSHOT_ROWS
+            || self.total_text_bytes > MAX_EXACT_RENDER_SNAPSHOT_TEXT_BYTES
+            || retained_text_bytes > MAX_EXACT_RENDER_SNAPSHOT_TEXT_BYTES
+        {
+            return Err(ExactRenderDeliveryProtocolError::SnapshotTotalsInvalid);
+        }
+        if self.chunk_count > MAX_EXACT_RENDER_SNAPSHOT_CHUNKS
+            || (self.total_rows == 0 && self.chunk_count != 0)
+            || (self.total_rows != 0 && self.chunk_count == 0)
+            || self.chunk_count > self.total_rows
+            || (self.total_rows == 0 && self.total_text_bytes != 0)
+        {
+            return Err(ExactRenderDeliveryProtocolError::SnapshotChunkCountInvalid);
+        }
+
+        let row_text_capacity = self
+            .total_rows
+            .checked_mul(u64::try_from(MAX_EXACT_RENDER_ROW_TEXT_BYTES).map_err(|_| {
+                ExactRenderDeliveryProtocolError::ArithmeticOverflow {
+                    field: "snapshot_row_text_capacity",
+                }
+            })?)
+            .ok_or(ExactRenderDeliveryProtocolError::ArithmeticOverflow {
+                field: "snapshot_row_text_capacity",
+            })?;
+        if self.total_text_bytes > row_text_capacity {
+            return Err(ExactRenderDeliveryProtocolError::SnapshotTotalsInvalid);
+        }
+
+        let chunk_row_capacity = self
+            .chunk_count
+            .checked_mul(MAX_EXACT_RENDER_DELIVERY_ROWS_U64)
+            .ok_or(ExactRenderDeliveryProtocolError::ArithmeticOverflow {
+                field: "snapshot_chunk_row_capacity",
+            })?;
+        let row_text_bytes_per_chunk = MAX_EXACT_RENDER_DELIVERY_TEXT_BYTES_U64
+            .checked_sub(projection_text_bytes)
+            .ok_or(ExactRenderDeliveryProtocolError::SnapshotChunkCountInvalid)?;
+        let chunk_text_capacity = self
+            .chunk_count
+            .checked_mul(row_text_bytes_per_chunk)
+            .ok_or(ExactRenderDeliveryProtocolError::ArithmeticOverflow {
+                field: "snapshot_chunk_text_capacity",
+            })?;
+        if self.total_rows > chunk_row_capacity
+            || self.total_text_bytes > chunk_text_capacity
+        {
+            return Err(ExactRenderDeliveryProtocolError::SnapshotChunkCountInvalid);
+        }
+        Ok(retained_text_bytes)
+    }
+
+    pub fn canonical_manifest_digest(
+        &self,
+    ) -> Result<ExactRenderDigest, ExactRenderDeliveryProtocolError> {
+        self.validate()?;
+        let mut hasher = Sha256::new();
+        hasher.update(EXACT_RENDER_SNAPSHOT_MANIFEST_DIGEST_DOMAIN_V1);
+        hash_exact_render_token(&mut hasher, self.snapshot)?;
+        hasher.update(self.source_version.to_be_bytes());
+        hash_exact_render_projection(&mut hasher, &self.projection)?;
+        hasher.update(self.total_rows.to_be_bytes());
+        hasher.update(self.total_text_bytes.to_be_bytes());
+        hasher.update(self.chunk_count.to_be_bytes());
+        Ok(ExactRenderDigest::from_bytes(hasher.finalize().into()))
+    }
+
+    pub fn computed_content_digest(
+        &self,
+        rows: &[ExactRenderRowV1],
+    ) -> Result<ExactRenderDigest, ExactRenderDeliveryProtocolError> {
+        validate_exact_render_connection_identity(self.snapshot.connection_identity)?;
+        self.snapshot.pane_id.try_into_mux()?;
+        self.snapshot.resulting_baseline.validate()?;
+        self.validated_retained_text_bytes()?;
+        let row_count = u64::try_from(rows.len()).map_err(|_| {
+            ExactRenderDeliveryProtocolError::ArithmeticOverflow {
+                field: "snapshot_row_count",
+            }
+        })?;
+        if row_count != self.total_rows {
+            return Err(ExactRenderDeliveryProtocolError::SnapshotTotalsInvalid);
+        }
+        let mut hasher = Sha256::new();
+        hasher.update(EXACT_RENDER_SNAPSHOT_DIGEST_DOMAIN_V1);
+        hash_exact_render_token_context(&mut hasher, self.snapshot)?;
+        hasher.update(self.source_version.to_be_bytes());
+        hash_exact_render_projection(&mut hasher, &self.projection)?;
+        hasher.update(self.total_rows.to_be_bytes());
+        hasher.update(self.total_text_bytes.to_be_bytes());
+        hasher.update(row_count.to_be_bytes());
+        let mut usage = ExactRenderDeliveryResourceUsage {
+            rows: row_count,
+            ..ExactRenderDeliveryResourceUsage::default()
+        };
+        let mut expected = self.projection.first_stable_row;
+        for row in rows {
+            #[cfg(test)]
+            record_test_exact_render_validation_row_visit();
+            if row.stable_row != expected {
+                return Err(ExactRenderDeliveryProtocolError::UnexpectedStableRow {
+                    expected,
+                    actual: row.stable_row,
+                });
+            }
+            accumulate_and_hash_exact_render_row(&mut usage, &mut hasher, row)?;
+            if usage.text_bytes > self.total_text_bytes {
+                return Err(ExactRenderDeliveryProtocolError::SnapshotTotalsInvalid);
+            }
+            expected = expected.checked_add(1).ok_or(
+                ExactRenderDeliveryProtocolError::ArithmeticOverflow {
+                    field: "snapshot_stable_row",
+                },
+            )?;
+        }
+        if usage.text_bytes != self.total_text_bytes {
+            return Err(ExactRenderDeliveryProtocolError::SnapshotTotalsInvalid);
+        }
+        Ok(ExactRenderDigest::from_bytes(hasher.finalize().into()))
+    }
+
+    pub fn validate_complete_rows(
+        &self,
+        rows: &[ExactRenderRowV1],
+    ) -> Result<(), ExactRenderDeliveryProtocolError> {
+        self.snapshot
+            .content_digest
+            .validate("snapshot_content_digest")?;
+        if self.computed_content_digest(rows)? != self.snapshot.content_digest {
+            return Err(ExactRenderDeliveryProtocolError::DigestMismatch {
+                field: "snapshot_content_digest",
+            });
+        }
+        Ok(())
+    }
+
+    pub fn with_computed_content_digest(
+        mut self,
+        rows: &[ExactRenderRowV1],
+    ) -> Result<Self, ExactRenderDeliveryProtocolError> {
+        self.snapshot.content_digest = self.computed_content_digest(rows)?;
+        Ok(self)
+    }
+}
+
+/// One independently bounded chunk of an immutable snapshot.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ExactRenderSnapshotChunkV1 {
+    pub source_version: u64,
+    pub ordinal: u64,
+    pub first_row_ordinal: u64,
+    pub first_text_byte: u64,
+    #[serde(
+        serialize_with = "serialize_exact_render_rows",
+        deserialize_with = "deserialize_exact_render_rows"
+    )]
+    pub rows: Vec<ExactRenderRowV1>,
+    pub chunk_digest: ExactRenderDigest,
+}
+
+impl ExactRenderSnapshotChunkV1 {
+    pub fn validate_for(
+        &self,
+        manifest: &ExactRenderSnapshotManifestV1,
+    ) -> Result<(), ExactRenderDeliveryProtocolError> {
+        self.validated_rows_usage_for(manifest).map(|_| ())
+    }
+
+    fn validated_rows_usage_for(
+        &self,
+        manifest: &ExactRenderSnapshotManifestV1,
+    ) -> Result<ExactRenderDeliveryResourceUsage, ExactRenderDeliveryProtocolError> {
+        manifest.validate()?;
+        if self.source_version != manifest.source_version {
+            return Err(ExactRenderDeliveryProtocolError::SnapshotSourceVersionMismatch);
+        }
+        if self.ordinal >= manifest.chunk_count || self.rows.is_empty() {
+            return Err(ExactRenderDeliveryProtocolError::SnapshotChunkRangeInvalid);
+        }
+        let expected_first_stable_row = checked_stable_row_offset(
+            manifest.projection.first_stable_row,
+            self.first_row_ordinal,
+            "snapshot_chunk_first_stable_row",
+        )?;
+        if self.rows.len() > MAX_EXACT_RENDER_DELIVERY_ROWS {
+            return Err(ExactRenderDeliveryProtocolError::ResourceLimitExceeded {
+                resource: "reply_rows",
+                requested: u64::try_from(self.rows.len()).unwrap_or(u64::MAX),
+                limit: MAX_EXACT_RENDER_DELIVERY_ROWS_U64,
+            });
+        }
+        let row_count = u64::try_from(self.rows.len()).map_err(|_| {
+            ExactRenderDeliveryProtocolError::ArithmeticOverflow { field: "row_count" }
+        })?;
+        let mut usage = ExactRenderDeliveryResourceUsage {
+            rows: row_count,
+            ..ExactRenderDeliveryResourceUsage::default()
+        };
+        let mut hasher = Sha256::new();
+        hasher.update(EXACT_RENDER_SNAPSHOT_CHUNK_DIGEST_DOMAIN_V1);
+        hash_exact_render_token(&mut hasher, manifest.snapshot)?;
+        hasher.update(self.source_version.to_be_bytes());
+        hasher.update(self.ordinal.to_be_bytes());
+        hasher.update(self.first_row_ordinal.to_be_bytes());
+        hasher.update(self.first_text_byte.to_be_bytes());
+        hasher.update(row_count.to_be_bytes());
+        let mut expected = expected_first_stable_row;
+        for row in &self.rows {
+            #[cfg(test)]
+            record_test_exact_render_validation_row_visit();
+            if row.stable_row != expected {
+                return Err(ExactRenderDeliveryProtocolError::UnexpectedStableRow {
+                    expected,
+                    actual: row.stable_row,
+                });
+            }
+            accumulate_and_hash_exact_render_row(&mut usage, &mut hasher, row)?;
+            if usage.text_bytes > MAX_EXACT_RENDER_DELIVERY_TEXT_BYTES_U64 {
+                return Err(ExactRenderDeliveryProtocolError::ResourceLimitExceeded {
+                    resource: "reply_text_bytes",
+                    requested: usage.text_bytes,
+                    limit: MAX_EXACT_RENDER_DELIVERY_TEXT_BYTES_U64,
+                });
+            }
+            expected = expected.checked_add(1).ok_or(
+                ExactRenderDeliveryProtocolError::ArithmeticOverflow {
+                    field: "stable_row",
+                },
+            )?;
+        }
+        let row_end = self
+            .first_row_ordinal
+            .checked_add(usage.rows)
+            .ok_or(ExactRenderDeliveryProtocolError::ArithmeticOverflow {
+                field: "snapshot_chunk_row_end",
+            })?;
+        let text_end = self
+            .first_text_byte
+            .checked_add(usage.text_bytes)
+            .ok_or(ExactRenderDeliveryProtocolError::ArithmeticOverflow {
+                field: "snapshot_chunk_text_end",
+            })?;
+        let is_last = self.ordinal + 1 == manifest.chunk_count;
+        if self.first_row_ordinal >= manifest.total_rows
+            || row_end > manifest.total_rows
+            || self.first_text_byte > manifest.total_text_bytes
+            || text_end > manifest.total_text_bytes
+            || (self.ordinal == 0
+                && (self.first_row_ordinal != 0 || self.first_text_byte != 0))
+            || (is_last
+                && (row_end != manifest.total_rows || text_end != manifest.total_text_bytes))
+            || (!is_last && row_end >= manifest.total_rows)
+        {
+            return Err(ExactRenderDeliveryProtocolError::SnapshotChunkRangeInvalid);
+        }
+        self.chunk_digest.validate("snapshot_chunk_digest")?;
+        if self.chunk_digest != ExactRenderDigest::from_bytes(hasher.finalize().into()) {
+            return Err(ExactRenderDeliveryProtocolError::DigestMismatch {
+                field: "snapshot_chunk_digest",
+            });
+        }
+        Ok(usage)
+    }
+
+    pub fn canonical_digest(
+        &self,
+        manifest: &ExactRenderSnapshotManifestV1,
+    ) -> Result<ExactRenderDigest, ExactRenderDeliveryProtocolError> {
+        let mut hasher = Sha256::new();
+        hasher.update(EXACT_RENDER_SNAPSHOT_CHUNK_DIGEST_DOMAIN_V1);
+        hash_exact_render_token(&mut hasher, manifest.snapshot)?;
+        hasher.update(self.source_version.to_be_bytes());
+        hasher.update(self.ordinal.to_be_bytes());
+        hasher.update(self.first_row_ordinal.to_be_bytes());
+        hasher.update(self.first_text_byte.to_be_bytes());
+        hash_exact_render_rows(&mut hasher, &self.rows)?;
+        Ok(ExactRenderDigest::from_bytes(hasher.finalize().into()))
+    }
+
+    pub fn with_computed_digest(
+        mut self,
+        manifest: &ExactRenderSnapshotManifestV1,
+    ) -> Result<Self, ExactRenderDeliveryProtocolError> {
+        self.chunk_digest = self.canonical_digest(manifest)?;
+        Ok(self)
+    }
+
+    pub fn next_continuation(
+        &self,
+        manifest: &ExactRenderSnapshotManifestV1,
+    ) -> Result<Option<ExactRenderSnapshotContinuationV1>, ExactRenderDeliveryProtocolError> {
+        let usage = self.validated_rows_usage_for(manifest)?;
+        if self.ordinal + 1 == manifest.chunk_count {
+            return Ok(None);
+        }
+        Ok(Some(ExactRenderSnapshotContinuationV1 {
+            snapshot: manifest.snapshot,
+            manifest_digest: manifest.canonical_manifest_digest()?,
+            source_version: manifest.source_version,
+            next_chunk_ordinal: self.ordinal + 1,
+            next_row_ordinal: self.first_row_ordinal.checked_add(usage.rows).ok_or(
+                ExactRenderDeliveryProtocolError::ArithmeticOverflow {
+                    field: "snapshot_next_row_ordinal",
+                },
+            )?,
+            next_text_byte: self.first_text_byte.checked_add(usage.text_bytes).ok_or(
+                ExactRenderDeliveryProtocolError::ArithmeticOverflow {
+                    field: "snapshot_next_text_byte",
+                },
+            )?,
+        }))
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum ExactRenderAuthority {
+    ConnectionIdentity,
+    PaneGeneration,
+    DeliveryGeneration,
+    DeliverySequence,
+    SnapshotIdentity,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum ExactRenderLimitResource {
+    DecompressedBytes,
+    TextBytes,
+    Rows,
+    SnapshotTextBytes,
+    SnapshotRows,
+    SnapshotChunks,
+}
+
+/// Closed correlated result. No string reason is delivery authority.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum ExactRenderDeliveryOutcomeV1 {
+    NoChange {
+        current: ExactRenderDeliveryCursor,
+        source_version: u64,
+    },
+    ExactDelta(ExactRenderDeltaV1),
+    FullManifest(ExactRenderSnapshotManifestV1),
+    FullChunk {
+        manifest: ExactRenderSnapshotManifestV1,
+        chunk: ExactRenderSnapshotChunkV1,
+    },
+    BaselineTooOld {
+        requested: ExactRenderDeliveryCursor,
+        oldest_available: ExactRenderDeliveryCursor,
+        current: ExactRenderDeliveryCursor,
+    },
+    GenerationChanged {
+        requested: ExactRenderDeliveryCursor,
+        current_pane_generation: ExactRenderPaneGeneration,
+        current_delivery_generation: ExactRenderDeliveryGeneration,
+    },
+    PaneRemoved {
+        last_pane_generation: Option<ExactRenderPaneGeneration>,
+    },
+    AuthorityExhausted {
+        authority: ExactRenderAuthority,
+    },
+    LimitsExceeded {
+        resource: ExactRenderLimitResource,
+        required: u64,
+        limit: u64,
+    },
+}
+
+impl ExactRenderDeliveryOutcomeV1 {
+    fn validated_resource_usage(
+        &self,
+    ) -> Result<ExactRenderDeliveryResourceUsage, ExactRenderDeliveryProtocolError> {
+        match self {
+            Self::NoChange { current, .. } => {
+                current.validate()?;
+                Ok(ExactRenderDeliveryResourceUsage::default())
+            }
+            Self::ExactDelta(delta) => delta.validated_resource_usage(),
+            Self::FullManifest(manifest) => {
+                manifest.validate()?;
+                Ok(ExactRenderDeliveryResourceUsage {
+                    text_bytes: manifest.projection.text_bytes()?,
+                    ..ExactRenderDeliveryResourceUsage::default()
+                })
+            }
+            Self::FullChunk { manifest, chunk } => {
+                let mut usage = chunk.validated_rows_usage_for(manifest)?;
+                usage.text_bytes = usage
+                    .text_bytes
+                    .checked_add(manifest.projection.text_bytes()?)
+                    .ok_or(ExactRenderDeliveryProtocolError::ArithmeticOverflow {
+                        field: "reply_text_bytes",
+                    })?;
+                Ok(usage)
+            }
+            Self::BaselineTooOld {
+                requested,
+                oldest_available,
+                current,
+            } => {
+                requested.validate()?;
+                oldest_available.validate()?;
+                current.validate()?;
+                if requested.pane_generation != oldest_available.pane_generation
+                    || requested.delivery_generation != oldest_available.delivery_generation
+                    || requested.pane_generation != current.pane_generation
+                    || requested.delivery_generation != current.delivery_generation
+                    || requested.sequence >= oldest_available.sequence
+                    || oldest_available.sequence > current.sequence
+                {
+                    return Err(ExactRenderDeliveryProtocolError::BaselineTooOldInvalid);
+                }
+                Ok(ExactRenderDeliveryResourceUsage::default())
+            }
+            Self::GenerationChanged {
+                requested,
+                current_pane_generation,
+                current_delivery_generation,
+            } => {
+                requested.validate()?;
+                current_pane_generation.validate()?;
+                current_delivery_generation.validate()?;
+                if requested.pane_generation == *current_pane_generation
+                    && requested.delivery_generation == *current_delivery_generation
+                {
+                    return Err(ExactRenderDeliveryProtocolError::GenerationChangeInvalid);
+                }
+                Ok(ExactRenderDeliveryResourceUsage::default())
+            }
+            Self::PaneRemoved {
+                last_pane_generation,
+            } => {
+                if let Some(generation) = last_pane_generation {
+                    generation.validate()?;
+                }
+                Ok(ExactRenderDeliveryResourceUsage::default())
+            }
+            Self::AuthorityExhausted { .. } => {
+                Ok(ExactRenderDeliveryResourceUsage::default())
+            }
+            Self::LimitsExceeded {
+                required, limit, ..
+            } => {
+                if *limit == 0 || required <= limit {
+                    return Err(ExactRenderDeliveryProtocolError::LimitsOutcomeInvalid);
+                }
+                Ok(ExactRenderDeliveryResourceUsage::default())
+            }
+        }
+    }
+
+    fn delivery_token(&self) -> Option<ExactRenderDeliveryToken> {
+        match self {
+            Self::ExactDelta(delta) => Some(delta.delivery),
+            Self::FullManifest(manifest) | Self::FullChunk { manifest, .. } => {
+                Some(manifest.snapshot)
+            }
+            Self::NoChange { .. }
+            | Self::BaselineTooOld { .. }
+            | Self::GenerationChanged { .. }
+            | Self::PaneRemoved { .. }
+            | Self::AuthorityExhausted { .. }
+            | Self::LimitsExceeded { .. } => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct GetPaneRenderDeliveryV1Response {
+    pub protocol_version: u16,
+    pub request_identity: ExactRenderDeliveryRequestIdentity,
+    /// Echo of the validated request-body digest. The identity and digest are
+    /// deliberately separate so retry-ledger equivocation remains observable.
+    pub request_digest: ExactRenderDigest,
+    pub outcome: ExactRenderDeliveryOutcomeV1,
+}
+
+impl GetPaneRenderDeliveryV1Response {
+    /// Validate the closed response structure and its text/row resource caps.
+    ///
+    /// The codec's encode path checks the actual uncompressed byte count from
+    /// its one canonical serialization before compression. Call
+    /// [`Self::resource_usage`] when an independent caller explicitly needs
+    /// measured decompressed-byte accounting.
+    pub fn validate(&self) -> Result<(), ExactRenderDeliveryProtocolError> {
+        self.validated_structural_resource_usage().map(|_| ())
+    }
+
+    fn validated_resource_usage(
+        &self,
+    ) -> Result<ExactRenderDeliveryResourceUsage, ExactRenderDeliveryProtocolError> {
+        let usage = self.validated_structural_resource_usage()?;
+        let decompressed_bytes = exact_render_encoded_len(self)?;
+        Self::with_validated_decompressed_bytes(usage, decompressed_bytes)
+    }
+
+    fn validate_with_decompressed_bytes(
+        &self,
+        decompressed_bytes: u64,
+    ) -> Result<(), ExactRenderDeliveryProtocolError> {
+        self.validated_resource_usage_with_decompressed_bytes(decompressed_bytes)
+            .map(|_| ())
+    }
+
+    fn validated_resource_usage_with_decompressed_bytes(
+        &self,
+        decompressed_bytes: u64,
+    ) -> Result<ExactRenderDeliveryResourceUsage, ExactRenderDeliveryProtocolError> {
+        let usage = self.validated_structural_resource_usage()?;
+        Self::with_validated_decompressed_bytes(usage, decompressed_bytes)
+    }
+
+    fn with_validated_decompressed_bytes(
+        mut usage: ExactRenderDeliveryResourceUsage,
+        decompressed_bytes: u64,
+    ) -> Result<ExactRenderDeliveryResourceUsage, ExactRenderDeliveryProtocolError> {
+        usage.decompressed_bytes = decompressed_bytes;
+        if usage.decompressed_bytes > MAX_EXACT_RENDER_DELIVERY_DECOMPRESSED_BYTES_U64 {
+            return Err(ExactRenderDeliveryProtocolError::ResourceLimitExceeded {
+                resource: "reply_decompressed_bytes",
+                requested: usage.decompressed_bytes,
+                limit: MAX_EXACT_RENDER_DELIVERY_DECOMPRESSED_BYTES_U64,
+            });
+        }
+        Ok(usage)
+    }
+
+    fn validated_structural_resource_usage(
+        &self,
+    ) -> Result<ExactRenderDeliveryResourceUsage, ExactRenderDeliveryProtocolError> {
+        validate_exact_render_protocol_version(self.protocol_version)?;
+        self.request_identity.validate()?;
+        self.request_digest.validate("request_digest")?;
+        // Outcome validation returns its wire usage from the same traversal;
+        // row-heavy deltas/chunks are not rescanned for accounting after their
+        // continuity and digest checks.
+        let usage = self.outcome.validated_resource_usage()?;
+        if usage.text_bytes > MAX_EXACT_RENDER_DELIVERY_TEXT_BYTES_U64 {
+            return Err(ExactRenderDeliveryProtocolError::ResourceLimitExceeded {
+                resource: "reply_text_bytes",
+                requested: usage.text_bytes,
+                limit: MAX_EXACT_RENDER_DELIVERY_TEXT_BYTES_U64,
+            });
+        }
+        if usage.rows > MAX_EXACT_RENDER_DELIVERY_ROWS_U64 {
+            return Err(ExactRenderDeliveryProtocolError::ResourceLimitExceeded {
+                resource: "reply_rows",
+                requested: usage.rows,
+                limit: MAX_EXACT_RENDER_DELIVERY_ROWS_U64,
+            });
+        }
+        Ok(usage)
+    }
+
+    pub fn resource_usage(
+        &self,
+    ) -> Result<ExactRenderDeliveryResourceUsage, ExactRenderDeliveryProtocolError> {
+        self.validated_resource_usage()
+    }
+
+    /// Validate this correlated reply against the exact request and its
+    /// receiver-advertised limits.
+    pub fn validate_for(
+        &self,
+        request: &GetPaneRenderDeliveryV1,
+    ) -> Result<(), ExactRenderDeliveryProtocolError> {
+        request.validate()?;
+        validate_exact_render_protocol_version(self.protocol_version)?;
+        self.request_identity.validate()?;
+        self.request_digest.validate("request_digest")?;
+        if self.request_identity != request.identity {
+            return Err(ExactRenderDeliveryProtocolError::ReplyRequestMismatch);
+        }
+        if self.request_digest != request.request_digest {
+            return Err(ExactRenderDeliveryProtocolError::ReplyRequestDigestMismatch {
+                expected: request.request_digest,
+                actual: self.request_digest,
+            });
+        }
+        if let Some(token) = self.outcome.delivery_token() {
+            if token.connection_identity != request.identity.connection_identity
+                || token.pane_id != request.identity.pane_id
+            {
+                return Err(ExactRenderDeliveryProtocolError::ReplyRequestMismatch);
+            }
+        }
+        // Correlation failures are rejected before measuring or validating a
+        // potentially multi-megabyte body. Successful replies then perform the
+        // single fused structural row traversal plus encoded-size accounting.
+        let usage = self.validated_resource_usage()?;
+
+        match &self.outcome {
+            ExactRenderDeliveryOutcomeV1::NoChange { current, .. } => {
+                if request.mode != ExactRenderDeliveryMode::Incremental
+                    || request.continuation.is_some()
+                    || request.applied_baseline != ExactRenderAppliedBaseline::Applied(*current)
+                {
+                    return Err(ExactRenderDeliveryProtocolError::OutcomeModeMismatch);
+                }
+            }
+            ExactRenderDeliveryOutcomeV1::ExactDelta(delta) => {
+                if request.mode == ExactRenderDeliveryMode::ForceFull {
+                    return Err(ExactRenderDeliveryProtocolError::ForceFullReturnedDelta);
+                }
+                if request.continuation.is_some()
+                    || request.applied_baseline
+                        != ExactRenderAppliedBaseline::Applied(delta.base)
+                {
+                    return Err(ExactRenderDeliveryProtocolError::DeltaBaseMismatch);
+                }
+            }
+            ExactRenderDeliveryOutcomeV1::FullManifest(manifest) => {
+                if request.mode != ExactRenderDeliveryMode::ForceFull
+                    || request.continuation.is_some()
+                {
+                    return Err(ExactRenderDeliveryProtocolError::OutcomeModeMismatch);
+                }
+                validate_snapshot_result_against_baseline(
+                    manifest.snapshot.resulting_baseline,
+                    request.applied_baseline,
+                )?;
+            }
+            ExactRenderDeliveryOutcomeV1::FullChunk { manifest, chunk } => {
+                let continuation = request
+                    .continuation
+                    .ok_or(ExactRenderDeliveryProtocolError::ChunkContinuationMismatch)?;
+                let manifest_digest = manifest.canonical_manifest_digest()?;
+                if request.mode != ExactRenderDeliveryMode::ForceFull
+                    || continuation.snapshot != manifest.snapshot
+                    || continuation.manifest_digest != manifest_digest
+                    || continuation.source_version != manifest.source_version
+                    || continuation.next_chunk_ordinal != chunk.ordinal
+                    || continuation.next_row_ordinal != chunk.first_row_ordinal
+                    || continuation.next_text_byte != chunk.first_text_byte
+                {
+                    return Err(ExactRenderDeliveryProtocolError::ChunkContinuationMismatch);
+                }
+                validate_snapshot_result_against_baseline(
+                    manifest.snapshot.resulting_baseline,
+                    request.applied_baseline,
+                )?;
+            }
+            ExactRenderDeliveryOutcomeV1::BaselineTooOld { requested, .. } => {
+                if request.mode != ExactRenderDeliveryMode::Incremental
+                    || request.continuation.is_some()
+                    || request.applied_baseline
+                        != ExactRenderAppliedBaseline::Applied(*requested)
+                {
+                    return Err(ExactRenderDeliveryProtocolError::OutcomeModeMismatch);
+                }
+            }
+            ExactRenderDeliveryOutcomeV1::GenerationChanged { requested, .. } => {
+                if request.applied_baseline != ExactRenderAppliedBaseline::Applied(*requested) {
+                    return Err(ExactRenderDeliveryProtocolError::OutcomeModeMismatch);
+                }
+            }
+            ExactRenderDeliveryOutcomeV1::PaneRemoved { .. }
+            | ExactRenderDeliveryOutcomeV1::AuthorityExhausted { .. } => {}
+            ExactRenderDeliveryOutcomeV1::LimitsExceeded {
+                resource, limit, ..
+            } => {
+                let expected_limit = match resource {
+                    ExactRenderLimitResource::DecompressedBytes => {
+                        request.receiver_caps.max_decompressed_bytes
+                    }
+                    ExactRenderLimitResource::TextBytes => request.receiver_caps.max_text_bytes,
+                    ExactRenderLimitResource::Rows => request.receiver_caps.max_rows,
+                    ExactRenderLimitResource::SnapshotTextBytes => {
+                        request.receiver_caps.max_snapshot_text_bytes
+                    }
+                    ExactRenderLimitResource::SnapshotRows => {
+                        request.receiver_caps.max_snapshot_rows
+                    }
+                    ExactRenderLimitResource::SnapshotChunks => {
+                        request.receiver_caps.max_snapshot_chunks
+                    }
+                };
+                if *limit != expected_limit {
+                    return Err(ExactRenderDeliveryProtocolError::LimitsOutcomeInvalid);
+                }
+            }
+        }
+
+        validate_response_cap(
+            "decompressed_bytes",
+            usage.decompressed_bytes,
+            request.receiver_caps.max_decompressed_bytes,
+        )?;
+        validate_response_cap(
+            "text_bytes",
+            usage.text_bytes,
+            request.receiver_caps.max_text_bytes,
+        )?;
+        validate_response_cap("rows", usage.rows, request.receiver_caps.max_rows)?;
+        if let ExactRenderDeliveryOutcomeV1::FullManifest(manifest)
+        | ExactRenderDeliveryOutcomeV1::FullChunk { manifest, .. } = &self.outcome
+        {
+            validate_response_cap(
+                "snapshot_text_bytes",
+                manifest.validated_retained_text_bytes()?,
+                request.receiver_caps.max_snapshot_text_bytes,
+            )?;
+            validate_response_cap(
+                "snapshot_rows",
+                manifest.total_rows,
+                request.receiver_caps.max_snapshot_rows,
+            )?;
+            validate_response_cap(
+                "snapshot_chunks",
+                manifest.chunk_count,
+                request.receiver_caps.max_snapshot_chunks,
+            )?;
+        }
+        Ok(())
+    }
+}
+
+fn validate_snapshot_result_against_baseline(
+    result: ExactRenderDeliveryCursor,
+    applied: ExactRenderAppliedBaseline,
+) -> Result<(), ExactRenderDeliveryProtocolError> {
+    let ExactRenderAppliedBaseline::Applied(applied) = applied else {
+        return Ok(());
+    };
+    // Equal sequence is intentionally legal: ForceFull may repair corrupt or
+    // lost local content without requiring a new terminal mutation. A lower
+    // sequence within the same generation would regress acknowledged state.
+    if result.pane_generation == applied.pane_generation
+        && result.delivery_generation == applied.delivery_generation
+        && result.sequence < applied.sequence
+    {
+        return Err(ExactRenderDeliveryProtocolError::SnapshotRegressesBaseline);
+    }
+    Ok(())
+}
+
+fn validate_response_cap(
+    resource: &'static str,
+    requested: u64,
+    limit: u64,
+) -> Result<(), ExactRenderDeliveryProtocolError> {
+    if requested > limit {
+        return Err(ExactRenderDeliveryProtocolError::ResponseExceedsReceiverCap {
+            resource,
+            requested,
+            limit,
+        });
+    }
+    Ok(())
+}
+
+/// Connection/coordinator aggregate wire-response admission caps. This is not
+/// serialized and deliberately does not count the complete immutable backing
+/// described by a small manifest; use
+/// [`validate_exact_render_backing_reservations`] for that separate resource.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ExactRenderDeliveryAggregateCaps {
+    pub max_members: u64,
+    pub max_decompressed_bytes: u64,
+    pub max_text_bytes: u64,
+    pub max_rows: u64,
+}
+
+impl ExactRenderDeliveryAggregateCaps {
+    #[must_use]
+    pub const fn protocol_maximum() -> Self {
+        Self {
+            max_members: MAX_EXACT_RENDER_BATCH_MEMBERS,
+            max_decompressed_bytes: MAX_EXACT_RENDER_BATCH_DECOMPRESSED_BYTES,
+            max_text_bytes: MAX_EXACT_RENDER_BATCH_TEXT_BYTES,
+            max_rows: MAX_EXACT_RENDER_BATCH_ROWS,
+        }
+    }
+
+    fn validate(self) -> Result<(), ExactRenderDeliveryProtocolError> {
+        validate_exact_render_cap(
+            "aggregate_members",
+            self.max_members,
+            MAX_EXACT_RENDER_BATCH_MEMBERS,
+        )?;
+        validate_exact_render_cap(
+            "aggregate_decompressed_bytes",
+            self.max_decompressed_bytes,
+            MAX_EXACT_RENDER_BATCH_DECOMPRESSED_BYTES,
+        )?;
+        validate_exact_render_cap(
+            "aggregate_text_bytes",
+            self.max_text_bytes,
+            MAX_EXACT_RENDER_BATCH_TEXT_BYTES,
+        )?;
+        validate_exact_render_cap(
+            "aggregate_rows",
+            self.max_rows,
+            MAX_EXACT_RENDER_BATCH_ROWS,
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ExactRenderDeliveryAggregateUsage {
+    pub members: u64,
+    pub decompressed_bytes: u64,
+    pub text_bytes: u64,
+    pub rows: u64,
+}
+
+pub fn validate_exact_render_delivery_aggregate(
+    responses: &[GetPaneRenderDeliveryV1Response],
+    caps: ExactRenderDeliveryAggregateCaps,
+) -> Result<ExactRenderDeliveryAggregateUsage, ExactRenderDeliveryProtocolError> {
+    caps.validate()?;
+    let mut aggregate = ExactRenderDeliveryAggregateUsage::default();
+    for response in responses {
+        let usage = response.validated_resource_usage()?;
+        aggregate.members = aggregate.members.checked_add(1).ok_or(
+            ExactRenderDeliveryProtocolError::ArithmeticOverflow {
+                field: "aggregate_members",
+            },
+        )?;
+        aggregate.decompressed_bytes = aggregate
+            .decompressed_bytes
+            .checked_add(usage.decompressed_bytes)
+            .ok_or(ExactRenderDeliveryProtocolError::ArithmeticOverflow {
+                field: "aggregate_decompressed_bytes",
+            })?;
+        aggregate.text_bytes = aggregate.text_bytes.checked_add(usage.text_bytes).ok_or(
+            ExactRenderDeliveryProtocolError::ArithmeticOverflow {
+                field: "aggregate_text_bytes",
+            },
+        )?;
+        aggregate.rows = aggregate.rows.checked_add(usage.rows).ok_or(
+            ExactRenderDeliveryProtocolError::ArithmeticOverflow {
+                field: "aggregate_rows",
+            },
+        )?;
+        validate_aggregate_cap("members", aggregate.members, caps.max_members)?;
+        validate_aggregate_cap(
+            "decompressed_bytes",
+            aggregate.decompressed_bytes,
+            caps.max_decompressed_bytes,
+        )?;
+        validate_aggregate_cap("text_bytes", aggregate.text_bytes, caps.max_text_bytes)?;
+        validate_aggregate_cap("rows", aggregate.rows, caps.max_rows)?;
+    }
+    Ok(aggregate)
+}
+
+/// Aggregate admission caps for immutable snapshot backing retained on behalf
+/// of manifest/chunk responses. Zero is a valid local policy (retain none), but
+/// a caller cannot raise any ceiling above the v1 protocol maximum.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ExactRenderBackingReservationCaps {
+    pub max_distinct_snapshots: u64,
+    /// Row text plus retained projection title/working-directory bytes.
+    pub max_total_text_bytes: u64,
+    pub max_total_rows: u64,
+    pub max_total_chunks: u64,
+}
+
+impl ExactRenderBackingReservationCaps {
+    #[must_use]
+    pub const fn protocol_maximum() -> Self {
+        Self {
+            max_distinct_snapshots: MAX_EXACT_RENDER_BACKING_DISTINCT_SNAPSHOTS,
+            max_total_text_bytes: MAX_EXACT_RENDER_BACKING_TEXT_BYTES,
+            max_total_rows: MAX_EXACT_RENDER_BACKING_ROWS,
+            max_total_chunks: MAX_EXACT_RENDER_BACKING_CHUNKS,
+        }
+    }
+
+    fn validate(self) -> Result<(), ExactRenderDeliveryProtocolError> {
+        for (resource, requested, maximum) in [
+            (
+                "backing_distinct_snapshots",
+                self.max_distinct_snapshots,
+                MAX_EXACT_RENDER_BACKING_DISTINCT_SNAPSHOTS,
+            ),
+            (
+                "backing_text_bytes",
+                self.max_total_text_bytes,
+                MAX_EXACT_RENDER_BACKING_TEXT_BYTES,
+            ),
+            (
+                "backing_rows",
+                self.max_total_rows,
+                MAX_EXACT_RENDER_BACKING_ROWS,
+            ),
+            (
+                "backing_chunks",
+                self.max_total_chunks,
+                MAX_EXACT_RENDER_BACKING_CHUNKS,
+            ),
+        ] {
+            if requested > maximum {
+                return Err(
+                    ExactRenderDeliveryProtocolError::InvalidBackingReservationCap {
+                        resource,
+                        requested,
+                        maximum,
+                    },
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ExactRenderBackingReservationUsage {
+    pub distinct_snapshots: u64,
+    pub total_text_bytes: u64,
+    pub total_rows: u64,
+    pub total_chunks: u64,
+}
+
+/// Logical immutable-snapshot identity for deduplication and equivocation.
+/// The claimed content digest is deliberately excluded: changing that digest
+/// for the same connection/pane/baseline is the equivocation this key must
+/// expose, not a second reservable snapshot.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct ExactRenderSnapshotBackingIdentity {
+    connection_identity: RenderConnectionIdentity,
+    pane_id: ExactRenderPaneId,
+    resulting_baseline: ExactRenderDeliveryCursor,
+}
+
+impl From<ExactRenderDeliveryToken> for ExactRenderSnapshotBackingIdentity {
+    fn from(token: ExactRenderDeliveryToken) -> Self {
+        Self {
+            connection_identity: token.connection_identity,
+            pane_id: token.pane_id,
+            resulting_baseline: token.resulting_baseline,
+        }
+    }
+}
+
+/// Validate and reserve complete immutable backing once per logical snapshot
+/// identity. Repeated chunks with the same manifest are deduplicated; changing
+/// any manifest claim, including the content digest, for the same
+/// connection/pane/baseline is equivocation and fails closed.
+pub fn validate_exact_render_backing_reservations(
+    responses: &[GetPaneRenderDeliveryV1Response],
+    caps: ExactRenderBackingReservationCaps,
+) -> Result<ExactRenderBackingReservationUsage, ExactRenderDeliveryProtocolError> {
+    caps.validate()?;
+    let member_count = u64::try_from(responses.len()).map_err(|_| {
+        ExactRenderDeliveryProtocolError::ArithmeticOverflow {
+            field: "backing_members",
+        }
+    })?;
+    if member_count > MAX_EXACT_RENDER_BATCH_MEMBERS {
+        return Err(
+            ExactRenderDeliveryProtocolError::BackingReservationLimitExceeded {
+                resource: "members",
+                requested: member_count,
+                limit: MAX_EXACT_RENDER_BATCH_MEMBERS,
+            },
+        );
+    }
+    let mut manifest_by_snapshot = HashMap::new();
+    let mut usage = ExactRenderBackingReservationUsage::default();
+    for response in responses {
+        response.validate()?;
+        let manifest = match &response.outcome {
+            ExactRenderDeliveryOutcomeV1::FullManifest(manifest)
+            | ExactRenderDeliveryOutcomeV1::FullChunk { manifest, .. } => manifest,
+            ExactRenderDeliveryOutcomeV1::NoChange { .. }
+            | ExactRenderDeliveryOutcomeV1::ExactDelta(_)
+            | ExactRenderDeliveryOutcomeV1::BaselineTooOld { .. }
+            | ExactRenderDeliveryOutcomeV1::GenerationChanged { .. }
+            | ExactRenderDeliveryOutcomeV1::PaneRemoved { .. }
+            | ExactRenderDeliveryOutcomeV1::AuthorityExhausted { .. }
+            | ExactRenderDeliveryOutcomeV1::LimitsExceeded { .. } => continue,
+        };
+        let retained_text_bytes = manifest.validated_retained_text_bytes()?;
+        let manifest_digest = manifest.canonical_manifest_digest()?;
+        let snapshot_identity = ExactRenderSnapshotBackingIdentity::from(manifest.snapshot);
+        if let Some(retained_digest) = manifest_by_snapshot.get(&snapshot_identity) {
+            if *retained_digest != manifest_digest {
+                return Err(
+                    ExactRenderDeliveryProtocolError::SnapshotManifestEquivocation,
+                );
+            }
+            continue;
+        }
+        manifest_by_snapshot.insert(snapshot_identity, manifest_digest);
+        usage.distinct_snapshots = usage.distinct_snapshots.checked_add(1).ok_or(
+            ExactRenderDeliveryProtocolError::ArithmeticOverflow {
+                field: "backing_distinct_snapshots",
+            },
+        )?;
+        usage.total_text_bytes = usage
+            .total_text_bytes
+            .checked_add(retained_text_bytes)
+            .ok_or(ExactRenderDeliveryProtocolError::ArithmeticOverflow {
+                field: "backing_text_bytes",
+            })?;
+        usage.total_rows = usage.total_rows.checked_add(manifest.total_rows).ok_or(
+            ExactRenderDeliveryProtocolError::ArithmeticOverflow {
+                field: "backing_rows",
+            },
+        )?;
+        usage.total_chunks = usage.total_chunks.checked_add(manifest.chunk_count).ok_or(
+            ExactRenderDeliveryProtocolError::ArithmeticOverflow {
+                field: "backing_chunks",
+            },
+        )?;
+        validate_backing_reservation_cap(
+            "distinct_snapshots",
+            usage.distinct_snapshots,
+            caps.max_distinct_snapshots,
+        )?;
+        validate_backing_reservation_cap(
+            "text_bytes",
+            usage.total_text_bytes,
+            caps.max_total_text_bytes,
+        )?;
+        validate_backing_reservation_cap("rows", usage.total_rows, caps.max_total_rows)?;
+        validate_backing_reservation_cap(
+            "chunks",
+            usage.total_chunks,
+            caps.max_total_chunks,
+        )?;
+    }
+    Ok(usage)
+}
+
+fn validate_backing_reservation_cap(
+    resource: &'static str,
+    requested: u64,
+    limit: u64,
+) -> Result<(), ExactRenderDeliveryProtocolError> {
+    if requested > limit {
+        return Err(
+            ExactRenderDeliveryProtocolError::BackingReservationLimitExceeded {
+                resource,
+                requested,
+                limit,
+            },
+        );
+    }
+    Ok(())
+}
+
+fn validate_aggregate_cap(
+    resource: &'static str,
+    requested: u64,
+    limit: u64,
+) -> Result<(), ExactRenderDeliveryProtocolError> {
+    if requested > limit {
+        return Err(ExactRenderDeliveryProtocolError::AggregateLimitExceeded {
+            resource,
+            requested,
+            limit,
+        });
+    }
+    Ok(())
+}
+
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+pub enum ExactRenderDeliveryProtocolError {
+    #[error("exact render-delivery protocol version {actual} is unsupported; expected {expected}")]
+    UnsupportedProtocolVersion { actual: u16, expected: u16 },
+    #[error("exact render connection identity uses a reserved zero value")]
+    ReservedConnectionIdentity,
+    #[error("exact render numeric identity {field} uses reserved value {value}")]
+    ReservedNumericIdentity { field: &'static str, value: u64 },
+    #[error("exact render digest {field} uses the reserved all-zero value")]
+    ReservedDigest { field: &'static str },
+    #[error("exact render authority {field} exhausted without a reusable successor")]
+    AuthorityExhausted { field: &'static str },
+    #[error(
+        "exact render receiver cap {resource}={requested} is outside {protocol_minimum}..={protocol_maximum}"
+    )]
+    InvalidReceiverCap {
+        resource: &'static str,
+        requested: u64,
+        protocol_minimum: u64,
+        protocol_maximum: u64,
+    },
+    #[error("exact render receiver cap {larger}={larger_value} exceeds {smaller}={smaller_value}")]
+    InconsistentReceiverCaps {
+        smaller: &'static str,
+        smaller_value: u64,
+        larger: &'static str,
+        larger_value: u64,
+    },
+    #[error("exact render resource {resource} requested {requested}; protocol limit is {limit}")]
+    ResourceLimitExceeded {
+        resource: &'static str,
+        requested: u64,
+        limit: u64,
+    },
+    #[error("exact render arithmetic overflow while computing {field}")]
+    ArithmeticOverflow { field: &'static str },
+    #[error("exact render row order expected stable row {expected}, received {actual}")]
+    UnexpectedStableRow { expected: i64, actual: i64 },
+    #[error("exact render persisted-text projection metadata is internally inconsistent")]
+    ProjectionMetadataInvalid,
+    #[error("exact render settlement targets a different connection or pane")]
+    SettlementIdentityMismatch,
+    #[error("exact render settlement does not match the request's applied baseline")]
+    SettlementBaselineMismatch,
+    #[error("exact render snapshot continuation requires ForceFull mode")]
+    ContinuationRequiresForceFull,
+    #[error("exact render incremental request requires an applied delivery baseline")]
+    IncrementalRequiresBaseline,
+    #[error("exact render snapshot continuation targets a different connection or pane")]
+    ContinuationIdentityMismatch,
+    #[error("exact render settlement and snapshot continuation cannot share one request")]
+    SettlementWithContinuation,
+    #[error("exact render delta crosses a pane or delivery generation")]
+    DeliveryGenerationMismatch,
+    #[error("exact render delta does not advance its explicit delivery sequence")]
+    NonAdvancingDelta,
+    #[error("exact render row patch removes and inserts zero rows")]
+    EmptyRowPatch,
+    #[error("exact render row patches are not strictly ordered and disjoint")]
+    PatchOrderInvalid,
+    #[error("exact render patch replacement rows expected offset {expected_start}, received {actual_start}")]
+    PatchRowsNotPartitioned {
+        expected_start: u64,
+        actual_start: u64,
+    },
+    #[error("exact render patch replacement end {end} exceeds row count {row_count}")]
+    PatchReplacementOutOfRange { end: u64, row_count: u64 },
+    #[error("exact render replacement rows fall outside the resulting projection")]
+    PatchProjectionOutOfRange,
+    #[error("exact render digest mismatch for {field}")]
+    DigestMismatch { field: &'static str },
+    #[error("exact render request digest mismatch: expected {expected:?}, received {actual:?}")]
+    RequestDigestMismatch {
+        expected: ExactRenderDigest,
+        actual: ExactRenderDigest,
+    },
+    #[error("exact render snapshot totals are inconsistent or exceed protocol maxima")]
+    SnapshotTotalsInvalid,
+    #[error("exact render snapshot chunk plan cannot carry its declared totals")]
+    SnapshotChunkCountInvalid,
+    #[error("exact render snapshot chunk source version differs from its immutable manifest")]
+    SnapshotSourceVersionMismatch,
+    #[error("exact render snapshot chunk ordinal or row/text range is invalid")]
+    SnapshotChunkRangeInvalid,
+    #[error("exact render LimitsExceeded outcome must report required > nonzero limit")]
+    LimitsOutcomeInvalid,
+    #[error("exact render reply does not echo the exact request identity")]
+    ReplyRequestMismatch,
+    #[error(
+        "exact render reply request digest mismatch: expected {expected:?}, received {actual:?}"
+    )]
+    ReplyRequestDigestMismatch {
+        expected: ExactRenderDigest,
+        actual: ExactRenderDigest,
+    },
+    #[error("exact render outcome is incompatible with the request mode or baseline")]
+    OutcomeModeMismatch,
+    #[error("ForceFull exact render request returned a delta")]
+    ForceFullReturnedDelta,
+    #[error("exact render delta does not advance the request's applied baseline")]
+    DeltaBaseMismatch,
+    #[error("exact render full chunk does not match the requested continuation")]
+    ChunkContinuationMismatch,
+    #[error("exact render full snapshot regresses the applied baseline within one generation")]
+    SnapshotRegressesBaseline,
+    #[error("exact render baseline-too-old range is inconsistent")]
+    BaselineTooOldInvalid,
+    #[error("exact render generation-change result did not change a generation")]
+    GenerationChangeInvalid,
+    #[error("exact render response {resource}={requested} exceeds receiver cap {limit}")]
+    ResponseExceedsReceiverCap {
+        resource: &'static str,
+        requested: u64,
+        limit: u64,
+    },
+    #[error("exact render aggregate {resource}={requested} exceeds cap {limit}")]
+    AggregateLimitExceeded {
+        resource: &'static str,
+        requested: u64,
+        limit: u64,
+    },
+    #[error("exact render backing reservation {resource}={requested} exceeds cap {limit}")]
+    BackingReservationLimitExceeded {
+        resource: &'static str,
+        requested: u64,
+        limit: u64,
+    },
+    #[error(
+        "exact render backing reservation cap {resource}={requested} exceeds protocol maximum {maximum}"
+    )]
+    InvalidBackingReservationCap {
+        resource: &'static str,
+        requested: u64,
+        maximum: u64,
+    },
+    #[error("exact render snapshot token was paired with inconsistent immutable manifests")]
+    SnapshotManifestEquivocation,
+    #[error("exact render pane id cannot be represented by the local mux architecture")]
+    PaneIdOutOfRange,
+    #[error("exact render authority value could not be canonically measured")]
+    Encoding,
+}
+
+fn validate_exact_render_protocol_version(
+    version: u16,
+) -> Result<(), ExactRenderDeliveryProtocolError> {
+    if version != EXACT_RENDER_DELIVERY_PROTOCOL_VERSION {
+        return Err(
+            ExactRenderDeliveryProtocolError::UnsupportedProtocolVersion {
+                actual: version,
+                expected: EXACT_RENDER_DELIVERY_PROTOCOL_VERSION,
+            },
+        );
+    }
+    Ok(())
+}
+
+fn exact_render_encoded_len<T: Serialize>(
+    value: &T,
+) -> Result<u64, ExactRenderDeliveryProtocolError> {
+    struct CountingWriter {
+        bytes: u64,
+    }
+
+    impl std::io::Write for CountingWriter {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            self.bytes = self
+                .bytes
+                .checked_add(u64::try_from(buffer.len()).map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "exact render encoded length does not fit u64",
+                    )
+                })?)
+                .ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "exact render encoded length overflow",
+                    )
+                })?;
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let mut counter = CountingWriter { bytes: 0 };
+    let mut serializer = varbincode::Serializer::new(&mut counter);
+    #[cfg(test)]
+    record_test_serialize_invocation();
+    value
+        .serialize(&mut serializer)
+        .map_err(|_| ExactRenderDeliveryProtocolError::Encoding)?;
+    Ok(counter.bytes)
+}
+
+fn hash_exact_render_cursor(hasher: &mut Sha256, cursor: ExactRenderDeliveryCursor) {
+    hasher.update(cursor.pane_generation.get().to_be_bytes());
+    hasher.update(cursor.delivery_generation.get().to_be_bytes());
+    hasher.update(cursor.sequence.get().to_be_bytes());
+}
+
+fn hash_exact_render_request_identity(
+    hasher: &mut Sha256,
+    identity: ExactRenderDeliveryRequestIdentity,
+) {
+    hasher.update(identity.connection_identity.stream_id.as_bytes());
+    hasher.update(
+        identity
+            .connection_identity
+            .session_incarnation
+            .as_bytes(),
+    );
+    hasher.update(identity.pane_id.get().to_be_bytes());
+    hasher.update(identity.request_sequence.get().to_be_bytes());
+}
+
+fn hash_exact_render_applied_baseline(
+    hasher: &mut Sha256,
+    baseline: ExactRenderAppliedBaseline,
+) {
+    match baseline {
+        ExactRenderAppliedBaseline::Uninitialized => hasher.update([0]),
+        ExactRenderAppliedBaseline::Applied(cursor) => {
+            hasher.update([1]);
+            hash_exact_render_cursor(hasher, cursor);
+        }
+    }
+}
+
+fn hash_exact_render_projection(
+    hasher: &mut Sha256,
+    projection: &ExactRenderProjectionV1,
+) -> Result<(), ExactRenderDeliveryProtocolError> {
+    hasher.update(projection.first_stable_row.to_be_bytes());
+    hasher.update(projection.row_count.to_be_bytes());
+    hasher.update([u8::from(projection.alt_screen_active)]);
+    hasher.update([u8::from(projection.mouse_grabbed)]);
+    hasher.update(projection.cursor_position.x.to_be_bytes());
+    hasher.update(projection.cursor_position.y.to_be_bytes());
+    hasher.update([projection.cursor_position.shape.digest_tag()]);
+    hasher.update([projection.cursor_position.visibility.digest_tag()]);
+    hasher.update(projection.dimensions.cols.to_be_bytes());
+    hasher.update(projection.dimensions.viewport_rows.to_be_bytes());
+    hasher.update(projection.dimensions.scrollback_rows.to_be_bytes());
+    hasher.update(projection.dimensions.physical_top.to_be_bytes());
+    hasher.update(projection.dimensions.scrollback_top.to_be_bytes());
+    hasher.update(projection.dimensions.dpi.to_be_bytes());
+    hasher.update(projection.dimensions.pixel_width.to_be_bytes());
+    hasher.update(projection.dimensions.pixel_height.to_be_bytes());
+    hasher.update([u8::from(projection.dimensions.reverse_video)]);
+    hash_exact_render_bytes(hasher, projection.title.as_bytes())?;
+    match &projection.working_dir {
+        Some(working_dir) => {
+            hasher.update([1]);
+            hash_exact_render_bytes(hasher, working_dir.as_bytes())?;
+        }
+        None => hasher.update([0]),
+    }
+    Ok(())
+}
+
+fn hash_exact_render_bytes(
+    hasher: &mut Sha256,
+    bytes: &[u8],
+) -> Result<(), ExactRenderDeliveryProtocolError> {
+    hasher.update(
+        u64::try_from(bytes.len())
+            .map_err(|_| ExactRenderDeliveryProtocolError::ArithmeticOverflow {
+                field: "digest_byte_length",
+            })?
+            .to_be_bytes(),
+    );
+    hasher.update(bytes);
+    Ok(())
+}
+
+fn hash_exact_render_token_context(
+    hasher: &mut Sha256,
+    token: ExactRenderDeliveryToken,
+) -> Result<(), ExactRenderDeliveryProtocolError> {
+    hasher.update(token.connection_identity.stream_id.as_bytes());
+    hasher.update(token.connection_identity.session_incarnation.as_bytes());
+    hasher.update(token.pane_id.get().to_be_bytes());
+    hash_exact_render_cursor(hasher, token.resulting_baseline);
+    Ok(())
+}
+
+fn hash_exact_render_token(
+    hasher: &mut Sha256,
+    token: ExactRenderDeliveryToken,
+) -> Result<(), ExactRenderDeliveryProtocolError> {
+    hash_exact_render_token_context(hasher, token)?;
+    hasher.update(token.content_digest.as_bytes());
+    Ok(())
+}
+
+fn hash_exact_render_rows(
+    hasher: &mut Sha256,
+    rows: &[ExactRenderRowV1],
+) -> Result<(), ExactRenderDeliveryProtocolError> {
+    hasher.update(
+        u64::try_from(rows.len())
+            .map_err(|_| ExactRenderDeliveryProtocolError::ArithmeticOverflow {
+                field: "digest_row_count",
+            })?
+            .to_be_bytes(),
+    );
+    for row in rows {
+        hash_exact_render_row(hasher, row)?;
+    }
+    Ok(())
+}
+
+fn hash_exact_render_row(
+    hasher: &mut Sha256,
+    row: &ExactRenderRowV1,
+) -> Result<(), ExactRenderDeliveryProtocolError> {
+    hasher.update(row.stable_row.to_be_bytes());
+    hasher.update([u8::from(row.wrapped)]);
+    hasher.update(
+        u64::try_from(row.text.len())
+            .map_err(|_| ExactRenderDeliveryProtocolError::ArithmeticOverflow {
+                field: "digest_row_text_bytes",
+            })?
+            .to_be_bytes(),
+    );
+    hasher.update(row.text.as_bytes());
+    Ok(())
 }
 
 #[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]
@@ -6010,6 +9448,31 @@ pub struct GetImageCellResponse {
 #[cfg(test)]
 mod test {
     use super::*;
+    use sha2::Digest as _;
+
+    fn declared_pdu_frame_header(
+        ident: u64,
+        serial: u64,
+        encoded_payload_bytes: usize,
+        is_compressed: bool,
+    ) -> Vec<u8> {
+        let frame_body_bytes = encoded_payload_bytes
+            .checked_add(encoded_length(serial))
+            .and_then(|len| len.checked_add(encoded_length(ident)))
+            .expect("test frame-body length must fit usize");
+        let frame_body_bytes = u64::try_from(frame_body_bytes)
+            .expect("test frame-body length must fit u64");
+        let tagged_len = if is_compressed {
+            frame_body_bytes | COMPRESSED_MASK
+        } else {
+            frame_body_bytes
+        };
+        let mut header = Vec::new();
+        leb128::write::unsigned(&mut header, tagged_len).expect("encode test frame length");
+        leb128::write::unsigned(&mut header, serial).expect("encode test serial");
+        leb128::write::unsigned(&mut header, ident).expect("encode test identifier");
+        header
+    }
 
     #[test]
     fn test_frame() {
@@ -6832,6 +10295,2505 @@ mod test {
         ]
     }
 
+    fn exact_render_connection() -> RenderConnectionIdentity {
+        RenderConnectionIdentity::new(
+            TopologyStreamId::from_bytes([0xa1; 16]),
+            MuxSessionIncarnation::from_bytes([0xb2; 16]),
+        )
+    }
+
+    fn exact_render_cursor(sequence: u64) -> ExactRenderDeliveryCursor {
+        ExactRenderDeliveryCursor {
+            pane_generation: ExactRenderPaneGeneration::try_new(1)
+                .expect("sample pane generation is nonzero"),
+            delivery_generation: ExactRenderDeliveryGeneration::try_new(1)
+                .expect("sample delivery generation is nonzero"),
+            sequence: ExactRenderDeliverySequence::try_new(sequence)
+                .expect("sample delivery sequence is nonzero"),
+        }
+    }
+
+    fn exact_render_request_identity(sequence: u64) -> ExactRenderDeliveryRequestIdentity {
+        ExactRenderDeliveryRequestIdentity {
+            connection_identity: exact_render_connection(),
+            pane_id: ExactRenderPaneId::new(42),
+            request_sequence: ExactRenderRequestSequence::try_new(sequence)
+                .expect("sample request sequence is nonzero"),
+        }
+    }
+
+    fn sample_exact_render_rows() -> Vec<ExactRenderRowV1> {
+        vec![
+            ExactRenderRowV1 {
+                stable_row: -2,
+                text: ExactRenderRowTextV1::try_from_str("wide: 界")
+                    .expect("sample row text is bounded UTF-8"),
+                wrapped: true,
+            },
+            ExactRenderRowV1 {
+                stable_row: -1,
+                text: ExactRenderRowTextV1::try_from_str("combining: e\u{301}")
+                    .expect("sample combining row is bounded UTF-8"),
+                wrapped: false,
+            },
+        ]
+    }
+
+    fn sample_exact_render_projection() -> ExactRenderProjectionV1 {
+        ExactRenderProjectionV1 {
+            first_stable_row: -2,
+            row_count: 2,
+            alt_screen_active: false,
+            mouse_grabbed: false,
+            cursor_position: ExactRenderCursorPositionV1 {
+                x: 7,
+                y: -1,
+                shape: ExactRenderCursorShapeV1::SteadyBlock,
+                visibility: ExactRenderCursorVisibilityV1::Visible,
+            },
+            dimensions: ExactRenderDimensionsV1 {
+                cols: 80,
+                viewport_rows: 2,
+                scrollback_rows: 2,
+                physical_top: -2,
+                scrollback_top: -2,
+                dpi: 144,
+                pixel_width: 1_600,
+                pixel_height: 900,
+                reverse_video: false,
+            },
+            title: ExactRenderTitleV1::try_from_str("sample exact render")
+                .expect("sample title is bounded UTF-8"),
+            working_dir: Some(
+                ExactRenderWorkingDirectoryV1::try_from_str("file:///tmp/frankenterm")
+                    .expect("sample working directory is bounded UTF-8"),
+            ),
+        }
+    }
+
+    fn sample_exact_render_delta(source_version: u64) -> ExactRenderDeltaV1 {
+        let rows = sample_exact_render_rows();
+        ExactRenderDeltaV1 {
+            delivery: ExactRenderDeliveryToken {
+                connection_identity: exact_render_connection(),
+                pane_id: ExactRenderPaneId::new(42),
+                resulting_baseline: exact_render_cursor(8),
+                content_digest: ExactRenderDigest::ZERO,
+            },
+            base: exact_render_cursor(7),
+            source_version,
+            resulting_projection: sample_exact_render_projection(),
+            patches: vec![ExactRenderRowPatchV1 {
+                start_stable_row: -2,
+                removed_rows: 2,
+                replacement_start: 0,
+                replacement_count: 2,
+            }],
+            rows,
+        }
+        .with_computed_digest()
+        .expect("sample delta digest must compute")
+    }
+
+    fn sample_exact_render_request(mode: ExactRenderDeliveryMode) -> GetPaneRenderDeliveryV1 {
+        GetPaneRenderDeliveryV1 {
+            protocol_version: EXACT_RENDER_DELIVERY_PROTOCOL_VERSION,
+            identity: exact_render_request_identity(1),
+            request_digest: ExactRenderDigest::ZERO,
+            applied_baseline: ExactRenderAppliedBaseline::Applied(exact_render_cursor(7)),
+            settlement: None,
+            mode,
+            receiver_caps: ExactRenderReceiverCaps::protocol_maximum(),
+            continuation: None,
+        }
+        .with_computed_request_digest()
+        .expect("sample request digest must compute")
+    }
+
+    fn sample_exact_render_manifest_and_chunks() -> (
+        Vec<ExactRenderRowV1>,
+        ExactRenderSnapshotManifestV1,
+        ExactRenderSnapshotChunkV1,
+        ExactRenderSnapshotChunkV1,
+    ) {
+        let rows = sample_exact_render_rows();
+        let total_text_bytes = exact_render_rows_usage(&rows)
+            .expect("sample rows have bounded usage")
+            .text_bytes;
+        let manifest = ExactRenderSnapshotManifestV1 {
+            snapshot: ExactRenderDeliveryToken {
+                connection_identity: exact_render_connection(),
+                pane_id: ExactRenderPaneId::new(42),
+                resulting_baseline: exact_render_cursor(9),
+                content_digest: ExactRenderDigest::ZERO,
+            },
+            source_version: 500,
+            projection: sample_exact_render_projection(),
+            total_rows: 2,
+            total_text_bytes,
+            chunk_count: 2,
+        }
+        .with_computed_content_digest(&rows)
+        .expect("sample snapshot content digest must compute");
+        let first_text_bytes = u64::try_from(rows[0].text.len())
+            .expect("sample row text length fits u64");
+        let first = ExactRenderSnapshotChunkV1 {
+            source_version: manifest.source_version,
+            ordinal: 0,
+            first_row_ordinal: 0,
+            first_text_byte: 0,
+            rows: vec![rows[0].clone()],
+            chunk_digest: ExactRenderDigest::ZERO,
+        }
+        .with_computed_digest(&manifest)
+        .expect("first sample chunk digest must compute");
+        let second = ExactRenderSnapshotChunkV1 {
+            source_version: manifest.source_version,
+            ordinal: 1,
+            first_row_ordinal: 1,
+            first_text_byte: first_text_bytes,
+            rows: vec![rows[1].clone()],
+            chunk_digest: ExactRenderDigest::ZERO,
+        }
+        .with_computed_digest(&manifest)
+        .expect("second sample chunk digest must compute");
+        (rows, manifest, first, second)
+    }
+
+    fn sample_exact_render_response(
+        outcome: ExactRenderDeliveryOutcomeV1,
+    ) -> GetPaneRenderDeliveryV1Response {
+        let request = sample_exact_render_request(ExactRenderDeliveryMode::Incremental);
+        sample_exact_render_response_for(&request, outcome)
+    }
+
+    fn sample_exact_render_response_for(
+        request: &GetPaneRenderDeliveryV1,
+        outcome: ExactRenderDeliveryOutcomeV1,
+    ) -> GetPaneRenderDeliveryV1Response {
+        GetPaneRenderDeliveryV1Response {
+            protocol_version: EXACT_RENDER_DELIVERY_PROTOCOL_VERSION,
+            request_identity: request.identity,
+            request_digest: request.request_digest,
+            outcome,
+        }
+    }
+
+    #[test]
+    fn exact_render_delivery_v1_is_known_but_not_runtime_advertised() {
+        let exact_render = TopologyCapabilities::from_bits(
+            TopologyCapabilities::FENCED_SNAPSHOT_V1.bits()
+                | TopologyCapabilities::EXACT_RENDER_DELIVERY_V1.bits(),
+        );
+        assert_eq!(TopologyCapabilities::EXACT_RENDER_DELIVERY_V1.bits(), 1 << 3);
+        assert!(exact_render.validate().is_ok());
+        assert_eq!(
+            TopologyCapabilities::EXACT_RENDER_DELIVERY_V1.validate(),
+            Err(
+                TopologyCapabilitiesError::ExactRenderDeliveryWithoutFencedSnapshot {
+                    bits: 1 << 3,
+                }
+            )
+        );
+        assert!(!TopologyCapabilities::SERVER_SUPPORTED
+            .contains(TopologyCapabilities::EXACT_RENDER_DELIVERY_V1));
+        assert_eq!(EXACT_RENDER_DELIVERY_V1_MIN_CODEC_VERSION, 52);
+        assert!(!codec_version_supports_exact_render_delivery_v1(51));
+        assert!(codec_version_supports_exact_render_delivery_v1(52));
+
+        let request_spec =
+            Pdu::wire_spec_for_ident(91).expect("exact render request ID must be assigned");
+        assert_eq!(request_spec.min_codec_version, 52);
+        assert!(request_spec.authorizes(PduProducer::Client, PduWireRole::Request));
+        assert!(!request_spec.authorizes(
+            PduProducer::Server,
+            PduWireRole::CorrelatedReply
+        ));
+        assert_eq!(
+            request_spec.capability,
+            PduCapabilityUse::Requires(exact_render)
+        );
+        let request_body_limit = PduEncodedBodyLimit::SchemaDecompressedWithZstdBound {
+            max_decompressed_bytes: MAX_EXACT_RENDER_REQUEST_DECOMPRESSED_BYTES,
+            max_zstd_encoded_bytes: MAX_EXACT_RENDER_REQUEST_ZSTD_ENCODED_BYTES,
+        };
+        assert_eq!(request_spec.encoded_body_limit, request_body_limit);
+        assert_eq!(
+            request_spec
+                .encoded_body_limit
+                .maximum_encoded_payload_bytes(false),
+            MAX_EXACT_RENDER_REQUEST_DECOMPRESSED_BYTES,
+        );
+        assert_eq!(
+            request_spec
+                .encoded_body_limit
+                .maximum_encoded_payload_bytes(true),
+            MAX_EXACT_RENDER_REQUEST_ZSTD_ENCODED_BYTES,
+        );
+        assert_eq!(
+            MAX_EXACT_RENDER_REQUEST_ZSTD_ENCODED_BYTES,
+            zstd::zstd_safe::compress_bound(MAX_EXACT_RENDER_REQUEST_DECOMPRESSED_BYTES),
+            "frozen request ceiling must continue to admit the pinned zstd encoder bound",
+        );
+        assert!(
+            request_spec
+                .encoded_body_limit
+                .maximum_encoded_payload_bytes(true)
+                > MAX_EXACT_RENDER_REQUEST_DECOMPRESSED_BYTES
+        );
+
+        let response_spec =
+            Pdu::wire_spec_for_ident(92).expect("exact render response ID must be assigned");
+        assert_eq!(response_spec.min_codec_version, 52);
+        assert!(response_spec.authorizes(
+            PduProducer::Server,
+            PduWireRole::CorrelatedReply
+        ));
+        assert!(!response_spec.authorizes(PduProducer::Server, PduWireRole::Unilateral));
+        assert_eq!(
+            response_spec.capability,
+            PduCapabilityUse::Requires(exact_render)
+        );
+        let response_body_limit = PduEncodedBodyLimit::SchemaDecompressedWithZstdBound {
+            max_decompressed_bytes: MAX_EXACT_RENDER_DELIVERY_DECOMPRESSED_BYTES,
+            max_zstd_encoded_bytes: MAX_EXACT_RENDER_DELIVERY_ZSTD_ENCODED_BYTES,
+        };
+        assert_eq!(response_spec.encoded_body_limit, response_body_limit);
+        assert!(
+            request_spec
+                .encoded_body_limit
+                .maximum_encoded_payload_bytes(false)
+                < response_spec
+                    .encoded_body_limit
+                    .maximum_encoded_payload_bytes(false),
+            "compact PDU 91 must not inherit PDU 92's multi-megabyte body cap",
+        );
+        assert_eq!(
+            MAX_EXACT_RENDER_DELIVERY_ZSTD_ENCODED_BYTES,
+            zstd::zstd_safe::compress_bound(MAX_EXACT_RENDER_DELIVERY_DECOMPRESSED_BYTES),
+            "frozen response ceiling must continue to admit the pinned zstd encoder bound",
+        );
+        assert_eq!(
+            Pdu::wire_spec_for_ident(1)
+                .expect("legacy ping ID must be assigned")
+                .encoded_body_limit,
+            PduEncodedBodyLimit::GlobalMaximum,
+        );
+        assert_eq!(
+            Pdu::GetPaneRenderDeliveryV1(sample_exact_render_request(
+                ExactRenderDeliveryMode::Incremental
+            ))
+            .pane_id(),
+            Some(42)
+        );
+        assert_eq!(
+            Pdu::GetPaneRenderDeliveryV1Response(sample_exact_render_response(
+                ExactRenderDeliveryOutcomeV1::NoChange {
+                    current: exact_render_cursor(7),
+                    source_version: 1,
+                }
+            ))
+            .pane_id(),
+            Some(42)
+        );
+    }
+
+    #[test]
+    fn exact_render_encoded_body_cap_precedes_sync_and_async_allocation() {
+        for ident in [91, 92] {
+            let spec = Pdu::wire_spec_for_ident(ident).expect("exact render ID must be assigned");
+            for is_compressed in [false, true] {
+                let limit = spec
+                    .encoded_body_limit
+                    .maximum_encoded_payload_bytes(is_compressed);
+
+                let exact_header =
+                    declared_pdu_frame_header(ident, 17, limit, is_compressed);
+                let exact_error = decode_raw(exact_header.as_slice())
+                    .expect_err("admitted header without its declared body must reach body read");
+                assert!(
+                    exact_error
+                        .downcast_ref::<PduEncodedBodyLimitExceeded>()
+                        .is_none(),
+                    "exact boundary was rejected as oversized: {exact_error:#}",
+                );
+
+                let plus = limit.checked_add(1).expect("exact body limit has headroom");
+                let plus_header =
+                    declared_pdu_frame_header(ident, 17, plus, is_compressed);
+                let plus_error = decode_raw(plus_header.as_slice())
+                    .expect_err("limit-plus-one header must fail before body allocation");
+                let exceeded = plus_error
+                    .downcast_ref::<PduEncodedBodyLimitExceeded>()
+                    .expect("sync decoder must return the typed schema-body limit error");
+                assert_eq!(exceeded.declared_payload_bytes(), plus);
+                assert_eq!(exceeded.max_payload_bytes(), limit);
+                assert_eq!(exceeded.serial(), 17);
+                assert_eq!(exceeded.ident(), ident);
+                assert_eq!(exceeded.is_compressed(), is_compressed);
+
+                runtime::block_on(async {
+                    let mut exact_reader = runtime::Cursor::new(exact_header);
+                    let header = decode_raw_header_async(&mut exact_reader, Some(17))
+                        .await
+                        .expect("async header decoder must admit the exact boundary");
+                    assert_eq!(header.encoded_payload_len(), limit);
+                    assert_eq!(header.maximum_encoded_payload_bytes(), limit);
+
+                    let mut plus_reader = runtime::Cursor::new(plus_header);
+                    let plus_error = decode_raw_header_async(&mut plus_reader, Some(17))
+                        .await
+                        .expect_err("async limit-plus-one header must fail before body allocation");
+                    let exceeded = plus_error
+                        .downcast_ref::<PduEncodedBodyLimitExceeded>()
+                        .expect("async decoder must return the typed schema-body limit error");
+                    assert_eq!(exceeded.declared_payload_bytes(), plus);
+                    assert_eq!(exceeded.max_payload_bytes(), limit);
+                    assert_eq!(exceeded.serial(), 17);
+                    assert_eq!(exceeded.ident(), ident);
+                    assert_eq!(exceeded.is_compressed(), is_compressed);
+                });
+            }
+        }
+    }
+
+    #[test]
+    fn exact_render_encode_serializes_once_after_structural_validation() {
+        let response = sample_exact_render_response(ExactRenderDeliveryOutcomeV1::NoChange {
+            current: exact_render_cursor(7),
+            source_version: 77,
+        });
+        reset_test_serialize_invocations();
+        response
+            .validate()
+            .expect("structural response validation must succeed");
+        assert_eq!(
+            test_serialize_invocations(),
+            0,
+            "pre-encode structural validation must not perform a counting serialization",
+        );
+        response
+            .resource_usage()
+            .expect("explicit resource accounting must remain measurable");
+        assert_eq!(
+            test_serialize_invocations(),
+            1,
+            "explicit byte accounting must perform exactly one counting traversal",
+        );
+        reset_test_serialize_invocations();
+
+        for mode in [
+            CompressionMode::Auto,
+            CompressionMode::Always,
+            CompressionMode::Never,
+        ] {
+            let before = test_serialize_invocations();
+            Pdu::GetPaneRenderDeliveryV1Response(response.clone())
+                .encode_frame_with_mode(31, mode)
+                .expect("valid exact-render response must encode");
+            assert_eq!(
+                test_serialize_invocations(),
+                before + 1,
+                "one frame encode must perform exactly one serde traversal in {mode:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn streaming_exact_render_body_cap_rejects_limit_plus_one_without_consumption() {
+        for ident in [91, 92] {
+            let spec = Pdu::wire_spec_for_ident(ident).expect("exact render ID must be assigned");
+            for is_compressed in [false, true] {
+                let limit = spec
+                    .encoded_body_limit
+                    .maximum_encoded_payload_bytes(is_compressed);
+                let exact_header =
+                    declared_pdu_frame_header(ident, 23, limit, is_compressed);
+                let mut exact_buffer = StreamingPduBuffer::from(exact_header.clone());
+                assert_eq!(
+                    Pdu::stream_decode(&mut exact_buffer)
+                        .expect("exact boundary declaration is admissible"),
+                    None,
+                );
+                assert_eq!(exact_buffer.as_slice(), exact_header.as_slice());
+
+                let plus = limit.checked_add(1).expect("exact body limit has headroom");
+                let plus_header =
+                    declared_pdu_frame_header(ident, 23, plus, is_compressed);
+                let mut plus_buffer = StreamingPduBuffer::from(plus_header.clone());
+                let error = Pdu::stream_decode(&mut plus_buffer)
+                    .expect_err("limit-plus-one stream must fail before body accumulation");
+                let exceeded = error
+                    .downcast_ref::<PduEncodedBodyLimitExceeded>()
+                    .expect("stream decoder must return the typed schema-body limit error");
+                assert_eq!(exceeded.declared_payload_bytes(), plus);
+                assert_eq!(exceeded.max_payload_bytes(), limit);
+                assert_eq!(exceeded.serial(), 23);
+                assert_eq!(exceeded.ident(), ident);
+                assert_eq!(exceeded.is_compressed(), is_compressed);
+                assert_eq!(plus_buffer.as_slice(), plus_header.as_slice());
+            }
+        }
+    }
+
+    #[test]
+    fn streaming_header_parser_waits_for_serial_and_ident_without_consumption() {
+        let mut buffer = StreamingPduBuffer::new();
+        let mut tagged_len = Vec::new();
+        leb128::write::unsigned(&mut tagged_len, 4).expect("encode test frame body length");
+        buffer.extend_from_slice(&tagged_len);
+        assert_eq!(Pdu::stream_decode(&mut buffer).expect("length prefix"), None);
+        assert_eq!(buffer.as_slice(), tagged_len.as_slice());
+
+        for byte in [0x80, 0x01, 0x81] {
+            buffer.extend_from_slice(&[byte]);
+            let before = buffer.as_slice().to_vec();
+            assert_eq!(
+                Pdu::stream_decode(&mut buffer).expect("incomplete header remains pending"),
+                None,
+            );
+            assert_eq!(buffer.as_slice(), before.as_slice());
+        }
+
+        buffer.extend_from_slice(&[0x01]);
+        let decoded = Pdu::stream_decode(&mut buffer)
+            .expect("complete unknown-PDU header must decode")
+            .expect("complete unknown-PDU frame must be present");
+        assert_eq!(decoded.serial, 128);
+        assert_eq!(decoded.pdu, Pdu::Invalid { ident: 129 });
+        assert!(buffer.is_empty());
+    }
+
+    #[test]
+    fn exact_render_delivery_v1_roundtrips_every_closed_outcome_in_every_mode() {
+        assert_eq!(<GetPaneRenderDeliveryV1 as PduWireIdent>::IDENT, 91);
+        assert_eq!(<GetPaneRenderDeliveryV1Response as PduWireIdent>::IDENT, 92);
+        let (rows, manifest, first_chunk, _) = sample_exact_render_manifest_and_chunks();
+        manifest
+            .validate_complete_rows(&rows)
+            .expect("sample manifest must bind the complete row sequence");
+        let old_requested = ExactRenderDeliveryCursor {
+            sequence: ExactRenderDeliverySequence::try_new(1).expect("nonzero"),
+            ..exact_render_cursor(7)
+        };
+        let oldest = ExactRenderDeliveryCursor {
+            sequence: ExactRenderDeliverySequence::try_new(2).expect("nonzero"),
+            ..exact_render_cursor(7)
+        };
+        let outcomes = vec![
+            ExactRenderDeliveryOutcomeV1::NoChange {
+                current: exact_render_cursor(7),
+                source_version: 900,
+            },
+            ExactRenderDeliveryOutcomeV1::ExactDelta(sample_exact_render_delta(901)),
+            ExactRenderDeliveryOutcomeV1::FullManifest(manifest.clone()),
+            ExactRenderDeliveryOutcomeV1::FullChunk {
+                manifest: manifest.clone(),
+                chunk: first_chunk,
+            },
+            ExactRenderDeliveryOutcomeV1::BaselineTooOld {
+                requested: old_requested,
+                oldest_available: oldest,
+                current: exact_render_cursor(7),
+            },
+            ExactRenderDeliveryOutcomeV1::GenerationChanged {
+                requested: exact_render_cursor(7),
+                current_pane_generation: ExactRenderPaneGeneration::try_new(2)
+                    .expect("nonzero"),
+                current_delivery_generation: ExactRenderDeliveryGeneration::try_new(1)
+                    .expect("nonzero"),
+            },
+            ExactRenderDeliveryOutcomeV1::PaneRemoved {
+                last_pane_generation: Some(
+                    ExactRenderPaneGeneration::try_new(1).expect("nonzero"),
+                ),
+            },
+            ExactRenderDeliveryOutcomeV1::AuthorityExhausted {
+                authority: ExactRenderAuthority::DeliverySequence,
+            },
+            ExactRenderDeliveryOutcomeV1::LimitsExceeded {
+                resource: ExactRenderLimitResource::Rows,
+                required: 2,
+                limit: 1,
+            },
+        ];
+
+        let request = Pdu::GetPaneRenderDeliveryV1(sample_exact_render_request(
+            ExactRenderDeliveryMode::Incremental,
+        ));
+        for mode in [
+            CompressionMode::Auto,
+            CompressionMode::Never,
+            CompressionMode::Always,
+        ] {
+            let frame = request
+                .encode_frame_with_mode(0x51, mode)
+                .expect("exact render request must encode");
+            assert_eq!(
+                Pdu::decode(frame.as_slice())
+                    .expect("exact render request must decode")
+                    .pdu,
+                request
+            );
+            for outcome in &outcomes {
+                let pdu = Pdu::GetPaneRenderDeliveryV1Response(
+                    sample_exact_render_response(outcome.clone()),
+                );
+                let frame = pdu
+                    .encode_frame_with_mode(0x52, mode)
+                    .expect("closed exact render outcome must encode");
+                assert_eq!(
+                    Pdu::decode(frame.as_slice())
+                        .expect("closed exact render outcome must decode")
+                        .pdu,
+                    pdu
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn exact_render_delivery_authorities_never_wrap_and_pane_ids_are_fixed_width() {
+        assert!(ExactRenderPaneGeneration::try_new(0).is_err());
+        assert!(ExactRenderDeliveryGeneration::try_new(0).is_err());
+        assert!(ExactRenderDeliverySequence::try_new(0).is_err());
+        assert!(ExactRenderRequestSequence::try_new(0).is_err());
+        assert_eq!(ExactRenderPaneId::new(0).try_into_mux(), Ok(0));
+        let mut pane_zero_request =
+            sample_exact_render_request(ExactRenderDeliveryMode::Incremental);
+        pane_zero_request.identity.pane_id = ExactRenderPaneId::new(0);
+        pane_zero_request = pane_zero_request
+            .with_computed_request_digest()
+            .expect("pane-zero request digest must compute");
+        pane_zero_request
+            .validate()
+            .expect("mux pane zero is a valid exact-render authority");
+        let pane_id =
+            ExactRenderPaneId::try_from_mux(42).expect("local pane id fits fixed wire id");
+        assert_eq!(pane_id.get(), 42);
+        assert_eq!(pane_id.try_into_mux(), Ok(42));
+        let widest = ExactRenderPaneId::new(u64::MAX);
+        if usize::BITS < 64 {
+            assert_eq!(
+                widest.try_into_mux(),
+                Err(ExactRenderDeliveryProtocolError::PaneIdOutOfRange)
+            );
+        } else {
+            assert_eq!(widest.try_into_mux(), Ok(usize::MAX));
+        }
+        let mut zero_connection =
+            sample_exact_render_request(ExactRenderDeliveryMode::Incremental);
+        zero_connection.identity.connection_identity = RenderConnectionIdentity::new(
+            TopologyStreamId::from_bytes([0; 16]),
+            MuxSessionIncarnation::from_bytes([0; 16]),
+        );
+        assert_eq!(
+            zero_connection.validate(),
+            Err(ExactRenderDeliveryProtocolError::ReservedConnectionIdentity)
+        );
+
+        assert_eq!(
+            ExactRenderPaneGeneration::try_new(u64::MAX)
+                .expect("maximum generation is the final usable identity")
+                .checked_next(),
+            Err(ExactRenderDeliveryProtocolError::AuthorityExhausted {
+                field: "pane_generation",
+            })
+        );
+        assert_eq!(
+            ExactRenderDeliveryGeneration::try_new(u64::MAX)
+                .expect("maximum generation is the final usable identity")
+                .checked_next(),
+            Err(ExactRenderDeliveryProtocolError::AuthorityExhausted {
+                field: "delivery_generation",
+            })
+        );
+        assert_eq!(
+            ExactRenderDeliverySequence::try_new(u64::MAX)
+                .expect("maximum sequence is the final usable identity")
+                .checked_next(),
+            Err(ExactRenderDeliveryProtocolError::AuthorityExhausted {
+                field: "delivery_sequence",
+            })
+        );
+        assert_eq!(
+            ExactRenderRequestSequence::try_new(u64::MAX)
+                .expect("maximum request is the final usable identity")
+                .checked_next(),
+            Err(ExactRenderDeliveryProtocolError::AuthorityExhausted {
+                field: "request_sequence",
+            })
+        );
+        assert_eq!(exact_render_cursor(7).checked_next().expect("7 advances").sequence.get(), 8);
+
+        let mut uninitialized_incremental =
+            sample_exact_render_request(ExactRenderDeliveryMode::Incremental);
+        uninitialized_incremental.applied_baseline = ExactRenderAppliedBaseline::Uninitialized;
+        assert_eq!(
+            uninitialized_incremental.validate(),
+            Err(ExactRenderDeliveryProtocolError::IncrementalRequiresBaseline)
+        );
+        uninitialized_incremental.mode = ExactRenderDeliveryMode::ForceFull;
+        uninitialized_incremental = uninitialized_incremental
+            .with_computed_request_digest()
+            .expect("force-full bootstrap request digest must compute");
+        uninitialized_incremental
+            .validate()
+            .expect("an uninitialized client must bootstrap through ForceFull");
+    }
+
+    #[test]
+    fn exact_render_request_digest_has_frozen_architecture_independent_preimage() {
+        const REQUEST_GOLDEN: ExactRenderDigest = ExactRenderDigest::from_bytes([
+            0x59, 0x80, 0x36, 0x25, 0x12, 0xf4, 0xe3, 0x2d, 0x18, 0x82, 0xb7, 0x66, 0xb5,
+            0x7d, 0x62, 0x1a, 0x1f, 0x14, 0x6b, 0x40, 0x14, 0x41, 0x62, 0xd5, 0xf8, 0xd5,
+            0xc3, 0xc2, 0x43, 0xb3, 0x45, 0xe4,
+        ]);
+        let connection = RenderConnectionIdentity::new(
+            TopologyStreamId::from_bytes([0x01; 16]),
+            MuxSessionIncarnation::from_bytes([0x02; 16]),
+        );
+        let cursor = |sequence| ExactRenderDeliveryCursor {
+            pane_generation: ExactRenderPaneGeneration::try_new(4).expect("nonzero"),
+            delivery_generation: ExactRenderDeliveryGeneration::try_new(5).expect("nonzero"),
+            sequence: ExactRenderDeliverySequence::try_new(sequence).expect("nonzero"),
+        };
+        let request = GetPaneRenderDeliveryV1 {
+            protocol_version: EXACT_RENDER_DELIVERY_PROTOCOL_VERSION,
+            identity: ExactRenderDeliveryRequestIdentity {
+                connection_identity: connection,
+                pane_id: ExactRenderPaneId::new(3),
+                request_sequence: ExactRenderRequestSequence::try_new(9).expect("nonzero"),
+            },
+            request_digest: ExactRenderDigest::ZERO,
+            applied_baseline: ExactRenderAppliedBaseline::Applied(cursor(6)),
+            settlement: Some(ExactRenderDeliverySettlement {
+                delivery: ExactRenderDeliveryToken {
+                    connection_identity: connection,
+                    pane_id: ExactRenderPaneId::new(3),
+                    resulting_baseline: cursor(7),
+                    content_digest: ExactRenderDigest::from_bytes([0xaa; 32]),
+                },
+                outcome: ExactRenderDeliverySettlementOutcome::Nack {
+                    reason: ExactRenderDeliveryNackReason::SnapshotCorrupt,
+                    observed_baseline: ExactRenderAppliedBaseline::Applied(cursor(6)),
+                },
+            }),
+            mode: ExactRenderDeliveryMode::Incremental,
+            receiver_caps: ExactRenderReceiverCaps {
+                max_decompressed_bytes: 4_096,
+                max_text_bytes: 123,
+                max_rows: 4,
+                max_snapshot_text_bytes: 999,
+                max_snapshot_rows: 20,
+                max_snapshot_chunks: 5,
+            },
+            continuation: None,
+        }
+        .with_computed_request_digest()
+        .expect("golden request digest must compute");
+        request
+            .validate()
+            .expect("golden request must be self-consistent");
+        assert_eq!(request.request_digest, REQUEST_GOLDEN);
+
+        let mut preimage = EXACT_RENDER_REQUEST_DIGEST_DOMAIN_V1.to_vec();
+        preimage.extend_from_slice(&1_u16.to_be_bytes());
+        preimage.extend_from_slice(&[0x01; 16]);
+        preimage.extend_from_slice(&[0x02; 16]);
+        preimage.extend_from_slice(&3_u64.to_be_bytes());
+        preimage.extend_from_slice(&9_u64.to_be_bytes());
+        preimage.push(1);
+        for value in [4_u64, 5, 6] {
+            preimage.extend_from_slice(&value.to_be_bytes());
+        }
+        preimage.push(1);
+        preimage.extend_from_slice(&[0x01; 16]);
+        preimage.extend_from_slice(&[0x02; 16]);
+        preimage.extend_from_slice(&3_u64.to_be_bytes());
+        for value in [4_u64, 5, 7] {
+            preimage.extend_from_slice(&value.to_be_bytes());
+        }
+        preimage.extend_from_slice(&[0xaa; 32]);
+        preimage.extend_from_slice(&[1, 2, 1]);
+        for value in [4_u64, 5, 6] {
+            preimage.extend_from_slice(&value.to_be_bytes());
+        }
+        preimage.push(0);
+        for value in [4_096_u64, 123, 4, 999, 20, 5] {
+            preimage.extend_from_slice(&value.to_be_bytes());
+        }
+        preimage.push(0);
+        assert_eq!(preimage.len(), 285);
+        assert_eq!(
+            ExactRenderDigest::from_bytes(Sha256::digest(&preimage).into()),
+            REQUEST_GOLDEN,
+        );
+    }
+
+    #[test]
+    fn exact_render_request_digest_binds_identity_body_and_response_echo() {
+        fn assert_digest_changes(
+            base: &GetPaneRenderDeliveryV1,
+            field: &str,
+            mutate: impl FnOnce(&mut GetPaneRenderDeliveryV1),
+        ) {
+            let mut changed = base.clone();
+            mutate(&mut changed);
+            assert_ne!(
+                changed
+                    .canonical_request_digest()
+                    .expect("mutated request digest must compute"),
+                base.request_digest,
+                "request digest omitted {field}",
+            );
+        }
+
+        let base = sample_exact_render_request(ExactRenderDeliveryMode::Incremental);
+        assert_digest_changes(&base, "protocol_version", |request| {
+            request.protocol_version += 1;
+        });
+        assert_digest_changes(&base, "stream_id", |request| {
+            request.identity.connection_identity.stream_id =
+                TopologyStreamId::from_bytes([0xc1; 16]);
+        });
+        assert_digest_changes(&base, "session_incarnation", |request| {
+            request.identity.connection_identity.session_incarnation =
+                MuxSessionIncarnation::from_bytes([0xc2; 16]);
+        });
+        assert_digest_changes(&base, "pane_id", |request| {
+            request.identity.pane_id = ExactRenderPaneId::new(43);
+        });
+        assert_digest_changes(&base, "request_sequence", |request| {
+            request.identity.request_sequence =
+                ExactRenderRequestSequence::try_new(2).expect("nonzero");
+        });
+        assert_digest_changes(&base, "applied_baseline", |request| {
+            request.applied_baseline = ExactRenderAppliedBaseline::Uninitialized;
+        });
+        assert_digest_changes(&base, "settlement", |request| {
+            request.settlement = Some(ExactRenderDeliverySettlement {
+                delivery: sample_exact_render_delta(44).delivery,
+                outcome: ExactRenderDeliverySettlementOutcome::Nack {
+                    reason: ExactRenderDeliveryNackReason::BaseMismatch,
+                    observed_baseline: request.applied_baseline,
+                },
+            });
+        });
+        assert_digest_changes(&base, "mode", |request| {
+            request.mode = ExactRenderDeliveryMode::ForceFull;
+        });
+        assert_digest_changes(&base, "max_decompressed_bytes", |request| {
+            request.receiver_caps.max_decompressed_bytes -= 1;
+        });
+        assert_digest_changes(&base, "max_text_bytes", |request| {
+            request.receiver_caps.max_text_bytes -= 1;
+        });
+        assert_digest_changes(&base, "max_rows", |request| {
+            request.receiver_caps.max_rows -= 1;
+        });
+        assert_digest_changes(&base, "max_snapshot_text_bytes", |request| {
+            request.receiver_caps.max_snapshot_text_bytes -= 1;
+        });
+        assert_digest_changes(&base, "max_snapshot_rows", |request| {
+            request.receiver_caps.max_snapshot_rows -= 1;
+        });
+        assert_digest_changes(&base, "max_snapshot_chunks", |request| {
+            request.receiver_caps.max_snapshot_chunks -= 1;
+        });
+
+        let mut mismatched_body = base.clone();
+        mismatched_body.receiver_caps.max_rows -= 1;
+        let expected = mismatched_body
+            .canonical_request_digest()
+            .expect("mismatched body digest must compute");
+        assert_eq!(
+            mismatched_body.validate(),
+            Err(ExactRenderDeliveryProtocolError::RequestDigestMismatch {
+                expected,
+                actual: base.request_digest,
+            }),
+        );
+        let changed_body = mismatched_body
+            .with_computed_request_digest()
+            .expect("changed body digest must compute");
+        assert_eq!(changed_body.identity, base.identity);
+        assert_ne!(changed_body.request_digest, base.request_digest);
+        let response = sample_exact_render_response_for(
+            &base,
+            ExactRenderDeliveryOutcomeV1::NoChange {
+                current: exact_render_cursor(7),
+                source_version: 1,
+            },
+        );
+        assert_eq!(
+            response.validate_for(&changed_body),
+            Err(
+                ExactRenderDeliveryProtocolError::ReplyRequestDigestMismatch {
+                    expected: changed_body.request_digest,
+                    actual: base.request_digest,
+                }
+            ),
+            "same request sequence with a different body is equivocation, not a retry alias",
+        );
+
+        let (_, manifest, first, _) = sample_exact_render_manifest_and_chunks();
+        let mut continuation = sample_exact_render_request(ExactRenderDeliveryMode::ForceFull);
+        continuation.continuation = Some(ExactRenderSnapshotContinuationV1 {
+            snapshot: manifest.snapshot,
+            manifest_digest: manifest
+                .canonical_manifest_digest()
+                .expect("sample manifest digest must compute"),
+            source_version: manifest.source_version,
+            next_chunk_ordinal: first.ordinal,
+            next_row_ordinal: first.first_row_ordinal,
+            next_text_byte: first.first_text_byte,
+        });
+        continuation = continuation
+            .with_computed_request_digest()
+            .expect("continuation request digest must compute");
+        assert_digest_changes(&continuation, "continuation snapshot", |request| {
+            request
+                .continuation
+                .as_mut()
+                .expect("continuation")
+                .snapshot
+                .content_digest = ExactRenderDigest::from_bytes([0xcc; 32]);
+        });
+        assert_digest_changes(&continuation, "continuation manifest digest", |request| {
+            request
+                .continuation
+                .as_mut()
+                .expect("continuation")
+                .manifest_digest = ExactRenderDigest::from_bytes([0xdd; 32]);
+        });
+        assert_digest_changes(&continuation, "continuation source version", |request| {
+            request
+                .continuation
+                .as_mut()
+                .expect("continuation")
+                .source_version += 1;
+        });
+        assert_digest_changes(&continuation, "continuation chunk ordinal", |request| {
+            request
+                .continuation
+                .as_mut()
+                .expect("continuation")
+                .next_chunk_ordinal += 1;
+        });
+        assert_digest_changes(&continuation, "continuation row ordinal", |request| {
+            request
+                .continuation
+                .as_mut()
+                .expect("continuation")
+                .next_row_ordinal += 1;
+        });
+        assert_digest_changes(&continuation, "continuation text offset", |request| {
+            request
+                .continuation
+                .as_mut()
+                .expect("continuation")
+                .next_text_byte += 1;
+        });
+    }
+
+    #[test]
+    fn exact_render_delivery_continuity_never_infers_from_source_version() {
+        for source_version in [0, 1, 4, 1_000_000, u64::MAX] {
+            sample_exact_render_delta(source_version)
+                .validate()
+                .expect("arbitrary terminal mutation jumps are diagnostic only");
+        }
+
+        let mut non_advancing = sample_exact_render_delta(4);
+        non_advancing.delivery.resulting_baseline.sequence = non_advancing.base.sequence;
+        non_advancing = non_advancing
+            .with_computed_digest()
+            .expect("non-advancing fixture digest must still compute");
+        assert_eq!(
+            non_advancing.validate(),
+            Err(ExactRenderDeliveryProtocolError::NonAdvancingDelta)
+        );
+
+        let mut wrong_generation = sample_exact_render_delta(5);
+        wrong_generation.delivery.resulting_baseline.delivery_generation =
+            ExactRenderDeliveryGeneration::try_new(2).expect("nonzero");
+        wrong_generation = wrong_generation
+            .with_computed_digest()
+            .expect("wrong-generation fixture digest must still compute");
+        assert_eq!(
+            wrong_generation.validate(),
+            Err(ExactRenderDeliveryProtocolError::DeliveryGenerationMismatch)
+        );
+
+        let mut outside_projection = sample_exact_render_delta(6);
+        outside_projection.patches[0].start_stable_row = 100;
+        outside_projection.rows[0].stable_row = 100;
+        outside_projection.rows[1].stable_row = 101;
+        outside_projection = outside_projection
+            .with_computed_digest()
+            .expect("out-of-projection fixture digest must still compute");
+        assert_eq!(
+            outside_projection.validate(),
+            Err(ExactRenderDeliveryProtocolError::PatchProjectionOutOfRange)
+        );
+
+        let mut overlapping_replacements = sample_exact_render_delta(7);
+        overlapping_replacements.patches = vec![
+            ExactRenderRowPatchV1 {
+                start_stable_row: -2,
+                removed_rows: 1,
+                replacement_start: 0,
+                replacement_count: 2,
+            },
+            ExactRenderRowPatchV1 {
+                start_stable_row: -1,
+                removed_rows: 1,
+                replacement_start: 2,
+                replacement_count: 1,
+            },
+        ];
+        overlapping_replacements.rows.push(ExactRenderRowV1 {
+            stable_row: -1,
+            text: ExactRenderRowTextV1::try_from_str("overlap")
+                .expect("overlap fixture text is bounded"),
+            wrapped: false,
+        });
+        overlapping_replacements = overlapping_replacements
+            .with_computed_digest()
+            .expect("overlap fixture digest must still compute");
+        assert_eq!(
+            overlapping_replacements.validate(),
+            Err(ExactRenderDeliveryProtocolError::PatchOrderInvalid)
+        );
+    }
+
+    #[test]
+    fn exact_render_settlement_and_retry_identity_are_idempotent_and_generation_bound() {
+        let delta = sample_exact_render_delta(75);
+        let mut request = sample_exact_render_request(ExactRenderDeliveryMode::Incremental);
+        request.identity.request_sequence =
+            ExactRenderRequestSequence::try_new(2).expect("nonzero");
+        request.applied_baseline =
+            ExactRenderAppliedBaseline::Applied(delta.delivery.resulting_baseline);
+        request.settlement = Some(ExactRenderDeliverySettlement {
+            delivery: delta.delivery,
+            outcome: ExactRenderDeliverySettlementOutcome::Applied,
+        });
+        request = request
+            .with_computed_request_digest()
+            .expect("settlement request digest must compute");
+        request
+            .validate()
+            .expect("matching post-persistence ACK must validate");
+
+        let first = Pdu::GetPaneRenderDeliveryV1(request.clone())
+            .encode_frame_with_mode(81, CompressionMode::Never)
+            .expect("first retry representation must encode");
+        let duplicate = Pdu::GetPaneRenderDeliveryV1(request.clone())
+            .encode_frame_with_mode(82, CompressionMode::Never)
+            .expect("duplicate retry representation must encode");
+        let first_raw = decode_raw(first.as_slice()).expect("first retry frame must decode raw");
+        let duplicate_raw =
+            decode_raw(duplicate.as_slice()).expect("duplicate retry frame must decode raw");
+        assert_ne!(first_raw.serial, duplicate_raw.serial);
+        assert_eq!(first_raw.ident, duplicate_raw.ident);
+        assert_eq!(
+            first_raw.data, duplicate_raw.data,
+            "lost-ACK retry must preserve one application identity while the transport serial remains independently owned",
+        );
+
+        let response = sample_exact_render_response_for(
+            &request,
+            ExactRenderDeliveryOutcomeV1::NoChange {
+                current: delta.delivery.resulting_baseline,
+                source_version: u64::MAX,
+            },
+        );
+        response
+            .validate_for(&request)
+            .expect("correlated duplicate settlement must retain exact identity");
+
+        for reason in [
+            ExactRenderDeliveryNackReason::BaseMismatch,
+            ExactRenderDeliveryNackReason::GenerationMismatch,
+            ExactRenderDeliveryNackReason::SnapshotCorrupt,
+            ExactRenderDeliveryNackReason::BoundedResourceRejected,
+            ExactRenderDeliveryNackReason::PersistenceFailure,
+        ] {
+            let mut nack_request =
+                sample_exact_render_request(ExactRenderDeliveryMode::Incremental);
+            nack_request.identity.request_sequence =
+                ExactRenderRequestSequence::try_new(3).expect("nonzero");
+            nack_request.settlement = Some(ExactRenderDeliverySettlement {
+                delivery: delta.delivery,
+                outcome: ExactRenderDeliverySettlementOutcome::Nack {
+                    reason,
+                    observed_baseline: nack_request.applied_baseline,
+                },
+            });
+            nack_request = nack_request
+                .with_computed_request_digest()
+                .expect("NACK request digest must compute");
+            nack_request
+                .validate()
+                .expect("typed NACK must retain the exact observed baseline");
+            let pdu = Pdu::GetPaneRenderDeliveryV1(nack_request);
+            let frame = pdu
+                .encode_frame_with_mode(82, CompressionMode::Never)
+                .expect("typed NACK request must encode");
+            assert_eq!(
+                Pdu::decode(frame.as_slice())
+                    .expect("typed NACK request must decode")
+                    .pdu,
+                pdu
+            );
+        }
+
+        let mut wrong_generation = request.clone();
+        wrong_generation.applied_baseline =
+            ExactRenderAppliedBaseline::Applied(ExactRenderDeliveryCursor {
+                delivery_generation: ExactRenderDeliveryGeneration::try_new(2)
+                    .expect("nonzero"),
+                ..delta.delivery.resulting_baseline
+            });
+        assert_eq!(
+            wrong_generation.validate(),
+            Err(ExactRenderDeliveryProtocolError::SettlementBaselineMismatch)
+        );
+
+        let mut wrong_connection = request;
+        let mut settlement = wrong_connection.settlement.expect("settlement present");
+        settlement.delivery.connection_identity = RenderConnectionIdentity::new(
+            TopologyStreamId::from_bytes([0xc3; 16]),
+            MuxSessionIncarnation::from_bytes([0xd4; 16]),
+        );
+        wrong_connection.settlement = Some(settlement);
+        assert_eq!(
+            wrong_connection.validate(),
+            Err(ExactRenderDeliveryProtocolError::SettlementIdentityMismatch)
+        );
+    }
+
+    #[test]
+    fn exact_render_force_full_manifest_and_chunks_are_exactly_ordered() {
+        let (rows, manifest, first, second) = sample_exact_render_manifest_and_chunks();
+        manifest
+            .validate_complete_rows(&rows)
+            .expect("complete snapshot digest and totals must validate");
+        let mut rechunked_manifest = manifest.clone();
+        rechunked_manifest.chunk_count = 1;
+        rechunked_manifest
+            .validate_complete_rows(&rows)
+            .expect("content identity must be independent of chunk boundaries");
+        assert_eq!(
+            rechunked_manifest.snapshot.content_digest,
+            manifest.snapshot.content_digest,
+        );
+        assert_ne!(
+            rechunked_manifest
+                .canonical_manifest_digest()
+                .expect("rechunked manifest identity must compute"),
+            manifest
+                .canonical_manifest_digest()
+                .expect("sample manifest identity must compute"),
+            "continuation identity must still bind the immutable chunk plan",
+        );
+        first
+            .validate_for(&manifest)
+            .expect("first immutable chunk must validate");
+        second
+            .validate_for(&manifest)
+            .expect("last immutable chunk must validate");
+
+        let force_full = sample_exact_render_request(ExactRenderDeliveryMode::ForceFull);
+        sample_exact_render_response_for(
+            &force_full,
+            ExactRenderDeliveryOutcomeV1::FullManifest(manifest.clone()),
+        )
+        .validate_for(&force_full)
+        .expect("force-full must begin with the immutable manifest");
+        let mut same_baseline_refresh = force_full.clone();
+        same_baseline_refresh.applied_baseline =
+            ExactRenderAppliedBaseline::Applied(manifest.snapshot.resulting_baseline);
+        same_baseline_refresh = same_baseline_refresh
+            .with_computed_request_digest()
+            .expect("same-baseline refresh request digest must compute");
+        sample_exact_render_response_for(
+            &same_baseline_refresh,
+            ExactRenderDeliveryOutcomeV1::FullManifest(manifest.clone()),
+        )
+        .validate_for(&same_baseline_refresh)
+        .expect("ForceFull may repair content at the same non-regressing baseline");
+        let mut stale_snapshot_request = force_full.clone();
+        stale_snapshot_request.applied_baseline =
+            ExactRenderAppliedBaseline::Applied(ExactRenderDeliveryCursor {
+                sequence: ExactRenderDeliverySequence::try_new(10).expect("nonzero"),
+                ..manifest.snapshot.resulting_baseline
+            });
+        stale_snapshot_request = stale_snapshot_request
+            .with_computed_request_digest()
+            .expect("stale snapshot request digest must compute");
+        assert_eq!(
+            sample_exact_render_response_for(
+                &stale_snapshot_request,
+                ExactRenderDeliveryOutcomeV1::FullManifest(manifest.clone()),
+            )
+            .validate_for(&stale_snapshot_request),
+            Err(ExactRenderDeliveryProtocolError::SnapshotRegressesBaseline)
+        );
+        assert_eq!(
+            sample_exact_render_response_for(
+                &force_full,
+                ExactRenderDeliveryOutcomeV1::ExactDelta(sample_exact_render_delta(500)),
+            )
+            .validate_for(&force_full),
+            Err(ExactRenderDeliveryProtocolError::ForceFullReturnedDelta)
+        );
+
+        let mut first_request = force_full.clone();
+        first_request.identity.request_sequence =
+            ExactRenderRequestSequence::try_new(2).expect("nonzero");
+        first_request.continuation = Some(ExactRenderSnapshotContinuationV1 {
+            snapshot: manifest.snapshot,
+            manifest_digest: manifest
+                .canonical_manifest_digest()
+                .expect("sample manifest identity must compute"),
+            source_version: manifest.source_version,
+            next_chunk_ordinal: 0,
+            next_row_ordinal: 0,
+            next_text_byte: 0,
+        });
+        first_request = first_request
+            .with_computed_request_digest()
+            .expect("first continuation request digest must compute");
+        let first_response = sample_exact_render_response_for(
+            &first_request,
+            ExactRenderDeliveryOutcomeV1::FullChunk {
+                manifest: manifest.clone(),
+                chunk: first.clone(),
+            },
+        );
+        first_response
+            .validate_for(&first_request)
+            .expect("requested first chunk must validate");
+
+        let mut drifted_manifest = manifest.clone();
+        drifted_manifest.projection.title =
+            ExactRenderTitleV1::try_from_str("drifted mid-stream title")
+                .expect("drifted title remains bounded");
+        let drifted_response = sample_exact_render_response_for(
+            &first_request,
+            ExactRenderDeliveryOutcomeV1::FullChunk {
+                manifest: drifted_manifest,
+                chunk: first.clone(),
+            },
+        );
+        assert_eq!(
+            drifted_response.validate_for(&first_request),
+            Err(ExactRenderDeliveryProtocolError::ChunkContinuationMismatch),
+            "continuation must bind the entire immutable manifest, not only its snapshot token",
+        );
+
+        let continuation = first
+            .next_continuation(&manifest)
+            .expect("first chunk continuation must compute")
+            .expect("first of two chunks has a successor");
+        let mut second_request = first_request;
+        second_request.identity.request_sequence =
+            ExactRenderRequestSequence::try_new(3).expect("nonzero");
+        second_request.continuation = Some(continuation);
+        second_request = second_request
+            .with_computed_request_digest()
+            .expect("second continuation request digest must compute");
+        let second_response = sample_exact_render_response_for(
+            &second_request,
+            ExactRenderDeliveryOutcomeV1::FullChunk {
+                manifest: manifest.clone(),
+                chunk: second.clone(),
+            },
+        );
+        second_response
+            .validate_for(&second_request)
+            .expect("requested final chunk must validate");
+        assert_eq!(
+            second
+                .next_continuation(&manifest)
+                .expect("last chunk must validate"),
+            None
+        );
+        let snapshot_ack = GetPaneRenderDeliveryV1 {
+            protocol_version: EXACT_RENDER_DELIVERY_PROTOCOL_VERSION,
+            identity: exact_render_request_identity(4),
+            request_digest: ExactRenderDigest::ZERO,
+            applied_baseline: ExactRenderAppliedBaseline::Applied(
+                manifest.snapshot.resulting_baseline,
+            ),
+            settlement: Some(ExactRenderDeliverySettlement {
+                delivery: manifest.snapshot,
+                outcome: ExactRenderDeliverySettlementOutcome::Applied,
+            }),
+            mode: ExactRenderDeliveryMode::Incremental,
+            receiver_caps: ExactRenderReceiverCaps::protocol_maximum(),
+            continuation: None,
+        }
+        .with_computed_request_digest()
+        .expect("snapshot ACK request digest must compute");
+        snapshot_ack
+            .validate()
+            .expect("snapshot baseline can advance only in the post-persistence ACK request");
+
+        let mut wrong_order = second.clone();
+        wrong_order.ordinal = 0;
+        wrong_order = wrong_order
+            .with_computed_digest(&manifest)
+            .expect("wrong-order fixture digest must still compute");
+        assert_eq!(
+            wrong_order.validate_for(&manifest),
+            Err(ExactRenderDeliveryProtocolError::SnapshotChunkRangeInvalid)
+        );
+
+        let mut wrong_digest = first.clone();
+        wrong_digest.chunk_digest = ExactRenderDigest::from_bytes([0xee; 32]);
+        assert_eq!(
+            wrong_digest.validate_for(&manifest),
+            Err(ExactRenderDeliveryProtocolError::DigestMismatch {
+                field: "snapshot_chunk_digest",
+            })
+        );
+
+        let mut wrong_totals = manifest.clone();
+        wrong_totals.total_text_bytes += 1;
+        assert_eq!(
+            wrong_totals.validate_complete_rows(&rows),
+            Err(ExactRenderDeliveryProtocolError::SnapshotTotalsInvalid)
+        );
+
+        let mut wrong_source = first;
+        wrong_source.source_version += 1;
+        wrong_source = wrong_source
+            .with_computed_digest(&manifest)
+            .expect("wrong-source fixture digest must still compute");
+        assert_eq!(
+            wrong_source.validate_for(&manifest),
+            Err(ExactRenderDeliveryProtocolError::SnapshotSourceVersionMismatch)
+        );
+    }
+
+    #[test]
+    fn exact_render_receiver_and_q200_aggregate_caps_fail_closed() {
+        let mut request = sample_exact_render_request(ExactRenderDeliveryMode::Incremental);
+        let outcome = ExactRenderDeliveryOutcomeV1::ExactDelta(sample_exact_render_delta(88));
+        let response = sample_exact_render_response(outcome.clone());
+        let usage = response.resource_usage().expect("sample usage must measure");
+        request.receiver_caps.max_text_bytes = usage.text_bytes - 1;
+        request = request
+            .with_computed_request_digest()
+            .expect("bounded request digest must compute");
+        let response = sample_exact_render_response_for(&request, outcome);
+        assert_eq!(
+            response.validate_for(&request),
+            Err(
+                ExactRenderDeliveryProtocolError::ResponseExceedsReceiverCap {
+                    resource: "text_bytes",
+                    requested: usage.text_bytes,
+                    limit: usage.text_bytes - 1,
+                }
+            )
+        );
+
+        let mut zero_cap = ExactRenderReceiverCaps::protocol_maximum();
+        zero_cap.max_rows = 0;
+        assert!(zero_cap.validate().is_err());
+        let mut excessive_cap = ExactRenderReceiverCaps::protocol_maximum();
+        excessive_cap.max_snapshot_chunks = MAX_EXACT_RENDER_SNAPSHOT_CHUNKS + 1;
+        assert!(excessive_cap.validate().is_err());
+
+        let (_, manifest, _, _) = sample_exact_render_manifest_and_chunks();
+        let retained_snapshot_text = manifest
+            .validated_retained_text_bytes()
+            .expect("sample retained snapshot text must measure");
+        assert!(retained_snapshot_text > manifest.total_text_bytes);
+        let mut text_bounded_full =
+            sample_exact_render_request(ExactRenderDeliveryMode::ForceFull);
+        text_bounded_full.receiver_caps.max_snapshot_text_bytes = retained_snapshot_text - 1;
+        text_bounded_full = text_bounded_full
+            .with_computed_request_digest()
+            .expect("snapshot-text-bounded request digest must compute");
+        assert_eq!(
+            sample_exact_render_response_for(
+                &text_bounded_full,
+                ExactRenderDeliveryOutcomeV1::FullManifest(manifest.clone()),
+            )
+            .validate_for(&text_bounded_full),
+            Err(
+                ExactRenderDeliveryProtocolError::ResponseExceedsReceiverCap {
+                    resource: "snapshot_text_bytes",
+                    requested: retained_snapshot_text,
+                    limit: retained_snapshot_text - 1,
+                }
+            ),
+            "snapshot receiver caps must charge retained title and working-directory bytes",
+        );
+
+        let mut bounded_full = sample_exact_render_request(ExactRenderDeliveryMode::ForceFull);
+        bounded_full.receiver_caps.max_snapshot_rows = 1;
+        bounded_full.receiver_caps.max_snapshot_chunks = 1;
+        bounded_full = bounded_full
+            .with_computed_request_digest()
+            .expect("bounded force-full request digest must compute");
+        assert_eq!(
+            sample_exact_render_response_for(
+                &bounded_full,
+                ExactRenderDeliveryOutcomeV1::FullManifest(manifest),
+            )
+                .validate_for(&bounded_full),
+            Err(
+                ExactRenderDeliveryProtocolError::ResponseExceedsReceiverCap {
+                    resource: "snapshot_rows",
+                    requested: 2,
+                    limit: 1,
+                }
+            )
+        );
+
+        let responses: Vec<_> = (1..=200)
+            .map(|request_sequence| {
+                let mut response = response.clone();
+                response.request_identity.request_sequence =
+                    ExactRenderRequestSequence::try_new(request_sequence)
+                        .expect("q200 request sequence is nonzero");
+                let mut correlated_request =
+                    sample_exact_render_request(ExactRenderDeliveryMode::Incremental);
+                correlated_request.identity = response.request_identity;
+                correlated_request = correlated_request
+                    .with_computed_request_digest()
+                    .expect("q200 request digest must compute");
+                response.request_digest = correlated_request.request_digest;
+                response
+            })
+            .collect();
+        let aggregate = validate_exact_render_delivery_aggregate(
+            &responses,
+            ExactRenderDeliveryAggregateCaps::protocol_maximum(),
+        )
+        .expect("q200 sample must fit the protocol aggregate ceiling");
+        assert_eq!(aggregate.members, 200);
+        assert_eq!(aggregate.text_bytes, usage.text_bytes * 200);
+        assert_eq!(aggregate.rows, usage.rows * 200);
+
+        let exact_caps = ExactRenderDeliveryAggregateCaps {
+            max_members: aggregate.members,
+            max_decompressed_bytes: aggregate.decompressed_bytes,
+            max_text_bytes: aggregate.text_bytes,
+            max_rows: aggregate.rows,
+        };
+        assert_eq!(
+            validate_exact_render_delivery_aggregate(&responses, exact_caps)
+                .expect("exact q200 aggregate boundary must pass"),
+            aggregate
+        );
+        let one_byte_short = ExactRenderDeliveryAggregateCaps {
+            max_text_bytes: aggregate.text_bytes - 1,
+            ..exact_caps
+        };
+        assert_eq!(
+            validate_exact_render_delivery_aggregate(&responses, one_byte_short),
+            Err(ExactRenderDeliveryProtocolError::AggregateLimitExceeded {
+                resource: "text_bytes",
+                requested: aggregate.text_bytes,
+                limit: aggregate.text_bytes - 1,
+            })
+        );
+    }
+
+    #[test]
+    fn exact_render_snapshot_backing_is_reserved_once_and_equivocation_fails_closed() {
+        let (rows, manifest, first, _) = sample_exact_render_manifest_and_chunks();
+        let manifest_response = sample_exact_render_response(
+            ExactRenderDeliveryOutcomeV1::FullManifest(manifest.clone()),
+        );
+        let chunk_response = sample_exact_render_response(
+            ExactRenderDeliveryOutcomeV1::FullChunk {
+                manifest: manifest.clone(),
+                chunk: first,
+            },
+        );
+        let repeated = [manifest_response.clone(), chunk_response];
+        let retained_text_bytes = manifest
+            .total_text_bytes
+            .checked_add(
+                manifest
+                    .projection
+                    .text_bytes()
+                    .expect("sample projection text bytes must measure"),
+            )
+            .expect("sample retained text bytes must not overflow");
+        let expected_once = ExactRenderBackingReservationUsage {
+            distinct_snapshots: 1,
+            total_text_bytes: retained_text_bytes,
+            total_rows: manifest.total_rows,
+            total_chunks: manifest.chunk_count,
+        };
+        let exact_once = ExactRenderBackingReservationCaps {
+            max_distinct_snapshots: expected_once.distinct_snapshots,
+            max_total_text_bytes: expected_once.total_text_bytes,
+            max_total_rows: expected_once.total_rows,
+            max_total_chunks: expected_once.total_chunks,
+        };
+        assert_eq!(
+            validate_exact_render_backing_reservations(&repeated, exact_once)
+                .expect("repeated chunks reserve one immutable snapshot"),
+            expected_once,
+        );
+        for (resource, caps, requested, limit) in [
+            (
+                "distinct_snapshots",
+                ExactRenderBackingReservationCaps {
+                    max_distinct_snapshots: 0,
+                    ..exact_once
+                },
+                1,
+                0,
+            ),
+            (
+                "text_bytes",
+                ExactRenderBackingReservationCaps {
+                    max_total_text_bytes: expected_once.total_text_bytes - 1,
+                    ..exact_once
+                },
+                expected_once.total_text_bytes,
+                expected_once.total_text_bytes - 1,
+            ),
+            (
+                "rows",
+                ExactRenderBackingReservationCaps {
+                    max_total_rows: expected_once.total_rows - 1,
+                    ..exact_once
+                },
+                expected_once.total_rows,
+                expected_once.total_rows - 1,
+            ),
+            (
+                "chunks",
+                ExactRenderBackingReservationCaps {
+                    max_total_chunks: expected_once.total_chunks - 1,
+                    ..exact_once
+                },
+                expected_once.total_chunks,
+                expected_once.total_chunks - 1,
+            ),
+        ] {
+            assert_eq!(
+                validate_exact_render_backing_reservations(&repeated, caps),
+                Err(
+                    ExactRenderDeliveryProtocolError::BackingReservationLimitExceeded {
+                        resource,
+                        requested,
+                        limit,
+                    }
+                ),
+            );
+        }
+
+        let mut second_manifest = manifest.clone();
+        second_manifest.snapshot.resulting_baseline = second_manifest
+            .snapshot
+            .resulting_baseline
+            .checked_next()
+            .expect("sample snapshot baseline advances");
+        second_manifest = second_manifest
+            .with_computed_content_digest(&rows)
+            .expect("second immutable snapshot digest must compute");
+        let second_response = sample_exact_render_response(
+            ExactRenderDeliveryOutcomeV1::FullManifest(second_manifest),
+        );
+        let distinct = [manifest_response.clone(), second_response];
+        validate_exact_render_delivery_aggregate(
+            &distinct,
+            ExactRenderDeliveryAggregateCaps::protocol_maximum(),
+        )
+        .expect("two tiny wire manifests fit the independent wire aggregate");
+        let expected_two = ExactRenderBackingReservationUsage {
+            distinct_snapshots: 2,
+            total_text_bytes: expected_once.total_text_bytes * 2,
+            total_rows: expected_once.total_rows * 2,
+            total_chunks: expected_once.total_chunks * 2,
+        };
+        let exact_two = ExactRenderBackingReservationCaps {
+            max_distinct_snapshots: expected_two.distinct_snapshots,
+            max_total_text_bytes: expected_two.total_text_bytes,
+            max_total_rows: expected_two.total_rows,
+            max_total_chunks: expected_two.total_chunks,
+        };
+        assert_eq!(
+            validate_exact_render_backing_reservations(&distinct, exact_two)
+                .expect("two distinct snapshots fit their exact backing reservation"),
+            expected_two,
+        );
+        assert_eq!(
+            validate_exact_render_backing_reservations(
+                &distinct,
+                ExactRenderBackingReservationCaps {
+                    max_total_text_bytes: expected_once.total_text_bytes,
+                    ..exact_two
+                },
+            ),
+            Err(
+                ExactRenderDeliveryProtocolError::BackingReservationLimitExceeded {
+                    resource: "text_bytes",
+                    requested: expected_two.total_text_bytes,
+                    limit: expected_once.total_text_bytes,
+                }
+            ),
+            "tiny manifest bodies cannot hide complete immutable text backing",
+        );
+
+        let mut content_digest_equivocation = manifest.clone();
+        content_digest_equivocation.snapshot.content_digest =
+            ExactRenderDigest::from_bytes([0xcc; 32]);
+        assert_eq!(
+            validate_exact_render_backing_reservations(
+                &[
+                    manifest_response.clone(),
+                    sample_exact_render_response(ExactRenderDeliveryOutcomeV1::FullManifest(
+                        content_digest_equivocation,
+                    )),
+                ],
+                ExactRenderBackingReservationCaps::protocol_maximum(),
+            ),
+            Err(ExactRenderDeliveryProtocolError::SnapshotManifestEquivocation),
+            "content digest is a manifest claim, not part of snapshot dedup identity",
+        );
+
+        let mut equivocated_manifest = manifest;
+        equivocated_manifest.source_version += 1;
+        let equivocated = [
+            manifest_response,
+            sample_exact_render_response(ExactRenderDeliveryOutcomeV1::FullManifest(
+                equivocated_manifest,
+            )),
+        ];
+        assert_eq!(
+            validate_exact_render_backing_reservations(
+                &equivocated,
+                ExactRenderBackingReservationCaps::protocol_maximum(),
+            ),
+            Err(ExactRenderDeliveryProtocolError::SnapshotManifestEquivocation),
+        );
+    }
+
+    #[test]
+    fn exact_render_manifest_rejects_impossible_chunk_plans_and_row_text_totals() {
+        let (_, manifest, _, _) = sample_exact_render_manifest_and_chunks();
+
+        let mut row_infeasible = manifest.clone();
+        row_infeasible.total_rows = MAX_EXACT_RENDER_DELIVERY_ROWS_U64 + 1;
+        row_infeasible.total_text_bytes = 0;
+        row_infeasible.chunk_count = 1;
+        row_infeasible.projection.row_count = row_infeasible.total_rows;
+        row_infeasible.projection.first_stable_row =
+            -i64::try_from(row_infeasible.total_rows).expect("test row count fits i64");
+        row_infeasible.projection.dimensions.scrollback_rows = row_infeasible.total_rows;
+        row_infeasible.projection.dimensions.scrollback_top =
+            row_infeasible.projection.first_stable_row;
+        assert_eq!(
+            row_infeasible.validate(),
+            Err(ExactRenderDeliveryProtocolError::SnapshotChunkCountInvalid),
+            "one chunk cannot claim more than the per-response row envelope",
+        );
+
+        let mut text_infeasible = manifest.clone();
+        text_infeasible.total_rows = 3;
+        text_infeasible.chunk_count = 1;
+        text_infeasible.projection.row_count = 3;
+        text_infeasible.projection.first_stable_row = -3;
+        text_infeasible.projection.dimensions.scrollback_rows = 3;
+        text_infeasible.projection.dimensions.scrollback_top = -3;
+        let projection_text_bytes = text_infeasible
+            .projection
+            .text_bytes()
+            .expect("sample projection text bytes must measure");
+        text_infeasible.total_text_bytes = MAX_EXACT_RENDER_DELIVERY_TEXT_BYTES_U64
+            .checked_sub(projection_text_bytes)
+            .and_then(|capacity| capacity.checked_add(1))
+            .expect("test chunk text capacity must fit u64");
+        assert_eq!(
+            text_infeasible.validate(),
+            Err(ExactRenderDeliveryProtocolError::SnapshotChunkCountInvalid),
+            "chunk feasibility must reserve the repeated projection metadata",
+        );
+
+        let mut row_text_inconsistent = manifest;
+        row_text_inconsistent.total_rows = 1;
+        row_text_inconsistent.total_text_bytes =
+            u64::try_from(MAX_EXACT_RENDER_ROW_TEXT_BYTES)
+                .expect("row text ceiling fits u64")
+                + 1;
+        row_text_inconsistent.chunk_count = 1;
+        row_text_inconsistent.projection.row_count = 1;
+        row_text_inconsistent.projection.first_stable_row = -1;
+        row_text_inconsistent.projection.dimensions.viewport_rows = 1;
+        row_text_inconsistent.projection.dimensions.scrollback_rows = 1;
+        row_text_inconsistent.projection.dimensions.physical_top = -1;
+        row_text_inconsistent.projection.dimensions.scrollback_top = -1;
+        assert_eq!(
+            row_text_inconsistent.validate(),
+            Err(ExactRenderDeliveryProtocolError::SnapshotTotalsInvalid),
+            "one row cannot claim more text than the row schema can contain",
+        );
+    }
+
+    #[test]
+    fn exact_render_delta_rechecks_text_limit_after_projection_metadata() {
+        let mut delta = sample_exact_render_delta(101);
+        delta.rows[0].text = ExactRenderRowTextV1::try_from_string(
+            "a".repeat(MAX_EXACT_RENDER_ROW_TEXT_BYTES),
+        )
+        .expect("first maximum-size row must be representable");
+        delta.rows[1].text = ExactRenderRowTextV1::try_from_string(
+            "b".repeat(MAX_EXACT_RENDER_ROW_TEXT_BYTES),
+        )
+        .expect("second maximum-size row must be representable");
+        delta.resulting_projection.title = ExactRenderTitleV1::try_from_string(
+            "t".repeat(MAX_EXACT_RENDER_PROJECTION_TITLE_BYTES),
+        )
+        .expect("maximum-size title must be representable");
+        delta.resulting_projection.working_dir = Some(
+            ExactRenderWorkingDirectoryV1::try_from_string(
+                "w".repeat(MAX_EXACT_RENDER_PROJECTION_WORKING_DIR_BYTES),
+            )
+            .expect("maximum-size working directory must be representable"),
+        );
+        delta = delta
+            .with_computed_digest()
+            .expect("oversized aggregate fixture digest must compute");
+        let requested = 2_u64
+            .checked_mul(
+                u64::try_from(MAX_EXACT_RENDER_ROW_TEXT_BYTES)
+                    .expect("row text ceiling fits u64"),
+            )
+            .and_then(|bytes| {
+                bytes.checked_add(
+                    u64::try_from(MAX_EXACT_RENDER_PROJECTION_TITLE_BYTES)
+                        .expect("title ceiling fits u64"),
+                )
+            })
+            .and_then(|bytes| {
+                bytes.checked_add(
+                    u64::try_from(MAX_EXACT_RENDER_PROJECTION_WORKING_DIR_BYTES)
+                        .expect("working-directory ceiling fits u64"),
+                )
+            })
+            .expect("test text usage must fit u64");
+        assert_eq!(
+            delta.validate(),
+            Err(ExactRenderDeliveryProtocolError::ResourceLimitExceeded {
+                resource: "reply_text_bytes",
+                requested,
+                limit: MAX_EXACT_RENDER_DELIVERY_TEXT_BYTES_U64,
+            }),
+        );
+    }
+
+    #[test]
+    fn exact_render_validation_visits_each_heavy_row_once() {
+        let delta = sample_exact_render_delta(99);
+        let delta_rows = delta.rows.len();
+        reset_test_exact_render_validation_row_visits();
+        sample_exact_render_response(ExactRenderDeliveryOutcomeV1::ExactDelta(delta))
+            .validate()
+            .expect("sample delta must validate");
+        assert_eq!(test_exact_render_validation_row_visits(), delta_rows);
+
+        let (rows, manifest, first, _) = sample_exact_render_manifest_and_chunks();
+        let chunk_rows = first.rows.len();
+        reset_test_exact_render_validation_row_visits();
+        sample_exact_render_response(ExactRenderDeliveryOutcomeV1::FullChunk {
+            manifest: manifest.clone(),
+            chunk: first,
+        })
+        .validate()
+        .expect("sample chunk must validate");
+        assert_eq!(test_exact_render_validation_row_visits(), chunk_rows);
+
+        reset_test_exact_render_validation_row_visits();
+        manifest
+            .validate_complete_rows(&rows)
+            .expect("complete sample snapshot must validate");
+        assert_eq!(test_exact_render_validation_row_visits(), rows.len());
+    }
+
+    #[test]
+    fn exact_render_minimum_envelope_can_report_every_zero_content_terminal_outcome() {
+        let mut request = sample_exact_render_request(ExactRenderDeliveryMode::Incremental);
+        request.receiver_caps.max_decompressed_bytes =
+            MIN_EXACT_RENDER_DELIVERY_DECOMPRESSED_BYTES;
+        request.receiver_caps.max_text_bytes = 1;
+        request = request
+            .with_computed_request_digest()
+            .expect("minimum-envelope request digest must compute");
+        request
+            .validate()
+            .expect("the protocol reply-envelope floor must be admissible");
+
+        let oldest = ExactRenderDeliveryCursor {
+            sequence: ExactRenderDeliverySequence::try_new(8).expect("nonzero"),
+            ..exact_render_cursor(7)
+        };
+        let current = ExactRenderDeliveryCursor {
+            sequence: ExactRenderDeliverySequence::try_new(9).expect("nonzero"),
+            ..exact_render_cursor(7)
+        };
+        let outcomes = [
+            ExactRenderDeliveryOutcomeV1::NoChange {
+                current: exact_render_cursor(7),
+                source_version: 1,
+            },
+            ExactRenderDeliveryOutcomeV1::BaselineTooOld {
+                requested: exact_render_cursor(7),
+                oldest_available: oldest,
+                current,
+            },
+            ExactRenderDeliveryOutcomeV1::GenerationChanged {
+                requested: exact_render_cursor(7),
+                current_pane_generation: ExactRenderPaneGeneration::try_new(2)
+                    .expect("nonzero"),
+                current_delivery_generation: ExactRenderDeliveryGeneration::try_new(1)
+                    .expect("nonzero"),
+            },
+            ExactRenderDeliveryOutcomeV1::PaneRemoved {
+                last_pane_generation: Some(
+                    ExactRenderPaneGeneration::try_new(1).expect("nonzero"),
+                ),
+            },
+            ExactRenderDeliveryOutcomeV1::AuthorityExhausted {
+                authority: ExactRenderAuthority::DeliverySequence,
+            },
+            ExactRenderDeliveryOutcomeV1::LimitsExceeded {
+                resource: ExactRenderLimitResource::Rows,
+                required: request.receiver_caps.max_rows + 1,
+                limit: request.receiver_caps.max_rows,
+            },
+        ];
+
+        for outcome in outcomes {
+            let response = sample_exact_render_response_for(&request, outcome);
+            response
+                .validate_for(&request)
+                .expect("every zero-content terminal outcome must fit the reply floor");
+            let usage = response
+                .resource_usage()
+                .expect("terminal response usage must be measurable");
+            assert_eq!(usage.text_bytes, 0);
+            assert_eq!(usage.rows, 0);
+            assert!(
+                usage.decompressed_bytes <= MIN_EXACT_RENDER_DELIVERY_DECOMPRESSED_BYTES,
+                "terminal response used {} bytes above the {}-byte protocol floor",
+                usage.decompressed_bytes,
+                MIN_EXACT_RENDER_DELIVERY_DECOMPRESSED_BYTES,
+            );
+        }
+
+        let mut impossible = request.receiver_caps;
+        impossible.max_decompressed_bytes =
+            MIN_EXACT_RENDER_DELIVERY_DECOMPRESSED_BYTES - 1;
+        assert_eq!(
+            impossible.validate(),
+            Err(ExactRenderDeliveryProtocolError::InvalidReceiverCap {
+                resource: "max_decompressed_bytes",
+                requested: MIN_EXACT_RENDER_DELIVERY_DECOMPRESSED_BYTES - 1,
+                protocol_minimum: MIN_EXACT_RENDER_DELIVERY_DECOMPRESSED_BYTES,
+                protocol_maximum: MAX_EXACT_RENDER_DELIVERY_DECOMPRESSED_BYTES_U64,
+            })
+        );
+    }
+
+    #[test]
+    fn exact_render_projection_metadata_converges_and_digest_failures_surface() {
+        let (rows, manifest, _, _) = sample_exact_render_manifest_and_chunks();
+        let sample_projection = sample_exact_render_projection();
+        assert_eq!(
+            ExactRenderCursorPositionV1::try_from_stable(StableCursorPosition {
+                x: 7,
+                y: -1,
+                shape: termwiz::surface::CursorShape::SteadyBlock,
+                visibility: termwiz::surface::CursorVisibility::Visible,
+            })
+            .expect("native cursor must narrow into fixed-width v1 authority"),
+            sample_projection.cursor_position,
+        );
+        assert_eq!(
+            ExactRenderDimensionsV1::try_from_renderable(RenderableDimensions {
+                cols: 80,
+                viewport_rows: 2,
+                scrollback_rows: 2,
+                physical_top: -2,
+                scrollback_top: -2,
+                dpi: 144,
+                pixel_width: 1_600,
+                pixel_height: 900,
+                reverse_video: false,
+            })
+            .expect("native dimensions must narrow into fixed-width v1 authority"),
+            sample_projection.dimensions,
+        );
+
+        let mut changed_title = manifest.clone();
+        changed_title.projection.title =
+            ExactRenderTitleV1::try_from_str("sample exact render!")
+                .expect("changed title remains bounded");
+        assert_eq!(
+            changed_title.validate_complete_rows(&rows),
+            Err(ExactRenderDeliveryProtocolError::DigestMismatch {
+                field: "snapshot_content_digest",
+            })
+        );
+        changed_title = changed_title
+            .with_computed_content_digest(&rows)
+            .expect("bounded title metadata must have a canonical digest");
+        changed_title
+            .validate_complete_rows(&rows)
+            .expect("re-digested title metadata must converge");
+
+        let mut changed_cursor = manifest.clone();
+        changed_cursor.projection.cursor_position.x += 1;
+        assert_eq!(
+            changed_cursor.validate_complete_rows(&rows),
+            Err(ExactRenderDeliveryProtocolError::DigestMismatch {
+                field: "snapshot_content_digest",
+            })
+        );
+
+        let mut changed_mouse_capture = manifest.clone();
+        changed_mouse_capture.projection.mouse_grabbed = true;
+        assert_eq!(
+            changed_mouse_capture.validate_complete_rows(&rows),
+            Err(ExactRenderDeliveryProtocolError::DigestMismatch {
+                field: "snapshot_content_digest",
+            })
+        );
+
+        let mut changed_dimensions = manifest.clone();
+        changed_dimensions.projection.dimensions.cols += 1;
+        assert_eq!(
+            changed_dimensions.validate_complete_rows(&rows),
+            Err(ExactRenderDeliveryProtocolError::DigestMismatch {
+                field: "snapshot_content_digest",
+            }),
+            "a valid resize must still change the persisted projection identity",
+        );
+
+        let mut changed_working_dir = manifest.clone();
+        changed_working_dir.projection.working_dir = Some(
+            ExactRenderWorkingDirectoryV1::try_from_str("file:///tmp/other")
+                .expect("changed working directory remains bounded"),
+        );
+        assert_eq!(
+            changed_working_dir.validate_complete_rows(&rows),
+            Err(ExactRenderDeliveryProtocolError::DigestMismatch {
+                field: "snapshot_content_digest",
+            })
+        );
+
+        let mut malformed_dimensions = manifest.clone();
+        malformed_dimensions.projection.dimensions.viewport_rows = 1;
+        assert_eq!(
+            malformed_dimensions.validate(),
+            Err(ExactRenderDeliveryProtocolError::ProjectionMetadataInvalid)
+        );
+
+        assert_eq!(
+            ExactRenderTitleV1::try_from_string(
+                "x".repeat(MAX_EXACT_RENDER_PROJECTION_TITLE_BYTES + 1),
+            ),
+            Err(ExactRenderDeliveryProtocolError::ResourceLimitExceeded {
+                resource: "exact_render_utf8_bytes",
+                requested: MAX_EXACT_RENDER_PROJECTION_TITLE_BYTES_U64 + 1,
+                limit: MAX_EXACT_RENDER_PROJECTION_TITLE_BYTES_U64,
+            })
+        );
+        let oversized_borrowed_title =
+            "x".repeat(MAX_EXACT_RENDER_PROJECTION_TITLE_BYTES + 1);
+        assert_eq!(
+            ExactRenderTitleV1::try_from_str(&oversized_borrowed_title),
+            Err(ExactRenderDeliveryProtocolError::ResourceLimitExceeded {
+                resource: "exact_render_utf8_bytes",
+                requested: MAX_EXACT_RENDER_PROJECTION_TITLE_BYTES_U64 + 1,
+                limit: MAX_EXACT_RENDER_PROJECTION_TITLE_BYTES_U64,
+            }),
+            "borrowed UTF-8 must fail its byte bound before any owned copy",
+        );
+        let mut hostile_title_prefix = Vec::new();
+        leb128::write::unsigned(
+            &mut hostile_title_prefix,
+            MAX_EXACT_RENDER_PROJECTION_TITLE_BYTES_U64 + 1,
+        )
+        .expect("hostile title length prefix must encode");
+        let title_error = bounded_varbincode::deserialize::<ExactRenderTitleV1, _>(
+            &mut hostile_title_prefix.as_slice(),
+        )
+        .expect_err("title length must fail before payload allocation");
+        assert!(
+            title_error
+                .to_string()
+                .contains(
+                    "exact render metadata UTF-8 bytes length 65537 exceeds maximum 65536"
+                ),
+            "unexpected schema-specific title bound: {title_error}",
+        );
+
+        let mut hostile_row_prefix = Vec::new();
+        leb128::write::unsigned(
+            &mut hostile_row_prefix,
+            u64::try_from(MAX_EXACT_RENDER_ROW_TEXT_BYTES + 1)
+                .expect("row text ceiling fits u64"),
+        )
+        .expect("hostile row length prefix must encode");
+        let row_error = bounded_varbincode::deserialize::<ExactRenderRowTextV1, _>(
+            &mut hostile_row_prefix.as_slice(),
+        )
+        .expect_err("row length must fail before payload allocation");
+        assert!(
+            row_error
+                .to_string()
+                .contains(
+                    "exact render row UTF-8 bytes length 1000001 exceeds maximum 1000000"
+                ),
+            "unexpected schema-specific row bound: {row_error}",
+        );
+        let exact_row = ExactRenderRowTextV1::try_from_string(
+            "x".repeat(MAX_EXACT_RENDER_ROW_TEXT_BYTES),
+        )
+        .expect("the exact per-row UTF-8 ceiling must be constructible");
+        let (exact_row_payload, exact_row_compressed) =
+            serialize_with_mode(&exact_row, CompressionMode::Never)
+                .expect("the exact per-row ceiling must serialize");
+        assert!(!exact_row_compressed);
+        let mut expected_row_payload = Vec::new();
+        leb128::write::unsigned(
+            &mut expected_row_payload,
+            u64::try_from(MAX_EXACT_RENDER_ROW_TEXT_BYTES)
+                .expect("row text ceiling fits u64"),
+        )
+        .expect("row text length prefix must encode");
+        expected_row_payload.extend_from_slice(exact_row.as_bytes());
+        assert!(
+            exact_row_payload == expected_row_payload,
+            "schema markers must add zero bytes to the frozen varbincode wire",
+        );
+        let decoded_exact_row = bounded_varbincode::deserialize::<ExactRenderRowTextV1, _>(
+            &mut exact_row_payload.as_slice(),
+        )
+        .expect("the exact per-row ceiling must deserialize symmetrically");
+        assert!(decoded_exact_row == exact_row);
+
+        let exact_title = ExactRenderTitleV1::try_from_string(
+            "m".repeat(MAX_EXACT_RENDER_PROJECTION_TITLE_BYTES),
+        )
+        .expect("the exact metadata UTF-8 ceiling must be constructible");
+        let (exact_title_payload, exact_title_compressed) =
+            serialize_with_mode(&exact_title, CompressionMode::Never)
+                .expect("the exact metadata ceiling must serialize");
+        assert!(!exact_title_compressed);
+        let decoded_exact_title = bounded_varbincode::deserialize::<ExactRenderTitleV1, _>(
+            &mut exact_title_payload.as_slice(),
+        )
+        .expect("the exact metadata ceiling must deserialize symmetrically");
+        assert!(decoded_exact_title == exact_title);
+        let legacy_string = "s".repeat(MAX_EXACT_RENDER_PROJECTION_TITLE_BYTES + 1);
+        let (scoped_payload, scoped_compressed) = serialize_with_mode(
+            &(decoded_exact_title, legacy_string.clone()),
+            CompressionMode::Never,
+        )
+        .expect("metadata marker scope fixture must serialize");
+        assert!(!scoped_compressed);
+        let (_, decoded_legacy_string) = bounded_varbincode::deserialize::<
+            (ExactRenderTitleV1, String),
+            _,
+        >(&mut scoped_payload.as_slice())
+        .expect("metadata byte cap must be restored after its marked newtype");
+        assert!(decoded_legacy_string == legacy_string);
+        assert_eq!(
+            ExactRenderRowTextV1::try_from_string(
+                "x".repeat(MAX_EXACT_RENDER_ROW_TEXT_BYTES + 1),
+            ),
+            Err(ExactRenderDeliveryProtocolError::ResourceLimitExceeded {
+                resource: "exact_render_utf8_bytes",
+                requested: u64::try_from(MAX_EXACT_RENDER_ROW_TEXT_BYTES + 1)
+                    .expect("row text ceiling fits u64"),
+                limit: u64::try_from(MAX_EXACT_RENDER_ROW_TEXT_BYTES)
+                    .expect("row text ceiling fits u64"),
+            })
+        );
+
+        let mut mismatched_totals = manifest;
+        mismatched_totals.total_rows += 1;
+        assert_eq!(
+            mismatched_totals.with_computed_content_digest(&rows),
+            Err(ExactRenderDeliveryProtocolError::SnapshotTotalsInvalid),
+            "digest constructors must propagate canonicalization failure",
+        );
+    }
+
+    #[test]
+    fn exact_render_v1_authority_digests_match_frozen_golden_preimages() {
+        const DELTA_GOLDEN: ExactRenderDigest = ExactRenderDigest::from_bytes([
+            0xad, 0x7f, 0x05, 0x21, 0xc7, 0x59, 0x6e, 0x6e, 0xad, 0x37, 0xb3, 0x1d, 0x15,
+            0x67, 0xdb, 0xdb, 0x85, 0x49, 0xc6, 0xc4, 0xcb, 0xe1, 0x14, 0x47, 0xba, 0xa2,
+            0x3f, 0x9f, 0x26, 0xe7, 0xd0, 0xad,
+        ]);
+        const SNAPSHOT_GOLDEN: ExactRenderDigest = ExactRenderDigest::from_bytes([
+            0x4f, 0x3b, 0x1c, 0xce, 0xb7, 0x99, 0x41, 0x18, 0xf6, 0xfc, 0x88, 0xe5, 0xe2,
+            0x7e, 0x4a, 0xdb, 0x5c, 0xa1, 0x48, 0x79, 0x21, 0xf4, 0xb3, 0x18, 0xb1, 0x9f,
+            0xea, 0xdf, 0x80, 0xa2, 0x03, 0xac,
+        ]);
+        const MANIFEST_GOLDEN: ExactRenderDigest = ExactRenderDigest::from_bytes([
+            0x2e, 0x85, 0xad, 0x8d, 0x7c, 0x6d, 0x67, 0xfe, 0x80, 0x76, 0xdd, 0x22, 0xfe,
+            0xda, 0x20, 0x05, 0x94, 0x91, 0x6e, 0x94, 0x28, 0x11, 0xbb, 0xfc, 0xa1, 0x88,
+            0x94, 0xb1, 0xc3, 0xae, 0xfc, 0x8f,
+        ]);
+        const CHUNK_GOLDEN: ExactRenderDigest = ExactRenderDigest::from_bytes([
+            0xd2, 0x58, 0x8c, 0x96, 0xe2, 0x46, 0x8b, 0x28, 0x4b, 0x3c, 0x46, 0x78, 0x1e,
+            0x95, 0x8d, 0xe9, 0x62, 0xd8, 0xd4, 0x36, 0xff, 0xf4, 0x15, 0x9a, 0x15, 0xa1,
+            0x63, 0xa1, 0x53, 0x9f, 0x14, 0xca,
+        ]);
+
+        let connection = RenderConnectionIdentity::new(
+            TopologyStreamId::from_bytes([0x01; 16]),
+            MuxSessionIncarnation::from_bytes([0x02; 16]),
+        );
+        let result_cursor = ExactRenderDeliveryCursor {
+            pane_generation: ExactRenderPaneGeneration::try_new(4).expect("nonzero"),
+            delivery_generation: ExactRenderDeliveryGeneration::try_new(5).expect("nonzero"),
+            sequence: ExactRenderDeliverySequence::try_new(7).expect("nonzero"),
+        };
+        let base_cursor = ExactRenderDeliveryCursor {
+            sequence: ExactRenderDeliverySequence::try_new(6).expect("nonzero"),
+            ..result_cursor
+        };
+        let projection = ExactRenderProjectionV1 {
+            first_stable_row: 0,
+            row_count: 1,
+            alt_screen_active: false,
+            mouse_grabbed: true,
+            cursor_position: ExactRenderCursorPositionV1 {
+                x: 1,
+                y: 0,
+                shape: ExactRenderCursorShapeV1::SteadyBlock,
+                visibility: ExactRenderCursorVisibilityV1::Visible,
+            },
+            dimensions: ExactRenderDimensionsV1 {
+                cols: 80,
+                viewport_rows: 1,
+                scrollback_rows: 1,
+                physical_top: 0,
+                scrollback_top: 0,
+                dpi: 96,
+                pixel_width: 800,
+                pixel_height: 600,
+                reverse_video: true,
+            },
+            title: ExactRenderTitleV1::try_from_str("T").expect("bounded title"),
+            working_dir: Some(
+                ExactRenderWorkingDirectoryV1::try_from_str("W")
+                    .expect("bounded working directory"),
+            ),
+        };
+        let rows = vec![ExactRenderRowV1 {
+            stable_row: 0,
+            text: ExactRenderRowTextV1::try_from_str("x").expect("bounded row"),
+            wrapped: false,
+        }];
+        let delta = ExactRenderDeltaV1 {
+            delivery: ExactRenderDeliveryToken {
+                connection_identity: connection,
+                pane_id: ExactRenderPaneId::new(3),
+                resulting_baseline: result_cursor,
+                content_digest: ExactRenderDigest::ZERO,
+            },
+            base: base_cursor,
+            source_version: 8,
+            resulting_projection: projection.clone(),
+            patches: vec![ExactRenderRowPatchV1 {
+                start_stable_row: 0,
+                removed_rows: 1,
+                replacement_start: 0,
+                replacement_count: 1,
+            }],
+            rows: rows.clone(),
+        }
+        .with_computed_digest()
+        .expect("golden delta digest must compute");
+        assert_eq!(delta.delivery.content_digest, DELTA_GOLDEN);
+
+        let manifest = ExactRenderSnapshotManifestV1 {
+            snapshot: ExactRenderDeliveryToken {
+                connection_identity: connection,
+                pane_id: ExactRenderPaneId::new(3),
+                resulting_baseline: result_cursor,
+                content_digest: ExactRenderDigest::ZERO,
+            },
+            source_version: 8,
+            projection,
+            total_rows: 1,
+            total_text_bytes: 1,
+            chunk_count: 1,
+        }
+        .with_computed_content_digest(&rows)
+        .expect("golden snapshot digest must compute");
+        assert_eq!(manifest.snapshot.content_digest, SNAPSHOT_GOLDEN);
+        assert_eq!(
+            manifest
+                .canonical_manifest_digest()
+                .expect("golden manifest digest must compute"),
+            MANIFEST_GOLDEN,
+        );
+        let chunk = ExactRenderSnapshotChunkV1 {
+            source_version: 8,
+            ordinal: 0,
+            first_row_ordinal: 0,
+            first_text_byte: 0,
+            rows,
+            chunk_digest: ExactRenderDigest::ZERO,
+        }
+        .with_computed_digest(&manifest)
+        .expect("golden chunk digest must compute");
+        assert_eq!(chunk.chunk_digest, CHUNK_GOLDEN);
+
+        // Independent, byte-explicit grammar audit. Every integer is fixed-width
+        // big endian; booleans/tags are one byte; text is u64 length + UTF-8.
+        let mut token_context = Vec::new();
+        token_context.extend_from_slice(&[0x01; 16]);
+        token_context.extend_from_slice(&[0x02; 16]);
+        token_context.extend_from_slice(&3_u64.to_be_bytes());
+        token_context.extend_from_slice(&4_u64.to_be_bytes());
+        token_context.extend_from_slice(&5_u64.to_be_bytes());
+        token_context.extend_from_slice(&7_u64.to_be_bytes());
+
+        let mut projection_preimage = Vec::new();
+        projection_preimage.extend_from_slice(&0_i64.to_be_bytes());
+        projection_preimage.extend_from_slice(&1_u64.to_be_bytes());
+        projection_preimage.extend_from_slice(&[0, 1]);
+        projection_preimage.extend_from_slice(&1_u64.to_be_bytes());
+        projection_preimage.extend_from_slice(&0_i64.to_be_bytes());
+        projection_preimage.extend_from_slice(&[2, 1]);
+        projection_preimage.extend_from_slice(&80_u64.to_be_bytes());
+        projection_preimage.extend_from_slice(&1_u64.to_be_bytes());
+        projection_preimage.extend_from_slice(&1_u64.to_be_bytes());
+        projection_preimage.extend_from_slice(&0_i64.to_be_bytes());
+        projection_preimage.extend_from_slice(&0_i64.to_be_bytes());
+        projection_preimage.extend_from_slice(&96_u32.to_be_bytes());
+        projection_preimage.extend_from_slice(&800_u64.to_be_bytes());
+        projection_preimage.extend_from_slice(&600_u64.to_be_bytes());
+        projection_preimage.push(1);
+        projection_preimage.extend_from_slice(&1_u64.to_be_bytes());
+        projection_preimage.push(b'T');
+        projection_preimage.push(1);
+        projection_preimage.extend_from_slice(&1_u64.to_be_bytes());
+        projection_preimage.push(b'W');
+        assert_eq!(projection_preimage.len(), 116);
+
+        let mut row_preimage = Vec::new();
+        row_preimage.extend_from_slice(&1_u64.to_be_bytes());
+        row_preimage.extend_from_slice(&0_i64.to_be_bytes());
+        row_preimage.push(0);
+        row_preimage.extend_from_slice(&1_u64.to_be_bytes());
+        row_preimage.push(b'x');
+
+        let mut delta_preimage = b"frankenterm.exact-render-delta.v1\0".to_vec();
+        delta_preimage.extend_from_slice(&token_context);
+        delta_preimage.extend_from_slice(&4_u64.to_be_bytes());
+        delta_preimage.extend_from_slice(&5_u64.to_be_bytes());
+        delta_preimage.extend_from_slice(&6_u64.to_be_bytes());
+        delta_preimage.extend_from_slice(&8_u64.to_be_bytes());
+        delta_preimage.extend_from_slice(&projection_preimage);
+        delta_preimage.extend_from_slice(&1_u64.to_be_bytes());
+        delta_preimage.extend_from_slice(&0_i64.to_be_bytes());
+        delta_preimage.extend_from_slice(&1_u64.to_be_bytes());
+        delta_preimage.extend_from_slice(&0_u64.to_be_bytes());
+        delta_preimage.extend_from_slice(&1_u64.to_be_bytes());
+        delta_preimage.extend_from_slice(&row_preimage);
+        assert_eq!(delta_preimage.len(), 312);
+        assert_eq!(
+            ExactRenderDigest::from_bytes(Sha256::digest(&delta_preimage).into()),
+            DELTA_GOLDEN,
+        );
+
+        let mut snapshot_preimage = b"frankenterm.exact-render-snapshot.v1\0".to_vec();
+        snapshot_preimage.extend_from_slice(&token_context);
+        snapshot_preimage.extend_from_slice(&8_u64.to_be_bytes());
+        snapshot_preimage.extend_from_slice(&projection_preimage);
+        snapshot_preimage.extend_from_slice(&1_u64.to_be_bytes());
+        snapshot_preimage.extend_from_slice(&1_u64.to_be_bytes());
+        snapshot_preimage.extend_from_slice(&row_preimage);
+        assert_eq!(snapshot_preimage.len(), 267);
+        assert_eq!(
+            ExactRenderDigest::from_bytes(Sha256::digest(&snapshot_preimage).into()),
+            SNAPSHOT_GOLDEN,
+        );
+
+        let mut token = token_context.clone();
+        token.extend_from_slice(&SNAPSHOT_GOLDEN.as_bytes());
+        let mut manifest_preimage =
+            b"frankenterm.exact-render-snapshot-manifest.v1\0".to_vec();
+        manifest_preimage.extend_from_slice(&token);
+        manifest_preimage.extend_from_slice(&8_u64.to_be_bytes());
+        manifest_preimage.extend_from_slice(&projection_preimage);
+        manifest_preimage.extend_from_slice(&1_u64.to_be_bytes());
+        manifest_preimage.extend_from_slice(&1_u64.to_be_bytes());
+        manifest_preimage.extend_from_slice(&1_u64.to_be_bytes());
+        assert_eq!(manifest_preimage.len(), 290);
+        assert_eq!(
+            ExactRenderDigest::from_bytes(Sha256::digest(&manifest_preimage).into()),
+            MANIFEST_GOLDEN,
+        );
+
+        let mut chunk_preimage =
+            b"frankenterm.exact-render-snapshot-chunk.v1\0".to_vec();
+        chunk_preimage.extend_from_slice(&token);
+        chunk_preimage.extend_from_slice(&8_u64.to_be_bytes());
+        chunk_preimage.extend_from_slice(&0_u64.to_be_bytes());
+        chunk_preimage.extend_from_slice(&0_u64.to_be_bytes());
+        chunk_preimage.extend_from_slice(&0_u64.to_be_bytes());
+        chunk_preimage.extend_from_slice(&row_preimage);
+        assert_eq!(chunk_preimage.len(), 197);
+        assert_eq!(
+            ExactRenderDigest::from_bytes(Sha256::digest(&chunk_preimage).into()),
+            CHUNK_GOLDEN,
+        );
+    }
+
+    #[test]
+    fn exact_render_canonical_comparator_rejects_both_length_directions_and_byte_drift() {
+        let value = 7_u64;
+        let canonical = serialize_with_mode(&value, CompressionMode::Never)
+            .expect("canonical scalar must serialize")
+            .0;
+        ensure_exact_render_canonical_payload(&value, &canonical, "test")
+            .expect("exact canonical bytes must compare equal");
+
+        let mut byte_drift = canonical.clone();
+        let last = byte_drift
+            .last_mut()
+            .expect("canonical scalar encoding is nonempty");
+        *last ^= 1;
+        let byte_error = ensure_exact_render_canonical_payload(&value, &byte_drift, "test")
+            .expect_err("one changed byte must fail");
+        assert!(format!("{byte_error:#}").contains("byte mismatch at offset"));
+
+        let canonical_longer = &canonical[..canonical.len() - 1];
+        let longer_error =
+            ensure_exact_render_canonical_payload(&value, canonical_longer, "test")
+                .expect_err("canonical serialization longer than payload must fail");
+        assert!(format!("{longer_error:#}").contains("canonical serialization is longer"));
+
+        let mut canonical_shorter = canonical;
+        canonical_shorter.push(0);
+        let shorter_error =
+            ensure_exact_render_canonical_payload(&value, &canonical_shorter, "test")
+                .expect_err("canonical serialization shorter than payload must fail");
+        assert!(format!("{shorter_error:#}").contains("canonical serialization is 1 bytes shorter"));
+    }
+
+    #[test]
+    fn exact_render_decoders_reject_trailing_truncated_and_over_limit_payloads() {
+        let request = sample_exact_render_request(ExactRenderDeliveryMode::Incremental);
+        let response = sample_exact_render_response(ExactRenderDeliveryOutcomeV1::ExactDelta(
+            sample_exact_render_delta(91),
+        ));
+        for mode in [CompressionMode::Never, CompressionMode::Always] {
+            for (name, frame) in [
+                (
+                    "GetPaneRenderDeliveryV1",
+                    encode_authority_payload_with_trailing_schema_byte(91, 1, &request, mode),
+                ),
+                (
+                    "GetPaneRenderDeliveryV1Response",
+                    encode_authority_payload_with_trailing_schema_byte(92, 2, &response, mode),
+                ),
+            ] {
+                let error = Pdu::decode(frame.as_slice())
+                    .expect_err("closed exact render schema must reject trailing bytes");
+                assert!(
+                    format!("{error:#}").contains(&format!(
+                        "{name} payload has trailing schema bytes"
+                    )),
+                    "unexpected trailing-byte rejection for {name}: {error:#}",
+                );
+            }
+        }
+
+        for (name, frame) in [
+            (
+                "GetPaneRenderDeliveryV1",
+                encode_authority_payload_with_compressed_suffix(
+                    91,
+                    3,
+                    &request,
+                    &[0xde, 0xad],
+                ),
+            ),
+            (
+                "GetPaneRenderDeliveryV1Response",
+                encode_authority_payload_with_compressed_suffix(
+                    92,
+                    4,
+                    &response,
+                    &[0xbe, 0xef],
+                ),
+            ),
+        ] {
+            let error = Pdu::decode(frame.as_slice())
+                .expect_err("compressed suffix after exact render schema must fail closed");
+            assert!(
+                format!("{error:#}").contains("trailing compressed frame bytes"),
+                "unexpected compressed-suffix rejection for {name}: {error:#}",
+            );
+        }
+
+        let truncated_request =
+            encode_authority_payload_with_truncated_zstd(91, 5, &request);
+        Pdu::decode(truncated_request.as_slice())
+            .expect_err("checksum-truncated compressed request must fail closed");
+        let truncated_response =
+            encode_authority_payload_with_truncated_zstd(92, 6, &response);
+        Pdu::decode(truncated_response.as_slice())
+            .expect_err("checksum-truncated compressed response must fail closed");
+
+        for mut frame in [
+            Pdu::GetPaneRenderDeliveryV1(request.clone())
+                .encode_frame_with_mode(5, CompressionMode::Never)
+                .expect("request fixture must encode"),
+            Pdu::GetPaneRenderDeliveryV1Response(response.clone())
+                .encode_frame_with_mode(6, CompressionMode::Never)
+                .expect("response fixture must encode"),
+        ] {
+            frame.pop().expect("fixture frame is non-empty");
+            Pdu::decode(frame.as_slice())
+                .expect_err("truncated uncompressed exact render frame must fail closed");
+        }
+
+        for (name, ident, serial, canonical) in [
+            (
+                "GetPaneRenderDeliveryV1",
+                91,
+                7,
+                serialize_with_mode(&request, CompressionMode::Never)
+                    .expect("canonical request payload must serialize")
+                    .0,
+            ),
+            (
+                "GetPaneRenderDeliveryV1Response",
+                92,
+                8,
+                serialize_with_mode(&response, CompressionMode::Never)
+                    .expect("canonical response payload must serialize")
+                    .0,
+            ),
+        ] {
+            assert_eq!(canonical.first(), Some(&1));
+            let mut noncanonical = Vec::with_capacity(canonical.len() + 1);
+            noncanonical.extend_from_slice(&[0x81, 0x00]);
+            noncanonical.extend_from_slice(&canonical[1..]);
+            let mut frame = Vec::new();
+            encode_raw(ident, serial, &noncanonical, false, &mut frame)
+                .expect("noncanonical exact render payload should frame");
+            let error = Pdu::decode(frame.as_slice())
+                .expect_err("non-minimal LEB authority must fail canonical decode");
+            assert!(
+                format!("{error:#}").contains(&format!(
+                    "{name} payload is not canonical varbincode"
+                )),
+                "unexpected noncanonical authority rejection for {name}: {error:#}",
+            );
+        }
+
+        for (ident, maximum) in [
+            (91, MAX_EXACT_RENDER_REQUEST_DECOMPRESSED_BYTES),
+            (92, MAX_EXACT_RENDER_DELIVERY_DECOMPRESSED_BYTES),
+        ] {
+            let oversized = vec![0_u8; maximum + 1];
+            for (payload, compressed) in [
+                (oversized.clone(), false),
+                (
+                    zstd::stream::encode_all(
+                        oversized.as_slice(),
+                        zstd::DEFAULT_COMPRESSION_LEVEL,
+                    )
+                    .expect("oversized exact render fixture should compress"),
+                    true,
+                ),
+            ] {
+                let mut frame = Vec::new();
+                encode_raw(ident, 9, &payload, compressed, &mut frame)
+                    .expect("oversized exact render payload should frame");
+                let error = Pdu::decode(frame.as_slice())
+                    .expect_err("schema-specific decompressed ceiling must fail closed");
+                assert!(
+                    format!("{error:#}")
+                        .contains(&format!("exceeds maximum {maximum}")),
+                    "unexpected PDU {ident} decompressed-cap rejection: {error:#}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn exact_render_frames_survive_every_fragment_boundary_and_coalescing() {
+        let request = Pdu::GetPaneRenderDeliveryV1(sample_exact_render_request(
+            ExactRenderDeliveryMode::Incremental,
+        ));
+        let response = Pdu::GetPaneRenderDeliveryV1Response(sample_exact_render_response(
+            ExactRenderDeliveryOutcomeV1::ExactDelta(sample_exact_render_delta(123_456)),
+        ));
+        let request_frame = request
+            .encode_frame_with_mode(71, CompressionMode::Never)
+            .expect("request fixture must encode");
+        let response_frame = response
+            .encode_frame_with_mode(71, CompressionMode::Always)
+            .expect("response fixture must encode");
+
+        for split in 0..request_frame.len() {
+            let mut buffer = StreamingPduBuffer::new();
+            buffer.extend_from_slice(&request_frame[..split]);
+            assert!(
+                Pdu::stream_decode(&mut buffer)
+                    .expect("incomplete request fragment must remain decodable")
+                    .is_none(),
+                "split {split} unexpectedly completed the request",
+            );
+            buffer.extend_from_slice(&request_frame[split..]);
+            assert_eq!(
+                Pdu::stream_decode(&mut buffer)
+                    .expect("completed request fragment must decode")
+                    .expect("completed request must be present")
+                    .pdu,
+                request
+            );
+            assert!(buffer.is_empty());
+        }
+
+        let mut coalesced = request_frame;
+        coalesced.extend_from_slice(&response_frame);
+        let mut buffer = StreamingPduBuffer::from(coalesced);
+        assert_eq!(
+            Pdu::stream_decode(&mut buffer)
+                .expect("first coalesced frame must decode")
+                .expect("request must be present")
+                .pdu,
+            request
+        );
+        assert_eq!(
+            Pdu::stream_decode(&mut buffer)
+                .expect("second coalesced frame must decode")
+                .expect("response must be present")
+                .pdu,
+            response
+        );
+        assert!(buffer.is_empty());
+    }
+
     #[test]
     fn ordered_window_v1_capabilities_are_known_but_not_advertised() {
         assert_eq!(
@@ -7010,8 +12972,10 @@ mod test {
     }
 
     #[test]
-    fn ordered_window_v1_rejects_zero_duplicate_and_impossible_identities() {
+    fn ordered_window_v1_accepts_zero_mux_ids_and_rejects_reserved_or_duplicate_ids() {
         let valid = sample_reorder_window_tabs_v1();
+        assert_eq!(RemoteWindowId::new(0).try_into_usize(), Ok(0));
+        assert_eq!(RemoteTabId::new(0).try_into_usize(), Ok(0));
         let mut zero_window = valid.clone();
         zero_window.window_id = RemoteWindowId::new(0);
         zero_window = zero_window.with_computed_digest();
@@ -7025,6 +12989,47 @@ mod test {
         zero_tab.desired_tab_ids[0] = RemoteTabId::new(0);
         zero_tab = zero_tab.with_computed_digest();
 
+        let mut active_zero_tab = zero_tab.clone();
+        active_zero_tab.desired_active_tab_id = Some(RemoteTabId::new(0));
+        active_zero_tab = active_zero_tab.with_computed_digest();
+
+        for zero_is_valid in [zero_window, zero_tab, active_zero_tab] {
+            let pdu = Pdu::ReorderWindowTabsV1(zero_is_valid);
+            let frame = pdu
+                .encode_frame_with_mode(6, CompressionMode::Never)
+                .expect("live mux ID zero must encode");
+            assert_eq!(
+                Pdu::decode(frame.as_slice())
+                    .expect("live mux ID zero must decode")
+                    .pdu,
+                pdu,
+            );
+        }
+
+        let mut reserved_window = valid.clone();
+        reserved_window.window_id = RemoteWindowId::new(u64::MAX);
+        reserved_window = reserved_window.with_computed_digest();
+
+        let mut reserved_tab = valid.clone();
+        reserved_tab.desired_tab_ids[0] = RemoteTabId::new(u64::MAX);
+        reserved_tab = reserved_tab.with_computed_digest();
+
+        let mut zero_binding = valid.clone();
+        zero_binding.domain_binding_id = DomainBindingId::from_bytes([0; 16]);
+        zero_binding = zero_binding.with_computed_digest();
+
+        let mut zero_stream = valid.clone();
+        zero_stream.stream_id = TopologyStreamId::from_bytes([0; 16]);
+        zero_stream = zero_stream.with_computed_digest();
+
+        let mut zero_session = valid.clone();
+        zero_session.session_incarnation = MuxSessionIncarnation::from_bytes([0; 16]);
+        zero_session = zero_session.with_computed_digest();
+
+        let mut zero_mutation_namespace = valid.clone();
+        zero_mutation_namespace.mutation_id.namespace = [0; 16];
+        zero_mutation_namespace = zero_mutation_namespace.with_computed_digest();
+
         let mut missing_active = valid.clone();
         missing_active.desired_active_tab_id = None;
         missing_active = missing_active.with_computed_digest();
@@ -7034,9 +13039,13 @@ mod test {
         foreign_active = foreign_active.with_computed_digest();
 
         for (name, malformed) in [
-            ("zero window", zero_window),
             ("duplicate tab", duplicate_tab),
-            ("zero tab", zero_tab),
+            ("reserved window", reserved_window),
+            ("reserved tab", reserved_tab),
+            ("zero binding identity", zero_binding),
+            ("zero stream identity", zero_stream),
+            ("zero session identity", zero_session),
+            ("zero mutation namespace", zero_mutation_namespace),
             ("missing active", missing_active),
             ("foreign active", foreign_active),
         ] {
@@ -7352,18 +13361,28 @@ mod test {
     }
 
     #[test]
-    fn codec_v51_keeps_v50_legacy_dialect_inert_and_compatible() {
-        assert_eq!(CODEC_VERSION, 51);
+    fn codec_v52_keeps_v51_legacy_dialect_inert_and_compatible() {
+        assert_eq!(CODEC_VERSION, 52);
         assert_eq!(CODEC_VERSION_MIN_SUPPORTED, 46);
         assert_eq!(ORDERED_WINDOW_V1_MIN_CODEC_VERSION, 51);
         assert!(!codec_version_supports_ordered_window_v1(50));
         assert!(codec_version_supports_ordered_window_v1(51));
+        assert!(!codec_version_supports_exact_render_delivery_v1(51));
+        assert!(codec_version_supports_exact_render_delivery_v1(52));
         assert_eq!(
-            check_compat(51, 46, 50, 46).expect("v50 remains in the additive window"),
-            CompatDecision::Compatible { agreed: 50 }
+            check_compat(52, 46, 51, 46).expect("v51 remains in the additive window"),
+            CompatDecision::Compatible { agreed: 51 }
         );
         assert_eq!(<ListPanesCoherent as PduWireIdent>::IDENT, 81);
         assert_eq!(<RenderApplicationResult as PduWireIdent>::IDENT, 85);
+        assert_eq!(
+            <GetPaneRenderDeliveryV1 as PduWireIdent>::WIRE_SPEC.min_codec_version,
+            52
+        );
+        assert_eq!(
+            <GetPaneRenderDeliveryV1Response as PduWireIdent>::WIRE_SPEC.min_codec_version,
+            52
+        );
         assert_eq!(
             TopologyCapabilities::SERVER_SUPPORTED.bits(),
             TopologyCapabilities::FENCED_SNAPSHOT_V1.bits()
@@ -8109,14 +14128,14 @@ mod test {
 
     #[test]
     fn codec_version_is_current() {
-        assert_eq!(CODEC_VERSION, 51);
+        assert_eq!(CODEC_VERSION, 52);
     }
 
     #[test]
     fn pdu_wire_registry_covers_every_assigned_id_and_only_the_historical_gaps() {
         const GAPS: &[u64] = &[5, 6, 7, 15, 16, 17, 18, 19, 21];
 
-        for ident in 0..=90 {
+        for ident in 0..=92 {
             let spec = Pdu::wire_spec_for_ident(ident);
             assert_eq!(
                 spec.is_none(),
@@ -8130,9 +14149,9 @@ mod test {
             }
         }
 
-        assert!(Pdu::wire_spec_for_ident(91).is_none());
+        assert!(Pdu::wire_spec_for_ident(93).is_none());
         assert!(Pdu::wire_spec_for_ident(u64::MAX).is_none());
-        assert_eq!(Pdu::all_wire_specs().len(), 91 - GAPS.len());
+        assert_eq!(Pdu::all_wire_specs().len(), 93 - GAPS.len());
     }
 
     #[test]
@@ -8161,6 +14180,7 @@ mod test {
                 81..=83 => 49,
                 84..=85 => 50,
                 86..=90 => 51,
+                91..=92 => 52,
                 ident => panic!("unexpected assigned PDU ID {}", ident),
             };
             assert_eq!(
@@ -8190,11 +14210,11 @@ mod test {
         const CLIENT_REQUESTS: &[u64] = &[
             1, 3, 9, 11, 12, 13, 14, 22, 24, 26, 28, 31, 33, 34, 35, 36, 38, 40, 41, 43,
             45, 46, 48, 50, 51, 56, 57, 58, 59, 60, 62, 63, 64, 65, 66, 67, 68, 69, 70,
-            71, 72, 73, 74, 75, 77, 80, 81, 85, 86, 88,
+            71, 72, 73, 74, 75, 77, 80, 81, 85, 86, 88, 91,
         ];
         const SERVER_REPLIES: &[u64] = &[
             0, 2, 4, 8, 10, 23, 25, 27, 29, 30, 32, 42, 47, 49, 52, 61, 76, 78, 82, 87,
-            89,
+            89, 92,
         ];
         const SERVER_UNILATERALS: &[u64] = &[
             20, 25, 37, 38, 39, 44, 53, 54, 55, 56, 57, 58, 79, 83, 84, 90,
@@ -8265,6 +14285,9 @@ mod test {
         let reorder = TopologyCapabilities::from_bits(
             ordered.bits() | TopologyCapabilities::WINDOW_REORDER_CAS_V1.bits(),
         );
+        let exact_render = TopologyCapabilities::from_bits(
+            fenced.bits() | TopologyCapabilities::EXACT_RENDER_DELIVERY_V1.bits(),
+        );
 
         for spec in Pdu::all_wire_specs() {
             let expected = match spec.ident {
@@ -8273,6 +14296,7 @@ mod test {
                 86 | 87 => PduCapabilityUse::Negotiates(ordered),
                 88 | 89 => PduCapabilityUse::Requires(reorder),
                 90 => PduCapabilityUse::Requires(ordered),
+                91 | 92 => PduCapabilityUse::Requires(exact_render),
                 _ => PduCapabilityUse::None,
             };
             assert_eq!(
@@ -8296,6 +14320,8 @@ mod test {
             .contains(TopologyCapabilities::ORDERED_WINDOW_STREAM_V1));
         assert!(!TopologyCapabilities::SERVER_SUPPORTED
             .contains(TopologyCapabilities::WINDOW_REORDER_CAS_V1));
+        assert!(!TopologyCapabilities::SERVER_SUPPORTED
+            .contains(TopologyCapabilities::EXACT_RENDER_DELIVERY_V1));
     }
 
     #[test]
@@ -8352,7 +14378,7 @@ mod test {
     #[test]
     fn check_compat_additive_window_keeps_min_supported() {
         assert_eq!(CODEC_VERSION_MIN_SUPPORTED, 46);
-        assert_eq!(CODEC_VERSION, 51);
+        assert_eq!(CODEC_VERSION, 52);
     }
 
     #[test]

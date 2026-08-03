@@ -77,10 +77,11 @@ const TOPOLOGY_FENCE_MAX_RETAINED_BYTES: usize = 4 * 1024 * 1024;
 /// topology negotiation.  Those request-implied authorities do not require
 /// the server to guess the client's otherwise-unobservable codec window.
 ///
-/// In contrast, render-application delivery has no live ordinary-server
-/// coordinator and ordered-window support is intentionally absent from
-/// `TopologyCapabilities::SERVER_SUPPORTED`.  Keep every server-produced PDU
-/// in those dormant families fail-closed until its own activation work lands.
+/// In contrast, render-application and exact-render delivery have no live
+/// ordinary-server coordinator, and ordered-window support is intentionally
+/// absent from `TopologyCapabilities::SERVER_SUPPORTED`. Keep every
+/// server-produced PDU in those dormant families fail-closed until its own
+/// activation work lands.
 fn is_dormant_server_wire_spec(spec: &codec::PduWireSpec) -> bool {
     let ident = spec.ident;
     ident == <codec::RenderApplicationUpdateV1 as codec::PduWireIdent>::IDENT
@@ -88,6 +89,7 @@ fn is_dormant_server_wire_spec(spec: &codec::PduWireSpec) -> bool {
         || ident == <codec::ListPanesOrderedV1Response as codec::PduWireIdent>::IDENT
         || ident == <codec::ReorderWindowTabsV1Response as codec::PduWireIdent>::IDENT
         || ident == <codec::WindowOrderEventV1 as codec::PduWireIdent>::IDENT
+        || ident == <codec::GetPaneRenderDeliveryV1Response as codec::PduWireIdent>::IDENT
 }
 
 /// Final connection-terminal guard against accidentally activating a frozen
@@ -3572,6 +3574,35 @@ enum ClientDecodeError {
     TerminalChannelClosed,
 }
 
+/// Keep the newly reserved exact-render family dormant before body admission.
+/// The complete ordinary-server dialect/direction/capability authority is
+/// tracked separately; this family-specific fence prevents merely adding its
+/// codec schema from exposing a large pre-handler allocation surface.
+fn select_dormant_client_body(
+    header: &codec::PduFrameHeader,
+) -> anyhow::Result<codec::PduBodyDisposition> {
+    let belongs_to_exact_render =
+        Pdu::wire_spec_for_ident(header.ident()).is_some_and(|spec| match spec.capability {
+            codec::PduCapabilityUse::Negotiates(capability)
+            | codec::PduCapabilityUse::Requires(capability) => {
+                capability.contains(TopologyCapabilities::EXACT_RENDER_DELIVERY_V1)
+            }
+            codec::PduCapabilityUse::None => false,
+        });
+    if belongs_to_exact_render {
+        metrics::counter!(
+            "mux.dispatch.protocol_error",
+            "reason" => "dormant_exact_render_family",
+        )
+        .increment(1);
+        anyhow::bail!(
+            "mux client PDU ident {} belongs to the dormant exact render-delivery family",
+            header.ident()
+        );
+    }
+    Ok(codec::PduBodyDisposition::Materialize)
+}
+
 async fn decode_client_pdu_or_terminal<T>(
     stream: &mut T,
     terminal_rx: &Receiver<&'static str>,
@@ -3580,7 +3611,14 @@ where
     T: DispatchStream,
 {
     let terminal_event = terminal_rx.recv();
-    let decode = Pdu::decode_async(stream, None);
+    let decode = async {
+        match Pdu::decode_async_with_selector(stream, None, select_dormant_client_body).await? {
+            codec::AsyncPduDecode::Decoded(decoded) => Ok(decoded),
+            codec::AsyncPduDecode::Discarded { ident, serial, .. } => anyhow::bail!(
+                "mux server decoder unexpectedly discarded client PDU ident {ident} serial {serial}"
+            ),
+        }
+    };
     pin_mut!(terminal_event);
     pin_mut!(decode);
     match select(terminal_event, decode).await {
@@ -5573,6 +5611,100 @@ mod tests {
             polls_before_terminal,
             "a ready terminal event must win without polling the partial decode again"
         );
+    }
+
+    #[test]
+    fn ordinary_ping_materializes_through_dormant_exact_render_selector() {
+        let mut wire = Vec::new();
+        Pdu::Ping(Ping {})
+            .encode(&mut wire, 41)
+            .expect("ordinary Ping frame should encode");
+        let wire_len = wire.len();
+        let mut stream = PartialFrameDisconnectStream::new(wire, usize::MAX);
+        let (_terminal, terminal_rx) = DispatchTerminal::channel();
+
+        let decoded = promise::spawn::block_on(decode_client_pdu_or_terminal(
+            &mut stream,
+            &terminal_rx,
+        ))
+        .expect("ordinary Ping must retain the materializing decode path");
+        assert_eq!(decoded.serial, 41);
+        assert_eq!(decoded.pdu, Pdu::Ping(Ping {}));
+        assert_eq!(
+            stream.cursor, wire_len,
+            "ordinary materialization must consume exactly one complete frame"
+        );
+    }
+
+    #[test]
+    fn dormant_exact_render_headers_are_rejected_before_body_admission() {
+        // len=33, serial=1, and IDs 91/92 each have a one-byte LEB128
+        // encoding, leaving an opaque 31-byte body after the three-byte
+        // header. The payload is deliberately not a valid schema value: the
+        // dormant-family authority must never inspect it.
+        for ident in [
+            <codec::GetPaneRenderDeliveryV1 as codec::PduWireIdent>::IDENT,
+            <codec::GetPaneRenderDeliveryV1Response as codec::PduWireIdent>::IDENT,
+        ] {
+            let mut wire = vec![33, 1, u8::try_from(ident).expect("test PDU ID fits one byte")];
+            wire.extend_from_slice(&[0xa5; 31]);
+            let mut stream = PartialFrameDisconnectStream::new(wire, usize::MAX);
+            let (_terminal, terminal_rx) = DispatchTerminal::channel();
+
+            let error = promise::spawn::block_on(decode_client_pdu_or_terminal(
+                &mut stream,
+                &terminal_rx,
+            ))
+            .expect_err("dormant exact-render family must fail from its header");
+            let ClientDecodeError::Decode(error) = error else {
+                panic!("expected header-policy decode error, got {error:?}");
+            };
+            assert!(
+                format!("{error:#}").contains("dormant exact render-delivery family"),
+                "unexpected dormant-family error: {error:#}"
+            );
+            assert_eq!(
+                stream.cursor, 3,
+                "dormant PDU {ident} body must remain completely unread"
+            );
+        }
+    }
+
+    #[test]
+    fn compressed_dormant_exact_render_headers_are_rejected_before_body_admission() {
+        // Unsigned LEB128 for `(1 << 63) | 33`: the compression flag plus a
+        // 33-byte frame body. Serial=1 and IDs 91/92 then leave 31 opaque
+        // compressed bytes. The selector must reject before touching them.
+        for ident in [
+            <codec::GetPaneRenderDeliveryV1 as codec::PduWireIdent>::IDENT,
+            <codec::GetPaneRenderDeliveryV1Response as codec::PduWireIdent>::IDENT,
+        ] {
+            let mut wire = vec![
+                0xa1, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x01, 1,
+                u8::try_from(ident).expect("test PDU ID fits one byte"),
+            ];
+            let header_bytes = wire.len();
+            wire.extend_from_slice(&[0xa5; 31]);
+            let mut stream = PartialFrameDisconnectStream::new(wire, usize::MAX);
+            let (_terminal, terminal_rx) = DispatchTerminal::channel();
+
+            let error = promise::spawn::block_on(decode_client_pdu_or_terminal(
+                &mut stream,
+                &terminal_rx,
+            ))
+            .expect_err("compressed dormant exact-render family must fail from its header");
+            let ClientDecodeError::Decode(error) = error else {
+                panic!("expected compressed header-policy decode error, got {error:?}");
+            };
+            assert!(
+                format!("{error:#}").contains("dormant exact render-delivery family"),
+                "unexpected compressed dormant-family error: {error:#}"
+            );
+            assert_eq!(
+                stream.cursor, header_bytes,
+                "compressed dormant PDU {ident} body must remain completely unread"
+            );
+        }
     }
 
     #[test]
@@ -8637,13 +8769,13 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(
             dormant,
-            [79, 84, 87, 89, 90],
+            [79, 84, 87, 89, 90, 92],
             "only the unactivated render and ordered-window server families may be frozen"
         );
         for ident in &dormant {
             let spec = Pdu::wire_spec_for_ident(*ident)
                 .expect("every dormant server family must retain a wire specification");
-            let role = if matches!(*ident, 87 | 89) {
+            let role = if matches!(*ident, 87 | 89 | 92) {
                 codec::PduWireRole::CorrelatedReply
             } else {
                 codec::PduWireRole::Unilateral
@@ -8672,6 +8804,8 @@ mod tests {
             .contains(TopologyCapabilities::ORDERED_WINDOW_STREAM_V1));
         assert!(!TopologyCapabilities::SERVER_SUPPORTED
             .contains(TopologyCapabilities::WINDOW_REORDER_CAS_V1));
+        assert!(!TopologyCapabilities::SERVER_SUPPORTED
+            .contains(TopologyCapabilities::EXACT_RENDER_DELIVERY_V1));
     }
 
     fn dormant_window_order_event() -> Pdu {

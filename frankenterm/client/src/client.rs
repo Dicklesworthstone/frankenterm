@@ -33,7 +33,7 @@ use std::num::NonZeroU64;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::task::{Context as TaskContext, Poll};
 use std::thread;
@@ -370,6 +370,691 @@ enum RpcTransportPhase {
     },
 }
 
+#[derive(Error, Debug, Clone, PartialEq, Eq)]
+#[error("mux RPC generation {generation} was cancelled while reader I/O was pending: {reason}")]
+struct RpcGenerationReaderAborted {
+    generation: NonZeroU64,
+    reason: &'static str,
+}
+
+/// Sticky, generation-scoped cancellation authority for the one physical
+/// reader that owns socket I/O.
+///
+/// The ordinary request queue is not a cancellation primitive: a reader can be
+/// suspended inside a write, flush, or partial-frame decode and never poll that
+/// queue again. A single-reader atomic waker interrupts those operations
+/// without channel traffic on every I/O turn, while the sticky cause closes
+/// the race where cancellation commits immediately before or after an I/O
+/// future becomes ready. A successor generation receives a fresh authority,
+/// so a stale wake can never cancel its transport.
+#[derive(Debug)]
+struct RpcGenerationReaderAbortAuthority {
+    generation: NonZeroU64,
+    cancelled: AtomicBool,
+    cause: ParkingMutex<Option<&'static str>>,
+    reader_waker: futures::task::AtomicWaker,
+}
+
+impl RpcGenerationReaderAbortAuthority {
+    fn new(generation: NonZeroU64) -> Self {
+        Self {
+            generation,
+            cancelled: AtomicBool::new(false),
+            cause: ParkingMutex::new(None),
+            reader_waker: futures::task::AtomicWaker::new(),
+        }
+    }
+
+    fn cause(&self) -> Option<&'static str> {
+        if self.cancelled.load(AtomicOrdering::Acquire) {
+            *self.cause.lock()
+        } else {
+            None
+        }
+    }
+
+    fn commit_abort(&self, reason: &'static str) -> bool {
+        let first = {
+            let mut cause = self.cause.lock();
+            if cause.is_some() {
+                false
+            } else {
+                *cause = Some(reason);
+                true
+            }
+        };
+        if first {
+            self.cancelled.store(true, AtomicOrdering::Release);
+        }
+        first
+    }
+
+    fn wake_reader(&self) {
+        self.reader_waker.wake();
+    }
+
+    async fn cancelled(&self) {
+        poll_fn(|task_cx| {
+            if self.cancelled.load(AtomicOrdering::Acquire) {
+                return Poll::Ready(());
+            }
+            self.reader_waker.register(task_cx.waker());
+            if self.cancelled.load(AtomicOrdering::Acquire) {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        })
+        .await;
+    }
+
+    fn aborted_error(&self) -> Option<anyhow::Error> {
+        self.cause().map(|reason| {
+            anyhow::Error::new(RpcGenerationReaderAborted {
+                generation: self.generation,
+                reason,
+            })
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RpcCodecAuthority {
+    generation: NonZeroU64,
+    local_max: usize,
+    local_min: usize,
+    remote_max: usize,
+    remote_min: usize,
+    agreed: usize,
+}
+
+impl RpcCodecAuthority {
+    fn negotiate(
+        generation: NonZeroU64,
+        remote_max: usize,
+        advertised_remote_min: usize,
+    ) -> Result<Self, codec::CompatError> {
+        let remote_min = if advertised_remote_min == 0 {
+            remote_max
+        } else {
+            advertised_remote_min
+        };
+        let codec::CompatDecision::Compatible { agreed } = codec::check_compat(
+            CODEC_VERSION,
+            codec::CODEC_VERSION_MIN_SUPPORTED,
+            remote_max,
+            remote_min,
+        )?;
+        Ok(Self {
+            generation,
+            local_max: CODEC_VERSION,
+            local_min: codec::CODEC_VERSION_MIN_SUPPORTED,
+            remote_max,
+            remote_min,
+            agreed,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RpcProtocolPhase {
+    AwaitingCodecRequest,
+    AwaitingCodecResponse,
+    AwaitingRegistrationRequest,
+    AwaitingRegistrationResponse,
+    Established,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RpcProtocolDirection {
+    Outbound,
+    Inbound,
+}
+
+#[derive(Error, Debug, Clone, PartialEq, Eq)]
+enum OrdinaryMuxProtocolError {
+    #[error("ordinary mux {direction:?} PDU identity {ident} has no assigned wire policy")]
+    UnknownPdu {
+        direction: RpcProtocolDirection,
+        ident: u64,
+    },
+    #[error(
+        "ordinary mux {direction:?} PDU {name} ({ident}) is not legal during protocol phase \
+         {phase:?}"
+    )]
+    PhaseViolation {
+        direction: RpcProtocolDirection,
+        ident: u64,
+        name: &'static str,
+        phase: RpcProtocolPhase,
+    },
+    #[error(
+        "ordinary mux {direction:?} PDU {name} ({ident}) does not authorize producer \
+         {producer:?} with role {role:?}"
+    )]
+    DirectionViolation {
+        direction: RpcProtocolDirection,
+        ident: u64,
+        name: &'static str,
+        producer: PduProducer,
+        role: PduWireRole,
+    },
+    #[error(
+        "ordinary mux {direction:?} PDU {name} ({ident}) requires codec dialect \
+         {required}, but generation {generation} agreed on {agreed}"
+    )]
+    DialectViolation {
+        direction: RpcProtocolDirection,
+        generation: NonZeroU64,
+        ident: u64,
+        name: &'static str,
+        required: usize,
+        agreed: usize,
+    },
+    #[error(
+        "ordinary mux {direction:?} PDU {name} ({ident}) requires locally activated \
+         capabilities {required:#x}, but this client activates {activated:#x}"
+    )]
+    CapabilityNotActivated {
+        direction: RpcProtocolDirection,
+        ident: u64,
+        name: &'static str,
+        required: u64,
+        activated: u64,
+    },
+    #[error(
+        "ordinary mux {direction:?} PDU {name} ({ident}) requires established capabilities \
+         {required:#x}, but generation {generation} established {established:#x}"
+    )]
+    CapabilityNotEstablished {
+        direction: RpcProtocolDirection,
+        generation: NonZeroU64,
+        ident: u64,
+        name: &'static str,
+        required: u64,
+        established: u64,
+    },
+    #[error(
+        "ordinary mux outbound ListPanesCoherent advertised supported={supported:#x}, \
+         required={required:#x}; the exact activated mask is {activated:#x}"
+    )]
+    CapabilityAdvertisementMismatch {
+        supported: u64,
+        required: u64,
+        activated: u64,
+    },
+    #[error(
+        "ordinary mux {direction:?} PDU {name} ({ident}) belongs to an inactive endpoint family"
+    )]
+    EndpointInactive {
+        direction: RpcProtocolDirection,
+        ident: u64,
+        name: &'static str,
+    },
+    #[error(
+        "ordinary mux codec authority belongs to generation {authority_generation}, not \
+         requested generation {requested_generation}"
+    )]
+    CodecGenerationMismatch {
+        authority_generation: NonZeroU64,
+        requested_generation: NonZeroU64,
+    },
+    #[error("ordinary mux generation {generation} has no live protocol authority")]
+    ProtocolAuthorityUnavailable { generation: NonZeroU64 },
+}
+
+impl OrdinaryMuxProtocolError {
+    const fn metric_reason(&self) -> &'static str {
+        match self {
+            Self::UnknownPdu { .. } => "unknown_pdu",
+            Self::PhaseViolation { .. } => "phase_violation",
+            Self::DirectionViolation { .. } => "direction_violation",
+            Self::DialectViolation { .. } => "dialect_violation",
+            Self::CapabilityNotActivated { .. } => "capability_not_activated",
+            Self::CapabilityNotEstablished { .. } => "capability_not_established",
+            Self::CapabilityAdvertisementMismatch { .. } => {
+                "capability_advertisement_mismatch"
+            }
+            Self::EndpointInactive { .. } => "endpoint_inactive",
+            Self::CodecGenerationMismatch { .. } => "codec_generation_mismatch",
+            Self::ProtocolAuthorityUnavailable { .. } => "protocol_authority_unavailable",
+        }
+    }
+}
+
+fn record_ordinary_mux_protocol_rejection(
+    error: &OrdinaryMuxProtocolError,
+    direction: &'static str,
+    stage: &'static str,
+) {
+    metrics::counter!(
+        "mux.client.protocol.rejection.total",
+        "direction" => direction,
+        "stage" => stage,
+        "reason" => error.metric_reason(),
+    )
+    .increment(1);
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RpcOutboundAdmissionPoint {
+    Preflight,
+    Enqueue,
+    Dequeue,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RpcProtocolTransition {
+    None,
+    CodecRequest,
+    RegistrationRequest,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RpcProtocolAuthority {
+    generation: NonZeroU64,
+    phase: RpcProtocolPhase,
+    codec: Option<RpcCodecAuthority>,
+    established_capabilities: TopologyCapabilities,
+}
+
+impl RpcProtocolAuthority {
+    fn new(generation: NonZeroU64) -> Self {
+        Self {
+            generation,
+            phase: RpcProtocolPhase::AwaitingCodecRequest,
+            codec: None,
+            established_capabilities: TopologyCapabilities::NONE,
+        }
+    }
+
+    #[cfg(test)]
+    fn established_for_test(generation: NonZeroU64, agreed: usize) -> Self {
+        Self {
+            generation,
+            phase: RpcProtocolPhase::Established,
+            codec: Some(RpcCodecAuthority {
+                generation,
+                local_max: CODEC_VERSION,
+                local_min: codec::CODEC_VERSION_MIN_SUPPORTED,
+                remote_max: agreed,
+                remote_min: agreed,
+                agreed,
+            }),
+            established_capabilities: TopologyCapabilities::NONE,
+        }
+    }
+
+    const fn locally_activated_capabilities() -> TopologyCapabilities {
+        // Every additive capability remains deliberately inactive. Do not
+        // replace this exact mask with decoder support or a broad server mask.
+        TopologyCapabilities::FENCED_SNAPSHOT_V1
+    }
+
+    fn endpoint_is_activated(spec: &PduWireSpec) -> bool {
+        // Fail closed for every additive endpoint until the ordinary client
+        // has an explicit live coordinator. Decoder/handler presence is not
+        // activation. Spell the assigned legacy ranges exactly: a future PDU
+        // placed in one of the historical numeric gaps must remain dormant by
+        // default instead of inheriting authority from a broad `<=` cutoff.
+        // Only the fenced-topology trio is active above the legacy surface.
+        matches!(
+            spec.ident,
+            0..=4 | 8..=14 | 20 | 22..=78 | 81..=83
+        )
+    }
+
+    fn uses_ordered_window_capability(spec: &PduWireSpec) -> bool {
+        let capability = match spec.capability {
+            PduCapabilityUse::Negotiates(capability)
+            | PduCapabilityUse::Requires(capability) => capability,
+            PduCapabilityUse::None => return false,
+        };
+        capability.contains(TopologyCapabilities::ORDERED_WINDOW_STREAM_V1)
+    }
+
+    fn agreed_dialect(&self) -> usize {
+        self.codec.map_or(CODEC_VERSION, |codec| codec.agreed)
+    }
+
+    fn validate_common(
+        &self,
+        spec: &PduWireSpec,
+        direction: RpcProtocolDirection,
+        producer: PduProducer,
+        role: PduWireRole,
+    ) -> Result<(), OrdinaryMuxProtocolError> {
+        if !Self::endpoint_is_activated(spec) {
+            return Err(OrdinaryMuxProtocolError::EndpointInactive {
+                direction,
+                ident: spec.ident,
+                name: spec.name,
+            });
+        }
+        if !spec.authorizes(producer, role) {
+            return Err(OrdinaryMuxProtocolError::DirectionViolation {
+                direction,
+                ident: spec.ident,
+                name: spec.name,
+                producer,
+                role,
+            });
+        }
+        let agreed = self.agreed_dialect();
+        if spec.min_codec_version > agreed {
+            return Err(OrdinaryMuxProtocolError::DialectViolation {
+                direction,
+                generation: self.generation,
+                ident: spec.ident,
+                name: spec.name,
+                required: spec.min_codec_version,
+                agreed,
+            });
+        }
+        match spec.capability {
+            PduCapabilityUse::None => {}
+            PduCapabilityUse::Negotiates(required) => {
+                let activated = Self::locally_activated_capabilities();
+                if !activated.contains(required) {
+                    return Err(OrdinaryMuxProtocolError::CapabilityNotActivated {
+                        direction,
+                        ident: spec.ident,
+                        name: spec.name,
+                        required: required.bits(),
+                        activated: activated.bits(),
+                    });
+                }
+            }
+            PduCapabilityUse::Requires(required) => {
+                let activated = Self::locally_activated_capabilities();
+                if !activated.contains(required) {
+                    return Err(OrdinaryMuxProtocolError::CapabilityNotActivated {
+                        direction,
+                        ident: spec.ident,
+                        name: spec.name,
+                        required: required.bits(),
+                        activated: activated.bits(),
+                    });
+                }
+                if !self.established_capabilities.contains(required) {
+                    return Err(OrdinaryMuxProtocolError::CapabilityNotEstablished {
+                        direction,
+                        generation: self.generation,
+                        ident: spec.ident,
+                        name: spec.name,
+                        required: required.bits(),
+                        established: self.established_capabilities.bits(),
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_outbound(
+        &self,
+        spec: &PduWireSpec,
+        point: RpcOutboundAdmissionPoint,
+    ) -> Result<(), OrdinaryMuxProtocolError> {
+        self.validate_common(
+            spec,
+            RpcProtocolDirection::Outbound,
+            PduProducer::Client,
+            PduWireRole::Request,
+        )?;
+        let codec_request = spec.ident == <GetCodecVersion as PduWireIdent>::IDENT;
+        let registration_request = spec.ident == <SetClientId as PduWireIdent>::IDENT;
+        let phase_authorized = match (self.phase, point) {
+            (
+                RpcProtocolPhase::AwaitingCodecRequest,
+                RpcOutboundAdmissionPoint::Preflight | RpcOutboundAdmissionPoint::Enqueue,
+            ) => codec_request,
+            (RpcProtocolPhase::AwaitingCodecResponse, RpcOutboundAdmissionPoint::Dequeue) => {
+                codec_request
+            }
+            (
+                RpcProtocolPhase::AwaitingRegistrationRequest,
+                RpcOutboundAdmissionPoint::Preflight | RpcOutboundAdmissionPoint::Enqueue,
+            ) => registration_request,
+            (
+                RpcProtocolPhase::AwaitingRegistrationResponse,
+                RpcOutboundAdmissionPoint::Dequeue,
+            ) => registration_request,
+            (RpcProtocolPhase::Established, _) => !codec_request && !registration_request,
+            _ => false,
+        };
+        if !phase_authorized {
+            return Err(OrdinaryMuxProtocolError::PhaseViolation {
+                direction: RpcProtocolDirection::Outbound,
+                ident: spec.ident,
+                name: spec.name,
+                phase: self.phase,
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_outbound_pdu(
+        &self,
+        pdu: &Pdu,
+        point: RpcOutboundAdmissionPoint,
+    ) -> Result<(), OrdinaryMuxProtocolError> {
+        let spec = assigned_pdu_spec(pdu, RpcProtocolDirection::Outbound)?;
+        self.validate_outbound(spec, point)?;
+        if let Pdu::ListPanesCoherent(request) = pdu {
+            let activated = Self::locally_activated_capabilities();
+            if request.supported != activated || request.required != activated {
+                return Err(
+                    OrdinaryMuxProtocolError::CapabilityAdvertisementMismatch {
+                        supported: request.supported.bits(),
+                        required: request.required.bits(),
+                        activated: activated.bits(),
+                    },
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn admit_outbound(
+        &mut self,
+        pdu: &Pdu,
+    ) -> Result<RpcProtocolTransition, OrdinaryMuxProtocolError> {
+        self.validate_outbound_pdu(pdu, RpcOutboundAdmissionPoint::Enqueue)?;
+        let transition = match self.phase {
+            RpcProtocolPhase::AwaitingCodecRequest => {
+                self.phase = RpcProtocolPhase::AwaitingCodecResponse;
+                RpcProtocolTransition::CodecRequest
+            }
+            RpcProtocolPhase::AwaitingRegistrationRequest => {
+                self.phase = RpcProtocolPhase::AwaitingRegistrationResponse;
+                RpcProtocolTransition::RegistrationRequest
+            }
+            RpcProtocolPhase::Established => RpcProtocolTransition::None,
+            _ => unreachable!("outbound admission validated an ineligible protocol phase"),
+        };
+        Ok(transition)
+    }
+
+    fn rollback_outbound(&mut self, transition: RpcProtocolTransition) {
+        self.phase = match (transition, self.phase) {
+            (RpcProtocolTransition::None, phase) => phase,
+            (RpcProtocolTransition::CodecRequest, RpcProtocolPhase::AwaitingCodecResponse) => {
+                RpcProtocolPhase::AwaitingCodecRequest
+            }
+            (
+                RpcProtocolTransition::RegistrationRequest,
+                RpcProtocolPhase::AwaitingRegistrationResponse,
+            ) => RpcProtocolPhase::AwaitingRegistrationRequest,
+            _ => self.phase,
+        };
+    }
+
+    fn rollback_unadmitted_outbound(
+        &mut self,
+        pdu: &Pdu,
+    ) -> Result<(), OrdinaryMuxProtocolError> {
+        let spec = assigned_pdu_spec(pdu, RpcProtocolDirection::Outbound)?;
+        let transition = if spec.ident == <GetCodecVersion as PduWireIdent>::IDENT {
+            RpcProtocolTransition::CodecRequest
+        } else if spec.ident == <SetClientId as PduWireIdent>::IDENT {
+            RpcProtocolTransition::RegistrationRequest
+        } else {
+            RpcProtocolTransition::None
+        };
+        self.rollback_outbound(transition);
+        Ok(())
+    }
+
+    fn validate_inbound(
+        &self,
+        spec: &PduWireSpec,
+        role: PduWireRole,
+    ) -> Result<(), OrdinaryMuxProtocolError> {
+        self.validate_common(
+            spec,
+            RpcProtocolDirection::Inbound,
+            PduProducer::Server,
+            role,
+        )?;
+        let codec_response = spec.ident == <GetCodecVersionResponse as PduWireIdent>::IDENT;
+        let unit_response = spec.ident == <UnitResponse as PduWireIdent>::IDENT;
+        let error_response = spec.ident == <ErrorResponse as PduWireIdent>::IDENT;
+        let phase_authorized = match self.phase {
+            RpcProtocolPhase::AwaitingCodecResponse => codec_response || error_response,
+            RpcProtocolPhase::AwaitingRegistrationResponse => unit_response || error_response,
+            RpcProtocolPhase::Established => !codec_response,
+            RpcProtocolPhase::AwaitingCodecRequest
+            | RpcProtocolPhase::AwaitingRegistrationRequest => false,
+        };
+        if !phase_authorized {
+            return Err(OrdinaryMuxProtocolError::PhaseViolation {
+                direction: RpcProtocolDirection::Inbound,
+                ident: spec.ident,
+                name: spec.name,
+                phase: self.phase,
+            });
+        }
+        Ok(())
+    }
+
+    fn install_codec(
+        &mut self,
+        codec: RpcCodecAuthority,
+    ) -> Result<(), OrdinaryMuxProtocolError> {
+        if codec.generation != self.generation {
+            return Err(OrdinaryMuxProtocolError::CodecGenerationMismatch {
+                authority_generation: codec.generation,
+                requested_generation: self.generation,
+            });
+        }
+        if self.phase == RpcProtocolPhase::AwaitingRegistrationRequest
+            && self.codec == Some(codec)
+        {
+            return Ok(());
+        }
+        if self.phase != RpcProtocolPhase::AwaitingCodecResponse {
+            return Err(OrdinaryMuxProtocolError::PhaseViolation {
+                direction: RpcProtocolDirection::Inbound,
+                ident: <GetCodecVersionResponse as PduWireIdent>::IDENT,
+                name: "GetCodecVersionResponse",
+                phase: self.phase,
+            });
+        }
+        self.codec = Some(codec);
+        self.phase = RpcProtocolPhase::AwaitingRegistrationRequest;
+        Ok(())
+    }
+
+    fn complete_correlated_response(
+        &mut self,
+        request: &'static str,
+        pdu: &Pdu,
+    ) -> Result<(), OrdinaryMuxProtocolError> {
+        if request == "GetCodecVersion" {
+            if let Pdu::GetCodecVersionResponse(info) = pdu {
+                // Install a compatible window in the reader before it can
+                // select another frame. The caller repeats the same exact
+                // installation after applying UI/topology policy; that path
+                // is intentionally idempotent. An incompatible tuple remains
+                // caller-visible through the existing version error flow.
+                if let Ok(codec) = RpcCodecAuthority::negotiate(
+                    self.generation,
+                    info.codec_vers,
+                    info.min_supported,
+                ) {
+                    self.install_codec(codec)?;
+                }
+            }
+        }
+        self.complete_registration(request, pdu)
+    }
+
+    fn complete_registration(
+        &mut self,
+        request: &'static str,
+        pdu: &Pdu,
+    ) -> Result<(), OrdinaryMuxProtocolError> {
+        if request != "SetClientId" || !matches!(pdu, Pdu::UnitResponse(_)) {
+            return Ok(());
+        }
+        if self.phase != RpcProtocolPhase::AwaitingRegistrationResponse {
+            let spec = pdu
+                .wire_spec()
+                .expect("UnitResponse always has generated wire policy");
+            return Err(OrdinaryMuxProtocolError::PhaseViolation {
+                direction: RpcProtocolDirection::Inbound,
+                ident: spec.ident,
+                name: spec.name,
+                phase: self.phase,
+            });
+        }
+        self.phase = RpcProtocolPhase::Established;
+        Ok(())
+    }
+
+    fn establish_capabilities(
+        &mut self,
+        capabilities: TopologyCapabilities,
+    ) -> Result<(), OrdinaryMuxProtocolError> {
+        if self.phase != RpcProtocolPhase::Established {
+            return Err(OrdinaryMuxProtocolError::PhaseViolation {
+                direction: RpcProtocolDirection::Inbound,
+                ident: <ListPanesCoherentResponse as PduWireIdent>::IDENT,
+                name: "ListPanesCoherentResponse",
+                phase: self.phase,
+            });
+        }
+        let activated = Self::locally_activated_capabilities();
+        if !activated.contains(capabilities) {
+            return Err(OrdinaryMuxProtocolError::CapabilityNotActivated {
+                direction: RpcProtocolDirection::Inbound,
+                ident: <ListPanesCoherentResponse as PduWireIdent>::IDENT,
+                name: "ListPanesCoherentResponse",
+                required: capabilities.bits(),
+                activated: activated.bits(),
+            });
+        }
+        self.established_capabilities = TopologyCapabilities::from_bits(
+            self.established_capabilities.bits() | capabilities.bits(),
+        );
+        Ok(())
+    }
+}
+
+fn assigned_pdu_spec(
+    pdu: &Pdu,
+    direction: RpcProtocolDirection,
+) -> Result<&'static PduWireSpec, OrdinaryMuxProtocolError> {
+    pdu.wire_spec().ok_or_else(|| {
+        let ident = match pdu {
+            Pdu::Invalid { ident } => *ident,
+            _ => unreachable!("assigned PDU variant is missing generated wire policy"),
+        };
+        OrdinaryMuxProtocolError::UnknownPdu { direction, ident }
+    })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RpcReadinessAuthorityPhase {
     Pending,
@@ -602,12 +1287,54 @@ impl Drop for RpcReadinessPublicationLease {
 #[derive(Debug)]
 struct RpcTransportLifecycle {
     phase: RpcTransportPhase,
+    /// Exact-generation bootstrap, codec-dialect, direction, and capability
+    /// authority. `None` means that no live transport owns wire authority.
+    protocol: Option<RpcProtocolAuthority>,
     active_consumer_commits: usize,
     terminal_error: Option<RpcTransportError>,
     readiness_authority: Arc<RpcReadinessAuthority>,
+    /// Exact-generation sticky cancellation and wake authority for the socket
+    /// reader. Replaced before each successor generation becomes live.
+    reader_abort: Arc<RpcGenerationReaderAbortAuthority>,
     /// Exact stream/session authority established only after the coherent
     /// topology snapshot has been applied and committed by its consumer.
     render_connection_identity: Option<RenderConnectionIdentity>,
+}
+
+impl RpcTransportLifecycle {
+    fn protocol_for(
+        &self,
+        generation: NonZeroU64,
+    ) -> Result<&RpcProtocolAuthority, OrdinaryMuxProtocolError> {
+        let protocol = self
+            .protocol
+            .as_ref()
+            .ok_or(OrdinaryMuxProtocolError::ProtocolAuthorityUnavailable { generation })?;
+        if protocol.generation != generation {
+            return Err(OrdinaryMuxProtocolError::CodecGenerationMismatch {
+                authority_generation: protocol.generation,
+                requested_generation: generation,
+            });
+        }
+        Ok(protocol)
+    }
+
+    fn protocol_for_mut(
+        &mut self,
+        generation: NonZeroU64,
+    ) -> Result<&mut RpcProtocolAuthority, OrdinaryMuxProtocolError> {
+        let protocol = self
+            .protocol
+            .as_mut()
+            .ok_or(OrdinaryMuxProtocolError::ProtocolAuthorityUnavailable { generation })?;
+        if protocol.generation != generation {
+            return Err(OrdinaryMuxProtocolError::CodecGenerationMismatch {
+                authority_generation: protocol.generation,
+                requested_generation: generation,
+            });
+        }
+        Ok(protocol)
+    }
 }
 
 #[derive(Debug)]
@@ -671,9 +1398,11 @@ impl RpcTransportState {
         Self {
             lifecycle: ParkingMutex::new(RpcTransportLifecycle {
                 phase: RpcTransportPhase::Live(generation),
+                protocol: Some(RpcProtocolAuthority::new(generation)),
                 active_consumer_commits: 0,
                 terminal_error: None,
                 readiness_authority: Arc::new(RpcReadinessAuthority::new(generation)),
+                reader_abort: Arc::new(RpcGenerationReaderAbortAuthority::new(generation)),
                 render_connection_identity: None,
             }),
             consumer_commits_drained: Condvar::new(),
@@ -792,6 +1521,7 @@ impl RpcTransportState {
             self.live_generation.store(0, AtomicOrdering::Release);
             lifecycle.readiness_authority.retire();
             lifecycle.render_connection_identity = None;
+            lifecycle.protocol = None;
             lifecycle.phase = RpcTransportPhase::Closed { last_live };
             lifecycle.terminal_error = Some(error.clone());
             error
@@ -802,6 +1532,208 @@ impl RpcTransportState {
 
     fn terminal_error(&self) -> Option<RpcTransportError> {
         self.lifecycle.lock().terminal_error.clone()
+    }
+
+    fn codec_authority(&self, generation: NonZeroU64) -> Option<RpcCodecAuthority> {
+        let lifecycle = self.lifecycle.lock();
+        if !matches!(
+            lifecycle.phase,
+            RpcTransportPhase::Live(observed) if observed == generation
+        ) || self.live_generation.load(AtomicOrdering::Acquire) != generation.get()
+        {
+            return None;
+        }
+        lifecycle
+            .protocol_for(generation)
+            .ok()
+            .and_then(|protocol| protocol.codec)
+    }
+
+    fn reader_abort_for(
+        &self,
+        generation: NonZeroU64,
+    ) -> anyhow::Result<Arc<RpcGenerationReaderAbortAuthority>> {
+        let lifecycle = self.lifecycle.lock();
+        if let Some(error) = &lifecycle.terminal_error {
+            return Err(anyhow::Error::new(error.clone()));
+        }
+        if !matches!(
+            lifecycle.phase,
+            RpcTransportPhase::Live(observed) if observed == generation
+        ) || self.live_generation.load(AtomicOrdering::Acquire) != generation.get()
+            || lifecycle.reader_abort.generation != generation
+        {
+            bail!(
+                "mux RPC reader abort authority for generation {} is not live",
+                generation
+            );
+        }
+        Ok(Arc::clone(&lifecycle.reader_abort))
+    }
+
+    fn reader_abort_for_reader(
+        &self,
+        generation: NonZeroU64,
+    ) -> anyhow::Result<Arc<RpcGenerationReaderAbortAuthority>> {
+        let lifecycle = self.lifecycle.lock();
+        if let Some(error) = &lifecycle.terminal_error {
+            return Err(anyhow::Error::new(error.clone()));
+        }
+        if !matches!(
+            lifecycle.phase,
+            RpcTransportPhase::Live(observed) if observed == generation
+        ) || lifecycle.reader_abort.generation != generation
+        {
+            bail!(
+                "mux RPC socket reader has no authority for generation {}",
+                generation
+            );
+        }
+        Ok(Arc::clone(&lifecycle.reader_abort))
+    }
+
+    fn validate_live_control_ack(
+        &self,
+        generation: NonZeroU64,
+        reader_abort: &Arc<RpcGenerationReaderAbortAuthority>,
+        operation: &'static str,
+    ) -> anyhow::Result<()> {
+        let lifecycle = self.lifecycle.lock();
+        if let Some(error) = &lifecycle.terminal_error {
+            return Err(anyhow::Error::new(error.clone()));
+        }
+        if let Some(error) = reader_abort.aborted_error() {
+            return Err(error);
+        }
+        if !matches!(
+            lifecycle.phase,
+            RpcTransportPhase::Live(observed) if observed == generation
+        ) || self.live_generation.load(AtomicOrdering::Acquire) != generation.get()
+            || reader_abort.generation != generation
+            || !Arc::ptr_eq(&lifecycle.reader_abort, reader_abort)
+        {
+            bail!(
+                "mux RPC {operation} acknowledgement lost exact live generation {generation} \
+                 before caller observation"
+            );
+        }
+        Ok(())
+    }
+
+    /// Commit an exact-generation cancellation and revoke admission before the
+    /// reader is woken. The lifecycle intentionally remains `Live` until the
+    /// owning reader executes the checked Live-to-Reconnecting transition.
+    fn request_generation_abort(
+        &self,
+        authority: &Arc<RpcGenerationReaderAbortAuthority>,
+        reason: &'static str,
+    ) -> bool {
+        let outcome = {
+            let mut lifecycle = self.lifecycle.lock();
+            if !matches!(
+                lifecycle.phase,
+                RpcTransportPhase::Live(observed) if observed == authority.generation
+            ) || !Arc::ptr_eq(&lifecycle.reader_abort, authority)
+            {
+                "stale"
+            } else if !authority.commit_abort(reason) {
+                "already_committed"
+            } else {
+                self.ready_generation.store(0, AtomicOrdering::Release);
+                self.live_generation.store(0, AtomicOrdering::Release);
+                lifecycle.readiness_authority.retire();
+                lifecycle.render_connection_identity = None;
+                lifecycle.protocol = None;
+                "committed"
+            }
+        };
+        if outcome == "committed" {
+            authority.wake_reader();
+        }
+        metrics::counter!(
+            "mux.client.rpc.generation_abort.total",
+            "outcome" => outcome,
+        )
+        .increment(1);
+        outcome == "committed"
+    }
+
+    fn install_codec_authority(
+        &self,
+        generation: NonZeroU64,
+        codec: RpcCodecAuthority,
+    ) -> Result<(), OrdinaryMuxProtocolError> {
+        self.lifecycle
+            .lock()
+            .protocol_for_mut(generation)?
+            .install_codec(codec)
+    }
+
+    fn validate_dequeued_outbound(
+        &self,
+        generation: NonZeroU64,
+        pdu: &Pdu,
+    ) -> Result<(), OrdinaryMuxProtocolError> {
+        self.lifecycle
+            .lock()
+            .protocol_for(generation)?
+            .validate_outbound_pdu(pdu, RpcOutboundAdmissionPoint::Dequeue)
+    }
+
+    fn validate_inbound_header(
+        &self,
+        generation: NonZeroU64,
+        header: &PduFrameHeader,
+    ) -> Result<(), OrdinaryMuxProtocolError> {
+        let spec = Pdu::wire_spec_for_ident(header.ident()).ok_or(
+            OrdinaryMuxProtocolError::UnknownPdu {
+                direction: RpcProtocolDirection::Inbound,
+                ident: header.ident(),
+            },
+        )?;
+        let role = if header.serial() == 0 {
+            PduWireRole::Unilateral
+        } else {
+            PduWireRole::CorrelatedReply
+        };
+        self.lifecycle
+            .lock()
+            .protocol_for(generation)?
+            .validate_inbound(spec, role)
+    }
+
+    fn rollback_unadmitted_outbound(
+        &self,
+        generation: NonZeroU64,
+        pdu: &Pdu,
+    ) -> Result<(), OrdinaryMuxProtocolError> {
+        self.lifecycle
+            .lock()
+            .protocol_for_mut(generation)?
+            .rollback_unadmitted_outbound(pdu)
+    }
+
+    fn complete_protocol_response(
+        &self,
+        generation: NonZeroU64,
+        request: &'static str,
+        pdu: &Pdu,
+    ) -> Result<(), OrdinaryMuxProtocolError> {
+        self.lifecycle
+            .lock()
+            .protocol_for_mut(generation)?
+            .complete_correlated_response(request, pdu)
+    }
+
+    fn establish_protocol_capabilities(
+        &self,
+        generation: NonZeroU64,
+        capabilities: TopologyCapabilities,
+    ) -> Result<(), OrdinaryMuxProtocolError> {
+        self.lifecycle
+            .lock()
+            .protocol_for_mut(generation)?
+            .establish_capabilities(capabilities)
     }
 
     async fn complete_before_terminal<T>(
@@ -824,6 +1756,55 @@ impl RpcTransportState {
                 Err(anyhow::Error::new(error))
             }
         }
+    }
+
+    /// Snapshot the two reader-stop authorities under the lifecycle lock.
+    ///
+    /// Terminal incarnation failure permanently outranks a generation-local
+    /// cancellation.  Both authorities can become observable in the same
+    /// scheduler turn, so sampling them through separate lock acquisitions can
+    /// return the lower-priority generation cause after terminal failure has
+    /// already committed.
+    fn reader_stop_error(
+        &self,
+        reader_abort: &RpcGenerationReaderAbortAuthority,
+    ) -> Option<anyhow::Error> {
+        let lifecycle = self.lifecycle.lock();
+        if let Some(error) = &lifecycle.terminal_error {
+            return Some(anyhow::Error::new(error.clone()));
+        }
+        reader_abort.aborted_error()
+    }
+
+    async fn complete_before_reader_stop<T>(
+        &self,
+        reader_abort: &RpcGenerationReaderAbortAuthority,
+        operation: impl Future<Output = T>,
+    ) -> anyhow::Result<T> {
+        if let Some(error) = self.reader_stop_error(reader_abort) {
+            return Err(error);
+        }
+
+        let operation = self.complete_before_terminal(operation);
+        let generation_abort = reader_abort.cancelled();
+        pin_mut!(operation);
+        pin_mut!(generation_abort);
+        let result = match select(operation, generation_abort).await {
+            Either::Left((result, _)) => result,
+            Either::Right(((), _)) => Err(self
+                .reader_stop_error(reader_abort)
+                .unwrap_or_else(|| {
+                    anyhow!(
+                        "mux RPC generation {} reader woke without a cancellation cause",
+                        reader_abort.generation
+                    )
+                })),
+        };
+
+        if let Some(error) = self.reader_stop_error(reader_abort) {
+            return Err(error);
+        }
+        result
     }
 
     fn begin_consumer_commit(
@@ -937,8 +1918,14 @@ impl RpcTransportState {
         let generation = self
             .active_generation()
             .expect("test RPC transport generation should be live");
-        let readiness_authority =
-            Arc::clone(&self.lifecycle.lock().readiness_authority);
+        let readiness_authority = {
+            let mut lifecycle = self.lifecycle.lock();
+            lifecycle.protocol = Some(RpcProtocolAuthority::established_for_test(
+                generation,
+                CODEC_VERSION,
+            ));
+            Arc::clone(&lifecycle.readiness_authority)
+        };
         let participating = readiness_authority
             .register_participant()
             .expect("test readiness participant should register");
@@ -953,15 +1940,17 @@ impl RpcTransportState {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TopologySnapshotDecisionAck {
+    CommittedLive,
+    RejectedTerminal,
+}
+
 enum ReaderMessage {
     SendPdu {
         binding: RpcBinding,
         pdu: Box<Pdu>,
         promise: Sender<anyhow::Result<Pdu>>,
-    },
-    AbortGeneration {
-        generation: NonZeroU64,
-        reason: &'static str,
     },
     PublishReady {
         generation: NonZeroU64,
@@ -979,12 +1968,12 @@ enum ReaderMessage {
     CommitTopologySnapshot {
         generation: NonZeroU64,
         authority: TopologyFenceAuthority,
-        promise: Sender<anyhow::Result<()>>,
+        promise: Sender<anyhow::Result<TopologySnapshotDecisionAck>>,
     },
     RejectTopologySnapshot {
         generation: NonZeroU64,
         authority: TopologyFenceAuthority,
-        promise: Sender<anyhow::Result<()>>,
+        promise: Sender<anyhow::Result<TopologySnapshotDecisionAck>>,
     },
 }
 
@@ -1002,7 +1991,6 @@ impl ReaderMessage {
                 );
                 let _ = promise.try_send(Err(anyhow::Error::new(error)));
             }
-            Self::AbortGeneration { .. } => {}
             Self::PublishReady { promise, .. } => {
                 let _ = promise.try_send(Err(anyhow!(
                     "mux RPC readiness publication retired before reader admission: {reason}"
@@ -1043,14 +2031,15 @@ pub(crate) struct RpcGenerationScope {
     sender: Sender<ReaderMessage>,
     rpc_transport: Arc<RpcTransportState>,
     generation: Option<NonZeroU64>,
+    reader_abort: Option<Arc<RpcGenerationReaderAbortAuthority>>,
     allow_unready: bool,
 }
 
 /// Cancellation-safe retirement for a bootstrap operation that may have
 /// received a state-subsuming response but has not yet published readiness.
 pub(crate) struct RpcGenerationAbortGuard {
-    sender: Sender<ReaderMessage>,
     rpc_transport: Arc<RpcTransportState>,
+    reader_abort: Arc<RpcGenerationReaderAbortAuthority>,
     readiness_authority: Option<Arc<RpcReadinessAuthority>>,
     generation: NonZeroU64,
     reason: &'static str,
@@ -1063,26 +2052,28 @@ pub(crate) struct RpcGenerationAbortGuard {
 /// A snapshot response is not authority to discard any event until its exact
 /// consumer has applied the snapshot and the reader has acknowledged the
 /// matching commit. Dropping the consumer anywhere inside that interval
-/// therefore sends an explicit rejection to the owning reader. The reader
-/// treats rejection as loss-terminal for this connection generation.
+/// therefore revokes admission and wakes the owning reader directly. Reader
+/// teardown discards the uncommitted topology state without pruning it.
 struct TopologySnapshotDecisionGuard {
-    sender: Sender<ReaderMessage>,
-    generation: NonZeroU64,
-    authority: TopologyFenceAuthority,
+    rpc_transport: Arc<RpcTransportState>,
+    reader_abort: Arc<RpcGenerationReaderAbortAuthority>,
     armed: bool,
 }
 
 struct TopologySnapshotRequestGuard {
-    sender: Sender<ReaderMessage>,
-    generation: NonZeroU64,
+    rpc_transport: Arc<RpcTransportState>,
+    reader_abort: Arc<RpcGenerationReaderAbortAuthority>,
     armed: bool,
 }
 
 impl TopologySnapshotRequestGuard {
-    fn new(sender: Sender<ReaderMessage>, generation: NonZeroU64) -> Self {
+    fn new(
+        rpc_transport: Arc<RpcTransportState>,
+        reader_abort: Arc<RpcGenerationReaderAbortAuthority>,
+    ) -> Self {
         Self {
-            sender,
-            generation,
+            rpc_transport,
+            reader_abort,
             armed: true,
         }
     }
@@ -1095,24 +2086,22 @@ impl TopologySnapshotRequestGuard {
 impl Drop for TopologySnapshotRequestGuard {
     fn drop(&mut self) {
         if self.armed {
-            let _ = self.sender.try_send(ReaderMessage::AbortGeneration {
-                generation: self.generation,
-                reason: "coherent topology snapshot cancelled before exact consumer decision",
-            });
+            self.rpc_transport.request_generation_abort(
+                &self.reader_abort,
+                "coherent topology snapshot cancelled before exact consumer decision",
+            );
         }
     }
 }
 
 impl TopologySnapshotDecisionGuard {
     fn new(
-        sender: Sender<ReaderMessage>,
-        generation: NonZeroU64,
-        authority: TopologyFenceAuthority,
+        rpc_transport: Arc<RpcTransportState>,
+        reader_abort: Arc<RpcGenerationReaderAbortAuthority>,
     ) -> Self {
         Self {
-            sender,
-            generation,
-            authority,
+            rpc_transport,
+            reader_abort,
             armed: true,
         }
     }
@@ -1127,13 +2116,10 @@ impl Drop for TopologySnapshotDecisionGuard {
         if !self.armed {
             return;
         }
-        let (promise, receiver) = bounded(1);
-        drop(receiver);
-        let _ = self.sender.try_send(ReaderMessage::RejectTopologySnapshot {
-            generation: self.generation,
-            authority: self.authority,
-            promise,
-        });
+        self.rpc_transport.request_generation_abort(
+            &self.reader_abort,
+            "coherent topology snapshot cancelled after response delivery",
+        );
     }
 }
 
@@ -1177,23 +2163,14 @@ impl Drop for RpcGenerationAbortGuard {
         if !should_abort {
             return;
         }
-        let lifecycle = self.rpc_transport.lifecycle.lock();
-        if !matches!(
-            lifecycle.phase,
-            RpcTransportPhase::Live(observed) if observed == self.generation
-        ) {
-            return;
-        }
-        let _ = self.sender.try_send(ReaderMessage::AbortGeneration {
-            generation: self.generation,
-            reason: self.reason,
-        });
+        self.rpc_transport
+            .request_generation_abort(&self.reader_abort, self.reason);
     }
 }
 
 impl RpcGenerationScope {
     fn capture(sender: Sender<ReaderMessage>, rpc_transport: Arc<RpcTransportState>) -> Self {
-        let generation = {
+        let (generation, reader_abort) = {
             let lifecycle = rpc_transport.lifecycle.lock();
             match lifecycle.phase {
                 RpcTransportPhase::Live(generation)
@@ -1202,15 +2179,19 @@ impl RpcGenerationScope {
                         && rpc_transport.ready_generation.load(AtomicOrdering::Acquire)
                             == generation.get() =>
                 {
-                    Some(generation)
+                    (
+                        Some(generation),
+                        Some(Arc::clone(&lifecycle.reader_abort)),
+                    )
                 }
-                _ => None,
+                _ => (None, None),
             }
         };
         Self {
             sender,
             rpc_transport,
             generation,
+            reader_abort,
             allow_unready: false,
         }
     }
@@ -1221,31 +2202,37 @@ impl RpcGenerationScope {
         generation: NonZeroU64,
         allow_unready: bool,
     ) -> Self {
+        let reader_abort = rpc_transport.reader_abort_for(generation).ok();
         Self {
             sender,
             rpc_transport,
-            generation: Some(generation),
+            generation: reader_abort.as_ref().map(|_| generation),
+            reader_abort,
             allow_unready,
         }
     }
 
     fn bootstrap(sender: Sender<ReaderMessage>, rpc_transport: Arc<RpcTransportState>) -> Self {
-        let generation = {
+        let (generation, reader_abort) = {
             let lifecycle = rpc_transport.lifecycle.lock();
             match lifecycle.phase {
                 RpcTransportPhase::Live(generation)
                     if rpc_transport.live_generation.load(AtomicOrdering::Acquire)
                         == generation.get() =>
                 {
-                    Some(generation)
+                    (
+                        Some(generation),
+                        Some(Arc::clone(&lifecycle.reader_abort)),
+                    )
                 }
-                _ => None,
+                _ => (None, None),
             }
         };
         Self {
             sender,
             rpc_transport,
             generation,
+            reader_abort,
             allow_unready: true,
         }
     }
@@ -1254,18 +2241,37 @@ impl RpcGenerationScope {
         Arc::ptr_eq(&self.rpc_transport, &other.rpc_transport)
             && self.generation.is_some()
             && self.generation == other.generation
+            && self
+                .reader_abort
+                .as_ref()
+                .zip(other.reader_abort.as_ref())
+                .is_some_and(|(left, right)| Arc::ptr_eq(left, right))
     }
 
     pub(crate) fn is_available(&self) -> bool {
         self.generation.is_some()
     }
 
-    #[allow(
-        dead_code,
-        reason = "the render-application endpoint is activated by ft-interactive-systems-performance-4tenz.5.5.10"
-    )]
     pub(crate) const fn connection_generation(&self) -> Option<NonZeroU64> {
         self.generation
+    }
+
+    fn codec_authority(&self) -> Option<RpcCodecAuthority> {
+        self.generation
+            .and_then(|generation| self.rpc_transport.codec_authority(generation))
+    }
+
+    fn retain_codec_authority(
+        &self,
+        codec: RpcCodecAuthority,
+    ) -> Result<(), OrdinaryMuxProtocolError> {
+        let generation = self.generation.ok_or(
+            OrdinaryMuxProtocolError::ProtocolAuthorityUnavailable {
+                generation: codec.generation,
+            },
+        )?;
+        self.rpc_transport
+            .install_codec_authority(generation, codec)
     }
 
     #[allow(
@@ -1306,12 +2312,22 @@ impl RpcGenerationScope {
         let generation = self
             .generation
             .ok_or_else(|| anyhow!("cannot guard an unavailable mux RPC scope"))?;
-        let readiness_authority = {
+        let scoped_reader_abort = self
+            .reader_abort
+            .as_ref()
+            .ok_or_else(|| anyhow!("mux RPC scope has no exact reader abort authority"))?;
+        let (readiness_authority, reader_abort) = {
             let lifecycle = self.rpc_transport.lifecycle.lock();
             if !matches!(
                 lifecycle.phase,
                 RpcTransportPhase::Live(observed) if observed == generation
-            ) {
+            ) || self
+                .rpc_transport
+                .live_generation
+                .load(AtomicOrdering::Acquire)
+                != generation.get()
+                || !Arc::ptr_eq(&lifecycle.reader_abort, scoped_reader_abort)
+            {
                 bail!(
                     "cannot register readiness participant for retired mux RPC generation {}",
                     generation
@@ -1324,12 +2340,15 @@ impl RpcGenerationScope {
                     generation
                 );
             }
-            Arc::clone(&lifecycle.readiness_authority)
+            (
+                Arc::clone(&lifecycle.readiness_authority),
+                Arc::clone(&lifecycle.reader_abort),
+            )
         };
         let participating = readiness_authority.register_participant()?;
         Ok(RpcGenerationAbortGuard {
-            sender: self.sender.clone(),
             rpc_transport: Arc::clone(&self.rpc_transport),
+            reader_abort,
             readiness_authority: participating.then_some(readiness_authority),
             generation,
             reason,
@@ -1345,23 +2364,36 @@ impl RpcGenerationScope {
         let generation = self
             .generation
             .ok_or_else(|| anyhow!("cannot guard an unavailable mux RPC scope"))?;
-        let readiness_authority = {
+        let scoped_reader_abort = self
+            .reader_abort
+            .as_ref()
+            .ok_or_else(|| anyhow!("mux RPC scope has no exact reader abort authority"))?;
+        let (readiness_authority, reader_abort) = {
             let lifecycle = self.rpc_transport.lifecycle.lock();
             if !matches!(
                 lifecycle.phase,
                 RpcTransportPhase::Live(observed) if observed == generation
-            ) || lifecycle.readiness_authority.generation != generation
+            ) || self
+                .rpc_transport
+                .live_generation
+                .load(AtomicOrdering::Acquire)
+                != generation.get()
+                || lifecycle.readiness_authority.generation != generation
+                || !Arc::ptr_eq(&lifecycle.reader_abort, scoped_reader_abort)
             {
                 bail!(
                     "cannot register fatal readiness guard for retired mux RPC generation {}",
                     generation
                 );
             }
-            Arc::clone(&lifecycle.readiness_authority)
+            (
+                Arc::clone(&lifecycle.readiness_authority),
+                Arc::clone(&lifecycle.reader_abort),
+            )
         };
         Ok(RpcGenerationAbortGuard {
-            sender: self.sender.clone(),
             rpc_transport: Arc::clone(&self.rpc_transport),
+            reader_abort,
             readiness_authority: Some(readiness_authority),
             generation,
             reason,
@@ -1388,59 +2420,77 @@ impl RpcGenerationScope {
         let scoped_generation = self.generation;
         let allow_unready = self.allow_unready;
         let attempt = rpc_transport.allocate_attempt(request);
-        let binding = attempt.and_then(|attempt_id| {
-            let Some(generation) = scoped_generation else {
-                return Err(RpcTransportState::unavailable_error(
-                    attempt_id,
-                    request,
-                    RpcRetirementStage::Admission,
-                ));
-            };
-            let lifecycle = rpc_transport.lifecycle.lock();
-            if !matches!(
-                lifecycle.phase,
-                RpcTransportPhase::Live(observed) if observed == generation
-            ) || rpc_transport.live_generation.load(AtomicOrdering::Acquire) != generation.get()
-            {
-                return Err(rpc_transport.retirement_error(
-                    RpcBinding {
-                        generation,
+        let binding: anyhow::Result<RpcBinding> = attempt
+            .map_err(anyhow::Error::new)
+            .and_then(|attempt_id| {
+                let Some(generation) = scoped_generation else {
+                    return Err(anyhow::Error::new(RpcTransportState::unavailable_error(
                         attempt_id,
                         request,
-                        expected_response_ident,
-                    },
-                    RpcRetirementStage::Admission,
-                    RpcDeliveryCertainty::DefinitelyNotSent,
-                    "exact-generation RPC scope is no longer live",
-                ));
-            }
-            if !allow_unready
-                && rpc_transport.ready_generation.load(AtomicOrdering::Acquire) != generation.get()
-            {
-                return Err(RpcTransportState::unavailable_error(
+                        RpcRetirementStage::Admission,
+                    )));
+                };
+                let lifecycle = rpc_transport.lifecycle.lock();
+                if !matches!(
+                    lifecycle.phase,
+                    RpcTransportPhase::Live(observed) if observed == generation
+                ) || rpc_transport.live_generation.load(AtomicOrdering::Acquire)
+                    != generation.get()
+                {
+                    return Err(anyhow::Error::new(rpc_transport.retirement_error(
+                        RpcBinding {
+                            generation,
+                            attempt_id,
+                            request,
+                            expected_response_ident,
+                        },
+                        RpcRetirementStage::Admission,
+                        RpcDeliveryCertainty::DefinitelyNotSent,
+                        "exact-generation RPC scope is no longer live",
+                    )));
+                }
+                if !allow_unready
+                    && rpc_transport.ready_generation.load(AtomicOrdering::Acquire)
+                        != generation.get()
+                {
+                    return Err(anyhow::Error::new(RpcTransportState::unavailable_error(
+                        attempt_id,
+                        request,
+                        RpcRetirementStage::Admission,
+                    )));
+                }
+                lifecycle
+                    .protocol_for(generation)
+                    .and_then(|protocol| {
+                        protocol
+                            .validate_outbound_pdu(&pdu, RpcOutboundAdmissionPoint::Preflight)
+                    })
+                    .map_err(|error| {
+                        record_ordinary_mux_protocol_rejection(
+                            &error,
+                            "outbound",
+                            "preflight",
+                        );
+                        anyhow::Error::new(error)
+                    })?;
+                Ok(RpcBinding {
+                    generation,
                     attempt_id,
                     request,
-                    RpcRetirementStage::Admission,
-                ));
-            }
-            Ok(RpcBinding {
-                generation,
-                attempt_id,
-                request,
-                expected_response_ident,
-            })
-        });
+                    expected_response_ident,
+                })
+            });
         async move {
             let binding = match binding {
                 Ok(binding) => binding,
-                Err(error) => return Err(anyhow::Error::new(error)),
+                Err(error) => return Err(error),
             };
             let (promise, rx) = bounded(1);
             // Hold the short admission gate through the nonblocking enqueue.
             // Retirement takes the same gate before publishing Reconnecting,
             // so bind-then-enqueue cannot straddle transport generations.
             {
-                let lifecycle = rpc_transport.lifecycle.lock();
+                let mut lifecycle = rpc_transport.lifecycle.lock();
                 if !matches!(
                     lifecycle.phase,
                     RpcTransportPhase::Live(generation) if generation == binding.generation
@@ -1457,6 +2507,17 @@ impl RpcGenerationScope {
                         "bound RPC was first polled after its transport retired",
                     )));
                 }
+                let transition = lifecycle
+                    .protocol_for_mut(binding.generation)
+                    .and_then(|protocol| protocol.admit_outbound(&pdu))
+                    .map_err(|error| {
+                        record_ordinary_mux_protocol_rejection(
+                            &error,
+                            "outbound",
+                            "enqueue",
+                        );
+                        anyhow::Error::new(error)
+                    })?;
                 if let Err(TrySendError::Closed(_) | TrySendError::Full(_)) =
                     sender.try_send(ReaderMessage::SendPdu {
                         binding,
@@ -1464,6 +2525,10 @@ impl RpcGenerationScope {
                         promise,
                     })
                 {
+                    lifecycle
+                        .protocol_for_mut(binding.generation)
+                        .map_err(anyhow::Error::new)?
+                        .rollback_outbound(transition);
                     return Err(anyhow::Error::new(rpc_transport.retirement_error(
                         binding,
                         RpcRetirementStage::Enqueue,
@@ -1506,6 +2571,12 @@ impl RpcGenerationScope {
         let generation = self
             .generation
             .ok_or_else(|| anyhow!("cannot decide a topology snapshot on an unavailable scope"))?;
+        let reader_abort = self
+            .reader_abort
+            .as_ref()
+            .filter(|authority| authority.generation == generation)
+            .cloned()
+            .ok_or_else(|| anyhow!("topology snapshot decision lacks exact reader authority"))?;
         let (promise, receiver) = bounded(1);
         {
             let lifecycle = self.rpc_transport.lifecycle.lock();
@@ -1517,6 +2588,7 @@ impl RpcGenerationScope {
                 .live_generation
                 .load(AtomicOrdering::Acquire)
                 != generation.get()
+                || !Arc::ptr_eq(&lifecycle.reader_abort, &reader_abort)
             {
                 bail!(
                     "topology snapshot decision lost exact generation {} before enqueue",
@@ -1543,20 +2615,39 @@ impl RpcGenerationScope {
                 )
             })?;
         }
-        receiver.recv().await.map_err(|_| {
+        let acknowledgement = receiver.recv().await.map_err(|_| {
             anyhow!(
                 "mux RPC reader closed without acknowledging topology snapshot {}",
                 if commit { "commit" } else { "rejection" }
             )
-        })?
+        })??;
+        match (commit, acknowledgement) {
+            (true, TopologySnapshotDecisionAck::CommittedLive) => self
+                .rpc_transport
+                .validate_live_control_ack(
+                    generation,
+                    &reader_abort,
+                    "topology snapshot commit",
+                ),
+            (false, TopologySnapshotDecisionAck::RejectedTerminal) => Ok(()),
+            (expected_commit, observed) => bail!(
+                "mux RPC topology snapshot decision acknowledgement mismatch: expected {}, \
+                 observed {observed:?}",
+                if expected_commit {
+                    "committed-live"
+                } else {
+                    "rejected-terminal"
+                }
+            ),
+        }
     }
 
     /// Fetch, apply, and commit one exact-generation coherent topology snapshot.
     ///
     /// The per-transport gate remains held from request admission through the
-    /// reader's commit acknowledgement. A failed or cancelled consumer sends a
-    /// rejection, which makes the owning connection generation loss-terminal
-    /// without pruning any buffered event.
+    /// reader's commit acknowledgement. A failed or cancelled consumer revokes
+    /// and wakes the owning connection generation without pruning any buffered
+    /// event.
     pub(crate) async fn with_coherent_topology_snapshot<T>(
         &self,
         consumer: RpcConsumerKind,
@@ -1565,9 +2656,17 @@ impl RpcGenerationScope {
         let generation = self
             .generation
             .ok_or_else(|| anyhow!("cannot snapshot topology on an unavailable mux RPC scope"))?;
+        let reader_abort = self
+            .reader_abort
+            .as_ref()
+            .filter(|authority| authority.generation == generation)
+            .cloned()
+            .ok_or_else(|| anyhow!("coherent topology snapshot lacks reader abort authority"))?;
         let _topology_gate = self.rpc_transport.topology_sync.lock().await;
-        let mut request_guard =
-            TopologySnapshotRequestGuard::new(self.sender.clone(), generation);
+        let mut request_guard = TopologySnapshotRequestGuard::new(
+            Arc::clone(&self.rpc_transport),
+            Arc::clone(&reader_abort),
+        );
         let response = self
             .list_panes_coherent(ListPanesCoherent {
                 supported: TopologyCapabilities::FENCED_SNAPSHOT_V1,
@@ -1606,8 +2705,10 @@ impl RpcGenerationScope {
             }
         };
         let authority = authority.expect("snapshot outcome must carry validated topology authority");
-        let mut decision =
-            TopologySnapshotDecisionGuard::new(self.sender.clone(), generation, authority);
+        let mut decision = TopologySnapshotDecisionGuard::new(
+            Arc::clone(&self.rpc_transport),
+            reader_abort,
+        );
         request_guard.disarm();
         let applied = self
             .commit_sync(consumer, || apply(snapshot.panes))
@@ -1702,6 +2803,15 @@ impl ClientDispatchAuthority {
             && self.connection_generation.load(AtomicOrdering::Acquire) == self.generation
     }
 
+    fn rpc_generation_is_live(&self) -> bool {
+        self.generation_is_current()
+            && self
+                .rpc_transport
+                .live_generation
+                .load(AtomicOrdering::Acquire)
+                == self.generation
+    }
+
     /// Revoke this reader's transport before any of its pending RPCs are
     /// completed with a retirement error.
     ///
@@ -1766,6 +2876,7 @@ impl ClientDispatchAuthority {
             .store(0, AtomicOrdering::Release);
         lifecycle.readiness_authority.retire();
         lifecycle.render_connection_identity = None;
+        lifecycle.protocol = None;
         lifecycle.phase = RpcTransportPhase::Reconnecting {
             retired: current,
             next: next_generation,
@@ -1886,6 +2997,7 @@ impl ClientDispatchAuthority {
         let generation = NonZeroU64::new(self.generation)
             .ok_or_else(|| anyhow!("cannot activate zero mux client connection generation"))?;
         let readiness_authority = Arc::new(RpcReadinessAuthority::new(generation));
+        let reader_abort = Arc::new(RpcGenerationReaderAbortAuthority::new(generation));
         let mut lifecycle = self.rpc_transport.lifecycle.lock();
         match lifecycle.phase {
             RpcTransportPhase::Reconnecting { next, .. }
@@ -1896,7 +3008,9 @@ impl ClientDispatchAuthority {
                         == generation.get() =>
             {
                 lifecycle.phase = RpcTransportPhase::Live(generation);
+                lifecycle.protocol = Some(RpcProtocolAuthority::new(generation));
                 lifecycle.readiness_authority = readiness_authority;
+                lifecycle.reader_abort = reader_abort;
                 lifecycle.render_connection_identity = None;
                 self.rpc_transport
                     .ready_generation
@@ -1930,6 +3044,7 @@ impl ClientDispatchAuthority {
             };
             lifecycle.readiness_authority.retire();
             lifecycle.render_connection_identity = None;
+            lifecycle.protocol = None;
             lifecycle.phase = RpcTransportPhase::Closed { last_live };
         }
         receiver.close();
@@ -1959,6 +3074,7 @@ impl ClientDispatchAuthority {
         };
         lifecycle.readiness_authority.retire();
         lifecycle.render_connection_identity = None;
+        lifecycle.protocol = None;
         lifecycle.phase = RpcTransportPhase::Closed { last_live };
         while lifecycle.active_consumer_commits != 0 {
             self.rpc_transport
@@ -2066,6 +3182,10 @@ impl CurrentClientDispatch {
                 .client
                 .matches_dispatch_authority(&self.authority)
     }
+
+    fn rpc_generation_is_live(&self) -> bool {
+        self.is_current() && self.authority.rpc_generation_is_live()
+    }
 }
 
 #[derive(Error, Debug, Clone, PartialEq, Eq)]
@@ -2110,13 +3230,52 @@ fn sanitized_remote_error_reason(reason: &str) -> String {
     sanitized
 }
 
+struct RpcAttemptMetricGuard {
+    method: &'static str,
+    started: std::time::Instant,
+    outcome: &'static str,
+    active: metrics::Gauge,
+}
+
+impl RpcAttemptMetricGuard {
+    fn new(method: &'static str) -> Self {
+        metrics::counter!("rpc.attempt.total", "method" => method).increment(1);
+        let active = metrics::gauge!("rpc.active", "method" => method);
+        active.increment(1);
+        Self {
+            method,
+            started: std::time::Instant::now(),
+            outcome: "abandoned",
+            active,
+        }
+    }
+
+    fn finish(&mut self, outcome: &'static str) {
+        self.outcome = outcome;
+    }
+}
+
+impl Drop for RpcAttemptMetricGuard {
+    fn drop(&mut self) {
+        self.active.decrement(1);
+        metrics::histogram!("rpc", "method" => self.method).record(self.started.elapsed());
+        metrics::counter!("rpc.count", "method" => self.method).increment(1);
+        metrics::counter!(
+            "rpc.outcome.total",
+            "method" => self.method,
+            "outcome" => self.outcome,
+        )
+        .increment(1);
+    }
+}
+
 macro_rules! rpc {
     ($method_name:ident, $request_type:ident, $response_type:ident) => {
         pub fn $method_name(
             &self,
             pdu: $request_type,
         ) -> impl std::future::Future<Output = anyhow::Result<$response_type>> + Send + 'static {
-            let start = std::time::Instant::now();
+            let mut metric_guard = RpcAttemptMetricGuard::new(stringify!($method_name));
             // `send_pdu` binds synchronously here, before this future can be
             // moved into a detached task and first polled on a later transport.
             let request = self.send_pdu_expect(
@@ -2128,25 +3287,32 @@ macro_rules! rpc {
             );
             async move {
                 let result = request.await;
-                let elapsed = start.elapsed();
-                metrics::histogram!("rpc", "method" => stringify!($method_name)).record(elapsed);
-                metrics::counter!("rpc.count", "method" => stringify!($method_name)).increment(1);
                 match result {
-                    Ok(Pdu::$response_type(res)) => Ok(res),
+                    Ok(Pdu::$response_type(res)) => {
+                        metric_guard.finish("success");
+                        Ok(res)
+                    }
                     Ok(Pdu::ErrorResponse(err)) => {
-                        bail!(
+                        metric_guard.finish("remote_error");
+                        Err(anyhow!(
                             "{} failed: {}",
                             stringify!($method_name),
                             sanitized_remote_error_reason(&err.reason)
-                        )
+                        ))
                     }
-                    Ok(other) => bail!(
-                        "unexpected {} response to {}; expected {}",
-                        other.pdu_name(),
-                        stringify!($method_name),
-                        stringify!($response_type)
-                    ),
-                    Err(err) => Err(err),
+                    Ok(other) => {
+                        metric_guard.finish("unexpected_response");
+                        Err(anyhow!(
+                            "unexpected {} response to {}; expected {}",
+                            other.pdu_name(),
+                            stringify!($method_name),
+                            stringify!($response_type)
+                        ))
+                    }
+                    Err(err) => {
+                        metric_guard.finish("transport_error");
+                        Err(err)
+                    }
                 }
             }
         }
@@ -2160,7 +3326,7 @@ macro_rules! rpc {
         pub fn $method_name(
             &self,
         ) -> impl std::future::Future<Output = anyhow::Result<$response_type>> + Send + 'static {
-            let start = std::time::Instant::now();
+            let mut metric_guard = RpcAttemptMetricGuard::new(stringify!($method_name));
             let request = self.send_pdu_expect(
                 Pdu::$request_type($request_type {}),
                 Some(
@@ -2170,25 +3336,32 @@ macro_rules! rpc {
             );
             async move {
                 let result = request.await;
-                let elapsed = start.elapsed();
-                metrics::histogram!("rpc", "method" => stringify!($method_name)).record(elapsed);
-                metrics::counter!("rpc.count", "method" => stringify!($method_name)).increment(1);
                 match result {
-                    Ok(Pdu::$response_type(res)) => Ok(res),
+                    Ok(Pdu::$response_type(res)) => {
+                        metric_guard.finish("success");
+                        Ok(res)
+                    }
                     Ok(Pdu::ErrorResponse(err)) => {
-                        bail!(
+                        metric_guard.finish("remote_error");
+                        Err(anyhow!(
                             "{} failed: {}",
                             stringify!($method_name),
                             sanitized_remote_error_reason(&err.reason)
-                        )
+                        ))
                     }
-                    Ok(other) => bail!(
-                        "unexpected {} response to {}; expected {}",
-                        other.pdu_name(),
-                        stringify!($method_name),
-                        stringify!($response_type)
-                    ),
-                    Err(err) => Err(err),
+                    Ok(other) => {
+                        metric_guard.finish("unexpected_response");
+                        Err(anyhow!(
+                            "unexpected {} response to {}; expected {}",
+                            other.pdu_name(),
+                            stringify!($method_name),
+                            stringify!($response_type)
+                        ))
+                    }
+                    Err(err) => {
+                        metric_guard.finish("transport_error");
+                        Err(err)
+                    }
                 }
             }
         }
@@ -2262,7 +3435,7 @@ fn admit_client_pane(
     dispatch: &CurrentClientDispatch,
     remote_pane_id: PaneId,
 ) -> Option<(Arc<dyn Pane>, PaneRegistrationHandle)> {
-    if !dispatch.is_current() {
+    if !dispatch.rpc_generation_is_live() {
         return None;
     }
     let local_pane_id = dispatch
@@ -2276,7 +3449,9 @@ fn admit_client_pane(
         return None;
     }
     let registration = dispatch.mux.capture_pane_registration(&pane)?;
-    dispatch.is_current().then_some((pane, registration))
+    dispatch
+        .rpc_generation_is_live()
+        .then_some((pane, registration))
 }
 
 async fn process_unilateral_inner_async(
@@ -2286,7 +3461,7 @@ async fn process_unilateral_inner_async(
     decoded: DecodedPdu,
 ) -> anyhow::Result<()> {
     let local_domain_id = dispatch.local_domain_id();
-    if !dispatch.is_current() {
+    if !dispatch.rpc_generation_is_live() {
         log::trace!(
             "discarding unilateral PDU for retired client connection in domain {}",
             local_domain_id
@@ -2309,13 +3484,13 @@ async fn process_unilateral_inner_async(
             Some(p) => p,
             None => {
                 log::debug!("got {decoded:?}, pane not found locally, resync");
-                if !dispatch.is_current() {
+                if !dispatch.rpc_generation_is_live() {
                     return Ok(());
                 }
                 let resync_result = client_domain
                     .resync_if_current(Arc::clone(&dispatch.mux), Arc::clone(&dispatch.inner), &rpc)
                     .await;
-                if !dispatch.is_current() {
+                if !dispatch.rpc_generation_is_live() {
                     return Ok(());
                 }
                 let _ = resync_result?;
@@ -2334,13 +3509,13 @@ async fn process_unilateral_inner_async(
                 log::debug!(
                     "got {decoded:?}, but local pane {local_pane_id} no longer exists; resync"
                 );
-                if !dispatch.is_current() {
+                if !dispatch.rpc_generation_is_live() {
                     return Ok(());
                 }
                 let resync_result = client_domain
                     .resync_if_current(Arc::clone(&dispatch.mux), Arc::clone(&dispatch.inner), &rpc)
                     .await;
-                if !dispatch.is_current() {
+                if !dispatch.rpc_generation_is_live() {
                     return Ok(());
                 }
                 let _ = resync_result?;
@@ -2358,7 +3533,7 @@ async fn process_unilateral_inner_async(
                     .ok_or_else(|| anyhow!("local pane {local_pane_id} not found"))?
             }
         };
-        if !dispatch.is_current() {
+        if !dispatch.rpc_generation_is_live() {
             return Ok(());
         }
         let registration = dispatch
@@ -2382,7 +3557,7 @@ async fn process_unilateral_inner_async(
             decoded.pdu
         )
     })?;
-    if !dispatch.is_current()
+    if !dispatch.rpc_generation_is_live()
         || !client_pane.belongs_to_client(&dispatch.inner)
         || client_pane.remote_pane_id() != pane_id
     {
@@ -2396,7 +3571,7 @@ async fn process_unilateral_inner_async(
     let result = client_pane
         .process_unilateral(&registration, &rpc, decoded.pdu)
         .await;
-    if !dispatch.is_current() {
+    if !dispatch.rpc_generation_is_live() {
         return Ok(());
     }
     result?;
@@ -2447,7 +3622,7 @@ fn process_unilateral(
     authority: &ClientDispatchAuthority,
     decoded: DecodedPdu,
 ) -> anyhow::Result<()> {
-    if !authority.generation_is_current() {
+    if !authority.rpc_generation_is_live() {
         return Ok(());
     }
     if authority.is_standalone() {
@@ -2467,7 +3642,7 @@ async fn process_unilateral_with_barrier(
     authority: &ClientDispatchAuthority,
     decoded: DecodedPdu,
 ) -> anyhow::Result<()> {
-    if !authority.generation_is_current() {
+    if !authority.rpc_generation_is_live() {
         return Ok(());
     }
     if authority.is_standalone() {
@@ -2495,7 +3670,7 @@ async fn apply_unilateral_on_main_thread(
             let window_id = *window_id;
             let workspace = workspace.to_string();
             return dispatch.commit_sync(RpcConsumerKind::GlobalUnilateral, || {
-                if !dispatch.is_current() {
+                if !dispatch.rpc_generation_is_live() {
                     return Ok(());
                 }
                 let local_window_id = dispatch
@@ -2512,7 +3687,7 @@ async fn apply_unilateral_on_main_thread(
             let title = title.to_string();
             let window_id = *window_id;
             return dispatch.commit_sync(RpcConsumerKind::GlobalUnilateral, || {
-                if !dispatch.is_current() {
+                if !dispatch.rpc_generation_is_live() {
                     return Ok(());
                 }
                 let local_window_id = dispatch
@@ -2530,7 +3705,7 @@ async fn apply_unilateral_on_main_thread(
             let old_workspace = old_workspace.to_string();
             let new_workspace = new_workspace.to_string();
             return dispatch.commit_sync(RpcConsumerKind::GlobalUnilateral, || {
-                if !dispatch.is_current() {
+                if !dispatch.rpc_generation_is_live() {
                     return Ok(());
                 }
                 log::debug!("got a rename {old_workspace} -> {new_workspace}");
@@ -2544,7 +3719,7 @@ async fn apply_unilateral_on_main_thread(
             let title = title.to_string();
             let tab_id = *tab_id;
             return dispatch.commit_sync(RpcConsumerKind::GlobalUnilateral, || {
-                if !dispatch.is_current() {
+                if !dispatch.rpc_generation_is_live() {
                     return Ok(());
                 }
                 let local_tab_id = dispatch
@@ -2557,7 +3732,7 @@ async fn apply_unilateral_on_main_thread(
         }
         Pdu::TabResized(_) | Pdu::TabAddedToWindow(_) => {
             log::trace!("resync due to {:?}", decoded.pdu);
-            if !dispatch.is_current() {
+            if !dispatch.rpc_generation_is_live() {
                 return Ok(());
             }
             let rpc = dispatch.bootstrap_rpc_scope();
@@ -2565,7 +3740,7 @@ async fn apply_unilateral_on_main_thread(
                 .client_domain()
                 .resync_if_current(Arc::clone(&dispatch.mux), Arc::clone(&dispatch.inner), &rpc)
                 .await;
-            if !dispatch.is_current() {
+            if !dispatch.rpc_generation_is_live() {
                 return Ok(());
             }
             let _ = result?;
@@ -2575,11 +3750,11 @@ async fn apply_unilateral_on_main_thread(
     }
 
     if let Some(pane_id) = decoded.pdu.pane_id() {
-        if !dispatch.is_current() {
+        if !dispatch.rpc_generation_is_live() {
             return Ok(());
         }
         let admitted = admit_client_pane(&dispatch, pane_id);
-        if !dispatch.is_current() {
+        if !dispatch.rpc_generation_is_live() {
             return Ok(());
         }
         process_unilateral_inner_async(dispatch, admitted, pane_id, decoded).await
@@ -3198,6 +4373,18 @@ impl ClientTopologyCoordinator {
         Ok(())
     }
 
+    /// Reject a delivered snapshot and revoke its transport before publishing
+    /// the terminal acknowledgement to the consumer.
+    fn reject_and_retire_transport(
+        &mut self,
+        authority: TopologyFenceAuthority,
+        dispatch_authority: &ClientDispatchAuthority,
+    ) -> anyhow::Result<TopologySnapshotDecisionAck> {
+        self.reject(authority)?;
+        dispatch_authority.begin_rpc_transport_retirement()?;
+        Ok(TopologySnapshotDecisionAck::RejectedTerminal)
+    }
+
     fn restore_prior(
         &mut self,
         prior: ClientTopologyPrior,
@@ -3676,6 +4863,8 @@ fn commit_rpc_transport_ready(
 enum NotReconnectableError {
     #[error("Client was destroyed")]
     ClientWasDestroyed,
+    #[error("ordinary mux inbound protocol violation: {0}")]
+    ProtocolViolation(#[source] OrdinaryMuxProtocolError),
     #[error(
         "inactive ordered-window PDU {ident} reached the ordinary mux client with serial \
          {serial}, encoded_payload_len={encoded_payload_len}, compressed={compressed}; \
@@ -3689,30 +4878,6 @@ enum NotReconnectableError {
     },
 }
 
-/// Reject the complete frozen ordered-window wire family while its ordinary
-/// client implementation remains deliberately inactive.
-///
-/// This predicate is called from the codec's frame-header selector, before
-/// request correlation chooses a body disposition and before the codec reads
-/// or allocates the body. Keep all five identities explicit: response-shaped
-/// frames are not authorized merely because a pending caller can name them.
-#[inline]
-fn reject_inactive_ordered_window_pdu_header(
-    header: &PduFrameHeader,
-) -> Result<(), NotReconnectableError> {
-    let ident = header.ident();
-    let inactive = ident == <ListPanesOrderedV1 as PduWireIdent>::IDENT
-        || ident == <ListPanesOrderedV1Response as PduWireIdent>::IDENT
-        || ident == <ReorderWindowTabsV1 as PduWireIdent>::IDENT
-        || ident == <ReorderWindowTabsV1Response as PduWireIdent>::IDENT
-        || ident == <WindowOrderEventV1 as PduWireIdent>::IDENT;
-    if !inactive {
-        return Ok(());
-    }
-
-    Err(inactive_ordered_window_pdu_error(header))
-}
-
 #[cold]
 fn inactive_ordered_window_pdu_error(header: &PduFrameHeader) -> NotReconnectableError {
     metrics::counter!("mux.client.protocol.inactive_ordered_window_pdu.total").increment(1);
@@ -3724,14 +4889,41 @@ fn inactive_ordered_window_pdu_error(header: &PduFrameHeader) -> NotReconnectabl
     }
 }
 
+fn classify_inbound_protocol_error(
+    error: OrdinaryMuxProtocolError,
+    header: &PduFrameHeader,
+) -> NotReconnectableError {
+    record_ordinary_mux_protocol_rejection(&error, "inbound", "header");
+    let ordered_window = matches!(
+        &error,
+        OrdinaryMuxProtocolError::EndpointInactive { ident, .. }
+            if Pdu::wire_spec_for_ident(*ident)
+                .is_some_and(RpcProtocolAuthority::uses_ordered_window_capability)
+    );
+    if ordered_window {
+        // Preserve the committed .12.1 no-reconnect diagnosis, but derive the
+        // family from generated registry capability metadata. Admission itself
+        // has already failed through the one exhaustive authority path above.
+        inactive_ordered_window_pdu_error(header)
+    } else {
+        NotReconnectableError::ProtocolViolation(error)
+    }
+}
+
 /// Apply ordinary-client header policy in the order required for fail-closed
 /// feature gating: inactive families win before legacy serial correlation.
 #[inline]
 fn validate_ordinary_mux_inbound_header(
+    rpc_transport: &RpcTransportState,
+    generation: NonZeroU64,
     header: &PduFrameHeader,
     highest_issued: u64,
 ) -> anyhow::Result<()> {
-    reject_inactive_ordered_window_pdu_header(header)?;
+    if let Err(error) = rpc_transport.validate_inbound_header(generation, header) {
+        return Err(anyhow::Error::new(classify_inbound_protocol_error(
+            error, header,
+        )));
+    }
     if header.serial() > highest_issued {
         return Err(anyhow::Error::new(CorruptResponse::SerialAboveCeiling {
             serial: header.serial(),
@@ -4076,6 +5268,13 @@ impl PendingReplies {
 
     fn highest_issued(&self) -> u64 {
         self.highest_issued
+    }
+
+    fn binding_for_correlated_response(&self, serial: NonZeroU64) -> RpcBinding {
+        self.map
+            .get(&serial)
+            .expect("decoded correlated response must retain its pending RPC")
+            .binding
     }
 
     fn response_body_disposition(
@@ -4487,6 +5686,9 @@ async fn client_thread_async(
 ) -> anyhow::Result<()> {
     let generation = NonZeroU64::new(dispatch_authority.generation)
         .ok_or_else(|| anyhow!("mux client reader cannot own generation zero"))?;
+    let reader_abort = dispatch_authority
+        .rpc_transport
+        .reader_abort_for_reader(generation)?;
     let mut pending = PendingReplies::new(
         RpcMetrics::register(),
         generation,
@@ -4568,7 +5770,7 @@ async fn client_thread_async(
 
                 let selected = dispatch_authority
                     .rpc_transport
-                    .complete_before_terminal(select(rx_msg, wait_for_read))
+                    .complete_before_reader_stop(&reader_abort, select(rx_msg, wait_for_read))
                     .await?;
                 match selected {
                     Either::Left((message, _)) => NextEvent::Message(message),
@@ -4577,23 +5779,6 @@ async fn client_thread_async(
             };
 
             match next_event {
-                NextEvent::Message(Ok(ReaderMessage::AbortGeneration {
-                    generation: aborted_generation,
-                    reason,
-                })) => {
-                    if aborted_generation == generation {
-                        bail!(
-                            "mux RPC generation {} aborted before becoming usable: {}",
-                            generation,
-                            reason
-                        );
-                    }
-                    log::trace!(
-                        "discarding abort for retired mux RPC generation {} on reader {}",
-                        aborted_generation,
-                        generation
-                    );
-                }
                 NextEvent::Message(Ok(ReaderMessage::CommitTopologySnapshot {
                     generation: committed_generation,
                     authority,
@@ -4646,7 +5831,7 @@ async fn client_thread_async(
                         let _ = promise.try_send(Err(anyhow!(message.clone())));
                         return Err(error).context(message);
                     }
-                    match promise.try_send(Ok(())) {
+                    match promise.try_send(Ok(TopologySnapshotDecisionAck::CommittedLive)) {
                         Ok(()) | Err(TrySendError::Closed(_)) => {}
                         Err(TrySendError::Full(_)) => {
                             bail!(
@@ -4668,15 +5853,28 @@ async fn client_thread_async(
                         )));
                         continue;
                     }
-                    if let Err(error) = topology.reject(authority) {
-                        let message = format!(
-                            "topology snapshot rejection failed on generation {}: {error:#}",
-                            generation
-                        );
-                        let _ = promise.try_send(Err(anyhow!(message.clone())));
-                        return Err(error).context(message);
+                    let acknowledgement = match topology
+                        .reject_and_retire_transport(authority, dispatch_authority)
+                    {
+                        Ok(acknowledgement) => acknowledgement,
+                        Err(error) => {
+                            let message = format!(
+                                "topology snapshot rejection or retirement failed on generation \
+                                 {}: {error:#}",
+                                generation
+                            );
+                            let _ = promise.try_send(Err(anyhow!(message.clone())));
+                            return Err(error).context(message);
+                        }
+                    };
+                    match promise.try_send(Ok(acknowledgement)) {
+                        Ok(()) | Err(TrySendError::Closed(_)) => {}
+                        Err(TrySendError::Full(_)) => {
+                            bail!(
+                                "topology snapshot rejection acknowledgement channel was full"
+                            );
+                        }
                     }
-                    let _ = promise.try_send(Ok(()));
                     bail!(
                         "coherent topology snapshot consumer rejected generation {}",
                         generation
@@ -4834,6 +6032,25 @@ async fn client_thread_async(
                         complete_with_rpc_transport_error(&promise, error);
                         continue;
                     }
+                    if let Err(error) = dispatch_authority
+                        .rpc_transport
+                        .validate_dequeued_outbound(generation, &pdu)
+                    {
+                        record_ordinary_mux_protocol_rejection(
+                            &error,
+                            "outbound",
+                            "dequeue",
+                        );
+                        match promise.try_send(Err(anyhow::Error::new(error))) {
+                            Ok(()) | Err(TrySendError::Closed(_)) => continue,
+                            Err(TrySendError::Full(_)) => {
+                                bail!(
+                                    "ordinary mux outbound protocol rejection found a full \
+                                     completion channel"
+                                );
+                            }
+                        }
+                    }
                     let effect = if matches!(pdu.as_ref(), Pdu::ListPanesCoherent(_)) {
                         PendingRpcEffect::CoherentTopologyFence
                     } else {
@@ -4841,7 +6058,13 @@ async fn client_thread_async(
                     };
                     let serial = match pending.admit(promise, binding, effect) {
                         Ok(Some(serial)) => serial,
-                        Ok(None) => continue,
+                        Ok(None) => {
+                            dispatch_authority
+                                .rpc_transport
+                                .rollback_unadmitted_outbound(generation, &pdu)
+                                .map_err(anyhow::Error::new)?;
+                            continue;
+                        }
                         Err(PendingRpcError::IncarnationTerminal(error)) => {
                             return Err(anyhow::Error::new(error));
                         }
@@ -4887,7 +6110,10 @@ async fn client_thread_async(
                     pending.set_stage(serial, RpcRetirementStage::WriteStarted)?;
                     dispatch_authority
                         .rpc_transport
-                        .complete_before_terminal(reader.get_mut().write_all(&frame))
+                        .complete_before_reader_stop(
+                            &reader_abort,
+                            reader.get_mut().write_all(&frame),
+                        )
                         .await?
                         .context("writing an encoded PDU frame to the server")?;
 
@@ -4902,7 +6128,7 @@ async fn client_thread_async(
                     }
                     dispatch_authority
                         .rpc_transport
-                        .complete_before_terminal(reader.get_mut().flush())
+                        .complete_before_reader_stop(&reader_abort, reader.get_mut().flush())
                         .await?
                         .context("flushing PDU to server")?;
                     pending.set_stage(serial, RpcRetirementStage::AfterFlush)?;
@@ -4922,19 +6148,22 @@ async fn client_thread_async(
                 NextEvent::Readable(Ok(())) => {
                     let rpc_transport = Arc::clone(&dispatch_authority.rpc_transport);
                     let inbound = rpc_transport
-                        .complete_before_terminal(async {
+                        .complete_before_reader_stop(&reader_abort, async {
                             let mut selected_effect = None;
                             let highest_issued = pending.highest_issued();
                             // The codec's optional serial ceiling is checked
                             // before it reads the PDU identity. Pass `None` so
-                            // the selector can classify the dormant 86-90
-                            // family for every serial, then reapply the same
-                            // legacy ceiling in `validate_ordinary_mux_inbound_header`.
+                            // the selector can classify every inactive or
+                            // misdirected identity for every serial, then
+                            // reapply the same legacy ceiling in
+                            // `validate_ordinary_mux_inbound_header`.
                             let decoded = Pdu::decode_async_with_selector(
                                 &mut reader,
                                 None,
                                 |header| {
                                     validate_ordinary_mux_inbound_header(
+                                        &rpc_transport,
+                                        generation,
                                         header,
                                         highest_issued,
                                     )?;
@@ -5004,6 +6233,7 @@ async fn client_thread_async(
                                         serial
                                     )
                                 })?;
+                                let binding = pending.binding_for_correlated_response(serial);
                                 let topology_action =
                                     if effect == PendingRpcEffect::CoherentTopologyFence {
                                         Some(topology.on_response(serial, &decoded.pdu)?)
@@ -5039,6 +6269,21 @@ async fn client_thread_async(
                                     ) => (false, Some(reason)),
                                     None => (false, None),
                                 };
+                                rpc_transport
+                                    .complete_protocol_response(
+                                        generation,
+                                        binding.request,
+                                        &decoded.pdu,
+                                    )
+                                    .map_err(NotReconnectableError::ProtocolViolation)?;
+                                if awaiting_commit {
+                                    rpc_transport
+                                        .establish_protocol_capabilities(
+                                            generation,
+                                            TopologyCapabilities::FENCED_SNAPSHOT_V1,
+                                        )
+                                        .map_err(NotReconnectableError::ProtocolViolation)?;
+                                }
                                 let completion = pending.complete(serial, decoded.pdu)?;
                                 if awaiting_commit
                                     && completion.disposition == ReplyDisposition::Abandoned
@@ -6181,7 +7426,7 @@ impl Client {
                                         Ok(Some(dispatch)) => {
                                             let rpc = dispatch.bootstrap_rpc_scope();
                                             promise::spawn::spawn_into_main_thread(async move {
-                                                if !dispatch.is_current() {
+                                                if !dispatch.rpc_generation_is_live() {
                                                     return Ok(());
                                                 }
                                                 let result = ClientDomain::reattach_if_current(
@@ -6192,7 +7437,7 @@ impl Client {
                                                     reattach_ui,
                                                 )
                                                 .await;
-                                                if !dispatch.is_current() {
+                                                if !dispatch.rpc_generation_is_live() {
                                                     return Ok(());
                                                 }
                                                 result
@@ -6348,57 +7593,15 @@ impl Client {
 
         match version_info {
             Ok(info) => {
-                // ft-kuxho.B.1 + ft-kuxho.B.3: feed the rolling-upgrade
-                // window helper with the real symmetric tuple. The
-                // server's GetCodecVersionResponse now carries
-                // `min_supported` (ft-kuxho.B.3); a legacy peer that
-                // pre-dates the field will deserialize with the sentinel
-                // value 0, in which case we conservatively substitute
-                // `info.codec_vers` (treat the legacy server as
-                // supporting only its own version).
-                let remote_min = if info.min_supported == 0 {
-                    info.codec_vers
-                } else {
-                    info.min_supported
-                };
-                match codec::check_compat(
-                    CODEC_VERSION,
-                    codec::CODEC_VERSION_MIN_SUPPORTED,
+                let generation = rpc.connection_generation().ok_or_else(|| {
+                    anyhow!("codec negotiation completed for an unavailable RPC scope")
+                })?;
+                let codec = match RpcCodecAuthority::negotiate(
+                    generation,
                     info.codec_vers,
-                    remote_min,
+                    info.min_supported,
                 ) {
-                    Ok(codec::CompatDecision::Compatible { agreed }) => {
-                        if info.codec_vers < TOPOLOGY_FENCE_MIN_CODEC_VERSION {
-                            let error = MissingTopologyFenceProtocolError {
-                                remote_codec_version: info.codec_vers,
-                                minimum_codec_version: TOPOLOGY_FENCE_MIN_CODEC_VERSION,
-                            };
-                            ui.output_str(&error.to_string());
-                            log::error!("{error}");
-                            return Err(error.into());
-                        }
-                        if info.codec_vers != CODEC_VERSION {
-                            log::warn!(
-                                "Codec compat window: server={}, client={}, agreed={} \
-                                 (peer is inside the supported window)",
-                                info.codec_vers,
-                                CODEC_VERSION,
-                                agreed
-                            );
-                        }
-                        log::trace!(
-                            "Server version is {} (codec version {}, agreed {})",
-                            info.version_string,
-                            info.codec_vers,
-                            agreed
-                        );
-                        rpc.set_client_id(SetClientId {
-                            client_id: self.client_id.clone(),
-                            is_proxy: false,
-                        })
-                        .await?;
-                        Ok(info)
-                    }
+                    Ok(codec) => codec,
                     Err(_) => {
                         let err = IncompatibleVersionError {
                             version: info.version_string,
@@ -6406,9 +7609,52 @@ impl Client {
                         };
                         ui.output_str(&err.to_string());
                         log::error!("{:?}", err);
-                        Err(err.into())
+                        return Err(err.into());
                     }
+                };
+                if codec.agreed < TOPOLOGY_FENCE_MIN_CODEC_VERSION {
+                    let error = MissingTopologyFenceProtocolError {
+                        remote_codec_version: info.codec_vers,
+                        minimum_codec_version: TOPOLOGY_FENCE_MIN_CODEC_VERSION,
+                    };
+                    ui.output_str(&error.to_string());
+                    log::error!("{error}");
+                    return Err(error.into());
                 }
+                rpc.retain_codec_authority(codec)
+                    .context("retaining agreed codec authority for the live RPC generation")?;
+                let codec = rpc.codec_authority().ok_or_else(|| {
+                    anyhow!(
+                        "RPC generation {} retired while retaining codec authority",
+                        generation
+                    )
+                })?;
+                if info.codec_vers != CODEC_VERSION {
+                    log::warn!(
+                        "Codec compat window: server={}, client={}, agreed={} \
+                         (peer is inside the supported window)",
+                        info.codec_vers,
+                        CODEC_VERSION,
+                        codec.agreed
+                    );
+                }
+                log::trace!(
+                    "Server version is {} (local codec window {}..={}, remote window {}..={}, \
+                     agreed {}, generation {})",
+                    info.version_string,
+                    codec.local_min,
+                    codec.local_max,
+                    codec.remote_min,
+                    codec.remote_max,
+                    codec.agreed,
+                    codec.generation,
+                );
+                rpc.set_client_id(SetClientId {
+                    client_id: self.client_id.clone(),
+                    is_proxy: false,
+                })
+                .await?;
+                Ok(info)
             }
             Err(err) => {
                 log::trace!("{:?}", err);
@@ -6578,6 +7824,12 @@ impl Client {
         let generation = rpc
             .generation
             .ok_or_else(|| anyhow!("cannot publish readiness for an unavailable RPC scope"))?;
+        let reader_abort = rpc
+            .reader_abort
+            .as_ref()
+            .filter(|authority| authority.generation == generation)
+            .cloned()
+            .ok_or_else(|| anyhow!("readiness publisher lacks exact reader authority"))?;
         let readiness_authority = {
             let lifecycle = self.rpc_transport.lifecycle.lock();
             if !matches!(
@@ -6601,6 +7853,17 @@ impl Client {
                     generation
                 );
             }
+            let protocol = lifecycle
+                .protocol_for(generation)
+                .map_err(anyhow::Error::new)?;
+            if protocol.phase != RpcProtocolPhase::Established || protocol.codec.is_none() {
+                bail!(
+                    "cannot publish mux RPC generation {} readiness before codec negotiation and \
+                     client registration are established (phase {:?})",
+                    generation,
+                    protocol.phase
+                );
+            }
             if self
                 .rpc_transport
                 .ready_generation
@@ -6608,6 +7871,12 @@ impl Client {
                 == generation.get()
             {
                 return Ok(());
+            }
+            if !Arc::ptr_eq(&lifecycle.reader_abort, &reader_abort) {
+                bail!(
+                    "mux RPC generation {} readiness publisher has stale reader authority",
+                    generation
+                );
             }
             if !readiness_guard.authorizes_pending_readiness(
                 &self.rpc_transport,
@@ -6634,7 +7903,12 @@ impl Client {
         result
             .recv()
             .await
-            .map_err(|_| anyhow!("mux RPC reader dropped readiness publication"))?
+            .map_err(|_| anyhow!("mux RPC reader dropped readiness publication"))??;
+        self.rpc_transport.validate_live_control_ack(
+            generation,
+            &reader_abort,
+            "readiness publication",
+        )
     }
 
     pub(crate) fn abort_rpc_transport_generation(
@@ -6648,16 +7922,14 @@ impl Client {
         let generation = rpc
             .generation
             .ok_or_else(|| anyhow!("cannot abort an unavailable mux RPC scope"))?;
-        let lifecycle = self.rpc_transport.lifecycle.lock();
-        if !matches!(
-            lifecycle.phase,
-            RpcTransportPhase::Live(observed) if observed == generation
-        ) {
-            return Ok(());
-        }
-        self.sender
-            .try_send(ReaderMessage::AbortGeneration { generation, reason })
-            .map_err(|_| anyhow!("mux RPC reader queue closed before generation abort"))
+        let reader_abort = rpc
+            .reader_abort
+            .as_ref()
+            .filter(|authority| authority.generation == generation)
+            .ok_or_else(|| anyhow!("mux RPC scope has no exact reader abort authority"))?;
+        self.rpc_transport
+            .request_generation_abort(reader_abort, reason);
+        Ok(())
     }
 
     pub async fn resolve_pane_id(&self, pane_id: Option<PaneId>) -> anyhow::Result<PaneId> {
@@ -7131,6 +8403,205 @@ mod tests {
         )
     }
 
+    #[cfg(unix)]
+    struct RealHandshakeProbe {
+        result: anyhow::Result<GetCodecVersionResponse>,
+        transcript: Vec<&'static str>,
+        codec: Option<RpcCodecAuthority>,
+        phase: Option<RpcProtocolPhase>,
+        ready_generation: u64,
+        connection_generation: u64,
+    }
+
+    /// Drive the ambient `Client::verify_version_compat` path against the real
+    /// reader and a kernel socket pair. This is intentionally stronger than a
+    /// direct `RpcCodecAuthority::negotiate` unit test: both bootstrap requests
+    /// must pass through the queue, serial allocator, frame codec, socket, and
+    /// inbound correlation path before readiness can publish.
+    #[cfg(unix)]
+    fn run_real_socket_pair_handshake(
+        remote_max: usize,
+        remote_min: usize,
+        expect_registration: bool,
+    ) -> RealHandshakeProbe {
+        let _watchdog = hang_watchdog(15, "real socket-pair codec handshake", 93);
+        let (client_stream, mut server_stream) =
+            UnixStream::pair().expect("create codec-handshake socket pair");
+        server_stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("bound codec-handshake server reads");
+        server_stream
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .expect("bound codec-handshake server writes");
+        let (server_release_tx, server_release_rx) = mpsc::channel::<()>();
+        let server = std::thread::Builder::new()
+            .name("ft-codec-window-server".to_string())
+            .spawn(move || -> anyhow::Result<Vec<&'static str>> {
+                let mut transcript = Vec::new();
+                let request = Pdu::decode(&mut server_stream)
+                    .context("decode socket-pair GetCodecVersion")?;
+                transcript.push(request.pdu.pdu_name());
+                anyhow::ensure!(
+                    matches!(request.pdu, Pdu::GetCodecVersion(_)),
+                    "bootstrap did not begin with GetCodecVersion"
+                );
+                Pdu::GetCodecVersionResponse(GetCodecVersionResponse {
+                    codec_vers: remote_max,
+                    version_string: format!("socket-pair-codec-{remote_min}-{remote_max}"),
+                    executable_path: PathBuf::from("/test/frankenterm-mux-server"),
+                    config_file_path: None,
+                    min_supported: remote_min,
+                })
+                .encode(&mut server_stream, request.serial)
+                .context("encode socket-pair GetCodecVersionResponse")?;
+                Write::flush(&mut server_stream)
+                    .context("flush socket-pair GetCodecVersionResponse")?;
+
+                if expect_registration {
+                    let request = Pdu::decode(&mut server_stream)
+                        .context("decode socket-pair SetClientId")?;
+                    transcript.push(request.pdu.pdu_name());
+                    anyhow::ensure!(
+                        matches!(request.pdu, Pdu::SetClientId(_)),
+                        "compatible bootstrap did not continue with SetClientId"
+                    );
+                    Pdu::UnitResponse(UnitResponse {})
+                        .encode(&mut server_stream, request.serial)
+                        .context("encode socket-pair registration response")?;
+                    Write::flush(&mut server_stream)
+                        .context("flush socket-pair registration response")?;
+                }
+
+                server_release_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .context("hold socket-pair peer through client assertions")?;
+
+                if !expect_registration && server_stream.try_readable_without_consuming()? {
+                    match Pdu::decode(&mut server_stream) {
+                        Ok(unexpected) => transcript.push(unexpected.pdu.pdu_name()),
+                        Err(error)
+                            if error
+                                .root_cause()
+                                .downcast_ref::<std::io::Error>()
+                                .is_some_and(|io| io.kind() == ErrorKind::UnexpectedEof) =>
+                        {
+                        }
+                        Err(error) => {
+                            return Err(error)
+                                .context("probe rejected-handshake socket for a request prefix");
+                        }
+                    }
+                }
+                Ok(transcript)
+            })
+            .expect("spawn socket-pair codec server");
+
+        let client_domain_config = ClientDomainConfig::Unix(UnixDomain {
+            name: "ft-codec-window-test".to_string(),
+            no_serve_automatically: true,
+            read_timeout: Duration::from_secs(5),
+            write_timeout: Duration::from_secs(5),
+            ..Default::default()
+        });
+        let reconnectable = Reconnectable::new(
+            client_domain_config.clone(),
+            Some(Box::new(client_stream)),
+        );
+        let (sender, receiver) = unbounded();
+        let client = Client {
+            sender,
+            local_domain_id: None,
+            incarnation: Arc::new(ClientIncarnation),
+            connection_generation: Arc::new(AtomicU64::new(INITIAL_CONNECTION_GENERATION)),
+            rpc_transport: Arc::new(RpcTransportState::new()),
+            client_id: ClientId::new(),
+            client_domain_config,
+            is_reconnectable: false,
+            is_local: true,
+        };
+        let dispatch_authority = client.test_dispatch_authority(Weak::new());
+        let reader = std::thread::Builder::new()
+            .name("ft-codec-window-reader".to_string())
+            .spawn(move || {
+                let (result, _reconnectable, _receiver) =
+                    client_thread(reconnectable, receiver, dispatch_authority);
+                result
+            })
+            .expect("spawn socket-pair codec reader");
+
+        let ui = ConnectionUI::new_headless();
+        let result = asupersync_block_on(client.verify_version_compat(&ui));
+        let generation = NonZeroU64::new(INITIAL_CONNECTION_GENERATION)
+            .expect("initial generation is nonzero");
+        let (codec, phase) = {
+            let lifecycle = client.rpc_transport.lifecycle.lock();
+            (
+                lifecycle.protocol.and_then(|protocol| protocol.codec),
+                lifecycle.protocol.map(|protocol| protocol.phase),
+            )
+        };
+        let ready_generation = client
+            .rpc_transport
+            .ready_generation
+            .load(AtomicOrdering::Acquire);
+        assert_eq!(codec, client.rpc_transport.codec_authority(generation));
+        let connection_generation = Arc::clone(&client.connection_generation);
+
+        server_release_tx
+            .send(())
+            .expect("release socket-pair codec server");
+        drop(client);
+        assert!(
+            reader
+                .join()
+                .expect("socket-pair codec reader thread panicked")
+                .is_err(),
+            "closing the test socket must terminate its reader"
+        );
+        let transcript = server
+            .join()
+            .expect("socket-pair codec server thread panicked")
+            .expect("socket-pair codec server failed");
+
+        RealHandshakeProbe {
+            result,
+            transcript,
+            codec,
+            phase,
+            ready_generation,
+            connection_generation: connection_generation.load(AtomicOrdering::Acquire),
+        }
+    }
+
+    fn advance_bootstrap_to_registration_request(client: &Client) -> NonZeroU64 {
+        let generation = client
+            .rpc_transport
+            .active_generation()
+            .expect("bootstrap queue transport starts live");
+        let response = Pdu::GetCodecVersionResponse(GetCodecVersionResponse {
+            codec_vers: CODEC_VERSION,
+            version_string: "registration-rollback-test".to_string(),
+            executable_path: PathBuf::from("/test/frankenterm-mux-server"),
+            config_file_path: None,
+            min_supported: codec::CODEC_VERSION_MIN_SUPPORTED,
+        });
+        let mut lifecycle = client.rpc_transport.lifecycle.lock();
+        let protocol = lifecycle
+            .protocol_for_mut(generation)
+            .expect("bootstrap protocol authority is live");
+        protocol
+            .admit_outbound(&Pdu::GetCodecVersion(GetCodecVersion {}))
+            .expect("admit prerequisite codec request");
+        protocol
+            .complete_correlated_response("GetCodecVersion", &response)
+            .expect("complete prerequisite codec negotiation");
+        assert_eq!(
+            protocol.phase,
+            RpcProtocolPhase::AwaitingRegistrationRequest
+        );
+        generation
+    }
+
     fn pending_readiness_scope_for_test() -> (
         RpcGenerationScope,
         Receiver<ReaderMessage>,
@@ -7338,20 +8809,6 @@ mod tests {
     #[test]
     fn scripted_transport_boundaries_preserve_delivery_certainty_and_wire_evidence() {
         let (_reader_error, rpc_error, transcript) = run_scripted_rpc_failure(
-            Pdu::Invalid { ident: 0xdead_beef },
-            ScriptedFailureBoundary::Flush,
-        );
-        assert_rpc_retirement(
-            &rpc_error,
-            RpcRetirementStage::FrameEncoding,
-            RpcDeliveryCertainty::DefinitelyNotSent,
-        );
-        assert!(
-            transcript.is_empty(),
-            "pure frame-construction failure must write zero bytes"
-        );
-
-        let (_reader_error, rpc_error, transcript) = run_scripted_rpc_failure(
             Pdu::Ping(Ping {}),
             ScriptedFailureBoundary::PartialWrite { accepted_prefix: 1 },
         );
@@ -7392,6 +8849,789 @@ mod tests {
             assert_eq!(decoded.serial, 1);
             assert_eq!(decoded.pdu, Pdu::Ping(Ping {}));
         }
+    }
+
+    #[test]
+    fn frame_encoding_failure_retires_one_pending_caller_before_a_frame_exists() {
+        // Every currently activated ordinary request has an infallible schema,
+        // while `Invalid` is correctly stopped by the earlier protocol gate.
+        // Start at the reader's already-admitted FrameEncoding boundary so the
+        // test can exercise the real codec failure plus the exact production
+        // pending-retirement path without weakening admission or adding a
+        // failpoint. `encode_frame` returning `Err` means there is no frame that
+        // could be handed to `write_all`, which is the zero-wire guarantee.
+        let (client, receiver) = client_with_idle_rpc_queue();
+        let generation = client
+            .rpc_transport
+            .active_generation()
+            .expect("frame-encoding test transport starts live");
+        let authority = client.test_dispatch_authority(Weak::new());
+        let (metrics, probe) = RpcMetricProbe::new();
+        let mut pending = PendingReplies::new(
+            metrics,
+            generation,
+            Arc::clone(&client.rpc_transport),
+        );
+        let (completion_tx, completion_rx) = bounded(1);
+        let serial = pending
+            .admit_named(completion_tx, "Invalid")
+            .expect("admit frame-encoding boundary request")
+            .expect("live caller receives one wire serial");
+        pending
+            .set_stage(serial, RpcRetirementStage::FrameEncoding)
+            .expect("record the real pre-write encoding boundary");
+
+        let encode_error = Pdu::Invalid { ident: 0xdead_beef }
+            .encode_frame(serial.get())
+            .expect_err("Invalid must fail before producing any frame")
+            .context("encoding a PDU frame to send to the server");
+        assert_eq!(
+            authority
+                .connection_generation
+                .load(AtomicOrdering::Acquire),
+            INITIAL_CONNECTION_GENERATION
+        );
+        authority
+            .begin_rpc_transport_retirement()
+            .expect("encoding failure retires the exact generation");
+        pending.fail_after_transport_error(&encode_error);
+
+        let caller_error = completion_rx
+            .try_recv()
+            .expect("encoding failure must settle the admitted caller")
+            .expect_err("encoding failure must not synthesize a response");
+        assert_rpc_retirement(
+            &caller_error,
+            RpcRetirementStage::FrameEncoding,
+            RpcDeliveryCertainty::DefinitelyNotSent,
+        );
+        assert!(matches!(
+            completion_rx.try_recv(),
+            Err(async_channel::TryRecvError::Closed)
+        ));
+        assert_eq!(RpcMetricProbe::counter(&probe.transport_failed_live), 1);
+        assert_eq!(probe.pending(), 0.0);
+        probe.assert_balanced();
+        assert_eq!(client.rpc_transport.active_generation(), None);
+        assert_eq!(
+            authority
+                .connection_generation
+                .load(AtomicOrdering::Acquire),
+            INITIAL_CONNECTION_GENERATION,
+            "retirement must not itself publish the planned successor"
+        );
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(async_channel::TryRecvError::Empty)
+        ));
+    }
+
+    #[test]
+    fn unknown_and_above_dialect_outbound_pdus_stop_before_queue_serial_and_wire() {
+        let (client, receiver) = client_with_idle_rpc_queue();
+        let generation = client
+            .rpc_transport
+            .active_generation()
+            .expect("local-gate test transport starts live");
+        client.rpc_transport.lifecycle.lock().protocol = Some(
+            RpcProtocolAuthority::established_for_test(
+                generation,
+                codec::CODEC_VERSION_MIN_SUPPORTED,
+            ),
+        );
+        let serial_before = client
+            .rpc_transport
+            .next_wire_serial
+            .load(AtomicOrdering::Acquire);
+        let error = asupersync_block_on(client.send_pdu(Pdu::Invalid { ident: 0xdead_beef }))
+            .expect_err("an unassigned PDU must fail at local preflight");
+
+        assert_eq!(
+            error.downcast_ref::<OrdinaryMuxProtocolError>(),
+            Some(&OrdinaryMuxProtocolError::UnknownPdu {
+                direction: RpcProtocolDirection::Outbound,
+                ident: 0xdead_beef,
+            })
+        );
+        let above_dialect = asupersync_block_on(client.send_pdu(Pdu::ListPanesTabStacks(
+            ListPanesTabStacks {},
+        )))
+        .expect_err("a request above the agreed dialect must fail at local preflight");
+        assert!(matches!(
+            above_dialect.downcast_ref::<OrdinaryMuxProtocolError>(),
+            Some(OrdinaryMuxProtocolError::DialectViolation {
+                ident,
+                required: 47,
+                agreed,
+                ..
+            }) if *ident == <ListPanesTabStacks as PduWireIdent>::IDENT
+                && *agreed == codec::CODEC_VERSION_MIN_SUPPORTED
+        ));
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(async_channel::TryRecvError::Empty)
+        ));
+        assert_eq!(
+            client
+                .rpc_transport
+                .next_wire_serial
+                .load(AtomicOrdering::Acquire),
+            serial_before,
+            "local rejection must not allocate a wire serial"
+        );
+
+        let (response, ()) = asupersync_block_on(futures::future::join(
+            client.send_pdu(Pdu::Ping(Ping {})),
+            async {
+                let message = receiver
+                    .recv()
+                    .await
+                    .expect("a valid successor request must still enqueue");
+                let ReaderMessage::SendPdu { pdu, promise, .. } = message else {
+                    panic!("valid successor must enqueue as a reader PDU");
+                };
+                assert!(matches!(pdu.as_ref(), Pdu::Ping(_)));
+                promise
+                    .send(Ok(Pdu::Pong(Pong {})))
+                    .await
+                    .expect("valid successor caller must remain live");
+            },
+        ));
+        assert_eq!(response.expect("connection must remain reusable"), Pdu::Pong(Pong {}));
+    }
+
+    #[test]
+    fn codec_authority_negotiation_covers_overlap_legacy_and_invalid_windows() {
+        let generation = NonZeroU64::new(7).expect("test generation is nonzero");
+        let previous = CODEC_VERSION - 1;
+        let previous_peer = RpcCodecAuthority::negotiate(
+            generation,
+            previous,
+            codec::CODEC_VERSION_MIN_SUPPORTED,
+        )
+        .expect("current client must overlap the previous peer");
+        assert_eq!(previous_peer.agreed, previous);
+
+        let next_peer = RpcCodecAuthority::negotiate(
+            generation,
+            CODEC_VERSION + 1,
+            CODEC_VERSION,
+        )
+        .expect("current client must overlap a current-plus-one peer");
+        assert_eq!(next_peer.agreed, CODEC_VERSION);
+
+        let legacy = RpcCodecAuthority::negotiate(generation, previous, 0)
+            .expect("legacy min zero must conservatively mean remote max only");
+        assert_eq!(legacy.remote_min, previous);
+        assert_eq!(legacy.agreed, previous);
+
+        assert!(RpcCodecAuthority::negotiate(generation, previous, CODEC_VERSION).is_err());
+        assert!(
+            RpcCodecAuthority::negotiate(
+                generation,
+                CODEC_VERSION + 1,
+                CODEC_VERSION + 1,
+            )
+            .is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ambient_real_handshake_covers_previous_legacy_and_disjoint_codec_windows() {
+        let previous = CODEC_VERSION - 1;
+        for (advertised_min, retained_min, label) in [
+            (
+                codec::CODEC_VERSION_MIN_SUPPORTED,
+                codec::CODEC_VERSION_MIN_SUPPORTED,
+                "explicit-overlap",
+            ),
+            (0, previous, "legacy-min-zero"),
+        ] {
+            let RealHandshakeProbe {
+                result,
+                transcript,
+                codec,
+                phase,
+                ready_generation,
+                connection_generation,
+            } = run_real_socket_pair_handshake(previous, advertised_min, true);
+            let info = result.unwrap_or_else(|error| {
+                panic!("{label} real handshake failed unexpectedly: {error:#}")
+            });
+            assert_eq!(info.codec_vers, previous, "{label}");
+            assert_eq!(info.min_supported, advertised_min, "{label}");
+            assert_eq!(transcript, ["GetCodecVersion", "SetClientId"], "{label}");
+            let codec = codec.unwrap_or_else(|| panic!("{label} lost codec authority"));
+            assert_eq!(codec.remote_max, previous, "{label}");
+            assert_eq!(codec.remote_min, retained_min, "{label}");
+            assert_eq!(codec.agreed, previous, "{label}");
+            assert_eq!(phase, Some(RpcProtocolPhase::Established), "{label}");
+            assert_eq!(ready_generation, INITIAL_CONNECTION_GENERATION, "{label}");
+            assert_eq!(
+                connection_generation, INITIAL_CONNECTION_GENERATION,
+                "{label} must not mint a successor generation"
+            );
+        }
+
+        for (remote_max, remote_min, label) in [
+            (previous, CODEC_VERSION, "impossible-window"),
+            (
+                CODEC_VERSION + 1,
+                CODEC_VERSION + 1,
+                "disjoint-window",
+            ),
+        ] {
+            let RealHandshakeProbe {
+                result,
+                transcript,
+                codec,
+                phase,
+                ready_generation,
+                connection_generation,
+            } = run_real_socket_pair_handshake(remote_max, remote_min, false);
+            let error = result.expect_err("an incompatible real handshake must fail");
+            assert!(
+                error.downcast_ref::<IncompatibleVersionError>().is_some(),
+                "{label} lost its typed incompatibility: {error:#}"
+            );
+            assert_eq!(transcript, ["GetCodecVersion"], "{label}");
+            assert_eq!(codec, None, "{label} retained invalid codec authority");
+            assert_ne!(
+                phase,
+                Some(RpcProtocolPhase::Established),
+                "{label} established ordinary traffic"
+            );
+            assert_eq!(ready_generation, 0, "{label} published readiness");
+            assert_eq!(
+                connection_generation, INITIAL_CONNECTION_GENERATION,
+                "{label} must not publish a successor generation"
+            );
+        }
+    }
+
+    #[test]
+    fn reconnect_replaces_codec_authority_instead_of_leaking_the_retired_window() {
+        let (sender, receiver) = unbounded();
+        let rpc_transport = Arc::new(RpcTransportState::new());
+        let first_generation = rpc_transport
+            .active_generation()
+            .expect("first generation starts live");
+        let first_scope = RpcGenerationScope::bootstrap(
+            sender.clone(),
+            Arc::clone(&rpc_transport),
+        );
+        rpc_transport
+            .lifecycle
+            .lock()
+            .protocol_for_mut(first_generation)
+            .expect("first protocol authority is live")
+            .admit_outbound(&Pdu::GetCodecVersion(GetCodecVersion {}))
+            .expect("first generation admits its codec request");
+        let first_codec = RpcCodecAuthority::negotiate(
+            first_generation,
+            CODEC_VERSION - 1,
+            codec::CODEC_VERSION_MIN_SUPPORTED,
+        )
+        .expect("first peer overlaps locally");
+        first_scope
+            .retain_codec_authority(first_codec)
+            .expect("first generation retains its codec window");
+        assert_eq!(first_scope.codec_authority(), Some(first_codec));
+
+        let dispatch = ClientDispatchAuthority::new(
+            None,
+            Weak::new(),
+            Arc::new(ClientIncarnation),
+            Arc::new(AtomicU64::new(INITIAL_CONNECTION_GENERATION)),
+            Arc::clone(&rpc_transport),
+        );
+        let successor = dispatch
+            .advance_generation(&receiver)
+            .expect("retire first codec generation");
+        successor
+            .activate_rpc_transport()
+            .expect("activate successor codec generation");
+        let successor_generation = NonZeroU64::new(successor.generation)
+            .expect("successor generation is nonzero");
+        let successor_scope = RpcGenerationScope::exact(
+            sender,
+            Arc::clone(&rpc_transport),
+            successor_generation,
+            true,
+        );
+        assert_eq!(first_scope.codec_authority(), None);
+        assert_eq!(successor_scope.codec_authority(), None);
+
+        rpc_transport
+            .lifecycle
+            .lock()
+            .protocol_for_mut(successor_generation)
+            .expect("successor protocol authority is live")
+            .admit_outbound(&Pdu::GetCodecVersion(GetCodecVersion {}))
+            .expect("successor admits its own codec request");
+        let successor_codec = RpcCodecAuthority::negotiate(
+            successor_generation,
+            CODEC_VERSION + 1,
+            CODEC_VERSION,
+        )
+        .expect("successor peer overlaps locally");
+        successor_scope
+            .retain_codec_authority(successor_codec)
+            .expect("successor retains only its codec window");
+        assert_eq!(successor_scope.codec_authority(), Some(successor_codec));
+        assert_eq!(first_scope.codec_authority(), None);
+    }
+
+    #[test]
+    fn protocol_bootstrap_is_exactly_codec_then_registration() {
+        let generation = NonZeroU64::new(11).expect("test generation is nonzero");
+        let mut protocol = RpcProtocolAuthority::new(generation);
+        let ping = Pdu::Ping(Ping {});
+        assert!(matches!(
+            protocol.validate_outbound_pdu(&ping, RpcOutboundAdmissionPoint::Preflight),
+            Err(OrdinaryMuxProtocolError::PhaseViolation { .. })
+        ));
+
+        protocol
+            .admit_outbound(&Pdu::GetCodecVersion(GetCodecVersion {}))
+            .expect("codec request reaches enqueue authority");
+        protocol
+            .rollback_unadmitted_outbound(&Pdu::GetCodecVersion(GetCodecVersion {}))
+            .expect("preclosed codec request rolls its phase back");
+        assert_eq!(protocol.phase, RpcProtocolPhase::AwaitingCodecRequest);
+        assert_eq!(
+            protocol
+                .admit_outbound(&Pdu::GetCodecVersion(GetCodecVersion {}))
+                .expect("codec request is the only first request"),
+            RpcProtocolTransition::CodecRequest
+        );
+        assert!(matches!(
+            protocol.validate_outbound_pdu(
+                &Pdu::GetCodecVersion(GetCodecVersion {}),
+                RpcOutboundAdmissionPoint::Preflight,
+            ),
+            Err(OrdinaryMuxProtocolError::PhaseViolation { .. })
+        ));
+        let codec = RpcCodecAuthority::negotiate(
+            generation,
+            CODEC_VERSION,
+            codec::CODEC_VERSION_MIN_SUPPORTED,
+        )
+        .expect("current codec window overlaps itself");
+        protocol
+            .complete_correlated_response(
+                "GetCodecVersion",
+                &Pdu::GetCodecVersionResponse(GetCodecVersionResponse {
+                    codec_vers: CODEC_VERSION,
+                    version_string: "registry-bootstrap-test".to_string(),
+                    executable_path: PathBuf::from("/test/ft"),
+                    config_file_path: None,
+                    min_supported: codec::CODEC_VERSION_MIN_SUPPORTED,
+                }),
+            )
+            .expect("reader response advances bootstrap before another frame");
+        protocol
+            .install_codec(codec)
+            .expect("caller-side retention of the same authority is idempotent");
+        assert!(matches!(
+            protocol.validate_inbound(
+                &<NotifyAlert as PduWireIdent>::WIRE_SPEC,
+                PduWireRole::Unilateral,
+            ),
+            Err(OrdinaryMuxProtocolError::PhaseViolation {
+                phase: RpcProtocolPhase::AwaitingRegistrationRequest,
+                ..
+            })
+        ));
+        assert_eq!(
+            protocol
+                .admit_outbound(&Pdu::SetClientId(SetClientId {
+                    client_id: ClientId::new(),
+                    is_proxy: false,
+                }))
+                .expect("registration is the only second request"),
+            RpcProtocolTransition::RegistrationRequest
+        );
+        assert!(matches!(
+            protocol.validate_inbound(
+                &<NotifyAlert as PduWireIdent>::WIRE_SPEC,
+                PduWireRole::Unilateral,
+            ),
+            Err(OrdinaryMuxProtocolError::PhaseViolation {
+                phase: RpcProtocolPhase::AwaitingRegistrationResponse,
+                ..
+            })
+        ));
+        protocol
+            .validate_inbound(
+                &<UnitResponse as PduWireIdent>::WIRE_SPEC,
+                PduWireRole::CorrelatedReply,
+            )
+            .expect("registration unit response is authorized");
+        protocol
+            .complete_registration("SetClientId", &Pdu::UnitResponse(UnitResponse {}))
+            .expect("unit response establishes ordinary traffic");
+        protocol
+            .validate_outbound_pdu(&ping, RpcOutboundAdmissionPoint::Preflight)
+            .expect("ordinary request is legal after registration");
+        assert!(matches!(
+            protocol.validate_outbound_pdu(
+                &Pdu::GetCodecVersion(GetCodecVersion {}),
+                RpcOutboundAdmissionPoint::Preflight,
+            ),
+            Err(OrdinaryMuxProtocolError::PhaseViolation { .. })
+        ));
+    }
+
+    #[test]
+    fn registration_transition_rolls_back_for_queue_rejection_and_preclosed_dequeue() {
+        let (rejected_client, rejected_receiver) = client_with_bootstrap_rpc_queue();
+        let rejected_generation = advance_bootstrap_to_registration_request(&rejected_client);
+        let rejected_scope = rejected_client.bootstrap_rpc_scope();
+        let rejected_registration = rejected_scope.set_client_id(SetClientId {
+            client_id: rejected_client.client_id.clone(),
+            is_proxy: false,
+        });
+        let serial_before_rejection = rejected_client
+            .rpc_transport
+            .next_wire_serial
+            .load(AtomicOrdering::Acquire);
+        drop(rejected_receiver);
+        let error = asupersync_block_on(rejected_registration)
+            .expect_err("a closed real reader queue must reject registration enqueue");
+        assert!(matches!(
+            error.downcast_ref::<RpcTransportError>(),
+            Some(RpcTransportError::Retired {
+                stage: RpcRetirementStage::Enqueue,
+                certainty: RpcDeliveryCertainty::DefinitelyNotSent,
+                ..
+            })
+        ));
+        assert_eq!(
+            rejected_client
+                .rpc_transport
+                .lifecycle
+                .lock()
+                .protocol_for(rejected_generation)
+                .expect("queue rejection leaves protocol authority live")
+                .phase,
+            RpcProtocolPhase::AwaitingRegistrationRequest
+        );
+        assert_eq!(
+            rejected_client
+                .rpc_transport
+                .next_wire_serial
+                .load(AtomicOrdering::Acquire),
+            serial_before_rejection,
+            "queue rejection must not allocate a serial"
+        );
+
+        let (client, receiver) = client_with_bootstrap_rpc_queue();
+        let generation = advance_bootstrap_to_registration_request(&client);
+        let scope = client.bootstrap_rpc_scope();
+        let mut registration = Box::pin(scope.set_client_id(SetClientId {
+            client_id: client.client_id.clone(),
+            is_proxy: false,
+        }));
+        asupersync_block_on(poll_fn(|task_cx| match registration.as_mut().poll(task_cx) {
+            Poll::Pending => Poll::Ready(()),
+            Poll::Ready(result) => {
+                panic!("registration unexpectedly completed before reader dequeue: {result:?}")
+            }
+        }));
+        assert_eq!(
+            client
+                .rpc_transport
+                .lifecycle
+                .lock()
+                .protocol_for(generation)
+                .expect("queued registration keeps protocol authority live")
+                .phase,
+            RpcProtocolPhase::AwaitingRegistrationResponse
+        );
+        drop(registration);
+
+        let ReaderMessage::SendPdu {
+            binding,
+            pdu,
+            promise,
+        } = receiver
+            .try_recv()
+            .expect("registration must traverse the real reader queue")
+        else {
+            panic!("registration enqueued a non-PDU reader message");
+        };
+        client
+            .rpc_transport
+            .validate_dequeued_outbound(generation, &pdu)
+            .expect("registration remains valid at its exact dequeue gate");
+        let (metrics, probe) = RpcMetricProbe::new();
+        let mut pending = PendingReplies::new(
+            metrics,
+            generation,
+            Arc::clone(&client.rpc_transport),
+        );
+        assert_eq!(
+            pending
+                .admit(promise, binding, PendingRpcEffect::Ordinary)
+                .expect("preclosed dequeue is a normal admission disposition"),
+            None
+        );
+        assert_eq!(RpcMetricProbe::counter(&probe.preclosed), 1);
+        assert_eq!(probe.pending(), 0.0);
+        assert_eq!(pending.highest_issued(), 0);
+        client
+            .rpc_transport
+            .rollback_unadmitted_outbound(generation, &pdu)
+            .expect("preclosed registration must roll its transition back");
+        assert_eq!(
+            client
+                .rpc_transport
+                .lifecycle
+                .lock()
+                .protocol_for(generation)
+                .expect("preclosed registration leaves protocol authority live")
+                .phase,
+            RpcProtocolPhase::AwaitingRegistrationRequest
+        );
+
+        let (response, ()) = asupersync_block_on(futures::future::join(
+            scope.set_client_id(SetClientId {
+                client_id: client.client_id.clone(),
+                is_proxy: false,
+            }),
+            async {
+                let ReaderMessage::SendPdu {
+                    binding,
+                    pdu,
+                    promise,
+                } = receiver
+                    .recv()
+                    .await
+                    .expect("a replacement registration must enqueue")
+                else {
+                    panic!("replacement registration enqueued a non-PDU message");
+                };
+                assert!(matches!(pdu.as_ref(), Pdu::SetClientId(_)));
+                let response = Pdu::UnitResponse(UnitResponse {});
+                client
+                    .rpc_transport
+                    .complete_protocol_response(generation, binding.request, &response)
+                    .expect("replacement registration establishes the protocol");
+                promise
+                    .send(Ok(response))
+                    .await
+                    .expect("replacement registration caller remains live");
+            },
+        ));
+        assert_eq!(
+            response.expect("replacement registration must complete"),
+            Pdu::UnitResponse(UnitResponse {})
+        );
+        assert_eq!(
+            client
+                .rpc_transport
+                .lifecycle
+                .lock()
+                .protocol_for(generation)
+                .expect("replacement registration retains protocol authority")
+                .phase,
+            RpcProtocolPhase::Established
+        );
+        probe.assert_balanced();
+    }
+
+    #[test]
+    fn readiness_cannot_publish_before_codec_and_registration_establish() {
+        let (client, receiver) = client_with_bootstrap_rpc_queue();
+        let rpc = client.bootstrap_rpc_scope();
+        let mut guard = rpc
+            .abort_guard("readiness-before-bootstrap test")
+            .expect("register pending readiness participant");
+        let error = asupersync_block_on(client.publish_rpc_transport_ready(&rpc, &guard))
+            .expect_err("readiness must fail before bootstrap establishes protocol authority");
+        assert!(error
+            .to_string()
+            .contains("before codec negotiation and client registration are established"));
+        assert_eq!(
+            client
+                .rpc_transport
+                .ready_generation
+                .load(AtomicOrdering::Acquire),
+            0
+        );
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(async_channel::TryRecvError::Empty)
+        ));
+        guard.disarm();
+    }
+
+    #[test]
+    fn registry_policy_matrix_covers_every_tuple_and_dialect_boundary() {
+        let generation = NonZeroU64::new(13).expect("test generation is nonzero");
+        let established = TopologyCapabilities::FENCED_SNAPSHOT_V1;
+        let endpoint_tuples = [
+            (PduProducer::Client, PduWireRole::Request),
+            (PduProducer::Client, PduWireRole::CorrelatedReply),
+            (PduProducer::Client, PduWireRole::Unilateral),
+            (PduProducer::Server, PduWireRole::Request),
+            (PduProducer::Server, PduWireRole::CorrelatedReply),
+            (PduProducer::Server, PduWireRole::Unilateral),
+        ];
+
+        for spec in Pdu::all_wire_specs() {
+            for agreed in [
+                spec.min_codec_version.saturating_sub(1),
+                spec.min_codec_version,
+                CODEC_VERSION,
+                CODEC_VERSION + 1,
+            ] {
+                let mut protocol = RpcProtocolAuthority::established_for_test(generation, agreed);
+                protocol.established_capabilities = established;
+                for (producer, role) in endpoint_tuples {
+                    let direction = if producer == PduProducer::Client {
+                        RpcProtocolDirection::Outbound
+                    } else {
+                        RpcProtocolDirection::Inbound
+                    };
+                    let capability_ok = match spec.capability {
+                        PduCapabilityUse::None => true,
+                        PduCapabilityUse::Negotiates(required) => {
+                            RpcProtocolAuthority::locally_activated_capabilities()
+                                .contains(required)
+                        }
+                        PduCapabilityUse::Requires(required) => established.contains(required),
+                    };
+                    let expected = spec.authorizes(producer, role)
+                        && RpcProtocolAuthority::endpoint_is_activated(spec)
+                        && spec.min_codec_version <= agreed
+                        && capability_ok;
+                    assert_eq!(
+                        protocol
+                            .validate_common(spec, direction, producer, role)
+                            .is_ok(),
+                        expected,
+                        "registry policy mismatch for {} ({}) at dialect {} and {:?}/{:?}",
+                        spec.name,
+                        spec.ident,
+                        agreed,
+                        producer,
+                        role,
+                    );
+                }
+            }
+        }
+
+        for gap in [5, 6, 7, 15, 16, 17, 18, 19, 21, 93, u64::MAX] {
+            assert_eq!(Pdu::wire_spec_for_ident(gap), None, "wire gap {gap} was assigned");
+        }
+    }
+
+    #[test]
+    fn capability_policy_keeps_only_the_exact_topology_fence_active() {
+        let generation = NonZeroU64::new(17).expect("test generation is nonzero");
+        let mut protocol = RpcProtocolAuthority::established_for_test(generation, CODEC_VERSION);
+        let coherent_request = Pdu::ListPanesCoherent(ListPanesCoherent {
+            supported: TopologyCapabilities::FENCED_SNAPSHOT_V1,
+            required: TopologyCapabilities::FENCED_SNAPSHOT_V1,
+        });
+        protocol
+            .validate_outbound_pdu(&coherent_request, RpcOutboundAdmissionPoint::Preflight)
+            .expect("the exact fenced snapshot offer remains active");
+
+        let overbroad = TopologyCapabilities::from_bits(
+            TopologyCapabilities::FENCED_SNAPSHOT_V1.bits()
+                | TopologyCapabilities::ORDERED_WINDOW_STREAM_V1.bits(),
+        );
+        assert!(matches!(
+            protocol.validate_outbound_pdu(
+                &Pdu::ListPanesCoherent(ListPanesCoherent {
+                    supported: overbroad,
+                    required: TopologyCapabilities::FENCED_SNAPSHOT_V1,
+                }),
+                RpcOutboundAdmissionPoint::Preflight,
+            ),
+            Err(OrdinaryMuxProtocolError::CapabilityAdvertisementMismatch { .. })
+        ));
+
+        assert!(matches!(
+            protocol.validate_common(
+                &<TopologyEvent as PduWireIdent>::WIRE_SPEC,
+                RpcProtocolDirection::Inbound,
+                PduProducer::Server,
+                PduWireRole::Unilateral,
+            ),
+            Err(OrdinaryMuxProtocolError::CapabilityNotEstablished { .. })
+        ));
+        protocol
+            .establish_capabilities(TopologyCapabilities::FENCED_SNAPSHOT_V1)
+            .expect("successful coherent snapshot establishes only its fenced bit");
+        protocol
+            .validate_common(
+                &<TopologyEvent as PduWireIdent>::WIRE_SPEC,
+                RpcProtocolDirection::Inbound,
+                PduProducer::Server,
+                PduWireRole::Unilateral,
+            )
+            .expect("topology events activate only after the fenced snapshot");
+
+        for inactive in [79, 80, 84, 85, 86, 87, 88, 89, 90, 91, 92] {
+            let spec = Pdu::wire_spec_for_ident(inactive).expect("inactive PDU remains assigned");
+            let authority = spec
+                .authorities
+                .first()
+                .expect("assigned PDU has at least one authority");
+            let direction = if authority.producer == PduProducer::Client {
+                RpcProtocolDirection::Outbound
+            } else {
+                RpcProtocolDirection::Inbound
+            };
+            assert!(matches!(
+                protocol.validate_common(spec, direction, authority.producer, authority.role),
+                Err(OrdinaryMuxProtocolError::EndpointInactive { ident, .. }) if ident == inactive
+            ));
+        }
+
+        for historical_gap in [5, 6, 7, 15, 16, 17, 18, 19, 21] {
+            let synthetic = PduWireSpec {
+                ident: historical_gap,
+                name: "SyntheticFuturePdu",
+                min_codec_version: CODEC_VERSION,
+                producer: PduProducer::Client,
+                capability: PduCapabilityUse::None,
+                authorities: &[PduWireAuthority {
+                    producer: PduProducer::Client,
+                    role: PduWireRole::Request,
+                }],
+                encoded_body_limit: codec::PduEncodedBodyLimit::GlobalMaximum,
+            };
+            assert!(
+                !RpcProtocolAuthority::endpoint_is_activated(&synthetic),
+                "a future assignment in historical gap {historical_gap} must default dormant"
+            );
+        }
+    }
+
+    #[test]
+    fn active_endpoint_identity_baseline_is_independent_of_policy_evaluation() {
+        let mut expected = Vec::new();
+        expected.extend(0..=4);
+        expected.extend(8..=14);
+        expected.push(20);
+        expected.extend(22..=78);
+        expected.extend(81..=83);
+
+        let actual = Pdu::all_wire_specs()
+            .iter()
+            .filter(|spec| RpcProtocolAuthority::endpoint_is_activated(spec))
+            .map(|spec| spec.ident)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            actual, expected,
+            "ordinary-client endpoint activation changed without updating its explicit baseline"
+        );
     }
 
     #[test]
@@ -7590,6 +9830,384 @@ mod tests {
     }
 
     #[test]
+    fn generation_abort_interrupts_a_blocked_reader_operation() {
+        let rpc_transport = Arc::new(RpcTransportState::new());
+        let generation = rpc_transport
+            .active_generation()
+            .expect("test reader generation is live");
+        let reader_abort = rpc_transport
+            .reader_abort_for(generation)
+            .expect("test reader has generation abort authority");
+        let blocked_transport = Arc::clone(&rpc_transport);
+        let blocked_abort = Arc::clone(&reader_abort);
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let blocked_reader = std::thread::spawn(move || {
+            let operation = async move {
+                started_tx
+                    .send(())
+                    .expect("announce polled generation reader operation");
+                futures::future::pending::<()>().await;
+            };
+            let result = asupersync_block_on(
+                blocked_transport.complete_before_reader_stop(&blocked_abort, operation),
+            );
+            result_tx
+                .send(result)
+                .expect("publish generation-aborted reader outcome");
+        });
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("reader operation must start");
+
+        assert!(rpc_transport.request_generation_abort(
+            &reader_abort,
+            "test cancellation while reader I/O is pending",
+        ));
+        let error = result_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("generation cancellation must wake the blocked reader")
+            .expect_err("generation cancellation must fail the blocked operation");
+        assert!(matches!(
+            error.downcast_ref::<RpcGenerationReaderAborted>(),
+            Some(RpcGenerationReaderAborted {
+                generation: observed,
+                reason: "test cancellation while reader I/O is pending",
+            }) if *observed == generation
+        ));
+        assert_eq!(
+            rpc_transport.live_generation.load(AtomicOrdering::Acquire),
+            0,
+            "cancellation must revoke admission before waking the reader"
+        );
+        blocked_reader
+            .join()
+            .expect("blocked generation reader thread must not panic");
+    }
+
+    #[test]
+    fn sticky_generation_abort_wins_over_an_already_ready_operation() {
+        let rpc_transport = RpcTransportState::new();
+        let generation = rpc_transport
+            .active_generation()
+            .expect("test reader generation is live");
+        let reader_abort = rpc_transport
+            .reader_abort_for(generation)
+            .expect("test reader has generation abort authority");
+        assert!(rpc_transport.request_generation_abort(
+            &reader_abort,
+            "ready-operation cancellation race",
+        ));
+
+        let error = asupersync_block_on(rpc_transport.complete_before_reader_stop(
+            &reader_abort,
+            futures::future::ready("must-not-commit"),
+        ))
+        .expect_err("a committed cancellation must win over ready I/O");
+        assert!(matches!(
+            error.downcast_ref::<RpcGenerationReaderAborted>(),
+            Some(RpcGenerationReaderAborted {
+                generation: observed,
+                reason: "ready-operation cancellation race",
+            }) if *observed == generation
+        ));
+    }
+
+    #[test]
+    fn stale_generation_abort_authority_cannot_revoke_successor() {
+        let (client, receiver) = client_with_idle_rpc_queue();
+        let authority = client.test_dispatch_authority(Weak::new());
+        let first_generation = authority
+            .rpc_transport
+            .active_generation()
+            .expect("first generation is live");
+        let first_abort = authority
+            .rpc_transport
+            .reader_abort_for(first_generation)
+            .expect("first generation has reader abort authority");
+
+        let successor = authority
+            .advance_generation(&receiver)
+            .expect("retire first generation");
+        successor
+            .activate_rpc_transport()
+            .expect("activate successor generation");
+        authority
+            .rpc_transport
+            .mark_current_generation_ready_for_test();
+        let successor_generation = authority
+            .rpc_transport
+            .active_generation()
+            .expect("successor generation is live");
+        let successor_abort = authority
+            .rpc_transport
+            .reader_abort_for(successor_generation)
+            .expect("successor has fresh reader abort authority");
+
+        assert!(!authority.rpc_transport.request_generation_abort(
+            &first_abort,
+            "stale first-generation cancellation",
+        ));
+        assert!(first_abort.cause().is_none());
+        assert!(successor_abort.cause().is_none());
+        assert_eq!(
+            authority
+                .rpc_transport
+                .live_generation
+                .load(AtomicOrdering::Acquire),
+            successor_generation.get()
+        );
+        assert_eq!(
+            authority
+                .rpc_transport
+                .ready_generation
+                .load(AtomicOrdering::Acquire),
+            successor_generation.get()
+        );
+
+        assert!(first_abort.commit_abort("queued stale wake"));
+        first_abort.wake_reader();
+        let successor_result = asupersync_block_on(
+            authority.rpc_transport.complete_before_reader_stop(
+                &successor_abort,
+                futures::future::ready("successor remains live"),
+            ),
+        )
+        .expect("an old generation waker cannot affect its successor");
+        assert_eq!(successor_result, "successor remains live");
+    }
+
+    #[test]
+    fn first_generation_abort_reason_wins() {
+        let rpc_transport = RpcTransportState::new();
+        let generation = rpc_transport
+            .active_generation()
+            .expect("test reader generation is live");
+        let reader_abort = rpc_transport
+            .reader_abort_for(generation)
+            .expect("test reader has generation abort authority");
+
+        assert!(rpc_transport.request_generation_abort(&reader_abort, "first cause"));
+        assert!(!rpc_transport.request_generation_abort(&reader_abort, "second cause"));
+        assert_eq!(reader_abort.cause(), Some("first cause"));
+    }
+
+    #[test]
+    fn live_control_ack_rejects_abort_committed_after_reader_ack() {
+        let rpc_transport = RpcTransportState::new();
+        let generation = rpc_transport
+            .active_generation()
+            .expect("test reader generation is live");
+        let reader_abort = rpc_transport
+            .reader_abort_for(generation)
+            .expect("test reader has generation abort authority");
+
+        assert!(rpc_transport.request_generation_abort(
+            &reader_abort,
+            "cancellation raced control acknowledgement",
+        ));
+        let error = rpc_transport
+            .validate_live_control_ack(generation, &reader_abort, "test control operation")
+            .expect_err("a revoked generation cannot publish a successful control result");
+        assert!(matches!(
+            error.downcast_ref::<RpcGenerationReaderAborted>(),
+            Some(RpcGenerationReaderAborted {
+                generation: observed,
+                reason: "cancellation raced control acknowledgement",
+            }) if *observed == generation
+        ));
+    }
+
+    #[test]
+    fn terminal_error_outranks_committed_generation_abort() {
+        let rpc_transport = RpcTransportState::new();
+        let generation = rpc_transport
+            .active_generation()
+            .expect("test reader generation is live");
+        let reader_abort = rpc_transport
+            .reader_abort_for(generation)
+            .expect("test reader has generation abort authority");
+        assert!(rpc_transport.request_generation_abort(
+            &reader_abort,
+            "generation cancellation committed first",
+        ));
+        rpc_transport.mark_incarnation_terminal(RpcTransportError::AttemptIdentityExhausted {
+            request: "PublishReady",
+        });
+
+        let error = rpc_transport
+            .validate_live_control_ack(generation, &reader_abort, "readiness publication")
+            .expect_err("terminal authority must dominate a generation abort");
+        assert!(matches!(
+            error.downcast_ref::<RpcTransportError>(),
+            Some(RpcTransportError::AttemptIdentityExhausted {
+                request: "PublishReady",
+            })
+        ));
+    }
+
+    #[test]
+    fn terminal_error_outranks_generation_abort_at_reader_completion() {
+        let rpc_transport = RpcTransportState::new();
+        let generation = rpc_transport
+            .active_generation()
+            .expect("test reader generation is live");
+        let reader_abort = rpc_transport
+            .reader_abort_for(generation)
+            .expect("test reader has generation abort authority");
+        assert!(rpc_transport.request_generation_abort(
+            &reader_abort,
+            "generation cancellation committed first",
+        ));
+        rpc_transport.mark_incarnation_terminal(RpcTransportError::AttemptIdentityExhausted {
+            request: "reader completion",
+        });
+
+        let error = asupersync_block_on(rpc_transport.complete_before_reader_stop(
+            &reader_abort,
+            futures::future::ready("must-not-commit"),
+        ))
+        .expect_err("terminal authority must dominate reader-generation cancellation");
+        assert!(matches!(
+            error.downcast_ref::<RpcTransportError>(),
+            Some(RpcTransportError::AttemptIdentityExhausted {
+                request: "reader completion",
+            })
+        ));
+    }
+
+    #[test]
+    fn terminal_commit_cannot_interleave_between_reader_stop_precedence_samples() {
+        let rpc_transport = Arc::new(RpcTransportState::new());
+        let generation = rpc_transport
+            .active_generation()
+            .expect("test reader generation is live");
+        let reader_abort = rpc_transport
+            .reader_abort_for(generation)
+            .expect("test reader has generation abort authority");
+        let blocked_transport = Arc::clone(&rpc_transport);
+        let blocked_abort = Arc::clone(&reader_abort);
+        let terminal_transport = Arc::clone(&rpc_transport);
+        let (reader_result_tx, reader_result_rx) = std::sync::mpsc::channel();
+        let (terminal_result_tx, terminal_result_rx) = std::sync::mpsc::channel();
+
+        // Hold the cause mutex after publishing a sticky cancellation. The
+        // reader-stop sampler must keep the lifecycle lock while it blocks on
+        // this cause; otherwise terminal authority can commit in the old gap
+        // between the two precedence checks.
+        let mut cause = reader_abort.cause.lock();
+        *cause = Some("generation cause under precedence race");
+        reader_abort
+            .cancelled
+            .store(true, AtomicOrdering::Release);
+        let reader = std::thread::spawn(move || {
+            let result = asupersync_block_on(blocked_transport.complete_before_reader_stop(
+                &blocked_abort,
+                futures::future::ready("must-not-commit"),
+            ));
+            reader_result_tx
+                .send(result)
+                .expect("publish reader-stop precedence result");
+        });
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while rpc_transport.lifecycle.try_lock().is_some() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "reader-stop sampler never acquired the lifecycle lock"
+            );
+            std::thread::yield_now();
+        }
+        let terminal = std::thread::spawn(move || {
+            let error = terminal_transport.mark_incarnation_terminal(
+                RpcTransportError::AttemptIdentityExhausted {
+                    request: "precedence race",
+                },
+            );
+            terminal_result_tx
+                .send(error)
+                .expect("publish terminal commit result");
+        });
+        assert!(matches!(
+            terminal_result_rx.recv_timeout(Duration::from_millis(50)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+
+        drop(cause);
+        let reader_error = reader_result_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("reader-stop sample should complete after cause release")
+            .expect_err("sticky generation cancellation must stop the reader");
+        assert!(matches!(
+            reader_error.downcast_ref::<RpcGenerationReaderAborted>(),
+            Some(RpcGenerationReaderAborted {
+                generation: observed,
+                reason: "generation cause under precedence race",
+            }) if *observed == generation
+        ));
+        assert!(matches!(
+            terminal_result_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("terminal commit should proceed after precedence sampling"),
+            RpcTransportError::AttemptIdentityExhausted {
+                request: "precedence race",
+            }
+        ));
+        reader.join().expect("reader precedence thread must not panic");
+        terminal
+            .join()
+            .expect("terminal precedence thread must not panic");
+    }
+
+    #[test]
+    fn terminal_reader_authority_acquisition_preserves_terminal_cause() {
+        let rpc_transport = RpcTransportState::new();
+        let generation = rpc_transport
+            .active_generation()
+            .expect("test reader generation is live");
+        rpc_transport.mark_incarnation_terminal(RpcTransportError::AttemptIdentityExhausted {
+            request: "reader startup",
+        });
+
+        for result in [
+            rpc_transport.reader_abort_for(generation),
+            rpc_transport.reader_abort_for_reader(generation),
+        ] {
+            let error = result.expect_err("terminal closure must reject reader authority");
+            assert!(matches!(
+                error.downcast_ref::<RpcTransportError>(),
+                Some(RpcTransportError::AttemptIdentityExhausted {
+                    request: "reader startup",
+                })
+            ));
+        }
+    }
+
+    #[test]
+    fn generation_abort_revokes_admission_but_retains_owning_reader_authority() {
+        let rpc_transport = RpcTransportState::new();
+        let generation = rpc_transport
+            .active_generation()
+            .expect("test reader generation is live");
+        let reader_abort = rpc_transport
+            .reader_abort_for(generation)
+            .expect("test reader has generation abort authority");
+        assert!(rpc_transport.request_generation_abort(
+            &reader_abort,
+            "test exact-generation predicate split",
+        ));
+
+        assert!(
+            rpc_transport.reader_abort_for(generation).is_err(),
+            "revoked admission must not mint an ordinary RPC scope"
+        );
+        let owning_reader = rpc_transport
+            .reader_abort_for_reader(generation)
+            .expect("the physical reader must recover its sticky wake authority");
+        assert!(Arc::ptr_eq(&reader_abort, &owning_reader));
+    }
+
+    #[test]
     fn duplicate_readiness_participant_cancellation_hands_off_to_a_live_peer() {
         let generation =
             NonZeroU64::new(INITIAL_CONNECTION_GENERATION).expect("generation is nonzero");
@@ -7727,7 +10345,12 @@ mod tests {
 
     #[test]
     fn duplicate_readiness_guards_abort_only_after_the_last_participant_cancels() {
-        let (scope, receiver, _rpc_transport) = pending_readiness_scope_for_test();
+        let (scope, receiver, rpc_transport) = pending_readiness_scope_for_test();
+        let reader_abort = scope
+            .reader_abort
+            .as_ref()
+            .expect("pending scope has reader abort authority")
+            .clone();
         let first = scope
             .abort_guard("first readiness participant cancelled")
             .expect("register first readiness participant");
@@ -7740,16 +10363,17 @@ mod tests {
             receiver.try_recv(),
             Err(async_channel::TryRecvError::Empty)
         ));
+        assert!(reader_abort.cause().is_none());
         drop(second);
-        match receiver
-            .try_recv()
-            .expect("last participant cancellation must enqueue one abort")
-        {
-            ReaderMessage::AbortGeneration { reason, .. } => {
-                assert_eq!(reason, "last readiness participant cancelled");
-            }
-            _ => panic!("last participant cancellation enqueued a non-abort message"),
-        }
+        assert_eq!(
+            reader_abort.cause(),
+            Some("last readiness participant cancelled")
+        );
+        assert_eq!(
+            rpc_transport.live_generation.load(AtomicOrdering::Acquire),
+            0,
+            "the last cancellation must revoke admission before waking the reader"
+        );
         assert!(matches!(
             receiver.try_recv(),
             Err(async_channel::TryRecvError::Empty)
@@ -7784,6 +10408,11 @@ mod tests {
     #[test]
     fn fatal_replay_guard_commits_one_abort_despite_live_external_participant() {
         let (scope, receiver, rpc_transport) = pending_readiness_scope_for_test();
+        let reader_abort = scope
+            .reader_abort
+            .as_ref()
+            .expect("pending scope has reader abort authority")
+            .clone();
         let mut external = scope
             .abort_guard("external readiness participant cancelled")
             .expect("register external readiness participant");
@@ -7792,15 +10421,15 @@ mod tests {
             .expect("register fatal replay guard");
 
         drop(fatal);
-        match receiver
-            .try_recv()
-            .expect("fatal replay failure must enqueue an abort")
-        {
-            ReaderMessage::AbortGeneration { reason, .. } => {
-                assert_eq!(reason, "pre-ready replay failed");
-            }
-            _ => panic!("fatal replay failure enqueued a non-abort message"),
-        }
+        assert_eq!(reader_abort.cause(), Some("pre-ready replay failed"));
+        assert_eq!(
+            rpc_transport.live_generation.load(AtomicOrdering::Acquire),
+            0
+        );
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(async_channel::TryRecvError::Empty)
+        ));
         let authority = Arc::clone(&rpc_transport.lifecycle.lock().readiness_authority);
         {
             let state = authority.state.lock();
@@ -9166,6 +11795,11 @@ mod tests {
 
     #[test]
     fn inactive_ordered_window_family_is_rejected_from_every_header_shape_before_body() {
+        let rpc_transport = RpcTransportState::new();
+        rpc_transport.mark_current_generation_ready_for_test();
+        let generation = rpc_transport
+            .active_generation()
+            .expect("ordered-window test transport starts live");
         let ordered_idents = [
             <ListPanesOrderedV1 as PduWireIdent>::IDENT,
             <ListPanesOrderedV1Response as PduWireIdent>::IDENT,
@@ -9187,7 +11821,12 @@ mod tests {
                         &mut reader,
                         None,
                         |header| {
-                            validate_ordinary_mux_inbound_header(header, u64::MAX)?;
+                            validate_ordinary_mux_inbound_header(
+                                &rpc_transport,
+                                generation,
+                                header,
+                                u64::MAX,
+                            )?;
                             downstream_selector_reached = true;
                             Ok(PduBodyDisposition::Materialize)
                         },
@@ -9218,47 +11857,353 @@ mod tests {
     }
 
     #[test]
-    fn inactive_ordered_window_header_predicate_preserves_adjacent_legacy_controls() {
+    fn additive_render_families_use_registry_inactive_errors_not_ordered_classification() {
+        let rpc_transport = RpcTransportState::new();
+        rpc_transport.mark_current_generation_ready_for_test();
+        let generation = rpc_transport
+            .active_generation()
+            .expect("additive-family test transport starts live");
         let payload = [0x5a; 31];
-        for ident in [
-            <RenderApplicationResult as PduWireIdent>::IDENT,
-            <WindowOrderEventV1 as PduWireIdent>::IDENT + 1,
+        for (ident, serial) in [
+            (<RenderApplicationUpdateV1 as PduWireIdent>::IDENT, 0),
+            (<RenderApplicationUpdate as PduWireIdent>::IDENT, 0),
+            (<GetPaneRenderDeliveryV1Response as PduWireIdent>::IDENT, 7),
         ] {
             for compressed in [false, true] {
-                let (wire, header_len) = test_opaque_frame(ident, 7, compressed, &payload);
+                let (wire, header_len) = test_opaque_frame(ident, serial, compressed, &payload);
                 let mut reader = std::io::Cursor::new(wire);
                 let mut downstream_selector_reached = false;
                 let error = asupersync_block_on(Pdu::decode_async_with_selector(
                     &mut reader,
                     None,
                     |header| {
-                        reject_inactive_ordered_window_pdu_header(header)?;
+                        validate_ordinary_mux_inbound_header(
+                            &rpc_transport,
+                            generation,
+                            header,
+                            u64::MAX,
+                        )?;
                         downstream_selector_reached = true;
-                        Err(anyhow!("legacy control reached downstream selector"))
+                        Err(anyhow!("inactive additive PDU reached downstream selector"))
                     },
                 ))
-                .expect_err("the test selector deliberately stops before the opaque body");
+                .expect_err("inactive additive PDU must fail before its opaque body");
 
-                assert!(downstream_selector_reached);
-                assert!(error
-                    .downcast_ref::<NotReconnectableError>()
-                    .is_none());
+                assert!(!downstream_selector_reached);
+                assert!(matches!(
+                    error.downcast_ref::<NotReconnectableError>(),
+                    Some(NotReconnectableError::ProtocolViolation(
+                        OrdinaryMuxProtocolError::EndpointInactive {
+                            ident: observed_ident,
+                            ..
+                        }
+                    )) if *observed_ident == ident
+                ));
                 assert_eq!(
                     usize::try_from(reader.position()).expect("cursor position fits usize"),
                     header_len,
-                    "the control selector deliberately leaves its body unread"
+                    "registry inactive rejection must leave its body unread"
                 );
             }
         }
     }
 
     #[test]
+    fn bootstrap_rejects_unilateral_headers_before_registration_and_body_admission() {
+        let rpc_transport = RpcTransportState::new();
+        let generation = rpc_transport
+            .active_generation()
+            .expect("bootstrap unilateral test transport starts live");
+        let payload = [0x3b; 257];
+
+        for phase in [
+            RpcProtocolPhase::AwaitingRegistrationRequest,
+            RpcProtocolPhase::AwaitingRegistrationResponse,
+        ] {
+            let mut protocol =
+                RpcProtocolAuthority::established_for_test(generation, CODEC_VERSION);
+            protocol.phase = phase;
+            rpc_transport.lifecycle.lock().protocol = Some(protocol);
+
+            for compressed in [false, true] {
+                let (wire, header_len) = test_opaque_frame(
+                    <NotifyAlert as PduWireIdent>::IDENT,
+                    0,
+                    compressed,
+                    &payload,
+                );
+                let mut reader = std::io::Cursor::new(wire);
+                let mut downstream_selector_reached = false;
+                let error = asupersync_block_on(Pdu::decode_async_with_selector(
+                    &mut reader,
+                    None,
+                    |header| {
+                        validate_ordinary_mux_inbound_header(
+                            &rpc_transport,
+                            generation,
+                            header,
+                            u64::MAX,
+                        )?;
+                        downstream_selector_reached = true;
+                        Ok(PduBodyDisposition::Materialize)
+                    },
+                ))
+                .expect_err("pre-registration unilateral header must fail closed");
+
+                assert!(!downstream_selector_reached);
+                assert!(matches!(
+                    error.downcast_ref::<NotReconnectableError>(),
+                    Some(NotReconnectableError::ProtocolViolation(
+                        OrdinaryMuxProtocolError::PhaseViolation {
+                            phase: observed_phase,
+                            ..
+                        }
+                    )) if *observed_phase == phase
+                ));
+                assert_eq!(
+                    usize::try_from(reader.position()).expect("cursor position fits usize"),
+                    header_len,
+                    "bootstrap phase rejection must leave the complete body unread",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn inbound_header_role_and_pending_authority_precede_every_response_body() {
+        let rpc_transport = RpcTransportState::new();
+        rpc_transport.mark_current_generation_ready_for_test();
+        let generation = rpc_transport
+            .active_generation()
+            .expect("header-role test transport starts live");
+        let payload = [0x6d; 257];
+
+        for (ident, serial, authorized) in [
+            (<GetPaneRenderChangesResponse as PduWireIdent>::IDENT, 0, true),
+            (<GetPaneRenderChangesResponse as PduWireIdent>::IDENT, 1, true),
+            (<ErrorResponse as PduWireIdent>::IDENT, 0, false),
+            (<ErrorResponse as PduWireIdent>::IDENT, 1, true),
+            (<Pong as PduWireIdent>::IDENT, 0, false),
+            (<PaneRemoved as PduWireIdent>::IDENT, 1, false),
+        ] {
+            let (wire, header_len) = test_opaque_frame(ident, serial, false, &payload);
+            let mut reader = std::io::Cursor::new(wire);
+            let mut downstream_selector_reached = false;
+            let error = asupersync_block_on(Pdu::decode_async_with_selector(
+                &mut reader,
+                None,
+                |header| {
+                    validate_ordinary_mux_inbound_header(
+                        &rpc_transport,
+                        generation,
+                        header,
+                        u64::MAX,
+                    )?;
+                    downstream_selector_reached = true;
+                    Err(anyhow!("authorized header reached pending correlation"))
+                },
+            ))
+            .expect_err("the selector deliberately leaves every opaque body unread");
+
+            assert_eq!(downstream_selector_reached, authorized, "ident {ident}, serial {serial}");
+            if !authorized {
+                assert!(matches!(
+                    error.downcast_ref::<NotReconnectableError>(),
+                    Some(NotReconnectableError::ProtocolViolation(
+                        OrdinaryMuxProtocolError::DirectionViolation { .. }
+                    ))
+                ));
+            }
+            assert_eq!(
+                usize::try_from(reader.position()).expect("cursor position fits usize"),
+                header_len,
+                "role admission must never read the response body"
+            );
+        }
+
+        rpc_transport.lifecycle.lock().protocol = Some(
+            RpcProtocolAuthority::established_for_test(
+                generation,
+                codec::CODEC_VERSION_MIN_SUPPORTED,
+            ),
+        );
+        for (ident, unknown) in [
+            (5, true),
+            (<ListPanesTabStacksResponse as PduWireIdent>::IDENT, false),
+        ] {
+            let (wire, header_len) = test_opaque_frame(ident, 1, true, &payload);
+            let mut reader = std::io::Cursor::new(wire);
+            let error = asupersync_block_on(Pdu::decode_async_with_selector(
+                &mut reader,
+                None,
+                |header| {
+                    validate_ordinary_mux_inbound_header(
+                        &rpc_transport,
+                        generation,
+                        header,
+                        u64::MAX,
+                    )?;
+                    panic!("unknown or above-dialect header must fail before body admission");
+                },
+            ))
+            .expect_err("unknown and above-dialect inbound identities fail closed");
+            let protocol_error = match error.downcast_ref::<NotReconnectableError>() {
+                Some(NotReconnectableError::ProtocolViolation(error)) => error,
+                other => panic!("unexpected protocol rejection for ident {ident}: {other:?}"),
+            };
+            if unknown {
+                assert!(matches!(
+                    protocol_error,
+                    OrdinaryMuxProtocolError::UnknownPdu { ident: 5, .. }
+                ));
+            } else {
+                assert!(matches!(
+                    protocol_error,
+                    OrdinaryMuxProtocolError::DialectViolation {
+                        ident: observed_ident,
+                        agreed,
+                        ..
+                    } if *observed_ident == ident
+                        && *agreed == codec::CODEC_VERSION_MIN_SUPPORTED
+                ));
+            }
+            assert_eq!(
+                usize::try_from(reader.position()).expect("cursor position fits usize"),
+                header_len,
+                "unknown and above-dialect headers must leave bodies unread"
+            );
+        }
+
+        for ident in [
+            <GetPaneRenderChangesResponse as PduWireIdent>::IDENT,
+            <ErrorResponse as PduWireIdent>::IDENT,
+        ] {
+            let (mut pending, probe) = pending_replies_for_test();
+            pending.rpc_transport.lifecycle.lock().protocol = Some(
+                RpcProtocolAuthority::established_for_test(pending.generation, CODEC_VERSION),
+            );
+            let (completion_tx, completion_rx) = bounded(1);
+            let serial = pending
+                .admit_named_expect(
+                    completion_tx,
+                    "GetPaneRenderChanges",
+                    NonZeroU64::new(<GetPaneRenderChangesResponse as PduWireIdent>::IDENT),
+                )
+                .expect("admit dual-role correlation probe")
+                .expect("assign dual-role correlation serial");
+            pending
+                .set_stage(serial, RpcRetirementStage::AwaitingResponse)
+                .expect("mark dual-role probe awaiting response");
+            let generation = pending.generation;
+            let rpc_transport = Arc::clone(&pending.rpc_transport);
+            let (wire, header_len) = test_opaque_frame(ident, serial.get(), false, &payload);
+            let mut reader = std::io::Cursor::new(wire);
+            let mut correlation_reached = false;
+            let error = asupersync_block_on(Pdu::decode_async_with_selector(
+                &mut reader,
+                None,
+                |header| {
+                    validate_ordinary_mux_inbound_header(
+                        &rpc_transport,
+                        generation,
+                        header,
+                        pending.highest_issued(),
+                    )?;
+                    let disposition = pending.response_body_disposition(serial, header)?;
+                    assert!(matches!(
+                        disposition,
+                        PendingResponseBodyDisposition::Materialize(_)
+                    ));
+                    correlation_reached = true;
+                    Err(anyhow!("authorized correlation reached body admission"))
+                },
+            ))
+            .expect_err("the correlation selector deliberately stops before the body");
+            assert!(correlation_reached, "ident {ident} must reach exact pending authority");
+            assert_eq!(pending.map[&serial].stage, RpcRetirementStage::ResponseMatch);
+            assert_eq!(
+                usize::try_from(reader.position()).expect("cursor position fits usize"),
+                header_len
+            );
+            pending.fail_after_decode_error(&error);
+            assert!(completion_rx
+                .try_recv()
+                .expect("terminal cleanup wakes the pending caller exactly once")
+                .is_err());
+            assert!(matches!(
+                completion_rx.try_recv(),
+                Err(async_channel::TryRecvError::Empty)
+                    | Err(async_channel::TryRecvError::Closed)
+            ));
+            probe.assert_balanced();
+        }
+
+        let (mut pending, probe) = pending_replies_for_test();
+        pending.rpc_transport.lifecycle.lock().protocol = Some(
+            RpcProtocolAuthority::established_for_test(pending.generation, CODEC_VERSION),
+        );
+        let (completion_tx, completion_rx) = bounded(1);
+        let serial = pending
+            .admit_named_expect(completion_tx, "Ping", Some(test_wire_ident::<Pong>()))
+            .expect("admit unilateral-on-pending probe")
+            .expect("assign unilateral-on-pending serial");
+        pending
+            .set_stage(serial, RpcRetirementStage::AwaitingResponse)
+            .expect("mark unilateral-on-pending probe awaiting response");
+        let generation = pending.generation;
+        let rpc_transport = Arc::clone(&pending.rpc_transport);
+        let (wire, header_len) = test_opaque_frame(
+            <PaneRemoved as PduWireIdent>::IDENT,
+            serial.get(),
+            false,
+            &payload,
+        );
+        let mut reader = std::io::Cursor::new(wire);
+        let error = asupersync_block_on(Pdu::decode_async_with_selector(
+            &mut reader,
+            None,
+            |header| {
+                validate_ordinary_mux_inbound_header(
+                    &rpc_transport,
+                    generation,
+                    header,
+                    pending.highest_issued(),
+                )?;
+                panic!("unsolicited-shaped PDU must fail before pending correlation");
+            },
+        ))
+        .expect_err("unilateral-shaped PDU on a pending serial must fail closed");
+        assert!(matches!(
+            error.downcast_ref::<NotReconnectableError>(),
+            Some(NotReconnectableError::ProtocolViolation(
+                OrdinaryMuxProtocolError::DirectionViolation { .. }
+            ))
+        ));
+        assert_eq!(pending.map[&serial].stage, RpcRetirementStage::AwaitingResponse);
+        assert_eq!(
+            usize::try_from(reader.position()).expect("cursor position fits usize"),
+            header_len
+        );
+        pending.fail_after_decode_error(&error);
+        assert!(completion_rx
+            .try_recv()
+            .expect("terminal cleanup wakes the pending caller")
+            .is_err());
+        probe.assert_balanced();
+    }
+
+    #[test]
     fn inactive_ordered_window_rejection_precedes_serial_ceiling_for_every_serial() {
+        let rpc_transport = RpcTransportState::new();
+        rpc_transport.mark_current_generation_ready_for_test();
+        let generation = rpc_transport
+            .active_generation()
+            .expect("serial-ceiling test transport starts live");
         let highest_issued = 1;
         let payload = [0x7e; 19];
         for (ident, ordered_window) in [
             (<WindowOrderEventV1 as PduWireIdent>::IDENT, true),
-            (<RenderApplicationResult as PduWireIdent>::IDENT, false),
+            (<Pong as PduWireIdent>::IDENT, false),
         ] {
             let (wire, header_len) = test_opaque_frame(ident, u64::MAX, false, &payload);
             let mut reader = std::io::Cursor::new(wire);
@@ -9266,7 +12211,12 @@ mod tests {
                 &mut reader,
                 None,
                 |header| {
-                    validate_ordinary_mux_inbound_header(header, highest_issued)?;
+                    validate_ordinary_mux_inbound_header(
+                        &rpc_transport,
+                        generation,
+                        header,
+                        highest_issued,
+                    )?;
                     Ok(PduBodyDisposition::Materialize)
                 },
             ))
@@ -9321,11 +12271,18 @@ mod tests {
                 test_opaque_frame(ordered_response_ident, serial.get(), false, &payload);
             let mut reader = std::io::Cursor::new(wire);
             let highest_issued = pending.highest_issued();
+            let generation = pending.generation;
+            let rpc_transport = Arc::clone(&pending.rpc_transport);
             let error = asupersync_block_on(Pdu::decode_async_with_selector(
                 &mut reader,
                 None,
                 |header| {
-                    validate_ordinary_mux_inbound_header(header, highest_issued)?;
+                    validate_ordinary_mux_inbound_header(
+                        &rpc_transport,
+                        generation,
+                        header,
+                        highest_issued,
+                    )?;
                     let correlated_serial = NonZeroU64::new(header.serial())
                         .expect("the response-shaped probe serial is nonzero");
                     let disposition =
@@ -9394,26 +12351,30 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn assert_inactive_ordered_window_transport_rejection(
+    fn run_inbound_protocol_transport_rejection(
         ident: u64,
         use_request_serial: bool,
         compressed: bool,
-    ) {
-        let _watchdog = hang_watchdog(12, "inactive ordered-window transport gate", 95);
+        agreed: usize,
+    ) -> (anyhow::Error, anyhow::Error) {
+        let _watchdog = hang_watchdog(12, "inbound protocol transport gate", 95);
         let (client_stream, mut server_stream) =
-            UnixStream::pair().expect("create ordered-window gate socket pair");
+            UnixStream::pair().expect("create inbound protocol gate socket pair");
         server_stream
             .set_read_timeout(Some(Duration::from_secs(10)))
-            .expect("bound ordered-window gate server reads");
+            .expect("bound inbound protocol gate server reads");
         server_stream
             .set_write_timeout(Some(Duration::from_secs(10)))
-            .expect("bound ordered-window gate server writes");
+            .expect("bound inbound protocol gate server writes");
 
         let rpc_transport = Arc::new(RpcTransportState::new());
         rpc_transport.mark_current_generation_ready_for_test();
         let generation = rpc_transport
             .active_generation()
-            .expect("ordered-window gate transport starts live");
+            .expect("inbound protocol gate transport starts live");
+        rpc_transport.lifecycle.lock().protocol = Some(
+            RpcProtocolAuthority::established_for_test(generation, agreed),
+        );
         rpc_transport
             .bind_render_connection_identity(generation, TEST_RENDER_CONNECTION_IDENTITY)
             .expect("test transport should bind its pre-rejection topology identity");
@@ -9428,23 +12389,23 @@ mod tests {
         let (sender, receiver) = unbounded();
         let (completion_tx, completion_rx) = bounded(1);
         let attempt_id = rpc_transport
-            .allocate_attempt("inactive-ordered-window-transport-probe")
+            .allocate_attempt("inbound-protocol-transport-probe")
             .expect("test transport should allocate its probe attempt");
         sender
             .try_send(ReaderMessage::SendPdu {
                 binding: RpcBinding {
                     generation,
                     attempt_id,
-                    request: "inactive-ordered-window-transport-probe",
+                    request: "inbound-protocol-transport-probe",
                     expected_response_ident: NonZeroU64::new(ident),
                 },
                 pdu: Box::new(Pdu::Ping(Ping {})),
                 promise: completion_tx,
             })
-            .expect("queue ordered-window transport probe");
+            .expect("queue inbound protocol transport probe");
 
         let unix_domain = UnixDomain {
-            name: "inactive-ordered-window-gate".to_string(),
+            name: "inbound-protocol-gate".to_string(),
             no_serve_automatically: true,
             read_timeout: Duration::from_secs(10),
             write_timeout: Duration::from_secs(10),
@@ -9455,13 +12416,13 @@ mod tests {
             Some(Box::new(client_stream)),
         );
         let reader = std::thread::Builder::new()
-            .name("inactive-ordered-window-gate-reader".to_string())
+            .name("inbound-protocol-gate-reader".to_string())
             .spawn(move || {
                 let (result, _reconnectable, _receiver) =
                     client_thread(reconnectable, receiver, dispatch_authority);
                 result
             })
-            .expect("spawn ordered-window gate reader");
+            .expect("spawn inbound protocol gate reader");
 
         let request = Pdu::decode(&mut server_stream)
             .expect("server should receive the probe before its hostile response");
@@ -9471,36 +12432,31 @@ mod tests {
         let payload = [0x3c; 8_192];
         let (frame, _) = test_opaque_frame(ident, response_serial, compressed, &payload);
         Write::write_all(&mut server_stream, &frame)
-            .expect("write hostile ordered-window frame");
-        Write::flush(&mut server_stream).expect("flush hostile ordered-window frame");
+            .expect("write hostile inbound protocol frame");
+        Write::flush(&mut server_stream).expect("flush hostile inbound protocol frame");
 
         let reader_error = reader
             .join()
-            .expect("ordered-window gate reader thread should not panic")
-            .expect_err("inactive ordered-window frame must terminate its reader");
-        assert_eq!(
-            reader_error.downcast_ref::<NotReconnectableError>(),
-            Some(&NotReconnectableError::InactiveOrderedWindowPdu {
-                ident,
-                serial: response_serial,
-                encoded_payload_len: payload.len(),
-                compressed,
-            })
-        );
+            .expect("inbound protocol gate reader thread should not panic")
+            .expect_err("hostile inbound protocol frame must terminate its reader");
 
         let caller_error = completion_rx
             .try_recv()
-            .expect("ordered-window gate must wake its pending caller")
+            .expect("inbound protocol gate must wake its pending caller")
             .expect_err("pending caller must lose authority with the transport");
         assert!(matches!(
             caller_error.downcast_ref::<RpcTransportError>(),
             Some(RpcTransportError::Retired {
-                request: "inactive-ordered-window-transport-probe",
+                request: "inbound-protocol-transport-probe",
                 stage: RpcRetirementStage::AwaitingResponse,
                 certainty: RpcDeliveryCertainty::OutcomeUnknown,
-                reason,
                 ..
-            }) if reason.contains("inactive ordered-window PDU")
+            })
+        ));
+        assert!(matches!(
+            completion_rx.try_recv(),
+            Err(async_channel::TryRecvError::Empty)
+                | Err(async_channel::TryRecvError::Closed)
         ));
         assert_eq!(
             rpc_transport
@@ -9515,6 +12471,11 @@ mod tests {
             "protocol rejection must close RPC admission"
         );
         assert_eq!(
+            rpc_transport.codec_authority(generation),
+            None,
+            "protocol rejection must revoke the generation codec authority"
+        );
+        assert_eq!(
             rpc_transport.render_connection_identity(generation),
             None,
             "protocol rejection must revoke topology/render authority before any mutation"
@@ -9527,6 +12488,35 @@ mod tests {
         assert!(matches!(
             rpc_transport.lifecycle.lock().phase,
             RpcTransportPhase::Reconnecting { retired, .. } if retired == generation
+        ));
+        (reader_error, caller_error)
+    }
+
+    #[cfg(unix)]
+    fn assert_inactive_ordered_window_transport_rejection(
+        ident: u64,
+        use_request_serial: bool,
+        compressed: bool,
+    ) {
+        let (reader_error, caller_error) = run_inbound_protocol_transport_rejection(
+            ident,
+            use_request_serial,
+            compressed,
+            CODEC_VERSION,
+        );
+        assert_eq!(
+            reader_error.downcast_ref::<NotReconnectableError>(),
+            Some(&NotReconnectableError::InactiveOrderedWindowPdu {
+                ident,
+                serial: if use_request_serial { 1 } else { 0 },
+                encoded_payload_len: 8_192,
+                compressed,
+            })
+        );
+        assert!(matches!(
+            caller_error.downcast_ref::<RpcTransportError>(),
+            Some(RpcTransportError::Retired { reason, .. })
+                if reason.contains("inactive ordered-window PDU")
         ));
     }
 
@@ -9548,6 +12538,58 @@ mod tests {
             true,
             false,
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn above_dialect_reply_retires_exact_transport_without_body_or_successor() {
+        let ident = <ListPanesTabStacksResponse as PduWireIdent>::IDENT;
+        let agreed = codec::CODEC_VERSION_MIN_SUPPORTED;
+        assert!(<ListPanesTabStacksResponse as PduWireIdent>::WIRE_SPEC.min_codec_version > agreed);
+        let (reader_error, caller_error) =
+            run_inbound_protocol_transport_rejection(ident, true, true, agreed);
+        assert!(matches!(
+            reader_error.downcast_ref::<NotReconnectableError>(),
+            Some(NotReconnectableError::ProtocolViolation(
+                OrdinaryMuxProtocolError::DialectViolation {
+                    ident: observed_ident,
+                    agreed: observed_agreed,
+                    ..
+                }
+            )) if *observed_ident == ident && *observed_agreed == agreed
+        ));
+        assert!(matches!(
+            caller_error.downcast_ref::<RpcTransportError>(),
+            Some(RpcTransportError::Retired { reason, .. })
+                if reason.contains("requires codec dialect")
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unsolicited_pdu_on_pending_serial_retires_exact_transport_without_successor() {
+        let ident = <PaneRemoved as PduWireIdent>::IDENT;
+        let (reader_error, caller_error) = run_inbound_protocol_transport_rejection(
+            ident,
+            true,
+            false,
+            CODEC_VERSION,
+        );
+        assert!(matches!(
+            reader_error.downcast_ref::<NotReconnectableError>(),
+            Some(NotReconnectableError::ProtocolViolation(
+                OrdinaryMuxProtocolError::DirectionViolation {
+                    ident: observed_ident,
+                    role: PduWireRole::CorrelatedReply,
+                    ..
+                }
+            )) if *observed_ident == ident
+        ));
+        assert!(matches!(
+            caller_error.downcast_ref::<RpcTransportError>(),
+            Some(RpcTransportError::Retired { reason, .. })
+                if reason.contains("does not authorize producer")
+        ));
     }
 
     #[test]
@@ -10293,6 +13335,14 @@ mod tests {
         let (client, receiver) = client_with_bootstrap_rpc_queue();
         let ui = ConnectionUI::new_headless();
         let rejected_codec_version = TOPOLOGY_FENCE_MIN_CODEC_VERSION - 1;
+        let rejected_generation = client
+            .rpc_transport
+            .active_generation()
+            .expect("version-gate test transport starts live");
+        let rejected_reader_abort = client
+            .rpc_transport
+            .reader_abort_for(rejected_generation)
+            .expect("version-gate test has exact reader abort authority");
 
         let (result, transcript) = asupersync_block_on(async {
             let verify = client.verify_version_compat(&ui);
@@ -10324,23 +13374,11 @@ mod tests {
                     .await
                     .expect("version response consumer must remain live");
 
-                let second = receiver
-                    .recv()
-                    .await
-                    .expect("rejected bootstrap must abort its exact generation");
-                assert!(matches!(
-                    second,
-                    ReaderMessage::AbortGeneration {
-                        generation,
-                        reason:
-                            "standalone mux RPC bootstrap failed, timed out, or was cancelled",
-                    } if generation == binding.generation
-                ));
                 assert!(
                     matches!(receiver.try_recv(), Err(async_channel::TryRecvError::Empty)),
                     "version rejection must not enqueue SetClientId, topology, or readiness work"
                 );
-                ["GetCodecVersion", "AbortGeneration"]
+                ["GetCodecVersion"]
             };
             futures::future::join(verify, peer).await
         });
@@ -10354,7 +13392,25 @@ mod tests {
             rejection.minimum_codec_version,
             TOPOLOGY_FENCE_MIN_CODEC_VERSION
         );
-        assert_eq!(transcript, ["GetCodecVersion", "AbortGeneration"]);
+        assert_eq!(transcript, ["GetCodecVersion"]);
+        assert_eq!(
+            rejected_reader_abort.cause(),
+            Some("standalone mux RPC bootstrap failed, timed out, or was cancelled")
+        );
+        assert_eq!(
+            client
+                .rpc_transport
+                .live_generation
+                .load(AtomicOrdering::Acquire),
+            0
+        );
+        assert_eq!(
+            client
+                .rpc_transport
+                .codec_authority(rejected_generation),
+            None,
+            "a compatible-but-pre-fence peer must be rejected before codec authority is retained"
+        );
         assert_eq!(
             client
                 .rpc_transport
@@ -10697,7 +13753,7 @@ mod tests {
                         "unexpected first request"
                     );
                     anyhow::ensure!(
-                        matches!(second.pdu, Pdu::GetCodecVersion(_)),
+                        matches!(second.pdu, Pdu::GetTlsCreds(_)),
                         "unexpected second request"
                     );
                     anyhow::ensure!(
@@ -10724,12 +13780,9 @@ mod tests {
                     })
                     .encode(&mut server_stream, third.serial)
                     .context("encode third response")?;
-                    Pdu::GetCodecVersionResponse(GetCodecVersionResponse {
-                        codec_vers: CODEC_VERSION,
-                        version_string: "ft-rpc-correlation".to_string(),
-                        executable_path: PathBuf::from("/test/ft"),
-                        config_file_path: None,
-                        min_supported: CODEC_VERSION,
+                    Pdu::GetTlsCredsResponse(GetTlsCredsResponse {
+                        ca_cert_pem: "ft-rpc-correlation-ca".to_string(),
+                        client_cert_pem: "ft-rpc-correlation-client".to_string(),
                     })
                     .encode(&mut server_stream, second.serial)
                     .context("encode second response")?;
@@ -10777,6 +13830,13 @@ mod tests {
             Some(Box::new(client_stream)),
         );
         let client = Client::new(None, reconnectable, Weak::new());
+        let generation = client
+            .rpc_transport
+            .active_generation()
+            .expect("abandonment test transport starts live");
+        client.rpc_transport.lifecycle.lock().protocol = Some(
+            RpcProtocolAuthority::established_for_test(generation, CODEC_VERSION),
+        );
 
         let (preclosed_tx, preclosed_rx) = bounded(1);
         drop(preclosed_rx);
@@ -10808,7 +13868,7 @@ mod tests {
                 .sender
                 .send(
                     client
-                        .test_reader_message(Pdu::GetCodecVersion(GetCodecVersion {}), live_two_tx),
+                        .test_reader_message(Pdu::GetTlsCreds(GetTlsCreds {}), live_two_tx),
                 )
                 .await?;
             client
@@ -10836,10 +13896,9 @@ mod tests {
         let second = recv_rpc_with_timeout(&live_two_rx, "second live RPC");
         assert_eq!(fourth, Pdu::Pong(Pong {}));
         match second {
-            Pdu::GetCodecVersionResponse(info) => {
-                assert_eq!(info.codec_vers, CODEC_VERSION);
-                assert_eq!(info.version_string, "ft-rpc-correlation");
-                assert_eq!(info.executable_path, PathBuf::from("/test/ft"));
+            Pdu::GetTlsCredsResponse(info) => {
+                assert_eq!(info.ca_cert_pem, "ft-rpc-correlation-ca");
+                assert_eq!(info.client_cert_pem, "ft-rpc-correlation-client");
             }
             other => panic!(
                 "serial two received the wrong response type: {}",
@@ -11463,32 +14522,86 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_decision_drop_sends_exact_generation_rejection() {
-        let generation = NonZeroU64::new(19).expect("test generation is nonzero");
+    fn rejected_snapshot_ack_is_published_only_after_transport_revocation() {
+        let stream_id = TopologyStreamId::from_bytes([0x54; 16]);
+        let session_incarnation = MuxSessionIncarnation::from_bytes([0xa4; 16]);
         let authority = TopologyFenceAuthority {
-            stream_id: TopologyStreamId::from_bytes([0x54; 16]),
-            session_incarnation: MuxSessionIncarnation::from_bytes([0xa4; 16]),
-            snapshot_revision: TopologyRevision::new(17),
+            stream_id,
+            session_incarnation,
+            snapshot_revision: TopologyRevision::new(13),
         };
-        let (sender, receiver) = unbounded();
+        let mut coordinator = ClientTopologyCoordinator::default();
+        let serial = NonZeroU64::new(4).expect("test serial is nonzero");
+        coordinator
+            .begin_fence(serial)
+            .expect("coherent fence should admit");
+        coordinator
+            .on_response(
+                serial,
+                &coherent_snapshot_response(stream_id, session_incarnation, 13),
+            )
+            .expect("snapshot should await a decision");
+
+        let (client, _receiver) = client_with_idle_rpc_queue();
+        let dispatch_authority = client.test_dispatch_authority(Weak::new());
+        let generation = dispatch_authority
+            .rpc_transport
+            .active_generation()
+            .expect("test transport generation is live");
+        let (promise, acknowledgement_rx): (
+            Sender<anyhow::Result<TopologySnapshotDecisionAck>>,
+            Receiver<anyhow::Result<TopologySnapshotDecisionAck>>,
+        ) = bounded(1);
+        let acknowledgement = coordinator
+            .reject_and_retire_transport(authority, &dispatch_authority)
+            .expect("snapshot rejection should retire its exact transport");
+        promise
+            .try_send(Ok(acknowledgement))
+            .expect("publish typed terminal acknowledgement");
+
+        assert_eq!(
+            acknowledgement_rx
+                .try_recv()
+                .expect("consumer should observe the terminal acknowledgement")
+                .expect("terminal acknowledgement should be successful"),
+            TopologySnapshotDecisionAck::RejectedTerminal
+        );
+        assert_eq!(
+            dispatch_authority
+                .rpc_transport
+                .live_generation
+                .load(AtomicOrdering::Acquire),
+            0,
+            "terminal acknowledgement must not become observable while RPC admission is live"
+        );
+        assert!(matches!(
+            dispatch_authority.rpc_transport.lifecycle.lock().phase,
+            RpcTransportPhase::Reconnecting { retired, .. } if retired == generation
+        ));
+    }
+
+    #[test]
+    fn snapshot_decision_drop_revokes_exact_generation() {
+        let rpc_transport = Arc::new(RpcTransportState::new());
+        let generation = rpc_transport
+            .active_generation()
+            .expect("test generation is live");
+        let reader_abort = rpc_transport
+            .reader_abort_for(generation)
+            .expect("test generation has reader abort authority");
         drop(TopologySnapshotDecisionGuard::new(
-            sender,
-            generation,
-            authority,
+            Arc::clone(&rpc_transport),
+            Arc::clone(&reader_abort),
         ));
 
-        let message = receiver
-            .try_recv()
-            .expect("guard cancellation must enqueue one exact rejection");
-        assert!(matches!(
-            message,
-            ReaderMessage::RejectTopologySnapshot {
-                generation: observed_generation,
-                authority: observed_authority,
-                ..
-            } if observed_generation == generation && observed_authority == authority
-        ));
-        assert!(receiver.try_recv().is_err());
+        assert_eq!(
+            reader_abort.cause(),
+            Some("coherent topology snapshot cancelled after response delivery")
+        );
+        assert_eq!(
+            rpc_transport.live_generation.load(AtomicOrdering::Acquire),
+            0
+        );
     }
 
     #[test]
@@ -11578,41 +14691,29 @@ mod tests {
             "delivering a snapshot is not readiness authority"
         );
 
-        let (decision_tx, decision_rx) = unbounded();
+        let reader_abort = pending
+            .rpc_transport
+            .reader_abort_for(generation)
+            .expect("pending topology response has reader abort authority");
         drop(TopologySnapshotDecisionGuard::new(
-            decision_tx,
-            generation,
-            authority,
+            Arc::clone(&pending.rpc_transport),
+            Arc::clone(&reader_abort),
         ));
-        let rejection = decision_rx
-            .try_recv()
-            .expect("cancelled consumer must reject one exact delivered authority");
-        let ReaderMessage::RejectTopologySnapshot {
-            generation: rejected_generation,
-            authority: rejected_authority,
-            promise,
-        } = rejection
-        else {
-            panic!("cancelled delivered snapshot must enqueue a rejection");
+        assert_eq!(
+            reader_abort.cause(),
+            Some("coherent topology snapshot cancelled after response delivery")
+        );
+        let ClientTopologyPhase::AwaitingCommit(awaiting) = &topology.phase else {
+            panic!("reader-local topology state must remain unpruned until teardown");
         };
-        assert_eq!(rejected_generation, generation);
-        assert_eq!(rejected_authority, authority);
-        topology
-            .reject(rejected_authority)
-            .expect("reader must accept the exact cancellation authority");
         assert!(
-            matches!(promise.try_send(Ok(())), Err(TrySendError::Closed(_))),
-            "the dropped consumer must not retain an acknowledgement receiver"
+            awaiting
+                .events
+                .events
+                .contains_key(&authority.snapshot_revision),
+            "direct cancellation must not authorize snapshot-covered pruning"
         );
-        assert!(decision_rx.try_recv().is_err());
-        assert!(matches!(topology.phase, ClientTopologyPhase::Closed));
-        assert!(
-            topology
-                .on_unilateral(stamped_title_event(stream_id, 18, "too-late"))
-                .expect_err("terminal rejection must forbid every later topology frame")
-                .to_string()
-                .contains("closed")
-        );
+        drop(topology);
 
         assert!(pending.map.is_empty());
         assert_eq!(probe.pending(), 0.0);
@@ -11632,21 +14733,26 @@ mod tests {
 
     #[test]
     fn snapshot_request_drop_aborts_its_exact_generation() {
-        let generation = NonZeroU64::new(20).expect("test generation is nonzero");
-        let (sender, receiver) = unbounded();
-        drop(TopologySnapshotRequestGuard::new(sender, generation));
-
-        let message = receiver
-            .try_recv()
-            .expect("request cancellation must enqueue one generation abort");
-        assert!(matches!(
-            message,
-            ReaderMessage::AbortGeneration {
-                generation: observed_generation,
-                reason: "coherent topology snapshot cancelled before exact consumer decision",
-            } if observed_generation == generation
+        let rpc_transport = Arc::new(RpcTransportState::new());
+        let generation = rpc_transport
+            .active_generation()
+            .expect("test generation is live");
+        let reader_abort = rpc_transport
+            .reader_abort_for(generation)
+            .expect("test generation has reader abort authority");
+        drop(TopologySnapshotRequestGuard::new(
+            Arc::clone(&rpc_transport),
+            Arc::clone(&reader_abort),
         ));
-        assert!(receiver.try_recv().is_err());
+
+        assert_eq!(
+            reader_abort.cause(),
+            Some("coherent topology snapshot cancelled before exact consumer decision")
+        );
+        assert_eq!(
+            rpc_transport.live_generation.load(AtomicOrdering::Acquire),
+            0
+        );
     }
 
     #[test]
@@ -12131,6 +15237,38 @@ mod tests {
             unilateral(Pdu::PaneRemoved(PaneRemoved { pane_id: 9 })),
         )
         .expect_err("the current standalone transport retains topology classification");
+    }
+
+    #[test]
+    fn generation_abort_revokes_unilateral_dispatch_before_reader_teardown() {
+        let authority = standalone_dispatch_authority();
+        let generation = authority
+            .rpc_transport
+            .active_generation()
+            .expect("standalone test transport is live");
+        let reader_abort = authority
+            .rpc_transport
+            .reader_abort_for(generation)
+            .expect("live generation has exact reader abort authority");
+        assert!(authority.generation_is_current());
+
+        assert!(authority.rpc_transport.request_generation_abort(
+            &reader_abort,
+            "test cancellation before reader teardown",
+        ));
+        assert!(
+            authority.generation_is_current(),
+            "identity authority must remain current so final detach can resolve its owner"
+        );
+        assert!(
+            !authority.rpc_generation_is_live(),
+            "revoked live authority must fence main-thread mutation before generation advance"
+        );
+        process_unilateral(
+            &authority,
+            unilateral(Pdu::PaneRemoved(PaneRemoved { pane_id: 9 })),
+        )
+        .expect("a unilateral queued before cancellation must be discarded after revocation");
     }
 
     #[test]

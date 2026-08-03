@@ -2856,6 +2856,12 @@ impl SessionHandler {
                      was activated for this connection"
                 )));
             }
+            Pdu::GetPaneRenderDeliveryV1(_) => {
+                send_response(Err(anyhow!(
+                    "exact render-delivery request received before its live retention and \
+                     settlement coordinator was activated for this connection"
+                )));
+            }
             Pdu::Invalid { .. } => send_response(Err(anyhow!("invalid PDU {:?}", decoded.pdu))),
             Pdu::Pong { .. }
             | Pdu::ListPanesResponse { .. }
@@ -2864,6 +2870,7 @@ impl SessionHandler {
             | Pdu::ListPanesOrderedV1Response { .. }
             | Pdu::ReorderWindowTabsV1Response { .. }
             | Pdu::WindowOrderEventV1 { .. }
+            | Pdu::GetPaneRenderDeliveryV1Response { .. }
             | Pdu::SetClipboard { .. }
             | Pdu::NotifyAlert { .. }
             | Pdu::SpawnResponse { .. }
@@ -4834,6 +4841,82 @@ mod tests {
                 reason.contains("before its live capability was activated"),
                 "ordered-window request must retain the fail-closed activation reason, got: \
                  {reason}"
+            ),
+            other => panic!("expected ErrorResponse, got {other:?}"),
+        }
+    }
+
+    fn exact_render_request_for_session_test() -> codec::GetPaneRenderDeliveryV1 {
+        codec::GetPaneRenderDeliveryV1 {
+            protocol_version: codec::EXACT_RENDER_DELIVERY_PROTOCOL_VERSION,
+            identity: codec::ExactRenderDeliveryRequestIdentity {
+                connection_identity: codec::RenderConnectionIdentity::new(
+                    TopologyStreamId::from_bytes([0x91; 16]),
+                    mux::MuxSessionIncarnation::from_bytes([0x52; 16]),
+                ),
+                pane_id: codec::ExactRenderPaneId::new(0),
+                request_sequence: codec::ExactRenderRequestSequence::try_new(1)
+                    .expect("test exact-render request sequence is nonzero"),
+            },
+            request_digest: codec::ExactRenderDigest::ZERO,
+            applied_baseline: codec::ExactRenderAppliedBaseline::Uninitialized,
+            settlement: None,
+            mode: codec::ExactRenderDeliveryMode::ForceFull,
+            receiver_caps: codec::ExactRenderReceiverCaps::protocol_maximum(),
+            continuation: None,
+        }
+        .with_computed_request_digest()
+        .expect("test exact-render request digest should compute")
+    }
+
+    #[test]
+    fn exact_render_request_fails_closed_until_live_retention_activation() {
+        let (sender, captured) = capturing_sender();
+        let mut handler = SessionHandler::new(sender);
+
+        handler.process_one(DecodedPdu {
+            serial: 202,
+            pdu: Pdu::GetPaneRenderDeliveryV1(exact_render_request_for_session_test()),
+        });
+
+        let response = take_response(&captured);
+        assert_eq!(response.serial, 202);
+        match response.pdu {
+            Pdu::ErrorResponse(ErrorResponse { reason }) => assert!(
+                reason.contains("live retention and settlement coordinator"),
+                "exact-render request must retain its fail-closed activation reason, got: \
+                 {reason}"
+            ),
+            other => panic!("expected ErrorResponse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn exact_render_response_is_treated_as_unexpected_client_request() {
+        let (sender, captured) = capturing_sender();
+        let mut handler = SessionHandler::new(sender);
+        let request = exact_render_request_for_session_test();
+
+        handler.process_one(DecodedPdu {
+            serial: 203,
+            pdu: Pdu::GetPaneRenderDeliveryV1Response(
+                codec::GetPaneRenderDeliveryV1Response {
+                    protocol_version: codec::EXACT_RENDER_DELIVERY_PROTOCOL_VERSION,
+                    request_identity: request.identity,
+                    request_digest: request.request_digest,
+                    outcome: codec::ExactRenderDeliveryOutcomeV1::PaneRemoved {
+                        last_pane_generation: None,
+                    },
+                },
+            ),
+        });
+
+        let response = take_response(&captured);
+        assert_eq!(response.serial, 203);
+        match response.pdu {
+            Pdu::ErrorResponse(ErrorResponse { reason }) => assert!(
+                reason.contains("expected a request"),
+                "exact-render server response must be rejected as client input, got: {reason}"
             ),
             other => panic!("expected ErrorResponse, got {other:?}"),
         }
