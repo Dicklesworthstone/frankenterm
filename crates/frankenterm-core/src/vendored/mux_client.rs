@@ -25,7 +25,8 @@ use codec::{
     GetPaneRenderChangesResponse, GetSemanticZones, GetSemanticZonesResponse, ListPanes,
     ListPanesResponse, MoveFloatingPane, Pdu, RemoveFloatingPane, Resize, SelectStackPane,
     SendPaste, SetClientId, SetFloatingPaneZ, SetLayoutCycle, SpawnResponse, SpawnV2, SplitPane,
-    SwapToLayout, ToggleFloatingPane, UnitResponse, UpdatePaneConstraints, WriteToPane,
+    StreamingPduBuffer, SwapToLayout, ToggleFloatingPane, UnitResponse, UpdatePaneConstraints,
+    WriteToPane,
 };
 use config as wezterm_config;
 use frankenterm_term::TerminalSize;
@@ -388,7 +389,7 @@ pub struct DirectMuxClient {
     connection_id: u64,
     stream: UnixStream,
     socket_path: PathBuf,
-    read_buf: Vec<u8>,
+    read_buf: StreamingPduBuffer,
     serial: u64,
     outstanding_requests: HashSet<u64>,
     pending_responses: HashMap<u64, RetainedMuxPdu>,
@@ -866,7 +867,7 @@ impl DirectMuxClient {
             stream,
             compression_mode,
             socket_path,
-            read_buf: Vec::new(),
+            read_buf: StreamingPduBuffer::new(),
             serial: 0,
             outstanding_requests: HashSet::new(),
             pending_responses: HashMap::new(),
@@ -2018,7 +2019,7 @@ impl DirectMuxClient {
         self.pending_render_change_bytes = 0;
         self.render_change_snapshots = HashMap::new();
         self.render_change_snapshot_bytes = 0;
-        self.read_buf = Vec::new();
+        self.read_buf = StreamingPduBuffer::new();
     }
 
     fn ensure_outstanding_request_slots(&self, additional: usize) -> Result<(), DirectMuxError> {
@@ -3051,7 +3052,7 @@ fn take_in_flight_slot(in_flight: &mut VecDeque<(usize, u64)>, serial: u64) -> O
 }
 
 fn decode_from_buffer(
-    buffer: &mut Vec<u8>,
+    buffer: &mut StreamingPduBuffer,
     max_frame_bytes: usize,
 ) -> Result<Option<DecodedPdu>, DirectMuxError> {
     if buffer.len() > max_frame_bytes {
@@ -3795,7 +3796,7 @@ mod tests {
         let pdu = Pdu::Ping(codec::Ping {});
         pdu.encode(&mut buf, 42).expect("encode should succeed");
 
-        let mut partial = buf[..buf.len() / 2].to_vec();
+        let mut partial = StreamingPduBuffer::from(buf[..buf.len() / 2].to_vec());
         let result = decode_from_buffer(&mut partial, 1024).expect("decode should not error");
         assert!(result.is_none());
 
@@ -3808,7 +3809,7 @@ mod tests {
 
     #[test]
     fn decode_from_buffer_rejects_oversize() {
-        let mut buf = vec![0u8; 10];
+        let mut buf = StreamingPduBuffer::from(vec![0u8; 10]);
         let err = decode_from_buffer(&mut buf, 4).expect_err("should reject oversize buffer");
         match err {
             DirectMuxError::FrameTooLarge { .. } => {}
