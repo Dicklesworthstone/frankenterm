@@ -6704,6 +6704,7 @@ mod tests {
     };
     use metrics::atomics::AtomicU64 as MetricAtomicU64;
     use metrics::{Counter, Gauge};
+    use mux::tab::{PaneEntry, PaneNode};
     use std::fmt;
     #[cfg(unix)]
     use std::os::unix::net::UnixListener;
@@ -6713,6 +6714,7 @@ mod tests {
     use std::sync::{Mutex as StdMutex, Once};
     #[cfg(unix)]
     use std::time::{SystemTime, UNIX_EPOCH};
+    use wezterm_term::TerminalSize;
 
     static TEST_LOGGER: TestLogger = TestLogger {
         records: StdMutex::new(Vec::new()),
@@ -10683,6 +10685,49 @@ mod tests {
         })
     }
 
+    fn same_numeric_id_snapshot_response(
+        stream_id: TopologyStreamId,
+        session_incarnation: MuxSessionIncarnation,
+        snapshot_revision: u64,
+        label: &str,
+    ) -> Pdu {
+        Pdu::ListPanesCoherentResponse(ListPanesCoherentResponse {
+            negotiated: TopologyCapabilities::FENCED_SNAPSHOT_V1,
+            stream_id,
+            outcome: ListPanesCoherentOutcome::Snapshot(CoherentPaneSnapshot {
+                session_incarnation,
+                snapshot_revision: TopologyRevision::new(snapshot_revision),
+                panes: ListPanesResponse {
+                    tabs: vec![PaneNode::Leaf(PaneEntry {
+                        window_id: 41,
+                        tab_id: 51,
+                        pane_id: 61,
+                        title: format!("{label} pane"),
+                        size: TerminalSize {
+                            cols: 120,
+                            rows: 40,
+                            pixel_width: 1_200,
+                            pixel_height: 800,
+                            dpi: 96,
+                        },
+                        working_dir: None,
+                        alt_screen_active: false,
+                        is_active_pane: true,
+                        is_zoomed_pane: false,
+                        workspace: "ops".to_string(),
+                        cursor_pos: mux::renderable::StableCursorPosition::default(),
+                        physical_top: 0,
+                        top_row: 0,
+                        left_col: 0,
+                        tty_name: None,
+                    })],
+                    tab_titles: vec![format!("{label} tab")],
+                    window_titles: HashMap::from([(41, format!("{label} window"))]),
+                },
+            }),
+        })
+    }
+
     fn stamped_title_event(
         stream_id: TopologyStreamId,
         revision: u64,
@@ -11048,7 +11093,10 @@ mod tests {
         topology
             .reject(rejected_authority)
             .expect("reader must accept the exact cancellation authority");
-        let _ = promise.try_send(Ok(()));
+        assert!(
+            matches!(promise.try_send(Ok(())), Err(TrySendError::Closed(_))),
+            "the dropped consumer must not retain an acknowledgement receiver"
+        );
         assert!(decision_rx.try_recv().is_err());
         assert!(matches!(topology.phase, ClientTopologyPhase::Closed));
         assert!(
@@ -11230,6 +11278,190 @@ mod tests {
         assert_ne!(
             first_authority.session_incarnation,
             second_authority.session_incarnation
+        );
+    }
+
+    #[test]
+    fn reused_numeric_ids_cannot_carry_stale_topology_into_a_new_session_incarnation() {
+        let old_stream = TopologyStreamId::from_bytes([0x6a; 16]);
+        let new_stream = TopologyStreamId::from_bytes([0x6b; 16]);
+        let old_session = MuxSessionIncarnation::from_bytes([0xba; 16]);
+        let new_session = MuxSessionIncarnation::from_bytes([0xbb; 16]);
+        let old_snapshot = same_numeric_id_snapshot_response(old_stream, old_session, 0, "old");
+        let new_snapshot = same_numeric_id_snapshot_response(new_stream, new_session, 0, "new");
+
+        let numeric_ids = |response: &Pdu| {
+            let Pdu::ListPanesCoherentResponse(ListPanesCoherentResponse {
+                outcome: ListPanesCoherentOutcome::Snapshot(snapshot),
+                ..
+            }) = response
+            else {
+                panic!("same-ID helper must return a coherent snapshot");
+            };
+            let [PaneNode::Leaf(entry)] = snapshot.panes.tabs.as_slice() else {
+                panic!("same-ID helper must return one leaf pane");
+            };
+            (entry.window_id, entry.tab_id, entry.pane_id)
+        };
+        assert_eq!(numeric_ids(&old_snapshot), (41, 51, 61));
+        assert_eq!(numeric_ids(&new_snapshot), (41, 51, 61));
+
+        let establish = |serial: u64, response: &Pdu| {
+            let Pdu::ListPanesCoherentResponse(response_body) = response else {
+                panic!("establishment requires a coherent response");
+            };
+            let authority = TopologyFenceAuthority::from_response(response_body)
+                .expect("snapshot must carry valid authority");
+            let mut coordinator = ClientTopologyCoordinator::default();
+            let serial = NonZeroU64::new(serial).expect("test serial is nonzero");
+            coordinator
+                .begin_fence(serial)
+                .expect("initial coherent fence should admit");
+            assert!(matches!(
+                coordinator
+                    .on_response(serial, response)
+                    .expect("snapshot should await its exact commit"),
+                ClientTopologyResponseAction::AwaitCommit
+            ));
+            assert!(
+                coordinator
+                    .commit(authority)
+                    .expect("snapshot should establish its connection-scoped stream")
+                    .is_empty()
+            );
+            (coordinator, authority)
+        };
+        let (mut old_topology, old_authority) = establish(1, &old_snapshot);
+        let (mut new_topology, new_authority) = establish(1, &new_snapshot);
+        assert_ne!(old_authority.stream_id, new_authority.stream_id);
+        assert_ne!(
+            old_authority.session_incarnation,
+            new_authority.session_incarnation
+        );
+
+        let (client, rpc_queue) = client_with_idle_rpc_queue();
+        let retired_dispatch = client.test_dispatch_authority(Weak::new());
+        let successor_dispatch = retired_dispatch
+            .advance_generation(&rpc_queue)
+            .expect("reconnect should mint one successor generation");
+        successor_dispatch
+            .activate_rpc_transport()
+            .expect("successor generation should become live but remain unready");
+        assert!(!retired_dispatch.generation_is_current());
+        assert!(successor_dispatch.generation_is_current());
+        assert_eq!(
+            client
+                .rpc_transport
+                .ready_generation
+                .load(AtomicOrdering::Acquire),
+            0,
+            "a new incarnation must not inherit readiness from the retired connection"
+        );
+
+        let new_fence_serial = NonZeroU64::new(2).expect("test serial is nonzero");
+        new_topology
+            .begin_fence(new_fence_serial)
+            .expect("new incarnation should admit its own resnapshot");
+        assert!(matches!(
+            new_topology
+                .on_unilateral(unilateral(Pdu::TopologyEvent(TopologyEvent {
+                    stream_id: new_stream,
+                    revision: TopologyRevision::new(2),
+                    event: TopologyEventKind::PaneFocused { pane_id: 61 },
+                })))
+                .expect("new-stream event should remain buffered behind its missing predecessor"),
+            ClientTopologyUnilateralAction::Buffered
+        ));
+
+        let new_state = |coordinator: &ClientTopologyCoordinator| {
+            let ClientTopologyPhase::Fencing(ClientTopologyFenceInFlight {
+                prior: ClientTopologyPrior::Established(established),
+                ..
+            }) = &coordinator.phase
+            else {
+                panic!("new incarnation must retain its established stream behind the fence");
+            };
+            let retained = established
+                .events
+                .events
+                .get(&TopologyRevision::new(2))
+                .expect("new incarnation must retain its revision-2 event");
+            assert!(matches!(
+                &retained.event.event,
+                TopologyEventKind::PaneFocused { pane_id: 61 }
+            ));
+            (
+                established.authority,
+                established.next_revision,
+                established.events.events.len(),
+                established.events.retained_bytes,
+            )
+        };
+        let before_stale_delivery = new_state(&new_topology);
+
+        let late_old_serial = NonZeroU64::new(2).expect("test serial is nonzero");
+        old_topology
+            .begin_fence(late_old_serial)
+            .expect("retired reader owns its own late resnapshot fence");
+        let late_old_snapshot =
+            same_numeric_id_snapshot_response(old_stream, old_session, 1, "late-old");
+        assert!(matches!(
+            old_topology
+                .on_response(late_old_serial, &late_old_snapshot)
+                .expect("late old snapshot remains confined to the retired coordinator"),
+            ClientTopologyResponseAction::AwaitCommit
+        ));
+        let late_old_authority = match &late_old_snapshot {
+            Pdu::ListPanesCoherentResponse(response) => {
+                TopologyFenceAuthority::from_response(response)
+                    .expect("late old snapshot authority should remain well formed")
+            }
+            _ => unreachable!("same-ID helper always returns a coherent response"),
+        };
+        assert!(
+            old_topology
+                .commit(late_old_authority)
+                .expect("retired coordinator may settle only its own snapshot")
+                .is_empty()
+        );
+        assert_eq!(
+            new_state(&new_topology),
+            before_stale_delivery,
+            "a late old-session snapshot must not mutate or prune successor state"
+        );
+
+        let stale_event_error = new_topology
+            .on_unilateral(unilateral(Pdu::TopologyEvent(TopologyEvent {
+                stream_id: old_stream,
+                revision: TopologyRevision::new(2),
+                event: TopologyEventKind::TabAddedToWindow {
+                    tab_id: 51,
+                    window_id: 41,
+                },
+            })))
+            .expect_err("an old-session event must not target reused successor identifiers");
+        assert!(
+            stale_event_error
+                .to_string()
+                .contains("wrong established stream identity")
+        );
+        assert_eq!(
+            new_state(&new_topology),
+            before_stale_delivery,
+            "a rejected stale event must not mutate or prune successor state"
+        );
+        process_unilateral(
+            &retired_dispatch,
+            unilateral(Pdu::PaneRemoved(PaneRemoved { pane_id: 61 })),
+        )
+        .expect("retired dispatch must discard queued work for the reused pane id");
+        assert_eq!(
+            client
+                .rpc_transport
+                .ready_generation
+                .load(AtomicOrdering::Acquire),
+            0,
+            "stale same-ID work must never publish successor readiness"
         );
     }
 
