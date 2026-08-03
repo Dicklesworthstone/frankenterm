@@ -3319,8 +3319,8 @@ impl StreamIngester {
         // If this pane has pending overflow, emit GAP first
         if self.overflow_pending.remove(&pane_id) {
             let gap = cursor.emit_gap("stream_overflow");
-            self.gaps_emitted += 1;
-            self.segments_emitted += 1;
+            self.gaps_emitted = self.gaps_emitted.saturating_add(1);
+            self.segments_emitted = self.segments_emitted.saturating_add(1);
             segments.push(gap);
         }
 
@@ -3333,7 +3333,7 @@ impl StreamIngester {
         // Emit the delta segment via PaneCursor (bypasses snapshot diff,
         // since streaming gives us actual deltas directly)
         let seg = cursor.capture_delta(data, received_at);
-        self.segments_emitted += 1;
+        self.segments_emitted = self.segments_emitted.saturating_add(1);
         segments.push(seg);
 
         segments
@@ -3345,8 +3345,8 @@ impl StreamIngester {
         // If we have a cursor for this pane, emit a final gap marking the close
         if let Some(mut cursor) = self.cursors.remove(&pane_id) {
             let gap = cursor.emit_gap("pane_closed");
-            self.gaps_emitted += 1;
-            self.segments_emitted += 1;
+            self.gaps_emitted = self.gaps_emitted.saturating_add(1);
+            self.segments_emitted = self.segments_emitted.saturating_add(1);
             vec![gap]
         } else {
             vec![]
@@ -3360,8 +3360,8 @@ impl StreamIngester {
         // Emit a GAP for every active pane
         for cursor in self.cursors.values_mut() {
             let gap = cursor.emit_gap(&gap_reason);
-            self.gaps_emitted += 1;
-            self.segments_emitted += 1;
+            self.gaps_emitted = self.gaps_emitted.saturating_add(1);
+            self.segments_emitted = self.segments_emitted.saturating_add(1);
             segments.push(gap);
         }
 
@@ -7195,6 +7195,40 @@ mod tests {
         assert_eq!(segs[0].content, "line1\n");
         assert_eq!(segs[0].kind, CapturedSegmentKind::Delta);
         assert_eq!(segs[0].captured_at, 100);
+    }
+
+    #[test]
+    fn ingester_empty_nonoverflow_output_emits_nothing_and_does_not_create_cursor() {
+        let mut ingester = StreamIngester::new();
+        let segments = ingester.process(StreamEvent::OutputData {
+            pane_id: 41,
+            data: String::new(),
+            received_at: 100,
+            overflow: false,
+        });
+
+        assert!(segments.is_empty());
+        assert_eq!(ingester.active_panes(), 0);
+        assert_eq!(ingester.total_segments(), 0);
+        assert_eq!(ingester.total_gaps(), 0);
+    }
+
+    #[test]
+    fn ingester_diagnostic_counters_saturate() {
+        let mut ingester = StreamIngester::new();
+        ingester.segments_emitted = u64::MAX;
+        ingester.gaps_emitted = u64::MAX;
+
+        let segments = ingester.process(StreamEvent::OutputData {
+            pane_id: 43,
+            data: "payload".to_string(),
+            received_at: 100,
+            overflow: true,
+        });
+
+        assert_eq!(segments.len(), 2);
+        assert_eq!(ingester.total_segments(), u64::MAX);
+        assert_eq!(ingester.total_gaps(), u64::MAX);
     }
 
     // --- Property: seq monotonicity ---

@@ -10178,6 +10178,44 @@ mod tests {
 
     #[cfg(all(feature = "vendored", unix))]
     #[test]
+    fn forward_vendored_streaming_empty_projection_emits_no_capture_event() {
+        run_async_test(async {
+            let (capture_tx, mut capture_rx) = mpsc::channel(1);
+            let loop_cx = runtime_loop_cx();
+            let mut bridge = StreamingBridge::new();
+            let lease = test_capture_lease(19, CaptureSourceKind::VendoredStreaming);
+            let identity = test_streaming_identity(19, 19, 0, 0, &lease);
+
+            let exit_reason = forward_vendored_streaming_delta(
+                &loop_cx,
+                &mut bridge,
+                &capture_tx,
+                &identity,
+                &lease,
+                PaneDelta::Output {
+                    pane_id: 19,
+                    seqno: 7,
+                    delta_text: String::new(),
+                    title: "metadata-only".to_string(),
+                    dirty_range_count: 2,
+                    dirty_row_count: 6,
+                },
+            )
+            .await;
+
+            assert!(exit_reason.is_none());
+            assert!(capture_rx.try_recv().is_err());
+            assert_eq!(bridge.events_processed(), 1);
+            assert_eq!(bridge.ingester().active_panes(), 0);
+            assert_eq!(
+                bridge.render_metadata(19).map(|metadata| metadata.title.as_str()),
+                Some("metadata-only")
+            );
+        });
+    }
+
+    #[cfg(all(feature = "vendored", unix))]
+    #[test]
     fn forward_vendored_streaming_delta_returns_end_reason_and_emits_close_gap() {
         run_async_test(async {
             let (capture_tx, mut capture_rx) = mpsc::channel(4);

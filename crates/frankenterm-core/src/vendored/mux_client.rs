@@ -4726,20 +4726,25 @@ async fn unix_stream_read_with_cx(
 // PaneOutputSubscription: stream pane output as deltas (wa-nu4.4.2.2)
 // ---------------------------------------------------------------------------
 
-/// A delta event from a pane's output, compatible with the seq/gap model.
+/// A delta event from a pane's output, compatible with the capture gap model.
 #[derive(Debug, Clone)]
 pub enum PaneDelta {
     /// New content was rendered (dirty lines changed).
     Output {
         pane_id: u64,
-        /// Mux-side sequence number from `GetPaneRenderChangesResponse`.
+        /// Mux-side terminal mutation version from
+        /// `GetPaneRenderChangesResponse`.
+        ///
+        /// This is diagnostic source state, not a contiguous delivery
+        /// sequence. Multiple terminal mutations between polls can advance it
+        /// by more than one without any transport loss.
         seqno: u64,
         /// Best-effort UTF-8 text extracted from render-change bonus lines.
         ///
         /// This is the closest available approximation to output deltas using
         /// `GetPaneRenderChanges` polling. It may be empty when no bonus lines
-        /// are present, in which case downstream can fall back to metadata-only
-        /// handling.
+        /// are present. Downstream must retain that as typed metadata-only
+        /// activity and must not fabricate terminal output bytes.
         delta_text: String,
         /// Title of the pane at the time of the delta.
         title: String,
@@ -4748,7 +4753,8 @@ pub enum PaneDelta {
         /// Total number of dirty rows across all ranges.
         dirty_row_count: usize,
     },
-    /// A gap was detected (polling too slow or reconnect).
+    /// A proven capture-delivery gap was detected (for example, bounded-channel
+    /// overflow or reconnect without an exact recovery baseline).
     Gap { pane_id: u64, reason: String },
     /// Subscription ended (pane closed, shutdown, or error).
     Ended { pane_id: u64, reason: String },
@@ -4852,8 +4858,6 @@ async fn run_subscription_loop(
     tx: mpsc::Sender<PaneDelta>,
     mut cancel_rx: watch::Receiver<bool>,
 ) {
-    let mut last_seqno: Option<u64> = None;
-
     loop {
         if cx.checkpoint().is_err() {
             pane_delta_try_emit_ended(&tx, pane_id, "cancelled");
@@ -4871,24 +4875,6 @@ async fn run_subscription_loop(
             Ok(changes) => {
                 let seqno = changes.seqno as u64;
                 let has_dirty = !changes.dirty_lines.is_empty();
-
-                if let Some(prev) = last_seqno {
-                    if seqno > prev + 1 {
-                        let _ = pane_delta_try_send(
-                            &tx,
-                            PaneDelta::Gap {
-                                pane_id,
-                                reason: format!(
-                                    "seqno jump: {} -> {} (missed {})",
-                                    prev,
-                                    seqno,
-                                    seqno - prev - 1
-                                ),
-                            },
-                        );
-                    }
-                }
-                last_seqno = Some(seqno);
 
                 if has_dirty {
                     let delta_text = bonus_lines_to_text(changes.bonus_lines);
@@ -5054,8 +5040,9 @@ impl Drop for PaneOutputSubscription {
 /// `PaneDelta` events through a bounded channel. Dropping the returned
 /// `PaneOutputSubscription` cancels the background poller.
 ///
-/// The poller tracks the last seen `seqno` and emits a `PaneDelta::Gap`
-/// if the mux-side seqno jumps by more than 1.
+/// The mux-side terminal mutation `seqno` is retained on each output event for
+/// diagnostics only. It is not a delivery counter, so ordinary jumps between
+/// polls never imply a [`PaneDelta::Gap`].
 #[allow(dead_code)]
 pub fn subscribe_pane_output_with_cx(
     handle: &RuntimeHandle,
@@ -5113,12 +5100,15 @@ pub fn subscribe_pane_output(
 fn total_dirty_rows(ranges: &[std::ops::Range<isize>]) -> usize {
     ranges.iter().fold(0usize, |acc, range| {
         let span = if range.end > range.start {
-            range.end - range.start
+            range
+                .end
+                .checked_sub(range.start)
+                .and_then(|span| usize::try_from(span).ok())
+                .unwrap_or(usize::MAX)
         } else {
             0
         };
-        let span_usize = usize::try_from(span).unwrap_or(usize::MAX);
-        acc.saturating_add(span_usize)
+        acc.saturating_add(span)
     })
 }
 
@@ -13952,6 +13942,12 @@ mod tests {
     }
 
     #[test]
+    fn total_dirty_rows_saturates_for_extreme_signed_range() {
+        let ranges = vec![isize::MIN..isize::MAX, 0..1];
+        assert_eq!(total_dirty_rows(&ranges), usize::MAX);
+    }
+
+    #[test]
     fn pane_delta_output_debug_format() {
         let delta = PaneDelta::Output {
             pane_id: 42,
@@ -13971,11 +13967,11 @@ mod tests {
     fn pane_delta_gap_debug_format() {
         let delta = PaneDelta::Gap {
             pane_id: 1,
-            reason: "seqno jump".to_string(),
+            reason: "bounded channel loss".to_string(),
         };
         let dbg = format!("{delta:?}");
         assert!(dbg.contains("Gap"));
-        assert!(dbg.contains("seqno jump"));
+        assert!(dbg.contains("bounded channel loss"));
     }
 
     #[test]
@@ -14671,10 +14667,10 @@ mod tests {
     }
 
     #[test]
-    fn subscription_emits_gap_when_seqno_jumps() {
+    fn subscription_terminal_seqno_jump_does_not_emit_delivery_gap() {
         run_async_test(async {
             let temp_dir = tempfile::tempdir().expect("tempdir");
-            let socket_path = temp_dir.path().join("seqno-gap.sock");
+            let socket_path = temp_dir.path().join("terminal-seqno-jump.sock");
             let listener = compat_unix::bind(&socket_path).await.expect("bind");
 
             task::spawn(async move {
@@ -14757,31 +14753,32 @@ mod tests {
             );
 
             let mut saw_seq1 = false;
-            let mut saw_gap = false;
             let mut saw_seq4 = false;
+            let mut unexpected_gap = None;
 
             for _ in 0..30 {
                 match timeout(Duration::from_millis(200), sub.next()).await {
                     Ok(Some(PaneDelta::Output { seqno: 1, .. })) => saw_seq1 = true,
                     Ok(Some(PaneDelta::Output { seqno: 4, .. })) => saw_seq4 = true,
                     Ok(Some(PaneDelta::Gap { reason, .. })) => {
-                        if reason.contains("seqno jump: 1 -> 4") && reason.contains("missed 2") {
-                            saw_gap = true;
-                        }
+                        unexpected_gap = Some(reason);
                     }
                     Ok(Some(_)) => {}
                     Ok(None) => break,
                     Err(_) => {}
                 }
 
-                if saw_seq1 && saw_gap && saw_seq4 {
+                if saw_seq1 && saw_seq4 {
                     break;
                 }
             }
 
             assert!(saw_seq1, "expected first output event at seqno=1");
-            assert!(saw_gap, "expected gap event for seqno jump 1 -> 4");
             assert!(saw_seq4, "expected second output event at seqno=4");
+            assert!(
+                unexpected_gap.is_none(),
+                "terminal mutation seqno jump must not imply delivery loss: {unexpected_gap:?}"
+            );
             timeout(Duration::from_millis(500), sub.shutdown())
                 .await
                 .expect("shutdown should finish promptly");
@@ -15172,10 +15169,10 @@ mod tests {
     }
 
     #[test]
-    fn subscription_cancel_closes_connection_when_seq_gap_emit_is_backpressured() {
+    fn subscription_cancel_closes_connection_when_output_channel_is_full() {
         run_async_test(async {
             let temp_dir = tempfile::tempdir().expect("tempdir");
-            let socket_path = temp_dir.path().join("cancel-gap-backpressure.sock");
+            let socket_path = temp_dir.path().join("cancel-full-output-channel.sock");
             let listener = compat_unix::bind(&socket_path).await.expect("bind");
 
             let render_request_count = Arc::new(AtomicUsize::new(0));
@@ -15220,10 +15217,10 @@ mod tests {
                                 let (seqno, dirty_lines) = if request_number == 1 {
                                     (1, std::iter::once(0isize..1isize).collect())
                                 } else {
-                                    // Force a seqno jump with no dirty output. This drives
-                                    // the poller through the gap-emission path while the
-                                    // bounded channel is already full.
-                                    (3, Vec::new())
+                                    // Keep polling while the first output event occupies
+                                    // the bounded channel. Cancellation must remain
+                                    // independent of receiver progress.
+                                    (2, Vec::new())
                                 };
                                 Pdu::GetPaneRenderChangesResponse(GetPaneRenderChangesResponse {
                                     pane_id: 13,
@@ -15244,7 +15241,7 @@ mod tests {
                                     },
                                     tiered_scrollback_status: None,
                                     dirty_lines,
-                                    title: "cancel-gap-backpressure".to_string(),
+                                    title: "cancel-full-output-channel".to_string(),
                                     working_dir: None,
                                     bonus_lines: Vec::new().into(),
                                     input_serial: None,
@@ -15290,8 +15287,8 @@ mod tests {
             .await
             .expect("subscription should issue at least two render requests");
 
-            // Cancel without draining the receiver. Gap emission under backpressure
-            // must not block cancellation/connection teardown, and the background
+            // Cancel without draining the receiver. A full output channel must
+            // not block cancellation/connection teardown, and the background
             // poller must finish instead of lingering past the test.
             sub.cancel();
             timeout(Duration::from_millis(500), sub.shutdown())
@@ -15309,7 +15306,7 @@ mod tests {
     }
 
     #[test]
-    fn subscription_with_cx_cancel_closes_connection_when_seq_gap_emit_is_backpressured() {
+    fn subscription_with_cx_cancel_closes_connection_when_output_channel_is_full() {
         let runtime = crate::cx::CxRuntimeBuilder::current_thread()
             .build()
             .expect("runtime");
@@ -15318,7 +15315,7 @@ mod tests {
 
         runtime.block_on(async {
             let temp_dir = tempfile::tempdir().expect("tempdir");
-            let socket_path = temp_dir.path().join("cancel-gap-backpressure-with-cx.sock");
+            let socket_path = temp_dir.path().join("cancel-full-output-channel-with-cx.sock");
             let listener = compat_unix::bind(&socket_path).await.expect("bind");
 
             let render_request_count = Arc::new(AtomicUsize::new(0));
@@ -15366,7 +15363,7 @@ mod tests {
                                     let (seqno, dirty_lines) = if request_number == 1 {
                                         (1, std::iter::once(0isize..1isize).collect())
                                     } else {
-                                        (3, Vec::new())
+                                        (2, Vec::new())
                                     };
                                     Pdu::GetPaneRenderChangesResponse(
                                         GetPaneRenderChangesResponse {
@@ -15388,7 +15385,8 @@ mod tests {
                                             },
                                             tiered_scrollback_status: None,
                                             dirty_lines,
-                                            title: "cancel-gap-backpressure-with-cx".to_string(),
+                                            title: "cancel-full-output-channel-with-cx"
+                                                .to_string(),
                                             working_dir: None,
                                             bonus_lines: Vec::new().into(),
                                             input_serial: None,

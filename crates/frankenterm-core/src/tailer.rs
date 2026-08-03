@@ -2396,12 +2396,26 @@ pub fn detect_tailer_mode(config: &crate::config::Config) -> TailerMode {
     }
 }
 
+/// Typed metadata retained from the latest vendored render mutation.
+#[cfg(feature = "vendored")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamingRenderMetadata {
+    /// Diagnostic terminal mutation version; never delivery continuity.
+    pub source_version: u64,
+    /// Pane title observed with this render mutation.
+    pub title: String,
+    /// Number of dirty line ranges reported by the mux.
+    pub dirty_range_count: usize,
+    /// Total dirty rows reported by the mux.
+    pub dirty_row_count: usize,
+}
+
 /// Bridges vendored `PaneDelta` events into the existing `StreamIngester`
 /// pipeline, producing `CapturedSegment`s with monotonic seq.
 ///
 /// The bridge converts each delta kind:
-/// - `Output` → `StreamEvent::OutputData` (`delta_text` when present, otherwise
-///   a metadata fallback string)
+/// - `Output` → `StreamEvent::OutputData` only when `delta_text` contains
+///   actual best-effort terminal text; empty projections remain typed metadata
 /// - `Gap` → `StreamEvent::OutputData` with overflow flag and empty payload;
 ///   the ingester converts that into a GAP-only segment
 /// - `Ended` → `StreamEvent::PaneClosed`
@@ -2415,10 +2429,15 @@ pub struct StreamingBridge {
     dirty_range_total: u64,
     /// Aggregate dirty row count observed from render-change deltas.
     dirty_row_total: u64,
-    /// Last observed mux seqno per pane for anomaly detection.
+    /// Last observed mux mutation version per pane for regression diagnostics.
     #[cfg(feature = "vendored")]
     last_mux_seqno: HashMap<u64, u64>,
-    /// Number of out-of-order or jumped seqno anomalies detected.
+    /// Latest typed render metadata per pane. It deliberately stays out of
+    /// process-global metric labels so pane titles cannot create unbounded or
+    /// sensitive metric cardinality.
+    #[cfg(feature = "vendored")]
+    last_render_metadata: HashMap<u64, StreamingRenderMetadata>,
+    /// Number of non-increasing mux mutation versions observed.
     seq_anomaly_count: u64,
 }
 
@@ -2436,6 +2455,8 @@ impl StreamingBridge {
             dirty_row_total: 0,
             #[cfg(feature = "vendored")]
             last_mux_seqno: HashMap::new(),
+            #[cfg(feature = "vendored")]
+            last_render_metadata: HashMap::new(),
             seq_anomaly_count: 0,
         }
     }
@@ -2446,7 +2467,7 @@ impl StreamingBridge {
     #[cfg(feature = "vendored")]
     pub fn process_delta(&mut self, delta: crate::vendored::PaneDelta) -> Vec<CapturedSegment> {
         use crate::ingest::StreamEvent;
-        self.events_processed += 1;
+        self.events_processed = self.events_processed.saturating_add(1);
 
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -2463,25 +2484,31 @@ impl StreamingBridge {
                 dirty_range_count,
                 dirty_row_count,
             } => {
-                let seq_anomaly = self.note_output_seqno(pane_id, seqno);
+                self.note_output_seqno(pane_id, seqno);
                 self.dirty_range_total = self
                     .dirty_range_total
                     .saturating_add(u64::try_from(dirty_range_count).unwrap_or(u64::MAX));
                 self.dirty_row_total = self
                     .dirty_row_total
                     .saturating_add(u64::try_from(dirty_row_count).unwrap_or(u64::MAX));
-                let data = if delta_text.is_empty() {
-                    format!(
-                        "[render_changes: {dirty_range_count} dirty ranges, {dirty_row_count} dirty rows, title={title}]"
-                    )
-                } else {
-                    delta_text
-                };
-                StreamEvent::OutputData {
+                self.last_render_metadata.insert(
                     pane_id,
-                    data,
-                    received_at: now_ms,
-                    overflow: seq_anomaly,
+                    StreamingRenderMetadata {
+                        source_version: seqno,
+                        title,
+                        dirty_range_count,
+                        dirty_row_count,
+                    },
+                );
+                if delta_text.is_empty() {
+                    None
+                } else {
+                    Some(StreamEvent::OutputData {
+                        pane_id,
+                        data: delta_text,
+                        received_at: now_ms,
+                        overflow: false,
+                    })
                 }
             }
             crate::vendored::PaneDelta::Gap { pane_id, reason: _ } => {
@@ -2491,27 +2518,28 @@ impl StreamingBridge {
                 // Explicit upstream gaps are bridged as overflow + empty data.
                 // StreamIngester recognizes that pair and emits only a GAP
                 // instead of fabricating an empty delta segment.
-                StreamEvent::OutputData {
+                Some(StreamEvent::OutputData {
                     pane_id,
                     data: String::new(),
                     received_at: now_ms,
                     overflow: true,
-                }
+                })
             }
             crate::vendored::PaneDelta::Ended { pane_id, reason: _ } => {
                 self.last_mux_seqno.remove(&pane_id);
-                StreamEvent::PaneClosed { pane_id }
+                self.last_render_metadata.remove(&pane_id);
+                Some(StreamEvent::PaneClosed { pane_id })
             }
         };
 
-        let segments = self.ingester.process(event);
+        let segments = event.map_or_else(Vec::new, |event| self.ingester.process(event));
         StreamingHealth::update_global(self.snapshot_health());
         segments
     }
 
     /// Record that a fallback to polling occurred.
     pub fn record_fallback(&mut self) {
-        self.fallback_count += 1;
+        self.fallback_count = self.fallback_count.saturating_add(1);
         StreamingHealth::update_global(self.snapshot_health());
     }
 
@@ -2539,10 +2567,23 @@ impl StreamingBridge {
         self.dirty_row_total
     }
 
-    /// Number of seqno anomalies detected from output deltas.
+    /// Number of non-increasing terminal mutation versions observed.
+    ///
+    /// This is diagnostic only and never creates a capture gap. Forward jumps
+    /// are ordinary when multiple terminal mutations occur between polls.
     #[must_use]
     pub fn seq_anomaly_count(&self) -> u64 {
         self.seq_anomaly_count
+    }
+
+    /// Latest typed render metadata observed for `pane_id`.
+    ///
+    /// Empty best-effort text projections still update this state without
+    /// entering the terminal-output capture pipeline.
+    #[cfg(feature = "vendored")]
+    #[must_use]
+    pub fn render_metadata(&self, pane_id: u64) -> Option<&StreamingRenderMetadata> {
+        self.last_render_metadata.get(&pane_id)
     }
 
     /// Access the underlying ingester for diagnostics.
@@ -2552,24 +2593,18 @@ impl StreamingBridge {
     }
 
     #[cfg(feature = "vendored")]
-    fn note_output_seqno(&mut self, pane_id: u64, seqno: u64) -> bool {
+    fn note_output_seqno(&mut self, pane_id: u64, seqno: u64) {
         if let Some(prev) = self.last_mux_seqno.insert(pane_id, seqno) {
-            let out_of_order = seqno <= prev;
-            let jumped = seqno > prev.saturating_add(1);
-            if out_of_order || jumped {
+            if seqno <= prev {
                 self.seq_anomaly_count = self.seq_anomaly_count.saturating_add(1);
                 debug!(
                     pane_id,
                     previous_seqno = prev,
                     current_seqno = seqno,
-                    out_of_order,
-                    jumped,
-                    "streaming seq anomaly detected; emitting overflow GAP"
+                    "non-increasing terminal mutation version observed; retaining diagnostic only"
                 );
-                return true;
             }
         }
-        false
     }
 
     fn snapshot_health(&self) -> StreamingHealth {
@@ -5380,6 +5415,8 @@ mod tests {
         assert_eq!(bridge.dirty_range_total(), 0);
         assert_eq!(bridge.dirty_row_total(), 0);
         assert_eq!(bridge.seq_anomaly_count(), 0);
+        #[cfg(feature = "vendored")]
+        assert!(bridge.render_metadata(1).is_none());
         assert_eq!(bridge.ingester().active_panes(), 0);
     }
 
@@ -5428,11 +5465,54 @@ mod tests {
         assert_eq!(bridge.dirty_range_total(), 2);
         assert_eq!(bridge.dirty_row_total(), 8);
         assert_eq!(bridge.seq_anomaly_count(), 0);
+        assert_eq!(
+            bridge.render_metadata(1),
+            Some(&StreamingRenderMetadata {
+                source_version: 5,
+                title: "bash".to_string(),
+                dirty_range_count: 2,
+                dirty_row_count: 8,
+            })
+        );
     }
 
     #[cfg(feature = "vendored")]
     #[test]
-    fn streaming_bridge_seq_jump_emits_gap_before_delta() {
+    fn streaming_bridge_empty_projection_emits_no_segments_or_capture_cursor() {
+        use crate::vendored::PaneDelta;
+
+        let mut bridge = StreamingBridge::new();
+        let segments = bridge.process_delta(PaneDelta::Output {
+            pane_id: 5,
+            seqno: 9,
+            delta_text: String::new(),
+            title: "metadata-only".to_string(),
+            dirty_range_count: 3,
+            dirty_row_count: 11,
+        });
+
+        assert!(segments.is_empty());
+        assert_eq!(bridge.events_processed(), 1);
+        assert_eq!(bridge.dirty_range_total(), 3);
+        assert_eq!(bridge.dirty_row_total(), 11);
+        assert_eq!(bridge.seq_anomaly_count(), 0);
+        assert_eq!(bridge.ingester().active_panes(), 0);
+        assert_eq!(bridge.ingester().total_segments(), 0);
+        assert_eq!(bridge.ingester().total_gaps(), 0);
+        assert_eq!(
+            bridge.render_metadata(5),
+            Some(&StreamingRenderMetadata {
+                source_version: 9,
+                title: "metadata-only".to_string(),
+                dirty_range_count: 3,
+                dirty_row_count: 11,
+            })
+        );
+    }
+
+    #[cfg(feature = "vendored")]
+    #[test]
+    fn streaming_bridge_terminal_seq_jump_does_not_emit_gap() {
         use crate::ingest::CapturedSegmentKind;
         use crate::vendored::PaneDelta;
 
@@ -5455,15 +5535,15 @@ mod tests {
             dirty_row_count: 2,
         });
 
-        assert_eq!(segments.len(), 2);
-        assert!(matches!(segments[0].kind, CapturedSegmentKind::Gap { .. }));
-        assert_eq!(segments[1].content, "jump");
-        assert_eq!(bridge.seq_anomaly_count(), 1);
+        assert_eq!(segments.len(), 1);
+        assert!(matches!(segments[0].kind, CapturedSegmentKind::Delta));
+        assert_eq!(segments[0].content, "jump");
+        assert_eq!(bridge.seq_anomaly_count(), 0);
     }
 
     #[cfg(feature = "vendored")]
     #[test]
-    fn streaming_bridge_seq_regression_emits_gap_before_delta() {
+    fn streaming_bridge_terminal_seq_regression_is_diagnostic_only() {
         use crate::ingest::CapturedSegmentKind;
         use crate::vendored::PaneDelta;
 
@@ -5486,15 +5566,15 @@ mod tests {
             dirty_row_count: 1,
         });
 
-        assert_eq!(segments.len(), 2);
-        assert!(matches!(segments[0].kind, CapturedSegmentKind::Gap { .. }));
-        assert_eq!(segments[1].content, "older");
+        assert_eq!(segments.len(), 1);
+        assert!(matches!(segments[0].kind, CapturedSegmentKind::Delta));
+        assert_eq!(segments[0].content, "older");
         assert_eq!(bridge.seq_anomaly_count(), 1);
     }
 
     #[cfg(feature = "vendored")]
     #[test]
-    fn streaming_bridge_gap_resets_seq_tracking_baseline() {
+    fn streaming_bridge_explicit_gap_resets_diagnostic_seq_baseline() {
         use crate::ingest::CapturedSegmentKind;
         use crate::vendored::PaneDelta;
 
@@ -5510,7 +5590,7 @@ mod tests {
 
         let _ = bridge.process_delta(PaneDelta::Gap {
             pane_id: 23,
-            reason: "seqno jump".to_string(),
+            reason: "bounded transport loss".to_string(),
         });
 
         let segments = bridge.process_delta(PaneDelta::Output {
@@ -5550,7 +5630,7 @@ mod tests {
         // Now send a gap
         let gap = PaneDelta::Gap {
             pane_id: 1,
-            reason: "seqno jump".to_string(),
+            reason: "bounded transport loss".to_string(),
         };
         let segments = bridge.process_delta(gap);
 
@@ -5596,6 +5676,16 @@ mod tests {
             }
             CapturedSegmentKind::Delta => panic!("expected Gap segment for pane close"),
         }
+        assert!(bridge.render_metadata(1).is_none());
+    }
+
+    #[test]
+    fn streaming_bridge_source_forbids_render_metadata_marker() {
+        let forbidden = ["[render_", "changes:"].concat();
+        assert!(
+            !include_str!("tailer.rs").contains(&forbidden),
+            "render metadata must never be materialized as terminal output"
+        );
     }
 
     #[cfg(feature = "vendored")]
