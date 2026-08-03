@@ -2114,11 +2114,17 @@ fn validate_ordered_snapshot_projection(
             let tree = pane_trees.next().ok_or_else(|| {
                 anyhow!("PDU87 pane tree vector ended before ordered tab {pane_index}")
             })?;
-            match tree.window_and_tab_ids() {
-                Some(actual) if actual == expected => {}
-                Some(actual) => {
+            match tree.all_window_and_tab_ids_match(expected) {
+                Some(true) => {}
+                Some(false) => {
+                    let actual = tree.window_and_tab_ids();
+                    if actual.is_some_and(|actual| actual != expected) {
+                        return Err(anyhow!(
+                            "PDU87 pane tree {pane_index} identifies window/tab {actual:?}, expected {expected:?}"
+                        ));
+                    }
                     return Err(anyhow!(
-                        "PDU87 pane tree {pane_index} identifies window/tab {actual:?}, expected {expected:?}"
+                        "PDU87 pane tree {pane_index} contains a leaf outside expected window/tab {expected:?}"
                     ));
                 }
                 None if matches!(tree, mux::tab::PaneNode::Empty) => {
@@ -5695,6 +5701,31 @@ mod tests {
                     .expect_err("a missing pane tree must fail complete PDU87 validation")
             )
             .contains("tab cardinality mismatch")
+        );
+
+        let mut mixed_leaf = snapshot.clone();
+        let first_entry = match &mixed_leaf.panes.tabs[0] {
+            mux::tab::PaneNode::Leaf(entry) => entry.clone(),
+            other => panic!("single-pane test tab must serialize as one leaf, got {other:?}"),
+        };
+        let mut wrong_second_entry = first_entry.clone();
+        wrong_second_entry.tab_id = first_entry.tab_id.saturating_add(1_000_000);
+        mixed_leaf.panes.tabs[0] = mux::tab::PaneNode::Split {
+            left: Box::new(mux::tab::PaneNode::Leaf(first_entry.clone())),
+            right: Box::new(mux::tab::PaneNode::Leaf(wrong_second_entry)),
+            node: mux::tab::SplitDirectionAndSize {
+                direction: mux::tab::SplitDirection::Horizontal,
+                first: first_entry.size,
+                second: first_entry.size,
+            },
+        };
+        assert!(
+            format!(
+                "{:#}",
+                validate_ordered_snapshot_projection(&mixed_leaf)
+                    .expect_err("a mismatched second leaf must fail complete PDU87 validation")
+            )
+            .contains("contains a leaf outside expected")
         );
 
         let mut cross_wired = snapshot;

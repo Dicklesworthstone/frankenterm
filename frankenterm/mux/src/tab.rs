@@ -5414,6 +5414,31 @@ impl PaneNode {
             PaneNode::Leaf(entry) => Some((entry.window_id, entry.tab_id)),
         }
     }
+
+    /// Return whether every leaf carries one expected window/tab identity.
+    ///
+    /// `None` means that the tree contains no leaves. Unlike
+    /// [`Self::window_and_tab_ids`], this is an adversarial validator rather
+    /// than a representative-identity accessor: a mismatched second leaf can
+    /// never be hidden behind a valid first leaf.
+    pub fn all_window_and_tab_ids_match(&self, expected: (WindowId, TabId)) -> Option<bool> {
+        match self {
+            Self::Empty => None,
+            Self::Leaf(entry) => Some((entry.window_id, entry.tab_id) == expected),
+            Self::Split { left, right, .. } => {
+                match (
+                    left.all_window_and_tab_ids_match(expected),
+                    right.all_window_and_tab_ids_match(expected),
+                ) {
+                    (None, None) => None,
+                    (Some(matches), None) | (None, Some(matches)) => Some(matches),
+                    (Some(left_matches), Some(right_matches)) => {
+                        Some(left_matches && right_matches)
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// This type is used directly by the codec, take care to bump
@@ -7959,6 +7984,40 @@ mod test {
         };
         let node = PaneNode::Leaf(entry);
         assert_eq!(node.window_and_tab_ids(), Some((5, 10)));
+    }
+
+    #[test]
+    fn pane_node_all_window_and_tab_ids_match_checks_every_split_leaf() {
+        let entry = |window_id, tab_id, pane_id| PaneEntry {
+            window_id,
+            tab_id,
+            pane_id,
+            title: "test".to_string(),
+            size: TerminalSize::default(),
+            working_dir: None,
+            alt_screen_active: false,
+            is_active_pane: false,
+            is_zoomed_pane: false,
+            workspace: "ws".to_string(),
+            cursor_pos: StableCursorPosition::default(),
+            physical_top: 0,
+            top_row: 0,
+            left_col: 0,
+            tty_name: None,
+        };
+        let node = PaneNode::Split {
+            left: Box::new(PaneNode::Leaf(entry(5, 10, 1))),
+            right: Box::new(PaneNode::Leaf(entry(5, 11, 2))),
+            node: SplitDirectionAndSize {
+                direction: SplitDirection::Horizontal,
+                first: TerminalSize::default(),
+                second: TerminalSize::default(),
+            },
+        };
+
+        assert_eq!(node.window_and_tab_ids(), Some((5, 10)));
+        assert_eq!(node.all_window_and_tab_ids_match((5, 10)), Some(false));
+        assert_eq!(PaneNode::Empty.all_window_and_tab_ids_match((5, 10)), None);
     }
 
     #[test]
