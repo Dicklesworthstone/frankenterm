@@ -125,39 +125,51 @@ fn saturating_increment(counter: &AtomicU64) {
 /// Typed reason why a sequence pair could not be assigned.
 ///
 /// `u64::MAX` is reserved as an exhausted sentinel for both frontiers and is
-/// never returned as a usable sequence number.
+/// never returned as a usable sequence number. Capacity failure for a new pane
+/// is also reported explicitly before either logical frontier changes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SequenceExhaustion {
+pub enum SequenceAssignmentError {
     /// The process-wide sequence space is exhausted.
-    Global,
+    GlobalExhausted,
     /// The sequence space for one pane is exhausted.
-    Pane {
+    PaneExhausted {
         /// Pane whose local sequence space is exhausted.
         pane_id: u64,
     },
     /// Both the process-wide and pane-local sequence spaces are exhausted.
-    GlobalAndPane {
+    GlobalAndPaneExhausted {
         /// Pane whose local sequence space is exhausted.
+        pane_id: u64,
+    },
+    /// Capacity for a previously unseen pane could not be reserved.
+    ///
+    /// This error is returned before either logical frontier is mutated.
+    PaneTableCapacityUnavailable {
+        /// Pane whose frontier could not be inserted.
         pane_id: u64,
     },
 }
 
-impl std::fmt::Display for SequenceExhaustion {
+impl std::fmt::Display for SequenceAssignmentError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Global => formatter.write_str("global sequence space exhausted"),
-            Self::Pane { pane_id } => {
+            Self::GlobalExhausted => formatter.write_str("global sequence space exhausted"),
+            Self::PaneExhausted { pane_id } => {
                 write!(formatter, "sequence space exhausted for pane {pane_id}")
             }
-            Self::GlobalAndPane { pane_id } => write!(
+            Self::GlobalAndPaneExhausted { pane_id } => write!(
                 formatter,
                 "global and pane-local sequence spaces exhausted for pane {pane_id}"
+            ),
+            Self::PaneTableCapacityUnavailable { pane_id } => write!(
+                formatter,
+                "sequence frontier capacity unavailable for pane {pane_id}"
             ),
         }
     }
 }
 
-impl std::error::Error for SequenceExhaustion {}
+impl std::error::Error for SequenceAssignmentError {}
 
 #[derive(Debug, Default)]
 struct SequenceFrontiers {
@@ -235,7 +247,13 @@ impl SequenceAssigner {
     /// a single pane. `u64::MAX - 1` is the last usable value. Once either
     /// frontier reaches the reserved `u64::MAX` sentinel, assignment fails and
     /// neither frontier advances.
-    pub fn assign(&self, pane_id: u64) -> Result<(u64, u64), SequenceExhaustion> {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SequenceAssignmentError`] when either sequence space is
+    /// exhausted or capacity for a previously unseen pane cannot be reserved.
+    /// Every error leaves both logical frontiers unchanged.
+    pub fn assign(&self, pane_id: u64) -> Result<(u64, u64), SequenceAssignmentError> {
         self.assign_with_commit_hook(pane_id, || {})
     }
 
@@ -243,9 +261,24 @@ impl SequenceAssigner {
         &self,
         pane_id: u64,
         before_global_commit: F,
-    ) -> Result<(u64, u64), SequenceExhaustion>
+    ) -> Result<(u64, u64), SequenceAssignmentError>
     where
         F: FnOnce(),
+    {
+        self.assign_with_hooks(pane_id, before_global_commit, |panes| {
+            panes.try_reserve(1).is_ok()
+        })
+    }
+
+    fn assign_with_hooks<F, R>(
+        &self,
+        pane_id: u64,
+        before_global_commit: F,
+        reserve_pane: R,
+    ) -> Result<(u64, u64), SequenceAssignmentError>
+    where
+        F: FnOnce(),
+        R: FnOnce(&mut HashMap<u64, u64>) -> bool,
     {
         let mut frontiers = self
             .frontiers
@@ -259,19 +292,20 @@ impl SequenceAssigner {
             global_sequence == u64::MAX,
             pane_sequence == u64::MAX,
         ) {
-            (true, true) => return Err(SequenceExhaustion::GlobalAndPane { pane_id }),
-            (true, false) => return Err(SequenceExhaustion::Global),
-            (false, true) => return Err(SequenceExhaustion::Pane { pane_id }),
+            (true, true) => {
+                return Err(SequenceAssignmentError::GlobalAndPaneExhausted { pane_id });
+            }
+            (true, false) => return Err(SequenceAssignmentError::GlobalExhausted),
+            (false, true) => {
+                return Err(SequenceAssignmentError::PaneExhausted { pane_id });
+            }
             (false, false) => {}
         }
 
         if previous_pane.is_none() {
-            frontiers
-                .panes
-                .try_reserve(1)
-                .unwrap_or_else(|error| {
-                    panic!("reserve sequence frontier for pane {pane_id}: {error}");
-                });
+            if !reserve_pane(&mut frontiers.panes) {
+                return Err(SequenceAssignmentError::PaneTableCapacityUnavailable { pane_id });
+            }
         }
 
         let mut transaction = SequenceAssignmentTransaction {
@@ -831,7 +865,7 @@ mod tests {
 
         assert_eq!(
             assigner.assign(pane_id),
-            Err(SequenceExhaustion::Pane { pane_id })
+            Err(SequenceAssignmentError::PaneExhausted { pane_id })
         );
         assert_eq!(assigner.current_pane(pane_id), u64::MAX);
         assert_eq!(assigner.current_global(), 42);
@@ -848,11 +882,17 @@ mod tests {
         assert_eq!(assigner.current_pane(pane_id), 13);
         assert_eq!(assigner.current_global(), u64::MAX);
 
-        assert_eq!(assigner.assign(pane_id), Err(SequenceExhaustion::Global));
+        assert_eq!(
+            assigner.assign(pane_id),
+            Err(SequenceAssignmentError::GlobalExhausted)
+        );
         assert_eq!(assigner.current_pane(pane_id), 13);
         assert_eq!(assigner.current_global(), u64::MAX);
 
-        assert_eq!(assigner.assign(8), Err(SequenceExhaustion::Global));
+        assert_eq!(
+            assigner.assign(8),
+            Err(SequenceAssignmentError::GlobalExhausted)
+        );
         assert_eq!(assigner.current_pane(8), 0);
         assert_eq!(assigner.pane_count(), 1);
     }
@@ -864,7 +904,7 @@ mod tests {
 
         assert_eq!(
             assigner.assign(pane_id),
-            Err(SequenceExhaustion::GlobalAndPane { pane_id })
+            Err(SequenceAssignmentError::GlobalAndPaneExhausted { pane_id })
         );
         assert_eq!(assigner.current_pane(pane_id), u64::MAX);
         assert_eq!(assigner.current_global(), u64::MAX);
@@ -880,7 +920,7 @@ mod tests {
         assert_eq!(assigner.current_pane(pane_id), u64::MAX);
         assert_eq!(
             assigner.assign(pane_id),
-            Err(SequenceExhaustion::Pane { pane_id })
+            Err(SequenceAssignmentError::PaneExhausted { pane_id })
         );
         assert_eq!(assigner.current_global(), 41);
     }
@@ -911,7 +951,7 @@ mod tests {
             match handle.join().unwrap() {
                 Ok(pair) => successes.push(pair),
                 Err(error) => {
-                    assert_eq!(error, SequenceExhaustion::Pane { pane_id });
+                    assert_eq!(error, SequenceAssignmentError::PaneExhausted { pane_id });
                     exhausted += 1;
                 }
             }
@@ -950,7 +990,7 @@ mod tests {
                     assert!(winner.replace((pane_id, pair)).is_none());
                 }
                 Err(error) => {
-                    assert_eq!(error, SequenceExhaustion::Global);
+                    assert_eq!(error, SequenceAssignmentError::GlobalExhausted);
                     assert_eq!(assigner.current_pane(pane_id), 0);
                 }
             }
@@ -961,6 +1001,23 @@ mod tests {
         assert_eq!(assigner.current_pane(winning_pane), 1);
         assert_eq!(assigner.current_global(), u64::MAX);
         assert_eq!(assigner.pane_count(), 1);
+    }
+
+    #[test]
+    fn pane_table_capacity_failure_is_typed_and_nonmutating() {
+        let pane_id = 7;
+        let assigner = assigner_at(41, &[]);
+
+        let result = assigner.assign_with_hooks(pane_id, || {}, |_| false);
+
+        assert_eq!(
+            result,
+            Err(SequenceAssignmentError::PaneTableCapacityUnavailable { pane_id })
+        );
+        assert_eq!(assigner.current_pane(pane_id), 0);
+        assert_eq!(assigner.current_global(), 41);
+        assert_eq!(assigner.pane_count(), 0);
+        assert_eq!(assigner.assign(pane_id), Ok((0, 41)));
     }
 
     #[test]
