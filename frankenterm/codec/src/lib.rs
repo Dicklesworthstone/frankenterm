@@ -3959,11 +3959,11 @@ pub const MAX_ORDERED_TABS_PER_WINDOW: usize = 4_096;
 pub const MAX_ORDERED_TABS_PER_SNAPSHOT: usize = 16_384;
 pub const MAX_ORDERED_WINDOW_SECTION_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_REORDER_WINDOW_TABS_DECOMPRESSED_BYTES: usize = 512 * 1024;
-/// Frozen zstd `compressBound` result for either compact reorder PDU body.
-/// At 512 KiB the small-input term is zero, leaving `input + input / 256`.
+/// The 512 KiB contract is an outer body ceiling, not merely a decompressed
+/// budget. Canonical q4096 requests are far smaller, so legal frames need no
+/// zstd worst-case headroom beyond this limit.
 pub const MAX_REORDER_WINDOW_TABS_ZSTD_ENCODED_BYTES: usize =
-    MAX_REORDER_WINDOW_TABS_DECOMPRESSED_BYTES
-        + (MAX_REORDER_WINDOW_TABS_DECOMPRESSED_BYTES >> 8);
+    MAX_REORDER_WINDOW_TABS_DECOMPRESSED_BYTES;
 
 /// A single committed transition can freeze one affected window or both sides
 /// of one cross-window move. Publishing separate same-revision events would be
@@ -13031,8 +13031,8 @@ mod test {
         }
         assert_eq!(
             MAX_REORDER_WINDOW_TABS_ZSTD_ENCODED_BYTES,
-            zstd::zstd_safe::compress_bound(MAX_REORDER_WINDOW_TABS_DECOMPRESSED_BYTES),
-            "frozen reorder ceiling must continue to admit the pinned zstd encoder bound",
+            512 * 1024,
+            "compressed and decompressed reorder bodies share the frozen outer ceiling",
         );
 
         let (payload, compressed) = serialize_with_mode(
