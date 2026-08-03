@@ -2478,14 +2478,14 @@ mod tests {
         let observed_additions = Arc::new(Mutex::new(Vec::new()));
         let observed_additions_for_subscriber = Arc::clone(&observed_additions);
         mux.subscribe(move |notification| {
-            if let MuxNotification::TabAddedToWindow { tab_id, window_id } = notification
-                && window_id == local_window_id
-            {
-                lock_or_recover(
-                    &observed_additions_for_subscriber,
-                    "observed_tab_additions",
-                )
-                .push(tab_id);
+            if let MuxNotification::TabAddedToWindow { tab_id, window_id } = notification {
+                if window_id == local_window_id {
+                    lock_or_recover(
+                        &observed_additions_for_subscriber,
+                        "observed_tab_additions",
+                    )
+                    .push(tab_id);
+                }
             }
             true
         })
