@@ -2358,6 +2358,31 @@ experiment. It is not converted into a flattering keep or a durable rejection.
 - **Primary retry condition:**
   > Reconsider worker-count scaling only after disjoint-window barriers prove q-sized preparation is outside global locks, same-window and cross-window mutation lanes remain correct, aggregate scratch is bounded, and isolated M4, M5, and Threadripper sweeps show improved p95/p99 without worse keypress tails, RSS, or energy.
 
+### IS-N070 — Eager per-subscriber order projection multiplies q-sized fanout
+
+- **Classification:** topology-blind fanout rejection; candidate corrected before
+  commit
+- **Beads:** `ft-interactive-swarm-product-convergence-7xqz4.8.10.2.2`
+  and `ft-interactive-swarm-product-convergence-7xqz4.8.10.3.5`
+- **Rejected candidate:** convert every shared `FrozenWindowOrder` notification
+  into a fresh per-connection `OrderedWindowStateV1` before checking whether
+  that connection negotiated ordered delivery.
+- **Negative evidence:** the mux publishes one shared frozen order, but eager
+  projection traverses and allocates q tab IDs once per subscriber. Legacy and
+  coherent-only clients would pay this cost even while ordered capabilities
+  are dormant, so a q4096 reorder with many attached clients multiplies work
+  and allocation by fanout precisely on the interaction path being optimized.
+  Moving that multiplication outside the coordinator mutex fixes lock hold
+  time but does not fix total CPU, allocator pressure, or callback latency.
+- **Decision:** keep legacy, coherent-only, dormant, and partially supported
+  generations on an O(1) fallback carrying only window/resync identity. Permit
+  q-sized projection only for an exact ordered fence or established ordered
+  generation, outside the coordinator lock, followed by a generation and
+  revision recheck. Activation still waits for source-shared compact order
+  state so multiple ordered subscribers do not rebuild the same vector.
+- **Primary retry condition:**
+  > Reconsider per-subscriber projection only when q1/q20/q200/q4096 fanout sweeps prove total conversions and allocations remain independent of legacy/coherent subscriber count, ordered generations preserve exact PDU90 state, callback tails remain bounded, and shared compact source state cannot be reused.
+
 ## Open hypothesis register
 
 These are not negative results. Each remains open until a retained same-window
