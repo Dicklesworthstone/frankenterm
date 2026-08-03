@@ -2241,6 +2241,36 @@ experiment. It is not converted into a flattering keep or a durable rejection.
 - **Primary retry condition:**
   > Activate overlap only after ordinary client, DirectMux, server dispatch, and pooling retain generation-bound dialect and capability state; reject every outbound PDU before serial allocation and first write; reject inbound above-dialect or wrong-authority frames fail-closed; clear state on reconnect; classify permanent incompatibility as non-retryable; and pass exact current/previous, current/current-plus-one, legacy-sentinel, disjoint-window, capability-disabled, and no-write barriers on one retained revision.
 
+### IS-N065 — An identical reorder CAS is not a free no-op under the frozen protocol
+
+- **Classification:** semantic-shortcut and false-hot-path-win rejection; no
+  candidate code retained
+- **Beads:** `ft-interactive-swarm-product-convergence-7xqz4.8.10.3` and
+  `ft-interactive-swarm-product-convergence-7xqz4.8.10.3.3`
+- **Rejected candidate:** detect that a reorder request's desired tab vector and
+  active identity already equal the live window and return success without
+  reserving window/topology revisions or publishing the frozen order event.
+- **Negative evidence:** the current v1 authority defines a first successful
+  compare-and-set as `Applied`: one new window revision, one new topology
+  revision, one frozen event, and one bounded replay receipt. Exact retries must
+  replay that same terminal commit without republication, while the same
+  mutation identity with a different canonical digest must remain
+  equivocation. A special identical-order fast path would therefore either
+  make `Applied` mean two observably different things or require a new terminal
+  outcome. Skipping or shrinking its receipt would also change bounded ledger
+  admission and eviction behavior, so a retry could cease to replay the
+  original decision after later mutations.
+- **Review result:** the speculative fast path was fully reverted before
+  commit `0ebc32d0912201786ef38c17f638b4f4883e62f6`. The retained code keeps the
+  single authoritative apply path. Static review is not latency evidence, and
+  no identical-order performance improvement is claimed.
+- **Decision:** reject the shortcut under v1. Preserve one meaning for
+  `Applied`, exact replay/equivocation behavior, monotonic revision authority,
+  and the existing receipt budget until a versioned protocol change proves a
+  different contract end to end.
+- **Primary retry condition:**
+  > Optimize identical-order CAS only through an explicit versioned outcome whose server, ordinary client, reconnect, event, revision, replay, equivocation, receipt-budget, and mixed-version semantics pass deterministic tests and whose retained same-window A/B shows a material target-class benefit without weakening tab-order convergence.
+
 ## Open hypothesis register
 
 These are not negative results. Each remains open until a retained same-window
