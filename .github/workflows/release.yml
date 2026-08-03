@@ -27,7 +27,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v7.0.0
+      - uses: actions/checkout@v7.0.1
         with:
           ref: ${{ github.event.inputs.tag || github.ref }}
       - uses: dtolnay/rust-toolchain@nightly
@@ -94,7 +94,7 @@ jobs:
           #   artifact: ft.exe
           #   asset: ft-windows-amd64.exe
     steps:
-      - uses: actions/checkout@v7.0.0
+      - uses: actions/checkout@v7.0.1
         with:
           ref: ${{ github.event.inputs.tag || github.ref }}
           fetch-depth: 0  # Full history for version metadata
@@ -368,7 +368,7 @@ jobs:
       id-token: write
       attestations: write
     steps:
-      - uses: actions/checkout@v7.0.0
+      - uses: actions/checkout@v7.0.1
         with:
           ref: ${{ github.event.inputs.tag || github.ref }}
       - uses: actions/download-artifact@v8.0.1
@@ -576,14 +576,14 @@ jobs:
             --manifest "$MANIFEST"
 
       - name: Generate build provenance attestations
-        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4.1.1
+        uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4.2.1
         with:
           # Attest every file a downloader might trust, including the exact
           # offline release inventory and its verifier. The manifest itself
           # covers all archives, checksum files, and shipped attestations.
           subject-path: dist/*
 
-      - uses: softprops/action-gh-release@v3.0.1
+      - uses: softprops/action-gh-release@v3.0.2
         with:
           tag_name: ${{ steps.version.outputs.tag }}
           name: ${{ steps.version.outputs.tag }}
