@@ -257,13 +257,12 @@ impl InteractionTraceTimestamp {
                 to: later.clock_domain,
             });
         }
-        later
-            .monotonic_ns
-            .checked_sub(self.monotonic_ns)
-            .ok_or(TraceContractError::ClockRegression {
+        later.monotonic_ns.checked_sub(self.monotonic_ns).ok_or(
+            TraceContractError::ClockRegression {
                 start_ns: self.monotonic_ns,
                 end_ns: later.monotonic_ns,
-            })
+            },
+        )
     }
 }
 
@@ -301,12 +300,8 @@ impl InteractionTraceCorrelation {
     pub const fn quality(self) -> InteractionTraceCorrelationQuality {
         match self {
             Self::ExactProtocol { .. } => InteractionTraceCorrelationQuality::ExactProtocol,
-            Self::ExactEchoFixture { .. } => {
-                InteractionTraceCorrelationQuality::ExactEchoFixture
-            }
-            Self::CausalCandidate { .. } => {
-                InteractionTraceCorrelationQuality::CausalCandidate
-            }
+            Self::ExactEchoFixture { .. } => InteractionTraceCorrelationQuality::ExactEchoFixture,
+            Self::CausalCandidate { .. } => InteractionTraceCorrelationQuality::CausalCandidate,
             Self::Uncorrelated => InteractionTraceCorrelationQuality::Uncorrelated,
         }
     }
@@ -689,9 +684,7 @@ fn validate_producer(
         });
     }
     if producer.thread_id == 0 {
-        return Err(TraceContractError::InvalidProducerIdentity {
-            field: "thread_id",
-        });
+        return Err(TraceContractError::InvalidProducerIdentity { field: "thread_id" });
     }
     if producer.connection_generation == Some(0) {
         return Err(TraceContractError::InvalidProducerIdentity {
@@ -829,9 +822,7 @@ fn validate_observation_boundary(
                 | InteractionTraceObservationBoundary::Photon
         )
     {
-        return Err(TraceContractError::DisplayCompletionBoundaryMissing {
-            stage: event.stage,
-        });
+        return Err(TraceContractError::DisplayCompletionBoundaryMissing { stage: event.stage });
     }
     Ok(())
 }
@@ -1086,12 +1077,20 @@ pub fn lint_interaction_trace_v2_metric_map() -> Result<(), TraceContractError> 
 pub enum TraceContractError {
     UnsupportedSchemaVersion,
     InvalidRunId,
-    ReservedTraceSequence { sequence: u64 },
+    ReservedTraceSequence {
+        sequence: u64,
+    },
     TraceSequenceExhausted,
     EmptyTrace,
     EmptyRun,
-    TooManyEvents { actual: usize, maximum: usize },
-    TooManyTraces { actual: usize, maximum: usize },
+    TooManyEvents {
+        actual: usize,
+        maximum: usize,
+    },
+    TooManyTraces {
+        actual: usize,
+        maximum: usize,
+    },
     EventTraceIdMismatch {
         expected: InteractionTraceId,
         actual: InteractionTraceId,
@@ -1100,33 +1099,64 @@ pub enum TraceContractError {
         expected: InteractionTraceRunId,
         actual: InteractionTraceRunId,
     },
-    TraceSequenceNotIncreasing { previous: u64, actual: u64 },
-    EventOrdinalNotContiguous { expected: u64, actual: u64 },
+    TraceSequenceNotIncreasing {
+        previous: u64,
+        actual: u64,
+    },
+    EventOrdinalNotContiguous {
+        expected: u64,
+        actual: u64,
+    },
     TracePathMismatch {
         expected: InteractionTracePath,
         actual: InteractionTracePath,
     },
-    UnexpectedStage { stage: InteractionTraceStage },
-    DuplicateStage { stage: InteractionTraceStage },
+    UnexpectedStage {
+        stage: InteractionTraceStage,
+    },
+    DuplicateStage {
+        stage: InteractionTraceStage,
+    },
     StageOutOfOrder {
         expected: InteractionTraceStage,
         actual: InteractionTraceStage,
     },
-    MissingStage { stage: InteractionTraceStage },
+    MissingStage {
+        stage: InteractionTraceStage,
+    },
     ReservedSpanId,
-    DuplicateSpanId { span_id: u64 },
-    SelfParentSpan { span_id: u64 },
-    UnknownParentSpan { parent_span_id: u64 },
-    InvalidProducerIdentity { field: &'static str },
-    ConnectionGenerationMissing { stage: InteractionTraceStage },
-    InvalidTopologyIdentity { field: &'static str },
-    InvalidClockDomain { field: &'static str },
-    ClockProducerMismatch { field: &'static str },
+    DuplicateSpanId {
+        span_id: u64,
+    },
+    SelfParentSpan {
+        span_id: u64,
+    },
+    UnknownParentSpan {
+        parent_span_id: u64,
+    },
+    InvalidProducerIdentity {
+        field: &'static str,
+    },
+    ConnectionGenerationMissing {
+        stage: InteractionTraceStage,
+    },
+    InvalidTopologyIdentity {
+        field: &'static str,
+    },
+    InvalidClockDomain {
+        field: &'static str,
+    },
+    ClockProducerMismatch {
+        field: &'static str,
+    },
     CrossClockArithmetic {
         from: InteractionTraceClockDomain,
         to: InteractionTraceClockDomain,
     },
-    ClockRegression { start_ns: u64, end_ns: u64 },
+    ClockRegression {
+        start_ns: u64,
+        end_ns: u64,
+    },
     CrossEventClockRegression {
         clock_domain: InteractionTraceClockDomain,
         previous_start_ns: u64,
@@ -1134,7 +1164,9 @@ pub enum TraceContractError {
         event_ordinal: u64,
     },
     InvalidCorrelationAuthority,
-    InvalidGeneration { field: &'static str },
+    InvalidGeneration {
+        field: &'static str,
+    },
     GenerationMissing {
         field: &'static str,
         stage: InteractionTraceStage,
@@ -1154,14 +1186,23 @@ pub enum TraceContractError {
     DisplayCompletionBoundaryMissing {
         stage: InteractionTraceStage,
     },
-    DuplicateMetricBinding { metric: InteractionTraceMetric },
-    MissingMetricBinding { metric: InteractionTraceMetric },
-    InvalidPhysicalMetricAuthority { metric: InteractionTraceMetric },
+    DuplicateMetricBinding {
+        metric: InteractionTraceMetric,
+    },
+    MissingMetricBinding {
+        metric: InteractionTraceMetric,
+    },
+    InvalidPhysicalMetricAuthority {
+        metric: InteractionTraceMetric,
+    },
 }
 
 impl fmt::Display for TraceContractError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "interaction trace v2 contract violation: {self:?}")
+        write!(
+            formatter,
+            "interaction trace v2 contract violation: {self:?}"
+        )
     }
 }
 
@@ -1172,18 +1213,13 @@ mod tests {
     use super::*;
     use jsonschema::{Draft, Validator};
 
-    const GOOD_FIXTURE: &str = include_str!(
-        "../../../fixtures/perf/interaction-trace-v2/good-keypress-v2.json"
-    );
-    const OLD_FIXTURE: &str = include_str!(
-        "../../../fixtures/perf/interaction-trace-v2/old-keypress-v1.json"
-    );
-    const PRIVACY_BAD_FIXTURE: &str = include_str!(
-        "../../../fixtures/perf/interaction-trace-v2/bad-raw-content-v2.json"
-    );
-    const JSON_SCHEMA: &str = include_str!(
-        "../../../docs/perf/interaction-trace-v2.schema.json"
-    );
+    const GOOD_FIXTURE: &str =
+        include_str!("../../../fixtures/perf/interaction-trace-v2/good-keypress-v2.json");
+    const OLD_FIXTURE: &str =
+        include_str!("../../../fixtures/perf/interaction-trace-v2/old-keypress-v1.json");
+    const PRIVACY_BAD_FIXTURE: &str =
+        include_str!("../../../fixtures/perf/interaction-trace-v2/bad-raw-content-v2.json");
+    const JSON_SCHEMA: &str = include_str!("../../../docs/perf/interaction-trace-v2.schema.json");
 
     fn run_id() -> InteractionTraceRunId {
         InteractionTraceRunId::new(0xfeed, 0xbeef).expect("test run ID is non-zero")
@@ -1379,8 +1415,8 @@ mod tests {
         };
         assert!(first_run.validate_structure().is_ok());
 
-        let second_run_id = InteractionTraceRunId::new(0xfeed, 0xcafe)
-            .expect("second run ID is non-zero");
+        let second_run_id =
+            InteractionTraceRunId::new(0xfeed, 0xcafe).expect("second run ID is non-zero");
         let mut second_trace = keypress_trace(1);
         second_trace.trace_id.run_id = second_run_id;
         for event in &mut second_trace.events {
@@ -1580,8 +1616,18 @@ mod tests {
     fn unknown_raw_content_fields_are_rejected_and_never_serialized() {
         assert!(serde_json::from_str::<InteractionTraceV2>(PRIVACY_BAD_FIXTURE).is_err());
         let encoded = serde_json::to_string(&keypress_trace(1)).expect("trace encodes");
-        for forbidden in ["raw_key", "key_text", "pane_content", "pane_text", "title", "cwd"] {
-            assert!(!encoded.contains(forbidden), "serialized trace leaked {forbidden}");
+        for forbidden in [
+            "raw_key",
+            "key_text",
+            "pane_content",
+            "pane_text",
+            "title",
+            "cwd",
+        ] {
+            assert!(
+                !encoded.contains(forbidden),
+                "serialized trace leaked {forbidden}"
+            );
         }
 
         let mut nested: serde_json::Value =
