@@ -14505,7 +14505,7 @@ mod tests {
             ReorderWindowTabsResult::Decision(WindowReorderTerminalOutcome::Applied(commit)) => {
                 commit
             }
-            other => panic!("expected first authoritative apply, got {other:?}"),
+            other => panic!("expected first authoritative apply, got {other:?}", other = other),
         };
         assert_eq!(
             applied.topology_revision.get(),
@@ -14569,7 +14569,7 @@ mod tests {
                     applied.window.order_revision
                 );
             }
-            other => panic!("expected exact applied replay, got {other:?}"),
+            other => panic!("expected exact applied replay, got {other:?}", other = other),
         }
         let equivocation = test_window_reorder_request_for(
             request.session_incarnation(),
@@ -14751,7 +14751,7 @@ mod tests {
                 assert_eq!(commit.topology_revision, topology_before);
                 assert_eq!(commit.window.order_revision, before.order_revision());
             }
-            other => panic!("expected stale-revision conflict, got {other:?}"),
+            other => panic!("expected stale-revision conflict, got {other:?}", other = other),
         }
 
         let cases = [
@@ -14792,7 +14792,10 @@ mod tests {
                 ReorderWindowTabsResult::Decision(WindowReorderTerminalOutcome::Malformed(
                     actual,
                 )) => assert_eq!(actual, expected),
-                other => panic!("expected malformed zero-mutation result, got {other:?}"),
+                other => panic!(
+                    "expected malformed zero-mutation result, got {other:?}",
+                    other = other
+                ),
             }
         }
         let missing_window_id = usize::MAX - 1;
@@ -14810,8 +14813,7 @@ mod tests {
             mux.reorder_window_tabs(missing_window),
             ReorderWindowTabsResult::Decision(
                 WindowReorderTerminalOutcome::MissingWindow { window_id }
-                    if window_id == missing_window_id
-            )
+            ) if window_id == missing_window_id
         ));
         let stale_session = test_window_reorder_request_for(
             MuxSessionIncarnation::from_bytes([0x99; 16]),
