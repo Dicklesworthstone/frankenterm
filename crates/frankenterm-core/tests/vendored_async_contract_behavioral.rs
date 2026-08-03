@@ -142,6 +142,17 @@ fn behavioral_mux_pool_config(socket_path: std::path::PathBuf) -> MuxPoolConfig 
     config
 }
 
+/// Create a randomized Unix-socket root whose encoded path stays below the
+/// smallest supported `sockaddr_un.sun_path` limit even when the test runner's
+/// inherited `TMPDIR` is a deep remote-build path.
+#[cfg(all(feature = "vendored", unix, feature = "asupersync-runtime"))]
+fn behavioral_socket_tempdir() -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .prefix("ft-b23-")
+        .tempdir_in("/tmp")
+        .expect("create short randomized socket tempdir")
+}
+
 // =============================================================================
 // B01–B04: Channel delivery contracts (ABC-CHN-001, ABC-CHN-002)
 // =============================================================================
@@ -933,7 +944,7 @@ fn b23_channel_pipeline_mpsc_to_broadcast() {
 fn b23b_explicit_cx_public_list_panes_timeout_contract() {
     run_async_test(async {
         let cx = for_testing();
-        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let temp_dir = behavioral_socket_tempdir();
         let socket_path = temp_dir
             .path()
             .join("behavioral-explicit-cx-read-timeout.sock");
@@ -1032,7 +1043,7 @@ fn b23b_explicit_cx_public_list_panes_timeout_contract() {
 fn b23c_explicit_cx_public_send_paste_write_timeout_contract() {
     run_async_test(async {
         let cx = for_testing();
-        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let temp_dir = behavioral_socket_tempdir();
         let socket_path = temp_dir
             .path()
             .join("behavioral-explicit-cx-write-timeout.sock");
@@ -1134,7 +1145,7 @@ fn b23c_explicit_cx_public_send_paste_write_timeout_contract() {
 fn b23d_explicit_cx_public_connect_cancellation_contract() {
     run_async_test(async {
         let cancelled_cx = cancelled_test_cx("behavioral public connect cancellation");
-        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let temp_dir = behavioral_socket_tempdir();
         let socket_path = temp_dir
             .path()
             .join("behavioral-explicit-cx-connect-cancel.sock");
@@ -1185,7 +1196,7 @@ fn b23e_explicit_cx_public_list_panes_cancellation_contract() {
     run_async_test(async {
         let connect_cx = for_testing();
         let cancelled_cx = cancelled_test_cx("behavioral public request cancellation");
-        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let temp_dir = behavioral_socket_tempdir();
         let socket_path = temp_dir
             .path()
             .join("behavioral-explicit-cx-list-panes-cancel.sock");
@@ -1303,7 +1314,7 @@ fn b23f_explicit_cx_public_render_batch_cancellation_contract() {
     run_async_test(async {
         let connect_cx = for_testing();
         let cancelled_cx = cancelled_test_cx("behavioral public batch cancellation");
-        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let temp_dir = behavioral_socket_tempdir();
         let socket_path = temp_dir
             .path()
             .join("behavioral-explicit-cx-render-batch-cancel.sock");
@@ -1429,7 +1440,7 @@ fn b23g_explicit_cx_public_get_lines_cancellation_contract() {
     run_async_test(async {
         let connect_cx = for_testing();
         let cancelled_cx = cancelled_test_cx("behavioral public get-lines cancellation");
-        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let temp_dir = behavioral_socket_tempdir();
         let socket_path = temp_dir
             .path()
             .join("behavioral-explicit-cx-get-lines-cancel.sock");
@@ -1547,7 +1558,7 @@ fn b23h_explicit_cx_public_write_to_pane_cancellation_contract() {
     run_async_test(async {
         let connect_cx = for_testing();
         let cancelled_cx = cancelled_test_cx("behavioral public write-to-pane cancellation");
-        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let temp_dir = behavioral_socket_tempdir();
         let socket_path = temp_dir
             .path()
             .join("behavioral-explicit-cx-write-to-pane-cancel.sock");
@@ -1669,7 +1680,7 @@ fn b23i_explicit_cx_public_single_render_cancellation_contract() {
     run_async_test(async {
         let connect_cx = for_testing();
         let cancelled_cx = cancelled_test_cx("behavioral public single-render cancellation");
-        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let temp_dir = behavioral_socket_tempdir();
         let socket_path = temp_dir
             .path()
             .join("behavioral-explicit-cx-single-render-cancel.sock");
@@ -1790,7 +1801,7 @@ fn b23j_explicit_cx_public_send_paste_cancellation_contract() {
     run_async_test(async {
         let connect_cx = for_testing();
         let cancelled_cx = cancelled_test_cx("behavioral public send-paste cancellation");
-        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let temp_dir = behavioral_socket_tempdir();
         let socket_path = temp_dir
             .path()
             .join("behavioral-explicit-cx-send-paste-cancel.sock");
@@ -1911,7 +1922,7 @@ fn b23j_explicit_cx_public_send_paste_cancellation_contract() {
 fn b23k_explicit_cx_public_render_batch_timeout_contract() {
     run_async_test(async {
         let cx = for_testing();
-        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let temp_dir = behavioral_socket_tempdir();
         let socket_path = temp_dir
             .path()
             .join("behavioral-explicit-cx-render-batch-timeout.sock");
@@ -2057,7 +2068,7 @@ fn b23k_explicit_cx_public_render_batch_timeout_contract() {
 fn b23l_explicit_cx_public_subscription_cancel_shutdown_contract() {
     run_async_test(async {
         let cx = for_testing();
-        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let temp_dir = behavioral_socket_tempdir();
         let socket_path = temp_dir
             .path()
             .join("behavioral-explicit-cx-subscription-cancel.sock");
@@ -2229,7 +2240,7 @@ fn b23p_explicit_cx_public_subscription_startup_cancellation_contract() {
     run_async_test(async {
         let connect_cx = for_testing();
         let cancelled_cx = cancelled_test_cx("behavioral public subscription startup cancellation");
-        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let temp_dir = behavioral_socket_tempdir();
         let socket_path = temp_dir
             .path()
             .join("behavioral-explicit-cx-subscription-startup-cancel.sock");
@@ -2388,7 +2399,7 @@ fn b23p_explicit_cx_public_subscription_startup_cancellation_contract() {
 fn b23m_explicit_cx_public_single_render_read_timeout_contract() {
     run_async_test(async {
         let cx = for_testing();
-        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let temp_dir = behavioral_socket_tempdir();
         let socket_path = temp_dir
             .path()
             .join("behavioral-explicit-cx-single-render-timeout.sock");
@@ -2488,7 +2499,7 @@ fn b23m_explicit_cx_public_single_render_read_timeout_contract() {
 fn b23n_explicit_cx_public_get_lines_read_timeout_contract() {
     run_async_test(async {
         let cx = for_testing();
-        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let temp_dir = behavioral_socket_tempdir();
         let socket_path = temp_dir
             .path()
             .join("behavioral-explicit-cx-get-lines-timeout.sock");
@@ -2591,7 +2602,7 @@ fn b23n_explicit_cx_public_get_lines_read_timeout_contract() {
 fn b23o_explicit_cx_public_write_to_pane_read_timeout_contract() {
     run_async_test(async {
         let cx = for_testing();
-        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let temp_dir = behavioral_socket_tempdir();
         let socket_path = temp_dir
             .path()
             .join("behavioral-explicit-cx-write-to-pane-read-timeout.sock");
@@ -2693,7 +2704,7 @@ fn b23o_explicit_cx_public_write_to_pane_read_timeout_contract() {
 fn b23q_explicit_cx_public_mux_pool_list_panes_cancellation_contract() {
     run_async_test(async {
         let cancelled_cx = cancelled_test_cx("behavioral public mux-pool list-panes cancellation");
-        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let temp_dir = behavioral_socket_tempdir();
         let socket_path = temp_dir
             .path()
             .join("behavioral-explicit-cx-mux-pool-list-panes-cancel.sock");
@@ -2819,7 +2830,7 @@ fn b23r_explicit_cx_public_mux_pool_render_batch_cancellation_contract() {
     run_async_test(async {
         let cancelled_cx =
             cancelled_test_cx("behavioral public mux-pool render-batch cancellation");
-        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let temp_dir = behavioral_socket_tempdir();
         let socket_path = temp_dir
             .path()
             .join("behavioral-explicit-cx-mux-pool-render-batch-cancel.sock");
@@ -2953,7 +2964,7 @@ fn b23r_explicit_cx_public_mux_pool_render_batch_cancellation_contract() {
 fn b23s_explicit_cx_public_mux_pool_list_panes_read_timeout_contract() {
     run_async_test(async {
         let cx = for_testing();
-        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let temp_dir = behavioral_socket_tempdir();
         let socket_path = temp_dir
             .path()
             .join("behavioral-explicit-cx-mux-pool-list-panes-timeout.sock");
@@ -3086,7 +3097,7 @@ fn b23s_explicit_cx_public_mux_pool_list_panes_read_timeout_contract() {
 fn b23t_explicit_cx_public_mux_pool_single_render_read_timeout_contract() {
     run_async_test(async {
         let cx = for_testing();
-        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let temp_dir = behavioral_socket_tempdir();
         let socket_path = temp_dir
             .path()
             .join("behavioral-explicit-cx-mux-pool-single-render-timeout.sock");
@@ -3221,7 +3232,7 @@ fn b23u_explicit_cx_public_mux_pool_health_check_cancellation_contract() {
     run_async_test(async {
         let cancelled_cx =
             cancelled_test_cx("behavioral public mux-pool health-check cancellation");
-        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let temp_dir = behavioral_socket_tempdir();
         let socket_path = temp_dir
             .path()
             .join("behavioral-explicit-cx-mux-pool-health-check-cancel.sock");
@@ -3342,7 +3353,7 @@ fn b23u_explicit_cx_public_mux_pool_health_check_cancellation_contract() {
 fn b23v_explicit_cx_public_mux_pool_health_check_read_timeout_contract() {
     run_async_test(async {
         let cx = for_testing();
-        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let temp_dir = behavioral_socket_tempdir();
         let socket_path = temp_dir
             .path()
             .join("behavioral-explicit-cx-mux-pool-health-check-timeout.sock");
@@ -3471,7 +3482,7 @@ fn b23v_explicit_cx_public_mux_pool_health_check_read_timeout_contract() {
 fn b23w_explicit_cx_public_mux_pool_get_lines_cancellation_contract() {
     run_async_test(async {
         let cancelled_cx = cancelled_test_cx("behavioral public mux-pool get-lines cancellation");
-        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let temp_dir = behavioral_socket_tempdir();
         let socket_path = temp_dir
             .path()
             .join("behavioral-explicit-cx-mux-pool-get-lines-cancel.sock");
@@ -3599,7 +3610,7 @@ fn b23x_explicit_cx_public_mux_pool_write_to_pane_cancellation_contract() {
     run_async_test(async {
         let cancelled_cx =
             cancelled_test_cx("behavioral public mux-pool write-to-pane cancellation");
-        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let temp_dir = behavioral_socket_tempdir();
         let socket_path = temp_dir
             .path()
             .join("behavioral-explicit-cx-mux-pool-write-to-pane-cancel.sock");
@@ -3726,7 +3737,7 @@ fn b23x_explicit_cx_public_mux_pool_write_to_pane_cancellation_contract() {
 fn b23y_explicit_cx_public_mux_pool_send_paste_cancellation_contract() {
     run_async_test(async {
         let cancelled_cx = cancelled_test_cx("behavioral public mux-pool send-paste cancellation");
-        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let temp_dir = behavioral_socket_tempdir();
         let socket_path = temp_dir
             .path()
             .join("behavioral-explicit-cx-mux-pool-send-paste-cancel.sock");
