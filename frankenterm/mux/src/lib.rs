@@ -15185,14 +15185,16 @@ mod tests {
             .expect_err("an exhausted destination must reject a new attachment");
         assert!(
             format!("{attach_error:#}").contains("revision space is exhausted"),
-            "unexpected exhausted-attachment error: {attach_error:#}"
+            "unexpected exhausted-attachment error: {attach_error:#}",
+            attach_error = attach_error,
         );
         let move_error = mux
             .move_tab_between_windows(source_tab.tab_id(), destination_id, None)
             .expect_err("an exhausted destination must reject before source detach");
         assert!(
             format!("{move_error:#}").contains("destination window"),
-            "unexpected exhausted-move error: {move_error:#}"
+            "unexpected exhausted-move error: {move_error:#}",
+            move_error = move_error,
         );
 
         let source = mux.get_window(source_id).expect("source window survives");
