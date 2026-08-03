@@ -27,7 +27,8 @@ const PANE_IO_BATCH_COUNT: usize = 256;
 fn bench_fire_single_native(c: &mut Criterion) {
     let bus = EventBus::new();
     let handler: Arc<HandlerFn> = Arc::new(|_| vec![]);
-    bus.register(HandlerPriority::Native, None, handler);
+    bus.register(HandlerPriority::Native, None, handler)
+        .expect("handler registration should succeed");
 
     let event = Event::with_timestamp(EventType::PaneOutput, EventPayload::Empty, 0);
 
@@ -45,7 +46,8 @@ fn bench_fire_10_native_handlers(c: &mut Criterion) {
                 message: String::new(),
             }]
         });
-        bus.register(HandlerPriority::Native, None, handler);
+        bus.register(HandlerPriority::Native, None, handler)
+            .expect("handler registration should succeed");
     }
 
     let event = Event::with_timestamp(EventType::PaneOutput, EventPayload::Empty, 0);
@@ -61,13 +63,16 @@ fn bench_fire_mixed_priorities(c: &mut Criterion) {
     let handler: Arc<HandlerFn> = Arc::new(|_| vec![]);
 
     for _ in 0..3 {
-        bus.register(HandlerPriority::Native, None, handler.clone());
+        bus.register(HandlerPriority::Native, None, handler.clone())
+            .expect("handler registration should succeed");
     }
     for _ in 0..3 {
-        bus.register(HandlerPriority::Wasm, None, handler.clone());
+        bus.register(HandlerPriority::Wasm, None, handler.clone())
+            .expect("handler registration should succeed");
     }
     for _ in 0..3 {
-        bus.register(HandlerPriority::Lua, None, handler.clone());
+        bus.register(HandlerPriority::Lua, None, handler.clone())
+            .expect("handler registration should succeed");
     }
 
     let event = Event::with_timestamp(EventType::PaneOutput, EventPayload::Empty, 0);
@@ -88,14 +93,16 @@ fn bench_fire_filtered(c: &mut Criterion) {
             HandlerPriority::Native,
             Some(EventType::UpdateStatus),
             handler.clone(),
-        );
+        )
+        .expect("handler registration should succeed");
     }
     // 1 handler for the type we'll fire.
     bus.register(
         HandlerPriority::Native,
         Some(EventType::PaneOutput),
         handler,
-    );
+    )
+    .expect("handler registration should succeed");
 
     let event = Event::with_timestamp(EventType::PaneOutput, EventPayload::Empty, 0);
 
@@ -111,7 +118,9 @@ fn bench_register_deregister(c: &mut Criterion) {
 
     c.bench_function("register_deregister_cycle", |b| {
         b.iter(|| {
-            let id = bus.register(HandlerPriority::Native, None, handler.clone());
+            let id = bus
+                .register(HandlerPriority::Native, None, handler.clone())
+                .expect("handler registration should succeed");
             bus.deregister(black_box(id));
         });
     });
@@ -133,7 +142,8 @@ fn bench_fire_pane_text_payload(c: &mut Criterion) {
         HandlerPriority::Native,
         Some(EventType::PaneOutput),
         handler,
-    );
+    )
+    .expect("handler registration should succeed");
 
     let text: Arc<str> = Arc::from("$ cargo build\n   Compiling mux v0.1.0\n");
     let event = Event::with_timestamp(
@@ -160,7 +170,8 @@ fn bench_update_status_60hz(c: &mut Criterion) {
             HandlerPriority::Native,
             Some(EventType::UpdateStatus),
             handler,
-        );
+        )
+        .expect("handler registration should succeed");
     }
 
     let event = Event::with_timestamp(

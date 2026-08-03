@@ -174,6 +174,18 @@ pub enum EventAction {
 /// Opaque handle returned when registering a handler.
 pub type HandlerId = u64;
 
+/// Terminal failure from the handler-ID allocator.
+///
+/// `u64::MAX` is reserved as a sticky exhausted state. Refusing the
+/// registration prevents two live handlers from sharing an opaque ID and
+/// preserves one-to-one deregistration semantics.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum HandlerRegistrationError {
+    /// The process-lifetime handler-ID space has no usable values left.
+    #[error("mux event handler ID space is exhausted; create a new event bus")]
+    IdExhausted,
+}
+
 /// Handler callback signature.
 ///
 /// Receives an immutable reference to the event and returns zero or more
@@ -219,40 +231,37 @@ impl EventBus {
     /// Register a handler with the given priority and optional event filter.
     ///
     /// Returns a `HandlerId` that can be used to deregister the handler.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HandlerRegistrationError::IdExhausted`] without mutating the
+    /// handler set when the process-lifetime ID space is exhausted.
     pub fn register(
         &self,
         priority: HandlerPriority,
         filter: Option<EventType>,
         handler: Arc<HandlerFn>,
-    ) -> HandlerId {
-        let id = self.next_handler_id();
+    ) -> Result<HandlerId, HandlerRegistrationError> {
+        let mut handlers = self.handlers.write();
+        let id = self.next_handler_id()?;
         let record = HandlerRecord {
             id,
             priority,
             handler,
             filter,
         };
-        let mut handlers = self.handlers.write();
         handlers.push(record);
         // Maintain sort by priority so dispatch is a simple linear scan.
         handlers.sort_by_key(|r| r.priority);
-        id
+        Ok(id)
     }
 
-    fn next_handler_id(&self) -> HandlerId {
-        let mut current = self.next_id.load(Ordering::Relaxed);
-        loop {
-            let next = current.saturating_add(1);
-            match self.next_id.compare_exchange_weak(
-                current,
-                next,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => return current,
-                Err(actual) => current = actual,
-            }
-        }
+    fn next_handler_id(&self) -> Result<HandlerId, HandlerRegistrationError> {
+        self.next_id
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current.checked_add(1)
+            })
+            .map_err(|_| HandlerRegistrationError::IdExhausted)
     }
 
     /// Remove a previously registered handler.
@@ -373,7 +382,9 @@ mod tests {
                 message: "fired".into(),
             }]
         });
-        let _id = bus.register(HandlerPriority::Native, None, handler);
+        let _id = bus
+            .register(HandlerPriority::Native, None, handler)
+            .expect("handler registration should succeed");
 
         let actions = bus.fire(&make_event(EventType::PaneOutput));
         assert_eq!(actions.len(), 1);
@@ -386,11 +397,64 @@ mod tests {
     }
 
     #[test]
-    fn handler_id_allocator_saturates_instead_of_wrapping_to_zero() {
+    fn handler_id_allocator_fails_closed_without_mutating_handlers() {
         let bus = EventBus::new();
-        bus.next_id.store(u64::MAX, Ordering::Relaxed);
+        bus.next_id.store(u64::MAX - 1, Ordering::Relaxed);
+        let handler: Arc<HandlerFn> = Arc::new(|_| vec![]);
 
-        assert_eq!(bus.next_handler_id(), u64::MAX);
+        let last = bus
+            .register(HandlerPriority::Native, None, Arc::clone(&handler))
+            .expect("MAX - 1 is the last usable handler ID");
+        assert_eq!(last, u64::MAX - 1);
+        assert_eq!(bus.next_id.load(Ordering::Relaxed), u64::MAX);
+
+        assert_eq!(
+            bus.register(HandlerPriority::Native, None, handler),
+            Err(HandlerRegistrationError::IdExhausted)
+        );
+        assert_eq!(bus.handler_ids(), vec![last]);
+        assert!(bus.deregister(last));
+        assert_eq!(bus.handler_count(), 0);
+        assert_eq!(
+            bus.next_handler_id(),
+            Err(HandlerRegistrationError::IdExhausted)
+        );
+        assert_eq!(bus.next_id.load(Ordering::Relaxed), u64::MAX);
+    }
+
+    #[test]
+    fn concurrent_handler_id_exhaustion_admits_exactly_one_last_handler() {
+        let bus = Arc::new(EventBus::new());
+        bus.next_id.store(u64::MAX - 1, Ordering::Relaxed);
+
+        let mut threads = Vec::new();
+        for _ in 0..8 {
+            let bus = Arc::clone(&bus);
+            threads.push(std::thread::spawn(move || {
+                let handler: Arc<HandlerFn> = Arc::new(|_| vec![]);
+                bus.register(HandlerPriority::Native, None, handler)
+            }));
+        }
+
+        let results: Vec<_> = threads
+            .into_iter()
+            .map(|thread| thread.join().expect("registration thread should not panic"))
+            .collect();
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| **result == Ok(u64::MAX - 1))
+                .count(),
+            1
+        );
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| **result == Err(HandlerRegistrationError::IdExhausted))
+                .count(),
+            7
+        );
+        assert_eq!(bus.handler_ids(), vec![u64::MAX - 1]);
         assert_eq!(bus.next_id.load(Ordering::Relaxed), u64::MAX);
     }
 
@@ -402,7 +466,9 @@ mod tests {
                 message: "fired".into(),
             }]
         });
-        let id = bus.register(HandlerPriority::Native, None, handler);
+        let id = bus
+            .register(HandlerPriority::Native, None, handler)
+            .expect("handler registration should succeed");
         assert_eq!(bus.handler_count(), 1);
 
         assert!(bus.deregister(id));
@@ -426,11 +492,13 @@ mod tests {
                 message: "pane_output".into(),
             }]
         });
-        let _id = bus.register(
-            HandlerPriority::Native,
-            Some(EventType::PaneOutput),
-            handler,
-        );
+        let _id = bus
+            .register(
+                HandlerPriority::Native,
+                Some(EventType::PaneOutput),
+                handler,
+            )
+            .expect("handler registration should succeed");
 
         // Should fire for PaneOutput.
         let actions = bus.fire(&make_event(EventType::PaneOutput));
@@ -465,9 +533,12 @@ mod tests {
             }]
         });
 
-        bus.register(HandlerPriority::Lua, None, lua_handler);
-        bus.register(HandlerPriority::Wasm, None, wasm_handler);
-        bus.register(HandlerPriority::Native, None, native_handler);
+        bus.register(HandlerPriority::Lua, None, lua_handler)
+            .expect("handler registration should succeed");
+        bus.register(HandlerPriority::Wasm, None, wasm_handler)
+            .expect("handler registration should succeed");
+        bus.register(HandlerPriority::Native, None, native_handler)
+            .expect("handler registration should succeed");
 
         let actions = bus.fire(&make_event(EventType::PaneOutput));
         assert_eq!(actions.len(), 3);
@@ -486,9 +557,15 @@ mod tests {
     fn handler_ids_returns_all_registered() {
         let bus = EventBus::new();
         let h: Arc<HandlerFn> = Arc::new(|_| vec![]);
-        let id1 = bus.register(HandlerPriority::Native, None, h.clone());
-        let id2 = bus.register(HandlerPriority::Wasm, None, h.clone());
-        let id3 = bus.register(HandlerPriority::Lua, None, h);
+        let id1 = bus
+            .register(HandlerPriority::Native, None, h.clone())
+            .expect("handler registration should succeed");
+        let id2 = bus
+            .register(HandlerPriority::Wasm, None, h.clone())
+            .expect("handler registration should succeed");
+        let id3 = bus
+            .register(HandlerPriority::Lua, None, h)
+            .expect("handler registration should succeed");
 
         let ids = bus.handler_ids();
         assert!(ids.contains(&id1));
@@ -500,8 +577,10 @@ mod tests {
     fn clear_removes_all_handlers() {
         let bus = EventBus::new();
         let h: Arc<HandlerFn> = Arc::new(|_| vec![]);
-        bus.register(HandlerPriority::Native, None, h.clone());
-        bus.register(HandlerPriority::Wasm, None, h);
+        bus.register(HandlerPriority::Native, None, h.clone())
+            .expect("handler registration should succeed");
+        bus.register(HandlerPriority::Wasm, None, h)
+            .expect("handler registration should succeed");
         assert_eq!(bus.handler_count(), 2);
 
         let removed = bus.clear();
@@ -517,13 +596,16 @@ mod tests {
             HandlerPriority::Native,
             Some(EventType::PaneOutput),
             h.clone(),
-        );
+        )
+        .expect("handler registration should succeed");
         bus.register(
             HandlerPriority::Native,
             Some(EventType::UpdateStatus),
             h.clone(),
-        );
-        bus.register(HandlerPriority::Native, None, h); // wildcard
+        )
+        .expect("handler registration should succeed");
+        bus.register(HandlerPriority::Native, None, h)
+            .expect("handler registration should succeed"); // wildcard
 
         // PaneOutput: 1 specific + 1 wildcard = 2
         assert_eq!(bus.handler_count_for(&EventType::PaneOutput), 2);
@@ -590,7 +672,8 @@ mod tests {
                 },
             ]
         });
-        bus.register(HandlerPriority::Native, None, h);
+        bus.register(HandlerPriority::Native, None, h)
+            .expect("handler registration should succeed");
 
         let (action_count, matched) = bus.fire_counted(&make_event(EventType::PaneOutput));
         assert_eq!(action_count, 2);
@@ -613,7 +696,9 @@ mod tests {
             }]
         });
 
-        let id = bus.register(HandlerPriority::Native, None, handler);
+        let id = bus
+            .register(HandlerPriority::Native, None, handler)
+            .expect("handler registration should succeed");
         *handler_id.lock().unwrap() = Some(id);
 
         let (tx, rx) = std::sync::mpsc::channel();
@@ -647,7 +732,9 @@ mod tests {
             }]
         });
 
-        let id = bus.register(HandlerPriority::Native, None, handler);
+        let id = bus
+            .register(HandlerPriority::Native, None, handler)
+            .expect("handler registration should succeed");
         *handler_id.lock().unwrap() = Some(id);
 
         let (tx, rx) = std::sync::mpsc::channel();
@@ -684,7 +771,8 @@ mod tests {
                 results.lock().unwrap().push(i);
                 vec![]
             });
-            bus.register(HandlerPriority::Native, None, handler);
+            bus.register(HandlerPriority::Native, None, handler)
+                .expect("handler registration should succeed");
         }
 
         bus.fire(&make_event(EventType::PaneOutput));
@@ -778,7 +866,9 @@ mod tests {
             let h: Arc<HandlerFn> = Arc::new(|_| vec![]);
             let mut ids = HashSet::new();
             for _ in 0..count {
-                let id = bus.register(HandlerPriority::Native, None, h.clone());
+                let id = bus
+                    .register(HandlerPriority::Native, None, h.clone())
+                    .expect("handler registration should succeed");
                 let inserted = ids.insert(id);
                 prop_assert!(inserted, "handler id was reused");
             }
@@ -796,7 +886,9 @@ mod tests {
 
             for register in ops {
                 if register {
-                    let id = bus.register(HandlerPriority::Native, None, h.clone());
+                    let id = bus
+                        .register(HandlerPriority::Native, None, h.clone())
+                        .expect("handler registration should succeed");
                     registered.push(id);
                 } else if let Some(id) = registered.pop() {
                     bus.deregister(id);
@@ -818,7 +910,10 @@ mod tests {
 
             let mut ids: Vec<HandlerId> = Vec::new();
             for _ in 0..n_register {
-                ids.push(bus.register(HandlerPriority::Native, None, h.clone()));
+                ids.push(
+                    bus.register(HandlerPriority::Native, None, h.clone())
+                        .expect("handler registration should succeed"),
+                );
             }
 
             let mut removed = 0_usize;
@@ -847,7 +942,8 @@ mod tests {
             let h: Arc<HandlerFn> = Arc::new(|_| {
                 vec![EventAction::Log { message: "hit".into() }]
             });
-            bus.register(HandlerPriority::Native, Some(filter_type.clone()), h);
+            bus.register(HandlerPriority::Native, Some(filter_type.clone()), h)
+                .expect("handler registration should succeed");
 
             let actions = bus.fire(&make_event(fire_type.clone()));
             let should_fire = filter_type == fire_type;
@@ -863,7 +959,8 @@ mod tests {
             let h: Arc<HandlerFn> = Arc::new(|_| {
                 vec![EventAction::Log { message: "wild".into() }]
             });
-            bus.register(HandlerPriority::Native, None, h);
+            bus.register(HandlerPriority::Native, None, h)
+                .expect("handler registration should succeed");
 
             let actions = bus.fire(&make_event(fire_type));
             prop_assert_eq!(actions.len(), 1);
@@ -886,7 +983,8 @@ mod tests {
                         data: format!("{}", p as u8),
                     }]
                 });
-                bus.register(*priority, None, handler);
+                bus.register(*priority, None, handler)
+                    .expect("handler registration should succeed");
             }
 
             let actions = bus.fire(&make_event(EventType::PaneOutput));
@@ -928,7 +1026,9 @@ mod tests {
                                 data: String::new(),
                             }]
                         });
-                        let id = bus.register(HandlerPriority::Native, None, handler);
+                        let id = bus
+                            .register(HandlerPriority::Native, None, handler)
+                            .expect("handler registration should succeed");
                         let is_new = seen_handler_ids.insert(id);
                         prop_assert!(is_new, "handler id reused");
                         active_ids.push((token, id));
@@ -966,7 +1066,8 @@ mod tests {
             let bus = EventBus::new();
             let h: Arc<HandlerFn> = Arc::new(|_| vec![]);
             for _ in 0..count {
-                bus.register(HandlerPriority::Native, None, h.clone());
+                bus.register(HandlerPriority::Native, None, h.clone())
+                    .expect("handler registration should succeed");
             }
             let removed = bus.clear();
             prop_assert_eq!(removed, count);
@@ -989,19 +1090,22 @@ mod tests {
                     HandlerPriority::Native,
                     Some(EventType::PaneOutput),
                     h.clone(),
-                );
+                )
+                .expect("handler registration should succeed");
             }
             // Also add a wildcard handler for each matching handler.
             let n_wildcard = n_matching;
             for _ in 0..n_wildcard {
-                bus.register(HandlerPriority::Native, None, h.clone());
+                bus.register(HandlerPriority::Native, None, h.clone())
+                    .expect("handler registration should succeed");
             }
             for _ in 0..n_nonmatching {
                 bus.register(
                     HandlerPriority::Native,
                     Some(EventType::UpdateStatus),
                     h.clone(),
-                );
+                )
+                .expect("handler registration should succeed");
             }
 
             let (action_count, matched) =
@@ -1052,17 +1156,20 @@ mod tests {
                     HandlerPriority::Native,
                     Some(EventType::PaneOutput),
                     h.clone(),
-                );
+                )
+                .expect("handler registration should succeed");
             }
             for _ in 0..n_wildcard {
-                bus.register(HandlerPriority::Native, None, h.clone());
+                bus.register(HandlerPriority::Native, None, h.clone())
+                    .expect("handler registration should succeed");
             }
             for _ in 0..n_other {
                 bus.register(
                     HandlerPriority::Native,
                     Some(EventType::UpdateStatus),
                     h.clone(),
-                );
+                )
+                .expect("handler registration should succeed");
             }
 
             let total = bus.handler_count();
@@ -1093,7 +1200,8 @@ mod tests {
                 message: "hit".into(),
             }]
         });
-        bus.register(HandlerPriority::Native, None, handler);
+        bus.register(HandlerPriority::Native, None, handler)
+            .expect("handler registration should succeed");
 
         let n_threads = 8;
         let n_fires_per_thread = 1000;
@@ -1157,7 +1265,8 @@ mod tests {
                             message: "x".into(),
                         }]
                     });
-                    bus.register(HandlerPriority::Native, None, h);
+                    bus.register(HandlerPriority::Native, None, h)
+                        .expect("handler registration should succeed");
                 }
             }));
         }
@@ -1208,7 +1317,9 @@ mod tests {
                     let mut ids = Vec::new();
                     for _ in 0..n_ops {
                         let h: Arc<HandlerFn> = Arc::new(|_| vec![]);
-                        let id = bus.register(HandlerPriority::Native, None, h);
+                        let id = bus
+                            .register(HandlerPriority::Native, None, h)
+                            .expect("handler registration should succeed");
                         ids.push(id);
                     }
                     // Deregister all in reverse order.
@@ -1244,7 +1355,8 @@ mod tests {
                 c.fetch_add(1, Ordering::Relaxed);
                 vec![]
             });
-            bus.register(HandlerPriority::Native, Some(EventType::UpdateStatus), h);
+            bus.register(HandlerPriority::Native, Some(EventType::UpdateStatus), h)
+                .expect("handler registration should succeed");
         }
         {
             let c = output_count.clone();
@@ -1252,7 +1364,8 @@ mod tests {
                 c.fetch_add(1, Ordering::Relaxed);
                 vec![]
             });
-            bus.register(HandlerPriority::Native, Some(EventType::PaneOutput), h);
+            bus.register(HandlerPriority::Native, Some(EventType::PaneOutput), h)
+                .expect("handler registration should succeed");
         }
         {
             let c = resize_count.clone();
@@ -1260,7 +1373,8 @@ mod tests {
                 c.fetch_add(1, Ordering::Relaxed);
                 vec![]
             });
-            bus.register(HandlerPriority::Native, Some(EventType::WindowResized), h);
+            bus.register(HandlerPriority::Native, Some(EventType::WindowResized), h)
+                .expect("handler registration should succeed");
         }
 
         let n_fires = 1000;
@@ -1335,7 +1449,8 @@ mod tests {
                 c.fetch_add(1, Ordering::Relaxed);
                 vec![]
             });
-            bus.register(HandlerPriority::Native, Some(EventType::UpdateStatus), h);
+            bus.register(HandlerPriority::Native, Some(EventType::UpdateStatus), h)
+                .expect("handler registration should succeed");
         }
 
         let n_events = 10_000;
