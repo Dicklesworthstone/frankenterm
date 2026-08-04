@@ -3415,6 +3415,7 @@ mod tests {
         assert!(
             error.to_string().contains("requires an atomic existing-window reorder"),
             "unexpected error: {error:#}",
+            error = error,
         );
         assert_eq!(
             remote_tab_order(&mux, &inner, local_window_id),
@@ -3460,6 +3461,7 @@ mod tests {
         assert!(
             error.to_string().contains("atomic pane migration is required"),
             "unexpected error: {error:#}",
+            error = error,
         );
         assert_eq!(inner.remote_to_local_tab_id(51), Some(local_tab_id));
         assert_eq!(inner.remote_to_local_tab_id(52), None);
@@ -3494,6 +3496,7 @@ mod tests {
         assert!(
             error.to_string().contains("mappings alias remote tabs"),
             "unexpected error: {error:#}",
+            error = error,
         );
         assert_eq!(mux.iter_panes().len(), 2);
         assert_eq!(mux.iter_windows().len(), 1);
@@ -3533,6 +3536,7 @@ mod tests {
                 .to_string()
                 .contains("does not belong exactly to this client"),
             "unexpected error: {error:#}",
+            error = error,
         );
         assert_eq!(owner.remote_to_local_tab_id(51), Some(owner_tab));
         assert_eq!(owner.remote_to_local_window(41), Some(owner_window));
@@ -3564,6 +3568,7 @@ mod tests {
         assert!(
             error.to_string().contains("atomic stale-pane removal is required"),
             "unexpected error: {error:#}",
+            error = error,
         );
         assert!(inner.remote_to_local_tab_id(51).is_some());
         assert!(inner.remote_to_local_tab_id(52).is_some());
@@ -3591,6 +3596,7 @@ mod tests {
         assert!(
             format!("{error:#}").contains("reserved value"),
             "unexpected error: {error:#}",
+            error = error,
         );
         assert!(mux.iter_panes().is_empty());
         assert!(mux.iter_windows().is_empty());
@@ -3622,6 +3628,7 @@ mod tests {
                 .to_string()
                 .contains("requires exact ordered workspace and client ownership authority"),
             "unexpected error: {error:#}",
+            error = error,
         );
         assert!(mux.iter_panes().is_empty());
         assert!(mux.iter_windows().is_empty());
@@ -3682,6 +3689,7 @@ mod tests {
                 .to_string()
                 .contains("requires exact ordered workspace and client ownership authority"),
             "unexpected error: {error:#}",
+            error = error,
         );
         assert_eq!(
             mux.get_window(foreign_window_id)
