@@ -903,6 +903,24 @@ fn capture_pane_arena_tree(
                         let node = data.ok_or_else(|| {
                             anyhow::anyhow!("tab {tab_title:?} has an uninitialized split node")
                         })?;
+                        let right_left_col = if node.direction == SplitDirection::Vertical {
+                            left_col
+                        } else {
+                            left_col.checked_add(node.left_of_second()).ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "tab {tab_title:?} right-pane column offset overflows usize"
+                                )
+                            })?
+                        };
+                        let right_top_row = if node.direction == SplitDirection::Horizontal {
+                            top_row
+                        } else {
+                            top_row.checked_add(node.top_of_second()).ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "tab {tab_title:?} right-pane row offset overflows usize"
+                                )
+                            })?
+                        };
                         let split_index = captured.len();
                         captured.push(CapturedPaneArenaNode::Split {
                             left: split_index.checked_add(1).ok_or_else(|| {
@@ -918,16 +936,8 @@ fn capture_pane_arena_tree(
                             split_index,
                             tree: right,
                             depth: next_depth,
-                            left_col: if node.direction == SplitDirection::Vertical {
-                                left_col
-                            } else {
-                                left_col.saturating_add(node.left_of_second())
-                            },
-                            top_row: if node.direction == SplitDirection::Horizontal {
-                                top_row
-                            } else {
-                                top_row.saturating_add(node.top_of_second())
-                            },
+                            left_col: right_left_col,
+                            top_row: right_top_row,
                         });
                         tasks.push(CapturePaneArenaTask::Visit {
                             tree: left,
