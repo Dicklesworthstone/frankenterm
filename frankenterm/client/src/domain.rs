@@ -2987,7 +2987,7 @@ mod tests {
         .expect_err("existing-window reorder must fail before pane preparation");
         assert!(
             error.to_string().contains("requires an atomic existing-window reorder"),
-            "unexpected error: {error:#}"
+            "unexpected error: {error:#}",
         );
         assert_eq!(
             remote_tab_order(&mux, &inner, local_window_id),
@@ -3027,7 +3027,7 @@ mod tests {
             error
                 .to_string()
                 .contains("creating an empty window requires ordered workspace authority"),
-            "unexpected error: {error:#}"
+            "unexpected error: {error:#}",
         );
         assert!(mux.iter_panes().is_empty());
         assert!(mux.iter_windows().is_empty());
