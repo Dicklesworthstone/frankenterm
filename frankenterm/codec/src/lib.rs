@@ -929,11 +929,11 @@ impl StreamingPduFrameLimitExceeded {
     }
 }
 
-/// A validated frame header declared more encoded body bytes than its wire
-/// schema permits.
+/// An encoded body crossed the byte ceiling published by its wire schema.
 ///
-/// This is checked after the serial and PDU identifier are decoded but before
-/// the body reader reserves or materializes any payload storage. Unknown and
+/// A decoder reports the length declared by a validated frame header before it
+/// reserves or materializes payload storage. A producer reports the first
+/// cumulative serialization length that crossed the same limit. Unknown and
 /// legacy identifiers retain [`MAX_PDU_SIZE`]; closed authority schemas may
 /// publish a tighter limit in [`PDU_WIRE_SPECS`].
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -1626,6 +1626,85 @@ fn serialize_uncompressed<T: serde::Serialize>(t: &T) -> Result<Vec<u8>, Error> 
     Ok(uncompressed)
 }
 
+struct BoundedSerializeBuffer {
+    bytes: Vec<u8>,
+    logical_len: usize,
+    max_bytes: usize,
+    exceeded: bool,
+}
+
+impl BoundedSerializeBuffer {
+    fn new(max_bytes: usize) -> Self {
+        Self {
+            bytes: Vec::with_capacity(64.min(max_bytes)),
+            logical_len: 0,
+            max_bytes,
+            exceeded: false,
+        }
+    }
+}
+
+impl std::io::Write for BoundedSerializeBuffer {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let Some(next_len) = self.logical_len.checked_add(buf.len()) else {
+            self.logical_len = usize::MAX;
+            self.exceeded = true;
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "serialized PDU body length overflow",
+            ));
+        };
+        self.logical_len = next_len;
+        if next_len > self.max_bytes {
+            self.exceeded = true;
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "serialized PDU body exceeded its wire limit",
+            ));
+        }
+        // Avoid Vec's geometric growth policy here.  This writer is the
+        // producer-side wire admission boundary, so reserving only the exact
+        // increment prevents a small final write from doubling a near-limit
+        // buffer before the logical ceiling can reject it.
+        self.bytes
+            .try_reserve_exact(buf.len())
+            .map_err(std::io::Error::other)?;
+        self.bytes.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn serialize_uncompressed_bounded<T: serde::Serialize>(
+    value: &T,
+    max_payload_bytes: usize,
+    serial: u64,
+    ident: u64,
+) -> Result<Vec<u8>, Error> {
+    #[cfg(test)]
+    record_test_serialize_invocation();
+    let mut output = BoundedSerializeBuffer::new(max_payload_bytes);
+    let serialize_result = {
+        let mut encoder = varbincode::Serializer::new(&mut output);
+        value.serialize(&mut encoder)
+    };
+    if output.exceeded {
+        return Err(PduEncodedBodyLimitExceeded {
+            declared_payload_bytes: output.logical_len,
+            max_payload_bytes,
+            serial,
+            ident,
+            is_compressed: false,
+        }
+        .into());
+    }
+    serialize_result?;
+    Ok(output.bytes)
+}
+
 fn finish_serialized_payload(
     uncompressed: Vec<u8>,
     compression_mode: CompressionMode,
@@ -1672,9 +1751,18 @@ fn serialize_pdu_payload<T: serde::Serialize>(
     serial: u64,
     compression_mode: CompressionMode,
 ) -> Result<SerializedPayload, Error> {
-    let uncompressed = serialize_uncompressed(value)?;
-    // This is the real serialization length, checked before zstd work or frame
-    // allocation. Exact-render structural validation has already run once.
+    let max_uncompressed_bytes = wire_spec
+        .encoded_body_limit
+        .maximum_encoded_payload_bytes(false);
+    let uncompressed = serialize_uncompressed_bounded(
+        value,
+        max_uncompressed_bytes,
+        serial,
+        wire_spec.ident,
+    )?;
+    // This defense-in-depth check uses the real retained serialization length;
+    // the bounded writer already stopped serialization at the same
+    // schema-specific ceiling before zstd or final-frame work.
     validate_encoded_body_admission(uncompressed.len(), serial, wire_spec.ident, false)?;
     let serialized = finish_serialized_payload(uncompressed, compression_mode)?;
     if !serialized.is_compressed {
@@ -2056,6 +2144,12 @@ macro_rules! pdu_capability_use {
 }
 
 macro_rules! pdu_encoded_body_limit {
+    (ListPanesOrderedV1Response, negotiates_ordered) => {
+        PduEncodedBodyLimit::SchemaDecompressedWithZstdBound {
+            max_decompressed_bytes: MAX_LIST_PANES_ORDERED_V1_RESPONSE_DECOMPRESSED_BYTES,
+            max_zstd_encoded_bytes: MAX_LIST_PANES_ORDERED_V1_RESPONSE_ZSTD_ENCODED_BYTES,
+        }
+    };
     ($_name:ident, requires_reorder) => {
         PduEncodedBodyLimit::SchemaDecompressedWithZstdBound {
             max_decompressed_bytes: MAX_REORDER_WINDOW_TABS_DECOMPRESSED_BYTES,
@@ -2772,7 +2866,9 @@ impl Pdu {
     fn validate_before_encode(&self) -> Result<(), Error> {
         match self {
             Self::ListPanesOrderedV1(value) => value.validate()?,
-            Self::ListPanesOrderedV1Response(value) => value.validate()?,
+            Self::ListPanesOrderedV1Response(value) => {
+                value.validate_around_bounded_snapshot_section()?
+            }
             Self::ReorderWindowTabsV1(value) => value.validate()?,
             Self::ReorderWindowTabsV1Response(value) => value.validate()?,
             Self::WindowOrderEventV1(value) => value.validate()?,
@@ -3451,9 +3547,13 @@ fn deserialize_list_panes_ordered_v1_response(
     data: &[u8],
     is_compressed: bool,
 ) -> Result<ListPanesOrderedV1Response, Error> {
-    let response: ListPanesOrderedV1Response =
-        deserialize_exact_payload(data, is_compressed, "ListPanesOrderedV1Response")?;
-    response.validate()?;
+    let response: ListPanesOrderedV1Response = deserialize_exact_payload_with_limit(
+        data,
+        is_compressed,
+        "ListPanesOrderedV1Response",
+        MAX_LIST_PANES_ORDERED_V1_RESPONSE_DECOMPRESSED_BYTES,
+    )?;
+    response.validate_around_bounded_snapshot_section()?;
     Ok(response)
 }
 
@@ -3957,7 +4057,55 @@ pub const fn codec_version_supports_ordered_window_v1(codec_version: usize) -> b
 pub const MAX_ORDERED_WINDOWS_PER_SNAPSHOT: usize = 4_096;
 pub const MAX_ORDERED_TABS_PER_WINDOW: usize = 4_096;
 pub const MAX_ORDERED_TABS_PER_SNAPSHOT: usize = 16_384;
-pub const MAX_ORDERED_WINDOW_SECTION_BYTES: usize = 4 * 1024 * 1024;
+/// A legal v1 section is bounded below 332 KiB by the frozen cardinality and
+/// integer-only schema. The 512 KiB ceiling leaves explicit headroom while
+/// keeping a hostile temporary byte buffer eight times smaller than the
+/// original provisional 4 MiB cap.
+pub const MAX_ORDERED_WINDOW_SECTION_BYTES: usize = 512 * 1024;
+const MAX_STRUCTURALLY_VALID_ORDERED_WINDOW_SECTION_BYTES: usize = 10
+    + MAX_ORDERED_WINDOWS_PER_SNAPSHOT * (10 + 10 + 10 + 1 + 10)
+    + MAX_ORDERED_TABS_PER_SNAPSHOT * 10;
+const _: () = assert!(
+    MAX_STRUCTURALLY_VALID_ORDERED_WINDOW_SECTION_BYTES <= MAX_ORDERED_WINDOW_SECTION_BYTES
+);
+const _: () = assert!(
+    MAX_ORDERED_WINDOW_SECTION_BYTES
+        == bounded_varbincode::ORDERED_WINDOW_SECTION_V1_MAX_BYTES
+);
+const _: () = assert!(
+    MAX_ORDERED_TABS_PER_SNAPSHOT == bounded_varbincode::ORDERED_PANE_TABS_V1_MAX_ITEMS
+);
+const _: () = assert!(
+    MAX_ORDERED_TABS_PER_SNAPSHOT
+        == bounded_varbincode::ORDERED_PANE_TAB_TITLES_V1_MAX_ITEMS
+);
+const _: () = assert!(
+    MAX_ORDERED_WINDOWS_PER_SNAPSHOT
+        == bounded_varbincode::ORDERED_PANE_WINDOW_TITLES_V1_MAX_ITEMS
+);
+const _: () = assert!(
+    MAX_ORDERED_WINDOWS_PER_SNAPSHOT == bounded_varbincode::ORDERED_WINDOWS_V1_MAX_ITEMS
+);
+const _: () = assert!(
+    MAX_ORDERED_TABS_PER_WINDOW == bounded_varbincode::ORDERED_TAB_IDS_V1_MAX_ITEMS
+);
+/// Total decompressed body ceiling for PDU 87, including the pane snapshot and
+/// ordered-window section. Sixteen MiB admits the pinned representative
+/// 4,096-window/16,384-tab fixture without inheriting the global 256 MiB PDU
+/// allocation envelope. Structurally valid snapshots with unusually large
+/// pane metadata can still exceed this explicit wire budget and fail closed.
+pub const MAX_LIST_PANES_ORDERED_V1_RESPONSE_DECOMPRESSED_BYTES: usize =
+    16 * 1024 * 1024;
+/// Frozen zstd `compressBound` result for a legal PDU 87 body. At sixteen MiB
+/// the small-input term is zero, leaving `input + input / 256`.
+pub const MAX_LIST_PANES_ORDERED_V1_RESPONSE_ZSTD_ENCODED_BYTES: usize =
+    MAX_LIST_PANES_ORDERED_V1_RESPONSE_DECOMPRESSED_BYTES
+        + (MAX_LIST_PANES_ORDERED_V1_RESPONSE_DECOMPRESSED_BYTES >> 8);
+/// Maximum complete PDU 87 frame allocation. A compressed frame has a
+/// ten-byte tagged-length LEB128, a worst-case ten-byte serial, and the
+/// one-byte wire identifier in addition to its bounded encoded body.
+pub const MAX_LIST_PANES_ORDERED_V1_RESPONSE_FRAME_BYTES: usize =
+    MAX_LIST_PANES_ORDERED_V1_RESPONSE_ZSTD_ENCODED_BYTES + 21;
 pub const MAX_REORDER_WINDOW_TABS_DECOMPRESSED_BYTES: usize = 512 * 1024;
 /// The 512 KiB contract is an outer body ceiling, not merely a decompressed
 /// budget. Canonical q4096 requests are far smaller, so legal frames need no
@@ -4112,11 +4260,7 @@ pub struct OrderedWindowStateV1 {
 
 impl OrderedWindowStateV1 {
     pub fn validate(&self) -> Result<(), OrderedWindowProtocolError> {
-        validate_ordered_windows_with_section_limit(
-            std::slice::from_ref(self),
-            false,
-            MAX_ORDERED_WINDOW_SECTION_BYTES,
-        )
+        validate_ordered_windows_structure(std::slice::from_ref(self), false)
     }
 }
 
@@ -4127,6 +4271,10 @@ impl OrderedWindowStateV1 {
 pub struct OrderedPaneSnapshotV1 {
     pub session_incarnation: MuxSessionIncarnation,
     pub topology_revision: TopologyRevision,
+    #[serde(
+        serialize_with = "serialize_ordered_panes",
+        deserialize_with = "deserialize_ordered_panes"
+    )]
     pub panes: ListPanesResponse,
     #[serde(
         serialize_with = "serialize_ordered_window_section",
@@ -4136,17 +4284,18 @@ pub struct OrderedPaneSnapshotV1 {
 }
 
 impl OrderedPaneSnapshotV1 {
-    pub fn validate(&self) -> Result<(), OrderedWindowProtocolError> {
+    fn validate_envelope_and_panes(&self) -> Result<(), OrderedWindowProtocolError> {
         validate_nonzero_identity(
             "session_incarnation",
             self.session_incarnation.as_bytes(),
         )?;
         validate_topology_revision(self.topology_revision)?;
-        validate_ordered_windows_with_section_limit(
-            &self.ordered_windows,
-            false,
-            MAX_ORDERED_WINDOW_SECTION_BYTES,
-        )
+        validate_ordered_pane_cardinality(&self.panes)
+    }
+
+    pub fn validate(&self) -> Result<(), OrderedWindowProtocolError> {
+        self.validate_envelope_and_panes()?;
+        validate_ordered_windows_structure(&self.ordered_windows, false)
     }
 }
 
@@ -4241,6 +4390,36 @@ pub struct ListPanesOrderedV1Response {
 }
 
 impl ListPanesOrderedV1Response {
+    fn validate_around_bounded_snapshot_section(&self) -> Result<(), OrderedWindowProtocolError> {
+        validate_protocol_version(self.protocol_version)?;
+        validate_nonzero_identity("domain_binding_id", self.domain_binding_id.as_bytes())?;
+        self.negotiated.validate()?;
+        validate_nonzero_identity("stream_id", self.stream_id.as_bytes())?;
+        match &self.outcome {
+            ListPanesOrderedV1Outcome::Snapshot(snapshot) => {
+                // The custom field decoder/serializer already enforced both
+                // ordered-window structure and its exact byte ceiling. Avoid
+                // a second O(q) scan plus canonical re-serialization on the
+                // interactive bootstrap path.
+                snapshot.validate_envelope_and_panes()?;
+            }
+            other => other.validate()?,
+        }
+        if matches!(&self.outcome, ListPanesOrderedV1Outcome::Snapshot(_)) {
+            let foundation = TopologyCapabilities::from_bits(
+                TopologyCapabilities::FENCED_SNAPSHOT_V1.bits()
+                    | TopologyCapabilities::ORDERED_WINDOW_STREAM_V1.bits(),
+            );
+            if !self.negotiated.contains(foundation) {
+                return Err(OrderedWindowProtocolError::MissingNegotiatedCapabilities {
+                    negotiated: self.negotiated.bits(),
+                    missing: foundation.bits() & !self.negotiated.bits(),
+                });
+            }
+        }
+        Ok(())
+    }
+
     pub fn validate(&self) -> Result<(), OrderedWindowProtocolError> {
         validate_protocol_version(self.protocol_version)?;
         validate_nonzero_identity("domain_binding_id", self.domain_binding_id.as_bytes())?;
@@ -4486,11 +4665,7 @@ impl WindowOrderEventV1 {
                 max: MAX_ORDERED_WINDOWS_PER_EVENT,
             });
         }
-        validate_ordered_windows_with_section_limit(
-            &self.windows,
-            true,
-            MAX_ORDERED_WINDOW_SECTION_BYTES,
-        )
+        validate_ordered_windows_structure(&self.windows, true)
     }
 }
 
@@ -4535,6 +4710,12 @@ pub enum OrderedWindowProtocolError {
     RevisionExhausted { field: &'static str },
     #[error("ordered-window snapshot has {count} windows; maximum is {max}")]
     TooManyWindows { count: usize, max: usize },
+    #[error("ordered-window pane snapshot has {count} tab trees; maximum is {max}")]
+    TooManyPaneTrees { count: usize, max: usize },
+    #[error("ordered-window pane snapshot has {count} tab titles; maximum is {max}")]
+    TooManyPaneTabTitles { count: usize, max: usize },
+    #[error("ordered-window pane snapshot has {count} window titles; maximum is {max}")]
+    TooManyPaneWindowTitles { count: usize, max: usize },
     #[error("ordered-window event has {count} windows; maximum is {max}")]
     TooManyEventWindows { count: usize, max: usize },
     #[error("ordered-window event must contain at least one frozen window")]
@@ -4634,6 +4815,31 @@ fn validate_window_order_revision(
     Ok(())
 }
 
+fn validate_ordered_pane_cardinality(
+    panes: &ListPanesResponse,
+) -> Result<(), OrderedWindowProtocolError> {
+    if panes.tabs.len() > MAX_ORDERED_TABS_PER_SNAPSHOT {
+        return Err(OrderedWindowProtocolError::TooManyPaneTrees {
+            count: panes.tabs.len(),
+            max: MAX_ORDERED_TABS_PER_SNAPSHOT,
+        });
+    }
+    if panes.tab_titles.len() > MAX_ORDERED_TABS_PER_SNAPSHOT {
+        return Err(OrderedWindowProtocolError::TooManyPaneTabTitles {
+            count: panes.tab_titles.len(),
+            max: MAX_ORDERED_TABS_PER_SNAPSHOT,
+        });
+    }
+    if panes.window_titles.len() > MAX_ORDERED_WINDOWS_PER_SNAPSHOT {
+        return Err(OrderedWindowProtocolError::TooManyPaneWindowTitles {
+            count: panes.window_titles.len(),
+            max: MAX_ORDERED_WINDOWS_PER_SNAPSHOT,
+        });
+    }
+    Ok(())
+}
+
+#[cfg(test)]
 fn encoded_ordered_window_section_len(
     windows: &[OrderedWindowStateV1],
 ) -> Result<usize, OrderedWindowProtocolError> {
@@ -4666,10 +4872,26 @@ fn encoded_ordered_window_section_len(
     Ok(counter.bytes)
 }
 
+#[cfg(test)]
 fn validate_ordered_windows_with_section_limit(
     windows: &[OrderedWindowStateV1],
     require_nonempty: bool,
     max_section_bytes: usize,
+) -> Result<(), OrderedWindowProtocolError> {
+    validate_ordered_windows_structure(windows, require_nonempty)?;
+    let section_bytes = encoded_ordered_window_section_len(windows)?;
+    if section_bytes > max_section_bytes {
+        return Err(OrderedWindowProtocolError::OrderSectionTooLarge {
+            bytes: section_bytes,
+            max: max_section_bytes,
+        });
+    }
+    Ok(())
+}
+
+fn validate_ordered_windows_structure(
+    windows: &[OrderedWindowStateV1],
+    require_nonempty: bool,
 ) -> Result<(), OrderedWindowProtocolError> {
     if require_nonempty && windows.is_empty() {
         return Err(OrderedWindowProtocolError::EmptyWindowEvent);
@@ -4690,11 +4912,12 @@ fn validate_ordered_windows_with_section_limit(
                 window_id: window.window_id.get(),
             });
         }
-        let local_tabs = validate_ordered_window_components(
+        validate_ordered_window_components(
             window.window_id,
             window.order_revision,
             &window.ordered_tab_ids,
             window.active_tab_id,
+            &mut tab_ids,
         )?;
         total_tabs = total_tabs
             .checked_add(window.ordered_tab_ids.len())
@@ -4705,22 +4928,6 @@ fn validate_ordered_windows_with_section_limit(
                 max: MAX_ORDERED_TABS_PER_SNAPSHOT,
             });
         }
-
-        for tab_id in local_tabs {
-            if !tab_ids.insert(tab_id) {
-                return Err(OrderedWindowProtocolError::DuplicateTabId {
-                    tab_id: tab_id.get(),
-                });
-            }
-        }
-    }
-
-    let section_bytes = encoded_ordered_window_section_len(windows)?;
-    if section_bytes > max_section_bytes {
-        return Err(OrderedWindowProtocolError::OrderSectionTooLarge {
-            bytes: section_bytes,
-            max: max_section_bytes,
-        });
     }
     Ok(())
 }
@@ -4760,7 +4967,8 @@ fn validate_ordered_window_components(
     order_revision: WindowOrderRevision,
     ordered_tab_ids: &[RemoteTabId],
     active_tab_id: Option<RemoteTabId>,
-) -> Result<HashSet<RemoteTabId>, OrderedWindowProtocolError> {
+    snapshot_tab_ids: &mut HashSet<RemoteTabId>,
+) -> Result<(), OrderedWindowProtocolError> {
     validate_remote_wire_id("window_id", window_id.get())?;
     validate_window_order_revision(order_revision)?;
     if ordered_tab_ids.len() > MAX_ORDERED_TABS_PER_WINDOW {
@@ -4771,10 +4979,9 @@ fn validate_ordered_window_components(
         });
     }
 
-    let mut local_tabs = HashSet::with_capacity(ordered_tab_ids.len());
     for tab_id in ordered_tab_ids {
         validate_remote_wire_id("tab_id", tab_id.get())?;
-        if !local_tabs.insert(*tab_id) {
+        if !snapshot_tab_ids.insert(*tab_id) {
             return Err(OrderedWindowProtocolError::DuplicateTabId {
                 tab_id: tab_id.get(),
             });
@@ -4789,7 +4996,7 @@ fn validate_ordered_window_components(
                 window_id: window_id.get(),
             });
         }
-        (_, Some(active_tab_id)) if !local_tabs.contains(&active_tab_id) => {
+        (_, Some(active_tab_id)) if !ordered_tab_ids.contains(&active_tab_id) => {
             return Err(OrderedWindowProtocolError::ActiveTabNotInWindow {
                 window_id: window_id.get(),
                 active_tab_id: active_tab_id.get(),
@@ -4797,7 +5004,7 @@ fn validate_ordered_window_components(
         }
         _ => {}
     }
-    Ok(local_tabs)
+    Ok(())
 }
 
 fn serialize_bounded_vec<S, T, const MAX: usize>(
@@ -4878,6 +5085,262 @@ where
     })
 }
 
+struct BoundedMapVisitor<K, V, const MAX: usize> {
+    label: &'static str,
+    marker: std::marker::PhantomData<(K, V)>,
+}
+
+impl<'de, K, V, const MAX: usize> serde::de::Visitor<'de>
+    for BoundedMapVisitor<K, V, MAX>
+where
+    K: Deserialize<'de> + Eq + std::hash::Hash,
+    V: Deserialize<'de>,
+{
+    type Value = HashMap<K, V>;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "at most {MAX} {}", self.label)
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: serde::de::MapAccess<'de>,
+    {
+        let hinted = map.size_hint().unwrap_or(0);
+        if hinted > MAX {
+            return Err(serde::de::Error::custom(format_args!(
+                "{} length {hinted} exceeds maximum {MAX}",
+                self.label
+            )));
+        }
+        let mut values = HashMap::new();
+        values.try_reserve(hinted).map_err(|error| {
+            serde::de::Error::custom(format_args!(
+                "allocating {} length {hinted} failed: {error}",
+                self.label
+            ))
+        })?;
+        let mut entries = 0_usize;
+        while let Some((key, value)) = map.next_entry()? {
+            if entries == MAX {
+                return Err(serde::de::Error::custom(format_args!(
+                    "{} length exceeds maximum {MAX}",
+                    self.label
+                )));
+            }
+            if let std::collections::hash_map::Entry::Vacant(entry) = values.entry(key) {
+                entry.insert(value);
+            } else {
+                return Err(serde::de::Error::custom(format_args!(
+                    "{} contains a duplicate key",
+                    self.label
+                )));
+            }
+            entries += 1;
+        }
+        Ok(values)
+    }
+}
+
+fn deserialize_bounded_map<'de, D, K, V, const MAX: usize>(
+    deserializer: D,
+    label: &'static str,
+) -> Result<HashMap<K, V>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    K: Deserialize<'de> + Eq + std::hash::Hash,
+    V: Deserialize<'de>,
+{
+    deserializer.deserialize_map(BoundedMapVisitor::<K, V, MAX> {
+        label,
+        marker: std::marker::PhantomData,
+    })
+}
+
+fn serialize_ordered_panes<S>(
+    panes: &ListPanesResponse,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    validate_ordered_pane_cardinality(panes).map_err(serde::ser::Error::custom)?;
+
+    #[derive(Serialize)]
+    struct OrderedPanesWire<'a> {
+        tabs: OrderedPaneTabsWire<'a>,
+        tab_titles: OrderedPaneTabTitlesWire<'a>,
+        window_titles: OrderedPaneWindowTitlesWire<'a>,
+    }
+
+    OrderedPanesWire {
+        tabs: OrderedPaneTabsWire(&panes.tabs),
+        tab_titles: OrderedPaneTabTitlesWire(&panes.tab_titles),
+        window_titles: OrderedPaneWindowTitlesWire(&panes.window_titles),
+    }
+    .serialize(serializer)
+}
+
+struct OrderedPaneTabsWire<'a>(&'a [PaneNode]);
+
+impl Serialize for OrderedPaneTabsWire<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_newtype_struct(
+            bounded_varbincode::ORDERED_PANE_TABS_V1_NEWTYPE,
+            self.0,
+        )
+    }
+}
+
+struct OrderedPaneTabTitlesWire<'a>(&'a [String]);
+
+impl Serialize for OrderedPaneTabTitlesWire<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_newtype_struct(
+            bounded_varbincode::ORDERED_PANE_TAB_TITLES_V1_NEWTYPE,
+            self.0,
+        )
+    }
+}
+
+struct OrderedPaneWindowTitlesWire<'a>(&'a HashMap<WindowId, String>);
+
+impl Serialize for OrderedPaneWindowTitlesWire<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_newtype_struct(
+            bounded_varbincode::ORDERED_PANE_WINDOW_TITLES_V1_NEWTYPE,
+            self.0,
+        )
+    }
+}
+
+struct OrderedPaneTabsNewtypeVisitor;
+
+impl<'de> serde::de::Visitor<'de> for OrderedPaneTabsNewtypeVisitor {
+    type Value = Vec<PaneNode>;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a bounded ordered pane tab-tree collection")
+    }
+
+    fn visit_newtype_struct<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserialize_bounded_vec::<D, _, MAX_ORDERED_TABS_PER_SNAPSHOT>(
+            deserializer,
+            "ordered pane tab trees",
+        )
+    }
+}
+
+struct OrderedPaneTabTitlesNewtypeVisitor;
+
+impl<'de> serde::de::Visitor<'de> for OrderedPaneTabTitlesNewtypeVisitor {
+    type Value = Vec<String>;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a bounded ordered pane tab-title collection")
+    }
+
+    fn visit_newtype_struct<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserialize_bounded_vec::<D, _, MAX_ORDERED_TABS_PER_SNAPSHOT>(
+            deserializer,
+            "ordered pane tab titles",
+        )
+    }
+}
+
+struct OrderedPaneWindowTitlesNewtypeVisitor;
+
+impl<'de> serde::de::Visitor<'de> for OrderedPaneWindowTitlesNewtypeVisitor {
+    type Value = HashMap<WindowId, String>;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a bounded ordered pane window-title map")
+    }
+
+    fn visit_newtype_struct<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserialize_bounded_map::<D, _, _, MAX_ORDERED_WINDOWS_PER_SNAPSHOT>(
+            deserializer,
+            "ordered pane window titles",
+        )
+    }
+}
+
+fn deserialize_ordered_pane_tabs<'de, D>(deserializer: D) -> Result<Vec<PaneNode>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserializer.deserialize_newtype_struct(
+        bounded_varbincode::ORDERED_PANE_TABS_V1_NEWTYPE,
+        OrderedPaneTabsNewtypeVisitor,
+    )
+}
+
+fn deserialize_ordered_pane_tab_titles<'de, D>(
+    deserializer: D,
+) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserializer.deserialize_newtype_struct(
+        bounded_varbincode::ORDERED_PANE_TAB_TITLES_V1_NEWTYPE,
+        OrderedPaneTabTitlesNewtypeVisitor,
+    )
+}
+
+fn deserialize_ordered_pane_window_titles<'de, D>(
+    deserializer: D,
+) -> Result<HashMap<WindowId, String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserializer.deserialize_newtype_struct(
+        bounded_varbincode::ORDERED_PANE_WINDOW_TITLES_V1_NEWTYPE,
+        OrderedPaneWindowTitlesNewtypeVisitor,
+    )
+}
+
+fn deserialize_ordered_panes<'de, D>(deserializer: D) -> Result<ListPanesResponse, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    struct OrderedPanesWire {
+        #[serde(deserialize_with = "deserialize_ordered_pane_tabs")]
+        tabs: Vec<PaneNode>,
+        #[serde(deserialize_with = "deserialize_ordered_pane_tab_titles")]
+        tab_titles: Vec<String>,
+        #[serde(deserialize_with = "deserialize_ordered_pane_window_titles")]
+        window_titles: HashMap<WindowId, String>,
+    }
+
+    let panes = OrderedPanesWire::deserialize(deserializer)?;
+    let panes = ListPanesResponse {
+        tabs: panes.tabs,
+        tab_titles: panes.tab_titles,
+        window_titles: panes.window_titles,
+    };
+    validate_ordered_pane_cardinality(&panes).map_err(serde::de::Error::custom)?;
+    Ok(panes)
+}
+
 fn serialize_ordered_tab_ids<S>(
     values: &[RemoteTabId],
     serializer: S,
@@ -4885,20 +5348,46 @@ fn serialize_ordered_tab_ids<S>(
 where
     S: serde::Serializer,
 {
-    serialize_bounded_vec::<S, _, MAX_ORDERED_TABS_PER_WINDOW>(
+    if values.len() > MAX_ORDERED_TABS_PER_WINDOW {
+        return Err(serde::ser::Error::custom(format_args!(
+            "ordered tab ids length {} exceeds maximum {}",
+            values.len(),
+            MAX_ORDERED_TABS_PER_WINDOW,
+        )));
+    }
+    serializer.serialize_newtype_struct(
+        bounded_varbincode::ORDERED_TAB_IDS_V1_NEWTYPE,
         values,
-        serializer,
-        "ordered tab ids",
     )
+}
+
+struct OrderedTabIdsNewtypeVisitor;
+
+impl<'de> serde::de::Visitor<'de> for OrderedTabIdsNewtypeVisitor {
+    type Value = Vec<RemoteTabId>;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a bounded ordered tab-id collection")
+    }
+
+    fn visit_newtype_struct<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserialize_bounded_vec::<D, _, MAX_ORDERED_TABS_PER_WINDOW>(
+            deserializer,
+            "ordered tab ids",
+        )
+    }
 }
 
 fn deserialize_ordered_tab_ids<'de, D>(deserializer: D) -> Result<Vec<RemoteTabId>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    deserialize_bounded_vec::<D, _, MAX_ORDERED_TABS_PER_WINDOW>(
-        deserializer,
-        "ordered tab ids",
+    deserializer.deserialize_newtype_struct(
+        bounded_varbincode::ORDERED_TAB_IDS_V1_NEWTYPE,
+        OrderedTabIdsNewtypeVisitor,
     )
 }
 
@@ -4909,11 +5398,37 @@ fn serialize_ordered_windows<S>(
 where
     S: serde::Serializer,
 {
-    serialize_bounded_vec::<S, _, MAX_ORDERED_WINDOWS_PER_SNAPSHOT>(
+    if values.len() > MAX_ORDERED_WINDOWS_PER_SNAPSHOT {
+        return Err(serde::ser::Error::custom(format_args!(
+            "ordered windows length {} exceeds maximum {}",
+            values.len(),
+            MAX_ORDERED_WINDOWS_PER_SNAPSHOT,
+        )));
+    }
+    serializer.serialize_newtype_struct(
+        bounded_varbincode::ORDERED_WINDOWS_V1_NEWTYPE,
         values,
-        serializer,
-        "ordered windows",
     )
+}
+
+struct OrderedWindowsNewtypeVisitor;
+
+impl<'de> serde::de::Visitor<'de> for OrderedWindowsNewtypeVisitor {
+    type Value = Vec<OrderedWindowStateV1>;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a bounded ordered-window collection")
+    }
+
+    fn visit_newtype_struct<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserialize_bounded_vec::<D, _, MAX_ORDERED_WINDOWS_PER_SNAPSHOT>(
+            deserializer,
+            "ordered windows",
+        )
+    }
 }
 
 fn deserialize_ordered_windows<'de, D>(
@@ -4922,10 +5437,114 @@ fn deserialize_ordered_windows<'de, D>(
 where
     D: serde::Deserializer<'de>,
 {
-    deserialize_bounded_vec::<D, _, MAX_ORDERED_WINDOWS_PER_SNAPSHOT>(
-        deserializer,
-        "ordered windows",
+    deserializer.deserialize_newtype_struct(
+        bounded_varbincode::ORDERED_WINDOWS_V1_NEWTYPE,
+        OrderedWindowsNewtypeVisitor,
     )
+}
+
+struct OrderedWindowSectionWireBytes<'a>(&'a [u8]);
+
+impl Serialize for OrderedWindowSectionWireBytes<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_bytes(self.0)
+    }
+}
+
+struct OrderedWindowSectionBytesVisitor;
+
+impl<'de> serde::de::Visitor<'de> for OrderedWindowSectionBytesVisitor {
+    type Value = Vec<u8>;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "at most {MAX_ORDERED_WINDOW_SECTION_BYTES} ordered-window section bytes"
+        )
+    }
+
+    fn visit_bytes<E>(self, value: &[u8]) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        if value.len() > MAX_ORDERED_WINDOW_SECTION_BYTES {
+            return Err(E::custom(format_args!(
+                "ordered-window section length {} exceeds maximum {}",
+                value.len(),
+                MAX_ORDERED_WINDOW_SECTION_BYTES,
+            )));
+        }
+        let mut owned = Vec::new();
+        owned.try_reserve_exact(value.len()).map_err(E::custom)?;
+        owned.extend_from_slice(value);
+        Ok(owned)
+    }
+
+    fn visit_borrowed_bytes<E>(self, value: &'de [u8]) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        self.visit_bytes(value)
+    }
+
+    fn visit_byte_buf<E>(self, value: Vec<u8>) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        if value.len() > MAX_ORDERED_WINDOW_SECTION_BYTES {
+            return Err(E::custom(format_args!(
+                "ordered-window section length {} exceeds maximum {}",
+                value.len(),
+                MAX_ORDERED_WINDOW_SECTION_BYTES,
+            )));
+        }
+        Ok(value)
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: serde::de::SeqAccess<'de>,
+    {
+        let hinted = sequence.size_hint().unwrap_or(0);
+        if hinted > MAX_ORDERED_WINDOW_SECTION_BYTES {
+            return Err(serde::de::Error::custom(format_args!(
+                "ordered-window section length {hinted} exceeds maximum {}",
+                MAX_ORDERED_WINDOW_SECTION_BYTES,
+            )));
+        }
+        let mut value = Vec::new();
+        value.try_reserve(hinted).map_err(serde::de::Error::custom)?;
+        while let Some(byte) = sequence.next_element()? {
+            if value.len() == MAX_ORDERED_WINDOW_SECTION_BYTES {
+                return Err(serde::de::Error::custom(format_args!(
+                    "ordered-window section length exceeds maximum {}",
+                    MAX_ORDERED_WINDOW_SECTION_BYTES,
+                )));
+            }
+            value.push(byte);
+        }
+        Ok(value)
+    }
+}
+
+struct OrderedWindowSectionNewtypeVisitor;
+
+impl<'de> serde::de::Visitor<'de> for OrderedWindowSectionNewtypeVisitor {
+    type Value = Vec<u8>;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a bounded ordered-window section newtype")
+    }
+
+    fn visit_newtype_struct<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_byte_buf(OrderedWindowSectionBytesVisitor)
+    }
 }
 
 fn serialize_ordered_window_section<S>(
@@ -4935,25 +5554,25 @@ fn serialize_ordered_window_section<S>(
 where
     S: serde::Serializer,
 {
-    validate_ordered_windows_with_section_limit(
-        values,
-        false,
-        MAX_ORDERED_WINDOW_SECTION_BYTES,
-    )
-    .map_err(serde::ser::Error::custom)?;
+    validate_ordered_windows_structure(values, false).map_err(serde::ser::Error::custom)?;
 
-    let mut section = Vec::new();
-    let mut section_serializer = varbincode::Serializer::new(&mut section);
-    serialize_ordered_windows(values, &mut section_serializer)
-        .map_err(serde::ser::Error::custom)?;
-    if section.len() > MAX_ORDERED_WINDOW_SECTION_BYTES {
+    let mut section = BoundedSerializeBuffer::new(MAX_ORDERED_WINDOW_SECTION_BYTES);
+    let serialize_result = {
+        let mut section_serializer = varbincode::Serializer::new(&mut section);
+        serialize_ordered_windows(values, &mut section_serializer)
+    };
+    if section.exceeded {
         return Err(serde::ser::Error::custom(format_args!(
             "ordered-window section length {} exceeds maximum {}",
-            section.len(),
+            section.logical_len,
             MAX_ORDERED_WINDOW_SECTION_BYTES
         )));
     }
-    section.serialize(serializer)
+    serialize_result.map_err(serde::ser::Error::custom)?;
+    serializer.serialize_newtype_struct(
+        bounded_varbincode::ORDERED_WINDOW_SECTION_V1_NEWTYPE,
+        &OrderedWindowSectionWireBytes(&section.bytes),
+    )
 }
 
 fn deserialize_ordered_window_section<'de, D>(
@@ -4968,9 +5587,9 @@ where
         Vec<OrderedWindowStateV1>,
     );
 
-    let section = deserialize_bounded_vec::<D, u8, MAX_ORDERED_WINDOW_SECTION_BYTES>(
-        deserializer,
-        "ordered-window section bytes",
+    let section = deserializer.deserialize_newtype_struct(
+        bounded_varbincode::ORDERED_WINDOW_SECTION_V1_NEWTYPE,
+        OrderedWindowSectionNewtypeVisitor,
     )?;
     let mut reader = section.as_slice();
     let OrderedWindowsWire(windows) =
@@ -4981,12 +5600,7 @@ where
             "ordered-window section has trailing schema bytes",
         ));
     }
-    validate_ordered_windows_with_section_limit(
-        &windows,
-        false,
-        MAX_ORDERED_WINDOW_SECTION_BYTES,
-    )
-    .map_err(serde::de::Error::custom)?;
+    validate_ordered_windows_structure(&windows, false).map_err(serde::de::Error::custom)?;
     Ok(windows)
 }
 
@@ -10317,6 +10931,251 @@ mod test {
         }
     }
 
+    struct OrderedPanesTestWire<'a>(&'a ListPanesResponse);
+
+    impl Serialize for OrderedPanesTestWire<'_> {
+        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: serde::Serializer,
+        {
+            serialize_ordered_panes(self.0, serializer)
+        }
+    }
+
+    struct OrderedWindowSectionTestWire<'a>(&'a [OrderedWindowStateV1]);
+
+    impl Serialize for OrderedWindowSectionTestWire<'_> {
+        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: serde::Serializer,
+        {
+            serialize_ordered_window_section(self.0, serializer)
+        }
+    }
+
+    struct DeclaredEmptySequence(usize);
+
+    impl Serialize for DeclaredEmptySequence {
+        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: serde::Serializer,
+        {
+            let sequence = serializer.serialize_seq(Some(self.0))?;
+            serde::ser::SerializeSeq::end(sequence)
+        }
+    }
+
+    struct DeclaredEmptyMap(usize);
+
+    impl Serialize for DeclaredEmptyMap {
+        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: serde::Serializer,
+        {
+            let map = serializer.serialize_map(Some(self.0))?;
+            serde::ser::SerializeMap::end(map)
+        }
+    }
+
+    struct DuplicateWindowTitleMap;
+
+    impl Serialize for DuplicateWindowTitleMap {
+        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: serde::Serializer,
+        {
+            let mut map = serializer.serialize_map(Some(2))?;
+            serde::ser::SerializeMap::serialize_entry(&mut map, &7_usize, "first")?;
+            serde::ser::SerializeMap::serialize_entry(&mut map, &7_usize, "second")?;
+            serde::ser::SerializeMap::end(map)
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum HostileOrderedSnapshotField {
+        PaneTrees,
+        PaneTabTitles,
+        PaneWindowTitles,
+        DuplicatePaneWindowTitle,
+        OrderedSectionBytes,
+        OrderedWindows,
+        OrderedTabIds,
+    }
+
+    struct HostileOrderedPanes(HostileOrderedSnapshotField);
+
+    impl Serialize for HostileOrderedPanes {
+        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: serde::Serializer,
+        {
+            let mut state = serializer.serialize_struct("ListPanesResponse", 3)?;
+            let empty_tabs: &[PaneNode] = &[];
+            let empty_titles: &[String] = &[];
+            let empty_window_titles = HashMap::<WindowId, String>::new();
+
+            if self.0 == HostileOrderedSnapshotField::PaneTrees {
+                serde::ser::SerializeStruct::serialize_field(
+                    &mut state,
+                    "tabs",
+                    &DeclaredEmptySequence(MAX_ORDERED_TABS_PER_SNAPSHOT + 1),
+                )?;
+            } else {
+                serde::ser::SerializeStruct::serialize_field(
+                    &mut state,
+                    "tabs",
+                    empty_tabs,
+                )?;
+            }
+            if self.0 == HostileOrderedSnapshotField::PaneTabTitles {
+                serde::ser::SerializeStruct::serialize_field(
+                    &mut state,
+                    "tab_titles",
+                    &DeclaredEmptySequence(MAX_ORDERED_TABS_PER_SNAPSHOT + 1),
+                )?;
+            } else {
+                serde::ser::SerializeStruct::serialize_field(
+                    &mut state,
+                    "tab_titles",
+                    empty_titles,
+                )?;
+            }
+            match self.0 {
+                HostileOrderedSnapshotField::PaneWindowTitles => {
+                    serde::ser::SerializeStruct::serialize_field(
+                        &mut state,
+                        "window_titles",
+                        &DeclaredEmptyMap(MAX_ORDERED_WINDOWS_PER_SNAPSHOT + 1),
+                    )?;
+                }
+                HostileOrderedSnapshotField::DuplicatePaneWindowTitle => {
+                    serde::ser::SerializeStruct::serialize_field(
+                        &mut state,
+                        "window_titles",
+                        &DuplicateWindowTitleMap,
+                    )?;
+                }
+                _ => {
+                    serde::ser::SerializeStruct::serialize_field(
+                        &mut state,
+                        "window_titles",
+                        &empty_window_titles,
+                    )?;
+                }
+            }
+            serde::ser::SerializeStruct::end(state)
+        }
+    }
+
+    struct OrderedSectionBytes<'a>(&'a [u8]);
+
+    impl Serialize for OrderedSectionBytes<'_> {
+        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: serde::Serializer,
+        {
+            serializer.serialize_bytes(self.0)
+        }
+    }
+
+    #[derive(Serialize)]
+    struct UncheckedOrderedWindowWithDeclaredTabs {
+        window_id: RemoteWindowId,
+        order_revision: WindowOrderRevision,
+        ordered_tab_ids: DeclaredEmptySequence,
+        active_tab_id: Option<RemoteTabId>,
+    }
+
+    struct HostileOrderedPaneSnapshot {
+        field: HostileOrderedSnapshotField,
+        ordered_section: Vec<u8>,
+    }
+
+    impl Serialize for HostileOrderedPaneSnapshot {
+        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: serde::Serializer,
+        {
+            let mut state = serializer.serialize_struct("OrderedPaneSnapshotV1", 4)?;
+            serde::ser::SerializeStruct::serialize_field(
+                &mut state,
+                "session_incarnation",
+                &MuxSessionIncarnation::from_bytes([0x91; 16]),
+            )?;
+            serde::ser::SerializeStruct::serialize_field(
+                &mut state,
+                "topology_revision",
+                &TopologyRevision::new(1),
+            )?;
+            serde::ser::SerializeStruct::serialize_field(
+                &mut state,
+                "panes",
+                &HostileOrderedPanes(self.field),
+            )?;
+            if self.field == HostileOrderedSnapshotField::OrderedSectionBytes {
+                serde::ser::SerializeStruct::serialize_field(
+                    &mut state,
+                    "ordered_windows",
+                    &DeclaredEmptySequence(MAX_ORDERED_WINDOW_SECTION_BYTES + 1),
+                )?;
+            } else {
+                serde::ser::SerializeStruct::serialize_field(
+                    &mut state,
+                    "ordered_windows",
+                    &OrderedSectionBytes(&self.ordered_section),
+                )?;
+            }
+            serde::ser::SerializeStruct::end(state)
+        }
+    }
+
+    #[derive(Serialize)]
+    enum HostileListPanesOrderedV1Outcome {
+        Snapshot(HostileOrderedPaneSnapshot),
+    }
+
+    #[derive(Serialize)]
+    struct HostileListPanesOrderedV1Response {
+        protocol_version: u16,
+        domain_binding_id: DomainBindingId,
+        negotiated: TopologyCapabilities,
+        stream_id: TopologyStreamId,
+        outcome: HostileListPanesOrderedV1Outcome,
+    }
+
+    fn hostile_ordered_snapshot_response_body(field: HostileOrderedSnapshotField) -> Vec<u8> {
+        let ordered_section = match field {
+            HostileOrderedSnapshotField::OrderedWindows => {
+                serialize_uncompressed(&DeclaredEmptySequence(
+                    MAX_ORDERED_WINDOWS_PER_SNAPSHOT + 1,
+                ))
+                .expect("encode prefix-only hostile ordered-window collection")
+            }
+            HostileOrderedSnapshotField::OrderedTabIds => serialize_uncompressed(&vec![
+                UncheckedOrderedWindowWithDeclaredTabs {
+                    window_id: RemoteWindowId::new(1),
+                    order_revision: WindowOrderRevision::INITIAL,
+                    ordered_tab_ids: DeclaredEmptySequence(MAX_ORDERED_TABS_PER_WINDOW + 1),
+                    active_tab_id: None,
+                },
+            ])
+            .expect("encode prefix-only hostile ordered-tab collection"),
+            _ => serialize_uncompressed(&Vec::<OrderedWindowStateV1>::new())
+                .expect("encode legal empty ordered-window section"),
+        };
+        serialize_uncompressed(&HostileListPanesOrderedV1Response {
+            protocol_version: ORDERED_WINDOW_PROTOCOL_VERSION,
+            domain_binding_id: DomainBindingId::from_bytes([0x92; 16]),
+            negotiated: ordered_window_foundation_capabilities(),
+            stream_id: TopologyStreamId::from_bytes([0x93; 16]),
+            outcome: HostileListPanesOrderedV1Outcome::Snapshot(HostileOrderedPaneSnapshot {
+                field,
+                ordered_section,
+            }),
+        })
+        .expect("encode unchecked hostile PDU 87 body")
+    }
+
     fn sample_reorder_window_tabs_v1() -> ReorderWindowTabsV1 {
         let window = sample_ordered_window();
         ReorderWindowTabsV1 {
@@ -13119,6 +13978,628 @@ mod test {
             "unexpected capability rejection: {error:#}",
             error = error,
         );
+    }
+
+    #[test]
+    fn pdu87_snapshot_body_limit_is_frozen_and_scoped_to_the_response() {
+        assert_eq!(MAX_STRUCTURALLY_VALID_ORDERED_WINDOW_SECTION_BYTES, 331_786);
+        assert_eq!(MAX_ORDERED_WINDOW_SECTION_BYTES, 512 * 1024);
+        assert_eq!(
+            MAX_LIST_PANES_ORDERED_V1_RESPONSE_DECOMPRESSED_BYTES,
+            16 * 1024 * 1024,
+        );
+        assert_eq!(
+            MAX_LIST_PANES_ORDERED_V1_RESPONSE_ZSTD_ENCODED_BYTES,
+            MAX_LIST_PANES_ORDERED_V1_RESPONSE_DECOMPRESSED_BYTES
+                + (MAX_LIST_PANES_ORDERED_V1_RESPONSE_DECOMPRESSED_BYTES >> 8),
+        );
+        assert_eq!(
+            MAX_LIST_PANES_ORDERED_V1_RESPONSE_ZSTD_ENCODED_BYTES,
+            zstd::zstd_safe::compress_bound(
+                MAX_LIST_PANES_ORDERED_V1_RESPONSE_DECOMPRESSED_BYTES,
+            ),
+            "frozen PDU 87 ceiling must continue to admit the pinned zstd encoder bound",
+        );
+        assert_eq!(
+            MAX_LIST_PANES_ORDERED_V1_RESPONSE_FRAME_BYTES,
+            encoded_frame_len(
+                87,
+                u64::MAX,
+                MAX_LIST_PANES_ORDERED_V1_RESPONSE_ZSTD_ENCODED_BYTES,
+                true,
+            )
+            .expect("the maximum legal PDU 87 frame length must be representable"),
+            "the dispatch reservation ceiling must include the complete worst-case frame",
+        );
+
+        let expected = PduEncodedBodyLimit::SchemaDecompressedWithZstdBound {
+            max_decompressed_bytes: MAX_LIST_PANES_ORDERED_V1_RESPONSE_DECOMPRESSED_BYTES,
+            max_zstd_encoded_bytes: MAX_LIST_PANES_ORDERED_V1_RESPONSE_ZSTD_ENCODED_BYTES,
+        };
+        let response_spec =
+            Pdu::wire_spec_for_ident(87).expect("ordered snapshot response ID must be assigned");
+        assert_eq!(
+            response_spec,
+            &<ListPanesOrderedV1Response as PduWireIdent>::WIRE_SPEC,
+        );
+        assert_eq!(response_spec.encoded_body_limit, expected);
+        assert_eq!(
+            response_spec
+                .encoded_body_limit
+                .maximum_encoded_payload_bytes(false),
+            MAX_LIST_PANES_ORDERED_V1_RESPONSE_DECOMPRESSED_BYTES,
+        );
+        assert_eq!(
+            response_spec
+                .encoded_body_limit
+                .maximum_encoded_payload_bytes(true),
+            MAX_LIST_PANES_ORDERED_V1_RESPONSE_ZSTD_ENCODED_BYTES,
+        );
+
+        for ident in [86, 90] {
+            assert_eq!(
+                Pdu::wire_spec_for_ident(ident)
+                    .expect("adjacent ordered-window ID must be assigned")
+                    .encoded_body_limit,
+                PduEncodedBodyLimit::GlobalMaximum,
+                "the PDU 87 total-body ceiling must not spread to ident {ident}",
+            );
+        }
+    }
+
+    #[test]
+    fn pdu87_encoded_body_cap_rejects_limit_plus_one_before_body_allocation() {
+        let spec = Pdu::wire_spec_for_ident(87).expect("PDU 87 must be assigned");
+        for is_compressed in [false, true] {
+            let limit = spec
+                .encoded_body_limit
+                .maximum_encoded_payload_bytes(is_compressed);
+            let exact_header =
+                declared_pdu_frame_header(87, 29, limit, is_compressed);
+            let exact_error = decode_raw(exact_header.as_slice())
+                .expect_err("admitted PDU 87 header without its body must reach the body read");
+            assert!(
+                exact_error
+                    .downcast_ref::<PduEncodedBodyLimitExceeded>()
+                    .is_none(),
+                "exact PDU 87 boundary was rejected as oversized: {:#}",
+                exact_error,
+            );
+
+            let plus = limit.checked_add(1).expect("PDU 87 limit has headroom");
+            let plus_header = declared_pdu_frame_header(87, 29, plus, is_compressed);
+            let plus_error = decode_raw(plus_header.as_slice())
+                .expect_err("limit-plus-one PDU 87 header must fail before body allocation");
+            let exceeded = plus_error
+                .downcast_ref::<PduEncodedBodyLimitExceeded>()
+                .expect("PDU 87 decoder must return the typed schema-body limit error");
+            assert_eq!(exceeded.declared_payload_bytes(), plus);
+            assert_eq!(exceeded.max_payload_bytes(), limit);
+            assert_eq!(exceeded.serial(), 29);
+            assert_eq!(exceeded.ident(), 87);
+            assert_eq!(exceeded.is_compressed(), is_compressed);
+
+            runtime::block_on(async {
+                let mut exact_reader = runtime::Cursor::new(exact_header);
+                let header = decode_raw_header_async(&mut exact_reader, Some(29))
+                    .await
+                    .expect("async PDU 87 header decoder must admit the exact boundary");
+                assert_eq!(header.encoded_payload_len(), limit);
+                assert_eq!(header.maximum_encoded_payload_bytes(), limit);
+
+                let mut plus_reader = runtime::Cursor::new(plus_header);
+                let plus_error = decode_raw_header_async(&mut plus_reader, Some(29))
+                    .await
+                    .expect_err("async limit-plus-one PDU 87 header must fail before allocation");
+                let exceeded = plus_error
+                    .downcast_ref::<PduEncodedBodyLimitExceeded>()
+                    .expect("async PDU 87 decoder must return the typed body-limit error");
+                assert_eq!(exceeded.declared_payload_bytes(), plus);
+                assert_eq!(exceeded.max_payload_bytes(), limit);
+                assert_eq!(exceeded.serial(), 29);
+                assert_eq!(exceeded.ident(), 87);
+                assert_eq!(exceeded.is_compressed(), is_compressed);
+            });
+        }
+    }
+
+    #[test]
+    fn pdu87_exact_decoder_accepts_legal_payload_and_enforces_its_bound() {
+        let mut samples = sample_ordered_window_pdus();
+        let (_, Pdu::ListPanesOrderedV1Response(response)) = samples.remove(1) else {
+            panic!("second ordered-window sample must be PDU 87");
+        };
+        let canonical =
+            serialize_uncompressed(&response).expect("legal PDU 87 payload must serialize");
+        let legal_len = canonical.len();
+        let too_small_limit = legal_len
+            .checked_sub(1)
+            .expect("legal PDU 87 fixture must not be empty");
+
+        for mode in [CompressionMode::Never, CompressionMode::Always] {
+            let (payload, is_compressed) = serialize_with_mode(&response, mode)
+                .expect("legal PDU 87 payload must serialize in either wire mode");
+            assert!(matches!(
+                (mode, is_compressed),
+                (CompressionMode::Never, false) | (CompressionMode::Always, true)
+            ));
+            assert_eq!(
+                deserialize_list_panes_ordered_v1_response(&payload, is_compressed)
+                    .expect("the production PDU 87 decoder must accept a legal payload"),
+                response,
+            );
+            assert_eq!(
+                deserialize_exact_payload_with_limit::<ListPanesOrderedV1Response>(
+                    &payload,
+                    is_compressed,
+                    "ListPanesOrderedV1Response",
+                    legal_len,
+                )
+                .expect("the exact decompressed boundary must remain legal"),
+                response,
+            );
+
+            let error =
+                deserialize_exact_payload_with_limit::<ListPanesOrderedV1Response>(
+                    &payload,
+                    is_compressed,
+                    "ListPanesOrderedV1Response",
+                    too_small_limit,
+                )
+                .expect_err("one byte below a legal PDU 87 body must fail closed");
+            assert!(
+                format!("{error:#}").contains(&format!("maximum {too_small_limit}")),
+                "unexpected bounded PDU 87 rejection under {:?}: {:#}",
+                mode,
+                error,
+            );
+        }
+    }
+
+    #[test]
+    fn ordered_snapshot_container_markers_are_zero_wire_changes() {
+        let panes = ListPanesResponse {
+            tabs: vec![PaneNode::Leaf(mux::tab::PaneEntry {
+                window_id: 7,
+                tab_id: 11,
+                pane_id: 13,
+                title: "wire-golden-pane".to_string(),
+                size: TerminalSize::default(),
+                working_dir: None,
+                alt_screen_active: false,
+                is_active_pane: true,
+                is_zoomed_pane: false,
+                workspace: "wire-golden".to_string(),
+                cursor_pos: StableCursorPosition::default(),
+                physical_top: 0,
+                top_row: 0,
+                left_col: 0,
+                tty_name: Some("tty-wire-golden".to_string()),
+            })],
+            tab_titles: vec!["wire-golden-tab".to_string()],
+            window_titles: HashMap::from([(7, "wire-golden-window".to_string())]),
+        };
+        let legacy_panes =
+            serialize_uncompressed(&panes).expect("serialize legacy pane representation");
+        let marked_panes = serialize_uncompressed(&OrderedPanesTestWire(&panes))
+            .expect("serialize schema-marked pane representation");
+        assert_eq!(
+            marked_panes, legacy_panes,
+            "serde newtype admission markers must add no pane wire bytes",
+        );
+
+        let windows = [sample_ordered_window()];
+        let section = serialize_uncompressed(&windows.as_slice())
+            .expect("serialize legacy ordered-window section");
+        let legacy_section_wire =
+            serialize_uncompressed(&section).expect("serialize legacy section byte vector");
+        let marked_section_wire =
+            serialize_uncompressed(&OrderedWindowSectionTestWire(&windows))
+                .expect("serialize schema-marked section bytes");
+        assert_eq!(
+            marked_section_wire, legacy_section_wire,
+            "serde newtype admission markers must add no section wire bytes",
+        );
+    }
+
+    #[test]
+    fn pdu87_rejects_hostile_collection_prefixes_before_elements_in_every_mode() {
+        let cases = [
+            (
+                HostileOrderedSnapshotField::PaneTrees,
+                "ordered pane tab trees length 16385 exceeds maximum 16384",
+            ),
+            (
+                HostileOrderedSnapshotField::PaneTabTitles,
+                "ordered pane tab titles length 16385 exceeds maximum 16384",
+            ),
+            (
+                HostileOrderedSnapshotField::PaneWindowTitles,
+                "ordered pane window titles length 4097 exceeds maximum 4096",
+            ),
+            (
+                HostileOrderedSnapshotField::OrderedSectionBytes,
+                "ordered-window section bytes length 524289 exceeds maximum 524288",
+            ),
+            (
+                HostileOrderedSnapshotField::OrderedWindows,
+                "ordered windows length 4097 exceeds maximum 4096",
+            ),
+            (
+                HostileOrderedSnapshotField::OrderedTabIds,
+                "ordered tab ids length 4097 exceeds maximum 4096",
+            ),
+        ];
+
+        for (field, expected_error) in cases {
+            let canonical = hostile_ordered_snapshot_response_body(field);
+            assert!(
+                canonical.len() < 1024,
+                "{:?} fixture must contain only hostile prefixes, not materialized elements",
+                field,
+            );
+            for (payload, is_compressed) in [
+                (canonical.clone(), false),
+                (
+                    zstd::stream::encode_all(canonical.as_slice(), 1)
+                        .expect("compress prefix-only hostile PDU 87 body"),
+                    true,
+                ),
+            ] {
+                let mut frame = Vec::new();
+                encode_raw(87, 39, &payload, is_compressed, &mut frame)
+                    .expect("frame prefix-only hostile PDU 87 body");
+                let error = Pdu::decode(frame.as_slice())
+                    .expect_err("hostile PDU 87 collection prefix must fail closed");
+                assert!(
+                    format!("{error:#}").contains(expected_error),
+                    "unexpected {:?} rejection compressed={}: {:#}",
+                    field,
+                    is_compressed,
+                    error,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn pdu87_rejects_duplicate_window_title_keys_in_every_mode() {
+        let canonical = hostile_ordered_snapshot_response_body(
+            HostileOrderedSnapshotField::DuplicatePaneWindowTitle,
+        );
+        for (payload, is_compressed) in [
+            (canonical.clone(), false),
+            (
+                zstd::stream::encode_all(canonical.as_slice(), 1)
+                    .expect("compress duplicate-window-title PDU 87 body"),
+                true,
+            ),
+        ] {
+            let mut frame = Vec::new();
+            encode_raw(87, 40, &payload, is_compressed, &mut frame)
+                .expect("frame duplicate-window-title PDU 87 body");
+            let error = Pdu::decode(frame.as_slice())
+                .expect_err("duplicate PDU 87 window-title key must fail closed");
+            assert!(
+                format!("{error:#}").contains("ordered pane window titles contains a duplicate key"),
+                "unexpected duplicate-key rejection compressed={}: {:#}",
+                is_compressed,
+                error,
+            );
+        }
+    }
+
+    #[test]
+    fn maximum_width_ordered_section_stays_below_its_structural_proof() {
+        const TABS_PER_WINDOW: usize =
+            MAX_ORDERED_TABS_PER_SNAPSHOT / MAX_ORDERED_WINDOWS_PER_SNAPSHOT;
+        let mut windows = Vec::with_capacity(MAX_ORDERED_WINDOWS_PER_SNAPSHOT);
+        for window_offset in 0..MAX_ORDERED_WINDOWS_PER_SNAPSHOT {
+            let ordered_tab_ids = (0..TABS_PER_WINDOW)
+                .map(|tab_offset| {
+                    let ordinal = window_offset * TABS_PER_WINDOW + tab_offset;
+                    RemoteTabId::new(
+                        (u64::MAX - 1)
+                            - u64::try_from(ordinal).expect("bounded tab ordinal fits in u64"),
+                    )
+                })
+                .collect::<Vec<_>>();
+            windows.push(OrderedWindowStateV1 {
+                window_id: RemoteWindowId::new(
+                    (u64::MAX - 1)
+                        - u64::try_from(window_offset)
+                            .expect("bounded window ordinal fits in u64"),
+                ),
+                order_revision: WindowOrderRevision::new(u64::MAX - 1),
+                active_tab_id: ordered_tab_ids.first().copied(),
+                ordered_tab_ids,
+            });
+        }
+        validate_ordered_windows_structure(&windows, false)
+            .expect("maximum-width maximum-cardinality section must be structurally legal");
+        let encoded = encoded_ordered_window_section_len(&windows)
+            .expect("maximum-width ordered section must have a representable length");
+        assert!(
+            encoded <= MAX_STRUCTURALLY_VALID_ORDERED_WINDOW_SECTION_BYTES,
+            "maximum-width section {encoded} exceeded conservative proof {}",
+            MAX_STRUCTURALLY_VALID_ORDERED_WINDOW_SECTION_BYTES,
+        );
+        assert!(encoded <= MAX_ORDERED_WINDOW_SECTION_BYTES);
+    }
+
+    #[test]
+    fn pdu87_producer_and_expansion_decoder_enforce_total_body_ceiling() {
+        let mut samples = sample_ordered_window_pdus();
+        let (_, Pdu::ListPanesOrderedV1Response(mut response)) = samples.remove(1) else {
+            panic!("second ordered-window sample must be PDU 87");
+        };
+        {
+            let ListPanesOrderedV1Outcome::Snapshot(snapshot) = &mut response.outcome else {
+                panic!("sample PDU 87 must carry a snapshot");
+            };
+            let window = snapshot
+                .ordered_windows
+                .first_mut()
+                .expect("sample PDU 87 must carry one ordered window");
+            window.window_id = RemoteWindowId::new(7);
+            for (offset, tab_id) in window.ordered_tab_ids.iter_mut().enumerate() {
+                *tab_id = RemoteTabId::new(
+                    u64::try_from(offset + 11).expect("small test tab id fits u64"),
+                );
+            }
+            window.active_tab_id = window.ordered_tab_ids.first().copied();
+            let (remote_window_id, remote_active_tab_id, remote_tab_ids) = {
+                let window = snapshot
+                    .ordered_windows
+                    .first()
+                    .expect("sample PDU 87 must carry one ordered window");
+                (
+                    window.window_id,
+                    window.active_tab_id,
+                    window.ordered_tab_ids.clone(),
+                )
+            };
+            let window_id = remote_window_id
+                .try_into_usize()
+                .expect("sample remote window id must fit this mux target");
+            snapshot.panes.tabs = remote_tab_ids
+                .iter()
+                .map(|remote_tab_id| {
+                    let tab_id = remote_tab_id
+                        .try_into_usize()
+                        .expect("sample remote tab id must fit this mux target");
+                    PaneNode::Leaf(mux::tab::PaneEntry {
+                        window_id,
+                        tab_id,
+                        pane_id: tab_id,
+                        title: format!("pane-{tab_id}"),
+                        size: TerminalSize::default(),
+                        working_dir: None,
+                        alt_screen_active: false,
+                        is_active_pane: Some(*remote_tab_id) == remote_active_tab_id,
+                        is_zoomed_pane: false,
+                        workspace: "body-limit-fixture".to_string(),
+                        cursor_pos: StableCursorPosition::default(),
+                        physical_top: 0,
+                        top_row: 0,
+                        left_col: 0,
+                        tty_name: Some(format!("tty-{tab_id}")),
+                    })
+                })
+                .collect();
+            snapshot.panes.tab_titles = remote_tab_ids
+                .iter()
+                .map(|remote_tab_id| format!("tab-{}", remote_tab_id.get()))
+                .collect();
+            snapshot.panes.tab_titles[0].clear();
+            snapshot
+                .panes
+                .window_titles
+                .insert(window_id, format!("window-{window_id}"));
+        }
+        let empty_title_body =
+            serialize_uncompressed(&response).expect("baseline PDU 87 fixture must serialize");
+        let target_body_bytes = MAX_LIST_PANES_ORDERED_V1_RESPONSE_DECOMPRESSED_BYTES + 1;
+        let fixed_body_bytes = empty_title_body
+            .len()
+            .checked_sub(encoded_length(0))
+            .expect("empty title length prefix must be present");
+        let target_body_bytes_u64 =
+            u64::try_from(target_body_bytes).expect("PDU 87 body limit fits in u64");
+        let initial_overhead = fixed_body_bytes
+            .checked_add(encoded_length(target_body_bytes_u64))
+            .expect("PDU 87 fixture overhead is representable");
+        let mut title_bytes = target_body_bytes
+            .checked_sub(initial_overhead)
+            .expect("PDU 87 fixture overhead must fit beneath the target");
+        loop {
+            let next = target_body_bytes
+                .checked_sub(
+                    fixed_body_bytes
+                        .checked_add(encoded_length(
+                            u64::try_from(title_bytes).expect("title length fits in u64"),
+                        ))
+                        .expect("PDU 87 fixture overhead is representable"),
+                )
+                .expect("PDU 87 fixture overhead must fit beneath the target");
+            if next == title_bytes {
+                break;
+            }
+            title_bytes = next;
+        }
+        let ListPanesOrderedV1Outcome::Snapshot(snapshot) = &mut response.outcome else {
+            unreachable!("sample PDU 87 snapshot outcome was not replaced");
+        };
+        snapshot.panes.tab_titles[0] = "x".repeat(title_bytes);
+        response
+            .validate()
+            .expect("the oversized fixture must remain structurally valid");
+
+        let canonical =
+            serialize_uncompressed(&response).expect("oversized PDU 87 fixture must serialize");
+        assert_eq!(
+            canonical.len(),
+            target_body_bytes,
+            "the expansion fixture must cross the aggregate cap by exactly one byte",
+        );
+
+        let oversized = Pdu::ListPanesOrderedV1Response(response);
+        for mode in [CompressionMode::Never, CompressionMode::Always] {
+            let error = oversized
+                .encode_frame_with_mode(37, mode)
+                .expect_err("PDU 87 producer must reject an oversized canonical body");
+            let exceeded = error
+                .downcast_ref::<PduEncodedBodyLimitExceeded>()
+                .expect("PDU 87 producer must retain the typed body-limit error");
+            assert_eq!(exceeded.serial(), 37);
+            assert_eq!(exceeded.ident(), 87);
+            assert!(!exceeded.is_compressed());
+            assert_eq!(
+                exceeded.max_payload_bytes(),
+                MAX_LIST_PANES_ORDERED_V1_RESPONSE_DECOMPRESSED_BYTES,
+            );
+            assert_eq!(exceeded.declared_payload_bytes(), target_body_bytes);
+        }
+
+        let compressed = zstd::stream::encode_all(canonical.as_slice(), 1)
+            .expect("compress highly repetitive oversized PDU 87 fixture");
+        assert!(
+            compressed.len() < MAX_LIST_PANES_ORDERED_V1_RESPONSE_ZSTD_ENCODED_BYTES,
+            "the expansion fixture must pass the encoded-body admission ceiling",
+        );
+        let error = deserialize_list_panes_ordered_v1_response(&compressed, true)
+            .expect_err("bounded PDU 87 decompression must reject limit-plus-one output");
+        assert!(
+            format!("{error:#}").contains(&format!(
+                "decompressed payload size exceeds maximum {}",
+                MAX_LIST_PANES_ORDERED_V1_RESPONSE_DECOMPRESSED_BYTES,
+            )),
+            "unexpected PDU 87 expansion rejection: {:#}",
+            error,
+        );
+    }
+
+    #[test]
+    fn pdu87_dense_max_cardinality_snapshot_roundtrips_under_total_body_cap() {
+        const TABS_PER_REPRESENTATIVE_WINDOW: usize =
+            MAX_ORDERED_TABS_PER_SNAPSHOT / MAX_ORDERED_WINDOWS_PER_SNAPSHOT;
+        assert_eq!(TABS_PER_REPRESENTATIVE_WINDOW, 4);
+
+        let mut ordered_windows = Vec::with_capacity(MAX_ORDERED_WINDOWS_PER_SNAPSHOT);
+        let mut tabs = Vec::with_capacity(MAX_ORDERED_TABS_PER_SNAPSHOT);
+        let mut tab_titles = Vec::with_capacity(MAX_ORDERED_TABS_PER_SNAPSHOT);
+        let mut window_titles = HashMap::with_capacity(MAX_ORDERED_WINDOWS_PER_SNAPSHOT);
+
+        for window_offset in 0..MAX_ORDERED_WINDOWS_PER_SNAPSHOT {
+            let window_id = window_offset + 1;
+            let first_tab_offset = window_offset * TABS_PER_REPRESENTATIVE_WINDOW;
+            let ordered_tab_ids = (0..TABS_PER_REPRESENTATIVE_WINDOW)
+                .map(|tab_offset| {
+                    let tab_id = first_tab_offset + tab_offset + 1;
+                    RemoteTabId::new(u64::try_from(tab_id).expect("bounded tab id fits in u64"))
+                })
+                .collect::<Vec<_>>();
+
+            ordered_windows.push(OrderedWindowStateV1 {
+                window_id: RemoteWindowId::new(
+                    u64::try_from(window_id).expect("bounded window id fits in u64"),
+                ),
+                order_revision: WindowOrderRevision::INITIAL,
+                active_tab_id: ordered_tab_ids.first().copied(),
+                ordered_tab_ids,
+            });
+            window_titles.insert(window_id, format!("window-{window_id}"));
+
+            for tab_offset in 0..TABS_PER_REPRESENTATIVE_WINDOW {
+                let tab_id = first_tab_offset + tab_offset + 1;
+                tab_titles.push(format!("tab-{tab_id}"));
+                tabs.push(PaneNode::Leaf(mux::tab::PaneEntry {
+                    window_id,
+                    tab_id,
+                    pane_id: tab_id,
+                    title: format!("pane-{tab_id}"),
+                    size: TerminalSize::default(),
+                    working_dir: None,
+                    alt_screen_active: false,
+                    is_active_pane: tab_offset == 0,
+                    is_zoomed_pane: false,
+                    workspace: "dense-large-session".to_string(),
+                    cursor_pos: StableCursorPosition::default(),
+                    physical_top: 0,
+                    top_row: 0,
+                    left_col: 0,
+                    tty_name: Some(format!("tty-{tab_id}")),
+                }));
+            }
+        }
+
+        let response = ListPanesOrderedV1Response {
+            protocol_version: ORDERED_WINDOW_PROTOCOL_VERSION,
+            domain_binding_id: DomainBindingId::from_bytes([0x81; 16]),
+            negotiated: ordered_window_foundation_capabilities(),
+            stream_id: TopologyStreamId::from_bytes([0x82; 16]),
+            outcome: ListPanesOrderedV1Outcome::Snapshot(OrderedPaneSnapshotV1 {
+                session_incarnation: MuxSessionIncarnation::from_bytes([0x83; 16]),
+                topology_revision: TopologyRevision::new(1),
+                panes: ListPanesResponse {
+                    tabs,
+                    tab_titles,
+                    window_titles,
+                },
+                ordered_windows,
+            }),
+        };
+        response
+            .validate()
+            .expect("dense maximum-cardinality snapshot must be structurally valid");
+        let pdu = Pdu::ListPanesOrderedV1Response(response);
+        let frame = pdu
+            .encode_frame_with_mode(38, CompressionMode::Never)
+            .expect("dense maximum-cardinality PDU 87 must fit its body ceiling");
+        assert!(
+            frame.len() <= MAX_LIST_PANES_ORDERED_V1_RESPONSE_FRAME_BYTES,
+            "dense PDU 87 complete frame exceeded its dispatch ceiling",
+        );
+        let raw = decode_raw(frame.as_slice()).expect("decode dense PDU 87 frame");
+        assert_eq!(raw.ident, 87);
+        assert_eq!(raw.serial, 38);
+        assert!(!raw.is_compressed);
+        assert!(
+            raw.data.len() <= MAX_LIST_PANES_ORDERED_V1_RESPONSE_DECOMPRESSED_BYTES,
+            "dense PDU 87 body exceeded its schema ceiling",
+        );
+        drop(raw);
+        let decoded = Pdu::decode(frame.as_slice())
+            .expect("roundtrip dense maximum-cardinality PDU 87");
+        let Pdu::ListPanesOrderedV1Response(expected) = pdu else {
+            unreachable!("fixture was constructed as PDU 87");
+        };
+        let Pdu::ListPanesOrderedV1Response(actual) = decoded.pdu else {
+            panic!("dense maximum-cardinality frame must decode as PDU 87");
+        };
+        assert_eq!(actual.protocol_version, expected.protocol_version);
+        assert_eq!(actual.domain_binding_id, expected.domain_binding_id);
+        assert_eq!(actual.negotiated, expected.negotiated);
+        assert_eq!(actual.stream_id, expected.stream_id);
+        let (
+            ListPanesOrderedV1Outcome::Snapshot(actual),
+            ListPanesOrderedV1Outcome::Snapshot(expected),
+        ) = (actual.outcome, expected.outcome)
+        else {
+            panic!("dense maximum-cardinality PDU 87 must retain its snapshot outcome");
+        };
+        assert_eq!(actual.session_incarnation, expected.session_incarnation);
+        assert_eq!(actual.topology_revision, expected.topology_revision);
+        assert!(actual.panes.tabs.iter().eq(expected.panes.tabs.iter()));
+        assert!(
+            actual
+                .panes
+                .tab_titles
+                .iter()
+                .eq(expected.panes.tab_titles.iter())
+        );
+        assert_eq!(actual.panes.window_titles, expected.panes.window_titles);
+        assert!(actual.ordered_windows.iter().eq(expected.ordered_windows.iter()));
     }
 
     #[test]

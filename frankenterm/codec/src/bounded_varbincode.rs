@@ -13,8 +13,26 @@ pub(crate) const EXACT_RENDER_ROW_UTF8_V1_NEWTYPE: &str =
     "frankenterm.codec.ExactRenderRowUtf8V1";
 pub(crate) const EXACT_RENDER_METADATA_UTF8_V1_NEWTYPE: &str =
     "frankenterm.codec.ExactRenderMetadataUtf8V1";
+pub(crate) const ORDERED_WINDOW_SECTION_V1_NEWTYPE: &str =
+    "frankenterm.codec.OrderedWindowSectionV1";
+pub(crate) const ORDERED_PANE_TABS_V1_NEWTYPE: &str =
+    "frankenterm.codec.OrderedPaneTabsV1";
+pub(crate) const ORDERED_PANE_TAB_TITLES_V1_NEWTYPE: &str =
+    "frankenterm.codec.OrderedPaneTabTitlesV1";
+pub(crate) const ORDERED_PANE_WINDOW_TITLES_V1_NEWTYPE: &str =
+    "frankenterm.codec.OrderedPaneWindowTitlesV1";
+pub(crate) const ORDERED_WINDOWS_V1_NEWTYPE: &str =
+    "frankenterm.codec.OrderedWindowsV1";
+pub(crate) const ORDERED_TAB_IDS_V1_NEWTYPE: &str =
+    "frankenterm.codec.OrderedTabIdsV1";
 pub(crate) const EXACT_RENDER_ROW_UTF8_V1_MAX_BYTES: usize = 1_000_000;
 pub(crate) const EXACT_RENDER_METADATA_UTF8_V1_MAX_BYTES: usize = 65_536;
+pub(crate) const ORDERED_WINDOW_SECTION_V1_MAX_BYTES: usize = 512 * 1024;
+pub(crate) const ORDERED_PANE_TABS_V1_MAX_ITEMS: usize = 16_384;
+pub(crate) const ORDERED_PANE_TAB_TITLES_V1_MAX_ITEMS: usize = 16_384;
+pub(crate) const ORDERED_PANE_WINDOW_TITLES_V1_MAX_ITEMS: usize = 4_096;
+pub(crate) const ORDERED_WINDOWS_V1_MAX_ITEMS: usize = 4_096;
+pub(crate) const ORDERED_TAB_IDS_V1_MAX_ITEMS: usize = 4_096;
 
 /// Hard byte budget for any single varbincode container or byte-buffer
 /// allocation. Attacker-controlled leb128 lengths get clamped by this cap
@@ -35,12 +53,66 @@ pub fn deserialize<T: serde::de::DeserializeOwned, R: Read>(reader: &mut R) -> R
 pub struct Deserializer<'a, R: Read> {
     reader: &'a mut R,
     byte_buffer_admission: ByteBufferAdmission,
+    container_admission: ContainerAdmission,
 }
 
 #[derive(Clone, Copy)]
 struct ByteBufferAdmission {
     label: &'static str,
     maximum: usize,
+}
+
+#[derive(Clone, Copy)]
+struct ContainerAdmission {
+    label: &'static str,
+    maximum: usize,
+    preallocation_maximum: usize,
+}
+
+impl ContainerAdmission {
+    const GLOBAL: Self = Self {
+        label: "container",
+        maximum: MAX_CONTAINER_ITEMS,
+        preallocation_maximum: 4_096,
+    };
+
+    const ORDERED_PANE_TABS: Self = Self {
+        label: "ordered pane tab trees",
+        maximum: ORDERED_PANE_TABS_V1_MAX_ITEMS,
+        preallocation_maximum: ORDERED_PANE_TABS_V1_MAX_ITEMS,
+    };
+
+    const ORDERED_PANE_TAB_TITLES: Self = Self {
+        label: "ordered pane tab titles",
+        maximum: ORDERED_PANE_TAB_TITLES_V1_MAX_ITEMS,
+        preallocation_maximum: ORDERED_PANE_TAB_TITLES_V1_MAX_ITEMS,
+    };
+
+    const ORDERED_PANE_WINDOW_TITLES: Self = Self {
+        label: "ordered pane window titles",
+        maximum: ORDERED_PANE_WINDOW_TITLES_V1_MAX_ITEMS,
+        preallocation_maximum: ORDERED_PANE_WINDOW_TITLES_V1_MAX_ITEMS,
+    };
+
+    const ORDERED_WINDOWS: Self = Self {
+        label: "ordered windows",
+        maximum: ORDERED_WINDOWS_V1_MAX_ITEMS,
+        preallocation_maximum: ORDERED_WINDOWS_V1_MAX_ITEMS,
+    };
+
+    const ORDERED_TAB_IDS: Self = Self {
+        label: "ordered tab ids",
+        maximum: ORDERED_TAB_IDS_V1_MAX_ITEMS,
+        preallocation_maximum: ORDERED_TAB_IDS_V1_MAX_ITEMS,
+    };
+
+    const fn restricted_by(self, requested: Self) -> Self {
+        if requested.maximum <= self.maximum {
+            requested
+        } else {
+            self
+        }
+    }
 }
 
 impl ByteBufferAdmission {
@@ -59,6 +131,11 @@ impl ByteBufferAdmission {
         maximum: EXACT_RENDER_METADATA_UTF8_V1_MAX_BYTES,
     };
 
+    const ORDERED_WINDOW_SECTION: Self = Self {
+        label: "ordered-window section bytes",
+        maximum: ORDERED_WINDOW_SECTION_V1_MAX_BYTES,
+    };
+
     const fn restricted_by(self, requested: Self) -> Self {
         if requested.maximum < self.maximum {
             requested
@@ -73,6 +150,7 @@ impl<'a, R: Read> Deserializer<'a, R> {
         Self {
             reader,
             byte_buffer_admission: ByteBufferAdmission::GLOBAL,
+            container_admission: ContainerAdmission::GLOBAL,
         }
     }
 
@@ -92,10 +170,12 @@ impl<'a, R: Read> Deserializer<'a, R> {
     }
 
     fn read_container_len(&mut self, kind: &str) -> Result<usize> {
+        let admission = self.container_admission;
         let len = self.read_len_prefix(kind)?;
-        if len > MAX_CONTAINER_ITEMS {
+        if len > admission.maximum {
             return Err(Error::custom(format!(
-                "{kind} length {len} exceeds safe maximum {MAX_CONTAINER_ITEMS}"
+                "{} length {len} exceeds maximum {}",
+                admission.label, admission.maximum,
             )));
         }
         Ok(len)
@@ -347,19 +427,39 @@ impl<'de, 'a, 'b, R: Read> serde::Deserializer<'de> for &'a mut Deserializer<'b,
     where
         V: de::Visitor<'de>,
     {
-        let requested = if name == EXACT_RENDER_ROW_UTF8_V1_NEWTYPE {
+        let requested_byte_buffer = if name == EXACT_RENDER_ROW_UTF8_V1_NEWTYPE {
             Some(ByteBufferAdmission::EXACT_RENDER_ROW_UTF8)
         } else if name == EXACT_RENDER_METADATA_UTF8_V1_NEWTYPE {
             Some(ByteBufferAdmission::EXACT_RENDER_METADATA_UTF8)
+        } else if name == ORDERED_WINDOW_SECTION_V1_NEWTYPE {
+            Some(ByteBufferAdmission::ORDERED_WINDOW_SECTION)
         } else {
             None
         };
-        let prior = self.byte_buffer_admission;
-        if let Some(requested) = requested {
-            self.byte_buffer_admission = prior.restricted_by(requested);
+        let requested_container = if name == ORDERED_PANE_TABS_V1_NEWTYPE {
+            Some(ContainerAdmission::ORDERED_PANE_TABS)
+        } else if name == ORDERED_PANE_TAB_TITLES_V1_NEWTYPE {
+            Some(ContainerAdmission::ORDERED_PANE_TAB_TITLES)
+        } else if name == ORDERED_PANE_WINDOW_TITLES_V1_NEWTYPE {
+            Some(ContainerAdmission::ORDERED_PANE_WINDOW_TITLES)
+        } else if name == ORDERED_WINDOWS_V1_NEWTYPE {
+            Some(ContainerAdmission::ORDERED_WINDOWS)
+        } else if name == ORDERED_TAB_IDS_V1_NEWTYPE {
+            Some(ContainerAdmission::ORDERED_TAB_IDS)
+        } else {
+            None
+        };
+        let prior_byte_buffer = self.byte_buffer_admission;
+        let prior_container = self.container_admission;
+        if let Some(requested) = requested_byte_buffer {
+            self.byte_buffer_admission = prior_byte_buffer.restricted_by(requested);
+        }
+        if let Some(requested) = requested_container {
+            self.container_admission = prior_container.restricted_by(requested);
         }
         let result = visitor.visit_newtype_struct(&mut *self);
-        self.byte_buffer_admission = prior;
+        self.byte_buffer_admission = prior_byte_buffer;
+        self.container_admission = prior_container;
         result
     }
 
@@ -416,13 +516,15 @@ impl<'de, 'a, 'b, R: Read> de::SeqAccess<'de> for Access<'a, 'b, R> {
     }
 
     fn size_hint(&self) -> Option<usize> {
-        // Clamp the hint so visitor-driven `Vec::with_capacity(size_hint)`
-        // cannot preallocate an attacker-controlled number of elements.
-        // `self.len` is already bounded by MAX_CONTAINER_ITEMS at the call
-        // site, but 1M × sizeof(T) can still OOM for large T. 4096 is the
-        // serde convention for a "reasonable" starter capacity; the vec
-        // still grows to hold every element actually deserialized.
-        Some(self.len.min(4096))
+        // Generic containers retain the conservative 4096-element hint.
+        // A schema-scoped newtype can raise that hint only after its exact
+        // length prefix has passed the correspondingly tighter hard ceiling,
+        // allowing known q=16384 snapshots to allocate once without allowing
+        // arbitrary wire lengths to become allocation requests.
+        Some(
+            self.len
+                .min(self.deserializer.container_admission.preallocation_maximum),
+        )
     }
 }
 
@@ -450,13 +552,10 @@ impl<'de, 'a, 'b, R: Read> de::MapAccess<'de> for Access<'a, 'b, R> {
     }
 
     fn size_hint(&self) -> Option<usize> {
-        // Clamp the hint so visitor-driven `Vec::with_capacity(size_hint)`
-        // cannot preallocate an attacker-controlled number of elements.
-        // `self.len` is already bounded by MAX_CONTAINER_ITEMS at the call
-        // site, but 1M × sizeof(T) can still OOM for large T. 4096 is the
-        // serde convention for a "reasonable" starter capacity; the vec
-        // still grows to hold every element actually deserialized.
-        Some(self.len.min(4096))
+        Some(
+            self.len
+                .min(self.deserializer.container_admission.preallocation_maximum),
+        )
     }
 }
 
