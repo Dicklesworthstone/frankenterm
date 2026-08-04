@@ -806,6 +806,57 @@ fn encode_raw_as_vec_impl(
     Ok(buffer)
 }
 
+/// Turn an owned serialized payload into its framed representation without
+/// allocating and copying a second payload-sized vector.
+///
+/// The payload is shifted by the small LEB128 header inside its existing
+/// allocation. This retains the single contiguous write required by the wire
+/// path while avoiding the peak live allocation of `payload + frame`.
+fn prepend_frame_header_to_owned_payload(
+    ident: u64,
+    serial: u64,
+    mut data: Vec<u8>,
+    is_compressed: bool,
+    record_metrics: bool,
+) -> anyhow::Result<Vec<u8>> {
+    let body_len = data
+        .len()
+        .checked_add(encoded_length(ident))
+        .and_then(|len| len.checked_add(encoded_length(serial)))
+        .context("encoded PDU body length overflow")?;
+    let body_len_u64 =
+        u64::try_from(body_len).context("encoded PDU length does not fit in u64")?;
+    let masked_len = if is_compressed {
+        body_len_u64 | COMPRESSED_MASK
+    } else {
+        body_len_u64
+    };
+    let frame_len = encoded_frame_len(ident, serial, data.len(), is_compressed)?;
+    let header_len = frame_len
+        .checked_sub(data.len())
+        .context("encoded PDU header length underflow")?;
+    let payload_len = data.len();
+    data.try_reserve_exact(header_len)
+        .context("reserving owned PDU frame header")?;
+    data.resize(frame_len, 0);
+    data.copy_within(0..payload_len, header_len);
+
+    let mut header = &mut data[..header_len];
+    leb128::write::unsigned(&mut header, masked_len).context("writing pdu len")?;
+    leb128::write::unsigned(&mut header, serial).context("writing pdu serial")?;
+    leb128::write::unsigned(&mut header, ident).context("writing pdu ident")?;
+    debug_assert!(header.is_empty());
+
+    if record_metrics {
+        if is_compressed {
+            metrics::histogram!("pdu.encode.compressed.size").record(data.len() as f64);
+        } else {
+            metrics::histogram!("pdu.encode.size").record(data.len() as f64);
+        }
+    }
+    Ok(data)
+}
+
 /// Encode a frame.  If the data is compressed, the high bit of the length
 /// is set to indicate that.  The data written out has the format:
 /// tagged_len: leb128  (u64 msb is set if data is compressed)
@@ -1583,6 +1634,12 @@ std::thread_local! {
     static TEST_SERIALIZE_INVOCATIONS: std::cell::Cell<usize> = const {
         std::cell::Cell::new(0)
     };
+    static TEST_BOUNDED_SERIALIZE_GROWTH_EVENTS: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
+    static TEST_BOUNDED_SERIALIZE_MAX_REQUESTED_CAPACITY: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
     static TEST_EXACT_RENDER_VALIDATION_ROW_VISITS: std::cell::Cell<usize> = const {
         std::cell::Cell::new(0)
     };
@@ -1601,6 +1658,33 @@ fn test_serialize_invocations() -> usize {
 #[cfg(test)]
 fn record_test_serialize_invocation() {
     TEST_SERIALIZE_INVOCATIONS.set(TEST_SERIALIZE_INVOCATIONS.get().saturating_add(1));
+}
+
+#[cfg(test)]
+fn reset_test_bounded_serialize_growth_events() {
+    TEST_BOUNDED_SERIALIZE_GROWTH_EVENTS.set(0);
+    TEST_BOUNDED_SERIALIZE_MAX_REQUESTED_CAPACITY.set(0);
+}
+
+#[cfg(test)]
+fn test_bounded_serialize_growth_events() -> usize {
+    TEST_BOUNDED_SERIALIZE_GROWTH_EVENTS.get()
+}
+
+#[cfg(test)]
+fn test_bounded_serialize_max_requested_capacity() -> usize {
+    TEST_BOUNDED_SERIALIZE_MAX_REQUESTED_CAPACITY.get()
+}
+
+#[cfg(test)]
+fn record_test_bounded_serialize_growth_event(requested_capacity: usize) {
+    TEST_BOUNDED_SERIALIZE_GROWTH_EVENTS
+        .set(TEST_BOUNDED_SERIALIZE_GROWTH_EVENTS.get().saturating_add(1));
+    TEST_BOUNDED_SERIALIZE_MAX_REQUESTED_CAPACITY.set(
+        TEST_BOUNDED_SERIALIZE_MAX_REQUESTED_CAPACITY
+            .get()
+            .max(requested_capacity),
+    );
 }
 
 #[cfg(test)]
@@ -1667,13 +1751,20 @@ impl std::io::Write for BoundedSerializeBuffer {
                 "serialized PDU body exceeded its wire limit",
             ));
         }
-        // Avoid Vec's geometric growth policy here.  This writer is the
-        // producer-side wire admission boundary, so reserving only the exact
-        // increment prevents a small final write from doubling a near-limit
-        // buffer before the logical ceiling can reject it.
-        self.bytes
-            .try_reserve_exact(buf.len())
-            .map_err(std::io::Error::other)?;
+        // Retain amortized growth without requesting capacity beyond the wire
+        // ceiling. Exact-reserving every serializer write makes a q-element
+        // payload perform O(q) allocator requests; choosing the next bounded
+        // geometric capacity keeps that to O(log(bytes)).
+        if next_len > self.bytes.capacity() {
+            let doubled = self.bytes.capacity().saturating_mul(2);
+            let target_capacity = next_len.max(doubled).min(self.max_bytes);
+            let additional = target_capacity.saturating_sub(self.bytes.len());
+            self.bytes
+                .try_reserve_exact(additional)
+                .map_err(std::io::Error::other)?;
+            #[cfg(test)]
+            record_test_bounded_serialize_growth_event(target_capacity);
+        }
         self.bytes.extend_from_slice(buf);
         Ok(buf.len())
     }
@@ -2299,14 +2390,13 @@ macro_rules! pdu {
                                 serial,
                                 compression_mode,
                             )?;
-                            let frame =
-                                encode_raw_as_vec_impl(
-                                    $vers,
-                                    serial,
-                                    &serialized.data,
-                                    serialized.is_compressed,
-                                    record_metrics,
-                                )?;
+                            let frame = prepend_frame_header_to_owned_payload(
+                                $vers,
+                                serial,
+                                serialized.data,
+                                serialized.is_compressed,
+                                record_metrics,
+                            )?;
                             log::debug!(
                                 "encode_frame {} size={}",
                                 stringify!($name),
@@ -11080,6 +11170,60 @@ mod test {
         encode_raw(ident, serial, data, false, &mut write_result).unwrap();
 
         assert_eq!(vec_result, write_result);
+    }
+
+    #[test]
+    fn pdu_frame_memory_owned_header_prepend_matches_borrowed_framing_at_leb128_boundaries() {
+        for ident in [0, 1, 127, 128, u16::MAX as u64, u64::MAX] {
+            for serial in [0, 1, 127, 128, u32::MAX as u64, u64::MAX] {
+                for payload_len in [0_usize, 1, 127, 128, 16_384] {
+                    let payload = (0..payload_len)
+                        .map(|ordinal| ordinal.wrapping_mul(131) as u8)
+                        .collect::<Vec<_>>();
+                    for is_compressed in [false, true] {
+                        let expected = encode_raw_as_vec_impl(
+                            ident,
+                            serial,
+                            &payload,
+                            is_compressed,
+                            false,
+                        )
+                        .expect("borrowed framing must succeed");
+                        let actual = prepend_frame_header_to_owned_payload(
+                            ident,
+                            serial,
+                            payload.clone(),
+                            is_compressed,
+                            false,
+                        )
+                        .expect("owned framing must succeed");
+                        assert_eq!(actual, expected);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn pdu_frame_memory_bounded_growth_is_logarithmic_and_never_exceeds_its_ceiling() {
+        let payload = (0..1_048_576_u32)
+            .map(|ordinal| ordinal.wrapping_mul(2_654_435_761) as u8)
+            .collect::<Vec<_>>();
+        reset_test_bounded_serialize_growth_events();
+        let encoded = serialize_uncompressed_bounded(&payload, payload.len() + 16, 91, 87)
+            .expect("bounded serializer must admit an in-limit payload");
+        let growth_events = test_bounded_serialize_growth_events();
+        assert!(
+            growth_events <= 16,
+            "one-megabyte payload used {growth_events} allocation-growth events"
+        );
+        assert!(encoded.len() <= payload.len() + 16);
+        assert!(test_bounded_serialize_max_requested_capacity() <= payload.len() + 16);
+
+        reset_test_bounded_serialize_growth_events();
+        let error = serialize_uncompressed_bounded(&payload, payload.len() - 1, 92, 87)
+            .expect_err("an over-limit payload must fail before exceeding its ceiling");
+        assert!(error.downcast_ref::<PduEncodedBodyLimitExceeded>().is_some());
     }
 
     #[test]
