@@ -1343,6 +1343,49 @@ impl PaneArenaPreparationScratch {
     }
 }
 
+struct ClearPaneArenaApplicationOnDrop<'a> {
+    stack: &'a mut Vec<(usize, Tree)>,
+}
+
+impl Drop for ClearPaneArenaApplicationOnDrop<'_> {
+    fn drop(&mut self) {
+        self.stack.clear();
+    }
+}
+
+struct VecAppendRollback<'a, T> {
+    vector: &'a mut Vec<T>,
+    original_len: usize,
+    committed: bool,
+}
+
+impl<'a, T> VecAppendRollback<'a, T> {
+    fn new(vector: &'a mut Vec<T>) -> Self {
+        let original_len = vector.len();
+        Self {
+            vector,
+            original_len,
+            committed: false,
+        }
+    }
+
+    fn vector(&mut self) -> &mut Vec<T> {
+        self.vector
+    }
+
+    fn commit(mut self) {
+        self.committed = true;
+    }
+}
+
+impl<T> Drop for VecAppendRollback<'_, T> {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.vector.truncate(self.original_len);
+        }
+    }
+}
+
 fn reserve_pane_arena_stack_push<T>(
     stack: &mut Vec<T>,
     additional_entries: usize,
@@ -1514,7 +1557,13 @@ where
         );
     }
 
-    let stack = &mut scratch.application;
+    // The application vector owns partially materialized pane subtrees. Keep
+    // its reusable allocation, but never retain those subtrees if a caller's
+    // pane factory unwinds instead of returning an error.
+    let application_guard = ClearPaneArenaApplicationOnDrop {
+        stack: &mut scratch.application,
+    };
+    let stack = &mut *application_guard.stack;
     let mut active = None;
     let mut zoomed = None;
 
@@ -2804,11 +2853,29 @@ impl Tab {
             };
 
             let arena_start = arena.len();
+            let node_count = captured.len();
+            let root_index = if node_count == 0 {
+                None
+            } else {
+                Some(
+                    u32::try_from(arena_start)
+                        .map_err(|_| anyhow::anyhow!("ordered pane arena root exceeds u32"))?,
+                )
+            };
+            let node_count = u32::try_from(node_count)
+                .map_err(|_| anyhow::anyhow!("ordered pane arena tree exceeds u32"))?;
+            let arena_end = arena_start
+                .checked_add(captured.len())
+                .ok_or_else(|| anyhow::anyhow!("ordered pane arena length overflows usize"))?;
+            if arena_end > (u32::MAX as usize).saturating_add(1) {
+                anyhow::bail!("ordered pane arena final node exceeds u32");
+            }
             arena
                 .try_reserve_exact(captured.len())
                 .map_err(|error| anyhow::anyhow!("reserve ordered pane arena nodes: {error}"))?;
+            let mut append = VecAppendRollback::new(arena);
             for node in captured {
-                arena.push(match node {
+                append.vector().push(match node {
                     CapturedPaneArenaNode::Empty => PaneArenaNode::Empty,
                     CapturedPaneArenaNode::Split { left, right, node } => PaneArenaNode::Split {
                         left: u32::try_from(arena_start.checked_add(left).ok_or_else(|| {
@@ -2839,19 +2906,10 @@ impl Tab {
                     )),
                 });
             }
-            let node_count = arena.len().checked_sub(arena_start).ok_or_else(|| {
-                anyhow::anyhow!("ordered pane arena node count moved backwards")
-            })?;
+            append.commit();
             return Ok(PaneArenaTree {
-                root_index: if node_count == 0 {
-                    None
-                } else {
-                    Some(u32::try_from(arena_start).map_err(|_| {
-                        anyhow::anyhow!("ordered pane arena root exceeds u32")
-                    })?)
-                },
-                node_count: u32::try_from(node_count)
-                    .map_err(|_| anyhow::anyhow!("ordered pane arena tree exceeds u32"))?,
+                root_index,
+                node_count,
                 tab_title,
             });
         }
@@ -7481,6 +7539,75 @@ mod test {
         );
     }
 
+    fn balanced_mux_tree_for_capture(
+        first_pane: PaneId,
+        leaf_count: usize,
+        size: TerminalSize,
+        pane_ids: &mut HashMap<PaneIdentity, PaneId>,
+    ) -> Tree {
+        assert!(leaf_count > 0);
+        if leaf_count == 1 {
+            let pane = FakePane::new(first_pane, size);
+            assert_eq!(pane_ids.insert(pane_identity(&pane), first_pane), None);
+            return Tree::Leaf(pane);
+        }
+        let left_leaves = leaf_count.div_ceil(2);
+        let right_leaves = leaf_count - left_leaves;
+        Tree::Node {
+            left: Box::new(balanced_mux_tree_for_capture(
+                first_pane,
+                left_leaves,
+                size,
+                pane_ids,
+            )),
+            right: Box::new(balanced_mux_tree_for_capture(
+                first_pane + left_leaves,
+                right_leaves,
+                size,
+                pane_ids,
+            )),
+            data: Some(SplitDirectionAndSize {
+                direction: if leaf_count % 2 == 0 {
+                    SplitDirection::Horizontal
+                } else {
+                    SplitDirection::Vertical
+                },
+                first: size,
+                second: size,
+            }),
+        }
+    }
+
+    #[test]
+    fn flat_codec_capture_growth_is_bounded_across_q_scale() {
+        let size = TerminalSize::default();
+        for leaf_count in [1_usize, 20, 200, 4_096] {
+            let node_count = leaf_count * 2 - 1;
+            let mut pane_ids = HashMap::new();
+            pane_ids
+                .try_reserve(leaf_count)
+                .expect("reserve q-scale pane identities");
+            let tree = balanced_mux_tree_for_capture(1, leaf_count, size, &mut pane_ids);
+            let (captured, active, zoomed, title) = capture_pane_arena_tree(
+                Some(&tree),
+                None,
+                None,
+                pane_ids,
+                format!("q-{leaf_count}"),
+                0,
+                32,
+                node_count,
+            )
+            .unwrap_or_else(|error| {
+                panic!("q={leaf_count} flat capture failed: {error:#}")
+            });
+            assert_eq!(captured.len(), node_count);
+            assert!(active.is_none());
+            assert!(zoomed.is_none());
+            assert_eq!(title, format!("q-{leaf_count}"));
+        }
+    }
+
     fn flatten_legacy_pane_node_for_test(
         node: &PaneNode,
         arena: &mut Vec<PaneArenaNode>,
@@ -7626,6 +7753,42 @@ mod test {
             .expect_err("five tree nodes plus one prefix must exceed a five-node ceiling");
         assert!(format!("{node_error:#}").contains("total node limit 5"));
         assert_eq!(node_limited, [prefix]);
+    }
+
+    #[test]
+    fn flat_codec_snapshot_rolls_back_arena_when_pane_observation_panics() {
+        let size = TerminalSize::default();
+        let tab = Tab::new(&size);
+        let armed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let armed_for_probe = Arc::clone(&armed);
+        let probe: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+            assert!(
+                !armed_for_probe.load(std::sync::atomic::Ordering::Acquire),
+                "injected Pane observation panic"
+            );
+        });
+        tab.assign_pane(&FakePane::new(601, size));
+        tab.split_and_insert(
+            0,
+            SplitRequest::default(),
+            FakePane::new_with_callback_probe(602, size, false, false, probe),
+        )
+        .expect("test split before arming callback panic");
+
+        let prefix = PaneArenaNode::Leaf(pane_arena_test_entry(997, false, false));
+        let mut arena = vec![prefix.clone()];
+        armed.store(true, std::sync::atomic::Ordering::Release);
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            let _ = tab.append_codec_pane_arena_in_window(
+                90,
+                "panic-workspace",
+                &mut arena,
+                64,
+                16,
+            );
+        }));
+        assert!(result.is_err(), "the injected pane panic must propagate");
+        assert_eq!(arena, [prefix]);
     }
 
     #[test]
@@ -9357,7 +9520,11 @@ mod test {
         let mut arena = Vec::with_capacity(SNAPSHOT_NODES);
         let mut first_leaf = 0_usize;
         let mut node_counts = Vec::with_capacity(SLOT_COUNTS.len());
-        for (slots, empty_slots) in SLOT_COUNTS.into_iter().zip(EMPTY_COUNTS) {
+        for (slots, empty_slots) in SLOT_COUNTS
+            .iter()
+            .copied()
+            .zip(EMPTY_COUNTS.iter().copied())
+        {
             let expected_root = arena.len();
             assert_eq!(
                 usize::try_from(append_balanced_pane_arena_slots(
@@ -9393,7 +9560,11 @@ mod test {
         assert_eq!(stats.validation_node_visits, SNAPSHOT_NODES);
         assert_eq!(stats.application_node_visits, SNAPSHOT_NODES);
         assert_eq!(stats.leaf_resolutions, SNAPSHOT_LEAVES);
-        let expected_splits = SLOT_COUNTS.into_iter().map(|slots| slots - 1).sum::<usize>();
+        let expected_splits = SLOT_COUNTS
+            .iter()
+            .copied()
+            .map(|slots| slots - 1)
+            .sum::<usize>();
         assert_eq!(stats.split_materializations, expected_splits);
         assert_eq!(
             stats.required_final_tree_box_allocations,
@@ -9497,6 +9668,52 @@ mod test {
             1,
             "terminal stats must retain the successful pane callback that preceded failure",
         );
+        scratch.release_retained_storage();
+        assert_eq!(scratch.requested_retained_storage_bytes(), Some(0));
+    }
+
+    #[test]
+    fn pane_arena_scale_factory_panic_drops_partially_prepared_subtrees() {
+        let size = TerminalSize::default();
+        let mut arena = vec![
+            PaneArenaNode::Split {
+                left: 1,
+                right: 2,
+                node: SplitDirectionAndSize {
+                    direction: SplitDirection::Horizontal,
+                    first: size,
+                    second: size,
+                },
+            },
+            PaneArenaNode::Leaf(pane_arena_test_entry(91, true, false)),
+            PaneArenaNode::Leaf(pane_arena_test_entry(92, false, false)),
+        ];
+        let mut scratch = PaneArenaPreparationScratch::default();
+        let mut prepared_pane = None;
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            let _ = prepare_pane_tree_from_arena_with_scratch(
+                &mut arena,
+                3,
+                &mut scratch,
+                |entry| -> anyhow::Result<Arc<dyn Pane>> {
+                    assert_ne!(entry.pane_id, 91, "injected pane factory panic");
+                    let pane: Arc<dyn Pane> = FakePane::new(entry.pane_id, entry.size);
+                    prepared_pane = Some(Arc::downgrade(&pane));
+                    Ok(pane)
+                },
+            );
+        }));
+        assert!(result.is_err(), "the injected factory panic must propagate");
+        assert!(arena.is_empty(), "the failed tree range must be consumed once");
+        assert!(
+            prepared_pane
+                .expect("the reverse traversal prepares pane 92 first")
+                .upgrade()
+                .is_none(),
+            "application scratch retained a subtree after factory panic",
+        );
+        assert_eq!(scratch.stats().trees_completed, 0);
+        assert_eq!(scratch.stats().leaf_resolutions, 1);
         scratch.release_retained_storage();
         assert_eq!(scratch.requested_retained_storage_bytes(), Some(0));
     }
