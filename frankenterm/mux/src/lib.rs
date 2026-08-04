@@ -6551,11 +6551,10 @@ impl Mux {
         }
         self.flush_window_notifications();
 
-        let pane_ids = removed_panes
-            .iter()
-            .map(|removed| removed.pane_id)
-            .collect::<Vec<_>>();
-        log::debug!("panes to remove from exact tab: {pane_ids:?}");
+        log::debug!(
+            "removing {} panes from exact tab {tab_id}",
+            removed_panes.len()
+        );
         for removed in removed_panes {
             self.finish_pane_removal(removed, kill_remote_panes);
         }
@@ -6564,10 +6563,7 @@ impl Mux {
         Some(tab)
     }
 
-    fn remove_empty_tab_internal_if_same(
-        &self,
-        expected: &Arc<Tab>,
-    ) -> Option<(Arc<Tab>, Vec<WindowId>)> {
+    fn remove_empty_tab_internal_if_same(&self, expected: &Arc<Tab>) -> Option<Arc<Tab>> {
         let tab_id = expected.tab_id();
         let tab = {
             // Match the staged pane-prune lock order. Holding `Tab::inner`
@@ -6585,18 +6581,23 @@ impl Mux {
                 .flatten()
         }?;
 
-        let detached_window_ids = {
+        {
             let mut windows = self.windows.write();
-            windows
-                .iter_mut()
-                .filter_map(|(window_id, window)| {
-                    window.remove_tab_if_same(&tab).then_some(*window_id)
-                })
-                .collect::<Vec<_>>()
-        };
+            let provisional_windows = self.provisional_windows.lock();
+            windows.retain(|window_id, window| {
+                let detached = window.remove_tab_if_same(&tab);
+                let remove = detached
+                    && window.is_empty()
+                    && !provisional_windows.contains(window_id);
+                if remove {
+                    self.queue_window_notification(MuxNotification::WindowRemoved(*window_id));
+                }
+                !remove
+            });
+        }
         self.flush_window_notifications();
         self.recompute_pane_count();
-        Some((tab, detached_window_ids))
+        Some(tab)
     }
 
     fn remove_window_internal(&self, window_id: WindowId) {
@@ -6775,11 +6776,10 @@ impl Mux {
         }
         self.flush_window_notifications();
 
-        let pane_ids: Vec<PaneId> = removed_panes
-            .iter()
-            .map(|removed| removed.pane_id)
-            .collect();
-        log::debug!("panes to drop (local-only): {pane_ids:?}");
+        log::debug!(
+            "dropping {} panes from local-only tab {tab_id}",
+            removed_panes.len()
+        );
         for removed in removed_panes {
             self.finish_pane_removal(removed, false);
         }
@@ -6811,12 +6811,8 @@ impl Mux {
     /// killing a remote pane or tearing down topology published after the
     /// staging handle became stale.
     pub fn remove_empty_tab_local_only_if_same(&self, expected: &Arc<Tab>) -> bool {
-        let Some((_tab, detached_window_ids)) = self.remove_empty_tab_internal_if_same(expected)
-        else {
+        if self.remove_empty_tab_internal_if_same(expected).is_none() {
             return false;
-        };
-        for window_id in detached_window_ids {
-            self.remove_window_if_empty_internal(window_id);
         }
         true
     }
