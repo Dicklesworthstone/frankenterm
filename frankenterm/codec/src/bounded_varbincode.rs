@@ -15,10 +15,10 @@ pub(crate) const EXACT_RENDER_METADATA_UTF8_V1_NEWTYPE: &str =
     "frankenterm.codec.ExactRenderMetadataUtf8V1";
 pub(crate) const ORDERED_WINDOW_SECTION_V1_NEWTYPE: &str =
     "frankenterm.codec.OrderedWindowSectionV1";
-pub(crate) const ORDERED_PANE_TABS_V1_NEWTYPE: &str =
-    "frankenterm.codec.OrderedPaneTabsV1";
-pub(crate) const ORDERED_PANE_TAB_TITLES_V1_NEWTYPE: &str =
-    "frankenterm.codec.OrderedPaneTabTitlesV1";
+pub(crate) const ORDERED_PANE_TREE_DESCRIPTORS_V1_NEWTYPE: &str =
+    "frankenterm.codec.OrderedPaneTreeDescriptorsV1";
+pub(crate) const ORDERED_PANE_NODES_V1_NEWTYPE: &str =
+    "frankenterm.codec.OrderedPaneNodesV1";
 pub(crate) const ORDERED_PANE_WINDOW_TITLES_V1_NEWTYPE: &str =
     "frankenterm.codec.OrderedPaneWindowTitlesV1";
 pub(crate) const ORDERED_WINDOWS_V1_NEWTYPE: &str =
@@ -28,8 +28,8 @@ pub(crate) const ORDERED_TAB_IDS_V1_NEWTYPE: &str =
 pub(crate) const EXACT_RENDER_ROW_UTF8_V1_MAX_BYTES: usize = 1_000_000;
 pub(crate) const EXACT_RENDER_METADATA_UTF8_V1_MAX_BYTES: usize = 65_536;
 pub(crate) const ORDERED_WINDOW_SECTION_V1_MAX_BYTES: usize = 512 * 1024;
-pub(crate) const ORDERED_PANE_TABS_V1_MAX_ITEMS: usize = 16_384;
-pub(crate) const ORDERED_PANE_TAB_TITLES_V1_MAX_ITEMS: usize = 16_384;
+pub(crate) const ORDERED_PANE_TREE_DESCRIPTORS_V1_MAX_ITEMS: usize = 16_384;
+pub(crate) const ORDERED_PANE_NODES_V1_MAX_ITEMS: usize = 32_767;
 pub(crate) const ORDERED_PANE_WINDOW_TITLES_V1_MAX_ITEMS: usize = 4_096;
 pub(crate) const ORDERED_WINDOWS_V1_MAX_ITEMS: usize = 4_096;
 pub(crate) const ORDERED_TAB_IDS_V1_MAX_ITEMS: usize = 4_096;
@@ -52,17 +52,17 @@ pub fn deserialize<T: serde::de::DeserializeOwned, R: Read>(reader: &mut R) -> R
 
 pub struct Deserializer<'a, R: Read> {
     reader: &'a mut R,
-    byte_buffer_admission: ByteBufferAdmission,
-    container_admission: ContainerAdmission,
+    pending_byte_buffer_admission: Option<ByteBufferAdmission>,
+    pending_container_admission: Option<ContainerAdmission>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Eq, PartialEq)]
 struct ByteBufferAdmission {
     label: &'static str,
     maximum: usize,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Eq, PartialEq)]
 struct ContainerAdmission {
     label: &'static str,
     maximum: usize,
@@ -76,16 +76,16 @@ impl ContainerAdmission {
         preallocation_maximum: 4_096,
     };
 
-    const ORDERED_PANE_TABS: Self = Self {
-        label: "ordered pane tab trees",
-        maximum: ORDERED_PANE_TABS_V1_MAX_ITEMS,
-        preallocation_maximum: ORDERED_PANE_TABS_V1_MAX_ITEMS,
+    const ORDERED_PANE_TREE_DESCRIPTORS: Self = Self {
+        label: "ordered pane tree descriptors",
+        maximum: ORDERED_PANE_TREE_DESCRIPTORS_V1_MAX_ITEMS,
+        preallocation_maximum: ORDERED_PANE_TREE_DESCRIPTORS_V1_MAX_ITEMS,
     };
 
-    const ORDERED_PANE_TAB_TITLES: Self = Self {
-        label: "ordered pane tab titles",
-        maximum: ORDERED_PANE_TAB_TITLES_V1_MAX_ITEMS,
-        preallocation_maximum: ORDERED_PANE_TAB_TITLES_V1_MAX_ITEMS,
+    const ORDERED_PANE_NODES: Self = Self {
+        label: "ordered pane arena nodes",
+        maximum: ORDERED_PANE_NODES_V1_MAX_ITEMS,
+        preallocation_maximum: ORDERED_PANE_NODES_V1_MAX_ITEMS,
     };
 
     const ORDERED_PANE_WINDOW_TITLES: Self = Self {
@@ -149,8 +149,8 @@ impl<'a, R: Read> Deserializer<'a, R> {
     pub fn new(reader: &'a mut R) -> Self {
         Self {
             reader,
-            byte_buffer_admission: ByteBufferAdmission::GLOBAL,
-            container_admission: ContainerAdmission::GLOBAL,
+            pending_byte_buffer_admission: None,
+            pending_container_admission: None,
         }
     }
 
@@ -169,8 +169,11 @@ impl<'a, R: Read> Deserializer<'a, R> {
             .map_err(|_| Error::custom(format!("{kind} length {raw_len} does not fit in usize")))
     }
 
-    fn read_container_len(&mut self, kind: &str) -> Result<usize> {
-        let admission = self.container_admission;
+    fn read_container_len(
+        &mut self,
+        kind: &str,
+        admission: ContainerAdmission,
+    ) -> Result<usize> {
         let len = self.read_len_prefix(kind)?;
         if len > admission.maximum {
             return Err(Error::custom(format!(
@@ -182,7 +185,10 @@ impl<'a, R: Read> Deserializer<'a, R> {
     }
 
     fn read_vec(&mut self) -> Result<Vec<u8>> {
-        let admission = self.byte_buffer_admission;
+        let admission = self
+            .pending_byte_buffer_admission
+            .take()
+            .unwrap_or(ByteBufferAdmission::GLOBAL);
         let len = self.read_len_prefix(admission.label)?;
         if len > admission.maximum {
             return Err(Error::custom(format!(
@@ -370,6 +376,7 @@ impl<'de, 'a, 'b, R: Read> serde::Deserializer<'de> for &'a mut Deserializer<'b,
         visitor.visit_seq(Access {
             deserializer: self,
             len,
+            preallocation_maximum: ContainerAdmission::GLOBAL.preallocation_maximum,
         })
     }
 
@@ -389,18 +396,31 @@ impl<'de, 'a, 'b, R: Read> serde::Deserializer<'de> for &'a mut Deserializer<'b,
     where
         V: de::Visitor<'de>,
     {
-        let len = self.read_container_len("sequence")?;
-        self.deserialize_tuple(len, visitor)
+        let admission = self
+            .pending_container_admission
+            .take()
+            .unwrap_or(ContainerAdmission::GLOBAL);
+        let len = self.read_container_len("sequence", admission)?;
+        visitor.visit_seq(Access {
+            deserializer: self,
+            len,
+            preallocation_maximum: admission.preallocation_maximum,
+        })
     }
 
     fn deserialize_map<V>(self, visitor: V) -> Result<V::Value>
     where
         V: de::Visitor<'de>,
     {
-        let len = self.read_container_len("map")?;
+        let admission = self
+            .pending_container_admission
+            .take()
+            .unwrap_or(ContainerAdmission::GLOBAL);
+        let len = self.read_container_len("map", admission)?;
         visitor.visit_map(Access {
             deserializer: self,
             len,
+            preallocation_maximum: admission.preallocation_maximum,
         })
     }
 
@@ -436,10 +456,10 @@ impl<'de, 'a, 'b, R: Read> serde::Deserializer<'de> for &'a mut Deserializer<'b,
         } else {
             None
         };
-        let requested_container = if name == ORDERED_PANE_TABS_V1_NEWTYPE {
-            Some(ContainerAdmission::ORDERED_PANE_TABS)
-        } else if name == ORDERED_PANE_TAB_TITLES_V1_NEWTYPE {
-            Some(ContainerAdmission::ORDERED_PANE_TAB_TITLES)
+        let requested_container = if name == ORDERED_PANE_TREE_DESCRIPTORS_V1_NEWTYPE {
+            Some(ContainerAdmission::ORDERED_PANE_TREE_DESCRIPTORS)
+        } else if name == ORDERED_PANE_NODES_V1_NEWTYPE {
+            Some(ContainerAdmission::ORDERED_PANE_NODES)
         } else if name == ORDERED_PANE_WINDOW_TITLES_V1_NEWTYPE {
             Some(ContainerAdmission::ORDERED_PANE_WINDOW_TITLES)
         } else if name == ORDERED_WINDOWS_V1_NEWTYPE {
@@ -449,17 +469,31 @@ impl<'de, 'a, 'b, R: Read> serde::Deserializer<'de> for &'a mut Deserializer<'b,
         } else {
             None
         };
-        let prior_byte_buffer = self.byte_buffer_admission;
-        let prior_container = self.container_admission;
+        let prior_byte_buffer = self.pending_byte_buffer_admission;
+        let prior_container = self.pending_container_admission;
         if let Some(requested) = requested_byte_buffer {
-            self.byte_buffer_admission = prior_byte_buffer.restricted_by(requested);
+            self.pending_byte_buffer_admission = Some(
+                prior_byte_buffer
+                    .unwrap_or(ByteBufferAdmission::GLOBAL)
+                    .restricted_by(requested),
+            );
         }
         if let Some(requested) = requested_container {
-            self.container_admission = prior_container.restricted_by(requested);
+            self.pending_container_admission = Some(
+                prior_container
+                    .unwrap_or(ContainerAdmission::GLOBAL)
+                    .restricted_by(requested),
+            );
         }
+        let armed_byte_buffer = self.pending_byte_buffer_admission;
+        let armed_container = self.pending_container_admission;
         let result = visitor.visit_newtype_struct(&mut *self);
-        self.byte_buffer_admission = prior_byte_buffer;
-        self.container_admission = prior_container;
+        if self.pending_byte_buffer_admission == armed_byte_buffer {
+            self.pending_byte_buffer_admission = prior_byte_buffer;
+        }
+        if self.pending_container_admission == armed_container {
+            self.pending_container_admission = prior_container;
+        }
         result
     }
 
@@ -497,6 +531,7 @@ impl<'de, 'a, 'b, R: Read> serde::Deserializer<'de> for &'a mut Deserializer<'b,
 struct Access<'a, 'b, R: Read> {
     deserializer: &'a mut Deserializer<'b, R>,
     len: usize,
+    preallocation_maximum: usize,
 }
 
 impl<'de, 'a, 'b, R: Read> de::SeqAccess<'de> for Access<'a, 'b, R> {
@@ -523,7 +558,7 @@ impl<'de, 'a, 'b, R: Read> de::SeqAccess<'de> for Access<'a, 'b, R> {
         // arbitrary wire lengths to become allocation requests.
         Some(
             self.len
-                .min(self.deserializer.container_admission.preallocation_maximum),
+                .min(self.preallocation_maximum),
         )
     }
 }
@@ -554,7 +589,7 @@ impl<'de, 'a, 'b, R: Read> de::MapAccess<'de> for Access<'a, 'b, R> {
     fn size_hint(&self) -> Option<usize> {
         Some(
             self.len
-                .min(self.deserializer.container_admission.preallocation_maximum),
+                .min(self.preallocation_maximum),
         )
     }
 }
@@ -599,5 +634,306 @@ impl<'de, 'a, 'b, R: Read> de::VariantAccess<'de> for &'a mut Deserializer<'b, R
         V: de::Visitor<'de>,
     {
         serde::de::Deserializer::deserialize_tuple(self, fields.len(), visitor)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde::Deserialize;
+    use std::convert::TryFrom;
+    use std::fmt;
+
+    #[derive(Debug, Deserialize, Eq, PartialEq)]
+    struct TwoSequences {
+        first: Vec<u8>,
+        second: Vec<u8>,
+    }
+
+    struct OrderedTabSequence(TwoSequences);
+
+    struct OrderedTabSequenceVisitor;
+
+    impl<'de> de::Visitor<'de> for OrderedTabSequenceVisitor {
+        type Value = OrderedTabSequence;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("an ordered-tab marker around two sequences")
+        }
+
+        fn visit_newtype_struct<D>(
+            self,
+            deserializer: D,
+        ) -> std::result::Result<Self::Value, D::Error>
+        where
+            D: serde::Deserializer<'de>,
+        {
+            TwoSequences::deserialize(deserializer).map(OrderedTabSequence)
+        }
+    }
+
+    impl<'de> Deserialize<'de> for OrderedTabSequence {
+        fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+        where
+            D: serde::Deserializer<'de>,
+        {
+            deserializer.deserialize_newtype_struct(
+                ORDERED_TAB_IDS_V1_NEWTYPE,
+                OrderedTabSequenceVisitor,
+            )
+        }
+    }
+
+    #[derive(Debug)]
+    struct OrderedTabVector(Vec<u8>);
+
+    struct OrderedTabVectorVisitor;
+
+    impl<'de> de::Visitor<'de> for OrderedTabVectorVisitor {
+        type Value = OrderedTabVector;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("an ordered-tab marker around one sequence")
+        }
+
+        fn visit_newtype_struct<D>(
+            self,
+            deserializer: D,
+        ) -> std::result::Result<Self::Value, D::Error>
+        where
+            D: serde::Deserializer<'de>,
+        {
+            Vec::<u8>::deserialize(deserializer).map(OrderedTabVector)
+        }
+    }
+
+    impl<'de> Deserialize<'de> for OrderedTabVector {
+        fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+        where
+            D: serde::Deserializer<'de>,
+        {
+            deserializer.deserialize_newtype_struct(
+                ORDERED_TAB_IDS_V1_NEWTYPE,
+                OrderedTabVectorVisitor,
+            )
+        }
+    }
+
+    #[derive(Debug)]
+    struct NestedWindowTitleVector(Vec<u8>);
+
+    struct NestedWindowTitleVectorVisitor;
+
+    impl<'de> de::Visitor<'de> for NestedWindowTitleVectorVisitor {
+        type Value = NestedWindowTitleVector;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("nested ordered-window-title marker")
+        }
+
+        fn visit_newtype_struct<D>(
+            self,
+            deserializer: D,
+        ) -> std::result::Result<Self::Value, D::Error>
+        where
+            D: serde::Deserializer<'de>,
+        {
+            Vec::<u8>::deserialize(deserializer).map(NestedWindowTitleVector)
+        }
+    }
+
+    impl<'de> Deserialize<'de> for NestedWindowTitleVector {
+        fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+        where
+            D: serde::Deserializer<'de>,
+        {
+            deserializer.deserialize_newtype_struct(
+                ORDERED_PANE_WINDOW_TITLES_V1_NEWTYPE,
+                NestedWindowTitleVectorVisitor,
+            )
+        }
+    }
+
+    #[derive(Debug)]
+    struct NestedOrderedTabVector(NestedWindowTitleVector);
+
+    struct NestedOrderedTabVectorVisitor;
+
+    impl<'de> de::Visitor<'de> for NestedOrderedTabVectorVisitor {
+        type Value = NestedOrderedTabVector;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("nested ordered-tab marker")
+        }
+
+        fn visit_newtype_struct<D>(
+            self,
+            deserializer: D,
+        ) -> std::result::Result<Self::Value, D::Error>
+        where
+            D: serde::Deserializer<'de>,
+        {
+            NestedWindowTitleVector::deserialize(deserializer).map(NestedOrderedTabVector)
+        }
+    }
+
+    impl<'de> Deserialize<'de> for NestedOrderedTabVector {
+        fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+        where
+            D: serde::Deserializer<'de>,
+        {
+            deserializer.deserialize_newtype_struct(
+                ORDERED_PANE_TREE_DESCRIPTORS_V1_NEWTYPE,
+                NestedOrderedTabVectorVisitor,
+            )
+        }
+    }
+
+    #[derive(Debug)]
+    struct NestedTreeDescriptorVector(Vec<u8>);
+
+    struct NestedTreeDescriptorVectorVisitor;
+
+    impl<'de> de::Visitor<'de> for NestedTreeDescriptorVectorVisitor {
+        type Value = NestedTreeDescriptorVector;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("nested ordered-pane-tree descriptor marker")
+        }
+
+        fn visit_newtype_struct<D>(
+            self,
+            deserializer: D,
+        ) -> std::result::Result<Self::Value, D::Error>
+        where
+            D: serde::Deserializer<'de>,
+        {
+            Vec::<u8>::deserialize(deserializer).map(NestedTreeDescriptorVector)
+        }
+    }
+
+    impl<'de> Deserialize<'de> for NestedTreeDescriptorVector {
+        fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+        where
+            D: serde::Deserializer<'de>,
+        {
+            deserializer.deserialize_newtype_struct(
+                ORDERED_PANE_TREE_DESCRIPTORS_V1_NEWTYPE,
+                NestedTreeDescriptorVectorVisitor,
+            )
+        }
+    }
+
+    #[derive(Debug)]
+    struct OuterWindowTitleVector(NestedTreeDescriptorVector);
+
+    struct OuterWindowTitleVectorVisitor;
+
+    impl<'de> de::Visitor<'de> for OuterWindowTitleVectorVisitor {
+        type Value = OuterWindowTitleVector;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("outer ordered-window-title marker")
+        }
+
+        fn visit_newtype_struct<D>(
+            self,
+            deserializer: D,
+        ) -> std::result::Result<Self::Value, D::Error>
+        where
+            D: serde::Deserializer<'de>,
+        {
+            NestedTreeDescriptorVector::deserialize(deserializer).map(OuterWindowTitleVector)
+        }
+    }
+
+    impl<'de> Deserialize<'de> for OuterWindowTitleVector {
+        fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+        where
+            D: serde::Deserializer<'de>,
+        {
+            deserializer.deserialize_newtype_struct(
+                ORDERED_PANE_WINDOW_TITLES_V1_NEWTYPE,
+                OuterWindowTitleVectorVisitor,
+            )
+        }
+    }
+
+    fn write_len(wire: &mut Vec<u8>, len: usize) {
+        let len = u64::try_from(len).expect("test length fits u64");
+        leb128::write::unsigned(wire, len).expect("write in-memory length prefix");
+    }
+
+    #[test]
+    fn container_marker_is_consumed_by_only_the_first_nested_container() {
+        let second_len = ORDERED_TAB_IDS_V1_MAX_ITEMS + 1;
+        let mut wire = Vec::with_capacity(second_len + 8);
+        write_len(&mut wire, 0);
+        write_len(&mut wire, second_len);
+        wire.resize(wire.len() + second_len, 0x5a);
+
+        let mut reader = wire.as_slice();
+        let decoded: OrderedTabSequence =
+            deserialize(&mut reader).expect("second sequence uses global admission");
+        assert!(decoded.0.first.is_empty());
+        assert_eq!(decoded.0.second, vec![0x5a; second_len]);
+    }
+
+    #[test]
+    fn consumed_container_marker_does_not_leak_after_prefix_error() {
+        let rejected_len = ORDERED_TAB_IDS_V1_MAX_ITEMS + 1;
+        let mut wire = Vec::with_capacity(rejected_len + 16);
+        write_len(&mut wire, rejected_len);
+        write_len(&mut wire, rejected_len);
+        wire.resize(wire.len() + rejected_len, 0x6b);
+        let mut reader = wire.as_slice();
+        let mut deserializer = Deserializer::new(&mut reader);
+
+        let rejected = OrderedTabVector::deserialize(&mut deserializer)
+            .expect_err("the marked sequence must reject its oversized prefix");
+        assert!(
+            rejected.to_string().contains("ordered tab ids length"),
+            "unexpected marker rejection: {}",
+            rejected,
+        );
+        let recovered = Vec::<u8>::deserialize(&mut deserializer)
+            .expect("the following unmarked sequence must use global admission");
+        assert_eq!(recovered, vec![0x6b; rejected_len]);
+    }
+
+    #[test]
+    fn nested_container_markers_can_only_tighten_the_pending_admission() {
+        let rejected_len = ORDERED_PANE_WINDOW_TITLES_V1_MAX_ITEMS + 1;
+        let mut wire = Vec::new();
+        write_len(&mut wire, rejected_len);
+
+        let mut reader = wire.as_slice();
+        let rejected = deserialize::<NestedOrderedTabVector, _>(&mut reader)
+            .expect_err("the tighter nested marker must reject before elements");
+        assert!(
+            rejected
+                .to_string()
+                .contains("ordered pane window titles length"),
+            "unexpected nested marker rejection: {}",
+            rejected,
+        );
+    }
+
+    #[test]
+    fn nested_container_marker_cannot_relax_a_tighter_outer_admission() {
+        let rejected_len = ORDERED_PANE_WINDOW_TITLES_V1_MAX_ITEMS + 1;
+        let mut wire = Vec::new();
+        write_len(&mut wire, rejected_len);
+
+        let mut reader = wire.as_slice();
+        let rejected = deserialize::<OuterWindowTitleVector, _>(&mut reader)
+            .expect_err("the looser inner marker must preserve the outer ceiling");
+        assert!(
+            rejected
+                .to_string()
+                .contains("ordered pane window titles length"),
+            "unexpected non-relaxation rejection: {}",
+            rejected,
+        );
     }
 }
