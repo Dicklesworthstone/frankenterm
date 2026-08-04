@@ -24,8 +24,11 @@ use mux::client::{ClientId, ClientInfo};
 use mux::pane::PaneId;
 use mux::renderable::{PaneTieredScrollbackStatus, RenderableDimensions, StableCursorPosition};
 use mux::tab::{
-    FloatingPaneRect, PaneEntry, PaneNode, SerdeUrl, SplitRequest, TabId, TabStackId,
+    FloatingPaneRect, PaneArena, PaneArenaNode, PaneArenaTree, PaneArenaWindowTitle, PaneNode,
+    SerdeUrl, SplitRequest, TabId, TabStackId,
 };
+#[cfg(test)]
+use mux::tab::PaneEntry;
 use mux::window::WindowId;
 use mux::{MuxSessionIncarnation, TopologyRevision};
 use portable_pty::CommandBuilder;
@@ -4272,8 +4275,8 @@ impl OrderedWindowStateV1 {
 }
 
 /// One coherent pane plus ordered-window bootstrap at a shared topology
-/// revision. This is the PDU87 success body; flat PDU4/PDU82 vectors alone do
-/// not acquire ordering authority.
+/// revision. This is the PDU87 success body; legacy PDU4/PDU82 pane listings
+/// alone do not acquire ordering authority.
 #[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]
 pub struct OrderedPaneSnapshotV1 {
     pub session_incarnation: MuxSessionIncarnation,
@@ -4282,7 +4285,7 @@ pub struct OrderedPaneSnapshotV1 {
         serialize_with = "serialize_ordered_panes",
         deserialize_with = "deserialize_ordered_panes"
     )]
-    pub panes: ListPanesResponse,
+    pub panes: PaneArena,
     #[serde(
         serialize_with = "serialize_ordered_window_section",
         deserialize_with = "deserialize_ordered_window_section"
@@ -4297,7 +4300,7 @@ impl OrderedPaneSnapshotV1 {
             self.session_incarnation.as_bytes(),
         )?;
         validate_topology_revision(self.topology_revision)?;
-        validate_ordered_pane_cardinality(&self.panes)
+        validate_flat_ordered_panes(&self.panes)
     }
 
     pub fn validate(&self) -> Result<(), OrderedWindowProtocolError> {
@@ -4862,135 +4865,6 @@ fn validate_window_order_revision(
     Ok(())
 }
 
-fn validate_ordered_pane_cardinality(
-    panes: &ListPanesResponse,
-) -> Result<(), OrderedWindowProtocolError> {
-    if panes.tabs.len() > MAX_ORDERED_TABS_PER_SNAPSHOT {
-        return Err(OrderedWindowProtocolError::TooManyPaneTrees {
-            count: panes.tabs.len(),
-            max: MAX_ORDERED_TABS_PER_SNAPSHOT,
-        });
-    }
-    if panes.tab_titles.len() > MAX_ORDERED_TABS_PER_SNAPSHOT {
-        return Err(OrderedWindowProtocolError::TooManyPaneTabTitles {
-            count: panes.tab_titles.len(),
-            max: MAX_ORDERED_TABS_PER_SNAPSHOT,
-        });
-    }
-    if panes.tabs.len() != panes.tab_titles.len() {
-        return Err(
-            OrderedWindowProtocolError::PaneTreeTitleCardinalityMismatch {
-                trees: panes.tabs.len(),
-                titles: panes.tab_titles.len(),
-            },
-        );
-    }
-    if panes.window_titles.len() > MAX_ORDERED_WINDOWS_PER_SNAPSHOT {
-        return Err(OrderedWindowProtocolError::TooManyPaneWindowTitles {
-            count: panes.window_titles.len(),
-            max: MAX_ORDERED_WINDOWS_PER_SNAPSHOT,
-        });
-    }
-    validate_in_memory_ordered_pane_tree_limits(&panes.tabs)?;
-    Ok(())
-}
-
-fn validate_in_memory_ordered_pane_tree_limits(
-    trees: &[PaneNode],
-) -> Result<(), OrderedWindowProtocolError> {
-    let mut work = Vec::new();
-    work.try_reserve_exact(MAX_ORDERED_PANE_TREE_DEPTH)
-        .map_err(|_| OrderedWindowProtocolError::PaneArenaAllocation)?;
-    let mut total_nodes = 0_usize;
-    let mut total_leaves = 0_usize;
-
-    for (tree_index, tree) in trees.iter().enumerate() {
-        if matches!(tree, PaneNode::Empty) {
-            continue;
-        }
-        work.push((tree, 1_usize));
-        let mut tree_nodes = 0_usize;
-        let mut tree_leaves = 0_usize;
-        while let Some((node, depth)) = work.pop() {
-            if depth > MAX_ORDERED_PANE_TREE_DEPTH {
-                return Err(OrderedWindowProtocolError::PaneTreeResourceLimit {
-                    tree_index,
-                    resource: "levels",
-                    count: depth,
-                    max: MAX_ORDERED_PANE_TREE_DEPTH,
-                });
-            }
-            tree_nodes = tree_nodes
-                .checked_add(1)
-                .ok_or(OrderedWindowProtocolError::CountOverflow)?;
-            total_nodes = total_nodes
-                .checked_add(1)
-                .ok_or(OrderedWindowProtocolError::CountOverflow)?;
-            if tree_nodes > MAX_ORDERED_PANE_NODES_PER_TREE {
-                return Err(OrderedWindowProtocolError::PaneTreeResourceLimit {
-                    tree_index,
-                    resource: "nodes",
-                    count: tree_nodes,
-                    max: MAX_ORDERED_PANE_NODES_PER_TREE,
-                });
-            }
-            if total_nodes > MAX_ORDERED_PANE_NODES_PER_SNAPSHOT {
-                return Err(OrderedWindowProtocolError::TooManyPaneNodes {
-                    count: total_nodes,
-                    max: MAX_ORDERED_PANE_NODES_PER_SNAPSHOT,
-                });
-            }
-            match node {
-                PaneNode::Empty => {}
-                PaneNode::Leaf(_) => {
-                    tree_leaves = tree_leaves
-                        .checked_add(1)
-                        .ok_or(OrderedWindowProtocolError::CountOverflow)?;
-                    total_leaves = total_leaves
-                        .checked_add(1)
-                        .ok_or(OrderedWindowProtocolError::CountOverflow)?;
-                    if tree_leaves > MAX_ORDERED_PANE_LEAVES_PER_TREE {
-                        return Err(OrderedWindowProtocolError::PaneTreeResourceLimit {
-                            tree_index,
-                            resource: "leaves",
-                            count: tree_leaves,
-                            max: MAX_ORDERED_PANE_LEAVES_PER_TREE,
-                        });
-                    }
-                    if total_leaves > MAX_ORDERED_PANE_LEAVES_PER_SNAPSHOT {
-                        return Err(OrderedWindowProtocolError::TooManyPaneLeaves {
-                            count: total_leaves,
-                            max: MAX_ORDERED_PANE_LEAVES_PER_SNAPSHOT,
-                        });
-                    }
-                }
-                PaneNode::Split { left, right, .. } => {
-                    if depth == MAX_ORDERED_PANE_TREE_DEPTH {
-                        return Err(OrderedWindowProtocolError::PaneTreeResourceLimit {
-                            tree_index,
-                            resource: "levels",
-                            count: depth.saturating_add(1),
-                            max: MAX_ORDERED_PANE_TREE_DEPTH,
-                        });
-                    }
-                    let child_depth = depth
-                        .checked_add(1)
-                        .ok_or(OrderedWindowProtocolError::CountOverflow)?;
-                    work.push((right.as_ref(), child_depth));
-                    work.push((left.as_ref(), child_depth));
-                }
-            }
-        }
-        if tree_leaves == 0 {
-            return Err(OrderedWindowProtocolError::InvalidPaneTreeDescriptor {
-                tree_index,
-                detail: "non-empty tree contains no pane leaves",
-            });
-        }
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 fn encoded_ordered_window_section_len(
     windows: &[OrderedWindowStateV1],
@@ -5310,69 +5184,24 @@ where
 }
 
 fn serialize_ordered_panes<S>(
-    panes: &ListPanesResponse,
+    panes: &PaneArena,
     serializer: S,
 ) -> Result<S::Ok, S::Error>
 where
     S: serde::Serializer,
 {
-    let wire = flatten_ordered_panes(panes).map_err(serde::ser::Error::custom)?;
-    wire.serialize(serializer)
+    validate_flat_ordered_panes(panes).map_err(serde::ser::Error::custom)?;
+    PaneArenaWireRef {
+        trees: PaneArenaTreesWire(panes.trees()),
+        nodes: PaneArenaNodesWire(panes.nodes()),
+        window_titles: PaneArenaWindowTitlesWire(panes.window_titles()),
+    }
+    .serialize(serializer)
 }
 
-#[derive(Serialize)]
-struct OrderedPaneTreeDescriptorRef<'a> {
-    root_index: Option<u32>,
-    node_count: u32,
-    tab_title: &'a str,
-}
+struct PaneArenaTreesWire<'a>(&'a [PaneArenaTree]);
 
-#[derive(Deserialize, Serialize)]
-struct OrderedPaneTreeDescriptorOwned {
-    root_index: Option<u32>,
-    node_count: u32,
-    tab_title: String,
-}
-
-#[derive(Serialize)]
-enum OrderedPaneArenaNodeRef<'a> {
-    Empty,
-    Split {
-        left: u32,
-        right: u32,
-        node: mux::tab::SplitDirectionAndSize,
-    },
-    Leaf(&'a PaneEntry),
-}
-
-#[derive(Deserialize, Serialize)]
-enum OrderedPaneArenaNodeOwned {
-    Empty,
-    Split {
-        left: u32,
-        right: u32,
-        node: mux::tab::SplitDirectionAndSize,
-    },
-    Leaf(PaneEntry),
-}
-
-#[derive(Serialize)]
-struct OrderedPaneWindowTitleRef<'a> {
-    window_id: u64,
-    title: &'a str,
-}
-
-#[derive(Deserialize, Serialize)]
-struct OrderedPaneWindowTitleOwned {
-    window_id: u64,
-    title: String,
-}
-
-struct OrderedPaneTreeDescriptorsWire<'slice, 'data>(
-    &'slice [OrderedPaneTreeDescriptorRef<'data>],
-);
-
-impl Serialize for OrderedPaneTreeDescriptorsWire<'_, '_> {
+impl Serialize for PaneArenaTreesWire<'_> {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: serde::Serializer,
@@ -5384,9 +5213,9 @@ impl Serialize for OrderedPaneTreeDescriptorsWire<'_, '_> {
     }
 }
 
-struct OrderedPaneNodesWire<'slice, 'data>(&'slice [OrderedPaneArenaNodeRef<'data>]);
+struct PaneArenaNodesWire<'a>(&'a [PaneArenaNode]);
 
-impl Serialize for OrderedPaneNodesWire<'_, '_> {
+impl Serialize for PaneArenaNodesWire<'_> {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: serde::Serializer,
@@ -5398,11 +5227,9 @@ impl Serialize for OrderedPaneNodesWire<'_, '_> {
     }
 }
 
-struct OrderedPaneWindowTitlesWire<'slice, 'data>(
-    &'slice [OrderedPaneWindowTitleRef<'data>],
-);
+struct PaneArenaWindowTitlesWire<'a>(&'a [PaneArenaWindowTitle]);
 
-impl Serialize for OrderedPaneWindowTitlesWire<'_, '_> {
+impl Serialize for PaneArenaWindowTitlesWire<'_> {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: serde::Serializer,
@@ -5415,18 +5242,10 @@ impl Serialize for OrderedPaneWindowTitlesWire<'_, '_> {
 }
 
 #[derive(Serialize)]
-struct OrderedPanesFlatWireRef<'slice, 'data> {
-    trees: OrderedPaneTreeDescriptorsWire<'slice, 'data>,
-    nodes: OrderedPaneNodesWire<'slice, 'data>,
-    window_titles: OrderedPaneWindowTitlesWire<'slice, 'data>,
-}
-
-struct OrderedPanesFlatSerialization<'a> {
-    trees: Vec<OrderedPaneTreeDescriptorRef<'a>>,
-    nodes: Vec<OrderedPaneArenaNodeRef<'a>>,
-    window_titles: Vec<OrderedPaneWindowTitleRef<'a>>,
-    #[cfg(test)]
-    stats: OrderedPanesFlattenStats,
+struct PaneArenaWireRef<'a> {
+    trees: PaneArenaTreesWire<'a>,
+    nodes: PaneArenaNodesWire<'a>,
+    window_titles: PaneArenaWindowTitlesWire<'a>,
 }
 
 #[cfg(test)]
@@ -5439,28 +5258,20 @@ struct OrderedPanesFlattenStats {
     flatten_allocation_requests: usize,
 }
 
-impl Serialize for OrderedPanesFlatSerialization<'_> {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        OrderedPanesFlatWireRef {
-            trees: OrderedPaneTreeDescriptorsWire(&self.trees),
-            nodes: OrderedPaneNodesWire(&self.nodes),
-            window_titles: OrderedPaneWindowTitlesWire(&self.window_titles),
-        }
-        .serialize(serializer)
-    }
+struct OrderedPanesFlattenResult {
+    panes: PaneArena,
+    #[cfg(test)]
+    stats: OrderedPanesFlattenStats,
 }
 
-enum FlattenPaneTask<'a> {
+enum FlattenPaneTask {
     Visit {
-        node: &'a PaneNode,
+        node: PaneNode,
         depth: usize,
     },
     VisitRight {
         split_index: usize,
-        right: &'a PaneNode,
+        right: PaneNode,
         depth: usize,
     },
 }
@@ -5483,37 +5294,53 @@ fn reserve_flat_node_slot<T>(values: &mut Vec<T>) -> Result<bool, OrderedWindowP
     Ok(false)
 }
 
+/// Consume a legacy recursive pane listing into the PDU87 application arena.
+///
+/// This is the only bridge needed by the current server producer. Pane entries
+/// and title strings move into the arena; serialization and decoding retain
+/// that storage without reconstructing a recursive transfer tree.
+pub fn ordered_pane_arena_from_list_panes(
+    panes: ListPanesResponse,
+) -> Result<PaneArena, OrderedWindowProtocolError> {
+    Ok(flatten_ordered_panes(panes)?.panes)
+}
+
 fn flatten_ordered_panes(
-    panes: &ListPanesResponse,
-) -> Result<OrderedPanesFlatSerialization<'_>, OrderedWindowProtocolError> {
-    if panes.tabs.len() > MAX_ORDERED_TABS_PER_SNAPSHOT {
+    panes: ListPanesResponse,
+) -> Result<OrderedPanesFlattenResult, OrderedWindowProtocolError> {
+    let ListPanesResponse {
+        tabs,
+        tab_titles,
+        window_titles: pane_window_titles,
+    } = panes;
+    if tabs.len() > MAX_ORDERED_TABS_PER_SNAPSHOT {
         return Err(OrderedWindowProtocolError::TooManyPaneTrees {
-            count: panes.tabs.len(),
+            count: tabs.len(),
             max: MAX_ORDERED_TABS_PER_SNAPSHOT,
         });
     }
-    if panes.tabs.len() != panes.tab_titles.len() {
+    if tabs.len() != tab_titles.len() {
         return Err(
             OrderedWindowProtocolError::PaneTreeTitleCardinalityMismatch {
-                trees: panes.tabs.len(),
-                titles: panes.tab_titles.len(),
+                trees: tabs.len(),
+                titles: tab_titles.len(),
             },
         );
     }
-    if panes.window_titles.len() > MAX_ORDERED_WINDOWS_PER_SNAPSHOT {
+    if pane_window_titles.len() > MAX_ORDERED_WINDOWS_PER_SNAPSHOT {
         return Err(OrderedWindowProtocolError::TooManyPaneWindowTitles {
-            count: panes.window_titles.len(),
+            count: pane_window_titles.len(),
             max: MAX_ORDERED_WINDOWS_PER_SNAPSHOT,
         });
     }
 
     let mut descriptors = Vec::new();
     descriptors
-        .try_reserve_exact(panes.tabs.len())
+        .try_reserve_exact(tabs.len())
         .map_err(|_| OrderedWindowProtocolError::PaneArenaAllocation)?;
     let mut nodes = Vec::new();
     nodes
-        .try_reserve_exact(panes.tabs.len().min(MAX_ORDERED_PANE_NODES_PER_SNAPSHOT))
+        .try_reserve_exact(tabs.len().min(MAX_ORDERED_PANE_NODES_PER_SNAPSHOT))
         .map_err(|_| OrderedWindowProtocolError::PaneArenaAllocation)?;
     let mut tasks = Vec::new();
     tasks
@@ -5522,20 +5349,18 @@ fn flatten_ordered_panes(
     let mut total_leaves = 0_usize;
     #[cfg(test)]
     let mut stats = OrderedPanesFlattenStats {
-        flatten_allocation_requests: (if panes.tabs.is_empty() { 0 } else { 2 })
+        flatten_allocation_requests: (if tabs.is_empty() { 0 } else { 2 })
             + 1
-            + (if panes.window_titles.is_empty() { 0 } else { 1 }),
+            + (if pane_window_titles.is_empty() { 0 } else { 1 }),
         ..OrderedPanesFlattenStats::default()
     };
 
-    for (tree_index, (tree, title)) in panes.tabs.iter().zip(&panes.tab_titles).enumerate() {
+    for (tree_index, (tree, title)) in tabs.into_iter().zip(tab_titles).enumerate() {
         if matches!(tree, PaneNode::Empty) {
-            descriptors.push(OrderedPaneTreeDescriptorRef {
-                root_index: None,
-                node_count: 0,
-                tab_title: title,
+            return Err(OrderedWindowProtocolError::InvalidPaneTreeDescriptor {
+                tree_index,
+                detail: "ordered pane snapshots cannot recreate an empty tab without size authority",
             });
-            continue;
         }
 
         let tree_start = nodes.len();
@@ -5591,7 +5416,7 @@ fn flatten_ordered_panes(
                     let _ = node_allocation;
                     let node_index = nodes.len();
                     match node {
-                        PaneNode::Empty => nodes.push(OrderedPaneArenaNodeRef::Empty),
+                        PaneNode::Empty => nodes.push(PaneArenaNode::Empty),
                         PaneNode::Leaf(entry) => {
                             #[cfg(test)]
                             {
@@ -5617,7 +5442,7 @@ fn flatten_ordered_panes(
                                     max: MAX_ORDERED_PANE_LEAVES_PER_SNAPSHOT,
                                 });
                             }
-                            nodes.push(OrderedPaneArenaNodeRef::Leaf(entry));
+                            nodes.push(PaneArenaNode::Leaf(entry));
                         }
                         PaneNode::Split { left, right, node } => {
                             if depth == MAX_ORDERED_PANE_TREE_DEPTH {
@@ -5635,21 +5460,21 @@ fn flatten_ordered_panes(
                                     detail: "left child index does not fit u32",
                                 },
                             )?;
-                            nodes.push(OrderedPaneArenaNodeRef::Split {
+                            nodes.push(PaneArenaNode::Split {
                                 left: left_index,
                                 right: u32::MAX,
-                                node: *node,
+                                node,
                             });
                             let child_depth = depth.checked_add(1).ok_or(
                                 OrderedWindowProtocolError::CountOverflow,
                             )?;
                             tasks.push(FlattenPaneTask::VisitRight {
                                 split_index: node_index,
-                                right,
+                                right: *right,
                                 depth: child_depth,
                             });
                             tasks.push(FlattenPaneTask::Visit {
-                                node: left,
+                                node: *left,
                                 depth: child_depth,
                             });
                             #[cfg(test)]
@@ -5672,7 +5497,7 @@ fn flatten_ordered_panes(
                             detail: "right child index does not fit u32",
                         }
                     })?;
-                    let OrderedPaneArenaNodeRef::Split {
+                    let PaneArenaNode::Split {
                         right: stored_right,
                         ..
                     } = &mut nodes[split_index]
@@ -5706,7 +5531,7 @@ fn flatten_ordered_panes(
                 detail: "node count does not fit u32",
             }
         })?;
-        descriptors.push(OrderedPaneTreeDescriptorRef {
+        descriptors.push(PaneArenaTree {
             root_index: Some(root_index),
             node_count,
             tab_title: title,
@@ -5715,24 +5540,24 @@ fn flatten_ordered_panes(
 
     let mut window_titles = Vec::new();
     window_titles
-        .try_reserve_exact(panes.window_titles.len())
+        .try_reserve_exact(pane_window_titles.len())
         .map_err(|_| OrderedWindowProtocolError::PaneArenaAllocation)?;
-    for (window_id, title) in &panes.window_titles {
-        let window_id = u64::try_from(*window_id).map_err(|_| {
+    for (window_id, title) in pane_window_titles {
+        let window_id = u64::try_from(window_id).map_err(|_| {
             OrderedWindowProtocolError::ProcessIdDoesNotFitWire {
                 field: "window_id",
-                value: *window_id,
+                value: window_id,
             }
         })?;
         validate_remote_wire_id("window_id", window_id)?;
-        window_titles.push(OrderedPaneWindowTitleRef { window_id, title });
+        window_titles.push(PaneArenaWindowTitle { window_id, title });
     }
     window_titles.sort_unstable_by_key(|entry| entry.window_id);
 
-    Ok(OrderedPanesFlatSerialization {
-        trees: descriptors,
-        nodes,
-        window_titles,
+    let panes = PaneArena::from_unvalidated_parts(descriptors, nodes, window_titles);
+    validate_flat_ordered_panes(&panes)?;
+    Ok(OrderedPanesFlattenResult {
+        panes,
         #[cfg(test)]
         stats,
     })
@@ -5741,7 +5566,7 @@ fn flatten_ordered_panes(
 struct OrderedPaneTreeDescriptorsNewtypeVisitor;
 
 impl<'de> serde::de::Visitor<'de> for OrderedPaneTreeDescriptorsNewtypeVisitor {
-    type Value = Vec<OrderedPaneTreeDescriptorOwned>;
+    type Value = Vec<PaneArenaTree>;
 
     fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str("a bounded ordered pane tree-descriptor collection")
@@ -5761,7 +5586,7 @@ impl<'de> serde::de::Visitor<'de> for OrderedPaneTreeDescriptorsNewtypeVisitor {
 struct OrderedPaneNodesNewtypeVisitor;
 
 impl<'de> serde::de::Visitor<'de> for OrderedPaneNodesNewtypeVisitor {
-    type Value = Vec<OrderedPaneArenaNodeOwned>;
+    type Value = Vec<PaneArenaNode>;
 
     fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str("a bounded ordered pane node arena")
@@ -5781,7 +5606,7 @@ impl<'de> serde::de::Visitor<'de> for OrderedPaneNodesNewtypeVisitor {
 struct OrderedPaneWindowTitlesNewtypeVisitor;
 
 impl<'de> serde::de::Visitor<'de> for OrderedPaneWindowTitlesNewtypeVisitor {
-    type Value = Vec<OrderedPaneWindowTitleOwned>;
+    type Value = Vec<PaneArenaWindowTitle>;
 
     fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str("a bounded canonical ordered pane window-title collection")
@@ -5800,7 +5625,7 @@ impl<'de> serde::de::Visitor<'de> for OrderedPaneWindowTitlesNewtypeVisitor {
 
 fn deserialize_ordered_pane_tree_descriptors<'de, D>(
     deserializer: D,
-) -> Result<Vec<OrderedPaneTreeDescriptorOwned>, D::Error>
+) -> Result<Vec<PaneArenaTree>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
@@ -5812,7 +5637,7 @@ where
 
 fn deserialize_ordered_pane_nodes<'de, D>(
     deserializer: D,
-) -> Result<Vec<OrderedPaneArenaNodeOwned>, D::Error>
+) -> Result<Vec<PaneArenaNode>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
@@ -5824,7 +5649,7 @@ where
 
 fn deserialize_ordered_pane_window_titles<'de, D>(
     deserializer: D,
-) -> Result<Vec<OrderedPaneWindowTitleOwned>, D::Error>
+) -> Result<Vec<PaneArenaWindowTitle>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
@@ -5837,42 +5662,44 @@ where
 #[derive(Deserialize, Serialize)]
 struct OrderedPanesFlatWireOwned {
     #[serde(deserialize_with = "deserialize_ordered_pane_tree_descriptors")]
-    trees: Vec<OrderedPaneTreeDescriptorOwned>,
+    trees: Vec<PaneArenaTree>,
     #[serde(deserialize_with = "deserialize_ordered_pane_nodes")]
-    nodes: Vec<OrderedPaneArenaNodeOwned>,
+    nodes: Vec<PaneArenaNode>,
     #[serde(deserialize_with = "deserialize_ordered_pane_window_titles")]
-    window_titles: Vec<OrderedPaneWindowTitleOwned>,
+    window_titles: Vec<PaneArenaWindowTitle>,
 }
 
 fn validate_flat_ordered_panes(
-    panes: &OrderedPanesFlatWireOwned,
+    panes: &PaneArena,
 ) -> Result<(), OrderedWindowProtocolError> {
-    if panes.trees.len() > MAX_ORDERED_TABS_PER_SNAPSHOT {
+    let trees = panes.trees();
+    let nodes = panes.nodes();
+    let window_titles = panes.window_titles();
+    if trees.len() > MAX_ORDERED_TABS_PER_SNAPSHOT {
         return Err(OrderedWindowProtocolError::TooManyPaneTrees {
-            count: panes.trees.len(),
+            count: trees.len(),
             max: MAX_ORDERED_TABS_PER_SNAPSHOT,
         });
     }
-    if panes.nodes.len() > MAX_ORDERED_PANE_NODES_PER_SNAPSHOT {
+    if nodes.len() > MAX_ORDERED_PANE_NODES_PER_SNAPSHOT {
         return Err(OrderedWindowProtocolError::TooManyPaneNodes {
-            count: panes.nodes.len(),
+            count: nodes.len(),
             max: MAX_ORDERED_PANE_NODES_PER_SNAPSHOT,
         });
     }
-    if panes.window_titles.len() > MAX_ORDERED_WINDOWS_PER_SNAPSHOT {
+    if window_titles.len() > MAX_ORDERED_WINDOWS_PER_SNAPSHOT {
         return Err(OrderedWindowProtocolError::TooManyPaneWindowTitles {
-            count: panes.window_titles.len(),
+            count: window_titles.len(),
             max: MAX_ORDERED_WINDOWS_PER_SNAPSHOT,
         });
     }
-    if panes
-        .window_titles
+    if window_titles
         .windows(2)
         .any(|pair| pair[0].window_id >= pair[1].window_id)
     {
         return Err(OrderedWindowProtocolError::NonCanonicalPaneWindowTitleOrder);
     }
-    for entry in &panes.window_titles {
+    for entry in window_titles {
         validate_remote_wire_id("window_id", entry.window_id)?;
     }
 
@@ -5882,7 +5709,7 @@ fn validate_flat_ordered_panes(
     work.try_reserve_exact(MAX_ORDERED_PANE_TREE_DEPTH)
         .map_err(|_| OrderedWindowProtocolError::PaneArenaAllocation)?;
 
-    for (tree_index, descriptor) in panes.trees.iter().enumerate() {
+    for (tree_index, descriptor) in trees.iter().enumerate() {
         let node_count = usize::try_from(descriptor.node_count).map_err(|_| {
             OrderedWindowProtocolError::InvalidPaneTreeDescriptor {
                 tree_index,
@@ -5890,7 +5717,12 @@ fn validate_flat_ordered_panes(
             }
         })?;
         match (descriptor.root_index, node_count) {
-            (None, 0) => continue,
+            (None, 0) => {
+                return Err(OrderedWindowProtocolError::InvalidPaneTreeDescriptor {
+                    tree_index,
+                    detail: "ordered pane snapshots cannot recreate an empty tab without size authority",
+                });
+            }
             (None, _) => {
                 return Err(OrderedWindowProtocolError::InvalidPaneTreeDescriptor {
                     tree_index,
@@ -5927,13 +5759,13 @@ fn validate_flat_ordered_panes(
                 let end = cursor.checked_add(node_count).ok_or(
                     OrderedWindowProtocolError::CountOverflow,
                 )?;
-                if end > panes.nodes.len() {
+                if end > nodes.len() {
                     return Err(OrderedWindowProtocolError::InvalidPaneTreeDescriptor {
                         tree_index,
                         detail: "node range exceeds the admitted arena",
                     });
                 }
-                if matches!(panes.nodes.get(root), Some(OrderedPaneArenaNodeOwned::Empty)) {
+                if matches!(nodes.get(root), Some(PaneArenaNode::Empty)) {
                     return Err(OrderedWindowProtocolError::InvalidPaneTreeDescriptor {
                         tree_index,
                         detail: "empty root must use the zero-node descriptor",
@@ -5943,6 +5775,8 @@ fn validate_flat_ordered_panes(
                 work.push((root, 1_usize));
                 let mut expected = root;
                 let mut tree_leaves = 0_usize;
+                let mut active_leaves = 0_usize;
+                let mut zoomed_leaves = 0_usize;
                 while let Some((node_index, depth)) = work.pop() {
                     if depth > MAX_ORDERED_PANE_TREE_DEPTH {
                         return Err(OrderedWindowProtocolError::PaneTreeResourceLimit {
@@ -5962,12 +5796,18 @@ fn validate_flat_ordered_panes(
                     expected = expected.checked_add(1).ok_or(
                         OrderedWindowProtocolError::CountOverflow,
                     )?;
-                    match &panes.nodes[node_index] {
-                        OrderedPaneArenaNodeOwned::Empty => {}
-                        OrderedPaneArenaNodeOwned::Leaf(_) => {
+                    match &nodes[node_index] {
+                        PaneArenaNode::Empty => {}
+                        PaneArenaNode::Leaf(entry) => {
                             tree_leaves = tree_leaves.checked_add(1).ok_or(
                                 OrderedWindowProtocolError::CountOverflow,
                             )?;
+                            active_leaves = active_leaves
+                                .checked_add(usize::from(entry.is_active_pane))
+                                .ok_or(OrderedWindowProtocolError::CountOverflow)?;
+                            zoomed_leaves = zoomed_leaves
+                                .checked_add(usize::from(entry.is_zoomed_pane))
+                                .ok_or(OrderedWindowProtocolError::CountOverflow)?;
                             total_leaves = total_leaves.checked_add(1).ok_or(
                                 OrderedWindowProtocolError::CountOverflow,
                             )?;
@@ -5986,7 +5826,7 @@ fn validate_flat_ordered_panes(
                                 });
                             }
                         }
-                        OrderedPaneArenaNodeOwned::Split { left, right, .. } => {
+                        PaneArenaNode::Split { left, right, .. } => {
                             if depth == MAX_ORDERED_PANE_TREE_DEPTH {
                                 return Err(OrderedWindowProtocolError::PaneTreeResourceLimit {
                                     tree_index,
@@ -6043,139 +5883,38 @@ fn validate_flat_ordered_panes(
                         detail: "non-empty tree contains no pane leaves",
                     });
                 }
+                if active_leaves > 1 || zoomed_leaves > 1 {
+                    return Err(OrderedWindowProtocolError::InvalidPaneTreeDescriptor {
+                        tree_index,
+                        detail: "pane tree has multiple active or zoomed leaves",
+                    });
+                }
                 cursor = end;
             }
         }
     }
-    if cursor != panes.nodes.len() {
+    if cursor != nodes.len() {
         return Err(OrderedWindowProtocolError::PaneArenaCardinalityMismatch {
             referenced: cursor,
-            total: panes.nodes.len(),
+            total: nodes.len(),
         });
     }
     Ok(())
 }
 
-fn ordered_panes_from_flat(
-    panes: OrderedPanesFlatWireOwned,
-) -> Result<ListPanesResponse, OrderedWindowProtocolError> {
-    validate_flat_ordered_panes(&panes)?;
-    let OrderedPanesFlatWireOwned {
-        trees,
-        nodes,
-        window_titles: flat_window_titles,
-    } = panes;
-    let mut reversed_tabs = Vec::new();
-    let mut reversed_titles = Vec::new();
-    reversed_tabs
-        .try_reserve_exact(trees.len())
-        .map_err(|_| OrderedWindowProtocolError::PaneArenaAllocation)?;
-    reversed_titles
-        .try_reserve_exact(trees.len())
-        .map_err(|_| OrderedWindowProtocolError::PaneArenaAllocation)?;
-    let mut nodes = nodes.into_iter().rev();
-    let mut stack = Vec::new();
-    stack
-        .try_reserve_exact(MAX_ORDERED_PANE_LEAVES_PER_TREE)
-        .map_err(|_| OrderedWindowProtocolError::PaneArenaAllocation)?;
-
-    for (tree_index, descriptor) in trees.into_iter().enumerate().rev() {
-        reversed_titles.push(descriptor.tab_title);
-        let node_count = usize::try_from(descriptor.node_count).map_err(|_| {
-            OrderedWindowProtocolError::InvalidPaneTreeDescriptor {
-                tree_index,
-                detail: "validated node count no longer fits usize",
-            }
-        })?;
-        if descriptor.root_index.is_none() {
-            reversed_tabs.push(PaneNode::Empty);
-            continue;
-        }
-        for _ in 0..node_count {
-            let node = nodes.next().ok_or(
-                OrderedWindowProtocolError::PaneArenaCardinalityMismatch {
-                    referenced: 0,
-                    total: node_count,
-                },
-            )?;
-            match node {
-                OrderedPaneArenaNodeOwned::Empty => stack.push(PaneNode::Empty),
-                OrderedPaneArenaNodeOwned::Leaf(entry) => stack.push(PaneNode::Leaf(entry)),
-                OrderedPaneArenaNodeOwned::Split { node, .. } => {
-                    let left = stack.pop().ok_or(
-                        OrderedWindowProtocolError::InvalidPaneArenaNode {
-                            tree_index,
-                            node_index: 0,
-                            detail: "validated split lost its left operand",
-                        },
-                    )?;
-                    let right = stack.pop().ok_or(
-                        OrderedWindowProtocolError::InvalidPaneArenaNode {
-                            tree_index,
-                            node_index: 0,
-                            detail: "validated split lost its right operand",
-                        },
-                    )?;
-                    stack.push(PaneNode::Split {
-                        left: Box::new(left),
-                        right: Box::new(right),
-                        node,
-                    });
-                }
-            }
-        }
-        if stack.len() != 1 {
-            return Err(OrderedWindowProtocolError::InvalidPaneTreeDescriptor {
-                tree_index,
-                detail: "validated reverse conversion did not produce one root",
-            });
-        }
-        let root = stack.pop().ok_or(
-            OrderedWindowProtocolError::InvalidPaneTreeDescriptor {
-                tree_index,
-                detail: "validated reverse conversion lost its root",
-            },
-        )?;
-        reversed_tabs.push(root);
-    }
-    if nodes.next().is_some() {
-        return Err(OrderedWindowProtocolError::PaneArenaCardinalityMismatch {
-            referenced: 0,
-            total: 1,
-        });
-    }
-    reversed_tabs.reverse();
-    reversed_titles.reverse();
-
-    let mut window_titles = HashMap::new();
-    window_titles
-        .try_reserve(flat_window_titles.len())
-        .map_err(|_| OrderedWindowProtocolError::PaneArenaAllocation)?;
-    for entry in flat_window_titles {
-        let window_id = usize::try_from(entry.window_id).map_err(|_| {
-            OrderedWindowProtocolError::WireIdDoesNotFitUsize {
-                field: "window_id",
-                value: entry.window_id,
-            }
-        })?;
-        if window_titles.insert(window_id, entry.title).is_some() {
-            return Err(OrderedWindowProtocolError::NonCanonicalPaneWindowTitleOrder);
-        }
-    }
-
-    Ok(ListPanesResponse {
-        tabs: reversed_tabs,
-        tab_titles: reversed_titles,
-        window_titles,
-    })
-}
-
-fn deserialize_ordered_panes<'de, D>(deserializer: D) -> Result<ListPanesResponse, D::Error>
+fn deserialize_ordered_panes<'de, D>(deserializer: D) -> Result<PaneArena, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    let panes = OrderedPanesFlatWireOwned::deserialize(deserializer)?;
-    ordered_panes_from_flat(panes).map_err(serde::de::Error::custom)
+    let wire = OrderedPanesFlatWireOwned::deserialize(deserializer)?;
+    let OrderedPanesFlatWireOwned {
+        trees,
+        nodes,
+        window_titles,
+    } = wire;
+    let panes = PaneArena::from_unvalidated_parts(trees, nodes, window_titles);
+    validate_flat_ordered_panes(&panes).map_err(serde::de::Error::custom)?;
+    Ok(panes)
 }
 
 fn serialize_ordered_tab_ids<S>(
@@ -11846,30 +11585,35 @@ mod test {
         level.pop().expect("positive slot count produces one root")
     }
 
-    fn sample_flat_tree() -> OrderedPanesFlatWireOwned {
+    fn sample_flat_wire() -> OrderedPanesFlatWireOwned {
         OrderedPanesFlatWireOwned {
-            trees: vec![OrderedPaneTreeDescriptorOwned {
+            trees: vec![PaneArenaTree {
                 root_index: Some(0),
                 node_count: 3,
                 tab_title: "tab-1".to_string(),
             }],
             nodes: vec![
-                OrderedPaneArenaNodeOwned::Split {
+                PaneArenaNode::Split {
                     left: 1,
                     right: 2,
                     node: sample_split(),
                 },
-                OrderedPaneArenaNodeOwned::Leaf(sample_pane_entry(0)),
-                OrderedPaneArenaNodeOwned::Leaf(sample_pane_entry(1)),
+                PaneArenaNode::Leaf(sample_pane_entry(0)),
+                PaneArenaNode::Leaf(sample_pane_entry(1)),
             ],
-            window_titles: vec![OrderedPaneWindowTitleOwned {
+            window_titles: vec![PaneArenaWindowTitle {
                 window_id: 1,
                 title: "window-1".to_string(),
             }],
         }
     }
 
-    struct OrderedPanesTestWire<'a>(&'a ListPanesResponse);
+    fn sample_flat_tree() -> PaneArena {
+        let wire = sample_flat_wire();
+        PaneArena::from_unvalidated_parts(wire.trees, wire.nodes, wire.window_titles)
+    }
+
+    struct OrderedPanesTestWire<'a>(&'a PaneArena);
 
     impl Serialize for OrderedPanesTestWire<'_> {
         fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
@@ -11880,7 +11624,7 @@ mod test {
         }
     }
 
-    struct OrderedPanesTestOwned(ListPanesResponse);
+    struct OrderedPanesTestOwned(PaneArena);
 
     impl<'de> Deserialize<'de> for OrderedPanesTestOwned {
         fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
@@ -11924,14 +11668,14 @@ mod test {
             let mut sequence = serializer.serialize_seq(Some(2))?;
             serde::ser::SerializeSeq::serialize_element(
                 &mut sequence,
-                &OrderedPaneWindowTitleOwned {
+                &PaneArenaWindowTitle {
                     window_id: 7,
                     title: "first".to_string(),
                 },
             )?;
             serde::ser::SerializeSeq::serialize_element(
                 &mut sequence,
-                &OrderedPaneWindowTitleOwned {
+                &PaneArenaWindowTitle {
                     window_id: 7,
                     title: "second".to_string(),
                 },
@@ -11969,24 +11713,24 @@ mod test {
                     | HostileOrderedSnapshotField::PaneChildOutOfRange
                     | HostileOrderedSnapshotField::TrailingPaneArenaNode
             ) {
-                let mut panes = sample_flat_tree();
+                let mut panes = sample_flat_wire();
                 match self.0 {
                     HostileOrderedSnapshotField::DuplicatePaneChildIndex => {
-                        let OrderedPaneArenaNodeOwned::Split { right, .. } = &mut panes.nodes[0]
+                        let PaneArenaNode::Split { right, .. } = &mut panes.nodes[0]
                         else {
                             unreachable!("hostile control root is split");
                         };
                         *right = 1;
                     }
                     HostileOrderedSnapshotField::PaneBackEdge => {
-                        let OrderedPaneArenaNodeOwned::Split { right, .. } = &mut panes.nodes[0]
+                        let PaneArenaNode::Split { right, .. } = &mut panes.nodes[0]
                         else {
                             unreachable!("hostile control root is split");
                         };
                         *right = 0;
                     }
                     HostileOrderedSnapshotField::PaneChildOutOfRange => {
-                        let OrderedPaneArenaNodeOwned::Split { right, .. } = &mut panes.nodes[0]
+                        let PaneArenaNode::Split { right, .. } = &mut panes.nodes[0]
                         else {
                             unreachable!("hostile control root is split");
                         };
@@ -11994,7 +11738,7 @@ mod test {
                     }
                     HostileOrderedSnapshotField::TrailingPaneArenaNode => panes
                         .nodes
-                        .push(OrderedPaneArenaNodeOwned::Leaf(sample_pane_entry(2))),
+                        .push(PaneArenaNode::Leaf(sample_pane_entry(2))),
                     _ => unreachable!("malformed pane variant was exhaustively matched"),
                 }
                 return panes.serialize(serializer);
@@ -12248,7 +11992,8 @@ mod test {
                     outcome: ListPanesOrderedV1Outcome::Snapshot(OrderedPaneSnapshotV1 {
                         session_incarnation: reorder.session_incarnation,
                         topology_revision: TopologyRevision::new(11),
-                        panes: empty_pane_list(),
+                        panes: ordered_pane_arena_from_list_panes(empty_pane_list())
+                            .expect("empty ordered-pane arena must be valid"),
                         ordered_windows: vec![window.clone()],
                     }),
                 }),
@@ -15160,7 +14905,9 @@ mod test {
         };
         let legacy_panes =
             serialize_uncompressed(&panes).expect("serialize legacy pane representation");
-        let flat_panes = serialize_uncompressed(&OrderedPanesTestWire(&panes))
+        let arena = ordered_pane_arena_from_list_panes(panes.clone())
+            .expect("convert canonical pane representation");
+        let flat_panes = serialize_uncompressed(&OrderedPanesTestWire(&arena))
             .expect("serialize canonical flat pane representation");
         assert_ne!(
             flat_panes, legacy_panes,
@@ -15170,8 +14917,10 @@ mod test {
             (7, "wire-golden-window-seven".to_string()),
             (9, "wire-golden-window-nine".to_string()),
         ]);
+        let reordered_arena = ordered_pane_arena_from_list_panes(panes)
+            .expect("convert reordered title map through canonical flat schema");
         assert_eq!(
-            serialize_uncompressed(&OrderedPanesTestWire(&panes))
+            serialize_uncompressed(&OrderedPanesTestWire(&reordered_arena))
                 .expect("serialize reordered title map through canonical flat schema"),
             flat_panes,
             "PDU87 window-title bytes must not depend on HashMap iteration order",
@@ -15202,7 +14951,9 @@ mod test {
             tab_titles: vec!["golden-tab".to_string()],
             window_titles: HashMap::from([(1, "golden-window".to_string())]),
         };
-        let encoded = serialize_uncompressed(&OrderedPanesTestWire(&panes))
+        let arena = ordered_pane_arena_from_list_panes(panes)
+            .expect("convert v54 split-tree golden body");
+        let encoded = serialize_uncompressed(&OrderedPanesTestWire(&arena))
             .expect("serialize v54 split-tree golden body");
         let digest: [u8; 32] = Sha256::digest(&encoded).into();
         assert_eq!(
@@ -15218,7 +14969,7 @@ mod test {
         let OrderedPanesTestOwned(decoded) = bounded_varbincode::deserialize(&mut reader)
             .expect("decode the exact v54 split-tree golden body");
         assert!(reader.is_empty());
-        assert_eq!(decoded, panes);
+        assert_eq!(decoded, arena);
     }
 
     #[test]
@@ -15228,21 +14979,23 @@ mod test {
             tab_titles: vec!["depth-boundary".to_string()],
             window_titles: HashMap::from([(1, "window-1".to_string())]),
         };
-        let encoded = serialize_uncompressed(&OrderedPanesTestWire(&panes))
+        let arena = ordered_pane_arena_from_list_panes(panes)
+            .expect("maximum admitted pane-tree depth must flatten");
+        let encoded = serialize_uncompressed(&OrderedPanesTestWire(&arena))
             .expect("maximum admitted pane-tree depth must serialize");
         let mut reader = encoded.as_slice();
         let OrderedPanesTestOwned(decoded) =
             bounded_varbincode::deserialize(&mut reader)
                 .expect("maximum admitted pane-tree depth must decode iteratively");
         assert!(reader.is_empty(), "flat pane DTO must consume its exact bytes");
-        assert_eq!(decoded, panes);
+        assert_eq!(decoded, arena);
 
         let too_deep = ListPanesResponse {
             tabs: vec![left_deep_pane_tree(MAX_ORDERED_PANE_TREE_DEPTH + 1)],
             tab_titles: vec!["depth-plus-one".to_string()],
             window_titles: HashMap::new(),
         };
-        let error = serialize_uncompressed(&OrderedPanesTestWire(&too_deep))
+        let error = ordered_pane_arena_from_list_panes(too_deep)
             .expect_err("depth-plus-one pane tree must fail before wire emission");
         assert!(
             error.to_string().contains("has 65 levels; maximum is 64"),
@@ -15258,26 +15011,30 @@ mod test {
             tab_titles: vec!["broad-boundary".to_string()],
             window_titles: HashMap::from([(1, "window-1".to_string())]),
         };
-        let flat = flatten_ordered_panes(&panes)
+        let flat = flatten_ordered_panes(panes)
             .expect("exact broad-tree resource boundaries must flatten");
-        assert_eq!(flat.trees[0].node_count as usize, MAX_ORDERED_PANE_NODES_PER_TREE);
-        assert_eq!(flat.nodes.len(), MAX_ORDERED_PANE_NODES_PER_TREE);
         assert_eq!(
-            flat.nodes
+            flat.panes.trees()[0].node_count as usize,
+            MAX_ORDERED_PANE_NODES_PER_TREE
+        );
+        assert_eq!(flat.panes.nodes().len(), MAX_ORDERED_PANE_NODES_PER_TREE);
+        assert_eq!(
+            flat.panes
+                .nodes()
                 .iter()
-                .filter(|node| matches!(node, OrderedPaneArenaNodeRef::Leaf(_)))
+                .filter(|node| matches!(node, PaneArenaNode::Leaf(_)))
                 .count(),
             MAX_ORDERED_PANE_LEAVES_PER_TREE,
         );
 
-        let encoded = serialize_uncompressed(&OrderedPanesTestWire(&panes))
+        let encoded = serialize_uncompressed(&OrderedPanesTestWire(&flat.panes))
             .expect("exact broad-tree resource boundaries must serialize");
         let mut reader = encoded.as_slice();
         let OrderedPanesTestOwned(decoded) =
             bounded_varbincode::deserialize(&mut reader)
                 .expect("exact broad-tree resource boundaries must decode");
         assert!(reader.is_empty());
-        assert_eq!(decoded, panes);
+        assert_eq!(decoded, flat.panes);
     }
 
     #[test]
@@ -15302,19 +15059,22 @@ mod test {
             tabs,
             window_titles: HashMap::new(),
         };
-        let flat = flatten_ordered_panes(&panes)
+        let flat = flatten_ordered_panes(panes)
             .expect("exact snapshot node and leaf ceilings must flatten");
-        assert_eq!(flat.nodes.len(), MAX_ORDERED_PANE_NODES_PER_SNAPSHOT);
+        assert_eq!(
+            flat.panes.nodes().len(),
+            MAX_ORDERED_PANE_NODES_PER_SNAPSHOT
+        );
         assert_eq!(flat.stats.node_visits, MAX_ORDERED_PANE_NODES_PER_SNAPSHOT);
         assert_eq!(flat.stats.leaf_visits, MAX_ORDERED_PANE_LEAVES_PER_SNAPSHOT);
 
-        let encoded = serialize_uncompressed(&OrderedPanesTestWire(&panes))
+        let encoded = serialize_uncompressed(&OrderedPanesTestWire(&flat.panes))
             .expect("exact snapshot node and leaf ceilings must serialize");
         let mut reader = encoded.as_slice();
         let OrderedPanesTestOwned(decoded) = bounded_varbincode::deserialize(&mut reader)
             .expect("exact snapshot node and leaf ceilings must decode");
         assert!(reader.is_empty());
-        assert_eq!(decoded, panes);
+        assert_eq!(decoded, flat.panes);
     }
 
     #[test]
@@ -15322,43 +15082,45 @@ mod test {
         let valid = sample_flat_tree();
         validate_flat_ordered_panes(&valid).expect("control flat tree must be canonical");
 
-        let mut duplicate_child = sample_flat_tree();
-        let OrderedPaneArenaNodeOwned::Split { right, .. } = &mut duplicate_child.nodes[0]
+        let (trees, mut nodes, window_titles) = sample_flat_tree().into_parts();
+        let PaneArenaNode::Split { right, .. } = &mut nodes[0]
         else {
             unreachable!("control root is split");
         };
         *right = 1;
+        let duplicate_child = PaneArena::from_unvalidated_parts(trees, nodes, window_titles);
         assert!(matches!(
             validate_flat_ordered_panes(&duplicate_child),
             Err(OrderedWindowProtocolError::InvalidPaneArenaNode { .. })
         ));
 
-        let mut back_edge = sample_flat_tree();
-        let OrderedPaneArenaNodeOwned::Split { right, .. } = &mut back_edge.nodes[0]
+        let (trees, mut nodes, window_titles) = sample_flat_tree().into_parts();
+        let PaneArenaNode::Split { right, .. } = &mut nodes[0]
         else {
             unreachable!("control root is split");
         };
         *right = 0;
+        let back_edge = PaneArena::from_unvalidated_parts(trees, nodes, window_titles);
         assert!(matches!(
             validate_flat_ordered_panes(&back_edge),
             Err(OrderedWindowProtocolError::InvalidPaneArenaNode { .. })
         ));
 
-        let mut out_of_range = sample_flat_tree();
-        let OrderedPaneArenaNodeOwned::Split { right, .. } = &mut out_of_range.nodes[0]
+        let (trees, mut nodes, window_titles) = sample_flat_tree().into_parts();
+        let PaneArenaNode::Split { right, .. } = &mut nodes[0]
         else {
             unreachable!("control root is split");
         };
         *right = 3;
+        let out_of_range = PaneArena::from_unvalidated_parts(trees, nodes, window_titles);
         assert!(matches!(
             validate_flat_ordered_panes(&out_of_range),
             Err(OrderedWindowProtocolError::InvalidPaneArenaNode { .. })
         ));
 
-        let mut trailing = sample_flat_tree();
-        trailing
-            .nodes
-            .push(OrderedPaneArenaNodeOwned::Leaf(sample_pane_entry(2)));
+        let (trees, mut nodes, window_titles) = sample_flat_tree().into_parts();
+        nodes.push(PaneArenaNode::Leaf(sample_pane_entry(2)));
+        let trailing = PaneArena::from_unvalidated_parts(trees, nodes, window_titles);
         assert!(matches!(
             validate_flat_ordered_panes(&trailing),
             Err(OrderedWindowProtocolError::PaneArenaCardinalityMismatch {
@@ -15422,10 +15184,13 @@ mod test {
                 tab_titles: vec![format!("depth-{depth}")],
                 window_titles: HashMap::new(),
             };
-            let flat = flatten_ordered_panes(&panes)
+            let flat = flatten_ordered_panes(panes)
                 .unwrap_or_else(|error| panic!("admitted depth {} failed: {error:#}", depth));
-            assert_eq!(flat.trees.len(), 1);
-            assert_eq!(flat.nodes.len(), depth.saturating_mul(2).saturating_sub(1));
+            assert_eq!(flat.panes.trees().len(), 1);
+            assert_eq!(
+                flat.panes.nodes().len(),
+                depth.saturating_mul(2).saturating_sub(1)
+            );
         }
     }
 
@@ -15457,7 +15222,11 @@ mod test {
                 tab_titles: vec!["generated-chain".to_string()],
                 window_titles: HashMap::new(),
             };
-            let encoded = serialize_uncompressed(&OrderedPanesTestWire(&panes))
+            let arena = ordered_pane_arena_from_list_panes(panes)
+                .unwrap_or_else(|error| {
+                    panic!("generated admitted chain failed to flatten: {:#}", error)
+                });
+            let encoded = serialize_uncompressed(&OrderedPanesTestWire(&arena))
                 .unwrap_or_else(|error| {
                     panic!("generated admitted chain failed to serialize: {:#}", error)
                 });
@@ -15467,7 +15236,7 @@ mod test {
                     panic!("generated admitted chain failed to decode: {}", error)
                 });
             prop_assert!(reader.is_empty());
-            prop_assert_eq!(decoded, panes);
+            prop_assert_eq!(decoded, arena);
         }
     }
 
@@ -15481,9 +15250,9 @@ mod test {
                 tab_titles: (0..q).map(|ordinal| format!("tab-{ordinal}")).collect(),
                 window_titles: HashMap::new(),
             };
-            let first = flatten_ordered_panes(&panes)
+            let first = flatten_ordered_panes(panes.clone())
                 .unwrap_or_else(|error| panic!("q={} first flatten failed: {error:#}", q));
-            let second = flatten_ordered_panes(&panes)
+            let second = flatten_ordered_panes(panes)
                 .unwrap_or_else(|error| panic!("q={} second flatten failed: {error:#}", q));
 
             let expected = OrderedPanesFlattenStats {
@@ -15495,8 +15264,8 @@ mod test {
             };
             assert_eq!(first.stats, expected, "unexpected q={} first-pass work", q);
             assert_eq!(second.stats, expected, "unexpected q={} repeated work", q);
-            assert_eq!(first.trees.len(), q);
-            assert_eq!(first.nodes.len(), q);
+            assert_eq!(first.panes.trees().len(), q);
+            assert_eq!(first.panes.nodes().len(), q);
         }
     }
 
@@ -15662,7 +15431,7 @@ mod test {
             let window_id = remote_window_id
                 .try_into_usize()
                 .expect("sample remote window id must fit this mux target");
-            snapshot.panes.tabs = remote_tab_ids
+            let tabs = remote_tab_ids
                 .iter()
                 .map(|remote_tab_id| {
                     let tab_id = remote_tab_id
@@ -15687,15 +15456,17 @@ mod test {
                     })
                 })
                 .collect();
-            snapshot.panes.tab_titles = remote_tab_ids
+            let mut tab_titles = remote_tab_ids
                 .iter()
                 .map(|remote_tab_id| format!("tab-{}", remote_tab_id.get()))
-                .collect();
-            snapshot.panes.tab_titles[0].clear();
-            snapshot
-                .panes
-                .window_titles
-                .insert(window_id, format!("window-{window_id}"));
+                .collect::<Vec<_>>();
+            tab_titles[0].clear();
+            snapshot.panes = ordered_pane_arena_from_list_panes(ListPanesResponse {
+                tabs,
+                tab_titles,
+                window_titles: HashMap::from([(window_id, format!("window-{window_id}"))]),
+            })
+            .expect("body-limit fixture must flatten");
         }
         let empty_title_body =
             serialize_uncompressed(&response).expect("baseline PDU 87 fixture must serialize");
@@ -15730,7 +15501,9 @@ mod test {
         let ListPanesOrderedV1Outcome::Snapshot(snapshot) = &mut response.outcome else {
             unreachable!("sample PDU 87 snapshot outcome was not replaced");
         };
-        snapshot.panes.tab_titles[0] = "x".repeat(title_bytes);
+        let (mut trees, nodes, window_titles) = snapshot.panes.clone().into_parts();
+        trees[0].tab_title = "x".repeat(title_bytes);
+        snapshot.panes = PaneArena::from_unvalidated_parts(trees, nodes, window_titles);
         response
             .validate()
             .expect("the oversized fixture must remain structurally valid");
@@ -15841,11 +15614,12 @@ mod test {
             outcome: ListPanesOrderedV1Outcome::Snapshot(OrderedPaneSnapshotV1 {
                 session_incarnation: MuxSessionIncarnation::from_bytes([0x83; 16]),
                 topology_revision: TopologyRevision::new(1),
-                panes: ListPanesResponse {
+                panes: ordered_pane_arena_from_list_panes(ListPanesResponse {
                     tabs,
                     tab_titles,
                     window_titles,
-                },
+                })
+                .expect("dense maximum-cardinality pane listing must flatten"),
                 ordered_windows,
             }),
         };
@@ -15890,15 +15664,7 @@ mod test {
         };
         assert_eq!(actual.session_incarnation, expected.session_incarnation);
         assert_eq!(actual.topology_revision, expected.topology_revision);
-        assert!(actual.panes.tabs.iter().eq(expected.panes.tabs.iter()));
-        assert!(
-            actual
-                .panes
-                .tab_titles
-                .iter()
-                .eq(expected.panes.tab_titles.iter())
-        );
-        assert_eq!(actual.panes.window_titles, expected.panes.window_titles);
+        assert_eq!(actual.panes, expected.panes);
         assert!(actual.ordered_windows.iter().eq(expected.ordered_windows.iter()));
     }
 
@@ -16388,7 +16154,8 @@ mod test {
                 outcome: ListPanesOrderedV1Outcome::Snapshot(OrderedPaneSnapshotV1 {
                     session_incarnation: MuxSessionIncarnation::from_bytes([0x72; 16]),
                     topology_revision: TopologyRevision::new(1),
-                    panes: empty_pane_list(),
+                    panes: ordered_pane_arena_from_list_panes(empty_pane_list())
+                        .expect("empty ordered-pane arena must be valid"),
                     ordered_windows: windows_at_limit.clone(),
                 }),
             },
