@@ -1217,7 +1217,15 @@ impl RpcReadinessAuthority {
     }
 
     fn retire(&self) {
-        self.state.lock().phase = RpcReadinessAuthorityPhase::Retired;
+        let mut state = self.state.lock();
+        // A fatal replay guard commits stronger, causal terminal evidence than
+        // ordinary transport retirement.  Preserve it when the same abort
+        // revokes admission; otherwise the abort path immediately erases the
+        // state that prevents participant resurrection and classifies later
+        // guard settlement.
+        if state.phase != RpcReadinessAuthorityPhase::AbortCommitted {
+            state.phase = RpcReadinessAuthorityPhase::Retired;
+        }
     }
 
     fn reserve_publication(self: &Arc<Self>) -> anyhow::Result<RpcReadinessPublicationLease> {
@@ -9057,12 +9065,12 @@ mod tests {
                 connection_generation,
             } = run_real_socket_pair_handshake(previous, advertised_min, true);
             let info = result.unwrap_or_else(|error| {
-                panic!("{label} real handshake failed unexpectedly: {error:#}")
+                panic!("{} real handshake failed unexpectedly: {:#}", label, error)
             });
             assert_eq!(info.codec_vers, previous, "{label}");
             assert_eq!(info.min_supported, advertised_min, "{label}");
             assert_eq!(transcript, ["GetCodecVersion", "SetClientId"], "{label}");
-            let codec = codec.unwrap_or_else(|| panic!("{label} lost codec authority"));
+            let codec = codec.unwrap_or_else(|| panic!("{} lost codec authority", label));
             assert_eq!(codec.remote_max, previous, "{label}");
             assert_eq!(codec.remote_min, retained_min, "{label}");
             assert_eq!(codec.agreed, previous, "{label}");
@@ -9093,7 +9101,9 @@ mod tests {
             let error = result.expect_err("an incompatible real handshake must fail");
             assert!(
                 error.downcast_ref::<IncompatibleVersionError>().is_some(),
-                "{label} lost its typed incompatibility: {error:#}"
+                "{} lost its typed incompatibility: {:#}",
+                label,
+                error
             );
             assert_eq!(transcript, ["GetCodecVersion"], "{label}");
             assert_eq!(codec, None, "{label} retained invalid codec authority");
@@ -9337,7 +9347,10 @@ mod tests {
         asupersync_block_on(poll_fn(|task_cx| match registration.as_mut().poll(task_cx) {
             Poll::Pending => Poll::Ready(()),
             Poll::Ready(result) => {
-                panic!("registration unexpectedly completed before reader dequeue: {result:?}")
+                panic!(
+                    "registration unexpectedly completed before reader dequeue: {:?}",
+                    result
+                )
             }
         }));
         assert_eq!(
@@ -9427,7 +9440,7 @@ mod tests {
         ));
         assert_eq!(
             response.expect("replacement registration must complete"),
-            Pdu::UnitResponse(UnitResponse {})
+            UnitResponse {}
         );
         assert_eq!(
             client
@@ -9609,7 +9622,8 @@ mod tests {
             };
             assert!(
                 !RpcProtocolAuthority::endpoint_is_activated(&synthetic),
-                "a future assignment in historical gap {historical_gap} must default dormant"
+                "a future assignment in historical gap {} must default dormant",
+                historical_gap
             );
         }
     }
@@ -12049,7 +12063,10 @@ mod tests {
             .expect_err("unknown and above-dialect inbound identities fail closed");
             let protocol_error = match error.downcast_ref::<NotReconnectableError>() {
                 Some(NotReconnectableError::ProtocolViolation(error)) => error,
-                other => panic!("unexpected protocol rejection for ident {ident}: {other:?}"),
+                other => panic!(
+                    "unexpected protocol rejection for ident {}: {:?}",
+                    ident, other
+                ),
             };
             if unknown {
                 assert!(matches!(
@@ -12119,7 +12136,11 @@ mod tests {
                 },
             ))
             .expect_err("the correlation selector deliberately stops before the body");
-            assert!(correlation_reached, "ident {ident} must reach exact pending authority");
+            assert!(
+                correlation_reached,
+                "ident {} must reach exact pending authority",
+                ident
+            );
             assert_eq!(pending.map[&serial].stage, RpcRetirementStage::ResponseMatch);
             assert_eq!(
                 usize::try_from(reader.position()).expect("cursor position fits usize"),
