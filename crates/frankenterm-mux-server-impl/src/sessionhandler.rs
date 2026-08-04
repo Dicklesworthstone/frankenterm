@@ -2065,6 +2065,21 @@ fn checked_ordered_snapshot_tab_total(
     Ok(total)
 }
 
+fn ordered_snapshot_tab_node_ceiling(
+    prior_nodes: usize,
+) -> Result<usize, codec::OrderedWindowProtocolError> {
+    if prior_nodes > codec::MAX_ORDERED_PANE_NODES_PER_SNAPSHOT {
+        return Err(codec::OrderedWindowProtocolError::TooManyPaneNodes {
+            count: prior_nodes,
+            max: codec::MAX_ORDERED_PANE_NODES_PER_SNAPSHOT,
+        });
+    }
+    let per_tree_end = prior_nodes
+        .checked_add(codec::MAX_ORDERED_PANE_NODES_PER_TREE)
+        .ok_or(codec::OrderedWindowProtocolError::CountOverflow)?;
+    Ok(per_tree_end.min(codec::MAX_ORDERED_PANE_NODES_PER_SNAPSHOT))
+}
+
 pub(crate) fn validate_ordered_snapshot_projection(
     snapshot: &codec::OrderedPaneSnapshotV1,
 ) -> anyhow::Result<()> {
@@ -2253,12 +2268,18 @@ fn collect_ordered_list_panes_snapshot_with_stage_observer(
                 title: frozen.title.clone(),
             });
             for tab in frozen.order.ordered_tabs() {
+                // Admit no more than one tree's wire budget from the current
+                // arena position. The codec validator remains authoritative,
+                // but enforcing its per-tree ceiling here prevents a single
+                // oversized tab from walking and allocating toward the much
+                // larger whole-snapshot ceiling before it is rejected.
+                let tab_node_ceiling = ordered_snapshot_tab_node_ceiling(pane_nodes.len())?;
                 pane_trees.push(tab.append_codec_pane_arena_in_window(
                     window_id,
                     &frozen.workspace,
                     &mut pane_nodes,
                     codec::MAX_ORDERED_PANE_TREE_DEPTH,
-                    codec::MAX_ORDERED_PANE_NODES_PER_SNAPSHOT,
+                    tab_node_ceiling,
                 )?);
                 observer(ListPanesSnapshotStage::TabTreeCaptured);
             }
@@ -5670,6 +5691,26 @@ mod tests {
             checked_ordered_snapshot_tab_total(usize::MAX, 1),
             Err(codec::OrderedWindowProtocolError::CountOverflow)
         );
+        assert_eq!(
+            ordered_snapshot_tab_node_ceiling(0),
+            Ok(codec::MAX_ORDERED_PANE_NODES_PER_TREE)
+        );
+        assert_eq!(
+            ordered_snapshot_tab_node_ceiling(
+                codec::MAX_ORDERED_PANE_NODES_PER_SNAPSHOT
+                    - codec::MAX_ORDERED_PANE_NODES_PER_TREE
+                    + 1,
+            ),
+            Ok(codec::MAX_ORDERED_PANE_NODES_PER_SNAPSHOT)
+        );
+        assert!(matches!(
+            ordered_snapshot_tab_node_ceiling(
+                codec::MAX_ORDERED_PANE_NODES_PER_SNAPSHOT + 1,
+            ),
+            Err(codec::OrderedWindowProtocolError::TooManyPaneNodes { count, max })
+                if count == codec::MAX_ORDERED_PANE_NODES_PER_SNAPSHOT + 1
+                    && max == codec::MAX_ORDERED_PANE_NODES_PER_SNAPSHOT
+        ));
     }
 
     #[test]
