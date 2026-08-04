@@ -2635,7 +2635,10 @@ impl Tab {
 
         for _ in 0..SNAPSHOT_ATTEMPTS {
             let observed = Self::observe_panes(self.snapshot_panes_callback_free());
-            let mut pane_ids = HashMap::with_capacity(observed.len());
+            let mut pane_ids = HashMap::new();
+            pane_ids
+                .try_reserve(observed.len())
+                .map_err(|error| anyhow::anyhow!("reserve pane identity snapshot: {error}"))?;
             for pane in &observed {
                 let pane_id = pane.pane_id.ok_or_else(|| {
                     anyhow::anyhow!(
@@ -2644,15 +2647,29 @@ impl Tab {
                         self.tab_id,
                     )
                 })?;
-                pane_ids.insert(pane_identity(&pane.pane), pane_id);
+                let identity = pane_identity(&pane.pane);
+                if pane_ids.insert(identity, pane_id).is_some() {
+                    anyhow::bail!(
+                        "pane identity {:p} appears more than once while tab {} is being encoded",
+                        Arc::as_ptr(&pane.pane),
+                        self.tab_id,
+                    );
+                }
             }
 
             let snapshot = {
                 let inner = self.inner.lock();
                 let current = inner.snapshot_panes_callback_free();
-                let current_identities = current.iter().map(pane_identity).collect::<HashSet<_>>();
-                let observed_identities = pane_ids.keys().copied().collect::<HashSet<_>>();
-                if current_identities != observed_identities {
+                let mut current_identities = HashSet::new();
+                current_identities.try_reserve(current.len()).map_err(|error| {
+                    anyhow::anyhow!("reserve callback-coherence pane identities: {error}")
+                })?;
+                let identities_match = current.len() == pane_ids.len()
+                    && current.iter().all(|pane| {
+                        let identity = pane_identity(pane);
+                        current_identities.insert(identity) && pane_ids.contains_key(&identity)
+                    });
+                if !identities_match {
                     None
                 } else {
                     Some((
@@ -2719,15 +2736,29 @@ impl Tab {
                         self.tab_id,
                     )
                 })?;
-                pane_ids.insert(pane_identity(&pane.pane), pane_id);
+                let identity = pane_identity(&pane.pane);
+                if pane_ids.insert(identity, pane_id).is_some() {
+                    anyhow::bail!(
+                        "pane identity {:p} appears more than once while tab {} is being encoded",
+                        Arc::as_ptr(&pane.pane),
+                        self.tab_id,
+                    );
+                }
             }
 
             let captured = {
                 let inner = self.inner.lock();
                 let current = inner.snapshot_panes_callback_free();
-                let current_identities = current.iter().map(pane_identity).collect::<HashSet<_>>();
-                let observed_identities = pane_ids.keys().copied().collect::<HashSet<_>>();
-                if current_identities != observed_identities {
+                let mut current_identities = HashSet::new();
+                current_identities.try_reserve(current.len()).map_err(|error| {
+                    anyhow::anyhow!("reserve callback-coherence pane identities: {error}")
+                })?;
+                let identities_match = current.len() == pane_ids.len()
+                    && current.iter().all(|pane| {
+                        let identity = pane_identity(pane);
+                        current_identities.insert(identity) && pane_ids.contains_key(&identity)
+                    });
+                if !identities_match {
                     None
                 } else {
                     Some(capture_pane_arena_tree(
