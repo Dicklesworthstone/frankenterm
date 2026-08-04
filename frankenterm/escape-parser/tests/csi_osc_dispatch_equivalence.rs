@@ -29,6 +29,34 @@ fn parse_chunked(bytes: &[u8], split: usize, table_dispatch: bool) -> Vec<Action
     actions
 }
 
+/// Normalize only the representation of contiguous printable output.
+///
+/// A parser call must flush a printable run at the end of its input slice, so
+/// splitting the same byte stream can legitimately turn one `PrintString`
+/// into a `Print` plus a shorter `PrintString`. Table dispatch must remain
+/// byte-identical for the same chunking, while chunked-versus-whole parsing is
+/// compared after this representation-only normalization.
+fn normalize_print_runs(actions: Vec<Action>) -> Vec<Action> {
+    let mut normalized = Vec::with_capacity(actions.len());
+    let mut pending = String::new();
+    for action in actions {
+        match action {
+            Action::Print(character) => pending.push(character),
+            Action::PrintString(string) => pending.push_str(&string),
+            other => {
+                if !pending.is_empty() {
+                    normalized.push(Action::PrintString(std::mem::take(&mut pending)));
+                }
+                normalized.push(other);
+            }
+        }
+    }
+    if !pending.is_empty() {
+        normalized.push(Action::PrintString(pending));
+    }
+    normalized
+}
+
 /// CSI/OSC-focused battery covering the fast paths and the shapes that MUST fall
 /// back to the generic parser.
 fn battery() -> Vec<(String, Vec<u8>)> {
@@ -222,7 +250,9 @@ fn decode_hex(text: &str) -> Option<Vec<u8>> {
         }
     };
     let mut out = Vec::with_capacity(clean.len() / 2);
-    for pair in clean.chunks_exact(2) {
+    let (pairs, remainder) = clean.as_chunks::<2>();
+    debug_assert!(remainder.is_empty(), "even-length hex has no remainder");
+    for pair in pairs {
         out.push((nibble(pair[0])? << 4) | nibble(pair[1])?);
     }
     Some(out)
@@ -255,21 +285,20 @@ fn whole_buffer_equivalence_corpus() {
 #[test]
 fn chunk_boundary_equivalence_battery() {
     for (name, bytes) in battery() {
-        let reference = parse_whole(&bytes, false);
+        let reference = normalize_print_runs(parse_whole(&bytes, false));
         for split in 0..=bytes.len() {
             let on = parse_chunked(&bytes, split, true);
-            // Chunked + fast must match whole-buffer generic. (Chunking can
-            // legitimately split a sequence; the generic chunked parse is the
-            // same as whole-buffer here because these inputs don't straddle a
-            // partial control sequence in a way that changes actions — the
-            // conformance corpus test exercises arbitrary streaming.)
+            // The fast and generic paths must remain byte-identical under the
+            // same chunking. Chunked versus whole-buffer parsing may differ
+            // only in `Print`/`PrintString` segmentation at the call boundary.
             let off_chunked = parse_chunked(&bytes, split, false);
             assert_eq!(
                 on, off_chunked,
                 "table-dispatch chunked parse diverged for {name} at split {split}"
             );
             assert_eq!(
-                off_chunked, reference,
+                normalize_print_runs(off_chunked),
+                reference,
                 "generic chunked parse changed stream for {name} at split {split}"
             );
         }
