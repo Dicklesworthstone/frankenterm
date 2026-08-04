@@ -21,7 +21,7 @@ use std::process::{Command, Stdio};
 /// Run `ft <args>` with stdout connected to a pipe whose read end is
 /// already closed, and return the resulting `ExitStatus`.
 fn run_ft_with_closed_stdout(args: &[&str]) -> std::process::ExitStatus {
-    let mut pipe = filedescriptor::Pipe::new().expect("create pipe");
+    let pipe = filedescriptor::Pipe::new().expect("create pipe");
     let stdout = pipe
         .write
         .as_stdio()
