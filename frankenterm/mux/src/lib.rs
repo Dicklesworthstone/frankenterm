@@ -6772,6 +6772,22 @@ impl Mux {
         Some(tab)
     }
 
+    /// Roll back an exact, still-empty local tab registration without risking
+    /// removal of a concurrent replacement that happens to carry the same ID.
+    ///
+    /// This is intentionally narrower than [`Mux::remove_tab_local_only`]: it
+    /// refuses to remove a tab once any pane tree has been installed. That
+    /// makes it suitable for unwinding fallible topology staging without ever
+    /// killing a remote pane or tearing down topology published after the
+    /// staging handle became stale.
+    pub fn remove_empty_tab_local_only_if_same(&self, expected: &Arc<Tab>) -> bool {
+        if self.remove_empty_tab_internal_if_same(expected).is_none() {
+            return false;
+        }
+        self.prune_dead_windows_ignoring_activity();
+        true
+    }
+
     pub fn prune_dead_windows(&self) {
         self.prune_dead_windows_impl(false);
     }
@@ -15326,6 +15342,34 @@ mod tests {
 
         drop(normal_window);
         drop(local_only_window);
+        Mux::shutdown();
+    }
+
+    #[test]
+    fn remove_empty_tab_local_only_if_same_rolls_back_exact_staging() {
+        let _guard = global_test_lock();
+        Mux::shutdown();
+
+        let mux = Arc::new(Mux::new(None));
+        Mux::set_mux(&mux);
+        let window = mux.new_empty_window(Some("ordered-staging".to_string()), None);
+        let window_id = *window;
+        drop(window);
+        let tab = Arc::new(Tab::new(&test_size()));
+        let tab_id = tab.tab_id();
+        mux.add_tab_no_panes(&tab)
+            .expect("empty staging tab should register");
+        mux.add_tab_to_window(&tab, window_id)
+            .expect("empty staging tab should attach");
+
+        assert!(mux.remove_empty_tab_local_only_if_same(&tab));
+        assert!(mux.get_tab(tab_id).is_none());
+        assert!(mux.get_window(window_id).is_none());
+        assert!(
+            !mux.remove_empty_tab_local_only_if_same(&tab),
+            "a stale exact staging handle must be inert"
+        );
+
         Mux::shutdown();
     }
 
