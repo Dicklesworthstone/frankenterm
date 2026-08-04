@@ -1352,7 +1352,46 @@ The umbrella epic closes only when all of the following are true:
 The campaign is successful when these user-level properties are durable and
 explainable—not when a proxy benchmark alone reports an attractive number.
 
-## 19. Primary external references
+## 19. Current reality checkpoint (2026-08-04)
+
+This campaign is **PARTIAL and not release-qualified**. The repository now has
+substantial bounded protocol, persistence, rendering, telemetry, and test
+substrate, but the user-level result promised above has not yet been proved:
+
+- PDU86-PDU90 ordered-window support remains capability-fenced rather than
+  activated end to end. The server can produce the ordered snapshot and the
+  client contains guarded application seams, but production still uses the
+  legacy coherent pane-list path. Consequently, remote-domain tab order is not
+  yet restored from an authoritative ordered snapshot after reconnect/restart.
+- The client persistence substrate can store stable layout intent, but the live
+  GUI does not yet own the complete stable layout-window identity, startup
+  binding, reorder, and active-tab restore sequence required for mixed local and
+  remote domains. Transient process-local numeric mux IDs are not an acceptable
+  persistence identity.
+- The flat pane-arena producer and client validation/application code exist,
+  but the negotiated production path is still dormant. Its presence is not a
+  latency or allocation win until capability activation and real workload
+  evidence prove that the legacy path is no longer serving supported sessions.
+- A fresh-eyes review removed duplicate whole-window resize invalidation and
+  tightened ordered-snapshot per-tab producer admission. These are bounded code
+  improvements, not proof of improved native key-to-photon or resize latency.
+- The latest retained target-class resource-cockpit artifact remains
+  `skipped_not_proven`; there is no admissible native M4/M5/Threadripper
+  key-to-photon, continuous-resize, visual-quality, or long-session result for
+  the current source candidate.
+- A separate risk-weighted closure audit sampled 15 campaign-relevant closed
+  Beads. It verified three, found six substantially complete, two partial, and
+  four false-closed at varying severity. Precise completion-debt Beads now
+  track the four false-closed cases; the sample is intentionally not
+  extrapolated to the whole tracker.
+
+The next promotion boundary is therefore implementation and evidence, not a
+broader claim: activate ordered snapshots fail-closed, complete stable GUI
+layout restoration, replace the legacy production pane projection, and then
+run correlated native quiet/loaded interaction plus resize/zoom qualification
+on the named targets without touching a user's live session.
+
+## 20. Primary external references
 
 - Apple, [Tuning your code's performance for Apple silicon](https://developer.apple.com/documentation/apple-silicon/tuning-your-code-s-performance-for-apple-silicon/)
 - Apple, [Recording performance data with signposts](https://developer.apple.com/documentation/os/recording-performance-data)
