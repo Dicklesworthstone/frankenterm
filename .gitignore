@@ -278,6 +278,9 @@ ubs_*.txt
 *.rlib
 # br doctor per-run artifacts
 .doctor/
+# Recoverable write-lock snapshots retained when a stale Beads lock is moved
+# aside. They are intentionally not deleted under repository safety policy.
+.beads/.write.lock.stale-*
 
 # Beads compliance audit dir (managed by /beads-compliance-and-completion-verification skill)
 /beads_compliance_audit/
