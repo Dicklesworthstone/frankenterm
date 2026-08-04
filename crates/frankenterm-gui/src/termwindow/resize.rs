@@ -78,10 +78,6 @@ impl super::TermWindow {
         }
         let last_state = self.window_state;
         self.window_state = window_state;
-        self.quad_generation += 1;
-        self.mark_all_panes_dirty_with_source(
-            frankenterm_core::dirty_line_telemetry::DirtyEventSource::Resize,
-        );
         if last_state != self.window_state {
             self.load_os_parameters();
             // Queue the maximize/fullscreen bits for this window's workspace
@@ -102,8 +98,14 @@ impl super::TermWindow {
             webgpu.resize(dimensions);
         }
 
+        // `apply_dimensions` is the single resize invalidation authority. It
+        // advances the quad/damage generations and marks the pane bitmaps once
+        // after the final dimensions have been selected. Keeping that work out
+        // of this outer dispatcher avoids doing the same whole-window dirty
+        // walk twice for every high-frequency live-resize event.
+        //
         // For simple, user-interactive resizes where the dpi doesn't change,
-        // skip our scaling recalculation
+        // skip our scaling recalculation.
         if live_resizing && self.dimensions.dpi == dimensions.dpi {
             self.apply_dimensions(&dimensions, None, window);
         } else {
