@@ -15425,6 +15425,10 @@ mod tests {
         let window = mux.new_empty_window(Some("ordered-staging".to_string()), None);
         let window_id = *window;
         drop(window);
+        let unrelated_window =
+            mux.new_empty_window(Some("unrelated-empty-window".to_string()), None);
+        let unrelated_window_id = *unrelated_window;
+        drop(unrelated_window);
         let tab = Arc::new(Tab::new(&test_size()));
         let tab_id = tab.tab_id();
         mux.add_tab_no_panes(&tab)
@@ -15435,6 +15439,10 @@ mod tests {
         assert!(mux.remove_empty_tab_local_only_if_same(&tab));
         assert!(mux.get_tab(tab_id).is_none());
         assert!(mux.get_window(window_id).is_none());
+        assert!(
+            mux.get_window(unrelated_window_id).is_some(),
+            "exact rollback must not prune a pre-existing unrelated empty window"
+        );
         assert!(
             !mux.remove_empty_tab_local_only_if_same(&tab),
             "a stale exact staging handle must be inert"
