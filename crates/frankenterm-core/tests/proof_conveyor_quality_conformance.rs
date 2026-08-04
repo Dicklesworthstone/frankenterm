@@ -124,7 +124,7 @@ fn only_confirmed_remote_pass_validates_every_other_outcome_fails_closed() {
             Outcome::RemoteProofPassed | Outcome::RemoteProofFailed
         );
         let local_fallback = outcome == Outcome::BlockedLocalFallback;
-        let exit = Some(if is_pass { 0 } else { 1 });
+        let exit = Some(i32::from(!is_pass));
         let attempt = attempt(outcome, remote_reached, local_fallback, exit);
 
         let receipt = classify_proof_quality(ProofQualityInput {

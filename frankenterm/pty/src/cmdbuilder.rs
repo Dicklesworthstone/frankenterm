@@ -95,9 +95,11 @@ fn nul_terminated_utf16_from_reg_bytes(bytes: &[u8]) -> anyhow::Result<Vec<u16>>
         bytes.len()
     );
 
-    let mut words = bytes
-        .chunks_exact(2)
-        .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+    let (word_bytes, remainder) = bytes.as_chunks::<2>();
+    debug_assert!(remainder.is_empty(), "even-length UTF-16 has no remainder");
+    let mut words = word_bytes
+        .iter()
+        .map(|chunk| u16::from_le_bytes(*chunk))
         .collect::<Vec<_>>();
 
     if !matches!(words.last(), Some(0)) {

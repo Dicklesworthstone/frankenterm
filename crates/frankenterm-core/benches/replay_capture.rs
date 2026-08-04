@@ -37,7 +37,7 @@ fn bench_capture_overhead_per_event(c: &mut Criterion) {
         b.iter(|| {
             adapter
                 .capture_egress(black_box(&segment))
-                .expect("benchmark sequence space must remain available")
+                .expect("benchmark sequence space must remain available");
         });
     });
 

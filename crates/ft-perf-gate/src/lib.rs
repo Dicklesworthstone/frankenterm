@@ -826,7 +826,7 @@ mod tests {
 
         assert_eq!(report.mode, PerfGateMode::Fixed);
         assert_eq!(report.bands, PerfGateBandMode::Fixed);
-        assert_eq!(report.mean, legacy.mean);
+        assert_eq!(report.mean.to_bits(), legacy.mean.to_bits());
         assert_eq!(report.decision, legacy.decision);
         assert_eq!(
             report.keep_candidate,
@@ -980,7 +980,7 @@ mod tests {
             .map(|i| {
                 EvidenceSample::new(
                     claim_id,
-                    mean + gaussian(seed) * sigma,
+                    gaussian(seed).mul_add(sigma, mean),
                     "ms",
                     1,
                     u64::try_from(i + 1).unwrap(),

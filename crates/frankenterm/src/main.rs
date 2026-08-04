@@ -7154,7 +7154,7 @@ fn robot_gui_unify_window_snapshots(mux: &mux::Mux) -> Vec<mux::unify::WindowSna
             let workspace = window.get_workspace().to_string();
             let tabs = window
                 .iter()
-                .map(|tab| robot_gui_unify_tab_snapshot(tab))
+                .map(robot_gui_unify_tab_snapshot)
                 .collect();
             Some(mux::unify::WindowSnapshot {
                 window_id,
@@ -16616,7 +16616,7 @@ async fn authorize_read_or_search_policy(
             None
         };
 
-        let wezterm = frankenterm_core::wezterm::wezterm_handle_from_config(&config);
+        let wezterm = frankenterm_core::wezterm::wezterm_handle_from_config(config);
         // ft-xbnl0.2.3 tick 230: cx-first wezterm dispatch.
         let cx =
             frankenterm_core::cx::Cx::current().unwrap_or_else(frankenterm_core::cx::for_request);
@@ -21654,7 +21654,7 @@ fn restart_snapshot_json(
 struct RestartWorkflowAbort {
     phase: &'static str,
     error: String,
-    snapshot: Option<frankenterm_core::snapshot_engine::SnapshotResult>,
+    snapshot: Option<Box<frankenterm_core::snapshot_engine::SnapshotResult>>,
     stopped_mux_pids: Vec<i32>,
     hint: Option<String>,
 }
@@ -21675,7 +21675,7 @@ impl RestartWorkflowAbort {
         mut self,
         snapshot: &frankenterm_core::snapshot_engine::SnapshotResult,
     ) -> Self {
-        self.snapshot = Some(snapshot.clone());
+        self.snapshot = Some(Box::new(snapshot.clone()));
         self
     }
 
@@ -23323,7 +23323,7 @@ async fn relay_ipc_event_line(
             if let (Some(min), Some(prev)) = (max_hz_interval, *last_event_emit) {
                 let elapsed = prev.elapsed();
                 if elapsed < min {
-                    let wait = min - elapsed;
+                    let wait = min.saturating_sub(elapsed);
                     let _ = frankenterm_core::runtime_async::spawn_blocking(move || {
                         std::thread::sleep(wait);
                     })
@@ -30839,8 +30839,7 @@ fn maybe_trigger_e2e_watcher_panic_once(layout: &frankenterm_core::config::Works
     const ENV_VAR: &str = "FT_E2E_WATCHER_PANIC_ONCE";
 
     let enabled = std::env::var(ENV_VAR)
-        .ok()
-        .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
+        .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
     if !enabled {
         return;
     }
@@ -35774,10 +35773,12 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                     .and_then(|evs| evs.first().map(|e| e.id));
                                 if let Some(oldest) = watch_cursor_expiry(Some(requested), oldest) {
                                     let rec = watch_cursor_expired_ndjson(requested, oldest);
-                                    let mut lock = stdout.lock();
-                                    let cont = write_ndjson_line(&mut lock, &rec)?;
-                                    let _ = lock.flush();
-                                    drop(lock);
+                                    let cont = {
+                                        let mut lock = stdout.lock();
+                                        let cont = write_ndjson_line(&mut lock, &rec)?;
+                                        let _ = lock.flush();
+                                        cont
+                                    };
                                     if !cont {
                                         storage.shutdown().await.ok();
                                         return Ok(());
@@ -35852,7 +35853,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                         if let Some(prev) = last_event_emit {
                                             let elapsed = prev.elapsed();
                                             if elapsed < min {
-                                                let wait = min - elapsed;
+                                                let wait = min.saturating_sub(elapsed);
                                                 let _ = frankenterm_core::runtime_async::spawn_blocking(
                                                     move || std::thread::sleep(wait),
                                                 )
@@ -35866,10 +35867,12 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                     let redacted =
                                         frankenterm_core::export::redact_event(event, &redactor);
                                     let record = watch_event_ndjson(&redacted);
-                                    let mut lock = stdout.lock();
-                                    let cont = write_ndjson_line(&mut lock, &record)?;
-                                    let _ = lock.flush();
-                                    drop(lock);
+                                    let cont = {
+                                        let mut lock = stdout.lock();
+                                        let cont = write_ndjson_line(&mut lock, &record)?;
+                                        let _ = lock.flush();
+                                        cont
+                                    };
                                     if !cont {
                                         break 'follow; // consumer closed the pipe
                                     }
@@ -35899,46 +35902,38 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                         // relay live events until the watcher
                                         // closes the stream (or the consumer
                                         // closes the pipe).
-                                        loop {
-                                            match stream.next_line_with_cx(&cx).await {
-                                                Ok(Some(line)) => {
-                                                    match relay_ipc_event_line(
-                                                        &stdout,
-                                                        &line,
-                                                        &mut current_cursor,
-                                                        max_hz_interval,
-                                                        &mut last_event_emit,
-                                                        claim.then_some(&storage),
-                                                    )
-                                                    .await?
-                                                    {
-                                                        IpcRelayAction::PipeClosed => {
-                                                            break 'follow;
-                                                        }
-                                                        // Broadcast lag: drop
-                                                        // out of the relay so the
-                                                        // outer loop re-drains the
-                                                        // DB cursor (backfilling
-                                                        // the missed events) and
-                                                        // then re-subscribes.
-                                                        IpcRelayAction::Resync => {
-                                                            break;
-                                                        }
-                                                        IpcRelayAction::Emitted
-                                                        | IpcRelayAction::Skipped => {
-                                                            last_emit = std::time::Instant::now();
-                                                        }
-                                                    }
+                                        while let Ok(Some(line)) =
+                                            stream.next_line_with_cx(&cx).await
+                                        {
+                                            match relay_ipc_event_line(
+                                                &stdout,
+                                                &line,
+                                                &mut current_cursor,
+                                                max_hz_interval,
+                                                &mut last_event_emit,
+                                                claim.then_some(&storage),
+                                            )
+                                            .await?
+                                            {
+                                                IpcRelayAction::PipeClosed => {
+                                                    break 'follow;
                                                 }
-                                                // Watcher closed the stream
-                                                // (shutdown) or read failed —
-                                                // `ipc_stream` is already None, so
-                                                // fall through to the DB poll
-                                                // fallback and retry IPC on the
-                                                // next iteration.
-                                                Ok(None) | Err(_) => break,
+                                                // Broadcast lag: drop out of the
+                                                // relay so the outer loop re-drains
+                                                // the DB cursor (backfilling missed
+                                                // events) and then re-subscribes.
+                                                IpcRelayAction::Resync => {
+                                                    break;
+                                                }
+                                                IpcRelayAction::Emitted
+                                                | IpcRelayAction::Skipped => {
+                                                    last_emit = std::time::Instant::now();
+                                                }
                                             }
                                         }
+                                        // Watcher closure or a read failure leaves
+                                        // `ipc_stream` as None, so the DB-poll
+                                        // fallback retries IPC on the next iteration.
                                     } else {
                                         // Not subscribed yet: try now. On success
                                         // loop back to drain any gap between the
@@ -35968,10 +35963,12 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                 // Idle: emit a heartbeat if enabled and due.
                                 if heartbeat_interval_ms > 0 && last_emit.elapsed() >= heartbeat {
                                     let hb = watch_heartbeat_ndjson(current_cursor, now_ms_i64());
-                                    let mut lock = stdout.lock();
-                                    let cont = write_ndjson_line(&mut lock, &hb)?;
-                                    let _ = lock.flush();
-                                    drop(lock);
+                                    let cont = {
+                                        let mut lock = stdout.lock();
+                                        let cont = write_ndjson_line(&mut lock, &hb)?;
+                                        let _ = lock.flush();
+                                        cont
+                                    };
                                     if !cont {
                                         break 'follow;
                                     }
@@ -35981,7 +35978,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                 // sleep hangs without a timer-capable cx).
                                 let _ =
                                     frankenterm_core::runtime_async::spawn_blocking(move || {
-                                        std::thread::sleep(poll)
+                                        std::thread::sleep(poll);
                                     })
                                     .await;
                             }
@@ -36183,7 +36180,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                 // sleep hangs; offload to the blocking pool.
                                 let _ =
                                     frankenterm_core::runtime_async::spawn_blocking(move || {
-                                        std::thread::sleep(poll)
+                                        std::thread::sleep(poll);
                                     })
                                     .await;
                             };
@@ -36200,10 +36197,11 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                 &any_status,
                                 &all_status,
                             );
-                            let mut lock = stdout.lock();
-                            let _ = write_ndjson_line(&mut lock, &result)?;
-                            let _ = lock.flush();
-                            drop(lock);
+                            {
+                                let mut lock = stdout.lock();
+                                let _ = write_ndjson_line(&mut lock, &result)?;
+                                let _ = lock.flush();
+                            }
                             storage.shutdown().await.ok();
                         }
                         RobotCommands::Workflow { command } => {
@@ -79435,14 +79433,13 @@ log_level = "debug"
         let completed = robot_work_complete_data(&db_path, "A", None, &[], 0)
             .ok()
             .expect("complete A");
-        let unblocked: Vec<String> = completed["unblocked"]
+        let unblocked_contains_b = completed["unblocked"]
             .as_array()
             .expect("unblocked array")
             .iter()
-            .filter_map(|v| v.as_str().map(str::to_string))
-            .collect();
+            .any(|value| value.as_str() == Some("B"));
         assert!(
-            unblocked.contains(&"B".to_string()),
+            unblocked_contains_b,
             "completing A unblocks B: {completed:?}"
         );
 
@@ -85187,7 +85184,9 @@ A  docs/new-proof.md\n";
                         assert_eq!(casr_binary, "/tmp/fake-casr");
                         assert_eq!(timeout_secs, 7);
                     }
-                    _ => panic!("expected RobotSessionResumeCommands::List"),
+                    RobotSessionResumeCommands::Resume { .. } => {
+                        panic!("expected RobotSessionResumeCommands::List")
+                    }
                 }
             }
             _ => panic!("expected RobotCommands::SessionResume"),
@@ -85224,7 +85223,9 @@ A  docs/new-proof.md\n";
                     assert_eq!(provider, "gmi");
                     assert!(dry_run);
                 }
-                _ => panic!("expected RobotSessionResumeCommands::Resume"),
+                RobotSessionResumeCommands::List { .. } => {
+                    panic!("expected RobotSessionResumeCommands::Resume")
+                }
             },
             _ => panic!("expected RobotCommands::SessionResume"),
         }

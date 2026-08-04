@@ -127,14 +127,13 @@ fn fixture_root_or_prepare(project_root: &Path) -> (PathBuf, PathBuf, PathBuf) {
         .arg(&fixture_root)
         .output()
         .expect("run Antigravity e2e fixture-preparation script");
-    if !output.status.success() {
-        panic!(
-            "fixture preparation failed with status {:?}\nstdout:\n{}\nstderr:\n{}",
-            output.status.code(),
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
+    assert!(
+        output.status.success(),
+        "fixture preparation failed with status {:?}\nstdout:\n{}\nstderr:\n{}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
     let manifest: Value = read_json(&fixture_root.join("manifest.json"));
     let log_jsonl = path_field(&manifest, "log_jsonl");
     (fixture_root, artifact_dir, log_jsonl)
@@ -148,11 +147,6 @@ fn validate_scenario(scenario: &Value, log_jsonl: &Path, project_root: &Path) {
     let path_env = str_field(scenario, "path_env");
     let agy_uuid = scenario.get("agy_uuid").and_then(Value::as_str);
     let legacy_session_id = scenario.get("legacy_session_id").and_then(Value::as_str);
-    let expect_missing_agy_binary = scenario
-        .get("expect_missing_agy_binary")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-
     let resumer = SessionResumer::new(SessionResumeConfig {
         casr_binary: casr_binary.to_string(),
         working_dir: Some(project_root.to_path_buf()),
@@ -287,10 +281,6 @@ fn validate_scenario(scenario: &Value, log_jsonl: &Path, project_root: &Path) {
             );
         }
         other => panic!("unexpected Antigravity e2e scenario: {other}"),
-    }
-
-    if expect_missing_agy_binary {
-        return;
     }
 }
 

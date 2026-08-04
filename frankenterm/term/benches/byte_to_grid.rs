@@ -70,11 +70,10 @@ fn wrapped_agent_payload() -> &'static [u8] {
             for idx in 0..64 {
                 writeln!(
                     payload,
-                    "wrap-{idx:04}: {} {} {} {}",
-                    "abcdefghijklmnopqrstuvwxyz0123456789",
-                    "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789",
-                    "diagnostics=warning,error,rate-limit,context-window",
-                    "cwd=/Users/jemanuel/projects/frankenterm/frankenterm/term/src"
+                    "wrap-{idx:04}: abcdefghijklmnopqrstuvwxyz0123456789 \
+                     ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 \
+                     diagnostics=warning,error,rate-limit,context-window \
+                     cwd=/Users/jemanuel/projects/frankenterm/frankenterm/term/src"
                 )
                 .expect("write wrapped agent payload");
             }

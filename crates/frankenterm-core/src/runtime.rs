@@ -9798,22 +9798,22 @@ mod tests {
 
             let mut semantic_side_effects = 0_u64;
             let mut rejected = 0_u64;
-            let mut stale_spsc = ring_rx.try_recv().expect("old SPSC event");
-            let mut spsc_decision = stale_spsc
+            let mut direct_ring_event = ring_rx.try_recv().expect("old SPSC event");
+            let mut direct_ring_decision = direct_ring_event
                 .take_resync_decision()
                 .expect("SPSC resync decision");
             match admit_capture_event_for_persistence(
                 &authority,
                 &capture_metadata,
                 &publication_rx,
-                &stale_spsc,
+                &direct_ring_event,
             )
             .await
             {
                 Ok((_guard, _metadata)) => semantic_side_effects += 1,
                 Err(error) => {
                     rejected += 1;
-                    spsc_decision.finish(Err(error.to_string()));
+                    direct_ring_decision.finish(Err(error.to_string()));
                 }
             }
             assert!(
@@ -9823,22 +9823,23 @@ mod tests {
                     .is_err()
             );
 
-            let mut stale_mpsc = ring_rx.try_recv().expect("relayed MPSC event");
-            let mut mpsc_decision = stale_mpsc
+            let mut relayed_ingress_event =
+                ring_rx.try_recv().expect("relayed MPSC event");
+            let mut relayed_ingress_decision = relayed_ingress_event
                 .take_resync_decision()
                 .expect("MPSC resync decision");
             match admit_capture_event_for_persistence(
                 &authority,
                 &capture_metadata,
                 &publication_rx,
-                &stale_mpsc,
+                &relayed_ingress_event,
             )
             .await
             {
                 Ok((_guard, _metadata)) => semantic_side_effects += 1,
                 Err(error) => {
                     rejected += 1;
-                    mpsc_decision.finish(Err(error.to_string()));
+                    relayed_ingress_decision.finish(Err(error.to_string()));
                 }
             }
             assert!(

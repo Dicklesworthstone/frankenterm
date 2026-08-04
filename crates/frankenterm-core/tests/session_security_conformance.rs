@@ -14,7 +14,7 @@
 //!     lives inline in connector_outbound_bridge.rs).
 //!   * ft-ps9fu — the MCP wa://swarm/scent read routes through the read-policy
 //!     + Redactor boundary (wiring guard; needs a live wezterm handle to drive
-//!     behaviorally).
+//!       behaviorally).
 //!
 //! Scripting-crate fixes (ft-0dki4 WASM sandbox, ft-a58cq extension
 //! path-traversal) are covered by the sibling suite
