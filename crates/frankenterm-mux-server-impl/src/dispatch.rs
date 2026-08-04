@@ -75,8 +75,9 @@ const TOPOLOGY_FENCE_MAX_RETAINED_BYTES: usize = 4 * 1024 * 1024;
 /// an ordered snapshot has a separate complete-frame ceiling. Their aggregate
 /// permits one maximum snapshot to coexist with the separately bounded
 /// successor queue, while each class remains unable to borrow the other's
-/// tranche. Typed-to-encoded overlap is charged to the same class and fails
-/// closed if it would exceed that class ceiling.
+/// tranche. This retained-owner budget begins when the complete encoded frame
+/// is reserved; codec-bounded transient serialization/compression workspace is
+/// a separate peak-memory concern and is not represented by these counters.
 const OUTBOUND_ACCOUNTED_MAX_RETAINED_BYTES: usize =
     codec::MAX_LIST_PANES_ORDERED_V1_RESPONSE_FRAME_BYTES
         + TOPOLOGY_FENCE_MAX_RETAINED_BYTES;

@@ -11215,7 +11215,8 @@ mod test {
         let growth_events = test_bounded_serialize_growth_events();
         assert!(
             growth_events <= 16,
-            "one-megabyte payload used {growth_events} allocation-growth events"
+            "one-megabyte payload used {} allocation-growth events",
+            growth_events,
         );
         assert!(encoded.len() <= payload.len() + 16);
         assert!(test_bounded_serialize_max_requested_capacity() <= payload.len() + 16);
@@ -15218,8 +15219,19 @@ mod test {
         assert_eq!(flat.stats.node_visits, MAX_ORDERED_PANE_NODES_PER_SNAPSHOT);
         assert_eq!(flat.stats.leaf_visits, MAX_ORDERED_PANE_LEAVES_PER_SNAPSHOT);
 
-        let encoded = serialize_uncompressed(&OrderedPanesTestWire(&flat.panes))
-            .expect("exact snapshot node and leaf ceilings must serialize");
+        reset_test_bounded_serialize_growth_events();
+        let encoded = serialize_uncompressed_bounded(
+            &OrderedPanesTestWire(&flat.panes),
+            MAX_LIST_PANES_ORDERED_V1_RESPONSE_DECOMPRESSED_BYTES,
+            87,
+            87,
+        )
+        .expect("exact snapshot node and leaf ceilings must serialize");
+        assert!(test_bounded_serialize_growth_events() <= 24);
+        assert!(
+            test_bounded_serialize_max_requested_capacity()
+                <= MAX_LIST_PANES_ORDERED_V1_RESPONSE_DECOMPRESSED_BYTES,
+        );
         let mut reader = encoded.as_slice();
         let OrderedPanesTestOwned(decoded) = bounded_varbincode::deserialize(&mut reader)
             .expect("exact snapshot node and leaf ceilings must decode");
@@ -15394,10 +15406,8 @@ mod test {
     fn pdu87_flat_pane_encoder_has_deterministic_q_scale_work_and_allocation_counts() {
         for q in [1_usize, 20, 200, 4_096] {
             let panes = ListPanesResponse {
-                tabs: (0..q)
-                    .map(|ordinal| PaneNode::Leaf(sample_pane_entry(ordinal)))
-                    .collect(),
-                tab_titles: (0..q).map(|ordinal| format!("tab-{ordinal}")).collect(),
+                tabs: vec![broad_pane_tree(q)],
+                tab_titles: vec![format!("split-heavy-q-{q}")],
                 window_titles: HashMap::new(),
             };
             let first = flatten_ordered_panes(panes.clone())
@@ -15405,17 +15415,44 @@ mod test {
             let second = flatten_ordered_panes(panes)
                 .unwrap_or_else(|error| panic!("q={} second flatten failed: {error:#}", q));
 
-            let expected = OrderedPanesFlattenStats {
-                node_visits: q,
-                leaf_visits: q,
-                task_pushes: q,
-                peak_pending_tasks: 1,
-                flatten_allocation_requests: 3,
-            };
-            assert_eq!(first.stats, expected, "unexpected q={} first-pass work", q);
-            assert_eq!(second.stats, expected, "unexpected q={} repeated work", q);
-            assert_eq!(first.panes.trees().len(), q);
-            assert_eq!(first.panes.nodes().len(), q);
+            assert_eq!(
+                first.stats, second.stats,
+                "q={} flatten work must be deterministic across repetitions",
+                q,
+            );
+            assert_eq!(first.stats.node_visits, q * 2 - 1);
+            assert_eq!(first.stats.leaf_visits, q);
+            assert_eq!(first.stats.task_pushes, q.saturating_sub(1) * 3 + 1);
+            assert!(first.stats.peak_pending_tasks <= MAX_ORDERED_PANE_TREE_DEPTH);
+            assert!(first.stats.flatten_allocation_requests <= 24);
+            assert_eq!(first.panes.trees().len(), 1);
+            assert_eq!(first.panes.nodes().len(), q * 2 - 1);
+            assert_eq!(first.panes, second.panes);
+
+            reset_test_bounded_serialize_growth_events();
+            let encoded = serialize_uncompressed_bounded(
+                &OrderedPanesTestWire(&first.panes),
+                MAX_LIST_PANES_ORDERED_V1_RESPONSE_DECOMPRESSED_BYTES,
+                87,
+                87,
+            )
+            .unwrap_or_else(|error| panic!("q={} serialization failed: {error:#}", q));
+            let growth_events = test_bounded_serialize_growth_events();
+            assert!(
+                growth_events <= 24,
+                "q={} serialization used {} growth events",
+                q,
+                growth_events,
+            );
+            assert!(
+                test_bounded_serialize_max_requested_capacity()
+                    <= MAX_LIST_PANES_ORDERED_V1_RESPONSE_DECOMPRESSED_BYTES,
+            );
+            let mut reader = encoded.as_slice();
+            let OrderedPanesTestOwned(decoded) = bounded_varbincode::deserialize(&mut reader)
+                .unwrap_or_else(|error| panic!("q={} decode failed: {error}", q));
+            assert!(reader.is_empty());
+            assert_eq!(decoded, first.panes);
         }
     }
 
