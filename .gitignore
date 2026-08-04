@@ -276,3 +276,8 @@ ubs_*.txt
 # Stray out-of-tree rustc outputs (normal builds live under target/).
 /librust_out.rlib
 *.rlib
+# br doctor per-run artifacts
+.doctor/
+
+# Beads compliance audit dir (managed by /beads-compliance-and-completion-verification skill)
+/beads_compliance_audit/
