@@ -1185,10 +1185,14 @@ mod test {
         if let (Some(ft), Some(wz)) = (first_frankenterm, first_wezterm) {
             assert!(
                 ft < wz,
-                "frankenterm-namespaced dirs must precede wezterm-namespaced dirs in package.path: {package_path}"
+                "frankenterm-namespaced dirs must precede wezterm-namespaced dirs in package.path: {}",
+                package_path
             );
         } else {
-            panic!("expected both frankenterm and wezterm entries in package.path: {package_path}");
+            panic!(
+                "expected both frankenterm and wezterm entries in package.path: {}",
+                package_path
+            );
         }
         Ok(())
     }
