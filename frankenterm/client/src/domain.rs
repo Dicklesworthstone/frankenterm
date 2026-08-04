@@ -13,12 +13,13 @@ use mux::connui::{ConnectionUI, ConnectionUIParams};
 use mux::domain::{alloc_domain_id, Domain, DomainId, DomainState};
 use mux::pane::{reserve_pane_ids, Pane, PaneId};
 use mux::tab::{
-    prepare_pane_tree_from_arena, PaneArena, PaneArenaNode, PaneEntry, PaneNode,
-    PreparedPaneTree, SplitRequest, Tab, TabId,
+    prepare_pane_tree_from_arena_with_scratch, PaneArena, PaneArenaNode,
+    PaneArenaPreparationScratch, PaneEntry, PaneNode, PreparedPaneTree, SplitRequest, Tab, TabId,
 };
 use mux::window::WindowId;
 use mux::{
-    CurrentPane, MoveCommitReceipt, Mux, MuxNotification, PaneOperationGuard, SplitCommitReceipt,
+    CurrentPane, MoveCommitReceipt, Mux, MuxNotification, PaneOperationGuard,
+    PaneRegistrationHandle, SplitCommitReceipt,
 };
 use portable_pty::CommandBuilder;
 use promise::spawn::spawn_into_new_thread;
@@ -93,19 +94,67 @@ struct PaneArenaTabPlan {
     root_size: TerminalSize,
     remote_window_id: WindowId,
     remote_tab_id: TabId,
-    workspace: String,
-    tab_title: String,
 }
 
 struct PreparedPaneArenaTab {
     plan: PaneArenaTabPlan,
+    workspace: String,
+    tab_title: String,
     tree: PreparedPaneTree,
+}
+
+struct StagedPaneArenaTab {
+    prepared: PreparedPaneArenaTab,
+    tab: Arc<Tab>,
+}
+
+#[derive(Default)]
+struct PendingPaneArenaPublication {
+    new_panes: Vec<(PaneId, Arc<dyn Pane>)>,
+    existing_sync: Vec<(Arc<dyn Pane>, bool)>,
+}
+
+struct PaneArenaPublicationRollback {
+    mux: Arc<Mux>,
+    pane_registrations: Vec<PaneRegistrationHandle>,
+    new_tabs: Vec<Arc<Tab>>,
+    committed: bool,
+}
+
+impl PaneArenaPublicationRollback {
+    fn new(mux: &Arc<Mux>) -> Self {
+        Self {
+            mux: Arc::clone(mux),
+            pane_registrations: Vec::new(),
+            new_tabs: Vec::new(),
+            committed: false,
+        }
+    }
+
+    fn commit(&mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for PaneArenaPublicationRollback {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        for tab in self.new_tabs.drain(..).rev() {
+            self.mux.remove_empty_tab_local_only_if_same(&tab);
+        }
+        for registration in self.pane_registrations.drain(..).rev() {
+            registration.detach_local_if_current();
+        }
+    }
 }
 
 struct PaneArenaPreflight {
     tabs: Vec<PaneArenaTabPlan>,
     remote_pane_ids: Vec<PaneId>,
-    window_titles: Vec<(WindowId, String)>,
+    remote_pane_tabs: Vec<(PaneId, TabId)>,
+    window_ids: Vec<WindowId>,
 }
 
 /// Validate every descriptor, child edge, and remote identity before a direct
@@ -114,14 +163,32 @@ struct PaneArenaPreflight {
 /// the dormant client application seam must not assume that its caller used
 /// the codec validator.
 fn preflight_pane_arena(panes: &PaneArena) -> anyhow::Result<PaneArenaPreflight> {
+    codec::validate_ordered_pane_arena(panes)
+        .context("validate ordered pane arena resource and topology admission")?;
     let mut cursor = 0usize;
     let mut tabs = Vec::new();
     tabs.try_reserve_exact(panes.trees().len())
         .context("reserve ordered pane arena tab preflight")?;
     let mut remote_pane_ids = Vec::new();
+    remote_pane_ids
+        .try_reserve_exact(panes.nodes().len().div_ceil(2))
+        .context("reserve ordered pane arena pane identities")?;
+    let mut remote_pane_tabs = Vec::new();
+    remote_pane_tabs
+        .try_reserve_exact(panes.nodes().len().div_ceil(2))
+        .context("reserve ordered pane arena pane/tab identities")?;
     let mut seen_remote_pane_ids = HashSet::new();
+    seen_remote_pane_ids
+        .try_reserve(panes.nodes().len().div_ceil(2))
+        .context("reserve ordered pane arena unique pane identities")?;
     let mut seen_remote_tab_ids = HashSet::new();
+    seen_remote_tab_ids
+        .try_reserve(panes.trees().len())
+        .context("reserve ordered pane arena unique tab identities")?;
     let mut seen_remote_window_ids = HashSet::new();
+    seen_remote_window_ids
+        .try_reserve(panes.window_titles().len())
+        .context("reserve ordered pane arena unique window identities")?;
 
     for (tree_index, descriptor) in panes.trees().iter().enumerate() {
         let node_count = usize::try_from(descriptor.node_count).with_context(|| {
@@ -156,113 +223,45 @@ fn preflight_pane_arena(panes: &PaneArena) -> anyhow::Result<PaneArenaPreflight>
             PaneArenaNode::Split { node, .. } => node.size(),
             PaneArenaNode::Leaf(entry) => entry.size,
         };
-        let mut pending = Vec::new();
-        pending
-            .try_reserve_exact(node_count.div_ceil(2))
-            .with_context(|| format!("reserve ordered pane arena tree {tree_index} preflight"))?;
-        pending.push(root_index);
-        let mut expected = root_index;
         let mut tree_identity = None;
-        let mut workspace: Option<String> = None;
-        let mut leaf_count = 0usize;
-        let mut active_count = 0usize;
-        let mut zoomed_count = 0usize;
-
-        while let Some(node_index) = pending.pop() {
-            if node_index != expected || node_index >= arena_end {
-                bail!(
-                    "ordered pane arena tree {tree_index} violates contiguous preorder at \
-                     node {node_index}; expected {expected} within {root_index}..{arena_end}"
-                );
-            }
-            expected = expected.checked_add(1).ok_or_else(|| {
-                anyhow!("ordered pane arena tree {tree_index} preorder index overflows")
-            })?;
-            match &panes.nodes()[node_index] {
-                PaneArenaNode::Empty => {}
-                PaneArenaNode::Leaf(entry) => {
-                    leaf_count = leaf_count.checked_add(1).ok_or_else(|| {
-                        anyhow!("ordered pane arena tree {tree_index} leaf count overflows")
-                    })?;
-                    active_count = active_count
-                        .checked_add(usize::from(entry.is_active_pane))
-                        .ok_or_else(|| {
-                            anyhow!(
-                                "ordered pane arena tree {tree_index} active count overflows"
-                            )
-                        })?;
-                    zoomed_count = zoomed_count
-                        .checked_add(usize::from(entry.is_zoomed_pane))
-                        .ok_or_else(|| {
-                            anyhow!(
-                                "ordered pane arena tree {tree_index} zoomed count overflows"
-                            )
-                        })?;
-
-                    let identity = (entry.window_id, entry.tab_id);
-                    if tree_identity.is_some_and(|expected| expected != identity) {
-                        bail!(
-                            "ordered pane arena tree {tree_index} mixes window/tab identities \
-                             {tree_identity:?} and {identity:?}"
-                        );
-                    }
-                    tree_identity = Some(identity);
-                    if workspace
-                        .as_ref()
-                        .is_some_and(|expected| expected != &entry.workspace)
-                    {
-                        bail!(
-                            "ordered pane arena tree {tree_index} mixes workspace identities"
-                        );
-                    }
-                    if workspace.is_none() {
-                        workspace = Some(entry.workspace.clone());
-                    }
-                    if !seen_remote_pane_ids.insert(entry.pane_id) {
-                        bail!(
-                            "ordered pane arena remote pane {} appears more than once",
-                            entry.pane_id
-                        );
-                    }
-                    remote_pane_ids.push(entry.pane_id);
+        let mut workspace: Option<&str> = None;
+        for node in &panes.nodes()[root_index..arena_end] {
+            if let PaneArenaNode::Leaf(entry) = node {
+                if matches!(u64::try_from(entry.window_id), Ok(u64::MAX))
+                    || matches!(u64::try_from(entry.tab_id), Ok(u64::MAX))
+                    || entry.pane_id == usize::MAX
+                {
+                    bail!(
+                        "ordered pane arena tree {tree_index} uses a reserved terminal \
+                         window, tab, or pane identity"
+                    );
                 }
-                PaneArenaNode::Split { left, right, .. } => {
-                    let expected_left = node_index.checked_add(1).ok_or_else(|| {
-                        anyhow!("ordered pane arena tree {tree_index} left index overflows")
-                    })?;
-                    let left = usize::try_from(*left).with_context(|| {
-                        format!(
-                            "ordered pane arena tree {tree_index} left index does not fit usize"
-                        )
-                    })?;
-                    let right = usize::try_from(*right).with_context(|| {
-                        format!(
-                            "ordered pane arena tree {tree_index} right index does not fit usize"
-                        )
-                    })?;
-                    if left != expected_left || right <= left || right >= arena_end {
-                        bail!(
-                            "ordered pane arena tree {tree_index} split {node_index} has \
-                             non-canonical children ({left}, {right})"
-                        );
-                    }
-                    pending.push(right);
-                    pending.push(left);
+                let identity = (entry.window_id, entry.tab_id);
+                if tree_identity.is_some_and(|expected| expected != identity) {
+                    bail!(
+                        "ordered pane arena tree {tree_index} mixes window/tab identities \
+                         {tree_identity:?} and {identity:?}"
+                    );
                 }
+                tree_identity = Some(identity);
+                if workspace
+                    .as_ref()
+                    .is_some_and(|expected| *expected != entry.workspace.as_str())
+                {
+                    bail!("ordered pane arena tree {tree_index} mixes workspace identities");
+                }
+                if workspace.is_none() {
+                    workspace = Some(entry.workspace.as_str());
+                }
+                if !seen_remote_pane_ids.insert(entry.pane_id) {
+                    bail!(
+                        "ordered pane arena remote pane {} appears more than once",
+                        entry.pane_id
+                    );
+                }
+                remote_pane_ids.push(entry.pane_id);
+                remote_pane_tabs.push((entry.pane_id, entry.tab_id));
             }
-        }
-
-        if expected != arena_end || leaf_count == 0 {
-            bail!(
-                "ordered pane arena tree {tree_index} does not cover one complete non-empty \
-                 tree range {root_index}..{arena_end}"
-            );
-        }
-        if active_count > 1 || zoomed_count > 1 {
-            bail!(
-                "ordered pane arena tree {tree_index} has {active_count} active and \
-                 {zoomed_count} zoomed leaves; each authority must be unique"
-            );
         }
         let (remote_window_id, remote_tab_id) = tree_identity.ok_or_else(|| {
             anyhow!("ordered pane arena tree {tree_index} has no pane identity")
@@ -270,16 +269,15 @@ fn preflight_pane_arena(panes: &PaneArena) -> anyhow::Result<PaneArenaPreflight>
         if !seen_remote_tab_ids.insert(remote_tab_id) {
             bail!("ordered pane arena remote tab {remote_tab_id} appears more than once");
         }
+        workspace.ok_or_else(|| {
+            anyhow!("ordered pane arena tree {tree_index} has no workspace authority")
+        })?;
         seen_remote_window_ids.insert(remote_window_id);
         tabs.push(PaneArenaTabPlan {
             node_count,
             root_size,
             remote_window_id,
             remote_tab_id,
-            workspace: workspace.ok_or_else(|| {
-                anyhow!("ordered pane arena tree {tree_index} has no workspace authority")
-            })?,
-            tab_title: descriptor.tab_title.clone(),
         });
         cursor = arena_end;
     }
@@ -291,13 +289,19 @@ fn preflight_pane_arena(panes: &PaneArena) -> anyhow::Result<PaneArenaPreflight>
         );
     }
 
-    let mut window_titles = Vec::new();
-    window_titles
+    let mut window_ids = Vec::new();
+    window_ids
         .try_reserve_exact(panes.window_titles().len())
         .context("reserve ordered pane arena window-title preflight")?;
     let mut title_window_ids = HashSet::new();
+    title_window_ids
+        .try_reserve(panes.window_titles().len())
+        .context("reserve ordered pane arena title identities")?;
     let mut prior_window_id = None;
     for entry in panes.window_titles() {
+        if entry.window_id == u64::MAX {
+            bail!("ordered pane arena window title uses the reserved terminal identity");
+        }
         let remote_window_id = usize::try_from(entry.window_id).with_context(|| {
             format!(
                 "ordered pane arena window id {} does not fit this process",
@@ -311,7 +315,7 @@ fn preflight_pane_arena(panes: &PaneArena) -> anyhow::Result<PaneArenaPreflight>
         if !title_window_ids.insert(remote_window_id) {
             bail!("ordered pane arena repeats window title {remote_window_id}");
         }
-        window_titles.push((remote_window_id, entry.title.clone()));
+        window_ids.push(remote_window_id);
     }
     if !seen_remote_window_ids.is_subset(&title_window_ids) {
         bail!(
@@ -322,7 +326,8 @@ fn preflight_pane_arena(panes: &PaneArena) -> anyhow::Result<PaneArenaPreflight>
     Ok(PaneArenaPreflight {
         tabs,
         remote_pane_ids,
-        window_titles,
+        remote_pane_tabs,
+        window_ids,
     })
 }
 
@@ -334,85 +339,290 @@ fn ensure_pane_arena_append_order_is_sound(
     mux: &Mux,
     inner: &ClientInner,
     tabs: &[PaneArenaTabPlan],
-    window_titles: &[(WindowId, String)],
+    remote_pane_tabs: &[(PaneId, TabId)],
+    window_ids: &[WindowId],
 ) -> anyhow::Result<()> {
     let mut desired_by_window: HashMap<WindowId, Vec<TabId>> = HashMap::new();
+    desired_by_window
+        .try_reserve(window_ids.len())
+        .context("reserve ordered pane arena desired windows")?;
+    let mut desired_tabs = HashSet::new();
+    desired_tabs
+        .try_reserve(tabs.len())
+        .context("reserve ordered pane arena desired tabs")?;
     for tab in tabs {
+        desired_tabs.insert(tab.remote_tab_id);
         desired_by_window
             .entry(tab.remote_window_id)
             .or_default()
             .push(tab.remote_tab_id);
     }
 
-    for (remote_window_id, _) in window_titles {
-        if desired_by_window.contains_key(remote_window_id) {
+    let mut desired_windows = HashSet::new();
+    desired_windows
+        .try_reserve(window_ids.len())
+        .context("reserve ordered pane arena desired window identities")?;
+    desired_windows.extend(window_ids.iter().copied());
+
+    let mut desired_pane_tabs = HashMap::new();
+    desired_pane_tabs
+        .try_reserve(remote_pane_tabs.len())
+        .context("reserve ordered pane arena desired pane ownership")?;
+    for &(remote_pane_id, remote_tab_id) in remote_pane_tabs {
+        if desired_pane_tabs
+            .insert(remote_pane_id, remote_tab_id)
+            .is_some()
+        {
+            bail!("ordered pane arena repeats remote pane {remote_pane_id}");
+        }
+    }
+
+    let tab_mappings = {
+        let mappings = lock_or_recover(&inner.remote_to_local_tab, "remote_to_local_tab");
+        let mut snapshot = Vec::new();
+        snapshot
+            .try_reserve_exact(mappings.len())
+            .context("reserve ordered pane arena tab-mapping snapshot")?;
+        snapshot.extend(mappings.iter().map(|(remote, local)| (*remote, *local)));
+        snapshot
+    };
+    let window_mappings = {
+        let mappings = lock_or_recover(&inner.remote_to_local_window, "remote_to_local_window");
+        let mut snapshot = Vec::new();
+        snapshot
+            .try_reserve_exact(mappings.len())
+            .context("reserve ordered pane arena window-mapping snapshot")?;
+        snapshot.extend(mappings.iter().map(|(remote, local)| (*remote, *local)));
+        snapshot
+    };
+
+    let mut local_to_remote_tab = HashMap::new();
+    local_to_remote_tab
+        .try_reserve(tab_mappings.len())
+        .context("reserve ordered pane arena reverse tab mappings")?;
+    let mut remote_to_local_tab = HashMap::new();
+    remote_to_local_tab
+        .try_reserve(tab_mappings.len())
+        .context("reserve ordered pane arena tab mappings")?;
+    for &(remote_tab_id, local_tab_id) in &tab_mappings {
+        if let Some(prior_remote_tab_id) = local_to_remote_tab.insert(local_tab_id, remote_tab_id) {
+            bail!(
+                "ordered pane arena mappings alias remote tabs {prior_remote_tab_id} and \
+                 {remote_tab_id} onto local tab {local_tab_id}"
+            );
+        }
+        remote_to_local_tab.insert(remote_tab_id, local_tab_id);
+    }
+
+    let mut local_to_remote_window = HashMap::new();
+    local_to_remote_window
+        .try_reserve(window_mappings.len())
+        .context("reserve ordered pane arena reverse window mappings")?;
+    let mut remote_to_local_window = HashMap::new();
+    remote_to_local_window
+        .try_reserve(window_mappings.len())
+        .context("reserve ordered pane arena window mappings")?;
+    for &(remote_window_id, local_window_id) in &window_mappings {
+        if let Some(prior_remote_window_id) =
+            local_to_remote_window.insert(local_window_id, remote_window_id)
+        {
+            bail!(
+                "ordered pane arena mappings alias remote windows {prior_remote_window_id} and \
+                 {remote_window_id} onto local window {local_window_id}"
+            );
+        }
+        remote_to_local_window.insert(remote_window_id, local_window_id);
+    }
+
+    let mut parent_by_local_tab = HashMap::new();
+    parent_by_local_tab
+        .try_reserve(tab_mappings.len().max(tabs.len()))
+        .context("reserve ordered pane arena tab-parent index")?;
+    for local_window_id in mux.iter_windows() {
+        let window = mux.get_window(local_window_id).ok_or_else(|| {
+            anyhow!("local window {local_window_id} disappeared while indexing tab parents")
+        })?;
+        for tab in window.iter() {
+            if let Some(prior_window_id) =
+                parent_by_local_tab.insert(tab.tab_id(), local_window_id)
+            {
+                bail!(
+                    "local tab {} is attached to windows {prior_window_id} and {local_window_id}",
+                    tab.tab_id()
+                );
+            }
+        }
+    }
+
+    let mut live_remote_panes = HashMap::new();
+    live_remote_panes
+        .try_reserve(remote_pane_tabs.len())
+        .context("reserve ordered pane arena live pane ownership")?;
+    for pane in mux.iter_panes() {
+        let Some(client_pane) = pane.downcast_ref::<ClientPane>() else {
+            continue;
+        };
+        if !client_pane.belongs_to_client(inner) {
             continue;
         }
-        let live_local_window = inner
-            .remote_to_local_window(*remote_window_id)
-            .filter(|local_window_id| mux.get_window(*local_window_id).is_some());
-        if live_local_window.is_none() {
+        let remote_pane_id = client_pane.remote_pane_id();
+        if let Some(prior_local_pane_id) = live_remote_panes.insert(remote_pane_id, pane.pane_id()) {
             bail!(
-                "ordered pane arena window {remote_window_id} has no tab tree or live local \
-                 mirror; creating an empty window requires ordered workspace authority"
+                "remote pane {remote_pane_id} is mirrored by local panes \
+                 {prior_local_pane_id} and {}",
+                pane.pane_id()
+            );
+        }
+        let Some(&desired_remote_tab_id) = desired_pane_tabs.get(&remote_pane_id) else {
+            bail!(
+                "ordered pane arena removes live remote pane {remote_pane_id}; atomic stale-pane \
+                 removal is required"
+            );
+        };
+        if client_pane.remote_tab_id != desired_remote_tab_id {
+            bail!(
+                "ordered pane arena moves remote pane {remote_pane_id} from tab {} to tab \
+                 {desired_remote_tab_id}; atomic pane migration is required",
+                client_pane.remote_tab_id
             );
         }
     }
 
+    for &(remote_tab_id, local_tab_id) in &tab_mappings {
+        let Some(tab) = mux.get_tab(local_tab_id) else {
+            continue;
+        };
+        if !desired_tabs.contains(&remote_tab_id) {
+            bail!(
+                "ordered pane arena removes live remote tab {remote_tab_id}; atomic stale-tab \
+                 removal is required"
+            );
+        }
+        let panes = tab.iter_all_panes();
+        if panes.is_empty() {
+            bail!(
+                "ordered pane arena mapping {remote_tab_id}->{local_tab_id} targets an empty \
+                 local tab whose client ownership cannot be proven"
+            );
+        }
+        for pane in panes {
+            let Some(client_pane) = pane.downcast_ref::<ClientPane>() else {
+                bail!(
+                    "ordered pane arena mapping {remote_tab_id}->{local_tab_id} targets a tab \
+                     containing a non-client pane"
+                );
+            };
+            if !client_pane.belongs_to_client(inner)
+                || client_pane.remote_tab_id != remote_tab_id
+            {
+                bail!(
+                    "ordered pane arena mapping {remote_tab_id}->{local_tab_id} does not belong \
+                     exactly to this client and remote tab"
+                );
+            }
+        }
+    }
+
+    for &(remote_window_id, local_window_id) in &window_mappings {
+        let Some(window) = mux.get_window(local_window_id) else {
+            continue;
+        };
+        if !desired_windows.contains(&remote_window_id) {
+            bail!(
+                "ordered pane arena removes live remote window {remote_window_id}; atomic \
+                 stale-window removal is required"
+            );
+        }
+        if window.is_empty() {
+            bail!(
+                "ordered pane arena mapping {remote_window_id}->{local_window_id} targets an \
+                 empty local window whose client ownership cannot be proven"
+            );
+        }
+    }
+
+    for remote_window_id in window_ids {
+        if desired_by_window.contains_key(remote_window_id) {
+            continue;
+        }
+        bail!(
+            "ordered pane arena window {remote_window_id} has no tab tree; applying a title-only \
+             window requires exact ordered workspace and client ownership authority"
+        );
+    }
+
     for (remote_window_id, desired_remote_tabs) in desired_by_window {
-        let local_window_id = inner.remote_to_local_window(remote_window_id);
-        let live_local_window_id = local_window_id.filter(|id| mux.get_window(*id).is_some());
+        let live_local_window_id = remote_to_local_window
+            .get(&remote_window_id)
+            .copied()
+            .filter(|id| mux.get_window(*id).is_some());
         let Some(local_window_id) = live_local_window_id else {
             for remote_tab_id in &desired_remote_tabs {
-                let Some(local_tab_id) = inner.remote_to_local_tab_id(*remote_tab_id) else {
+                let Some(local_tab_id) = remote_to_local_tab.get(remote_tab_id).copied() else {
                     continue;
                 };
-                if mux.get_tab(local_tab_id).is_some()
-                    && mux.window_containing_tab(local_tab_id).is_some()
-                {
+                if mux.get_tab(local_tab_id).is_some() {
                     bail!(
                         "ordered pane arena remote window {remote_window_id} has no live local \
-                         window mapping, but tab {remote_tab_id} is already attached; atomic \
-                         snapshot mirroring is required"
+                         window mapping, but tab {remote_tab_id} already has a live local mirror; \
+                         atomic snapshot mirroring is required"
                     );
                 }
             }
             continue;
         };
 
-        let desired = desired_remote_tabs.iter().copied().collect::<HashSet<_>>();
-        let attached_remote_tabs = mux
+        let window = mux
             .get_window(local_window_id)
-            .ok_or_else(|| anyhow!("local window {local_window_id} disappeared during preflight"))?
-            .iter()
-            .filter_map(|tab| inner.local_to_remote_tab(tab.tab_id()))
-            .filter(|remote_tab_id| desired.contains(remote_tab_id))
-            .collect::<Vec<_>>();
-        if attached_remote_tabs.len() > desired_remote_tabs.len()
-            || attached_remote_tabs
-                != desired_remote_tabs[..attached_remote_tabs.len()]
-        {
+            .ok_or_else(|| anyhow!("local window {local_window_id} disappeared during preflight"))?;
+        if window.len() > desired_remote_tabs.len() {
             bail!(
                 "ordered pane arena window {remote_window_id} requires an atomic existing-window \
-                 reorder from {attached_remote_tabs:?} to {desired_remote_tabs:?}"
+                 reorder because it has {} attached tabs but authority has {}",
+                window.len(),
+                desired_remote_tabs.len()
             );
+        }
+        for (index, tab) in window.iter().enumerate() {
+            let attached_remote_tab = local_to_remote_tab
+                .get(&tab.tab_id())
+                .copied()
+                .ok_or_else(|| {
+                    anyhow!(
+                        "ordered pane arena mapped window {remote_window_id} contains unmapped or \
+                         foreign local tab {}",
+                        tab.tab_id()
+                    )
+                })?;
+            if desired_remote_tabs[index] != attached_remote_tab {
+                bail!(
+                    "ordered pane arena window {remote_window_id} requires an atomic existing-window \
+                     reorder at index {index}: attached remote tab {attached_remote_tab}, desired {}",
+                    desired_remote_tabs[index]
+                );
+            }
         }
 
         for remote_tab_id in &desired_remote_tabs {
-            let Some(local_tab_id) = inner.remote_to_local_tab_id(*remote_tab_id) else {
+            let Some(local_tab_id) = remote_to_local_tab.get(remote_tab_id).copied() else {
                 continue;
             };
-            let Some(tab) = mux.get_tab(local_tab_id) else {
+            if mux.get_tab(local_tab_id).is_none() {
                 continue;
-            };
-            if let Some(parent) = mux.window_containing_tab(tab.tab_id()) {
+            }
+            if let Some(parent) = parent_by_local_tab.get(&local_tab_id).copied() {
                 if parent != local_window_id {
                     bail!(
                         "ordered pane arena tab {remote_tab_id} is attached to local window \
                          {parent}, not mapped window {local_window_id}; atomic snapshot mirroring \
-                         is required"
+                        is required"
                     );
                 }
+            } else {
+                bail!(
+                    "ordered pane arena tab {remote_tab_id} has a live but unattached local \
+                     mirror; transactional attachment rollback is required"
+                );
             }
         }
     }
@@ -426,6 +636,7 @@ fn resolve_pane_arena_entry(
     remote_panes_to_forget: &mut HashSet<PaneId>,
     local_pane_ids_by_remote: &mut HashMap<PaneId, PaneId>,
     reserved_local_pane_ids: &mut LocalPaneIdReservations<'_>,
+    pending: &mut PendingPaneArenaPublication,
 ) -> anyhow::Result<Arc<dyn Pane>> {
     remote_panes_to_forget.remove(&entry.pane_id);
     let pane = if let Some(local_pane_id) = local_pane_ids_by_remote.get(&entry.pane_id).copied() {
@@ -434,12 +645,15 @@ fn resolve_pane_arena_entry(
                 if pane.downcast_ref::<ClientPane>().is_some_and(|client_pane| {
                     client_pane.belongs_to_client(inner)
                         && client_pane.remote_pane_id() == entry.pane_id
+                        && client_pane.remote_tab_id == entry.tab_id
                 }) =>
             {
+                pending
+                    .existing_sync
+                    .push((Arc::clone(&pane), entry.alt_screen_active));
                 pane
             }
             Some(_) | None => {
-                inner.remove_old_pane_mapping(entry.pane_id);
                 let local_pane_id = reserved_local_pane_ids
                     .take(entry.pane_id)
                     .ok_or_else(|| {
@@ -458,10 +672,10 @@ fn resolve_pane_arena_entry(
                     &entry.title,
                     entry.alt_screen_active,
                 ));
-                mux.add_pane(&pane)
-                    .with_context(|| format!("register remote pane {} in mux", entry.pane_id))?;
-                inner.record_remote_to_local_pane_mapping(entry.pane_id, local_pane_id);
                 local_pane_ids_by_remote.insert(entry.pane_id, local_pane_id);
+                pending
+                    .new_panes
+                    .push((entry.pane_id, Arc::clone(&pane)));
                 pane
             }
         }
@@ -483,15 +697,12 @@ fn resolve_pane_arena_entry(
             &entry.title,
             entry.alt_screen_active,
         ));
-        mux.add_pane(&pane)
-            .with_context(|| format!("register remote pane {} in mux", entry.pane_id))?;
-        inner.record_remote_to_local_pane_mapping(entry.pane_id, local_pane_id);
         local_pane_ids_by_remote.insert(entry.pane_id, local_pane_id);
+        pending
+            .new_panes
+            .push((entry.pane_id, Arc::clone(&pane)));
         pane
     };
-    if let Some(client_pane) = pane.downcast_ref::<ClientPane>() {
-        client_pane.sync_remote_listing_state(entry.alt_screen_active);
-    }
     Ok(pane)
 }
 
@@ -1621,21 +1832,37 @@ impl ClientDomain {
         mux: &Arc<Mux>,
         inner: Arc<ClientInner>,
         panes: PaneArena,
-        mut primary_window_id: Option<WindowId>,
+        primary_window_id: Option<WindowId>,
     ) -> anyhow::Result<()> {
         let preflight = preflight_pane_arena(&panes)?;
         ensure_pane_arena_append_order_is_sound(
             mux,
             &inner,
             &preflight.tabs,
-            &preflight.window_titles,
+            &preflight.remote_pane_tabs,
+            &preflight.window_ids,
         )?;
+        if primary_window_id.is_some()
+            && preflight.tabs.iter().any(|plan| {
+                inner
+                    .remote_to_local_window(plan.remote_window_id)
+                    .is_none_or(|local_window_id| mux.get_window(local_window_id).is_none())
+            })
+        {
+            bail!(
+                "ordered pane arena requires transactional primary-window reuse before it can \
+                 bootstrap an unmapped remote window"
+            );
+        }
 
         let mut reserved_local_pane_ids = inner
             .reserve_local_pane_ids(preflight.remote_pane_ids)
             .context("reserve local pane identifiers for ordered remote topology")?;
         let live_panes = mux.iter_panes();
-        let mut local_pane_ids_by_remote = HashMap::with_capacity(live_panes.len());
+        let mut local_pane_ids_by_remote = HashMap::new();
+        local_pane_ids_by_remote
+            .try_reserve(live_panes.len())
+            .context("reserve ordered pane live-pane index")?;
         for pane in live_panes {
             if pane.domain_id() != inner.local_domain_id {
                 continue;
@@ -1651,60 +1878,93 @@ impl ClientDomain {
                 )?;
             }
         }
+        let mut remote_windows_to_forget = HashSet::new();
         {
-            let mut pane_map = lock_or_recover(&inner.remote_to_local_pane, "remote_to_local_pane");
-            pane_map.extend(
-                local_pane_ids_by_remote
-                    .iter()
-                    .map(|(remote, local)| (*remote, *local)),
-            );
+            let mappings =
+                lock_or_recover(&inner.remote_to_local_window, "remote_to_local_window");
+            remote_windows_to_forget
+                .try_reserve(mappings.len())
+                .context("reserve ordered pane stale-window marks")?;
+            remote_windows_to_forget.extend(mappings.keys().copied());
+        }
+        let mut remote_tabs_to_forget = HashSet::new();
+        {
+            let mappings = lock_or_recover(&inner.remote_to_local_tab, "remote_to_local_tab");
+            remote_tabs_to_forget
+                .try_reserve(mappings.len())
+                .context("reserve ordered pane stale-tab marks")?;
+            remote_tabs_to_forget.extend(mappings.keys().copied());
+        }
+        let mut remote_panes_to_forget = HashSet::new();
+        {
+            let mappings = lock_or_recover(&inner.remote_to_local_pane, "remote_to_local_pane");
+            remote_panes_to_forget
+                .try_reserve(mappings.len())
+                .context("reserve ordered pane stale-pane marks")?;
+            remote_panes_to_forget.extend(mappings.keys().copied());
         }
 
-        let mut remote_windows_to_forget: HashSet<WindowId> =
-            lock_or_recover(&inner.remote_to_local_window, "remote_to_local_window")
-                .keys()
-                .copied()
-                .collect();
-        let mut remote_tabs_to_forget: HashSet<TabId> =
-            lock_or_recover(&inner.remote_to_local_tab, "remote_to_local_tab")
-                .keys()
-                .copied()
-                .collect();
-        let mut remote_panes_to_forget: HashSet<PaneId> =
-            lock_or_recover(&inner.remote_to_local_pane, "remote_to_local_pane")
-                .keys()
-                .copied()
-                .collect();
-
-        let (descriptors, mut nodes, _) = panes.into_parts();
+        let (descriptors, mut nodes, window_titles) = panes.into_parts();
         if descriptors.len() != preflight.tabs.len() {
             bail!("ordered pane arena changed descriptor cardinality after preflight");
+        }
+        if window_titles.len() != preflight.window_ids.len() {
+            bail!("ordered pane arena changed window-title cardinality after preflight");
         }
         let mut prepared_tabs = Vec::new();
         prepared_tabs
             .try_reserve_exact(descriptors.len())
             .context("reserve prepared ordered pane tabs")?;
+        let mut pending = PendingPaneArenaPublication::default();
+        pending
+            .new_panes
+            .try_reserve_exact(reserved_local_pane_ids.by_remote_pane.len())
+            .context("reserve pending ordered pane registrations")?;
+        pending
+            .existing_sync
+            .try_reserve_exact(local_pane_ids_by_remote.len())
+            .context("reserve pending ordered pane state updates")?;
+        let mut preparation_scratch = PaneArenaPreparationScratch::default();
         for (descriptor, plan) in descriptors
             .into_iter()
-            .zip(preflight.tabs.into_iter())
+            .zip(preflight.tabs)
             .rev()
         {
-            if usize::try_from(descriptor.node_count).ok() != Some(plan.node_count)
-                || descriptor.tab_title != plan.tab_title
-            {
+            if usize::try_from(descriptor.node_count).ok() != Some(plan.node_count) {
                 bail!("ordered pane arena descriptor changed after preflight");
             }
-            let tree = prepare_pane_tree_from_arena(&mut nodes, plan.node_count, |entry| {
-                resolve_pane_arena_entry(
-                    mux,
-                    &inner,
-                    entry,
-                    &mut remote_panes_to_forget,
-                    &mut local_pane_ids_by_remote,
-                    &mut reserved_local_pane_ids,
+            let mut workspace = None;
+            let tree = prepare_pane_tree_from_arena_with_scratch(
+                &mut nodes,
+                plan.node_count,
+                &mut preparation_scratch,
+                |mut entry| {
+                    if workspace.is_none() {
+                        workspace = Some(std::mem::take(&mut entry.workspace));
+                    }
+                    resolve_pane_arena_entry(
+                        mux,
+                        &inner,
+                        entry,
+                        &mut remote_panes_to_forget,
+                        &mut local_pane_ids_by_remote,
+                        &mut reserved_local_pane_ids,
+                        &mut pending,
+                    )
+                },
+            )?;
+            let workspace = workspace.ok_or_else(|| {
+                anyhow!(
+                    "ordered pane arena tab {} lost its preflighted workspace authority",
+                    plan.remote_tab_id
                 )
             })?;
-            prepared_tabs.push(PreparedPaneArenaTab { plan, tree });
+            prepared_tabs.push(PreparedPaneArenaTab {
+                plan,
+                workspace,
+                tab_title: descriptor.tab_title,
+                tree,
+            });
         }
         if !nodes.is_empty() {
             bail!(
@@ -1712,106 +1972,183 @@ impl ClientDomain {
                 nodes.len()
             );
         }
+        drop(nodes);
+        drop(preparation_scratch);
         prepared_tabs.reverse();
 
+        let mut publication = PaneArenaPublicationRollback::new(mux);
+        publication
+            .pane_registrations
+            .try_reserve_exact(pending.new_panes.len())
+            .context("reserve ordered pane registration rollback authority")?;
+        for (remote_pane_id, pane) in &pending.new_panes {
+            mux.add_pane(pane)
+                .with_context(|| format!("register remote pane {remote_pane_id} in mux"))?;
+            let registration = mux.capture_pane_registration(pane).ok_or_else(|| {
+                anyhow!(
+                    "remote pane {remote_pane_id} was published without exact rollback authority"
+                )
+            })?;
+            publication.pane_registrations.push(registration);
+        }
+
+        let mut local_tabs_by_remote = HashMap::new();
+        local_tabs_by_remote
+            .try_reserve(prepared_tabs.len())
+            .context("reserve ordered pane staged tab identities")?;
+        let mut staged_tabs = Vec::new();
+        staged_tabs
+            .try_reserve_exact(prepared_tabs.len())
+            .context("reserve ordered pane staged tabs")?;
+        let existing_tab_mappings = {
+            let mappings = lock_or_recover(&inner.remote_to_local_tab, "remote_to_local_tab");
+            let mut snapshot = HashMap::new();
+            snapshot
+                .try_reserve(mappings.len())
+                .context("reserve ordered pane existing tab mappings")?;
+            snapshot.extend(mappings.iter().map(|(remote, local)| (*remote, *local)));
+            snapshot
+        };
+        publication
+            .new_tabs
+            .try_reserve_exact(prepared_tabs.len())
+            .context("reserve ordered pane tab rollback authority")?;
         for prepared in prepared_tabs {
-            let PreparedPaneArenaTab { plan, tree } = prepared;
+            let remote_tab_id = prepared.plan.remote_tab_id;
+            let tab = existing_tab_mappings
+                .get(&remote_tab_id)
+                .copied()
+                .and_then(|local_tab_id| mux.get_tab(local_tab_id))
+                .unwrap_or_else(|| Arc::new(Tab::new(&prepared.plan.root_size)));
+            if mux.get_tab(tab.tab_id()).is_none() {
+                mux.add_tab_no_panes(&tab).with_context(|| {
+                    format!("stage ordered remote tab {remote_tab_id} in mux")
+                })?;
+                publication.new_tabs.push(Arc::clone(&tab));
+            }
+            local_tabs_by_remote.insert(remote_tab_id, Arc::clone(&tab));
+            staged_tabs.push(StagedPaneArenaTab { prepared, tab });
+        }
+
+        let mut local_windows_by_remote = HashMap::new();
+        local_windows_by_remote
+            .try_reserve(preflight.window_ids.len())
+            .context("reserve ordered pane staged window identities")?;
+        let existing_window_mappings = {
+            let mappings =
+                lock_or_recover(&inner.remote_to_local_window, "remote_to_local_window");
+            let mut snapshot = Vec::new();
+            snapshot
+                .try_reserve_exact(mappings.len())
+                .context("reserve ordered pane existing window mappings")?;
+            snapshot.extend(mappings.iter().map(|(remote, local)| (*remote, *local)));
+            snapshot
+        };
+        for (remote_window_id, local_window_id) in existing_window_mappings {
+            if mux.get_window(local_window_id).is_some() {
+                local_windows_by_remote.insert(remote_window_id, local_window_id);
+            }
+        }
+        let mut attached_tabs = HashSet::new();
+        attached_tabs
+            .try_reserve(existing_tab_mappings.len().saturating_add(staged_tabs.len()))
+            .context("reserve ordered pane attachment index")?;
+        for &local_window_id in local_windows_by_remote.values() {
+            let window = mux.get_window(local_window_id).ok_or_else(|| {
+                anyhow!(
+                    "local window {local_window_id} disappeared while indexing ordered \
+                     attachments"
+                )
+            })?;
+            attached_tabs.extend(
+                window
+                    .iter()
+                    .map(|attached_tab| (local_window_id, attached_tab.tab_id())),
+            );
+        }
+
+        for staged in &mut staged_tabs {
+            let plan = &staged.prepared.plan;
             remote_windows_to_forget.remove(&plan.remote_window_id);
             remote_tabs_to_forget.remove(&plan.remote_tab_id);
 
-            let tab = if let Some(local_tab_id) =
-                inner.remote_to_local_tab_id(plan.remote_tab_id)
+            if let Some(local_window_id) = local_windows_by_remote
+                .get(&plan.remote_window_id)
+                .copied()
             {
-                match mux.get_tab(local_tab_id) {
-                    Some(tab) => tab,
-                    None => {
-                        inner.remove_old_tab_mapping(plan.remote_tab_id);
-                        let tab = Arc::new(Tab::new(&plan.root_size));
-                        mux.add_tab_no_panes(&tab)?;
-                        inner.record_remote_to_local_tab_mapping(
-                            plan.remote_tab_id,
-                            tab.tab_id(),
-                        );
-                        tab
-                    }
-                }
-            } else {
-                let tab = Arc::new(Tab::new(&plan.root_size));
-                mux.add_tab_no_panes(&tab)?;
-                inner.record_remote_to_local_tab_mapping(plan.remote_tab_id, tab.tab_id());
-                tab
-            };
-
-            mux.set_tab_title(tab.tab_id(), &plan.tab_title);
-            tab.sync_with_prepared_pane_tree(plan.root_size, tree);
-
-            if let Some(local_window_id) =
-                inner.remote_to_local_window(plan.remote_window_id)
-            {
-                let needs_attach = mux.get_window(local_window_id).map(|window| {
-                    window
-                        .iter()
-                        .all(|candidate| !Arc::ptr_eq(candidate, &tab))
-                });
-                if let Some(needs_attach) = needs_attach {
-                    if needs_attach {
-                        mux.add_tab_to_window(&tab, local_window_id).with_context(|| {
+                if attached_tabs.insert((local_window_id, staged.tab.tab_id())) {
+                    mux.add_tab_to_window(&staged.tab, local_window_id)
+                        .with_context(|| {
                             format!(
                                 "attach ordered remote tab {} to existing local window {}",
                                 plan.remote_tab_id, local_window_id
                             )
                         })?;
-                    }
-                    continue;
                 }
-                lock_or_recover(&inner.remote_to_local_window, "remote_to_local_window")
-                    .remove(&plan.remote_window_id);
+                continue;
             }
 
-            if let Some(local_window_id) = primary_window_id {
-                enum PrimaryWindow {
-                    Reuse,
-                    WorkspaceMismatch,
-                    Disappeared,
-                }
-                let decision = match mux.get_window(local_window_id) {
-                    Some(window) if window.get_workspace() == plan.workspace.as_str() => {
-                        PrimaryWindow::Reuse
-                    }
-                    Some(_) => PrimaryWindow::WorkspaceMismatch,
-                    None => PrimaryWindow::Disappeared,
-                };
-                match decision {
-                    PrimaryWindow::Reuse => {
-                        inner.record_remote_to_local_window_mapping(
-                            plan.remote_window_id,
-                            local_window_id,
-                        );
-                        mux.add_tab_to_window(&tab, local_window_id)?;
-                        primary_window_id.take();
-                        continue;
-                    }
-                    PrimaryWindow::WorkspaceMismatch => {}
-                    PrimaryWindow::Disappeared => {
-                        primary_window_id.take();
-                    }
-                }
-            }
-
-            let local_window_id =
-                mux.new_empty_window(Some(plan.workspace.clone()), None);
-            inner.record_remote_to_local_window_mapping(
-                plan.remote_window_id,
-                *local_window_id,
+            let local_window_id = *mux.new_empty_window(
+                Some(std::mem::take(&mut staged.prepared.workspace)),
+                None,
             );
-            mux.add_tab_to_window(&tab, *local_window_id)?;
+            local_windows_by_remote.insert(plan.remote_window_id, local_window_id);
+            mux.add_tab_to_window(&staged.tab, local_window_id)
+                .with_context(|| {
+                    format!(
+                        "attach ordered remote tab {} to staged local window {}",
+                        plan.remote_tab_id, local_window_id
+                    )
+                })?;
+            attached_tabs.insert((local_window_id, staged.tab.tab_id()));
         }
 
-        for (remote_window_id, window_title) in preflight.window_titles {
+        for StagedPaneArenaTab { prepared, tab } in staged_tabs {
+            mux.set_tab_title(tab.tab_id(), &prepared.tab_title);
+            tab.sync_with_prepared_pane_tree(prepared.plan.root_size, prepared.tree);
+        }
+
+        for (pane, alt_screen_active) in pending.existing_sync {
+            if let Some(client_pane) = pane.downcast_ref::<ClientPane>() {
+                client_pane.sync_remote_listing_state(alt_screen_active);
+            }
+        }
+        {
+            let mut pane_mappings =
+                lock_or_recover(&inner.remote_to_local_pane, "remote_to_local_pane");
+            pane_mappings.extend(
+                local_pane_ids_by_remote
+                    .iter()
+                    .map(|(remote, local)| (*remote, *local)),
+            );
+        }
+        {
+            let mut tab_mappings =
+                lock_or_recover(&inner.remote_to_local_tab, "remote_to_local_tab");
+            tab_mappings.extend(
+                local_tabs_by_remote
+                    .iter()
+                    .map(|(remote, tab)| (*remote, tab.tab_id())),
+            );
+        }
+        {
+            let mut window_mappings =
+                lock_or_recover(&inner.remote_to_local_window, "remote_to_local_window");
+            window_mappings.extend(
+                local_windows_by_remote
+                    .iter()
+                    .map(|(remote, local)| (*remote, *local)),
+            );
+        }
+        publication.commit();
+
+        for (window_title, remote_window_id) in
+            window_titles.into_iter().zip(preflight.window_ids)
+        {
             remote_windows_to_forget.remove(&remote_window_id);
             if let Some(local_window_id) = inner.remote_to_local_window(remote_window_id) {
                 if let Some(mut window) = mux.get_window_mut(local_window_id) {
-                    window.set_title(&window_title);
+                    window.set_title(&window_title.title);
                 } else {
                     lock_or_recover(&inner.remote_to_local_window, "remote_to_local_window")
                         .remove(&remote_window_id);
@@ -2954,6 +3291,93 @@ mod tests {
     }
 
     #[test]
+    fn direct_pane_arena_application_preserves_split_shape_and_focus() {
+        let scope = MuxTestScope::enter();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let inner = test_client_inner(91_008);
+        let mut listing = sample_remote_tab_listing();
+        let PaneNode::Leaf(mut left) = listing
+            .tabs
+            .pop()
+            .expect("sample listing must contain one leaf")
+        else {
+            panic!("sample listing root must be a leaf");
+        };
+        let mut right = left.clone();
+        left.pane_id = 61;
+        left.is_active_pane = true;
+        left.is_zoomed_pane = false;
+        right.pane_id = 62;
+        right.title = "remote shell 62".to_string();
+        right.is_active_pane = false;
+        right.is_zoomed_pane = true;
+        let split = mux::tab::SplitDirectionAndSize {
+            direction: mux::tab::SplitDirection::Horizontal,
+            first: left.size,
+            second: right.size,
+        };
+        listing.tabs.push(PaneNode::Split {
+            left: Box::new(PaneNode::Leaf(left)),
+            right: Box::new(PaneNode::Leaf(right)),
+            node: split,
+        });
+
+        ClientDomain::process_pane_arena(
+            &mux,
+            Arc::clone(&inner),
+            codec::ordered_pane_arena_from_list_panes(listing)
+                .expect("split listing must flatten into a canonical pane arena"),
+            None,
+        )
+        .expect("direct flat arena application should preserve a split tree");
+
+        let local_tab_id = inner
+            .remote_to_local_tab_id(51)
+            .expect("remote split tab should map locally");
+        let tab = mux
+            .get_tab(local_tab_id)
+            .expect("mapped split tab must exist");
+        let panes = tab.iter_panes_ignoring_zoom();
+        assert_eq!(panes.len(), 2);
+        assert_eq!(tab.iter_splits().len(), 1);
+        assert_eq!(tab.iter_splits()[0].direction, split.direction);
+        assert_eq!(
+            tab.get_active_idx(),
+            0,
+            "left pane remains the base active pane"
+        );
+        assert_eq!(
+            panes
+                .iter()
+                .map(|pane| {
+                    inner
+                        .local_to_remote_pane(pane.pane.pane_id())
+                        .expect("every split pane must retain its remote identity")
+                })
+                .collect::<Vec<_>>(),
+            vec![61, 62]
+        );
+        assert_eq!(
+            inner.local_to_remote_pane(
+                tab.get_active_pane()
+                    .expect("zoomed split pane must be publicly active")
+                    .pane_id()
+            ),
+            Some(62),
+            "the zoomed pane must retain public focus semantics"
+        );
+        assert_eq!(
+            inner.local_to_remote_pane(
+                tab.get_zoomed_pane()
+                    .expect("split pane must retain zoom authority")
+                    .pane_id()
+            ),
+            Some(62)
+        );
+    }
+
+    #[test]
     fn direct_pane_arena_rejects_reorder_before_tree_mutation() {
         let scope = MuxTestScope::enter();
         let mux = Arc::new(Mux::new(None));
@@ -3003,6 +3427,173 @@ mod tests {
     }
 
     #[test]
+    fn direct_pane_arena_rejects_remote_pane_migration_before_mutation() {
+        let scope = MuxTestScope::enter();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let inner = test_client_inner(91_009);
+
+        ClientDomain::process_pane_arena(
+            &mux,
+            Arc::clone(&inner),
+            sample_remote_pane_arena(&[(51, 61)]),
+            None,
+        )
+        .expect("initial direct flat arena application should attach");
+        let local_tab_id = inner
+            .remote_to_local_tab_id(51)
+            .expect("initial remote tab should map locally");
+        let local_pane_id = inner
+            .remote_to_local_pane_id(&mux, 61)
+            .expect("initial remote pane should map locally");
+
+        let error = ClientDomain::process_pane_arena(
+            &mux,
+            Arc::clone(&inner),
+            sample_remote_pane_arena(&[(52, 61)]),
+            None,
+        )
+        .expect_err("moving a live remote pane between tabs must fail before mutation");
+        assert!(
+            error.to_string().contains("atomic pane migration is required"),
+            "unexpected error: {error:#}",
+        );
+        assert_eq!(inner.remote_to_local_tab_id(51), Some(local_tab_id));
+        assert_eq!(inner.remote_to_local_tab_id(52), None);
+        assert_eq!(inner.remote_to_local_pane_id(&mux, 61), Some(local_pane_id));
+        assert_eq!(mux.iter_panes().len(), 1);
+        assert_eq!(mux.iter_windows().len(), 1);
+    }
+
+    #[test]
+    fn direct_pane_arena_rejects_aliased_tab_mappings_before_mutation() {
+        let scope = MuxTestScope::enter();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let inner = test_client_inner(91_010);
+        let snapshot = sample_remote_pane_arena(&[(51, 61), (52, 62)]);
+
+        ClientDomain::process_pane_arena(&mux, Arc::clone(&inner), snapshot.clone(), None)
+            .expect("initial direct flat arena application should attach");
+        let first_local_tab = inner
+            .remote_to_local_tab_id(51)
+            .expect("first remote tab should map locally");
+        lock_or_recover(&inner.remote_to_local_tab, "remote_to_local_tab")
+            .insert(52, first_local_tab);
+
+        let error = ClientDomain::process_pane_arena(
+            &mux,
+            Arc::clone(&inner),
+            snapshot,
+            None,
+        )
+        .expect_err("aliased remote tab mappings must fail before mutation");
+        assert!(
+            error.to_string().contains("mappings alias remote tabs"),
+            "unexpected error: {error:#}",
+        );
+        assert_eq!(mux.iter_panes().len(), 2);
+        assert_eq!(mux.iter_windows().len(), 1);
+    }
+
+    #[test]
+    fn direct_pane_arena_rejects_foreign_tab_and_window_mappings() {
+        let scope = MuxTestScope::enter();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let owner = test_client_inner(91_012);
+        let foreign = test_client_inner(91_013);
+        let snapshot = sample_remote_pane_arena(&[(51, 61)]);
+
+        ClientDomain::process_pane_arena(&mux, Arc::clone(&owner), snapshot.clone(), None)
+            .expect("owner should establish the initial direct mirror");
+        let owner_tab = owner
+            .remote_to_local_tab_id(51)
+            .expect("owner tab should map locally");
+        let owner_window = owner
+            .remote_to_local_window(41)
+            .expect("owner window should map locally");
+        lock_or_recover(&foreign.remote_to_local_tab, "remote_to_local_tab")
+            .insert(51, owner_tab);
+        lock_or_recover(&foreign.remote_to_local_window, "remote_to_local_window")
+            .insert(41, owner_window);
+
+        let error = ClientDomain::process_pane_arena(
+            &mux,
+            Arc::clone(&foreign),
+            snapshot,
+            None,
+        )
+        .expect_err("foreign live topology mappings must fail before mutation");
+        assert!(
+            error
+                .to_string()
+                .contains("does not belong exactly to this client"),
+            "unexpected error: {error:#}",
+        );
+        assert_eq!(owner.remote_to_local_tab_id(51), Some(owner_tab));
+        assert_eq!(owner.remote_to_local_window(41), Some(owner_window));
+        assert_eq!(mux.iter_panes().len(), 1);
+        assert_eq!(mux.iter_windows().len(), 1);
+    }
+
+    #[test]
+    fn direct_pane_arena_rejects_stale_topology_removal_before_mutation() {
+        let scope = MuxTestScope::enter();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let inner = test_client_inner(91_014);
+
+        ClientDomain::process_pane_arena(
+            &mux,
+            Arc::clone(&inner),
+            sample_remote_pane_arena(&[(51, 61), (52, 62)]),
+            None,
+        )
+        .expect("initial direct flat arena application should attach");
+        let error = ClientDomain::process_pane_arena(
+            &mux,
+            Arc::clone(&inner),
+            sample_remote_pane_arena(&[(51, 61)]),
+            None,
+        )
+        .expect_err("removing live stale topology requires an atomic reconciliation path");
+        assert!(
+            error.to_string().contains("atomic stale-pane removal is required"),
+            "unexpected error: {error:#}",
+        );
+        assert!(inner.remote_to_local_tab_id(51).is_some());
+        assert!(inner.remote_to_local_tab_id(52).is_some());
+        assert_eq!(mux.iter_panes().len(), 2);
+        assert_eq!(mux.iter_windows().len(), 1);
+    }
+
+    #[test]
+    fn direct_pane_arena_rejects_reserved_window_title_before_mutation() {
+        let scope = MuxTestScope::enter();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let inner = test_client_inner(91_011);
+        let (trees, nodes, mut window_titles) =
+            sample_remote_pane_arena(&[(51, 61)]).into_parts();
+        window_titles[0].window_id = u64::MAX;
+
+        let error = ClientDomain::process_pane_arena(
+            &mux,
+            Arc::clone(&inner),
+            PaneArena::from_unvalidated_parts(trees, nodes, window_titles),
+            None,
+        )
+        .expect_err("reserved terminal identities must fail before mutation");
+        assert!(
+            format!("{error:#}").contains("reserved value"),
+            "unexpected error: {error:#}",
+        );
+        assert!(mux.iter_panes().is_empty());
+        assert!(mux.iter_windows().is_empty());
+    }
+
+    #[test]
     fn direct_pane_arena_rejects_new_empty_window_before_tree_mutation() {
         let scope = MuxTestScope::enter();
         let mux = Arc::new(Mux::new(None));
@@ -3026,7 +3617,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("creating an empty window requires ordered workspace authority"),
+                .contains("requires exact ordered workspace and client ownership authority"),
             "unexpected error: {error:#}",
         );
         assert!(mux.iter_panes().is_empty());
@@ -3036,6 +3627,55 @@ mod tests {
         );
         assert!(lock_or_recover(&inner.remote_to_local_tab, "remote_to_local_tab").is_empty());
         assert!(lock_or_recover(&inner.remote_to_local_pane, "remote_to_local_pane").is_empty());
+    }
+
+    #[test]
+    fn direct_pane_arena_rejects_title_only_foreign_window_mapping() {
+        let scope = MuxTestScope::enter();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let inner = test_client_inner(91_015);
+
+        ClientDomain::process_pane_arena(
+            &mux,
+            Arc::clone(&inner),
+            sample_remote_pane_arena(&[(51, 61)]),
+            None,
+        )
+        .expect("initial direct flat arena application should attach");
+        let local_window_id = inner
+            .remote_to_local_window(41)
+            .expect("initial remote window should map locally");
+        lock_or_recover(&inner.remote_to_local_window, "remote_to_local_window")
+            .insert(42, local_window_id);
+
+        let (trees, nodes, mut window_titles) =
+            sample_remote_pane_arena(&[(51, 61)]).into_parts();
+        window_titles.push(mux::tab::PaneArenaWindowTitle {
+            window_id: 42,
+            title: "must not replace owned title".to_string(),
+        });
+        let error = ClientDomain::process_pane_arena(
+            &mux,
+            Arc::clone(&inner),
+            PaneArena::from_unvalidated_parts(trees, nodes, window_titles),
+            None,
+        )
+        .expect_err("title-only mappings must not confer window ownership");
+        assert!(
+            error
+                .to_string()
+                .contains("requires exact ordered workspace and client ownership authority"),
+            "unexpected error: {error:#}",
+        );
+        assert_eq!(
+            mux.get_window(local_window_id)
+                .expect("owned window must survive rejection")
+                .get_title(),
+            "ops window"
+        );
+        assert_eq!(mux.iter_windows().len(), 1);
+        assert_eq!(mux.iter_panes().len(), 1);
     }
 
     #[test]
