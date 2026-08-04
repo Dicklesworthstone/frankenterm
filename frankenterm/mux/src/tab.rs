@@ -1233,6 +1233,27 @@ pub struct PreparedPaneTree {
     zoomed: Option<Arc<dyn Pane>>,
 }
 
+/// Deterministic work and allocation-growth accounting for direct pane-arena
+/// application.
+///
+/// `required_final_tree_box_allocations` counts the two owned children that
+/// are intrinsic to each final mux split. It deliberately excludes pane
+/// implementation allocations performed by the caller's `make_pane` callback.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PaneArenaPreparationStats {
+    pub trees_started: usize,
+    pub trees_completed: usize,
+    pub validation_node_visits: usize,
+    pub application_node_visits: usize,
+    pub leaf_resolutions: usize,
+    pub split_materializations: usize,
+    pub required_final_tree_box_allocations: usize,
+    pub validation_stack_growth_events: usize,
+    pub application_stack_growth_events: usize,
+    pub peak_validation_stack_entries: usize,
+    pub peak_application_stack_entries: usize,
+}
+
 /// Reusable fallible work storage for direct pane-arena preparation.
 ///
 /// A connection should retain one instance while consuming all tab ranges in
@@ -1242,6 +1263,68 @@ pub struct PreparedPaneTree {
 pub struct PaneArenaPreparationScratch {
     validation: Vec<usize>,
     application: Vec<(usize, Tree)>,
+    stats: PaneArenaPreparationStats,
+}
+
+impl PaneArenaPreparationScratch {
+    /// Cumulative accounting since construction or the last explicit reset.
+    pub const fn stats(&self) -> PaneArenaPreparationStats {
+        self.stats
+    }
+
+    /// Reset counters without discarding reusable stack allocations.
+    pub fn reset_stats(&mut self) {
+        self.stats = PaneArenaPreparationStats::default();
+    }
+
+    /// Bytes requested by the two retained stack buffers, excluding allocator
+    /// metadata and any allocator-specific size-class rounding.
+    pub fn requested_retained_storage_bytes(&self) -> Option<usize> {
+        self.validation
+            .capacity()
+            .checked_mul(std::mem::size_of::<usize>())?
+            .checked_add(
+                self.application
+                    .capacity()
+                    .checked_mul(std::mem::size_of::<(usize, Tree)>())?,
+            )
+    }
+
+    /// Release reusable stack storage at a connection-terminal or quarantine
+    /// boundary. Ordinary successful snapshots should keep the buffers for
+    /// reuse; terminal paths should not retain their high-water capacity.
+    pub fn release_retained_storage(&mut self) {
+        self.validation.clear();
+        self.application.clear();
+        self.validation.shrink_to_fit();
+        self.application.shrink_to_fit();
+    }
+}
+
+fn reserve_pane_arena_stack_push<T>(
+    stack: &mut Vec<T>,
+    additional_entries: usize,
+    maximum_entries: usize,
+    label: &str,
+) -> anyhow::Result<bool> {
+    let required = stack
+        .len()
+        .checked_add(additional_entries)
+        .ok_or_else(|| anyhow::anyhow!("{label} length overflows usize"))?;
+    if required > maximum_entries {
+        anyhow::bail!(
+            "{label} requires {required} entries for a {maximum_entries}-node pane arena"
+        );
+    }
+    if required <= stack.capacity() {
+        return Ok(false);
+    }
+    let geometric = stack.capacity().max(4).saturating_mul(2);
+    let target_capacity = required.max(geometric).min(maximum_entries);
+    stack
+        .try_reserve_exact(target_capacity.saturating_sub(stack.len()))
+        .map_err(|error| anyhow::anyhow!("reserve {label}: {error}"))?;
+    Ok(true)
 }
 
 /// Consume one validated contiguous preorder range directly into the final
@@ -1279,7 +1362,9 @@ where
 {
     scratch.validation.clear();
     scratch.application.clear();
+    scratch.stats.trees_started = scratch.stats.trees_started.saturating_add(1);
     if node_count == 0 {
+        scratch.stats.trees_completed = scratch.stats.trees_completed.saturating_add(1);
         return Ok(PreparedPaneTree {
             tree: Tree::Empty,
             active: None,
@@ -1298,15 +1383,25 @@ where
     // from causing a partial topology mutation even though the codec normally
     // supplies already-validated arenas.
     let validation = &mut scratch.validation;
-    validation
-        .try_reserve_exact(node_count.div_ceil(2))
-        .map_err(|error| anyhow::anyhow!("reserve pane arena validation stack: {error}"))?;
+    if reserve_pane_arena_stack_push(validation, 1, node_count, "pane arena validation stack")?
+    {
+        scratch.stats.validation_stack_growth_events = scratch
+            .stats
+            .validation_stack_growth_events
+            .saturating_add(1);
+    }
     validation.push(arena_start);
+    scratch.stats.peak_validation_stack_entries = scratch
+        .stats
+        .peak_validation_stack_entries
+        .max(validation.len());
     let mut expected = arena_start;
     let mut leaf_count = 0usize;
     let mut active_count = 0usize;
     let mut zoomed_count = 0usize;
     while let Some(node_index) = validation.pop() {
+        scratch.stats.validation_node_visits =
+            scratch.stats.validation_node_visits.saturating_add(1);
         if node_index != expected || node_index >= arena_end {
             anyhow::bail!(
                 "pane arena node {node_index} violates contiguous preorder at {expected}"
@@ -1345,8 +1440,23 @@ where
                          ({left_index}, {right_index}) for range {arena_start}..{arena_end}"
                     );
                 }
+                if reserve_pane_arena_stack_push(
+                    validation,
+                    2,
+                    node_count,
+                    "pane arena validation stack",
+                )? {
+                    scratch.stats.validation_stack_growth_events = scratch
+                        .stats
+                        .validation_stack_growth_events
+                        .saturating_add(1);
+                }
                 validation.push(right_index);
                 validation.push(left_index);
+                scratch.stats.peak_validation_stack_entries = scratch
+                    .stats
+                    .peak_validation_stack_entries
+                    .max(validation.len());
             }
         }
     }
@@ -1363,18 +1473,30 @@ where
     }
 
     let stack = &mut scratch.application;
-    stack
-        .try_reserve_exact(node_count.div_ceil(2))
-        .map_err(|error| anyhow::anyhow!("reserve pane arena application stack: {error}"))?;
     let mut active = None;
     let mut zoomed = None;
 
     for (offset, node) in arena.drain(arena_start..).enumerate().rev() {
+        scratch.stats.application_node_visits =
+            scratch.stats.application_node_visits.saturating_add(1);
         let node_index = arena_start
             .checked_add(offset)
             .ok_or_else(|| anyhow::anyhow!("pane arena node index overflows usize"))?;
         match node {
-            PaneArenaNode::Empty => stack.push((node_index, Tree::Empty)),
+            PaneArenaNode::Empty => {
+                if reserve_pane_arena_stack_push(
+                    stack,
+                    1,
+                    node_count,
+                    "pane arena application stack",
+                )? {
+                    scratch.stats.application_stack_growth_events = scratch
+                        .stats
+                        .application_stack_growth_events
+                        .saturating_add(1);
+                }
+                stack.push((node_index, Tree::Empty));
+            }
             PaneArenaNode::Leaf(entry) => {
                 let is_zoomed_pane = entry.is_zoomed_pane;
                 let is_active_pane = entry.is_active_pane;
@@ -1385,7 +1507,20 @@ where
                 if is_active_pane {
                     active.replace(Arc::clone(&pane));
                 }
+                if reserve_pane_arena_stack_push(
+                    stack,
+                    1,
+                    node_count,
+                    "pane arena application stack",
+                )? {
+                    scratch.stats.application_stack_growth_events = scratch
+                        .stats
+                        .application_stack_growth_events
+                        .saturating_add(1);
+                }
                 stack.push((node_index, Tree::Leaf(pane)));
+                scratch.stats.leaf_resolutions =
+                    scratch.stats.leaf_resolutions.saturating_add(1);
             }
             PaneArenaNode::Split {
                 left,
@@ -1420,6 +1555,17 @@ where
                          {right_index}) but produced ({actual_left}, {actual_right})"
                     );
                 }
+                if reserve_pane_arena_stack_push(
+                    stack,
+                    1,
+                    node_count,
+                    "pane arena application stack",
+                )? {
+                    scratch.stats.application_stack_growth_events = scratch
+                        .stats
+                        .application_stack_growth_events
+                        .saturating_add(1);
+                }
                 stack.push((
                     node_index,
                     Tree::Node {
@@ -1428,8 +1574,18 @@ where
                         data: Some(node),
                     },
                 ));
+                scratch.stats.split_materializations =
+                    scratch.stats.split_materializations.saturating_add(1);
+                scratch.stats.required_final_tree_box_allocations = scratch
+                    .stats
+                    .required_final_tree_box_allocations
+                    .saturating_add(2);
             }
         }
+        scratch.stats.peak_application_stack_entries = scratch
+            .stats
+            .peak_application_stack_entries
+            .max(stack.len());
     }
 
     if stack.len() != 1 {
@@ -1446,6 +1602,7 @@ where
             "pane arena application produced root {root_index}, expected {arena_start}"
         );
     }
+    scratch.stats.trees_completed = scratch.stats.trees_completed.saturating_add(1);
     Ok(PreparedPaneTree {
         tree,
         active,
