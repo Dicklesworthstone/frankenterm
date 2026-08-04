@@ -2243,16 +2243,24 @@ fn collect_ordered_list_panes_snapshot_with_stage_observer(
             );
         }
 
-        let mut tabs = Vec::with_capacity(total_tabs);
-        let mut tab_titles = Vec::with_capacity(total_tabs);
-        let mut window_titles = HashMap::with_capacity(frozen_windows.len());
-        for frozen in &frozen_windows {
+        let mut pane_trees = Vec::with_capacity(total_tabs);
+        let mut pane_nodes = Vec::new();
+        let mut pane_window_titles = Vec::with_capacity(frozen_windows.len());
+        for (frozen, ordered_window) in frozen_windows.iter().zip(&ordered_windows) {
             let window_id = frozen.order.window_id();
-            window_titles.insert(window_id, frozen.title.clone());
+            pane_window_titles.push(mux::tab::PaneArenaWindowTitle {
+                window_id: ordered_window.window_id.get(),
+                title: frozen.title.clone(),
+            });
             for tab in frozen.order.ordered_tabs() {
-                tabs.push(tab.codec_pane_tree_in_window(window_id, &frozen.workspace)?);
+                pane_trees.push(tab.append_codec_pane_arena_in_window(
+                    window_id,
+                    &frozen.workspace,
+                    &mut pane_nodes,
+                    codec::MAX_ORDERED_PANE_TREE_DEPTH,
+                    codec::MAX_ORDERED_PANE_NODES_PER_SNAPSHOT,
+                )?);
                 observer(ListPanesSnapshotStage::TabTreeCaptured);
-                tab_titles.push(tab.get_title());
             }
         }
         observer(ListPanesSnapshotStage::TitlesCaptured);
@@ -2270,12 +2278,11 @@ fn collect_ordered_list_panes_snapshot_with_stage_observer(
             ));
         }
         if before_revision == after_revision {
-            let panes = codec::ordered_pane_arena_from_list_panes(ListPanesResponse {
-                tabs,
-                tab_titles,
-                window_titles,
-            })
-            .context("converting the stable PDU87 pane projection into its mux arena")?;
+            let panes = mux::tab::PaneArena::from_unvalidated_parts(
+                pane_trees,
+                pane_nodes,
+                pane_window_titles,
+            );
             let snapshot = codec::OrderedPaneSnapshotV1 {
                 session_incarnation: after_session,
                 topology_revision: after_revision,
