@@ -14486,7 +14486,10 @@ mod tests {
         Mux::shutdown();
 
         let mux = Arc::new(Mux::new(None));
-        Mux::set_mux(&mux);
+        // `reorder_window_tabs` is exact-owner API and must not depend on the
+        // mutable process singleton. Keeping this fixture local also prevents
+        // an unrelated deferred global task in the parallel suite from
+        // advancing this mux's topology authority.
         let window_builder = mux.new_empty_window(Some("authoritative-order".to_string()), None);
         let window_id = *window_builder;
         let first = Arc::new(Tab::new(&test_size()));
@@ -14667,7 +14670,8 @@ mod tests {
         Mux::shutdown();
 
         let mux = Arc::new(Mux::new(None));
-        Mux::set_mux(&mux);
+        // Keep the exact-owner authority under test isolated from deferred
+        // tasks belonging to the process-global mux used by other tests.
         let window_builder = mux.new_empty_window(Some("order-conflicts".to_string()), None);
         let other_builder = mux.new_empty_window(Some("order-conflicts".to_string()), None);
         let window_id = *window_builder;
