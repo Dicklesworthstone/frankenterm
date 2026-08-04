@@ -866,14 +866,23 @@ fn capture_pane_arena_tree(
             "ordered pane arena already has {arena_start} nodes, above limit {max_total_nodes}"
         )
     })?;
+    if remaining == 0 {
+        anyhow::bail!("ordered pane arena exceeds total node limit {max_total_nodes}");
+    }
     let mut captured = Vec::new();
     captured
         .try_reserve_exact(remaining.min(64))
         .map_err(|error| anyhow::anyhow!("reserve callback-free pane capture: {error}"))?;
     let mut tasks = Vec::new();
     tasks
-        .try_reserve_exact(max_depth.saturating_mul(2).min(256))
+        .try_reserve_exact(max_depth.saturating_mul(2).min(256).min(remaining))
         .map_err(|error| anyhow::anyhow!("reserve callback-free pane traversal: {error}"))?;
+    reserve_pane_arena_stack_push(
+        &mut tasks,
+        1,
+        remaining,
+        "callback-free pane traversal",
+    )?;
     tasks.push(CapturePaneArenaTask::Visit {
         tree,
         depth: 1,
@@ -899,6 +908,12 @@ fn capture_pane_arena_tree(
                         "ordered pane arena exceeds total node limit {max_total_nodes}"
                     );
                 }
+                reserve_pane_arena_stack_push(
+                    &mut captured,
+                    1,
+                    remaining,
+                    "callback-free pane capture",
+                )?;
                 match tree {
                     Tree::Empty => captured.push(CapturedPaneArenaNode::Empty),
                     Tree::Leaf(pane) => {
@@ -949,6 +964,12 @@ fn capture_pane_arena_tree(
                         let next_depth = depth.checked_add(1).ok_or_else(|| {
                             anyhow::anyhow!("ordered pane arena depth overflows usize")
                         })?;
+                        reserve_pane_arena_stack_push(
+                            &mut tasks,
+                            2,
+                            remaining,
+                            "callback-free pane traversal",
+                        )?;
                         tasks.push(CapturePaneArenaTask::VisitRight {
                             split_index,
                             tree: right,
@@ -983,6 +1004,12 @@ fn capture_pane_arena_tree(
                     );
                 };
                 *split_right = right;
+                reserve_pane_arena_stack_push(
+                    &mut tasks,
+                    1,
+                    remaining,
+                    "callback-free pane traversal",
+                )?;
                 tasks.push(CapturePaneArenaTask::Visit {
                     tree,
                     depth,
