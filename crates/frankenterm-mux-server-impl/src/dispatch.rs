@@ -62,13 +62,24 @@ const TOPOLOGY_PROTOCOL_FAILURE: &str =
 const TOPOLOGY_BUFFER_OVERFLOW: &str =
     "mux topology fence exceeded its retained event or byte bound";
 const OUTBOUND_BUDGET_OVERFLOW: &str =
-    "mux outbound delivery exceeded its retained topology or slot bound";
+    "mux outbound delivery exceeded its retained-memory or slot bound";
 const TOPOLOGY_REVISION_EXHAUSTED: &str =
     "mux topology revision authority is exhausted";
 const DORMANT_OUTBOUND_PROTOCOL_FAILURE: &str =
     "mux server attempted to emit a protocol family without live activation authority";
+const OUTBOUND_WIRE_AUTHORITY_FAILURE: &str =
+    "mux server attempted to emit a protocol family with the wrong wire role";
 const TOPOLOGY_FENCE_MAX_EVENTS: usize = 4096;
 const TOPOLOGY_FENCE_MAX_RETAINED_BYTES: usize = 4 * 1024 * 1024;
+/// Accounted topology values retain their original 4 MiB connection ceiling;
+/// an ordered snapshot has a separate complete-frame ceiling. Their aggregate
+/// permits one maximum snapshot to coexist with the separately bounded
+/// successor queue, while each class remains unable to borrow the other's
+/// tranche. Typed-to-encoded overlap is charged to the same class and fails
+/// closed if it would exceed that class ceiling.
+const OUTBOUND_ACCOUNTED_MAX_RETAINED_BYTES: usize =
+    codec::MAX_LIST_PANES_ORDERED_V1_RESPONSE_FRAME_BYTES
+        + TOPOLOGY_FENCE_MAX_RETAINED_BYTES;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct TopologyRetentionLimits {
@@ -123,29 +134,104 @@ enum ServerEmissionAuthority {
 }
 
 impl ServerEmissionAuthority {
+    #[cfg(test)]
     fn permits(self, pdu: &Pdu, serial: u64) -> bool {
-        match (self, pdu) {
-            (Self::OrderedSnapshotFence, Pdu::ListPanesOrderedV1Response(_)) => serial != 0,
-            (Self::OrderedStreamEvent, Pdu::WindowOrderEventV1(_)) => serial == 0,
-            _ => false,
+        pdu.wire_spec()
+            .is_some_and(|spec| self.permits_wire(spec, serial))
+    }
+
+    fn permits_wire(self, spec: &codec::PduWireSpec, serial: u64) -> bool {
+        (self == Self::OrderedSnapshotFence
+            && spec.ident == <codec::ListPanesOrderedV1Response as codec::PduWireIdent>::IDENT
+            && serial != 0)
+            || (self == Self::OrderedStreamEvent
+                && spec.ident == <codec::WindowOrderEventV1 as codec::PduWireIdent>::IDENT
+                && serial == 0)
+    }
+}
+
+/// Immutable identity retained when a typed PDU becomes a byte frame. This
+/// prevents deferred/pre-encoded frames from bypassing the same dormant-family
+/// guard that applies to the typed queue path.
+#[derive(Clone, Copy, Debug)]
+struct EncodedPduAuthority {
+    wire_spec: Option<&'static codec::PduWireSpec>,
+    serial: u64,
+    emission: ServerEmissionAuthority,
+}
+
+impl EncodedPduAuthority {
+    fn capture(pdu: &Pdu, serial: u64, emission: ServerEmissionAuthority) -> Self {
+        Self {
+            wire_spec: pdu.wire_spec(),
+            serial,
+            emission,
         }
+    }
+
+    fn validate(self, terminal: &DispatchTerminal) -> anyhow::Result<()> {
+        validate_server_wire_emission_authority(
+            self.wire_spec,
+            self.serial,
+            terminal,
+            self.emission,
+        )
     }
 }
 
 /// Final connection-terminal guard against accidentally activating a frozen
 /// server-produced protocol family through a generic response or notification
-/// queue.  Callers invoke this before queue allocation; the encoder invokes it
-/// again as a defense in depth for any already-typed internal item.
-fn reject_dormant_server_emission(
+/// queue. Callers invoke this before queue allocation; typed-to-encoded and
+/// already-encoded paths retain and recheck the same immutable authority.
+fn validate_server_emission_authority(
     pdu: &Pdu,
     serial: u64,
     terminal: &DispatchTerminal,
     authority: ServerEmissionAuthority,
 ) -> anyhow::Result<()> {
-    let Some(spec) = pdu.wire_spec() else {
-        return Ok(());
+    validate_server_wire_emission_authority(pdu.wire_spec(), serial, terminal, authority)
+}
+
+fn validate_server_wire_emission_authority(
+    wire_spec: Option<&'static codec::PduWireSpec>,
+    serial: u64,
+    terminal: &DispatchTerminal,
+    authority: ServerEmissionAuthority,
+) -> anyhow::Result<()> {
+    let Some(spec) = wire_spec else {
+        metrics::counter!(
+            "mux.dispatch.protocol_error",
+            "reason" => "unassigned_server_wire_family",
+            "pdu" => "unassigned",
+        )
+        .increment(1);
+        terminal.trip(OUTBOUND_WIRE_AUTHORITY_FAILURE);
+        anyhow::bail!(
+            "mux server attempted to emit an unassigned PDU family (serial {serial})"
+        );
     };
-    if !is_dormant_server_wire_spec(spec) || authority.permits(pdu, serial) {
+    let role = if serial == 0 {
+        codec::PduWireRole::Unilateral
+    } else {
+        codec::PduWireRole::CorrelatedReply
+    };
+    if !spec.authorizes(codec::PduProducer::Server, role) {
+        metrics::counter!(
+            "mux.dispatch.protocol_error",
+            "reason" => "server_wire_authority",
+            "pdu" => spec.name,
+        )
+        .increment(1);
+        terminal.trip(OUTBOUND_WIRE_AUTHORITY_FAILURE);
+        anyhow::bail!(
+            "mux server PDU {} (ident {}, serial {}) cannot emit as {:?}",
+            spec.name,
+            spec.ident,
+            serial,
+            role,
+        );
+    }
+    if !is_dormant_server_wire_spec(spec) || authority.permits_wire(spec, serial) {
         return Ok(());
     }
 
@@ -169,6 +255,7 @@ enum OutboundClass {
     Control,
     Bulk,
     Topology,
+    OrderedSnapshot,
 }
 
 impl OutboundClass {
@@ -177,15 +264,60 @@ impl OutboundClass {
             Self::Control => "control",
             Self::Bulk => "bulk",
             Self::Topology => "topology",
+            Self::OrderedSnapshot => "ordered_snapshot",
         }
     }
 
     const fn is_bulk(self) -> bool {
-        !matches!(self, Self::Control)
+        matches!(self, Self::Bulk | Self::Topology)
     }
 
-    const fn is_topology(self) -> bool {
-        matches!(self, Self::Topology)
+    const fn batch_class(self) -> OutboundBatchClass {
+        match self {
+            Self::Control | Self::Bulk => OutboundBatchClass::Control,
+            Self::Topology => OutboundBatchClass::Topology,
+            Self::OrderedSnapshot => OutboundBatchClass::OrderedSnapshot,
+        }
+    }
+
+    const fn retained_class(self) -> OutboundRetainedClass {
+        match self {
+            Self::Control | Self::Bulk => OutboundRetainedClass::None,
+            Self::Topology => OutboundRetainedClass::Topology,
+            Self::OrderedSnapshot => OutboundRetainedClass::OrderedSnapshot,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OutboundBatchClass {
+    Control,
+    Topology,
+    OrderedSnapshot,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OutboundRetainedClass {
+    None,
+    Topology,
+    OrderedSnapshot,
+}
+
+impl OutboundRetainedClass {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Topology => "topology",
+            Self::OrderedSnapshot => "ordered_snapshot",
+        }
+    }
+
+    const fn maximum(self) -> usize {
+        match self {
+            Self::None => 0,
+            Self::Topology => TOPOLOGY_FENCE_MAX_RETAINED_BYTES,
+            Self::OrderedSnapshot => codec::MAX_LIST_PANES_ORDERED_V1_RESPONSE_FRAME_BYTES,
+        }
     }
 }
 
@@ -194,8 +326,11 @@ enum OutboundBudgetLimit {
     Arithmetic,
     TotalSlots,
     BulkSlots,
-    TopologyBytes,
+    RetainedBytes,
+    TopologyRetainedBytes,
+    OrderedSnapshotRetainedBytes,
     MixedConnection,
+    MixedRetainedClass,
 }
 
 impl OutboundBudgetLimit {
@@ -204,18 +339,23 @@ impl OutboundBudgetLimit {
             Self::Arithmetic => "arithmetic",
             Self::TotalSlots => "total_slots",
             Self::BulkSlots => "bulk_slots",
-            Self::TopologyBytes => "topology_bytes",
+            Self::RetainedBytes => "retained_bytes",
+            Self::TopologyRetainedBytes => "topology_retained_bytes",
+            Self::OrderedSnapshotRetainedBytes => "ordered_snapshot_retained_bytes",
             Self::MixedConnection => "mixed_connection",
+            Self::MixedRetainedClass => "mixed_retained_class",
         }
     }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct OutboundBudgetState {
-    topology_bytes: usize,
+    retained_bytes: usize,
+    topology_retained_bytes: usize,
+    ordered_snapshot_retained_bytes: usize,
     total_slots: usize,
     bulk_slots: usize,
-    peak_topology_bytes: usize,
+    peak_retained_bytes: usize,
 }
 
 #[derive(Debug, Default)]
@@ -224,92 +364,175 @@ struct OutboundBudget {
 }
 
 impl OutboundBudget {
-    fn try_reserve(
-        self: &Arc<Self>,
+    fn checked_reservation_state(
+        mut state: OutboundBudgetState,
         class: OutboundClass,
-        topology_bytes: usize,
-    ) -> Result<OutboundReservation, OutboundBudgetLimit> {
-        debug_assert_eq!(class.is_topology(), topology_bytes != 0);
-        let mut state = self.state.lock();
-        let next_total_slots = state
+        retained_bytes: usize,
+    ) -> Result<OutboundBudgetState, OutboundBudgetLimit> {
+        if (class.retained_class() != OutboundRetainedClass::None) != (retained_bytes != 0) {
+            return Err(OutboundBudgetLimit::Arithmetic);
+        }
+        state.total_slots = state
             .total_slots
             .checked_add(1)
             .ok_or(OutboundBudgetLimit::Arithmetic)?;
-        if next_total_slots > DISPATCH_ITEM_QUEUE_TOTAL_CAPACITY {
+        if state.total_slots > DISPATCH_ITEM_QUEUE_TOTAL_CAPACITY {
             return Err(OutboundBudgetLimit::TotalSlots);
         }
 
-        let bulk_slots = usize::from(class.is_bulk());
-        let next_bulk_slots = state
+        state.bulk_slots = state
             .bulk_slots
-            .checked_add(bulk_slots)
+            .checked_add(usize::from(class.is_bulk()))
             .ok_or(OutboundBudgetLimit::Arithmetic)?;
-        if next_bulk_slots > DISPATCH_ITEM_QUEUE_CAPACITY {
+        if state.bulk_slots > DISPATCH_ITEM_QUEUE_CAPACITY {
             return Err(OutboundBudgetLimit::BulkSlots);
         }
 
-        let next_topology_bytes = state
-            .topology_bytes
-            .checked_add(topology_bytes)
+        state.retained_bytes = state
+            .retained_bytes
+            .checked_add(retained_bytes)
             .ok_or(OutboundBudgetLimit::Arithmetic)?;
-        if next_topology_bytes > TOPOLOGY_FENCE_MAX_RETAINED_BYTES {
-            return Err(OutboundBudgetLimit::TopologyBytes);
+        if state.retained_bytes > OUTBOUND_ACCOUNTED_MAX_RETAINED_BYTES {
+            return Err(OutboundBudgetLimit::RetainedBytes);
         }
 
-        state.total_slots = next_total_slots;
-        state.bulk_slots = next_bulk_slots;
-        state.topology_bytes = next_topology_bytes;
-        state.peak_topology_bytes = state.peak_topology_bytes.max(next_topology_bytes);
+        let class_bytes = match class.retained_class() {
+            OutboundRetainedClass::None => 0,
+            OutboundRetainedClass::Topology => {
+                state.topology_retained_bytes = state
+                    .topology_retained_bytes
+                    .checked_add(retained_bytes)
+                    .ok_or(OutboundBudgetLimit::Arithmetic)?;
+                state.topology_retained_bytes
+            }
+            OutboundRetainedClass::OrderedSnapshot => {
+                state.ordered_snapshot_retained_bytes = state
+                    .ordered_snapshot_retained_bytes
+                    .checked_add(retained_bytes)
+                    .ok_or(OutboundBudgetLimit::Arithmetic)?;
+                state.ordered_snapshot_retained_bytes
+            }
+        };
+        if class_bytes > class.retained_class().maximum() {
+            return Err(match class.retained_class() {
+                OutboundRetainedClass::None => OutboundBudgetLimit::Arithmetic,
+                OutboundRetainedClass::Topology => {
+                    OutboundBudgetLimit::TopologyRetainedBytes
+                }
+                OutboundRetainedClass::OrderedSnapshot => {
+                    OutboundBudgetLimit::OrderedSnapshotRetainedBytes
+                }
+            });
+        }
+        state.peak_retained_bytes = state.peak_retained_bytes.max(state.retained_bytes);
+        Ok(state)
+    }
+
+    fn preflight(
+        &self,
+        class: OutboundClass,
+        minimum_retained_bytes: usize,
+    ) -> Result<(), OutboundBudgetLimit> {
+        Self::checked_reservation_state(*self.state.lock(), class, minimum_retained_bytes)
+            .map(|_| ())
+    }
+
+    fn try_reserve(
+        self: &Arc<Self>,
+        class: OutboundClass,
+        retained_bytes: usize,
+    ) -> Result<OutboundReservation, OutboundBudgetLimit> {
+        let mut state = self.state.lock();
+        *state = Self::checked_reservation_state(*state, class, retained_bytes)?;
         Ok(OutboundReservation {
             budget: Arc::clone(self),
-            topology_bytes,
+            retained_bytes,
             total_slots: 1,
-            bulk_slots,
-            is_topology: class.is_topology(),
+            bulk_slots: usize::from(class.is_bulk()),
+            batch_class: class.batch_class(),
+            retained_class: class.retained_class(),
         })
     }
 
-    fn reweight_topology_batch(
+    fn reweight_accounted_batch(
         reservations: &mut [OutboundReservation],
         retained_bytes: usize,
     ) -> Result<(), OutboundBudgetLimit> {
-        let Some(first_topology_index) = reservations
+        let Some(first_accounted_index) = reservations
             .iter()
-            .position(|reservation| reservation.is_topology)
+            .position(OutboundReservation::accounts_retained_bytes)
         else {
             return Ok(());
         };
-        let budget = Arc::clone(&reservations[first_topology_index].budget);
+        let budget = Arc::clone(&reservations[first_accounted_index].budget);
+        let retained_class = reservations[first_accounted_index].retained_class;
         if reservations
             .iter()
             .any(|reservation| !Arc::ptr_eq(&budget, &reservation.budget))
         {
             return Err(OutboundBudgetLimit::MixedConnection);
         }
+        if reservations.iter().any(|reservation| {
+            reservation.accounts_retained_bytes()
+                && reservation.retained_class != retained_class
+        }) {
+            return Err(OutboundBudgetLimit::MixedRetainedClass);
+        }
         let current_batch_bytes = reservations
             .iter()
-            .filter(|reservation| reservation.is_topology)
+            .filter(|reservation| reservation.accounts_retained_bytes())
             .try_fold(0_usize, |total, reservation| {
-                total.checked_add(reservation.topology_bytes)
+                total.checked_add(reservation.retained_bytes)
             })
             .ok_or(OutboundBudgetLimit::Arithmetic)?;
 
         let mut state = budget.state.lock();
-        let other_topology_bytes = state
-            .topology_bytes
+        let other_retained_bytes = state
+            .retained_bytes
             .checked_sub(current_batch_bytes)
             .ok_or(OutboundBudgetLimit::Arithmetic)?;
-        let next_topology_bytes = other_topology_bytes
+        let next_retained_bytes = other_retained_bytes
             .checked_add(retained_bytes)
             .ok_or(OutboundBudgetLimit::Arithmetic)?;
-        if next_topology_bytes > TOPOLOGY_FENCE_MAX_RETAINED_BYTES {
-            return Err(OutboundBudgetLimit::TopologyBytes);
+        if next_retained_bytes > OUTBOUND_ACCOUNTED_MAX_RETAINED_BYTES {
+            return Err(OutboundBudgetLimit::RetainedBytes);
         }
-        state.topology_bytes = next_topology_bytes;
-        state.peak_topology_bytes = state.peak_topology_bytes.max(next_topology_bytes);
+        let current_class_total = match retained_class {
+            OutboundRetainedClass::None => return Err(OutboundBudgetLimit::Arithmetic),
+            OutboundRetainedClass::Topology => state.topology_retained_bytes,
+            OutboundRetainedClass::OrderedSnapshot => state.ordered_snapshot_retained_bytes,
+        };
+        let other_class_bytes = current_class_total
+            .checked_sub(current_batch_bytes)
+            .ok_or(OutboundBudgetLimit::Arithmetic)?;
+        let next_class_bytes = other_class_bytes
+            .checked_add(retained_bytes)
+            .ok_or(OutboundBudgetLimit::Arithmetic)?;
+        if next_class_bytes > retained_class.maximum() {
+            return Err(match retained_class {
+                OutboundRetainedClass::None => OutboundBudgetLimit::Arithmetic,
+                OutboundRetainedClass::Topology => {
+                    OutboundBudgetLimit::TopologyRetainedBytes
+                }
+                OutboundRetainedClass::OrderedSnapshot => {
+                    OutboundBudgetLimit::OrderedSnapshotRetainedBytes
+                }
+            });
+        }
+        match retained_class {
+            OutboundRetainedClass::None => unreachable!("accounted batch has a retained class"),
+            OutboundRetainedClass::Topology => {
+                state.topology_retained_bytes = next_class_bytes;
+            }
+            OutboundRetainedClass::OrderedSnapshot => {
+                state.ordered_snapshot_retained_bytes = next_class_bytes;
+            }
+        }
+        state.retained_bytes = next_retained_bytes;
+        state.peak_retained_bytes = state.peak_retained_bytes.max(next_retained_bytes);
         for (index, reservation) in reservations.iter_mut().enumerate() {
-            if reservation.is_topology {
-                reservation.topology_bytes = if index == first_topology_index {
+            if reservation.accounts_retained_bytes() {
+                reservation.retained_bytes = if index == first_accounted_index {
                     retained_bytes
                 } else {
                     0
@@ -328,19 +551,41 @@ impl OutboundBudget {
 #[derive(Debug)]
 struct OutboundReservation {
     budget: Arc<OutboundBudget>,
-    topology_bytes: usize,
+    retained_bytes: usize,
     total_slots: usize,
     bulk_slots: usize,
-    is_topology: bool,
+    batch_class: OutboundBatchClass,
+    retained_class: OutboundRetainedClass,
+}
+
+impl OutboundReservation {
+    const fn accounts_retained_bytes(&self) -> bool {
+        !matches!(self.retained_class, OutboundRetainedClass::None)
+    }
 }
 
 impl Drop for OutboundReservation {
     fn drop(&mut self) {
         let mut state = self.budget.state.lock();
-        state.topology_bytes = state
-            .topology_bytes
-            .checked_sub(self.topology_bytes)
-            .expect("outbound topology-byte reservation underflow");
+        state.retained_bytes = state
+            .retained_bytes
+            .checked_sub(self.retained_bytes)
+            .expect("outbound retained-byte reservation underflow");
+        match self.retained_class {
+            OutboundRetainedClass::None => {}
+            OutboundRetainedClass::Topology => {
+                state.topology_retained_bytes = state
+                    .topology_retained_bytes
+                    .checked_sub(self.retained_bytes)
+                    .expect("outbound topology reservation underflow");
+            }
+            OutboundRetainedClass::OrderedSnapshot => {
+                state.ordered_snapshot_retained_bytes = state
+                    .ordered_snapshot_retained_bytes
+                    .checked_sub(self.retained_bytes)
+                    .expect("outbound ordered-snapshot reservation underflow");
+            }
+        }
         state.total_slots = state
             .total_slots
             .checked_sub(self.total_slots)
@@ -418,12 +663,12 @@ fn reserve_outbound(
     terminal: &DispatchTerminal,
     budget: &Arc<OutboundBudget>,
     class: OutboundClass,
-    topology_bytes: usize,
+    retained_bytes: usize,
 ) -> anyhow::Result<OutboundReservation> {
     let Some(admission) = terminal.admit() else {
         anyhow::bail!("mux dispatch connection is already terminal");
     };
-    match reserve_outbound_admitted(budget, class, topology_bytes) {
+    match reserve_outbound_admitted(budget, class, retained_bytes) {
         Ok(reservation) => Ok(reservation),
         Err(limit) => {
             admission.trip(OUTBOUND_BUDGET_OVERFLOW);
@@ -436,9 +681,9 @@ fn reserve_outbound(
 fn reserve_outbound_admitted(
     budget: &Arc<OutboundBudget>,
     class: OutboundClass,
-    topology_bytes: usize,
+    retained_bytes: usize,
 ) -> Result<OutboundReservation, OutboundBudgetLimit> {
-    budget.try_reserve(class, topology_bytes)
+    budget.try_reserve(class, retained_bytes)
 }
 
 fn outbound_budget_rejection(
@@ -945,15 +1190,83 @@ struct ReservedDecodedPdu {
 }
 
 #[derive(Debug)]
+struct AuthorizedOrderedSnapshotFrame {
+    bytes: Vec<u8>,
+    authority: EncodedPduAuthority,
+}
+
+impl AuthorizedOrderedSnapshotFrame {
+    fn encode(
+        pdu: Pdu,
+        serial: u64,
+        terminal: &DispatchTerminal,
+    ) -> anyhow::Result<Self> {
+        if !matches!(&pdu, Pdu::ListPanesOrderedV1Response(_)) {
+            terminal.trip(DORMANT_OUTBOUND_PROTOCOL_FAILURE);
+            anyhow::bail!(
+                "ordered snapshot encoder rejected non-PDU87 family {}",
+                pdu.pdu_name(),
+            );
+        }
+        let authority = EncodedPduAuthority::capture(
+            &pdu,
+            serial,
+            ServerEmissionAuthority::OrderedSnapshotFence,
+        );
+        authority.validate(terminal)?;
+        let bytes = pdu
+            .encode_frame_with_mode(serial, codec::CompressionMode::Auto)
+            .context("encoding request-correlated PDU87 outside the coordinator lock")?;
+        Ok(Self { bytes, authority })
+    }
+
+    fn reserve(
+        self,
+        terminal: &DispatchTerminal,
+        budget: &Arc<OutboundBudget>,
+    ) -> anyhow::Result<EncodedOutboundFrame> {
+        let retained_bytes = self.bytes.capacity();
+        let reservation = reserve_outbound(
+            terminal,
+            budget,
+            OutboundClass::OrderedSnapshot,
+            retained_bytes,
+        )?;
+        Ok(EncodedOutboundFrame {
+            bytes: self.bytes,
+            reservation,
+            authority: self.authority,
+        })
+    }
+}
+
+#[derive(Debug)]
 struct EncodedOutboundFrame {
     bytes: Vec<u8>,
     reservation: OutboundReservation,
+    authority: EncodedPduAuthority,
 }
 
 #[derive(Debug)]
 enum WritePayload {
     Typed(ReservedDecodedPdu),
     Encoded(EncodedOutboundFrame),
+}
+
+impl WritePayload {
+    const fn batch_class(&self) -> OutboundBatchClass {
+        match self {
+            Self::Typed(typed) => typed.reservation.batch_class,
+            Self::Encoded(frame) => frame.reservation.batch_class,
+        }
+    }
+
+    const fn accounts_retained_bytes(&self) -> bool {
+        match self {
+            Self::Typed(typed) => typed.reservation.accounts_retained_bytes(),
+            Self::Encoded(frame) => frame.reservation.accounts_retained_bytes(),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -1044,6 +1357,15 @@ fn test_write_item(decoded: Box<DecodedPdu>) -> Item {
 }
 
 #[cfg(test)]
+fn test_encoded_authority(serial: u64) -> EncodedPduAuthority {
+    EncodedPduAuthority::capture(
+        &Pdu::Pong(codec::Pong {}),
+        serial,
+        ServerEmissionAuthority::Ordinary,
+    )
+}
+
+#[cfg(test)]
 fn test_notification_item(notification: MuxNotification) -> Item {
     let reservation = test_reservation(OutboundClass::Bulk);
     Item::Notif(ReservedNotification {
@@ -1100,7 +1422,7 @@ fn queue_response_pdu_with_emission_authority(
     delivery_class: PduDeliveryClass,
     emission_authority: ServerEmissionAuthority,
 ) -> anyhow::Result<()> {
-    reject_dormant_server_emission(&pdu, serial, terminal, emission_authority)?;
+    validate_server_emission_authority(&pdu, serial, terminal, emission_authority)?;
     // Avoid even the outbound Box allocation on an already-dead connection;
     // `admit` below remains the authoritative race-closing check.
     if terminal.is_tripped() {
@@ -1154,6 +1476,105 @@ fn queue_response_pdu_with_emission_authority(
     }
 }
 
+#[derive(Debug)]
+enum OrderedSnapshotFrameOwner {
+    Reserved(EncodedOutboundFrame),
+    Published,
+}
+
+#[derive(Debug)]
+struct OrderedSnapshotQueueRejection {
+    error: anyhow::Error,
+    owner: OrderedSnapshotFrameOwner,
+}
+
+/// Reject a known-full control queue or a budget with no minimum snapshot
+/// headroom before paying q-sized validation and serialization. This is an
+/// advisory optimization only: exact reservation follows encoding outside the
+/// coordinator lock, and terminal admission is checked again at publication.
+fn preflight_ordered_snapshot_response(
+    item_tx: &Sender<Item>,
+    terminal: &DispatchTerminal,
+    budget: &OutboundBudget,
+) -> anyhow::Result<()> {
+    let Some(admission) = terminal.admit() else {
+        anyhow::bail!("mux dispatch connection is already terminal");
+    };
+    if item_tx.is_full() {
+        admission.trip(RESPONSE_QUEUE_FAILURE);
+        drop(admission);
+        metrics::counter!("mux.dispatch.response_enqueue_failure").increment(1);
+        anyhow::bail!(
+            "mux dispatch item queue is full (capacity \
+             {DISPATCH_ITEM_QUEUE_TOTAL_CAPACITY}); applying client backpressure"
+        );
+    }
+    if let Err(limit) = budget.preflight(OutboundClass::OrderedSnapshot, 1) {
+        admission.trip(OUTBOUND_BUDGET_OVERFLOW);
+        drop(admission);
+        return Err(outbound_budget_rejection(
+            OutboundClass::OrderedSnapshot,
+            limit,
+        ));
+    }
+    Ok(())
+}
+
+/// Publish one already-validated and already-encoded PDU87 while preserving
+/// control-slot priority and a dedicated transport batch boundary. The only
+/// accepted owner was constructed from a typed PDU87 through the private
+/// `OrderedSnapshotFence` encoder. Queue rejection returns the allocation to
+/// the caller so it can be destroyed after releasing the coordinator lock.
+fn queue_prepared_ordered_snapshot_response(
+    item_tx: &Sender<Item>,
+    terminal: &DispatchTerminal,
+    frame: EncodedOutboundFrame,
+) -> Result<(), OrderedSnapshotQueueRejection> {
+    if terminal.is_tripped() {
+        return Err(OrderedSnapshotQueueRejection {
+            error: anyhow::anyhow!("mux dispatch connection is already terminal"),
+            owner: OrderedSnapshotFrameOwner::Reserved(frame),
+        });
+    }
+    let Some(admission) = terminal.admit() else {
+        return Err(OrderedSnapshotQueueRejection {
+            error: anyhow::anyhow!("mux dispatch connection is already terminal"),
+            owner: OrderedSnapshotFrameOwner::Reserved(frame),
+        });
+    };
+    let item = Item::WritePdu(WritePayload::Encoded(frame));
+    match item_tx.try_send(item) {
+        Ok(()) => Ok(()),
+        Err(TrySendError::Full(item)) => {
+            admission.trip(RESPONSE_QUEUE_FAILURE);
+            drop(admission);
+            metrics::counter!("mux.dispatch.response_enqueue_failure").increment(1);
+            let Item::WritePdu(WritePayload::Encoded(frame)) = item else {
+                unreachable!("ordered snapshot queue rejection changed item shape");
+            };
+            Err(OrderedSnapshotQueueRejection {
+                error: anyhow::anyhow!(
+                    "mux dispatch item queue is full (capacity \
+                     {DISPATCH_ITEM_QUEUE_TOTAL_CAPACITY}); applying client backpressure"
+                ),
+                owner: OrderedSnapshotFrameOwner::Reserved(frame),
+            })
+        }
+        Err(TrySendError::Closed(item)) => {
+            admission.trip(RESPONSE_QUEUE_FAILURE);
+            drop(admission);
+            metrics::counter!("mux.dispatch.response_enqueue_failure").increment(1);
+            let Item::WritePdu(WritePayload::Encoded(frame)) = item else {
+                unreachable!("ordered snapshot queue rejection changed item shape");
+            };
+            Err(OrderedSnapshotQueueRejection {
+                error: anyhow::anyhow!("mux dispatch item queue is closed"),
+                owner: OrderedSnapshotFrameOwner::Reserved(frame),
+            })
+        }
+    }
+}
+
 fn queue_reserved_pdu(
     item_tx: &Sender<Item>,
     terminal: &DispatchTerminal,
@@ -1169,6 +1590,12 @@ fn queue_reserved_pdu(
     )
 }
 
+#[derive(Debug)]
+struct ReservedTopologyItemQueueRejection {
+    error: anyhow::Error,
+    item: Item,
+}
+
 fn queue_reserved_pdu_with_emission_authority(
     item_tx: &Sender<Item>,
     terminal: &DispatchTerminal,
@@ -1176,37 +1603,75 @@ fn queue_reserved_pdu_with_emission_authority(
     reservation: OutboundReservation,
     emission_authority: ServerEmissionAuthority,
 ) -> anyhow::Result<()> {
-    reject_dormant_server_emission(
-        &decoded.pdu,
-        decoded.serial,
+    match try_queue_reserved_pdu_with_emission_authority(
+        item_tx,
         terminal,
+        decoded,
+        reservation,
         emission_authority,
-    )?;
+    ) {
+        Ok(()) => Ok(()),
+        Err(rejected) => {
+            let ReservedTopologyItemQueueRejection { error, item } = rejected;
+            drop(item);
+            Err(error)
+        }
+    }
+}
+
+/// Publish a topology PDU without consuming its owner on rejection. Callers
+/// holding the coordinator state mutex must move the returned `Item` to an
+/// outside-the-lock retirement carrier before propagating the error.
+fn try_queue_reserved_pdu_with_emission_authority(
+    item_tx: &Sender<Item>,
+    terminal: &DispatchTerminal,
+    decoded: Box<DecodedPdu>,
+    reservation: OutboundReservation,
+    emission_authority: ServerEmissionAuthority,
+) -> Result<(), ReservedTopologyItemQueueRejection> {
     let item = Item::WritePdu(WritePayload::Typed(ReservedDecodedPdu {
         decoded,
         reservation,
         emission_authority,
     }));
+    let Item::WritePdu(WritePayload::Typed(typed)) = &item else {
+        unreachable!("reserved topology PDU changed item shape");
+    };
+    if let Err(error) = validate_server_emission_authority(
+        &typed.decoded.pdu,
+        typed.decoded.serial,
+        terminal,
+        emission_authority,
+    ) {
+        return Err(ReservedTopologyItemQueueRejection { error, item });
+    }
     let Some(admission) = terminal.admit() else {
-        anyhow::bail!("mux dispatch connection is already terminal");
+        return Err(ReservedTopologyItemQueueRejection {
+            error: anyhow::anyhow!("mux dispatch connection is already terminal"),
+            item,
+        });
     };
     match item_tx.try_send(item) {
         Ok(()) => Ok(()),
         Err(TrySendError::Full(item)) => {
             admission.trip(NOTIFICATION_QUEUE_OVERFLOW);
             drop(admission);
-            drop(item);
             metrics::counter!("mux.dispatch.notification_queue.full").increment(1);
-            Err(anyhow::anyhow!(
-                "mux dispatch topology queue is full (bulk capacity \
-                 {DISPATCH_ITEM_QUEUE_CAPACITY}); applying client backpressure"
-            ))
+            Err(ReservedTopologyItemQueueRejection {
+                error: anyhow::anyhow!(
+                    "mux dispatch topology queue is full (bulk capacity \
+                     {DISPATCH_ITEM_QUEUE_CAPACITY}); applying client backpressure"
+                ),
+                item,
+            })
         }
         Err(TrySendError::Closed(item)) => {
             admission.trip(NOTIFICATION_QUEUE_CLOSED);
             drop(admission);
-            drop(item);
-            Err(anyhow::anyhow!("mux dispatch topology queue is closed"))
+            Err(ReservedTopologyItemQueueRejection {
+                error: anyhow::anyhow!("mux dispatch topology queue is closed"),
+                item,
+            })
         }
     }
 }
@@ -1217,19 +1682,36 @@ fn queue_reserved_notification(
     notification: MuxNotification,
     reservation: OutboundReservation,
 ) -> bool {
+    match try_queue_reserved_notification(item_tx, terminal, notification, reservation) {
+        Ok(()) => true,
+        Err(rejected) => {
+            drop(rejected.item);
+            false
+        }
+    }
+}
+
+fn try_queue_reserved_notification(
+    item_tx: &Sender<Item>,
+    terminal: &DispatchTerminal,
+    notification: MuxNotification,
+    reservation: OutboundReservation,
+) -> Result<(), ReservedTopologyItemQueueRejection> {
     let item = Item::Notif(ReservedNotification {
         notification,
         reservation,
     });
     let Some(admission) = terminal.admit() else {
-        return false;
+        return Err(ReservedTopologyItemQueueRejection {
+            error: anyhow::anyhow!("mux dispatch connection is already terminal"),
+            item,
+        });
     };
     match item_tx.try_send(item) {
-        Ok(()) => true,
+        Ok(()) => Ok(()),
         Err(TrySendError::Full(item)) => {
             admission.trip(NOTIFICATION_QUEUE_OVERFLOW);
             drop(admission);
-            drop(item);
             let dropped = DROPPED_NOTIFICATION_COUNT
                 .fetch_add(1, Ordering::Relaxed)
                 .saturating_add(1);
@@ -1238,16 +1720,24 @@ fn queue_reserved_notification(
                 log::warn!(
                     "mux dispatch notification queue is full (bulk capacity \
                      {DISPATCH_ITEM_QUEUE_CAPACITY}); terminating the affected connection after \
-                     {dropped} overflow(s) since process start"
+                    {dropped} overflow(s) since process start"
                 );
             }
-            false
+            Err(ReservedTopologyItemQueueRejection {
+                error: anyhow::anyhow!(
+                    "mux dispatch notification queue is full (bulk capacity \
+                     {DISPATCH_ITEM_QUEUE_CAPACITY}); applying client backpressure"
+                ),
+                item,
+            })
         }
         Err(TrySendError::Closed(item)) => {
             admission.trip(NOTIFICATION_QUEUE_CLOSED);
             drop(admission);
-            drop(item);
-            false
+            Err(ReservedTopologyItemQueueRejection {
+                error: anyhow::anyhow!("mux dispatch notification queue is closed"),
+                item,
+            })
         }
     }
 }
@@ -1370,6 +1860,12 @@ struct TopologyEventBuffer {
     retained_bytes: usize,
 }
 
+#[derive(Debug)]
+struct TopologyEventInsertRejection {
+    error: anyhow::Error,
+    event: RetainedTopologyEvent,
+}
+
 impl TopologyEventBuffer {
     /// Validate duplicate/count admission while the coordinator state lock is
     /// still held and before the candidate acquires an outbound reservation.
@@ -1401,15 +1897,37 @@ impl TopologyEventBuffer {
         event: RetainedTopologyEvent,
         limits: TopologyRetentionLimits,
     ) -> anyhow::Result<()> {
-        let next_len = self.preflight_insert(event.revision, limits)?;
-        let next_bytes = self
+        match self.try_insert(event, limits) {
+            Ok(()) => Ok(()),
+            Err(rejected) => Err(rejected.error),
+        }
+    }
+
+    fn try_insert(
+        &mut self,
+        event: RetainedTopologyEvent,
+        limits: TopologyRetentionLimits,
+    ) -> Result<(), TopologyEventInsertRejection> {
+        let next_len = match self.preflight_insert(event.revision, limits) {
+            Ok(next_len) => next_len,
+            Err(error) => return Err(TopologyEventInsertRejection { error, event }),
+        };
+        let Some(next_bytes) = self
             .retained_bytes
             .checked_add(event.retained_bytes)
-            .context("counting retained mux topology bytes")?;
+        else {
+            return Err(TopologyEventInsertRejection {
+                error: anyhow::anyhow!("counting retained mux topology bytes"),
+                event,
+            });
+        };
         if next_bytes > limits.max_retained_bytes {
-            anyhow::bail!(
-                "mux topology fence buffer would retain {next_len} events and {next_bytes} bytes"
-            );
+            return Err(TopologyEventInsertRejection {
+                error: anyhow::anyhow!(
+                    "mux topology fence buffer would retain {next_len} events and {next_bytes} bytes"
+                ),
+                event,
+            });
         }
         self.retained_bytes = next_bytes;
         self.events.insert(event.revision, event);
@@ -1424,14 +1942,30 @@ impl TopologyEventBuffer {
         &mut self,
         revision: TopologyRevision,
     ) -> anyhow::Result<Option<RetainedTopologyEvent>> {
-        let Some(event) = self.events.remove(&revision) else {
+        let Some(event) = self.events.get(&revision) else {
             return Ok(None);
         };
-        self.retained_bytes = self
+        let next_retained_bytes = self
             .retained_bytes
             .checked_sub(event.retained_bytes)
             .context("decrementing retained mux topology bytes")?;
+        let event = self
+            .events
+            .remove(&revision)
+            .expect("borrowed topology revision must remain present");
+        self.retained_bytes = next_retained_bytes;
         Ok(Some(event))
+    }
+
+    fn first_revision(&self) -> Option<TopologyRevision> {
+        self.events.first_key_value().map(|(revision, _)| *revision)
+    }
+
+    fn pop_first(&mut self) -> anyhow::Result<Option<RetainedTopologyEvent>> {
+        let Some(revision) = self.first_revision() else {
+            return Ok(None);
+        };
+        self.remove(revision)
     }
 
     fn take_all(&mut self) -> impl Iterator<Item = RetainedTopologyEvent> {
@@ -1556,6 +2090,95 @@ enum TopologyFenceKind {
         request: Arc<codec::ListPanesOrderedV1>,
         negotiated: TopologyCapabilities,
     },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OrderedFenceOutcomeAuthority {
+    Snapshot {
+        session_incarnation: MuxSessionIncarnation,
+        snapshot_revision: TopologyRevision,
+    },
+    Contended,
+    RevisionExhausted,
+    Unsupported,
+}
+
+#[derive(Debug)]
+enum DeferredTopologyOwner {
+    Prepared(PreparedTopologyNotification),
+    Event(RetainedTopologyEvent),
+    OrderedWindow(codec::OrderedWindowStateV1),
+    Item(Item),
+}
+
+fn defer_topology_owner(
+    retired_owners: &mut Vec<DeferredTopologyOwner>,
+    owner: DeferredTopologyOwner,
+) {
+    assert!(
+        retired_owners.len() < retired_owners.capacity(),
+        "bounded topology retirement carrier exhausted"
+    );
+    retired_owners.push(owner);
+}
+
+#[derive(Debug)]
+struct PreparedOrderedFenceResponse {
+    stream_id: TopologyStreamId,
+    negotiated: TopologyCapabilities,
+    outcome: OrderedFenceOutcomeAuthority,
+    /// Exact PDU87 wire frame produced after request correlation and the private
+    /// ordered-snapshot permit were validated, but before reacquiring the
+    /// coordinator lock for FIFO admission.
+    frame: OrderedSnapshotFrameOwner,
+    /// The complete prior/next phase and every q-bearing owner retired while
+    /// `TopologyStreamState` is locked. This carrier itself is created outside
+    /// the lock and is destroyed only by `release_after_unlock`.
+    retired_phase: Option<TopologyStreamPhase>,
+    retired_owners: Vec<DeferredTopologyOwner>,
+}
+
+impl PreparedOrderedFenceResponse {
+    fn publish(
+        &mut self,
+        item_tx: &Sender<Item>,
+        terminal: &DispatchTerminal,
+    ) -> anyhow::Result<()> {
+        let owner = std::mem::replace(&mut self.frame, OrderedSnapshotFrameOwner::Published);
+        let OrderedSnapshotFrameOwner::Reserved(frame) = owner else {
+            self.frame = owner;
+            anyhow::bail!("ordered snapshot frame did not retain unpublished authority");
+        };
+        match queue_prepared_ordered_snapshot_response(item_tx, terminal, frame) {
+            Ok(()) => Ok(()),
+            Err(rejected) => {
+                self.frame = rejected.owner;
+                Err(rejected.error)
+            }
+        }
+    }
+
+    fn release_after_unlock(self) {
+        let Self {
+            frame,
+            retired_phase,
+            retired_owners,
+            ..
+        } = self;
+        match frame {
+            OrderedSnapshotFrameOwner::Reserved(frame) => drop(frame),
+            OrderedSnapshotFrameOwner::Published => {}
+        }
+        drop(retired_phase);
+        for owner in retired_owners {
+            match owner {
+                DeferredTopologyOwner::Prepared(notification) => drop(notification),
+                DeferredTopologyOwner::Event(event) => drop(event),
+                DeferredTopologyOwner::OrderedWindow(window) => drop(window),
+                DeferredTopologyOwner::Item(item) => drop(item),
+            }
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -1700,6 +2323,12 @@ struct TopologyStreamCoordinator {
     stream_id: TopologyStreamId,
     retention_limits: TopologyRetentionLimits,
     state: ParkingMutex<TopologyStreamState>,
+    #[cfg(test)]
+    before_ordered_snapshot_publish: ParkingMutex<Option<Box<dyn FnOnce() + Send>>>,
+    #[cfg(test)]
+    after_ordered_snapshot_validation: ParkingMutex<Option<Box<dyn FnOnce() + Send>>>,
+    #[cfg(test)]
+    after_ordered_snapshot_publish: ParkingMutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 impl TopologyStreamCoordinator {
@@ -1729,13 +2358,85 @@ impl TopologyStreamCoordinator {
             stream_id,
             retention_limits,
             state: ParkingMutex::new(TopologyStreamState::default()),
+            #[cfg(test)]
+            before_ordered_snapshot_publish: ParkingMutex::new(None),
+            #[cfg(test)]
+            after_ordered_snapshot_validation: ParkingMutex::new(None),
+            #[cfg(test)]
+            after_ordered_snapshot_publish: ParkingMutex::new(None),
+        }
+    }
+
+    #[cfg(test)]
+    fn set_before_ordered_snapshot_publish_hook(
+        &self,
+        hook: impl FnOnce() + Send + 'static,
+    ) {
+        *self.before_ordered_snapshot_publish.lock() = Some(Box::new(hook));
+    }
+
+    #[cfg(test)]
+    fn set_after_ordered_snapshot_publish_hook(
+        &self,
+        hook: impl FnOnce() + Send + 'static,
+    ) {
+        *self.after_ordered_snapshot_publish.lock() = Some(Box::new(hook));
+    }
+
+    #[cfg(test)]
+    fn set_after_ordered_snapshot_validation_hook(
+        &self,
+        hook: impl FnOnce() + Send + 'static,
+    ) {
+        *self.after_ordered_snapshot_validation.lock() = Some(Box::new(hook));
+    }
+
+    #[cfg(test)]
+    fn run_before_ordered_snapshot_publish_hook(&self) {
+        let hook = self.before_ordered_snapshot_publish.lock().take();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    #[cfg(test)]
+    fn run_after_ordered_snapshot_validation_hook(&self) {
+        let hook = self.after_ordered_snapshot_validation.lock().take();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    #[cfg(test)]
+    fn run_after_ordered_snapshot_publish_hook(&self) {
+        let hook = self.after_ordered_snapshot_publish.lock().take();
+        if let Some(hook) = hook {
+            hook();
         }
     }
 
     fn discard_retained_state(&self) {
-        let mut state = self.state.lock();
-        state.prebind = TopologyEventBuffer::default();
-        state.phase = TopologyStreamPhase::Exhausted;
+        let retired = {
+            let mut state = self.state.lock();
+            (
+                std::mem::take(&mut state.prebind),
+                std::mem::replace(&mut state.phase, TopologyStreamPhase::Exhausted),
+            )
+        };
+        // A retained phase can own thousands of dynamic payloads and outbound
+        // reservations. Release all of them after the coordinator lock so
+        // destructors never nest the budget mutex under `state`.
+        drop(retired);
+    }
+
+    /// Convert every request-boundary rejection into one sticky connection
+    /// failure and revoke all retained topology authority. Callers invoke this
+    /// only after the rejecting operation has returned, so q-sized snapshots,
+    /// buffered events, and their budget reservations are destroyed outside
+    /// both the coordinator and terminal-admission locks.
+    fn reject_client_request(&self) {
+        self.terminal.trip(TOPOLOGY_PROTOCOL_FAILURE);
+        self.discard_retained_state();
     }
 
     fn with_live_result<T>(
@@ -1830,6 +2531,18 @@ impl TopologyStreamCoordinator {
             self.terminal.trip(TOPOLOGY_PROTOCOL_FAILURE);
             anyhow::bail!("mux topology fence began before its subscription was bound");
         }
+        if matches!(
+            &state.phase,
+            TopologyStreamPhase::Established(EstablishedTopologyStream {
+                ordered: Some(_),
+                ..
+            })
+        ) {
+            self.terminal.trip(TOPOLOGY_PROTOCOL_FAILURE);
+            anyhow::bail!(
+                "a coherent-only snapshot cannot replace established ordered-window capabilities"
+            );
+        }
         let phase = std::mem::replace(&mut state.phase, TopologyStreamPhase::Exhausted);
         state.phase = match phase {
             TopologyStreamPhase::Legacy => {
@@ -1841,12 +2554,7 @@ impl TopologyStreamCoordinator {
                 })
             }
             TopologyStreamPhase::Established(established) => {
-                if established.ordered.is_some() {
-                    self.terminal.trip(TOPOLOGY_PROTOCOL_FAILURE);
-                    anyhow::bail!(
-                        "a coherent-only snapshot cannot replace established ordered-window capabilities"
-                    );
-                }
+                debug_assert!(established.ordered.is_none());
                 TopologyStreamPhase::Fencing(TopologyFenceInFlight {
                     serial,
                     kind: TopologyFenceKind::Coherent { negotiated },
@@ -1917,6 +2625,20 @@ impl TopologyStreamCoordinator {
             self.terminal.trip(TOPOLOGY_PROTOCOL_FAILURE);
             anyhow::bail!("ordered mux topology fence began before its subscription was bound");
         }
+        if let TopologyStreamPhase::Established(EstablishedTopologyStream {
+            ordered: Some(ordered),
+            ..
+        }) = &state.phase
+        {
+            if ordered.request.as_ref() != request.as_ref()
+                || ordered.authority.negotiated != negotiated
+            {
+                self.terminal.trip(TOPOLOGY_PROTOCOL_FAILURE);
+                anyhow::bail!(
+                    "ordered-window request or negotiated capability change revoked the connection authority"
+                );
+            }
+        }
 
         let phase = std::mem::replace(&mut state.phase, TopologyStreamPhase::Exhausted);
         state.phase = match phase {
@@ -1932,16 +2654,6 @@ impl TopologyStreamCoordinator {
                 })
             }
             TopologyStreamPhase::Established(established) => {
-                if let Some(ordered) = &established.ordered {
-                    if ordered.request.as_ref() != request.as_ref()
-                        || ordered.authority.negotiated != negotiated
-                    {
-                        self.terminal.trip(TOPOLOGY_PROTOCOL_FAILURE);
-                        anyhow::bail!(
-                            "ordered-window request or negotiated capability change revoked the connection authority"
-                        );
-                    }
-                }
                 TopologyStreamPhase::Fencing(TopologyFenceInFlight {
                     serial,
                     kind: TopologyFenceKind::Ordered {
@@ -2066,6 +2778,19 @@ impl TopologyStreamCoordinator {
                 .inspect_err(|_| self.terminal.trip(TOPOLOGY_PROTOCOL_FAILURE)),
             other => {
                 let mut state = self.state.lock();
+                if matches!(
+                    &state.phase,
+                    TopologyStreamPhase::Fencing(TopologyFenceInFlight {
+                        serial: fence_serial,
+                        kind: TopologyFenceKind::Ordered { .. },
+                        ..
+                    }) if *fence_serial == serial
+                ) {
+                    self.terminal.trip(TOPOLOGY_PROTOCOL_FAILURE);
+                    anyhow::bail!(
+                        "ordered mux snapshot fence produced a non-PDU87 response"
+                    );
+                }
                 let phase =
                     std::mem::replace(&mut state.phase, TopologyStreamPhase::Exhausted);
                 let result = (|| {
@@ -2073,12 +2798,10 @@ impl TopologyStreamCoordinator {
                         TopologyStreamPhase::Fencing(in_flight)
                             if in_flight.serial == serial =>
                         {
-                            if matches!(&in_flight.kind, TopologyFenceKind::Ordered { .. }) {
-                                self.terminal.trip(TOPOLOGY_PROTOCOL_FAILURE);
-                                anyhow::bail!(
-                                    "ordered mux snapshot fence produced a non-PDU87 response"
-                                );
-                            }
+                            debug_assert!(matches!(
+                                &in_flight.kind,
+                                TopologyFenceKind::Coherent { .. }
+                            ));
                             queue_response_pdu(
                                 &self.item_tx,
                                 &self.terminal,
@@ -2141,6 +2864,11 @@ impl TopologyStreamCoordinator {
             (Arc::clone(request), subscription)
         };
 
+        preflight_ordered_snapshot_response(
+            &self.item_tx,
+            &self.terminal,
+            &self.outbound_budget,
+        )?;
         response
             .validate_for_request(&request_generation)
             .context("validating request-correlated PDU87 at the dispatch fence")?;
@@ -2149,14 +2877,70 @@ impl TopologyStreamCoordinator {
                 .context("validating PDU87 pane/order projection at the dispatch fence")?;
         }
 
-        let mut state = self.state.lock();
-        self.complete_ordered_fence_response(
-            &mut state,
+        let outcome = match &response.outcome {
+            codec::ListPanesOrderedV1Outcome::Snapshot(snapshot) => {
+                OrderedFenceOutcomeAuthority::Snapshot {
+                    session_incarnation: snapshot.session_incarnation,
+                    snapshot_revision: snapshot.topology_revision,
+                }
+            }
+            codec::ListPanesOrderedV1Outcome::Contended { .. } => {
+                OrderedFenceOutcomeAuthority::Contended
+            }
+            codec::ListPanesOrderedV1Outcome::RevisionExhausted => {
+                OrderedFenceOutcomeAuthority::RevisionExhausted
+            }
+            codec::ListPanesOrderedV1Outcome::Unsupported { .. } => {
+                OrderedFenceOutcomeAuthority::Unsupported
+            }
+        };
+        let response_stream_id = response.stream_id;
+        let response_negotiated = response.negotiated;
+        let frame = AuthorizedOrderedSnapshotFrame::encode(
+            Pdu::ListPanesOrderedV1Response(response),
             serial,
-            request_generation,
-            subscription_authority,
-            response,
-        )
+            &self.terminal,
+        )?
+        .reserve(&self.terminal, &self.outbound_budget)
+        .context("reserving exact PDU87 frame outside the coordinator lock")?;
+        let mut retired_owners = Vec::new();
+        retired_owners
+            .try_reserve_exact(self.retention_limits.max_events.saturating_add(1))
+            .map_err(|error| {
+                self.terminal.trip(TOPOLOGY_BUFFER_OVERFLOW);
+                anyhow::anyhow!(
+                    "allocating ordered-fence deferred-release carrier failed: {error}"
+                )
+            })?;
+        // The encoded frame is the sole q-sized outbound owner from this point;
+        // the private encoder released the typed pane/order graph before FIFO
+        // admission begins.
+        let mut prepared = PreparedOrderedFenceResponse {
+            stream_id: response_stream_id,
+            negotiated: response_negotiated,
+            outcome,
+            frame: OrderedSnapshotFrameOwner::Reserved(frame),
+            retired_phase: None,
+            retired_owners,
+        };
+
+        #[cfg(test)]
+        self.run_before_ordered_snapshot_publish_hook();
+
+        let result = {
+            let mut state = self.state.lock();
+            self.complete_ordered_fence_response(
+                &mut state,
+                serial,
+                request_generation,
+                subscription_authority,
+                &mut prepared,
+            )
+        };
+        // Revalidation and queue failures deliberately return ownership here;
+        // a maximum-size frame must never be deallocated under `state`.
+        prepared.release_after_unlock();
+        result
     }
 
     fn complete_fence_response(
@@ -2331,18 +3115,20 @@ impl TopologyStreamCoordinator {
         serial: u64,
         request_generation: Arc<codec::ListPanesOrderedV1>,
         subscription_authority: TopologySubscriptionAuthority,
-        response: codec::ListPanesOrderedV1Response,
+        prepared: &mut PreparedOrderedFenceResponse,
     ) -> anyhow::Result<()> {
+        debug_assert!(prepared.retired_phase.is_none());
+        prepared.retired_phase = Some(std::mem::replace(
+            &mut state.phase,
+            TopologyStreamPhase::Exhausted,
+        ));
         if state.subscription != Some(subscription_authority) {
-            state.phase = TopologyStreamPhase::Exhausted;
             self.terminal.trip(TOPOLOGY_PROTOCOL_FAILURE);
             anyhow::bail!(
                 "ordered mux snapshot response crossed a subscription-authority generation"
             );
         }
-        let phase = std::mem::replace(&mut state.phase, TopologyStreamPhase::Exhausted);
-        let TopologyStreamPhase::Fencing(mut in_flight) = phase else {
-            state.phase = phase;
+        let Some(TopologyStreamPhase::Fencing(in_flight)) = prepared.retired_phase.as_ref() else {
             self.terminal.trip(TOPOLOGY_PROTOCOL_FAILURE);
             anyhow::bail!("ordered mux snapshot response arrived without an active fence");
         };
@@ -2363,40 +3149,14 @@ impl TopologyStreamCoordinator {
             }
         };
         if in_flight.serial != serial
-            || response.stream_id != self.stream_id
-            || response.negotiated != negotiated
+            || prepared.stream_id != self.stream_id
+            || prepared.negotiated != negotiated
         {
             self.terminal.trip(TOPOLOGY_PROTOCOL_FAILURE);
             anyhow::bail!("ordered mux snapshot response did not match its request fence");
         }
 
-        enum OrderedFenceOutcomeAuthority {
-            Snapshot {
-                session_incarnation: MuxSessionIncarnation,
-                snapshot_revision: TopologyRevision,
-            },
-            Contended,
-            RevisionExhausted,
-            Unsupported,
-        }
-
-        let outcome = match &response.outcome {
-            codec::ListPanesOrderedV1Outcome::Snapshot(snapshot) => {
-                OrderedFenceOutcomeAuthority::Snapshot {
-                    session_incarnation: snapshot.session_incarnation,
-                    snapshot_revision: snapshot.topology_revision,
-                }
-            }
-            codec::ListPanesOrderedV1Outcome::Contended { .. } => {
-                OrderedFenceOutcomeAuthority::Contended
-            }
-            codec::ListPanesOrderedV1Outcome::RevisionExhausted => {
-                OrderedFenceOutcomeAuthority::RevisionExhausted
-            }
-            codec::ListPanesOrderedV1Outcome::Unsupported { .. } => {
-                OrderedFenceOutcomeAuthority::Unsupported
-            }
-        };
+        let outcome = prepared.outcome;
 
         match outcome {
             OrderedFenceOutcomeAuthority::Snapshot {
@@ -2441,70 +3201,77 @@ impl TopologyStreamCoordinator {
                     );
                 }
 
-                queue_response_pdu_with_emission_authority(
-                    &self.item_tx,
-                    &self.terminal,
-                    &self.outbound_budget,
-                    Pdu::ListPanesOrderedV1Response(response),
-                    serial,
-                    PduDeliveryClass::Control,
-                    ServerEmissionAuthority::OrderedSnapshotFence,
-                )?;
+                #[cfg(test)]
+                self.run_after_ordered_snapshot_validation_hook();
+                prepared.publish(&self.item_tx, &self.terminal)?;
+                #[cfg(test)]
+                self.run_after_ordered_snapshot_publish_hook();
 
-                let mut established = EstablishedTopologyStream {
-                    snapshot_revision,
-                    next_revision: snapshot_revision
-                        .get()
-                        .checked_add(1)
-                        .map(TopologyRevision::new),
-                    ordered: Some(EstablishedOrderedWindowStream {
-                        authority,
-                        request: request_generation,
-                    }),
-                    buffer: TopologyEventBuffer::default(),
-                };
-                for event in in_flight.buffer.take_all() {
-                    if event.revision > snapshot_revision {
-                        established
-                            .buffer
-                            .insert(event, self.retention_limits)
-                            .inspect_err(|_| {
-                                self.terminal.trip(TOPOLOGY_BUFFER_OVERFLOW);
-                            })?;
-                    } else {
-                        metrics::counter!(
-                            "mux.dispatch.ordered_fence.events.total",
-                            "outcome" => "snapshot_subsumed"
-                        )
-                        .increment(1);
+                loop {
+                    let first_revision = match prepared.retired_phase.as_ref() {
+                        Some(TopologyStreamPhase::Fencing(in_flight)) => {
+                            in_flight.buffer.first_revision()
+                        }
+                        _ => unreachable!("validated ordered fence changed phase"),
+                    };
+                    if first_revision.is_none_or(|revision| revision > snapshot_revision) {
+                        break;
                     }
+                    let event = match prepared.retired_phase.as_mut() {
+                        Some(TopologyStreamPhase::Fencing(in_flight)) => in_flight
+                            .buffer
+                            .pop_first()?
+                            .expect("observed first ordered-fence revision must remain present"),
+                        _ => unreachable!("validated ordered fence changed phase"),
+                    };
+                    defer_topology_owner(
+                        &mut prepared.retired_owners,
+                        DeferredTopologyOwner::Event(event),
+                    );
+                    metrics::counter!(
+                        "mux.dispatch.ordered_fence.events.total",
+                        "outcome" => "snapshot_subsumed"
+                    )
+                    .increment(1);
                 }
-                self.drain_established(&mut established)?;
-                state.phase = TopologyStreamPhase::Established(established);
+
+                let phase = prepared
+                    .retired_phase
+                    .take()
+                    .expect("ordered fence retirement carrier must own its phase");
+                let TopologyStreamPhase::Fencing(in_flight) = phase else {
+                    unreachable!("validated ordered fence changed phase");
+                };
+                prepared.retired_phase = Some(TopologyStreamPhase::Established(
+                    EstablishedTopologyStream {
+                        snapshot_revision,
+                        next_revision: snapshot_revision
+                            .get()
+                            .checked_add(1)
+                            .map(TopologyRevision::new),
+                        ordered: Some(EstablishedOrderedWindowStream {
+                            authority,
+                            request: request_generation,
+                        }),
+                        buffer: in_flight.buffer,
+                    },
+                ));
+                self.drain_retired_ordered_established(prepared)?;
+                state.phase = prepared
+                    .retired_phase
+                    .take()
+                    .expect("successful ordered fence must retain its established phase");
             }
             OrderedFenceOutcomeAuthority::Contended => {
-                queue_response_pdu_with_emission_authority(
-                    &self.item_tx,
-                    &self.terminal,
-                    &self.outbound_budget,
-                    Pdu::ListPanesOrderedV1Response(response),
-                    serial,
-                    PduDeliveryClass::Control,
-                    ServerEmissionAuthority::OrderedSnapshotFence,
-                )?;
-                state.phase = self.restore_prior(in_flight)?;
+                prepared.publish(&self.item_tx, &self.terminal)?;
+                self.restore_retired_ordered_prior(prepared)?;
+                state.phase = prepared
+                    .retired_phase
+                    .take()
+                    .expect("contended ordered fence must restore its prior phase");
             }
             OrderedFenceOutcomeAuthority::RevisionExhausted => {
-                queue_response_pdu_with_emission_authority(
-                    &self.item_tx,
-                    &self.terminal,
-                    &self.outbound_budget,
-                    Pdu::ListPanesOrderedV1Response(response),
-                    serial,
-                    PduDeliveryClass::Control,
-                    ServerEmissionAuthority::OrderedSnapshotFence,
-                )?;
-                state.phase = TopologyStreamPhase::Exhausted;
+                prepared.publish(&self.item_tx, &self.terminal)?;
                 self.terminal.trip(TOPOLOGY_REVISION_EXHAUSTED);
             }
             OrderedFenceOutcomeAuthority::Unsupported => {
@@ -2516,19 +3283,189 @@ impl TopologyStreamCoordinator {
                         "ordered mux snapshot became unsupported after its fence was admitted"
                     );
                 }
-                queue_response_pdu_with_emission_authority(
-                    &self.item_tx,
-                    &self.terminal,
-                    &self.outbound_budget,
-                    Pdu::ListPanesOrderedV1Response(response),
-                    serial,
-                    PduDeliveryClass::Control,
-                    ServerEmissionAuthority::OrderedSnapshotFence,
-                )?;
-                state.phase = self.restore_prior(in_flight)?;
+                prepared.publish(&self.item_tx, &self.terminal)?;
+                self.restore_retired_ordered_prior(prepared)?;
+                state.phase = prepared
+                    .retired_phase
+                    .take()
+                    .expect("unsupported ordered fence must restore its prior phase");
             }
         }
         Ok(())
+    }
+
+    fn restore_retired_ordered_prior(
+        &self,
+        prepared: &mut PreparedOrderedFenceResponse,
+    ) -> anyhow::Result<()> {
+        let prior_is_legacy = matches!(
+            prepared.retired_phase.as_ref(),
+            Some(TopologyStreamPhase::Fencing(TopologyFenceInFlight {
+                prior: TopologyFencePrior::Legacy,
+                ..
+            }))
+        );
+        if prior_is_legacy {
+            loop {
+                let event = match prepared.retired_phase.as_mut() {
+                    Some(TopologyStreamPhase::Fencing(in_flight)) => {
+                        in_flight.buffer.pop_first()?
+                    }
+                    _ => unreachable!("validated ordered fence changed phase"),
+                };
+                let Some(event) = event else {
+                    break;
+                };
+                self.queue_retired_ordered_event_as_legacy(
+                    event,
+                    &mut prepared.retired_owners,
+                )?;
+            }
+            let phase = prepared
+                .retired_phase
+                .take()
+                .expect("ordered fence retirement carrier must own its phase");
+            let TopologyStreamPhase::Fencing(in_flight) = phase else {
+                unreachable!("validated ordered fence changed phase");
+            };
+            debug_assert!(in_flight.buffer.events.is_empty());
+            prepared.retired_phase = Some(TopologyStreamPhase::Legacy);
+            return Ok(());
+        }
+
+        let phase = prepared
+            .retired_phase
+            .take()
+            .expect("ordered fence retirement carrier must own its phase");
+        let TopologyStreamPhase::Fencing(in_flight) = phase else {
+            prepared.retired_phase = Some(phase);
+            anyhow::bail!("ordered fence prior restore lost its in-flight phase");
+        };
+        let TopologyFencePrior::Established {
+            snapshot_revision,
+            next_revision,
+            ordered,
+        } = in_flight.prior
+        else {
+            unreachable!("ordered fence prior restore changed authority class");
+        };
+        prepared.retired_phase = Some(TopologyStreamPhase::Established(
+            EstablishedTopologyStream {
+                snapshot_revision,
+                next_revision,
+                ordered,
+                buffer: in_flight.buffer,
+            },
+        ));
+        self.drain_retired_ordered_established(prepared)
+    }
+
+    fn drain_retired_ordered_established(
+        &self,
+        prepared: &mut PreparedOrderedFenceResponse,
+    ) -> anyhow::Result<()> {
+        loop {
+            let (next_revision, ordered_authority) = match prepared.retired_phase.as_ref() {
+                Some(TopologyStreamPhase::Established(established)) => (
+                    established.next_revision,
+                    established
+                        .ordered
+                        .as_ref()
+                        .map(|ordered| ordered.authority),
+                ),
+                _ => anyhow::bail!(
+                    "ordered fence drain lost its retirement-owned established phase"
+                ),
+            };
+            let Some(next_revision) = next_revision else {
+                return Ok(());
+            };
+            let event = match prepared.retired_phase.as_mut() {
+                Some(TopologyStreamPhase::Established(established)) => {
+                    established.buffer.remove(next_revision)?
+                }
+                _ => unreachable!("ordered established phase changed during drain"),
+            };
+            let Some(event) = event else {
+                return Ok(());
+            };
+            self.queue_stamped_event_deferred(
+                ordered_authority,
+                event,
+                &mut prepared.retired_owners,
+            )?;
+            metrics::counter!(
+                "mux.dispatch.topology_fence.events.total",
+                "outcome" => "replayed"
+            )
+            .increment(1);
+            let next = next_revision
+                .get()
+                .checked_add(1)
+                .map(TopologyRevision::new);
+            let Some(TopologyStreamPhase::Established(established)) =
+                prepared.retired_phase.as_mut()
+            else {
+                unreachable!("ordered established phase changed during drain");
+            };
+            established.next_revision = next;
+        }
+    }
+
+    fn queue_retired_ordered_event_as_legacy(
+        &self,
+        event: RetainedTopologyEvent,
+        retired_owners: &mut Vec<DeferredTopologyOwner>,
+    ) -> anyhow::Result<()> {
+        let RetainedTopologyEvent {
+            notification,
+            reservation,
+            ..
+        } = event;
+        let result = match notification {
+            RetainedTopologyNotification::Ordinary(notification) => {
+                try_queue_reserved_notification(
+                    &self.item_tx,
+                    &self.terminal,
+                    notification,
+                    reservation,
+                )
+            }
+            RetainedTopologyNotification::WindowOrderChanged {
+                legacy_resync_tab_id,
+                ordered_window,
+                ..
+            } => {
+                if let Some(ordered_window) = ordered_window {
+                    defer_topology_owner(
+                        retired_owners,
+                        DeferredTopologyOwner::OrderedWindow(ordered_window),
+                    );
+                }
+                try_queue_reserved_pdu_with_emission_authority(
+                    &self.item_tx,
+                    &self.terminal,
+                    Box::new(DecodedPdu {
+                        pdu: Pdu::TabResized(codec::TabResized {
+                            tab_id: legacy_resync_tab_id,
+                        }),
+                        serial: 0,
+                    }),
+                    reservation,
+                    ServerEmissionAuthority::Ordinary,
+                )
+            }
+        };
+        match result {
+            Ok(()) => Ok(()),
+            Err(rejected) => {
+                defer_topology_owner(
+                    retired_owners,
+                    DeferredTopologyOwner::Item(rejected.item),
+                );
+                Err(rejected.error)
+            }
+        }
     }
 
     fn restore_prior(
@@ -2579,6 +3516,33 @@ impl TopologyStreamCoordinator {
             self.queue_stamped_event(
                 established.ordered.as_ref().map(|ordered| ordered.authority),
                 event,
+            )?;
+            metrics::counter!(
+                "mux.dispatch.topology_fence.events.total",
+                "outcome" => "replayed"
+            )
+            .increment(1);
+            established.next_revision = next_revision
+                .get()
+                .checked_add(1)
+                .map(TopologyRevision::new);
+        }
+        Ok(())
+    }
+
+    fn drain_established_deferred(
+        &self,
+        established: &mut EstablishedTopologyStream,
+        retired_owners: &mut Vec<DeferredTopologyOwner>,
+    ) -> anyhow::Result<()> {
+        while let Some(next_revision) = established.next_revision {
+            let Some(event) = established.buffer.remove(next_revision)? else {
+                break;
+            };
+            self.queue_stamped_event_deferred(
+                established.ordered.as_ref().map(|ordered| ordered.authority),
+                event,
+                retired_owners,
             )?;
             metrics::counter!(
                 "mux.dispatch.topology_fence.events.total",
@@ -2657,6 +3621,124 @@ impl TopologyStreamCoordinator {
         )
     }
 
+    fn queue_stamped_event_deferred(
+        &self,
+        ordered_authority: Option<EstablishedOrderedWindowAuthority>,
+        event: RetainedTopologyEvent,
+        retired_owners: &mut Vec<DeferredTopologyOwner>,
+    ) -> anyhow::Result<()> {
+        let notification_is_topology = match &event.notification {
+            RetainedTopologyNotification::Ordinary(notification) => notification.is_topology(),
+            RetainedTopologyNotification::WindowOrderChanged { .. } => true,
+        };
+        if !notification_is_topology {
+            defer_topology_owner(retired_owners, DeferredTopologyOwner::Event(event));
+            anyhow::bail!("non-topology mux notification carried a topology revision");
+        }
+        let ordered_event_has_no_wire_authority = matches!(
+            (&ordered_authority, &event.notification),
+            (
+                Some(authority),
+                RetainedTopologyNotification::WindowOrderChanged { .. }
+            ) if !authority
+                .negotiated
+                .contains(TopologyCapabilities::ORDERED_WINDOW_STREAM_V1)
+        );
+        let ordered_event_lost_frozen_state = matches!(
+            (&ordered_authority, &event.notification),
+            (
+                Some(_),
+                RetainedTopologyNotification::WindowOrderChanged {
+                    ordered_window: None,
+                    ..
+                }
+            )
+        );
+        if ordered_event_has_no_wire_authority || ordered_event_lost_frozen_state {
+            defer_topology_owner(retired_owners, DeferredTopologyOwner::Event(event));
+            anyhow::bail!(
+                "ordered-window authority reached an event without permitted frozen PDU90 state"
+            );
+        }
+
+        let RetainedTopologyEvent {
+            notification,
+            revision,
+            reservation,
+            ..
+        } = event;
+        let (pdu, emission_authority) = match (ordered_authority, notification) {
+            (
+                Some(authority),
+                RetainedTopologyNotification::WindowOrderChanged {
+                    ordered_window: Some(ordered_window),
+                    ..
+                },
+            ) if authority
+                .negotiated
+                .contains(TopologyCapabilities::ORDERED_WINDOW_STREAM_V1) =>
+            {
+                (
+                    Pdu::WindowOrderEventV1(codec::WindowOrderEventV1 {
+                        protocol_version: codec::ORDERED_WINDOW_PROTOCOL_VERSION,
+                        stream_id: authority.stream_id,
+                        session_incarnation: authority.session_incarnation,
+                        topology_revision: revision,
+                        windows: vec![ordered_window],
+                    }),
+                    ServerEmissionAuthority::OrderedStreamEvent,
+                )
+            }
+            (
+                None,
+                RetainedTopologyNotification::WindowOrderChanged {
+                    window_id,
+                    ordered_window,
+                    ..
+                },
+            ) => {
+                if let Some(ordered_window) = ordered_window {
+                    defer_topology_owner(
+                        retired_owners,
+                        DeferredTopologyOwner::OrderedWindow(ordered_window),
+                    );
+                }
+                (
+                    Pdu::TopologyEvent(TopologyEvent {
+                        stream_id: self.stream_id,
+                        revision,
+                        event: TopologyEventKind::WindowInvalidated { window_id },
+                    }),
+                    ServerEmissionAuthority::Ordinary,
+                )
+            }
+            (_, notification) => (
+                Pdu::TopologyEvent(TopologyEvent {
+                    stream_id: self.stream_id,
+                    revision,
+                    event: into_topology_event_kind(notification)?,
+                }),
+                ServerEmissionAuthority::Ordinary,
+            ),
+        };
+        match try_queue_reserved_pdu_with_emission_authority(
+            &self.item_tx,
+            &self.terminal,
+            Box::new(DecodedPdu { pdu, serial: 0 }),
+            reservation,
+            emission_authority,
+        ) {
+            Ok(()) => Ok(()),
+            Err(rejected) => {
+                defer_topology_owner(
+                    retired_owners,
+                    DeferredTopologyOwner::Item(rejected.item),
+                );
+                Err(rejected.error)
+            }
+        }
+    }
+
     fn on_notification(&self, _mux: &Mux, envelope: MuxNotificationEnvelope) -> bool {
         if self.terminal.is_tripped() {
             self.discard_retained_state();
@@ -2723,8 +3805,18 @@ impl TopologyStreamCoordinator {
                 return false;
             }
         };
-        let mut state = self.state.lock();
-        self.admit_prepared_topology_notification(&mut state, notification, revision)
+        let mut retired_owners = Vec::with_capacity(2);
+        let accepted = {
+            let mut state = self.state.lock();
+            self.admit_prepared_topology_notification(
+                &mut state,
+                notification,
+                revision,
+                &mut retired_owners,
+            )
+        };
+        drop(retired_owners);
+        accepted
     }
 
     fn on_window_order_topology_notification(
@@ -2734,6 +3826,7 @@ impl TopologyStreamCoordinator {
     ) -> bool {
         let window_id = window.window_id();
         let legacy_resync_tab_id = window.active_tab_id().unwrap_or(0);
+        let mut retired_owners = Vec::with_capacity(2);
         let state = self.state.lock();
         let ordered_generation = OrderedDeliveryGeneration::capture(&state.phase);
 
@@ -2751,12 +3844,14 @@ impl TopologyStreamCoordinator {
                 &mut state,
                 notification,
                 revision,
+                &mut retired_owners,
             );
             drop(state);
             // `FrozenWindowOrder` can own q tab Arcs. Drop it only after the
             // coordinator guard so the last-reference destructor is never
             // hidden inside the state critical section.
             drop(window);
+            drop(retired_owners);
             return accepted;
         };
 
@@ -2807,16 +3902,30 @@ impl TopologyStreamCoordinator {
                 dynamic_bytes: 0,
             };
             let accepted =
-                self.admit_prepared_topology_notification(&mut state, fallback, revision);
+                self.admit_prepared_topology_notification(
+                    &mut state,
+                    fallback,
+                    revision,
+                    &mut retired_owners,
+                );
             drop(state);
             // The optimistic q-sized representation is not useful to the
             // phase that won the race. Release its Vec only after leaving the
             // coordinator critical section; no legacy/coherent buffer pays
             // ordered-state accounting or allocator work.
             drop(notification);
+            drop(retired_owners);
             return accepted;
         }
-        self.admit_prepared_topology_notification(&mut state, notification, revision)
+        let accepted = self.admit_prepared_topology_notification(
+            &mut state,
+            notification,
+            revision,
+            &mut retired_owners,
+        );
+        drop(state);
+        drop(retired_owners);
+        accepted
     }
 
     fn admit_prepared_topology_notification(
@@ -2824,6 +3933,7 @@ impl TopologyStreamCoordinator {
         state: &mut TopologyStreamState,
         notification: PreparedTopologyNotification,
         revision: TopologyRevision,
+        retired_owners: &mut Vec<DeferredTopologyOwner>,
     ) -> bool {
         if let Some(subscription) = state.subscription {
             // The subscription baseline is the causal cut at which this
@@ -2832,6 +3942,10 @@ impl TopologyStreamCoordinator {
             // is already represented by the baseline and must never leak as a
             // legacy predecessor or enter a later fence buffer.
             if revision <= subscription.baseline_revision {
+                defer_topology_owner(
+                    retired_owners,
+                    DeferredTopologyOwner::Prepared(notification),
+                );
                 return true;
             }
         } else {
@@ -2841,24 +3955,42 @@ impl TopologyStreamCoordinator {
             {
                 log::error!("failed to preflight pre-bind mux topology event: {err:#}");
                 self.terminal.trip(TOPOLOGY_BUFFER_OVERFLOW);
+                defer_topology_owner(
+                    retired_owners,
+                    DeferredTopologyOwner::Prepared(notification),
+                );
                 return false;
             }
-            let event = match retained_topology_event(
+            let event = match try_retained_topology_event(
                 notification,
                 revision,
                 &self.terminal,
                 &self.outbound_budget,
             ) {
                 Ok(event) => event,
-                Err(err) => {
-                    log::error!("failed to retain pre-bind mux topology event: {err:#}");
+                Err(rejected) => {
+                    log::error!(
+                        "failed to retain pre-bind mux topology event: {:#}",
+                        rejected.error
+                    );
                     self.terminal.trip(TOPOLOGY_BUFFER_OVERFLOW);
+                    defer_topology_owner(
+                        retired_owners,
+                        DeferredTopologyOwner::Prepared(rejected.notification),
+                    );
                     return false;
                 }
             };
-            if let Err(err) = state.prebind.insert(event, self.retention_limits) {
-                log::error!("failed to retain pre-bind mux topology event: {err:#}");
+            if let Err(rejected) = state.prebind.try_insert(event, self.retention_limits) {
+                log::error!(
+                    "failed to retain pre-bind mux topology event: {:#}",
+                    rejected.error
+                );
                 self.terminal.trip(TOPOLOGY_BUFFER_OVERFLOW);
+                defer_topology_owner(
+                    retired_owners,
+                    DeferredTopologyOwner::Event(rejected.event),
+                );
                 return false;
             }
             return true;
@@ -2872,25 +4004,34 @@ impl TopologyStreamCoordinator {
         let phase = &mut state.phase;
         match phase {
             TopologyStreamPhase::Legacy => {
-                let event = match retained_topology_event(
+                let event = match try_retained_topology_event(
                     notification,
                     revision,
                     &self.terminal,
                     &self.outbound_budget,
                 ) {
                     Ok(event) => event,
-                    Err(err) => {
-                        log::error!("failed to retain legacy mux topology event: {err:#}");
+                    Err(rejected) => {
+                        log::error!(
+                            "failed to retain legacy mux topology event: {:#}",
+                            rejected.error
+                        );
                         self.terminal.trip(TOPOLOGY_BUFFER_OVERFLOW);
+                        defer_topology_owner(
+                            retired_owners,
+                            DeferredTopologyOwner::Prepared(rejected.notification),
+                        );
                         return false;
                     }
                 };
-                queue_reserved_retained_notification(
-                    &self.item_tx,
-                    &self.terminal,
-                    event.notification,
-                    event.reservation,
-                )
+                if let Err(err) =
+                    self.queue_retired_ordered_event_as_legacy(event, retired_owners)
+                {
+                    log::error!("failed to queue legacy mux topology event: {err:#}");
+                    false
+                } else {
+                    true
+                }
             }
             TopologyStreamPhase::Fencing(in_flight) => {
                 if let Err(err) = in_flight
@@ -2901,24 +4042,44 @@ impl TopologyStreamCoordinator {
                         "failed to preflight in-flight mux topology event: {err:#}"
                     );
                     self.terminal.trip(TOPOLOGY_BUFFER_OVERFLOW);
+                    defer_topology_owner(
+                        retired_owners,
+                        DeferredTopologyOwner::Prepared(notification),
+                    );
                     return false;
                 }
-                let event = match retained_topology_event(
+                let event = match try_retained_topology_event(
                     notification,
                     revision,
                     &self.terminal,
                     &self.outbound_budget,
                 ) {
                     Ok(event) => event,
-                    Err(err) => {
-                        log::error!("failed to retain in-flight mux topology event: {err:#}");
+                    Err(rejected) => {
+                        log::error!(
+                            "failed to retain in-flight mux topology event: {:#}",
+                            rejected.error
+                        );
                         self.terminal.trip(TOPOLOGY_BUFFER_OVERFLOW);
+                        defer_topology_owner(
+                            retired_owners,
+                            DeferredTopologyOwner::Prepared(rejected.notification),
+                        );
                         return false;
                     }
                 };
-                if let Err(err) = in_flight.buffer.insert(event, self.retention_limits) {
-                    log::error!("failed to retain in-flight mux topology event: {err:#}");
+                if let Err(rejected) =
+                    in_flight.buffer.try_insert(event, self.retention_limits)
+                {
+                    log::error!(
+                        "failed to retain in-flight mux topology event: {:#}",
+                        rejected.error
+                    );
                     self.terminal.trip(TOPOLOGY_BUFFER_OVERFLOW);
+                    defer_topology_owner(
+                        retired_owners,
+                        DeferredTopologyOwner::Event(rejected.event),
+                    );
                     false
                 } else {
                     true
@@ -2926,35 +4087,53 @@ impl TopologyStreamCoordinator {
             }
             TopologyStreamPhase::Established(established) => {
                 if revision <= established.snapshot_revision {
+                    defer_topology_owner(
+                        retired_owners,
+                        DeferredTopologyOwner::Prepared(notification),
+                    );
                     return true;
                 }
                 let Some(next_revision) = established.next_revision else {
                     self.terminal.trip(TOPOLOGY_PROTOCOL_FAILURE);
+                    defer_topology_owner(
+                        retired_owners,
+                        DeferredTopologyOwner::Prepared(notification),
+                    );
                     return false;
                 };
                 if revision < next_revision {
                     self.terminal.trip(TOPOLOGY_PROTOCOL_FAILURE);
+                    defer_topology_owner(
+                        retired_owners,
+                        DeferredTopologyOwner::Prepared(notification),
+                    );
                     return false;
                 }
                 if revision == next_revision {
-                    let event = match retained_topology_event(
+                    let event = match try_retained_topology_event(
                         notification,
                         revision,
                         &self.terminal,
                         &self.outbound_budget,
                     ) {
                         Ok(event) => event,
-                        Err(err) => {
+                        Err(rejected) => {
                             log::error!(
-                                "failed to retain contiguous mux topology event: {err:#}"
+                                "failed to retain contiguous mux topology event: {:#}",
+                                rejected.error
                             );
                             self.terminal.trip(TOPOLOGY_BUFFER_OVERFLOW);
+                            defer_topology_owner(
+                                retired_owners,
+                                DeferredTopologyOwner::Prepared(rejected.notification),
+                            );
                             return false;
                         }
                     };
-                    if let Err(err) = self.queue_stamped_event(
+                    if let Err(err) = self.queue_stamped_event_deferred(
                         established.ordered.as_ref().map(|ordered| ordered.authority),
                         event,
+                        retired_owners,
                     ) {
                         log::error!("failed to enqueue contiguous mux topology event: {err:#}");
                         self.terminal.trip(TOPOLOGY_PROTOCOL_FAILURE);
@@ -2964,7 +4143,9 @@ impl TopologyStreamCoordinator {
                         .get()
                         .checked_add(1)
                         .map(TopologyRevision::new);
-                    if let Err(err) = self.drain_established(established) {
+                    if let Err(err) =
+                        self.drain_established_deferred(established, retired_owners)
+                    {
                         log::error!("failed to drain reordered mux topology events: {err:#}");
                         self.terminal.trip(TOPOLOGY_PROTOCOL_FAILURE);
                         return false;
@@ -2978,26 +4159,44 @@ impl TopologyStreamCoordinator {
                             "failed to preflight gapped mux topology event: {err:#}"
                         );
                         self.terminal.trip(TOPOLOGY_BUFFER_OVERFLOW);
+                        defer_topology_owner(
+                            retired_owners,
+                            DeferredTopologyOwner::Prepared(notification),
+                        );
                         return false;
                     }
-                    let event = match retained_topology_event(
+                    let event = match try_retained_topology_event(
                         notification,
                         revision,
                         &self.terminal,
                         &self.outbound_budget,
                     ) {
                         Ok(event) => event,
-                        Err(err) => {
+                        Err(rejected) => {
                             log::error!(
-                                "failed to retain gapped mux topology event: {err:#}"
+                                "failed to retain gapped mux topology event: {:#}",
+                                rejected.error
                             );
                             self.terminal.trip(TOPOLOGY_BUFFER_OVERFLOW);
+                            defer_topology_owner(
+                                retired_owners,
+                                DeferredTopologyOwner::Prepared(rejected.notification),
+                            );
                             return false;
                         }
                     };
-                    if let Err(err) = established.buffer.insert(event, self.retention_limits) {
-                        log::error!("failed to retain gapped mux topology event: {err:#}");
+                    if let Err(rejected) =
+                        established.buffer.try_insert(event, self.retention_limits)
+                    {
+                        log::error!(
+                            "failed to retain gapped mux topology event: {:#}",
+                            rejected.error
+                        );
                         self.terminal.trip(TOPOLOGY_BUFFER_OVERFLOW);
+                        defer_topology_owner(
+                            retired_owners,
+                            DeferredTopologyOwner::Event(rejected.event),
+                        );
                         return false;
                     }
                     metrics::counter!(
@@ -3010,27 +4209,61 @@ impl TopologyStreamCoordinator {
             }
             TopologyStreamPhase::Exhausted => {
                 self.terminal.trip(TOPOLOGY_REVISION_EXHAUSTED);
+                defer_topology_owner(
+                    retired_owners,
+                    DeferredTopologyOwner::Prepared(notification),
+                );
                 false
             }
         }
     }
 }
 
-fn retained_topology_event(
+#[derive(Debug)]
+struct RetainedTopologyEventRejection {
+    error: anyhow::Error,
+    notification: PreparedTopologyNotification,
+}
+
+fn try_retained_topology_event(
     notification: PreparedTopologyNotification,
     revision: TopologyRevision,
     terminal: &DispatchTerminal,
     outbound_budget: &Arc<OutboundBudget>,
-) -> anyhow::Result<RetainedTopologyEvent> {
-    let retained_bytes = RETAINED_TOPOLOGY_EVENT_ACCOUNTED_FIXED_BYTES
+) -> Result<RetainedTopologyEvent, RetainedTopologyEventRejection> {
+    if matches!(
+        &notification.notification,
+        RetainedTopologyNotification::Ordinary(MuxNotification::WindowOrderChanged { .. })
+    ) {
+        return Err(RetainedTopologyEventRejection {
+            error: anyhow::anyhow!(
+                "unprepared frozen window-order graph reached retained topology admission"
+            ),
+            notification,
+        });
+    }
+    let Some(retained_bytes) = RETAINED_TOPOLOGY_EVENT_ACCOUNTED_FIXED_BYTES
         .checked_add(notification.dynamic_bytes)
-        .context("counting retained mux topology event bytes")?;
-    let reservation = reserve_outbound(
+    else {
+        return Err(RetainedTopologyEventRejection {
+            error: anyhow::anyhow!("counting retained mux topology event bytes"),
+            notification,
+        });
+    };
+    let reservation = match reserve_outbound(
         terminal,
         outbound_budget,
         OutboundClass::Topology,
         retained_bytes,
-    )?;
+    ) {
+        Ok(reservation) => reservation,
+        Err(error) => {
+            return Err(RetainedTopologyEventRejection {
+                error,
+                notification,
+            });
+        }
+    };
     Ok(RetainedTopologyEvent {
         notification: notification.notification,
         revision,
@@ -3196,7 +4429,7 @@ fn prepare_unilateral_pdu(
     deferred_item: &mut Option<Item>,
     terminal: &DispatchTerminal,
 ) -> anyhow::Result<PendingOutboundBatch> {
-    reject_dormant_server_emission(
+    validate_server_emission_authority(
         &pdu,
         0,
         terminal,
@@ -3536,21 +4769,22 @@ enum OutboundService {
     Terminal,
 }
 
-fn reweight_topology_batch(
+fn reweight_accounted_batch(
     terminal: &DispatchTerminal,
     reservations: &mut [OutboundReservation],
     retained_bytes: usize,
 ) -> anyhow::Result<()> {
-    if !reservations
+    let Some(retained_class) = reservations
         .iter()
-        .any(|reservation| reservation.is_topology)
-    {
+        .find(|reservation| reservation.accounts_retained_bytes())
+        .map(|reservation| reservation.retained_class)
+    else {
         return Ok(());
-    }
+    };
     let Some(admission) = terminal.admit() else {
         anyhow::bail!("mux dispatch connection is already terminal");
     };
-    match OutboundBudget::reweight_topology_batch(reservations, retained_bytes) {
+    match OutboundBudget::reweight_accounted_batch(reservations, retained_bytes) {
         Ok(()) => {
             drop(admission);
             Ok(())
@@ -3560,12 +4794,13 @@ fn reweight_topology_batch(
             drop(admission);
             metrics::counter!(
                 "mux.dispatch.outbound_budget.rejected",
-                "class" => OutboundClass::Topology.label(),
+                "class" => retained_class.label(),
                 "limit" => limit.label(),
             )
             .increment(1);
             anyhow::bail!(
-                "encoded mux topology delivery exceeded the {} bound",
+                "encoded mux {} delivery exceeded the {} bound",
+                retained_class.label(),
                 limit.label()
             )
         }
@@ -3578,27 +4813,30 @@ fn encode_write_payload(
     terminal: &DispatchTerminal,
 ) -> anyhow::Result<EncodedOutboundFrame> {
     match payload {
-        WritePayload::Encoded(frame) => Ok(frame),
+        WritePayload::Encoded(frame) => {
+            frame.authority.validate(terminal)?;
+            Ok(frame)
+        }
         WritePayload::Typed(mut typed) => {
-            reject_dormant_server_emission(
+            let authority = EncodedPduAuthority::capture(
                 &typed.decoded.pdu,
                 typed.decoded.serial,
-                terminal,
                 typed.emission_authority,
-            )?;
+            );
+            authority.validate(terminal)?;
             let bytes = typed
                 .decoded
                 .pdu
                 .encode_frame_with_mode(typed.decoded.serial, compression_mode)
                 .context("encoding PDU frame")?;
             let encoded_capacity = bytes.capacity();
-            if typed.reservation.is_topology {
+            if typed.reservation.accounts_retained_bytes() {
                 let transition_bytes = typed
                     .reservation
-                    .topology_bytes
+                    .retained_bytes
                     .checked_add(encoded_capacity)
-                    .context("counting typed-to-encoded topology allocation transition")?;
-                reweight_topology_batch(
+                    .context("counting typed-to-encoded retained allocation transition")?;
+                reweight_accounted_batch(
                     terminal,
                     std::slice::from_mut(&mut typed.reservation),
                     transition_bytes,
@@ -3610,9 +4848,13 @@ fn encode_write_payload(
                 emission_authority: _,
             } = typed;
             drop(decoded);
-            let mut frame = EncodedOutboundFrame { bytes, reservation };
-            if frame.reservation.is_topology {
-                reweight_topology_batch(
+            let mut frame = EncodedOutboundFrame {
+                bytes,
+                reservation,
+                authority,
+            };
+            if frame.reservation.accounts_retained_bytes() {
+                reweight_accounted_batch(
                     terminal,
                     std::slice::from_mut(&mut frame.reservation),
                     encoded_capacity,
@@ -3637,6 +4879,10 @@ fn prepare_pending_outbound_batch(
     let mut reservations = vec![first.reservation];
     let mut bytes = first.bytes;
     let mut frames = 1_usize;
+    let batch_class = reservations
+        .first()
+        .map(|reservation| reservation.batch_class)
+        .expect("an outbound batch always retains its first reservation");
 
     while frames < OUTBOUND_WRITE_QUANTUM_FRAMES
         && bytes.len() < OUTBOUND_WRITE_QUANTUM_BYTES
@@ -3649,6 +4895,25 @@ fn prepare_pending_outbound_batch(
             }
             Err(TryRecvError::Empty | TryRecvError::Closed) => break,
         };
+        if payload.batch_class() != batch_class {
+            // Class boundaries are visible in the reservation before encoding.
+            // Defer the typed owner itself so PDU87 never speculatively pays
+            // PDU90 serialization before its own flush epoch completes.
+            *deferred_item = Some(Item::WritePdu(payload));
+            break;
+        }
+        if reservations
+            .iter()
+            .any(OutboundReservation::accounts_retained_bytes)
+            || payload.accounts_retained_bytes()
+        {
+            // A retained frame already owns an exact allocation and charge.
+            // Concatenating it would allocate and copy before a replacement
+            // reservation could be admitted. Keep retained frames segmented
+            // until the writer gains an explicitly accounted vectored batch.
+            *deferred_item = Some(Item::WritePdu(payload));
+            break;
+        }
         let frame = encode_write_payload(payload, compression_mode, terminal)?;
         if bytes
             .len()
@@ -3659,35 +4924,17 @@ fn prepare_pending_outbound_batch(
             break;
         }
 
-        let batch_is_topology = reservations
-            .first()
-            .is_some_and(|reservation| reservation.is_topology);
-        if frame.reservation.is_topology != batch_is_topology {
-            // A shared Vec allocation cannot be attributed exactly across the
-            // topology byte ceiling and uncharged control/bulk traffic. Keep
-            // each topology/non-topology transition as an encoded FIFO boundary
-            // so control capacity never consumes the topology byte budget.
-            *deferred_item = Some(Item::WritePdu(WritePayload::Encoded(frame)));
-            break;
-        }
-
         let EncodedOutboundFrame {
             bytes: frame_bytes,
             reservation,
+            authority: _,
         } = frame;
+        bytes
+            .try_reserve(frame_bytes.len())
+            .context("reserving unaccounted outbound batch concatenation")?;
         bytes.extend_from_slice(&frame_bytes);
         reservations.push(reservation);
-        if batch_is_topology {
-            let transition_bytes = bytes
-                .capacity()
-                .checked_add(frame_bytes.capacity())
-                .context("counting topology batch allocation transition")?;
-            reweight_topology_batch(terminal, &mut reservations, transition_bytes)?;
-            drop(frame_bytes);
-            reweight_topology_batch(terminal, &mut reservations, bytes.capacity())?;
-        } else {
-            drop(frame_bytes);
-        }
+        drop(frame_bytes);
         frames = frames.saturating_add(1);
     }
 
@@ -3914,21 +5161,14 @@ where
         .await
         .context("waiting for mux stream to become writable")?;
 
+    let terminal = test_terminal();
     let mut current = Some(test_write_payload(first));
     while let Some(payload) = current.take() {
-        let (frame, _reservation) = match payload {
-            WritePayload::Typed(typed) => (
-                typed
-                    .decoded
-                    .pdu
-                    .encode_frame_with_mode(typed.decoded.serial, compression_mode)
-                    .context("encoding PDU frame")?,
-                typed.reservation,
-            ),
-            WritePayload::Encoded(EncodedOutboundFrame { bytes, reservation }) => {
-                (bytes, reservation)
-            }
-        };
+        let EncodedOutboundFrame {
+            bytes: frame,
+            reservation: _reservation,
+            authority: _,
+        } = encode_write_payload(payload, compression_mode, &terminal)?;
         write_frame_with_transient_retries(stream, &frame, io_uring_runtime)
             .await
             .context("encoding PDU to client")?;
@@ -4683,31 +5923,37 @@ fn dispatch_client_request(
     topology: &TopologyStreamCoordinator,
     decoded: DecodedPdu,
 ) -> anyhow::Result<()> {
-    if decoded.serial == 0 {
-        metrics::counter!(
-            "mux.dispatch.protocol_error",
-            "reason" => "reserved_request_serial_zero"
-        )
-        .increment(1);
-        anyhow::bail!("mux client request used reserved server-unilateral serial zero");
-    }
+    let result = (|| {
+        if decoded.serial == 0 {
+            metrics::counter!(
+                "mux.dispatch.protocol_error",
+                "reason" => "reserved_request_serial_zero"
+            )
+            .increment(1);
+            anyhow::bail!("mux client request used reserved server-unilateral serial zero");
+        }
 
-    let ordered_authority = match &decoded.pdu {
-        Pdu::ListPanesCoherent(request) => {
-            topology.begin_fence(decoded.serial, request)?;
-            None
-        }
-        Pdu::ListPanesOrderedV1(request) => {
-            topology.begin_ordered_fence(decoded.serial, request)?;
-            None
-        }
-        Pdu::ReorderWindowTabsV1(request) => {
-            Some(topology.admit_ordered_reorder(request)?)
-        }
-        _ => None,
-    };
-    handler.process_one_with_dispatch_authority(decoded, ordered_authority);
-    Ok(())
+        let ordered_authority = match &decoded.pdu {
+            Pdu::ListPanesCoherent(request) => {
+                topology.begin_fence(decoded.serial, request)?;
+                None
+            }
+            Pdu::ListPanesOrderedV1(request) => {
+                topology.begin_ordered_fence(decoded.serial, request)?;
+                None
+            }
+            Pdu::ReorderWindowTabsV1(request) => {
+                Some(topology.admit_ordered_reorder(request)?)
+            }
+            _ => None,
+        };
+        handler.process_one_with_dispatch_authority(decoded, ordered_authority);
+        Ok(())
+    })();
+    if result.is_err() {
+        topology.reject_client_request();
+    }
+    result
 }
 
 #[derive(Debug)]
@@ -4999,6 +6245,7 @@ where
                                 // Client disconnected: no need to make a noise.
                                 return Ok(());
                             }
+                            topology.reject_client_request();
                             return Err(err).context("reading Pdu from client");
                         }
                         Ok(data) => data,
@@ -5206,7 +6453,7 @@ mod tests {
     use super::*;
     use asupersync::io::{AsyncRead, AsyncWrite, ReadBuf};
     use async_channel::unbounded;
-    use codec::{CompressionMode, Ping, Pong, SendPaste, WriteToPane};
+    use codec::{CompressionMode, Ping, Pong, WriteToPane};
     use mux::domain::DomainId;
     use mux::pane::{CachePolicy, ForEachPaneLogicalLine, LogicalLine, Pane, WithPaneLines};
     use mux::renderable::{RenderableDimensions, StableCursorPosition};
@@ -5448,7 +6695,19 @@ mod tests {
         MuxSessionIncarnation,
         TopologyStreamId,
     ) {
-        let (item_tx, item_rx) = bounded(DISPATCH_ITEM_QUEUE_TOTAL_CAPACITY);
+        bound_topology_coordinator_with_item_capacity(DISPATCH_ITEM_QUEUE_TOTAL_CAPACITY)
+    }
+
+    fn bound_topology_coordinator_with_item_capacity(
+        item_capacity: usize,
+    ) -> (
+        TopologyStreamCoordinator,
+        Receiver<Item>,
+        Receiver<&'static str>,
+        MuxSessionIncarnation,
+        TopologyStreamId,
+    ) {
+        let (item_tx, item_rx) = bounded(item_capacity);
         let (terminal, terminal_rx) = DispatchTerminal::channel();
         let stream_id = TopologyStreamId::from_bytes([0x5a; 16]);
         let session_incarnation = MuxSessionIncarnation::from_bytes([0xa5; 16]);
@@ -5601,7 +6860,7 @@ mod tests {
         notification: MuxNotification,
         revision: TopologyRevision,
     ) -> RetainedTopologyEvent {
-        retained_topology_event(
+        try_retained_topology_event(
             prepare_retained_topology_notification(notification)
                 .expect("test topology notification should prepare"),
             revision,
@@ -5611,11 +6870,75 @@ mod tests {
         .expect("test topology notification should fit its connection budget")
     }
 
-    fn assert_outbound_live_counters_zero(coordinator: &TopologyStreamCoordinator) {
-        let released = coordinator.outbound_budget.snapshot();
+    #[test]
+    fn retained_topology_admission_rejects_unprepared_frozen_window_graph() {
+        let mux = Arc::new(Mux::new(None));
+        let _guard = ScopedMux::install(&mux);
+        let tab = Arc::new(mux::tab::Tab::new(&TerminalSize::default()));
+        mux.add_tab_no_panes(&tab)
+            .expect("register test tab for frozen ordered state");
+        let window = mux.new_empty_window(None, None);
+        let window_id = *window;
+        mux.add_tab_to_window(&tab, window_id)
+            .expect("attach test tab to ordered window");
+        drop(window);
+        let frozen = mux
+            .window_order_snapshot(window_id)
+            .expect("test ordered window must be valid")
+            .expect("test ordered window must exist");
+        let prepared = PreparedTopologyNotification {
+            notification: RetainedTopologyNotification::Ordinary(
+                MuxNotification::WindowOrderChanged {
+                    mutation_id: mux::WindowOrderMutationId::new([0x61; 16], 1),
+                    request_digest: mux::WindowReorderDigest::from_bytes([0x62; 32]),
+                    window: frozen,
+                },
+            ),
+            dynamic_bytes: 0,
+        };
+        let (terminal, terminal_rx) = DispatchTerminal::channel();
+        let budget = Arc::new(OutboundBudget::default());
+
+        let rejected = try_retained_topology_event(
+            prepared,
+            TopologyRevision::INITIAL,
+            &terminal,
+            &budget,
+        )
+        .expect_err("an unprepared frozen mux graph must never gain retention authority");
+
+        assert!(
+            format!("{:#}", rejected.error)
+                .contains("unprepared frozen window-order graph reached retained topology admission")
+        );
+        assert_eq!(rejected.notification.dynamic_bytes, 0);
+        assert!(matches!(
+            rejected.notification.notification,
+            RetainedTopologyNotification::Ordinary(MuxNotification::WindowOrderChanged {
+                ref window,
+                ..
+            }) if window.window_id() == window_id
+        ));
+        assert_outbound_budget_live_counters_zero(&budget);
+        assert!(
+            terminal_rx.is_empty(),
+            "preflight rejection must return the owner before admission without changing terminal state"
+        );
+    }
+
+    fn assert_outbound_budget_live_counters_zero(budget: &OutboundBudget) {
+        let released = budget.snapshot();
         assert_eq!(
-            released.topology_bytes, 0,
+            released.retained_bytes, 0,
             "terminal topology cleanup must release every live retained byte"
+        );
+        assert_eq!(
+            released.topology_retained_bytes, 0,
+            "terminal topology cleanup must release the topology tranche"
+        );
+        assert_eq!(
+            released.ordered_snapshot_retained_bytes, 0,
+            "terminal topology cleanup must release the ordered-snapshot tranche"
         );
         assert_eq!(
             released.total_slots, 0,
@@ -5625,8 +6948,13 @@ mod tests {
             released.bulk_slots, 0,
             "terminal topology cleanup must release every live bulk/topology slot"
         );
+    }
+
+    fn assert_outbound_live_counters_zero(coordinator: &TopologyStreamCoordinator) {
+        assert_outbound_budget_live_counters_zero(&coordinator.outbound_budget);
+        let released = coordinator.outbound_budget.snapshot();
         assert!(
-            released.peak_topology_bytes <= TOPOLOGY_FENCE_MAX_RETAINED_BYTES,
+            released.peak_retained_bytes <= OUTBOUND_ACCOUNTED_MAX_RETAINED_BYTES,
             "the historical topology high-water mark must remain within the connection cap"
         );
     }
@@ -5828,12 +7156,12 @@ mod tests {
             assert_eq!(retained.total_slots, depth);
             assert_eq!(retained.bulk_slots, depth);
             assert_eq!(
-                retained.topology_bytes,
+                retained.retained_bytes,
                 RETAINED_TOPOLOGY_EVENT_ACCOUNTED_FIXED_BYTES
                     .checked_mul(depth)
                     .expect("test retained-byte total fits usize")
             );
-            assert!(retained.topology_bytes <= TOPOLOGY_FENCE_MAX_RETAINED_BYTES);
+            assert!(retained.retained_bytes <= OUTBOUND_ACCOUNTED_MAX_RETAINED_BYTES);
 
             coordinator
                 .queue_response(
@@ -5858,7 +7186,7 @@ mod tests {
             let queued = coordinator.outbound_budget.snapshot();
             assert_eq!(queued.total_slots, depth + 1);
             assert_eq!(queued.bulk_slots, depth);
-            assert_eq!(queued.topology_bytes, retained.topology_bytes);
+            assert_eq!(queued.retained_bytes, retained.retained_bytes);
 
             let response = take_written_pdu(&item_rx);
             assert_eq!(response.serial, serial);
@@ -5881,10 +7209,10 @@ mod tests {
             assert!(item_rx.is_empty());
             assert!(terminal_rx.is_empty());
             let released = coordinator.outbound_budget.snapshot();
-            assert_eq!(released.topology_bytes, 0);
+            assert_eq!(released.retained_bytes, 0);
             assert_eq!(released.total_slots, 0);
             assert_eq!(released.bulk_slots, 0);
-            assert!(released.peak_topology_bytes <= TOPOLOGY_FENCE_MAX_RETAINED_BYTES);
+            assert!(released.peak_retained_bytes <= OUTBOUND_ACCOUNTED_MAX_RETAINED_BYTES);
         }
     }
 
@@ -5929,7 +7257,7 @@ mod tests {
             assert_eq!(queued.total_slots, depth);
             assert_eq!(queued.bulk_slots, depth);
             assert_eq!(
-                queued.topology_bytes,
+                queued.retained_bytes,
                 RETAINED_TOPOLOGY_EVENT_ACCOUNTED_FIXED_BYTES
                     .checked_mul(depth)
                     .expect("test retained-byte total fits usize")
@@ -5954,10 +7282,10 @@ mod tests {
             assert!(item_rx.is_empty());
             assert!(terminal_rx.is_empty());
             let released = coordinator.outbound_budget.snapshot();
-            assert_eq!(released.topology_bytes, 0);
+            assert_eq!(released.retained_bytes, 0);
             assert_eq!(released.total_slots, 0);
             assert_eq!(released.bulk_slots, 0);
-            assert!(released.peak_topology_bytes <= TOPOLOGY_FENCE_MAX_RETAINED_BYTES);
+            assert!(released.peak_retained_bytes <= OUTBOUND_ACCOUNTED_MAX_RETAINED_BYTES);
         }
     }
 
@@ -5968,7 +7296,7 @@ mod tests {
             coordinator
                 .queue_response(
                     DecodedPdu {
-                        pdu: Pdu::Pong(Pong {}),
+                        pdu: Pdu::PaneRemoved(codec::PaneRemoved { pane_id: 17 }),
                         serial: 0,
                     },
                     PduDeliveryClass::Bulk,
@@ -6000,7 +7328,10 @@ mod tests {
         for _ in 0..DISPATCH_ITEM_QUEUE_CAPACITY {
             let decoded = Pdu::decode(&mut cursor).expect("decode bulk wire predecessor");
             assert_eq!(decoded.serial, 0);
-            assert_eq!(decoded.pdu, Pdu::Pong(Pong {}));
+            assert_eq!(
+                decoded.pdu,
+                Pdu::PaneRemoved(codec::PaneRemoved { pane_id: 17 })
+            );
         }
         for expected_serial in 1..=DISPATCH_ITEM_QUEUE_CONTROL_RESERVE {
             let decoded = Pdu::decode(&mut cursor).expect("decode reserved control response");
@@ -6014,7 +7345,7 @@ mod tests {
         assert!(item_rx.is_empty());
         assert!(terminal_rx.is_empty());
         let released = coordinator.outbound_budget.snapshot();
-        assert_eq!(released.topology_bytes, 0);
+        assert_eq!(released.retained_bytes, 0);
         assert_eq!(released.total_slots, 0);
         assert_eq!(released.bulk_slots, 0);
     }
@@ -6026,7 +7357,7 @@ mod tests {
             coordinator
                 .queue_response(
                     DecodedPdu {
-                        pdu: Pdu::Pong(Pong {}),
+                        pdu: Pdu::PaneRemoved(codec::PaneRemoved { pane_id: 23 }),
                         serial: 0,
                     },
                     PduDeliveryClass::Bulk,
@@ -6079,7 +7410,7 @@ mod tests {
 
         while item_rx.try_recv().is_ok() {}
         let released = coordinator.outbound_budget.snapshot();
-        assert_eq!(released.topology_bytes, 0);
+        assert_eq!(released.retained_bytes, 0);
         assert_eq!(released.total_slots, 0);
         assert_eq!(released.bulk_slots, 0);
     }
@@ -6103,7 +7434,7 @@ mod tests {
         let first_queued = first.outbound_budget.snapshot();
         assert_eq!(first_queued.total_slots, 20);
         assert_eq!(first_queued.bulk_slots, 20);
-        assert!(first_queued.topology_bytes > 0);
+        assert!(first_queued.retained_bytes > 0);
 
         drop(first_rx);
         assert_eq!(
@@ -6123,7 +7454,7 @@ mod tests {
         );
         let after_rejected = first.outbound_budget.snapshot();
         assert_eq!(
-            after_rejected.topology_bytes, first_queued.topology_bytes,
+            after_rejected.retained_bytes, first_queued.retained_bytes,
             "the rejected closed-channel item must release only its own retained bytes"
         );
         assert_eq!(
@@ -6135,16 +7466,16 @@ mod tests {
             "the rejected closed-channel topology item must not perturb bulk slots"
         );
         assert_eq!(
-            after_rejected.peak_topology_bytes,
+            after_rejected.peak_retained_bytes,
             first_queued
-                .peak_topology_bytes
+                .peak_retained_bytes
                 .checked_add(RETAINED_TOPOLOGY_EVENT_ACCOUNTED_FIXED_BYTES)
                 .expect("test topology high-water fits usize"),
             "the high-water mark must retain the transient rejected reservation"
         );
         drop(first);
         let first_released = first_budget.snapshot();
-        assert_eq!(first_released.topology_bytes, 0);
+        assert_eq!(first_released.retained_bytes, 0);
         assert_eq!(first_released.total_slots, 0);
         assert_eq!(first_released.bulk_slots, 0);
 
@@ -6158,11 +7489,11 @@ mod tests {
         let second_queued = second.outbound_budget.snapshot();
         assert_eq!(second_queued.total_slots, 1);
         assert_eq!(second_queued.bulk_slots, 1);
-        assert!(second_queued.topology_bytes > 0);
+        assert!(second_queued.retained_bytes > 0);
         drop(second_rx);
         drop(second);
         let second_released = second_budget.snapshot();
-        assert_eq!(second_released.topology_bytes, 0);
+        assert_eq!(second_released.retained_bytes, 0);
         assert_eq!(second_released.total_slots, 0);
         assert_eq!(second_released.bulk_slots, 0);
         assert!(second_terminal_rx.is_empty());
@@ -6184,7 +7515,7 @@ mod tests {
 
         sender
             .send_bulk(DecodedPdu {
-                pdu: Pdu::Pong(Pong {}),
+                pdu: Pdu::PaneRemoved(codec::PaneRemoved { pane_id: 29 }),
                 serial: 0,
             })
             .expect("queue one response through the production weak sender");
@@ -6212,10 +7543,85 @@ mod tests {
             })
             .expect_err("a lingering response callback must fail after connection teardown");
         assert!(format!("{error:#}").contains("mux dispatch connection is retired"));
+        let request = ordered_snapshot_request(true);
+        let error = sender
+            .send_control(DecodedPdu {
+                pdu: Pdu::ListPanesOrderedV1Response(ordered_snapshot_response(
+                    &request,
+                    TopologyStreamId::from_bytes([0x5a; 16]),
+                    MuxSessionIncarnation::from_bytes([0xa5; 16]),
+                    TopologyRevision::INITIAL,
+                )),
+                serial: 2,
+            })
+            .expect_err("a pending PDU87 callback must fail after coordinator teardown");
+        assert!(format!("{error:#}").contains("mux dispatch connection is retired"));
+        assert_eq!(budget.snapshot(), OutboundBudgetState::default());
         assert!(!notification_route.deliver(topology_envelope(
             1,
             MuxNotification::PaneAdded(1),
         )));
+    }
+
+    #[test]
+    fn reconnect_rejects_delayed_old_stream_callback_without_touching_new_stream() {
+        let mux = Arc::new(Mux::new(None));
+        let (old_tx, old_rx) = bounded(DISPATCH_ITEM_QUEUE_TOTAL_CAPACITY);
+        let (old_terminal, old_terminal_rx) = DispatchTerminal::channel();
+        let old = Arc::new(TopologyStreamCoordinator::new(
+            old_tx,
+            old_terminal,
+            TopologyStreamId::from_bytes([0x41; 16]),
+        ));
+        old.bind_subscription(
+            MuxSessionIncarnation::from_bytes([0x51; 16]),
+            TopologyRevision::INITIAL,
+        )
+        .expect("bind old connection generation");
+        let old_owner = SessionOwner::new(Arc::clone(&mux));
+        let old_route = TopologyNotificationRoute::new(old_owner.authority(), &mux, &old);
+
+        let (new_tx, new_rx) = bounded(DISPATCH_ITEM_QUEUE_TOTAL_CAPACITY);
+        let (new_terminal, new_terminal_rx) = DispatchTerminal::channel();
+        let new = Arc::new(TopologyStreamCoordinator::new(
+            new_tx,
+            new_terminal,
+            TopologyStreamId::from_bytes([0x42; 16]),
+        ));
+        new.bind_subscription(
+            MuxSessionIncarnation::from_bytes([0x52; 16]),
+            TopologyRevision::INITIAL,
+        )
+        .expect("bind replacement connection generation");
+        let new_owner = SessionOwner::new(Arc::clone(&mux));
+        let new_route = TopologyNotificationRoute::new(new_owner.authority(), &mux, &new);
+
+        drop(old_owner);
+        assert!(
+            !old_route.deliver(topology_envelope(1, MuxNotification::PaneAdded(1))),
+            "retired connection authority must reject a delayed old-stream callback"
+        );
+        assert!(old_rx.is_empty());
+        assert_outbound_live_counters_zero(&old);
+
+        assert!(new_route.deliver(topology_envelope(
+            1,
+            MuxNotification::PaneAdded(2),
+        )));
+        let Item::Notif(ReservedNotification {
+            notification: MuxNotification::PaneAdded(2),
+            ..
+        }) = new_rx
+            .try_recv()
+            .expect("replacement route must retain its own callback")
+        else {
+            panic!("replacement stream must receive only its own notification")
+        };
+        assert!(new_rx.is_empty());
+        assert!(old_terminal_rx.is_empty());
+        assert!(new_terminal_rx.is_empty());
+        assert_outbound_live_counters_zero(&new);
+        drop(new_owner);
     }
 
     #[test]
@@ -6251,11 +7657,11 @@ mod tests {
         let encoded = coordinator.outbound_budget.snapshot();
         assert_eq!(encoded.total_slots, 1);
         assert_eq!(encoded.bulk_slots, 1);
-        assert_eq!(encoded.topology_bytes, pending.bytes.capacity());
-        assert!(encoded.topology_bytes <= TOPOLOGY_FENCE_MAX_RETAINED_BYTES);
+        assert_eq!(encoded.retained_bytes, pending.bytes.capacity());
+        assert!(encoded.retained_bytes <= OUTBOUND_ACCOUNTED_MAX_RETAINED_BYTES);
         drop(pending);
         let released = coordinator.outbound_budget.snapshot();
-        assert_eq!(released.topology_bytes, 0);
+        assert_eq!(released.retained_bytes, 0);
         assert_eq!(released.total_slots, 0);
         assert_eq!(released.bulk_slots, 0);
     }
@@ -6268,7 +7674,7 @@ mod tests {
                 OutboundClass::Topology,
                 TOPOLOGY_FENCE_MAX_RETAINED_BYTES - 2,
             )
-            .expect("reserve near-ceiling unrelated topology bytes");
+            .expect("reserve near-ceiling unrelated accounted bytes");
         let reservation = budget
             .try_reserve(OutboundClass::Topology, 1)
             .expect("reserve one typed topology byte");
@@ -6276,15 +7682,15 @@ mod tests {
 
         let error = encode_write_payload(
             WritePayload::Typed(ReservedDecodedPdu {
-                decoded: queued_ping(1),
+                decoded: queued_pong(1),
                 reservation,
                 emission_authority: ServerEmissionAuthority::Ordinary,
             }),
             CompressionMode::Never,
             &terminal,
         )
-        .expect_err("typed and encoded overlap must not exceed the topology ceiling");
-        assert!(format!("{error:#}").contains("topology_bytes"));
+        .expect_err("typed and encoded overlap must not exceed the retained-byte ceiling");
+        assert!(format!("{error:#}").contains("retained_bytes"));
         assert_eq!(
             terminal_rx
                 .try_recv()
@@ -6293,23 +7699,84 @@ mod tests {
         );
         let failed_released = budget.snapshot();
         assert_eq!(
-            failed_released.topology_bytes,
+            failed_released.retained_bytes,
             TOPOLOGY_FENCE_MAX_RETAINED_BYTES - 2
         );
         assert_eq!(failed_released.total_slots, 1);
         assert_eq!(failed_released.bulk_slots, 1);
         drop(other);
         let released = budget.snapshot();
-        assert_eq!(released.topology_bytes, 0);
+        assert_eq!(released.retained_bytes, 0);
         assert_eq!(released.total_slots, 0);
         assert_eq!(released.bulk_slots, 0);
+    }
+
+    #[test]
+    fn topology_and_ordered_snapshot_retained_tranches_cannot_borrow() {
+        let budget = Arc::new(OutboundBudget::default());
+        let topology = budget
+            .try_reserve(
+                OutboundClass::Topology,
+                TOPOLOGY_FENCE_MAX_RETAINED_BYTES,
+            )
+            .expect("the exact topology tranche must be legal");
+        let snapshot = budget
+            .try_reserve(
+                OutboundClass::OrderedSnapshot,
+                codec::MAX_LIST_PANES_ORDERED_V1_RESPONSE_FRAME_BYTES,
+            )
+            .expect("the exact snapshot tranche must coexist with topology");
+        let exact = budget.snapshot();
+        assert_eq!(
+            exact.retained_bytes,
+            OUTBOUND_ACCOUNTED_MAX_RETAINED_BYTES
+        );
+        assert_eq!(
+            exact.topology_retained_bytes,
+            TOPOLOGY_FENCE_MAX_RETAINED_BYTES
+        );
+        assert_eq!(
+            exact.ordered_snapshot_retained_bytes,
+            codec::MAX_LIST_PANES_ORDERED_V1_RESPONSE_FRAME_BYTES
+        );
+
+        drop(snapshot);
+        assert_eq!(
+            budget
+                .try_reserve(OutboundClass::Topology, 1)
+                .expect_err("topology must not borrow the released snapshot tranche"),
+            OutboundBudgetLimit::TopologyRetainedBytes,
+        );
+        drop(topology);
+
+        let snapshot = budget
+            .try_reserve(
+                OutboundClass::OrderedSnapshot,
+                codec::MAX_LIST_PANES_ORDERED_V1_RESPONSE_FRAME_BYTES,
+            )
+            .expect("reacquire exact snapshot tranche");
+        assert_eq!(
+            budget
+                .try_reserve(OutboundClass::OrderedSnapshot, 1)
+                .expect_err("snapshot must not borrow the free topology tranche"),
+            OutboundBudgetLimit::OrderedSnapshotRetainedBytes,
+        );
+        drop(snapshot);
+        assert_outbound_budget_live_counters_zero(&budget);
     }
 
     fn take_written_pdu(item_rx: &Receiver<Item>) -> DecodedPdu {
         match item_rx.try_recv().expect("queued dispatch item") {
             Item::WritePdu(WritePayload::Typed(ReservedDecodedPdu { decoded, .. })) => *decoded,
-            Item::WritePdu(WritePayload::Encoded(_)) => {
-                panic!("expected queued typed PDU, got an encoded frame")
+            Item::WritePdu(WritePayload::Encoded(frame)) => {
+                let mut cursor = Cursor::new(frame.bytes.as_slice());
+                let decoded = Pdu::decode(&mut cursor).expect("decode queued outbound frame");
+                assert_eq!(
+                    cursor.position() as usize,
+                    frame.bytes.len(),
+                    "one queued encoded item must contain exactly one PDU frame"
+                );
+                decoded
             }
             other => panic!("expected queued PDU, got {other:?}"),
         }
@@ -6378,7 +7845,7 @@ mod tests {
         let mut deferred_item = None;
         prepare_pending_outbound_batch(
             WritePayload::Typed(ReservedDecodedPdu {
-                decoded: queued_ping(1),
+                decoded: queued_pong(1),
                 reservation,
                 emission_authority: ServerEmissionAuthority::Ordinary,
             }),
@@ -6782,7 +8249,13 @@ mod tests {
         let mux = Arc::new(Mux::new(None));
         let (sender, captured) = capturing_pdu_sender();
         let mut handler = SessionHandler::new_for_mux(sender, Arc::clone(&mux));
-        let topology = idle_topology_coordinator();
+        let (item_tx, item_rx) = bounded(DISPATCH_ITEM_QUEUE_TOTAL_CAPACITY);
+        let (terminal, terminal_rx) = DispatchTerminal::channel();
+        let topology = TopologyStreamCoordinator::new(
+            item_tx,
+            terminal,
+            TopologyStreamId::from_bytes([0x5a; 16]),
+        );
 
         let error = dispatch_client_request(
             &mut handler,
@@ -6809,6 +8282,19 @@ mod tests {
             mux.iter_clients().is_empty(),
             "serial-zero SetClientId must be rejected before session mutation"
         );
+        assert_eq!(
+            terminal_rx
+                .try_recv()
+                .expect("serial-zero request must trip the connection"),
+            TOPOLOGY_PROTOCOL_FAILURE,
+        );
+        assert!(terminal_rx.is_empty(), "terminal reason must be sticky");
+        assert!(item_rx.is_empty(), "rejected request must emit no transcript");
+        assert!(matches!(
+            &topology.state.lock().phase,
+            TopologyStreamPhase::Exhausted
+        ));
+        assert_outbound_live_counters_zero(&topology);
     }
 
     #[test]
@@ -7128,6 +8614,20 @@ mod tests {
             )
             .expect("complete future-enabled ordered topology fence");
 
+        let queued = coordinator.outbound_budget.snapshot();
+        assert_eq!(queued.total_slots, 2);
+        assert_eq!(queued.bulk_slots, 1);
+        assert!(
+            queued.retained_bytes > 0,
+            "encoded PDU87 and retained PDU90 must both own accounted bytes"
+        );
+        assert!(queued.ordered_snapshot_retained_bytes > 0);
+        assert!(queued.topology_retained_bytes > 0);
+        assert_eq!(
+            queued.retained_bytes,
+            queued.ordered_snapshot_retained_bytes + queued.topology_retained_bytes,
+        );
+
         let snapshot = take_written_pdu(&item_rx);
         assert_eq!(snapshot.serial, 86);
         let Pdu::ListPanesOrderedV1Response(snapshot) = snapshot.pdu else {
@@ -7136,6 +8636,16 @@ mod tests {
         snapshot
             .validate_for_request(&request)
             .expect("authorized PDU87 must remain request-correlated");
+        let after_snapshot = coordinator.outbound_budget.snapshot();
+        assert_eq!(after_snapshot.total_slots, 1);
+        assert_eq!(after_snapshot.bulk_slots, 1);
+        assert_eq!(after_snapshot.ordered_snapshot_retained_bytes, 0);
+        assert!(after_snapshot.topology_retained_bytes > 0);
+        assert_eq!(
+            after_snapshot.retained_bytes,
+            after_snapshot.topology_retained_bytes,
+        );
+        assert!(after_snapshot.retained_bytes < queued.retained_bytes);
         let event = take_written_pdu(&item_rx);
         assert_eq!(event.serial, 0);
         let Pdu::WindowOrderEventV1(event) = event.pdu else {
@@ -7154,6 +8664,7 @@ mod tests {
         );
         assert!(item_rx.is_empty());
         assert!(terminal_rx.is_empty());
+        assert_outbound_live_counters_zero(&coordinator);
     }
 
     #[test]
@@ -7210,6 +8721,13 @@ mod tests {
             )
             .expect("publish the ordered snapshot and its contiguous successor");
 
+        let queued = coordinator.outbound_budget.snapshot();
+        assert_eq!(queued.total_slots, 2);
+        assert_eq!(queued.bulk_slots, 1);
+        assert!(queued.retained_bytes > 0);
+        assert!(queued.ordered_snapshot_retained_bytes > 0);
+        assert!(queued.topology_retained_bytes > 0);
+
         let first = item_rx.try_recv().expect("queued PDU87 control response");
         let Item::WritePdu(first) = first else {
             panic!("ordered fence must publish PDU87 as a write item");
@@ -7226,11 +8744,18 @@ mod tests {
         assert!(
             matches!(
                 deferred_item.as_ref(),
-                Some(Item::WritePdu(WritePayload::Encoded(_)))
+                Some(Item::WritePdu(WritePayload::Typed(ReservedDecodedPdu {
+                    decoded,
+                    ..
+                }))) if matches!(&decoded.pdu, Pdu::WindowOrderEventV1(_))
             ),
-            "the first PDU90 must be encoded once and deferred behind the PDU87 control batch"
+            "the first PDU90 must remain typed and deferred until PDU87 flushes"
         );
         assert!(item_rx.is_empty());
+        let prepared = coordinator.outbound_budget.snapshot();
+        assert_eq!(prepared.total_slots, 2);
+        assert_eq!(prepared.bulk_slots, 1);
+        assert!(prepared.retained_bytes > 0);
 
         let mut stream = ChunkedDispatchStream {
             max_write_size: Some(17),
@@ -7265,6 +8790,16 @@ mod tests {
         ));
         assert_eq!(first_cursor.position() as usize, pdu87_end);
         drop(first_pending);
+        let after_pdu87 = coordinator.outbound_budget.snapshot();
+        assert_eq!(after_pdu87.total_slots, 1);
+        assert_eq!(after_pdu87.bulk_slots, 1);
+        assert_eq!(after_pdu87.ordered_snapshot_retained_bytes, 0);
+        assert!(after_pdu87.topology_retained_bytes > 0);
+        assert_eq!(
+            after_pdu87.retained_bytes,
+            after_pdu87.topology_retained_bytes,
+        );
+        assert!(after_pdu87.retained_bytes < prepared.retained_bytes);
 
         let Item::WritePdu(second) = deferred_item
             .take()
@@ -7307,9 +8842,845 @@ mod tests {
             second_cursor.position() as usize,
             stream.bytes.len() - pdu87_end
         );
+        drop(second_pending);
         assert!(deferred_item.is_none());
         assert!(item_rx.is_empty());
         assert!(terminal_rx.is_empty());
+        assert_outbound_live_counters_zero(&coordinator);
+    }
+
+    #[test]
+    fn ordered_snapshot_known_full_queue_fails_before_response_validation() {
+        let (coordinator, item_rx, terminal_rx, session_incarnation, stream_id) =
+            bound_topology_coordinator_with_item_capacity(1);
+        coordinator
+            .queue_response(
+                DecodedPdu {
+                    serial: 0,
+                    pdu: Pdu::PaneRemoved(codec::PaneRemoved { pane_id: 31 }),
+                },
+                PduDeliveryClass::Bulk,
+            )
+            .expect("queue one legitimate predecessor through the connection coordinator");
+        let predecessor_budget = coordinator.outbound_budget.snapshot();
+        assert_eq!(predecessor_budget.total_slots, 1);
+        assert_eq!(predecessor_budget.bulk_slots, 1);
+        assert_eq!(predecessor_budget.retained_bytes, 0);
+
+        let request = ordered_snapshot_request(true);
+        coordinator
+            .begin_ordered_fence_with_server_capabilities(
+                188,
+                &request,
+                ordered_window_capabilities(true),
+            )
+            .expect("begin future-enabled ordered topology fence");
+        let mut invalid = ordered_snapshot_response(
+            &request,
+            stream_id,
+            session_incarnation,
+            TopologyRevision::INITIAL,
+        );
+        invalid.domain_binding_id = codec::DomainBindingId::from_bytes([0xee; 16]);
+
+        let error = coordinator
+            .queue_response(
+                DecodedPdu {
+                    serial: 188,
+                    pdu: Pdu::ListPanesOrderedV1Response(invalid),
+                },
+                PduDeliveryClass::Control,
+            )
+            .expect_err("a known-full physical queue must reject PDU87 before q-sized work");
+        assert!(
+            format!("{error:#}").contains("item queue is full"),
+            "queue preflight must precede the deliberately invalid response: {error:#}"
+        );
+        assert_eq!(
+            terminal_rx
+                .try_recv()
+                .expect("known-full PDU87 preflight must terminate the connection"),
+            RESPONSE_QUEUE_FAILURE,
+        );
+        assert!(matches!(
+            &coordinator.state.lock().phase,
+            TopologyStreamPhase::Exhausted
+        ));
+        assert_eq!(coordinator.outbound_budget.snapshot(), predecessor_budget);
+
+        let predecessor = take_written_pdu(&item_rx);
+        assert_eq!(predecessor.serial, 0);
+        assert_eq!(
+            predecessor.pdu,
+            Pdu::PaneRemoved(codec::PaneRemoved { pane_id: 31 })
+        );
+        assert!(item_rx.is_empty());
+        assert_outbound_live_counters_zero(&coordinator);
+    }
+
+    #[test]
+    fn ordered_snapshot_exact_reservation_rejects_class_overflow_and_releases_outside_fence() {
+        let (coordinator, item_rx, terminal_rx, session_incarnation, stream_id) =
+            bound_topology_coordinator();
+        let request = ordered_snapshot_request(true);
+        coordinator
+            .begin_ordered_fence_with_server_capabilities(
+                189,
+                &request,
+                ordered_window_capabilities(true),
+            )
+            .expect("begin future-enabled ordered topology fence");
+        let prior_snapshot = coordinator
+            .outbound_budget
+            .try_reserve(
+                OutboundClass::OrderedSnapshot,
+                codec::MAX_LIST_PANES_ORDERED_V1_RESPONSE_FRAME_BYTES - 1,
+            )
+            .expect("reserve all but one byte of the snapshot-specific tranche");
+
+        let error = coordinator
+            .queue_response(
+                DecodedPdu {
+                    serial: 189,
+                    pdu: Pdu::ListPanesOrderedV1Response(ordered_snapshot_response(
+                        &request,
+                        stream_id,
+                        session_incarnation,
+                        TopologyRevision::INITIAL,
+                    )),
+                },
+                PduDeliveryClass::Control,
+            )
+            .expect_err("the exact encoded PDU87 allocation must not borrow topology headroom");
+        assert!(
+            format!("{error:#}").contains("ordered_snapshot_retained_bytes"),
+            "unexpected ordered-snapshot budget rejection: {error:#}"
+        );
+        assert_eq!(
+            terminal_rx
+                .try_recv()
+                .expect("PDU87 snapshot-class overflow must terminate the connection"),
+            OUTBOUND_BUDGET_OVERFLOW,
+        );
+        assert!(item_rx.is_empty());
+        assert!(matches!(
+            &coordinator.state.lock().phase,
+            TopologyStreamPhase::Exhausted
+        ));
+        let retained = coordinator.outbound_budget.snapshot();
+        assert_eq!(retained.total_slots, 1);
+        assert_eq!(retained.bulk_slots, 0);
+        assert_eq!(retained.topology_retained_bytes, 0);
+        assert_eq!(
+            retained.ordered_snapshot_retained_bytes,
+            codec::MAX_LIST_PANES_ORDERED_V1_RESPONSE_FRAME_BYTES - 1,
+        );
+        drop(prior_snapshot);
+        assert_outbound_live_counters_zero(&coordinator);
+    }
+
+    #[test]
+    fn ordered_snapshot_post_preflight_queue_full_is_sticky_terminal() {
+        let (coordinator, item_rx, terminal_rx, session_incarnation, stream_id) =
+            bound_topology_coordinator_with_item_capacity(1);
+        let request = ordered_snapshot_request(true);
+        coordinator
+            .begin_ordered_fence_with_server_capabilities(
+                195,
+                &request,
+                ordered_window_capabilities(true),
+            )
+            .expect("begin future-enabled ordered topology fence");
+
+        let competing_tx = coordinator.item_tx.clone();
+        coordinator.set_before_ordered_snapshot_publish_hook(move || {
+            competing_tx
+                .try_send(Item::Readable)
+                .expect("test barrier must fill the queue after PDU87 preflight");
+        });
+        let error = coordinator
+            .queue_response(
+                DecodedPdu {
+                    serial: 195,
+                    pdu: Pdu::ListPanesOrderedV1Response(ordered_snapshot_response(
+                        &request,
+                        stream_id,
+                        session_incarnation,
+                        TopologyRevision::INITIAL,
+                    )),
+                },
+                PduDeliveryClass::Control,
+            )
+            .expect_err("PDU87 must recheck the physical FIFO after its optimistic preflight");
+        assert!(
+            format!("{error:#}").contains("item queue is full"),
+            "unexpected post-preflight PDU87 rejection: {error:#}"
+        );
+        assert_eq!(
+            terminal_rx
+                .try_recv()
+                .expect("post-preflight PDU87 loss must terminate the connection"),
+            RESPONSE_QUEUE_FAILURE,
+        );
+        assert!(terminal_rx.is_empty(), "terminal reason must publish exactly once");
+        assert!(matches!(
+            &coordinator.state.lock().phase,
+            TopologyStreamPhase::Exhausted
+        ));
+        assert!(matches!(
+            item_rx.try_recv(),
+            Ok(Item::Readable)
+        ));
+        assert!(item_rx.is_empty());
+        assert_outbound_live_counters_zero(&coordinator);
+    }
+
+    #[test]
+    fn ordered_snapshot_post_preflight_queue_closed_is_sticky_terminal() {
+        let (coordinator, item_rx, terminal_rx, session_incarnation, stream_id) =
+            bound_topology_coordinator_with_item_capacity(1);
+        let request = ordered_snapshot_request(true);
+        coordinator
+            .begin_ordered_fence_with_server_capabilities(
+                196,
+                &request,
+                ordered_window_capabilities(true),
+            )
+            .expect("begin future-enabled ordered topology fence");
+        coordinator.set_before_ordered_snapshot_publish_hook(move || drop(item_rx));
+
+        let error = coordinator
+            .queue_response(
+                DecodedPdu {
+                    serial: 196,
+                    pdu: Pdu::ListPanesOrderedV1Response(ordered_snapshot_response(
+                        &request,
+                        stream_id,
+                        session_incarnation,
+                        TopologyRevision::INITIAL,
+                    )),
+                },
+                PduDeliveryClass::Control,
+            )
+            .expect_err("PDU87 must fail closed when the FIFO closes after preflight");
+        assert!(
+            format!("{error:#}").contains("item queue is closed"),
+            "unexpected post-preflight PDU87 close: {error:#}"
+        );
+        assert_eq!(
+            terminal_rx
+                .try_recv()
+                .expect("post-preflight PDU87 close must terminate the connection"),
+            RESPONSE_QUEUE_FAILURE,
+        );
+        assert!(terminal_rx.is_empty(), "terminal reason must publish exactly once");
+        assert!(matches!(
+            &coordinator.state.lock().phase,
+            TopologyStreamPhase::Exhausted
+        ));
+        assert_outbound_live_counters_zero(&coordinator);
+    }
+
+    #[test]
+    fn ordered_snapshot_queue_close_after_final_validation_is_sticky_terminal() {
+        let (coordinator, item_rx, terminal_rx, session_incarnation, stream_id) =
+            bound_topology_coordinator_with_item_capacity(1);
+        let request = ordered_snapshot_request(true);
+        coordinator
+            .begin_ordered_fence_with_server_capabilities(
+                1_961,
+                &request,
+                ordered_window_capabilities(true),
+            )
+            .expect("begin future-enabled ordered topology fence");
+
+        let reached_final_validation = Arc::new(AtomicBool::new(false));
+        let reached_final_validation_for_hook = Arc::clone(&reached_final_validation);
+        coordinator.set_after_ordered_snapshot_validation_hook(move || {
+            reached_final_validation_for_hook.store(true, Ordering::SeqCst);
+            drop(item_rx);
+        });
+
+        let error = coordinator
+            .queue_response(
+                DecodedPdu {
+                    serial: 1_961,
+                    pdu: Pdu::ListPanesOrderedV1Response(ordered_snapshot_response(
+                        &request,
+                        stream_id,
+                        session_incarnation,
+                        TopologyRevision::INITIAL,
+                    )),
+                },
+                PduDeliveryClass::Control,
+            )
+            .expect_err("PDU87 must fail closed when its FIFO closes after final validation");
+
+        assert!(
+            reached_final_validation.load(Ordering::SeqCst),
+            "the queue failure must be injected only after final fence validation"
+        );
+        assert!(
+            format!("{error:#}").contains("item queue is closed"),
+            "unexpected post-validation PDU87 close: {error:#}"
+        );
+        assert_eq!(
+            terminal_rx
+                .try_recv()
+                .expect("post-validation PDU87 close must terminate the connection"),
+            RESPONSE_QUEUE_FAILURE,
+        );
+        assert!(terminal_rx.is_empty(), "terminal reason must publish exactly once");
+        assert!(matches!(
+            &coordinator.state.lock().phase,
+            TopologyStreamPhase::Exhausted
+        ));
+        assert_outbound_live_counters_zero(&coordinator);
+    }
+
+    #[test]
+    fn first_ordered_event_queue_loss_is_terminal_and_preserves_only_queued_pdu87() {
+        let (coordinator, item_rx, terminal_rx, session_incarnation, stream_id) =
+            bound_topology_coordinator_with_item_capacity(1);
+        let request = ordered_snapshot_request(true);
+        coordinator
+            .begin_ordered_fence_with_server_capabilities(
+                190,
+                &request,
+                ordered_window_capabilities(true),
+            )
+            .expect("begin future-enabled ordered topology fence");
+
+        let mux = Arc::new(Mux::new(None));
+        let _guard = ScopedMux::install(&mux);
+        let tab = Arc::new(mux::tab::Tab::new(&TerminalSize::default()));
+        mux.add_tab_no_panes(&tab)
+            .expect("register test tab for ordered queue-loss state");
+        let window = mux.new_empty_window(None, None);
+        let window_id = *window;
+        mux.add_tab_to_window(&tab, window_id)
+            .expect("attach test tab to ordered queue-loss window");
+        drop(window);
+        let frozen = mux
+            .window_order_snapshot(window_id)
+            .expect("test ordered window must be valid")
+            .expect("test ordered window must exist");
+        assert!(coordinator.on_notification(
+            &mux,
+            topology_envelope(
+                1,
+                MuxNotification::WindowOrderChanged {
+                    mutation_id: mux::WindowOrderMutationId::new([0xb1; 16], 1),
+                    request_digest: mux::WindowReorderDigest::from_bytes([0xb2; 32]),
+                    window: frozen,
+                },
+            ),
+        ));
+
+        let error = coordinator
+            .queue_response(
+                DecodedPdu {
+                    serial: 190,
+                    pdu: Pdu::ListPanesOrderedV1Response(ordered_snapshot_response(
+                        &request,
+                        stream_id,
+                        session_incarnation,
+                        TopologyRevision::INITIAL,
+                    )),
+                },
+                PduDeliveryClass::Control,
+            )
+            .expect_err("the first PDU90 must not disappear behind a full one-slot queue");
+        assert!(
+            format!("{error:#}").contains("topology queue is full"),
+            "unexpected first-PDU90 queue failure: {error:#}"
+        );
+        assert_eq!(
+            terminal_rx
+                .try_recv()
+                .expect("first-PDU90 queue loss must terminate the connection"),
+            NOTIFICATION_QUEUE_OVERFLOW,
+        );
+        assert!(terminal_rx.is_empty(), "terminal reason must publish exactly once");
+        assert!(matches!(
+            &coordinator.state.lock().phase,
+            TopologyStreamPhase::Exhausted
+        ));
+        let only_snapshot = coordinator.outbound_budget.snapshot();
+        assert_eq!(only_snapshot.total_slots, 1);
+        assert_eq!(only_snapshot.bulk_slots, 0);
+        assert_eq!(only_snapshot.topology_retained_bytes, 0);
+        assert!(only_snapshot.ordered_snapshot_retained_bytes > 0);
+
+        let snapshot = take_written_pdu(&item_rx);
+        assert_eq!(snapshot.serial, 190);
+        assert!(matches!(
+            snapshot.pdu,
+            Pdu::ListPanesOrderedV1Response(_)
+        ));
+        assert!(item_rx.is_empty(), "failed PDU90 must never reach the queue");
+        assert_outbound_live_counters_zero(&coordinator);
+    }
+
+    #[test]
+    fn first_ordered_event_queue_close_after_pdu87_is_sticky_terminal() {
+        let (coordinator, item_rx, terminal_rx, session_incarnation, stream_id) =
+            bound_topology_coordinator();
+        let request = ordered_snapshot_request(true);
+        coordinator
+            .begin_ordered_fence_with_server_capabilities(
+                197,
+                &request,
+                ordered_window_capabilities(true),
+            )
+            .expect("begin future-enabled ordered topology fence");
+
+        let mux = Arc::new(Mux::new(None));
+        let _guard = ScopedMux::install(&mux);
+        let tab = Arc::new(mux::tab::Tab::new(&TerminalSize::default()));
+        mux.add_tab_no_panes(&tab)
+            .expect("register test tab for ordered queue-close state");
+        let window = mux.new_empty_window(None, None);
+        let window_id = *window;
+        mux.add_tab_to_window(&tab, window_id)
+            .expect("attach test tab to ordered queue-close window");
+        drop(window);
+        let frozen = mux
+            .window_order_snapshot(window_id)
+            .expect("test ordered window must be valid")
+            .expect("test ordered window must exist");
+        assert!(coordinator.on_notification(
+            &mux,
+            topology_envelope(
+                1,
+                MuxNotification::WindowOrderChanged {
+                    mutation_id: mux::WindowOrderMutationId::new([0xb3; 16], 1),
+                    request_digest: mux::WindowReorderDigest::from_bytes([0xb4; 32]),
+                    window: frozen,
+                },
+            ),
+        ));
+
+        let (close_tx, close_rx) = std::sync::mpsc::sync_channel(0);
+        let (closed_tx, closed_rx) = std::sync::mpsc::sync_channel(0);
+        let closer = std::thread::spawn(move || {
+            close_rx
+                .recv()
+                .expect("PDU87 publication barrier must release the closer");
+            drop(item_rx);
+            closed_tx
+                .send(())
+                .expect("queue closer must acknowledge receiver destruction");
+        });
+        coordinator.set_after_ordered_snapshot_publish_hook(move || {
+            close_tx
+                .send(())
+                .expect("PDU87 publication must release the queue closer");
+            closed_rx
+                .recv()
+                .expect("PDU90 admission must wait for deterministic queue closure");
+        });
+
+        let error = coordinator
+            .queue_response(
+                DecodedPdu {
+                    serial: 197,
+                    pdu: Pdu::ListPanesOrderedV1Response(ordered_snapshot_response(
+                        &request,
+                        stream_id,
+                        session_incarnation,
+                        TopologyRevision::INITIAL,
+                    )),
+                },
+                PduDeliveryClass::Control,
+            )
+            .expect_err("the first PDU90 must fail when its FIFO closes after PDU87");
+        closer.join().expect("queue closer thread must finish");
+        assert!(
+            format!("{error:#}").contains("topology queue is closed"),
+            "unexpected first-PDU90 close: {error:#}"
+        );
+        assert_eq!(
+            terminal_rx
+                .try_recv()
+                .expect("first-PDU90 queue close must terminate the connection"),
+            NOTIFICATION_QUEUE_CLOSED,
+        );
+        assert!(terminal_rx.is_empty(), "terminal reason must publish exactly once");
+        assert!(matches!(
+            &coordinator.state.lock().phase,
+            TopologyStreamPhase::Exhausted
+        ));
+        assert_outbound_live_counters_zero(&coordinator);
+    }
+
+    #[test]
+    fn first_ordered_event_encode_overlap_cannot_borrow_snapshot_tranche() {
+        let (coordinator, item_rx, terminal_rx, session_incarnation, stream_id) =
+            bound_topology_coordinator();
+        let request = ordered_snapshot_request(true);
+        coordinator
+            .begin_ordered_fence_with_server_capabilities(
+                191,
+                &request,
+                ordered_window_capabilities(true),
+            )
+            .expect("begin future-enabled ordered topology fence");
+
+        let mux = Arc::new(Mux::new(None));
+        let _guard = ScopedMux::install(&mux);
+        let tab = Arc::new(mux::tab::Tab::new(&TerminalSize::default()));
+        mux.add_tab_no_panes(&tab)
+            .expect("register test tab for ordered encode-overlap state");
+        let window = mux.new_empty_window(None, None);
+        let window_id = *window;
+        mux.add_tab_to_window(&tab, window_id)
+            .expect("attach test tab to ordered encode-overlap window");
+        drop(window);
+        let frozen = mux
+            .window_order_snapshot(window_id)
+            .expect("test ordered window must be valid")
+            .expect("test ordered window must exist");
+        assert!(coordinator.on_notification(
+            &mux,
+            topology_envelope(
+                1,
+                MuxNotification::WindowOrderChanged {
+                    mutation_id: mux::WindowOrderMutationId::new([0xc1; 16], 1),
+                    request_digest: mux::WindowReorderDigest::from_bytes([0xc2; 32]),
+                    window: frozen,
+                },
+            ),
+        ));
+        let retained_event_bytes = coordinator
+            .outbound_budget
+            .snapshot()
+            .topology_retained_bytes;
+        assert!(retained_event_bytes > 1);
+        let unrelated_topology = coordinator
+            .outbound_budget
+            .try_reserve(
+                OutboundClass::Topology,
+                TOPOLOGY_FENCE_MAX_RETAINED_BYTES
+                    .checked_sub(retained_event_bytes)
+                    .and_then(|bytes| bytes.checked_sub(1))
+                    .expect("test event must leave topology accounting headroom"),
+            )
+            .expect("reserve all but one byte beyond the retained PDU90 state");
+
+        coordinator
+            .queue_response(
+                DecodedPdu {
+                    serial: 191,
+                    pdu: Pdu::ListPanesOrderedV1Response(ordered_snapshot_response(
+                        &request,
+                        stream_id,
+                        session_incarnation,
+                        TopologyRevision::INITIAL,
+                    )),
+                },
+                PduDeliveryClass::Control,
+            )
+            .expect("PDU87 and the typed PDU90 must fit their separate tranches");
+        let snapshot = take_written_pdu(&item_rx);
+        assert_eq!(snapshot.serial, 191);
+
+        let payload = match item_rx.try_recv().expect("queued typed PDU90") {
+            Item::WritePdu(payload) => payload,
+            other => panic!("expected queued PDU90 write, got {other:?}"),
+        };
+        let mut deferred_item = None;
+        let error = prepare_pending_outbound_batch(
+            payload,
+            &item_rx,
+            &mut deferred_item,
+            CompressionMode::Never,
+            &coordinator.terminal,
+        )
+        .expect_err("typed-to-encoded PDU90 overlap must respect its 4 MiB class ceiling");
+        assert!(
+            format!("{error:#}").contains("topology_retained_bytes"),
+            "unexpected PDU90 encode-overlap rejection: {error:#}"
+        );
+        assert_eq!(
+            terminal_rx
+                .try_recv()
+                .expect("PDU90 encode-overlap failure must terminate the connection"),
+            OUTBOUND_BUDGET_OVERFLOW,
+        );
+        assert!(deferred_item.is_none());
+        let only_unrelated = coordinator.outbound_budget.snapshot();
+        assert_eq!(only_unrelated.total_slots, 1);
+        assert_eq!(only_unrelated.bulk_slots, 1);
+        assert_eq!(only_unrelated.ordered_snapshot_retained_bytes, 0);
+        assert_eq!(
+            only_unrelated.topology_retained_bytes,
+            TOPOLOGY_FENCE_MAX_RETAINED_BYTES - retained_event_bytes - 1,
+        );
+        drop(unrelated_topology);
+        assert_outbound_live_counters_zero(&coordinator);
+    }
+
+    #[test]
+    fn ordered_fence_subsumes_snapshot_revision_and_replays_gaps_contiguously() {
+        let (coordinator, item_rx, terminal_rx, session_incarnation, stream_id) =
+            bound_topology_coordinator();
+        let request = ordered_snapshot_request(true);
+        coordinator
+            .begin_ordered_fence_with_server_capabilities(
+                192,
+                &request,
+                ordered_window_capabilities(true),
+            )
+            .expect("begin future-enabled ordered topology fence");
+
+        let mux = Arc::new(Mux::new(None));
+        let _guard = ScopedMux::install(&mux);
+        let tab = Arc::new(mux::tab::Tab::new(&TerminalSize::default()));
+        mux.add_tab_no_panes(&tab)
+            .expect("register test tab for reordered revisions");
+        let window = mux.new_empty_window(None, None);
+        let window_id = *window;
+        mux.add_tab_to_window(&tab, window_id)
+            .expect("attach test tab to reordered-revision window");
+        drop(window);
+        let frozen = mux
+            .window_order_snapshot(window_id)
+            .expect("test ordered window must be valid")
+            .expect("test ordered window must exist");
+
+        for revision in [3_u64, 1, 2] {
+            assert!(coordinator.on_notification(
+                &mux,
+                topology_envelope(
+                    revision,
+                    MuxNotification::WindowOrderChanged {
+                        mutation_id: mux::WindowOrderMutationId::new(
+                            [0xd1; 16],
+                            revision,
+                        ),
+                        request_digest: mux::WindowReorderDigest::from_bytes([
+                            u8::try_from(revision).expect("small revision fits u8");
+                            32
+                        ]),
+                        window: frozen.clone(),
+                    },
+                ),
+            ));
+        }
+        assert!(item_rx.is_empty());
+
+        coordinator
+            .queue_response(
+                DecodedPdu {
+                    serial: 192,
+                    pdu: Pdu::ListPanesOrderedV1Response(ordered_snapshot_response(
+                        &request,
+                        stream_id,
+                        session_incarnation,
+                        TopologyRevision::new(1),
+                    )),
+                },
+                PduDeliveryClass::Control,
+            )
+            .expect("ordered fence must subsume r1 and drain buffered r2/r3");
+
+        let snapshot = take_written_pdu(&item_rx);
+        assert_eq!(snapshot.serial, 192);
+        assert!(matches!(
+            snapshot.pdu,
+            Pdu::ListPanesOrderedV1Response(_)
+        ));
+        let mut revisions = Vec::new();
+        while let Ok(item) = item_rx.try_recv() {
+            let decoded = match item {
+                Item::WritePdu(WritePayload::Typed(ReservedDecodedPdu { decoded, .. })) => {
+                    *decoded
+                }
+                other => panic!("expected typed buffered PDU90, got {other:?}"),
+            };
+            let Pdu::WindowOrderEventV1(event) = decoded.pdu else {
+                panic!("ordered gap replay must emit only PDU90 successors");
+            };
+            revisions.push(event.topology_revision.get());
+        }
+        assert_eq!(
+            revisions,
+            [2, 3],
+            "the snapshot revision is subsumed and gaps publish only in contiguous order",
+        );
+        assert!(terminal_rx.is_empty());
+        assert_outbound_live_counters_zero(&coordinator);
+    }
+
+    #[test]
+    fn ordered_reorder_authority_exists_only_after_successful_pdu87() {
+        let (coordinator, item_rx, terminal_rx, session_incarnation, stream_id) =
+            bound_topology_coordinator();
+        let request = ordered_snapshot_request(true);
+        let reorder = ordered_reorder_request(&request, stream_id, session_incarnation);
+
+        let before = coordinator
+            .admit_ordered_reorder(&reorder)
+            .expect_err("PDU88 must be rejected before its ordered fence begins");
+        assert!(format!("{before:#}").contains("has not been established"));
+
+        coordinator
+            .begin_ordered_fence_with_server_capabilities(
+                193,
+                &request,
+                ordered_window_capabilities(true),
+            )
+            .expect("begin future-enabled ordered topology fence");
+        let during = coordinator
+            .admit_ordered_reorder(&reorder)
+            .expect_err("PDU88 must remain rejected while PDU87 is in flight");
+        assert!(format!("{during:#}").contains("has not been established"));
+
+        let response = ordered_snapshot_response(
+            &request,
+            stream_id,
+            session_incarnation,
+            TopologyRevision::INITIAL,
+        );
+        let expected_frame_capacity = Pdu::ListPanesOrderedV1Response(response.clone())
+            .encode_frame_with_mode(193, CompressionMode::Auto)
+            .expect("measure the exact authorized PDU87 frame allocation")
+            .capacity();
+        coordinator
+            .queue_response(
+                DecodedPdu {
+                    serial: 193,
+                    pdu: Pdu::ListPanesOrderedV1Response(response),
+                },
+                PduDeliveryClass::Control,
+            )
+            .expect("successful PDU87 must establish the immutable PDU88 token");
+        let queued = coordinator.outbound_budget.snapshot();
+        assert_eq!(queued.total_slots, 1);
+        assert_eq!(queued.bulk_slots, 0);
+        assert_eq!(queued.topology_retained_bytes, 0);
+        assert_eq!(
+            queued.ordered_snapshot_retained_bytes,
+            expected_frame_capacity,
+            "PDU87 must own exactly its sole encoded Vec allocation",
+        );
+        let snapshot = take_written_pdu(&item_rx);
+        assert_eq!(snapshot.serial, 193);
+        let after = coordinator
+            .admit_ordered_reorder(&reorder)
+            .expect("PDU88 must be admitted after its successful exact fence");
+        assert_eq!(after.stream_id(), stream_id);
+        assert_eq!(after.session_incarnation(), session_incarnation);
+        assert_eq!(after.domain_binding_id(), request.domain_binding_id);
+        assert!(
+            after
+                .negotiated()
+                .contains(TopologyCapabilities::WINDOW_REORDER_CAS_V1)
+        );
+        assert!(item_rx.is_empty());
+        assert!(terminal_rx.is_empty());
+        assert_outbound_live_counters_zero(&coordinator);
+    }
+
+    #[test]
+    fn ordered_snapshot_encoded_route_rejects_wrong_family_zero_serial_and_raw_bytes() {
+        let request = ordered_snapshot_request(true);
+        let stream_id = TopologyStreamId::from_bytes([0x5a; 16]);
+        let session_incarnation = MuxSessionIncarnation::from_bytes([0xa5; 16]);
+        let wrong_family_cases = [
+            (
+                "ordinary Pong",
+                Pdu::Pong(Pong {}),
+                201,
+            ),
+            (
+                "PDU89",
+                dormant_reorder_response(stream_id, session_incarnation),
+                202,
+            ),
+            (
+                "PDU90",
+                Pdu::WindowOrderEventV1(codec::WindowOrderEventV1 {
+                    protocol_version: codec::ORDERED_WINDOW_PROTOCOL_VERSION,
+                    stream_id,
+                    session_incarnation,
+                    topology_revision: TopologyRevision::new(1),
+                    windows: Vec::new(),
+                }),
+                0,
+            ),
+        ];
+        for (name, pdu, serial) in wrong_family_cases {
+            let (terminal, terminal_rx) = DispatchTerminal::channel();
+            let error = AuthorizedOrderedSnapshotFrame::encode(pdu, serial, &terminal)
+                .expect_err("only a typed PDU87 may construct the ordered snapshot owner");
+            assert!(
+                format!("{error:#}").contains("non-PDU87 family"),
+                "unexpected {name} rejection: {error:#}"
+            );
+            assert_eq!(
+                terminal_rx
+                    .try_recv()
+                    .expect("wrong ordered-snapshot family must trip the connection"),
+                DORMANT_OUTBOUND_PROTOCOL_FAILURE,
+            );
+        }
+
+        let (zero_terminal, zero_terminal_rx) = DispatchTerminal::channel();
+        let zero_error = AuthorizedOrderedSnapshotFrame::encode(
+            Pdu::ListPanesOrderedV1Response(ordered_snapshot_response(
+                &request,
+                stream_id,
+                session_incarnation,
+                TopologyRevision::INITIAL,
+            )),
+            0,
+            &zero_terminal,
+        )
+        .expect_err("PDU87 serial zero must not acquire correlated-response authority");
+        assert!(format!("{zero_error:#}").contains("cannot emit as Unilateral"));
+        assert_eq!(
+            zero_terminal_rx
+                .try_recv()
+                .expect("serial-zero PDU87 must trip the connection"),
+            OUTBOUND_WIRE_AUTHORITY_FAILURE,
+        );
+
+        let response = Pdu::ListPanesOrderedV1Response(ordered_snapshot_response(
+            &request,
+            stream_id,
+            session_incarnation,
+            TopologyRevision::INITIAL,
+        ));
+        let forged_authority = EncodedPduAuthority::capture(
+            &response,
+            203,
+            ServerEmissionAuthority::Ordinary,
+        );
+        let budget = Arc::new(OutboundBudget::default());
+        let bytes = vec![0x87];
+        let reservation = budget
+            .try_reserve(OutboundClass::OrderedSnapshot, bytes.capacity())
+            .expect("reserve one raw test byte");
+        let (raw_terminal, raw_terminal_rx) = DispatchTerminal::channel();
+        encode_write_payload(
+            WritePayload::Encoded(EncodedOutboundFrame {
+                bytes,
+                reservation,
+                authority: forged_authority,
+            }),
+            CompressionMode::Never,
+            &raw_terminal,
+        )
+        .expect_err("raw encoded bytes must retain and fail the dormant PDU87 guard");
+        assert_eq!(
+            raw_terminal_rx
+                .try_recv()
+                .expect("raw PDU87 authority bypass must trip the connection"),
+            DORMANT_OUTBOUND_PROTOCOL_FAILURE,
+        );
+        assert_outbound_budget_live_counters_zero(&budget);
     }
 
     #[test]
@@ -7520,6 +9891,138 @@ mod tests {
     }
 
     #[test]
+    fn ordered_contended_restore_uses_exact_max_events_plus_one_retirement_capacity() {
+        const MAX_EVENTS: usize = 2;
+        const FENCE_SERIAL: u64 = 187;
+
+        // PDU87 consumes the first slot. The first legacy fallback consumes
+        // the second, so the final fallback deterministically returns its Item
+        // owner after the notification queue becomes full. Every buffered
+        // window-order event also retires one compact ordered-window owner;
+        // this makes the outside-lock carrier reach exactly max_events + 1.
+        let (item_tx, item_rx) = bounded(MAX_EVENTS);
+        let (terminal, terminal_rx) = DispatchTerminal::channel();
+        let stream_id = TopologyStreamId::from_bytes([0x6a; 16]);
+        let session_incarnation = MuxSessionIncarnation::from_bytes([0xa6; 16]);
+        let coordinator = TopologyStreamCoordinator::new_with_retention_limits(
+            item_tx,
+            terminal,
+            stream_id,
+            TopologyRetentionLimits {
+                max_events: MAX_EVENTS,
+                max_retained_bytes: TOPOLOGY_FENCE_MAX_RETAINED_BYTES,
+            },
+        );
+        coordinator
+            .bind_subscription(session_incarnation, TopologyRevision::INITIAL)
+            .expect("bind exact-carrier topology subscription");
+        let request = ordered_snapshot_request(true);
+        coordinator
+            .begin_ordered_fence_with_server_capabilities(
+                FENCE_SERIAL,
+                &request,
+                ordered_window_capabilities(true),
+            )
+            .expect("begin future-enabled exact-carrier fence");
+
+        let mux = Arc::new(Mux::new(None));
+        let _guard = ScopedMux::install(&mux);
+        let tab = Arc::new(mux::tab::Tab::new(&TerminalSize::default()));
+        mux.add_tab_no_panes(&tab)
+            .expect("register exact-carrier test tab");
+        let window = mux.new_empty_window(None, None);
+        let window_id = *window;
+        mux.add_tab_to_window(&tab, window_id)
+            .expect("attach exact-carrier test tab");
+        drop(window);
+        for revision in 1..=MAX_EVENTS {
+            let frozen = mux
+                .window_order_snapshot(window_id)
+                .expect("exact-carrier test window must be valid")
+                .expect("exact-carrier test window must exist");
+            assert!(coordinator.on_notification(
+                &mux,
+                topology_envelope(
+                    u64::try_from(revision).expect("small revision fits u64"),
+                    MuxNotification::WindowOrderChanged {
+                        mutation_id: mux::WindowOrderMutationId::new(
+                            [0x6b; 16],
+                            u64::try_from(revision).expect("small mutation sequence fits u64"),
+                        ),
+                        request_digest: mux::WindowReorderDigest::from_bytes([0x6c; 32]),
+                        window: frozen,
+                    },
+                ),
+            ));
+        }
+        assert!(item_rx.is_empty());
+
+        let error = coordinator
+            .queue_response(
+                DecodedPdu {
+                    serial: FENCE_SERIAL,
+                    pdu: Pdu::ListPanesOrderedV1Response(
+                        codec::ListPanesOrderedV1Response {
+                            protocol_version: codec::ORDERED_WINDOW_PROTOCOL_VERSION,
+                            domain_binding_id: request.domain_binding_id,
+                            negotiated: request.supported,
+                            stream_id,
+                            outcome: codec::ListPanesOrderedV1Outcome::Contended {
+                                attempts: 1,
+                                first_revision: TopologyRevision::INITIAL,
+                                last_revision: TopologyRevision::new(
+                                    u64::try_from(MAX_EVENTS)
+                                        .expect("small last revision fits u64"),
+                                ),
+                            },
+                        },
+                    ),
+                },
+                PduDeliveryClass::Control,
+            )
+            .expect_err("the final legacy fallback must hit the exact queue boundary");
+        assert!(
+            format!("{error:#}").contains("mux dispatch topology queue is full"),
+            "unexpected exact-carrier rejection: {:#}",
+            error,
+        );
+        assert_eq!(
+            terminal_rx
+                .try_recv()
+                .expect("the exact carrier boundary must publish one terminal reason"),
+            NOTIFICATION_QUEUE_OVERFLOW,
+        );
+        assert!(terminal_rx.is_empty());
+        assert!(matches!(
+            &coordinator.state.lock().phase,
+            TopologyStreamPhase::Exhausted
+        ));
+        assert_eq!(item_rx.len(), MAX_EVENTS);
+
+        let response = take_written_pdu(&item_rx);
+        assert!(matches!(
+            response,
+            DecodedPdu {
+                serial: FENCE_SERIAL,
+                pdu: Pdu::ListPanesOrderedV1Response(codec::ListPanesOrderedV1Response {
+                    outcome: codec::ListPanesOrderedV1Outcome::Contended { .. },
+                    ..
+                }),
+            }
+        ));
+        let fallback = take_written_pdu(&item_rx);
+        assert!(matches!(
+            fallback,
+            DecodedPdu {
+                serial: 0,
+                pdu: Pdu::TabResized(_),
+            }
+        ));
+        assert!(item_rx.is_empty());
+        assert_outbound_live_counters_zero(&coordinator);
+    }
+
+    #[test]
     fn ordered_fence_same_serial_wrong_response_family_is_sticky_terminal() {
         let (coordinator, item_rx, terminal_rx, _, _) = bound_topology_coordinator();
         let request = ordered_snapshot_request(true);
@@ -7569,6 +10072,210 @@ mod tests {
     }
 
     #[test]
+    fn ordered_over_ordered_fence_overlap_is_terminal_and_releases_retained_owner() {
+        let (coordinator, item_rx, terminal_rx, session_incarnation, stream_id) =
+            bound_topology_coordinator();
+        let request = ordered_snapshot_request(true);
+        coordinator
+            .begin_ordered_fence_with_server_capabilities(
+                186,
+                &request,
+                ordered_window_capabilities(true),
+            )
+            .expect("begin first ordered topology fence");
+        assert!(coordinator.on_notification(
+            &Mux::new(None),
+            topology_envelope(1, MuxNotification::PaneAdded(1)),
+        ));
+        assert!(coordinator.outbound_budget.snapshot().retained_bytes > 0);
+
+        let error = coordinator
+            .begin_ordered_fence_with_server_capabilities(
+                187,
+                &request,
+                ordered_window_capabilities(true),
+            )
+            .expect_err("ordered-over-ordered overlap must fail closed");
+        assert!(
+            format!("{error:#}").contains("overlapping mux topology snapshot requests"),
+            "unexpected ordered-over-ordered error: {error:#}"
+        );
+        assert_eq!(
+            terminal_rx
+                .try_recv()
+                .expect("ordered overlap must publish one terminal reason"),
+            TOPOLOGY_PROTOCOL_FAILURE,
+        );
+        assert!(terminal_rx.is_empty());
+        assert!(item_rx.is_empty());
+        assert!(matches!(
+            &coordinator.state.lock().phase,
+            TopologyStreamPhase::Exhausted
+        ));
+        assert_outbound_live_counters_zero(&coordinator);
+        coordinator
+            .admit_ordered_reorder(&ordered_reorder_request(
+                &request,
+                stream_id,
+                session_incarnation,
+            ))
+            .expect_err("PDU88 must remain unavailable after ordered overlap");
+        assert!(terminal_rx.is_empty());
+    }
+
+    #[test]
+    fn coherent_over_ordered_fence_overlap_is_terminal_and_releases_retained_owner() {
+        let (coordinator, item_rx, terminal_rx, session_incarnation, stream_id) =
+            bound_topology_coordinator();
+        let request = ordered_snapshot_request(true);
+        coordinator
+            .begin_ordered_fence_with_server_capabilities(
+                187,
+                &request,
+                ordered_window_capabilities(true),
+            )
+            .expect("begin ordered topology fence");
+        assert!(coordinator.on_notification(
+            &Mux::new(None),
+            topology_envelope(1, MuxNotification::PaneAdded(1)),
+        ));
+        assert!(coordinator.outbound_budget.snapshot().retained_bytes > 0);
+
+        let error = coordinator
+            .begin_fence(188, &fenced_snapshot_request())
+            .expect_err("coherent-over-ordered overlap must fail closed");
+        assert!(
+            format!("{error:#}").contains("overlapping coherent mux topology snapshot requests"),
+            "unexpected coherent-over-ordered error: {error:#}"
+        );
+        assert_eq!(
+            terminal_rx
+                .try_recv()
+                .expect("coherent overlap must publish one terminal reason"),
+            TOPOLOGY_PROTOCOL_FAILURE,
+        );
+        assert!(terminal_rx.is_empty());
+        assert!(item_rx.is_empty());
+        assert!(matches!(
+            &coordinator.state.lock().phase,
+            TopologyStreamPhase::Exhausted
+        ));
+        assert_outbound_live_counters_zero(&coordinator);
+        coordinator
+            .admit_ordered_reorder(&ordered_reorder_request(
+                &request,
+                stream_id,
+                session_incarnation,
+            ))
+            .expect_err("PDU88 must remain unavailable after coherent overlap");
+        assert!(terminal_rx.is_empty());
+    }
+
+    #[test]
+    fn ordered_snapshot_authority_mismatch_matrix_is_terminal_and_owner_clean() {
+        #[derive(Clone, Copy)]
+        enum Mismatch {
+            Serial,
+            Stream,
+            Binding,
+            Negotiated,
+            Session,
+        }
+
+        for (label, mismatch) in [
+            ("serial", Mismatch::Serial),
+            ("stream", Mismatch::Stream),
+            ("binding", Mismatch::Binding),
+            ("negotiated", Mismatch::Negotiated),
+            ("session", Mismatch::Session),
+        ] {
+            let (coordinator, item_rx, terminal_rx, session_incarnation, stream_id) =
+                bound_topology_coordinator();
+            let request = ordered_snapshot_request(true);
+            const REQUEST_SERIAL: u64 = 188;
+            coordinator
+                .begin_ordered_fence_with_server_capabilities(
+                    REQUEST_SERIAL,
+                    &request,
+                    ordered_window_capabilities(true),
+                )
+                .expect("begin future-enabled ordered topology fence");
+            let mut response = ordered_snapshot_response(
+                &request,
+                stream_id,
+                session_incarnation,
+                TopologyRevision::new(1),
+            );
+            let response_serial = match mismatch {
+                Mismatch::Serial => REQUEST_SERIAL + 1,
+                Mismatch::Stream => {
+                    response.stream_id = TopologyStreamId::from_bytes([0x6e; 16]);
+                    REQUEST_SERIAL
+                }
+                Mismatch::Binding => {
+                    response.domain_binding_id = codec::DomainBindingId::from_bytes([0xe1; 16]);
+                    REQUEST_SERIAL
+                }
+                Mismatch::Negotiated => {
+                    response.negotiated = ordered_snapshot_foundation();
+                    REQUEST_SERIAL
+                }
+                Mismatch::Session => {
+                    let codec::ListPanesOrderedV1Outcome::Snapshot(snapshot) =
+                        &mut response.outcome
+                    else {
+                        unreachable!("ordered response helper must produce a snapshot")
+                    };
+                    snapshot.session_incarnation =
+                        MuxSessionIncarnation::from_bytes([0xe2; 16]);
+                    REQUEST_SERIAL
+                }
+            };
+
+            let _error = coordinator
+                .queue_response(
+                    DecodedPdu {
+                        serial: response_serial,
+                        pdu: Pdu::ListPanesOrderedV1Response(response),
+                    },
+                    PduDeliveryClass::Control,
+                )
+                .expect_err("mismatched PDU87 authority must fail closed");
+            assert_eq!(
+                terminal_rx
+                    .try_recv()
+                    .expect("PDU87 mismatch must publish one terminal reason"),
+                TOPOLOGY_PROTOCOL_FAILURE,
+                "wrong terminal reason for {label} mismatch",
+            );
+            assert!(
+                terminal_rx.is_empty(),
+                "terminal reason must be sticky for {label} mismatch"
+            );
+            assert!(
+                item_rx.is_empty(),
+                "{label} mismatch must leave an empty transcript"
+            );
+            assert!(matches!(
+                &coordinator.state.lock().phase,
+                TopologyStreamPhase::Exhausted
+            ));
+            assert_outbound_live_counters_zero(&coordinator);
+            coordinator
+                .admit_ordered_reorder(&ordered_reorder_request(
+                    &request,
+                    stream_id,
+                    session_incarnation,
+                ))
+                .expect_err("PDU88 must be unavailable after PDU87 authority failure");
+            assert!(
+                terminal_rx.is_empty(),
+                "PDU88 retry must not replace the {label} mismatch reason"
+            );
+        }
+    }
+
+    #[test]
     fn exact_ordered_refresh_succeeds_but_changed_request_sticky_revokes() {
         let (coordinator, item_rx, terminal_rx, session_incarnation, stream_id) =
             bound_topology_coordinator();
@@ -7605,6 +10312,17 @@ mod tests {
         coordinator
             .begin_ordered_fence_with_server_capabilities(190, &request, server_supported)
             .expect("an exact PDU86 refresh must be admitted");
+        let during_refresh = coordinator
+            .admit_ordered_reorder(&ordered_reorder_request(
+                &request,
+                stream_id,
+                session_incarnation,
+            ))
+            .expect_err("PDU88 must not borrow authority while an exact PDU87 refresh is in flight");
+        assert!(
+            format!("{during_refresh:#}").contains("has not been established"),
+            "unexpected in-refresh PDU88 rejection: {during_refresh:#}"
+        );
         coordinator
             .queue_response(
                 DecodedPdu {
@@ -7672,6 +10390,259 @@ mod tests {
             .expect_err("the revocation must remain sticky for an exact retry");
         assert!(item_rx.is_empty());
         assert!(terminal_rx.is_empty());
+    }
+
+    #[test]
+    fn malformed_ordered_refresh_at_dispatch_revokes_authority_and_retained_successors() {
+        let (coordinator, item_rx, terminal_rx, session_incarnation, stream_id) =
+            bound_topology_coordinator();
+        let request = ordered_snapshot_request(true);
+        coordinator
+            .begin_ordered_fence_with_server_capabilities(
+                193,
+                &request,
+                ordered_window_capabilities(true),
+            )
+            .expect("begin initial future-enabled ordered fence");
+        coordinator
+            .queue_response(
+                DecodedPdu {
+                    serial: 193,
+                    pdu: Pdu::ListPanesOrderedV1Response(ordered_snapshot_response(
+                        &request,
+                        stream_id,
+                        session_incarnation,
+                        TopologyRevision::new(1),
+                    )),
+                },
+                PduDeliveryClass::Control,
+            )
+            .expect("establish ordered authority before malformed refresh");
+        assert_eq!(take_written_pdu(&item_rx).serial, 193);
+
+        let mux = Arc::new(Mux::new(None));
+        assert!(coordinator.on_notification(
+            &mux,
+            topology_envelope(3, MuxNotification::PaneAdded(3)),
+        ));
+        assert!(item_rx.is_empty());
+        assert!(
+            coordinator.outbound_budget.snapshot().retained_bytes > 0,
+            "a revision gap must retain one successor before revocation"
+        );
+
+        let (sender, captured) = capturing_pdu_sender();
+        let mut handler = SessionHandler::new_for_mux(sender, mux);
+        let malformed = codec::ListPanesOrderedV1 {
+            protocol_version: codec::ORDERED_WINDOW_PROTOCOL_VERSION.saturating_add(1),
+            ..request.clone()
+        };
+        let error = dispatch_client_request(
+            &mut handler,
+            &coordinator,
+            DecodedPdu {
+                serial: 194,
+                pdu: Pdu::ListPanesOrderedV1(malformed),
+            },
+        )
+        .expect_err("malformed PDU86 refresh must revoke dispatch authority");
+        assert!(
+            format!("{error:#}").contains("validating PDU86"),
+            "unexpected malformed-refresh rejection: {error:#}"
+        );
+        assert!(captured.lock().is_empty());
+        assert_eq!(
+            terminal_rx
+                .try_recv()
+                .expect("malformed refresh must publish one terminal reason"),
+            TOPOLOGY_PROTOCOL_FAILURE,
+        );
+        assert!(terminal_rx.is_empty(), "terminal reason must remain sticky");
+        assert!(item_rx.is_empty(), "revocation must emit no new transcript");
+        assert!(matches!(
+            &coordinator.state.lock().phase,
+            TopologyStreamPhase::Exhausted
+        ));
+        assert_outbound_live_counters_zero(&coordinator);
+        coordinator
+            .admit_ordered_reorder(&ordered_reorder_request(
+                &request,
+                stream_id,
+                session_incarnation,
+            ))
+            .expect_err("PDU88 must remain unavailable after malformed refresh revocation");
+        assert!(terminal_rx.is_empty(), "PDU88 retry must not replace the reason");
+    }
+
+    #[test]
+    fn rejected_pdu88_at_dispatch_is_sticky_terminal_and_revokes_inflight_fence() {
+        let (coordinator, item_rx, terminal_rx, session_incarnation, stream_id) =
+            bound_topology_coordinator();
+        let request = ordered_snapshot_request(true);
+        coordinator
+            .begin_ordered_fence_with_server_capabilities(
+                195,
+                &request,
+                ordered_window_capabilities(true),
+            )
+            .expect("begin ordered fence before premature PDU88");
+        let mux = Arc::new(Mux::new(None));
+        assert!(coordinator.on_notification(
+            &mux,
+            topology_envelope(1, MuxNotification::PaneAdded(1)),
+        ));
+        assert!(coordinator.outbound_budget.snapshot().retained_bytes > 0);
+
+        let (sender, captured) = capturing_pdu_sender();
+        let mut handler = SessionHandler::new_for_mux(sender, mux);
+        let error = dispatch_client_request(
+            &mut handler,
+            &coordinator,
+            DecodedPdu {
+                serial: 196,
+                pdu: Pdu::ReorderWindowTabsV1(ordered_reorder_request(
+                    &request,
+                    stream_id,
+                    session_incarnation,
+                )),
+            },
+        )
+        .expect_err("PDU88 before successful PDU87 must fail at dispatch");
+        assert!(
+            format!("{error:#}").contains("has not been established"),
+            "unexpected premature PDU88 error: {error:#}"
+        );
+        assert!(captured.lock().is_empty());
+        assert_eq!(
+            terminal_rx
+                .try_recv()
+                .expect("rejected PDU88 must publish one terminal reason"),
+            TOPOLOGY_PROTOCOL_FAILURE,
+        );
+        assert!(terminal_rx.is_empty());
+        assert!(item_rx.is_empty());
+        assert!(matches!(
+            &coordinator.state.lock().phase,
+            TopologyStreamPhase::Exhausted
+        ));
+        assert_outbound_live_counters_zero(&coordinator);
+        let retry = dispatch_client_request_if_admitted(
+            &mut handler,
+            &coordinator,
+            &coordinator.terminal,
+            DecodedPdu {
+                serial: 197,
+                pdu: Pdu::Ping(Ping {}),
+            },
+        )
+        .expect("terminal request gate must return an explicit outcome");
+        assert_eq!(retry, RequestDispatchOutcome::Terminal);
+        assert!(terminal_rx.is_empty(), "terminal reason must remain sticky");
+        assert!(captured.lock().is_empty());
+    }
+
+    #[test]
+    fn exact_ordered_refresh_replays_frozen_successors_in_revision_order() {
+        let (coordinator, item_rx, terminal_rx, session_incarnation, stream_id) =
+            bound_topology_coordinator();
+        let request = ordered_snapshot_request(true);
+        let server_supported = ordered_window_capabilities(true);
+        coordinator
+            .begin_ordered_fence_with_server_capabilities(198, &request, server_supported)
+            .expect("begin initial future-enabled ordered fence");
+        coordinator
+            .queue_response(
+                DecodedPdu {
+                    serial: 198,
+                    pdu: Pdu::ListPanesOrderedV1Response(ordered_snapshot_response(
+                        &request,
+                        stream_id,
+                        session_incarnation,
+                        TopologyRevision::new(1),
+                    )),
+                },
+                PduDeliveryClass::Control,
+            )
+            .expect("establish the initial ordered stream");
+        assert_eq!(take_written_pdu(&item_rx).serial, 198);
+
+        coordinator
+            .begin_ordered_fence_with_server_capabilities(199, &request, server_supported)
+            .expect("begin an exact ordered refresh");
+        let mux = Arc::new(Mux::new(None));
+        let _guard = ScopedMux::install(&mux);
+        let tab = Arc::new(mux::tab::Tab::new(&TerminalSize::default()));
+        mux.add_tab_no_panes(&tab)
+            .expect("register test tab for ordered refresh successors");
+        let window = mux.new_empty_window(None, None);
+        let window_id = *window;
+        mux.add_tab_to_window(&tab, window_id)
+            .expect("attach test tab to ordered refresh window");
+        drop(window);
+
+        for revision in [3, 2] {
+            let frozen = mux
+                .window_order_snapshot(window_id)
+                .expect("test ordered window must be valid")
+                .expect("test ordered window must exist");
+            assert!(coordinator.on_notification(
+                &mux,
+                topology_envelope(
+                    revision,
+                    MuxNotification::WindowOrderChanged {
+                        mutation_id: mux::WindowOrderMutationId::new(
+                            [0xc1; 16],
+                            revision,
+                        ),
+                        request_digest: mux::WindowReorderDigest::from_bytes([0xc2; 32]),
+                        window: frozen,
+                    },
+                ),
+            ));
+        }
+        assert!(
+            item_rx.is_empty(),
+            "refresh successors must remain quarantined until the new PDU87 cut"
+        );
+
+        coordinator
+            .queue_response(
+                DecodedPdu {
+                    serial: 199,
+                    pdu: Pdu::ListPanesOrderedV1Response(ordered_snapshot_response(
+                        &request,
+                        stream_id,
+                        session_incarnation,
+                        TopologyRevision::new(1),
+                    )),
+                },
+                PduDeliveryClass::Control,
+            )
+            .expect("refresh must publish PDU87 then every contiguous frozen successor");
+        assert_eq!(take_written_pdu(&item_rx).serial, 199);
+        for expected_revision in [2, 3] {
+            let successor = take_written_pdu(&item_rx);
+            assert_eq!(successor.serial, 0);
+            let Pdu::WindowOrderEventV1(successor) = successor.pdu else {
+                panic!("ordered refresh successor must use PDU90");
+            };
+            assert_eq!(
+                successor.topology_revision,
+                TopologyRevision::new(expected_revision),
+            );
+            assert_eq!(successor.stream_id, stream_id);
+            assert_eq!(successor.session_incarnation, session_incarnation);
+        }
+        assert!(item_rx.is_empty());
+        coordinator
+            .admit_ordered_reorder(&ordered_reorder_request(
+                &request,
+                stream_id,
+                session_incarnation,
+            ))
+            .expect("complete refresh must restore PDU88 authority");
+        assert!(terminal_rx.is_empty());
+        assert_outbound_live_counters_zero(&coordinator);
     }
 
     #[test]
@@ -7837,8 +10808,8 @@ mod tests {
         let retained = coordinator.outbound_budget.snapshot();
         assert_eq!(retained.total_slots, TINY_EVENT_LIMIT);
         assert_eq!(retained.bulk_slots, TINY_EVENT_LIMIT);
-        assert_eq!(retained.topology_bytes, expected_retained_bytes);
-        assert_eq!(retained.peak_topology_bytes, expected_retained_bytes);
+        assert_eq!(retained.retained_bytes, expected_retained_bytes);
+        assert_eq!(retained.peak_retained_bytes, expected_retained_bytes);
         assert!(
             item_rx.is_empty(),
             "in-fence events must remain quarantined before the count limit trips"
@@ -7899,7 +10870,7 @@ mod tests {
         assert!(item_rx.is_empty());
         assert_outbound_live_counters_zero(&coordinator);
         assert_eq!(
-            coordinator.outbound_budget.snapshot().peak_topology_bytes,
+            coordinator.outbound_budget.snapshot().peak_retained_bytes,
             expected_retained_bytes,
             "count overflow must release live reservations without rewriting the exact high-water mark"
         );
@@ -8516,7 +11487,7 @@ mod tests {
         );
         assert!(item_rx.is_empty());
         let released = coordinator.outbound_budget.snapshot();
-        assert_eq!(released.topology_bytes, 0);
+        assert_eq!(released.retained_bytes, 0);
         assert_eq!(released.total_slots, 0);
         assert_eq!(released.bulk_slots, 0);
     }
@@ -8564,7 +11535,7 @@ mod tests {
         );
         assert!(item_rx.is_empty());
         let released = coordinator.outbound_budget.snapshot();
-        assert_eq!(released.topology_bytes, 0);
+        assert_eq!(released.retained_bytes, 0);
         assert_eq!(released.total_slots, 0);
         assert_eq!(released.bulk_slots, 0);
     }
@@ -8816,7 +11787,7 @@ mod tests {
         assert_eq!(retained.total_slots, 1);
         assert_eq!(retained.bulk_slots, 1);
         assert_eq!(
-            retained.topology_bytes,
+            retained.retained_bytes,
             RETAINED_TOPOLOGY_EVENT_ACCOUNTED_FIXED_BYTES
         );
         assert!(item_rx.is_empty());
@@ -9512,50 +12483,62 @@ mod tests {
         }
     }
 
-    fn queued_ping(serial: u64) -> Box<DecodedPdu> {
+    fn queued_pong(serial: u64) -> Box<DecodedPdu> {
         Box::new(DecodedPdu {
-            pdu: Pdu::Ping(Ping {}),
+            pdu: Pdu::Pong(Pong {}),
             serial,
         })
     }
 
     #[derive(Clone, Debug, Eq, PartialEq)]
     enum GeneratedOutboundPdu {
-        Ping,
         Pong,
-        WriteToPane { pane_id: usize, data: Vec<u8> },
-        SendPaste { pane_id: usize, data: String },
+        ErrorResponse { reason: String },
+        GetTlsCredsResponse {
+            ca_cert_pem: String,
+            client_cert_pem: String,
+        },
     }
 
     impl GeneratedOutboundPdu {
         fn into_pdu(self) -> Pdu {
             match self {
-                Self::Ping => Pdu::Ping(Ping {}),
                 Self::Pong => Pdu::Pong(Pong {}),
-                Self::WriteToPane { pane_id, data } => {
-                    Pdu::WriteToPane(WriteToPane { pane_id, data })
+                Self::ErrorResponse { reason } => {
+                    Pdu::ErrorResponse(codec::ErrorResponse { reason })
                 }
-                Self::SendPaste { pane_id, data } => Pdu::SendPaste(SendPaste { pane_id, data }),
+                Self::GetTlsCredsResponse {
+                    ca_cert_pem,
+                    client_cert_pem,
+                } => Pdu::GetTlsCredsResponse(codec::GetTlsCredsResponse {
+                    ca_cert_pem,
+                    client_cert_pem,
+                }),
             }
         }
 
         fn matches_decoded(&self, decoded: &Pdu) -> bool {
             match (self, decoded) {
-                (Self::Ping, Pdu::Ping(Ping {})) | (Self::Pong, Pdu::Pong(Pong {})) => true,
+                (Self::Pong, Pdu::Pong(Pong {})) => true,
                 (
-                    Self::WriteToPane { pane_id, data },
-                    Pdu::WriteToPane(WriteToPane {
-                        pane_id: decoded_pane_id,
-                        data: decoded_data,
+                    Self::ErrorResponse { reason },
+                    Pdu::ErrorResponse(codec::ErrorResponse {
+                        reason: decoded_reason,
                     }),
-                ) => pane_id == decoded_pane_id && data == decoded_data,
+                ) => reason == decoded_reason,
                 (
-                    Self::SendPaste { pane_id, data },
-                    Pdu::SendPaste(SendPaste {
-                        pane_id: decoded_pane_id,
-                        data: decoded_data,
+                    Self::GetTlsCredsResponse {
+                        ca_cert_pem,
+                        client_cert_pem,
+                    },
+                    Pdu::GetTlsCredsResponse(codec::GetTlsCredsResponse {
+                        ca_cert_pem: decoded_ca_cert_pem,
+                        client_cert_pem: decoded_client_cert_pem,
                     }),
-                ) => pane_id == decoded_pane_id && data == decoded_data,
+                ) => {
+                    ca_cert_pem == decoded_ca_cert_pem
+                        && client_cert_pem == decoded_client_cert_pem
+                }
                 _ => false,
             }
         }
@@ -10021,13 +13004,16 @@ mod tests {
     }
 
     fn generated_outbound_pdu() -> impl Strategy<Value = GeneratedOutboundPdu> {
+        let text = "[a-zA-Z0-9 _./-]{0,512}";
         prop_oneof![
-            Just(GeneratedOutboundPdu::Ping),
             Just(GeneratedOutboundPdu::Pong),
-            (0usize..4096, proptest::collection::vec(any::<u8>(), 0..512))
-                .prop_map(|(pane_id, data)| GeneratedOutboundPdu::WriteToPane { pane_id, data },),
-            (0usize..4096, "[a-zA-Z0-9 _./-]{0,512}")
-                .prop_map(|(pane_id, data)| { GeneratedOutboundPdu::SendPaste { pane_id, data } }),
+            text.prop_map(|reason| GeneratedOutboundPdu::ErrorResponse { reason }),
+            (text, text).prop_map(|(ca_cert_pem, client_cert_pem)| {
+                GeneratedOutboundPdu::GetTlsCredsResponse {
+                    ca_cert_pem,
+                    client_cert_pem,
+                }
+            }),
         ]
     }
 
@@ -10121,8 +13107,8 @@ mod tests {
                 match queued_item {
                     QueuedDispatchItem::WritePdu => {
                         item_tx
-                            .try_send(test_write_item(queued_ping(next_serial)))
-                            .expect("queue generated ping");
+                            .try_send(test_write_item(queued_pong(next_serial)))
+                            .expect("queue generated Pong response");
                         if still_in_write_prefix {
                             expected_written_serials.push(next_serial);
                         } else {
@@ -10159,7 +13145,7 @@ mod tests {
             let mut stream = RecordingDispatchStream::default();
             let result = promise::spawn::block_on(write_pending_pdus(
                 &mut stream,
-                queued_ping(1),
+                queued_pong(1),
                 &item_rx,
                 &mut deferred_item,
                 None,
@@ -10182,8 +13168,8 @@ mod tests {
             while (cursor.position() as usize) < stream.bytes.len() {
                 let decoded = Pdu::decode(&mut cursor).expect("decode recorded outbound PDU");
                 prop_assert!(
-                    matches!(decoded.pdu, Pdu::Ping(_)),
-                    "generated dispatch test should only encode Ping PDUs"
+                    matches!(decoded.pdu, Pdu::Pong(_)),
+                    "generated dispatch test should only encode Pong responses"
                 );
                 decoded_serials.push(decoded.serial);
             }
@@ -10211,7 +13197,7 @@ mod tests {
             compression_mode in compression_modes(),
             first_pdu in generated_outbound_pdu(),
             queued_items in queued_generated_dispatch_items(),
-            first_serial in any::<u16>(),
+            first_serial in 1u16..=u16::MAX,
         ) {
             let first_serial = u64::from(first_serial);
             let (item_tx, item_rx) = unbounded();
@@ -10529,7 +13515,7 @@ mod tests {
             failures_before_success in 1usize..=TRANSIENT_WRITE_RETRY_LIMIT,
             first_pdu in generated_outbound_pdu(),
             queued_items in queued_generated_dispatch_items(),
-            first_serial in any::<u16>(),
+            first_serial in 1u16..=u16::MAX,
         ) {
             let first_serial = u64::from(first_serial);
             let (item_tx, item_rx) = unbounded();
@@ -10658,7 +13644,7 @@ mod tests {
         fn proptest_write_pending_pdus_classifies_network_write_failures_without_reordering(
             failure in network_write_failures(),
             queued_items in queued_dispatch_items(),
-            first_serial in any::<u16>(),
+            first_serial in 1u16..=u16::MAX,
         ) {
             let (item_tx, item_rx) = unbounded();
             let mut next_serial = 2_u64;
@@ -10668,8 +13654,8 @@ mod tests {
                 match queued_item {
                     QueuedDispatchItem::WritePdu => {
                         item_tx
-                            .try_send(test_write_item(queued_ping(next_serial)))
-                            .expect("queue generated ping");
+                            .try_send(test_write_item(queued_pong(next_serial)))
+                            .expect("queue generated Pong response");
                         next_serial += 1;
                     }
                     QueuedDispatchItem::Notif => {
@@ -10690,7 +13676,7 @@ mod tests {
             let mut stream = FailingWriteDispatchStream::new(failure);
             let result = promise::spawn::block_on(write_pending_pdus(
                 &mut stream,
-                queued_ping(u64::from(first_serial)),
+                queued_pong(u64::from(first_serial)),
                 &item_rx,
                 &mut deferred_item,
                 None,
@@ -10752,14 +13738,14 @@ mod tests {
         fn proptest_write_pending_pdus_stops_on_partial_frame_eof_without_dropping_queue(
             failure in partial_frame_failures(),
             queued_items in queued_dispatch_items(),
-            first_serial in any::<u16>(),
+            first_serial in 1u16..=u16::MAX,
             cut_seed in any::<usize>(),
         ) {
             let serial = u64::from(first_serial);
             let mut full_frame = Vec::new();
-            Pdu::Ping(Ping {})
+            Pdu::Pong(Pong {})
                 .encode(&mut full_frame, serial)
-                .expect("generated Ping frame should encode");
+                .expect("generated Pong response frame should encode");
             prop_assume!(full_frame.len() > 1);
             let fail_after_bytes = 1 + (cut_seed % (full_frame.len() - 1));
 
@@ -10770,8 +13756,8 @@ mod tests {
                 match queued_item {
                     QueuedDispatchItem::WritePdu => {
                         item_tx
-                            .try_send(test_write_item(queued_ping(next_serial)))
-                            .expect("queue generated ping");
+                            .try_send(test_write_item(queued_pong(next_serial)))
+                            .expect("queue generated Pong response");
                         next_serial += 1;
                     }
                     QueuedDispatchItem::Notif => {
@@ -10792,7 +13778,7 @@ mod tests {
             let mut stream = PartialFrameFailingDispatchStream::new(fail_after_bytes, failure);
             let result = promise::spawn::block_on(write_pending_pdus(
                 &mut stream,
-                queued_ping(serial),
+                queued_pong(serial),
                 &item_rx,
                 &mut deferred_item,
                 None,
@@ -11066,7 +14052,7 @@ mod tests {
                 "typed permit mismatch: {label}"
             );
             let (terminal, terminal_rx) = DispatchTerminal::channel();
-            let result = reject_dormant_server_emission(pdu, serial, &terminal, authority);
+            let result = validate_server_emission_authority(pdu, serial, &terminal, authority);
             assert_eq!(
                 result.is_ok(),
                 expected_permitted,
@@ -11078,15 +14064,145 @@ mod tests {
                     "permitted family/serial pair must leave the connection live: {label}"
                 );
             } else {
+                let role = if serial == 0 {
+                    codec::PduWireRole::Unilateral
+                } else {
+                    codec::PduWireRole::CorrelatedReply
+                };
+                let expected_reason = if pdu
+                    .wire_spec()
+                    .is_some_and(|spec| spec.authorizes(codec::PduProducer::Server, role))
+                {
+                    DORMANT_OUTBOUND_PROTOCOL_FAILURE
+                } else {
+                    OUTBOUND_WIRE_AUTHORITY_FAILURE
+                };
                 assert_eq!(
                     terminal_rx
                         .try_recv()
                         .expect("rejected family/serial pair must trip the connection"),
-                    DORMANT_OUTBOUND_PROTOCOL_FAILURE,
+                    expected_reason,
                     "wrong terminal reason: {label}"
                 );
             }
         }
+    }
+
+    #[test]
+    fn server_emission_rejects_request_and_serial_role_mismatches_before_queueing() {
+        let cases = [
+            (
+                "response emitted as unilateral",
+                Pdu::Pong(Pong {}),
+                0,
+                "Pong",
+            ),
+            (
+                "request emitted as response",
+                Pdu::Ping(Ping {}),
+                1,
+                "Ping",
+            ),
+            (
+                "unilateral emitted as response",
+                Pdu::PaneRemoved(codec::PaneRemoved { pane_id: 41 }),
+                1,
+                "PaneRemoved",
+            ),
+            (
+                "unassigned family",
+                Pdu::Invalid { ident: 5 },
+                17,
+                "unassigned PDU family",
+            ),
+        ];
+
+        for (label, pdu, serial, error_fragment) in cases {
+            let (item_tx, item_rx) = bounded(1);
+            let (terminal, terminal_rx) = DispatchTerminal::channel();
+            let budget = Arc::new(OutboundBudget::default());
+            let error = queue_response_pdu(
+                &item_tx,
+                &terminal,
+                &budget,
+                pdu,
+                serial,
+                PduDeliveryClass::Control,
+            )
+            .expect_err("the server wire-role guard must fail closed");
+            let message = format!("{error:#}");
+            assert!(
+                message.contains(error_fragment),
+                "unexpected {label} rejection: {error:#}"
+            );
+            assert!(
+                message.contains(&serial.to_string()),
+                "{label} rejection omitted serial authority: {error:#}"
+            );
+            assert_eq!(
+                terminal_rx
+                    .try_recv()
+                    .expect("wire-role rejection must trip the connection"),
+                OUTBOUND_WIRE_AUTHORITY_FAILURE,
+                "wrong terminal reason: {label}"
+            );
+            assert!(terminal_rx.is_empty(), "terminal reason must be sticky");
+            assert!(item_rx.is_empty(), "{label} reached the outbound FIFO");
+            assert_eq!(
+                budget.snapshot(),
+                OutboundBudgetState::default(),
+                "{label} consumed outbound budget before rejection"
+            );
+        }
+
+        for (label, pdu, serial) in [
+            ("correlated response", Pdu::Pong(Pong {}), 1),
+            (
+                "unilateral notification",
+                Pdu::PaneRemoved(codec::PaneRemoved { pane_id: 43 }),
+                0,
+            ),
+        ] {
+            let (terminal, terminal_rx) = DispatchTerminal::channel();
+            validate_server_emission_authority(
+                &pdu,
+                serial,
+                &terminal,
+                ServerEmissionAuthority::Ordinary,
+            )
+            .unwrap_or_else(|error| panic!("valid {label} was rejected: {error:#}"));
+            assert!(
+                terminal_rx.is_empty(),
+                "valid {label} must leave the connection live"
+            );
+        }
+
+        let budget = Arc::new(OutboundBudget::default());
+        let reservation = budget
+            .try_reserve(OutboundClass::Control, 0)
+            .expect("reserve one synthetic encoded-frame slot");
+        let (terminal, terminal_rx) = DispatchTerminal::channel();
+        encode_write_payload(
+            WritePayload::Encoded(EncodedOutboundFrame {
+                bytes: vec![0x02],
+                reservation,
+                authority: EncodedPduAuthority::capture(
+                    &Pdu::Pong(Pong {}),
+                    0,
+                    ServerEmissionAuthority::Ordinary,
+                ),
+            }),
+            CompressionMode::Never,
+            &terminal,
+        )
+        .expect_err("pre-encoded serial-zero Pong must not bypass wire-role authority");
+        assert_eq!(
+            terminal_rx
+                .try_recv()
+                .expect("encoded wire-role rejection must trip the connection"),
+            OUTBOUND_WIRE_AUTHORITY_FAILURE,
+        );
+        assert_outbound_budget_live_counters_zero(&budget);
     }
 
     #[test]
@@ -11224,6 +14340,7 @@ mod tests {
                 EncodedOutboundFrame {
                     bytes: second_bytes,
                     reservation: second_reservation,
+                    authority: test_encoded_authority(2),
                 },
             )))
             .expect("queue already-encoded second frame");
@@ -11232,6 +14349,7 @@ mod tests {
             WritePayload::Encoded(EncodedOutboundFrame {
                 bytes: first_bytes,
                 reservation: first_reservation,
+                authority: test_encoded_authority(1),
             }),
             &item_rx,
             &mut deferred_item,
@@ -11253,7 +14371,7 @@ mod tests {
         let released = budget.snapshot();
         assert_eq!(released.total_slots, 0);
         assert_eq!(released.bulk_slots, 0);
-        assert_eq!(released.topology_bytes, 0);
+        assert_eq!(released.retained_bytes, 0);
     }
 
     #[test]
@@ -11271,12 +14389,14 @@ mod tests {
                 reservation: budget
                     .try_reserve(OutboundClass::Topology, topology_capacity)
                     .expect("near-ceiling topology frame must fit"),
+                authority: test_encoded_authority(1),
             };
             let control = EncodedOutboundFrame {
                 bytes: control_bytes,
                 reservation: budget
                     .try_reserve(OutboundClass::Control, 0)
                     .expect("control frame must use reserved headroom"),
+                authority: test_encoded_authority(2),
             };
             let (first, second) = if topology_first {
                 (topology, control)
@@ -11307,14 +14427,85 @@ mod tests {
                 panic!("cross-class successor must remain an encoded write frame");
             };
             assert_eq!(deferred.bytes.as_ptr(), expected_deferred_ptr);
-            assert_eq!(budget.snapshot().topology_bytes, topology_capacity);
+            assert_eq!(budget.snapshot().retained_bytes, topology_capacity);
 
             drop(pending);
             drop(deferred);
             let released = budget.snapshot();
-            assert_eq!(released.topology_bytes, 0);
+            assert_eq!(released.retained_bytes, 0);
             assert_eq!(released.total_slots, 0);
             assert_eq!(released.bulk_slots, 0);
+        }
+    }
+
+    #[test]
+    fn same_class_retained_frames_stay_segmented_below_the_write_quantum() {
+        for class in [OutboundClass::Topology, OutboundClass::OrderedSnapshot] {
+            let budget = Arc::new(OutboundBudget::default());
+            let terminal = test_terminal();
+            let mut first_bytes = Vec::with_capacity(32);
+            first_bytes.push(0x41);
+            let mut second_bytes = Vec::with_capacity(48);
+            second_bytes.push(0x42);
+            assert!(first_bytes.len() + second_bytes.len() < OUTBOUND_WRITE_QUANTUM_BYTES);
+            let first_capacity = first_bytes.capacity();
+            let second_capacity = second_bytes.capacity();
+            let first_ptr = first_bytes.as_ptr();
+            let second_ptr = second_bytes.as_ptr();
+            let first = EncodedOutboundFrame {
+                bytes: first_bytes,
+                reservation: budget
+                    .try_reserve(class, first_capacity)
+                    .expect("reserve first retained frame"),
+                authority: test_encoded_authority(1),
+            };
+            let second = EncodedOutboundFrame {
+                bytes: second_bytes,
+                reservation: budget
+                    .try_reserve(class, second_capacity)
+                    .expect("reserve second retained frame"),
+                authority: test_encoded_authority(2),
+            };
+            let retained_before = budget.snapshot();
+            assert_eq!(
+                retained_before.retained_bytes,
+                first_capacity + second_capacity,
+            );
+            let (item_tx, item_rx) = unbounded();
+            item_tx
+                .try_send(Item::WritePdu(WritePayload::Encoded(second)))
+                .expect("queue same-class retained successor");
+            let mut deferred_item = None;
+
+            let pending = prepare_pending_outbound_batch(
+                WritePayload::Encoded(first),
+                &item_rx,
+                &mut deferred_item,
+                CompressionMode::Never,
+                &terminal,
+            )
+            .unwrap_or_else(|error| {
+                panic!(
+                    "{} retained successor must stay segmented: {error:#}",
+                    class.label(),
+                )
+            });
+            assert_eq!(pending.bytes.as_ptr(), first_ptr);
+            assert_eq!(pending.bytes.capacity(), first_capacity);
+            let Item::WritePdu(WritePayload::Encoded(deferred)) = deferred_item
+                .take()
+                .expect("same-class retained successor must be deferred unchanged")
+            else {
+                panic!("deferred retained successor must remain encoded");
+            };
+            assert_eq!(deferred.bytes.as_ptr(), second_ptr);
+            assert_eq!(deferred.bytes.capacity(), second_capacity);
+            assert_eq!(budget.snapshot(), retained_before);
+
+            drop(pending);
+            assert_eq!(budget.snapshot().retained_bytes, second_capacity);
+            drop(deferred);
+            assert_eq!(budget.snapshot().retained_bytes, 0);
         }
     }
 
@@ -11343,12 +14534,14 @@ mod tests {
             reservation: budget
                 .try_reserve(OutboundClass::Topology, first_capacity)
                 .expect("reserve first topology frame"),
+            authority: test_encoded_authority(1),
         };
         let second = EncodedOutboundFrame {
             bytes: second_bytes,
             reservation: budget
                 .try_reserve(OutboundClass::Topology, second_capacity)
                 .expect("reserve second topology frame"),
+            authority: test_encoded_authority(2),
         };
         let (item_tx, item_rx) = unbounded();
         item_tx
@@ -11372,7 +14565,7 @@ mod tests {
         };
         assert_eq!(second.bytes.as_ptr(), second_ptr);
         assert_eq!(
-            budget.snapshot().topology_bytes,
+            budget.snapshot().retained_bytes,
             first_capacity + second_capacity
         );
 
@@ -11395,7 +14588,7 @@ mod tests {
             }
         }
         drop(first_pending);
-        assert_eq!(budget.snapshot().topology_bytes, second_capacity);
+        assert_eq!(budget.snapshot().retained_bytes, second_capacity);
 
         let mut second_pending = prepare_pending_outbound_batch(
             WritePayload::Encoded(second),
@@ -11422,7 +14615,7 @@ mod tests {
         }
         drop(second_pending);
         let released = budget.snapshot();
-        assert_eq!(released.topology_bytes, 0);
+        assert_eq!(released.retained_bytes, 0);
         assert_eq!(released.total_slots, 0);
         assert_eq!(released.bulk_slots, 0);
     }
@@ -11433,7 +14626,7 @@ mod tests {
         let (terminal, terminal_rx) = DispatchTerminal::channel();
         let mut deferred_item = None;
         let mut pending = prepare_pending_outbound_batch(
-            test_write_payload(queued_ping(1)),
+            test_write_payload(queued_pong(1)),
             &item_rx,
             &mut deferred_item,
             CompressionMode::Never,
@@ -11486,10 +14679,10 @@ mod tests {
             &terminal,
         ))
         .expect_err("hard write failure must stop outbound service");
-        assert!(write_budget.snapshot().topology_bytes > 0);
+        assert!(write_budget.snapshot().retained_bytes > 0);
         drop(write_pending);
         let write_released = write_budget.snapshot();
-        assert_eq!(write_released.topology_bytes, 0);
+        assert_eq!(write_released.retained_bytes, 0);
         assert_eq!(write_released.total_slots, 0);
         assert_eq!(write_released.bulk_slots, 0);
 
@@ -11516,10 +14709,10 @@ mod tests {
             &terminal,
         ))
         .expect_err("flush failure must stop outbound service");
-        assert!(flush_budget.snapshot().topology_bytes > 0);
+        assert!(flush_budget.snapshot().retained_bytes > 0);
         drop(flush_pending);
         let flush_released = flush_budget.snapshot();
-        assert_eq!(flush_released.topology_bytes, 0);
+        assert_eq!(flush_released.retained_bytes, 0);
         assert_eq!(flush_released.total_slots, 0);
         assert_eq!(flush_released.bulk_slots, 0);
     }
@@ -11529,7 +14722,7 @@ mod tests {
         let budget = Arc::new(OutboundBudget::default());
         let (terminal, _terminal_rx) = DispatchTerminal::channel();
         let mut pending = test_topology_pending(&budget, &terminal);
-        let encoded_charge = budget.snapshot().topology_bytes;
+        let encoded_charge = budget.snapshot().retained_bytes;
         assert!(encoded_charge > 0);
         let mut stream = PendingWriteThenReadableDispatchStream {
             admission: Arc::clone(&terminal.admission),
@@ -11546,13 +14739,13 @@ mod tests {
         assert!(matches!(service.as_mut().poll(&mut cx), Poll::Pending));
         drop(service);
         assert_eq!(
-            budget.snapshot().topology_bytes,
+            budget.snapshot().retained_bytes,
             encoded_charge,
             "cancelling the service future must not release its caller-owned batch"
         );
         drop(pending);
         let released = budget.snapshot();
-        assert_eq!(released.topology_bytes, 0);
+        assert_eq!(released.retained_bytes, 0);
         assert_eq!(released.total_slots, 0);
         assert_eq!(released.bulk_slots, 0);
     }
@@ -11563,7 +14756,7 @@ mod tests {
         let (terminal, terminal_rx) = DispatchTerminal::channel();
         let mut deferred_item = None;
         let pending = prepare_pending_outbound_batch(
-            test_write_payload(queued_ping(1)),
+            test_write_payload(queued_pong(1)),
             &item_rx,
             &mut deferred_item,
             CompressionMode::Never,
@@ -11662,7 +14855,7 @@ mod tests {
         let (terminal, terminal_rx) = DispatchTerminal::channel();
         let mut deferred_item = None;
         let mut pending = prepare_pending_outbound_batch(
-            test_write_payload(queued_ping(1)),
+            test_write_payload(queued_pong(1)),
             &item_rx,
             &mut deferred_item,
             CompressionMode::Never,
@@ -11785,8 +14978,8 @@ mod tests {
             .expect("global test lock");
         let (item_tx, item_rx) = unbounded();
         item_tx
-            .try_send(test_write_item(queued_ping(2)))
-            .expect("queue second ping");
+            .try_send(test_write_item(queued_pong(2)))
+            .expect("queue second Pong response");
         item_tx
             .try_send(test_notification_item(MuxNotification::Empty))
             .expect("queue notification");
@@ -11795,7 +14988,7 @@ mod tests {
         let mut stream = CountingDispatchStream::default();
         let result = promise::spawn::block_on(write_pending_pdus(
             &mut stream,
-            queued_ping(1),
+            queued_pong(1),
             &item_rx,
             &mut deferred_item,
             None,
@@ -11961,7 +15154,7 @@ mod tests {
     fn pending_write_rearms_combined_interest_and_yields_to_new_input() {
         let (_item_tx, item_rx) = unbounded();
         let first = Box::new(DecodedPdu {
-            pdu: Pdu::Ping(Ping {}),
+            pdu: Pdu::Pong(Pong {}),
             serial: 1,
         });
         let mut deferred_item = None;
@@ -11973,7 +15166,7 @@ mod tests {
             CompressionMode::Never,
             &terminal,
         )
-        .expect("ping frame should encode");
+        .expect("Pong response frame should encode");
         let mut stream = PendingWriteThenReadableDispatchStream {
             admission: Arc::clone(&terminal.admission),
             ..PendingWriteThenReadableDispatchStream::default()
@@ -12000,13 +15193,13 @@ mod tests {
         let mut deferred_item = None;
         let terminal = test_terminal();
         let mut pending = prepare_pending_outbound_batch(
-            test_write_payload(queued_ping(1)),
+            test_write_payload(queued_pong(1)),
             &item_rx,
             &mut deferred_item,
             CompressionMode::Never,
             &terminal,
         )
-        .expect("ping frame should encode");
+        .expect("Pong response frame should encode");
         let mut stream = PendingWriteThenReadableDispatchStream {
             admission: Arc::clone(&terminal.admission),
             requires_transport_retry: true,
@@ -12034,13 +15227,13 @@ mod tests {
         let mut deferred_item = None;
         let (terminal, terminal_rx) = DispatchTerminal::channel();
         let mut pending = prepare_pending_outbound_batch(
-            test_write_payload(queued_ping(1)),
+            test_write_payload(queued_pong(1)),
             &item_rx,
             &mut deferred_item,
             CompressionMode::Never,
             &terminal,
         )
-        .expect("ping frame should encode");
+        .expect("Pong response frame should encode");
         let mut stream = PendingWriteThenReadableDispatchStream {
             admission: Arc::clone(&terminal.admission),
             terminal_during_wait: Some(terminal.clone()),
@@ -12073,13 +15266,13 @@ mod tests {
         let mut deferred_item = None;
         let (terminal, terminal_rx) = DispatchTerminal::channel();
         let mut pending = prepare_pending_outbound_batch(
-            test_write_payload(queued_ping(1)),
+            test_write_payload(queued_pong(1)),
             &item_rx,
             &mut deferred_item,
             CompressionMode::Never,
             &terminal,
         )
-        .expect("ping frame should encode");
+        .expect("Pong response frame should encode");
         let mut stream = PendingWriteThenReadableDispatchStream {
             admission: Arc::clone(&terminal.admission),
             ready_side: Some(DispatchReadySide::Writable),
@@ -12113,13 +15306,13 @@ mod tests {
         let mut deferred_item = None;
         let (terminal, terminal_rx) = DispatchTerminal::channel();
         let mut pending = prepare_pending_outbound_batch(
-            test_write_payload(queued_ping(1)),
+            test_write_payload(queued_pong(1)),
             &item_rx,
             &mut deferred_item,
             CompressionMode::Never,
             &terminal,
         )
-        .expect("ping frame should encode");
+        .expect("Pong response frame should encode");
         let mut stream = PendingWriteThenReadableDispatchStream {
             admission: Arc::clone(&terminal.admission),
             requires_transport_retry: true,
@@ -12154,13 +15347,13 @@ mod tests {
         let mut deferred_item = None;
         let terminal = test_terminal();
         let mut pending = prepare_pending_outbound_batch(
-            test_write_payload(queued_ping(1)),
+            test_write_payload(queued_pong(1)),
             &item_rx,
             &mut deferred_item,
             CompressionMode::Never,
             &terminal,
         )
-        .expect("ping frame should encode");
+        .expect("Pong response frame should encode");
         let mut stream = UnsupportedReadinessPendingWriteStream::default();
 
         for expected_polls in 1..=2 {
@@ -12207,13 +15400,13 @@ mod tests {
         let total_frames = OUTBOUND_WRITE_QUANTUM_FRAMES + 5;
         for serial in 2..=u64::try_from(total_frames).expect("test frame count fits u64") {
             item_tx
-                .try_send(test_write_item(queued_ping(serial)))
-                .expect("queue outbound ping");
+                .try_send(test_write_item(queued_pong(serial)))
+                .expect("queue outbound Pong response");
         }
         let mut deferred_item = None;
         let terminal = test_terminal();
         let pending = prepare_pending_outbound_batch(
-            test_write_payload(queued_ping(1)),
+            test_write_payload(queued_pong(1)),
             &item_rx,
             &mut deferred_item,
             CompressionMode::Auto,

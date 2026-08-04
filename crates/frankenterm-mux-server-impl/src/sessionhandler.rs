@@ -1863,7 +1863,9 @@ fn session_mux(authority: &SessionAuthority) -> anyhow::Result<CurrentSession> {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ListPanesSnapshotStage {
+    BeforeOrderedAuthorityRead,
     WindowsEnumerated,
+    OrderedWindowsFrozen,
     TabTreeCaptured,
     TitlesCaptured,
 }
@@ -2171,6 +2173,7 @@ fn collect_ordered_list_panes_snapshot_with_stage_observer(
     let mut last_revision = None;
 
     for attempt in 1..=COHERENT_SNAPSHOT_ATTEMPTS {
+        observer(ListPanesSnapshotStage::BeforeOrderedAuthorityRead);
         let (before_session, before_revision) = match mux.topology_snapshot_authority() {
             Ok(authority) => authority,
             Err(_) => return Ok(codec::ListPanesOrderedV1Outcome::RevisionExhausted),
@@ -2209,6 +2212,7 @@ fn collect_ordered_list_panes_snapshot_with_stage_observer(
             )?;
             frozen_windows.push(frozen);
         }
+        observer(ListPanesSnapshotStage::OrderedWindowsFrozen);
 
         let mut ordered_windows = Vec::with_capacity(frozen_windows.len());
         for frozen in &frozen_windows {
@@ -4637,6 +4641,24 @@ mod tests {
         .with_computed_digest()
     }
 
+    fn mux_reorder_request_for_snapshot_stage(
+        snapshot: &mux::window::FrozenWindowOrder,
+        session_incarnation: mux::MuxSessionIncarnation,
+        mutation_sequence: u64,
+        desired_tab_ids: Vec<mux::tab::TabId>,
+    ) -> mux::ReorderWindowTabsRequest {
+        let wire_request = reorder_request_for_snapshot(
+            snapshot,
+            session_incarnation,
+            TopologyStreamId::from_bytes([0xa7; 16]),
+            codec::DomainBindingId::from_bytes([0xd7; 16]),
+            mutation_sequence,
+            desired_tab_ids,
+        );
+        ordered_window_adapter::codec_reorder_request_to_mux(&wire_request)
+            .expect("snapshot-stage reorder request must satisfy mux authority")
+    }
+
     fn install_tab_with_window(
         tab: &Arc<mux::tab::Tab>,
         extra_panes: &[Arc<dyn Pane>],
@@ -5713,6 +5735,200 @@ mod tests {
     }
 
     #[test]
+    fn ordered_snapshot_accepts_reorder_completed_before_initial_authority_cut() {
+        let _lock = crate::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let mux = Arc::new(Mux::new(None));
+        let first_tab = register_snapshot_tab(
+            &mux,
+            Arc::new(FakePane::new_with_id(7_551, None)),
+        );
+        let second_tab = register_snapshot_tab(
+            &mux,
+            Arc::new(FakePane::new_with_id(7_552, None)),
+        );
+        let window_id = attach_snapshot_tab_to_new_window(&mux, &first_tab);
+        mux.add_tab_to_window(&second_tab, window_id)
+            .expect("second authority-cut tab attaches exactly once");
+        let before = mux
+            .window_order_snapshot(window_id)
+            .expect("authority-cut window order remains well formed")
+            .expect("authority-cut window exists");
+        let session_incarnation = mux
+            .topology_snapshot_authority()
+            .expect("authority-cut mux authority remains live")
+            .0;
+        let reorder = mux_reorder_request_for_snapshot_stage(
+            &before,
+            session_incarnation,
+            1,
+            vec![second_tab.tab_id(), first_tab.tab_id()],
+        );
+
+        let barrier = NoSleepSnapshotBarrier::shared();
+        let barrier_for_mutator = Arc::clone(&barrier);
+        let mux_for_mutator = Arc::clone(&mux);
+        let mutator = thread::spawn(move || {
+            barrier_for_mutator.mutate(|| mux_for_mutator.reorder_window_tabs(reorder))
+        });
+
+        let barrier_for_collector = Arc::clone(&barrier);
+        let mut completed_attempts = 0usize;
+        let outcome = collect_ordered_list_panes_snapshot_with_stage_observer(
+            &mux,
+            &mut |stage| match stage {
+                ListPanesSnapshotStage::BeforeOrderedAuthorityRead => {
+                    barrier_for_collector.collector_arrive();
+                }
+                ListPanesSnapshotStage::TitlesCaptured => completed_attempts += 1,
+                ListPanesSnapshotStage::WindowsEnumerated
+                | ListPanesSnapshotStage::OrderedWindowsFrozen
+                | ListPanesSnapshotStage::TabTreeCaptured => {}
+            },
+        );
+        let reorder_result = mutator
+            .join()
+            .expect("before-authority-cut mutator must not panic");
+        assert!(matches!(
+            reorder_result,
+            mux::ReorderWindowTabsResult::Decision(
+                mux::WindowReorderTerminalOutcome::Applied(_)
+            )
+        ));
+        let snapshot = expect_current_ordered_snapshot(
+            &mux,
+            outcome.expect("post-reorder authority cut must remain collectable"),
+        );
+
+        assert_eq!(
+            completed_attempts, 1,
+            "a mutation completed before the initial authority read belongs to the first cut"
+        );
+        assert_eq!(barrier.observations(), 1);
+        let expected_tab_ids = vec![second_tab.tab_id(), first_tab.tab_id()];
+        assert_eq!(
+            snapshot.ordered_windows[0]
+                .ordered_tab_ids
+                .iter()
+                .map(|tab_id| usize::try_from(tab_id.get()).expect("test tab id narrows"))
+                .collect::<Vec<_>>(),
+            expected_tab_ids
+        );
+        assert_eq!(
+            snapshot
+                .panes
+                .tabs
+                .iter()
+                .map(|tree| {
+                    tree.window_and_tab_ids()
+                        .expect("accepted pane tree has window/tab identity")
+                        .1
+                })
+                .collect::<Vec<_>>(),
+            expected_tab_ids,
+            "pane projection must use the same post-reorder authority cut"
+        );
+    }
+
+    #[test]
+    fn ordered_snapshot_retries_reorder_after_all_window_orders_are_frozen() {
+        let _lock = crate::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let mux = Arc::new(Mux::new(None));
+        let first_tab = register_snapshot_tab(
+            &mux,
+            Arc::new(FakePane::new_with_id(7_571, None)),
+        );
+        let second_tab = register_snapshot_tab(
+            &mux,
+            Arc::new(FakePane::new_with_id(7_572, None)),
+        );
+        let window_id = attach_snapshot_tab_to_new_window(&mux, &first_tab);
+        mux.add_tab_to_window(&second_tab, window_id)
+            .expect("second frozen-cut tab attaches exactly once");
+        let before = mux
+            .window_order_snapshot(window_id)
+            .expect("frozen-cut window order remains well formed")
+            .expect("frozen-cut window exists");
+        let session_incarnation = mux
+            .topology_snapshot_authority()
+            .expect("frozen-cut mux authority remains live")
+            .0;
+        let reorder = mux_reorder_request_for_snapshot_stage(
+            &before,
+            session_incarnation,
+            2,
+            vec![second_tab.tab_id(), first_tab.tab_id()],
+        );
+
+        let barrier = NoSleepSnapshotBarrier::shared();
+        let barrier_for_mutator = Arc::clone(&barrier);
+        let mux_for_mutator = Arc::clone(&mux);
+        let mutator = thread::spawn(move || {
+            barrier_for_mutator.mutate(|| mux_for_mutator.reorder_window_tabs(reorder))
+        });
+
+        let barrier_for_collector = Arc::clone(&barrier);
+        let mut completed_attempts = 0usize;
+        let outcome = collect_ordered_list_panes_snapshot_with_stage_observer(
+            &mux,
+            &mut |stage| match stage {
+                ListPanesSnapshotStage::OrderedWindowsFrozen => {
+                    barrier_for_collector.collector_arrive();
+                }
+                ListPanesSnapshotStage::TitlesCaptured => completed_attempts += 1,
+                ListPanesSnapshotStage::BeforeOrderedAuthorityRead
+                | ListPanesSnapshotStage::WindowsEnumerated
+                | ListPanesSnapshotStage::TabTreeCaptured => {}
+            },
+        );
+        let reorder_result = mutator
+            .join()
+            .expect("post-frozen-window-cut mutator must not panic");
+        assert!(matches!(
+            reorder_result,
+            mux::ReorderWindowTabsResult::Decision(
+                mux::WindowReorderTerminalOutcome::Applied(_)
+            )
+        ));
+        let snapshot = expect_current_ordered_snapshot(
+            &mux,
+            outcome.expect("post-frozen-window-cut retry must remain collectable"),
+        );
+
+        assert_eq!(
+            completed_attempts, 2,
+            "the authority check must reject the stale frozen order and retry once"
+        );
+        assert_eq!(barrier.observations(), 2);
+        let expected_tab_ids = vec![second_tab.tab_id(), first_tab.tab_id()];
+        assert_eq!(
+            snapshot.ordered_windows[0]
+                .ordered_tab_ids
+                .iter()
+                .map(|tab_id| usize::try_from(tab_id.get()).expect("test tab id narrows"))
+                .collect::<Vec<_>>(),
+            expected_tab_ids
+        );
+        assert_eq!(
+            snapshot
+                .panes
+                .tabs
+                .iter()
+                .map(|tree| {
+                    tree.window_and_tab_ids()
+                        .expect("accepted pane tree has window/tab identity")
+                        .1
+                })
+                .collect::<Vec<_>>(),
+            expected_tab_ids,
+            "the accepted retry must project the post-reorder frozen identities"
+        );
+    }
+
+    #[test]
     fn ordered_snapshot_retries_a_tab_tree_cut_without_mixed_order_authority() {
         let _lock = crate::GLOBAL_STATE_TEST_LOCK
             .lock()
@@ -5746,7 +5962,9 @@ mod tests {
                     barrier_for_collector.collector_arrive();
                 }
                 ListPanesSnapshotStage::TitlesCaptured => completed_attempts += 1,
-                ListPanesSnapshotStage::WindowsEnumerated => {}
+                ListPanesSnapshotStage::BeforeOrderedAuthorityRead
+                | ListPanesSnapshotStage::WindowsEnumerated
+                | ListPanesSnapshotStage::OrderedWindowsFrozen => {}
             },
         );
         mutator
@@ -6147,7 +6365,9 @@ mod tests {
                     barrier_for_collector.collector_arrive();
                 }
                 ListPanesSnapshotStage::TitlesCaptured => completed_attempts += 1,
-                ListPanesSnapshotStage::TabTreeCaptured => {}
+                ListPanesSnapshotStage::BeforeOrderedAuthorityRead
+                | ListPanesSnapshotStage::OrderedWindowsFrozen
+                | ListPanesSnapshotStage::TabTreeCaptured => {}
             },
         );
         let mutator_result = mutator
@@ -6215,7 +6435,9 @@ mod tests {
                     barrier_for_collector.collector_arrive();
                 }
                 ListPanesSnapshotStage::TitlesCaptured => completed_attempts += 1,
-                ListPanesSnapshotStage::WindowsEnumerated => {}
+                ListPanesSnapshotStage::BeforeOrderedAuthorityRead
+                | ListPanesSnapshotStage::WindowsEnumerated
+                | ListPanesSnapshotStage::OrderedWindowsFrozen => {}
             },
         );
         let attach_result = mutator
