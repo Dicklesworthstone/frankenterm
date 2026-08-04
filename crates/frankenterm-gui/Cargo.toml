@@ -71,6 +71,9 @@ anyhow.workspace = true
 [dependencies]
 # Core library
 frankenterm-core = { workspace = true, features = ["native-wezterm"] }
+# GH#75: broken-pipe (EPIPE) panic-to-exit(141) handling for piped stdout
+# (e.g. `frankenterm-gui show-keys | head`).
+frankenterm-sigpipe.workspace = true
 
 # Allocator wiring (jemalloc by default for release builds; gated behind the
 # `jemalloc` feature so dhat-heap builds can opt out). ft-tkxpi.

@@ -24,6 +24,9 @@ workspace = true
 
 [dependencies]
 frankenterm-core = { workspace = true, default-features = false }
+# GH#75: broken-pipe (EPIPE) panic-to-exit(141) handling; `ft list | head`
+# must not SIGABRT under the release profile's panic = "abort".
+frankenterm-sigpipe = { workspace = true }
 # ft-y0loj.4 / ft-j1qjt.2: 24 replay_* modules moved out of frankenterm-core
 # to this sub-crate. `ft` consumes a handful of them directly (replay diff /
 # inspect / report / artifact-registry CLI subcommands in main.rs), so we
@@ -120,6 +123,9 @@ redis-session = ["frankenterm-core/redis-session"]
 jemalloc = ["dep:frankenterm-alloc", "frankenterm-alloc/jemalloc"]
 
 [dev-dependencies]
+# GH#75: tests/epipe_exit_code.rs builds a pipe whose read end is closed
+# before spawn so the child's first stdout write deterministically EPIPEs.
+filedescriptor = { workspace = true }
 assert_cmd = "2.2.2"
 predicates = "3.1.4"
 tempfile = "3.27.0"

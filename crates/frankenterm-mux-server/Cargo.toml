@@ -35,6 +35,8 @@ promise.workspace = true
 umask.workspace = true
 wezterm-blob-leases = {workspace=true, features=["simple_tempdir"]}
 frankenterm-mux-server-impl.workspace = true
+# GH#75: broken-pipe (EPIPE) panic-to-exit(141) handling for piped stdout.
+frankenterm-sigpipe.workspace = true
 wezterm-gui-subcommands.workspace = true
 wezterm-term.workspace = true
 

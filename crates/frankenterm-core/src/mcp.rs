@@ -61,9 +61,7 @@ use crate::query_contract::{
     to_storage_search_options,
 };
 use crate::storage::{EventQuery, PaneReservation, StorageHandle};
-use crate::wezterm::{
-    PaneInfo, PaneWaiter, WaitOptions, WaitResult, WeztermHandleSource, default_wezterm_handle,
-};
+use crate::wezterm::{PaneInfo, PaneWaiter, WaitOptions, WaitResult, WeztermHandleSource};
 use crate::workflows::{
     HandleAuthRequired, HandleClaudeCodeLimits, HandleCompaction, HandleGeminiQuota,
     HandleOnErrorCassSearch, HandleProcessTriageLifecycle, HandleSessionEnd,

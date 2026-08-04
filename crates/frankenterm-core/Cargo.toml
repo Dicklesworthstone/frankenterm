@@ -176,6 +176,9 @@ sysinfo = { version = "0.39.3", default-features = false, features = ["system", 
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
+# GH#73: unit tests for the vendored streaming readiness gate build
+# bonus-line payloads out of real `termwiz::surface::Line`s.
+termwiz = { workspace = true }
 proptest = "1.11.0"
 tempfile = "3.27.0"
 criterion = { version = "0.8.2", features = ["async_tokio"] }

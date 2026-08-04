@@ -16616,7 +16616,7 @@ async fn authorize_read_or_search_policy(
             None
         };
 
-        let wezterm = frankenterm_core::wezterm::default_wezterm_handle();
+        let wezterm = frankenterm_core::wezterm::wezterm_handle_from_config(&config);
         // ft-xbnl0.2.3 tick 230: cx-first wezterm dispatch.
         let cx =
             frankenterm_core::cx::Cx::current().unwrap_or_else(frankenterm_core::cx::for_request);
@@ -31510,6 +31510,12 @@ fn send_backup_notification(
 fn main() {
     use frankenterm_core::runtime_async::CompatRuntime;
 
+    // GH#75: `ft` output is machine-readable and destined for pipelines;
+    // a downstream `| head` closing stdout early must exit 141 quietly, not
+    // panic-abort with SIGABRT (and a macOS crash report) under the release
+    // profile's panic = "abort".
+    frankenterm_sigpipe::exit_quietly_on_broken_pipe();
+
     // Keep the exact compile-time package identity discoverable by the static
     // package verifier even under LTO/strip.  This does not launch or probe any
     // peer and has no observable output outside `ft version --full`.
@@ -33274,7 +33280,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             };
 
                             if command_ctx.is_dry_run() {
-                                let wezterm = frankenterm_core::wezterm::default_wezterm_handle();
+                                let wezterm = frankenterm_core::wezterm::wezterm_handle_from_config(&config);
                                 // ft-xbnl0.2.3 tick 231: cx-first.
                                 let cx = frankenterm_core::cx::Cx::current()
                                     .unwrap_or_else(frankenterm_core::cx::for_request);
@@ -33337,7 +33343,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                     }
                                 };
 
-                                let wezterm = frankenterm_core::wezterm::default_wezterm_handle();
+                                let wezterm = frankenterm_core::wezterm::wezterm_handle_from_config(&config);
                                 // ft-xbnl0.2.3 tick 231: cx-first.
                                 let cx = frankenterm_core::cx::Cx::current()
                                     .unwrap_or_else(frankenterm_core::cx::for_request);
@@ -33714,7 +33720,6 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         } => {
                             use frankenterm_core::wezterm::{
                                 PaneWaiter, WaitOptions, WaitResult, WeztermHandleSource,
-                                default_wezterm_handle,
                             };
                             use std::time::Duration;
 
@@ -33737,8 +33742,10 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             };
                             let redacted_pattern = redact_wait_pattern_for_output(&pattern);
 
-                            // Create WezTerm client
-                            let wezterm = default_wezterm_handle();
+                            // Create WezTerm client (GH#72: honor any
+                            // configured vendored mux socket).
+                            let wezterm =
+                                frankenterm_core::wezterm::wezterm_handle_from_config(&config);
                             // ft-xbnl0.2.3 tick 232: cx-first.
                             let cx = frankenterm_core::cx::Cx::current()
                                 .unwrap_or_else(frankenterm_core::cx::for_request);
@@ -36226,7 +36233,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                                 true,
                                             );
                                         let wezterm =
-                                            frankenterm_core::wezterm::default_wezterm_handle();
+                                            frankenterm_core::wezterm::wezterm_handle_from_config(&config);
                                         // ft-xbnl0.2.3 tick 232: cx-first.
                                         let cx = frankenterm_core::cx::Cx::current()
                                             .unwrap_or_else(frankenterm_core::cx::for_request);
@@ -36249,7 +36256,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
 
                                     // Verify pane exists
                                     let wezterm =
-                                        frankenterm_core::wezterm::default_wezterm_handle();
+                                        frankenterm_core::wezterm::wezterm_handle_from_config(&config);
                                     // ft-xbnl0.2.3 tick 232: cx-first.
                                     let cx = frankenterm_core::cx::Cx::current()
                                         .unwrap_or_else(frankenterm_core::cx::for_request);
@@ -36333,7 +36340,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
 
                                     // Create policy-gated injector with WezTerm client
                                     let wezterm_handle =
-                                        frankenterm_core::wezterm::default_wezterm_handle();
+                                        frankenterm_core::wezterm::wezterm_handle_from_config(&config);
                                     let injector =
                                         CxPolicyInjector::new(PolicyGatedInjector::with_storage(
                                             policy_engine,
@@ -37055,7 +37062,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                     .with_command_gate_config(config.safety.command_gate.clone())
                                     .with_policy_rules(config.safety.rules.clone());
                                     let wezterm_handle =
-                                        frankenterm_core::wezterm::default_wezterm_handle();
+                                        frankenterm_core::wezterm::wezterm_handle_from_config(&config);
                                     let injector =
                                         CxPolicyInjector::new(PolicyGatedInjector::with_storage(
                                             policy_engine,
@@ -41808,7 +41815,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
         }
 
         Some(Commands::List { json }) => {
-            let wezterm = frankenterm_core::wezterm::default_wezterm_handle();
+            let wezterm = frankenterm_core::wezterm::wezterm_handle_from_config(&config);
             // ft-xbnl0.2.3 tick 233: cx-first.
             let cx = frankenterm_core::cx::Cx::current()
                 .unwrap_or_else(frankenterm_core::cx::for_request);
@@ -42079,7 +42086,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
 
         Some(Commands::Show { pane_id, output }) => {
             tracing::info!("Showing pane {} (output={})", pane_id, output);
-            let wezterm = frankenterm_core::wezterm::default_wezterm_handle();
+            let wezterm = frankenterm_core::wezterm::wezterm_handle_from_config(&config);
             // ft-xbnl0.2.3 tick 233: cx-first.
             let cx = frankenterm_core::cx::Cx::current()
                 .unwrap_or_else(frankenterm_core::cx::for_request);
@@ -42221,7 +42228,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
             };
 
             if command_ctx.is_dry_run() {
-                let wezterm = frankenterm_core::wezterm::default_wezterm_handle();
+                let wezterm = frankenterm_core::wezterm::wezterm_handle_from_config(&config);
                 // ft-xbnl0.2.3 tick 233: cx-first.
                 let cx = frankenterm_core::cx::Cx::current()
                     .unwrap_or_else(frankenterm_core::cx::for_request);
@@ -42281,7 +42288,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     }
                 };
 
-                let wezterm = frankenterm_core::wezterm::default_wezterm_handle();
+                let wezterm = frankenterm_core::wezterm::wezterm_handle_from_config(&config);
                 // ft-xbnl0.2.3 tick 233: cx-first.
                 let cx = frankenterm_core::cx::Cx::current()
                     .unwrap_or_else(frankenterm_core::cx::for_request);
@@ -42628,7 +42635,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                 tail,
                 escapes
             );
-            let wezterm = frankenterm_core::wezterm::default_wezterm_handle();
+            let wezterm = frankenterm_core::wezterm::wezterm_handle_from_config(&config);
             // ft-xbnl0.2.3 tick 302: cx-first storage open.
             let gettext_cx = frankenterm_core::cx::Cx::current()
                 .unwrap_or_else(frankenterm_core::cx::for_request);
@@ -42769,7 +42776,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             || (matches!(output_format, OutputFormat::Auto)
                                 && !std::io::stdout().is_terminal());
 
-                        let wezterm = frankenterm_core::wezterm::default_wezterm_handle();
+                        let wezterm = frankenterm_core::wezterm::wezterm_handle_from_config(&config);
                         // ft-xbnl0.2.3 tick 234: cx-first.
                         let cx = frankenterm_core::cx::Cx::current()
                             .unwrap_or_else(frankenterm_core::cx::for_request);
@@ -42798,7 +42805,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         tracing::info!("Running workflow '{}' on pane {}", name, pane);
 
                         // Verify pane exists
-                        let wezterm = frankenterm_core::wezterm::default_wezterm_handle();
+                        let wezterm = frankenterm_core::wezterm::wezterm_handle_from_config(&config);
                         // ft-xbnl0.2.3 tick 234: cx-first.
                         let cx = frankenterm_core::cx::Cx::current()
                             .unwrap_or_else(frankenterm_core::cx::for_request);
@@ -42848,7 +42855,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         )
                         .with_tuning(&config.tuning);
 
-                        let wezterm_handle = frankenterm_core::wezterm::default_wezterm_handle();
+                        let wezterm_handle = frankenterm_core::wezterm::wezterm_handle_from_config(&config);
                         let injector = CxPolicyInjector::new(PolicyGatedInjector::with_storage(
                             policy_engine,
                             wezterm_handle,
@@ -43185,7 +43192,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
 
             if health {
                 // Health check mode: JSON status including runtime health snapshot
-                let wezterm = frankenterm_core::wezterm::default_wezterm_handle();
+                let wezterm = frankenterm_core::wezterm::wezterm_handle_from_config(&config);
                 let session_report = layout
                     .db_path
                     .exists()
@@ -43509,7 +43516,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     None
                 };
 
-                let wezterm = frankenterm_core::wezterm::default_wezterm_handle();
+                let wezterm = frankenterm_core::wezterm::wezterm_handle_from_config(&config);
                 // ft-xbnl0.2.3 tick 234: cx-first.
                 let cx = frankenterm_core::cx::Cx::current()
                     .unwrap_or_else(frankenterm_core::cx::for_request);
@@ -45385,7 +45392,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                 let workspace_id = layout.root.to_string_lossy().to_string();
                 let now = now_ms_i64();
 
-                let wezterm = frankenterm_core::wezterm::default_wezterm_handle();
+                let wezterm = frankenterm_core::wezterm::wezterm_handle_from_config(&config);
                 // ft-xbnl0.2.3 tick 234: cx-first.
                 let cx = frankenterm_core::cx::Cx::current()
                     .unwrap_or_else(frankenterm_core::cx::for_request);
@@ -45994,7 +46001,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         exit_on_commit_validation_error(err, &plan_id);
                     }
 
-                    let wezterm = frankenterm_core::wezterm::default_wezterm_handle();
+                    let wezterm = frankenterm_core::wezterm::wezterm_handle_from_config(&config);
                     // ft-xbnl0.2.3 tick 234: cx-first.
                     let cx = frankenterm_core::cx::Cx::current()
                         .unwrap_or_else(frankenterm_core::cx::for_request);
@@ -46400,7 +46407,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         true,
                     )
                     .with_tuning(&config.tuning);
-                    let wezterm_handle = frankenterm_core::wezterm::default_wezterm_handle();
+                    let wezterm_handle = frankenterm_core::wezterm::wezterm_handle_from_config(&config);
                     let injector = frankenterm_core::workflows::CxPolicyInjector::new(
                         frankenterm_core::policy::PolicyGatedInjector::with_storage(
                             policy_engine,
@@ -47902,7 +47909,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
 
             let executor = UndoExecutor::new(
                 Arc::clone(&storage),
-                frankenterm_core::wezterm::default_wezterm_handle(),
+                frankenterm_core::wezterm::wezterm_handle_from_config(&config),
             );
             let reason = if let Some(workflow_id) = &all_in_workflow {
                 format!("ft undo --all-in-workflow {workflow_id}")

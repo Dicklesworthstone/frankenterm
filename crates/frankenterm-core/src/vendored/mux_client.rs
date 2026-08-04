@@ -4872,22 +4872,8 @@ async fn run_subscription_loop(
         let result = client.get_pane_render_changes_with_cx(cx, pane_id).await;
 
         let saw_dirty_output = match result {
-            Ok(changes) => {
-                let seqno = changes.seqno as u64;
-                let has_dirty = !changes.dirty_lines.is_empty();
-
-                if has_dirty {
-                    let delta_text = bonus_lines_to_text(changes.bonus_lines);
-                    let dirty_row_count = total_dirty_rows(&changes.dirty_lines);
-                    let delta = PaneDelta::Output {
-                        pane_id,
-                        seqno,
-                        delta_text,
-                        title: changes.title,
-                        dirty_range_count: changes.dirty_lines.len(),
-                        dirty_row_count,
-                    };
-
+            Ok(changes) => match render_changes_to_output_delta(pane_id, changes) {
+                Some(delta) => {
                     if !pane_delta_try_send(&tx, delta) {
                         let _ = pane_delta_try_send(
                             &tx,
@@ -4897,10 +4883,10 @@ async fn run_subscription_loop(
                             },
                         );
                     }
+                    true
                 }
-
-                has_dirty
-            }
+                None => false,
+            },
             Err(err) if subscription_can_retry_same_client(&err) => {
                 tracing::debug!(
                     pane_id,
@@ -5109,6 +5095,40 @@ fn total_dirty_rows(ranges: &[std::ops::Range<isize>]) -> usize {
             0
         };
         acc.saturating_add(span)
+    })
+}
+
+/// Convert one poll's render-changes response into an emit-ready output
+/// delta, or `None` when the response genuinely carries no new content.
+///
+/// GH#73: the mux server moves changed viewport rows *out of* `dirty_lines`
+/// and into `bonus_lines` (see `sessionhandler.rs`, which removes each
+/// prefetched row id from the dirty set as it serializes the line), so an
+/// ordinary viewport update commonly arrives as bonus-lines-only. Readiness
+/// must therefore treat `bonus_lines` as content-bearing. The previous gate
+/// (`!dirty_lines.is_empty()`) silently discarded every bonus-lines-only
+/// update: no `PaneDelta::Output`, no `CaptureEvent`, no stored segment, and
+/// no gap marker — durable capture froze while every transport surface
+/// looked healthy.
+fn render_changes_to_output_delta(
+    pane_id: u64,
+    changes: codec::GetPaneRenderChangesResponse,
+) -> Option<PaneDelta> {
+    let seqno = changes.seqno as u64;
+    let dirty_range_count = changes.dirty_lines.len();
+    let has_bonus_lines = changes.bonus_lines.line_count() > 0;
+    if dirty_range_count == 0 && !has_bonus_lines {
+        return None;
+    }
+    let dirty_row_count = total_dirty_rows(&changes.dirty_lines);
+    let delta_text = bonus_lines_to_text(changes.bonus_lines);
+    Some(PaneDelta::Output {
+        pane_id,
+        seqno,
+        delta_text,
+        title: changes.title,
+        dirty_range_count,
+        dirty_row_count,
     })
 }
 
@@ -13952,6 +13972,95 @@ mod tests {
     fn total_dirty_rows_saturates_for_extreme_signed_range() {
         let ranges = vec![isize::MIN..isize::MAX, 0..1];
         assert_eq!(total_dirty_rows(&ranges), usize::MAX);
+    }
+
+    fn test_bonus_lines(texts: &[&str]) -> codec::SerializedLines {
+        use termwiz::cell::CellAttributes;
+        use termwiz::surface::Line;
+        texts
+            .iter()
+            .enumerate()
+            .map(|(idx, text)| {
+                (
+                    idx as isize,
+                    Line::from_text(text, &CellAttributes::default(), 1, None),
+                )
+            })
+            .collect::<Vec<_>>()
+            .into()
+    }
+
+    /// GH#73 regression: the mux server moves changed viewport rows out of
+    /// `dirty_lines` and into `bonus_lines`, so a bonus-lines-only response
+    /// is an ordinary content-bearing update and MUST produce an output
+    /// delta. The old gate (`!dirty_lines.is_empty()`) silently discarded
+    /// these updates end-to-end: no CaptureEvent, no stored segment, no gap.
+    #[test]
+    fn render_changes_bonus_lines_only_produces_output_delta() {
+        let mut changes = test_render_change(3, 11, "pane-title");
+        changes.dirty_lines = Vec::new();
+        changes.bonus_lines = test_bonus_lines(&["hello", "world"]);
+
+        let delta = render_changes_to_output_delta(3, changes)
+            .expect("bonus-lines-only update must emit an output delta");
+        match delta {
+            PaneDelta::Output {
+                pane_id,
+                seqno,
+                delta_text,
+                title,
+                dirty_range_count,
+                dirty_row_count,
+            } => {
+                assert_eq!(pane_id, 3);
+                assert_eq!(seqno, 11);
+                assert_eq!(delta_text, "hello\nworld");
+                assert_eq!(title, "pane-title");
+                assert_eq!(dirty_range_count, 0);
+                assert_eq!(dirty_row_count, 0);
+            }
+            other => panic!("expected PaneDelta::Output, got {other:?}"),
+        }
+    }
+
+    /// GH#73: dirty-lines-only updates (no prefetched bonus rows) must keep
+    /// emitting exactly as before.
+    #[test]
+    fn render_changes_dirty_lines_only_still_produces_output_delta() {
+        let changes = test_render_change(4, 5, "t");
+        assert!(!changes.dirty_lines.is_empty());
+        let delta = render_changes_to_output_delta(4, changes)
+            .expect("dirty-lines update must emit an output delta");
+        match delta {
+            PaneDelta::Output {
+                dirty_range_count,
+                dirty_row_count,
+                ..
+            } => {
+                assert_eq!(dirty_range_count, 1);
+                assert_eq!(dirty_row_count, 1);
+            }
+            other => panic!("expected PaneDelta::Output, got {other:?}"),
+        }
+    }
+
+    /// GH#73: a genuinely idle response (no dirty ranges, no bonus lines)
+    /// must not fabricate a delta.
+    #[test]
+    fn render_changes_idle_response_produces_no_delta() {
+        let mut changes = test_render_change(5, 9, "t");
+        changes.dirty_lines = Vec::new();
+        assert!(render_changes_to_output_delta(5, changes).is_none());
+    }
+
+    /// GH#73: bonus lines whose text is empty (blank rows) still represent a
+    /// content change and must emit rather than be classified as idle.
+    #[test]
+    fn render_changes_blank_bonus_lines_still_emit() {
+        let mut changes = test_render_change(6, 2, "t");
+        changes.dirty_lines = Vec::new();
+        changes.bonus_lines = test_bonus_lines(&[""]);
+        assert!(render_changes_to_output_delta(6, changes).is_some());
     }
 
     #[test]

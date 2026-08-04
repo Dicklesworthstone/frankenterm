@@ -26,6 +26,7 @@ members = [
     "crates/frankenterm-mux-server",
     "crates/frankenterm-mux-server-impl",
     "crates/frankenterm-alloc",
+    "crates/frankenterm-sigpipe",
     "crates/frankenterm-topo",
     "crates/ft-perf-gate",
     "crates/ft-test-log",
@@ -101,6 +102,7 @@ default-members = [
     "crates/frankenterm-mux-server",
     "crates/frankenterm-mux-server-impl",
     "crates/frankenterm-alloc",
+    "crates/frankenterm-sigpipe",
     "crates/frankenterm-topo",
     "crates/ft-perf-gate",
     "fuzz",
@@ -525,6 +527,7 @@ tabout = { path = "frankenterm/tabout" }
 mux-lua = { path = "frankenterm/lua-api-crates/mux-lua" }
 url-funcs = { path = "frankenterm/lua-api-crates/url-funcs" }
 frankenterm-mux-server-impl = { path = "crates/frankenterm-mux-server-impl" }
+frankenterm-sigpipe = { path = "crates/frankenterm-sigpipe" }
 
 # Notify: upstream used 5.0; FrankenTerm now targets the latest stable API.
 notify = "8.2.0"

@@ -3463,10 +3463,12 @@ dependencies = [
  "clap",
  "dirs",
  "fancy-regex 0.18.0",
+ "filedescriptor 0.8.3",
  "frankenterm-alloc",
  "frankenterm-client",
  "frankenterm-core",
  "frankenterm-core-replay",
+ "frankenterm-sigpipe",
  "hex",
  "mux",
  "openssl-sys",
@@ -3702,6 +3704,7 @@ dependencies = [
  "sysinfo",
  "tantivy",
  "tempfile",
+ "termwiz 0.24.0",
  "thiserror 2.0.18",
  "tokenizers 0.23.1",
  "tokio",
@@ -4076,6 +4079,7 @@ dependencies = [
  "frankenterm-gui-subcommands",
  "frankenterm-mux-server-impl",
  "frankenterm-open-url",
+ "frankenterm-sigpipe",
  "frankenterm-ssh",
  "frankenterm-term",
  "frankenterm-toast-notification",
@@ -4163,6 +4167,7 @@ dependencies = [
  "frankenterm-blob-leases",
  "frankenterm-gui-subcommands",
  "frankenterm-mux-server-impl",
+ "frankenterm-sigpipe",
  "frankenterm-term",
  "libc",
  "log",
@@ -4256,6 +4261,10 @@ dependencies = [
  "wasmtime-wasi",
  "zip",
 ]
+
+[[package]]
+name = "frankenterm-sigpipe"
+version = "0.13.0"
 
 [[package]]
 name = "frankenterm-ssh"

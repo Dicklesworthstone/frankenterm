@@ -43,7 +43,7 @@ use super::{
     UnifiedSearchMode, WaitOptions, WaitResult, WeztermError, WeztermHandleSource, Workflow,
     WorkflowExecutionResult, approval_command, build_mcp_shared_rate_limiter,
     build_mcp_workflow_assembly, build_policy_engine_with_shared_rate_limiter,
-    default_wezterm_handle, effective_search_fusion_backend, effective_search_fusion_weights,
+    effective_search_fusion_backend, effective_search_fusion_weights,
     effective_search_quality_timeout_ms, effective_search_rrf_k, elapsed_ms, envelope_to_content,
     map_cass_error, map_caut_error, map_mcp_error, mcp_build_mission_assignments,
     mcp_build_tx_compensation_inputs, mcp_load_mission_from_path,
@@ -2373,6 +2373,10 @@ impl ToolHandler for WaCassStatusTool {
 }
 
 pub(super) struct WaStateTool {
+    // GH#72: the parsed config is carried so pane listing goes through the
+    // config-aware unified handle (vendored mux socket when configured)
+    // instead of the CLI-only default handle.
+    config: Arc<Config>,
     filter: PaneFilterConfig,
     db_path: Option<Arc<PathBuf>>,
 }
@@ -2503,8 +2507,16 @@ fn redact_mcp_wait_pattern_for_output(pattern: &str) -> String {
 }
 
 impl WaStateTool {
-    pub(super) fn new(filter: PaneFilterConfig, db_path: Option<Arc<PathBuf>>) -> Self {
-        Self { filter, db_path }
+    pub(super) fn new(
+        config: Arc<Config>,
+        filter: PaneFilterConfig,
+        db_path: Option<Arc<PathBuf>>,
+    ) -> Self {
+        Self {
+            config,
+            filter,
+            db_path,
+        }
     }
 }
 
@@ -2553,13 +2565,15 @@ impl ToolHandler for WaStateTool {
         }
 
         let db_path = self.db_path.as_ref().map(Arc::clone);
+        let config = Arc::clone(&self.config);
 
         let runtime = CompatRuntimeBuilder::current_thread()
             .build()
             .map_err(|e| McpError::internal_error(format!("Tokio runtime init failed: {e}")))?;
 
         let result = runtime.block_on(async {
-            let wezterm = default_wezterm_handle();
+            // GH#72: honor any configured vendored mux socket.
+            let wezterm = crate::wezterm::wezterm_handle_from_config(config.as_ref());
             let panes = wezterm.list_panes().await?;
             let mut states: Vec<McpPaneState> = panes
                 .iter()
@@ -2727,7 +2741,8 @@ impl ToolHandler for WaGetTextTool {
                 let remote_pane = load_distributed_remote_pane(storage.as_ref(), params.pane_id)
                     .await
                     .map_err(McpToolError::from_error)?;
-                let wezterm = default_wezterm_handle();
+                // GH#72: honor any configured vendored mux socket.
+                let wezterm = crate::wezterm::wezterm_handle_from_config(config.as_ref());
                 // ft-xbnl0.2.3 tick 261: cx-first wezterm pane lookup.
                 let wezterm_cx = crate::cx::Cx::current()
                     .unwrap_or_else(crate::cx::for_request);
@@ -2990,7 +3005,8 @@ impl ToolHandler for WaDomTool {
                 };
 
                 let redactor = crate::redactor::Redactor::new();
-                let wezterm = default_wezterm_handle();
+                // GH#72: honor any configured vendored mux socket.
+                let wezterm = crate::wezterm::wezterm_handle_from_config(config.as_ref());
                 let wezterm_cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
 
                 // Semantic zones require a live local pane; no remote-pane path.
@@ -3151,10 +3167,12 @@ impl WaWaitForTool {
         db_path: Option<Arc<PathBuf>>,
         policy_rate_limiter: SharedRateLimiter,
     ) -> Self {
+        // GH#72: honor any configured vendored mux socket.
+        let wezterm = crate::wezterm::wezterm_handle_from_config(config.as_ref());
         Self::with_wezterm_handle_and_shared_rate_limiter(
             config,
             db_path,
-            default_wezterm_handle(),
+            wezterm,
             policy_rate_limiter,
         )
     }
@@ -3655,7 +3673,7 @@ impl ToolHandler for WaSearchTool {
                 if let Some(pane_id) = search_options.pane_id {
                     // br-ft-9ia4p: mirror WaGetTextTool's distributed-pane
                     // fallback. Distributed remote panes are persisted-only
-                    // by design — `default_wezterm_handle().get_pane(pane_id)`
+                    // by design — a live-mux `get_pane(pane_id)` lookup
                     // fails for them with no live WezTerm context. The
                     // user-facing recovery hint from wa.get_text points at
                     // wa.search/ft search, so this path must succeed
@@ -3663,7 +3681,8 @@ impl ToolHandler for WaSearchTool {
                     let remote_pane = load_distributed_remote_pane(Some(&storage), pane_id)
                         .await
                         .map_err(McpToolError::from_error)?;
-                    let wezterm = default_wezterm_handle();
+                    // GH#72: honor any configured vendored mux socket.
+                    let wezterm = crate::wezterm::wezterm_handle_from_config(config.as_ref());
                     let pane_info = match wezterm.get_pane(pane_id).await {
                         Ok(pane_info) => Some(pane_info),
                         Err(err) => {
@@ -4687,10 +4706,12 @@ impl WaSendTool {
     #[cfg(test)]
     pub(super) fn new(config: Arc<Config>, db_path: Arc<PathBuf>) -> Self {
         let policy_rate_limiter = build_mcp_shared_rate_limiter(config.as_ref());
+        // GH#72: honor any configured vendored mux socket.
+        let wezterm = crate::wezterm::wezterm_handle_from_config(config.as_ref());
         Self::with_wezterm_handle_and_shared_rate_limiter(
             config,
             db_path,
-            default_wezterm_handle(),
+            wezterm,
             policy_rate_limiter,
         )
     }
@@ -4700,10 +4721,12 @@ impl WaSendTool {
         db_path: Arc<PathBuf>,
         policy_rate_limiter: SharedRateLimiter,
     ) -> Self {
+        // GH#72: honor any configured vendored mux socket.
+        let wezterm = crate::wezterm::wezterm_handle_from_config(config.as_ref());
         Self::with_wezterm_handle_and_shared_rate_limiter(
             config,
             db_path,
-            default_wezterm_handle(),
+            wezterm,
             policy_rate_limiter,
         )
     }
@@ -5254,7 +5277,8 @@ impl ToolHandler for WaWorkflowRunTool {
                         .map_err(McpToolError::from_error)?;
                 let storage = Arc::new(storage);
 
-                let wezterm = default_wezterm_handle();
+                // GH#72: honor any configured vendored mux socket.
+                let wezterm = crate::wezterm::wezterm_handle_from_config(config.as_ref());
                 let pane_info = wezterm
                     .get_pane(params.pane_id)
                     .await
@@ -10163,7 +10187,7 @@ mod tests {
             WaCassSearchTool.definition(),
             WaCassViewTool.definition(),
             WaCassStatusTool.definition(),
-            WaStateTool::new(PaneFilterConfig::default(), None).definition(),
+            WaStateTool::new(Arc::new(Config::default()), PaneFilterConfig::default(), None).definition(),
             WaGetTextTool::new(Arc::clone(&cfg), Some(Arc::clone(&db))).definition(),
             WaWaitForTool::new(Arc::clone(&cfg), Some(Arc::clone(&db))).definition(),
             WaSearchTool::new(Arc::clone(&cfg), Arc::clone(&db)).definition(),
@@ -13813,7 +13837,7 @@ exit 17",
 
     #[test]
     fn state_tool_schema_has_domain_and_pane_id() {
-        let def = WaStateTool::new(PaneFilterConfig::default(), None).definition();
+        let def = WaStateTool::new(Arc::new(Config::default()), PaneFilterConfig::default(), None).definition();
         let props = def.input_schema.get("properties").unwrap();
         assert!(
             props.get("domain").is_some(),
@@ -13827,6 +13851,55 @@ exit 17",
             props["agent"]["maxLength"].as_u64(),
             Some(MAX_MCP_STATE_AGENT_FILTER_BYTES as u64)
         );
+    }
+
+    /// GH#72 regression guard: the production MCP constructors must build
+    /// their pane-control handle from the parsed `Config` (a config-aware
+    /// `UnifiedClient`), never from `default_wezterm_handle()`, which has no
+    /// mux pool and unconditionally falls through to the external
+    /// `wezterm cli` subprocess even when `vendored.mux_socket_path` is
+    /// explicitly configured. A config-aware handle reports
+    /// `Some(backend_selection)`; the CLI-only default handle reports `None`.
+    #[test]
+    fn wa_send_production_constructor_uses_config_aware_handle() {
+        use crate::wezterm::MuxInterface;
+        let config = Arc::new(Config::default());
+        let limiter = build_mcp_shared_rate_limiter(config.as_ref());
+        let tool = WaSendTool::new_with_shared_rate_limiter(
+            Arc::clone(&config),
+            Arc::new(PathBuf::from("/tmp/wa-send-handle-test.db")),
+            limiter,
+        );
+        assert!(
+            tool.wezterm.backend_selection().is_some(),
+            "wa.send production constructor must use the config-aware unified \
+             handle so a configured vendored mux socket is honored (GH#72)"
+        );
+    }
+
+    /// GH#72 regression guard: see
+    /// [`wa_send_production_constructor_uses_config_aware_handle`].
+    #[test]
+    fn wa_wait_for_production_constructor_uses_config_aware_handle() {
+        use crate::wezterm::MuxInterface;
+        let config = Arc::new(Config::default());
+        let limiter = build_mcp_shared_rate_limiter(config.as_ref());
+        let tool = WaWaitForTool::new_with_shared_rate_limiter(Arc::clone(&config), None, limiter);
+        assert!(
+            tool.wezterm.backend_selection().is_some(),
+            "wa.wait_for production constructor must use the config-aware \
+             unified handle so a configured vendored mux socket is honored (GH#72)"
+        );
+    }
+
+    /// GH#72 regression guard: `default_wezterm_handle()` must keep
+    /// reporting `None` so the two tests above cannot silently pass against
+    /// a config-blind handle.
+    #[test]
+    fn default_wezterm_handle_reports_no_backend_selection() {
+        use crate::wezterm::MuxInterface;
+        let handle = crate::wezterm::default_wezterm_handle();
+        assert!(handle.backend_selection().is_none());
     }
 
     #[test]
@@ -13863,7 +13936,7 @@ exit 17",
 
     #[test]
     fn wa_state_malformed_args_redacts_serde_error_value() {
-        let tool = WaStateTool::new(PaneFilterConfig::default(), None);
+        let tool = WaStateTool::new(Arc::new(Config::default()), PaneFilterConfig::default(), None);
         let redaction_sample = redaction_test_token();
 
         let envelope = parse_json_content(
@@ -13891,7 +13964,7 @@ exit 17",
 
     #[test]
     fn wa_state_rejects_oversized_agent_filter_without_echoing_value() {
-        let tool = WaStateTool::new(PaneFilterConfig::default(), None);
+        let tool = WaStateTool::new(Arc::new(Config::default()), PaneFilterConfig::default(), None);
         let redaction_sample = redaction_test_token();
         let agent = format!(
             "{redaction_sample}{}",
@@ -15004,8 +15077,8 @@ exit 17",
     }
 
     /// br-ft-9ia4p: wa.search with pane_id pointing at a distributed
-    /// remote pane must fall back to the storage record when live
-    /// `default_wezterm_handle().get_pane(pane_id)` fails. Without
+    /// remote pane must fall back to the storage record when the live
+    /// mux `get_pane(pane_id)` lookup fails. Without
     /// this, the recovery hint emitted by `wa.get_text` ("use
     /// wa.search ...") is broken — pane-scoped search aborts before
     /// querying storage.
