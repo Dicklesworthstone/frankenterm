@@ -1294,10 +1294,8 @@ impl PaneArenaPreparationScratch {
     /// boundary. Ordinary successful snapshots should keep the buffers for
     /// reuse; terminal paths should not retain their high-water capacity.
     pub fn release_retained_storage(&mut self) {
-        self.validation.clear();
-        self.application.clear();
-        self.validation.shrink_to_fit();
-        self.application.shrink_to_fit();
+        self.validation = Vec::new();
+        self.application = Vec::new();
     }
 }
 
@@ -1476,20 +1474,33 @@ where
     let mut active = None;
     let mut zoomed = None;
 
+    macro_rules! application_try {
+        ($expression:expr) => {
+            match $expression {
+                Ok(value) => value,
+                Err(error) => {
+                    stack.clear();
+                    return Err(error.into());
+                }
+            }
+        };
+    }
+
     for (offset, node) in arena.drain(arena_start..).enumerate().rev() {
         scratch.stats.application_node_visits =
             scratch.stats.application_node_visits.saturating_add(1);
         let node_index = arena_start
             .checked_add(offset)
-            .ok_or_else(|| anyhow::anyhow!("pane arena node index overflows usize"))?;
+            .ok_or_else(|| anyhow::anyhow!("pane arena node index overflows usize"));
+        let node_index = application_try!(node_index);
         match node {
             PaneArenaNode::Empty => {
-                if reserve_pane_arena_stack_push(
+                if application_try!(reserve_pane_arena_stack_push(
                     stack,
                     1,
                     node_count,
                     "pane arena application stack",
-                )? {
+                )) {
                     scratch.stats.application_stack_growth_events = scratch
                         .stats
                         .application_stack_growth_events
@@ -1500,19 +1511,19 @@ where
             PaneArenaNode::Leaf(entry) => {
                 let is_zoomed_pane = entry.is_zoomed_pane;
                 let is_active_pane = entry.is_active_pane;
-                let pane = make_pane(entry)?;
+                let pane = application_try!(make_pane(entry));
                 if is_zoomed_pane {
                     zoomed.replace(Arc::clone(&pane));
                 }
                 if is_active_pane {
                     active.replace(Arc::clone(&pane));
                 }
-                if reserve_pane_arena_stack_push(
+                if application_try!(reserve_pane_arena_stack_push(
                     stack,
                     1,
                     node_count,
                     "pane arena application stack",
-                )? {
+                )) {
                     scratch.stats.application_stack_growth_events = scratch
                         .stats
                         .application_stack_growth_events
@@ -1529,38 +1540,45 @@ where
             } => {
                 let expected_left = node_index
                     .checked_add(1)
-                    .ok_or_else(|| anyhow::anyhow!("pane arena left-child index overflows"))?;
+                    .ok_or_else(|| anyhow::anyhow!("pane arena left-child index overflows"));
+                let expected_left = application_try!(expected_left);
                 let left_index = usize::try_from(left)
-                    .map_err(|_| anyhow::anyhow!("pane arena left-child index does not fit"))?;
+                    .map_err(|_| anyhow::anyhow!("pane arena left-child index does not fit"));
+                let left_index = application_try!(left_index);
                 let right_index = usize::try_from(right)
-                    .map_err(|_| anyhow::anyhow!("pane arena right-child index does not fit"))?;
+                    .map_err(|_| anyhow::anyhow!("pane arena right-child index does not fit"));
+                let right_index = application_try!(right_index);
                 if left_index != expected_left
                     || right_index <= left_index
                     || right_index >= arena_end
                 {
+                    stack.clear();
                     anyhow::bail!(
                         "pane arena split {node_index} has non-canonical children \
                          ({left_index}, {right_index}) for range {arena_start}..{arena_end}"
                     );
                 }
-                let (actual_left, left) = stack.pop().ok_or_else(|| {
+                let left = stack.pop().ok_or_else(|| {
                     anyhow::anyhow!("pane arena split {node_index} lost its left subtree")
-                })?;
-                let (actual_right, right) = stack.pop().ok_or_else(|| {
+                });
+                let (actual_left, left) = application_try!(left);
+                let right = stack.pop().ok_or_else(|| {
                     anyhow::anyhow!("pane arena split {node_index} lost its right subtree")
-                })?;
+                });
+                let (actual_right, right) = application_try!(right);
                 if actual_left != left_index || actual_right != right_index {
+                    stack.clear();
                     anyhow::bail!(
                         "pane arena split {node_index} declared children ({left_index}, \
                          {right_index}) but produced ({actual_left}, {actual_right})"
                     );
                 }
-                if reserve_pane_arena_stack_push(
+                if application_try!(reserve_pane_arena_stack_push(
                     stack,
                     1,
                     node_count,
                     "pane arena application stack",
-                )? {
+                )) {
                     scratch.stats.application_stack_growth_events = scratch
                         .stats
                         .application_stack_growth_events
@@ -1589,14 +1607,17 @@ where
     }
 
     if stack.len() != 1 {
+        let produced_roots = stack.len();
+        stack.clear();
         anyhow::bail!(
             "pane arena range {arena_start}..{arena_end} produced {} roots instead of one",
-            stack.len()
+            produced_roots
         );
     }
-    let (root_index, tree) = stack
+    let root = stack
         .pop()
-        .ok_or_else(|| anyhow::anyhow!("pane arena application lost its root"))?;
+        .ok_or_else(|| anyhow::anyhow!("pane arena application lost its root"));
+    let (root_index, tree) = application_try!(root);
     if root_index != arena_start {
         anyhow::bail!(
             "pane arena application produced root {root_index}, expected {arena_start}"
@@ -9088,6 +9109,310 @@ mod test {
         assert!(format!("{error:#}").contains("non-canonical children"));
         assert_eq!(make_calls, 0);
         assert_eq!(arena.len(), 3, "rejected arena must remain owned by caller");
+    }
+
+    fn append_balanced_split_heavy_subtree(
+        nodes: &mut Vec<PaneArenaNode>,
+        first_leaf: usize,
+        leaves: usize,
+    ) -> u32 {
+        let node_index = nodes.len();
+        nodes.push(PaneArenaNode::Empty);
+        if leaves == 1 {
+            nodes[node_index] = PaneArenaNode::Leaf(pane_arena_test_entry(
+                first_leaf.saturating_add(1),
+                first_leaf == 0,
+                false,
+            ));
+            return u32::try_from(node_index).expect("test leaf index fits u32");
+        }
+        let left_leaves = leaves.div_ceil(2);
+        let left = append_balanced_split_heavy_subtree(nodes, first_leaf, left_leaves);
+        let right = append_balanced_split_heavy_subtree(
+            nodes,
+            first_leaf + left_leaves,
+            leaves - left_leaves,
+        );
+        nodes[node_index] = PaneArenaNode::Split {
+            left,
+            right,
+            node: SplitDirectionAndSize {
+                direction: if leaves % 2 == 0 {
+                    SplitDirection::Horizontal
+                } else {
+                    SplitDirection::Vertical
+                },
+                first: TerminalSize::default(),
+                second: TerminalSize::default(),
+            },
+        };
+        u32::try_from(node_index).expect("test split index fits u32")
+    }
+
+    fn balanced_split_heavy_pane_arena(leaf_count: usize) -> Vec<PaneArenaNode> {
+        assert!(leaf_count > 0);
+        let node_count = leaf_count
+            .checked_mul(2)
+            .and_then(|count| count.checked_sub(1))
+            .expect("test pane-arena node count fits usize");
+        let mut nodes = Vec::with_capacity(node_count);
+        assert_eq!(
+            append_balanced_split_heavy_subtree(&mut nodes, 0, leaf_count),
+            0,
+        );
+        assert_eq!(nodes.len(), node_count);
+        nodes
+    }
+
+    fn append_balanced_pane_arena_slots(
+        nodes: &mut Vec<PaneArenaNode>,
+        first_leaf: usize,
+        slots: usize,
+        empty_slots: usize,
+    ) -> u32 {
+        assert!(slots > 0);
+        assert!(empty_slots <= slots);
+        let node_index = nodes.len();
+        nodes.push(PaneArenaNode::Empty);
+        if slots == 1 {
+            if empty_slots == 0 {
+                nodes[node_index] = PaneArenaNode::Leaf(pane_arena_test_entry(
+                    first_leaf.saturating_add(1),
+                    first_leaf == 0,
+                    false,
+                ));
+            }
+            return u32::try_from(node_index).expect("test slot index fits u32");
+        }
+        let left_slots = slots.div_ceil(2);
+        let right_slots = slots - left_slots;
+        let left_empty_slots = empty_slots.min(left_slots);
+        let right_empty_slots = empty_slots - left_empty_slots;
+        let left = append_balanced_pane_arena_slots(
+            nodes,
+            first_leaf,
+            left_slots,
+            left_empty_slots,
+        );
+        let left_leaves = left_slots - left_empty_slots;
+        let right = append_balanced_pane_arena_slots(
+            nodes,
+            first_leaf + left_leaves,
+            right_slots,
+            right_empty_slots,
+        );
+        nodes[node_index] = PaneArenaNode::Split {
+            left,
+            right,
+            node: SplitDirectionAndSize {
+                direction: if slots % 2 == 0 {
+                    SplitDirection::Horizontal
+                } else {
+                    SplitDirection::Vertical
+                },
+                first: TerminalSize::default(),
+                second: TerminalSize::default(),
+            },
+        };
+        u32::try_from(node_index).expect("test split index fits u32")
+    }
+
+    #[test]
+    fn pane_arena_scale_work_boxes_and_scratch_storage_are_exact_and_bounded() {
+        let mut scratch = PaneArenaPreparationScratch::default();
+        for leaf_count in [1_usize, 20, 200, 4_096] {
+            let mut arena = balanced_split_heavy_pane_arena(leaf_count);
+            let node_count = leaf_count * 2 - 1;
+            scratch.reset_stats();
+            let prepared = prepare_pane_tree_from_arena_with_scratch(
+                &mut arena,
+                node_count,
+                &mut scratch,
+                |entry| Ok(FakePane::new(entry.pane_id, entry.size)),
+            )
+            .unwrap_or_else(|error| {
+                panic!(
+                    "split-heavy q={} application failed: {:#}",
+                    leaf_count, error,
+                )
+            });
+            assert!(arena.is_empty());
+            let stats = scratch.stats();
+            assert_eq!(stats.trees_started, 1);
+            assert_eq!(stats.trees_completed, 1);
+            assert_eq!(stats.validation_node_visits, node_count);
+            assert_eq!(stats.application_node_visits, node_count);
+            assert_eq!(stats.leaf_resolutions, leaf_count);
+            assert_eq!(stats.split_materializations, leaf_count - 1);
+            assert_eq!(
+                stats.required_final_tree_box_allocations,
+                (leaf_count - 1) * 2,
+            );
+            assert!(stats.peak_validation_stack_entries <= 16);
+            assert!(stats.peak_application_stack_entries <= 16);
+            assert!(stats.validation_stack_growth_events <= 3);
+            assert!(stats.application_stack_growth_events <= 3);
+            assert!(
+                scratch
+                    .requested_retained_storage_bytes()
+                    .expect("test storage count fits usize")
+                    < 64 * 1024,
+                "balanced q={} retained an oversized traversal scratch arena",
+                leaf_count,
+            );
+            drop(prepared);
+        }
+        scratch.release_retained_storage();
+        assert_eq!(scratch.requested_retained_storage_bytes(), Some(0));
+    }
+
+    #[test]
+    fn pane_arena_scale_exact_maximum_admitted_snapshot_reuses_one_bounded_scratch() {
+        const SLOT_COUNTS: [usize; 5] = [4_096, 4_096, 4_096, 2_049, 2_049];
+        const EMPTY_COUNTS: [usize; 5] = [0, 0, 0, 1, 1];
+        const SNAPSHOT_LEAVES: usize = 16_384;
+        const SNAPSHOT_NODES: usize = 32_767;
+
+        let mut arena = Vec::with_capacity(SNAPSHOT_NODES);
+        let mut first_leaf = 0_usize;
+        let mut node_counts = Vec::with_capacity(SLOT_COUNTS.len());
+        for (slots, empty_slots) in SLOT_COUNTS.into_iter().zip(EMPTY_COUNTS) {
+            let expected_root = arena.len();
+            assert_eq!(
+                usize::try_from(append_balanced_pane_arena_slots(
+                    &mut arena,
+                    first_leaf,
+                    slots,
+                    empty_slots,
+                ))
+                .expect("test root index fits usize"),
+                expected_root,
+            );
+            node_counts.push(slots * 2 - 1);
+            first_leaf += slots - empty_slots;
+        }
+        assert_eq!(arena.len(), SNAPSHOT_NODES);
+        assert_eq!(first_leaf, SNAPSHOT_LEAVES);
+
+        let mut scratch = PaneArenaPreparationScratch::default();
+        for node_count in node_counts.into_iter().rev() {
+            let prepared = prepare_pane_tree_from_arena_with_scratch(
+                &mut arena,
+                node_count,
+                &mut scratch,
+                |entry| Ok(FakePane::new(entry.pane_id, entry.size)),
+            )
+            .expect("each exact-maximum snapshot tree must apply");
+            drop(prepared);
+        }
+        assert!(arena.is_empty());
+        let stats = scratch.stats();
+        assert_eq!(stats.trees_started, SLOT_COUNTS.len());
+        assert_eq!(stats.trees_completed, SLOT_COUNTS.len());
+        assert_eq!(stats.validation_node_visits, SNAPSHOT_NODES);
+        assert_eq!(stats.application_node_visits, SNAPSHOT_NODES);
+        assert_eq!(stats.leaf_resolutions, SNAPSHOT_LEAVES);
+        let expected_splits = SLOT_COUNTS.into_iter().map(|slots| slots - 1).sum::<usize>();
+        assert_eq!(stats.split_materializations, expected_splits);
+        assert_eq!(
+            stats.required_final_tree_box_allocations,
+            expected_splits * 2,
+        );
+        assert!(stats.peak_validation_stack_entries <= 13);
+        assert!(stats.peak_application_stack_entries <= 13);
+        assert!(stats.validation_stack_growth_events <= 2);
+        assert!(stats.application_stack_growth_events <= 2);
+        assert!(
+            scratch
+                .requested_retained_storage_bytes()
+                .expect("test storage count fits usize")
+                < 64 * 1024,
+        );
+        scratch.release_retained_storage();
+        assert_eq!(scratch.requested_retained_storage_bytes(), Some(0));
+    }
+
+    #[test]
+    fn pane_arena_scale_malformed_preflight_releases_scratch_without_consuming_nodes() {
+        let size = TerminalSize::default();
+        let mut arena = vec![
+            PaneArenaNode::Split {
+                left: 1,
+                right: 1,
+                node: SplitDirectionAndSize {
+                    direction: SplitDirection::Horizontal,
+                    first: size,
+                    second: size,
+                },
+            },
+            PaneArenaNode::Leaf(pane_arena_test_entry(71, true, false)),
+            PaneArenaNode::Leaf(pane_arena_test_entry(72, false, false)),
+        ];
+        let mut scratch = PaneArenaPreparationScratch::default();
+        let error = match prepare_pane_tree_from_arena_with_scratch(
+            &mut arena,
+            3,
+            &mut scratch,
+            |entry| Ok(FakePane::new(entry.pane_id, entry.size)),
+        ) {
+            Ok(_) => panic!("malformed pane arena must fail during preflight"),
+            Err(error) => error,
+        };
+        assert!(format!("{error:#}").contains("non-canonical children"));
+        assert_eq!(arena.len(), 3);
+        assert_eq!(scratch.stats().trees_started, 1);
+        assert_eq!(scratch.stats().trees_completed, 0);
+        assert_eq!(scratch.stats().application_node_visits, 0);
+        scratch.release_retained_storage();
+        assert_eq!(scratch.requested_retained_storage_bytes(), Some(0));
+    }
+
+    #[test]
+    fn pane_arena_scale_factory_error_drops_partially_prepared_subtrees() {
+        let size = TerminalSize::default();
+        let mut arena = vec![
+            PaneArenaNode::Split {
+                left: 1,
+                right: 2,
+                node: SplitDirectionAndSize {
+                    direction: SplitDirection::Horizontal,
+                    first: size,
+                    second: size,
+                },
+            },
+            PaneArenaNode::Leaf(pane_arena_test_entry(81, true, false)),
+            PaneArenaNode::Leaf(pane_arena_test_entry(82, false, false)),
+        ];
+        let mut scratch = PaneArenaPreparationScratch::default();
+        let mut prepared_pane = None;
+        let error = match prepare_pane_tree_from_arena_with_scratch(
+            &mut arena,
+            3,
+            &mut scratch,
+            |entry| -> anyhow::Result<Arc<dyn Pane>> {
+                if entry.pane_id == 81 {
+                    anyhow::bail!("injected pane factory failure");
+                }
+                let pane: Arc<dyn Pane> = FakePane::new(entry.pane_id, entry.size);
+                prepared_pane = Some(Arc::downgrade(&pane));
+                Ok(pane)
+            },
+        ) {
+            Ok(_) => panic!("injected pane factory failure must abort application"),
+            Err(error) => error,
+        };
+        assert!(format!("{error:#}").contains("injected pane factory failure"));
+        assert!(arena.is_empty(), "the failed tree range must be consumed once");
+        assert!(
+            prepared_pane
+                .expect("the reverse traversal prepares pane 82 first")
+                .upgrade()
+                .is_none(),
+            "application scratch retained a partially prepared pane subtree",
+        );
+        assert_eq!(scratch.stats().trees_completed, 0);
+        scratch.release_retained_storage();
+        assert_eq!(scratch.requested_retained_storage_bytes(), Some(0));
     }
 
     #[test]

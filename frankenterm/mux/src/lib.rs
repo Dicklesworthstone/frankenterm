@@ -4005,12 +4005,15 @@ pub struct MuxWindowBuilder {
 }
 
 impl MuxWindowBuilder {
-    /// Releases a provisional window without publishing `WindowCreated`.
+    /// Releases an empty provisional window without publishing `WindowCreated`.
     ///
     /// Tmux control-mode domains retain a builder while their remote window
     /// topology materializes. Terminal cleanup must be able to release that
-    /// activity lease without making an abandoned window visible.
-    pub(crate) fn cancel(mut self) {
+    /// activity lease without making an abandoned empty window visible. If
+    /// the window gained a tab before cancellation, the mux preserves it and
+    /// publishes `WindowCreated`; rollback callers must first detach every tab
+    /// they provisionally attached.
+    pub fn cancel(mut self) {
         self.notified = true;
         if self.provisional {
             if let Some(owner) = self.owner.upgrade() {
