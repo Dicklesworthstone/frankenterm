@@ -6530,6 +6530,14 @@ impl Mux {
     }
 
     fn remove_tab_internal_if_same(&self, expected: &Arc<Tab>) -> Option<Arc<Tab>> {
+        self.remove_tab_internal_if_same_with_pane_disposition(expected, true)
+    }
+
+    fn remove_tab_internal_if_same_with_pane_disposition(
+        &self,
+        expected: &Arc<Tab>,
+        kill_remote_panes: bool,
+    ) -> Option<Arc<Tab>> {
         let tab_id = expected.tab_id();
         log::debug!("remove exact tab instance {}", tab_id);
 
@@ -6549,14 +6557,17 @@ impl Mux {
             .collect::<Vec<_>>();
         log::debug!("panes to remove from exact tab: {pane_ids:?}");
         for removed in removed_panes {
-            self.finish_pane_removal(removed, true);
+            self.finish_pane_removal(removed, kill_remote_panes);
         }
         self.recompute_pane_count();
 
         Some(tab)
     }
 
-    fn remove_empty_tab_internal_if_same(&self, expected: &Arc<Tab>) -> Option<Arc<Tab>> {
+    fn remove_empty_tab_internal_if_same(
+        &self,
+        expected: &Arc<Tab>,
+    ) -> Option<(Arc<Tab>, Vec<WindowId>)> {
         let tab_id = expected.tab_id();
         let tab = {
             // Match the staged pane-prune lock order. Holding `Tab::inner`
@@ -6574,15 +6585,18 @@ impl Mux {
                 .flatten()
         }?;
 
-        {
+        let detached_window_ids = {
             let mut windows = self.windows.write();
-            for window in windows.values_mut() {
-                window.remove_tab_if_same(&tab);
-            }
-        }
+            windows
+                .iter_mut()
+                .filter_map(|(window_id, window)| {
+                    window.remove_tab_if_same(&tab).then_some(*window_id)
+                })
+                .collect::<Vec<_>>()
+        };
         self.flush_window_notifications();
         self.recompute_pane_count();
-        Some(tab)
+        Some((tab, detached_window_ids))
     }
 
     fn remove_window_internal(&self, window_id: WindowId) {
@@ -6775,6 +6789,19 @@ impl Mux {
         Some(tab)
     }
 
+    /// Roll back one exact local tab mirror, including an already-installed
+    /// pane tree, without sending remote pane termination requests.
+    ///
+    /// Exact Arc identity prevents an exhausted/reused numeric tab ID from
+    /// removing a replacement. This is the populated counterpart to
+    /// [`Mux::remove_empty_tab_local_only_if_same`] for transactions that own
+    /// the staged tab from registration through publication.
+    pub fn remove_tab_local_only_if_same(&self, expected: &Arc<Tab>) -> bool {
+        self
+            .remove_tab_internal_if_same_with_pane_disposition(expected, false)
+            .is_some()
+    }
+
     /// Roll back an exact, still-empty local tab registration without risking
     /// removal of a concurrent replacement that happens to carry the same ID.
     ///
@@ -6784,10 +6811,13 @@ impl Mux {
     /// killing a remote pane or tearing down topology published after the
     /// staging handle became stale.
     pub fn remove_empty_tab_local_only_if_same(&self, expected: &Arc<Tab>) -> bool {
-        if self.remove_empty_tab_internal_if_same(expected).is_none() {
+        let Some((_tab, detached_window_ids)) = self.remove_empty_tab_internal_if_same(expected)
+        else {
             return false;
+        };
+        for window_id in detached_window_ids {
+            self.remove_window_if_empty_internal(window_id);
         }
-        self.prune_dead_windows_ignoring_activity();
         true
     }
 
@@ -15345,6 +15375,43 @@ mod tests {
 
         drop(normal_window);
         drop(local_only_window);
+        Mux::shutdown();
+    }
+
+    #[test]
+    fn remove_tab_local_only_if_same_rolls_back_populated_provisional_tab() {
+        let _guard = global_test_lock();
+        Mux::shutdown();
+
+        let mux = Arc::new(Mux::new(None));
+        Mux::set_mux(&mux);
+        let window = mux.new_empty_window(Some("ordered-staging".to_string()), None);
+        let window_id = *window;
+        let (tab, kills) = tab_with_kill_counter(&mux, 503);
+        let tab_id = tab.tab_id();
+        mux.add_tab_to_window(&tab, window_id)
+            .expect("populated staging tab should attach");
+
+        assert!(mux.remove_tab_local_only_if_same(&tab));
+        assert!(mux.get_tab(tab_id).is_none());
+        assert!(mux.get_pane(503).is_none());
+        assert_eq!(
+            kills.load(Ordering::SeqCst),
+            0,
+            "transaction rollback must not send a remote pane kill",
+        );
+        assert!(
+            mux.get_window(window_id)
+                .is_some_and(|candidate| candidate.is_empty()),
+            "exact tab rollback must detach the staged tab before window cancellation",
+        );
+        assert!(
+            !mux.remove_tab_local_only_if_same(&tab),
+            "a stale exact rollback handle must be inert",
+        );
+
+        window.cancel();
+        assert!(mux.get_window(window_id).is_none());
         Mux::shutdown();
     }
 

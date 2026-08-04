@@ -7567,7 +7567,7 @@ mod test {
                 pane_ids,
             )),
             data: Some(SplitDirectionAndSize {
-                direction: if leaf_count % 2 == 0 {
+                direction: if leaf_count.is_multiple_of(2) {
                     SplitDirection::Horizontal
                 } else {
                     SplitDirection::Vertical
@@ -7599,7 +7599,7 @@ mod test {
                 node_count,
             )
             .unwrap_or_else(|error| {
-                panic!("q={leaf_count} flat capture failed: {error:#}")
+                panic!("q={} flat capture failed: {:#}", leaf_count, error)
             });
             assert_eq!(captured.len(), node_count);
             assert!(active.is_none());
@@ -7739,7 +7739,7 @@ mod test {
             )
             .expect_err("depth-three tree must exceed a depth-two ceiling");
         assert!(format!("{depth_error:#}").contains("depth 3"));
-        assert_eq!(depth_limited, [prefix.clone()]);
+        assert_eq!(depth_limited.as_slice(), std::slice::from_ref(&prefix));
 
         let mut node_limited = vec![prefix.clone()];
         let node_error = tab
@@ -9381,7 +9381,7 @@ mod test {
             left,
             right,
             node: SplitDirectionAndSize {
-                direction: if leaves % 2 == 0 {
+                direction: if leaves.is_multiple_of(2) {
                     SplitDirection::Horizontal
                 } else {
                     SplitDirection::Vertical
@@ -9449,7 +9449,7 @@ mod test {
             left,
             right,
             node: SplitDirectionAndSize {
-                direction: if slots % 2 == 0 {
+                direction: if slots.is_multiple_of(2) {
                     SplitDirection::Horizontal
                 } else {
                     SplitDirection::Vertical

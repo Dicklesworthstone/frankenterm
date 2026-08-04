@@ -144,7 +144,7 @@ impl Drop for PaneArenaPublicationRollback {
             return;
         }
         for tab in self.new_tabs.drain(..).rev() {
-            self.mux.remove_empty_tab_local_only_if_same(&tab);
+            self.mux.remove_tab_local_only_if_same(&tab);
         }
         for window in self.new_windows.drain(..).rev() {
             window.cancel();
@@ -3252,7 +3252,7 @@ mod tests {
     }
 
     #[test]
-    fn pane_arena_publication_rollback_cancels_provisional_windows_after_detaching_tabs() {
+    fn pane_arena_publication_rollback_cancels_populated_provisional_windows() {
         let scope = MuxTestScope::enter();
         let mux = Arc::new(Mux::new(None));
         scope.set_mux(&mux);
@@ -3260,12 +3260,29 @@ mod tests {
         let tab = Arc::new(Tab::new(&TerminalSize::default()));
         mux.add_tab_no_panes(&tab)
             .expect("rollback fixture tab must register");
+        let inner = test_client_inner(70_001);
+        let pane: Arc<dyn Pane> = Arc::new(ClientPane::new(
+            &inner,
+            70_002,
+            51,
+            61,
+            TerminalSize::default(),
+            "rollback pane",
+            false,
+        ));
+        mux.add_pane(&pane)
+            .expect("rollback fixture pane must register");
+        let registration = mux
+            .capture_pane_registration(&pane)
+            .expect("rollback fixture must retain exact pane registration authority");
+        tab.assign_pane(&pane);
         let window_builder = mux.new_empty_window(Some("rollback".to_string()), None);
         let window_id = *window_builder;
         mux.add_tab_to_window(&tab, window_id)
             .expect("rollback fixture tab must attach to provisional window");
 
         let mut publication = PaneArenaPublicationRollback::new(&mux);
+        publication.pane_registrations.push(registration);
         publication.new_tabs.push(Arc::clone(&tab));
         publication.new_windows.push(window_builder);
         drop(publication);
@@ -3277,6 +3294,10 @@ mod tests {
         assert!(
             mux.get_tab(tab.tab_id()).is_none(),
             "rollback must remove the exact staged tab registration"
+        );
+        assert!(
+            mux.get_pane(pane.pane_id()).is_none(),
+            "rollback must detach the populated local pane mirror"
         );
         assert!(mux.iter_windows().is_empty());
     }
