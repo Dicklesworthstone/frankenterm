@@ -1,0 +1,17 @@
+[package]
+name = "frankenterm-sigpipe"
+description = "Broken-pipe (EPIPE) exit handling shared by every FrankenTerm binary"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license-file.workspace = true
+repository.workspace = true
+readme = "../../README.md"
+keywords = ["terminal", "frankenterm", "sigpipe", "epipe"]
+categories = ["command-line-interface"]
+
+[lints]
+workspace = true
+
+[dependencies]

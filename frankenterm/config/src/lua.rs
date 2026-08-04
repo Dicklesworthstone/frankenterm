@@ -13,7 +13,7 @@ use mlua::{FromLua, IntoLuaMulti, Lua, Table, Value, Variadic};
 use ordered_float::NotNan;
 use portable_pty::CommandBuilder;
 use std::convert::TryFrom;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
@@ -221,6 +221,26 @@ fn config_builder_new_index(
 ///
 /// In addition to this, the lua standard library, except for
 /// the `debug` module, is also available to the script.
+/// Build the list of `package.path` entries that front the Lua module
+/// search path, in priority order (earliest entry wins for `require`).
+///
+/// `config_dirs` must already be ordered highest-priority first; the legacy
+/// `~/.wezterm` directory is appended after all of them so that a
+/// side-by-side WezTerm install can never shadow a FrankenTerm-namespaced
+/// module of the same name (GH#76).
+fn lua_package_path_prefix(config_dirs: &[PathBuf], home_dir: &Path) -> Vec<String> {
+    let mut prefix = Vec::with_capacity((config_dirs.len() + 1) * 2);
+    let mut push_dir = |dir: &Path| {
+        prefix.push(format!("{}/?.lua", dir.display()));
+        prefix.push(format!("{}/?/init.lua", dir.display()));
+    };
+    for dir in config_dirs {
+        push_dir(dir);
+    }
+    push_dir(&home_dir.join(".wezterm"));
+    prefix
+}
+
 pub fn make_lua_context(config_file: &Path) -> anyhow::Result<Lua> {
     let lua = Lua::new();
 
@@ -240,10 +260,24 @@ pub fn make_lua_context(config_file: &Path) -> anyhow::Result<Lua> {
             array.insert(1, format!("{}/?/init.lua", path.display()));
         }
 
-        prefix_path(&mut path_array, &crate::HOME_DIR.join(".wezterm"));
-        for dir in crate::CONFIG_DIRS.iter() {
-            prefix_path(&mut path_array, dir);
-        }
+        // Splice the config-dir search entries onto the front of
+        // `package.path` in priority order. `CONFIG_DIRS` is ordered
+        // highest-priority first (FrankenTerm-namespaced dirs, then the
+        // wezterm-namespaced fallbacks — see `config_dirs()` in lib.rs), and
+        // `require` resolves left-to-right, so the resulting `package.path`
+        // must preserve that order. The legacy `~/.wezterm` directory is a
+        // wezterm-namespaced fallback and ranks below every `CONFIG_DIRS`
+        // entry.
+        //
+        // GH#76 regression note: this used to call `prefix_path` (which
+        // inserts at index 0) once per dir while iterating `CONFIG_DIRS`
+        // front-to-back, which *reversed* the precedence so that
+        // `~/.config/wezterm` shadowed `~/.config/frankenterm` for a bare
+        // `require("mod")` issued from frankenterm.lua.
+        path_array.splice(
+            0..0,
+            lua_package_path_prefix(&crate::CONFIG_DIRS, &crate::HOME_DIR),
+        );
         path_array.insert(
             2,
             format!("{}/plugins/?/plugin/init.lua", crate::DATA_DIR.display()),
@@ -1101,6 +1135,63 @@ pub fn add_to_config_reload_watch_list(lua: &Lua, args: Variadic<String>) -> mlu
 mod test {
     use super::*;
     use std::sync::{Arc, Mutex};
+
+    /// GH#76: `require` from frankenterm.lua must resolve modules in the
+    /// FrankenTerm-namespaced config dirs before any wezterm-namespaced
+    /// fallback, and the legacy `~/.wezterm` dir must rank last. The old
+    /// implementation inserted each dir at index 0 while iterating
+    /// front-to-back, which reversed the precedence so a side-by-side
+    /// `~/.config/wezterm/mod.lua` silently shadowed
+    /// `~/.config/frankenterm/mod.lua`.
+    #[test]
+    fn package_path_prefix_preserves_config_dir_precedence() {
+        let config_dirs = vec![
+            PathBuf::from("/home/u/.config/frankenterm"),
+            PathBuf::from("/etc/xdg/frankenterm"),
+            PathBuf::from("/home/u/.config/wezterm"),
+        ];
+        let prefix = lua_package_path_prefix(&config_dirs, Path::new("/home/u"));
+        assert_eq!(
+            prefix,
+            vec![
+                "/home/u/.config/frankenterm/?.lua".to_string(),
+                "/home/u/.config/frankenterm/?/init.lua".to_string(),
+                "/etc/xdg/frankenterm/?.lua".to_string(),
+                "/etc/xdg/frankenterm/?/init.lua".to_string(),
+                "/home/u/.config/wezterm/?.lua".to_string(),
+                "/home/u/.config/wezterm/?/init.lua".to_string(),
+                "/home/u/.wezterm/?.lua".to_string(),
+                "/home/u/.wezterm/?/init.lua".to_string(),
+            ]
+        );
+    }
+
+    /// GH#76: the fully-assembled `package.path` inside a live Lua context
+    /// must list every FrankenTerm-namespaced dir ahead of every
+    /// wezterm-namespaced dir.
+    #[test]
+    fn lua_context_package_path_orders_frankenterm_dirs_first() -> anyhow::Result<()> {
+        let _env = crate::test_env_lock();
+        let lua = make_lua_context(Path::new("testing"))?;
+        let package: Table = lua.globals().get("package")?;
+        let package_path: String = package.get("path")?;
+        let entries: Vec<&str> = package_path.split(';').collect();
+
+        let pos_of = |needle: &str| entries.iter().position(|e| e.contains(needle));
+        let first_frankenterm = pos_of("frankenterm");
+        let first_wezterm = entries
+            .iter()
+            .position(|e| e.contains("wezterm") && !e.contains("frankenterm"));
+        if let (Some(ft), Some(wz)) = (first_frankenterm, first_wezterm) {
+            assert!(
+                ft < wz,
+                "frankenterm-namespaced dirs must precede wezterm-namespaced dirs in package.path: {package_path}"
+            );
+        } else {
+            panic!("expected both frankenterm and wezterm entries in package.path: {package_path}");
+        }
+        Ok(())
+    }
 
     #[test]
     fn setup_funcs_recover_after_poisoned_lock() {

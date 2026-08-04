@@ -243,6 +243,7 @@ fn build_server_inner(config: &Config, db_path: Option<PathBuf>) -> Result<Serve
             tracing::info!("MCP server shutting down");
         })
         .tool(FormatAwareToolHandler::new(WaStateTool::new(
+            Arc::clone(&config),
             filter,
             db_path.clone(),
         )))
@@ -289,6 +290,7 @@ fn build_server_inner(config: &Config, db_path: Option<PathBuf>) -> Result<Serve
             Arc::clone(&config),
         )))
         .resource(WaPanesResource::new(
+            Arc::clone(&config),
             config.ingest.panes.clone(),
             db_path.clone(),
         ))

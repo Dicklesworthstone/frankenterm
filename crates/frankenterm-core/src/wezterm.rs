@@ -454,6 +454,13 @@ pub trait MuxInterface: Send + Sync {
     }
     /// Get current circuit breaker status.
     fn circuit_status(&self) -> CircuitBreakerStatus;
+    /// Backend-selection metadata when this handle was built from the parsed
+    /// config (a [`UnifiedClient`]); `None` means the handle was constructed
+    /// without consulting config — such a handle can never honor a
+    /// configured vendored mux socket (GH#72 regression guard).
+    fn backend_selection(&self) -> Option<&BackendSelection> {
+        None
+    }
     /// Emit health warnings suitable for watchdog snapshots.
     ///
     /// Implementations may provide backend-specific warnings; default is empty.
@@ -3433,6 +3440,10 @@ impl WeztermInterface for WeztermClient {
 }
 
 impl WeztermInterface for Arc<dyn WeztermInterface> {
+    fn backend_selection(&self) -> Option<&BackendSelection> {
+        self.as_ref().backend_selection()
+    }
+
     fn list_panes(&self) -> WeztermFuture<'_, Vec<PaneInfo>> {
         self.as_ref().list_panes()
     }
@@ -7416,6 +7427,10 @@ pub fn build_unified_client(config: &crate::config::Config) -> UnifiedClient {
 }
 
 impl WeztermInterface for UnifiedClient {
+    fn backend_selection(&self) -> Option<&BackendSelection> {
+        Some(self.selection())
+    }
+
     fn list_panes(&self) -> WeztermFuture<'_, Vec<PaneInfo>> {
         self.inner.list_panes()
     }

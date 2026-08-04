@@ -57,7 +57,7 @@ use crate::runtime_telemetry::{
 use crate::swarm_scheduler::{
     HerdWaveEventKind, HerdWaveMcpResourceSurface, build_herd_wave_surface_report,
 };
-use crate::wezterm::{PaneInfo, default_wezterm_handle};
+use crate::wezterm::PaneInfo;
 
 use super::mcp_missions::{
     mcp_load_mission_tx_contract_from_path, mcp_resolve_mission_tx_file_path,
@@ -439,13 +439,24 @@ const fn hex_value(byte: u8) -> Option<u8> {
 }
 
 pub(super) struct WaPanesResource {
+    // GH#72: carried so the delegated WaStateTool lists panes through the
+    // config-aware unified handle (vendored mux socket when configured).
+    config: Arc<Config>,
     filter: PaneFilterConfig,
     db_path: Option<Arc<PathBuf>>,
 }
 
 impl WaPanesResource {
-    pub(super) fn new(filter: PaneFilterConfig, db_path: Option<Arc<PathBuf>>) -> Self {
-        Self { filter, db_path }
+    pub(super) fn new(
+        config: Arc<Config>,
+        filter: PaneFilterConfig,
+        db_path: Option<Arc<PathBuf>>,
+    ) -> Self {
+        Self {
+            config,
+            filter,
+            db_path,
+        }
     }
 }
 
@@ -463,7 +474,11 @@ impl ResourceHandler for WaPanesResource {
     }
 
     fn read(&self, ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
-        let tool = WaStateTool::new(self.filter.clone(), self.db_path.as_ref().map(Arc::clone));
+        let tool = WaStateTool::new(
+            Arc::clone(&self.config),
+            self.filter.clone(),
+            self.db_path.as_ref().map(Arc::clone),
+        );
         let contents = tool.call(ctx, serde_json::Value::Null)?;
         tool_output_as_resource("wa://panes", contents)
     }
@@ -1278,7 +1293,8 @@ fn load_swarm_scent_report(
         .map_err(|err| SwarmScentLoadError::Runtime(format!("Runtime init failed: {err}")))?;
 
     runtime.block_on(async move {
-        let panes = default_wezterm_handle()
+        // GH#72: honor any configured vendored mux socket.
+        let panes = crate::wezterm::wezterm_handle_from_config(config.as_ref())
             .list_panes()
             .await
             .map_err(|err| SwarmScentLoadError::PaneDiscovery(format!("List live panes: {err}")))?;
@@ -2669,7 +2685,7 @@ mod tests {
 
     #[test]
     fn panes_resource_definition_uri() {
-        let resource = WaPanesResource::new(PaneFilterConfig::default(), None);
+        let resource = WaPanesResource::new(Arc::new(Config::default()), PaneFilterConfig::default(), None);
         let def = resource.definition();
         assert_eq!(def.uri, "wa://panes");
         assert_eq!(def.mime_type.as_deref(), Some("application/json"));
@@ -3353,7 +3369,7 @@ mod tests {
         let db = db_path();
         let config = Arc::new(Config::default());
         let uris = [
-            WaPanesResource::new(PaneFilterConfig::default(), None)
+            WaPanesResource::new(Arc::new(Config::default()), PaneFilterConfig::default(), None)
                 .definition()
                 .uri,
             WaEventsResource::new(Arc::clone(&db)).definition().uri,
@@ -3427,7 +3443,7 @@ mod tests {
         let db = db_path();
         let config = Arc::new(Config::default());
         let uris = [
-            WaPanesResource::new(PaneFilterConfig::default(), None)
+            WaPanesResource::new(Arc::new(Config::default()), PaneFilterConfig::default(), None)
                 .definition()
                 .uri,
             WaEventsResource::new(Arc::clone(&db)).definition().uri,
@@ -3486,7 +3502,7 @@ mod tests {
         let db = db_path();
         let config = Arc::new(Config::default());
         let defs = [
-            WaPanesResource::new(PaneFilterConfig::default(), None).definition(),
+            WaPanesResource::new(Arc::new(Config::default()), PaneFilterConfig::default(), None).definition(),
             WaEventsResource::new(Arc::clone(&db)).definition(),
             WaRulesResource.definition(),
             WaWorkflowsResource::new(Arc::new(Config::default())).definition(),
@@ -3526,7 +3542,7 @@ mod tests {
         let db = db_path();
         let config = Arc::new(Config::default());
         let defs = [
-            WaPanesResource::new(PaneFilterConfig::default(), None).definition(),
+            WaPanesResource::new(Arc::new(Config::default()), PaneFilterConfig::default(), None).definition(),
             WaEventsResource::new(Arc::clone(&db)).definition(),
             WaRulesResource.definition(),
             WaWorkflowsResource::new(Arc::new(Config::default())).definition(),

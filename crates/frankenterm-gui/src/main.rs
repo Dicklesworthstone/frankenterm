@@ -1143,6 +1143,11 @@ fn main() {
     config::designate_this_as_the_main_thread();
     config::assign_error_callback(mux::connui::show_configuration_error_message);
     notify_on_panic();
+    // GH#75: installed after notify_on_panic so broken-pipe write panics
+    // (e.g. `frankenterm-gui show-keys | head -5`) exit 141 quietly instead
+    // of raising a panic toast and SIGABRT under panic = "abort". Non-EPIPE
+    // panics still reach the notify hook unchanged.
+    frankenterm_sigpipe::exit_quietly_on_broken_pipe();
     log_renderer_rollout_env_overrides();
     if let Err(e) = run() {
         terminate_with_error(e);
