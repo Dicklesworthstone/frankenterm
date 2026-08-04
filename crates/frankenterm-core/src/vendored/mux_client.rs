@@ -736,6 +736,9 @@ impl PendingRenderChanges {
         Ok(Some(retained))
     }
 
+    // The mutable receiver accounts deterministic operation counts in test
+    // builds; production deliberately compiles those counters out.
+    #[cfg_attr(not(test), allow(clippy::needless_pass_by_ref_mut))]
     fn plan_remove_panes(
         &mut self,
         pane_ids: &HashSet<u64>,
@@ -850,8 +853,8 @@ impl RenderChangeSnapshots {
         self.totals.bytes
     }
 
-    fn get(&self, pane_id: &u64) -> Option<&RetainedRenderChange> {
-        self.by_pane.get(pane_id)
+    fn get(&self, pane_id: u64) -> Option<&RetainedRenderChange> {
+        self.by_pane.get(&pane_id)
     }
 
     #[cfg(test)]
@@ -901,6 +904,9 @@ impl RenderChangeSnapshots {
         self.totals.set(next.0, next.1);
     }
 
+    // The mutable receiver accounts deterministic operation counts in test
+    // builds; production deliberately compiles those counters out.
+    #[cfg_attr(not(test), allow(clippy::needless_pass_by_ref_mut))]
     fn plan_remove_panes(
         &mut self,
         pane_ids: &HashSet<u64>,
@@ -4012,7 +4018,7 @@ impl DirectMuxClient {
                 }
                 if let Some(payload) = self
                     .render_change_snapshots
-                    .get(&pane_id)
+                    .get(pane_id)
                     .map(|snapshot| snapshot.decode(self.connection_id))
                     .transpose()?
                 {
@@ -4182,6 +4188,9 @@ impl DirectMuxClient {
         Ok(())
     }
 
+    // Test-only codec accounting mutates the receiver; production retains the
+    // same signature so the measured and unmeasured paths cannot diverge.
+    #[cfg_attr(not(test), allow(clippy::needless_pass_by_ref_mut))]
     fn encode_pending_render_change(
         &mut self,
         payload: GetPaneRenderChangesResponse,
@@ -4200,6 +4209,9 @@ impl DirectMuxClient {
         Ok(retained)
     }
 
+    // Test-only codec accounting mutates the receiver; production retains the
+    // same signature so the measured and unmeasured paths cannot diverge.
+    #[cfg_attr(not(test), allow(clippy::needless_pass_by_ref_mut))]
     fn encode_render_change_snapshot(
         &mut self,
         payload: &GetPaneRenderChangesResponse,
@@ -8580,7 +8592,7 @@ mod tests {
                 }
                 let unrelated_snapshot_bytes = client
                     .render_change_snapshots
-                    .get(&999)
+                    .get(999)
                     .expect("unrelated snapshot")
                     .retained_bytes();
                 let unrelated_pending_bytes = client
