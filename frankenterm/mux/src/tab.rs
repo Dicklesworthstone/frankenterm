@@ -355,6 +355,23 @@ fn pane_identity(pane: &Arc<dyn Pane>) -> PaneIdentity {
     Arc::as_ptr(pane).cast::<()>()
 }
 
+fn callback_snapshot_matches(
+    current: &[Arc<dyn Pane>],
+    observed: &HashMap<PaneIdentity, PaneId>,
+) -> anyhow::Result<bool> {
+    if current.len() != observed.len() {
+        return Ok(false);
+    }
+    let mut current_identities = HashSet::new();
+    current_identities
+        .try_reserve(current.len())
+        .map_err(|error| anyhow::anyhow!("reserve callback-coherence pane identities: {error}"))?;
+    Ok(current.iter().all(|pane| {
+        let identity = pane_identity(pane);
+        current_identities.insert(identity) && observed.contains_key(&identity)
+    }))
+}
+
 #[derive(Clone)]
 struct ObservedPane {
     pane: Arc<dyn Pane>,
@@ -2660,16 +2677,7 @@ impl Tab {
             let snapshot = {
                 let inner = self.inner.lock();
                 let current = inner.snapshot_panes_callback_free();
-                let mut current_identities = HashSet::new();
-                current_identities.try_reserve(current.len()).map_err(|error| {
-                    anyhow::anyhow!("reserve callback-coherence pane identities: {error}")
-                })?;
-                let identities_match = current.len() == pane_ids.len()
-                    && current.iter().all(|pane| {
-                        let identity = pane_identity(pane);
-                        current_identities.insert(identity) && pane_ids.contains_key(&identity)
-                    });
-                if !identities_match {
+                if !callback_snapshot_matches(&current, &pane_ids)? {
                     None
                 } else {
                     Some((
@@ -2749,16 +2757,7 @@ impl Tab {
             let captured = {
                 let inner = self.inner.lock();
                 let current = inner.snapshot_panes_callback_free();
-                let mut current_identities = HashSet::new();
-                current_identities.try_reserve(current.len()).map_err(|error| {
-                    anyhow::anyhow!("reserve callback-coherence pane identities: {error}")
-                })?;
-                let identities_match = current.len() == pane_ids.len()
-                    && current.iter().all(|pane| {
-                        let identity = pane_identity(pane);
-                        current_identities.insert(identity) && pane_ids.contains_key(&identity)
-                    });
-                if !identities_match {
+                if !callback_snapshot_matches(&current, &pane_ids)? {
                     None
                 } else {
                     Some(capture_pane_arena_tree(
@@ -7428,6 +7427,30 @@ mod test {
         assert!(
             observations.load(std::sync::atomic::Ordering::Acquire) > 0,
             "the codec path must exercise a reentrancy-checked pane observation",
+        );
+    }
+
+    #[test]
+    fn callback_snapshot_identity_match_rejects_duplicates_and_substitutions() {
+        let size = TerminalSize::default();
+        let first = FakePane::new(291, size);
+        let second = FakePane::new(292, size);
+        let replacement = FakePane::new(293, size);
+        let mut observed = HashMap::new();
+        observed.insert(pane_identity(&first), first.pane_id());
+        observed.insert(pane_identity(&second), second.pane_id());
+
+        assert!(
+            callback_snapshot_matches(&[Arc::clone(&first), Arc::clone(&second)], &observed)
+                .expect("matching callback snapshot must be comparable")
+        );
+        assert!(
+            !callback_snapshot_matches(&[Arc::clone(&first), Arc::clone(&first)], &observed)
+                .expect("duplicate callback snapshot must be comparable")
+        );
+        assert!(
+            !callback_snapshot_matches(&[Arc::clone(&first), replacement], &observed)
+                .expect("substituted callback snapshot must be comparable")
         );
     }
 
