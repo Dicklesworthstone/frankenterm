@@ -6793,11 +6793,14 @@ mod tests {
                 codec::OrderedPaneSnapshotV1 {
                     session_incarnation,
                     topology_revision: snapshot_revision,
-                    panes: codec::ListPanesResponse {
-                        tabs: Vec::new(),
-                        tab_titles: Vec::new(),
-                        window_titles: std::collections::HashMap::new(),
-                    },
+                    panes: codec::ordered_pane_arena_from_list_panes(
+                        codec::ListPanesResponse {
+                            tabs: Vec::new(),
+                            tab_titles: Vec::new(),
+                            window_titles: std::collections::HashMap::new(),
+                        },
+                    )
+                    .expect("empty ordered-pane arena must be valid"),
                     ordered_windows: Vec::new(),
                 },
             ),
@@ -9723,7 +9726,7 @@ mod tests {
         let codec::ListPanesOrderedV1Outcome::Snapshot(snapshot) = &mut response.outcome else {
             panic!("ordered snapshot fixture must contain a snapshot");
         };
-        snapshot.panes = codec::ListPanesResponse {
+        snapshot.panes = codec::ordered_pane_arena_from_list_panes(codec::ListPanesResponse {
             tabs: vec![mux::tab::PaneNode::Leaf(mux::tab::PaneEntry {
                 window_id,
                 tab_id: pane_tab_id,
@@ -9746,7 +9749,8 @@ mod tests {
                 window_id,
                 "window".to_string(),
             )]),
-        };
+        })
+        .expect("cross-wired ordered-pane fixture must flatten");
         snapshot.ordered_windows = vec![codec::OrderedWindowStateV1 {
             window_id: codec::RemoteWindowId::new(
                 u64::try_from(window_id).expect("small window id fits u64"),

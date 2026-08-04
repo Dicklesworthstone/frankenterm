@@ -2068,20 +2068,29 @@ fn checked_ordered_snapshot_tab_total(
 pub(crate) fn validate_ordered_snapshot_projection(
     snapshot: &codec::OrderedPaneSnapshotV1,
 ) -> anyhow::Result<()> {
+    let pane_window_titles = snapshot.panes.window_titles();
+    if pane_window_titles.len() != snapshot.ordered_windows.len() {
+        return Err(anyhow!(
+            "PDU87 pane/order window cardinality mismatch: pane_titles={}, ordered_windows={}",
+            pane_window_titles.len(),
+            snapshot.ordered_windows.len()
+        ));
+    }
+
     let mut total_tabs = 0usize;
     let mut prior_window_id = None;
-    for window in &snapshot.ordered_windows {
+    for (window, pane_window_title) in snapshot
+        .ordered_windows
+        .iter()
+        .zip(pane_window_titles)
+    {
         if prior_window_id.is_some_and(|prior| prior >= window.window_id) {
             return Err(anyhow!(
                 "PDU87 ordered windows are not in strictly increasing window-id order"
             ));
         }
         prior_window_id = Some(window.window_id);
-        let window_id = window
-            .window_id
-            .try_into_usize()
-            .context("narrowing PDU87 window identity for pane projection validation")?;
-        if !snapshot.panes.window_titles.contains_key(&window_id) {
+        if pane_window_title.window_id != window.window_id.get() {
             return Err(anyhow!(
                 "PDU87 ordered window {} has no matching pane-list window title",
                 window.window_id.get()
@@ -2092,25 +2101,16 @@ pub(crate) fn validate_ordered_snapshot_projection(
             window.ordered_tab_ids.len(),
         )?;
     }
-    if snapshot.panes.window_titles.len() != snapshot.ordered_windows.len() {
+    let pane_trees = snapshot.panes.trees();
+    let pane_nodes = snapshot.panes.nodes();
+    if pane_trees.len() != total_tabs {
         return Err(anyhow!(
-            "PDU87 pane/order window cardinality mismatch: pane_titles={}, ordered_windows={}",
-            snapshot.panes.window_titles.len(),
-            snapshot.ordered_windows.len()
-        ));
-    }
-    if snapshot.panes.tabs.len() != total_tabs
-        || snapshot.panes.tab_titles.len() != total_tabs
-    {
-        return Err(anyhow!(
-            "PDU87 pane/order tab cardinality mismatch: pane_trees={}, tab_titles={}, ordered_tabs={total_tabs}",
-            snapshot.panes.tabs.len(),
-            snapshot.panes.tab_titles.len()
+            "PDU87 pane/order tab cardinality mismatch: pane_trees={}, ordered_tabs={total_tabs}",
+            pane_trees.len()
         ));
     }
 
     let mut pane_index = 0usize;
-    let mut pane_trees = snapshot.panes.tabs.iter();
     for window in &snapshot.ordered_windows {
         let window_id = window
             .window_id
@@ -2123,28 +2123,49 @@ pub(crate) fn validate_ordered_snapshot_projection(
                     .try_into_usize()
                     .context("narrowing PDU87 tab identity for pane projection validation")?,
             );
-            let tree = pane_trees.next().ok_or_else(|| {
+            let tree = pane_trees.get(pane_index).ok_or_else(|| {
                 anyhow!("PDU87 pane tree vector ended before ordered tab {pane_index}")
             })?;
-            match tree.all_window_and_tab_ids_match(expected) {
-                Some(true) => {}
-                Some(false) => {
-                    let actual = tree.window_and_tab_ids();
-                    if let Some(actual) = actual.filter(|actual| *actual != expected) {
-                        return Err(anyhow!(
-                            "PDU87 pane tree {pane_index} identifies window/tab {actual:?}, expected {expected:?}"
-                        ));
+            let root_index = tree.root_index.ok_or_else(|| {
+                anyhow!("PDU87 pane tree {pane_index} has no root identity")
+            })?;
+            let tree_start = usize::try_from(root_index)
+                .context("narrowing PDU87 pane-tree root index")?;
+            let node_count = usize::try_from(tree.node_count)
+                .context("narrowing PDU87 pane-tree node count")?;
+            let tree_end = tree_start
+                .checked_add(node_count)
+                .ok_or_else(|| anyhow!("PDU87 pane tree {pane_index} range overflows usize"))?;
+            let tree_nodes = pane_nodes.get(tree_start..tree_end).ok_or_else(|| {
+                anyhow!(
+                    "PDU87 pane tree {pane_index} range {tree_start}..{tree_end} exceeds its pane arena"
+                )
+            })?;
+
+            let mut first_actual = None;
+            let mut all_match = true;
+            for node in tree_nodes {
+                if let mux::tab::PaneArenaNode::Leaf(entry) = node {
+                    let actual = (entry.window_id, entry.tab_id);
+                    if first_actual.is_none() {
+                        first_actual = Some(actual);
                     }
+                    all_match &= actual == expected;
+                }
+            }
+            match (first_actual, all_match) {
+                (Some(_), true) => {}
+                (Some(actual), false) if actual != expected => {
+                    return Err(anyhow!(
+                        "PDU87 pane tree {pane_index} identifies window/tab {actual:?}, expected {expected:?}"
+                    ));
+                }
+                (Some(_), false) => {
                     return Err(anyhow!(
                         "PDU87 pane tree {pane_index} contains a leaf outside expected window/tab {expected:?}"
                     ));
                 }
-                None if matches!(tree, mux::tab::PaneNode::Empty) => {
-                    // Empty tabs carry no PaneEntry in the legacy pane tree.
-                    // Their position remains bound by the parallel exact
-                    // ordered-tab vector and cardinality checks above.
-                }
-                None => {
+                (None, _) => {
                     return Err(anyhow!(
                         "PDU87 pane tree {pane_index} has structure but no window/tab identity"
                     ));
@@ -2249,14 +2270,16 @@ fn collect_ordered_list_panes_snapshot_with_stage_observer(
             ));
         }
         if before_revision == after_revision {
+            let panes = codec::ordered_pane_arena_from_list_panes(ListPanesResponse {
+                tabs,
+                tab_titles,
+                window_titles,
+            })
+            .context("converting the stable PDU87 pane projection into its mux arena")?;
             let snapshot = codec::OrderedPaneSnapshotV1 {
                 session_incarnation: after_session,
                 topology_revision: after_revision,
-                panes: ListPanesResponse {
-                    tabs,
-                    tab_titles,
-                    window_titles,
-                },
+                panes,
                 ordered_windows,
             };
             // The dispatch coordinator is the sole PDU87 authority and runs
@@ -4606,6 +4629,38 @@ mod tests {
         snapshot
     }
 
+    fn ordered_pane_tree_identity(
+        panes: &mux::tab::PaneArena,
+        tree_index: usize,
+    ) -> Option<(usize, usize)> {
+        let descriptor = panes.trees().get(tree_index)?;
+        let tree_start = usize::try_from(descriptor.root_index?).ok()?;
+        let node_count = usize::try_from(descriptor.node_count).ok()?;
+        let tree_end = tree_start.checked_add(node_count)?;
+        panes
+            .nodes()
+            .get(tree_start..tree_end)?
+            .iter()
+            .find_map(|node| match node {
+                mux::tab::PaneArenaNode::Leaf(entry) => {
+                    Some((entry.window_id, entry.tab_id))
+                }
+                mux::tab::PaneArenaNode::Empty | mux::tab::PaneArenaNode::Split { .. } => None,
+            })
+    }
+
+    fn ordered_pane_tree_identities(panes: &mux::tab::PaneArena) -> Vec<(usize, usize)> {
+        panes
+            .trees()
+            .iter()
+            .enumerate()
+            .map(|(tree_index, _)| {
+                ordered_pane_tree_identity(panes, tree_index)
+                    .expect("accepted ordered pane tree has window/tab identity")
+            })
+            .collect()
+    }
+
     fn reorder_request_for_snapshot(
         snapshot: &mux::window::FrozenWindowOrder,
         session_incarnation: mux::MuxSessionIncarnation,
@@ -5657,15 +5712,7 @@ mod tests {
             expected_window_ids,
             "cross-window enumeration must be deterministic"
         );
-        let pane_pairs = snapshot
-            .panes
-            .tabs
-            .iter()
-            .map(|tree| {
-                tree.window_and_tab_ids()
-                    .expect("test pane tree carries its window and tab identity")
-            })
-            .collect::<Vec<_>>();
+        let pane_pairs = ordered_pane_tree_identities(&snapshot.panes);
         let ordered_pairs = snapshot
             .ordered_windows
             .iter()
@@ -5681,13 +5728,33 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(pane_pairs, ordered_pairs);
-        assert_eq!(snapshot.panes.tab_titles.len(), ordered_pairs.len());
+        assert_eq!(snapshot.panes.trees().len(), ordered_pairs.len());
         for window in &snapshot.ordered_windows {
             assert_eq!(window.ordered_tab_ids.as_slice(), &[window.active_tab_id.unwrap()]);
         }
 
         let mut missing_tree = snapshot.clone();
-        missing_tree.panes.tabs.pop();
+        let (mut trees, mut nodes, window_titles) = missing_tree.panes.into_parts();
+        let removed = trees.pop().expect("test snapshot has a second pane tree");
+        let removed_start = usize::try_from(
+            removed
+                .root_index
+                .expect("test pane-tree descriptor has a root"),
+        )
+        .expect("test pane-tree root narrows to usize");
+        let removed_count =
+            usize::try_from(removed.node_count).expect("test pane-tree node count narrows");
+        assert_eq!(
+            removed_start + removed_count,
+            nodes.len(),
+            "the removed canonical pane tree must own the trailing arena range"
+        );
+        nodes.truncate(removed_start);
+        missing_tree.panes =
+            mux::tab::PaneArena::from_unvalidated_parts(trees, nodes, window_titles);
+        missing_tree
+            .validate()
+            .expect("the missing-tree fixture remains schema-valid before projection validation");
         assert!(
             format!(
                 "{:#}",
@@ -5698,21 +5765,41 @@ mod tests {
         );
 
         let mut mixed_leaf = snapshot.clone();
-        let first_entry = match &mixed_leaf.panes.tabs[0] {
-            mux::tab::PaneNode::Leaf(entry) => entry.clone(),
-            other => panic!("single-pane test tab must serialize as one leaf, got {other:?}"),
+        let (mut trees, mut nodes, window_titles) = mixed_leaf.panes.into_parts();
+        assert_eq!(trees[0].root_index, Some(0));
+        assert_eq!(trees[0].node_count, 1);
+        let first_entry = match &nodes[0] {
+            mux::tab::PaneArenaNode::Leaf(entry) => entry.clone(),
+            other => panic!("single-pane test tab must flatten as one leaf, got {other:?}"),
         };
         let mut wrong_second_entry = first_entry.clone();
         wrong_second_entry.tab_id = first_entry.tab_id.saturating_add(1_000_000);
-        mixed_leaf.panes.tabs[0] = mux::tab::PaneNode::Split {
-            left: Box::new(mux::tab::PaneNode::Leaf(first_entry.clone())),
-            right: Box::new(mux::tab::PaneNode::Leaf(wrong_second_entry)),
-            node: mux::tab::SplitDirectionAndSize {
-                direction: mux::tab::SplitDirection::Horizontal,
-                first: first_entry.size,
-                second: first_entry.size,
-            },
+        wrong_second_entry.is_active_pane = false;
+        wrong_second_entry.is_zoomed_pane = false;
+        let split = mux::tab::SplitDirectionAndSize {
+            direction: mux::tab::SplitDirection::Horizontal,
+            first: first_entry.size,
+            second: first_entry.size,
         };
+        nodes[0] = mux::tab::PaneArenaNode::Split {
+            left: 1,
+            right: 2,
+            node: split,
+        };
+        nodes.insert(1, mux::tab::PaneArenaNode::Leaf(first_entry));
+        nodes.insert(2, mux::tab::PaneArenaNode::Leaf(wrong_second_entry));
+        trees[0].node_count = 3;
+        for descriptor in trees.iter_mut().skip(1) {
+            descriptor.root_index = descriptor.root_index.map(|root| {
+                root.checked_add(2)
+                    .expect("test pane-tree root adjustment fits u32")
+            });
+        }
+        mixed_leaf.panes =
+            mux::tab::PaneArena::from_unvalidated_parts(trees, nodes, window_titles);
+        mixed_leaf
+            .validate()
+            .expect("the mixed-identity pane arena remains schema-valid");
         assert!(
             format!(
                 "{:#}",
@@ -5723,7 +5810,14 @@ mod tests {
         );
 
         let mut cross_wired = snapshot;
-        cross_wired.panes.tabs.swap(0, 1);
+        let (trees, mut nodes, window_titles) = cross_wired.panes.into_parts();
+        assert_eq!(nodes.len(), 2, "test snapshot has two single-leaf trees");
+        nodes.swap(0, 1);
+        cross_wired.panes =
+            mux::tab::PaneArena::from_unvalidated_parts(trees, nodes, window_titles);
+        cross_wired
+            .validate()
+            .expect("the cross-wired pane arena remains schema-valid");
         assert!(
             format!(
                 "{:#}",
@@ -5816,15 +5910,9 @@ mod tests {
             expected_tab_ids
         );
         assert_eq!(
-            snapshot
-                .panes
-                .tabs
-                .iter()
-                .map(|tree| {
-                    tree.window_and_tab_ids()
-                        .expect("accepted pane tree has window/tab identity")
-                        .1
-                })
+            ordered_pane_tree_identities(&snapshot.panes)
+                .into_iter()
+                .map(|(_, tab_id)| tab_id)
                 .collect::<Vec<_>>(),
             expected_tab_ids,
             "pane projection must use the same post-reorder authority cut"
@@ -5913,15 +6001,9 @@ mod tests {
             expected_tab_ids
         );
         assert_eq!(
-            snapshot
-                .panes
-                .tabs
-                .iter()
-                .map(|tree| {
-                    tree.window_and_tab_ids()
-                        .expect("accepted pane tree has window/tab identity")
-                        .1
-                })
+            ordered_pane_tree_identities(&snapshot.panes)
+                .into_iter()
+                .map(|(_, tab_id)| tab_id)
                 .collect::<Vec<_>>(),
             expected_tab_ids,
             "the accepted retry must project the post-reorder frozen identities"
@@ -5979,16 +6061,10 @@ mod tests {
         assert_eq!(completed_attempts, 2, "the stale first attempt must be retried");
         assert_eq!(snapshot.ordered_windows.len(), 1);
         assert_eq!(snapshot.ordered_windows[0].ordered_tab_ids.len(), 2);
-        assert_eq!(snapshot.panes.tabs.len(), 2);
-        let pane_tab_ids = snapshot
-            .panes
-            .tabs
-            .iter()
-            .map(|tree| {
-                tree.window_and_tab_ids()
-                    .expect("accepted pane tree has window/tab identity")
-                    .1
-            })
+        assert_eq!(snapshot.panes.trees().len(), 2);
+        let pane_tab_ids = ordered_pane_tree_identities(&snapshot.panes)
+            .into_iter()
+            .map(|(_, tab_id)| tab_id)
             .collect::<Vec<_>>();
         let ordered_tab_ids = snapshot.ordered_windows[0]
             .ordered_tab_ids
