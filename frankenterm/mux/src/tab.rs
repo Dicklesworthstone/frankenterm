@@ -1518,6 +1518,8 @@ where
                 if is_active_pane {
                     active.replace(Arc::clone(&pane));
                 }
+                scratch.stats.leaf_resolutions =
+                    scratch.stats.leaf_resolutions.saturating_add(1);
                 if application_try!(reserve_pane_arena_stack_push(
                     stack,
                     1,
@@ -1530,8 +1532,6 @@ where
                         .saturating_add(1);
                 }
                 stack.push((node_index, Tree::Leaf(pane)));
-                scratch.stats.leaf_resolutions =
-                    scratch.stats.leaf_resolutions.saturating_add(1);
             }
             PaneArenaNode::Split {
                 left,
@@ -9411,6 +9411,11 @@ mod test {
             "application scratch retained a partially prepared pane subtree",
         );
         assert_eq!(scratch.stats().trees_completed, 0);
+        assert_eq!(
+            scratch.stats().leaf_resolutions,
+            1,
+            "terminal stats must retain the successful pane callback that preceded failure",
+        );
         scratch.release_retained_storage();
         assert_eq!(scratch.requested_retained_storage_bytes(), Some(0));
     }
