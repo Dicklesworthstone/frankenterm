@@ -19,7 +19,7 @@ use mux::tab::{
 use mux::window::WindowId;
 use mux::{
     CurrentPane, MoveCommitReceipt, Mux, MuxNotification, PaneOperationGuard,
-    PaneRegistrationHandle, SplitCommitReceipt,
+    MuxWindowBuilder, PaneRegistrationHandle, SplitCommitReceipt,
 };
 use portable_pty::CommandBuilder;
 use promise::spawn::spawn_into_new_thread;
@@ -118,6 +118,7 @@ struct PaneArenaPublicationRollback {
     mux: Arc<Mux>,
     pane_registrations: Vec<PaneRegistrationHandle>,
     new_tabs: Vec<Arc<Tab>>,
+    new_windows: Vec<MuxWindowBuilder>,
     committed: bool,
 }
 
@@ -127,6 +128,7 @@ impl PaneArenaPublicationRollback {
             mux: Arc::clone(mux),
             pane_registrations: Vec::new(),
             new_tabs: Vec::new(),
+            new_windows: Vec::new(),
             committed: false,
         }
     }
@@ -143,6 +145,9 @@ impl Drop for PaneArenaPublicationRollback {
         }
         for tab in self.new_tabs.drain(..).rev() {
             self.mux.remove_empty_tab_local_only_if_same(&tab);
+        }
+        for window in self.new_windows.drain(..).rev() {
+            window.cancel();
         }
         for registration in self.pane_registrations.drain(..).rev() {
             registration.detach_local_if_current();
@@ -2013,6 +2018,10 @@ impl ClientDomain {
             .new_tabs
             .try_reserve_exact(prepared_tabs.len())
             .context("reserve ordered pane tab rollback authority")?;
+        publication
+            .new_windows
+            .try_reserve_exact(preflight.window_ids.len())
+            .context("reserve ordered pane window rollback authority")?;
         for prepared in prepared_tabs {
             let remote_tab_id = prepared.plan.remote_tab_id;
             let tab = existing_tab_mappings
@@ -2088,10 +2097,12 @@ impl ClientDomain {
                 continue;
             }
 
-            let local_window_id = *mux.new_empty_window(
+            let window_builder = mux.new_empty_window(
                 Some(std::mem::take(&mut staged.prepared.workspace)),
                 None,
             );
+            let local_window_id = *window_builder;
+            publication.new_windows.push(window_builder);
             local_windows_by_remote.insert(plan.remote_window_id, local_window_id);
             mux.add_tab_to_window(&staged.tab, local_window_id)
                 .with_context(|| {
@@ -3241,6 +3252,36 @@ mod tests {
     }
 
     #[test]
+    fn pane_arena_publication_rollback_cancels_provisional_windows_after_detaching_tabs() {
+        let scope = MuxTestScope::enter();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+
+        let tab = Arc::new(Tab::new(&TerminalSize::default()));
+        mux.add_tab_no_panes(&tab)
+            .expect("rollback fixture tab must register");
+        let window_builder = mux.new_empty_window(Some("rollback".to_string()), None);
+        let window_id = *window_builder;
+        mux.add_tab_to_window(&tab, window_id)
+            .expect("rollback fixture tab must attach to provisional window");
+
+        let mut publication = PaneArenaPublicationRollback::new(&mux);
+        publication.new_tabs.push(Arc::clone(&tab));
+        publication.new_windows.push(window_builder);
+        drop(publication);
+
+        assert!(
+            mux.get_window(window_id).is_none(),
+            "rollback must cancel the now-empty provisional window without publishing it"
+        );
+        assert!(
+            mux.get_tab(tab.tab_id()).is_none(),
+            "rollback must remove the exact staged tab registration"
+        );
+        assert!(mux.iter_windows().is_empty());
+    }
+
+    #[test]
     fn direct_pane_arena_application_preserves_forward_tab_order() {
         let scope = MuxTestScope::enter();
         let mux = Arc::new(Mux::new(None));
@@ -3413,7 +3454,7 @@ mod tests {
         )
         .expect_err("existing-window reorder must fail before pane preparation");
         assert!(
-            error.to_string().contains("requires an atomic existing-window reorder"),
+            format!("{error:#}").contains("requires an atomic existing-window reorder"),
             "unexpected error: {error:#}",
             error = error,
         );
@@ -3459,7 +3500,7 @@ mod tests {
         )
         .expect_err("moving a live remote pane between tabs must fail before mutation");
         assert!(
-            error.to_string().contains("atomic pane migration is required"),
+            format!("{error:#}").contains("atomic pane migration is required"),
             "unexpected error: {error:#}",
             error = error,
         );
@@ -3494,7 +3535,7 @@ mod tests {
         )
         .expect_err("aliased remote tab mappings must fail before mutation");
         assert!(
-            error.to_string().contains("mappings alias remote tabs"),
+            format!("{error:#}").contains("mappings alias remote tabs"),
             "unexpected error: {error:#}",
             error = error,
         );
@@ -3532,9 +3573,7 @@ mod tests {
         )
         .expect_err("foreign live topology mappings must fail before mutation");
         assert!(
-            error
-                .to_string()
-                .contains("does not belong exactly to this client"),
+            format!("{error:#}").contains("does not belong exactly to this client"),
             "unexpected error: {error:#}",
             error = error,
         );
@@ -3566,7 +3605,7 @@ mod tests {
         )
         .expect_err("removing live stale topology requires an atomic reconciliation path");
         assert!(
-            error.to_string().contains("atomic stale-pane removal is required"),
+            format!("{error:#}").contains("atomic stale-pane removal is required"),
             "unexpected error: {error:#}",
             error = error,
         );
@@ -3624,8 +3663,7 @@ mod tests {
         )
         .expect_err("a new empty window without workspace authority must fail closed");
         assert!(
-            error
-                .to_string()
+            format!("{error:#}")
                 .contains("requires exact ordered workspace and client ownership authority"),
             "unexpected error: {error:#}",
             error = error,
@@ -3685,8 +3723,7 @@ mod tests {
         )
         .expect_err("title-only mappings must not confer window ownership");
         assert!(
-            error
-                .to_string()
+            format!("{error:#}")
                 .contains("requires exact ordered workspace and client ownership authority"),
             "unexpected error: {error:#}",
             error = error,
@@ -4119,9 +4156,7 @@ mod tests {
         };
 
         assert!(
-            error
-                .to_string()
-                .contains("remote tab 51 didn't resolve after resync"),
+            format!("{error:#}").contains("remote tab 51 didn't resolve after resync"),
             "unexpected error: {error:#}",
             error = error
         );
