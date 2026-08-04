@@ -344,7 +344,11 @@ The first protocol implementation uses these hard ceilings:
 - 4,096 ordered windows per snapshot;
 - 4,096 tabs per window;
 - 16,384 tabs total per snapshot;
-- 4 MiB for the encoded ordered-window section;
+- 16 MiB for the complete decompressed PDU87 response body, including its
+  pane snapshot and ordered-window section;
+- 16,842,752 bytes for a zstd-encoded PDU87 body and 16,842,773 bytes for its
+  maximum complete frame allocation;
+- 512 KiB for the encoded ordered-window section;
 - 512 KiB for one reorder request;
 - 4,096 retained idempotency receipts per server session; and
 - 1,024 retained receipts per client mutation namespace.
@@ -354,6 +358,19 @@ ceilings. Counts and encoded bytes are validated before allocation or
 mutation. Unknown/duplicate windows or tabs, a tab in multiple windows, an
 active tab outside its window, impossible `None` active state for a non-empty
 window, and any nonwrapping counter exhaustion fail before mutation.
+
+The frozen v1 integer schema and the three cardinality ceilings above imply a
+conservative maximum of 331,786 encoded section bytes: ten bytes for the outer
+length, at most 41 fixed bytes per window, and at most ten bytes for each of
+16,384 tab IDs. The 512 KiB wire ceiling therefore admits every structurally
+legal v1 section with explicit headroom; future schema growth requires a new
+protocol identifier rather than weakening this bound.
+
+The outer PDU87 body and frame ceilings are independent of the section bound.
+Both producer and decoder enforce them before an oversized body, zstd output,
+or final frame can acquire the workspace-wide 256 MiB generic PDU envelope.
+Pane metadata remains structurally valid below the collection-count ceilings
+but may still fail closed when its complete response body exceeds 16 MiB.
 
 Listing and reconciliation are `O(windows + tabs + panes)`. A pure reorder is
 `O(tabs in the affected window)` and allocates at most one bounded validation

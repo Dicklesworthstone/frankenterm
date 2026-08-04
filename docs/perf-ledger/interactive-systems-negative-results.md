@@ -2383,6 +2383,193 @@ experiment. It is not converted into a flattering keep or a durable rejection.
 - **Primary retry condition:**
   > Reconsider per-subscriber projection only when q1/q20/q200/q4096 fanout sweeps prove total conversions and allocations remain independent of legacy/coherent subscriber count, ordered generations preserve exact PDU90 state, callback tails remain bounded, and shared compact source state cannot be reused.
 
+### IS-N071 — Post-copy reweighting does not bound retained batch allocation
+
+- **Classification:** transient-memory and accounting-order rejection;
+  structural correction retained pending remote proof
+- **Beads:** `ft-interactive-swarm-product-convergence-7xqz4.8.10.2.2`
+  and `ft-interactive-systems-performance-4tenz.5.5.14.1.2.3.2.4`
+- **Rejected candidate:** concatenate two already-accounted topology or ordered-
+  snapshot frames into the first frame's `Vec`, then reweight the combined
+  reservation from the resulting capacities.
+- **Negative evidence:** `Vec::extend_from_slice` may allocate and copy the
+  combined target before the replacement charge is admitted. During that
+  transition the process owns both source frames and the new target allocation;
+  a later budget rejection therefore limits retained state only after the
+  allocator work and peak have occurred. Same-class batching also copies bytes
+  that already have a complete wire representation.
+- **Decision:** retain exact frame allocations as separate flush epochs and
+  batch only unaccounted control/bulk frames. A future segmented or vectored
+  writer may recover syscall amortization, but it must reserve aggregate iovec
+  metadata and preserve each frame's existing exact byte charge before any new
+  allocation.
+- **Primary retry condition:**
+  > Retry retained-frame batching only when a pre-admitted segmented or vectored implementation proves no payload copy, exact live-capacity accounting through every partial-write and terminal path, unchanged PDU87-before-PDU90 flush order, and a material isolated M4/M5/Threadripper p95/p99 benefit without higher peak allocation or keypress tails.
+
+### IS-N072 — A clamped serde size hint is not schema count admission
+
+- **Classification:** hostile-input and false-before-allocation rejection;
+  zero-wire decoder chokepoint retained pending remote proof
+- **Bead:** `ft-interactive-swarm-product-convergence-7xqz4.8.10.2.2`
+- **Rejected candidate:** read a hostile PDU87 sequence/map prefix through the
+  generic one-million-item decoder, expose only `min(length, 4096)` as serde's
+  size hint, and rely on a custom visitor's maximum check.
+- **Negative evidence:** the visitor cannot distinguish a declared 16,385-item
+  collection from a 4,096-item hint. It rejects only after decoding the 16,385th
+  pane/title or 4,097th map entry, including nested strings and pane graphs.
+  The clamp limits one eager capacity request but does not enforce the closed
+  PDU87 schema before element allocation.
+- **Decision:** use zero-wire named-newtype markers to install exact collection
+  admissions at the varbincode length-prefix chokepoint, restore the enclosing
+  admission after each field, and expose the admitted exact q=16,384 hint so a
+  maximum legal snapshot allocates once. This is structural boundedness, not
+  RSS or latency evidence.
+- **Primary retry condition:**
+  > Replace schema-scoped prefix admission only when every compressed and uncompressed max-plus-one collection fails from a prefix-only fixture before EOF or element decode, every exact boundary roundtrips, golden bytes remain unchanged, and retained target-class allocation evidence shows an alternative is both equally bounded and materially faster.
+
+### IS-N073 — A top-level pane-tree count does not bound recursive PDU87 graphs
+
+- **Classification:** incomplete resource-envelope rejection; capability stays
+  dormant
+- **Bead:** `ft-interactive-swarm-product-convergence-7xqz4.8.10.2.2.2`
+- **Rejected inference:** limiting `ListPanesResponse.tabs` to 16,384 values and
+  the PDU87 body to 16 MiB bounds pane snapshot decoding and destruction.
+- **Negative evidence:** each `PaneNode` is a recursively derived Split/Leaf
+  tree. A compact deeply nested Split chain can exhaust the Rust stack during
+  deserialize or drop, while total boxed nodes and leaves are not bounded by
+  the number of top-level tab trees. A byte ceiling limits input volume but is
+  not a proof of finite recursion depth or bounded Box amplification.
+- **Decision:** keep ordered-window capability activation blocked on an
+  iterative/flat, depth/node/leaf-bounded PDU87 representation or an equally
+  strong seeded-decoder proof. Do not infer authority safety, hostile-input
+  safety, memory bounds, or q4096 readiness from the new top-level collection
+  caps alone.
+- **Primary retry condition:**
+  > Activate PDU87 pane snapshots only after prefix-only, maximum-depth, depth-plus-one, maximum-node, node-plus-one, broad-tree, malformed-index, compressed, truncated, and drop-path tests prove finite iterative admission and conversion with bounded allocation and no recursive stack growth.
+
+### IS-N074 — Replacing dormant PDU87 does not harden live recursive PDU4/PDU82
+
+- **Classification:** hidden live-surface and incomplete-remediation rejection;
+  separate P0 hardening bead opened
+- **Beads:** `ft-interactive-swarm-product-convergence-7xqz4.8.10.2.2.2`
+  and `ft-interactive-systems-performance-4tenz.5.5.14.1.2.3.2.3.1.1`
+- **Rejected inference:** replacing PDU87's provisional recursive pane payload
+  with a flat arena removes the mux protocol's recursive pane-tree admission
+  risk.
+- **Negative evidence:** live PDU4 `ListPanesResponse` and authority-bearing
+  PDU82 `CoherentPaneSnapshot` also embed the recursively derived `PaneNode`.
+  They deserialize before client application and remain exposed to unbounded
+  depth, Box amplification, recursive validation/serialization, and recursive
+  drop even while PDU87 capability stays dormant.
+- **Decision:** redesign dormant PDU87 directly as a bounded flat arena, but
+  independently harden the byte-compatible PDU4/PDU82 field with seeded depth,
+  node, and leaf admission plus iterative producer preflight. Ordered-window
+  activation now also depends on the live-family hardening bead.
+- **Primary retry condition:**
+  > Treat recursive pane transport as bounded only after PDU4 and PDU82 golden bytes remain identical, hostile depth/node max-plus-one frames fail before unsafe construction in both compression modes, producer preflight is iterative, and every admitted value has a proven finite drop depth.
+
+### IS-N075 — The server's local codec version is not a peer-agreed dialect
+
+- **Classification:** false protocol-authority rejection; tentative local-only
+  threading removed before commit
+- **Beads:** `ft-interactive-swarm-product-convergence-7xqz4.8.10.2.2`,
+  `ft-interactive-systems-performance-4tenz.5.5.3.5.12.4`, and
+  `ft-interactive-systems-performance-4tenz.5.5.3.5.12.5`
+- **Rejected candidate:** initialize the server dispatch coordinator with its
+  own `codec::CODEC_VERSION` and retain that value as the connection's
+  `agreed_codec_version` for PDU86-PDU90 authority.
+- **Negative evidence:** PDU26 is empty and PDU27 advertises only the server's
+  version window. The client computes and retains the overlap result, but the
+  ordinary server never observes the client window and therefore cannot know
+  the peer-agreed dialect. A local value of 53 cannot distinguish a v52 peer,
+  a stale connection generation, or a forged v53-only request. The `None` in
+  `decode_async_with_selector` is a maximum-serial option, not a dialect gate.
+- **Decision:** make the ordered fence depend on symmetric codec-window
+  registration and exact per-generation server wire authority. Once that
+  authority exists, retain its immutable generation and agreed dialect in the
+  PDU86 fence, PDU87/PDU90 permits, established stream, and PDU88 token; reject
+  insufficient or stale dialects before body allocation.
+- **Primary retry condition:**
+  > Claim an agreed server dialect only after a symmetric nonce-bound registration proves both version windows and the exact overlap, a generation-bound pre-body selector rejects v52 PDU86 without q allocation, v53 establishes and retains exact authority, and stale-generation or forged permits cannot encode, queue, or mutate.
+
+### IS-N076 — A logical serializer ceiling does not prevent geometric capacity growth
+
+- **Classification:** producer peak-allocation rejection; exact-increment
+  containment retained pending allocator evidence
+- **Bead:** `ft-interactive-swarm-product-convergence-7xqz4.8.10.2.2`
+- **Rejected inference:** rejecting a `BoundedSerializeBuffer` write when its
+  logical length exceeds the wire limit also bounds the backing `Vec` to that
+  limit.
+- **Negative evidence:** `Vec::try_reserve` uses amortized growth. A small legal
+  write near the ceiling can therefore grow capacity geometrically before the
+  completed frame is charged, while the typed graph and compression buffers
+  are still live. The byte count is valid but the transient allocation claim
+  is false.
+- **Decision:** reserve each admitted increment with `try_reserve_exact`, while
+  retaining the checked logical ceiling before reservation. This removes the
+  collection's geometric growth policy; it does not claim allocator size-class
+  bytes, RSS, or that typed, uncompressed, compressed, and final owners never
+  overlap.
+- **Primary retry condition:**
+  > Claim a hard producer allocation envelope only after allocator-visible peak-live-byte counters cover the typed graph, exact-increment body, compressor workspace/output, final frame, and deallocation order at q1/q20/q200/q4096 on every supported target class.
+
+### IS-N077 — HashMap iteration is not canonical snapshot authority
+
+- **Classification:** nondeterministic wire-authority rejection; dormant schema
+  replacement required
+- **Bead:** `ft-interactive-swarm-product-convergence-7xqz4.8.10.2.2.2`
+- **Rejected candidate:** serialize PDU87 `window_titles` directly from a Rust
+  `HashMap` and treat the resulting bytes as a stable authoritative snapshot.
+- **Negative evidence:** semantically equal maps can iterate in different
+  orders across processes or runs. A single-entry golden fixture cannot expose
+  that ambiguity, and byte-level digests, replay comparison, and compression
+  results can diverge even when window/title state is identical.
+- **Decision:** the flat PDU87 replacement must encode window titles as one
+  sorted canonical sequence keyed by wire window identity. Capability stays
+  dormant; current bytes are not promoted as canonical.
+- **Primary retry condition:**
+  > Treat PDU87 bytes as canonical only after multi-entry permutation tests, repeated fresh-map construction, compressed and uncompressed golden fixtures, and decode-reencode identity prove one byte sequence for every equivalent admitted snapshot.
+
+### IS-N078 — Admission that cannot fund encoding is not a live queue contract
+
+- **Classification:** retained-memory liveness rejection; fail-closed
+  containment is insufficient for service
+- **Beads:** `ft-interactive-systems-performance-4tenz.5.5.14.1.2.3.2.4`
+  and `ft-interactive-systems-performance-4tenz.5.5.3.5.5.6`
+- **Rejected candidate:** admit a typed topology payload up to the complete
+  retained-byte ceiling, then require its typed owner and encoded allocation to
+  coexist under that same ceiling during drain.
+- **Negative evidence:** an accepted near-ceiling payload can have no remaining
+  headroom for its encoded representation. Later conversion must terminate the
+  connection even though initial admission reported success. This is memory
+  safe but converts a supposedly serviceable queue entry into a deterministic
+  liveness failure.
+- **Decision:** closure requires worst-case encode headroom at initial
+  admission, a lower typed ceiling, or move/stream/vectored encoding whose live
+  ownership is charged before allocation. Do not describe current fail-closed
+  conversion as guaranteed progress.
+- **Primary retry condition:**
+  > Claim queue liveness only when every admitted boundary payload reaches flush or a pre-admission typed rejection, never a post-admission capacity failure, with exact live-byte release under partial writes, cancellation, reconnect, and teardown.
+
+### IS-N079 — Claimed frame metadata is not proof of encoded byte identity
+
+- **Classification:** latent authority-binding rejection; private constructors
+  reduce reachability but do not prove the invariant
+- **Bead:** `ft-interactive-systems-performance-4tenz.5.5.3.5.5.7`
+- **Rejected inference:** validating an `EncodedPduAuthority` family, serial,
+  and emission tag proves its separately stored byte vector encodes that same
+  header and family.
+- **Negative evidence:** the current pre-encoded boundary trusts metadata
+  captured alongside bytes rather than deriving final authority from an opaque
+  encode-only owner or revalidating the actual header. Private constructors
+  make cross-wiring harder today, but future call sites can silently weaken the
+  invariant without a production source guard.
+- **Decision:** retain the current private typed permits as containment, but
+  block the complete claim on the no-bypass encoder census and an opaque owner
+  whose authoritative header identity cannot be paired with unrelated bytes.
+- **Primary retry condition:**
+  > Promote encoded-frame authority only after every production constructor is classified, raw construction is test-only, final write admission proves the actual encoded family and serial, and cross-wired metadata/byte fixtures fail before queue or network effects.
+
 ## Open hypothesis register
 
 These are not negative results. Each remains open until a retained same-window
