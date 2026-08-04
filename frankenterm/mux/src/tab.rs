@@ -826,6 +826,189 @@ fn is_pane(pane: &Arc<dyn Pane>, other: &Option<&Arc<dyn Pane>>) -> bool {
     }
 }
 
+fn capture_pane_arena_tree(
+    tree: Option<&Tree>,
+    active: Option<Arc<dyn Pane>>,
+    zoomed: Option<Arc<dyn Pane>>,
+    pane_ids: HashMap<PaneIdentity, PaneId>,
+    tab_title: String,
+    arena_start: usize,
+    max_depth: usize,
+    max_total_nodes: usize,
+) -> anyhow::Result<(
+    Vec<CapturedPaneArenaNode>,
+    Option<Arc<dyn Pane>>,
+    Option<Arc<dyn Pane>>,
+    String,
+)> {
+    let Some(tree) = tree else {
+        return Ok((Vec::new(), active, zoomed, tab_title));
+    };
+    let remaining = max_total_nodes.checked_sub(arena_start).ok_or_else(|| {
+        anyhow::anyhow!(
+            "ordered pane arena already has {arena_start} nodes, above limit {max_total_nodes}"
+        )
+    })?;
+    let mut captured = Vec::new();
+    captured
+        .try_reserve_exact(remaining.min(64))
+        .map_err(|error| anyhow::anyhow!("reserve callback-free pane capture: {error}"))?;
+    let mut tasks = Vec::new();
+    tasks
+        .try_reserve_exact(max_depth.saturating_mul(2).min(256))
+        .map_err(|error| anyhow::anyhow!("reserve callback-free pane traversal: {error}"))?;
+    tasks.push(CapturePaneArenaTask::Visit {
+        tree,
+        depth: 1,
+        left_col: 0,
+        top_row: 0,
+    });
+
+    while let Some(task) = tasks.pop() {
+        match task {
+            CapturePaneArenaTask::Visit {
+                tree,
+                depth,
+                left_col,
+                top_row,
+            } => {
+                if depth > max_depth {
+                    anyhow::bail!(
+                        "tab pane tree depth {depth} exceeds ordered snapshot limit {max_depth}"
+                    );
+                }
+                if captured.len() == remaining {
+                    anyhow::bail!(
+                        "ordered pane arena exceeds total node limit {max_total_nodes}"
+                    );
+                }
+                match tree {
+                    Tree::Empty => captured.push(CapturedPaneArenaNode::Empty),
+                    Tree::Leaf(pane) => {
+                        let pane_id = pane_ids.get(&pane_identity(pane)).copied().ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "pane identity {:p} disappeared from tab {} callback-free capture",
+                                Arc::as_ptr(pane),
+                                tab_title,
+                            )
+                        })?;
+                        captured.push(CapturedPaneArenaNode::Leaf {
+                            pane: Arc::clone(pane),
+                            pane_id,
+                            left_col,
+                            top_row,
+                        });
+                    }
+                    Tree::Node { left, right, data } => {
+                        let node = data.ok_or_else(|| {
+                            anyhow::anyhow!("tab {tab_title:?} has an uninitialized split node")
+                        })?;
+                        let split_index = captured.len();
+                        captured.push(CapturedPaneArenaNode::Split {
+                            left: split_index.checked_add(1).ok_or_else(|| {
+                                anyhow::anyhow!("ordered pane arena left-child index overflows")
+                            })?,
+                            right: usize::MAX,
+                            node,
+                        });
+                        let next_depth = depth.checked_add(1).ok_or_else(|| {
+                            anyhow::anyhow!("ordered pane arena depth overflows usize")
+                        })?;
+                        tasks.push(CapturePaneArenaTask::VisitRight {
+                            split_index,
+                            tree: right,
+                            depth: next_depth,
+                            left_col: if node.direction == SplitDirection::Vertical {
+                                left_col
+                            } else {
+                                left_col.saturating_add(node.left_of_second())
+                            },
+                            top_row: if node.direction == SplitDirection::Horizontal {
+                                top_row
+                            } else {
+                                top_row.saturating_add(node.top_of_second())
+                            },
+                        });
+                        tasks.push(CapturePaneArenaTask::Visit {
+                            tree: left,
+                            depth: next_depth,
+                            left_col,
+                            top_row,
+                        });
+                    }
+                }
+            }
+            CapturePaneArenaTask::VisitRight {
+                split_index,
+                tree,
+                depth,
+                left_col,
+                top_row,
+            } => {
+                let right = captured.len();
+                let Some(CapturedPaneArenaNode::Split {
+                    right: split_right,
+                    ..
+                }) = captured.get_mut(split_index)
+                else {
+                    anyhow::bail!(
+                        "ordered pane traversal lost split placeholder {split_index}"
+                    );
+                };
+                *split_right = right;
+                tasks.push(CapturePaneArenaTask::Visit {
+                    tree,
+                    depth,
+                    left_col,
+                    top_row,
+                });
+            }
+        }
+    }
+
+    Ok((captured, active, zoomed, tab_title))
+}
+
+fn pane_entry(
+    pane: &Arc<dyn Pane>,
+    pane_id: PaneId,
+    tab_id: TabId,
+    window_id: WindowId,
+    active: Option<&Arc<dyn Pane>>,
+    zoomed: Option<&Arc<dyn Pane>>,
+    workspace: &str,
+    left_col: usize,
+    top_row: usize,
+) -> PaneEntry {
+    let dims = pane.get_dimensions();
+    let working_dir = pane.get_current_working_dir(CachePolicy::AllowStale);
+    let cursor_pos = pane.get_cursor_position();
+
+    PaneEntry {
+        window_id,
+        tab_id,
+        pane_id,
+        title: pane.get_title(),
+        is_active_pane: is_pane(pane, &active),
+        is_zoomed_pane: is_pane(pane, &zoomed),
+        size: TerminalSize {
+            cols: dims.cols,
+            rows: dims.viewport_rows,
+            pixel_height: dims.pixel_height,
+            pixel_width: dims.pixel_width,
+            dpi: dims.dpi,
+        },
+        working_dir: working_dir.map(Into::into),
+        alt_screen_active: pane.is_alt_screen_active(),
+        workspace: workspace.to_string(),
+        cursor_pos,
+        physical_top: dims.physical_top,
+        left_col,
+        top_row,
+        tty_name: pane.tty_name(),
+    }
+}
+
 fn pane_tree(
     tree: &Tree,
     tab_id: TabId,
@@ -866,33 +1049,17 @@ fn pane_tree(
             }
         }
         Tree::Leaf(pane) => {
-            let dims = pane.get_dimensions();
-            let working_dir = pane.get_current_working_dir(CachePolicy::AllowStale);
-            let cursor_pos = pane.get_cursor_position();
-
-            PaneNode::Leaf(PaneEntry {
-                window_id,
+            PaneNode::Leaf(pane_entry(
+                pane,
+                pane.pane_id(),
                 tab_id,
-                pane_id: pane.pane_id(),
-                title: pane.get_title(),
-                is_active_pane: is_pane(pane, &active),
-                is_zoomed_pane: is_pane(pane, &zoomed),
-                size: TerminalSize {
-                    cols: dims.cols,
-                    rows: dims.viewport_rows,
-                    pixel_height: dims.pixel_height,
-                    pixel_width: dims.pixel_width,
-                    dpi: dims.dpi,
-                },
-                working_dir: working_dir.map(Into::into),
-                alt_screen_active: pane.is_alt_screen_active(),
-                workspace: workspace.to_string(),
-                cursor_pos,
-                physical_top: dims.physical_top,
+                window_id,
+                active,
+                zoomed,
+                workspace,
                 left_col,
                 top_row,
-                tty_name: pane.tty_name(),
-            })
+            ))
         }
     }
 }
@@ -958,6 +1125,37 @@ pub struct PaneArenaTree {
 pub struct PaneArenaWindowTitle {
     pub window_id: u64,
     pub title: String,
+}
+
+enum CapturedPaneArenaNode {
+    Empty,
+    Split {
+        left: usize,
+        right: usize,
+        node: SplitDirectionAndSize,
+    },
+    Leaf {
+        pane: Arc<dyn Pane>,
+        pane_id: PaneId,
+        left_col: usize,
+        top_row: usize,
+    },
+}
+
+enum CapturePaneArenaTask<'a> {
+    Visit {
+        tree: &'a Tree,
+        depth: usize,
+        left_col: usize,
+        top_row: usize,
+    },
+    VisitRight {
+        split_index: usize,
+        tree: &'a Tree,
+        depth: usize,
+        left_col: usize,
+        top_row: usize,
+    },
 }
 
 /// Owned flat pane topology used by ordered snapshot transport and direct mux
@@ -2297,6 +2495,124 @@ impl Tab {
 
         anyhow::bail!(
             "tab {} topology changed during all {SNAPSHOT_ATTEMPTS} codec snapshot attempts",
+            self.tab_id,
+        )
+    }
+
+    /// Append one callback-coherent tab directly to an ordered pane arena.
+    ///
+    /// Unlike [`Self::codec_pane_tree_in_window`], this path never constructs
+    /// a recursive [`PaneNode`] or a temporary `Box` per split. The tab lock
+    /// is held only while its existing mux tree is projected into an iterative
+    /// callback-free capture; pane observations happen afterward. The caller
+    /// supplies the protocol depth/node ceilings so the dependency-lower mux
+    /// crate does not own wire policy.
+    pub fn append_codec_pane_arena_in_window(
+        &self,
+        window_id: WindowId,
+        workspace: &str,
+        arena: &mut Vec<PaneArenaNode>,
+        max_depth: usize,
+        max_total_nodes: usize,
+    ) -> anyhow::Result<PaneArenaTree> {
+        const SNAPSHOT_ATTEMPTS: usize = 3;
+
+        for _ in 0..SNAPSHOT_ATTEMPTS {
+            let observed = Self::observe_panes(self.snapshot_panes_callback_free());
+            let mut pane_ids = HashMap::new();
+            pane_ids
+                .try_reserve(observed.len())
+                .map_err(|error| anyhow::anyhow!("reserve pane identity snapshot: {error}"))?;
+            for pane in &observed {
+                let pane_id = pane.pane_id.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "pane identity {:p} panicked while tab {} was being encoded",
+                        Arc::as_ptr(&pane.pane),
+                        self.tab_id,
+                    )
+                })?;
+                pane_ids.insert(pane_identity(&pane.pane), pane_id);
+            }
+
+            let captured = {
+                let inner = self.inner.lock();
+                let current = inner.snapshot_panes_callback_free();
+                let current_identities = current.iter().map(pane_identity).collect::<HashSet<_>>();
+                let observed_identities = pane_ids.keys().copied().collect::<HashSet<_>>();
+                if current_identities != observed_identities {
+                    None
+                } else {
+                    Some(capture_pane_arena_tree(
+                        inner.pane.as_ref(),
+                        inner.raw_active_pane_callback_free(&pane_ids),
+                        inner.zoomed.as_ref().map(Arc::clone),
+                        pane_ids,
+                        inner.title.clone(),
+                        arena.len(),
+                        max_depth,
+                        max_total_nodes,
+                    )?)
+                }
+            };
+            let Some((captured, active, zoomed, tab_title)) = captured else {
+                continue;
+            };
+
+            let arena_start = arena.len();
+            arena
+                .try_reserve_exact(captured.len())
+                .map_err(|error| anyhow::anyhow!("reserve ordered pane arena nodes: {error}"))?;
+            for node in captured {
+                arena.push(match node {
+                    CapturedPaneArenaNode::Empty => PaneArenaNode::Empty,
+                    CapturedPaneArenaNode::Split { left, right, node } => PaneArenaNode::Split {
+                        left: u32::try_from(arena_start.checked_add(left).ok_or_else(|| {
+                            anyhow::anyhow!("ordered pane arena left-child index overflows")
+                        })?)
+                        .map_err(|_| anyhow::anyhow!("ordered pane arena left child exceeds u32"))?,
+                        right: u32::try_from(arena_start.checked_add(right).ok_or_else(|| {
+                            anyhow::anyhow!("ordered pane arena right-child index overflows")
+                        })?)
+                        .map_err(|_| anyhow::anyhow!("ordered pane arena right child exceeds u32"))?,
+                        node,
+                    },
+                    CapturedPaneArenaNode::Leaf {
+                        pane,
+                        pane_id,
+                        left_col,
+                        top_row,
+                    } => PaneArenaNode::Leaf(pane_entry(
+                        &pane,
+                        pane_id,
+                        self.tab_id,
+                        window_id,
+                        active.as_ref(),
+                        zoomed.as_ref(),
+                        workspace,
+                        left_col,
+                        top_row,
+                    )),
+                });
+            }
+            let node_count = arena.len().checked_sub(arena_start).ok_or_else(|| {
+                anyhow::anyhow!("ordered pane arena node count moved backwards")
+            })?;
+            return Ok(PaneArenaTree {
+                root_index: if node_count == 0 {
+                    None
+                } else {
+                    Some(u32::try_from(arena_start).map_err(|_| {
+                        anyhow::anyhow!("ordered pane arena root exceeds u32")
+                    })?)
+                },
+                node_count: u32::try_from(node_count)
+                    .map_err(|_| anyhow::anyhow!("ordered pane arena tree exceeds u32"))?,
+                tab_title,
+            });
+        }
+
+        anyhow::bail!(
+            "tab {} topology changed during all {SNAPSHOT_ATTEMPTS} flat codec snapshot attempts",
             self.tab_id,
         )
     }
@@ -6894,6 +7210,153 @@ mod test {
             observations.load(std::sync::atomic::Ordering::Acquire) > 0,
             "the codec path must exercise a reentrancy-checked pane observation",
         );
+    }
+
+    fn flatten_legacy_pane_node_for_test(
+        node: &PaneNode,
+        arena: &mut Vec<PaneArenaNode>,
+    ) -> u32 {
+        let index = u32::try_from(arena.len()).expect("test arena fits u32");
+        arena.push(PaneArenaNode::Empty);
+        arena[usize::try_from(index).expect("u32 fits usize")] = match node {
+            PaneNode::Empty => PaneArenaNode::Empty,
+            PaneNode::Leaf(entry) => PaneArenaNode::Leaf(entry.clone()),
+            PaneNode::Split { left, right, node } => {
+                let left = flatten_legacy_pane_node_for_test(left, arena);
+                let right = flatten_legacy_pane_node_for_test(right, arena);
+                PaneArenaNode::Split {
+                    left,
+                    right,
+                    node: *node,
+                }
+            }
+        };
+        index
+    }
+
+    #[test]
+    fn flat_codec_snapshot_exactly_matches_legacy_recursive_projection() {
+        let size = TerminalSize {
+            rows: 36,
+            cols: 120,
+            pixel_width: 1_200,
+            pixel_height: 720,
+            dpi: 110,
+        };
+        let tab = Tab::new(&size);
+        tab.set_title("flat-equivalence");
+        tab.assign_pane(&FakePane::new(301, size));
+        tab.split_and_insert(
+            0,
+            SplitRequest {
+                direction: SplitDirection::Horizontal,
+                target_is_second: true,
+                top_level: false,
+                size: SplitSize::Percent(40),
+            },
+            FakePane::new(302, size),
+        )
+        .expect("first test split");
+        tab.split_and_insert(
+            1,
+            SplitRequest {
+                direction: SplitDirection::Vertical,
+                target_is_second: false,
+                top_level: false,
+                size: SplitSize::Percent(35),
+            },
+            FakePane::new(303, size),
+        )
+        .expect("second test split");
+        tab.set_active_idx(2);
+        assert!(!tab.set_zoomed(true), "set_zoomed returns the prior state");
+        assert_eq!(tab.get_zoomed_pane().map(|pane| pane.pane_id()), Some(302));
+
+        let legacy = tab
+            .codec_pane_tree_in_window(77, "equivalence-workspace")
+            .expect("legacy recursive projection");
+        let mut expected_nodes = Vec::new();
+        let expected_root = flatten_legacy_pane_node_for_test(&legacy, &mut expected_nodes);
+
+        let mut actual_nodes = Vec::new();
+        let actual_tree = tab
+            .append_codec_pane_arena_in_window(
+                77,
+                "equivalence-workspace",
+                &mut actual_nodes,
+                64,
+                1_024,
+            )
+            .expect("direct flat projection");
+
+        assert_eq!(actual_tree.root_index, Some(expected_root));
+        assert_eq!(
+            usize::try_from(actual_tree.node_count).expect("test node count fits usize"),
+            expected_nodes.len()
+        );
+        assert_eq!(actual_tree.tab_title, "flat-equivalence");
+        assert_eq!(actual_nodes, expected_nodes);
+    }
+
+    #[test]
+    fn flat_codec_snapshot_offsets_indices_and_preserves_prefix() {
+        let size = TerminalSize::default();
+        let tab = Tab::new(&size);
+        tab.assign_pane(&FakePane::new(401, size));
+        tab.split_and_insert(0, SplitRequest::default(), FakePane::new(402, size))
+            .expect("test split");
+        let prefix = PaneArenaNode::Leaf(pane_arena_test_entry(999, false, false));
+        let mut arena = vec![prefix.clone()];
+
+        let tree = tab
+            .append_codec_pane_arena_in_window(88, "offset-workspace", &mut arena, 64, 16)
+            .expect("offset flat projection");
+
+        assert_eq!(arena.first(), Some(&prefix));
+        assert_eq!(tree.root_index, Some(1));
+        assert_eq!(tree.node_count, 3);
+        let PaneArenaNode::Split { left, right, .. } = &arena[1] else {
+            panic!("two-pane projection must start with a split");
+        };
+        assert_eq!((*left, *right), (2, 3));
+    }
+
+    #[test]
+    fn flat_codec_snapshot_rejects_resource_limits_without_extending_arena() {
+        let size = TerminalSize::default();
+        let tab = Tab::new(&size);
+        tab.assign_pane(&FakePane::new(501, size));
+        tab.split_and_insert(0, SplitRequest::default(), FakePane::new(502, size))
+            .expect("first test split");
+        tab.split_and_insert(1, SplitRequest::default(), FakePane::new(503, size))
+            .expect("second test split");
+        let prefix = PaneArenaNode::Leaf(pane_arena_test_entry(998, false, false));
+
+        let mut depth_limited = vec![prefix.clone()];
+        let depth_error = tab
+            .append_codec_pane_arena_in_window(
+                89,
+                "limited-workspace",
+                &mut depth_limited,
+                2,
+                16,
+            )
+            .expect_err("depth-three tree must exceed a depth-two ceiling");
+        assert!(format!("{depth_error:#}").contains("depth 3"));
+        assert_eq!(depth_limited, [prefix.clone()]);
+
+        let mut node_limited = vec![prefix.clone()];
+        let node_error = tab
+            .append_codec_pane_arena_in_window(
+                89,
+                "limited-workspace",
+                &mut node_limited,
+                64,
+                5,
+            )
+            .expect_err("five tree nodes plus one prefix must exceed a five-node ceiling");
+        assert!(format!("{node_error:#}").contains("total node limit 5"));
+        assert_eq!(node_limited, [prefix]);
     }
 
     #[test]
