@@ -3234,6 +3234,12 @@ mod tests {
             .collect()
     }
 
+    fn client_remote_pane_id(pane: &Arc<dyn Pane>) -> PaneId {
+        pane.downcast_ref::<ClientPane>()
+            .expect("ordered test pane must be a ClientPane")
+            .remote_pane_id()
+    }
+
     #[test]
     fn direct_pane_arena_application_preserves_forward_tab_order() {
         let scope = MuxTestScope::enter();
@@ -3340,8 +3346,11 @@ mod tests {
             .expect("mapped split tab must exist");
         let panes = tab.iter_panes_ignoring_zoom();
         assert_eq!(panes.len(), 2);
-        assert_eq!(tab.iter_splits().len(), 1);
-        assert_eq!(tab.iter_splits()[0].direction, split.direction);
+        assert_eq!(panes[0].top, panes[1].top);
+        assert!(
+            panes[1].left > panes[0].left,
+            "a horizontal split must place the second pane to the right"
+        );
         assert_eq!(
             tab.get_active_idx(),
             0,
@@ -3350,30 +3359,24 @@ mod tests {
         assert_eq!(
             panes
                 .iter()
-                .map(|pane| {
-                    inner
-                        .local_to_remote_pane(pane.pane.pane_id())
-                        .expect("every split pane must retain its remote identity")
-                })
+                .map(|pane| client_remote_pane_id(&pane.pane))
                 .collect::<Vec<_>>(),
             vec![61, 62]
         );
         assert_eq!(
-            inner.local_to_remote_pane(
-                tab.get_active_pane()
+            client_remote_pane_id(
+                &tab.get_active_pane()
                     .expect("zoomed split pane must be publicly active")
-                    .pane_id()
             ),
-            Some(62),
+            62,
             "the zoomed pane must retain public focus semantics"
         );
         assert_eq!(
-            inner.local_to_remote_pane(
-                tab.get_zoomed_pane()
+            client_remote_pane_id(
+                &tab.get_zoomed_pane()
                     .expect("split pane must retain zoom authority")
-                    .pane_id()
             ),
-            Some(62)
+            62
         );
     }
 
@@ -3634,20 +3637,32 @@ mod tests {
         let scope = MuxTestScope::enter();
         let mux = Arc::new(Mux::new(None));
         scope.set_mux(&mux);
-        let inner = test_client_inner(91_015);
+        let owner = test_client_inner(91_015);
+        let foreign = test_client_inner(91_016);
 
         ClientDomain::process_pane_arena(
             &mux,
-            Arc::clone(&inner),
+            Arc::clone(&owner),
             sample_remote_pane_arena(&[(51, 61)]),
             None,
         )
-        .expect("initial direct flat arena application should attach");
-        let local_window_id = inner
+        .expect("owner direct flat arena application should attach");
+        ClientDomain::process_pane_arena(
+            &mux,
+            Arc::clone(&foreign),
+            sample_remote_pane_arena(&[(51, 61)]),
+            None,
+        )
+        .expect("foreign direct flat arena application should attach separately");
+        let owner_window_id = owner
             .remote_to_local_window(41)
-            .expect("initial remote window should map locally");
-        lock_or_recover(&inner.remote_to_local_window, "remote_to_local_window")
-            .insert(42, local_window_id);
+            .expect("owner remote window should map locally");
+        let foreign_window_id = foreign
+            .remote_to_local_window(41)
+            .expect("foreign remote window should map locally");
+        assert_ne!(owner_window_id, foreign_window_id);
+        lock_or_recover(&owner.remote_to_local_window, "remote_to_local_window")
+            .insert(42, foreign_window_id);
 
         let (trees, nodes, mut window_titles) =
             sample_remote_pane_arena(&[(51, 61)]).into_parts();
@@ -3657,7 +3672,7 @@ mod tests {
         });
         let error = ClientDomain::process_pane_arena(
             &mux,
-            Arc::clone(&inner),
+            Arc::clone(&owner),
             PaneArena::from_unvalidated_parts(trees, nodes, window_titles),
             None,
         )
@@ -3669,13 +3684,13 @@ mod tests {
             "unexpected error: {error:#}",
         );
         assert_eq!(
-            mux.get_window(local_window_id)
-                .expect("owned window must survive rejection")
+            mux.get_window(foreign_window_id)
+                .expect("foreign window must survive rejection")
                 .get_title(),
             "ops window"
         );
-        assert_eq!(mux.iter_windows().len(), 1);
-        assert_eq!(mux.iter_panes().len(), 1);
+        assert_eq!(mux.iter_windows().len(), 2);
+        assert_eq!(mux.iter_panes().len(), 2);
     }
 
     #[test]
