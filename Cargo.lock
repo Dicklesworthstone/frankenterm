@@ -1168,9 +1168,9 @@ checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
 
 [[package]]
 name = "cfg_aliases"
-version = "0.2.1"
+version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "613afe47fcd5fac7ccf1db93babcb082c5994d996f20b8b159f2ad1658eb5724"
+checksum = "f079e83a288787bcd14a6aea84cee5c87a67c5a3e660c30f557a3d24761b3527"
 
 [[package]]
 name = "cgl"
@@ -9392,13 +9392,12 @@ dependencies = [
 
 [[package]]
 name = "rich_rust"
-version = "0.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "28b19f5711867dc33a82cdbfd437c03b4089308f63a7ec3ee6ab34a9d74ff519"
+version = "0.2.2"
+source = "git+https://github.com/Dicklesworthstone/rich_rust?rev=b0b298fca7ea29d20cac4014dd6665b234685037#b0b298fca7ea29d20cac4014dd6665b234685037"
 dependencies = [
  "bitflags 2.13.0",
  "crossterm",
- "fancy-regex 0.17.0",
+ "fancy-regex 0.18.0",
  "log",
  "lru 0.16.4",
  "num-rational",
@@ -10906,9 +10905,9 @@ dependencies = [
 
 [[package]]
 name = "time"
-version = "0.3.51"
+version = "0.3.55"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "85c17d80feb7334b40c484e45ed1a5273dfd8bfda537c3be2e74a06a6686f327"
+checksum = "cdb87b95ec50ddfa440816d227a17b2ccbdda963a316a727fda0fc4334f7d134"
 dependencies = [
  "deranged",
  "libc",
@@ -10928,9 +10927,9 @@ checksum = "9e1c906769ad99c88eaa54e728060edef082f8e358ff32030cb7c7d315e81109"
 
 [[package]]
 name = "time-macros"
-version = "0.2.30"
+version = "0.2.32"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dcef1a61bdb119096e153208ec5cbec23944ce8bca13be5c7f60c634f7403935"
+checksum = "7e689342a48d2ea927c87ea50cabf8594854bf940e9310208848d680d668ed85"
 dependencies = [
  "num-conv",
  "time-core",
@@ -13665,8 +13664,3 @@ dependencies = [
  "syn 2.0.118",
  "winnow 1.0.3",
 ]
-
-[[patch.unused]]
-name = "rich_rust"
-version = "0.2.2"
-source = "git+https://github.com/Dicklesworthstone/rich_rust?rev=a4c3735ab62ffb7feb15d02bc3beb3bfe1e087ae#a4c3735ab62ffb7feb15d02bc3beb3bfe1e087ae"
