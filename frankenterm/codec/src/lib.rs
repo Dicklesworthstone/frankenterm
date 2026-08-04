@@ -15406,7 +15406,7 @@ mod test {
     fn pdu87_flat_pane_encoder_has_deterministic_q_scale_work_and_allocation_counts() {
         for q in [1_usize, 20, 200, 4_096] {
             let panes = ListPanesResponse {
-                tabs: vec![broad_pane_tree(q)],
+                tabs: vec![pane_tree_with_slots(q, 0, 0)],
                 tab_titles: vec![format!("split-heavy-q-{q}")],
                 window_titles: HashMap::new(),
             };
