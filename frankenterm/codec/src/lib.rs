@@ -5386,9 +5386,10 @@ fn reserve_flat_node_slot<T>(values: &mut Vec<T>) -> Result<bool, OrderedWindowP
 
 /// Consume a legacy recursive pane listing into the PDU87 application arena.
 ///
-/// This is the only bridge needed by the current server producer. Pane entries
-/// and title strings move into the arena; serialization and decoding retain
-/// that storage without reconstructing a recursive transfer tree.
+/// Production ordered-snapshot capture now appends directly into the flat
+/// arena. This bridge remains for bounded fixtures and callers that already
+/// own a legacy [`ListPanesResponse`]. Pane entries and title strings move into
+/// the arena without cloning, and no recursive transfer tree is reconstructed.
 pub fn ordered_pane_arena_from_list_panes(
     panes: ListPanesResponse,
 ) -> Result<PaneArena, OrderedWindowProtocolError> {
