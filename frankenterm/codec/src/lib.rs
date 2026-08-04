@@ -4300,7 +4300,7 @@ impl OrderedPaneSnapshotV1 {
             self.session_incarnation.as_bytes(),
         )?;
         validate_topology_revision(self.topology_revision)?;
-        validate_flat_ordered_panes(&self.panes)
+        validate_ordered_pane_arena(&self.panes)
     }
 
     pub fn validate(&self) -> Result<(), OrderedWindowProtocolError> {
@@ -5190,7 +5190,7 @@ fn serialize_ordered_panes<S>(
 where
     S: serde::Serializer,
 {
-    validate_flat_ordered_panes(panes).map_err(serde::ser::Error::custom)?;
+    validate_ordered_pane_arena(panes).map_err(serde::ser::Error::custom)?;
     PaneArenaWireRef {
         trees: PaneArenaTreesWire(panes.trees()),
         nodes: PaneArenaNodesWire(panes.nodes()),
@@ -5555,7 +5555,7 @@ fn flatten_ordered_panes(
     window_titles.sort_unstable_by_key(|entry| entry.window_id);
 
     let panes = PaneArena::from_unvalidated_parts(descriptors, nodes, window_titles);
-    validate_flat_ordered_panes(&panes)?;
+    validate_ordered_pane_arena(&panes)?;
     Ok(OrderedPanesFlattenResult {
         panes,
         #[cfg(test)]
@@ -5669,7 +5669,13 @@ struct OrderedPanesFlatWireOwned {
     window_titles: Vec<PaneArenaWindowTitle>,
 }
 
-fn validate_flat_ordered_panes(
+/// Validate an owned PDU87 pane arena against every codec resource and
+/// canonical-topology limit without decoding or rebuilding a recursive tree.
+///
+/// Direct application seams must call this before allocating work from arena
+/// counts because [`PaneArena::from_unvalidated_parts`] is intentionally public
+/// at the dependency-lower mux layer.
+pub fn validate_ordered_pane_arena(
     panes: &PaneArena,
 ) -> Result<(), OrderedWindowProtocolError> {
     let trees = panes.trees();
@@ -5913,7 +5919,7 @@ where
         window_titles,
     } = wire;
     let panes = PaneArena::from_unvalidated_parts(trees, nodes, window_titles);
-    validate_flat_ordered_panes(&panes).map_err(serde::de::Error::custom)?;
+    validate_ordered_pane_arena(&panes).map_err(serde::de::Error::custom)?;
     Ok(panes)
 }
 
@@ -15080,7 +15086,7 @@ mod test {
     #[test]
     fn pdu87_flat_pane_arena_rejects_noncanonical_indices_and_trailing_nodes() {
         let valid = sample_flat_tree();
-        validate_flat_ordered_panes(&valid).expect("control flat tree must be canonical");
+        validate_ordered_pane_arena(&valid).expect("control flat tree must be canonical");
 
         let (trees, mut nodes, window_titles) = sample_flat_tree().into_parts();
         let PaneArenaNode::Split { right, .. } = &mut nodes[0]
@@ -15090,7 +15096,7 @@ mod test {
         *right = 1;
         let duplicate_child = PaneArena::from_unvalidated_parts(trees, nodes, window_titles);
         assert!(matches!(
-            validate_flat_ordered_panes(&duplicate_child),
+            validate_ordered_pane_arena(&duplicate_child),
             Err(OrderedWindowProtocolError::InvalidPaneArenaNode { .. })
         ));
 
@@ -15102,7 +15108,7 @@ mod test {
         *right = 0;
         let back_edge = PaneArena::from_unvalidated_parts(trees, nodes, window_titles);
         assert!(matches!(
-            validate_flat_ordered_panes(&back_edge),
+            validate_ordered_pane_arena(&back_edge),
             Err(OrderedWindowProtocolError::InvalidPaneArenaNode { .. })
         ));
 
@@ -15114,7 +15120,7 @@ mod test {
         *right = 3;
         let out_of_range = PaneArena::from_unvalidated_parts(trees, nodes, window_titles);
         assert!(matches!(
-            validate_flat_ordered_panes(&out_of_range),
+            validate_ordered_pane_arena(&out_of_range),
             Err(OrderedWindowProtocolError::InvalidPaneArenaNode { .. })
         ));
 
@@ -15122,7 +15128,7 @@ mod test {
         nodes.push(PaneArenaNode::Leaf(sample_pane_entry(2)));
         let trailing = PaneArena::from_unvalidated_parts(trees, nodes, window_titles);
         assert!(matches!(
-            validate_flat_ordered_panes(&trailing),
+            validate_ordered_pane_arena(&trailing),
             Err(OrderedWindowProtocolError::PaneArenaCardinalityMismatch {
                 referenced: 3,
                 total: 4,

@@ -1025,6 +1025,17 @@ pub struct PreparedPaneTree {
     zoomed: Option<Arc<dyn Pane>>,
 }
 
+/// Reusable fallible work storage for direct pane-arena preparation.
+///
+/// A connection should retain one instance while consuming all tab ranges in
+/// a snapshot so leaf-heavy fleets do not allocate two temporary vectors for
+/// every tab.
+#[derive(Default)]
+pub struct PaneArenaPreparationScratch {
+    validation: Vec<usize>,
+    application: Vec<(usize, Tree)>,
+}
+
 /// Consume one validated contiguous preorder range directly into the final
 /// mux tree.
 ///
@@ -1038,11 +1049,28 @@ pub struct PreparedPaneTree {
 pub fn prepare_pane_tree_from_arena<F>(
     arena: &mut Vec<PaneArenaNode>,
     node_count: usize,
+    make_pane: F,
+) -> anyhow::Result<PreparedPaneTree>
+where
+    F: FnMut(PaneEntry) -> anyhow::Result<Arc<dyn Pane>>,
+{
+    let mut scratch = PaneArenaPreparationScratch::default();
+    prepare_pane_tree_from_arena_with_scratch(arena, node_count, &mut scratch, make_pane)
+}
+
+/// Equivalent to [`prepare_pane_tree_from_arena`] while reusing caller-owned
+/// validation and application stacks across every tab in one snapshot.
+pub fn prepare_pane_tree_from_arena_with_scratch<F>(
+    arena: &mut Vec<PaneArenaNode>,
+    node_count: usize,
+    scratch: &mut PaneArenaPreparationScratch,
     mut make_pane: F,
 ) -> anyhow::Result<PreparedPaneTree>
 where
     F: FnMut(PaneEntry) -> anyhow::Result<Arc<dyn Pane>>,
 {
+    scratch.validation.clear();
+    scratch.application.clear();
     if node_count == 0 {
         return Ok(PreparedPaneTree {
             tree: Tree::Empty,
@@ -1061,7 +1089,7 @@ where
     // may publish pane registrations.  This keeps malformed public-API input
     // from causing a partial topology mutation even though the codec normally
     // supplies already-validated arenas.
-    let mut validation = Vec::new();
+    let validation = &mut scratch.validation;
     validation
         .try_reserve_exact(node_count.div_ceil(2))
         .map_err(|error| anyhow::anyhow!("reserve pane arena validation stack: {error}"))?;
@@ -1126,7 +1154,7 @@ where
         );
     }
 
-    let mut stack = Vec::new();
+    let stack = &mut scratch.application;
     stack
         .try_reserve_exact(node_count.div_ceil(2))
         .map_err(|error| anyhow::anyhow!("reserve pane arena application stack: {error}"))?;
