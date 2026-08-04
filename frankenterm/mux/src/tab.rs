@@ -945,6 +945,76 @@ pub enum PaneArenaNode {
     Leaf(PaneEntry),
 }
 
+/// One tab's contiguous range in a [`PaneArena`].
+#[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]
+pub struct PaneArenaTree {
+    pub root_index: Option<u32>,
+    pub node_count: u32,
+    pub tab_title: String,
+}
+
+/// One canonical remote window title carried beside a [`PaneArena`].
+#[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]
+pub struct PaneArenaWindowTitle {
+    pub window_id: u64,
+    pub title: String,
+}
+
+/// Owned flat pane topology used by ordered snapshot transport and direct mux
+/// application.
+///
+/// The vectors are private to prevent consumers from accidentally treating an
+/// unvalidated partial mutation as authority.  Codec admission constructs the
+/// value from bounded sections and validates it before publication; server
+/// producers use the same constructor followed by the same validation path.
+#[derive(PartialEq, Debug, Clone)]
+pub struct PaneArena {
+    trees: Vec<PaneArenaTree>,
+    nodes: Vec<PaneArenaNode>,
+    window_titles: Vec<PaneArenaWindowTitle>,
+}
+
+impl PaneArena {
+    /// Assemble arena storage before protocol validation.
+    ///
+    /// This constructor deliberately does not claim validity; codec-specific
+    /// limits and identity rules cannot live in the dependency-lower mux
+    /// crate.
+    pub fn from_unvalidated_parts(
+        trees: Vec<PaneArenaTree>,
+        nodes: Vec<PaneArenaNode>,
+        window_titles: Vec<PaneArenaWindowTitle>,
+    ) -> Self {
+        Self {
+            trees,
+            nodes,
+            window_titles,
+        }
+    }
+
+    pub fn trees(&self) -> &[PaneArenaTree] {
+        &self.trees
+    }
+
+    pub fn nodes(&self) -> &[PaneArenaNode] {
+        &self.nodes
+    }
+
+    pub fn window_titles(&self) -> &[PaneArenaWindowTitle] {
+        &self.window_titles
+    }
+
+    pub fn into_parts(
+        self,
+    ) -> (
+        Vec<PaneArenaTree>,
+        Vec<PaneArenaNode>,
+        Vec<PaneArenaWindowTitle>,
+    ) {
+        (self.trees, self.nodes, self.window_titles)
+    }
+}
+
 /// A fully materialized mux pane tree that has not yet been installed in a
 /// tab.  Its fields stay private so callers cannot separate the tree from its
 /// active/zoomed authority while staging multiple remote tabs in forward
@@ -8324,7 +8394,12 @@ mod test {
                 .collect::<Vec<_>>(),
             [41, 42]
         );
-        assert_eq!(tab.get_active_pane().map(|pane| pane.pane_id()), Some(41));
+        assert_eq!(tab.get_active_idx(), 0);
+        assert_eq!(
+            tab.get_active_pane().map(|pane| pane.pane_id()),
+            Some(42),
+            "the public active-pane view deliberately resolves the zoomed pane first"
+        );
         assert_eq!(tab.get_zoomed_pane().map(|pane| pane.pane_id()), Some(42));
     }
 
