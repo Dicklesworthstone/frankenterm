@@ -8919,8 +8919,11 @@ mod tests {
             CAPTURE_IDLE_RETRY_DELAY,
         );
 
+        let drain_window_minus_one = CAPTURE_PROMPT_DRAIN_WINDOW
+            .checked_sub(Duration::from_nanos(1))
+            .expect("prompt drain window exceeds one nanosecond");
         let before_drain_window = started_at
-            .checked_add(CAPTURE_PROMPT_DRAIN_WINDOW - Duration::from_nanos(1))
+            .checked_add(drain_window_minus_one)
             .expect("drain pre-deadline");
         let at_drain_window = started_at
             .checked_add(CAPTURE_PROMPT_DRAIN_WINDOW)

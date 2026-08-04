@@ -858,8 +858,8 @@ impl RenderChangeSnapshots {
     }
 
     #[cfg(test)]
-    fn contains_key(&self, pane_id: &u64) -> bool {
-        self.by_pane.contains_key(pane_id)
+    fn contains_key(&self, pane_id: u64) -> bool {
+        self.by_pane.contains_key(&pane_id)
     }
 
     fn validate(&self) -> Result<(), DirectMuxError> {
@@ -6643,7 +6643,7 @@ mod tests {
             client
                 .stash_unilateral_pdu(Pdu::PaneRemoved(codec::PaneRemoved { pane_id: 27 }))
                 .expect("pane removal must invalidate retained render state");
-            assert!(!client.render_change_snapshots.contains_key(&27));
+            assert!(!client.render_change_snapshots.contains_key(27));
             assert_eq!(client.render_change_snapshots.retained_bytes(), 0);
             assert!(client.pending_render_changes.is_empty());
             assert_eq!(client.pending_render_changes.retained_bytes(), 0);
@@ -6674,7 +6674,7 @@ mod tests {
                 .expect("authoritative replacement snapshot may restart its sequence");
             assert_eq!(replacement.seqno, 1);
             assert_eq!(replacement.title, "replacement-pane");
-            assert!(client.render_change_snapshots.contains_key(&27));
+            assert!(client.render_change_snapshots.contains_key(27));
             assert!(client.render_change_snapshots.retained_bytes() > 0);
 
             client
@@ -6697,7 +6697,7 @@ mod tests {
                 wrong_liveness,
                 DirectMuxError::AlignedUnexpectedResponse { .. }
             ));
-            assert!(!client.render_change_snapshots.contains_key(&27));
+            assert!(!client.render_change_snapshots.contains_key(27));
             assert!(client.pending_render_changes.is_empty());
             assert_eq!(client.pending_render_changes.retained_bytes(), 0);
             assert_eq!(client.render_change_snapshots.retained_bytes(), 0);
@@ -6732,7 +6732,7 @@ mod tests {
                 )
                 .expect_err("dead liveness must invalidate retained pane state");
             assert!(matches!(dead, DirectMuxError::RemoteError(_)));
-            assert!(!client.render_change_snapshots.contains_key(&27));
+            assert!(!client.render_change_snapshots.contains_key(27));
             assert!(client.pending_render_changes.is_empty());
             assert_eq!(client.pending_render_changes.retained_bytes(), 0);
             assert_eq!(client.render_change_snapshots.retained_bytes(), 0);
@@ -6768,8 +6768,8 @@ mod tests {
                 legacy_mismatch,
                 DirectMuxError::AlignedUnexpectedResponse { .. }
             ));
-            assert!(!client.render_change_snapshots.contains_key(&27));
-            assert!(!client.render_change_snapshots.contains_key(&99));
+            assert!(!client.render_change_snapshots.contains_key(27));
+            assert!(!client.render_change_snapshots.contains_key(99));
             assert!(client.pending_render_changes.is_empty());
             assert_eq!(client.pending_render_changes.retained_bytes(), 0);
             assert_eq!(client.render_change_snapshots.retained_bytes(), 0);
@@ -6850,14 +6850,14 @@ mod tests {
                 snapshot_bytes,
                 "failed queue admission must not partially publish a snapshot"
             );
-            assert!(!client.render_change_snapshots.contains_key(&29));
+            assert!(!client.render_change_snapshots.contains_key(29));
 
             client
                 .stash_unilateral_pdu(Pdu::PaneRemoved(codec::PaneRemoved { pane_id: 28 }))
                 .expect("pane removal must release queued retention");
             assert!(client.pending_render_changes.is_empty());
             assert_eq!(client.pending_render_changes.retained_bytes(), 0);
-            assert!(!client.render_change_snapshots.contains_key(&28));
+            assert!(!client.render_change_snapshots.contains_key(28));
 
             let serial_before_duplicate = client.serial;
             let duplicate_error = client
@@ -8005,8 +8005,8 @@ mod tests {
                 client.pending_render_changes.iter().map(|item| item.pane_id).collect::<Vec<_>>(),
                 vec![999]
             );
-            assert!(client.render_change_snapshots.contains_key(&7));
-            assert!(client.render_change_snapshots.contains_key(&999));
+            assert!(client.render_change_snapshots.contains_key(7));
+            assert!(client.render_change_snapshots.contains_key(999));
             assert_eq!(client.render_retention_codec_stats.batch_local_claims, 1);
             assert_eq!(client.render_retention_codec_stats.batch_local_returns, 1);
             assert_eq!(client.render_retention_codec_stats.pending_payload_encodes, 1);
@@ -8663,7 +8663,7 @@ mod tests {
                     "{case:?}"
                 );
                 assert_eq!(client.render_change_snapshots.len(), 1, "{case:?}");
-                assert!(client.render_change_snapshots.contains_key(&999), "{case:?}");
+                assert!(client.render_change_snapshots.contains_key(999), "{case:?}");
                 assert_eq!(
                     client.render_change_snapshots.retained_bytes(),
                     unrelated_snapshot_bytes,
@@ -8772,7 +8772,7 @@ mod tests {
                 .await
                 .expect_err("ambient ErrorResponse must surface RemoteError");
             assert!(matches!(ambient_error, DirectMuxError::RemoteError(_)));
-            assert!(!client.render_change_snapshots.contains_key(&27));
+            assert!(!client.render_change_snapshots.contains_key(27));
             assert!(client.pending_render_changes.is_empty());
             assert_eq!(client.pending_render_changes.retained_bytes(), 0);
             assert!(!client.connection_poisoned);
@@ -8794,7 +8794,7 @@ mod tests {
                 .await
                 .expect_err("Cx ErrorResponse must surface RemoteError");
             assert!(matches!(cx_error, DirectMuxError::RemoteError(_)));
-            assert!(!client.render_change_snapshots.contains_key(&27));
+            assert!(!client.render_change_snapshots.contains_key(27));
             assert!(client.pending_render_changes.is_empty());
             assert_eq!(client.pending_render_changes.retained_bytes(), 0);
             assert!(!client.connection_poisoned);
@@ -8898,7 +8898,7 @@ mod tests {
             assert!(!client.connection_poisoned);
             assert_eq!(client.poison_transition_count, 0);
             assert!(client.outstanding_requests.is_empty());
-            assert!(!client.render_change_snapshots.contains_key(&11));
+            assert!(!client.render_change_snapshots.contains_key(11));
             let reuse_cx = crate::cx::for_testing();
             let reuse = client
                 .get_pane_render_changes_with_cx(&reuse_cx, 77)
@@ -9187,7 +9187,7 @@ mod tests {
                             Pdu::GetPaneRenderChanges(_) => {
                                 render_serials.push(decoded.serial);
                                 if render_serials.len() == 2 {
-                                    for serial in render_serials.drain(..).rev() {
+                                    for serial in render_serials.iter().rev().copied() {
                                         write_response_pdu(
                                             &mut stream,
                                             &Pdu::ErrorResponse(codec::ErrorResponse {
@@ -13470,7 +13470,7 @@ mod tests {
                             .expect("read post-gate request");
                         assert!(read > 0, "client disconnected before negative control");
                         read_buf.extend_from_slice(&temp[..read]);
-                        while let Some(decoded) = codec::Pdu::stream_decode(&mut read_buf)
+                        if let Some(decoded) = codec::Pdu::stream_decode(&mut read_buf)
                             .expect("decode post-gate request")
                         {
                             assert!(
@@ -13598,7 +13598,7 @@ mod tests {
                             .expect("read request preceding forbidden inbound PDU");
                         assert!(read > 0);
                         read_buf.extend_from_slice(&temp[..read]);
-                        while let Some(decoded) = codec::Pdu::stream_decode(&mut read_buf)
+                        if let Some(decoded) = codec::Pdu::stream_decode(&mut read_buf)
                             .expect("decode request preceding forbidden inbound PDU")
                         {
                             assert!(matches!(decoded.pdu, Pdu::ListPanes(_)));

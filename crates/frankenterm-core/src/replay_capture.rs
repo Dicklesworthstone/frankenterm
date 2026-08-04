@@ -1514,21 +1514,22 @@ mod tests {
         seed_pane_frontier(&adapter, pane_id, u64::MAX - 1);
         let barrier = Arc::new(std::sync::Barrier::new(THREADS));
 
-        let handles: Vec<_> = (0..THREADS)
-            .map(|_| {
-                let adapter = Arc::clone(&adapter);
-                let barrier = Arc::clone(&barrier);
-                std::thread::spawn(move || {
-                    barrier.wait();
-                    adapter.capture_lifecycle(
-                        pane_id,
-                        RecorderLifecyclePhase::PaneOpened,
-                        None,
-                        json!({}),
-                    )
-                })
-            })
-            .collect();
+        // Spawn every barrier participant eagerly before joining any of them;
+        // a lazy spawn-and-join iterator would deadlock on the first handle.
+        let mut handles = Vec::with_capacity(THREADS);
+        for _ in 0..THREADS {
+            let adapter = Arc::clone(&adapter);
+            let barrier = Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                adapter.capture_lifecycle(
+                    pane_id,
+                    RecorderLifecyclePhase::PaneOpened,
+                    None,
+                    json!({}),
+                )
+            }));
+        }
 
         let results: Vec<_> = handles
             .into_iter()
