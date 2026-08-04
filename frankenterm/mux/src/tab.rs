@@ -928,6 +928,225 @@ where
     })
 }
 
+/// One node in a canonical, contiguous preorder pane arena.
+///
+/// The codec owns protocol admission and resource ceilings.  The mux owns this
+/// application-facing representation so a validated snapshot can reach the
+/// real tab tree without first constructing a temporary recursive
+/// [`PaneNode`].
+#[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]
+pub enum PaneArenaNode {
+    Empty,
+    Split {
+        left: u32,
+        right: u32,
+        node: SplitDirectionAndSize,
+    },
+    Leaf(PaneEntry),
+}
+
+/// A fully materialized mux pane tree that has not yet been installed in a
+/// tab.  Its fields stay private so callers cannot separate the tree from its
+/// active/zoomed authority while staging multiple remote tabs in forward
+/// order.
+pub struct PreparedPaneTree {
+    tree: Tree,
+    active: Option<Arc<dyn Pane>>,
+    zoomed: Option<Arc<dyn Pane>>,
+}
+
+/// Consume one validated contiguous preorder range directly into the final
+/// mux tree.
+///
+/// `node_count` selects the trailing range of the global arena, which lets a
+/// client consume complete trees in reverse descriptor order without copying
+/// node storage. Child indices are checked again at the application boundary,
+/// so a caller cannot use this public API to bypass the codec's
+/// canonical-arena invariant. Reversing the drained range makes each child's
+/// final tree available when its split is visited; no temporary recursive
+/// transfer tree or per-split transfer `Box` is created.
+pub fn prepare_pane_tree_from_arena<F>(
+    arena: &mut Vec<PaneArenaNode>,
+    node_count: usize,
+    mut make_pane: F,
+) -> anyhow::Result<PreparedPaneTree>
+where
+    F: FnMut(PaneEntry) -> anyhow::Result<Arc<dyn Pane>>,
+{
+    if node_count == 0 {
+        return Ok(PreparedPaneTree {
+            tree: Tree::Empty,
+            active: None,
+            zoomed: None,
+        });
+    }
+    let arena_end = arena.len();
+    let arena_start = arena_end.checked_sub(node_count).ok_or_else(|| {
+        anyhow::anyhow!(
+            "pane arena requests {node_count} trailing nodes from a {arena_end}-node arena"
+        )
+    })?;
+
+    // Validate the complete range before invoking `make_pane`, whose caller
+    // may publish pane registrations.  This keeps malformed public-API input
+    // from causing a partial topology mutation even though the codec normally
+    // supplies already-validated arenas.
+    let mut validation = Vec::new();
+    validation
+        .try_reserve_exact(node_count.div_ceil(2))
+        .map_err(|error| anyhow::anyhow!("reserve pane arena validation stack: {error}"))?;
+    validation.push(arena_start);
+    let mut expected = arena_start;
+    let mut leaf_count = 0usize;
+    let mut active_count = 0usize;
+    let mut zoomed_count = 0usize;
+    while let Some(node_index) = validation.pop() {
+        if node_index != expected || node_index >= arena_end {
+            anyhow::bail!(
+                "pane arena node {node_index} violates contiguous preorder at {expected}"
+            );
+        }
+        expected = expected
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("pane arena preorder index overflows usize"))?;
+        match &arena[node_index] {
+            PaneArenaNode::Empty => {}
+            PaneArenaNode::Leaf(entry) => {
+                leaf_count = leaf_count
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow::anyhow!("pane arena leaf count overflows usize"))?;
+                active_count = active_count
+                    .checked_add(usize::from(entry.is_active_pane))
+                    .ok_or_else(|| anyhow::anyhow!("pane arena active count overflows usize"))?;
+                zoomed_count = zoomed_count
+                    .checked_add(usize::from(entry.is_zoomed_pane))
+                    .ok_or_else(|| anyhow::anyhow!("pane arena zoomed count overflows usize"))?;
+            }
+            PaneArenaNode::Split { left, right, .. } => {
+                let expected_left = node_index
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow::anyhow!("pane arena left-child index overflows"))?;
+                let left_index = usize::try_from(*left)
+                    .map_err(|_| anyhow::anyhow!("pane arena left-child index does not fit"))?;
+                let right_index = usize::try_from(*right)
+                    .map_err(|_| anyhow::anyhow!("pane arena right-child index does not fit"))?;
+                if left_index != expected_left
+                    || right_index <= left_index
+                    || right_index >= arena_end
+                {
+                    anyhow::bail!(
+                        "pane arena split {node_index} has non-canonical children \
+                         ({left_index}, {right_index}) for range {arena_start}..{arena_end}"
+                    );
+                }
+                validation.push(right_index);
+                validation.push(left_index);
+            }
+        }
+    }
+    if expected != arena_end || leaf_count == 0 {
+        anyhow::bail!(
+            "pane arena range {arena_start}..{arena_end} is not one complete non-empty tree"
+        );
+    }
+    if active_count > 1 || zoomed_count > 1 {
+        anyhow::bail!(
+            "pane arena range {arena_start}..{arena_end} has {active_count} active and \
+             {zoomed_count} zoomed leaves; each authority must be unique"
+        );
+    }
+
+    let mut stack = Vec::new();
+    stack
+        .try_reserve_exact(node_count.div_ceil(2))
+        .map_err(|error| anyhow::anyhow!("reserve pane arena application stack: {error}"))?;
+    let mut active = None;
+    let mut zoomed = None;
+
+    for (offset, node) in arena.drain(arena_start..).enumerate().rev() {
+        let node_index = arena_start
+            .checked_add(offset)
+            .ok_or_else(|| anyhow::anyhow!("pane arena node index overflows usize"))?;
+        match node {
+            PaneArenaNode::Empty => stack.push((node_index, Tree::Empty)),
+            PaneArenaNode::Leaf(entry) => {
+                let is_zoomed_pane = entry.is_zoomed_pane;
+                let is_active_pane = entry.is_active_pane;
+                let pane = make_pane(entry)?;
+                if is_zoomed_pane {
+                    zoomed.replace(Arc::clone(&pane));
+                }
+                if is_active_pane {
+                    active.replace(Arc::clone(&pane));
+                }
+                stack.push((node_index, Tree::Leaf(pane)));
+            }
+            PaneArenaNode::Split {
+                left,
+                right,
+                node,
+            } => {
+                let expected_left = node_index
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow::anyhow!("pane arena left-child index overflows"))?;
+                let left_index = usize::try_from(left)
+                    .map_err(|_| anyhow::anyhow!("pane arena left-child index does not fit"))?;
+                let right_index = usize::try_from(right)
+                    .map_err(|_| anyhow::anyhow!("pane arena right-child index does not fit"))?;
+                if left_index != expected_left
+                    || right_index <= left_index
+                    || right_index >= arena_end
+                {
+                    anyhow::bail!(
+                        "pane arena split {node_index} has non-canonical children \
+                         ({left_index}, {right_index}) for range {arena_start}..{arena_end}"
+                    );
+                }
+                let (actual_left, left) = stack.pop().ok_or_else(|| {
+                    anyhow::anyhow!("pane arena split {node_index} lost its left subtree")
+                })?;
+                let (actual_right, right) = stack.pop().ok_or_else(|| {
+                    anyhow::anyhow!("pane arena split {node_index} lost its right subtree")
+                })?;
+                if actual_left != left_index || actual_right != right_index {
+                    anyhow::bail!(
+                        "pane arena split {node_index} declared children ({left_index}, \
+                         {right_index}) but produced ({actual_left}, {actual_right})"
+                    );
+                }
+                stack.push((
+                    node_index,
+                    Tree::Node {
+                        left: Box::new(left),
+                        right: Box::new(right),
+                        data: Some(node),
+                    },
+                ));
+            }
+        }
+    }
+
+    if stack.len() != 1 {
+        anyhow::bail!(
+            "pane arena range {arena_start}..{arena_end} produced {} roots instead of one",
+            stack.len()
+        );
+    }
+    let (root_index, tree) = stack
+        .pop()
+        .ok_or_else(|| anyhow::anyhow!("pane arena application lost its root"))?;
+    if root_index != arena_start {
+        anyhow::bail!(
+            "pane arena application produced root {root_index}, expected {arena_start}"
+        );
+    }
+    Ok(PreparedPaneTree {
+        tree,
+        active,
+        zoomed,
+    })
+}
+
 /// Computes the minimum (x, y) size based on the panes in this portion
 /// of the tree.
 fn effective_pane_constraints(
@@ -1902,6 +2121,21 @@ impl Tab {
         self.inner.lock().sync_with_pane_tree(size, root, make_pane)
     }
 
+    /// Install a pane tree prepared directly from a validated flat arena.
+    ///
+    /// Preparation may happen in reverse arena order while a client consumes
+    /// one global node vector; installation can then remain in the snapshot's
+    /// forward tab order.
+    pub fn sync_with_prepared_pane_tree(
+        &self,
+        size: TerminalSize,
+        prepared: PreparedPaneTree,
+    ) {
+        self.inner
+            .lock()
+            .sync_with_prepared_pane_tree(size, prepared);
+    }
+
     /// Encode one coherent tab snapshot using caller-supplied owner metadata.
     ///
     /// The structural tree and focus identities are cloned under the tab lock;
@@ -2739,8 +2973,25 @@ impl TabInner {
 
         log::debug!("sync_with_pane_tree with size {:?}", size);
 
-        let t = build_from_pane_tree(root.into_tree(), &mut active, &mut zoomed, &mut make_pane)?;
-        let mut cursor = t.cursor();
+        let tree = build_from_pane_tree(root.into_tree(), &mut active, &mut zoomed, &mut make_pane)?;
+        self.sync_with_prepared_pane_tree(
+            size,
+            PreparedPaneTree {
+                tree,
+                active,
+                zoomed,
+            },
+        );
+        Ok(())
+    }
+
+    fn sync_with_prepared_pane_tree(&mut self, size: TerminalSize, prepared: PreparedPaneTree) {
+        let PreparedPaneTree {
+            tree,
+            active,
+            zoomed,
+        } = prepared;
+        let mut cursor = tree.cursor();
 
         self.active = 0;
         if let Some(active) = active {
@@ -2782,7 +3033,6 @@ impl TabInner {
             self.iter_panes()
         );
         assert!(self.pane.is_some());
-        Ok(())
     }
 
     /// Returns a count of how many panes are in this tab
@@ -8018,6 +8268,93 @@ mod test {
         assert_eq!(node.window_and_tab_ids(), Some((5, 10)));
         assert_eq!(node.all_window_and_tab_ids_match((5, 10)), Some(false));
         assert_eq!(PaneNode::Empty.all_window_and_tab_ids_match((5, 10)), None);
+    }
+
+    fn pane_arena_test_entry(pane_id: PaneId, active: bool, zoomed: bool) -> PaneEntry {
+        PaneEntry {
+            window_id: 5,
+            tab_id: 10,
+            pane_id,
+            title: format!("pane-{pane_id}"),
+            size: TerminalSize::default(),
+            working_dir: None,
+            alt_screen_active: false,
+            is_active_pane: active,
+            is_zoomed_pane: zoomed,
+            workspace: "ws".to_string(),
+            cursor_pos: StableCursorPosition::default(),
+            physical_top: 0,
+            top_row: 0,
+            left_col: 0,
+            tty_name: None,
+        }
+    }
+
+    #[test]
+    fn pane_arena_prepares_only_the_final_mux_tree_and_installs_focus() {
+        let size = TerminalSize::default();
+        let mut arena = vec![
+            PaneArenaNode::Split {
+                left: 1,
+                right: 2,
+                node: SplitDirectionAndSize {
+                    direction: SplitDirection::Horizontal,
+                    first: size,
+                    second: size,
+                },
+            },
+            PaneArenaNode::Leaf(pane_arena_test_entry(41, true, false)),
+            PaneArenaNode::Leaf(pane_arena_test_entry(42, false, true)),
+        ];
+        let mut made = Vec::new();
+        let prepared = prepare_pane_tree_from_arena(&mut arena, 3, |entry| {
+            made.push(entry.pane_id);
+            Ok(FakePane::new(entry.pane_id, entry.size))
+        })
+        .expect("prepare canonical pane arena");
+        assert!(arena.is_empty());
+        assert_eq!(made, [42, 41], "reverse consumption is deliberate");
+
+        let tab = Tab::new(&size);
+        tab.sync_with_prepared_pane_tree(size, prepared);
+        assert_eq!(
+            tab.iter_panes_ignoring_zoom()
+                .into_iter()
+                .map(|positioned| positioned.pane.pane_id())
+                .collect::<Vec<_>>(),
+            [41, 42]
+        );
+        assert_eq!(tab.get_active_pane().map(|pane| pane.pane_id()), Some(41));
+        assert_eq!(tab.get_zoomed_pane().map(|pane| pane.pane_id()), Some(42));
+    }
+
+    #[test]
+    fn pane_arena_rejects_bad_indices_before_invoking_pane_factory() {
+        let size = TerminalSize::default();
+        let mut arena = vec![
+            PaneArenaNode::Split {
+                left: 1,
+                right: 1,
+                node: SplitDirectionAndSize {
+                    direction: SplitDirection::Horizontal,
+                    first: size,
+                    second: size,
+                },
+            },
+            PaneArenaNode::Leaf(pane_arena_test_entry(41, true, false)),
+            PaneArenaNode::Leaf(pane_arena_test_entry(42, false, false)),
+        ];
+        let mut make_calls = 0usize;
+        let error = match prepare_pane_tree_from_arena(&mut arena, 3, |entry| {
+            make_calls += 1;
+            Ok(FakePane::new(entry.pane_id, entry.size))
+        }) {
+            Ok(_) => panic!("non-canonical children must fail before application"),
+            Err(error) => error,
+        };
+        assert!(format!("{error:#}").contains("non-canonical children"));
+        assert_eq!(make_calls, 0);
+        assert_eq!(arena.len(), 3, "rejected arena must remain owned by caller");
     }
 
     #[test]
