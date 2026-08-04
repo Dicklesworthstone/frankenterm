@@ -1593,7 +1593,7 @@ fn queue_reserved_pdu(
 #[derive(Debug)]
 struct ReservedTopologyItemQueueRejection {
     error: anyhow::Error,
-    item: Item,
+    item: Box<Item>,
 }
 
 fn queue_reserved_pdu_with_emission_authority(
@@ -1620,8 +1620,9 @@ fn queue_reserved_pdu_with_emission_authority(
 }
 
 /// Publish a topology PDU without consuming its owner on rejection. Callers
-/// holding the coordinator state mutex must move the returned `Item` to an
-/// outside-the-lock retirement carrier before propagating the error.
+/// holding the coordinator state mutex must move the returned boxed owner to
+/// an outside-the-lock retirement carrier before propagating the error.  The
+/// indirection keeps this rejection-only `Result` small on the success path.
 fn try_queue_reserved_pdu_with_emission_authority(
     item_tx: &Sender<Item>,
     terminal: &DispatchTerminal,
@@ -1643,12 +1644,15 @@ fn try_queue_reserved_pdu_with_emission_authority(
         terminal,
         emission_authority,
     ) {
-        return Err(ReservedTopologyItemQueueRejection { error, item });
+        return Err(ReservedTopologyItemQueueRejection {
+            error,
+            item: Box::new(item),
+        });
     }
     let Some(admission) = terminal.admit() else {
         return Err(ReservedTopologyItemQueueRejection {
             error: anyhow::anyhow!("mux dispatch connection is already terminal"),
-            item,
+            item: Box::new(item),
         });
     };
     match item_tx.try_send(item) {
@@ -1662,7 +1666,7 @@ fn try_queue_reserved_pdu_with_emission_authority(
                     "mux dispatch topology queue is full (bulk capacity \
                      {DISPATCH_ITEM_QUEUE_CAPACITY}); applying client backpressure"
                 ),
-                item,
+                item: Box::new(item),
             })
         }
         Err(TrySendError::Closed(item)) => {
@@ -1670,7 +1674,7 @@ fn try_queue_reserved_pdu_with_emission_authority(
             drop(admission);
             Err(ReservedTopologyItemQueueRejection {
                 error: anyhow::anyhow!("mux dispatch topology queue is closed"),
-                item,
+                item: Box::new(item),
             })
         }
     }
@@ -1704,7 +1708,7 @@ fn try_queue_reserved_notification(
     let Some(admission) = terminal.admit() else {
         return Err(ReservedTopologyItemQueueRejection {
             error: anyhow::anyhow!("mux dispatch connection is already terminal"),
-            item,
+            item: Box::new(item),
         });
     };
     match item_tx.try_send(item) {
@@ -1728,7 +1732,7 @@ fn try_queue_reserved_notification(
                     "mux dispatch notification queue is full (bulk capacity \
                      {DISPATCH_ITEM_QUEUE_CAPACITY}); applying client backpressure"
                 ),
-                item,
+                item: Box::new(item),
             })
         }
         Err(TrySendError::Closed(item)) => {
@@ -1736,7 +1740,7 @@ fn try_queue_reserved_notification(
             drop(admission);
             Err(ReservedTopologyItemQueueRejection {
                 error: anyhow::anyhow!("mux dispatch notification queue is closed"),
-                item,
+                item: Box::new(item),
             })
         }
     }
@@ -1863,7 +1867,7 @@ struct TopologyEventBuffer {
 #[derive(Debug)]
 struct TopologyEventInsertRejection {
     error: anyhow::Error,
-    event: RetainedTopologyEvent,
+    event: Box<RetainedTopologyEvent>,
 }
 
 impl TopologyEventBuffer {
@@ -1910,7 +1914,12 @@ impl TopologyEventBuffer {
     ) -> Result<(), TopologyEventInsertRejection> {
         let next_len = match self.preflight_insert(event.revision, limits) {
             Ok(next_len) => next_len,
-            Err(error) => return Err(TopologyEventInsertRejection { error, event }),
+            Err(error) => {
+                return Err(TopologyEventInsertRejection {
+                    error,
+                    event: Box::new(event),
+                });
+            }
         };
         let Some(next_bytes) = self
             .retained_bytes
@@ -1918,7 +1927,7 @@ impl TopologyEventBuffer {
         else {
             return Err(TopologyEventInsertRejection {
                 error: anyhow::anyhow!("counting retained mux topology bytes"),
-                event,
+                event: Box::new(event),
             });
         };
         if next_bytes > limits.max_retained_bytes {
@@ -1926,7 +1935,7 @@ impl TopologyEventBuffer {
                 error: anyhow::anyhow!(
                     "mux topology fence buffer would retain {next_len} events and {next_bytes} bytes"
                 ),
-                event,
+                event: Box::new(event),
             });
         }
         self.retained_bytes = next_bytes;
@@ -2204,7 +2213,7 @@ impl TopologyFencePrior {
                     next_revision
                         .get()
                         .checked_sub(1)
-                        .unwrap_or(snapshot_revision.get()),
+                        .unwrap_or_else(|| snapshot_revision.get()),
                 ),
                 None => TopologyRevision::new(u64::MAX),
             }
@@ -3461,7 +3470,7 @@ impl TopologyStreamCoordinator {
             Err(rejected) => {
                 defer_topology_owner(
                     retired_owners,
-                    DeferredTopologyOwner::Item(rejected.item),
+                    DeferredTopologyOwner::Item(*rejected.item),
                 );
                 Err(rejected.error)
             }
@@ -3732,7 +3741,7 @@ impl TopologyStreamCoordinator {
             Err(rejected) => {
                 defer_topology_owner(
                     retired_owners,
-                    DeferredTopologyOwner::Item(rejected.item),
+                    DeferredTopologyOwner::Item(*rejected.item),
                 );
                 Err(rejected.error)
             }
@@ -3989,7 +3998,7 @@ impl TopologyStreamCoordinator {
                 self.terminal.trip(TOPOLOGY_BUFFER_OVERFLOW);
                 defer_topology_owner(
                     retired_owners,
-                    DeferredTopologyOwner::Event(rejected.event),
+                    DeferredTopologyOwner::Event(*rejected.event),
                 );
                 return false;
             }
@@ -4078,7 +4087,7 @@ impl TopologyStreamCoordinator {
                     self.terminal.trip(TOPOLOGY_BUFFER_OVERFLOW);
                     defer_topology_owner(
                         retired_owners,
-                        DeferredTopologyOwner::Event(rejected.event),
+                        DeferredTopologyOwner::Event(*rejected.event),
                     );
                     false
                 } else {
@@ -4195,7 +4204,7 @@ impl TopologyStreamCoordinator {
                         self.terminal.trip(TOPOLOGY_BUFFER_OVERFLOW);
                         defer_topology_owner(
                             retired_owners,
-                            DeferredTopologyOwner::Event(rejected.event),
+                            DeferredTopologyOwner::Event(*rejected.event),
                         );
                         return false;
                     }
@@ -9311,7 +9320,13 @@ mod tests {
             &coordinator.state.lock().phase,
             TopologyStreamPhase::Exhausted
         ));
-        assert_outbound_live_counters_zero(&coordinator);
+        // The already-published PDU87 is owned by the closed channel until the
+        // last sender is destroyed; async-channel deliberately retains queued
+        // elements after its final receiver disappears. Connection teardown
+        // drops the coordinator and must then release that exact reservation.
+        let outbound_budget = Arc::clone(&coordinator.outbound_budget);
+        drop(coordinator);
+        assert_outbound_budget_live_counters_zero(&outbound_budget);
     }
 
     #[test]
@@ -10930,10 +10945,9 @@ mod tests {
             &coordinator.terminal,
         )
         .expect("prepare the production pending/deferred boundary");
-        let Some(Item::WritePdu(WritePayload::Encoded(deferred_frame))) =
-            deferred_item.as_ref()
+        let Some(Item::WritePdu(WritePayload::Typed(deferred))) = deferred_item.as_ref()
         else {
-            panic!("the control successor must remain one exact deferred frame");
+            panic!("the control successor must remain one exact deferred typed owner");
         };
 
         let mut pending_cursor = Cursor::new(pending.bytes.as_slice());
@@ -10945,18 +10959,14 @@ mod tests {
             }
         ));
         assert_eq!(pending_cursor.position() as usize, pending.bytes.len());
-        let mut deferred_cursor = Cursor::new(deferred_frame.bytes.as_slice());
         assert_eq!(
-            Pdu::decode(&mut deferred_cursor).expect("decode deferred control successor"),
-            DecodedPdu {
+            deferred.decoded.as_ref(),
+            &DecodedPdu {
                 serial: 201,
                 pdu: Pdu::Pong(Pong {}),
             }
         );
-        assert_eq!(
-            deferred_cursor.position() as usize,
-            deferred_frame.bytes.len()
-        );
+        assert_eq!(deferred.emission_authority, ServerEmissionAuthority::Ordinary);
         assert!(item_rx.is_empty());
 
         coordinator
@@ -15074,9 +15084,8 @@ mod tests {
     fn oversized_outbound_frame_yields_between_bounded_chunks_for_inbound_work() {
         let (item_tx, item_rx) = unbounded();
         let first = Box::new(DecodedPdu {
-            pdu: Pdu::WriteToPane(WriteToPane {
-                pane_id: 7,
-                data: vec![0x5a; OUTBOUND_WRITE_QUANTUM_BYTES * 3],
+            pdu: Pdu::ErrorResponse(codec::ErrorResponse {
+                reason: "z".repeat(OUTBOUND_WRITE_QUANTUM_BYTES * 3),
             }),
             serial: 1,
         });

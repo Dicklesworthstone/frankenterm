@@ -2130,7 +2130,7 @@ pub(crate) fn validate_ordered_snapshot_projection(
                 Some(true) => {}
                 Some(false) => {
                     let actual = tree.window_and_tab_ids();
-                    if actual.is_some_and(|actual| actual != expected) {
+                    if let Some(actual) = actual.filter(|actual| *actual != expected) {
                         return Err(anyhow!(
                             "PDU87 pane tree {pane_index} identifies window/tab {actual:?}, expected {expected:?}"
                         ));

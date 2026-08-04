@@ -19,7 +19,28 @@ pub mod pki;
 pub mod sessionhandler;
 
 #[cfg(test)]
-pub(crate) static GLOBAL_STATE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+pub(crate) struct RecoveringTestMutex(std::sync::Mutex<()>);
+
+#[cfg(test)]
+impl RecoveringTestMutex {
+    const fn new() -> Self {
+        Self(std::sync::Mutex::new(()))
+    }
+
+    fn lock(&self) -> std::sync::LockResult<std::sync::MutexGuard<'_, ()>> {
+        match self.0.lock() {
+            Ok(guard) => Ok(guard),
+            Err(poisoned) => {
+                let guard = poisoned.into_inner();
+                self.0.clear_poison();
+                Ok(guard)
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) static GLOBAL_STATE_TEST_LOCK: RecoveringTestMutex = RecoveringTestMutex::new();
 
 #[cfg(not(test))]
 const LIVE_SCROLLBACK_COMPACT_MIN_STALE_BYTES: u64 = 4 * 1024 * 1024;
@@ -442,12 +463,12 @@ pub static PKI: std::sync::LazyLock<pki::Pki> =
 mod tests {
     use super::*;
     use config::{Config, SshDomain};
-    use std::sync::{Mutex, MutexGuard};
+    use std::sync::MutexGuard;
     use termwiz::cell::CellAttributes;
     use wezterm_term::Line;
     use wezterm_term::config::ScrollbackSpillSink;
 
-    fn test_lock() -> &'static Mutex<()> {
+    fn test_lock() -> &'static RecoveringTestMutex {
         &GLOBAL_STATE_TEST_LOCK
     }
 
@@ -463,6 +484,22 @@ mod tests {
             reset_test_state();
             Self { _lock: lock }
         }
+    }
+
+    #[test]
+    fn global_test_state_lock_recovers_without_cascading_failures() {
+        let lock = Arc::new(RecoveringTestMutex::new());
+        let poisoner = Arc::clone(&lock);
+        let result = std::thread::spawn(move || {
+            let _guard = poisoner.lock().expect("fresh test lock");
+            panic!("deliberately poison the private test lock");
+        })
+        .join();
+        assert!(result.is_err(), "the poisoner must exercise unwind recovery");
+
+        let _guard = lock
+            .lock()
+            .expect("the next test owner must recover poisoned state");
     }
 
     impl Drop for ScopedTestState {
