@@ -17,10 +17,27 @@ use crate::wezterm::PaneInfo;
 
 pub(super) const MCP_VERSION: &str = "v1";
 
+/// Bound backend and validation diagnostics before they enter a generic MCP
+/// error envelope. Error strings are not bulk-data surfaces; inputs above the
+/// preflight ceiling receive a fixed, content-free diagnostic so malformed
+/// backends cannot force another unbounded scan or response allocation.
+const MCP_ENVELOPE_TEXT_INPUT_MAX_BYTES: usize = 64 * 1024;
+const MCP_ENVELOPE_TEXT_MAX_COLUMNS: usize = 400;
+const MCP_ENVELOPE_TEXT_MAX_BYTES: usize = 1_600;
+const MCP_ENVELOPE_TEXT_OVERSIZE: &str = "diagnostic unavailable: input exceeds safety limit";
+
 fn redact_mcp_envelope_text(text: &str) -> String {
     static REDACTOR: LazyLock<crate::redactor::Redactor> =
         LazyLock::new(crate::redactor::Redactor::new);
-    REDACTOR.redact(text)
+    if text.len() > MCP_ENVELOPE_TEXT_INPUT_MAX_BYTES {
+        return MCP_ENVELOPE_TEXT_OVERSIZE.to_string();
+    }
+    crate::output::sanitize_redact_truncate_bounded(
+        text,
+        MCP_ENVELOPE_TEXT_MAX_COLUMNS,
+        MCP_ENVELOPE_TEXT_MAX_BYTES,
+        |normalized| REDACTOR.redact(normalized),
+    )
 }
 
 pub(super) fn now_ms() -> u64 {
@@ -964,11 +981,11 @@ impl<T> McpEnvelope<T> {
 
     pub fn error(
         code: &str,
-        msg: impl Into<String>,
+        msg: impl AsRef<str>,
         hint: Option<String>,
         elapsed_ms: u64,
     ) -> Self {
-        let msg = redact_mcp_envelope_text(&msg.into());
+        let msg = redact_mcp_envelope_text(msg.as_ref());
         let hint = hint.map(|hint| redact_mcp_envelope_text(&hint));
         Self {
             ok: false,
@@ -1346,6 +1363,44 @@ mod tests {
             json.contains("[REDACTED]"),
             "MCP error envelope should preserve a redaction marker"
         );
+    }
+
+    #[test]
+    fn envelope_error_normalizes_and_bounds_all_diagnostic_text() {
+        let secret = "AKIAIOSFODNN7EXAMPLE";
+        let split_at = secret.len() / 2;
+        let hostile = format!(
+            "{}\x1b[31m{}\x1b[0m\u{202e}\n{}",
+            &secret[..split_at],
+            &secret[split_at..],
+            "x".repeat(4_000)
+        );
+        let envelope = McpEnvelope::<()>::error(
+            "FT-MCP-0001",
+            &hostile,
+            Some(hostile.clone()),
+            0,
+        );
+
+        for field in [envelope.error.as_deref(), envelope.hint.as_deref()] {
+            let field = field.expect("error envelope diagnostic field");
+            assert!(!field.contains(secret));
+            assert!(field.contains("[REDACTED]"));
+            assert!(!field.contains('\x1b'));
+            assert!(!field.contains('\u{202e}'));
+            assert!(!field.contains('\n'));
+            assert!(field.len() <= MCP_ENVELOPE_TEXT_MAX_BYTES);
+        }
+
+        let oversized = "x".repeat(MCP_ENVELOPE_TEXT_INPUT_MAX_BYTES + 1);
+        let envelope = McpEnvelope::<()>::error(
+            "FT-MCP-0001",
+            &oversized,
+            Some(oversized),
+            0,
+        );
+        assert_eq!(envelope.error.as_deref(), Some(MCP_ENVELOPE_TEXT_OVERSIZE));
+        assert_eq!(envelope.hint.as_deref(), Some(MCP_ENVELOPE_TEXT_OVERSIZE));
     }
 
     #[test]
@@ -2245,12 +2300,14 @@ mod tests {
             hint in arb_opt_string(),
             elapsed_ms in any::<u64>(),
         ) {
+            let expected_msg = redact_mcp_envelope_text(&msg);
+            let expected_hint = hint.as_deref().map(redact_mcp_envelope_text);
             let envelope = McpEnvelope::<()>::error(&code, msg.clone(), hint.clone(), elapsed_ms);
             prop_assert!(!envelope.ok);
             prop_assert!(envelope.data.is_none());
-            prop_assert_eq!(envelope.error.as_deref(), Some(msg.as_str()));
+            prop_assert_eq!(envelope.error.as_deref(), Some(expected_msg.as_str()));
             prop_assert_eq!(envelope.error_code.as_deref(), Some(code.as_str()));
-            prop_assert_eq!(envelope.hint, hint);
+            prop_assert_eq!(envelope.hint, expected_hint);
             prop_assert_eq!(envelope.elapsed_ms, elapsed_ms);
             prop_assert_eq!(envelope.version, crate::VERSION);
             prop_assert_eq!(envelope.mcp_version, MCP_VERSION);
