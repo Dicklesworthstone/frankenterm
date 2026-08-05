@@ -801,7 +801,7 @@ pub fn reconcile_overlay(
 
     let mut live_by_identity = HashMap::with_capacity(live.len());
     for slot in live {
-        validate_stable_tab_slot(*slot)?;
+        validate_stable_tab_slot(*slot, "live layout")?;
         if live_by_identity.insert(slot.identity(), *slot).is_some() {
             return Err(PersistenceFailure::invalid(
                 "live layout contains duplicate stable tab identities",
@@ -2168,7 +2168,10 @@ fn validate_remote_binding_aliases(
     Ok(())
 }
 
-fn validate_stable_tab_slot(slot: StableTabSlot) -> Result<(), PersistenceFailure> {
+fn validate_stable_tab_slot(
+    slot: StableTabSlot,
+    context: &'static str,
+) -> Result<(), PersistenceFailure> {
     let StableTabSlot::Remote {
         binding_id,
         session_id,
@@ -2180,24 +2183,24 @@ fn validate_stable_tab_slot(slot: StableTabSlot) -> Result<(), PersistenceFailur
     };
 
     if binding_id.as_bytes() == [0; 16] {
-        return Err(PersistenceFailure::invalid(
-            "remote overlay slot uses reserved zero domain binding identity",
-        ));
+        return Err(PersistenceFailure::invalid(format!(
+            "{context} remote tab slot uses reserved zero domain binding identity"
+        )));
     }
     if session_id.as_bytes() == [0; 16] {
-        return Err(PersistenceFailure::invalid(
-            "remote overlay slot uses reserved zero mux-session identity",
-        ));
+        return Err(PersistenceFailure::invalid(format!(
+            "{context} remote tab slot uses reserved zero mux-session identity"
+        )));
     }
     if remote_window_id == u64::MAX {
-        return Err(PersistenceFailure::invalid(
-            "remote overlay slot uses the terminal remote-window identity",
-        ));
+        return Err(PersistenceFailure::invalid(format!(
+            "{context} remote tab slot uses the terminal remote-window identity"
+        )));
     }
     if remote_tab_id == u64::MAX {
-        return Err(PersistenceFailure::invalid(
-            "remote overlay slot uses the terminal remote-tab identity",
-        ));
+        return Err(PersistenceFailure::invalid(format!(
+            "{context} remote tab slot uses the terminal remote-tab identity"
+        )));
     }
     Ok(())
 }
@@ -2218,7 +2221,7 @@ fn validate_overlay(overlay: &MixedDomainLayoutOverlay) -> Result<(), Persistenc
     }
     let mut identities = HashSet::with_capacity(overlay.slots.len());
     for &slot in &overlay.slots {
-        validate_stable_tab_slot(slot)?;
+        validate_stable_tab_slot(slot, "overlay")?;
         if !identities.insert(slot.identity()) {
             return Err(PersistenceFailure::invalid(
                 "overlay contains duplicate stable tab identities",
@@ -6535,6 +6538,10 @@ mod tests {
             .expect_err("reserved remote identity must fail before overlay admission");
             assert_eq!(error.code(), PersistenceFailureCode::Invalid);
             assert!(
+                error.to_string().starts_with("overlay remote tab slot"),
+                "overlay rejection must identify its authority source: {error}"
+            );
+            assert!(
                 error.to_string().contains(expected_reason),
                 "unexpected rejection: {error}"
             );
@@ -6546,6 +6553,12 @@ mod tests {
             )
             .expect_err("reserved live identity must fail before reconciliation");
             assert_eq!(error.code(), PersistenceFailureCode::Invalid);
+            assert!(
+                error
+                    .to_string()
+                    .starts_with("live layout remote tab slot"),
+                "live rejection must identify its authority source: {error}"
+            );
             assert!(
                 error.to_string().contains(expected_reason),
                 "unexpected live-slot rejection: {error}"

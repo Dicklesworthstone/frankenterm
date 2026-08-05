@@ -11,7 +11,7 @@ use termwiz::cell::{grapheme_column_width, unicode_column_width};
 // scalars in one grapheme cluster. Keep terminal-cell truncation from becoming
 // an unbounded byte-output path while retaining ample room for ordinary emoji
 // ZWJ sequences and combining scripts.
-const MAX_BYTES_PER_DISPLAY_CELL: usize = 256;
+pub(super) const MAX_BYTES_PER_DISPLAY_CELL: usize = 256;
 
 // Table cells are sometimes wrapped by `Style` before they reach this module.
 // Preserve only those exact, balanced wrappers.  Treat every other escape
@@ -36,8 +36,11 @@ pub(super) fn is_untrusted_display_control(character: char) -> bool {
             '\u{061c}'
                 | '\u{200e}'
                 | '\u{200f}'
+                | '\u{2028}'
+                | '\u{2029}'
                 | '\u{202a}'..='\u{202e}'
                 | '\u{2066}'..='\u{2069}'
+                | '\u{206a}'..='\u{206f}'
         )
 }
 
@@ -77,13 +80,24 @@ pub(super) fn sanitize_terminal_text(text: &str) -> String {
 }
 
 pub(super) fn prefix_within_width(text: &str, max_width: usize) -> &str {
-    if max_width == 0 {
+    prefix_within_width_and_bytes(
+        text,
+        max_width,
+        max_width.saturating_mul(MAX_BYTES_PER_DISPLAY_CELL),
+    )
+}
+
+pub(super) fn prefix_within_width_and_bytes(
+    text: &str,
+    max_width: usize,
+    max_bytes: usize,
+) -> &str {
+    if max_width == 0 || max_bytes == 0 {
         return "";
     }
 
     let mut byte_end = 0usize;
     let mut width = 0usize;
-    let max_bytes = max_width.saturating_mul(MAX_BYTES_PER_DISPLAY_CELL);
     for grapheme in Graphemes::new(text) {
         let grapheme_width = grapheme_column_width(grapheme, None);
         // A zero-cell grapheme at a table boundary can combine with or
@@ -698,8 +712,12 @@ mod tests {
     #[test]
     fn format_cell_neutralizes_untrusted_single_line_controls() {
         assert_eq!(
-            Table::format_cell("\x1b[31mline one\nline two\u{202e}x\x1b[0m", 25, Alignment::Left),
-            "line one line two x      "
+            Table::format_cell(
+                "\x1b[31mline one\nline\u{2028}two\u{202e}x\u{206a}y\x1b[0m",
+                27,
+                Alignment::Left,
+            ),
+            "line one line two x y      "
         );
     }
 

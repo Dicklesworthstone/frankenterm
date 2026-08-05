@@ -476,7 +476,7 @@ The `running-the-gauntlet-on-your-rust-port` and
 
 1. Build/profile with `release-perf`, debuginfo line tables, and forced frame
    pointers where the profiler requires them. `release-perf` inherits directly
-   from the built-in `release` profile and repeats `panic = "unwind"`
+   from the workspace's canonical `release` profile and repeats `panic = "unwind"`
    explicitly, matching the shipped interactive panic contract without custom
    profile chaining. Do not compare it to an aborting GUI/mux artifact or treat
    unit-profile catch behavior as release recovery proof.

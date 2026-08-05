@@ -457,8 +457,8 @@ impl DriftTriageWorkflow {
         if !stdout_match {
             divergences.push(FieldDivergence {
                 field: "stdout".to_string(),
-                ntm_value: truncate(ntm_stdout, 200),
-                ft_value: truncate(ft_stdout, 200),
+                ntm_value: bounded_run_diagnostic(ntm_stdout),
+                ft_value: bounded_run_diagnostic(ft_stdout),
                 is_blocking: dual.priority == DualRunPriority::Blocking,
                 reason_code: Some("STDOUT_MISMATCH".to_string()),
             });
@@ -471,8 +471,8 @@ impl DriftTriageWorkflow {
         if !stderr_match && !ntm_stderr.is_empty() && !ft_stderr.is_empty() {
             divergences.push(FieldDivergence {
                 field: "stderr".to_string(),
-                ntm_value: truncate(ntm_stderr, 200),
-                ft_value: truncate(ft_stderr, 200),
+                ntm_value: bounded_run_diagnostic(ntm_stderr),
+                ft_value: bounded_run_diagnostic(ft_stderr),
                 is_blocking: false,
                 reason_code: Some("STDERR_MISMATCH".to_string()),
             });
@@ -833,13 +833,31 @@ impl DriftTriageWorkflow {
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
-/// Truncate a string to max_len, appending "..." if truncated.
-fn truncate(s: &str, max_len: usize) -> String {
-    if s.chars().count() <= max_len {
-        s.to_string()
+const DUAL_RUN_DIAGNOSTIC_INPUT_MAX_BYTES: usize = 64 * 1024;
+const DUAL_RUN_DIAGNOSTIC_OUTPUT_MAX: usize = 200;
+
+/// Produce a bounded, terminal-safe, secret-redacted mismatch diagnostic.
+///
+/// The comparator still evaluates the complete captured streams for parity,
+/// but diagnostics are deliberately omitted instead of rescanning or copying
+/// an attacker-sized capture on an error-reporting path.
+fn bounded_run_diagnostic(text: &str) -> String {
+    if text.len() > DUAL_RUN_DIAGNOSTIC_INPUT_MAX_BYTES {
+        return "diagnostic omitted: input exceeds safety limit".to_string();
+    }
+
+    static REDACTOR: std::sync::LazyLock<crate::policy::Redactor> =
+        std::sync::LazyLock::new(crate::policy::Redactor::new);
+    let redacted = REDACTOR.redact(text);
+    let bounded = crate::output::truncate_bounded(
+        &redacted,
+        DUAL_RUN_DIAGNOSTIC_OUTPUT_MAX,
+        DUAL_RUN_DIAGNOSTIC_OUTPUT_MAX,
+    );
+    if bounded.is_empty() && !text.is_empty() {
+        "diagnostic omitted: no display-safe content".to_string()
     } else {
-        let prefix: String = s.chars().take(max_len).collect();
-        format!("{prefix}...")
+        bounded
     }
 }
 
@@ -1402,9 +1420,30 @@ mod tests {
 
     #[test]
     fn diagnostic_truncation_preserves_utf8_boundaries() {
-        assert_eq!(truncate("plain", 8), "plain");
-        assert_eq!(truncate("héllo", 3), "hél...");
-        assert_eq!(truncate("😀abc", 1), "😀...");
-        assert_eq!(truncate("text", 0), "...");
+        assert_eq!(bounded_run_diagnostic("plain"), "plain");
+        assert_eq!(
+            bounded_run_diagnostic("\x1b]0;title\x07safe\u{202e}id"),
+            "safe id"
+        );
+        assert_eq!(
+            bounded_run_diagnostic("\x1b]0;hidden\x07"),
+            "diagnostic omitted: no display-safe content"
+        );
+
+        let secret = "token AKIAIOSFODNN7EXAMPLE";
+        let bounded = bounded_run_diagnostic(secret);
+        assert!(!bounded.contains("AKIAIOSFODNN7EXAMPLE"));
+        assert!(bounded.contains("[REDACTED]"));
+
+        let multibyte_boundary = format!("{}ééé", "a".repeat(196));
+        let bounded = bounded_run_diagnostic(&multibyte_boundary);
+        assert_eq!(bounded, format!("{}...", "a".repeat(196)));
+        assert_eq!(bounded.len(), 199);
+
+        let oversized = "x".repeat(DUAL_RUN_DIAGNOSTIC_INPUT_MAX_BYTES + 1);
+        assert_eq!(
+            bounded_run_diagnostic(&oversized),
+            "diagnostic omitted: input exceeds safety limit"
+        );
     }
 }

@@ -262,15 +262,12 @@ impl Trie {
             match node.children.get(&byte) {
                 Some(child) => {
                     node = child;
-                    if node.is_terminal {
+                    if node.is_terminal && key.is_char_boundary(i + 1) {
                         longest = i + 1;
                     }
                 }
                 None => break,
             }
-        }
-        while longest > 0 && !key.is_char_boundary(longest) {
-            longest -= 1;
         }
         key[..longest].to_string()
     }
@@ -799,8 +796,14 @@ mod tests {
     fn longest_complete_prefix_ignores_invalid_byte_key_boundary() {
         let mut t = Trie::new();
         t.insert_bytes(&[0xc3]);
+        t.insert_bytes(&[0xc3, 0xa9, 0x80]);
 
         assert_eq!(t.longest_common_prefix("éclair"), "");
+
+        let mut with_valid_terminal = Trie::new();
+        with_valid_terminal.insert("é");
+        with_valid_terminal.insert_bytes(&[0xc3, 0xa9, 0x80]);
+        assert_eq!(with_valid_terminal.longest_common_prefix("éclair"), "é");
     }
 
     #[test]

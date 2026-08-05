@@ -229,12 +229,10 @@ struct PendingSizeRetentionReceipt {
     outcome: SizeEvictionOutcome,
     status: SizeRetentionReceiptStatus,
     retention_max_mb: u32,
+    attempt_timestamp: i64,
 }
 
-fn size_retention_receipt_record(
-    pending: PendingSizeRetentionReceipt,
-    timestamp: i64,
-) -> MaintenanceRecord {
+fn size_retention_receipt_record(pending: PendingSizeRetentionReceipt) -> MaintenanceRecord {
     let attempt_status = pending.status.as_str();
     let metadata = serde_json::json!({
         "schema": "size_retention_receipt.v1",
@@ -254,7 +252,7 @@ fn size_retention_receipt_record(
             pending.outcome.deleted_segments
         )),
         metadata: Some(metadata),
-        timestamp,
+        timestamp: pending.attempt_timestamp,
     }
 }
 
@@ -266,7 +264,7 @@ async fn record_size_retention_receipt(
     storage
         .record_maintenance_with_cx(
             &receipt_cx,
-            size_retention_receipt_record(pending, epoch_ms()),
+            size_retention_receipt_record(pending),
         )
         .await
 }
@@ -3771,6 +3769,7 @@ impl ObservationRuntime {
                     // loop Cx for cancellation. Run whenever a flat retention OR
                     // any tier rule is active.
                     if pending_cleanup_receipt.is_none()
+                        && pending_size_retention_receipt.is_none()
                         && (retention_days > 0 || !retention_policy.tiers().is_empty())
                     {
                         let outcome = crate::cleanup::cleanup_apply_with_compiled_retention_with_cx(
@@ -3851,7 +3850,15 @@ impl ObservationRuntime {
                     // Runs independently of retention_days so an operator who
                     // sets only a size cap (retention_days=0, retention_max_mb>0)
                     // still gets a bounded database instead of unbounded growth.
-                    if retention_max_mb > 0 && pending_size_retention_receipt.is_none() {
+                    if retention_max_mb > 0
+                        && pending_cleanup_receipt.is_none()
+                        && pending_size_retention_receipt.is_none()
+                    {
+                        // Preserve one immutable attempt timestamp across any
+                        // receipt retries; a later successful audit write must
+                        // not make the original deletion appear to have
+                        // happened at retry time.
+                        let size_retention_attempt_timestamp = epoch_ms();
                         match storage
                             .enforce_size_limit_progress_with_cx(&loop_cx, retention_max_mb)
                             .await
@@ -3868,6 +3875,7 @@ impl ObservationRuntime {
                                         outcome,
                                         status: SizeRetentionReceiptStatus::Completed,
                                         retention_max_mb,
+                                        attempt_timestamp: size_retention_attempt_timestamp,
                                     };
                                     if let Err(error) =
                                         record_size_retention_receipt(&storage, pending).await
@@ -3905,6 +3913,7 @@ impl ObservationRuntime {
                                         outcome,
                                         status: SizeRetentionReceiptStatus::InterruptedPartial,
                                         retention_max_mb,
+                                        attempt_timestamp: size_retention_attempt_timestamp,
                                     };
                                     if let Err(receipt_failure) =
                                         record_size_retention_receipt(&storage, pending).await
@@ -14416,16 +14425,20 @@ mod tests {
                 "interrupted_partial",
             ),
         ] {
-            let record = size_retention_receipt_record(
-                PendingSizeRetentionReceipt {
-                    outcome,
-                    status,
-                    retention_max_mb: 4,
-                },
-                123_456,
-            );
+            let pending = PendingSizeRetentionReceipt {
+                outcome,
+                status,
+                retention_max_mb: 4,
+                attempt_timestamp: 123_456,
+            };
+            let record = size_retention_receipt_record(pending);
             assert_eq!(record.event_type, "size_retention");
             assert_eq!(record.timestamp, 123_456);
+            assert_eq!(
+                size_retention_receipt_record(pending).timestamp,
+                123_456,
+                "receipt retries must preserve the original attempt timestamp"
+            );
             let message = record.message.expect("size receipt message");
             assert!(message.contains(expected_status));
             assert!(message.contains("17 durable segment deletions"));

@@ -296,7 +296,7 @@ impl HandleCompaction {
         let stable_for_ms_i64 = i64::try_from(stable_for_ms).unwrap_or(i64::MAX);
 
         loop {
-            polls += 1;
+            polls = polls.saturating_add(1);
 
             let last_activity_ms = storage
                 .pane_last_output_at(pane_id)
@@ -331,7 +331,23 @@ impl HandleCompaction {
                 ));
             }
 
-            sleep(interval).await;
+            // Never let the exponential polling delay itself overshoot the
+            // caller's deadline by as much as the one-second maximum interval.
+            // Recheck the actual clock after waking: scheduler delay can carry
+            // even a shorter requested sleep beyond the deadline. Report the
+            // timeout immediately instead of issuing one more storage query
+            // after the deadline has already elapsed.
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let sleep_for = interval.min(remaining);
+            sleep(sleep_for).await;
+            if Instant::now() >= deadline {
+                return Err(format!(
+                    "Stabilization timeout after {}ms (last_activity_ms={:?}, stable_for_ms={})",
+                    elapsed_ms(start),
+                    last_activity_ms,
+                    stable_for_ms
+                ));
+            }
             interval = interval.saturating_mul(2);
             if interval > Duration::from_secs(1) {
                 interval = Duration::from_secs(1);

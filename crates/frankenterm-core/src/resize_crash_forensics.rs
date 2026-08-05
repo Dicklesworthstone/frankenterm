@@ -53,6 +53,16 @@ fn write_resize_crash_context() -> RwLockWriteGuard<'static, Option<ResizeCrashC
     }
 }
 
+fn try_clone_resize_crash_context(
+    lock: &RwLock<Option<ResizeCrashContext>>,
+) -> Option<ResizeCrashContext> {
+    match lock.try_read() {
+        Ok(guard) => guard.clone(),
+        Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner().clone(),
+        Err(std::sync::TryLockError::WouldBlock) => None,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Core types
 // ---------------------------------------------------------------------------
@@ -90,6 +100,17 @@ impl ResizeCrashContext {
     #[must_use]
     pub fn get_global() -> Option<Self> {
         read_resize_crash_context().clone()
+    }
+
+    /// Retrieve the current context without waiting for an active writer.
+    ///
+    /// Panic hooks must use this path because the panicking thread may itself
+    /// own the write lock; normal callers retain [`Self::get_global`].
+    #[must_use]
+    pub(crate) fn try_get_global_for_panic() -> Option<Self> {
+        GLOBAL_RESIZE_CRASH_CTX
+            .get()
+            .and_then(try_clone_resize_crash_context)
     }
 
     /// Clear the process-global crash context (useful in tests).
@@ -406,6 +427,24 @@ mod tests {
             "global crash context should update after recovering RwLock poison"
         );
         ResizeCrashContext::clear_global();
+    }
+
+    #[test]
+    fn panic_snapshot_read_never_waits_for_an_active_writer() {
+        let lock = RwLock::new(Some(
+            ResizeCrashContextBuilder::new(44444)
+                .gate(sample_gate())
+                .build(),
+        ));
+        let writer = lock.write().expect("local resize snapshot writer");
+        assert!(try_clone_resize_crash_context(&lock).is_none());
+        drop(writer);
+        assert_eq!(
+            try_clone_resize_crash_context(&lock)
+                .expect("uncontended resize snapshot")
+                .captured_at_ms,
+            44444
+        );
     }
 
     #[test]

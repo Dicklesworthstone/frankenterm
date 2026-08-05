@@ -7428,7 +7428,10 @@ mod test {
         mux_registration: Arc<crate::PaneRegistrationSlot>,
         dead: bool,
         panic_in_is_dead: bool,
-        panic_in_ordered_observation: Option<OrderedObservationCallback>,
+        panic_in_ordered_observation: Option<(
+            OrderedObservationCallback,
+            Arc<std::sync::atomic::AtomicBool>,
+        )>,
         callback_probe: Option<Arc<dyn Fn() + Send + Sync>>,
         pane_id_probe: Option<Arc<dyn Fn() + Send + Sync>>,
         kills: std::sync::atomic::AtomicUsize,
@@ -7566,6 +7569,7 @@ mod test {
             id: PaneId,
             size: TerminalSize,
             callback: OrderedObservationCallback,
+            armed: Arc<std::sync::atomic::AtomicBool>,
         ) -> Arc<dyn Pane> {
             Arc::new(Self {
                 id,
@@ -7577,7 +7581,7 @@ mod test {
                 mux_registration: Arc::new(crate::PaneRegistrationSlot::default()),
                 dead: false,
                 panic_in_is_dead: false,
-                panic_in_ordered_observation: Some(callback),
+                panic_in_ordered_observation: Some((callback, armed)),
                 callback_probe: None,
                 pane_id_probe: None,
                 kills: std::sync::atomic::AtomicUsize::new(0),
@@ -7585,11 +7589,13 @@ mod test {
         }
 
         fn panic_if_ordered_observation_callback(&self, callback: OrderedObservationCallback) {
-            assert_ne!(
-                self.panic_in_ordered_observation,
-                Some(callback),
-                "injected ordered pane observation panic for {callback:?}"
-            );
+            if let Some((configured_callback, armed)) = &self.panic_in_ordered_observation {
+                assert!(
+                    *configured_callback != callback
+                        || !armed.load(std::sync::atomic::Ordering::Acquire),
+                    "injected ordered pane observation panic for {callback:?}"
+                );
+            }
         }
     }
 
@@ -9292,11 +9298,21 @@ mod test {
 
         for (index, callback) in callbacks.iter().copied().enumerate() {
             let tab = Tab::new(&size);
-            tab.assign_pane(&FakePane::new_with_ordered_observation_panic(
-                601_usize.saturating_add(index),
-                size,
-                callback,
-            ));
+            let first_pane_id = 601_usize.saturating_add(index.saturating_mul(2));
+            tab.assign_pane(&FakePane::new(first_pane_id, size));
+            let armed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            tab.split_and_insert(
+                0,
+                SplitRequest::default(),
+                FakePane::new_with_ordered_observation_panic(
+                    first_pane_id.saturating_add(1),
+                    size,
+                    callback,
+                    Arc::clone(&armed),
+                ),
+            )
+            .expect("install panicking pane after one observable predecessor");
+            armed.store(true, std::sync::atomic::Ordering::Release);
             let prefix = PaneArenaNode::Leaf(pane_arena_test_entry(997, false, false));
             let mut arena = vec![prefix.clone()];
             let prior_capacity = arena.capacity();
@@ -9320,11 +9336,13 @@ mod test {
                 })
                 .expect_err("a panicking pane callback must fail the ordered snapshot");
 
-            assert!(
-                format!("{error:#}").contains("a pane callback panicked while tab"),
-                "unexpected contained error for {:?}: {:#}",
-                callback,
-                error
+            assert_eq!(
+                format!("{error:#}"),
+                format!(
+                    "a pane callback panicked while tab {} was being observed for ordered encoding",
+                    tab.tab_id()
+                ),
+                "unexpected contained error for {callback:?}"
             );
             assert_eq!(
                 arena,

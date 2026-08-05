@@ -677,7 +677,11 @@ impl QueryClient for ProductionQueryClient {
         // Recent crash bundle
         if let Some(bundle) = latest_crash_bundle(&self.workspace_layout.crash_dir) {
             let detail = if let Some(ref report) = bundle.report {
-                let message = sanitize_historical_crash_text(&report.message, 100);
+                let message = sanitize_historical_crash_text(
+                    &report.message,
+                    MAX_HISTORICAL_CRASH_MESSAGE_WIDTH,
+                    MAX_HISTORICAL_CRASH_MESSAGE_BYTES,
+                );
                 let location = report
                     .location
                     .as_deref()
@@ -687,7 +691,11 @@ impl QueryClient for ProductionQueryClient {
             } else if let Some(ref manifest) = bundle.manifest {
                 format!(
                     "crash at {}",
-                    sanitize_historical_crash_text(&manifest.created_at, 40)
+                    sanitize_historical_crash_text(
+                        &manifest.created_at,
+                        MAX_HISTORICAL_CRASH_TIMESTAMP_WIDTH,
+                        MAX_HISTORICAL_CRASH_TIMESTAMP_BYTES,
+                    )
                 )
             } else {
                 "crash bundle found".to_string()
@@ -1136,13 +1144,23 @@ fn scrub_historical_crash_text(value: &str) -> String {
         .collect::<String>()
 }
 
-fn sanitize_historical_crash_text(value: &str, max_width: usize) -> String {
+const MAX_HISTORICAL_CRASH_MESSAGE_WIDTH: usize = 100;
+const MAX_HISTORICAL_CRASH_MESSAGE_BYTES: usize = 400;
+const MAX_HISTORICAL_CRASH_TIMESTAMP_WIDTH: usize = 40;
+const MAX_HISTORICAL_CRASH_TIMESTAMP_BYTES: usize = 160;
+const MAX_HISTORICAL_CRASH_LOCATION_WIDTH: usize = 80;
+const MAX_HISTORICAL_CRASH_LOCATION_BYTES: usize = 320;
+
+fn sanitize_historical_crash_text(
+    value: &str,
+    max_width: usize,
+    max_bytes: usize,
+) -> String {
     let scrubbed = scrub_historical_crash_text(value);
-    crate::output::truncate(scrubbed.trim(), max_width)
+    crate::output::truncate_bounded(scrubbed.trim(), max_width, max_bytes)
 }
 
 fn sanitize_historical_crash_location(value: &str) -> String {
-    const MAX_LOCATION_WIDTH: usize = 80;
     let scrubbed = scrub_historical_crash_text(value);
     let location = scrubbed.trim();
 
@@ -1171,7 +1189,11 @@ fn sanitize_historical_crash_location(value: &str) -> String {
         .next()
         .filter(|component| !component.is_empty())
         .unwrap_or("unknown");
-    crate::output::truncate(basename, MAX_LOCATION_WIDTH)
+    crate::output::truncate_bounded(
+        basename,
+        MAX_HISTORICAL_CRASH_LOCATION_WIDTH,
+        MAX_HISTORICAL_CRASH_LOCATION_BYTES,
+    )
 }
 
 #[cfg(test)]
@@ -1285,7 +1307,11 @@ mod tests {
             "\x1b[31m{}\x1b[0m\nspoofed\u{202e}direction",
             "猫".repeat(80)
         );
-        let sanitized = sanitize_historical_crash_text(&message, 100);
+        let sanitized = sanitize_historical_crash_text(
+            &message,
+            MAX_HISTORICAL_CRASH_MESSAGE_WIDTH,
+            MAX_HISTORICAL_CRASH_MESSAGE_BYTES,
+        );
         assert!(!sanitized.contains('\x1b'));
         assert!(!sanitized.contains('\n'));
         assert!(!sanitized.contains('\u{202e}'));
@@ -1295,6 +1321,15 @@ mod tests {
             sanitized,
             "sanitized detail must already fit the shared display-width bound"
         );
+        assert!(sanitized.len() <= MAX_HISTORICAL_CRASH_MESSAGE_BYTES);
+
+        let zero_width_payload = "\u{0301}".repeat(10_000);
+        let byte_bounded = sanitize_historical_crash_text(
+            &zero_width_payload,
+            MAX_HISTORICAL_CRASH_MESSAGE_WIDTH,
+            MAX_HISTORICAL_CRASH_MESSAGE_BYTES,
+        );
+        assert!(byte_bounded.len() <= MAX_HISTORICAL_CRASH_MESSAGE_BYTES);
 
         assert_eq!(
             sanitize_historical_crash_location(
@@ -1314,6 +1349,11 @@ mod tests {
             "line:123:column:45",
             "location parsing must retain a bounded coordinate even after a long legacy path"
         );
+        let location = sanitize_historical_crash_location(&format!(
+            "/private/{}",
+            "\u{0301}".repeat(10_000)
+        ));
+        assert!(location.len() <= MAX_HISTORICAL_CRASH_LOCATION_BYTES);
     }
 
     #[test]

@@ -101,16 +101,22 @@ for post-mortem analysis without rerunning interactively.
 
 ### 4.1  Crash Bundle (existing — crash.rs)
 
-Written to `.ft/crash/ft_crash_YYYYMMDD_HHMMSS/`:
+Written to `.ft/crash/ft_crash_YYYYMMDD_HHMMSS_pPID_SEQUENCE/`:
 
 | File | Content | Redacted |
 |------|---------|----------|
-| `manifest.json` | Bundle metadata (timestamp, pid, version) | No (metadata only) |
-| `crash_report.json` | Panic message, location (file:line:col), backtrace | Yes |
-| `health_snapshot.json` | Last known health state (pane statuses, queue depths) | Yes |
+| `manifest.json` | Bundle schema/version, creation time, bounded file inventory | No caller-controlled text |
+| `crash_report.json` | Generic fatal message, line/column without a source path, optional bounded backtrace, timestamp, pid | Panic payload and thread name are suppressed; retained text is redacted and bounded |
+| `health_snapshot.json` | Optional last known numeric health/scheduler state and bounded warnings | Warning/tier text is redacted, terminal-sanitized, and bounded |
+| `resize_forensics.json` | Optional last known resize transaction/scheduler context | Size-bounded by the bundle budget |
+| `environment_markers.json` | Terminal mode, feature, and backpressure markers | Text is redacted, terminal-sanitized, and bounded |
 
-**Size limits:** Backtrace capped at 64 KiB, total bundle at 1 MiB.
-**Permissions:** 0o600 (owner-only read/write).
+**Size limits:** Backtrace capped at 64 KiB; caller-controlled single-line
+diagnostics have smaller field-specific limits; non-manifest bundle content is
+capped at 1 MiB. Fatal hooks use a unique private staging directory and atomic
+rename, so concurrent failures do not overwrite one another.
+**Unix permissions:** Bundle directories are 0o700; bundle files are 0o600
+(owner-only).
 **Atomicity:** Temp directory + rename (all-or-nothing on POSIX).
 
 ### 4.2  Environment Markers

@@ -55,10 +55,12 @@ ft treats a crash as an observable event with artifacts, not a silent failure.
 On panic, the watcher writes a bounded, redacted crash bundle and then exits.
 
 Crash bundle facts:
-- Default location: `<workspace>/.ft/crash/ft_crash_YYYYMMDD_HHMMSS/`
-- Files included: `manifest.json`, `crash_report.json`, and `health_snapshot.json` (if available)
-- Redaction: all text is passed through the policy redactor before writing
-- Size bounds: backtrace truncated to 64 KiB, total bundle capped at 1 MiB
+- Default location: `<workspace>/.ft/crash/ft_crash_YYYYMMDD_HHMMSS_pPID_SEQUENCE/`
+- Core files: `manifest.json` and `crash_report.json`; `environment_markers.json` is added when the remaining bundle budget permits
+- Optional snapshots: `health_snapshot.json` and `resize_forensics.json`
+- Privacy: panic payload text, source paths, and panic-hook thread names are not persisted. The report retains a generic fatal message, line/column, and an optional redacted backtrace. Caller-controlled single-line report, health-warning, tier, and terminal-marker fields are redacted, terminal-sanitized, and bounded.
+- Size bounds: backtrace truncated to 64 KiB; non-manifest bundle content capped at 1 MiB
+- Concurrency: every writer uses a private process/sequence staging path followed by atomic rename, so rapid failures do not trample one another
 
 Where to find the crash directory:
 - It lives under the workspace root. Use `ft config show` or `ft status` to confirm the workspace path.

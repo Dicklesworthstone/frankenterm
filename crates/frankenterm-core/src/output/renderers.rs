@@ -1640,20 +1640,37 @@ fn days_in_month(year: u64, month: u64) -> u64 {
 /// Truncate a string with ellipsis
 #[must_use]
 pub fn truncate(s: &str, max_len: usize) -> String {
-    // Renderer inputs often originate in captured pane text or persisted
-    // diagnostics. Strip terminal control sequences before measuring or
-    // emitting them so a short (and therefore otherwise untruncated) value
-    // cannot smuggle cursor, title, or hyperlink controls into CLI output.
+    truncate_bounded(
+        s,
+        max_len,
+        max_len.saturating_mul(super::table::MAX_BYTES_PER_DISPLAY_CELL),
+    )
+}
+
+/// Sanitize and truncate a single-line diagnostic to both terminal-cell and
+/// UTF-8 byte ceilings. A truncation marker is emitted only when it fits
+/// inside both budgets, and the retained prefix always ends at a grapheme
+/// boundary.
+#[must_use]
+pub fn truncate_bounded(s: &str, max_width: usize, max_bytes: usize) -> String {
     let plain = super::table::sanitize_terminal_text(s);
-    if super::table::prefix_within_width(&plain, max_len).len() == plain.len() {
-        plain
-    } else if max_len > 3 {
-        let mut truncated =
-            super::table::prefix_within_width(&plain, max_len - 3).to_string();
+    if super::table::prefix_within_width_and_bytes(&plain, max_width, max_bytes).len()
+        == plain.len()
+    {
+        return plain;
+    }
+
+    if max_width > 3 && max_bytes > 3 {
+        let mut truncated = super::table::prefix_within_width_and_bytes(
+            &plain,
+            max_width - 3,
+            max_bytes - 3,
+        )
+        .to_string();
         truncated.push_str("...");
         truncated
     } else {
-        super::table::prefix_within_width(&plain, max_len).to_string()
+        super::table::prefix_within_width_and_bytes(&plain, max_width, max_bytes).to_string()
     }
 }
 
@@ -3227,7 +3244,10 @@ mod tests {
             "link"
         );
         assert_eq!(truncate("line one\nline two\tend", 80), "line one line two end");
-        assert_eq!(truncate("safe\u{202e}spoof", 80), "safe spoof");
+        assert_eq!(
+            truncate("safe\u{2028}line\u{202e}spoof\u{206a}shape", 80),
+            "safe line spoof shape"
+        );
 
         let combining_spam = "\u{0301}".repeat(1_024);
         assert_eq!(
@@ -3237,6 +3257,25 @@ mod tests {
         );
         assert_eq!(truncate("\u{0301}", 4), "...");
         assert_eq!(truncate("a\u{0301}", 2), "a\u{0301}");
+    }
+
+    #[test]
+    fn bounded_truncation_honors_columns_bytes_and_graphemes() {
+        assert_eq!(truncate_bounded("plain", 8, 8), "plain");
+        assert_eq!(truncate_bounded("héllo", 3, 3), "hé");
+        assert_eq!(truncate_bounded("😀abc", 3, 4), "😀");
+        assert_eq!(truncate_bounded("abcdef", 4, 4), "a...");
+        assert_eq!(truncate_bounded("ééé", 4, 5), "é...");
+        assert_eq!(truncate_bounded("abcdef", 80, 2), "ab");
+        assert_eq!(truncate_bounded("abcdef", 80, 0), "");
+        assert_eq!(
+            truncate_bounded("\x1b]0;title\x07safe\u{202e}id", 16, 16),
+            "safe id"
+        );
+
+        let long_zwj = format!("👩{}x", "\u{200d}👩".repeat(80));
+        let bounded = truncate_bounded(&long_zwj, 8, 32);
+        assert_eq!(bounded, "...");
     }
 
     #[test]
