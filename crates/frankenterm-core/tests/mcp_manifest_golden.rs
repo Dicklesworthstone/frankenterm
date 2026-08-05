@@ -5,7 +5,9 @@
 //! annotations — as a canonical JSON manifest. Any change to this manifest
 //! (additions, removals, description wording, or input-schema structure) will
 //! fail this test and must be reviewed and intentionally reflected in the
-//! committed golden file.
+//! committed golden file. Entry versions are asserted against the live crate
+//! version, then normalized only for the structural golden comparison so a
+//! package-version bump does not require rewriting every manifest row.
 //!
 //! Regeneration: run with `UPDATE_GOLDEN=1`:
 //!
@@ -118,11 +120,47 @@ fn capture_manifest(db_path: Option<PathBuf>) -> Value {
         ua.cmp(ub)
     });
 
-    json!({
+    let manifest = json!({
         "tools": tools,
         "resources": resources,
         "resource_templates": templates,
-    })
+    });
+    assert_manifest_entry_versions_are_current(&manifest);
+    manifest
+}
+
+fn assert_manifest_entry_versions_are_current(manifest: &Value) {
+    for collection in ["tools", "resources", "resource_templates"] {
+        for entry in manifest[collection]
+            .as_array()
+            .unwrap_or_else(|| panic!("manifest `{collection}` must be an array"))
+        {
+            assert_eq!(
+                entry.get("version").and_then(Value::as_str),
+                Some(env!("CARGO_PKG_VERSION")),
+                "manifest entry has a stale or missing live version: {entry}"
+            );
+        }
+    }
+}
+
+fn normalize_manifest_entry_versions(manifest: &mut Value) {
+    for collection in ["tools", "resources", "resource_templates"] {
+        let Some(entries) = manifest.get_mut(collection).and_then(Value::as_array_mut) else {
+            continue;
+        };
+        for entry in entries {
+            if let Some(version) = entry.get_mut("version") {
+                *version = Value::String("[VERSION]".to_string());
+            }
+        }
+    }
+}
+
+fn comparable_manifest(text: &str) -> String {
+    let mut manifest: Value = serde_json::from_str(text).expect("parse MCP manifest JSON");
+    normalize_manifest_entry_versions(&mut manifest);
+    pretty_canonical(&manifest)
 }
 
 fn canonicalize(value: &Value) -> Value {
@@ -189,10 +227,10 @@ fn read_or_update_golden(path: &PathBuf, actual: &str) -> String {
 
 fn assert_matches_golden(actual: &str, golden: &PathBuf) {
     let expected = read_or_update_golden(golden, actual);
-    let expected_trimmed = expected.trim_end_matches('\n');
-    let actual_trimmed = actual.trim_end_matches('\n');
+    let expected_comparable = comparable_manifest(&expected);
+    let actual_comparable = comparable_manifest(actual);
 
-    if expected_trimmed != actual_trimmed {
+    if expected_comparable != actual_comparable {
         let actual_path = golden.with_extension("actual.json");
         let _ = std::fs::write(&actual_path, format!("{actual}\n"));
         panic!(
@@ -218,6 +256,33 @@ fn string_set(values: &[Value], key: &str) -> std::collections::BTreeSet<String>
                 .to_string()
         })
         .collect()
+}
+
+#[test]
+fn manifest_comparison_normalizes_only_entry_versions() {
+    let old = json!({
+        "tools": [{
+            "name": "wa.example",
+            "version": "0.12.0",
+            "input_schema": {"properties": {"version": {"const": 1}}}
+        }],
+        "resources": [],
+        "resource_templates": []
+    });
+    let mut current = old.clone();
+    current["tools"][0]["version"] = json!("0.13.0");
+    assert_eq!(
+        comparable_manifest(&old.to_string()),
+        comparable_manifest(&current.to_string()),
+        "package-version churn must not rewrite the structural golden"
+    );
+
+    current["tools"][0]["input_schema"]["properties"]["version"]["const"] = json!(2);
+    assert_ne!(
+        comparable_manifest(&old.to_string()),
+        comparable_manifest(&current.to_string()),
+        "schema fields named version remain part of the frozen protocol shape"
+    );
 }
 
 /// With `db_path == None`, the server registers only the always-on tool set.

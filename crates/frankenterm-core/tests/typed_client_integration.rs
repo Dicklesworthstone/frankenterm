@@ -1171,6 +1171,90 @@ fn required_fields_coverage_events() {
 }
 
 #[test]
+fn events_cursor_triple_serializes_as_one_authority_token() {
+    let epoch = "0123456789abcdef0123456789abcdef".to_string();
+    let scope =
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_string();
+    let data = EventsData {
+        events: vec![],
+        total_count: 0,
+        limit: 20,
+        cursor: Some(7),
+        cursor_epoch: Some(epoch.clone()),
+        cursor_scope: Some(scope.clone()),
+        next_cursor: Some(9),
+        next_cursor_epoch: Some(epoch),
+        next_cursor_scope: Some(scope),
+        replay_limit: Some(20),
+        order: Some("id_asc".to_string()),
+        start_at_tail: false,
+        pane_filter: None,
+        rule_id_filter: None,
+        event_type_filter: None,
+        triage_state_filter: None,
+        label_filter: None,
+        unhandled_only: false,
+        since_filter: None,
+        would_handle: false,
+        dry_run: false,
+    };
+    let value = serde_json::to_value(data).expect("serialize scoped events response");
+    for field in [
+        "cursor",
+        "cursor_epoch",
+        "cursor_scope",
+        "next_cursor",
+        "next_cursor_epoch",
+        "next_cursor_scope",
+        "replay_limit",
+        "order",
+    ] {
+        assert!(value.get(field).is_some(), "missing cursor field {field}");
+    }
+    assert!(value.get("start_at_tail").is_none());
+}
+
+#[test]
+fn event_optional_fields_are_omitted_instead_of_serialized_as_null() {
+    let item = EventItem {
+        id: 1,
+        pane_id: 2,
+        rule_id: "build.done".to_string(),
+        pack_id: "builtin:test".to_string(),
+        event_type: "build.done".to_string(),
+        severity: "info".to_string(),
+        confidence: 1.0,
+        extracted: None,
+        annotations: None,
+        captured_at: 3,
+        handled_at: None,
+        workflow_id: None,
+        would_handle_with: Some(EventWouldHandle {
+            workflow: "notify".to_string(),
+            preview_command: None,
+            first_step: None,
+            estimated_duration_ms: None,
+            would_run: None,
+            reason: None,
+        }),
+    };
+    let value = serde_json::to_value(item).expect("serialize event item");
+    for field in [
+        "extracted",
+        "annotations",
+        "handled_at",
+        "workflow_id",
+    ] {
+        assert!(value.get(field).is_none(), "optional field {field} leaked null");
+    }
+    let preview = value["would_handle_with"]
+        .as_object()
+        .expect("workflow preview is an object");
+    assert_eq!(preview.len(), 1);
+    assert_eq!(preview["workflow"], "notify");
+}
+
+#[test]
 fn required_fields_coverage_why() {
     let schema = load_schema("wa-robot-why.json");
     let required = schema_required_fields(&schema);

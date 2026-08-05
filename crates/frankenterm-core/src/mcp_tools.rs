@@ -63,7 +63,7 @@ use crate::attention_router::{
     build_attention_router_surface_payload,
 };
 use crate::demo_scenarios::DemoScenarioManifest;
-use crate::mcp_error::MCP_ERR_REMOTE_TEXT_UNAVAILABLE;
+use crate::mcp_error::{MCP_ERR_CURSOR_DISCONTINUITY, MCP_ERR_REMOTE_TEXT_UNAVAILABLE};
 #[allow(unused_imports)]
 use crate::mcp_framework::{
     FrameworkContent as Content, FrameworkMcpContext as McpContext, FrameworkMcpError as McpError,
@@ -3956,29 +3956,213 @@ const MCP_AWAIT_EVENT_CURSOR_SCOPE_DOMAIN: &[u8] =
     b"frankenterm.wa.await_event.cursor-scope.v1";
 const MCP_AWAIT_EVENT_CURSOR_SCOPE_QUIESCENCE_MODE: &[u8] =
     b"unsupported-db-events-only";
-const MCP_ERR_CURSOR_DISCONTINUITY: &str = "FT-MCP-0016";
 pub(crate) const MCP_AWAIT_EVENT_DELIVERY_FINALIZE_GRACE_SECS: u64 = 30;
 const MCP_AWAIT_EVENT_CANCEL_POLL_INTERVAL: std::time::Duration =
     std::time::Duration::from_millis(50);
 const MCP_AWAIT_EVENT_CLAIM_WORKFLOW_ID: &str = "mcp.wa.await_event";
 const MCP_AWAIT_EVENT_CLAIM_STATUS: &str = "claimed";
+const MCP_AWAIT_EVENT_COMPLETION_WORKERS: usize = 2;
+const MCP_AWAIT_EVENT_COMPLETION_QUEUE_CAPACITY: usize = 64;
+const MCP_AWAIT_EVENT_COMPLETION_SHUTDOWN_POLL: std::time::Duration =
+    std::time::Duration::from_millis(50);
 
-#[derive(Debug, serde::Serialize)]
-struct McpAwaitEventResponseData {
-    #[serde(flatten)]
-    data: McpAwaitEventData,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    final_cursor_epoch: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    final_cursor_scope: Option<String>,
-    /// Highest cursor that could become authoritative if every locally owned
-    /// delivery candidate durably finalizes. This is diagnostic state, not a
-    /// resume token, and must never be copied into `cursor` pre-finalization.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    candidate_cursor: Option<i64>,
-    pending_finalize: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    bootstrap_state: Option<&'static str>,
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum McpAwaitEventIterationPhase {
+    BlockedRetry,
+    PageScan,
+}
+
+#[cfg(test)]
+type McpAwaitEventIterationObserver =
+    Arc<dyn Fn(McpAwaitEventIterationPhase, i64) + Send + Sync + 'static>;
+
+struct McpAwaitEventDeliveryCompletionJob {
+    db_path: Arc<PathBuf>,
+    leases: Vec<EventDeliveryLease>,
+    outcome: FrameworkResponseDeliveryOutcome,
+    enqueued_at: Instant,
+}
+
+type McpAwaitEventDeliveryCompletionHandler =
+    Arc<dyn Fn(McpAwaitEventDeliveryCompletionJob) + Send + Sync + 'static>;
+
+/// Bounded blocking lane for post-transport lease completion.
+///
+/// SQLite completion must never run inline in the sequential MCP transport's
+/// `send` callback: a busy database can otherwise freeze every subsequent MCP
+/// request for the full finalize deadline. Two fixed workers are intentional;
+/// adding CPU-count workers only increases contention on the SQLite writer.
+struct McpAwaitEventDeliveryCompletionExecutor {
+    sender: crossbeam::channel::Sender<McpAwaitEventDeliveryCompletionJob>,
+    shutdown: Arc<std::sync::atomic::AtomicBool>,
+    workers: Vec<std::thread::JoinHandle<()>>,
+}
+
+impl McpAwaitEventDeliveryCompletionExecutor {
+    fn new() -> std::io::Result<Self> {
+        Self::new_with_handler(Arc::new(|job| {
+            let queue_delay = job.enqueued_at.elapsed();
+            tracing::debug!(
+                queue_delay_ms = u64::try_from(queue_delay.as_millis()).unwrap_or(u64::MAX),
+                delivery_count = job.leases.len(),
+                ?job.outcome,
+                "Processing queued MCP event-delivery completion"
+            );
+            complete_mcp_await_event_deliveries(job.db_path, job.leases, job.outcome);
+        }))
+    }
+
+    fn new_with_handler(handler: McpAwaitEventDeliveryCompletionHandler) -> std::io::Result<Self> {
+        let (sender, receiver): (
+            crossbeam::channel::Sender<McpAwaitEventDeliveryCompletionJob>,
+            crossbeam::channel::Receiver<McpAwaitEventDeliveryCompletionJob>,
+        ) = crossbeam::channel::bounded(MCP_AWAIT_EVENT_COMPLETION_QUEUE_CAPACITY);
+        let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut workers = Vec::with_capacity(MCP_AWAIT_EVENT_COMPLETION_WORKERS);
+
+        for worker_index in 0..MCP_AWAIT_EVENT_COMPLETION_WORKERS {
+            let worker_receiver = receiver.clone();
+            let worker_shutdown = Arc::clone(&shutdown);
+            let worker_handler = Arc::clone(&handler);
+            let spawn_result = std::thread::Builder::new()
+                .name(format!("ft-mcp-claim-completion-{worker_index}"))
+                .spawn(move || {
+                    while !worker_shutdown.load(std::sync::atomic::Ordering::Acquire) {
+                        match worker_receiver.recv_timeout(
+                            MCP_AWAIT_EVENT_COMPLETION_SHUTDOWN_POLL,
+                        ) {
+                            Ok(job) => {
+                                if worker_shutdown.load(std::sync::atomic::Ordering::Acquire) {
+                                    tracing::warn!(
+                                        delivery_count = job.leases.len(),
+                                        ?job.outcome,
+                                        "Abandoning queued MCP event-delivery completion during shutdown; lease expiry remains authoritative"
+                                    );
+                                    break;
+                                }
+                                let delivery_count = job.leases.len();
+                                let outcome = job.outcome;
+                                if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                    worker_handler(job);
+                                }))
+                                .is_err()
+                                {
+                                    tracing::error!(
+                                        delivery_count,
+                                        ?outcome,
+                                        "MCP event-delivery completion handler panicked; lease expiry remains authoritative"
+                                    );
+                                }
+                            }
+                            Err(crossbeam::channel::RecvTimeoutError::Timeout) => {}
+                            Err(crossbeam::channel::RecvTimeoutError::Disconnected) => break,
+                        }
+                    }
+                });
+            match spawn_result {
+                Ok(worker) => workers.push(worker),
+                Err(error) => {
+                    shutdown.store(true, std::sync::atomic::Ordering::Release);
+                    drop(sender);
+                    for worker in workers {
+                        if worker.join().is_err() {
+                            tracing::error!(
+                                "MCP event-delivery completion worker panicked during failed initialization"
+                            );
+                        }
+                    }
+                    return Err(error);
+                }
+            }
+        }
+
+        Ok(Self {
+            sender,
+            shutdown,
+            workers,
+        })
+    }
+
+    /// Queue completion without ever waiting for worker or SQLite capacity.
+    /// A full/disconnected lane deliberately leaves leases untouched: their
+    /// durable TTL is the fail-safe authority and makes the events retryable.
+    fn try_submit(
+        &self,
+        db_path: Arc<PathBuf>,
+        leases: Vec<EventDeliveryLease>,
+        outcome: FrameworkResponseDeliveryOutcome,
+    ) -> bool {
+        if leases.is_empty() {
+            return true;
+        }
+        let job = McpAwaitEventDeliveryCompletionJob {
+            db_path,
+            leases,
+            outcome,
+            enqueued_at: Instant::now(),
+        };
+        match self.sender.try_send(job) {
+            Ok(()) => true,
+            Err(crossbeam::channel::TrySendError::Full(job)) => {
+                tracing::error!(
+                    delivery_count = job.leases.len(),
+                    ?job.outcome,
+                    queue_capacity = MCP_AWAIT_EVENT_COMPLETION_QUEUE_CAPACITY,
+                    "MCP event-delivery completion queue saturated; lease expiry remains authoritative"
+                );
+                false
+            }
+            Err(crossbeam::channel::TrySendError::Disconnected(job)) => {
+                tracing::error!(
+                    delivery_count = job.leases.len(),
+                    ?job.outcome,
+                    "MCP event-delivery completion queue disconnected; lease expiry remains authoritative"
+                );
+                false
+            }
+        }
+    }
+}
+
+impl Drop for McpAwaitEventDeliveryCompletionExecutor {
+    fn drop(&mut self) {
+        self.shutdown
+            .store(true, std::sync::atomic::Ordering::Release);
+        let queued_at_shutdown = self.sender.len();
+        for worker in self.workers.drain(..) {
+            if worker.join().is_err() {
+                tracing::error!("MCP event-delivery completion worker panicked");
+            }
+        }
+        if queued_at_shutdown > 0 {
+            tracing::warn!(
+                queued_at_shutdown,
+                "Abandoned queued MCP event-delivery completions during orderly shutdown; lease expiry remains authoritative"
+            );
+        }
+    }
+}
+
+fn enqueue_mcp_await_event_deliveries(
+    executor: Option<&Arc<McpAwaitEventDeliveryCompletionExecutor>>,
+    db_path: Arc<PathBuf>,
+    leases: Vec<EventDeliveryLease>,
+    outcome: FrameworkResponseDeliveryOutcome,
+) {
+    if leases.is_empty() {
+        return;
+    }
+    let delivery_count = leases.len();
+    let Some(executor) = executor else {
+        tracing::error!(
+            delivery_count,
+            ?outcome,
+            "MCP event-delivery completion executor unavailable; lease expiry remains authoritative"
+        );
+        return;
+    };
+    let _queued = executor.try_submit(db_path, leases, outcome);
 }
 
 fn mcp_request_checkpoint(cx: &crate::cx::Cx, operation: &str) -> crate::Result<()> {
@@ -4625,6 +4809,47 @@ fn mcp_await_event_is_satisfied(any_met: &[bool], all_met: &[bool]) -> bool {
     all_ok && any_ok
 }
 
+fn mcp_await_event_has_partial_latch(any_met: &[bool], all_met: &[bool]) -> bool {
+    !mcp_await_event_is_satisfied(any_met, all_met)
+        && (any_met.iter().any(|met| *met) || all_met.iter().any(|met| *met))
+}
+
+/// A condition latch exists only in this invocation. Until the complete
+/// condition expression is terminal, no public cursor may advance across the
+/// first contributing event and silently discard the evidence behind it.
+fn mcp_await_event_authoritative_cursor(
+    partial_latch_cursor: Option<i64>,
+    internal_cursor: Option<i64>,
+    any_met: &[bool],
+    all_met: &[bool],
+) -> Option<i64> {
+    if mcp_await_event_has_partial_latch(any_met, all_met) {
+        match (partial_latch_cursor, internal_cursor) {
+            (Some(partial_cursor), Some(internal_cursor)) => {
+                Some(partial_cursor.min(internal_cursor))
+            }
+            (Some(partial_cursor), None) => Some(partial_cursor),
+            (None, _) => None,
+        }
+    } else {
+        internal_cursor
+    }
+}
+
+fn mcp_await_event_record_partial_latch_cursor(
+    partial_latch_cursor: &mut Option<i64>,
+    event_id: i64,
+    any_met: &[bool],
+    all_met: &[bool],
+) {
+    if mcp_await_event_has_partial_latch(any_met, all_met) {
+        let before_event = event_id.saturating_sub(1);
+        *partial_latch_cursor = Some(
+            partial_latch_cursor.map_or(before_event, |cursor| cursor.min(before_event)),
+        );
+    }
+}
+
 fn mcp_await_condition_status(specs: &[String], met: &[bool]) -> Vec<McpAwaitConditionStatus> {
     specs
         .iter()
@@ -4634,30 +4859,16 @@ fn mcp_await_condition_status(specs: &[String], met: &[bool]) -> Vec<McpAwaitCon
         .collect()
 }
 
-async fn mcp_event_item_from_stored_event(
-    storage: &StorageHandle,
-    cx: &crate::cx::Cx,
+fn mcp_event_item_from_stored_event_with_annotations(
     event: crate::storage::StoredEvent,
     redactor: &crate::redactor::Redactor,
+    annotations: Option<crate::storage::EventAnnotations>,
 ) -> McpEventItem {
     let event = crate::export::redact_event(event, redactor);
     let pack_id = event.rule_id.split('.').next().map_or_else(
         || "builtin:unknown".to_string(),
         |agent| format!("builtin:{agent}"),
     );
-
-    let annotations = match storage.get_event_annotations_with_cx(cx, event.id).await {
-        Ok(Some(a)) => Some(a),
-        Ok(None) => None,
-        Err(err) => {
-            tracing::warn!(
-                error = %err,
-                event_id = event.id,
-                "Failed to load event annotations"
-            );
-            None
-        }
-    };
 
     McpEventItem {
         id: event.id,
@@ -4817,16 +5028,22 @@ impl ToolHandler for WaEventsTool {
                 let events = events_result?;
                 let total_count = events.len();
 
+                let event_ids = events.iter().map(|event| event.id).collect::<Vec<_>>();
+                let annotations_result = storage
+                    .get_event_annotations_bulk_with_cx(&request_cx, &event_ids)
+                    .await;
+                mcp_request_checkpoint(&request_cx, "wa.events")?;
+                let mut annotations_by_event = annotations_result?;
+
                 let redactor = crate::redactor::Redactor::new();
                 let mut items: Vec<McpEventItem> = Vec::with_capacity(events.len());
                 for event in events {
-                    let item = mcp_event_item_from_stored_event(
-                        &storage,
-                        &request_cx,
+                    let event_id = event.id;
+                    let item = mcp_event_item_from_stored_event_with_annotations(
                         event,
                         &redactor,
-                    )
-                    .await;
+                        annotations_by_event.remove(&event_id),
+                    );
                     mcp_request_checkpoint(&request_cx, "wa.events")?;
                     items.push(item);
                 }
@@ -4876,6 +5093,11 @@ impl ToolHandler for WaEventsTool {
 pub(super) struct WaAwaitEventTool {
     db_path: Arc<PathBuf>,
     response_delivery: Option<Arc<FrameworkResponseDeliveryCoordinator>>,
+    delivery_completion: Option<Arc<McpAwaitEventDeliveryCompletionExecutor>>,
+    #[cfg(test)]
+    blocked_retry_observer: Option<Arc<dyn Fn(usize) + Send + Sync + 'static>>,
+    #[cfg(test)]
+    iteration_observer: Option<McpAwaitEventIterationObserver>,
 }
 
 impl WaAwaitEventTool {
@@ -4884,6 +5106,9 @@ impl WaAwaitEventTool {
         Self {
             db_path,
             response_delivery: None,
+            delivery_completion: None,
+            blocked_retry_observer: None,
+            iteration_observer: None,
         }
     }
 
@@ -4891,10 +5116,61 @@ impl WaAwaitEventTool {
         db_path: Arc<PathBuf>,
         response_delivery: Arc<FrameworkResponseDeliveryCoordinator>,
     ) -> Self {
+        let delivery_completion =
+            match McpAwaitEventDeliveryCompletionExecutor::new() {
+                Ok(executor) => Some(Arc::new(executor)),
+                Err(error) => {
+                    tracing::error!(
+                        error = %error,
+                        "Unable to start bounded MCP event-delivery completion workers; claim requests will fail closed"
+                    );
+                    None
+                }
+            };
         Self {
             db_path,
             response_delivery: Some(response_delivery),
+            delivery_completion,
+            #[cfg(test)]
+            blocked_retry_observer: None,
+            #[cfg(test)]
+            iteration_observer: None,
         }
+    }
+
+    #[cfg(test)]
+    fn new_with_response_delivery_and_completion_handler(
+        db_path: Arc<PathBuf>,
+        response_delivery: Arc<FrameworkResponseDeliveryCoordinator>,
+        completion_handler: McpAwaitEventDeliveryCompletionHandler,
+    ) -> Self {
+        Self {
+            db_path,
+            response_delivery: Some(response_delivery),
+            delivery_completion: Some(Arc::new(
+                McpAwaitEventDeliveryCompletionExecutor::new_with_handler(
+                    completion_handler,
+                )
+                .expect("test completion workers must start"),
+            )),
+            blocked_retry_observer: None,
+            iteration_observer: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_blocked_retry_observer(
+        mut self,
+        observer: Arc<dyn Fn(usize) + Send + Sync + 'static>,
+    ) -> Self {
+        self.blocked_retry_observer = Some(observer);
+        self
+    }
+
+    #[cfg(test)]
+    fn with_iteration_observer(mut self, observer: McpAwaitEventIterationObserver) -> Self {
+        self.iteration_observer = Some(observer);
+        self
     }
 }
 
@@ -4995,82 +5271,6 @@ impl ToolHandler for WaAwaitEventTool {
     fn call(&self, ctx: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
         let start = Instant::now();
 
-        let mut arguments = arguments;
-        let mut cursor_epoch = None;
-        let mut cursor_scope = None;
-        let mut checkpoint_only = false;
-        if let Some(object) = arguments.as_object_mut() {
-            if let Some(value) = object.remove("cursor_epoch") {
-                let serde_json::Value::String(epoch) = value else {
-                    let envelope = McpEnvelope::<()>::error(
-                        MCP_ERR_INVALID_ARGS,
-                        "cursor_epoch must be a string".to_string(),
-                        Some(
-                            "Copy final_cursor_epoch exactly from the prior wa.await_event result."
-                                .to_string(),
-                        ),
-                        elapsed_ms(start),
-                    );
-                    return envelope_to_content(envelope);
-                };
-                cursor_epoch = Some(epoch);
-            }
-            if let Some(value) = object.remove("cursor_scope") {
-                let serde_json::Value::String(scope) = value else {
-                    let envelope = McpEnvelope::<()>::error(
-                        MCP_ERR_INVALID_ARGS,
-                        "cursor_scope must be a string".to_string(),
-                        Some(
-                            "Copy final_cursor_scope exactly from the same prior wa.await_event result."
-                                .to_string(),
-                        ),
-                        elapsed_ms(start),
-                    );
-                    return envelope_to_content(envelope);
-                };
-                cursor_scope = Some(scope);
-            }
-            if let Some(value) = object.remove("checkpoint_only") {
-                let serde_json::Value::Bool(enabled) = value else {
-                    let envelope = McpEnvelope::<()>::error(
-                        MCP_ERR_INVALID_ARGS,
-                        "checkpoint_only must be a boolean".to_string(),
-                        Some(
-                            "Use checkpoint_only=true only to acquire a fresh storage-tail cursor token."
-                                .to_string(),
-                        ),
-                        elapsed_ms(start),
-                    );
-                    return envelope_to_content(envelope);
-                };
-                checkpoint_only = enabled;
-            }
-            if let Some(unknown) = object.keys().find(|key| {
-                !matches!(
-                    key.as_str(),
-                    "any"
-                        | "all"
-                        | "timeout_secs"
-                        | "poll_interval_ms"
-                        | "cursor"
-                        | "pane"
-                        | "unhandled"
-                        | "claim"
-                )
-            }) {
-                let envelope = McpEnvelope::<()>::error(
-                    MCP_ERR_INVALID_ARGS,
-                    format!("unknown wa.await_event parameter `{unknown}`"),
-                    Some(
-                        "Use only the fields advertised by the wa.await_event input schema."
-                            .to_string(),
-                    ),
-                    elapsed_ms(start),
-                );
-                return envelope_to_content(envelope);
-            }
-        }
-
         let params: AwaitEventParams = if arguments.is_null() {
             AwaitEventParams::default()
         } else {
@@ -5164,8 +5364,8 @@ impl ToolHandler for WaAwaitEventTool {
         }
         if let Err(message) = validate_mcp_await_event_cursor_token(
             params.cursor,
-            cursor_epoch.as_deref(),
-            cursor_scope.as_deref(),
+            params.cursor_epoch.as_deref(),
+            params.cursor_scope.as_deref(),
         ) {
             let envelope = McpEnvelope::<()>::error(
                 MCP_ERR_INVALID_ARGS,
@@ -5178,7 +5378,7 @@ impl ToolHandler for WaAwaitEventTool {
             );
             return envelope_to_content(envelope);
         }
-        if checkpoint_only && (params.cursor.is_some() || params.claim) {
+        if params.checkpoint_only && (params.cursor.is_some() || params.claim) {
             let envelope = McpEnvelope::<()>::error(
                 MCP_ERR_INVALID_ARGS,
                 "checkpoint_only requires a fresh request without cursor/token and with claim=false"
@@ -5224,7 +5424,7 @@ impl ToolHandler for WaAwaitEventTool {
             params.unhandled || params.claim,
             params.claim,
         );
-        if let Some(supplied_scope) = cursor_scope.as_deref() {
+        if let Some(supplied_scope) = params.cursor_scope.as_deref() {
             if supplied_scope != canonical_cursor_scope {
                 let err = mcp_await_event_cursor_scope_mismatch_error(
                     supplied_scope,
@@ -5252,15 +5452,32 @@ impl ToolHandler for WaAwaitEventTool {
             );
             return envelope_to_content(envelope);
         }
+        if params.claim && self.delivery_completion.is_none() {
+            let envelope = McpEnvelope::<()>::error(
+                MCP_ERR_CONFIG,
+                "wa.await_event claim completion workers are unavailable".to_string(),
+                Some(
+                    "Retry after the MCP server can establish its bounded claim-completion lane"
+                        .to_string(),
+                ),
+                elapsed_ms(start),
+            );
+            return envelope_to_content(envelope);
+        }
 
         let db_path = Arc::clone(&self.db_path);
         let request_cx = ctx.cx().clone();
+        let delivery_completion = self.delivery_completion.as_ref().map(Arc::clone);
+        #[cfg(test)]
+        let blocked_retry_observer = self.blocked_retry_observer.as_ref().map(Arc::clone);
+        #[cfg(test)]
+        let iteration_observer = self.iteration_observer.as_ref().map(Arc::clone);
         let runtime = CompatRuntimeBuilder::current_thread()
             .build()
             .map_err(|e| McpError::internal_error(format!("MCP runtime init failed: {e}")))?;
 
-        let (result, delivery_leases): (
-            std::result::Result<McpAwaitEventResponseData, McpToolError>,
+        let (result, mut delivery_leases): (
+            std::result::Result<McpAwaitEventData, McpToolError>,
             Vec<EventDeliveryLease>,
         ) = runtime.block_on(async {
             let mut delivery_leases = Vec::new();
@@ -5296,18 +5513,19 @@ impl ToolHandler for WaAwaitEventTool {
             // every poll.
             let mut scan_after_id = params.cursor;
             let mut final_cursor = params.cursor;
-            let mut current_cursor_epoch = cursor_epoch.clone();
+            let mut partial_latch_cursor = None;
+            let mut current_cursor_epoch = params.cursor_epoch.clone();
             let mut retention_coverage = None;
             let mut any_met = vec![false; any_conditions.len()];
             let mut all_met = vec![false; all_conditions.len()];
-            let mut matched_events = Vec::new();
+            let mut matched_stored_events = Vec::new();
             let mut blocked_events =
                 Vec::<McpAwaitBlockedEvent>::with_capacity(MCP_AWAIT_EVENT_BLOCKED_EVENT_MAX);
             let mut blocked_retry_scratch =
                 Vec::<McpAwaitBlockedEvent>::with_capacity(MCP_AWAIT_EVENT_BLOCKED_EVENT_MAX);
             let mut retry_blocked_events = true;
 
-            let operation: std::result::Result<McpAwaitEventResponseData, McpToolError> = async {
+            let operation: std::result::Result<McpAwaitEventData, McpToolError> = async {
                 if scan_after_id.is_none() {
                     let baseline_result = storage
                         .get_events_stream_page_with_cx(
@@ -5337,7 +5555,7 @@ impl ToolHandler for WaAwaitEventTool {
 
                 let (satisfied, timed_out) = loop {
                     mcp_await_event_checkpoint(&cx).map_err(McpToolError::from_error)?;
-                    if checkpoint_only {
+                    if params.checkpoint_only {
                         break (false, false);
                     }
                     if started.elapsed() >= timeout {
@@ -5346,9 +5564,24 @@ impl ToolHandler for WaAwaitEventTool {
 
                     if params.claim && retry_blocked_events {
                         retry_blocked_events = false;
+                        let mut retry_timed_out = false;
+                        let mut retry_timeout_unleased_event = None;
                         debug_assert!(blocked_retry_scratch.is_empty());
                         std::mem::swap(&mut blocked_events, &mut blocked_retry_scratch);
-                        for blocked in blocked_retry_scratch.drain(..) {
+                        let mut blocked_retry_iter = blocked_retry_scratch.drain(..);
+                        for blocked in blocked_retry_iter.by_ref() {
+                            #[cfg(test)]
+                            if let Some(observer) = iteration_observer.as_ref() {
+                                observer(
+                                    McpAwaitEventIterationPhase::BlockedRetry,
+                                    blocked.event_id,
+                                );
+                            }
+                            if started.elapsed() >= timeout {
+                                retry_timeout_unleased_event = Some(blocked);
+                                retry_timed_out = true;
+                                break;
+                            }
                             // A cursor hole is independent of whether another
                             // event has since satisfied the same condition. An
                             // exact durable refetch proves handled/deleted state
@@ -5378,13 +5611,23 @@ impl ToolHandler for WaAwaitEventTool {
                                 McpAwaitExactEventResolution::MissingWithoutRetentionEvidence => {
                                     return Err(mcp_await_event_ambiguous_exact_event_error(
                                         blocked.event_id,
-                                        final_cursor,
+                                        mcp_await_event_authoritative_cursor(
+                                            partial_latch_cursor,
+                                            final_cursor,
+                                            &any_met,
+                                            &all_met,
+                                        ),
                                         cursor_epoch,
                                         &canonical_cursor_scope,
                                     ));
                                 }
                             };
 
+                            if started.elapsed() >= timeout {
+                                retry_timeout_unleased_event = Some(blocked);
+                                retry_timed_out = true;
+                                break;
+                            }
                             let remaining = timeout.saturating_sub(started.elapsed());
                             let lease_ttl = remaining.saturating_add(
                                 std::time::Duration::from_secs(
@@ -5433,7 +5676,12 @@ impl ToolHandler for WaAwaitEventTool {
                                             return Err(
                                                 mcp_await_event_ambiguous_exact_event_error(
                                                     blocked.event_id,
-                                                    final_cursor,
+                                                    mcp_await_event_authoritative_cursor(
+                                                        partial_latch_cursor,
+                                                        final_cursor,
+                                                        &any_met,
+                                                        &all_met,
+                                                    ),
                                                     cursor_epoch,
                                                     &canonical_cursor_scope,
                                                 ),
@@ -5447,6 +5695,10 @@ impl ToolHandler for WaAwaitEventTool {
                                     return Err(McpToolError::from_error(error));
                                 }
                             };
+                            if started.elapsed() >= timeout {
+                                retry_timed_out = true;
+                                break;
+                            }
                             let Some(acquired_event) = acquired_event else {
                                 continue;
                             };
@@ -5459,16 +5711,39 @@ impl ToolHandler for WaAwaitEventTool {
                                 &mut all_met,
                                 blocked.matching_all,
                             );
-                            let item = mcp_event_item_from_stored_event(
-                                &storage,
-                                &cx,
-                                acquired_event,
-                                &redactor,
-                            )
-                            .await;
+                            mcp_await_event_record_partial_latch_cursor(
+                                &mut partial_latch_cursor,
+                                blocked.event_id,
+                                &any_met,
+                                &all_met,
+                            );
                             mcp_await_event_checkpoint(&cx)
                                 .map_err(McpToolError::from_error)?;
-                            matched_events.push(item);
+                            matched_stored_events.push(acquired_event);
+                            if mcp_await_event_is_satisfied(&any_met, &all_met) {
+                                // The terminal cursor is the exact completing
+                                // event, even if the transient scanner had
+                                // already inspected later rows while this
+                                // foreign lease was blocking delivery.
+                                scan_after_id = Some(blocked.event_id);
+                                // Once this result is satisfied, do not reserve
+                                // additional events merely because their prior
+                                // third-party leases expired in the same retry
+                                // batch. They remain cursor holes until a later
+                                // await either claims them or observes their
+                                // durable handled state.
+                                break;
+                            }
+                            if started.elapsed() >= timeout {
+                                retry_timed_out = true;
+                                break;
+                            }
+                        }
+                        if let Some(blocked) = retry_timeout_unleased_event {
+                            blocked_events.push(blocked);
+                        }
+                        if retry_timed_out || mcp_await_event_is_satisfied(&any_met, &all_met) {
+                            blocked_events.extend(blocked_retry_iter);
                         }
                         final_cursor = mcp_await_event_committed_cursor(
                             scan_after_id,
@@ -5477,6 +5752,9 @@ impl ToolHandler for WaAwaitEventTool {
                         );
                         if mcp_await_event_is_satisfied(&any_met, &all_met) {
                             break (true, false);
+                        }
+                        if retry_timed_out {
+                            break (false, true);
                         }
                     }
 
@@ -5508,12 +5786,18 @@ impl ToolHandler for WaAwaitEventTool {
                             ),
                         )
                     })?;
-                    let committed_cursor = mcp_await_event_committed_cursor(
+                    let internal_committed_cursor = mcp_await_event_committed_cursor(
                         scan_after_id,
                         &blocked_events,
                         &delivery_leases,
                     )
-                    .or(final_cursor)
+                    .or(final_cursor);
+                    let committed_cursor = mcp_await_event_authoritative_cursor(
+                        partial_latch_cursor,
+                        internal_committed_cursor,
+                        &any_met,
+                        &all_met,
+                    )
                     .unwrap_or(0);
                     mcp_await_event_reconcile_page(
                         &storage,
@@ -5531,6 +5815,14 @@ impl ToolHandler for WaAwaitEventTool {
 
                     for (event_index, event) in page.events.into_iter().enumerate() {
                         let event_id = event.id;
+                        #[cfg(test)]
+                        if let Some(observer) = iteration_observer.as_ref() {
+                            observer(McpAwaitEventIterationPhase::PageScan, event_id);
+                        }
+                        if started.elapsed() >= timeout {
+                            processed_all_events = false;
+                            break;
+                        }
                         let matching_any = mcp_await_event_unmet_match_mask(
                             &any_conditions,
                             &any_met,
@@ -5549,6 +5841,10 @@ impl ToolHandler for WaAwaitEventTool {
                         }
 
                         if params.claim {
+                            if started.elapsed() >= timeout {
+                                processed_all_events = false;
+                                break;
+                            }
                             let remaining = timeout.saturating_sub(started.elapsed());
                             let lease_ttl = remaining.saturating_add(
                                 std::time::Duration::from_secs(
@@ -5625,7 +5921,12 @@ impl ToolHandler for WaAwaitEventTool {
                                             return Err(
                                                 mcp_await_event_ambiguous_exact_event_error(
                                                     event_id,
-                                                    final_cursor,
+                                                    mcp_await_event_authoritative_cursor(
+                                                        partial_latch_cursor,
+                                                        final_cursor,
+                                                        &any_met,
+                                                        &all_met,
+                                                    ),
                                                     cursor_epoch,
                                                     &canonical_cursor_scope,
                                                 ),
@@ -5639,15 +5940,23 @@ impl ToolHandler for WaAwaitEventTool {
                                     return Err(McpToolError::from_error(error));
                                 }
                             }
+                            if started.elapsed() >= timeout {
+                                processed_all_events = false;
+                                break;
+                            }
                         }
 
                         scan_after_id = Some(event_id);
                         mcp_await_event_apply_match_mask(&mut any_met, matching_any);
                         mcp_await_event_apply_match_mask(&mut all_met, matching_all);
-                        let item =
-                            mcp_event_item_from_stored_event(&storage, &cx, event, &redactor).await;
+                        mcp_await_event_record_partial_latch_cursor(
+                            &mut partial_latch_cursor,
+                            event_id,
+                            &any_met,
+                            &all_met,
+                        );
                         mcp_await_event_checkpoint(&cx).map_err(McpToolError::from_error)?;
-                        matched_events.push(item);
+                        matched_stored_events.push(event);
                         if mcp_await_event_is_satisfied(&any_met, &all_met) {
                             processed_all_events = event_index + 1 == batch_len;
                             break;
@@ -5667,6 +5976,12 @@ impl ToolHandler for WaAwaitEventTool {
                         &blocked_events,
                         &delivery_leases,
                     );
+                    #[cfg(test)]
+                    if !blocked_events.is_empty()
+                        && let Some(observer) = blocked_retry_observer.as_ref()
+                    {
+                        observer(blocked_events.len());
+                    }
                     mcp_await_event_checkpoint(&cx).map_err(McpToolError::from_error)?;
                     if mcp_await_event_is_satisfied(&any_met, &all_met) {
                         break (true, false);
@@ -5702,24 +6017,54 @@ impl ToolHandler for WaAwaitEventTool {
                     retry_blocked_events = true;
                 };
 
-                matched_events.sort_by_key(|event| event.id);
+                matched_stored_events.sort_by_key(|event| event.id);
+                let matched_event_ids = matched_stored_events
+                    .iter()
+                    .map(|event| event.id)
+                    .collect::<Vec<_>>();
+                let annotations_result = storage
+                    .get_event_annotations_bulk_with_cx(&cx, &matched_event_ids)
+                    .await;
+                mcp_await_event_checkpoint(&cx).map_err(McpToolError::from_error)?;
+                let mut annotations_by_event =
+                    annotations_result.map_err(McpToolError::from_error)?;
+                let matched_events = matched_stored_events
+                    .into_iter()
+                    .map(|event| {
+                        let event_id = event.id;
+                        mcp_event_item_from_stored_event_with_annotations(
+                            event,
+                            &redactor,
+                            annotations_by_event.remove(&event_id),
+                        )
+                    })
+                    .collect();
 
-                let pending_finalize = !delivery_leases.is_empty();
+                let published_final_cursor = mcp_await_event_authoritative_cursor(
+                    partial_latch_cursor,
+                    final_cursor,
+                    &any_met,
+                    &all_met,
+                );
+                // Partial composite matches are not a terminal delivery. Their
+                // leases are released below regardless of transport outcome so
+                // the request-start cursor can replay those rules on resume.
+                let pending_finalize = satisfied && !delivery_leases.is_empty();
                 let candidate_cursor = if pending_finalize {
                     mcp_await_event_safe_cursor(scan_after_id, &blocked_events)
                 } else {
                     None
                 };
-                let final_cursor_epoch = if final_cursor.is_some() {
+                let final_cursor_epoch = if published_final_cursor.is_some() {
                     current_cursor_epoch.clone()
                 } else {
                     None
                 };
-                let final_cursor_scope = final_cursor
+                let final_cursor_scope = published_final_cursor
                     .is_some()
                     .then(|| canonical_cursor_scope.clone());
-                if final_cursor.is_some() != final_cursor_epoch.is_some()
-                    || final_cursor.is_some() != final_cursor_scope.is_some()
+                if published_final_cursor.is_some() != final_cursor_epoch.is_some()
+                    || published_final_cursor.is_some() != final_cursor_scope.is_some()
                 {
                     return Err(McpToolError::new(
                         MCP_ERR_STORAGE,
@@ -5729,26 +6074,26 @@ impl ToolHandler for WaAwaitEventTool {
                     ));
                 }
 
-                Ok(McpAwaitEventResponseData {
-                    data: McpAwaitEventData {
-                        record_type: "await_result",
-                        satisfied,
-                        timed_out,
-                        elapsed_ms: elapsed_ms(start),
-                        final_cursor,
-                        any: mcp_await_condition_status(&params.any, &any_met),
-                        all: mcp_await_condition_status(&params.all, &all_met),
-                        events: matched_events,
-                        unhandled_only: params.unhandled || params.claim,
-                        claim: params.claim,
-                        claim_delivery: pending_finalize
-                            .then_some("pending_finalize_after_delivery_ack"),
-                    },
+                Ok(McpAwaitEventData {
+                    record_type: "await_result",
+                    satisfied,
+                    timed_out,
+                    elapsed_ms: elapsed_ms(start),
+                    final_cursor: published_final_cursor,
                     final_cursor_epoch,
                     final_cursor_scope,
                     candidate_cursor,
                     pending_finalize,
-                    bootstrap_state: checkpoint_only.then_some("storage_tail_checkpoint"),
+                    bootstrap_state: params
+                        .checkpoint_only
+                        .then_some("storage_tail_checkpoint"),
+                    any: mcp_await_condition_status(&params.any, &any_met),
+                    all: mcp_await_condition_status(&params.all, &all_met),
+                    events: matched_events,
+                    unhandled_only: params.unhandled || params.claim,
+                    claim: params.claim,
+                    claim_delivery: pending_finalize
+                        .then_some("pending_finalize_after_delivery_ack"),
                 })
             }
             .await;
@@ -5762,13 +6107,27 @@ impl ToolHandler for WaAwaitEventTool {
             (operation, delivery_leases)
         });
 
+        if result
+            .as_ref()
+            .is_ok_and(|data| !data.satisfied)
+            && !delivery_leases.is_empty()
+        {
+            enqueue_mcp_await_event_deliveries(
+                delivery_completion.as_ref(),
+                Arc::clone(&self.db_path),
+                std::mem::take(&mut delivery_leases),
+                FrameworkResponseDeliveryOutcome::Failed,
+            );
+        }
+
         match result {
             Ok(data) => {
                 let envelope = McpEnvelope::success(data, elapsed_ms(start));
                 let content = match envelope_to_content(envelope) {
                     Ok(content) => content,
                     Err(err) => {
-                        complete_mcp_await_event_deliveries(
+                        enqueue_mcp_await_event_deliveries(
+                            delivery_completion.as_ref(),
                             Arc::clone(&self.db_path),
                             delivery_leases,
                             FrameworkResponseDeliveryOutcome::Failed,
@@ -5782,7 +6141,8 @@ impl ToolHandler for WaAwaitEventTool {
                 }
 
                 let Some(response_delivery) = self.response_delivery.as_ref() else {
-                    complete_mcp_await_event_deliveries(
+                    enqueue_mcp_await_event_deliveries(
+                        delivery_completion.as_ref(),
                         Arc::clone(&self.db_path),
                         delivery_leases,
                         FrameworkResponseDeliveryOutcome::Failed,
@@ -5798,8 +6158,10 @@ impl ToolHandler for WaAwaitEventTool {
                 };
 
                 let completion_db_path = Arc::clone(&self.db_path);
+                let completion_executor = delivery_completion.as_ref().map(Arc::clone);
                 let action = Box::new(move |outcome| {
-                    complete_mcp_await_event_deliveries(
+                    enqueue_mcp_await_event_deliveries(
+                        completion_executor.as_ref(),
                         completion_db_path,
                         delivery_leases,
                         outcome,
@@ -5824,7 +6186,8 @@ impl ToolHandler for WaAwaitEventTool {
                 Ok(content)
             }
             Err(err) => {
-                complete_mcp_await_event_deliveries(
+                enqueue_mcp_await_event_deliveries(
+                    delivery_completion.as_ref(),
                     Arc::clone(&self.db_path),
                     delivery_leases,
                     FrameworkResponseDeliveryOutcome::Failed,
@@ -11985,6 +12348,74 @@ mod tests {
     }
 
     #[test]
+    fn await_event_partial_all_timeout_replays_from_first_contribution_boundary() {
+        let (_dir, db_path) = temp_db_path();
+        let initial_event_ids = seed_events_with_rules(
+            db_path.as_ref().as_path(),
+            &["other.irrelevant", "codex.phase_a"],
+        );
+        let irrelevant_prefix_id = initial_event_ids[0];
+        let first_event_id = initial_event_ids[1];
+        let cursor_epoch = event_cursor_epoch(db_path.as_ref().as_path());
+        let cursor_scope = await_event_cursor_scope(
+            &[],
+            &["rule:codex.phase_a", "rule:codex.phase_b"],
+            None,
+            false,
+            false,
+        );
+        let tool = WaAwaitEventTool::new(Arc::clone(&db_path));
+
+        let partial = parse_json_content(
+            tool.call(
+                &test_mcp_context(),
+                serde_json::json!({
+                    "all": ["rule:codex.phase_a", "rule:codex.phase_b"],
+                    "cursor": 0,
+                    "cursor_epoch": cursor_epoch,
+                    "cursor_scope": cursor_scope,
+                    "timeout_secs": 1,
+                    "poll_interval_ms": 10
+                }),
+            )
+            .expect("partial composite await should time out with a resumable token"),
+        );
+        assert_eq!(partial["ok"], true, "unexpected envelope: {partial}");
+        assert_eq!(partial["data"]["satisfied"], false);
+        assert_eq!(partial["data"]["timed_out"], true);
+        assert_eq!(partial["data"]["all"][0]["met"], true);
+        assert_eq!(partial["data"]["all"][1]["met"], false);
+        assert_eq!(
+            partial["data"]["final_cursor"], irrelevant_prefix_id,
+            "the public cursor may cross irrelevant rows but must stop before the first partial contribution"
+        );
+
+        let second_event_id = seed_events_with_rules(
+            db_path.as_ref().as_path(),
+            &["codex.phase_b"],
+        )[0];
+        let resumed = parse_json_content(
+            tool.call(
+                &test_mcp_context(),
+                serde_json::json!({
+                    "all": ["rule:codex.phase_a", "rule:codex.phase_b"],
+                    "cursor": partial["data"]["final_cursor"].clone(),
+                    "cursor_epoch": partial["data"]["final_cursor_epoch"].clone(),
+                    "cursor_scope": partial["data"]["final_cursor_scope"].clone(),
+                    "timeout_secs": 1,
+                    "poll_interval_ms": 10
+                }),
+            )
+            .expect("resume should replay phase A and combine it with phase B"),
+        );
+        assert_eq!(resumed["ok"], true, "unexpected envelope: {resumed}");
+        assert_eq!(resumed["data"]["satisfied"], true);
+        assert_eq!(resumed["data"]["timed_out"], false);
+        assert_eq!(resumed["data"]["events"][0]["id"], first_event_id);
+        assert_eq!(resumed["data"]["events"][1]["id"], second_event_id);
+    }
+
+    #[test]
     fn await_event_rejects_incomplete_or_noncanonical_cursor_token() {
         let (_dir, db_path) = temp_db_path();
         let tool = WaAwaitEventTool::new(db_path);
@@ -12465,6 +12896,479 @@ mod tests {
     }
 
     #[test]
+    fn await_event_delivery_completion_never_blocks_the_next_request() {
+        let (_dir, db_path) = temp_db_path();
+        let event_id = seed_event(db_path.as_ref().as_path());
+        let cursor_epoch = event_cursor_epoch(db_path.as_ref().as_path());
+        let cursor_scope = await_event_cursor_scope(
+            &["rule:codex.*"],
+            &[],
+            None,
+            false,
+            true,
+        );
+        let (worker_started_tx, worker_started_rx) = crossbeam::channel::bounded(1);
+        let (release_worker_tx, release_worker_rx) = crossbeam::channel::bounded(1);
+        let completion_handler: super::McpAwaitEventDeliveryCompletionHandler =
+            Arc::new(move |job| {
+                worker_started_tx.send(()).unwrap();
+                let _ = release_worker_rx.recv_timeout(std::time::Duration::from_secs(5));
+                drop(job);
+            });
+        let response_delivery = Arc::new(
+            super::FrameworkResponseDeliveryCoordinator::default(),
+        );
+        let tool = WaAwaitEventTool::new_with_response_delivery_and_completion_handler(
+            Arc::clone(&db_path),
+            Arc::clone(&response_delivery),
+            completion_handler,
+        );
+
+        let claimed = parse_json_content(
+            tool.call(
+                &test_mcp_context(),
+                serde_json::json!({
+                    "any": ["rule:codex.*"],
+                    "cursor": 0,
+                    "cursor_epoch": cursor_epoch,
+                    "cursor_scope": cursor_scope,
+                    "timeout_secs": 1,
+                    "poll_interval_ms": 10,
+                    "claim": true
+                }),
+            )
+            .expect("claim should prepare a transport completion"),
+        );
+        assert_eq!(claimed["ok"], true, "unexpected envelope: {claimed}");
+        assert_eq!(claimed["data"]["candidate_cursor"], event_id);
+        assert!(response_delivery.activate_prepared());
+
+        let (completion_returned_tx, completion_returned_rx) =
+            crossbeam::channel::bounded(1);
+        let response_delivery_for_thread = Arc::clone(&response_delivery);
+        let delivery_thread = std::thread::spawn(move || {
+            response_delivery_for_thread.fail_all();
+            completion_returned_tx.send(()).unwrap();
+        });
+        worker_started_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("completion worker did not receive the queued job");
+        completion_returned_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect(
+                "transport completion waited for the deliberately blocked completion handler",
+            );
+        delivery_thread.join().unwrap();
+
+        // The completion worker is deliberately blocked above. A following
+        // request must still execute to completion before the worker is freed.
+        let checkpoint = parse_json_content(
+            tool.call(
+                &test_mcp_context(),
+                serde_json::json!({
+                    "any": ["rule:codex.*"],
+                    "checkpoint_only": true
+                }),
+            )
+            .expect("following request must not wait for lease finalization"),
+        );
+        assert_eq!(checkpoint["ok"], true, "unexpected envelope: {checkpoint}");
+        assert_eq!(
+            checkpoint["data"]["bootstrap_state"],
+            "storage_tail_checkpoint"
+        );
+        release_worker_tx.send(()).unwrap();
+    }
+
+    #[test]
+    fn await_event_page_scan_stops_before_leasing_a_row_after_timeout() {
+        let (_dir, db_path) = temp_db_path();
+        let event_ids = seed_events_with_rules(
+            db_path.as_ref().as_path(),
+            &["codex.phase_a", "codex.phase_b"],
+        );
+        let cursor_epoch = event_cursor_epoch(db_path.as_ref().as_path());
+        let cursor_scope = await_event_cursor_scope(
+            &[],
+            &["rule:codex.phase_a", "rule:codex.phase_b"],
+            None,
+            false,
+            true,
+        );
+        let second_event_id = event_ids[1];
+        let iteration_observer: super::McpAwaitEventIterationObserver =
+            Arc::new(move |phase, event_id| {
+                if phase == super::McpAwaitEventIterationPhase::PageScan
+                    && event_id == second_event_id
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(1_100));
+                }
+            });
+        let response_delivery = Arc::new(
+            super::FrameworkResponseDeliveryCoordinator::default(),
+        );
+        let tool = WaAwaitEventTool::new_with_response_delivery(
+            Arc::clone(&db_path),
+            response_delivery,
+        )
+        .with_iteration_observer(iteration_observer);
+
+        let envelope = parse_json_content(
+            tool.call(
+                &test_mcp_context(),
+                serde_json::json!({
+                    "all": ["rule:codex.phase_a", "rule:codex.phase_b"],
+                    "cursor": 0,
+                    "cursor_epoch": cursor_epoch,
+                    "cursor_scope": cursor_scope,
+                    "timeout_secs": 1,
+                    "poll_interval_ms": 10,
+                    "claim": true
+                }),
+            )
+            .expect("page scan should return promptly after its deadline"),
+        );
+        assert_eq!(envelope["ok"], true, "unexpected envelope: {envelope}");
+        assert_eq!(envelope["data"]["satisfied"], false);
+        assert_eq!(envelope["data"]["timed_out"], true);
+        assert_eq!(envelope["data"]["events"].as_array().unwrap().len(), 1);
+        assert_eq!(envelope["data"]["events"][0]["id"], event_ids[0]);
+        assert_eq!(envelope["data"]["all"][0]["met"], true);
+        assert_eq!(envelope["data"]["all"][1]["met"], false);
+        assert_eq!(envelope["data"]["final_cursor"], 0);
+        assert_eq!(envelope["data"]["pending_finalize"], false);
+
+        let runtime = CompatRuntimeBuilder::current_thread().build().unwrap();
+        runtime.block_on(async {
+            let storage = StorageHandle::new(&db_path.to_string_lossy()).await.unwrap();
+            let reservation = storage
+                .reserve_event_delivery(
+                    second_event_id,
+                    std::time::Duration::from_secs(1),
+                )
+                .await
+                .unwrap();
+            let crate::storage::EventDeliveryReservation::Acquired(lease) = reservation else {
+                panic!("deadline-expired page row must remain unleased, got {reservation:?}");
+            };
+            assert!(storage.release_event_delivery(&lease).await.unwrap());
+            storage.shutdown().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn await_event_completion_queue_saturation_leaves_lease_authority_untouched() {
+        let (_dir, db_path) = temp_db_path();
+        let event_id = seed_event(db_path.as_ref().as_path());
+        let runtime = CompatRuntimeBuilder::current_thread().build().unwrap();
+        let lease = runtime.block_on(async {
+            let storage = StorageHandle::new(&db_path.to_string_lossy()).await.unwrap();
+            let reservation = storage
+                .reserve_event_delivery(event_id, std::time::Duration::from_secs(60))
+                .await
+                .unwrap();
+            storage.shutdown().await.unwrap();
+            let crate::storage::EventDeliveryReservation::Acquired(lease) = reservation else {
+                panic!("expected owned test lease, got {reservation:?}");
+            };
+            lease
+        });
+
+        let (worker_started_tx, worker_started_rx) = crossbeam::channel::unbounded();
+        let (release_worker_tx, release_worker_rx) = crossbeam::channel::unbounded();
+        let blocking_calls = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let blocking_calls_for_handler = Arc::clone(&blocking_calls);
+        let completion_handler: super::McpAwaitEventDeliveryCompletionHandler =
+            Arc::new(move |job| {
+                let call_index = blocking_calls_for_handler
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if call_index < u64::try_from(super::MCP_AWAIT_EVENT_COMPLETION_WORKERS).unwrap() {
+                    worker_started_tx.send(()).unwrap();
+                    release_worker_rx.recv().unwrap();
+                }
+                drop(job);
+            });
+        let executor = super::McpAwaitEventDeliveryCompletionExecutor::new_with_handler(
+            completion_handler,
+        )
+        .unwrap();
+        let fake_db_path = Arc::new(PathBuf::from("unused-test-completion.sqlite3"));
+
+        for worker_index in 0..super::MCP_AWAIT_EVENT_COMPLETION_WORKERS {
+            let fake_lease = crate::storage::EventDeliveryLease::new(
+                i64::try_from(worker_index + 10).unwrap(),
+                format!("worker-{worker_index}"),
+                0,
+                i64::MAX,
+            );
+            assert!(executor.try_submit(
+                Arc::clone(&fake_db_path),
+                vec![fake_lease],
+                super::FrameworkResponseDeliveryOutcome::Failed,
+            ));
+        }
+        for _ in 0..super::MCP_AWAIT_EVENT_COMPLETION_WORKERS {
+            worker_started_rx
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .expect("completion worker did not enter its blocking handler");
+        }
+
+        for queue_index in 0..super::MCP_AWAIT_EVENT_COMPLETION_QUEUE_CAPACITY {
+            let fake_lease = crate::storage::EventDeliveryLease::new(
+                i64::try_from(queue_index + 100).unwrap(),
+                format!("queued-{queue_index}"),
+                0,
+                i64::MAX,
+            );
+            assert!(executor.try_submit(
+                Arc::clone(&fake_db_path),
+                vec![fake_lease],
+                super::FrameworkResponseDeliveryOutcome::Failed,
+            ));
+        }
+        assert!(
+            !executor.try_submit(
+                Arc::clone(&db_path),
+                vec![lease.clone()],
+                super::FrameworkResponseDeliveryOutcome::Failed,
+            ),
+            "a saturated completion queue must reject without blocking"
+        );
+
+        runtime.block_on(async {
+            let storage = StorageHandle::new(&db_path.to_string_lossy()).await.unwrap();
+            assert!(
+                storage.release_event_delivery(&lease).await.unwrap(),
+                "rejected completion must leave the durable lease token untouched"
+            );
+            storage.shutdown().await.unwrap();
+        });
+        for _ in 0..super::MCP_AWAIT_EVENT_COMPLETION_WORKERS {
+            release_worker_tx.send(()).unwrap();
+        }
+        drop(executor);
+    }
+
+    #[test]
+    fn await_event_claim_retry_stops_after_first_satisfying_expired_lease() {
+        let (_dir, db_path) = temp_db_path();
+        let event_ids = seed_events_with_rules(
+            db_path.as_ref().as_path(),
+            &["codex.first", "codex.second"],
+        );
+        let cursor_epoch = event_cursor_epoch(db_path.as_ref().as_path());
+        let cursor_scope = await_event_cursor_scope(
+            &["rule:codex.*"],
+            &[],
+            None,
+            false,
+            true,
+        );
+        let runtime = CompatRuntimeBuilder::current_thread().build().unwrap();
+        let foreign_leases = runtime.block_on(async {
+            let storage = StorageHandle::new(&db_path.to_string_lossy()).await.unwrap();
+            let mut leases = Vec::new();
+            for event_id in &event_ids {
+                let reservation = storage
+                    .reserve_event_delivery(
+                        *event_id,
+                        std::time::Duration::from_secs(60),
+                    )
+                    .await
+                    .unwrap();
+                let crate::storage::EventDeliveryReservation::Acquired(lease) = reservation else {
+                    panic!("expected initial foreign lease, got {reservation:?}");
+                };
+                leases.push(lease);
+            }
+            storage.shutdown().await.unwrap();
+            leases
+        });
+        assert_eq!(foreign_leases.len(), 2);
+
+        let observer_calls = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let observer_calls_for_hook = Arc::clone(&observer_calls);
+        let leases_for_hook = Arc::new(std::sync::Mutex::new(Some(foreign_leases)));
+        let leases_for_observer = Arc::clone(&leases_for_hook);
+        let observer_db_path = Arc::clone(&db_path);
+        let blocked_retry_observer: Arc<dyn Fn(usize) + Send + Sync + 'static> =
+            Arc::new(move |blocked_count| {
+                observer_calls_for_hook.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let leases = leases_for_observer
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take();
+                if let Some(leases) = leases {
+                    assert_eq!(
+                        blocked_count, 2,
+                        "the first scan must retain both live foreign lease holes"
+                    );
+                    super::complete_mcp_await_event_deliveries(
+                        Arc::clone(&observer_db_path),
+                        leases,
+                        super::FrameworkResponseDeliveryOutcome::Failed,
+                    );
+                }
+            });
+
+        let response_delivery = Arc::new(
+            super::FrameworkResponseDeliveryCoordinator::default(),
+        );
+        let tool = WaAwaitEventTool::new_with_response_delivery(
+            Arc::clone(&db_path),
+            Arc::clone(&response_delivery),
+        )
+        .with_blocked_retry_observer(blocked_retry_observer);
+        let envelope = parse_json_content(
+            tool.call(
+                &test_mcp_context(),
+                serde_json::json!({
+                    "any": ["rule:codex.*"],
+                    "cursor": 0,
+                    "cursor_epoch": cursor_epoch,
+                    "cursor_scope": cursor_scope,
+                    "timeout_secs": 1,
+                    "poll_interval_ms": 10,
+                    "claim": true
+                }),
+            )
+            .expect("an expired foreign lease should become claimable"),
+        );
+
+        assert_eq!(envelope["ok"], true, "unexpected envelope: {envelope}");
+        assert_eq!(envelope["data"]["satisfied"], true);
+        assert_eq!(envelope["data"]["events"].as_array().unwrap().len(), 1);
+        assert_eq!(envelope["data"]["events"][0]["id"], event_ids[0]);
+        assert_eq!(envelope["data"]["final_cursor"], 0);
+        assert_eq!(envelope["data"]["candidate_cursor"], event_ids[0]);
+        assert_eq!(envelope["data"]["pending_finalize"], true);
+        assert_eq!(
+            observer_calls.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "the regression must exercise the retained-hole retry path exactly once"
+        );
+
+        // No transport response is sent in this direct test, so release the
+        // one prepared delivery instead of leaving its lease to expire.
+        response_delivery.fail_all();
+    }
+
+    #[test]
+    fn await_event_blocked_retry_stops_before_leasing_a_hole_after_timeout() {
+        let (_dir, db_path) = temp_db_path();
+        let event_ids = seed_events_with_rules(
+            db_path.as_ref().as_path(),
+            &["codex.phase_a", "codex.phase_b"],
+        );
+        let cursor_epoch = event_cursor_epoch(db_path.as_ref().as_path());
+        let cursor_scope = await_event_cursor_scope(
+            &[],
+            &["rule:codex.phase_a", "rule:codex.phase_b"],
+            None,
+            false,
+            true,
+        );
+        let runtime = CompatRuntimeBuilder::current_thread().build().unwrap();
+        let foreign_leases = runtime.block_on(async {
+            let storage = StorageHandle::new(&db_path.to_string_lossy()).await.unwrap();
+            let mut leases = Vec::new();
+            for event_id in &event_ids {
+                let reservation = storage
+                    .reserve_event_delivery(
+                        *event_id,
+                        std::time::Duration::from_secs(60),
+                    )
+                    .await
+                    .unwrap();
+                let crate::storage::EventDeliveryReservation::Acquired(lease) = reservation else {
+                    panic!("expected initial foreign lease, got {reservation:?}");
+                };
+                leases.push(lease);
+            }
+            storage.shutdown().await.unwrap();
+            leases
+        });
+
+        let leases_for_hook = Arc::new(std::sync::Mutex::new(Some(foreign_leases)));
+        let leases_for_observer = Arc::clone(&leases_for_hook);
+        let observer_db_path = Arc::clone(&db_path);
+        let blocked_retry_observer: Arc<dyn Fn(usize) + Send + Sync + 'static> =
+            Arc::new(move |blocked_count| {
+                let leases = leases_for_observer
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take();
+                if let Some(leases) = leases {
+                    assert_eq!(blocked_count, 2);
+                    super::complete_mcp_await_event_deliveries(
+                        Arc::clone(&observer_db_path),
+                        leases,
+                        super::FrameworkResponseDeliveryOutcome::Failed,
+                    );
+                }
+            });
+        let second_event_id = event_ids[1];
+        let iteration_observer: super::McpAwaitEventIterationObserver =
+            Arc::new(move |phase, event_id| {
+                if phase == super::McpAwaitEventIterationPhase::BlockedRetry
+                    && event_id == second_event_id
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(1_100));
+                }
+            });
+        let response_delivery = Arc::new(
+            super::FrameworkResponseDeliveryCoordinator::default(),
+        );
+        let tool = WaAwaitEventTool::new_with_response_delivery(
+            Arc::clone(&db_path),
+            response_delivery,
+        )
+        .with_blocked_retry_observer(blocked_retry_observer)
+        .with_iteration_observer(iteration_observer);
+
+        let envelope = parse_json_content(
+            tool.call(
+                &test_mcp_context(),
+                serde_json::json!({
+                    "all": ["rule:codex.phase_a", "rule:codex.phase_b"],
+                    "cursor": 0,
+                    "cursor_epoch": cursor_epoch,
+                    "cursor_scope": cursor_scope,
+                    "timeout_secs": 1,
+                    "poll_interval_ms": 10,
+                    "claim": true
+                }),
+            )
+            .expect("blocked retry should stop at its deadline"),
+        );
+        assert_eq!(envelope["ok"], true, "unexpected envelope: {envelope}");
+        assert_eq!(envelope["data"]["satisfied"], false);
+        assert_eq!(envelope["data"]["timed_out"], true);
+        assert_eq!(envelope["data"]["events"].as_array().unwrap().len(), 1);
+        assert_eq!(envelope["data"]["events"][0]["id"], event_ids[0]);
+        assert_eq!(envelope["data"]["all"][0]["met"], true);
+        assert_eq!(envelope["data"]["all"][1]["met"], false);
+        assert_eq!(envelope["data"]["final_cursor"], 0);
+        assert_eq!(envelope["data"]["pending_finalize"], false);
+
+        runtime.block_on(async {
+            let storage = StorageHandle::new(&db_path.to_string_lossy()).await.unwrap();
+            let reservation = storage
+                .reserve_event_delivery(
+                    second_event_id,
+                    std::time::Duration::from_secs(1),
+                )
+                .await
+                .unwrap();
+            let crate::storage::EventDeliveryReservation::Acquired(lease) = reservation else {
+                panic!("deadline-expired retained hole must remain unleased, got {reservation:?}");
+            };
+            assert!(storage.release_event_delivery(&lease).await.unwrap());
+            storage.shutdown().await.unwrap();
+        });
+    }
+
+    #[test]
     fn await_event_claim_timeout_without_candidate_has_no_pending_finalize_state() {
         let (_dir, db_path) = temp_db_path();
         let cursor_epoch = event_cursor_epoch(db_path.as_ref().as_path());
@@ -12505,6 +13409,112 @@ mod tests {
         assert_eq!(envelope["data"]["pending_finalize"], false);
         assert_eq!(envelope["data"]["candidate_cursor"], serde_json::Value::Null);
         assert_eq!(envelope["data"]["claim_delivery"], serde_json::Value::Null);
+        response_delivery.fail_all();
+    }
+
+    #[test]
+    fn await_event_partial_claim_releases_leases_and_replays_composite_rules() {
+        let (_dir, db_path) = temp_db_path();
+        let first_event_id = seed_events_with_rules(
+            db_path.as_ref().as_path(),
+            &["codex.phase_a"],
+        )[0];
+        let cursor_epoch = event_cursor_epoch(db_path.as_ref().as_path());
+        let cursor_scope = await_event_cursor_scope(
+            &[],
+            &["rule:codex.phase_a", "rule:codex.phase_b"],
+            None,
+            false,
+            true,
+        );
+        let response_delivery = Arc::new(
+            super::FrameworkResponseDeliveryCoordinator::default(),
+        );
+        let tool = WaAwaitEventTool::new_with_response_delivery(
+            Arc::clone(&db_path),
+            Arc::clone(&response_delivery),
+        );
+
+        let partial = parse_json_content(
+            tool.call(
+                &test_mcp_context(),
+                serde_json::json!({
+                    "all": ["rule:codex.phase_a", "rule:codex.phase_b"],
+                    "cursor": 0,
+                    "cursor_epoch": cursor_epoch,
+                    "cursor_scope": cursor_scope,
+                    "timeout_secs": 1,
+                    "poll_interval_ms": 10,
+                    "claim": true
+                }),
+            )
+            .expect("partial claim should return a retryable timeout"),
+        );
+        assert_eq!(partial["ok"], true, "unexpected envelope: {partial}");
+        assert_eq!(partial["data"]["satisfied"], false);
+        assert_eq!(partial["data"]["final_cursor"], 0);
+        assert_eq!(partial["data"]["candidate_cursor"], serde_json::Value::Null);
+        assert_eq!(partial["data"]["pending_finalize"], false);
+        assert_eq!(partial["data"]["claim_delivery"], serde_json::Value::Null);
+
+        // The incomplete composite must be released independently of transport
+        // delivery. Wait only for the bounded completion worker to apply that
+        // release, then prove the event is still claimable and unhandled.
+        let runtime = CompatRuntimeBuilder::current_thread().build().unwrap();
+        runtime.block_on(async {
+            let storage = StorageHandle::new(&db_path.to_string_lossy()).await.unwrap();
+            let mut probe_lease = None;
+            for _ in 0..100 {
+                match storage
+                    .reserve_event_delivery(
+                        first_event_id,
+                        std::time::Duration::from_secs(1),
+                    )
+                    .await
+                    .unwrap()
+                {
+                    crate::storage::EventDeliveryReservation::Acquired(lease) => {
+                        probe_lease = Some(lease);
+                        break;
+                    }
+                    crate::storage::EventDeliveryReservation::LeasedUntil { .. } => {
+                        crate::runtime_async::sleep(std::time::Duration::from_millis(10)).await;
+                    }
+                    other => panic!(
+                        "partial claim must remain unhandled and retryable, got {other:?}"
+                    ),
+                }
+            }
+            let probe_lease = probe_lease
+                .expect("bounded completion worker did not release partial claim within 1s");
+            assert!(storage.release_event_delivery(&probe_lease).await.unwrap());
+            storage.shutdown().await.unwrap();
+        });
+
+        let second_event_id = seed_events_with_rules(
+            db_path.as_ref().as_path(),
+            &["codex.phase_b"],
+        )[0];
+        let resumed = parse_json_content(
+            tool.call(
+                &test_mcp_context(),
+                serde_json::json!({
+                    "all": ["rule:codex.phase_a", "rule:codex.phase_b"],
+                    "cursor": partial["data"]["final_cursor"].clone(),
+                    "cursor_epoch": partial["data"]["final_cursor_epoch"].clone(),
+                    "cursor_scope": partial["data"]["final_cursor_scope"].clone(),
+                    "timeout_secs": 1,
+                    "poll_interval_ms": 10,
+                    "claim": true
+                }),
+            )
+            .expect("resumed claim should replay phase A and claim phase B"),
+        );
+        assert_eq!(resumed["ok"], true, "unexpected envelope: {resumed}");
+        assert_eq!(resumed["data"]["satisfied"], true);
+        assert_eq!(resumed["data"]["events"][0]["id"], first_event_id);
+        assert_eq!(resumed["data"]["events"][1]["id"], second_event_id);
+        assert_eq!(resumed["data"]["pending_finalize"], true);
         response_delivery.fail_all();
     }
 
@@ -12708,6 +13718,66 @@ mod tests {
                     .expect("release probe lease")
             );
             storage.shutdown().await.expect("shutdown storage");
+        });
+    }
+
+    #[test]
+    fn await_event_claim_fails_closed_when_completion_workers_are_unavailable() {
+        let (_dir, db_path) = temp_db_path();
+        let event_id = seed_event(db_path.as_ref().as_path());
+        let cursor_epoch = event_cursor_epoch(db_path.as_ref().as_path());
+        let cursor_scope = await_event_cursor_scope(
+            &["rule:codex.*"],
+            &[],
+            None,
+            false,
+            true,
+        );
+        let response_delivery = Arc::new(
+            super::FrameworkResponseDeliveryCoordinator::default(),
+        );
+        let mut tool = WaAwaitEventTool::new_with_response_delivery(
+            Arc::clone(&db_path),
+            response_delivery,
+        );
+        tool.delivery_completion = None;
+
+        let envelope = parse_json_content(
+            tool.call(
+                &test_mcp_context(),
+                serde_json::json!({
+                    "any": ["rule:codex.*"],
+                    "cursor": 0,
+                    "cursor_epoch": cursor_epoch,
+                    "cursor_scope": cursor_scope,
+                    "timeout_secs": 1,
+                    "poll_interval_ms": 10,
+                    "claim": true
+                }),
+            )
+            .expect("missing completion workers should return a fail-closed envelope"),
+        );
+        assert_eq!(envelope["ok"], false);
+        assert_eq!(envelope["error_code"], MCP_ERR_CONFIG);
+        assert!(
+            envelope["error"]
+                .as_str()
+                .is_some_and(|message| message.contains("completion workers")),
+            "configuration error must identify the unavailable completion lane: {envelope}"
+        );
+
+        let runtime = CompatRuntimeBuilder::current_thread().build().unwrap();
+        runtime.block_on(async {
+            let storage = StorageHandle::new(&db_path.to_string_lossy()).await.unwrap();
+            let reservation = storage
+                .reserve_event_delivery(event_id, std::time::Duration::from_secs(1))
+                .await
+                .unwrap();
+            let crate::storage::EventDeliveryReservation::Acquired(lease) = reservation else {
+                panic!("claim rejection must not leave a lease, got {reservation:?}");
+            };
+            assert!(storage.release_event_delivery(&lease).await.unwrap());
+            storage.shutdown().await.unwrap();
         });
     }
 
@@ -13960,6 +15030,7 @@ mod tests {
     }
 
     #[test]
+    // MCP-V1-002
     fn workflow_status_requires_filter_param() {
         let tool = WaWorkflowStatusTool::new(db_path());
 
@@ -16620,7 +17691,28 @@ exit 17",
     #[test]
     fn wa_events_identifies_its_non_resumable_snapshot_capability() {
         let (_dir, db_path) = temp_db_path();
-        let _event_id = seed_event(db_path.as_ref().as_path());
+        let event_id = seed_event(db_path.as_ref().as_path());
+        let runtime = CompatRuntimeBuilder::current_thread().build().unwrap();
+        runtime.block_on(async {
+            let storage = StorageHandle::new(&db_path.to_string_lossy()).await.unwrap();
+            assert!(
+                storage
+                    .set_event_triage_state(
+                        event_id,
+                        Some("investigating".to_string()),
+                        Some("mcp-test".to_string()),
+                    )
+                    .await
+                    .unwrap()
+            );
+            assert!(
+                storage
+                    .add_event_label(event_id, "bulk-read".to_string(), None)
+                    .await
+                    .unwrap()
+            );
+            storage.shutdown().await.unwrap();
+        });
         let tool = WaEventsTool::new(db_path);
         let definition = tool.definition();
         assert!(
@@ -16646,6 +17738,14 @@ exit 17",
         );
         assert!(envelope["data"].get("final_cursor").is_none());
         assert!(envelope["data"].get("cursor_epoch").is_none());
+        assert_eq!(
+            envelope["data"]["events"][0]["annotations"]["triage_state"],
+            "investigating"
+        );
+        assert_eq!(
+            envelope["data"]["events"][0]["annotations"]["labels"],
+            serde_json::json!(["bulk-read"])
+        );
     }
 
     #[test]

@@ -119,7 +119,7 @@ fn load_schema(name: &str) -> Value {
 fn compile_draft_2020_schema(schema: &Value) -> Validator {
     jsonschema::draft202012::options()
         .build(schema)
-        .expect("resource cockpit schema compiles as Draft 2020-12")
+        .expect("schema compiles as Draft 2020-12")
 }
 
 fn assert_schema_accepts(label: &str, validator: &Validator, value: &Value) {
@@ -131,7 +131,7 @@ fn assert_schema_accepts(label: &str, validator: &Validator, value: &Value) {
             .join("\n");
         assert!(
             false,
-            "{label} did not match resource cockpit schema:\n{messages}"
+            "{label} did not match schema:\n{messages}"
         );
     }
 }
@@ -1152,6 +1152,561 @@ fn events_schema_has_defs() {
     }
 }
 
+#[test]
+fn events_schema_enforces_cursor_triples_and_surface_modes() {
+    let schema = load_schema("wa-robot-events.json");
+    let validator = compile_draft_2020_schema(&schema);
+    let epoch = "0123456789abcdef0123456789abcdef";
+    let scope = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    let legacy = json!({
+        "events": [],
+        "total_count": 0,
+        "limit": 20,
+        "unhandled_only": false
+    });
+    assert_schema_accepts("legacy newest-first events snapshot", &validator, &legacy);
+
+    let cursor = json!({
+        "events": [],
+        "total_count": 0,
+        "limit": 20,
+        "unhandled_only": false,
+        "cursor": 7,
+        "cursor_epoch": epoch,
+        "cursor_scope": scope,
+        "next_cursor": 7,
+        "next_cursor_epoch": epoch,
+        "next_cursor_scope": scope,
+        "order": "id_asc"
+    });
+    assert_schema_accepts("resumable scoped events page", &validator, &cursor);
+
+    let tail = json!({
+        "events": [],
+        "total_count": 0,
+        "limit": 20,
+        "unhandled_only": false,
+        "next_cursor": 7,
+        "next_cursor_epoch": epoch,
+        "next_cursor_scope": scope,
+        "order": "id_asc",
+        "start_at_tail": true
+    });
+    assert_schema_accepts("fresh tail checkpoint", &validator, &tail);
+
+    let mcp_snapshot = json!({
+        "events": [],
+        "total_count": 0,
+        "limit": 20,
+        "unhandled_only": false,
+        "cursor_capability": "non_resumable_newest_first_snapshot"
+    });
+    assert_schema_accepts("honest MCP events snapshot", &validator, &mcp_snapshot);
+
+    let mut missing_scope = cursor.clone();
+    missing_scope
+        .as_object_mut()
+        .expect("cursor payload is an object")
+        .remove("cursor_scope");
+    assert!(
+        !validator.is_valid(&missing_scope),
+        "a durable cursor without its scope must fail schema validation"
+    );
+
+    let mut mixed_mcp_cursor = mcp_snapshot;
+    mixed_mcp_cursor["next_cursor"] = json!(7);
+    mixed_mcp_cursor["next_cursor_epoch"] = json!(epoch);
+    mixed_mcp_cursor["next_cursor_scope"] = json!(scope);
+    mixed_mcp_cursor["order"] = json!("id_asc");
+    assert!(
+        !validator.is_valid(&mixed_mcp_cursor),
+        "the non-resumable MCP snapshot marker must not coexist with cursor authority"
+    );
+
+    let mut negative_since = legacy;
+    negative_since["since_filter"] = json!(-1);
+    assert!(
+        !validator.is_valid(&negative_since),
+        "negative epoch milliseconds must fail schema validation"
+    );
+}
+
+#[test]
+fn event_stream_schema_covers_every_closed_record_family() {
+    let schema = load_schema("wa-robot-event-stream-record.json");
+    let validator = compile_draft_2020_schema(&schema);
+    let epoch = "0123456789abcdef0123456789abcdef";
+    let scope = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    let records = [
+        json!({
+            "type": "event",
+            "cursor": 7,
+            "cursor_epoch": epoch,
+            "cursor_scope": scope,
+            "id": 7,
+            "pane_id": 1,
+            "rule_id": "build.done",
+            "agent_type": "codex",
+            "event_type": "detection",
+            "severity": "info",
+            "confidence": 0.9,
+            "detected_at": 1_700_000_000_000_i64,
+            "matched_text": null,
+            "extracted": null,
+            "handled": false,
+            "handled_status": null
+        }),
+        json!({
+            "type": "event",
+            "cursor": 6,
+            "cursor_epoch": epoch,
+            "cursor_scope": scope,
+            "id": 7,
+            "pane_id": 1,
+            "rule_id": "build.done",
+            "agent_type": "codex",
+            "event_type": "detection",
+            "severity": "info",
+            "confidence": 0.9,
+            "detected_at": 1_700_000_000_000_i64,
+            "matched_text": null,
+            "extracted": null,
+            "handled": false,
+            "handled_status": null,
+            "claim_delivery": "finalize_after_output_flush",
+            "cursor_commit_state": "pending_finalize",
+            "pending_finalize": true,
+            "candidate_cursor": 7
+        }),
+        json!({
+            "type": "event",
+            "cursor": 7,
+            "cursor_epoch": epoch,
+            "cursor_scope": scope,
+            "id": null,
+            "pane_id": 2,
+            "rule_id": null,
+            "agent_type": null,
+            "event_type": "pane_discovered",
+            "severity": null,
+            "confidence": null,
+            "detected_at": 1_700_000_000_000_i64,
+            "matched_text": null,
+            "extracted": {"domain": "local", "title": "shell"},
+            "handled": false,
+            "handled_status": null
+        }),
+        json!({
+            "type": "event",
+            "cursor": 7,
+            "cursor_epoch": epoch,
+            "cursor_scope": scope,
+            "id": null,
+            "pane_id": 2,
+            "rule_id": null,
+            "agent_type": null,
+            "event_type": "pane_disappeared",
+            "severity": null,
+            "confidence": null,
+            "detected_at": 1_700_000_000_001_i64,
+            "matched_text": null,
+            "extracted": {},
+            "handled": false,
+            "handled_status": null
+        }),
+        json!({
+            "type": "cursor_checkpoint",
+            "cursor": 7,
+            "cursor_epoch": epoch,
+            "cursor_scope": scope,
+            "cursor_commit_state": "committed",
+            "reason": "fresh_watch_tail_baseline"
+        }),
+        json!({
+            "type": "cursor_checkpoint",
+            "cursor": 7,
+            "cursor_epoch": epoch,
+            "cursor_scope": scope,
+            "cursor_commit_state": "committed",
+            "reason": "fresh_await_tail_baseline"
+        }),
+        json!({
+            "type": "cursor_checkpoint",
+            "cursor": 7,
+            "cursor_epoch": epoch,
+            "cursor_scope": scope,
+            "cursor_commit_state": "committed",
+            "reason": "examined_through_page"
+        }),
+        json!({
+            "type": "cursor_checkpoint",
+            "cursor": 7,
+            "cursor_epoch": epoch,
+            "cursor_scope": scope,
+            "cursor_commit_state": "committed",
+            "reason": "claim_delivery_committed",
+            "claim_delivery": "finalized_after_output_flush",
+            "event_id": 7
+        }),
+        json!({
+            "type": "cursor_checkpoint",
+            "cursor": 7,
+            "cursor_epoch": epoch,
+            "cursor_scope": scope,
+            "cursor_commit_state": "committed",
+            "reason": "claim_delivery_committed",
+            "claim_delivery": "already_finalized",
+            "event_id": 7
+        }),
+        json!({
+            "type": "cursor_checkpoint",
+            "cursor": 7,
+            "cursor_epoch": epoch,
+            "cursor_scope": scope,
+            "cursor_commit_state": "committed",
+            "reason": "claim_delivery_committed",
+            "claim_delivery": "finalized_by_competitor",
+            "event_id": 7
+        }),
+        json!({
+            "type": "claim_deferred",
+            "terminal": true,
+            "retryable": true,
+            "reason": "delivery_lease_active",
+            "cursor": 7,
+            "cursor_epoch": epoch,
+            "cursor_scope": scope,
+            "candidate_cursor": 8,
+            "retry_after_ms": null,
+            "message": "retry with the unchanged token"
+        }),
+        json!({
+            "type": "claim_deferred",
+            "terminal": true,
+            "retryable": true,
+            "reason": "finalization_ownership_lost_after_output_flush",
+            "cursor": 7,
+            "cursor_epoch": epoch,
+            "cursor_scope": scope,
+            "candidate_cursor": 8,
+            "retry_after_ms": 1_700_000_000_000_i64,
+            "message": "retry with the unchanged token"
+        }),
+        json!({
+            "type": "error",
+            "terminal": true,
+            "retryable": false,
+            "code": "robot.invalid_args",
+            "message": "invalid condition",
+            "hint": null,
+            "cursor": null,
+            "cursor_epoch": null,
+            "cursor_scope": null
+        }),
+        json!({
+            "type": "cursor_discontinuity",
+            "terminal": true,
+            "reason": "cursor_scope_mismatch",
+            "requested_cursor": 7,
+            "requested_cursor_epoch": epoch,
+            "requested_cursor_scope": scope,
+            "expected_cursor_scope": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+            "message": "different conditions"
+        }),
+        json!({
+            "type": "cursor_discontinuity",
+            "terminal": true,
+            "reason": "retention_pruned",
+            "requested_cursor": 7,
+            "requested_cursor_epoch": epoch,
+            "requested_cursor_scope": scope,
+            "checked_through": 12,
+            "current_cursor_epoch": epoch,
+            "current_cursor_scope": scope,
+            "evidence_from_event_id": 1,
+            "max_event_id": 12,
+            "candidate_cursor": 10,
+            "deleted_interval": {
+                "start_id": 8,
+                "end_id": 9,
+                "first_generation": 1,
+                "last_generation": 1
+            },
+            "message": "retention pruned an event"
+        }),
+        json!({
+            "type": "cursor_discontinuity",
+            "terminal": true,
+            "reason": "legacy_history_unavailable",
+            "requested_cursor": 7,
+            "requested_cursor_epoch": epoch,
+            "requested_cursor_scope": scope,
+            "checked_through": 12,
+            "current_cursor_epoch": epoch,
+            "current_cursor_scope": scope,
+            "evidence_from_event_id": 8,
+            "max_event_id": 12,
+            "message": "cursor predates retention evidence"
+        }),
+        json!({
+            "type": "cursor_discontinuity",
+            "terminal": true,
+            "reason": "cursor_epoch_mismatch",
+            "requested_cursor": 7,
+            "requested_cursor_epoch": "ffffffffffffffffffffffffffffffff",
+            "requested_cursor_scope": scope,
+            "checked_through": 12,
+            "current_cursor_epoch": epoch,
+            "current_cursor_scope": scope,
+            "evidence_from_event_id": 1,
+            "max_event_id": 12,
+            "message": "cursor belongs to a different retention epoch"
+        }),
+        json!({
+            "type": "cursor_discontinuity",
+            "terminal": true,
+            "reason": "cursor_ahead_of_high_water",
+            "requested_cursor": 99,
+            "requested_cursor_epoch": epoch,
+            "requested_cursor_scope": scope,
+            "checked_through": 99,
+            "current_cursor_epoch": epoch,
+            "current_cursor_scope": scope,
+            "evidence_from_event_id": 1,
+            "max_event_id": 12,
+            "message": "cursor is beyond the durable high-water mark"
+        }),
+        json!({
+            "type": "await_result",
+            "satisfied": false,
+            "timed_out": true,
+            "elapsed_ms": 1_000,
+            "final_cursor": 7,
+            "final_cursor_epoch": epoch,
+            "final_cursor_scope": scope,
+            "any": [],
+            "all": [{"condition": "rule:build.done", "met": false}]
+        }),
+        json!({
+            "type": "await_result",
+            "satisfied": true,
+            "timed_out": false,
+            "elapsed_ms": 250,
+            "final_cursor": 8,
+            "final_cursor_epoch": epoch,
+            "final_cursor_scope": scope,
+            "any": [{"condition": "rule:build.done", "met": true}],
+            "all": []
+        }),
+        json!({
+            "type": "heartbeat",
+            "cursor": 7,
+            "cursor_epoch": epoch,
+            "cursor_scope": scope,
+            "now": 1_700_000_000_000_i64
+        }),
+        json!({
+            "type": "gap",
+            "reason": "broadcast_lag",
+            "cursor": 7,
+            "cursor_epoch": epoch,
+            "cursor_scope": scope,
+            "missed_count": 3,
+            "message": "live wakeups were dropped"
+        }),
+        json!({
+            "type": "gap",
+            "reason": "ipc_protocol_fault",
+            "cursor": 7,
+            "cursor_epoch": epoch,
+            "cursor_scope": scope,
+            "now": 1_700_000_000_000_i64,
+            "fault_kind": "invalid_record_shape",
+            "message": "the private IPC stream violated its closed contract"
+        }),
+        json!({
+            "type": "gap",
+            "reason": "ipc_subscribe_unavailable",
+            "cursor": 7,
+            "cursor_epoch": epoch,
+            "cursor_scope": scope,
+            "now": 1_700_000_000_000_i64,
+            "persisted_detection_recovery": "durable_cursor_backfill",
+            "live_only_signal_recovery": "unavailable",
+            "live_only_signals_at_risk": ["pane_discovered", "pane_disappeared"],
+            "message": "live IPC is degraded"
+        }),
+        json!({
+            "type": "gap",
+            "reason": "ipc_stream_eof",
+            "cursor": 7,
+            "cursor_epoch": epoch,
+            "cursor_scope": scope,
+            "now": 1_700_000_000_000_i64,
+            "persisted_detection_recovery": "durable_cursor_backfill",
+            "live_only_signal_recovery": "unavailable",
+            "live_only_signals_at_risk": ["pane_discovered", "pane_disappeared"],
+            "message": "live IPC closed"
+        }),
+        json!({
+            "type": "gap",
+            "reason": "ipc_stream_read_failure",
+            "cursor": 7,
+            "cursor_epoch": epoch,
+            "cursor_scope": scope,
+            "now": 1_700_000_000_000_i64,
+            "persisted_detection_recovery": "durable_cursor_backfill",
+            "live_only_signal_recovery": "unavailable",
+            "live_only_signals_at_risk": ["pane_discovered", "pane_disappeared"],
+            "message": "live IPC read failed"
+        }),
+    ];
+
+    for record in &records {
+        let label = record["type"].as_str().expect("record type");
+        assert_schema_accepts(label, &validator, record);
+    }
+
+    let mut extra_field = records
+        .iter()
+        .find(|record| {
+            record["type"].as_str() == Some("event") && record["id"].as_i64() == Some(7)
+        })
+        .expect("ordinary event fixture")
+        .clone();
+    extra_field["surprise"] = json!(true);
+    assert!(
+        !validator.is_valid(&extra_field),
+        "stream records must reject undeclared fields"
+    );
+
+    let mut split_token = records
+        .iter()
+        .find(|record| record["type"].as_str() == Some("heartbeat"))
+        .expect("heartbeat fixture")
+        .clone();
+    split_token["cursor_epoch"] = Value::Null;
+    assert!(
+        !validator.is_valid(&split_token),
+        "stream control records must not split cursor authority triples"
+    );
+
+    let mut malformed_error_token = records
+        .iter()
+        .find(|record| record["type"].as_str() == Some("error"))
+        .expect("terminal error fixture")
+        .clone();
+    malformed_error_token["cursor"] = json!(7);
+    malformed_error_token["cursor_epoch"] = json!("AKIAIOSFODNN7EXAMPLE");
+    malformed_error_token["cursor_scope"] = json!(scope);
+    assert!(
+        !validator.is_valid(&malformed_error_token),
+        "error records must never launder an untrusted cursor token into output"
+    );
+
+    let mut negative_error_cursor = records
+        .iter()
+        .find(|record| record["type"].as_str() == Some("error"))
+        .expect("terminal error fixture")
+        .clone();
+    negative_error_cursor["cursor"] = json!(-1);
+    negative_error_cursor["cursor_epoch"] = json!(epoch);
+    negative_error_cursor["cursor_scope"] = json!(scope);
+    assert!(
+        !validator.is_valid(&negative_error_cursor),
+        "error records must reject non-authoritative negative cursors"
+    );
+
+    let mut impossible_await = records
+        .iter()
+        .find(|record| {
+            record["type"].as_str() == Some("await_result")
+                && record["timed_out"].as_bool() == Some(true)
+        })
+        .expect("timed-out await fixture")
+        .clone();
+    impossible_await["satisfied"] = json!(true);
+    assert!(
+        !validator.is_valid(&impossible_await),
+        "an await result cannot be both satisfied and timed out"
+    );
+
+    let mut invented_reason = records
+        .iter()
+        .find(|record| {
+            record["type"].as_str() == Some("cursor_discontinuity")
+                && record["reason"].as_str() == Some("cursor_scope_mismatch")
+        })
+        .expect("scope discontinuity fixture")
+        .clone();
+    invented_reason["reason"] = json!("pruned");
+    assert!(
+        !validator.is_valid(&invented_reason),
+        "the closed discontinuity vocabulary must reject approximate aliases"
+    );
+
+    let mut impossible_checkpoint = records
+        .iter()
+        .find(|record| record["reason"].as_str() == Some("fresh_watch_tail_baseline"))
+        .expect("fresh watch checkpoint fixture")
+        .clone();
+    impossible_checkpoint["claim_delivery"] = json!("already_finalized");
+    impossible_checkpoint["event_id"] = json!(7);
+    assert!(
+        !validator.is_valid(&impossible_checkpoint),
+        "a baseline checkpoint must not masquerade as a claim-finalization receipt"
+    );
+
+    let mut incomplete_claim_checkpoint = records
+        .iter()
+        .find(|record| record["claim_delivery"].as_str() == Some("already_finalized"))
+        .expect("claim checkpoint fixture")
+        .clone();
+    incomplete_claim_checkpoint
+        .as_object_mut()
+        .expect("claim checkpoint object")
+        .remove("event_id");
+    assert!(
+        !validator.is_valid(&incomplete_claim_checkpoint),
+        "a claim checkpoint without its exact event identity must fail"
+    );
+
+    let mut malformed_gap = records
+        .iter()
+        .find(|record| record["reason"].as_str() == Some("broadcast_lag"))
+        .expect("broadcast-lag fixture")
+        .clone();
+    malformed_gap["fault_kind"] = json!("malformed_json");
+    assert!(
+        !validator.is_valid(&malformed_gap),
+        "gap fields from distinct reason families must not be mixed"
+    );
+
+    let mut malformed_lifecycle = records
+        .iter()
+        .find(|record| record["event_type"].as_str() == Some("pane_discovered"))
+        .expect("pane-discovered fixture")
+        .clone();
+    malformed_lifecycle["extracted"] = json!({"domain": "local"});
+    assert!(
+        !validator.is_valid(&malformed_lifecycle),
+        "live lifecycle records must preserve their exact relay metadata shape"
+    );
+
+    let mut impossible_pending_claim = records
+        .iter()
+        .find(|record| record["pending_finalize"].as_bool() == Some(true))
+        .expect("pending claim fixture")
+        .clone();
+    impossible_pending_claim["handled"] = json!(true);
+    assert!(
+        !validator.is_valid(&impossible_pending_claim),
+        "a pending claim record cannot already report handled state"
+    );
+}
+
 // ─────────────────────────────────────────────────────────────────────
 // Docs generation determinism
 // ─────────────────────────────────────────────────────────────────────
@@ -1571,6 +2126,7 @@ fn mcp_envelope_schema_tracks_current_core_error_codes() {
         "FT-MCP-0013",
         "FT-MCP-0014",
         "FT-MCP-0015",
+        "FT-MCP-0016",
         "FT-MCP-9000",
     ]
     .into_iter()

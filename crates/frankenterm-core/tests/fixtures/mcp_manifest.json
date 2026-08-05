@@ -480,9 +480,23 @@
     },
     {
       "annotations": null,
-      "description": "Long-poll for pattern events with ft robot await envelope parity",
+      "description": "Long-poll DB-backed rule events with storage-authoritative scope-bound cursor tokens, optional transport-acknowledged claim leases, and an immediate checkpoint-only tail bootstrap. Live pane-state and quiescence conditions are not supported.",
       "input_schema": {
         "additionalProperties": false,
+        "dependentRequired": {
+          "cursor": [
+            "cursor_epoch",
+            "cursor_scope"
+          ],
+          "cursor_epoch": [
+            "cursor",
+            "cursor_scope"
+          ],
+          "cursor_scope": [
+            "cursor",
+            "cursor_epoch"
+          ]
+        },
         "properties": {
           "all": {
             "default": [],
@@ -506,15 +520,34 @@
             "maxItems": 16,
             "type": "array"
           },
+          "checkpoint_only": {
+            "default": false,
+            "description": "Without a cursor/token or claim, atomically return the current storage-tail cursor token immediately without replaying or waiting",
+            "type": "boolean"
+          },
           "claim": {
             "default": false,
             "description": "Atomically lease matched emitted events; finalize handled only after successful requested-format response delivery, and release leases on known delivery failure",
             "type": "boolean"
           },
           "cursor": {
-            "description": "Resume cursor; only events with id greater than this are considered",
+            "description": "Resume cursor; must be paired with cursor_epoch and cursor_scope from the same prior result",
             "minimum": 0,
             "type": "integer"
+          },
+          "cursor_epoch": {
+            "description": "Retention epoch paired with cursor; copy final_cursor_epoch from the same prior result",
+            "maxLength": 32,
+            "minLength": 32,
+            "pattern": "^[0-9a-f]{32}$",
+            "type": "string"
+          },
+          "cursor_scope": {
+            "description": "SHA-256 request-scope authority paired with cursor; copy final_cursor_scope from the same prior result",
+            "maxLength": 64,
+            "minLength": 64,
+            "pattern": "^[0-9a-f]{64}$",
+            "type": "string"
           },
           "format": {
             "description": "Optional output format override for this call",
@@ -777,7 +810,7 @@
     },
     {
       "annotations": null,
-      "description": "Get pattern detection events (robot parity)",
+      "description": "Get a bounded, non-resumable newest-first snapshot of pattern detection events. This tool has no replay cursor; use wa.await_event for storage-authoritative resumable delivery.",
       "input_schema": {
         "additionalProperties": false,
         "properties": {
@@ -815,7 +848,8 @@
             "type": "string"
           },
           "since": {
-            "description": "Filter by time (epoch ms)",
+            "description": "Filter by time (non-negative epoch ms)",
+            "minimum": 0,
             "type": "integer"
           },
           "triage_state": {
@@ -834,7 +868,7 @@
       "output_schema": null,
       "tags": [
         "wa",
-        "robot",
+        "snapshot",
         "events"
       ],
       "version": "0.12.0"

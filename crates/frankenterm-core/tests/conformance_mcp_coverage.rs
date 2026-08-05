@@ -1,12 +1,11 @@
 //! CI-gating coverage matrix for MCP spec MUST/SHOULD clauses
 //! (bead ft-zaqi8).
 //!
-//! Parses `docs/mcp-api-spec-coverage.md`, extracts every clause ID
-//! whose `Status` column is `TESTED`, and asserts that the test
-//! corpus contains at least one `MCP-V1-NNN` annotation comment for
-//! each. Clauses marked `DEFERRED` are tracked in the matrix but
-//! exempt from the gate (the build fails only if a TESTED clause has
-//! no annotated test, or if the matrix file disappears).
+//! Parses `docs/mcp-api-spec.md` and its coverage matrix, requires every
+//! explicit normative clause to carry exactly one stable ID, and asserts that
+//! every clause marked `TESTED` has an annotation in the crate's unit or
+//! integration test corpus. Clauses marked `DEFERRED` are tracked in the
+//! matrix but exempt from the test-annotation gate.
 //!
 //! Why this exists: the conformance skill mandates a coverage
 //! accounting matrix for every spec MUST/SHOULD. Without a CI gate,
@@ -38,14 +37,20 @@ fn coverage_matrix_path() -> PathBuf {
         .join("mcp-api-spec-coverage.md")
 }
 
-fn tests_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests")
+fn spec_path() -> PathBuf {
+    workspace_root().join("docs").join("mcp-api-spec.md")
+}
+
+fn test_source_roots() -> [PathBuf; 2] {
+    let crate_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    [crate_root.join("src"), crate_root.join("tests")]
 }
 
 /// Extracted clause from the coverage matrix.
 #[derive(Debug, Clone)]
 struct Clause {
     id: String,
+    level: String,
     status: String,
 }
 
@@ -78,22 +83,44 @@ fn parse_clauses(matrix_md: &str) -> Vec<Clause> {
         let status = cells[3].to_string();
         out.push(Clause {
             id: id_cell.to_string(),
+            level: cells[2].to_string(),
             status,
         });
     }
     out
 }
 
-/// Walk the test corpus and collect every `MCP-V1-NNN` mention. Looks
-/// at both module-level docs (`//!`) and inline comments (`//`) so
-/// annotations can live wherever the test author finds natural.
-fn collect_annotations(tests_dir: &PathBuf) -> std::io::Result<Vec<String>> {
+/// Walk the crate's unit and integration test sources and collect every
+/// `MCP-V1-NNN` mention. Looks at both module-level docs (`//!`) and inline
+/// comments (`//`) so annotations can live beside the enforcing test.
+fn collect_ids(line: &str) -> Vec<String> {
     let mut found = Vec::new();
-    for entry in std::fs::read_dir(tests_dir)? {
+    let mut rest = line;
+    while let Some(start) = rest.find("MCP-V1-") {
+        let after = &rest[start + 7..];
+        let id_chars: String = after
+            .chars()
+            .take_while(|character| character.is_ascii_digit())
+            .collect();
+        if id_chars.is_empty() {
+            rest = after;
+            continue;
+        }
+        found.push(format!("MCP-V1-{id_chars}"));
+        rest = &after[id_chars.len()..];
+    }
+    found
+}
+
+fn collect_annotations_in(path: &std::path::Path, found: &mut Vec<String>) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(path)? {
         let entry = entry?;
         let path = entry.path();
-        // Only scan .rs files at the top level of tests/. Subdirectories
-        // (proptest-regressions, fixtures) don't carry annotations.
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
+            collect_annotations_in(&path, found)?;
+            continue;
+        }
         if path.extension().and_then(|s| s.to_str()) != Some("rs") {
             continue;
         }
@@ -102,22 +129,23 @@ fn collect_annotations(tests_dir: &PathBuf) -> std::io::Result<Vec<String>> {
             Err(_) => continue,
         };
         for line in body.lines() {
-            // Find every "MCP-V1-NNN" substring in the line. A single
-            // line can carry multiple annotations.
-            let mut rest = line;
-            while let Some(start) = rest.find("MCP-V1-") {
-                let after = &rest[start + 7..]; // skip "MCP-V1-"
-                let id_chars: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
-                if id_chars.is_empty() {
-                    rest = after;
-                    continue;
-                }
-                found.push(format!("MCP-V1-{id_chars}"));
-                rest = &after[id_chars.len()..];
-            }
+            found.extend(collect_ids(line));
         }
     }
+    Ok(())
+}
+
+fn collect_annotations(source_roots: &[PathBuf]) -> std::io::Result<Vec<String>> {
+    let mut found = Vec::new();
+    for root in source_roots {
+        collect_annotations_in(root, &mut found)?;
+    }
     Ok(found)
+}
+
+fn is_normative_spec_line(line: &str) -> bool {
+    line.split(|character: char| !character.is_ascii_alphabetic())
+        .any(|word| matches!(word, "MUST" | "SHOULD" | "REQUIRED"))
 }
 
 #[test]
@@ -138,13 +166,50 @@ fn matrix_file_exists_and_has_clauses() {
 }
 
 #[test]
+fn every_normative_spec_clause_has_one_matching_matrix_id() {
+    let spec = std::fs::read_to_string(spec_path()).expect("read MCP API spec");
+    let matrix = std::fs::read_to_string(coverage_matrix_path()).expect("read coverage matrix");
+    let clauses = parse_clauses(&matrix);
+    let matrix_normative = clauses
+        .iter()
+        .filter(|clause| matches!(clause.level.as_str(), "MUST" | "SHOULD" | "REQUIRED"))
+        .map(|clause| clause.id.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+
+    let mut spec_normative = std::collections::BTreeSet::new();
+    let mut malformed = Vec::new();
+    for (index, line) in spec.lines().enumerate() {
+        if !is_normative_spec_line(line) {
+            continue;
+        }
+        let ids = collect_ids(line);
+        if ids.len() != 1 {
+            malformed.push(format!("line {} has {} IDs: {line}", index + 1, ids.len()));
+            continue;
+        }
+        if !spec_normative.insert(ids[0].clone()) {
+            malformed.push(format!("line {} repeats ID {}", index + 1, ids[0]));
+        }
+    }
+
+    assert!(
+        malformed.is_empty(),
+        "every explicit MCP MUST/SHOULD/REQUIRED line must carry exactly one unique MCP-V1-NNN ID: {malformed:?}"
+    );
+    assert_eq!(
+        spec_normative, matrix_normative,
+        "normative IDs in the MCP spec and coverage matrix have drifted"
+    );
+}
+
+#[test]
 fn every_tested_clause_has_at_least_one_annotation() {
     let body = std::fs::read_to_string(coverage_matrix_path())
         .expect("read coverage matrix (matrix_file_exists_and_has_clauses runs first)");
     let clauses = parse_clauses(&body);
 
-    let annotations =
-        collect_annotations(&tests_dir()).expect("walk tests/ for MCP-V1-NNN annotations");
+    let annotations = collect_annotations(&test_source_roots())
+        .expect("walk src/ and tests/ for MCP-V1-NNN annotations");
 
     let mut missing = Vec::new();
     let mut counts = Vec::new();
@@ -185,8 +250,8 @@ fn every_annotation_corresponds_to_a_matrix_clause() {
     let known_ids: std::collections::HashSet<String> =
         clauses.iter().map(|c| c.id.clone()).collect();
 
-    let annotations =
-        collect_annotations(&tests_dir()).expect("walk tests/ for MCP-V1-NNN annotations");
+    let annotations = collect_annotations(&test_source_roots())
+        .expect("walk src/ and tests/ for MCP-V1-NNN annotations");
 
     let unknown: Vec<String> = annotations
         .iter()

@@ -422,6 +422,36 @@ fn matrix_covers_representative_contract_cases() {
             && entry.expected_code.as_deref() == Some("robot.policy_denied")),
         "matrix must pin policy-denied send as robot.policy_denied"
     );
+
+    let events = matrix
+        .entries
+        .iter()
+        .find(|entry| entry.id == "mcp-wa-events-json-healthy")
+        .and_then(|entry| entry.envelope.as_ref())
+        .expect("matrix must pin the healthy wa.events envelope");
+    let events_data = events
+        .get("data")
+        .and_then(Value::as_object)
+        .expect("healthy wa.events data must be an object");
+    assert_eq!(
+        events_data.keys().map(String::as_str).collect::<BTreeSet<_>>(),
+        BTreeSet::from([
+            "cursor_capability",
+            "events",
+            "limit",
+            "total_count",
+            "unhandled_only",
+        ]),
+        "wa.events golden must pin its complete unfiltered snapshot shape"
+    );
+    assert_eq!(
+        events.pointer("/data/cursor_capability").and_then(Value::as_str),
+        Some("non_resumable_newest_first_snapshot")
+    );
+    assert_eq!(
+        events.pointer("/data/unhandled_only").and_then(Value::as_bool),
+        Some(false)
+    );
     assert!(
         matrix
             .entries

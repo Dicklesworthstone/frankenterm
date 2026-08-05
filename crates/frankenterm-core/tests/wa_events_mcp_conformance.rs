@@ -787,13 +787,13 @@ fn assert_await_event_cursor_contract(envelope: &Value, args: &Value) {
     );
     if let Some(expected_cursor_epoch) = args.get("cursor_epoch") {
         assert_eq!(
-            envelope["data"]["final_cursor_epoch"], expected_cursor_epoch,
+            &envelope["data"]["final_cursor_epoch"], expected_cursor_epoch,
             "a current-epoch resume must preserve its cursor epoch"
         );
     }
     if let Some(expected_cursor_scope) = args.get("cursor_scope") {
         assert_eq!(
-            envelope["data"]["final_cursor_scope"], expected_cursor_scope,
+            &envelope["data"]["final_cursor_scope"], expected_cursor_scope,
             "a valid resume must preserve its canonical cursor scope"
         );
     }

@@ -102,14 +102,16 @@
         "data": {
           "events": [],
           "total_count": 0,
-          "limit": 50
+          "limit": 50,
+          "unhandled_only": false,
+          "cursor_capability": "non_resumable_newest_first_snapshot"
         },
         "elapsed_ms": 0,
         "version": "0.1.0",
         "now": 0,
         "mcp_version": "v1"
       },
-      "notes": "Pins the read-only events envelope shape without depending on a live event store."
+      "notes": "Pins the honest read-only MCP snapshot shape, including its non-resumable cursor capability, without depending on a live event store."
     },
     {
       "id": "robot-dom-zones-json-healthy",

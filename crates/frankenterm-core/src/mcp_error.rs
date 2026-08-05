@@ -18,6 +18,7 @@ pub(crate) const MCP_ERR_RESERVATION_CONFLICT: &str = "FT-MCP-0012";
 pub(crate) const MCP_ERR_CAUT: &str = "FT-MCP-0013";
 pub(crate) const MCP_ERR_CASS: &str = "FT-MCP-0014";
 pub(crate) const MCP_ERR_REMOTE_TEXT_UNAVAILABLE: &str = "FT-MCP-0015";
+pub(crate) const MCP_ERR_CURSOR_DISCONTINUITY: &str = "FT-MCP-0016";
 pub(crate) const MCP_ERR_INTERNAL: &str = "FT-MCP-9000";
 
 #[derive(Debug)]
@@ -173,11 +174,11 @@ pub(crate) fn map_mcp_error(error: &Error) -> (&'static str, Option<String>) {
 #[cfg(test)]
 mod tests {
     use super::{
-        MCP_ERR_CASS, MCP_ERR_CAUT, MCP_ERR_CONFIG, MCP_ERR_FTS_QUERY, MCP_ERR_INTERNAL,
-        MCP_ERR_INVALID_ARGS, MCP_ERR_NOT_IMPLEMENTED, MCP_ERR_PANE_NOT_FOUND, MCP_ERR_POLICY,
-        MCP_ERR_REMOTE_TEXT_UNAVAILABLE, MCP_ERR_RESERVATION_CONFLICT, MCP_ERR_STORAGE,
-        MCP_ERR_TIMEOUT, MCP_ERR_WEZTERM, MCP_ERR_WORKFLOW, McpToolError, map_cass_error,
-        map_caut_error, map_mcp_error,
+        MCP_ERR_CASS, MCP_ERR_CAUT, MCP_ERR_CONFIG, MCP_ERR_CURSOR_DISCONTINUITY,
+        MCP_ERR_FTS_QUERY, MCP_ERR_INTERNAL, MCP_ERR_INVALID_ARGS, MCP_ERR_NOT_IMPLEMENTED,
+        MCP_ERR_PANE_NOT_FOUND, MCP_ERR_POLICY, MCP_ERR_REMOTE_TEXT_UNAVAILABLE,
+        MCP_ERR_RESERVATION_CONFLICT, MCP_ERR_STORAGE, MCP_ERR_TIMEOUT, MCP_ERR_WEZTERM,
+        MCP_ERR_WORKFLOW, McpToolError, map_cass_error, map_caut_error, map_mcp_error,
     };
     use crate::cass::CassError;
     use crate::caut::CautError;
@@ -205,6 +206,7 @@ mod tests {
             MCP_ERR_CAUT,
             MCP_ERR_CASS,
             MCP_ERR_REMOTE_TEXT_UNAVAILABLE,
+            MCP_ERR_CURSOR_DISCONTINUITY,
             MCP_ERR_INTERNAL,
         ];
         let mut seen = std::collections::HashSet::new();
@@ -230,6 +232,7 @@ mod tests {
             MCP_ERR_CAUT,
             MCP_ERR_CASS,
             MCP_ERR_REMOTE_TEXT_UNAVAILABLE,
+            MCP_ERR_CURSOR_DISCONTINUITY,
             MCP_ERR_INTERNAL,
         ];
         for code in codes {
@@ -257,6 +260,7 @@ mod tests {
             (MCP_ERR_CAUT, "FT-MCP-0013"),
             (MCP_ERR_CASS, "FT-MCP-0014"),
             (MCP_ERR_REMOTE_TEXT_UNAVAILABLE, "FT-MCP-0015"),
+            (MCP_ERR_CURSOR_DISCONTINUITY, "FT-MCP-0016"),
             (MCP_ERR_INTERNAL, "FT-MCP-9000"),
         ];
 

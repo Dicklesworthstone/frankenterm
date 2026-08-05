@@ -219,6 +219,7 @@ pub(super) struct McpSearchHit {
 // ── Events ───────────────────────────────────────────────────────────────
 
 #[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct EventsParams {
     #[serde(default = "default_events_limit")]
     pub limit: usize,
@@ -237,6 +238,7 @@ pub(super) fn default_events_limit() -> usize {
 }
 
 #[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct AwaitEventParams {
     #[serde(default)]
     pub any: Vec<String>,
@@ -247,11 +249,15 @@ pub(super) struct AwaitEventParams {
     #[serde(default = "default_await_event_poll_interval_ms")]
     pub poll_interval_ms: u64,
     pub cursor: Option<i64>,
+    pub cursor_epoch: Option<String>,
+    pub cursor_scope: Option<String>,
     pub pane: Option<u64>,
     #[serde(default)]
     pub unhandled: bool,
     #[serde(default)]
     pub claim: bool,
+    #[serde(default)]
+    pub checkpoint_only: bool,
 }
 
 pub(super) fn default_await_event_poll_interval_ms() -> u64 {
@@ -273,6 +279,17 @@ pub(super) struct McpAwaitEventData {
     pub elapsed_ms: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub final_cursor: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub final_cursor_epoch: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub final_cursor_scope: Option<String>,
+    /// Highest cursor that can become authoritative only after every locally
+    /// owned delivery lease finalizes. Diagnostic only; never a resume token.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub candidate_cursor: Option<i64>,
+    pub pending_finalize: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bootstrap_state: Option<&'static str>,
     pub any: Vec<McpAwaitConditionStatus>,
     pub all: Vec<McpAwaitConditionStatus>,
     pub events: Vec<McpEventItem>,
@@ -3335,5 +3352,47 @@ mod tests {
         let exactly = "a".repeat(MAX_EVENT_LABEL_BYTES);
         validate_event_mutation_string(&exactly, "add", MAX_EVENT_LABEL_BYTES)
             .expect("exact-cap must validate");
+    }
+
+    #[test]
+    fn event_params_reject_fields_outside_the_advertised_schema() {
+        assert!(
+            serde_json::from_value::<EventsParams>(serde_json::json!({
+                "limit": 20,
+                "cursor": 7
+            }))
+            .is_err(),
+            "wa.events must not silently accept an unsupported cursor"
+        );
+        assert!(
+            serde_json::from_value::<AwaitEventParams>(serde_json::json!({
+                "all": ["rule:build.done"],
+                "mystery": true
+            }))
+            .is_err(),
+            "wa.await_event must enforce additionalProperties=false at runtime"
+        );
+    }
+
+    #[test]
+    fn await_event_params_parse_the_complete_resume_token_and_bootstrap_mode() {
+        let params = serde_json::from_value::<AwaitEventParams>(serde_json::json!({
+            "all": ["rule:build.done"],
+            "cursor": 42,
+            "cursor_epoch": "0123456789abcdef0123456789abcdef",
+            "cursor_scope": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "checkpoint_only": false
+        }))
+        .expect("complete typed await token");
+        assert_eq!(params.cursor, Some(42));
+        assert_eq!(
+            params.cursor_epoch.as_deref(),
+            Some("0123456789abcdef0123456789abcdef")
+        );
+        assert_eq!(
+            params.cursor_scope.as_deref(),
+            Some("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+        );
+        assert!(!params.checkpoint_only);
     }
 }
