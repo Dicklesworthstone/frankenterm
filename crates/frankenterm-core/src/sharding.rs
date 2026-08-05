@@ -724,18 +724,21 @@ impl ShardedWeztermClient {
         cleanup_op: &'static str,
         backend: &ShardBackend,
         local_pane_id: u64,
-        cleanup_error: crate::Error,
     ) -> crate::Error {
         // `try_encode_sharded_pane_id` currently returns this exact typed
         // shape. Keep the codec failure first and in the same error variant so
         // rollback trouble adds evidence without replacing the root cause.
+        // A backend label or ordinary cleanup error is just as untrusted as a
+        // panic payload: either can contain credentials, pane text, paths, or
+        // an arbitrarily large string. Retain only static operation classes
+        // and numeric routing identity in the compensator suffix.
         let primary_detail = match primary {
             crate::Error::Wezterm(WeztermError::CommandFailed(detail)) => detail,
             other => other.to_string(),
         };
         crate::Error::Wezterm(WeztermError::CommandFailed(format!(
-            "{primary_detail}; best-effort rollback after {creation_op} failed: {cleanup_op} for local pane {local_pane_id} on {} ({}) returned: {cleanup_error}",
-            backend.label, backend.id
+            "{primary_detail}; best-effort rollback after {creation_op} failed: {cleanup_op} for local pane {local_pane_id} on shard {} (cleanup_failed)",
+            backend.id
         )))
     }
 
@@ -752,13 +755,12 @@ impl ShardedWeztermClient {
 
         match Self::rollback_unencodable_pane_with_fresh_cx(backend, local_pane_id).await {
             Ok(()) => Err(primary),
-            Err(cleanup_error) => Err(Self::codec_error_with_cleanup_failure(
+            Err(_) => Err(Self::codec_error_with_cleanup_failure(
                 primary,
                 creation_op,
                 "kill_pane_with_fresh_cleanup_cx",
                 backend,
                 local_pane_id,
-                cleanup_error,
             )),
         }
     }
@@ -2055,7 +2057,8 @@ mod tests {
     }
 
     impl CreationBoundaryBackend {
-        const CLEANUP_FAILURE: &str = "injected rollback kill failure";
+        const CLEANUP_FAILURE_SECRET: &str =
+            "rollback-secret-sentinel-that-must-never-be-reflected";
         const OVERSIZED_LOCAL_PANE_ID: u64 = LOCAL_PANE_ID_MASK + 1;
         const VALID_LOCAL_PANE_ID: u64 = 41;
 
@@ -2115,7 +2118,11 @@ mod tests {
             }
             if self.fail_cleanup {
                 Err(crate::Error::Wezterm(WeztermError::CommandFailed(
-                    Self::CLEANUP_FAILURE.to_string(),
+                    format!(
+                        "{}{}",
+                        Self::CLEANUP_FAILURE_SECRET,
+                        "x".repeat(64 * 1_024)
+                    ),
                 )))
             } else {
                 Ok(())
@@ -2292,8 +2299,13 @@ mod tests {
     ) -> (ShardedWeztermClient, Arc<CreationBoundaryBackend>) {
         let backend = Arc::new(CreationBoundaryBackend::oversized(fail_cleanup));
         let handle: WeztermHandle = backend.clone();
+        let label = if fail_cleanup {
+            format!("backend-secret-sentinel-{}", "y".repeat(64 * 1_024))
+        } else {
+            "oversized".to_string()
+        };
         let client = ShardedWeztermClient::new(
-            vec![ShardBackend::new(ShardId(0), "oversized", handle)],
+            vec![ShardBackend::new(ShardId(0), label, handle)],
             AssignmentStrategy::RoundRobin,
         )
         .unwrap();
@@ -2422,17 +2434,13 @@ mod tests {
         )
         .unwrap_err()
         .to_string();
-        let cleanup = crate::Error::Wezterm(WeztermError::CommandFailed(
-            CreationBoundaryBackend::CLEANUP_FAILURE.to_string(),
-        ))
-        .to_string();
         assert!(
             rendered.starts_with(&primary),
             "primary codec error must remain the leading error: {rendered}"
         );
         assert!(
-            rendered.ends_with(&cleanup),
-            "cleanup error must remain intact as trailing evidence: {rendered}"
+            rendered.ends_with("on shard 0 (cleanup_failed)"),
+            "cleanup failure must retain only bounded classified evidence: {rendered}"
         );
         let codec_position = rendered
             .find("local pane id")
@@ -2450,8 +2458,13 @@ mod tests {
             "local pane {}",
             CreationBoundaryBackend::OVERSIZED_LOCAL_PANE_ID
         )));
-        assert!(rendered.contains("oversized (0)"));
-        assert!(rendered.contains(CreationBoundaryBackend::CLEANUP_FAILURE));
+        assert!(!rendered.contains("backend-secret-sentinel"));
+        assert!(!rendered.contains(CreationBoundaryBackend::CLEANUP_FAILURE_SECRET));
+        assert!(
+            rendered.len() < 512,
+            "classified rollback diagnostics must remain bounded: {} bytes",
+            rendered.len()
+        );
     }
 
     #[test]
