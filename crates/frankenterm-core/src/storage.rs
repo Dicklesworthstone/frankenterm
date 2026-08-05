@@ -1946,9 +1946,6 @@ const WRITER_TERMINAL_HEALTHY: u8 = 0;
 const WRITER_TERMINAL_BACKEND_EPOCH_POISONED: u8 = 1;
 const WRITER_TERMINAL_CLOSED_CLEANLY: u8 = 2;
 
-const WRITER_CLOSED_CLEANLY_ERROR: &str =
-    "storage writer closed cleanly before this command could be dispatched";
-
 #[derive(Debug)]
 enum WriteCommandSendError {
     Channel(Box<mpsc::SendError<WriteCommand>>),
@@ -2215,15 +2212,7 @@ impl WriteCommandSender {
                 if let Some(wakeup) = &self.wakeup {
                     wakeup.notify();
                 }
-                // A terminal transition can race the final non-awaiting
-                // permit send. The command is then owned by the receiver and
-                // will be explicitly failed by its terminal drain, but the
-                // enqueue caller must not observe a false successful submit.
-                if let Some(error) = self.terminal_send_error() {
-                    Err(error)
-                } else {
-                    Ok(())
-                }
+                Ok(())
             }
             Err(err) => {
                 Self::mark_command_dequeued(&self.queued_depth);
@@ -2542,7 +2531,9 @@ where
 {
     let mut loan = provider.lend_read_backend(db_path)?;
     let result = f(loan.backend());
-    loan.mark_successful_use();
+    if !result.as_ref().err().is_some_and(is_backend_epoch_poisoned) {
+        loan.mark_successful_use();
+    }
     result
 }
 
@@ -2680,7 +2671,7 @@ impl StorageHandle {
                 StorageError::WriterBackendEpochPoisoned.into()
             }
             WriteCommandSendError::WriterClosedCleanly => {
-                StorageError::Database(WRITER_CLOSED_CLEANLY_ERROR.to_string()).into()
+                StorageError::WriterClosed.into()
             }
             WriteCommandSendError::Channel(error) => match error.as_ref() {
                 mpsc::SendError::Cancelled(_) => crate::Error::Cancelled(format!(
@@ -10414,6 +10405,7 @@ fn is_backend_epoch_poisoned(error: &crate::Error) -> bool {
 enum WriterFailure {
     Database(String),
     BackendEpochPoisoned,
+    WriterClosed,
 }
 
 impl WriterFailure {
@@ -10421,6 +10413,7 @@ impl WriterFailure {
         match self {
             Self::Database(message) => Err(StorageError::Database(message.clone()).into()),
             Self::BackendEpochPoisoned => writer_backend_epoch_poisoned_error(),
+            Self::WriterClosed => Err(StorageError::WriterClosed.into()),
         }
     }
 }
@@ -12423,7 +12416,7 @@ fn writer_loop(
                     close_and_drain_writer_queue(
                         rx,
                         queued_depth,
-                        &WriterFailure::Database(WRITER_CLOSED_CLEANLY_ERROR.to_string()),
+                        &WriterFailure::WriterClosed,
                     );
                     break 'main;
                 }
@@ -18894,8 +18887,12 @@ fn open_read_storage_backend(db_path: &str) -> Result<RusqliteBackend> {
 
 fn storage_backend_error(context: &str, err: BackendError) -> StorageError {
     if matches!(&err, BackendError::TxPoisoned) {
-        mark_writer_backend_epoch_poisoned("storage backend operation", "backend");
-        StorageError::WriterBackendEpochPoisoned
+        if writer_dispatch_authority_is_active() {
+            mark_writer_backend_epoch_poisoned("storage backend operation", "backend");
+            StorageError::WriterBackendEpochPoisoned
+        } else {
+            StorageError::BackendEpochPoisoned
+        }
     } else {
         StorageError::Database(format!("{context}: {err}"))
     }
