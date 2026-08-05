@@ -2167,6 +2167,40 @@ fn validate_remote_binding_aliases(
     Ok(())
 }
 
+fn validate_stable_tab_slot(slot: StableTabSlot) -> Result<(), PersistenceFailure> {
+    let StableTabSlot::Remote {
+        binding_id,
+        session_id,
+        remote_window_id,
+        remote_tab_id,
+    } = slot
+    else {
+        return Ok(());
+    };
+
+    if binding_id.as_bytes() == [0; 16] {
+        return Err(PersistenceFailure::invalid(
+            "remote overlay slot uses reserved zero domain binding identity",
+        ));
+    }
+    if session_id.as_bytes() == [0; 16] {
+        return Err(PersistenceFailure::invalid(
+            "remote overlay slot uses reserved zero mux-session identity",
+        ));
+    }
+    if remote_window_id == u64::MAX {
+        return Err(PersistenceFailure::invalid(
+            "remote overlay slot uses the terminal remote-window identity",
+        ));
+    }
+    if remote_tab_id == u64::MAX {
+        return Err(PersistenceFailure::invalid(
+            "remote overlay slot uses the terminal remote-tab identity",
+        ));
+    }
+    Ok(())
+}
+
 fn validate_overlay(overlay: &MixedDomainLayoutOverlay) -> Result<(), PersistenceFailure> {
     validate_workspace(&overlay.workspace)?;
     if overlay.local_revision == 0 {
@@ -2181,15 +2215,14 @@ fn validate_overlay(overlay: &MixedDomainLayoutOverlay) -> Result<(), Persistenc
             MAX_TABS_PER_OVERLAY
         )));
     }
-    let identities = overlay
-        .slots
-        .iter()
-        .map(|slot| slot.identity())
-        .collect::<HashSet<_>>();
-    if identities.len() != overlay.slots.len() {
-        return Err(PersistenceFailure::invalid(
-            "overlay contains duplicate stable tab identities",
-        ));
+    let mut identities = HashSet::with_capacity(overlay.slots.len());
+    for &slot in &overlay.slots {
+        validate_stable_tab_slot(slot)?;
+        if !identities.insert(slot.identity()) {
+            return Err(PersistenceFailure::invalid(
+                "overlay contains duplicate stable tab identities",
+            ));
+        }
     }
     validate_remote_binding_aliases(&overlay.slots, "overlay")?;
     match overlay.active {
@@ -2232,6 +2265,15 @@ fn validate_state(state: &PersistedState) -> Result<(), PersistenceFailure> {
             state.domain_bindings.len(),
             MAX_DOMAIN_BINDINGS
         )));
+    }
+    if state
+        .domain_bindings
+        .iter()
+        .any(|record| record.binding_id.as_bytes() == [0; 16])
+    {
+        return Err(PersistenceFailure::invalid(
+            "domain binding record uses reserved zero identity",
+        ));
     }
     let fingerprints = state
         .domain_bindings
@@ -6431,6 +6473,87 @@ mod tests {
         assert_eq!(snapshot.overlays, vec![overlay]);
         assert_eq!(snapshot.domain_bindings.len(), 1);
         assert_eq!(snapshot.store_revision, 2);
+    }
+
+    #[test]
+    fn remote_overlay_rejects_reserved_authority_identities() {
+        let binding = DomainBindingId::from_bytes([0x21; 16]);
+        let session = StableMuxSessionId::from_bytes([0x31; 16]);
+        let cases = [
+            (
+                StableTabSlot::remote(
+                    DomainBindingId::from_bytes([0; 16]),
+                    session,
+                    1,
+                    2,
+                ),
+                "zero domain binding",
+            ),
+            (
+                StableTabSlot::remote(
+                    binding,
+                    StableMuxSessionId::from_bytes([0; 16]),
+                    1,
+                    2,
+                ),
+                "zero mux-session",
+            ),
+            (
+                StableTabSlot::remote(binding, session, u64::MAX, 2),
+                "terminal remote-window",
+            ),
+            (
+                StableTabSlot::remote(binding, session, 1, u64::MAX),
+                "terminal remote-tab",
+            ),
+        ];
+
+        for (index, (slot, expected_reason)) in cases.into_iter().enumerate() {
+            let error = MixedDomainLayoutOverlay::new(
+                LayoutWindowId::from_bytes([0x41; 16]),
+                "default",
+                u64::try_from(index + 1).expect("small test revision fits u64"),
+                vec![slot],
+                Some(slot),
+            )
+            .expect_err("reserved remote identity must fail before overlay admission");
+            assert_eq!(error.code(), PersistenceFailureCode::Invalid);
+            assert!(
+                error.to_string().contains(expected_reason),
+                "unexpected rejection: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn persisted_reserved_zero_domain_binding_is_rejected_before_restore() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("window-state.json");
+        let mut state = PersistedState::default();
+        state.store_revision = 1;
+        state.domain_bindings.push(DomainBindingRecord {
+            target_fingerprint: PrivacySafeTargetFingerprint::from_bytes([0x51; 32]),
+            binding_id: DomainBindingId::from_bytes([0; 16]),
+        });
+        let payload = serde_json::to_vec(&state).expect("serialize malformed state payload");
+        let sha256: [u8; 32] = Sha256::digest(&payload).into();
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&DiskSlot {
+                payload: state,
+                sha256,
+            })
+            .expect("serialize malformed disk slot"),
+        )
+        .expect("write malformed disk slot");
+
+        let error = load_snapshot_at(&path)
+            .expect_err("reserved zero binding must not enter the startup restore cohort");
+        assert_eq!(error.code(), PersistenceFailureCode::Invalid);
+        assert!(
+            error.to_string().contains("reserved zero identity"),
+            "unexpected rejection: {error}"
+        );
     }
 
     #[test]
