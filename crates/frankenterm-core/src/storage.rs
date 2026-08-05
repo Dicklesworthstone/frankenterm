@@ -237,7 +237,8 @@ pub use self::types::{FtsSyncConfig, Gap};
 // `super::now_ms()` (which is `pub fn` here) so the cross-module
 // dep stays clean.
 pub use self::types::{
-    AgentSessionRecord, EventAnnotations, EventMuteRecord, PaneRecord, StoredEvent,
+    AgentSessionRecord, EventAnnotations, EventDeliveryLease, EventDeliveryReservation,
+    EventMuteRecord, EventRecordOutcome, PaneRecord, StoredEvent,
 };
 
 // =============================================================================
@@ -658,7 +659,7 @@ enum WriteCommand {
         event: StoredEvent,
         /// Delegated capture hold retained through durable writer completion.
         capture_hold: Option<CapturePersistenceHold>,
-        respond: oneshot::Sender<Result<i64>>,
+        respond: oneshot::Sender<Result<EventRecordOutcome>>,
     },
     /// Mark event as handled
     MarkEventHandled {
@@ -666,6 +667,30 @@ enum WriteCommand {
         workflow_id: Option<String>,
         status: String,
         respond: oneshot::Sender<Result<()>>,
+    },
+    /// Atomically reserve an unhandled event for downstream delivery.
+    ReserveEventDelivery {
+        event_id: i64,
+        token: String,
+        /// Validated duration carried to the writer. The lease clock starts
+        /// only when the serialized backend dispatch begins, not while this
+        /// command waits behind an arbitrary writer backlog.
+        ttl_ms: i64,
+        respond: oneshot::Sender<Result<EventDeliveryReservation>>,
+    },
+    /// Mark a flushed delivery handled only while its lease token still owns it.
+    FinalizeEventDelivery {
+        event_id: i64,
+        token: String,
+        workflow_id: Option<String>,
+        status: String,
+        respond: oneshot::Sender<Result<bool>>,
+    },
+    /// Release an unhandled delivery reservation after a downstream failure.
+    ReleaseEventDelivery {
+        event_id: i64,
+        token: String,
+        respond: oneshot::Sender<Result<bool>>,
     },
     /// Set or clear triage state for an event.
     SetEventTriageState {
@@ -1081,6 +1106,9 @@ impl std::fmt::Debug for WriteCommand {
             Self::RecordGap { .. } => "RecordGap",
             Self::RecordEvent { .. } => "RecordEvent",
             Self::MarkEventHandled { .. } => "MarkEventHandled",
+            Self::ReserveEventDelivery { .. } => "ReserveEventDelivery",
+            Self::FinalizeEventDelivery { .. } => "FinalizeEventDelivery",
+            Self::ReleaseEventDelivery { .. } => "ReleaseEventDelivery",
             Self::SetEventTriageState { .. } => "SetEventTriageState",
             Self::SetEventNote { .. } => "SetEventNote",
             Self::AddEventLabel { .. } => "AddEventLabel",
@@ -1711,11 +1739,10 @@ impl WriteCommandSender {
     /// cx releases immediately rather than waiting for backpressure
     /// to drain.
     ///
-    /// Per-call-site migration is incremental; this tick wires
-    /// the 6 event-annotation writes from tick 136. Future ticks
-    /// can progressively migrate the remaining ~50+ `_with_cx`
-    /// storage methods. Legacy `send` stays available for
-    /// ambient-cx callers.
+    /// Every storage `_with_cx` writer call site routes through this method.
+    /// Callers classify `Cancelled` separately from a disconnected writer or
+    /// violated post-reservation capacity invariant. Legacy `send` stays
+    /// available for ambient-cx callers.
     async fn send_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -2103,6 +2130,37 @@ impl StorageHandle {
         }
     }
 
+    /// Preserve cancellation as a first-class error at every storage Cx gate.
+    ///
+    /// Storage used to flatten `Cx::checkpoint` failures into
+    /// `StorageError::Database`, which made a caller-requested cancellation
+    /// indistinguishable from SQLite corruption or I/O failure.  Keep the
+    /// operation name in the detail while retaining the typed cancellation
+    /// variant for policy and transport layers.
+    fn checkpoint_storage_operation(cx: &crate::cx::Cx, operation: &str) -> Result<()> {
+        cx.checkpoint().map_err(|err| {
+            crate::Error::Cancelled(format!("{operation} cancelled: {err}"))
+        })
+    }
+
+    /// Classify the Cx-aware writer enqueue failure without turning a
+    /// caller-requested cancellation into a false writer outage.
+    fn writer_send_error(operation: &str, error: WriteCommandSendError) -> crate::Error {
+        match error.as_ref() {
+            mpsc::SendError::Cancelled(_) => crate::Error::Cancelled(format!(
+                "{operation} cancelled while waiting for storage writer capacity"
+            )),
+            mpsc::SendError::Disconnected(_) => StorageError::Database(format!(
+                "{operation}: storage writer thread is not available"
+            ))
+            .into(),
+            mpsc::SendError::Full(_) => StorageError::Database(format!(
+                "{operation}: storage writer queue was unexpectedly full after reservation"
+            ))
+            .into(),
+        }
+    }
+
     async fn spawn_blocking_storage<T, F>(work: F) -> Result<T>
     where
         T: Send + 'static,
@@ -2156,9 +2214,17 @@ impl StorageHandle {
         T: Send + 'static,
         F: FnOnce() -> Result<T> + Send + 'static,
     {
-        crate::runtime_async::spawn_blocking_with_cx(cx, work)
-            .await
-            .map_err(|e| StorageError::Database(format!("{join_error_prefix}: {e}")))?
+        match crate::runtime_async::spawn_blocking_with_cx(cx, work).await {
+            Ok(result) => result,
+            Err(error) if error.starts_with("spawn_blocking_with_cx cancelled") => {
+                Err(crate::Error::Cancelled(format!(
+                    "{join_error_prefix}: {error}"
+                )))
+            }
+            Err(error) => {
+                Err(StorageError::Database(format!("{join_error_prefix}: {error}")).into())
+            }
+        }
     }
 
     async fn recv_writer_response<T>(rx: oneshot::Receiver<Result<T>>) -> Result<T> {
@@ -2239,9 +2305,7 @@ impl StorageHandle {
     }
 
     fn checkpoint_storage_open(cx: &crate::cx::Cx, phase: &str) -> Result<()> {
-        cx.checkpoint().map_err(|err| {
-            StorageError::Database(format!("storage open cancelled {phase}: {err}")).into()
-        })
+        Self::checkpoint_storage_operation(cx, &format!("storage open {phase}"))
     }
 
     async fn with_config_inner(
@@ -2461,8 +2525,7 @@ impl StorageHandle {
         zone_type: Option<&str>,
         capture_hold: Option<CapturePersistenceHold>,
     ) -> Result<Segment> {
-        cx.checkpoint()
-            .map_err(|err| StorageError::Database(format!("append_segment cancelled: {err}")))?;
+        Self::checkpoint_storage_operation(cx, "append_segment")?;
         let timer = SwarmCapacityStageTimer::start(SwarmCapacityStage::StorageWrite, 0);
         let (tx, rx) = oneshot::channel();
         self.write_tx
@@ -2478,7 +2541,7 @@ impl StorageHandle {
                 },
             )
             .await
-            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+            .map_err(|error| Self::writer_send_error("append_segment", error))?;
         let result = Self::recv_writer_response(rx).await;
         timer.finish_result(&result);
         result
@@ -2529,8 +2592,7 @@ impl StorageHandle {
         reason: &str,
         capture_hold: Option<CapturePersistenceHold>,
     ) -> Result<Option<Gap>> {
-        cx.checkpoint()
-            .map_err(|err| StorageError::Database(format!("record_gap cancelled: {err}")))?;
+        Self::checkpoint_storage_operation(cx, "record_gap")?;
         let (tx, rx) = oneshot::channel();
         self.write_tx
             .send_with_cx(
@@ -2543,16 +2605,27 @@ impl StorageHandle {
                 },
             )
             .await
-            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+            .map_err(|error| Self::writer_send_error("record_gap", error))?;
         Self::recv_writer_response(rx).await
     }
 
     /// Record an event (pattern detection)
     ///
-    /// Returns the event ID.
+    /// Returns the newly inserted event ID, or the existing event ID when the
+    /// event's dedupe key already exists.
     pub async fn record_event(&self, event: StoredEvent) -> Result<i64> {
         let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
         self.record_event_with_cx(&cx, event).await
+    }
+
+    /// Record an event and preserve whether this call inserted the durable row.
+    ///
+    /// Live publishers should prefer this method over [`Self::record_event`]
+    /// and publish only when [`EventRecordOutcome::inserted_event_id`] returns
+    /// `Some`.
+    pub async fn record_event_outcome(&self, event: StoredEvent) -> Result<EventRecordOutcome> {
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.record_event_outcome_with_cx(&cx, event).await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`record_event`].
@@ -2570,17 +2643,28 @@ impl StorageHandle {
         cx: &crate::cx::Cx,
         event: StoredEvent,
     ) -> Result<i64> {
+        self.record_event_outcome_with_cx(cx, event)
+            .await
+            .map(EventRecordOutcome::event_id)
+    }
+
+    /// Cx-first event recording with an authoritative insertion outcome.
+    pub async fn record_event_outcome_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        event: StoredEvent,
+    ) -> Result<EventRecordOutcome> {
         self.record_event_and_capture_hold_with_cx(cx, event, None)
             .await
     }
 
-    /// Capture-authorized writer handoff for a detected event.
-    pub(crate) async fn record_capture_event_with_cx(
+    /// Capture-authorized writer handoff with an authoritative insert outcome.
+    pub(crate) async fn record_capture_event_outcome_with_cx(
         &self,
         cx: &crate::cx::Cx,
         event: StoredEvent,
         capture_hold: CapturePersistenceHold,
-    ) -> Result<i64> {
+    ) -> Result<EventRecordOutcome> {
         self.record_event_and_capture_hold_with_cx(cx, event, Some(capture_hold))
             .await
     }
@@ -2590,9 +2674,8 @@ impl StorageHandle {
         cx: &crate::cx::Cx,
         event: StoredEvent,
         capture_hold: Option<CapturePersistenceHold>,
-    ) -> Result<i64> {
-        cx.checkpoint()
-            .map_err(|err| StorageError::Database(format!("record_event cancelled: {err}")))?;
+    ) -> Result<EventRecordOutcome> {
+        Self::checkpoint_storage_operation(cx, "record_event")?;
         let (tx, rx) = oneshot::channel();
         self.write_tx
             .send_with_cx(
@@ -2604,7 +2687,7 @@ impl StorageHandle {
                 },
             )
             .await
-            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+            .map_err(|error| Self::writer_send_error("record_event", error))?;
         Self::recv_writer_response(rx).await
     }
 
@@ -2635,9 +2718,7 @@ impl StorageHandle {
         workflow_id: Option<String>,
         status: &str,
     ) -> Result<()> {
-        cx.checkpoint().map_err(|err| {
-            StorageError::Database(format!("mark_event_handled cancelled: {err}"))
-        })?;
+        Self::checkpoint_storage_operation(cx, "mark_event_handled")?;
         let (tx, rx) = oneshot::channel();
         self.write_tx
             .send_with_cx(
@@ -2650,7 +2731,134 @@ impl StorageHandle {
                 },
             )
             .await
-            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+            .map_err(|error| Self::writer_send_error("mark_event_handled", error))?;
+        Self::recv_writer_response(rx).await
+    }
+
+    /// Atomically reserve an unhandled event for downstream delivery.
+    ///
+    /// Reservation alone does not change `handled_at`. After the downstream
+    /// write and flush succeed, call [`Self::finalize_event_delivery`]. On a
+    /// known delivery failure, call [`Self::release_event_delivery`]; if the
+    /// process dies, another consumer may acquire the event after `lease_ttl`.
+    /// The TTL clock starts at serialized writer dispatch, so time spent waiting
+    /// in the bounded writer queue cannot return an already-expired lease.
+    /// Positive sub-millisecond TTLs round up to the next persisted millisecond
+    /// so the stored deadline is never earlier than the requested duration.
+    pub async fn reserve_event_delivery(
+        &self,
+        event_id: i64,
+        lease_ttl: std::time::Duration,
+    ) -> Result<EventDeliveryReservation> {
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.reserve_event_delivery_with_cx(&cx, event_id, lease_ttl)
+            .await
+    }
+
+    /// Cx-first sibling of [`Self::reserve_event_delivery`].
+    pub async fn reserve_event_delivery_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        event_id: i64,
+        lease_ttl: std::time::Duration,
+    ) -> Result<EventDeliveryReservation> {
+        Self::checkpoint_storage_operation(cx, "reserve_event_delivery")?;
+        if event_id <= 0 {
+            return Err(StorageError::Database(format!(
+                "event delivery lease requires a positive event id, got {event_id}"
+            ))
+            .into());
+        }
+        let ttl_ms = checked_event_delivery_lease_ttl_ms(lease_ttl)?;
+        let token = new_event_delivery_lease_token();
+        let (tx, rx) = oneshot::channel();
+        self.write_tx
+            .send_with_cx(
+                cx,
+                WriteCommand::ReserveEventDelivery {
+                    event_id,
+                    token,
+                    ttl_ms,
+                    respond: tx,
+                },
+            )
+            .await
+            .map_err(|error| Self::writer_send_error("reserve_event_delivery", error))?;
+        Self::recv_writer_response(rx).await
+    }
+
+    /// Finalize a successfully flushed event delivery.
+    ///
+    /// Expiry is a soft steal deadline, not an automatic loss of ownership: a
+    /// token may still finalize after its deadline if no successor has replaced
+    /// it. Returns `true` only when `lease` still owns the unhandled event. A
+    /// `false` result means the token was replaced, the event was handled by
+    /// another path, or the row no longer exists; callers must not advance a
+    /// durable delivery cursor in that case. A successful finalization stamps
+    /// `handled_at` at serialized writer dispatch, after any bounded-queue wait.
+    pub async fn finalize_event_delivery(
+        &self,
+        lease: &EventDeliveryLease,
+        workflow_id: Option<String>,
+        status: &str,
+    ) -> Result<bool> {
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.finalize_event_delivery_with_cx(&cx, lease, workflow_id, status)
+            .await
+    }
+
+    /// Cx-first sibling of [`Self::finalize_event_delivery`].
+    pub async fn finalize_event_delivery_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        lease: &EventDeliveryLease,
+        workflow_id: Option<String>,
+        status: &str,
+    ) -> Result<bool> {
+        Self::checkpoint_storage_operation(cx, "finalize_event_delivery")?;
+        let (tx, rx) = oneshot::channel();
+        self.write_tx
+            .send_with_cx(
+                cx,
+                WriteCommand::FinalizeEventDelivery {
+                    event_id: lease.event_id(),
+                    token: lease.token().to_string(),
+                    workflow_id,
+                    status: status.to_string(),
+                    respond: tx,
+                },
+            )
+            .await
+            .map_err(|error| Self::writer_send_error("finalize_event_delivery", error))?;
+        Self::recv_writer_response(rx).await
+    }
+
+    /// Release an unhandled event-delivery lease after a known downstream
+    /// write or flush failure. Returns `false` if ownership was already lost.
+    pub async fn release_event_delivery(&self, lease: &EventDeliveryLease) -> Result<bool> {
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.release_event_delivery_with_cx(&cx, lease).await
+    }
+
+    /// Cx-first sibling of [`Self::release_event_delivery`].
+    pub async fn release_event_delivery_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        lease: &EventDeliveryLease,
+    ) -> Result<bool> {
+        Self::checkpoint_storage_operation(cx, "release_event_delivery")?;
+        let (tx, rx) = oneshot::channel();
+        self.write_tx
+            .send_with_cx(
+                cx,
+                WriteCommand::ReleaseEventDelivery {
+                    event_id: lease.event_id(),
+                    token: lease.token().to_string(),
+                    respond: tx,
+                },
+            )
+            .await
+            .map_err(|error| Self::writer_send_error("release_event_delivery", error))?;
         Self::recv_writer_response(rx).await
     }
 
@@ -2677,9 +2885,7 @@ impl StorageHandle {
         triage_state: Option<String>,
         updated_by: Option<String>,
     ) -> Result<bool> {
-        cx.checkpoint().map_err(|err| {
-            StorageError::Database(format!("set_event_triage_state cancelled: {err}"))
-        })?;
+        Self::checkpoint_storage_operation(cx, "set_event_triage_state")?;
         let (tx, rx) = oneshot::channel();
         self.write_tx
             .send_with_cx(
@@ -2692,7 +2898,7 @@ impl StorageHandle {
                 },
             )
             .await
-            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+            .map_err(|error| Self::writer_send_error("set_event_triage_state", error))?;
         Self::recv_writer_response(rx).await
     }
 
@@ -2719,8 +2925,7 @@ impl StorageHandle {
         note: Option<String>,
         updated_by: Option<String>,
     ) -> Result<()> {
-        cx.checkpoint()
-            .map_err(|err| StorageError::Database(format!("set_event_note cancelled: {err}")))?;
+        Self::checkpoint_storage_operation(cx, "set_event_note")?;
         let (tx, rx) = oneshot::channel();
         self.write_tx
             .send_with_cx(
@@ -2733,7 +2938,7 @@ impl StorageHandle {
                 },
             )
             .await
-            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+            .map_err(|error| Self::writer_send_error("set_event_note", error))?;
         Self::recv_writer_response(rx).await
     }
 
@@ -2760,8 +2965,7 @@ impl StorageHandle {
         label: String,
         created_by: Option<String>,
     ) -> Result<bool> {
-        cx.checkpoint()
-            .map_err(|err| StorageError::Database(format!("add_event_label cancelled: {err}")))?;
+        Self::checkpoint_storage_operation(cx, "add_event_label")?;
         let (tx, rx) = oneshot::channel();
         self.write_tx
             .send_with_cx(
@@ -2774,7 +2978,7 @@ impl StorageHandle {
                 },
             )
             .await
-            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+            .map_err(|error| Self::writer_send_error("add_event_label", error))?;
         Self::recv_writer_response(rx).await
     }
 
@@ -2794,9 +2998,7 @@ impl StorageHandle {
         event_id: i64,
         label: String,
     ) -> Result<bool> {
-        cx.checkpoint().map_err(|err| {
-            StorageError::Database(format!("remove_event_label cancelled: {err}"))
-        })?;
+        Self::checkpoint_storage_operation(cx, "remove_event_label")?;
         let (tx, rx) = oneshot::channel();
         self.write_tx
             .send_with_cx(
@@ -2808,7 +3010,7 @@ impl StorageHandle {
                 },
             )
             .await
-            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+            .map_err(|error| Self::writer_send_error("remove_event_label", error))?;
         Self::recv_writer_response(rx).await
     }
 
@@ -2824,9 +3026,7 @@ impl StorageHandle {
         cx: &crate::cx::Cx,
         event_id: i64,
     ) -> Result<Option<EventAnnotations>> {
-        cx.checkpoint().map_err(|err| {
-            StorageError::Database(format!("get_event_annotations cancelled: {err}"))
-        })?;
+        Self::checkpoint_storage_operation(cx, "get_event_annotations")?;
         let db_path = Arc::clone(&self.db_path);
         Self::spawn_blocking_storage_with_cx(cx, move || {
             pooled_backend(db_path.as_str(), |backend| {
@@ -2855,9 +3055,7 @@ impl StorageHandle {
         cx: &crate::cx::Cx,
         event_id: i64,
     ) -> Result<Option<String>> {
-        cx.checkpoint().map_err(|err| {
-            StorageError::Database(format!("get_event_identity_key cancelled: {err}"))
-        })?;
+        Self::checkpoint_storage_operation(cx, "get_event_identity_key")?;
         let db_path = Arc::clone(&self.db_path);
 
         Self::spawn_blocking_storage_with_cx(cx, move || {
@@ -2886,9 +3084,7 @@ impl StorageHandle {
         cx: &crate::cx::Cx,
         action: AuditActionRecord,
     ) -> Result<i64> {
-        cx.checkpoint().map_err(|err| {
-            StorageError::Database(format!("record_audit_action cancelled: {err}"))
-        })?;
+        Self::checkpoint_storage_operation(cx, "record_audit_action")?;
         let (tx, rx) = oneshot::channel();
         self.write_tx
             .send_with_cx(
@@ -2899,7 +3095,7 @@ impl StorageHandle {
                 },
             )
             .await
-            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+            .map_err(|error| Self::writer_send_error("record_audit_action", error))?;
         Self::recv_writer_response(rx).await
     }
 
@@ -2928,11 +3124,7 @@ impl StorageHandle {
         correlation_id: String,
         verification_summary: String,
     ) -> Result<bool> {
-        cx.checkpoint().map_err(|err| {
-            StorageError::Database(format!(
-                "update_audit_action_submit_receipt cancelled: {err}"
-            ))
-        })?;
+        Self::checkpoint_storage_operation(cx, "update_audit_action_submit_receipt")?;
         let (tx, rx) = oneshot::channel();
         self.write_tx
             .send_with_cx(
@@ -2945,7 +3137,9 @@ impl StorageHandle {
                 },
             )
             .await
-            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+            .map_err(|error| {
+                Self::writer_send_error("update_audit_action_submit_receipt", error)
+            })?;
         Self::recv_writer_response(rx).await
     }
 
@@ -2971,9 +3165,7 @@ impl StorageHandle {
         cx: &crate::cx::Cx,
         record: PolicyDeniedAuditRecord,
     ) -> Result<i64> {
-        cx.checkpoint().map_err(|err| {
-            StorageError::Database(format!("record_policy_denial_audit cancelled: {err}"))
-        })?;
+        Self::checkpoint_storage_operation(cx, "record_policy_denial_audit")?;
         let (tx, rx) = oneshot::channel();
         self.write_tx
             .send_with_cx(
@@ -2984,7 +3176,7 @@ impl StorageHandle {
                 },
             )
             .await
-            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+            .map_err(|error| Self::writer_send_error("record_policy_denial_audit", error))?;
         Self::recv_writer_response(rx).await
     }
 
@@ -3015,9 +3207,7 @@ impl StorageHandle {
         cx: &crate::cx::Cx,
         record: ActionUndoRecord,
     ) -> Result<()> {
-        cx.checkpoint().map_err(|err| {
-            StorageError::Database(format!("upsert_action_undo cancelled: {err}"))
-        })?;
+        Self::checkpoint_storage_operation(cx, "upsert_action_undo")?;
         let (tx, rx) = oneshot::channel();
         self.write_tx
             .send_with_cx(
@@ -3028,7 +3218,7 @@ impl StorageHandle {
                 },
             )
             .await
-            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+            .map_err(|error| Self::writer_send_error("upsert_action_undo", error))?;
         Self::recv_writer_response(rx).await
     }
 
@@ -3048,9 +3238,7 @@ impl StorageHandle {
         cx: &crate::cx::Cx,
         mut record: ActionUndoRecord,
     ) -> Result<()> {
-        cx.checkpoint().map_err(|err| {
-            StorageError::Database(format!("upsert_action_undo_redacted cancelled: {err}"))
-        })?;
+        Self::checkpoint_storage_operation(cx, "upsert_action_undo_redacted")?;
         let redactor = Redactor::new();
         record.redact_fields(&redactor);
         self.upsert_action_undo_with_cx(cx, record).await
@@ -3068,8 +3256,7 @@ impl StorageHandle {
         cx: &crate::cx::Cx,
         audit_action_id: i64,
     ) -> Result<Option<ActionUndoRecord>> {
-        cx.checkpoint()
-            .map_err(|err| StorageError::Database(format!("get_action_undo cancelled: {err}")))?;
+        Self::checkpoint_storage_operation(cx, "get_action_undo")?;
         let db_path = Arc::clone(&self.db_path);
 
         Self::spawn_blocking_storage_with_cx(cx, move || {
@@ -3097,9 +3284,7 @@ impl StorageHandle {
         audit_action_id: i64,
         undone_by: &str,
     ) -> Result<bool> {
-        cx.checkpoint().map_err(|err| {
-            StorageError::Database(format!("mark_action_undone cancelled: {err}"))
-        })?;
+        Self::checkpoint_storage_operation(cx, "mark_action_undone")?;
         let (tx, rx) = oneshot::channel();
         self.write_tx
             .send_with_cx(
@@ -3112,7 +3297,7 @@ impl StorageHandle {
                 },
             )
             .await
-            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+            .map_err(|error| Self::writer_send_error("mark_action_undone", error))?;
 
         Self::recv_writer_response(rx).await
     }
@@ -3130,9 +3315,7 @@ impl StorageHandle {
         cx: &crate::cx::Cx,
         before_ts: i64,
     ) -> Result<usize> {
-        cx.checkpoint().map_err(|err| {
-            StorageError::Database(format!("purge_audit_actions_before cancelled: {err}"))
-        })?;
+        Self::checkpoint_storage_operation(cx, "purge_audit_actions_before")?;
         let (tx, rx) = oneshot::channel();
         self.write_tx
             .send_with_cx(
@@ -3143,7 +3326,7 @@ impl StorageHandle {
                 },
             )
             .await
-            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+            .map_err(|error| Self::writer_send_error("purge_audit_actions_before", error))?;
 
         Self::recv_writer_response(rx).await
     }
@@ -3161,9 +3344,7 @@ impl StorageHandle {
         cx: &crate::cx::Cx,
         record: MaintenanceRecord,
     ) -> Result<i64> {
-        cx.checkpoint().map_err(|err| {
-            StorageError::Database(format!("record_maintenance cancelled: {err}"))
-        })?;
+        Self::checkpoint_storage_operation(cx, "record_maintenance")?;
         let (tx, rx) = oneshot::channel();
         self.write_tx
             .send_with_cx(
@@ -3174,7 +3355,7 @@ impl StorageHandle {
                 },
             )
             .await
-            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+            .map_err(|error| Self::writer_send_error("record_maintenance", error))?;
         Self::recv_writer_response(rx).await
     }
 
@@ -3190,9 +3371,7 @@ impl StorageHandle {
         cx: &crate::cx::Cx,
         record: SecretScanReportRecord,
     ) -> Result<i64> {
-        cx.checkpoint().map_err(|err| {
-            StorageError::Database(format!("record_secret_scan_report cancelled: {err}"))
-        })?;
+        Self::checkpoint_storage_operation(cx, "record_secret_scan_report")?;
         let (tx, rx) = oneshot::channel();
         self.write_tx
             .send_with_cx(
@@ -3203,7 +3382,7 @@ impl StorageHandle {
                 },
             )
             .await
-            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+            .map_err(|error| Self::writer_send_error("record_secret_scan_report", error))?;
 
         Self::recv_writer_response(rx).await
     }
@@ -3221,9 +3400,7 @@ impl StorageHandle {
         cx: &crate::cx::Cx,
         record: SavedSearchRecord,
     ) -> Result<()> {
-        cx.checkpoint().map_err(|err| {
-            StorageError::Database(format!("insert_saved_search cancelled: {err}"))
-        })?;
+        Self::checkpoint_storage_operation(cx, "insert_saved_search")?;
         let (tx, rx) = oneshot::channel();
         self.write_tx
             .send_with_cx(
@@ -3234,7 +3411,7 @@ impl StorageHandle {
                 },
             )
             .await
-            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+            .map_err(|error| Self::writer_send_error("insert_saved_search", error))?;
         Self::recv_writer_response(rx).await
     }
 
@@ -3261,9 +3438,7 @@ impl StorageHandle {
         last_result_count: Option<i64>,
         last_error: Option<String>,
     ) -> Result<()> {
-        cx.checkpoint().map_err(|err| {
-            StorageError::Database(format!("update_saved_search_run cancelled: {err}"))
-        })?;
+        Self::checkpoint_storage_operation(cx, "update_saved_search_run")?;
         let (tx, rx) = oneshot::channel();
         self.write_tx
             .send_with_cx(
@@ -3277,7 +3452,7 @@ impl StorageHandle {
                 },
             )
             .await
-            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+            .map_err(|error| Self::writer_send_error("update_saved_search_run", error))?;
         Self::recv_writer_response(rx).await
     }
 
@@ -3302,9 +3477,7 @@ impl StorageHandle {
         enabled: bool,
         schedule_interval_ms: Option<i64>,
     ) -> Result<()> {
-        cx.checkpoint().map_err(|err| {
-            StorageError::Database(format!("update_saved_search_schedule cancelled: {err}"))
-        })?;
+        Self::checkpoint_storage_operation(cx, "update_saved_search_schedule")?;
         let (tx, rx) = oneshot::channel();
         self.write_tx
             .send_with_cx(
@@ -3317,7 +3490,7 @@ impl StorageHandle {
                 },
             )
             .await
-            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+            .map_err(|error| Self::writer_send_error("update_saved_search_schedule", error))?;
         Self::recv_writer_response(rx).await
     }
 
@@ -3334,9 +3507,7 @@ impl StorageHandle {
         cx: &crate::cx::Cx,
         name: &str,
     ) -> Result<usize> {
-        cx.checkpoint().map_err(|err| {
-            StorageError::Database(format!("delete_saved_search cancelled: {err}"))
-        })?;
+        Self::checkpoint_storage_operation(cx, "delete_saved_search")?;
         let (tx, rx) = oneshot::channel();
         self.write_tx
             .send_with_cx(
@@ -3347,7 +3518,7 @@ impl StorageHandle {
                 },
             )
             .await
-            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+            .map_err(|error| Self::writer_send_error("delete_saved_search", error))?;
         Self::recv_writer_response(rx).await
     }
 
@@ -3363,9 +3534,7 @@ impl StorageHandle {
         cx: &crate::cx::Cx,
         name: &str,
     ) -> Result<Option<SavedSearchRecord>> {
-        cx.checkpoint().map_err(|err| {
-            StorageError::Database(format!("get_saved_search_by_name cancelled: {err}"))
-        })?;
+        Self::checkpoint_storage_operation(cx, "get_saved_search_by_name")?;
         let db_path = Arc::clone(&self.db_path);
         let name = name.to_string();
         Self::spawn_blocking_storage_with_cx(cx, move || {
@@ -3390,9 +3559,7 @@ impl StorageHandle {
         &self,
         cx: &crate::cx::Cx,
     ) -> Result<Vec<SavedSearchRecord>> {
-        cx.checkpoint().map_err(|err| {
-            StorageError::Database(format!("list_saved_searches cancelled: {err}"))
-        })?;
+        Self::checkpoint_storage_operation(cx, "list_saved_searches")?;
         let db_path = Arc::clone(&self.db_path);
         Self::spawn_blocking_storage_with_cx(cx, move || {
             // br-ft-l4yxp: trait-typed pooled_backend (was
@@ -3416,9 +3583,7 @@ impl StorageHandle {
         cx: &crate::cx::Cx,
         record: PaneBookmarkRecord,
     ) -> Result<i64> {
-        cx.checkpoint().map_err(|err| {
-            StorageError::Database(format!("insert_pane_bookmark cancelled: {err}"))
-        })?;
+        Self::checkpoint_storage_operation(cx, "insert_pane_bookmark")?;
         let (tx, rx) = oneshot::channel();
         self.write_tx
             .send_with_cx(
@@ -3429,7 +3594,7 @@ impl StorageHandle {
                 },
             )
             .await
-            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+            .map_err(|error| Self::writer_send_error("insert_pane_bookmark", error))?;
         Self::recv_writer_response(rx).await
     }
 
@@ -3446,9 +3611,7 @@ impl StorageHandle {
         cx: &crate::cx::Cx,
         alias: &str,
     ) -> Result<bool> {
-        cx.checkpoint().map_err(|err| {
-            StorageError::Database(format!("delete_pane_bookmark cancelled: {err}"))
-        })?;
+        Self::checkpoint_storage_operation(cx, "delete_pane_bookmark")?;
         let (tx, rx) = oneshot::channel();
         self.write_tx
             .send_with_cx(
@@ -3459,7 +3622,7 @@ impl StorageHandle {
                 },
             )
             .await
-            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+            .map_err(|error| Self::writer_send_error("delete_pane_bookmark", error))?;
         Self::recv_writer_response(rx).await
     }
 
@@ -3487,9 +3650,7 @@ impl StorageHandle {
         cx: &crate::cx::Cx,
         profile: crate::agent_profiles::AgentProfile,
     ) -> Result<String> {
-        cx.checkpoint().map_err(|err| {
-            StorageError::Database(format!("insert_agent_profile cancelled: {err}"))
-        })?;
+        Self::checkpoint_storage_operation(cx, "insert_agent_profile")?;
         let (tx, rx) = oneshot::channel();
         self.write_tx
             .send_with_cx(
@@ -3500,7 +3661,7 @@ impl StorageHandle {
                 },
             )
             .await
-            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+            .map_err(|error| Self::writer_send_error("insert_agent_profile", error))?;
         Self::recv_writer_response(rx).await
     }
 
@@ -3520,8 +3681,7 @@ impl StorageHandle {
         cx: &crate::cx::Cx,
         name: &str,
     ) -> Result<Option<crate::agent_profiles::AgentProfile>> {
-        cx.checkpoint()
-            .map_err(|err| StorageError::Database(format!("get_agent_profile cancelled: {err}")))?;
+        Self::checkpoint_storage_operation(cx, "get_agent_profile")?;
         let (tx, rx) = oneshot::channel();
         self.write_tx
             .send_with_cx(
@@ -3532,7 +3692,7 @@ impl StorageHandle {
                 },
             )
             .await
-            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+            .map_err(|error| Self::writer_send_error("get_agent_profile", error))?;
         Self::recv_writer_response(rx).await
     }
 
@@ -3553,9 +3713,7 @@ impl StorageHandle {
         cx: &crate::cx::Cx,
         role_filter: Option<&str>,
     ) -> Result<Vec<crate::agent_profiles::AgentProfile>> {
-        cx.checkpoint().map_err(|err| {
-            StorageError::Database(format!("list_agent_profiles cancelled: {err}"))
-        })?;
+        Self::checkpoint_storage_operation(cx, "list_agent_profiles")?;
         let (tx, rx) = oneshot::channel();
         self.write_tx
             .send_with_cx(
@@ -3566,7 +3724,7 @@ impl StorageHandle {
                 },
             )
             .await
-            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+            .map_err(|error| Self::writer_send_error("list_agent_profiles", error))?;
         Self::recv_writer_response(rx).await
     }
 
@@ -3583,9 +3741,7 @@ impl StorageHandle {
         cx: &crate::cx::Cx,
         name: &str,
     ) -> Result<bool> {
-        cx.checkpoint().map_err(|err| {
-            StorageError::Database(format!("delete_agent_profile cancelled: {err}"))
-        })?;
+        Self::checkpoint_storage_operation(cx, "delete_agent_profile")?;
         let (tx, rx) = oneshot::channel();
         self.write_tx
             .send_with_cx(
@@ -3596,7 +3752,7 @@ impl StorageHandle {
                 },
             )
             .await
-            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+            .map_err(|error| Self::writer_send_error("delete_agent_profile", error))?;
         Self::recv_writer_response(rx).await
     }
 
@@ -3613,8 +3769,7 @@ impl StorageHandle {
         cx: &crate::cx::Cx,
         key: &str,
     ) -> Result<Option<String>> {
-        cx.checkpoint()
-            .map_err(|err| StorageError::Database(format!("get_config_value cancelled: {err}")))?;
+        Self::checkpoint_storage_operation(cx, "get_config_value")?;
         let (tx, rx) = oneshot::channel();
         self.write_tx
             .send_with_cx(
@@ -3625,7 +3780,7 @@ impl StorageHandle {
                 },
             )
             .await
-            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+            .map_err(|error| Self::writer_send_error("get_config_value", error))?;
         Self::recv_writer_response(rx).await
     }
 
@@ -3642,8 +3797,7 @@ impl StorageHandle {
         key: &str,
         value: &str,
     ) -> Result<()> {
-        cx.checkpoint()
-            .map_err(|err| StorageError::Database(format!("set_config_value cancelled: {err}")))?;
+        Self::checkpoint_storage_operation(cx, "set_config_value")?;
         let (tx, rx) = oneshot::channel();
         self.write_tx
             .send_with_cx(
@@ -3655,7 +3809,7 @@ impl StorageHandle {
                 },
             )
             .await
-            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+            .map_err(|error| Self::writer_send_error("set_config_value", error))?;
         Self::recv_writer_response(rx).await
     }
 
@@ -3674,9 +3828,7 @@ impl StorageHandle {
         cx: &crate::cx::Cx,
         alias: &str,
     ) -> Result<Option<PaneBookmarkRecord>> {
-        cx.checkpoint().map_err(|err| {
-            StorageError::Database(format!("get_pane_bookmark_by_alias cancelled: {err}"))
-        })?;
+        Self::checkpoint_storage_operation(cx, "get_pane_bookmark_by_alias")?;
         let db_path = Arc::clone(&self.db_path);
         let alias = alias.to_string();
         Self::spawn_blocking_storage_with_cx(cx, move || {
@@ -3699,9 +3851,7 @@ impl StorageHandle {
         &self,
         cx: &crate::cx::Cx,
     ) -> Result<Vec<PaneBookmarkRecord>> {
-        cx.checkpoint().map_err(|err| {
-            StorageError::Database(format!("list_pane_bookmarks cancelled: {err}"))
-        })?;
+        Self::checkpoint_storage_operation(cx, "list_pane_bookmarks")?;
         let db_path = Arc::clone(&self.db_path);
         Self::spawn_blocking_storage_with_cx(cx, move || {
             // br-ft-l4yxp: trait-typed pool helper.
@@ -3722,9 +3872,7 @@ impl StorageHandle {
         cx: &crate::cx::Cx,
         tag: &str,
     ) -> Result<Vec<PaneBookmarkRecord>> {
-        cx.checkpoint().map_err(|err| {
-            StorageError::Database(format!("list_pane_bookmarks_by_tag cancelled: {err}"))
-        })?;
+        Self::checkpoint_storage_operation(cx, "list_pane_bookmarks_by_tag")?;
         let db_path = Arc::clone(&self.db_path);
         let tag = tag.to_string();
         Self::spawn_blocking_storage_with_cx(cx, move || {
@@ -3742,9 +3890,7 @@ impl StorageHandle {
         cx: &crate::cx::Cx,
         before_ts: i64,
     ) -> Result<usize> {
-        cx.checkpoint().map_err(|err| {
-            StorageError::Database(format!("prune_segments_before cancelled: {err}"))
-        })?;
+        Self::checkpoint_storage_operation(cx, "prune_segments_before")?;
         let (tx, rx) = oneshot::channel();
         self.write_tx
             .send_with_cx(
@@ -3755,7 +3901,7 @@ impl StorageHandle {
                 },
             )
             .await
-            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+            .map_err(|error| Self::writer_send_error("prune_segments_before", error))?;
 
         Self::recv_writer_response(rx).await
     }
@@ -3794,8 +3940,7 @@ impl StorageHandle {
         cx: &crate::cx::Cx,
         before_ts: i64,
     ) -> Result<usize> {
-        cx.checkpoint()
-            .map_err(|err| StorageError::Database(format!("retention_cleanup cancelled: {err}")))?;
+        Self::checkpoint_storage_operation(cx, "retention_cleanup")?;
         let deleted = self.prune_segments_before_with_cx(cx, before_ts).await?;
         let metadata = serde_json::json!({
             "deleted_segments": deleted,
@@ -3835,9 +3980,7 @@ impl StorageHandle {
         cx: &crate::cx::Cx,
         max_mb: u32,
     ) -> Result<SizeEvictionOutcome> {
-        cx.checkpoint().map_err(|err| {
-            StorageError::Database(format!("enforce_size_limit cancelled: {err}"))
-        })?;
+        Self::checkpoint_storage_operation(cx, "enforce_size_limit")?;
         let (tx, rx) = oneshot::channel();
         self.write_tx
             .send_with_cx(
@@ -3848,7 +3991,7 @@ impl StorageHandle {
                 },
             )
             .await
-            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+            .map_err(|error| Self::writer_send_error("enforce_size_limit", error))?;
         Self::recv_writer_response(rx).await
     }
 
@@ -3865,9 +4008,7 @@ impl StorageHandle {
         cx: &crate::cx::Cx,
         record: UsageMetricRecord,
     ) -> Result<i64> {
-        cx.checkpoint().map_err(|err| {
-            StorageError::Database(format!("record_usage_metric cancelled: {err}"))
-        })?;
+        Self::checkpoint_storage_operation(cx, "record_usage_metric")?;
         let (tx, rx) = oneshot::channel();
         self.write_tx
             .send_with_cx(
@@ -3878,7 +4019,7 @@ impl StorageHandle {
                 },
             )
             .await
-            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+            .map_err(|error| Self::writer_send_error("record_usage_metric", error))?;
         Self::recv_writer_response(rx).await
     }
 
@@ -3899,9 +4040,7 @@ impl StorageHandle {
         cx: &crate::cx::Cx,
         records: Vec<UsageMetricRecord>,
     ) -> Result<usize> {
-        cx.checkpoint().map_err(|err| {
-            StorageError::Database(format!("record_usage_metrics_batch cancelled: {err}"))
-        })?;
+        Self::checkpoint_storage_operation(cx, "record_usage_metrics_batch")?;
         let (tx, rx) = oneshot::channel();
         self.write_tx
             .send_with_cx(
@@ -3912,7 +4051,7 @@ impl StorageHandle {
                 },
             )
             .await
-            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+            .map_err(|error| Self::writer_send_error("record_usage_metrics_batch", error))?;
 
         Self::recv_writer_response(rx).await
     }
@@ -3929,9 +4068,7 @@ impl StorageHandle {
         cx: &crate::cx::Cx,
         before_ts: i64,
     ) -> Result<usize> {
-        cx.checkpoint().map_err(|err| {
-            StorageError::Database(format!("purge_usage_metrics cancelled: {err}"))
-        })?;
+        Self::checkpoint_storage_operation(cx, "purge_usage_metrics")?;
         let (tx, rx) = oneshot::channel();
         self.write_tx
             .send_with_cx(
@@ -3942,7 +4079,7 @@ impl StorageHandle {
                 },
             )
             .await
-            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+            .map_err(|error| Self::writer_send_error("purge_usage_metrics", error))?;
 
         Self::recv_writer_response(rx).await
     }
@@ -3959,9 +4096,7 @@ impl StorageHandle {
         cx: &crate::cx::Cx,
         query: MetricQuery,
     ) -> Result<Vec<UsageMetricRecord>> {
-        cx.checkpoint().map_err(|err| {
-            StorageError::Database(format!("query_usage_metrics cancelled: {err}"))
-        })?;
+        Self::checkpoint_storage_operation(cx, "query_usage_metrics")?;
         let db_path = Arc::clone(&self.db_path);
         Self::spawn_blocking_storage_with_cx_with_join_error(
             cx,
@@ -3987,9 +4122,7 @@ impl StorageHandle {
         cx: &crate::cx::Cx,
         since_ts: i64,
     ) -> Result<Vec<DailyMetricSummary>> {
-        cx.checkpoint().map_err(|err| {
-            StorageError::Database(format!("aggregate_daily_metrics cancelled: {err}"))
-        })?;
+        Self::checkpoint_storage_operation(cx, "aggregate_daily_metrics")?;
         let db_path = Arc::clone(&self.db_path);
         Self::spawn_blocking_storage_with_cx_with_join_error(
             cx,
@@ -4015,9 +4148,7 @@ impl StorageHandle {
         cx: &crate::cx::Cx,
         since_ts: i64,
     ) -> Result<Vec<AgentMetricBreakdown>> {
-        cx.checkpoint().map_err(|err| {
-            StorageError::Database(format!("aggregate_by_agent cancelled: {err}"))
-        })?;
+        Self::checkpoint_storage_operation(cx, "aggregate_by_agent")?;
         let db_path = Arc::clone(&self.db_path);
         Self::spawn_blocking_storage_with_cx_with_join_error(
             cx,
@@ -4046,9 +4177,7 @@ impl StorageHandle {
         cx: &crate::cx::Cx,
         record: NotificationHistoryRecord,
     ) -> Result<i64> {
-        cx.checkpoint().map_err(|err| {
-            StorageError::Database(format!("record_notification cancelled: {err}"))
-        })?;
+        Self::checkpoint_storage_operation(cx, "record_notification")?;
         let (tx, rx) = oneshot::channel();
         self.write_tx
             .send_with_cx(
@@ -4059,7 +4188,7 @@ impl StorageHandle {
                 },
             )
             .await
-            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+            .map_err(|error| Self::writer_send_error("record_notification", error))?;
         Self::recv_writer_response(rx).await
     }
 
@@ -4084,9 +4213,7 @@ impl StorageHandle {
         status: NotificationStatus,
         error_message: Option<String>,
     ) -> Result<()> {
-        cx.checkpoint().map_err(|err| {
-            StorageError::Database(format!("update_notification_status cancelled: {err}"))
-        })?;
+        Self::checkpoint_storage_operation(cx, "update_notification_status")?;
         let (tx, rx) = oneshot::channel();
         self.write_tx
             .send_with_cx(
@@ -4099,7 +4226,7 @@ impl StorageHandle {
                 },
             )
             .await
-            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+            .map_err(|error| Self::writer_send_error("update_notification_status", error))?;
         Self::recv_writer_response(rx).await
     }
 
@@ -4124,9 +4251,7 @@ impl StorageHandle {
         acknowledged_by: String,
         action_taken: Option<String>,
     ) -> Result<()> {
-        cx.checkpoint().map_err(|err| {
-            StorageError::Database(format!("acknowledge_notification cancelled: {err}"))
-        })?;
+        Self::checkpoint_storage_operation(cx, "acknowledge_notification")?;
         let (tx, rx) = oneshot::channel();
         self.write_tx
             .send_with_cx(
@@ -4139,7 +4264,7 @@ impl StorageHandle {
                 },
             )
             .await
-            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+            .map_err(|error| Self::writer_send_error("acknowledge_notification", error))?;
         Self::recv_writer_response(rx).await
     }
 
@@ -4156,9 +4281,7 @@ impl StorageHandle {
         cx: &crate::cx::Cx,
         id: i64,
     ) -> Result<()> {
-        cx.checkpoint().map_err(|err| {
-            StorageError::Database(format!("increment_notification_retry cancelled: {err}"))
-        })?;
+        Self::checkpoint_storage_operation(cx, "increment_notification_retry")?;
         let (tx, rx) = oneshot::channel();
         self.write_tx
             .send_with_cx(
@@ -4166,7 +4289,7 @@ impl StorageHandle {
                 WriteCommand::IncrementNotificationRetry { id, respond: tx },
             )
             .await
-            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+            .map_err(|error| Self::writer_send_error("increment_notification_retry", error))?;
         Self::recv_writer_response(rx).await
     }
 
@@ -4183,9 +4306,7 @@ impl StorageHandle {
         cx: &crate::cx::Cx,
         before_ts: i64,
     ) -> Result<usize> {
-        cx.checkpoint().map_err(|err| {
-            StorageError::Database(format!("purge_notification_history cancelled: {err}"))
-        })?;
+        Self::checkpoint_storage_operation(cx, "purge_notification_history")?;
         let (tx, rx) = oneshot::channel();
         self.write_tx
             .send_with_cx(
@@ -4196,7 +4317,7 @@ impl StorageHandle {
                 },
             )
             .await
-            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+            .map_err(|error| Self::writer_send_error("purge_notification_history", error))?;
 
         Self::recv_writer_response(rx).await
     }
@@ -4217,9 +4338,7 @@ impl StorageHandle {
         cx: &crate::cx::Cx,
         before_ts: i64,
     ) -> Result<usize> {
-        cx.checkpoint().map_err(|err| {
-            StorageError::Database(format!("count_segments_before cancelled: {err}"))
-        })?;
+        Self::checkpoint_storage_operation(cx, "count_segments_before")?;
         let db_path = Arc::clone(&self.db_path);
         Self::spawn_blocking_storage_with_cx_with_join_error(
             cx,
@@ -4247,8 +4366,7 @@ impl StorageHandle {
 
     /// Cx-first sibling of [`count_events`].
     pub async fn count_events_with_cx(&self, cx: &crate::cx::Cx) -> Result<usize> {
-        cx.checkpoint()
-            .map_err(|err| StorageError::Database(format!("count_events cancelled: {err}")))?;
+        Self::checkpoint_storage_operation(cx, "count_events")?;
         let db_path = Arc::clone(&self.db_path);
         Self::spawn_blocking_storage_with_cx_with_join_error(
             cx,
@@ -4264,9 +4382,7 @@ impl StorageHandle {
         cx: &crate::cx::Cx,
         before_ts: i64,
     ) -> Result<usize> {
-        cx.checkpoint().map_err(|err| {
-            StorageError::Database(format!("count_events_before cancelled: {err}"))
-        })?;
+        Self::checkpoint_storage_operation(cx, "count_events_before")?;
         let db_path = Arc::clone(&self.db_path);
         Self::spawn_blocking_storage_with_cx_with_join_error(
             cx,
@@ -4302,9 +4418,7 @@ impl StorageHandle {
         event_types: &[String],
         handled: Option<bool>,
     ) -> Result<usize> {
-        cx.checkpoint().map_err(|err| {
-            StorageError::Database(format!("count_events_by_tier cancelled: {err}"))
-        })?;
+        Self::checkpoint_storage_operation(cx, "count_events_by_tier")?;
         let db_path = Arc::clone(&self.db_path);
         let severities = severities.to_vec();
         let event_types = event_types.to_vec();
@@ -4339,9 +4453,7 @@ impl StorageHandle {
         cx: &crate::cx::Cx,
         before_ts: i64,
     ) -> Result<usize> {
-        cx.checkpoint().map_err(|err| {
-            StorageError::Database(format!("count_audit_actions_before cancelled: {err}"))
-        })?;
+        Self::checkpoint_storage_operation(cx, "count_audit_actions_before")?;
         let db_path = Arc::clone(&self.db_path);
         Self::spawn_blocking_storage_with_cx_with_join_error(
             cx,
@@ -4368,9 +4480,7 @@ impl StorageHandle {
         cx: &crate::cx::Cx,
         before_ts: i64,
     ) -> Result<usize> {
-        cx.checkpoint().map_err(|err| {
-            StorageError::Database(format!("count_usage_metrics_before cancelled: {err}"))
-        })?;
+        Self::checkpoint_storage_operation(cx, "count_usage_metrics_before")?;
         let db_path = Arc::clone(&self.db_path);
         Self::spawn_blocking_storage_with_cx_with_join_error(
             cx,
@@ -4397,11 +4507,7 @@ impl StorageHandle {
         cx: &crate::cx::Cx,
         before_ts: i64,
     ) -> Result<usize> {
-        cx.checkpoint().map_err(|err| {
-            StorageError::Database(format!(
-                "count_notification_history_before cancelled: {err}"
-            ))
-        })?;
+        Self::checkpoint_storage_operation(cx, "count_notification_history_before")?;
         let db_path = Arc::clone(&self.db_path);
         Self::spawn_blocking_storage_with_cx_with_join_error(
             cx,
@@ -4429,9 +4535,7 @@ impl StorageHandle {
         before_ts: i64,
         batch_size: usize,
     ) -> Result<usize> {
-        cx.checkpoint().map_err(|err| {
-            StorageError::Database(format!("delete_events_before cancelled: {err}"))
-        })?;
+        Self::checkpoint_storage_operation(cx, "delete_events_before")?;
         let (tx, rx) = oneshot::channel();
         self.write_tx
             .send_with_cx(
@@ -4443,7 +4547,7 @@ impl StorageHandle {
                 },
             )
             .await
-            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+            .map_err(|error| Self::writer_send_error("delete_events_before", error))?;
 
         Self::recv_writer_response(rx).await
     }
@@ -4479,9 +4583,7 @@ impl StorageHandle {
         handled: Option<bool>,
         batch_size: usize,
     ) -> Result<usize> {
-        cx.checkpoint().map_err(|err| {
-            StorageError::Database(format!("delete_events_by_tier cancelled: {err}"))
-        })?;
+        Self::checkpoint_storage_operation(cx, "delete_events_by_tier")?;
         let (tx, rx) = oneshot::channel();
         self.write_tx
             .send_with_cx(
@@ -4496,7 +4598,7 @@ impl StorageHandle {
                 },
             )
             .await
-            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+            .map_err(|error| Self::writer_send_error("delete_events_by_tier", error))?;
 
         Self::recv_writer_response(rx).await
     }
@@ -4516,9 +4618,7 @@ impl StorageHandle {
         cx: &crate::cx::Cx,
         query: NotificationHistoryQuery,
     ) -> Result<Vec<NotificationHistoryRecord>> {
-        cx.checkpoint().map_err(|err| {
-            StorageError::Database(format!("query_notification_history cancelled: {err}"))
-        })?;
+        Self::checkpoint_storage_operation(cx, "query_notification_history")?;
         let db_path = Arc::clone(&self.db_path);
         Self::spawn_blocking_storage_with_cx_with_join_error(
             cx,
@@ -4544,8 +4644,7 @@ impl StorageHandle {
         cx: &crate::cx::Cx,
         id: i64,
     ) -> Result<NotificationHistoryRecord> {
-        cx.checkpoint()
-            .map_err(|err| StorageError::Database(format!("get_notification cancelled: {err}")))?;
+        Self::checkpoint_storage_operation(cx, "get_notification")?;
         let db_path = Arc::clone(&self.db_path);
         Self::spawn_blocking_storage_with_cx_with_join_error(
             cx,
@@ -4597,13 +4696,12 @@ impl StorageHandle {
     /// ft-xbnl0.2.3 Cx-first sibling of [`vacuum`].
     /// Tick 171: inlined to route the mpsc send through `send_with_cx`.
     pub async fn vacuum_with_cx(&self, cx: &crate::cx::Cx) -> Result<()> {
-        cx.checkpoint()
-            .map_err(|err| StorageError::Database(format!("vacuum cancelled: {err}")))?;
+        Self::checkpoint_storage_operation(cx, "vacuum")?;
         let (tx, rx) = oneshot::channel();
         self.write_tx
             .send_with_cx(cx, WriteCommand::Vacuum { respond: tx })
             .await
-            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+            .map_err(|error| Self::writer_send_error("vacuum", error))?;
         Self::recv_writer_response(rx).await
     }
 
@@ -4624,13 +4722,12 @@ impl StorageHandle {
     /// ft-xbnl0.2.3 Cx-first sibling of [`checkpoint`].
     /// Tick 171: inlined to route the mpsc send through `send_with_cx`.
     pub async fn checkpoint_with_cx(&self, cx: &crate::cx::Cx) -> Result<CheckpointResult> {
-        cx.checkpoint()
-            .map_err(|err| StorageError::Database(format!("checkpoint cancelled: {err}")))?;
+        Self::checkpoint_storage_operation(cx, "checkpoint")?;
         let (tx, rx) = oneshot::channel();
         self.write_tx
             .send_with_cx(cx, WriteCommand::Checkpoint { respond: tx })
             .await
-            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+            .map_err(|error| Self::writer_send_error("checkpoint", error))?;
         Self::recv_writer_response(rx).await
     }
 
@@ -4645,9 +4742,7 @@ impl StorageHandle {
         &self,
         cx: &crate::cx::Cx,
     ) -> Result<DatabasePageStats> {
-        cx.checkpoint().map_err(|err| {
-            StorageError::Database(format!("database_page_stats cancelled: {err}"))
-        })?;
+        Self::checkpoint_storage_operation(cx, "database_page_stats")?;
         let db_path = Arc::clone(&self.db_path);
         Self::spawn_blocking_storage_with_cx(cx, move || {
             // br-ft-gz4dt: trait-typed pool helper; PRAGMA page_count
@@ -4669,9 +4764,7 @@ impl StorageHandle {
         &self,
         cx: &crate::cx::Cx,
     ) -> Result<Vec<PaneIndexingStats>> {
-        cx.checkpoint().map_err(|err| {
-            StorageError::Database(format!("get_pane_indexing_stats cancelled: {err}"))
-        })?;
+        Self::checkpoint_storage_operation(cx, "get_pane_indexing_stats")?;
         let db_path = Arc::clone(&self.db_path);
         Self::spawn_blocking_storage_with_cx(cx, move || {
             pooled_backend(db_path.as_str(), get_pane_indexing_stats_backend)
@@ -4690,9 +4783,7 @@ impl StorageHandle {
         &self,
         cx: &crate::cx::Cx,
     ) -> Result<IndexingHealthReport> {
-        cx.checkpoint().map_err(|err| {
-            StorageError::Database(format!("get_indexing_health cancelled: {err}"))
-        })?;
+        Self::checkpoint_storage_operation(cx, "get_indexing_health")?;
         let db_path = Arc::clone(&self.db_path);
         Self::spawn_blocking_storage_with_cx(cx, move || {
             pooled_backend(db_path.as_str(), |backend| {
@@ -4723,8 +4814,7 @@ impl StorageHandle {
         cx: &crate::cx::Cx,
         config: FtsSyncConfig,
     ) -> Result<FtsSyncResult> {
-        cx.checkpoint()
-            .map_err(|err| StorageError::Database(format!("sync_fts cancelled: {err}")))?;
+        Self::checkpoint_storage_operation(cx, "sync_fts")?;
         let (tx, rx) = oneshot::channel();
         self.write_tx
             .send_with_cx(
@@ -4735,7 +4825,7 @@ impl StorageHandle {
                 },
             )
             .await
-            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+            .map_err(|error| Self::writer_send_error("sync_fts", error))?;
         Self::recv_writer_response(rx).await
     }
 
@@ -4754,8 +4844,7 @@ impl StorageHandle {
         cx: &crate::cx::Cx,
         config: FtsSyncConfig,
     ) -> Result<FtsSyncResult> {
-        cx.checkpoint()
-            .map_err(|err| StorageError::Database(format!("rebuild_fts cancelled: {err}")))?;
+        Self::checkpoint_storage_operation(cx, "rebuild_fts")?;
         let (tx, rx) = oneshot::channel();
         self.write_tx
             .send_with_cx(
@@ -4766,7 +4855,7 @@ impl StorageHandle {
                 },
             )
             .await
-            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+            .map_err(|error| Self::writer_send_error("rebuild_fts", error))?;
         Self::recv_writer_response(rx).await
     }
 
@@ -4781,9 +4870,7 @@ impl StorageHandle {
         &self,
         cx: &crate::cx::Cx,
     ) -> Result<Option<FtsIndexState>> {
-        cx.checkpoint().map_err(|err| {
-            StorageError::Database(format!("get_fts_index_state cancelled: {err}"))
-        })?;
+        Self::checkpoint_storage_operation(cx, "get_fts_index_state")?;
         let db_path = Arc::clone(&self.db_path);
         Self::spawn_blocking_storage_with_cx(cx, move || {
             pooled_backend(db_path.as_str(), get_fts_index_state_backend)
@@ -4804,14 +4891,12 @@ impl StorageHandle {
         cx: &crate::cx::Cx,
         token: ApprovalTokenRecord,
     ) -> Result<i64> {
-        cx.checkpoint().map_err(|err| {
-            StorageError::Database(format!("insert_approval_token cancelled: {err}"))
-        })?;
+        Self::checkpoint_storage_operation(cx, "insert_approval_token")?;
         let (tx, rx) = oneshot::channel();
         self.write_tx
             .send_with_cx(cx, WriteCommand::InsertApprovalToken { token, respond: tx })
             .await
-            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+            .map_err(|error| Self::writer_send_error("insert_approval_token", error))?;
         Self::recv_writer_response(rx).await
     }
 
@@ -4848,9 +4933,7 @@ impl StorageHandle {
         pane_id: Option<u64>,
         action_fingerprint: &str,
     ) -> Result<Option<ApprovalTokenRecord>> {
-        cx.checkpoint().map_err(|err| {
-            StorageError::Database(format!("consume_approval_token cancelled: {err}"))
-        })?;
+        Self::checkpoint_storage_operation(cx, "consume_approval_token")?;
         let (tx, rx) = oneshot::channel();
         self.write_tx
             .send_with_cx(
@@ -4865,7 +4948,7 @@ impl StorageHandle {
                 },
             )
             .await
-            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+            .map_err(|error| Self::writer_send_error("consume_approval_token", error))?;
         Self::recv_writer_response(rx).await
     }
 
@@ -4887,9 +4970,7 @@ impl StorageHandle {
         code_hash: &str,
         workspace_id: &str,
     ) -> Result<Option<ApprovalTokenRecord>> {
-        cx.checkpoint().map_err(|err| {
-            StorageError::Database(format!("get_approval_token_by_code cancelled: {err}"))
-        })?;
+        Self::checkpoint_storage_operation(cx, "get_approval_token_by_code")?;
         let db_path = Arc::clone(&self.db_path);
         let code_hash = code_hash.to_string();
         let workspace_id = workspace_id.to_string();
@@ -4926,9 +5007,7 @@ impl StorageHandle {
         code_hash: &str,
         workspace_id: &str,
     ) -> Result<Option<ApprovalTokenRecord>> {
-        cx.checkpoint().map_err(|err| {
-            StorageError::Database(format!("consume_approval_token_by_code cancelled: {err}"))
-        })?;
+        Self::checkpoint_storage_operation(cx, "consume_approval_token_by_code")?;
         let (tx, rx) = oneshot::channel();
         self.write_tx
             .send_with_cx(
@@ -4940,7 +5019,7 @@ impl StorageHandle {
                 },
             )
             .await
-            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+            .map_err(|error| Self::writer_send_error("consume_approval_token_by_code", error))?;
         Self::recv_writer_response(rx).await
     }
 
@@ -4966,9 +5045,7 @@ impl StorageHandle {
         token_id: i64,
         workspace_id: &str,
     ) -> Result<Option<ApprovalTokenRecord>> {
-        cx.checkpoint().map_err(|err| {
-            StorageError::Database(format!("consume_approval_token_by_id cancelled: {err}"))
-        })?;
+        Self::checkpoint_storage_operation(cx, "consume_approval_token_by_id")?;
         let (tx, rx) = oneshot::channel();
         self.write_tx
             .send_with_cx(
@@ -4980,7 +5057,7 @@ impl StorageHandle {
                 },
             )
             .await
-            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+            .map_err(|error| Self::writer_send_error("consume_approval_token_by_id", error))?;
         Self::recv_writer_response(rx).await
     }
 
@@ -5004,13 +5081,12 @@ impl StorageHandle {
     /// storage write in the tree. A backpressured writer queue
     /// under a cancelled observation loop now releases immediately.
     pub async fn upsert_pane_with_cx(&self, cx: &crate::cx::Cx, pane: PaneRecord) -> Result<()> {
-        cx.checkpoint()
-            .map_err(|err| StorageError::Database(format!("upsert_pane cancelled: {err}")))?;
+        Self::checkpoint_storage_operation(cx, "upsert_pane")?;
         let (tx, rx) = oneshot::channel();
         self.write_tx
             .send_with_cx(cx, WriteCommand::UpsertPane { pane, respond: tx })
             .await
-            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+            .map_err(|error| Self::writer_send_error("upsert_pane", error))?;
         Self::recv_writer_response(rx).await
     }
 
@@ -5032,8 +5108,7 @@ impl StorageHandle {
         cx: &crate::cx::Cx,
         workflow: WorkflowRecord,
     ) -> Result<()> {
-        cx.checkpoint()
-            .map_err(|err| StorageError::Database(format!("upsert_workflow cancelled: {err}")))?;
+        Self::checkpoint_storage_operation(cx, "upsert_workflow")?;
         let (tx, rx) = oneshot::channel();
         self.write_tx
             .send_with_cx(
@@ -5044,7 +5119,7 @@ impl StorageHandle {
                 },
             )
             .await
-            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+            .map_err(|error| Self::writer_send_error("upsert_workflow", error))?;
         Self::recv_writer_response(rx).await
     }
 
@@ -5067,9 +5142,7 @@ impl StorageHandle {
         workflow_id: &str,
         plan: &crate::plan::ActionPlan,
     ) -> Result<()> {
-        cx.checkpoint().map_err(|err| {
-            StorageError::Database(format!("upsert_action_plan cancelled: {err}"))
-        })?;
+        Self::checkpoint_storage_operation(cx, "upsert_action_plan")?;
         let record = action_plan_record_from_plan(workflow_id, plan)?;
         let (tx, rx) = oneshot::channel();
         self.write_tx
@@ -5081,7 +5154,7 @@ impl StorageHandle {
                 },
             )
             .await
-            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+            .map_err(|error| Self::writer_send_error("upsert_action_plan", error))?;
         Self::recv_writer_response(rx).await
     }
 
@@ -5098,9 +5171,7 @@ impl StorageHandle {
         cx: &crate::cx::Cx,
         record: PreparedPlanRecord,
     ) -> Result<()> {
-        cx.checkpoint().map_err(|err| {
-            StorageError::Database(format!("insert_prepared_plan cancelled: {err}"))
-        })?;
+        Self::checkpoint_storage_operation(cx, "insert_prepared_plan")?;
         let (tx, rx) = oneshot::channel();
         self.write_tx
             .send_with_cx(
@@ -5111,7 +5182,7 @@ impl StorageHandle {
                 },
             )
             .await
-            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+            .map_err(|error| Self::writer_send_error("insert_prepared_plan", error))?;
         Self::recv_writer_response(rx).await
     }
 
@@ -5134,9 +5205,7 @@ impl StorageHandle {
         plan_id: &str,
         now_ms: i64,
     ) -> Result<Option<PreparedPlanRecord>> {
-        cx.checkpoint().map_err(|err| {
-            StorageError::Database(format!("consume_prepared_plan cancelled: {err}"))
-        })?;
+        Self::checkpoint_storage_operation(cx, "consume_prepared_plan")?;
         let (tx, rx) = oneshot::channel();
         self.write_tx
             .send_with_cx(
@@ -5148,7 +5217,7 @@ impl StorageHandle {
                 },
             )
             .await
-            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+            .map_err(|error| Self::writer_send_error("consume_prepared_plan", error))?;
         Self::recv_writer_response(rx).await
     }
 
@@ -5210,8 +5279,7 @@ impl StorageHandle {
         started_at: i64,
         completed_at: i64,
     ) -> Result<()> {
-        cx.checkpoint()
-            .map_err(|err| StorageError::Database(format!("insert_step_log cancelled: {err}")))?;
+        Self::checkpoint_storage_operation(cx, "insert_step_log")?;
         let (tx, rx) = oneshot::channel();
         self.write_tx
             .send_with_cx(
@@ -5234,7 +5302,7 @@ impl StorageHandle {
                 },
             )
             .await
-            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+            .map_err(|error| Self::writer_send_error("insert_step_log", error))?;
         Self::recv_writer_response(rx).await
     }
 
@@ -5269,9 +5337,7 @@ impl StorageHandle {
         ft_version: String,
         host_id: Option<String>,
     ) -> Result<()> {
-        cx.checkpoint().map_err(|err| {
-            StorageError::Database(format!("insert_mux_session cancelled: {err}"))
-        })?;
+        Self::checkpoint_storage_operation(cx, "insert_mux_session")?;
         let (tx, rx) = oneshot::channel();
         self.write_tx
             .send_with_cx(
@@ -5285,7 +5351,7 @@ impl StorageHandle {
                 },
             )
             .await
-            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+            .map_err(|error| Self::writer_send_error("insert_mux_session", error))?;
         Self::recv_writer_response(rx).await
     }
 
@@ -5331,9 +5397,7 @@ impl StorageHandle {
         metadata_json: Option<String>,
         pane_states: Vec<SessionPaneStateRow>,
     ) -> Result<i64> {
-        cx.checkpoint().map_err(|err| {
-            StorageError::Database(format!("insert_session_checkpoint cancelled: {err}"))
-        })?;
+        Self::checkpoint_storage_operation(cx, "insert_session_checkpoint")?;
         let (tx, rx) = oneshot::channel();
         self.write_tx
             .send_with_cx(
@@ -5350,7 +5414,7 @@ impl StorageHandle {
                 },
             )
             .await
-            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+            .map_err(|error| Self::writer_send_error("insert_session_checkpoint", error))?;
         Self::recv_writer_response(rx).await
     }
 
@@ -5381,9 +5445,7 @@ impl StorageHandle {
         session_id: String,
         retention: usize,
     ) -> Result<usize> {
-        cx.checkpoint().map_err(|err| {
-            StorageError::Database(format!("prune_session_checkpoints cancelled: {err}"))
-        })?;
+        Self::checkpoint_storage_operation(cx, "prune_session_checkpoints")?;
         let (tx, rx) = oneshot::channel();
         self.write_tx
             .send_with_cx(
@@ -5395,7 +5457,7 @@ impl StorageHandle {
                 },
             )
             .await
-            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+            .map_err(|error| Self::writer_send_error("prune_session_checkpoints", error))?;
         Self::recv_writer_response(rx).await
     }
 
@@ -5413,9 +5475,7 @@ impl StorageHandle {
         cx: &crate::cx::Cx,
         session_id: String,
     ) -> Result<()> {
-        cx.checkpoint().map_err(|err| {
-            StorageError::Database(format!("mark_session_shutdown_clean cancelled: {err}"))
-        })?;
+        Self::checkpoint_storage_operation(cx, "mark_session_shutdown_clean")?;
         let (tx, rx) = oneshot::channel();
         self.write_tx
             .send_with_cx(
@@ -5426,7 +5486,7 @@ impl StorageHandle {
                 },
             )
             .await
-            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+            .map_err(|error| Self::writer_send_error("mark_session_shutdown_clean", error))?;
         Self::recv_writer_response(rx).await
     }
 
@@ -5443,9 +5503,7 @@ impl StorageHandle {
         cx: &crate::cx::Cx,
         session_id: String,
     ) -> Result<Option<String>> {
-        cx.checkpoint().map_err(|err| {
-            StorageError::Database(format!("get_latest_checkpoint_hash cancelled: {err}"))
-        })?;
+        Self::checkpoint_storage_operation(cx, "get_latest_checkpoint_hash")?;
         let db_path = Arc::clone(&self.db_path);
         Self::spawn_blocking_storage_with_cx(cx, move || {
             // br-ft-l1jgo: trait-typed pooled_backend (was direct
@@ -5468,9 +5526,7 @@ impl StorageHandle {
         cx: &crate::cx::Cx,
         session: AgentSessionRecord,
     ) -> Result<i64> {
-        cx.checkpoint().map_err(|err| {
-            StorageError::Database(format!("upsert_agent_session cancelled: {err}"))
-        })?;
+        Self::checkpoint_storage_operation(cx, "upsert_agent_session")?;
         let (tx, rx) = oneshot::channel();
         self.write_tx
             .send_with_cx(
@@ -5481,7 +5537,7 @@ impl StorageHandle {
                 },
             )
             .await
-            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+            .map_err(|error| Self::writer_send_error("upsert_agent_session", error))?;
 
         Self::recv_writer_response(rx).await
     }
@@ -5498,8 +5554,7 @@ impl StorageHandle {
         cx: &crate::cx::Cx,
         session_id: i64,
     ) -> Result<Option<AgentSessionRecord>> {
-        cx.checkpoint()
-            .map_err(|err| StorageError::Database(format!("get_agent_session cancelled: {err}")))?;
+        Self::checkpoint_storage_operation(cx, "get_agent_session")?;
         let db_path = Arc::clone(&self.db_path);
 
         Self::spawn_blocking_storage_with_cx(cx, move || {
@@ -5521,9 +5576,7 @@ impl StorageHandle {
         &self,
         cx: &crate::cx::Cx,
     ) -> Result<Vec<AgentSessionRecord>> {
-        cx.checkpoint().map_err(|err| {
-            StorageError::Database(format!("get_active_sessions cancelled: {err}"))
-        })?;
+        Self::checkpoint_storage_operation(cx, "get_active_sessions")?;
         let db_path = Arc::clone(&self.db_path);
 
         Self::spawn_blocking_storage_with_cx(cx, move || {
@@ -5544,9 +5597,7 @@ impl StorageHandle {
         cx: &crate::cx::Cx,
         pane_id: u64,
     ) -> Result<Vec<AgentSessionRecord>> {
-        cx.checkpoint().map_err(|err| {
-            StorageError::Database(format!("get_sessions_for_pane cancelled: {err}"))
-        })?;
+        Self::checkpoint_storage_operation(cx, "get_sessions_for_pane")?;
         let db_path = Arc::clone(&self.db_path);
 
         Self::spawn_blocking_storage_with_cx(cx, move || {
@@ -5572,8 +5623,7 @@ impl StorageHandle {
     /// Routes through `search_with_results_with_cx` so the inner call
     /// honours cancellation as well.
     pub async fn search_with_cx(&self, cx: &crate::cx::Cx, query: &str) -> Result<Vec<Segment>> {
-        cx.checkpoint()
-            .map_err(|err| StorageError::Database(format!("search cancelled: {err}")))?;
+        Self::checkpoint_storage_operation(cx, "search")?;
         let results = self
             .search_with_results_with_cx(cx, query, SearchOptions::default())
             .await?;
@@ -5600,9 +5650,7 @@ impl StorageHandle {
         query: &str,
         options: SearchOptions,
     ) -> Result<Vec<Segment>> {
-        cx.checkpoint().map_err(|err| {
-            StorageError::Database(format!("search_with_options cancelled: {err}"))
-        })?;
+        Self::checkpoint_storage_operation(cx, "search_with_options")?;
         let results = self.search_with_results_with_cx(cx, query, options).await?;
         Ok(results.into_iter().map(|r| r.segment).collect())
     }
@@ -5640,9 +5688,7 @@ impl StorageHandle {
         query: &str,
         options: SearchOptions,
     ) -> Result<Vec<SearchResult>> {
-        cx.checkpoint().map_err(|err| {
-            StorageError::Database(format!("search_with_results cancelled: {err}"))
-        })?;
+        Self::checkpoint_storage_operation(cx, "search_with_results")?;
         let db_path = Arc::clone(&self.db_path);
         let query = query.to_string();
 
@@ -5680,8 +5726,7 @@ impl StorageHandle {
         dimension: i32,
         vector: &[u8],
     ) -> Result<()> {
-        cx.checkpoint()
-            .map_err(|err| StorageError::Database(format!("store_embedding cancelled: {err}")))?;
+        Self::checkpoint_storage_operation(cx, "store_embedding")?;
         let db_path = Arc::clone(&self.db_path);
         let embedder_id = embedder_id.to_string();
         let vector = vector.to_vec();
@@ -5730,9 +5775,7 @@ impl StorageHandle {
         embedder_id: &str,
         limit: usize,
     ) -> Result<Vec<i64>> {
-        cx.checkpoint().map_err(|err| {
-            StorageError::Database(format!("get_unembedded_segments cancelled: {err}"))
-        })?;
+        Self::checkpoint_storage_operation(cx, "get_unembedded_segments")?;
         let db_path = Arc::clone(&self.db_path);
         let embedder_id = embedder_id.to_string();
 
@@ -5783,8 +5826,7 @@ impl StorageHandle {
         segment_id: i64,
         embedder_id: &str,
     ) -> Result<Option<Vec<u8>>> {
-        cx.checkpoint()
-            .map_err(|err| StorageError::Database(format!("get_embedding cancelled: {err}")))?;
+        Self::checkpoint_storage_operation(cx, "get_embedding")?;
         let db_path = Arc::clone(&self.db_path);
         let embedder_id = embedder_id.to_string();
 
@@ -5822,8 +5864,7 @@ impl StorageHandle {
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`embedding_stats`].
     pub async fn embedding_stats_with_cx(&self, cx: &crate::cx::Cx) -> Result<Vec<EmbeddingStats>> {
-        cx.checkpoint()
-            .map_err(|err| StorageError::Database(format!("embedding_stats cancelled: {err}")))?;
+        Self::checkpoint_storage_operation(cx, "embedding_stats")?;
         let db_path = Arc::clone(&self.db_path);
 
         Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Task join error", move || {
@@ -5904,9 +5945,7 @@ impl StorageHandle {
         embedder_id: &str,
         vector: &[f32],
     ) -> Result<()> {
-        cx.checkpoint().map_err(|err| {
-            StorageError::Database(format!("store_embedding_f32 cancelled: {err}"))
-        })?;
+        Self::checkpoint_storage_operation(cx, "store_embedding_f32")?;
         if vector.is_empty() {
             return Err(
                 StorageError::Database("store_embedding_f32: vector is empty".to_string()).into(),
@@ -5942,8 +5981,7 @@ impl StorageHandle {
         query_vector: &[f32],
         options: SearchOptions,
     ) -> Result<Vec<SemanticSearchHit>> {
-        cx.checkpoint()
-            .map_err(|err| StorageError::Database(format!("semantic_search cancelled: {err}")))?;
+        Self::checkpoint_storage_operation(cx, "semantic_search")?;
         let db_path = Arc::clone(&self.db_path);
         let embedder_id = embedder_id.to_string();
         let query_vector = query_vector.to_vec();
@@ -6006,9 +6044,7 @@ impl StorageHandle {
         semantic_weight: f32,
         fusion_backend: Option<FusionBackend>,
     ) -> Result<HybridSearchBundle> {
-        cx.checkpoint().map_err(|err| {
-            StorageError::Database(format!("hybrid_search_with_results cancelled: {err}"))
-        })?;
+        Self::checkpoint_storage_operation(cx, "hybrid_search_with_results")?;
         let db_path = Arc::clone(&self.db_path);
         let semantic_budget_state = Arc::clone(&self.semantic_budget_state);
         let query = query.to_string();
@@ -6047,9 +6083,7 @@ impl StorageHandle {
         cx: &crate::cx::Cx,
         limit: usize,
     ) -> Result<Vec<StoredEvent>> {
-        cx.checkpoint().map_err(|err| {
-            StorageError::Database(format!("get_unhandled_events cancelled: {err}"))
-        })?;
+        Self::checkpoint_storage_operation(cx, "get_unhandled_events")?;
         let db_path = Arc::clone(&self.db_path);
 
         Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Task join error", move || {
@@ -6072,8 +6106,7 @@ impl StorageHandle {
         cx: &crate::cx::Cx,
         query: EventQuery,
     ) -> Result<Vec<StoredEvent>> {
-        cx.checkpoint()
-            .map_err(|err| StorageError::Database(format!("get_events cancelled: {err}")))?;
+        Self::checkpoint_storage_operation(cx, "get_events")?;
         let db_path = Arc::clone(&self.db_path);
 
         Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Task join error", move || {
@@ -6099,8 +6132,7 @@ impl StorageHandle {
         cx: &crate::cx::Cx,
         query: EventStreamQuery,
     ) -> Result<Vec<StoredEvent>> {
-        cx.checkpoint()
-            .map_err(|err| StorageError::Database(format!("get_events_stream cancelled: {err}")))?;
+        Self::checkpoint_storage_operation(cx, "get_events_stream")?;
         let db_path = Arc::clone(&self.db_path);
 
         Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Task join error", move || {
@@ -6126,8 +6158,7 @@ impl StorageHandle {
         cx: &crate::cx::Cx,
         query: TimelineQuery,
     ) -> Result<Timeline> {
-        cx.checkpoint()
-            .map_err(|err| StorageError::Database(format!("get_timeline cancelled: {err}")))?;
+        Self::checkpoint_storage_operation(cx, "get_timeline")?;
         let db_path = Arc::clone(&self.db_path);
 
         Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Task join error", move || {
@@ -6153,9 +6184,7 @@ impl StorageHandle {
         &self,
         cx: &crate::cx::Cx,
     ) -> Result<std::collections::HashMap<u64, u32>> {
-        cx.checkpoint().map_err(|err| {
-            StorageError::Database(format!("count_unhandled_events_by_pane cancelled: {err}"))
-        })?;
+        Self::checkpoint_storage_operation(cx, "count_unhandled_events_by_pane")?;
         let db_path = Arc::clone(&self.db_path);
 
         Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Task join error", move || {
@@ -6179,9 +6208,7 @@ impl StorageHandle {
         &self,
         cx: &crate::cx::Cx,
     ) -> Result<std::collections::HashMap<u64, i64>> {
-        cx.checkpoint().map_err(|err| {
-            StorageError::Database(format!("get_last_activity_by_pane cancelled: {err}"))
-        })?;
+        Self::checkpoint_storage_operation(cx, "get_last_activity_by_pane")?;
         let db_path = Arc::clone(&self.db_path);
 
         Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Task join error", move || {
@@ -6208,8 +6235,7 @@ impl StorageHandle {
         cx: &crate::cx::Cx,
         query: AuditQuery,
     ) -> Result<Vec<AuditActionRecord>> {
-        cx.checkpoint()
-            .map_err(|err| StorageError::Database(format!("get_audit_actions cancelled: {err}")))?;
+        Self::checkpoint_storage_operation(cx, "get_audit_actions")?;
         let db_path = Arc::clone(&self.db_path);
 
         Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Task join error", move || {
@@ -6237,9 +6263,7 @@ impl StorageHandle {
         cx: &crate::cx::Cx,
         query: AuditStreamQuery,
     ) -> Result<AuditStreamPage> {
-        cx.checkpoint().map_err(|err| {
-            StorageError::Database(format!("get_audit_actions_stream cancelled: {err}"))
-        })?;
+        Self::checkpoint_storage_operation(cx, "get_audit_actions_stream")?;
         let db_path = Arc::clone(&self.db_path);
 
         Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Task join error", move || {
@@ -6265,9 +6289,7 @@ impl StorageHandle {
         cx: &crate::cx::Cx,
         query: ActionHistoryQuery,
     ) -> Result<Vec<ActionHistoryRecord>> {
-        cx.checkpoint().map_err(|err| {
-            StorageError::Database(format!("get_action_history cancelled: {err}"))
-        })?;
+        Self::checkpoint_storage_operation(cx, "get_action_history")?;
         let db_path = Arc::clone(&self.db_path);
 
         Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Task join error", move || {
@@ -6292,9 +6314,7 @@ impl StorageHandle {
         workspace_id: &str,
         now_ms: i64,
     ) -> Result<u32> {
-        cx.checkpoint().map_err(|err| {
-            StorageError::Database(format!("count_active_approvals cancelled: {err}"))
-        })?;
+        Self::checkpoint_storage_operation(cx, "count_active_approvals")?;
         let db_path = Arc::clone(&self.db_path);
         let workspace_id = workspace_id.to_string();
 
@@ -6331,9 +6351,7 @@ impl StorageHandle {
         limit: usize,
         now_ms: i64,
     ) -> Result<Vec<ApprovalTokenRecord>> {
-        cx.checkpoint().map_err(|err| {
-            StorageError::Database(format!("list_approval_tokens cancelled: {err}"))
-        })?;
+        Self::checkpoint_storage_operation(cx, "list_approval_tokens")?;
         let db_path = Arc::clone(&self.db_path);
         let workspace_id = workspace_id.to_string();
         Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Task join error", move || {
@@ -6365,9 +6383,7 @@ impl StorageHandle {
         cx: &crate::cx::Cx,
         code_hash: &str,
     ) -> Result<Option<ApprovalTokenRecord>> {
-        cx.checkpoint().map_err(|err| {
-            StorageError::Database(format!("get_approval_token cancelled: {err}"))
-        })?;
+        Self::checkpoint_storage_operation(cx, "get_approval_token")?;
         let db_path = Arc::clone(&self.db_path);
         let code_hash = code_hash.to_string();
 
@@ -6397,9 +6413,7 @@ impl StorageHandle {
         token_id: i64,
         workspace_id: &str,
     ) -> Result<Option<ApprovalTokenRecord>> {
-        cx.checkpoint().map_err(|err| {
-            StorageError::Database(format!("get_approval_token_by_id cancelled: {err}"))
-        })?;
+        Self::checkpoint_storage_operation(cx, "get_approval_token_by_id")?;
         let db_path = Arc::clone(&self.db_path);
         let workspace_id = workspace_id.to_string();
 
@@ -6423,8 +6437,7 @@ impl StorageHandle {
         cx: &crate::cx::Cx,
         pane_id: u64,
     ) -> Result<Option<u64>> {
-        cx.checkpoint()
-            .map_err(|err| StorageError::Database(format!("get_max_seq cancelled: {err}")))?;
+        Self::checkpoint_storage_operation(cx, "get_max_seq")?;
         let db_path = Arc::clone(&self.db_path);
 
         Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Task join error", move || {
@@ -6453,9 +6466,7 @@ impl StorageHandle {
         cx: &crate::cx::Cx,
         pane_id: u64,
     ) -> Result<Option<i64>> {
-        cx.checkpoint().map_err(|err| {
-            StorageError::Database(format!("pane_last_output_at cancelled: {err}"))
-        })?;
+        Self::checkpoint_storage_operation(cx, "pane_last_output_at")?;
         let db_path = Arc::clone(&self.db_path);
 
         Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Task join error", move || {
@@ -6474,8 +6485,7 @@ impl StorageHandle {
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`get_panes`].
     pub async fn get_panes_with_cx(&self, cx: &crate::cx::Cx) -> Result<Vec<PaneRecord>> {
-        cx.checkpoint()
-            .map_err(|err| StorageError::Database(format!("get_panes cancelled: {err}")))?;
+        Self::checkpoint_storage_operation(cx, "get_panes")?;
         let db_path = Arc::clone(&self.db_path);
 
         Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Task join error", move || {
@@ -6492,8 +6502,7 @@ impl StorageHandle {
         cx: &crate::cx::Cx,
         pane_ids: &[u64],
     ) -> Result<Vec<PaneRecord>> {
-        cx.checkpoint()
-            .map_err(|err| StorageError::Database(format!("get_panes_by_ids cancelled: {err}")))?;
+        Self::checkpoint_storage_operation(cx, "get_panes_by_ids")?;
         if pane_ids.is_empty() {
             return Ok(Vec::new());
         }
@@ -6520,8 +6529,7 @@ impl StorageHandle {
         cx: &crate::cx::Cx,
         pane_id: u64,
     ) -> Result<Option<PaneRecord>> {
-        cx.checkpoint()
-            .map_err(|err| StorageError::Database(format!("get_pane cancelled: {err}")))?;
+        Self::checkpoint_storage_operation(cx, "get_pane")?;
         let db_path = Arc::clone(&self.db_path);
 
         Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Task join error", move || {
@@ -6559,8 +6567,7 @@ impl StorageHandle {
         pane_id: u64,
         limit: usize,
     ) -> Result<Vec<Segment>> {
-        cx.checkpoint()
-            .map_err(|err| StorageError::Database(format!("get_segments cancelled: {err}")))?;
+        Self::checkpoint_storage_operation(cx, "get_segments")?;
         let db_path = Arc::clone(&self.db_path);
         let mmap_mirror_dir = self
             .mmap_mirror_dir
@@ -6603,8 +6610,7 @@ impl StorageHandle {
         cx: &crate::cx::Cx,
         query: SegmentScanQuery,
     ) -> Result<Vec<Segment>> {
-        cx.checkpoint()
-            .map_err(|err| StorageError::Database(format!("scan_segments cancelled: {err}")))?;
+        Self::checkpoint_storage_operation(cx, "scan_segments")?;
         let db_path = Arc::clone(&self.db_path);
 
         Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Task join error", move || {
@@ -6633,9 +6639,7 @@ impl StorageHandle {
         cx: &crate::cx::Cx,
         scope_hash: &str,
     ) -> Result<Option<SecretScanReportRecord>> {
-        cx.checkpoint().map_err(|err| {
-            StorageError::Database(format!("latest_secret_scan_report cancelled: {err}"))
-        })?;
+        Self::checkpoint_storage_operation(cx, "latest_secret_scan_report")?;
         let db_path = Arc::clone(&self.db_path);
         let scope_hash = scope_hash.to_string();
 
@@ -6661,8 +6665,7 @@ impl StorageHandle {
         cx: &crate::cx::Cx,
         workflow_id: &str,
     ) -> Result<Option<WorkflowRecord>> {
-        cx.checkpoint()
-            .map_err(|err| StorageError::Database(format!("get_workflow cancelled: {err}")))?;
+        Self::checkpoint_storage_operation(cx, "get_workflow")?;
         let db_path = Arc::clone(&self.db_path);
         let workflow_id = workflow_id.to_string();
 
@@ -6693,8 +6696,7 @@ impl StorageHandle {
         cx: &crate::cx::Cx,
         workflow_id: &str,
     ) -> Result<Vec<WorkflowStepLogRecord>> {
-        cx.checkpoint()
-            .map_err(|err| StorageError::Database(format!("get_step_logs cancelled: {err}")))?;
+        Self::checkpoint_storage_operation(cx, "get_step_logs")?;
         let db_path = Arc::clone(&self.db_path);
         let workflow_id = workflow_id.to_string();
 
@@ -6721,9 +6723,7 @@ impl StorageHandle {
         cx: &crate::cx::Cx,
         workflow_id: &str,
     ) -> Result<Option<WorkflowStepLogRecord>> {
-        cx.checkpoint().map_err(|err| {
-            StorageError::Database(format!("get_latest_step_log cancelled: {err}"))
-        })?;
+        Self::checkpoint_storage_operation(cx, "get_latest_step_log")?;
         let db_path = Arc::clone(&self.db_path);
         let workflow_id = workflow_id.to_string();
 
@@ -6750,8 +6750,7 @@ impl StorageHandle {
         cx: &crate::cx::Cx,
         workflow_id: &str,
     ) -> Result<Option<WorkflowActionPlanRecord>> {
-        cx.checkpoint()
-            .map_err(|err| StorageError::Database(format!("get_action_plan cancelled: {err}")))?;
+        Self::checkpoint_storage_operation(cx, "get_action_plan")?;
         let db_path = Arc::clone(&self.db_path);
         let workflow_id = workflow_id.to_string();
 
@@ -6775,8 +6774,7 @@ impl StorageHandle {
         cx: &crate::cx::Cx,
         plan_id: &str,
     ) -> Result<Option<PreparedPlanRecord>> {
-        cx.checkpoint()
-            .map_err(|err| StorageError::Database(format!("get_prepared_plan cancelled: {err}")))?;
+        Self::checkpoint_storage_operation(cx, "get_prepared_plan")?;
         let db_path = Arc::clone(&self.db_path);
         let plan_id = plan_id.to_string();
 
@@ -6802,9 +6800,7 @@ impl StorageHandle {
         &self,
         cx: &crate::cx::Cx,
     ) -> Result<Vec<WorkflowRecord>> {
-        cx.checkpoint().map_err(|err| {
-            StorageError::Database(format!("find_incomplete_workflows cancelled: {err}"))
-        })?;
+        Self::checkpoint_storage_operation(cx, "find_incomplete_workflows")?;
         let db_path = Arc::clone(&self.db_path);
 
         Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Task join error", move || {
@@ -6836,8 +6832,7 @@ impl StorageHandle {
     /// check is infallible, so we return `Ok(bool)` and fold cancellation
     /// into the error path.
     pub async fn is_writable_with_cx(&self, cx: &crate::cx::Cx) -> Result<bool> {
-        cx.checkpoint()
-            .map_err(|err| StorageError::Database(format!("is_writable cancelled: {err}")))?;
+        Self::checkpoint_storage_operation(cx, "is_writable")?;
         Ok(self.is_writable().await)
     }
 
@@ -6860,8 +6855,7 @@ impl StorageHandle {
         cx: &crate::cx::Cx,
         account: crate::accounts::AccountRecord,
     ) -> Result<i64> {
-        cx.checkpoint()
-            .map_err(|err| StorageError::Database(format!("upsert_account cancelled: {err}")))?;
+        Self::checkpoint_storage_operation(cx, "upsert_account")?;
         let (tx, rx) = oneshot::channel();
         self.write_tx
             .send_with_cx(
@@ -6872,7 +6866,7 @@ impl StorageHandle {
                 },
             )
             .await
-            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+            .map_err(|error| Self::writer_send_error("upsert_account", error))?;
         Self::recv_writer_response(rx).await
     }
 
@@ -6899,9 +6893,7 @@ impl StorageHandle {
         account_id: &str,
         last_used_at: i64,
     ) -> Result<()> {
-        cx.checkpoint().map_err(|err| {
-            StorageError::Database(format!("update_account_last_used cancelled: {err}"))
-        })?;
+        Self::checkpoint_storage_operation(cx, "update_account_last_used")?;
         let (tx, rx) = oneshot::channel();
         self.write_tx
             .send_with_cx(
@@ -6914,7 +6906,7 @@ impl StorageHandle {
                 },
             )
             .await
-            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+            .map_err(|error| Self::writer_send_error("update_account_last_used", error))?;
         Self::recv_writer_response(rx).await
     }
 
@@ -6934,8 +6926,7 @@ impl StorageHandle {
         service: &str,
         account_id: &str,
     ) -> Result<bool> {
-        cx.checkpoint()
-            .map_err(|err| StorageError::Database(format!("delete_account cancelled: {err}")))?;
+        Self::checkpoint_storage_operation(cx, "delete_account")?;
         let (tx, rx) = oneshot::channel();
         self.write_tx
             .send_with_cx(
@@ -6947,7 +6938,7 @@ impl StorageHandle {
                 },
             )
             .await
-            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+            .map_err(|error| Self::writer_send_error("delete_account", error))?;
         Self::recv_writer_response(rx).await
     }
 
@@ -6968,9 +6959,7 @@ impl StorageHandle {
         cx: &crate::cx::Cx,
         service: &str,
     ) -> Result<Vec<crate::accounts::AccountRecord>> {
-        cx.checkpoint().map_err(|err| {
-            StorageError::Database(format!("get_accounts_by_service cancelled: {err}"))
-        })?;
+        Self::checkpoint_storage_operation(cx, "get_accounts_by_service")?;
         let db_path = self.db_path.clone();
         let service = service.to_string();
         Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Task join error", move || {
@@ -6999,8 +6988,7 @@ impl StorageHandle {
         service: &str,
         account_id: &str,
     ) -> Result<Option<crate::accounts::AccountRecord>> {
-        cx.checkpoint()
-            .map_err(|err| StorageError::Database(format!("get_account cancelled: {err}")))?;
+        Self::checkpoint_storage_operation(cx, "get_account")?;
         let db_path = self.db_path.clone();
         let service = service.to_string();
         let account_id = account_id.to_string();
@@ -7028,9 +7016,7 @@ impl StorageHandle {
         cx: &crate::cx::Cx,
         record: LimitWindowRecord,
     ) -> Result<LimitWindowRecord> {
-        cx.checkpoint().map_err(|err| {
-            StorageError::Database(format!("upsert_limit_window cancelled: {err}"))
-        })?;
+        Self::checkpoint_storage_operation(cx, "upsert_limit_window")?;
         let (tx, rx) = oneshot::channel();
         self.write_tx
             .send_with_cx(
@@ -7041,7 +7027,7 @@ impl StorageHandle {
                 },
             )
             .await
-            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+            .map_err(|error| Self::writer_send_error("upsert_limit_window", error))?;
         Self::recv_writer_response(rx).await
     }
 
@@ -7065,8 +7051,7 @@ impl StorageHandle {
         service: &str,
         account_id: &str,
     ) -> Result<Option<LimitWindowRecord>> {
-        cx.checkpoint()
-            .map_err(|err| StorageError::Database(format!("get_limit_window cancelled: {err}")))?;
+        Self::checkpoint_storage_operation(cx, "get_limit_window")?;
         let db_path = self.db_path.clone();
         let service = service.to_string();
         let account_id = account_id.to_string();
@@ -7093,9 +7078,7 @@ impl StorageHandle {
         cx: &crate::cx::Cx,
         now_ms: i64,
     ) -> Result<Vec<LimitWindowRecord>> {
-        cx.checkpoint().map_err(|err| {
-            StorageError::Database(format!("list_active_limit_windows cancelled: {err}"))
-        })?;
+        Self::checkpoint_storage_operation(cx, "list_active_limit_windows")?;
         let db_path = self.db_path.clone();
         Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Task join error", move || {
             pooled_backend(db_path.as_str(), |backend| {
@@ -7128,8 +7111,7 @@ impl StorageHandle {
         service: &str,
         config: &crate::accounts::AccountSelectionConfig,
     ) -> Result<crate::accounts::AccountSelectionResult> {
-        cx.checkpoint()
-            .map_err(|err| StorageError::Database(format!("select_account cancelled: {err}")))?;
+        Self::checkpoint_storage_operation(cx, "select_account")?;
         let accounts = self.get_accounts_by_service_with_cx(cx, service).await?;
         Ok(crate::accounts::select_account(&accounts, config))
     }
@@ -7166,9 +7148,7 @@ impl StorageHandle {
         reason: Option<&str>,
         ttl_ms: i64,
     ) -> Result<PaneReservation> {
-        cx.checkpoint().map_err(|err| {
-            StorageError::Database(format!("create_reservation cancelled: {err}"))
-        })?;
+        Self::checkpoint_storage_operation(cx, "create_reservation")?;
         let (tx, rx) = oneshot::channel();
         self.write_tx
             .send_with_cx(
@@ -7183,7 +7163,7 @@ impl StorageHandle {
                 },
             )
             .await
-            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+            .map_err(|error| Self::writer_send_error("create_reservation", error))?;
         Self::recv_writer_response(rx).await
     }
 
@@ -7202,9 +7182,7 @@ impl StorageHandle {
         cx: &crate::cx::Cx,
         reservation_id: i64,
     ) -> Result<bool> {
-        cx.checkpoint().map_err(|err| {
-            StorageError::Database(format!("release_reservation cancelled: {err}"))
-        })?;
+        Self::checkpoint_storage_operation(cx, "release_reservation")?;
         let (tx, rx) = oneshot::channel();
         self.write_tx
             .send_with_cx(
@@ -7215,7 +7193,7 @@ impl StorageHandle {
                 },
             )
             .await
-            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+            .map_err(|error| Self::writer_send_error("release_reservation", error))?;
         Self::recv_writer_response(rx).await
     }
 
@@ -7231,9 +7209,7 @@ impl StorageHandle {
         cx: &crate::cx::Cx,
         pane_id: u64,
     ) -> Result<Option<PaneReservation>> {
-        cx.checkpoint().map_err(|err| {
-            StorageError::Database(format!("get_active_reservation cancelled: {err}"))
-        })?;
+        Self::checkpoint_storage_operation(cx, "get_active_reservation")?;
         let db_path = self.db_path.clone();
         Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Task join error", move || {
             // br-ft-v5wjv: trait-typed pool helper (pooled_backend)
@@ -7265,9 +7241,7 @@ impl StorageHandle {
         &self,
         cx: &crate::cx::Cx,
     ) -> Result<Vec<PaneReservation>> {
-        cx.checkpoint().map_err(|err| {
-            StorageError::Database(format!("list_active_reservations cancelled: {err}"))
-        })?;
+        Self::checkpoint_storage_operation(cx, "list_active_reservations")?;
         let db_path = self.db_path.clone();
         Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Task join error", move || {
             // br-ft-v5wjv: trait-typed pool helper.
@@ -7314,8 +7288,7 @@ impl StorageHandle {
         cx: &crate::cx::Cx,
         query: ExportQuery,
     ) -> Result<Vec<Segment>> {
-        cx.checkpoint()
-            .map_err(|err| StorageError::Database(format!("export_segments cancelled: {err}")))?;
+        Self::checkpoint_storage_operation(cx, "export_segments")?;
         let db_path = Arc::clone(&self.db_path);
         Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Task join error", move || {
             pooled_backend(db_path.as_str(), |backend| {
@@ -7337,8 +7310,7 @@ impl StorageHandle {
         cx: &crate::cx::Cx,
         query: ExportQuery,
     ) -> Result<Vec<Gap>> {
-        cx.checkpoint()
-            .map_err(|err| StorageError::Database(format!("export_gaps cancelled: {err}")))?;
+        Self::checkpoint_storage_operation(cx, "export_gaps")?;
         let db_path = Arc::clone(&self.db_path);
         Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Task join error", move || {
             pooled_backend(db_path.as_str(), |backend| {
@@ -7356,8 +7328,7 @@ impl StorageHandle {
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`get_gaps`].
     pub async fn get_gaps_with_cx(&self, cx: &crate::cx::Cx) -> Result<Vec<Gap>> {
-        cx.checkpoint()
-            .map_err(|err| StorageError::Database(format!("get_gaps cancelled: {err}")))?;
+        Self::checkpoint_storage_operation(cx, "get_gaps")?;
         let db_path = Arc::clone(&self.db_path);
         Self::spawn_blocking_storage_with_cx_with_join_error(
             cx,
@@ -7412,9 +7383,7 @@ impl StorageHandle {
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`get_retention_cleanup_count`].
     pub async fn get_retention_cleanup_count_with_cx(&self, cx: &crate::cx::Cx) -> Result<u64> {
-        cx.checkpoint().map_err(|err| {
-            StorageError::Database(format!("get_retention_cleanup_count cancelled: {err}"))
-        })?;
+        Self::checkpoint_storage_operation(cx, "get_retention_cleanup_count")?;
         let db_path = Arc::clone(&self.db_path);
         Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Task join error", move || -> Result<u64> {
             // br-ft-3twzm: pooled backend re-fixes ft-bhyxz.
@@ -7458,9 +7427,7 @@ impl StorageHandle {
         &self,
         cx: &crate::cx::Cx,
     ) -> Result<(Option<i64>, Option<i64>)> {
-        cx.checkpoint().map_err(|err| {
-            StorageError::Database(format!("get_segment_time_range cancelled: {err}"))
-        })?;
+        Self::checkpoint_storage_operation(cx, "get_segment_time_range")?;
         let db_path = Arc::clone(&self.db_path);
         Self::spawn_blocking_storage_with_cx_with_join_error(
             cx,
@@ -7505,8 +7472,7 @@ impl StorageHandle {
         cx: &crate::cx::Cx,
         query: ExportQuery,
     ) -> Result<Vec<WorkflowRecord>> {
-        cx.checkpoint()
-            .map_err(|err| StorageError::Database(format!("export_workflows cancelled: {err}")))?;
+        Self::checkpoint_storage_operation(cx, "export_workflows")?;
         let db_path = Arc::clone(&self.db_path);
         Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Task join error", move || {
             pooled_backend(db_path.as_str(), |backend| {
@@ -7528,8 +7494,7 @@ impl StorageHandle {
         cx: &crate::cx::Cx,
         query: ExportQuery,
     ) -> Result<Vec<AgentSessionRecord>> {
-        cx.checkpoint()
-            .map_err(|err| StorageError::Database(format!("export_sessions cancelled: {err}")))?;
+        Self::checkpoint_storage_operation(cx, "export_sessions")?;
         let db_path = Arc::clone(&self.db_path);
         Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Task join error", move || {
             pooled_backend(db_path.as_str(), |backend| {
@@ -7551,9 +7516,7 @@ impl StorageHandle {
         cx: &crate::cx::Cx,
         query: ExportQuery,
     ) -> Result<Vec<PaneReservation>> {
-        cx.checkpoint().map_err(|err| {
-            StorageError::Database(format!("export_reservations cancelled: {err}"))
-        })?;
+        Self::checkpoint_storage_operation(cx, "export_reservations")?;
         let db_path = Arc::clone(&self.db_path);
         Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Task join error", move || {
             pooled_backend(db_path.as_str(), |backend| {
@@ -7574,14 +7537,12 @@ impl StorageHandle {
     /// ft-xbnl0.2.3 Cx-first sibling of [`expire_stale_reservations`].
     /// Tick 173: inlined to route the mpsc send through `send_with_cx`.
     pub async fn expire_stale_reservations_with_cx(&self, cx: &crate::cx::Cx) -> Result<usize> {
-        cx.checkpoint().map_err(|err| {
-            StorageError::Database(format!("expire_stale_reservations cancelled: {err}"))
-        })?;
+        Self::checkpoint_storage_operation(cx, "expire_stale_reservations")?;
         let (tx, rx) = oneshot::channel();
         self.write_tx
             .send_with_cx(cx, WriteCommand::ExpireStaleReservations { respond: tx })
             .await
-            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+            .map_err(|error| Self::writer_send_error("expire_stale_reservations", error))?;
         Self::recv_writer_response(rx).await
     }
 
@@ -9126,7 +9087,7 @@ enum PendingEventOrGap {
     Event {
         event: Box<StoredEvent>,
         capture_hold: Option<CapturePersistenceHold>,
-        respond: WriterResultResponder<i64>,
+        respond: WriterResultResponder<EventRecordOutcome>,
     },
     Gap {
         pane_id: u64,
@@ -9194,7 +9155,7 @@ fn pending_event_or_gap_from_command(
 /// Per-command outcome captured inside the group transaction, returned only
 /// after `COMMIT` succeeds so callers never see a value that did not durably land.
 enum EventGapCommitResult {
-    Event(i64),
+    Event(EventRecordOutcome),
     Gap(Option<Gap>),
 }
 
@@ -9298,8 +9259,8 @@ fn event_gap_group_commit_inner(
     for pending in group {
         match pending {
             PendingEventOrGap::Event { event, .. } => {
-                let id = record_event_backend(backend, event)?;
-                results.push(EventGapCommitResult::Event(id));
+                let outcome = record_event_backend(backend, event)?;
+                results.push(EventGapCommitResult::Event(outcome));
             }
             PendingEventOrGap::Gap {
                 pane_id, reason, ..
@@ -9345,9 +9306,9 @@ fn dispatch_event_gap_group_commit_result(
                             respond,
                             ..
                         },
-                        EventGapCommitResult::Event(id),
+                        EventGapCommitResult::Event(outcome),
                     ) => {
-                        respond.respond_best_effort(Ok(id));
+                        respond.respond_best_effort(Ok(outcome));
                         drop(capture_hold);
                     }
                     (
@@ -9638,6 +9599,9 @@ fn fail_undispatched_write_command(cmd: WriteCommand, message: String) -> bool {
             respond_oneshot_best_effort(respond, writer_panic_error(&message));
             drop(capture_hold);
         }
+        WriteCommand::ReserveEventDelivery { respond, .. } => {
+            respond_oneshot_best_effort(respond, writer_panic_error(&message));
+        }
         WriteCommand::MarkEventHandled { respond, .. }
         | WriteCommand::SetEventNote { respond, .. }
         | WriteCommand::UpsertEventMute { respond, .. }
@@ -9659,7 +9623,9 @@ fn fail_undispatched_write_command(cmd: WriteCommand, message: String) -> bool {
         | WriteCommand::MarkSessionShutdownClean { respond, .. } => {
             respond_oneshot_best_effort(respond, writer_panic_error(&message));
         }
-        WriteCommand::SetEventTriageState { respond, .. }
+        WriteCommand::FinalizeEventDelivery { respond, .. }
+        | WriteCommand::ReleaseEventDelivery { respond, .. }
+        | WriteCommand::SetEventTriageState { respond, .. }
         | WriteCommand::AddEventLabel { respond, .. }
         | WriteCommand::RemoveEventLabel { respond, .. }
         | WriteCommand::DeleteEventMute { respond, .. }
@@ -10744,6 +10710,9 @@ mod writer_io_scheduler_tests {
             let mut segment_redactors = HashMap::<u64, SegmentPersistRedactor>::new();
             let (panic_tx, panic_rx) = oneshot::channel();
             let (tail_tx, tail_rx) = oneshot::channel();
+            let (reserve_tx, reserve_rx) = oneshot::channel();
+            let (finalize_tx, finalize_rx) = oneshot::channel();
+            let (release_tx, release_rx) = oneshot::channel();
             let mut batch = VecDeque::new();
             batch.push_back(WriteCommand::PanicForTest { respond: panic_tx });
             batch.push_back(WriteCommand::MarkEventHandled {
@@ -10751,6 +10720,24 @@ mod writer_io_scheduler_tests {
                 workflow_id: None,
                 status: "handled".to_string(),
                 respond: tail_tx,
+            });
+            batch.push_back(WriteCommand::ReserveEventDelivery {
+                event_id: 42,
+                token: "reserve-tail".to_string(),
+                ttl_ms: 1_000,
+                respond: reserve_tx,
+            });
+            batch.push_back(WriteCommand::FinalizeEventDelivery {
+                event_id: 42,
+                token: "finalize-tail".to_string(),
+                workflow_id: None,
+                status: "delivered".to_string(),
+                respond: finalize_tx,
+            });
+            batch.push_back(WriteCommand::ReleaseEventDelivery {
+                event_id: 42,
+                token: "release-tail".to_string(),
+                respond: release_tx,
             });
 
             dispatch_write_command_batch(
@@ -10786,6 +10773,39 @@ mod writer_io_scheduler_tests {
                     .to_string()
                     .contains("storage writer recovered from dispatch panic"),
                 "{tail_error}"
+            );
+            let reserve_result = crate::runtime_async::oneshot_recv(reserve_rx)
+                .await
+                .expect("undispatched reserve should receive a panic error");
+            let reserve_error =
+                reserve_result.expect_err("undispatched reserve should fail closed");
+            assert!(
+                reserve_error
+                    .to_string()
+                    .contains("storage writer recovered from dispatch panic"),
+                "{reserve_error}"
+            );
+            let finalize_result = crate::runtime_async::oneshot_recv(finalize_rx)
+                .await
+                .expect("undispatched finalize should receive a panic error");
+            let finalize_error =
+                finalize_result.expect_err("undispatched finalize should fail closed");
+            assert!(
+                finalize_error
+                    .to_string()
+                    .contains("storage writer recovered from dispatch panic"),
+                "{finalize_error}"
+            );
+            let release_result = crate::runtime_async::oneshot_recv(release_rx)
+                .await
+                .expect("undispatched release should receive a panic error");
+            let release_error =
+                release_result.expect_err("undispatched release should fail closed");
+            assert!(
+                release_error
+                    .to_string()
+                    .contains("storage writer recovered from dispatch panic"),
+                "{release_error}"
             );
 
             let (shutdown_tx, shutdown_rx) = oneshot::channel();
@@ -10889,19 +10909,31 @@ mod writer_io_scheduler_tests {
             .expect("event group commit should succeed");
             dispatch_event_gap_group_commit_result(Ok(result), group);
 
-            let id1 = crate::runtime_async::oneshot_recv(rx1)
+            let outcome1 = crate::runtime_async::oneshot_recv(rx1)
                 .await
                 .expect("first response")
                 .expect("first ok");
-            let id2 = crate::runtime_async::oneshot_recv(rx2)
+            let outcome2 = crate::runtime_async::oneshot_recv(rx2)
                 .await
                 .expect("second response")
                 .expect("second ok");
-            let id3 = crate::runtime_async::oneshot_recv(rx3)
+            let outcome3 = crate::runtime_async::oneshot_recv(rx3)
                 .await
                 .expect("third response")
                 .expect("third ok");
-            assert_eq!((id1, id2, id3), (201, 202, 203), "ids in submission order");
+            assert_eq!(
+                (
+                    outcome1.event_id(),
+                    outcome2.event_id(),
+                    outcome3.event_id()
+                ),
+                (201, 202, 203),
+                "ids in submission order"
+            );
+            assert!(
+                outcome1.was_inserted() && outcome2.was_inserted() && outcome3.was_inserted(),
+                "mocked INSERT RETURNING rows are newly inserted events"
+            );
 
             assert_eq!(
                 backend.executed(),
@@ -10916,6 +10948,74 @@ mod writer_io_scheduler_tests {
             assert_eq!(
                 insert_count, 3,
                 "every grouped event inserts inside the txn"
+            );
+        });
+    }
+
+    #[test]
+    fn event_gap_group_commit_reports_in_batch_dedupe_without_a_second_insertion() {
+        run_storage_async_test(async {
+            let backend = crate::storage_backend_trait::MockBackend::new();
+            backend.enqueue_row_response(Some(vec!["211".to_string()]));
+            backend.enqueue_row_response(None);
+            backend.enqueue_row_response(Some(vec!["211".to_string()]));
+
+            let (first_tx, first_rx) = oneshot::channel();
+            let (retry_tx, retry_rx) = oneshot::channel();
+            let group = vec![
+                PendingEventOrGap::Event {
+                    event: Box::new(sample_event(
+                        7,
+                        "same-rule",
+                        1_700_000_000_000,
+                        Some("same-key"),
+                    )),
+                    capture_hold: None,
+                    respond: WriterResultResponder::new(first_tx),
+                },
+                PendingEventOrGap::Event {
+                    event: Box::new(sample_event(
+                        7,
+                        "same-rule",
+                        1_700_000_000_001,
+                        Some("same-key"),
+                    )),
+                    capture_hold: None,
+                    respond: WriterResultResponder::new(retry_tx),
+                },
+            ];
+            let mut mmap_mirror = None;
+            let mut segment_redactors = HashMap::<u64, SegmentPersistRedactor>::new();
+
+            let result = event_gap_group_commit_backend(
+                &backend,
+                &group,
+                &mut mmap_mirror,
+                &mut segment_redactors,
+            )
+            .expect("deduplicated event group should commit");
+            dispatch_event_gap_group_commit_result(Ok(result), group);
+
+            let first = crate::runtime_async::oneshot_recv(first_rx)
+                .await
+                .expect("first response")
+                .expect("first insert");
+            let retry = crate::runtime_async::oneshot_recv(retry_rx)
+                .await
+                .expect("retry response")
+                .expect("dedupe lookup");
+            assert_eq!(first.inserted_event_id(), Some(211));
+            assert_eq!(retry.inserted_event_id(), None);
+            assert_eq!(retry.event_id(), first.event_id());
+
+            let queries = backend.observed_queries();
+            assert_eq!(queries.len(), 3);
+            assert!(queries[0].0.contains("INSERT INTO events"));
+            assert!(queries[1].0.contains("INSERT INTO events"));
+            assert!(queries[2].0.contains("SELECT id FROM events"));
+            assert_eq!(
+                backend.executed(),
+                vec!["BEGIN".to_string(), "COMMIT".to_string()]
             );
         });
     }
@@ -10962,7 +11062,7 @@ mod writer_io_scheduler_tests {
             .expect("mixed group commit should succeed");
             dispatch_event_gap_group_commit_result(Ok(result), group);
 
-            let id1 = crate::runtime_async::oneshot_recv(rx1)
+            let outcome1 = crate::runtime_async::oneshot_recv(rx1)
                 .await
                 .expect("event1")
                 .expect("event1 ok");
@@ -10971,13 +11071,13 @@ mod writer_io_scheduler_tests {
                 .expect("gap")
                 .expect("gap ok")
                 .expect("gap recorded");
-            let id2 = crate::runtime_async::oneshot_recv(rx2)
+            let outcome2 = crate::runtime_async::oneshot_recv(rx2)
                 .await
                 .expect("event2")
                 .expect("event2 ok");
 
-            assert_eq!(id1, 301);
-            assert_eq!(id2, 302);
+            assert_eq!(outcome1.inserted_event_id(), Some(301));
+            assert_eq!(outcome2.inserted_event_id(), Some(302));
             assert_eq!(gap.id, 77);
             assert_eq!(gap.seq_before, 5);
             assert_eq!(gap.seq_after, 6);
@@ -11202,11 +11302,11 @@ mod writer_io_scheduler_tests {
                 &mut segment_redactors,
             );
             assert!(message.is_none(), "singleton dispatch should succeed");
-            let id = crate::runtime_async::oneshot_recv(rx)
+            let outcome = crate::runtime_async::oneshot_recv(rx)
                 .await
                 .expect("response")
                 .expect("ok");
-            assert_eq!(id, 601);
+            assert_eq!(outcome.inserted_event_id(), Some(601));
             assert!(
                 backend.executed().is_empty(),
                 "a lone event must not open an explicit transaction (legacy raw path)"
@@ -11261,15 +11361,18 @@ mod writer_io_scheduler_tests {
                 crate::runtime_async::oneshot_recv(rx1)
                     .await
                     .expect("rx1")
-                    .expect("ok1"),
+                    .expect("ok1")
+                    .event_id(),
                 crate::runtime_async::oneshot_recv(rx2)
                     .await
                     .expect("rx2")
-                    .expect("ok2"),
+                    .expect("ok2")
+                    .event_id(),
                 crate::runtime_async::oneshot_recv(rx3)
                     .await
                     .expect("rx3")
-                    .expect("ok3"),
+                    .expect("ok3")
+                    .event_id(),
             ];
             ids.sort_unstable();
             assert_eq!(ids, vec![701, 702, 703], "every event durably committed");
@@ -11977,8 +12080,8 @@ where
 ///    Operators see write-side failures via that telemetry, not
 ///    via the per-command `respond.send`.
 ///
-/// The 61 call sites in this function ALL share the above
-/// contract and route through [`respond_oneshot_best_effort`]
+/// Every response-producing dispatch arm shares the above contract and routes
+/// through [`respond_oneshot_best_effort`]
 /// (defined above) — the helper's name makes the contract
 /// self-documenting at every callsite. The original inline
 /// `let _ = respond.send(...)` pattern is no longer present in
@@ -12062,6 +12165,42 @@ fn dispatch_write_command_raw(
             let respond = WriterResultResponder::new(respond);
             let result =
                 mark_event_handled_backend(backend, event_id, workflow_id.as_deref(), &status);
+            respond_oneshot_best_effort(respond, result);
+        }
+        WriteCommand::ReserveEventDelivery {
+            event_id,
+            token,
+            ttl_ms,
+            respond,
+        } => {
+            let respond = WriterResultResponder::new(respond);
+            let result = reserve_event_delivery_backend(backend, event_id, &token, ttl_ms);
+            respond_oneshot_best_effort(respond, result);
+        }
+        WriteCommand::FinalizeEventDelivery {
+            event_id,
+            token,
+            workflow_id,
+            status,
+            respond,
+        } => {
+            let respond = WriterResultResponder::new(respond);
+            let result = finalize_event_delivery_backend(
+                backend,
+                event_id,
+                &token,
+                workflow_id.as_deref(),
+                &status,
+            );
+            respond_oneshot_best_effort(respond, result);
+        }
+        WriteCommand::ReleaseEventDelivery {
+            event_id,
+            token,
+            respond,
+        } => {
+            let respond = WriterResultResponder::new(respond);
+            let result = release_event_delivery_backend(backend, event_id, &token);
             respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::SetEventTriageState {
@@ -13030,6 +13169,49 @@ fn now_ms_strict() -> Result<i64> {
         })
 }
 
+fn checked_event_delivery_lease_ttl_ms(lease_ttl: std::time::Duration) -> Result<i64> {
+    if lease_ttl.is_zero() {
+        return Err(StorageError::Database(
+            "event delivery lease TTL must be non-zero".to_string(),
+        )
+        .into());
+    }
+
+    // Persisted deadlines use epoch milliseconds. Round every positive
+    // sub-millisecond remainder UP so storage never makes a lease stealable
+    // before the caller's requested Duration has elapsed.
+    const NANOS_PER_MILLI: u128 = 1_000_000;
+    let ttl_nanos = lease_ttl.as_nanos();
+    let ttl_ms_u128 = ttl_nanos.div_ceil(NANOS_PER_MILLI);
+    let ttl_ms = i64::try_from(ttl_ms_u128).map_err(|_| {
+        StorageError::Database(format!(
+            "event delivery lease TTL exceeds the epoch-millisecond range: {lease_ttl:?}"
+        ))
+    })?;
+    Ok(ttl_ms)
+}
+
+fn checked_event_delivery_lease_expiry(acquired_at_ms: i64, ttl_ms: i64) -> Result<i64> {
+    if acquired_at_ms < 0 || ttl_ms <= 0 {
+        return Err(StorageError::Database(format!(
+            "invalid event delivery lease clock inputs: acquired_at_ms={acquired_at_ms}, ttl_ms={ttl_ms}"
+        ))
+        .into());
+    }
+    acquired_at_ms.checked_add(ttl_ms).ok_or_else(|| {
+        StorageError::Database(format!(
+            "event delivery lease expiry overflows epoch milliseconds: now={acquired_at_ms}, ttl_ms={ttl_ms}"
+        ))
+        .into()
+    })
+}
+
+fn new_event_delivery_lease_token() -> String {
+    let high: u128 = rand::random();
+    let low: u128 = rand::random();
+    format!("event-delivery-{high:032x}{low:032x}")
+}
+
 fn u64_to_i64(value: u64, label: &str) -> Result<i64> {
     i64::try_from(value).map_err(|_| {
         StorageError::Database(format!("{label} value {value} exceeds i64 range")).into()
@@ -13778,7 +13960,10 @@ fn parse_distributed_gap_reason(reason: &str) -> Option<(u64, u64)> {
 }
 
 /// Record an event through the storage backend.
-fn record_event_backend(backend: &dyn StorageBackend, event: &StoredEvent) -> Result<i64> {
+fn record_event_backend(
+    backend: &dyn StorageBackend,
+    event: &StoredEvent,
+) -> Result<EventRecordOutcome> {
     let extracted_json = event.extracted.as_ref().map(|v| {
         serde_json::to_string(v).unwrap_or_else(|e| {
             tracing::warn!(error = %e, "event extracted field serialization failed");
@@ -13791,12 +13976,12 @@ fn record_event_backend(backend: &dyn StorageBackend, event: &StoredEvent) -> Re
         .filter(|key| !key.trim().is_empty());
 
     let pane_id_i64 = u64_to_i64(event.pane_id, "pane_id")?;
-    let row = backend
+    let inserted_row = backend
         .query_row_typed(
             "INSERT INTO events (pane_id, rule_id, agent_type, event_type, severity, confidence,
              extracted, matched_text, segment_id, detected_at, dedupe_key)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
-             ON CONFLICT(dedupe_key) DO UPDATE SET dedupe_key = excluded.dedupe_key
+             ON CONFLICT(dedupe_key) DO NOTHING
              RETURNING id",
             &[
                 ToSqlValue::Integer(pane_id_i64),
@@ -13812,12 +13997,37 @@ fn record_event_backend(backend: &dyn StorageBackend, event: &StoredEvent) -> Re
                 ToSqlValue::optional_text(dedupe_key),
             ],
         )
-        .map_err(|err| storage_backend_error("Failed to insert event", err))?
-        .ok_or_else(|| StorageError::Database("event insert returned no id".to_string()))?;
+        .map_err(|err| storage_backend_error("Failed to insert event", err))?;
 
-    RowReader::new(&row)
+    if let Some(row) = inserted_row {
+        let event_id = RowReader::new(&row)
+            .i64(0)
+            .map_err(|err| storage_backend_error("Inserted event id", err))?;
+        return Ok(EventRecordOutcome::new(event_id, true));
+    }
+
+    let Some(dedupe_key) = dedupe_key else {
+        return Err(StorageError::Database(
+            "non-deduplicated event insert returned no id".to_string(),
+        )
+        .into());
+    };
+
+    let existing_row = backend
+        .query_row_typed(
+            "SELECT id FROM events WHERE dedupe_key = ?1",
+            &[ToSqlValue::Text(dedupe_key)],
+        )
+        .map_err(|err| storage_backend_error("Failed to resolve deduplicated event", err))?
+        .ok_or_else(|| {
+            StorageError::Database(
+                "event dedupe conflict did not resolve to an existing row".to_string(),
+            )
+        })?;
+    let event_id = RowReader::new(&existing_row)
         .i64(0)
-        .map_err(|err| storage_backend_error("Event id", err).into())
+        .map_err(|err| storage_backend_error("Deduplicated event id", err))?;
+    Ok(EventRecordOutcome::new(event_id, false))
 }
 
 /// Mark event as handled through the storage backend.
@@ -13831,7 +14041,9 @@ fn mark_event_handled_backend(
 
     execute_typed(
         backend,
-        "UPDATE events SET handled_at = ?1, handled_by_workflow_id = ?2, handled_status = ?3
+        "UPDATE events SET handled_at = ?1, handled_by_workflow_id = ?2, handled_status = ?3,
+         delivery_lease_token = NULL, delivery_lease_acquired_at = NULL,
+         delivery_lease_expires_at = NULL
          WHERE id = ?4",
         &[
             ToSqlValue::Integer(now),
@@ -13843,6 +14055,198 @@ fn mark_event_handled_backend(
     .map_err(|err| storage_backend_error("Failed to mark event handled", err))?;
 
     Ok(())
+}
+
+/// Atomically acquire an unhandled event whose prior delivery lease is absent,
+/// malformed, or expired. SQLite serializes the conditional UPDATE, so only one
+/// competing writer can receive `Acquired` for a given live lease interval.
+fn reserve_event_delivery_backend(
+    backend: &dyn StorageBackend,
+    event_id: i64,
+    token: &str,
+    ttl_ms: i64,
+) -> Result<EventDeliveryReservation> {
+    // Start the lease clock inside the serialized writer dispatch. Computing
+    // this before enqueue could spend the entire TTL waiting behind unrelated
+    // durable writes and return an already-expired `Acquired` lease.
+    let acquired_at_ms = now_ms_strict()?;
+    reserve_event_delivery_backend_at(backend, event_id, token, acquired_at_ms, ttl_ms)
+}
+
+fn reserve_event_delivery_backend_at(
+    backend: &dyn StorageBackend,
+    event_id: i64,
+    token: &str,
+    acquired_at_ms: i64,
+    ttl_ms: i64,
+) -> Result<EventDeliveryReservation> {
+    if event_id <= 0 || token.is_empty() {
+        return Err(StorageError::Database(format!(
+            "invalid event delivery lease identity: event_id={event_id}, token_empty={}",
+            token.is_empty()
+        ))
+        .into());
+    }
+    let expires_at_ms = checked_event_delivery_lease_expiry(acquired_at_ms, ttl_ms)?;
+
+    let acquired = backend
+        .query_row_typed(
+            "UPDATE events
+             SET delivery_lease_token = ?1,
+                 delivery_lease_acquired_at = ?2,
+                 delivery_lease_expires_at = ?3
+             WHERE id = ?4
+               AND handled_at IS NULL
+               AND (
+                   delivery_lease_token IS NULL
+                   OR delivery_lease_expires_at IS NULL
+                   OR delivery_lease_expires_at <= ?2
+               )
+             RETURNING 1",
+            &[
+                ToSqlValue::Text(token),
+                ToSqlValue::Integer(acquired_at_ms),
+                ToSqlValue::Integer(expires_at_ms),
+                ToSqlValue::Integer(event_id),
+            ],
+        )
+        .map_err(|err| storage_backend_error("Failed to reserve event delivery", err))?
+        .is_some();
+
+    if acquired {
+        return Ok(EventDeliveryReservation::Acquired(
+            EventDeliveryLease::new(
+                event_id,
+                token.to_string(),
+                acquired_at_ms,
+                expires_at_ms,
+            ),
+        ));
+    }
+
+    // Classification happens immediately in the same writer dispatch. A
+    // different process may still change the row between this SELECT and the
+    // caller receiving it, but staleness can only make the caller retain its
+    // cursor and retry; it can never authorize an emission without ownership.
+    let row = backend
+        .query_row_cells(
+            "SELECT handled_at, delivery_lease_expires_at
+             FROM events WHERE id = ?1",
+            &[ToSqlValue::Integer(event_id)],
+        )
+        .map_err(|err| storage_backend_error("Failed to classify event delivery lease", err))?;
+    let Some(row) = row else {
+        return Ok(EventDeliveryReservation::AlreadyHandledOrMissing);
+    };
+    let reader = CellRowReader::new(&row);
+    if reader
+        .optional_i64(0)
+        .map_err(|err| storage_backend_error("Event delivery handled_at", err))?
+        .is_some()
+    {
+        return Ok(EventDeliveryReservation::AlreadyHandledOrMissing);
+    }
+    let expires_at_ms = reader
+        .optional_i64(1)
+        .map_err(|err| storage_backend_error("Event delivery lease expiry", err))?
+        // An unhandled malformed row must never be mistaken for handled. Retry
+        // immediately; the next conditional UPDATE repairs the missing expiry.
+        .unwrap_or(acquired_at_ms);
+    Ok(EventDeliveryReservation::LeasedUntil { expires_at_ms })
+}
+
+/// Token-CAS completion for a downstream delivery that was already written and
+/// flushed. Expiry is deliberately not part of the predicate: it only permits
+/// a later reservation to replace the token, so the original owner may still
+/// finalize after its deadline when no steal occurred. Returning `false` is a
+/// normal lost-ownership outcome, not an error. The production entry point
+/// stamps `handled_at` immediately before this token-CAS in writer dispatch.
+fn finalize_event_delivery_backend(
+    backend: &dyn StorageBackend,
+    event_id: i64,
+    token: &str,
+    workflow_id: Option<&str>,
+    status: &str,
+) -> Result<bool> {
+    // Timestamp at serialized writer dispatch so bounded-queue delay cannot
+    // make `handled_at` predate the durable token-CAS transition.
+    let handled_at_ms = now_ms_strict()?;
+    finalize_event_delivery_backend_at(
+        backend,
+        event_id,
+        token,
+        handled_at_ms,
+        workflow_id,
+        status,
+    )
+}
+
+fn finalize_event_delivery_backend_at(
+    backend: &dyn StorageBackend,
+    event_id: i64,
+    token: &str,
+    handled_at_ms: i64,
+    workflow_id: Option<&str>,
+    status: &str,
+) -> Result<bool> {
+    if event_id <= 0 || token.is_empty() || handled_at_ms < 0 {
+        return Err(StorageError::Database(format!(
+            "invalid event delivery finalization: event_id={event_id}, handled_at_ms={handled_at_ms}"
+        ))
+        .into());
+    }
+    let updated = backend
+        .query_row_typed(
+            "UPDATE events
+             SET handled_at = ?1,
+                 handled_by_workflow_id = ?2,
+                 handled_status = ?3,
+                 delivery_lease_token = NULL,
+                 delivery_lease_acquired_at = NULL,
+                 delivery_lease_expires_at = NULL
+             WHERE id = ?4
+               AND handled_at IS NULL
+               AND delivery_lease_token = ?5
+             RETURNING 1",
+            &[
+                ToSqlValue::Integer(handled_at_ms),
+                ToSqlValue::optional_text(workflow_id),
+                ToSqlValue::Text(status),
+                ToSqlValue::Integer(event_id),
+                ToSqlValue::Text(token),
+            ],
+        )
+        .map_err(|err| storage_backend_error("Failed to finalize event delivery", err))?;
+    Ok(updated.is_some())
+}
+
+/// Token-CAS release after a known downstream delivery failure. A stale owner
+/// cannot clear a successor's lease after expiry and steal.
+fn release_event_delivery_backend(
+    backend: &dyn StorageBackend,
+    event_id: i64,
+    token: &str,
+) -> Result<bool> {
+    if event_id <= 0 || token.is_empty() {
+        return Err(StorageError::Database(format!(
+            "invalid event delivery release: event_id={event_id}"
+        ))
+        .into());
+    }
+    let updated = backend
+        .query_row_typed(
+            "UPDATE events
+             SET delivery_lease_token = NULL,
+                 delivery_lease_acquired_at = NULL,
+                 delivery_lease_expires_at = NULL
+             WHERE id = ?1
+               AND handled_at IS NULL
+               AND delivery_lease_token = ?2
+             RETURNING 1",
+            &[ToSqlValue::Integer(event_id), ToSqlValue::Text(token)],
+        )
+        .map_err(|err| storage_backend_error("Failed to release event delivery", err))?;
+    Ok(updated.is_some())
 }
 
 /// Set or clear triage state on an event row.
@@ -23461,7 +23865,7 @@ fn storage_read_pool_size_reaches_handle() {
 }
 
 /// ft-xbnl0.2.3 Cx-first: `StorageHandle::new_with_cx` must
-/// return a `StorageError::Database` containing "cancelled"
+/// return typed `Error::Cancelled` with storage-open context
 /// when given a pre-cancelled cx, without creating the DB file
 /// or spawning the writer thread.
 #[test]
@@ -23488,11 +23892,13 @@ fn storage_handle_new_with_precancelled_cx_fails_before_fs_work() {
             )),
         };
 
-        let msg = err.to_string();
-        assert!(
-            msg.contains("cancelled"),
-            "error should mention cancellation: {msg}"
-        );
+        match err {
+            crate::Error::Cancelled(detail) => assert!(
+                detail.contains("storage open"),
+                "typed cancellation must retain storage-open context: {detail}"
+            ),
+            other => panic!("storage open must return Error::Cancelled, not {other:?}"),
+        }
         assert!(
             !db_path.exists(),
             "DB file should not be created when cx is pre-cancelled"
@@ -23587,11 +23993,13 @@ fn storage_upsert_pane_with_precancelled_cx_skips_enqueue() {
                 "upsert_pane_with_cx should fail on pre-cancelled cx",
             )),
         };
-        let msg = err.to_string();
-        assert!(
-            msg.contains("cancelled"),
-            "error should mention cancellation: {msg}"
-        );
+        match err {
+            crate::Error::Cancelled(detail) => assert!(
+                detail.contains("upsert_pane"),
+                "typed cancellation must retain upsert context: {detail}"
+            ),
+            other => panic!("upsert_pane must return Error::Cancelled, not {other:?}"),
+        }
 
         let panes = storage.get_panes().await.unwrap();
         assert!(
@@ -24481,6 +24889,104 @@ fn storage_tick146_event_reads_cluster_roundtrip() {
         let _ = std::fs::remove_file(&db_path);
         let _ = std::fs::remove_file(format!("{db_path_str}-wal"));
         let _ = std::fs::remove_file(format!("{db_path_str}-shm"));
+    });
+}
+
+#[test]
+fn storage_event_record_outcome_distinguishes_insert_from_dedupe_hit() {
+    run_storage_async_test(async {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let db_path = temp_dir.path().join("event_record_outcome.db");
+        let db_path_str = db_path.to_string_lossy().to_string();
+        let cx = crate::cx::for_testing();
+        let storage = StorageHandle::new_with_cx(&cx, &db_path_str).await.unwrap();
+
+        storage
+            .upsert_pane_with_cx(
+                &cx,
+                PaneRecord {
+                    pane_id: 60,
+                    pane_uuid: None,
+                    domain: "local".to_string(),
+                    window_id: None,
+                    tab_id: None,
+                    title: Some("event-outcome".to_string()),
+                    cwd: None,
+                    tty_name: None,
+                    first_seen_at: 1_700_000_000_000,
+                    last_seen_at: 1_700_000_000_000,
+                    observed: true,
+                    ignore_reason: None,
+                    last_decision_at: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        let first = StoredEvent {
+            id: 0,
+            pane_id: 60,
+            rule_id: "rule-dedupe-original".to_string(),
+            agent_type: "unknown".to_string(),
+            event_type: "pattern".to_string(),
+            severity: "info".to_string(),
+            confidence: 0.9,
+            extracted: None,
+            matched_text: Some("original".to_string()),
+            segment_id: None,
+            detected_at: 1_700_000_000_000,
+            dedupe_key: Some("stable-dedupe-key".to_string()),
+            handled_at: None,
+            handled_by_workflow_id: None,
+            handled_status: None,
+        };
+        let mut retry = first.clone();
+        retry.rule_id = "rule-dedupe-retry".to_string();
+        retry.matched_text = Some("retry".to_string());
+        retry.detected_at = 1_700_000_000_001;
+        let legacy_retry = retry.clone();
+
+        let inserted = storage
+            .record_event_outcome_with_cx(&cx, first)
+            .await
+            .unwrap();
+        let deduplicated = storage
+            .record_event_outcome_with_cx(&cx, retry)
+            .await
+            .unwrap();
+
+        assert!(inserted.was_inserted());
+        assert_eq!(inserted.inserted_event_id(), Some(inserted.event_id()));
+        assert!(!deduplicated.was_inserted());
+        assert_eq!(deduplicated.inserted_event_id(), None);
+        assert_eq!(deduplicated.event_id(), inserted.event_id());
+        let legacy_event_id = storage
+            .record_event_with_cx(&cx, legacy_retry)
+            .await
+            .unwrap();
+        assert_eq!(
+            legacy_event_id,
+            inserted.event_id(),
+            "the legacy ID-only API must retain its dedupe behavior"
+        );
+
+        let events = storage
+            .get_events_with_cx(
+                &cx,
+                EventQuery {
+                    pane_id: Some(60),
+                    limit: Some(10),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(events.len(), 1, "dedupe retry must not create a second row");
+        assert_eq!(events[0].id, inserted.event_id());
+        assert_eq!(events[0].rule_id, "rule-dedupe-original");
+        assert_eq!(events[0].matched_text.as_deref(), Some("original"));
+
+        storage.shutdown_with_cx(&cx).await.unwrap();
     });
 }
 
@@ -27592,8 +28098,56 @@ use fts_async_flat_tests::{run_storage_async_test, run_storage_proptest_async};
 
 #[cfg(test)]
 mod write_command_sender_tests {
-    use super::{WriteCommand, WriteCommandSender, run_storage_async_test};
+    use super::{
+        StorageError, StorageHandle, WriteCommand, WriteCommandSender, run_storage_async_test,
+    };
     use crate::runtime_async::{mpsc, oneshot};
+
+    fn shutdown_command() -> WriteCommand {
+        let (respond, _respond_rx) = oneshot::channel();
+        WriteCommand::Shutdown { respond }
+    }
+
+    #[test]
+    fn writer_send_error_distinguishes_cancellation_from_writer_failure() {
+        let cancelled = StorageHandle::writer_send_error(
+            "test_write",
+            Box::new(mpsc::SendError::Cancelled(shutdown_command())),
+        );
+        assert!(
+            matches!(
+                cancelled,
+                crate::Error::Cancelled(detail) if detail.contains("test_write")
+            ),
+            "Cx cancellation must stay typed"
+        );
+
+        let disconnected = StorageHandle::writer_send_error(
+            "test_write",
+            Box::new(mpsc::SendError::Disconnected(shutdown_command())),
+        );
+        assert!(
+            matches!(
+                disconnected,
+                crate::Error::Storage(StorageError::Database(detail))
+                    if detail.contains("not available")
+            ),
+            "a genuinely disconnected writer must remain a storage failure"
+        );
+
+        let full = StorageHandle::writer_send_error(
+            "test_write",
+            Box::new(mpsc::SendError::Full(shutdown_command())),
+        );
+        assert!(
+            matches!(
+                full,
+                crate::Error::Storage(StorageError::Database(detail))
+                    if detail.contains("unexpectedly full")
+            ),
+            "a violated post-reservation capacity invariant must remain a storage failure"
+        );
+    }
 
     #[test]
     fn write_command_sender_capacity_tracks_reserved_depth_ft_3hfif() {

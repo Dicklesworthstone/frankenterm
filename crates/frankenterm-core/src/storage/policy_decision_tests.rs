@@ -286,10 +286,23 @@ fn downgrade_below_forward_only_floor_fails_closed() {
     // (embedded_at DEFAULT repair) are deliberately forward-only
     // (down_sql: None). build_migration_plan hard-errors when any undone
     // migration lacks down_sql, so the lowest reachable downgrade target is
-    // the HIGHEST forward-only version. With v32 == SCHEMA_VERSION that
-    // floor equals head: downgrade is structurally impossible and every
-    // below-head target must fail closed with the typed rollback error.
-    for target in [1, 3, 17, SCHEMA_VERSION - 1] {
+    // the HIGHEST forward-only version. Reversible v33 sits above that floor,
+    // so head -> v32 is valid while every target below v32 must fail closed.
+    let forward_only_floor = MIGRATIONS
+        .iter()
+        .filter(|migration| migration.down_sql.is_none())
+        .map(|migration| migration.version)
+        .max()
+        .expect("the v1 baseline is forward-only");
+    assert_eq!(forward_only_floor, 32, "v32 is the current rollback floor");
+
+    let reachable = build_migration_plan(SCHEMA_VERSION, forward_only_floor)
+        .expect("reversible tail above the forward-only floor must be reachable");
+    assert_eq!(reachable.direction, MigrationDirection::Down);
+    assert_eq!(reachable.steps.len(), 1);
+    assert_eq!(reachable.steps[0].migration_version, 33);
+
+    for target in [1, 3, 17, forward_only_floor - 1] {
         let err = build_migration_plan(SCHEMA_VERSION, target)
             .expect_err("downgrade below the forward-only floor must fail closed");
         assert!(
@@ -297,28 +310,46 @@ fn downgrade_below_forward_only_floor_fails_closed() {
             "downgrade to {target} must surface the forward-only rollback error, got: {err}"
         );
     }
+}
 
-    // Guard on the floor/head relationship (ft-ftwck): if this fails, a new
-    // reversible migration landed above v32 and downgrade head->floor became
-    // reachable again. Restore a real down-then-up roundtrip test for that
-    // reversible tail instead of relaxing this assertion.
-    let forward_only_floor = MIGRATIONS
-        .iter()
-        .filter(|migration| migration.down_sql.is_none())
-        .map(|migration| migration.version)
-        .max()
-        .expect("the v1 baseline is forward-only");
-    assert_eq!(
-        forward_only_floor, SCHEMA_VERSION,
-        "forward-only floor no longer equals head: downgrade to v{forward_only_floor} is now \
-         reachable — add a roundtrip test covering the reversible migrations above it"
-    );
+#[test]
+fn migration_v33_down_up_roundtrip_preserves_the_reversible_tail() {
+    let conn = Connection::open_in_memory().expect("open in-memory sqlite");
+    initialize_schema(&conn).expect("initialize v33 schema");
+
+    let down = build_migration_plan(33, 32).expect("build v33 -> v32 plan");
+    apply_migration_plan(&conn, &down).expect("apply v33 down migration");
+    assert_eq!(get_user_version(&conn).expect("v32 user_version"), 32);
+    for column in [
+        "delivery_lease_token",
+        "delivery_lease_acquired_at",
+        "delivery_lease_expires_at",
+    ] {
+        assert!(
+            !table_has_column(&conn, "events", column).expect("inspect v32 events schema"),
+            "v33 down migration must remove {column}"
+        );
+    }
+
+    let up = build_migration_plan(32, 33).expect("build v32 -> v33 plan");
+    apply_migration_plan(&conn, &up).expect("apply v33 up migration");
+    assert_eq!(get_user_version(&conn).expect("v33 user_version"), 33);
+    for column in [
+        "delivery_lease_token",
+        "delivery_lease_acquired_at",
+        "delivery_lease_expires_at",
+    ] {
+        assert!(
+            table_has_column(&conn, "events", column).expect("inspect v33 events schema"),
+            "v33 up migration must restore {column}"
+        );
+    }
 }
 
 #[test]
 fn migration_v18_preserves_existing_events() {
-    // Downgrading head -> v17 is structurally impossible (the forward-only
-    // floor equals SCHEMA_VERSION), so build the pre-v18 shape directly:
+    // Downgrading head -> v17 is structurally impossible because v32 remains
+    // the forward-only floor, so build the pre-v18 shape directly:
     // the minimal `panes` + `events` tables the frozen v18 migration
     // operates on, plus `schema_version` for the migration bookkeeping.
     let conn = Connection::open_in_memory().unwrap();
@@ -1164,10 +1195,10 @@ fn each_migration_step_can_be_reapplied_without_panicking() {
     // applied ON TOP of the full head schema, so re-application on
     // already-applied state is a load-bearing property of fresh-DB init —
     // an unguarded ADD COLUMN here kills startup with "duplicate column
-    // name" (the v29 regression class, c24ce119c). Downgrade-then-reapply
-    // is no longer expressible (the forward-only floor equals head), so
-    // exercise the property directly against the head schema, twice per
-    // step to also cover replay-after-apply.
+    // name" (the v29 regression class, c24ce119c). Exercise the property
+    // directly against the head schema, twice per step to cover both
+    // fresh-head coexistence and replay-after-apply; v33's real down/up path is
+    // covered separately above.
     for migration in MIGRATIONS.iter().skip(1) {
         let conn = Connection::open_in_memory().unwrap();
         initialize_schema(&conn).unwrap();

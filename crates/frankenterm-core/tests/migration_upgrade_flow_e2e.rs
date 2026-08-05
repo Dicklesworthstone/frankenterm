@@ -1,13 +1,14 @@
 //! e2e: storage schema migration / upgrade flow (ft-cj3re).
 //!
 //! Drives the public [`initialize_schema`] entry on real (in-memory) SQLite
-//! connections and asserts the upgrade contract anchored on the ft-wi24o v32
-//! `segment_embeddings.embedded_at` default repair:
+//! connections and asserts the upgrade contract through the current head,
+//! including the ft-wi24o v32 `segment_embeddings.embedded_at` default repair
+//! and the v33 event-delivery lease columns:
 //!   1. a fresh DB initializes to `SCHEMA_VERSION` with the ms `embedded_at`
 //!      default and no orphan / leftover rebuild state;
 //!   2. re-running `initialize_schema` is an idempotent no-op;
 //!   3. a DB still on the legacy seconds default (user_version 31) is repaired
-//!      to ms on re-init, preserving rows;
+//!      to ms and upgraded through the current head on re-init, preserving rows;
 //!   4. `initialize_schema` fails closed on a future `user_version`.
 //!
 //! Zero-RCH authored; runs entirely against an in-memory DB (no remote build
@@ -49,6 +50,34 @@ fn table_exists(conn: &Connection, name: &str) -> bool {
         > 0
 }
 
+fn table_has_column(conn: &Connection, table: &str, column: &str) -> bool {
+    let mut stmt = conn
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .expect("table_info prepare");
+    let rows = stmt
+        .query_map([], |row| row.get::<_, String>(1))
+        .expect("table_info query");
+    for name in rows {
+        if name.expect("table_info row") == column {
+            return true;
+        }
+    }
+    false
+}
+
+fn assert_event_delivery_lease_columns(conn: &Connection) {
+    for column in [
+        "delivery_lease_token",
+        "delivery_lease_acquired_at",
+        "delivery_lease_expires_at",
+    ] {
+        assert!(
+            table_has_column(conn, "events", column),
+            "current events schema must contain {column}"
+        );
+    }
+}
+
 /// Insert one `output_segments` row (FK enforcement off so we don't have to
 /// seed the whole panes→output_segments chain) and return its id.
 fn seed_output_segment(conn: &Connection, seq: i64) -> i64 {
@@ -73,10 +102,11 @@ fn fresh_db_initializes_to_head_with_ms_embedded_at_default_and_no_orphans() {
         get_user_version(&conn).expect("user_version"),
         SCHEMA_VERSION
     );
-    assert_eq!(
-        SCHEMA_VERSION, 32,
-        "this e2e is pinned to the v32 default repair"
+    assert!(
+        SCHEMA_VERSION >= 33,
+        "current head must retain the v33 event-delivery lease migration"
     );
+    assert_event_delivery_lease_columns(&conn);
 
     // (2) segment_embeddings default is epoch ms (the v32 contract).
     let dflt = embedded_at_default(&conn).expect("embedded_at has a default");
@@ -140,6 +170,7 @@ fn re_running_initialize_schema_is_idempotent_noop() {
         default,
         "embedded_at default unchanged on re-run"
     );
+    assert_event_delivery_lease_columns(&conn);
     assert!(!table_exists(&conn, "segment_embeddings_legacy"));
 }
 
@@ -179,8 +210,8 @@ fn upgrade_from_seconds_default_at_v31_repairs_to_ms_preserving_rows() {
         "fixture must start on the legacy seconds default"
     );
 
-    // Re-init applies exactly v32.
-    initialize_schema(&conn).expect("upgrade 31 -> 32");
+    // Re-init applies the v32 repair and then the reversible v33 lease tail.
+    initialize_schema(&conn).expect("upgrade 31 -> current head");
 
     assert_eq!(
         get_user_version(&conn).expect("user_version"),
@@ -205,6 +236,7 @@ fn upgrade_from_seconds_default_at_v31_repairs_to_ms_preserving_rows() {
         !table_exists(&conn, "segment_embeddings_legacy"),
         "v32 rebuild must leave no orphan legacy table"
     );
+    assert_event_delivery_lease_columns(&conn);
 }
 
 #[test]

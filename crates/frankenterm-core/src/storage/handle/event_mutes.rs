@@ -8,8 +8,8 @@
 use std::sync::Arc;
 
 use super::super::{
-    EventMuteRecord, StorageError, StorageHandle, WriteCommand, list_active_mutes_backend,
-    pooled_backend, query_event_mute_backend,
+    EventMuteRecord, StorageHandle, WriteCommand, list_active_mutes_backend, pooled_backend,
+    query_event_mute_backend,
 };
 use crate::error::Result;
 use crate::runtime_async::oneshot;
@@ -28,8 +28,7 @@ impl StorageHandle {
         cx: &crate::cx::Cx,
         record: EventMuteRecord,
     ) -> Result<()> {
-        cx.checkpoint()
-            .map_err(|err| StorageError::Database(format!("add_event_mute cancelled: {err}")))?;
+        Self::checkpoint_storage_operation(cx, "add_event_mute")?;
         let (tx, rx) = oneshot::channel();
         self.write_tx
             .send_with_cx(
@@ -40,7 +39,7 @@ impl StorageHandle {
                 },
             )
             .await
-            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+            .map_err(|error| Self::writer_send_error("add_event_mute", error))?;
         Self::recv_writer_response(rx).await
     }
 
@@ -56,8 +55,7 @@ impl StorageHandle {
         cx: &crate::cx::Cx,
         identity_key: &str,
     ) -> Result<bool> {
-        cx.checkpoint()
-            .map_err(|err| StorageError::Database(format!("remove_event_mute cancelled: {err}")))?;
+        Self::checkpoint_storage_operation(cx, "remove_event_mute")?;
         let (tx, rx) = oneshot::channel();
         self.write_tx
             .send_with_cx(
@@ -68,7 +66,7 @@ impl StorageHandle {
                 },
             )
             .await
-            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+            .map_err(|error| Self::writer_send_error("remove_event_mute", error))?;
 
         Self::recv_writer_response(rx).await
     }
@@ -86,12 +84,11 @@ impl StorageHandle {
         identity_key: &str,
         now_ms: i64,
     ) -> Result<bool> {
-        cx.checkpoint()
-            .map_err(|err| StorageError::Database(format!("is_event_muted cancelled: {err}")))?;
+        Self::checkpoint_storage_operation(cx, "is_event_muted")?;
         let db_path = Arc::clone(&self.db_path);
         let identity_key = identity_key.to_string();
 
-        Self::spawn_blocking_storage(move || {
+        Self::spawn_blocking_storage_with_cx(cx, move || {
             pooled_backend(db_path.as_str(), |backend| {
                 query_event_mute_backend(backend, &identity_key, now_ms)
             })
@@ -111,11 +108,10 @@ impl StorageHandle {
         cx: &crate::cx::Cx,
         now_ms: i64,
     ) -> Result<Vec<EventMuteRecord>> {
-        cx.checkpoint()
-            .map_err(|err| StorageError::Database(format!("list_active_mutes cancelled: {err}")))?;
+        Self::checkpoint_storage_operation(cx, "list_active_mutes")?;
         let db_path = Arc::clone(&self.db_path);
 
-        Self::spawn_blocking_storage(move || {
+        Self::spawn_blocking_storage_with_cx(cx, move || {
             pooled_backend(db_path.as_str(), |backend| {
                 list_active_mutes_backend(backend, now_ms)
             })

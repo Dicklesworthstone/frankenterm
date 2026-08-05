@@ -17,6 +17,17 @@ where
     super::run_storage_async_test(future);
 }
 
+fn assert_typed_storage_cancellation<T>(result: crate::error::Result<T>, operation: &str) {
+    match result {
+        Err(crate::Error::Cancelled(detail)) => assert!(
+            detail.contains(operation),
+            "typed cancellation must retain operation context {operation:?}: {detail}"
+        ),
+        Err(other) => panic!("{operation} must return Error::Cancelled, not {other:?}"),
+        Ok(_) => panic!("{operation} must fail for a pre-cancelled Cx"),
+    }
+}
+
 static DB_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Generate a unique temp DB path
@@ -53,6 +64,389 @@ fn memory_pane_backend() -> RusqliteBackend {
     let conn = Connection::open_in_memory().expect("open in-memory pane query database");
     initialize_schema(&conn).expect("initialize pane query schema");
     RusqliteBackend::new(conn)
+}
+
+fn test_event(pane_id: u64) -> StoredEvent {
+    StoredEvent {
+        id: 0,
+        pane_id,
+        rule_id: "test.delivery".to_string(),
+        agent_type: "codex".to_string(),
+        event_type: "delivery".to_string(),
+        severity: "info".to_string(),
+        confidence: 1.0,
+        extracted: None,
+        matched_text: Some("ready".to_string()),
+        segment_id: None,
+        detected_at: now_ms(),
+        dedupe_key: None,
+        handled_at: None,
+        handled_by_workflow_id: None,
+        handled_status: None,
+    }
+}
+
+fn memory_event_backend() -> (RusqliteBackend, i64) {
+    let backend = memory_pane_backend();
+    upsert_pane_backend(&backend, &test_pane(1)).expect("seed event pane");
+    let event_id = record_event_backend(&backend, &test_event(1))
+        .expect("seed event")
+        .event_id();
+    (backend, event_id)
+}
+
+#[test]
+fn event_delivery_lease_reservation_is_exclusive_and_expiry_allows_steal() {
+    let (backend, event_id) = memory_event_backend();
+
+    let first = reserve_event_delivery_backend_at(&backend, event_id, "owner-a", 100, 100)
+        .expect("first reservation");
+    let first_lease = match first {
+        EventDeliveryReservation::Acquired(lease) => lease,
+        other => panic!("first reservation must acquire, got {other:?}"),
+    };
+    assert_eq!(first_lease.event_id(), event_id);
+    assert_eq!(first_lease.acquired_at_ms(), 100);
+    assert_eq!(first_lease.expires_at_ms(), 200);
+
+    assert_eq!(
+        reserve_event_delivery_backend_at(&backend, event_id, "owner-b", 150, 100)
+            .expect("competing reservation"),
+        EventDeliveryReservation::LeasedUntil { expires_at_ms: 200 },
+        "a live owner must retain exclusive delivery rights"
+    );
+
+    let second = reserve_event_delivery_backend_at(&backend, event_id, "owner-b", 200, 100)
+        .expect("reservation at the expiry boundary");
+    let second_lease = match second {
+        EventDeliveryReservation::Acquired(lease) => lease,
+        other => panic!("expired reservation must be stealable, got {other:?}"),
+    };
+
+    assert!(
+        !finalize_event_delivery_backend_at(
+            &backend,
+            first_lease.event_id(),
+            first_lease.token(),
+            201,
+            None,
+            "delivered",
+        )
+        .expect("stale finalization"),
+        "a replaced token must not finalize its successor's lease"
+    );
+    assert!(
+        !release_event_delivery_backend(&backend, first_lease.event_id(), first_lease.token())
+            .expect("stale release"),
+        "a replaced token must not release its successor's lease"
+    );
+    assert!(
+        finalize_event_delivery_backend_at(
+            &backend,
+            second_lease.event_id(),
+            second_lease.token(),
+            250,
+            Some("watch-stream"),
+            "delivered",
+        )
+        .expect("current finalization")
+    );
+    let finalized = backend
+        .query_row_cells(
+            "SELECT handled_at, handled_by_workflow_id, handled_status,
+                    delivery_lease_token, delivery_lease_acquired_at,
+                    delivery_lease_expires_at
+             FROM events WHERE id = ?1",
+            &[ToSqlValue::Integer(event_id)],
+        )
+        .expect("query finalized event")
+        .expect("finalized event row");
+    let finalized = CellRowReader::new(&finalized);
+    assert_eq!(finalized.optional_i64(0).expect("handled_at"), Some(250));
+    assert_eq!(
+        finalized
+            .optional_string(1)
+            .expect("handled_by_workflow_id")
+            .as_deref(),
+        Some("watch-stream")
+    );
+    assert_eq!(
+        finalized
+            .optional_string(2)
+            .expect("handled_status")
+            .as_deref(),
+        Some("delivered")
+    );
+    assert_eq!(finalized.optional_string(3).expect("lease token"), None);
+    assert_eq!(finalized.optional_i64(4).expect("lease acquired_at"), None);
+    assert_eq!(finalized.optional_i64(5).expect("lease expires_at"), None);
+
+    assert_eq!(
+        reserve_event_delivery_backend_at(&backend, event_id, "owner-c", 251, 100)
+            .expect("reserve handled event"),
+        EventDeliveryReservation::AlreadyHandledOrMissing
+    );
+    assert_eq!(
+        reserve_event_delivery_backend_at(&backend, event_id + 10_000, "owner-c", 251, 100)
+            .expect("reserve missing event"),
+        EventDeliveryReservation::AlreadyHandledOrMissing
+    );
+}
+
+#[test]
+fn event_delivery_lease_expiry_is_a_soft_deadline_until_a_steal_occurs() {
+    let (backend, event_id) = memory_event_backend();
+    let lease = match reserve_event_delivery_backend_at(&backend, event_id, "owner", 10, 10)
+        .expect("reserve event")
+    {
+        EventDeliveryReservation::Acquired(lease) => lease,
+        other => panic!("reservation must acquire, got {other:?}"),
+    };
+
+    assert!(
+        finalize_event_delivery_backend_at(
+            &backend,
+            lease.event_id(),
+            lease.token(),
+            50_000,
+            None,
+            "delivered",
+        )
+        .expect("post-expiry finalization"),
+        "expiry alone must not revoke a token that no successor replaced"
+    );
+}
+
+#[test]
+fn event_delivery_release_is_token_cas_and_makes_the_event_immediately_reservable() {
+    let (backend, event_id) = memory_event_backend();
+    let first = match reserve_event_delivery_backend_at(&backend, event_id, "owner-a", 100, 100)
+        .expect("reserve event")
+    {
+        EventDeliveryReservation::Acquired(lease) => lease,
+        other => panic!("reservation must acquire, got {other:?}"),
+    };
+
+    assert!(
+        release_event_delivery_backend(&backend, first.event_id(), first.token())
+            .expect("release current lease")
+    );
+    assert!(
+        !release_event_delivery_backend(&backend, first.event_id(), first.token())
+            .expect("repeat release"),
+        "release must be idempotently false after ownership is gone"
+    );
+
+    execute_typed(
+        &backend,
+        "UPDATE events
+         SET delivery_lease_token = ?1,
+             delivery_lease_acquired_at = ?2,
+             delivery_lease_expires_at = NULL
+         WHERE id = ?3",
+        &[
+            ToSqlValue::Text("malformed-owner"),
+            ToSqlValue::Integer(100),
+            ToSqlValue::Integer(event_id),
+        ],
+    )
+    .expect("seed malformed lease missing its expiry");
+    let second = reserve_event_delivery_backend_at(&backend, event_id, "owner-b", 101, 100)
+        .expect("repair malformed released event");
+    assert!(matches!(second, EventDeliveryReservation::Acquired(_)));
+}
+
+#[test]
+fn legacy_mark_handled_clears_any_active_delivery_lease() {
+    let (backend, event_id) = memory_event_backend();
+    assert!(matches!(
+        reserve_event_delivery_backend_at(&backend, event_id, "owner", 100, 100)
+            .expect("reserve event"),
+        EventDeliveryReservation::Acquired(_)
+    ));
+
+    mark_event_handled_backend(&backend, event_id, Some("workflow"), "completed")
+        .expect("mark handled");
+    let row = backend
+        .query_row_cells(
+            "SELECT handled_at, delivery_lease_token, delivery_lease_acquired_at,
+                    delivery_lease_expires_at
+             FROM events WHERE id = ?1",
+            &[ToSqlValue::Integer(event_id)],
+        )
+        .expect("query handled event")
+        .expect("event row");
+    let row = CellRowReader::new(&row);
+    assert!(row.optional_i64(0).expect("handled_at").is_some());
+    assert_eq!(row.optional_string(1).expect("lease token"), None);
+    assert_eq!(row.optional_i64(2).expect("lease acquired_at"), None);
+    assert_eq!(row.optional_i64(3).expect("lease expires_at"), None);
+}
+
+#[test]
+fn event_delivery_lease_validation_ceil_rounds_positive_ttls_and_checks_boundaries() {
+    assert!(checked_event_delivery_lease_ttl_ms(std::time::Duration::ZERO).is_err());
+    assert_eq!(
+        checked_event_delivery_lease_ttl_ms(std::time::Duration::from_nanos(1))
+            .expect("one nanosecond rounds up"),
+        1
+    );
+    assert_eq!(
+        checked_event_delivery_lease_ttl_ms(std::time::Duration::from_nanos(1_000_000))
+            .expect("one exact millisecond"),
+        1
+    );
+    assert_eq!(
+        checked_event_delivery_lease_ttl_ms(std::time::Duration::from_nanos(1_000_001))
+            .expect("one nanosecond above a millisecond rounds up"),
+        2
+    );
+
+    let largest_encodable = std::time::Duration::from_millis(i64::MAX as u64);
+    assert_eq!(
+        checked_event_delivery_lease_ttl_ms(largest_encodable)
+            .expect("i64::MAX exact milliseconds fit the serialized command"),
+        i64::MAX
+    );
+    let rounds_past_i64 = largest_encodable
+        .checked_add(std::time::Duration::from_nanos(1))
+        .expect("construct just-over-i64 millisecond duration");
+    assert!(
+        checked_event_delivery_lease_ttl_ms(rounds_past_i64).is_err(),
+        "ceil rounding just beyond i64::MAX milliseconds must fail closed"
+    );
+    assert!(
+        checked_event_delivery_lease_expiry(1, i64::MAX).is_err(),
+        "dispatch time plus i64::MAX milliseconds must overflow"
+    );
+    assert!(
+        checked_event_delivery_lease_ttl_ms(std::time::Duration::from_millis(
+            i64::MAX as u64 + 1,
+        ))
+        .is_err(),
+        "a TTL wider than i64 milliseconds must be rejected"
+    );
+    assert!(
+        checked_event_delivery_lease_ttl_ms(std::time::Duration::MAX).is_err(),
+        "Duration::MAX must exceed the persisted i64-millisecond range"
+    );
+}
+
+#[test]
+fn event_delivery_lease_clock_starts_at_writer_dispatch_after_queue_delay() {
+    run_async_test(async {
+        let (backend, event_id) = memory_event_backend();
+        let ttl_ms = checked_event_delivery_lease_ttl_ms(std::time::Duration::from_millis(5))
+            .expect("validate TTL before enqueue");
+        let (respond, response) = oneshot::channel();
+        let command = WriteCommand::ReserveEventDelivery {
+            event_id,
+            token: "queued-owner".to_string(),
+            ttl_ms,
+            respond,
+        };
+
+        // Simulate a writer backlog longer than the requested lease. The
+        // command intentionally contains only the duration, never a timestamp
+        // captured before this wait.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let dispatch_floor_ms = now_ms_strict().expect("clock before dispatch");
+        let mut should_break = false;
+        let mut mmap_mirror = None;
+        let mut segment_redactors = HashMap::<u64, SegmentPersistRedactor>::new();
+        dispatch_write_command_raw(
+            &backend,
+            command,
+            &mut should_break,
+            &mut mmap_mirror,
+            &mut segment_redactors,
+        );
+
+        let reservation = crate::runtime_async::oneshot_recv(response)
+            .await
+            .expect("reservation response")
+            .expect("reservation result");
+        let lease = match reservation {
+            EventDeliveryReservation::Acquired(lease) => lease,
+            other => panic!("queued reservation must acquire, got {other:?}"),
+        };
+        assert!(!should_break);
+        assert!(
+            lease.acquired_at_ms() >= dispatch_floor_ms,
+            "lease clock must not start while the command waits in the queue"
+        );
+        assert_eq!(lease.expires_at_ms() - lease.acquired_at_ms(), ttl_ms);
+        assert!(
+            lease.expires_at_ms() > dispatch_floor_ms,
+            "a successful reservation must not be already expired at dispatch"
+        );
+    });
+}
+
+#[test]
+fn event_delivery_handled_timestamp_starts_at_writer_dispatch_after_queue_delay() {
+    run_async_test(async {
+        let (backend, event_id) = memory_event_backend();
+        let lease = match reserve_event_delivery_backend(&backend, event_id, "queued-owner", 60_000)
+            .expect("reserve event before queued finalization")
+        {
+            EventDeliveryReservation::Acquired(lease) => lease,
+            other => panic!("finalization fixture must acquire, got {other:?}"),
+        };
+        let (respond, response) = oneshot::channel();
+        let command = WriteCommand::FinalizeEventDelivery {
+            event_id,
+            token: lease.token().to_string(),
+            workflow_id: Some("queued-finalizer".to_string()),
+            status: "delivered".to_string(),
+            respond,
+        };
+
+        // Simulate time spent behind unrelated writer work. The command must
+        // not carry a timestamp captured before this wait.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let dispatch_floor_ms = now_ms_strict().expect("clock before finalization dispatch");
+        let mut should_break = false;
+        let mut mmap_mirror = None;
+        let mut segment_redactors = HashMap::<u64, SegmentPersistRedactor>::new();
+        dispatch_write_command_raw(
+            &backend,
+            command,
+            &mut should_break,
+            &mut mmap_mirror,
+            &mut segment_redactors,
+        );
+
+        assert!(
+            crate::runtime_async::oneshot_recv(response)
+                .await
+                .expect("finalization response")
+                .expect("finalization result")
+        );
+        assert!(!should_break);
+        let row = backend
+            .query_row_cells(
+                "SELECT handled_at FROM events WHERE id = ?1",
+                &[ToSqlValue::Integer(event_id)],
+            )
+            .expect("query finalization timestamp")
+            .expect("finalized event row");
+        let handled_at_ms = CellRowReader::new(&row)
+            .i64(0)
+            .expect("handled_at timestamp");
+        assert!(
+            handled_at_ms >= dispatch_floor_ms,
+            "handled_at must not start while finalization waits in the writer queue"
+        );
+    });
+}
+
+#[test]
+fn event_delivery_lease_debug_output_redacts_the_ownership_token() {
+    let lease = EventDeliveryLease::new(7, "do-not-log-this-token".to_string(), 100, 200);
+    let debug = format!("{lease:?}");
+    assert!(debug.contains("<redacted>"));
+    assert!(!debug.contains("do-not-log-this-token"));
 }
 
 #[test]
@@ -178,14 +572,11 @@ fn storage_handle_get_panes_by_ids_honors_precancelled_context() {
             Some("pre-cancel pane-ID query test"),
         );
 
-        let error = handle
-            .get_panes_by_ids_with_cx(&cancelled_cx, &[1])
-            .await
-            .expect_err("pre-cancelled pane-ID query must fail before spawning blocking work");
-
-        assert!(
-            error.to_string().contains("get_panes_by_ids cancelled"),
-            "unexpected cancellation error: {error}"
+        assert_typed_storage_cancellation(
+            handle
+                .get_panes_by_ids_with_cx(&cancelled_cx, &[1])
+                .await,
+            "get_panes_by_ids",
         );
 
         handle.shutdown().await.unwrap();
@@ -1309,6 +1700,200 @@ fn storage_handle_event_lifecycle() {
         assert_eq!(handle.count_events().await.unwrap(), 1);
 
         handle.shutdown().await.unwrap();
+        let _ = std::fs::remove_file(&db_path);
+    });
+}
+
+#[test]
+fn storage_handle_event_delivery_race_has_one_owner_and_unique_successor_token() {
+    run_async_test(async {
+        let db_path = temp_db_path();
+        let handle = StorageHandle::new(&db_path).await.expect("open storage");
+        handle
+            .upsert_pane(test_pane(1))
+            .await
+            .expect("seed event pane");
+        let event_id = handle
+            .record_event(test_event(1))
+            .await
+            .expect("seed delivery event");
+
+        let left = handle.clone();
+        let right = handle.clone();
+        let (left_result, right_result) = futures::future::join(
+            left.reserve_event_delivery(event_id, std::time::Duration::from_secs(60)),
+            right.reserve_event_delivery(event_id, std::time::Duration::from_secs(60)),
+        )
+        .await;
+
+        let mut acquired = None;
+        let mut leased_until = None;
+        for reservation in [
+            left_result.expect("left reservation"),
+            right_result.expect("right reservation"),
+        ] {
+            match reservation {
+                EventDeliveryReservation::Acquired(lease) => {
+                    assert!(acquired.replace(lease).is_none(), "only one owner may win");
+                }
+                EventDeliveryReservation::LeasedUntil { expires_at_ms } => {
+                    assert!(
+                        leased_until.replace(expires_at_ms).is_none(),
+                        "only one contender should observe the owner"
+                    );
+                }
+                EventDeliveryReservation::AlreadyHandledOrMissing => {
+                    panic!("fresh event cannot be handled or missing")
+                }
+            }
+        }
+        let first = acquired.expect("one reservation must acquire");
+        assert_eq!(
+            leased_until,
+            Some(first.expires_at_ms()),
+            "loser must receive the durable owner's steal-eligibility deadline"
+        );
+
+        let first_token = first.token().to_string();
+        assert!(
+            handle
+                .release_event_delivery(&first)
+                .await
+                .expect("release first owner")
+        );
+        let second = match handle
+            .reserve_event_delivery(event_id, std::time::Duration::from_secs(60))
+            .await
+            .expect("reserve released event")
+        {
+            EventDeliveryReservation::Acquired(lease) => lease,
+            other => panic!("released event must be immediately reservable, got {other:?}"),
+        };
+        assert_ne!(
+            second.token(),
+            first_token.as_str(),
+            "independent reservations must receive independent ownership tokens"
+        );
+        assert!(
+            handle
+                .finalize_event_delivery(&second, Some("watch-stream".to_string()), "delivered")
+                .await
+                .expect("finalize successor")
+        );
+
+        let events = handle
+            .get_events(EventQuery {
+                limit: Some(10),
+                ..EventQuery::default()
+            })
+            .await
+            .expect("query finalized event");
+        let stored = events
+            .iter()
+            .find(|event| event.id == event_id)
+            .expect("finalized event row");
+        assert!(stored.handled_at.is_some());
+        assert_eq!(
+            stored.handled_by_workflow_id.as_deref(),
+            Some("watch-stream")
+        );
+        assert_eq!(stored.handled_status.as_deref(), Some("delivered"));
+
+        handle.shutdown().await.expect("shutdown storage");
+        let _ = std::fs::remove_file(&db_path);
+    });
+}
+
+#[test]
+fn storage_handle_event_delivery_cancellation_fails_before_mutation() {
+    run_async_test(async {
+        let db_path = temp_db_path();
+        let handle = StorageHandle::new(&db_path).await.expect("open storage");
+        handle
+            .upsert_pane(test_pane(1))
+            .await
+            .expect("seed event pane");
+        let event_id = handle
+            .record_event(test_event(1))
+            .await
+            .expect("seed delivery event");
+        let cancelled = crate::cx::for_testing();
+        cancelled.cancel_with(
+            crate::outcome::CancelKind::User,
+            Some("pre-cancel event delivery test"),
+        );
+
+        assert_typed_storage_cancellation(
+            handle
+                .get_events_stream_with_cx(&cancelled, EventStreamQuery::default())
+                .await,
+            "get_events_stream",
+        );
+        assert_typed_storage_cancellation(
+            handle
+                .reserve_event_delivery_with_cx(
+                    &cancelled,
+                    event_id,
+                    std::time::Duration::from_secs(60),
+                )
+                .await,
+            "reserve_event_delivery",
+        );
+        let lease = match handle
+            .reserve_event_delivery(event_id, std::time::Duration::from_secs(60))
+            .await
+            .expect("fresh reservation after cancelled attempt")
+        {
+            EventDeliveryReservation::Acquired(lease) => lease,
+            other => panic!("cancelled reservation must leave the event free, got {other:?}"),
+        };
+
+        assert_typed_storage_cancellation(
+            handle
+                .finalize_event_delivery_with_cx(
+                    &cancelled,
+                    &lease,
+                    Some("watch-stream".to_string()),
+                    "delivered",
+                )
+                .await,
+            "finalize_event_delivery",
+        );
+        assert_eq!(
+            handle
+                .reserve_event_delivery(event_id, std::time::Duration::from_secs(60))
+                .await
+                .expect("inspect lease after cancelled finalize"),
+            EventDeliveryReservation::LeasedUntil {
+                expires_at_ms: lease.expires_at_ms()
+            },
+            "cancelled finalization must neither handle nor release the event"
+        );
+
+        assert_typed_storage_cancellation(
+            handle
+                .release_event_delivery_with_cx(&cancelled, &lease)
+                .await,
+            "release_event_delivery",
+        );
+        assert_eq!(
+            handle
+                .reserve_event_delivery(event_id, std::time::Duration::from_secs(60))
+                .await
+                .expect("inspect lease after cancelled release"),
+            EventDeliveryReservation::LeasedUntil {
+                expires_at_ms: lease.expires_at_ms()
+            },
+            "cancelled release must preserve current ownership"
+        );
+
+        assert!(
+            handle
+                .finalize_event_delivery(&lease, None, "delivered")
+                .await
+                .expect("finalize with live context")
+        );
+        handle.shutdown().await.expect("shutdown storage");
         let _ = std::fs::remove_file(&db_path);
     });
 }

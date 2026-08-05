@@ -1657,6 +1657,26 @@ pub(crate) static MIGRATIONS: &[Migration] = &[
         // worth restoring.
         down_sql: None,
     },
+    Migration {
+        version: 33,
+        description: "Add expiring token-owned event-delivery leases for flush-before-handle streams",
+        // `SCHEMA_SQL` already contains these columns for fresh databases.
+        // `apply_migration_step` routes v33 through the guarded Rust helper
+        // below, so this SQL is reference/rollback-plan material rather than an
+        // unconditional fresh-init ALTER.
+        up_sql: r"
+        ALTER TABLE events ADD COLUMN delivery_lease_token TEXT;
+        ALTER TABLE events ADD COLUMN delivery_lease_acquired_at INTEGER;
+        ALTER TABLE events ADD COLUMN delivery_lease_expires_at INTEGER;
+        ",
+        down_sql: Some(
+            r"
+            ALTER TABLE events DROP COLUMN delivery_lease_expires_at;
+            ALTER TABLE events DROP COLUMN delivery_lease_acquired_at;
+            ALTER TABLE events DROP COLUMN delivery_lease_token;
+            ",
+        ),
+    },
 ];
 
 // =============================================================================
@@ -1875,6 +1895,30 @@ fn ensure_output_segments_zone_type(conn: &Connection) -> Result<()> {
             "Failed to create idx_segments_zone_type during migration v31: {e}"
         ))
     })?;
+    Ok(())
+}
+
+/// `SCHEMA_SQL` carries the v33 delivery-lease columns for fresh databases, so
+/// each ALTER must be guarded for the same fresh/init versus upgrade split as
+/// the v29 and v31 column migrations. Keeping the three additions in one
+/// migration transaction prevents a partially upgraded lease state.
+fn ensure_event_delivery_lease_schema(conn: &Connection) -> Result<()> {
+    for (column, sql) in [
+        (
+            "delivery_lease_token",
+            "ALTER TABLE events ADD COLUMN delivery_lease_token TEXT;",
+        ),
+        (
+            "delivery_lease_acquired_at",
+            "ALTER TABLE events ADD COLUMN delivery_lease_acquired_at INTEGER;",
+        ),
+        (
+            "delivery_lease_expires_at",
+            "ALTER TABLE events ADD COLUMN delivery_lease_expires_at INTEGER;",
+        ),
+    ] {
+        add_column_if_missing(conn, "events", column, sql, "migration v33")?;
+    }
     Ok(())
 }
 
@@ -2649,14 +2693,10 @@ pub(crate) fn build_migration_plan(from_version: i32, to_version: i32) -> Result
     }
 
     // Downgrade contract (ft-ftwck): v1, v30, and v32 are deliberately
-    // forward-only (down_sql: None), and the lowest reachable downgrade
-    // target is the HIGHEST forward-only version. With v32 == SCHEMA_VERSION
-    // that floor equals head, so this branch currently rejects every
-    // below-head target and MigrationDirection::Down is unreachable in
-    // production. This is the documented contract, not an oversight; the
-    // guard test downgrade_below_forward_only_floor_fails_closed pins the
-    // floor/head relationship and fails loudly when a reversible migration
-    // above v32 makes downgrade reachable again.
+    // forward-only (down_sql: None), so the lowest reachable downgrade target
+    // is the HIGHEST forward-only version. Reversible migrations may form a
+    // tail above that floor: v33 currently makes head -> v32 reachable, while
+    // every target below v32 must still fail closed at the forward-only step.
     let mut steps = Vec::new();
     for migration in MIGRATIONS.iter().rev() {
         if migration.version <= to_version || migration.version > from_version {
@@ -2760,6 +2800,10 @@ pub(crate) fn apply_migration_step(conn: &Connection, step: &MigrationStep) -> R
                 }
                 32 => {
                     ensure_segment_embeddings_embedded_at_default_ms(conn)?;
+                    apply_raw_up_sql = false;
+                }
+                33 => {
+                    ensure_event_delivery_lease_schema(conn)?;
                     apply_raw_up_sql = false;
                 }
                 _ => {}
@@ -3595,7 +3639,10 @@ mod tests {
             m32.down_sql.is_none(),
             "v32 is a forward-only default repair",
         );
-        assert_eq!(SCHEMA_VERSION, 32, "SCHEMA_VERSION must move with v32");
+        assert!(
+            SCHEMA_VERSION >= 32,
+            "schema head must retain the registered v32 repair"
+        );
     }
 
     /// ft-wi24o: on a DB upgraded through v22/v23 the segment_embeddings
@@ -3679,6 +3726,173 @@ mod tests {
             .unwrap();
         assert_eq!(count, 2, "re-run must not lose or duplicate rows");
         assert!(segment_embeddings_embedded_at_default_is_ms(&conn).unwrap());
+    }
+
+    #[test]
+    fn event_delivery_lease_migration_entry_present_at_version_33() {
+        let migration = MIGRATIONS
+            .iter()
+            .find(|migration| migration.version == 33)
+            .expect("version 33 migration must be registered");
+        assert!(migration.description.contains("event-delivery leases"));
+        for column in [
+            "delivery_lease_token",
+            "delivery_lease_acquired_at",
+            "delivery_lease_expires_at",
+        ] {
+            assert!(
+                migration.up_sql.contains(column),
+                "v33 up migration must mention {column}"
+            );
+            assert!(
+                migration
+                    .down_sql
+                    .expect("v33 is reversibly additive")
+                    .contains(column),
+                "v33 down migration must remove {column}"
+            );
+        }
+        assert!(
+            SCHEMA_VERSION >= 33,
+            "schema head must retain the registered v33 lease migration"
+        );
+    }
+
+    #[test]
+    fn event_delivery_lease_v33_upgrades_and_rolls_back_without_partial_columns() {
+        let conn = Connection::open_in_memory().expect("open in-memory sqlite");
+        conn.execute_batch(
+            "CREATE TABLE events (id INTEGER PRIMARY KEY);
+             CREATE TABLE schema_version (
+                 version INTEGER NOT NULL,
+                 applied_at INTEGER NOT NULL,
+                 description TEXT
+             );
+             PRAGMA user_version = 32;",
+        )
+        .expect("create pre-v33 events schema");
+        conn.execute("INSERT INTO events (id) VALUES (7)", [])
+            .expect("seed pre-v33 event row");
+
+        let step = MigrationStep {
+            migration_version: 33,
+            resulting_version: 33,
+            description: "test v33 event delivery lease upgrade",
+            direction: MigrationDirection::Up,
+        };
+        apply_migration_step(&conn, &step).expect("apply routed v33 migration");
+        apply_migration_step(&conn, &step).expect("reapply routed v33 migration");
+        assert_eq!(get_user_version(&conn).expect("user_version"), 33);
+        for column in [
+            "delivery_lease_token",
+            "delivery_lease_acquired_at",
+            "delivery_lease_expires_at",
+        ] {
+            assert!(
+                table_has_column(&conn, "events", column).expect("inspect events schema"),
+                "upgrade must add {column}"
+            );
+        }
+
+        let migration = MIGRATIONS
+            .iter()
+            .find(|migration| migration.version == 33)
+            .expect("v33");
+        conn.execute_batch(migration.down_sql.expect("v33 down SQL"))
+            .expect("roll back v33");
+        for column in [
+            "delivery_lease_token",
+            "delivery_lease_acquired_at",
+            "delivery_lease_expires_at",
+        ] {
+            assert!(
+                !table_has_column(&conn, "events", column).expect("inspect rolled-back schema"),
+                "rollback must remove {column}"
+            );
+        }
+        assert_eq!(
+            conn.query_row("SELECT id FROM events", [], |row| row.get::<_, i64>(0))
+                .expect("read event preserved across v33 up/down"),
+            7
+        );
+    }
+
+    #[test]
+    fn fresh_schema_and_v32_upgrade_have_identical_event_column_descriptors_and_order() {
+        fn events_table_info(
+            conn: &Connection,
+        ) -> Vec<(i64, String, String, i64, Option<String>, i64)> {
+            let mut stmt = conn
+                .prepare("PRAGMA table_info(events)")
+                .expect("prepare events table_info");
+            let rows = stmt.query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            })
+            .expect("query events table_info");
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+                .expect("collect events table_info")
+        }
+
+        let fresh = Connection::open_in_memory().expect("open fresh sqlite");
+        initialize_schema(&fresh).expect("initialize fresh current schema");
+        let fresh_descriptor = events_table_info(&fresh);
+        let fresh_names = fresh_descriptor
+            .iter()
+            .map(|descriptor| descriptor.1.as_str())
+            .collect::<Vec<_>>();
+        assert!(
+            fresh_names.ends_with(&[
+                "dedupe_key",
+                "delivery_lease_token",
+                "delivery_lease_acquired_at",
+                "delivery_lease_expires_at",
+            ]),
+            "v33 lease columns must be the append-compatible events-table tail"
+        );
+
+        let upgraded = Connection::open_in_memory().expect("open upgrade sqlite");
+        initialize_schema(&upgraded).expect("initialize upgrade fixture");
+        let down = build_migration_plan(SCHEMA_VERSION, 32)
+            .expect("build current-head -> v32 fixture plan");
+        apply_migration_plan(&upgraded, &down).expect("construct exact v32 fixture");
+        for column in [
+            "delivery_lease_token",
+            "delivery_lease_acquired_at",
+            "delivery_lease_expires_at",
+        ] {
+            assert!(
+                !table_has_column(&upgraded, "events", column)
+                    .expect("inspect v32 fixture schema"),
+                "v32 fixture must omit {column}"
+            );
+        }
+
+        let up = build_migration_plan(32, SCHEMA_VERSION)
+            .expect("build v32 -> current-head upgrade plan");
+        apply_migration_plan(&upgraded, &up).expect("upgrade fixture to current head");
+        ensure_event_delivery_lease_schema(&upgraded)
+            .expect("guarded v33 must be idempotent after upgrade");
+
+        assert_eq!(
+            get_user_version(&fresh).expect("fresh user_version"),
+            SCHEMA_VERSION
+        );
+        assert_eq!(
+            get_user_version(&upgraded).expect("upgraded user_version"),
+            SCHEMA_VERSION
+        );
+        assert_eq!(
+            events_table_info(&upgraded),
+            fresh_descriptor,
+            "fresh and v32-upgraded events tables must have identical PRAGMA descriptors and order"
+        );
     }
 
     #[test]

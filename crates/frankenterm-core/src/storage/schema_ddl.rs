@@ -54,7 +54,10 @@
 /// Per ft-wi24o: bumped 31 → 32 to repair the `segment_embeddings.embedded_at`
 /// column DEFAULT (still epoch seconds on DBs upgraded through v22/v23) to the
 /// schema-wide epoch-ms convention; v30 only fixed existing row values.
-pub const SCHEMA_VERSION: i32 = 32;
+/// Bumped 32 → 33 to add expiring, token-owned event-delivery leases. These
+/// leases let stream consumers reserve an unhandled event, flush it downstream,
+/// and only then atomically finalize `handled_at` without a crash-loss window.
+pub const SCHEMA_VERSION: i32 = 33;
 
 /// [ft-ih4tm] Idempotent re-creation of the three `output_segments` FTS
 /// triggers. Called when a database is opened with
@@ -227,6 +230,16 @@ CREATE TABLE IF NOT EXISTS events (
 
     -- Idempotency: optional dedupe key (pane_id + rule_id + time_window)
     dedupe_key TEXT,                  -- computed key for duplicate prevention
+
+    -- Two-phase downstream-delivery lease. A live token reserves an otherwise
+    -- unhandled event; handled_at stays NULL until the token owner confirms its
+    -- downstream write + flush. Expiry makes the token stealable for crash
+    -- recovery; it does not itself invalidate ownership before a steal.
+    -- Keep these append-only v33 columns at the table tail so fresh and
+    -- v32-upgraded databases have identical PRAGMA table_info order.
+    delivery_lease_token TEXT,
+    delivery_lease_acquired_at INTEGER,
+    delivery_lease_expires_at INTEGER,
 
     UNIQUE(dedupe_key)                -- prevents duplicate events when dedupe_key set
 );

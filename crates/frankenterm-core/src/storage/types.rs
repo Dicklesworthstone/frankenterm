@@ -388,6 +388,135 @@ pub struct StoredEvent {
     pub handled_status: Option<String>,
 }
 
+/// Authoritative result of attempting to durably record an event.
+///
+/// A dedupe-key conflict returns the identity of the already-durable row with
+/// `inserted == false`. Callers that fan newly persisted events out to live
+/// consumers must use [`Self::inserted_event_id`] so a retry cannot masquerade
+/// as a new event and retrigger workflows.
+#[must_use = "event insertion outcomes must be checked before live publication"]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EventRecordOutcome {
+    event_id: i64,
+    inserted: bool,
+}
+
+impl EventRecordOutcome {
+    pub(crate) const fn new(event_id: i64, inserted: bool) -> Self {
+        Self { event_id, inserted }
+    }
+
+    /// Identity of the newly inserted row or the existing deduplicated row.
+    #[must_use]
+    pub const fn event_id(self) -> i64 {
+        self.event_id
+    }
+
+    /// Whether this call inserted a new durable row.
+    #[must_use]
+    pub const fn was_inserted(self) -> bool {
+        self.inserted
+    }
+
+    /// Return an event identity only when this call created the durable row.
+    ///
+    /// This is the safe handoff for live publication and newly-recorded
+    /// metrics: an existing deduplicated row returns `None`.
+    #[must_use]
+    pub const fn inserted_event_id(self) -> Option<i64> {
+        if self.inserted {
+            Some(self.event_id)
+        } else {
+            None
+        }
+    }
+}
+
+/// Opaque ownership proof for one in-flight event delivery.
+///
+/// A lease does not mark the event handled. Callers must first write and flush
+/// the event to their downstream transport, then pass this value back to the
+/// storage layer to finalize delivery. If the caller dies before finalization,
+/// another consumer may acquire the event after [`Self::expires_at_ms`]. The
+/// deadline makes the lease stealable; it does not itself invalidate the token,
+/// which remains valid until replaced, finalized, or released.
+#[derive(Clone, PartialEq, Eq)]
+pub struct EventDeliveryLease {
+    event_id: i64,
+    token: String,
+    acquired_at_ms: i64,
+    expires_at_ms: i64,
+}
+
+impl EventDeliveryLease {
+    pub(crate) fn new(
+        event_id: i64,
+        token: String,
+        acquired_at_ms: i64,
+        expires_at_ms: i64,
+    ) -> Self {
+        Self {
+            event_id,
+            token,
+            acquired_at_ms,
+            expires_at_ms,
+        }
+    }
+
+    /// Event protected by this lease.
+    #[must_use]
+    pub const fn event_id(&self) -> i64 {
+        self.event_id
+    }
+
+    /// Epoch-millisecond time at which this lease was acquired.
+    #[must_use]
+    pub const fn acquired_at_ms(&self) -> i64 {
+        self.acquired_at_ms
+    }
+
+    /// Epoch-millisecond time at which another consumer may steal this lease.
+    /// The token remains valid after this time unless a steal actually occurs.
+    #[must_use]
+    pub const fn expires_at_ms(&self) -> i64 {
+        self.expires_at_ms
+    }
+
+    pub(crate) fn token(&self) -> &str {
+        &self.token
+    }
+}
+
+impl std::fmt::Debug for EventDeliveryLease {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("EventDeliveryLease")
+            .field("event_id", &self.event_id)
+            .field("token", &"<redacted>")
+            .field("acquired_at_ms", &self.acquired_at_ms)
+            .field("expires_at_ms", &self.expires_at_ms)
+            .finish()
+    }
+}
+
+/// Result of atomically trying to reserve an unhandled event for delivery.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EventDeliveryReservation {
+    /// This caller owns the returned lease until it finalizes, releases, or a
+    /// later reservation replaces its token after the soft expiry deadline.
+    Acquired(EventDeliveryLease),
+    /// Another token currently owns the unhandled event and becomes stealable
+    /// at this epoch-ms deadline. It may remain the owner after the deadline
+    /// until a reservation actually replaces it. The caller must retain its
+    /// cursor and retry on a bounded polling cadence so an early release is
+    /// observed promptly; the deadline says when stealing becomes eligible,
+    /// not when retrying first becomes legal.
+    LeasedUntil { expires_at_ms: i64 },
+    /// The event was already handled or disappeared after the caller read it.
+    /// It must not be emitted; a fresh durable query may safely move past it.
+    AlreadyHandledOrMissing,
+}
+
 /// Stored annotations for an event (bd-1yk8).
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct EventAnnotations {
