@@ -2519,14 +2519,92 @@ fn bounded_mcp_send_response_text(text: &str) -> String {
     )
 }
 
+fn bound_mcp_send_decision_context_output(context: &mut DecisionContext) {
+    for value in [
+        &mut context.domain,
+        &mut context.text_summary,
+        &mut context.workflow_id,
+        &mut context.determining_rule,
+        &mut context.capabilities.reserved_by,
+    ] {
+        if let Some(value) = value.as_mut() {
+            *value = bounded_mcp_send_response_text(value);
+        }
+    }
+    for rule in &mut context.rules_evaluated {
+        rule.rule_id = bounded_mcp_send_response_text(&rule.rule_id);
+        if let Some(decision) = rule.decision.as_mut() {
+            *decision = bounded_mcp_send_response_text(decision);
+        }
+        if let Some(reason) = rule.reason.as_mut() {
+            *reason = bounded_mcp_send_response_text(reason);
+        }
+    }
+    for evidence in &mut context.evidence {
+        evidence.key = bounded_mcp_send_response_text(&evidence.key);
+        evidence.value = bounded_mcp_send_response_text(&evidence.value);
+    }
+    if let Some(rate_limit) = context.rate_limit.as_mut() {
+        rate_limit.scope = bounded_mcp_send_response_text(&rate_limit.scope);
+        rate_limit.action = bounded_mcp_send_response_text(&rate_limit.action);
+    }
+    if let Some(risk) = context.risk.as_mut() {
+        risk.summary = bounded_mcp_send_response_text(&risk.summary);
+        for factor in &mut risk.factors {
+            factor.id = bounded_mcp_send_response_text(&factor.id);
+            factor.explanation = bounded_mcp_send_response_text(&factor.explanation);
+        }
+    }
+}
+
+fn bound_mcp_send_policy_decision_output(decision: &mut PolicyDecision) {
+    let context = match decision {
+        PolicyDecision::Allow { context, .. } => context,
+        PolicyDecision::Deny {
+            reason, context, ..
+        } => {
+            *reason = bounded_mcp_send_response_text(reason);
+            context
+        }
+        PolicyDecision::RequireApproval {
+            reason,
+            approval,
+            context,
+            ..
+        } => {
+            *reason = bounded_mcp_send_response_text(reason);
+            if let Some(approval) = approval.as_mut() {
+                // The code/hash/command are functional approval credentials;
+                // preserve them exactly. Only the human-readable summary can
+                // carry caller-controlled text.
+                approval.summary = bounded_mcp_send_response_text(&approval.summary);
+            }
+            context
+        }
+    };
+    if let Some(context) = context.as_mut() {
+        bound_mcp_send_decision_context_output(context);
+    }
+}
+
 fn bound_mcp_send_data_output(data: &mut McpSendData) {
     match &mut data.injection {
-        InjectionResult::Allowed { summary, .. }
-        | InjectionResult::Denied { summary, .. }
-        | InjectionResult::RequiresApproval { summary, .. } => {
+        InjectionResult::Allowed {
+            decision, summary, ..
+        }
+        | InjectionResult::Denied {
+            decision, summary, ..
+        }
+        | InjectionResult::RequiresApproval {
+            decision, summary, ..
+        } => {
+            bound_mcp_send_policy_decision_output(decision);
             *summary = bounded_mcp_send_response_text(summary);
         }
-        InjectionResult::Error { error, .. } => {
+        InjectionResult::Error {
+            decision, error, ..
+        } => {
+            bound_mcp_send_policy_decision_output(decision);
             *error = bounded_mcp_send_response_text(error);
         }
     }
