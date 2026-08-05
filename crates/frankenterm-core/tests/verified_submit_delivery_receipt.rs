@@ -23,9 +23,12 @@
 
 use frankenterm_core::policy::{ActionKind, InjectionResult, PolicyDecision};
 use frankenterm_core::robot_types::{SubmitGuaranteeLevel, SubmitReceipt, SubmitReceiptState};
-use frankenterm_core::submit_idempotency_store::{is_valid_submit_key, lookup, record};
+use frankenterm_core::submit_idempotency_store::{
+    ClaimOutcome, StoredSubmitState, claim, complete, is_valid_submit_key, lookup,
+};
 use frankenterm_core::verified_submit::{
-    VerifiedSubmitReport, submit_receipt_evidence_rule_ids, submit_receipt_state,
+    VerifiedSubmitReport, idempotency_binding, submit_receipt_evidence_rule_ids,
+    submit_receipt_state,
 };
 
 const ALL_STATES: &[SubmitReceiptState] = &[
@@ -120,7 +123,9 @@ fn receipt_with_state(state: SubmitReceiptState) -> SubmitReceipt {
         polls: 3,
         cursor_before: Some("pane:before".to_string()),
         cursor_after: Some("pane:after".to_string()),
-        idempotency_key: "idem:7:00112233445566ff".to_string(),
+        idempotency_key: idempotency_binding(7, "receipt", Some("roundtrip"))
+            .key()
+            .to_string(),
     }
 }
 
@@ -303,49 +308,57 @@ fn submit_receipt_evidence_rule_ids_merge_sorted_and_deduped() {
 
 #[test]
 fn idempotency_replay_returns_the_original_receipt() {
-    let ft_dir = std::env::temp_dir().join(format!("ft-7h5da38-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&ft_dir);
-    std::fs::create_dir_all(&ft_dir).expect("temp ft dir");
-
-    let key = "idem:7:00112233445566ff";
-    assert!(is_valid_submit_key(key));
+    let ft_dir = tempfile::tempdir().expect("temp ft dir");
+    let binding = idempotency_binding(7, "original prompt", Some("retry-1"));
+    assert!(is_valid_submit_key(binding.key()));
 
     // Unrecorded key -> None.
-    assert_eq!(lookup(&ft_dir, key).expect("lookup"), None);
+    assert_eq!(lookup(ft_dir.path(), &binding).expect("lookup"), None);
 
-    // Record a submitted receipt, then replay -> the original is returned verbatim.
+    // Claim and complete a submitted receipt, then replay -> the original is
+    // returned verbatim without granting a second owner.
     let original = report_with_state(
         SubmitReceiptState::Submitted,
         vec!["send.allow".to_string()],
     );
-    record(&ft_dir, key, &original).expect("record");
+    let token = match claim(ft_dir.path(), &binding).expect("claim") {
+        ClaimOutcome::Claimed(token) => token,
+        other => panic!("expected fresh claim, got {other:?}"),
+    };
+    complete(ft_dir.path(), &binding, token, &original).expect("complete");
     assert_eq!(
-        lookup(&ft_dir, key).expect("lookup").as_ref(),
-        Some(&original)
+        lookup(ft_dir.path(), &binding).expect("lookup"),
+        Some(StoredSubmitState::Completed(original.clone()))
+    );
+    assert_eq!(
+        claim(ft_dir.path(), &binding).expect("replay"),
+        ClaimOutcome::Completed(original.clone())
     );
 
     // A queued-behind-operation receipt under a distinct key is independent.
-    let queued_key = "idem:9:aabbccddeeff0011";
+    let queued_binding = idempotency_binding(9, "queued prompt", Some("retry-2"));
     let queued = report_with_state(SubmitReceiptState::QueuedBehindOperation, vec![]);
-    record(&ft_dir, queued_key, &queued).expect("record queued");
+    let queued_token = match claim(ft_dir.path(), &queued_binding).expect("claim queued") {
+        ClaimOutcome::Claimed(token) => token,
+        other => panic!("expected fresh queued claim, got {other:?}"),
+    };
+    complete(ft_dir.path(), &queued_binding, queued_token, &queued).expect("complete queued");
     assert_eq!(
-        lookup(&ft_dir, queued_key).expect("lookup queued").as_ref(),
-        Some(&queued)
+        lookup(ft_dir.path(), &queued_binding).expect("lookup queued"),
+        Some(StoredSubmitState::Completed(queued))
     );
     assert_eq!(
-        lookup(&ft_dir, key).expect("lookup").as_ref(),
-        Some(&original)
+        lookup(ft_dir.path(), &binding).expect("lookup"),
+        Some(StoredSubmitState::Completed(original))
     );
-
-    let _ = std::fs::remove_dir_all(&ft_dir);
 }
 
 #[test]
 fn submit_idempotency_key_guard_rejects_traversal_and_malformed() {
-    assert!(is_valid_submit_key("idem:0:0123456789abcdef"));
-    assert!(is_valid_submit_key(
-        "idem:18446744073709551615:deadbeefdeadbeef"
-    ));
+    let canonical = idempotency_binding(0, "prompt", None);
+    assert!(is_valid_submit_key(canonical.key()));
+    let max_pane = idempotency_binding(u64::MAX, "prompt", None);
+    assert!(is_valid_submit_key(max_pane.key()));
     // Path traversal / separators / absolute.
     assert!(!is_valid_submit_key("idem:7:../etc/passwd"));
     assert!(!is_valid_submit_key("../escape"));
@@ -354,6 +367,8 @@ fn submit_idempotency_key_guard_rejects_traversal_and_malformed() {
     assert!(!is_valid_submit_key("7:0123456789abcdef"));
     assert!(!is_valid_submit_key("idem:7:short"));
     assert!(!is_valid_submit_key("idem:7:0123456789ABCDEF"));
-    assert!(!is_valid_submit_key("idem:07:0123456789abcdef"));
+    assert!(!is_valid_submit_key(
+        "idem:07:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    ));
     assert!(!is_valid_submit_key(""));
 }

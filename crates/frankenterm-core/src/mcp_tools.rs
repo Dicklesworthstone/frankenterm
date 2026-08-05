@@ -8942,17 +8942,20 @@ fn mcp_submit_guarantee_level(params: &SendParams) -> Option<SubmitGuaranteeLeve
     })
 }
 
-fn mcp_submit_idempotency_key(params: &SendParams) -> Option<String> {
+fn mcp_submit_idempotency_binding(
+    params: &SendParams,
+) -> Option<crate::verified_submit::SubmitIdempotencyBinding> {
     params.idempotency_key.as_deref().map(|caller_key| {
-        crate::verified_submit::idempotency_key(params.pane_id, &params.text, Some(caller_key))
+        crate::verified_submit::idempotency_binding(params.pane_id, &params.text, Some(caller_key))
     })
 }
 
 fn mcp_submit_idempotency_storage_error(
-    operation: &'static str,
+    error: crate::submit_idempotency_store::SubmitIdempotencyError,
 ) -> crate::Error {
     crate::Error::Storage(crate::StorageError::Database(format!(
-        "submit idempotency {operation} failed"
+        "submit idempotency {}",
+        error.error_class()
     )))
 }
 
@@ -8992,6 +8995,60 @@ fn mcp_verified_report_from_submit_receipt(
         polls: receipt.polls,
         cursor_before: receipt.cursor_before.clone(),
         cursor_after: receipt.cursor_after.clone(),
+    }
+}
+
+fn mcp_completed_submit_replay(
+    pane_id: u64,
+    binding: &crate::verified_submit::SubmitIdempotencyBinding,
+    report: &crate::verified_submit::VerifiedSubmitReport,
+    guarantee_level: SubmitGuaranteeLevel,
+    elapsed_ms: u64,
+) -> McpSendData {
+    let submit = mcp_submit_receipt_from_verified_report(
+        report,
+        binding.key().to_string(),
+        elapsed_ms,
+        guarantee_level,
+    );
+    let verification_error = crate::verified_submit::submit_guarantee_failure_message(&submit);
+    McpSendData {
+        pane_id,
+        injection: InjectionResult::Allowed {
+            decision: PolicyDecision::allow_with_rule("submit_idempotency.duplicate_noop"),
+            summary: "duplicate submit replay suppressed".to_string(),
+            pane_id,
+            action: ActionKind::SendText,
+            audit_action_id: None,
+        },
+        wait_for: None,
+        verification_error,
+        submit: Some(submit),
+        output_omissions: None,
+        dry_run: false,
+    }
+}
+
+fn mcp_indeterminate_submit_replay(pane_id: u64) -> McpSendData {
+    McpSendData {
+        pane_id,
+        injection: InjectionResult::Denied {
+            decision: PolicyDecision::deny_with_rule(
+                "A prior send with this idempotency key has an indeterminate outcome; automatic replay is disabled",
+                "submit_idempotency.in_doubt_noop",
+            ),
+            summary: "indeterminate duplicate submit replay suppressed".to_string(),
+            pane_id,
+            action: ActionKind::SendText,
+            audit_action_id: None,
+        },
+        wait_for: None,
+        verification_error: Some(
+            "Prior send outcome is indeterminate; automatic resend refused".to_string(),
+        ),
+        submit: None,
+        output_omissions: None,
+        dry_run: false,
     }
 }
 
@@ -9228,7 +9285,7 @@ impl ToolHandler for WaSendTool {
                     "dry_run": { "type": "boolean", "default": false, "description": "Preview without sending" },
                     "verify_submit": { "type": "boolean", "default": false, "description": "Return a SubmitReceipt using the submitted guarantee level unless submit_level is set" },
                     "submit_level": { "type": "string", "enum": ["write", "composer", "submitted", "working"], "description": "Optional SubmitReceipt guarantee level; setting this enables verified-submit receipts" },
-                    "idempotency_key": { "type": "string", "maxLength": MAX_MCP_SUBMIT_IDEMPOTENCY_KEY_BYTES, "description": "Caller replay key; repeated non-dry-run sends with the same pane/text/key return the stored submitted or queued receipt without re-sending" },
+                    "idempotency_key": { "type": "string", "maxLength": MAX_MCP_SUBMIT_IDEMPOTENCY_KEY_BYTES, "description": "Caller replay key; a completed identical non-dry-run send returns its stored receipt without re-sending, while an interrupted/indeterminate prior send refuses automatic replay" },
                     "wait_for": { "type": "string", "maxLength": MAX_MCP_WAIT_PATTERN_BYTES, "description": "Wait for a pattern after sending" },
                     "timeout_secs": { "type": "integer", "minimum": 1, "maximum": 600, "default": 30, "description": "Wait-for timeout (seconds)" },
                     "wait_for_regex": { "type": "boolean", "default": false, "description": "Treat wait_for as regex" }
@@ -9304,78 +9361,46 @@ impl ToolHandler for WaSendTool {
         let db_path = Arc::clone(&self.db_path);
         let policy_rate_limiter = Arc::clone(&self.policy_rate_limiter);
         let submit_guarantee_level = mcp_submit_guarantee_level(&params);
-        let submit_idempotency_key = mcp_submit_idempotency_key(&params);
+        let submit_idempotency_binding = mcp_submit_idempotency_binding(&params);
         let runtime = CompatRuntimeBuilder::current_thread()
             .build()
             .map_err(|_error| McpError::internal_error("MCP runtime initialization failed"))?;
 
         let result = runtime.block_on(async move {
-            // ft-xbnl0.2.3 tick 303: cx-first MCP pane-state storage open (reuse wezterm_cx).
+            // Establish the request Cx first. A durable duplicate can return
+            // without opening unrelated primary pane-state storage.
             let wezterm_cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            let storage =
-                StorageHandle::new_with_cx(&wezterm_cx, &db_path.to_string_lossy()).await?;
             let ft_dir = db_path.parent().ok_or_else(|| {
                 crate::Error::Config(crate::error::ConfigError::ValidationError(
                     "database path has no parent directory".to_string(),
                 ))
             })?;
             if !params.dry_run {
-                if let Some(key) = submit_idempotency_key.as_deref() {
-                    let key_path =
-                        crate::submit_idempotency_store::key_path(ft_dir, key).map_err(|_error| {
-                            mcp_submit_idempotency_storage_error("key validation")
-                        })?;
-                    if let Some(store_dir) = key_path.parent() {
-                        std::fs::create_dir_all(store_dir).map_err(|_error| {
-                            mcp_submit_idempotency_storage_error("preflight")
-                        })?;
-                    }
-                    let (outcome, prior) = crate::submit_idempotency_store::decide(ft_dir, key)
-                        .map_err(|_error| {
-                            mcp_submit_idempotency_storage_error("lookup")
-                        })?;
-                    if matches!(
-                        outcome,
-                        crate::verified_submit::IdempotencyOutcome::DuplicateNoop
-                    ) {
-                        let guarantee_level =
-                            submit_guarantee_level.unwrap_or(SubmitGuaranteeLevel::Write);
-                        let prior = prior.ok_or_else(|| {
-                            crate::Error::Storage(crate::StorageError::Corruption {
-                                details: format!(
-                                    "submit idempotency key {key} had duplicate outcome without a stored receipt"
-                                ),
-                            })
-                        })?;
-                        let submit = mcp_submit_receipt_from_verified_report(
-                            &prior,
-                            key.to_string(),
-                            elapsed_ms(start),
-                            guarantee_level,
-                        );
-                        let verification_error =
-                            crate::verified_submit::submit_guarantee_failure_message(&submit);
-                        let injection = InjectionResult::Allowed {
-                            decision: PolicyDecision::allow_with_rule(
-                                "submit_idempotency.duplicate_noop",
-                            ),
-                            summary: "duplicate submit replay suppressed".to_string(),
-                            pane_id: params.pane_id,
-                            action: ActionKind::SendText,
-                            audit_action_id: None,
-                        };
-                        return Ok(McpSendData {
-                            pane_id: params.pane_id,
-                            injection,
-                            wait_for: None,
-                            verification_error,
-                            submit: Some(submit),
-                            output_omissions: None,
-                            dry_run: false,
-                        });
+                if let Some(binding) = submit_idempotency_binding.as_ref() {
+                    match crate::submit_idempotency_store::lookup(ft_dir, binding)
+                        .map_err(mcp_submit_idempotency_storage_error)?
+                    {
+                        Some(crate::submit_idempotency_store::StoredSubmitState::Completed(
+                            prior,
+                        )) => {
+                            return Ok(mcp_completed_submit_replay(
+                                params.pane_id,
+                                binding,
+                                &prior,
+                                submit_guarantee_level.unwrap_or(SubmitGuaranteeLevel::Write),
+                                elapsed_ms(start),
+                            ));
+                        }
+                        Some(crate::submit_idempotency_store::StoredSubmitState::InDoubt) => {
+                            return Ok(mcp_indeterminate_submit_replay(params.pane_id));
+                        }
+                        Some(crate::submit_idempotency_store::StoredSubmitState::Retryable(_))
+                        | None => {}
                     }
                 }
             }
+            let storage =
+                StorageHandle::new_with_cx(&wezterm_cx, &db_path.to_string_lossy()).await?;
             let wezterm = Arc::clone(&self.wezterm);
             let pane_info = wezterm
                 .get_pane_with_cx(&wezterm_cx, params.pane_id)
@@ -9457,6 +9482,29 @@ impl ToolHandler for WaSendTool {
             } else {
                 None
             };
+            let submit_idempotency_claim = if let Some(binding) =
+                submit_idempotency_binding.as_ref()
+            {
+                match crate::submit_idempotency_store::claim(ft_dir, binding)
+                    .map_err(mcp_submit_idempotency_storage_error)?
+                {
+                    crate::submit_idempotency_store::ClaimOutcome::Claimed(token) => Some(token),
+                    crate::submit_idempotency_store::ClaimOutcome::Completed(prior) => {
+                        return Ok(mcp_completed_submit_replay(
+                            params.pane_id,
+                            binding,
+                            &prior,
+                            submit_guarantee_level.unwrap_or(SubmitGuaranteeLevel::Write),
+                            elapsed_ms(start),
+                        ));
+                    }
+                    crate::submit_idempotency_store::ClaimOutcome::InDoubt => {
+                        return Ok(mcp_indeterminate_submit_replay(params.pane_id));
+                    }
+                }
+            } else {
+                None
+            };
             let mut injection = injector
                 .send_text(
                     params.pane_id,
@@ -9466,6 +9514,32 @@ impl ToolHandler for WaSendTool {
                     None,
                 )
                 .await;
+
+            // A policy denial or approval requirement proves that the
+            // injector performed no pane write. Persist that retryable state
+            // immediately, before approval enrichment or response/audit work
+            // can fail or the process can stop. Injector/backend errors are
+            // intentionally left `in_doubt` because they may follow a partial
+            // write.
+            if let (Some(binding), Some(token)) =
+                (submit_idempotency_binding.as_ref(), submit_idempotency_claim)
+            {
+                let retryable_reason = match &injection {
+                    InjectionResult::Denied { .. } => {
+                        Some(crate::submit_idempotency_store::RetryableReason::PolicyDenied)
+                    }
+                    InjectionResult::RequiresApproval { .. } => Some(
+                        crate::submit_idempotency_store::RetryableReason::ApprovalRequired,
+                    ),
+                    InjectionResult::Allowed { .. } | InjectionResult::Error { .. } => None,
+                };
+                if let Some(reason) = retryable_reason {
+                    crate::submit_idempotency_store::mark_retryable(
+                        ft_dir, binding, token, reason,
+                    )
+                    .map_err(mcp_submit_idempotency_storage_error)?;
+                }
+            }
 
             if let InjectionResult::RequiresApproval {
                 decision,
@@ -9607,8 +9681,8 @@ impl ToolHandler for WaSendTool {
                     elapsed_ms(start),
                     guarantee_level,
                 );
-                if let Some(key) = submit_idempotency_key.as_deref() {
-                    receipt.idempotency_key = key.to_string();
+                if let Some(binding) = submit_idempotency_binding.as_ref() {
+                    receipt.idempotency_key = binding.key().to_string();
                 }
                 if let Some(error) =
                     crate::verified_submit::submit_guarantee_failure_message(&receipt)
@@ -9620,15 +9694,47 @@ impl ToolHandler for WaSendTool {
                 }
                 attach_mcp_submit_receipt_to_audit(&storage, &wezterm_cx, &injection, &receipt)
                     .await;
-                if let Some(key) = submit_idempotency_key.as_deref() {
+                if let (Some(binding), Some(token)) =
+                    (submit_idempotency_binding.as_ref(), submit_idempotency_claim)
+                {
                     let report = mcp_verified_report_from_submit_receipt(&receipt);
-                    if let Err(_error) = crate::submit_idempotency_store::record(ft_dir, key, &report)
-                    {
+                    let transition = match &injection {
+                        InjectionResult::Allowed { .. } => {
+                            crate::submit_idempotency_store::complete(
+                                ft_dir, binding, token, &report,
+                            )
+                        }
+                        // Proven pre-effect terminals were durably released
+                        // immediately after the injector returned, before any
+                        // later response construction could fail.
+                        InjectionResult::Denied { .. }
+                        | InjectionResult::RequiresApproval { .. } => Ok(()),
+                        // An injector/backend error can follow a partial write.
+                        // Preserve `in_doubt`; automatic replay would risk a
+                        // duplicate effect.
+                        InjectionResult::Error { .. } => {
+                            verification_error = Some(match verification_error.take() {
+                                Some(existing) => format!(
+                                    "{existing}; send outcome is indeterminate; automatic retries disabled"
+                                ),
+                                None => "Send outcome is indeterminate; automatic retries disabled"
+                                    .to_string(),
+                            });
+                            Ok(())
+                        }
+                    };
+                    if let Err(error) = transition {
+                        tracing::warn!(
+                            error_class = error.error_class(),
+                            injection_allowed = injection.is_allowed(),
+                            "wa.send could not confirm its durable idempotency terminal transition"
+                        );
                         verification_error = Some(match verification_error.take() {
-                            Some(existing) => {
-                                format!("{existing}; submit idempotency record failed")
-                            }
-                            None => "submit idempotency record failed".to_string(),
+                            Some(existing) => format!(
+                                "{existing}; submit idempotency transition failed; automatic retries disabled"
+                            ),
+                            None => "Submit idempotency transition failed; automatic retries disabled"
+                                .to_string(),
                         });
                     }
                 }
@@ -19741,7 +19847,8 @@ mod tests {
                         &test_mcp_context(),
                         serde_json::json!({
                             "pane_id": pane_id,
-                            "text": "echo over-limit"
+                            "text": "echo over-limit",
+                            "idempotency_key": "over-limit-attempt"
                         }),
                     )
                     .expect("wa.send rate-limited call"),
@@ -19757,6 +19864,22 @@ mod tests {
                     .as_str()
                     .is_some_and(|error| error.to_ascii_lowercase().contains("rate limit")),
                 "expected rate-limit policy decision, got {envelope:?}"
+            );
+            let retryable_binding = crate::verified_submit::idempotency_binding(
+                pane_id,
+                "echo over-limit",
+                Some("over-limit-attempt"),
+            );
+            assert_eq!(
+                crate::submit_idempotency_store::lookup(
+                    db.parent().expect("test database parent"),
+                    &retryable_binding,
+                )
+                .expect("lookup approval-required claim"),
+                Some(crate::submit_idempotency_store::StoredSubmitState::Retryable(
+                    crate::submit_idempotency_store::RetryableReason::ApprovalRequired,
+                )),
+                "a proven pre-effect approval outcome must remain explicitly retryable"
             );
         });
     }
@@ -19969,6 +20092,9 @@ mod tests {
                 1,
                 "first send should inject exactly once"
             );
+            crate::wezterm::MuxInterface::kill_pane(mock.as_ref(), pane_id)
+                .await
+                .expect("remove pane after completed send");
 
             let second = parse_json_content(
                 tool.call(
@@ -19997,14 +20123,75 @@ mod tests {
                 second_submit["idempotency_key"],
                 serde_json::json!(expected_key)
             );
-            let content_after_second = mock
+            assert!(
+                mock.pane_state(pane_id).await.is_none(),
+                "completed replay must return its receipt without requiring or recreating the pane"
+            );
+        });
+    }
+
+    #[test]
+    fn wa_send_indeterminate_claim_refuses_automatic_resend() {
+        let runtime = CompatRuntimeBuilder::current_thread().build().unwrap();
+        runtime.block_on(async {
+            let (_dir, db) = temp_db_path();
+            let pane_id = 4_207;
+            let text = "echo indeterminate";
+            let caller_key = "crash-before-receipt";
+            let binding =
+                crate::verified_submit::idempotency_binding(pane_id, text, Some(caller_key));
+            let ft_dir = db.parent().expect("test database parent");
+            assert!(matches!(
+                crate::submit_idempotency_store::claim(ft_dir, &binding)
+                    .expect("seed in-doubt claim"),
+                crate::submit_idempotency_store::ClaimOutcome::Claimed(_)
+            ));
+
+            let mut cfg = Config::default();
+            cfg.safety.require_prompt_active = false;
+            cfg.safety.rate_limit_per_pane = 100;
+            cfg.safety.rate_limit_global = 100;
+            let cfg = Arc::new(cfg);
+            let mock = Arc::new(crate::wezterm::MockWezterm::new());
+            mock.add_default_pane(pane_id).await;
+            let _pane_state = set_mcp_test_pane_state_override(safe_test_ipc_pane_state(pane_id));
+            let tool = WaSendTool::with_wezterm_handle(
+                Arc::clone(&cfg),
+                Arc::clone(&db),
+                Arc::clone(&mock) as crate::wezterm::WeztermHandle,
+            );
+
+            let envelope = parse_json_content(
+                tool.call(
+                    &test_mcp_context(),
+                    serde_json::json!({
+                        "pane_id": pane_id,
+                        "text": text,
+                        "idempotency_key": caller_key
+                    }),
+                )
+                .expect("indeterminate duplicate call"),
+            );
+            assert_eq!(envelope["ok"], true, "envelope: {envelope:?}");
+            assert_eq!(envelope["data"]["injection"]["status"], "denied");
+            assert_eq!(
+                envelope["data"]["injection"]["decision"]["rule_id"],
+                "submit_idempotency.in_doubt_noop"
+            );
+            assert_eq!(envelope["data"]["submit"], serde_json::Value::Null);
+            let content = mock
                 .pane_state(pane_id)
                 .await
-                .expect("mock pane should still exist")
+                .expect("mock pane should exist")
                 .content;
+            assert!(
+                !content.contains(text),
+                "an indeterminate replay must not inject text"
+            );
             assert_eq!(
-                content_after_second, content_after_first,
-                "duplicate replay must not send text to the pane again"
+                crate::submit_idempotency_store::lookup(ft_dir, &binding)
+                    .expect("lookup in-doubt claim"),
+                Some(crate::submit_idempotency_store::StoredSubmitState::InDoubt)
             );
         });
     }

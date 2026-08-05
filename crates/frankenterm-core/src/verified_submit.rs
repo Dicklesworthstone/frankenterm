@@ -10,6 +10,48 @@ const CAPTURE_CURSOR_PREFIX: &str = "pane";
 const MAX_CLASSIFIER_CAPTURE_BYTES: usize = 32 * 1024;
 const VERIFIED_SUBMIT_CANARY_PREFIX: &str = "\u{2063}ft-vs:";
 const VERIFIED_SUBMIT_CANARY_DIGEST_CHARS: usize = 16;
+const SUBMIT_IDEMPOTENCY_REQUEST_DOMAIN: &[u8] = b"frankenterm:verified-submit:request:v2\0";
+const SUBMIT_IDEMPOTENCY_KEY_DOMAIN: &[u8] = b"frankenterm:verified-submit:key:v2\0";
+
+/// Full, domain-separated binding for one durable verified-submit claim.
+///
+/// `key` is the stable caller-facing identifier. `request_sha256` is stored
+/// independently beside it so the durable store can reject a row whose pane,
+/// key, or request binding was corrupted or substituted. Both digests retain
+/// all 256 bits; the old 64-bit truncated key was not collision-resistant
+/// enough to authorize suppression of a real prompt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubmitIdempotencyBinding {
+    key: String,
+    pane_id: u64,
+    request_sha256: String,
+}
+
+impl SubmitIdempotencyBinding {
+    #[must_use]
+    pub fn key(&self) -> &str {
+        &self.key
+    }
+
+    #[must_use]
+    pub const fn pane_id(&self) -> u64 {
+        self.pane_id
+    }
+
+    #[must_use]
+    pub fn request_sha256(&self) -> &str {
+        &self.request_sha256
+    }
+
+    /// Recompute the caller-facing key from the independently stored request
+    /// digest. The durable store calls this before every read or transition so
+    /// an internally forged/mismatched binding fails before filesystem access.
+    #[must_use]
+    pub fn is_canonical(&self) -> bool {
+        is_lower_hex_sha256(&self.request_sha256)
+            && self.key == submit_key_from_request_digest(self.pane_id, &self.request_sha256)
+    }
+}
 
 /// Inputs sampled around a policy-approved send operation.
 #[derive(Debug, Clone, Copy)]
@@ -393,69 +435,63 @@ pub fn verification_canary(pane_id: u64, command_text: &str) -> String {
     )
 }
 
-/// ft-7h5da.3.5: derive the idempotency key for a verified-submit send. The same
-/// `(pane_id, text, caller_key)` triple always maps to the same key; a different
-/// caller-supplied key (or different text / pane) yields a distinct key, letting
-/// a meta-agent force a genuinely new send. `caller_key` is an opaque token the
-/// caller controls (e.g. a retry / session nonce); `None` keys purely by content.
-#[must_use]
-pub fn idempotency_key(pane_id: u64, text: &str, caller_key: Option<&str>) -> String {
-    // Length-prefix every variable-length field and tag the Option so field
-    // boundaries are unambiguous. Without framing, ("a\x00b", None) vs
-    // ("a", Some("b\x00")) — or a None vs Some("") caller key — would hash to
-    // the same key, and a *different* prompt could then be suppressed as a
-    // duplicate (a silent prompt drop). Decimal lengths keep the encoding
-    // platform-independent (matching the canonical-string pattern in
-    // `steering.rs`).
+fn submit_request_digest(pane_id: u64, text: &str, caller_key: Option<&str>) -> [u8; 32] {
     let mut hasher = Sha256::new();
-    hasher.update(pane_id.to_le_bytes());
-    hasher.update(text.len().to_string().as_bytes());
-    hasher.update(b":");
+    hasher.update(SUBMIT_IDEMPOTENCY_REQUEST_DOMAIN);
+    hasher.update(pane_id.to_be_bytes());
+    // Fixed-width u128 lengths make the framing platform-independent and
+    // collision-free even on a hypothetical target whose usize exceeds u64.
+    hasher.update((text.len() as u128).to_be_bytes());
     hasher.update(text.as_bytes());
     match caller_key {
         Some(k) => {
-            hasher.update(b"some:");
-            hasher.update(k.len().to_string().as_bytes());
-            hasher.update(b":");
+            hasher.update([1]);
+            hasher.update((k.len() as u128).to_be_bytes());
             hasher.update(k.as_bytes());
         }
-        None => hasher.update(b"none"),
+        None => hasher.update([0]),
     }
-    let digest = hex::encode(hasher.finalize());
-    format!("idem:{pane_id}:{}", &digest[..16])
+    hasher.finalize().into()
 }
 
-/// ft-7h5da.3.5: whether a fresh send keyed by an idempotency key should be
-/// suppressed as a duplicate of a prior in-flight / completed send.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum IdempotencyOutcome {
-    /// A prior send for this key is already `submitted` or
-    /// `queued_behind_operation` — the replay is a NO-OP and the caller MUST
-    /// return the original receipt rather than re-injecting the prompt.
-    DuplicateNoop,
-    /// No conflicting prior send (never sent, or the prior attempt did not stick)
-    /// — the send proceeds.
-    Proceed,
+fn submit_key_from_request_digest(pane_id: u64, request_sha256: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(SUBMIT_IDEMPOTENCY_KEY_DOMAIN);
+    hasher.update(pane_id.to_be_bytes());
+    hasher.update(request_sha256.as_bytes());
+    format!("idem:{pane_id}:{}", hex::encode(hasher.finalize()))
 }
 
-/// ft-7h5da.3.5: decide a send's idempotency outcome from the last recorded
-/// receipt state for its key.
-///
-/// Only `Submitted` / `QueuedBehindOperation` suppress a replay — the prompt is
-/// already delivered or in flight, so re-sending would double-submit. Every
-/// other state (including `None` = never sent, and the non-delivered terminals
-/// `StuckInComposer` / `SendFailed` / `PaneCrashedToShell` /
-/// `VerificationUnavailable` / `PolicyDenied` / `RequiresApproval`) allows the
-/// send to proceed, because the prompt was NOT durably delivered and a
-/// disconnected meta-agent must be able to retry.
+fn is_lower_hex_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+/// Derive the durable claim binding for a verified-submit send. The same
+/// `(pane_id, text, caller_key)` triple always maps to the same binding; every
+/// variable field is fixed-width length-framed and the optional caller key has
+/// an explicit presence tag.
 #[must_use]
-pub fn idempotency_outcome(prior: Option<SubmitReceiptState>) -> IdempotencyOutcome {
-    match prior {
-        Some(SubmitReceiptState::Submitted | SubmitReceiptState::QueuedBehindOperation) => {
-            IdempotencyOutcome::DuplicateNoop
-        }
-        _ => IdempotencyOutcome::Proceed,
+pub fn idempotency_binding(
+    pane_id: u64,
+    text: &str,
+    caller_key: Option<&str>,
+) -> SubmitIdempotencyBinding {
+    let request_sha256 = hex::encode(submit_request_digest(pane_id, text, caller_key));
+    let key = submit_key_from_request_digest(pane_id, &request_sha256);
+    SubmitIdempotencyBinding {
+        key,
+        pane_id,
+        request_sha256,
     }
+}
+
+/// Derive the stable caller-facing key for a verified-submit send.
+#[must_use]
+pub fn idempotency_key(pane_id: u64, text: &str, caller_key: Option<&str>) -> String {
+    idempotency_binding(pane_id, text, caller_key).key
 }
 
 fn receipt_agent_type(agent_type: AgentType) -> Option<String> {
@@ -1020,6 +1056,15 @@ mod tests {
             "caller key must matter"
         );
         assert!(a.starts_with("idem:7:"), "key was {a}");
+        assert_eq!(
+            a.rsplit(':').next().map(str::len),
+            Some(64),
+            "idempotency key must retain the full SHA-256 digest"
+        );
+        let binding = idempotency_binding(7, "deploy now", None);
+        assert_eq!(binding.key(), a);
+        assert_eq!(binding.request_sha256().len(), 64);
+        assert!(binding.is_canonical());
     }
 
     #[test]
@@ -1043,39 +1088,6 @@ mod tests {
             idempotency_key(7, "deploy now", Some("")),
             "absent caller key must differ from empty caller key"
         );
-    }
-
-    #[test]
-    fn submitted_and_queued_suppress_replay() {
-        assert_eq!(
-            idempotency_outcome(Some(SubmitReceiptState::Submitted)),
-            IdempotencyOutcome::DuplicateNoop
-        );
-        assert_eq!(
-            idempotency_outcome(Some(SubmitReceiptState::QueuedBehindOperation)),
-            IdempotencyOutcome::DuplicateNoop
-        );
-    }
-
-    #[test]
-    fn never_sent_or_non_delivered_states_proceed() {
-        assert_eq!(idempotency_outcome(None), IdempotencyOutcome::Proceed);
-        let retryable = [
-            SubmitReceiptState::StuckInComposer,
-            SubmitReceiptState::SendFailed,
-            SubmitReceiptState::PaneCrashedToShell,
-            SubmitReceiptState::VerificationUnavailable,
-            SubmitReceiptState::PolicyDenied,
-            SubmitReceiptState::RequiresApproval,
-        ];
-        for state in retryable {
-            let label = format!("{state:?}");
-            assert_eq!(
-                idempotency_outcome(Some(state)),
-                IdempotencyOutcome::Proceed,
-                "{label} was not durably delivered and must allow retry"
-            );
-        }
     }
 
     #[test]
