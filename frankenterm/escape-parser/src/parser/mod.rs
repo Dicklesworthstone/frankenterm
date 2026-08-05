@@ -19,6 +19,10 @@ use sixel::SixelBuilder;
 
 const MAX_TCAP_NAMES: usize = 512;
 const MAX_TCAP_CURRENT_BYTES: usize = 1_048_576;
+// Bound the aggregate retained capability-name input as well as each name.
+// Without a request-wide budget, 512 individually valid near-limit names could
+// retain hundreds of MiB before the DCS terminator arrived.
+const MAX_TCAP_TOTAL_BYTES: usize = 1_048_576;
 
 /// Set-wide escape hatch for the Round-7 moonshot-recommended default-on set.
 /// Falsey values disable promoted recommended gates while leaving unrelated
@@ -108,6 +112,7 @@ fn env_value_is_falsey(value: &str) -> bool {
 struct GetTcapBuilder {
     current: Vec<u8>,
     names: Vec<String>,
+    accepted_raw_name_bytes: usize,
     discarding_current: bool,
     discarding_all: bool,
 }
@@ -135,10 +140,31 @@ impl GetTcapBuilder {
             self.current.clear();
             return;
         }
+        let Some(next_total) = self
+            .accepted_raw_name_bytes
+            .checked_add(self.current.len())
+        else {
+            log::warn!(
+                "XtGetTcap aggregate name input overflowed its byte counter; discarding further names"
+            );
+            self.discarding_all = true;
+            self.current.clear();
+            return;
+        };
+        if next_total > MAX_TCAP_TOTAL_BYTES {
+            log::warn!(
+                "XtGetTcap aggregate name input exceeded {} byte limit; discarding the current and further names",
+                MAX_TCAP_TOTAL_BYTES,
+            );
+            self.discarding_all = true;
+            self.current.clear();
+            return;
+        }
         let decoded = hex::decode(&self.current)
             .map(|s| String::from_utf8_lossy(&s).to_string())
             .unwrap_or_else(|_| String::from_utf8_lossy(&self.current).to_string());
         self.names.push(decoded);
+        self.accepted_raw_name_bytes = next_total;
         self.current.clear();
     }
 
@@ -1467,6 +1493,37 @@ mod test {
         assert!(tcap_results[0].len() <= MAX_TCAP_NAMES);
         // Second XtGetTcap: parser recovered
         assert_eq!(vec!["TN".to_string()], tcap_results[1]);
+    }
+
+    #[test]
+    fn aggregate_xtgettcap_name_bytes_are_capped_and_parser_recovers() {
+        let mut p = Parser::new();
+        let first_name_bytes = MAX_TCAP_TOTAL_BYTES - 2;
+        let mut seq = Vec::with_capacity(MAX_TCAP_TOTAL_BYTES + 512);
+        seq.extend_from_slice(b"\x1bP+q");
+        seq.extend(std::iter::repeat_n(b'4', first_name_bytes));
+        // The first raw name fits, but accepting this second name would exceed
+        // the aggregate request budget. It and all remaining names in this DCS
+        // must be ignored without truncating either name into a new command.
+        seq.extend_from_slice(b";544e;434f");
+        seq.extend_from_slice(b"\x1b\\");
+        // A fresh request must not inherit the discard state.
+        seq.extend_from_slice(b"\x1bP+q544e\x1b\\");
+
+        let actions = p.parse_as_vec(&seq);
+        let tcap_results: Vec<_> = actions
+            .iter()
+            .filter_map(|action| match action {
+                Action::XtGetTcap(names) => Some(names),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(2, tcap_results.len());
+        assert_eq!(1, tcap_results[0].len());
+        assert_eq!(first_name_bytes / 2, tcap_results[0][0].len());
+        assert!(tcap_results[0][0].bytes().all(|byte| byte == b'D'));
+        assert_eq!(&["TN".to_string()], tcap_results[1].as_slice());
     }
 
     #[test]
