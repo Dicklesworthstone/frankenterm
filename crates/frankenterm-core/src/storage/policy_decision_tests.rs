@@ -282,29 +282,21 @@ fn migration_plan_empty_when_at_target() {
 
 #[test]
 fn downgrade_below_forward_only_floor_fails_closed() {
-    // v1 (baseline), v30 (embedded_at seconds->ms normalization), and v32
-    // (embedded_at DEFAULT repair) are deliberately forward-only
-    // (down_sql: None). build_migration_plan hard-errors when any undone
-    // migration lacks down_sql, so the lowest reachable downgrade target is
-    // the HIGHEST forward-only version. Reversible v33 sits above that floor,
-    // so head -> v32 is valid while every target below v32 must fail closed.
+    // v34 is deliberately forward-only because downgrading it would discard
+    // authoritative deletion evidence. build_migration_plan hard-errors when
+    // any undone migration lacks down_sql, so current head cannot be rolled
+    // back to any older target.
     let forward_only_floor = MIGRATIONS
         .iter()
         .filter(|migration| migration.down_sql.is_none())
         .map(|migration| migration.version)
         .max()
         .expect("the v1 baseline is forward-only");
-    assert_eq!(forward_only_floor, 32, "v32 is the current rollback floor");
+    assert_eq!(forward_only_floor, 34, "v34 is the current rollback floor");
 
-    let reachable = build_migration_plan(SCHEMA_VERSION, forward_only_floor)
-        .expect("reversible tail above the forward-only floor must be reachable");
-    assert_eq!(reachable.direction, MigrationDirection::Down);
-    assert_eq!(reachable.steps.len(), 1);
-    assert_eq!(reachable.steps[0].migration_version, 33);
-
-    for target in [1, 3, 17, forward_only_floor - 1] {
+    for target in [1, 3, 17, 32, 33] {
         let err = build_migration_plan(SCHEMA_VERSION, target)
-            .expect_err("downgrade below the forward-only floor must fail closed");
+            .expect_err("downgrade from the forward-only head must fail closed");
         assert!(
             err.to_string().contains("Rollback not supported"),
             "downgrade to {target} must surface the forward-only rollback error, got: {err}"
@@ -315,7 +307,26 @@ fn downgrade_below_forward_only_floor_fails_closed() {
 #[test]
 fn migration_v33_down_up_roundtrip_preserves_the_reversible_tail() {
     let conn = Connection::open_in_memory().expect("open in-memory sqlite");
-    initialize_schema(&conn).expect("initialize v33 schema");
+    initialize_schema(&conn).expect("initialize current schema");
+    conn.execute_batch(
+        "DROP TRIGGER IF EXISTS events_retention_delete_guard;
+         DROP TRIGGER IF EXISTS events_id_update_guard;
+         DROP TRIGGER IF EXISTS events_monotonic_id_advance;
+         DROP TRIGGER IF EXISTS events_monotonic_id_guard;
+         DROP TRIGGER IF EXISTS event_retention_intervals_delete_guard;
+         DROP TRIGGER IF EXISTS event_retention_intervals_update_guard;
+         DROP TRIGGER IF EXISTS event_retention_intervals_insert_guard;
+         DROP TRIGGER IF EXISTS event_retention_state_monotonic_guard;
+         DROP TRIGGER IF EXISTS event_retention_state_delete_guard;
+         DROP INDEX IF EXISTS idx_events_segment_id;
+         DROP INDEX IF EXISTS idx_workflows_trigger_event_id;
+         DROP TABLE IF EXISTS event_retention_delete_authorizations;
+         DROP TABLE IF EXISTS event_retention_rotation_authorizations;
+         DROP TABLE IF EXISTS event_retention_intervals;
+         DROP TABLE IF EXISTS event_retention_state;
+         PRAGMA user_version = 33;",
+    )
+    .expect("construct exact v33 fixture without discarding real evidence");
 
     let down = build_migration_plan(33, 32).expect("build v33 -> v32 plan");
     apply_migration_plan(&conn, &down).expect("apply v33 down migration");
@@ -348,7 +359,7 @@ fn migration_v33_down_up_roundtrip_preserves_the_reversible_tail() {
 
 #[test]
 fn migration_v18_preserves_existing_events() {
-    // Downgrading head -> v17 is structurally impossible because v32 remains
+    // Downgrading head -> v17 is structurally impossible because v34 is now
     // the forward-only floor, so build the pre-v18 shape directly:
     // the minimal `panes` + `events` tables the frozen v18 migration
     // operates on, plus `schema_version` for the migration bookkeeping.
@@ -1558,8 +1569,9 @@ fn can_insert_event_and_mark_handled() {
 
     // Insert unhandled event
     conn.execute(
-            "INSERT INTO events (pane_id, rule_id, agent_type, event_type, severity, confidence, detected_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO events (id, pane_id, rule_id, agent_type, event_type, severity, confidence, detected_at)
+             SELECT max_event_id + 1, ?1, ?2, ?3, ?4, ?5, ?6, ?7
+             FROM event_retention_state WHERE singleton = 1",
             params![1i64, "codex.usage_limit", "codex", "usage", "warning", 0.95, now_ms],
         ).unwrap();
 

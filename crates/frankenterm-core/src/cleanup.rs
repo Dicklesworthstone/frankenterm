@@ -695,19 +695,33 @@ async fn preview_events_by_tier(
     }
 
     let mut summaries = Vec::new();
+    let mut earlier_tiers = Vec::new();
     for tier in &config.retention_tiers {
-        if tier.retention_days == 0 {
-            continue; // keep forever
+        if tier.retention_days > 0 {
+            let cutoff = retention_cutoff_ms(now, tier.retention_days);
+            let count = storage
+                .count_events_by_retention_rule(cutoff, Some(tier), &earlier_tiers)
+                .await?;
+            summaries.push(CleanupTableSummary {
+                table: format!("events (tier: {})", tier.name),
+                eligible_rows: count,
+                deleted_rows: 0,
+                retention_days: tier.retention_days,
+            });
         }
-        let cutoff = retention_cutoff_ms(now, tier.retention_days);
+        // Keep-forever rules still participate in first-match exclusion.
+        earlier_tiers.push(tier.clone());
+    }
+    if config.retention_days > 0 {
+        let cutoff = retention_cutoff_ms(now, config.retention_days);
         let count = storage
-            .count_events_by_tier(cutoff, &tier.severities, &tier.event_types, tier.handled)
+            .count_events_by_retention_rule(cutoff, None, &earlier_tiers)
             .await?;
         summaries.push(CleanupTableSummary {
-            table: format!("events (tier: {})", tier.name),
+            table: "events (global fallback)".to_string(),
             eligible_rows: count,
             deleted_rows: 0,
-            retention_days: tier.retention_days,
+            retention_days: config.retention_days,
         });
     }
     Ok(summaries)
@@ -735,25 +749,37 @@ async fn preview_events_by_tier_with_cx(
     }
 
     let mut summaries = Vec::new();
+    let mut earlier_tiers = Vec::new();
     for tier in &config.retention_tiers {
-        if tier.retention_days == 0 {
-            continue;
+        if tier.retention_days > 0 {
+            let cutoff = retention_cutoff_ms(now, tier.retention_days);
+            let count = storage
+                .count_events_by_retention_rule_with_cx(
+                    cx,
+                    cutoff,
+                    Some(tier),
+                    &earlier_tiers,
+                )
+                .await?;
+            summaries.push(CleanupTableSummary {
+                table: format!("events (tier: {})", tier.name),
+                eligible_rows: count,
+                deleted_rows: 0,
+                retention_days: tier.retention_days,
+            });
         }
-        let cutoff = retention_cutoff_ms(now, tier.retention_days);
+        earlier_tiers.push(tier.clone());
+    }
+    if config.retention_days > 0 {
+        let cutoff = retention_cutoff_ms(now, config.retention_days);
         let count = storage
-            .count_events_by_tier_with_cx(
-                cx,
-                cutoff,
-                &tier.severities,
-                &tier.event_types,
-                tier.handled,
-            )
+            .count_events_by_retention_rule_with_cx(cx, cutoff, None, &earlier_tiers)
             .await?;
         summaries.push(CleanupTableSummary {
-            table: format!("events (tier: {})", tier.name),
+            table: "events (global fallback)".to_string(),
             eligible_rows: count,
             deleted_rows: 0,
-            retention_days: tier.retention_days,
+            retention_days: config.retention_days,
         });
     }
     Ok(summaries)
@@ -783,28 +809,43 @@ async fn apply_events_by_tier(
     }
 
     let mut summaries = Vec::new();
+    let mut earlier_tiers = Vec::new();
     for tier in &config.retention_tiers {
-        if tier.retention_days == 0 {
-            continue;
+        if tier.retention_days > 0 {
+            let cutoff = retention_cutoff_ms(now, tier.retention_days);
+            let count = storage
+                .count_events_by_retention_rule(cutoff, Some(tier), &earlier_tiers)
+                .await?;
+            let deleted = storage
+                .delete_events_by_retention_rule(
+                    cutoff,
+                    Some(tier),
+                    &earlier_tiers,
+                    DELETE_BATCH_SIZE,
+                )
+                .await?;
+            summaries.push(CleanupTableSummary {
+                table: format!("events (tier: {})", tier.name),
+                eligible_rows: count,
+                deleted_rows: deleted,
+                retention_days: tier.retention_days,
+            });
         }
-        let cutoff = retention_cutoff_ms(now, tier.retention_days);
+        earlier_tiers.push(tier.clone());
+    }
+    if config.retention_days > 0 {
+        let cutoff = retention_cutoff_ms(now, config.retention_days);
         let count = storage
-            .count_events_by_tier(cutoff, &tier.severities, &tier.event_types, tier.handled)
+            .count_events_by_retention_rule(cutoff, None, &earlier_tiers)
             .await?;
         let deleted = storage
-            .delete_events_by_tier(
-                cutoff,
-                &tier.severities,
-                &tier.event_types,
-                tier.handled,
-                DELETE_BATCH_SIZE,
-            )
+            .delete_events_by_retention_rule(cutoff, None, &earlier_tiers, DELETE_BATCH_SIZE)
             .await?;
         summaries.push(CleanupTableSummary {
-            table: format!("events (tier: {})", tier.name),
+            table: "events (global fallback)".to_string(),
             eligible_rows: count,
             deleted_rows: deleted,
-            retention_days: tier.retention_days,
+            retention_days: config.retention_days,
         });
     }
     Ok(summaries)
@@ -835,35 +876,55 @@ async fn apply_events_by_tier_with_cx(
     }
 
     let mut summaries = Vec::new();
+    let mut earlier_tiers = Vec::new();
     for tier in &config.retention_tiers {
-        if tier.retention_days == 0 {
-            continue;
+        if tier.retention_days > 0 {
+            let cutoff = retention_cutoff_ms(now, tier.retention_days);
+            let count = storage
+                .count_events_by_retention_rule_with_cx(
+                    cx,
+                    cutoff,
+                    Some(tier),
+                    &earlier_tiers,
+                )
+                .await?;
+            let deleted = storage
+                .delete_events_by_retention_rule_with_cx(
+                    cx,
+                    cutoff,
+                    Some(tier),
+                    &earlier_tiers,
+                    DELETE_BATCH_SIZE,
+                )
+                .await?;
+            summaries.push(CleanupTableSummary {
+                table: format!("events (tier: {})", tier.name),
+                eligible_rows: count,
+                deleted_rows: deleted,
+                retention_days: tier.retention_days,
+            });
         }
-        let cutoff = retention_cutoff_ms(now, tier.retention_days);
+        earlier_tiers.push(tier.clone());
+    }
+    if config.retention_days > 0 {
+        let cutoff = retention_cutoff_ms(now, config.retention_days);
         let count = storage
-            .count_events_by_tier_with_cx(
-                cx,
-                cutoff,
-                &tier.severities,
-                &tier.event_types,
-                tier.handled,
-            )
+            .count_events_by_retention_rule_with_cx(cx, cutoff, None, &earlier_tiers)
             .await?;
         let deleted = storage
-            .delete_events_by_tier_with_cx(
+            .delete_events_by_retention_rule_with_cx(
                 cx,
                 cutoff,
-                &tier.severities,
-                &tier.event_types,
-                tier.handled,
+                None,
+                &earlier_tiers,
                 DELETE_BATCH_SIZE,
             )
             .await?;
         summaries.push(CleanupTableSummary {
-            table: format!("events (tier: {})", tier.name),
+            table: "events (global fallback)".to_string(),
             eligible_rows: count,
             deleted_rows: deleted,
-            retention_days: tier.retention_days,
+            retention_days: config.retention_days,
         });
     }
     Ok(summaries)
@@ -1622,6 +1683,8 @@ mod tests {
             let old_info_ts = now - 15 * 86_400_000;
             // info event: 3 days old (within 7-day info tier)
             let recent_info_ts = now - 3 * 86_400_000;
+            // unmatched warning: 40 days old (beyond 30-day global fallback)
+            let old_unmatched_ts = now - 40 * 86_400_000;
 
             storage
                 .record_event(make_event(old_critical_ts, "critical", "error"))
@@ -1637,6 +1700,10 @@ mod tests {
                 .unwrap();
             storage
                 .record_event(make_event(recent_info_ts, "info", "detection"))
+                .await
+                .unwrap();
+            storage
+                .record_event(make_event(old_unmatched_ts, "warning", "other"))
                 .await
                 .unwrap();
 
@@ -1680,7 +1747,14 @@ mod tests {
                 .unwrap();
             assert_eq!(info_tier.deleted_rows, 1, "only the 15-day-old info event");
 
-            // 2 events should remain: the recent critical and the recent info
+            let fallback = plan
+                .tables
+                .iter()
+                .find(|table| table.table == "events (global fallback)")
+                .expect("tiered cleanup reports unmatched rows");
+            assert_eq!(fallback.deleted_rows, 1, "the unmatched old event");
+
+            // 2 events should remain: the recent critical and the recent info.
             let remaining = storage.count_events_before(now + 1000).await.unwrap();
             assert_eq!(remaining, 2, "2 recent events should survive cleanup");
 
@@ -3576,7 +3650,7 @@ mod tests {
     }
 
     #[test]
-    fn multiple_tiers_all_zero_retention_produces_no_event_entries() {
+    fn multiple_keep_forever_tiers_protect_their_rows_from_global_fallback() {
         run_async_test(async {
             let (storage, db_path) = setup_storage("all_tiers_zero").await;
             let now = now_ms();
@@ -3614,11 +3688,16 @@ mod tests {
 
             let plan = cleanup_apply(&storage, &config).await.expect("apply");
 
-            // All tiers have retention_days=0, so they should all be skipped
-            assert!(
-                !plan.tables.iter().any(|t| t.table.starts_with("events")),
-                "all zero-retention tiers should be skipped"
-            );
+            // Keep-forever tiers do not produce their own cleanup entries, but
+            // they must still exclude their first-match partitions from the
+            // global fallback. The fallback remains visible and exact.
+            let fallback = plan
+                .tables
+                .iter()
+                .find(|table| table.table == "events (global fallback)")
+                .expect("tiered cleanup reports the unmatched global fallback");
+            assert_eq!(fallback.eligible_rows, 0);
+            assert_eq!(fallback.deleted_rows, 0);
 
             // Both events should survive
             let remaining = storage.count_events_before(now + 1000).await.unwrap();

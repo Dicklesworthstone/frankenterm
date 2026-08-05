@@ -47,6 +47,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{Result, StorageError};
 use crate::capture_authority::CapturePersistenceHold;
+use crate::config::RetentionTier;
 use crate::events::event_identity_key;
 use crate::lru_cache::LruCache;
 use crate::policy::Redactor;
@@ -1007,6 +1008,16 @@ enum WriteCommand {
         batch_size: usize,
         respond: oneshot::Sender<Result<usize>>,
     },
+    /// Delete one disjoint first-match retention-policy branch.  `tier=None`
+    /// is the global fallback; `excluded_tiers` are all earlier ordered rules,
+    /// including keep-forever rules.
+    DeleteEventsByRetentionRule {
+        before_ts: i64,
+        tier: Option<RetentionTier>,
+        excluded_tiers: Vec<RetentionTier>,
+        batch_size: usize,
+        respond: oneshot::Sender<Result<usize>>,
+    },
     /// Insert a pane bookmark
     InsertPaneBookmark {
         record: PaneBookmarkRecord,
@@ -1161,6 +1172,7 @@ impl std::fmt::Debug for WriteCommand {
             Self::PurgeNotificationHistory { .. } => "PurgeNotificationHistory",
             Self::DeleteEventsBefore { .. } => "DeleteEventsBefore",
             Self::DeleteEventsByTier { .. } => "DeleteEventsByTier",
+            Self::DeleteEventsByRetentionRule { .. } => "DeleteEventsByRetentionRule",
             Self::InsertPaneBookmark { .. } => "InsertPaneBookmark",
             Self::DeletePaneBookmark { .. } => "DeletePaneBookmark",
             Self::InsertAgentProfile { .. } => "InsertAgentProfile",
@@ -4441,6 +4453,54 @@ impl StorageHandle {
         .await
     }
 
+    /// Count one disjoint ordered retention-policy branch.  `tier=None`
+    /// counts the global fallback; `excluded_tiers` must contain every earlier
+    /// rule so first-match and keep-forever precedence are preserved.
+    pub async fn count_events_by_retention_rule(
+        &self,
+        before_ts: i64,
+        tier: Option<&RetentionTier>,
+        excluded_tiers: &[RetentionTier],
+    ) -> Result<usize> {
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.count_events_by_retention_rule_with_cx(
+            &cx,
+            before_ts,
+            tier,
+            excluded_tiers,
+        )
+        .await
+    }
+
+    /// Cx-first sibling of [`count_events_by_retention_rule`].
+    pub async fn count_events_by_retention_rule_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        before_ts: i64,
+        tier: Option<&RetentionTier>,
+        excluded_tiers: &[RetentionTier],
+    ) -> Result<usize> {
+        Self::checkpoint_storage_operation(cx, "count_events_by_retention_rule")?;
+        let db_path = Arc::clone(&self.db_path);
+        let tier = tier.cloned();
+        let excluded_tiers = excluded_tiers.to_vec();
+        Self::spawn_blocking_storage_with_cx_with_join_error(
+            cx,
+            "Spawn blocking failed",
+            move || {
+                pooled_backend(db_path.as_str(), |backend| {
+                    count_events_by_retention_rule_backend(
+                        backend,
+                        before_ts,
+                        tier.as_ref(),
+                        &excluded_tiers,
+                    )
+                })
+            },
+        )
+        .await
+    }
+
     /// Count audit_actions older than a cutoff (read-path).
     pub async fn count_audit_actions_before(&self, before_ts: i64) -> Result<usize> {
         let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
@@ -4601,6 +4661,54 @@ impl StorageHandle {
             .await
             .map_err(|error| Self::writer_send_error("delete_events_by_tier", error))?;
 
+        Self::recv_writer_response(rx).await
+    }
+
+    /// Delete one disjoint ordered retention-policy branch.
+    pub async fn delete_events_by_retention_rule(
+        &self,
+        before_ts: i64,
+        tier: Option<&RetentionTier>,
+        excluded_tiers: &[RetentionTier],
+        batch_size: usize,
+    ) -> Result<usize> {
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.delete_events_by_retention_rule_with_cx(
+            &cx,
+            before_ts,
+            tier,
+            excluded_tiers,
+            batch_size,
+        )
+        .await
+    }
+
+    /// Cx-first sibling of [`delete_events_by_retention_rule`].
+    pub async fn delete_events_by_retention_rule_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        before_ts: i64,
+        tier: Option<&RetentionTier>,
+        excluded_tiers: &[RetentionTier],
+        batch_size: usize,
+    ) -> Result<usize> {
+        Self::checkpoint_storage_operation(cx, "delete_events_by_retention_rule")?;
+        let (tx, rx) = oneshot::channel();
+        self.write_tx
+            .send_with_cx(
+                cx,
+                WriteCommand::DeleteEventsByRetentionRule {
+                    before_ts,
+                    tier: tier.cloned(),
+                    excluded_tiers: excluded_tiers.to_vec(),
+                    batch_size,
+                    respond: tx,
+                },
+            )
+            .await
+            .map_err(|error| {
+                Self::writer_send_error("delete_events_by_retention_rule", error)
+            })?;
         Self::recv_writer_response(rx).await
     }
 
@@ -6139,6 +6247,130 @@ impl StorageHandle {
         Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Task join error", move || {
             pooled_backend(db_path.as_str(), |backend| {
                 query_events_stream_backend(backend, &query)
+            })
+        })
+        .await
+    }
+
+    /// Query a cursor page and its durable retention generation in one SQLite
+    /// statement.  Prefer this over pairing [`get_events_stream`] with an
+    /// independent oldest-row probe: ordinary filter gaps are not deletion
+    /// evidence, and the summary sentinel is returned even for an empty page.
+    pub async fn get_events_stream_page(&self, query: EventStreamQuery) -> Result<EventStreamPage> {
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.get_events_stream_page_with_cx(&cx, query).await
+    }
+
+    /// Cx-first sibling of [`get_events_stream_page`].
+    pub async fn get_events_stream_page_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        query: EventStreamQuery,
+    ) -> Result<EventStreamPage> {
+        Self::checkpoint_storage_operation(cx, "get_events_stream_page")?;
+        let db_path = Arc::clone(&self.db_path);
+
+        Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Task join error", move || {
+            pooled_backend(db_path.as_str(), |backend| {
+                query_events_stream_page_backend(backend, &query)
+            })
+        })
+        .await
+    }
+
+    /// Read the singleton retention summary.  This is a one-row query intended
+    /// for inexpensive generation polling outside the page API.
+    pub async fn get_event_retention_snapshot(&self) -> Result<EventRetentionSnapshot> {
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.get_event_retention_snapshot_with_cx(&cx).await
+    }
+
+    /// Cx-first sibling of [`get_event_retention_snapshot`].
+    pub async fn get_event_retention_snapshot_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+    ) -> Result<EventRetentionSnapshot> {
+        Self::checkpoint_storage_operation(cx, "get_event_retention_snapshot")?;
+        let db_path = Arc::clone(&self.db_path);
+        Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Task join error", move || {
+            pooled_backend(db_path.as_str(), event_retention_snapshot_backend)
+        })
+        .await
+    }
+
+    /// Determine whether retention deleted any ID in `(after_id, through_id]`.
+    ///
+    /// The answer comes from committed deletion evidence, never from gaps in a
+    /// filtered event query.  The earliest intersecting deletion interval is
+    /// returned so a follower can stop precisely at the first real hole.
+    pub async fn check_event_retention(
+        &self,
+        after_id: i64,
+        through_id: i64,
+    ) -> Result<EventRetentionCheck> {
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.check_event_retention_with_cx(&cx, after_id, through_id)
+            .await
+    }
+
+    /// Cx-first sibling of [`check_event_retention`].
+    pub async fn check_event_retention_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        after_id: i64,
+        through_id: i64,
+    ) -> Result<EventRetentionCheck> {
+        Self::checkpoint_storage_operation(cx, "check_event_retention")?;
+        let db_path = Arc::clone(&self.db_path);
+        Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Task join error", move || {
+            pooled_backend(db_path.as_str(), |backend| {
+                check_event_retention_backend(backend, after_id, through_id, None)
+            })
+        })
+        .await
+    }
+
+    /// Epoch-aware retention reconciliation for cursors emitted by
+    /// [`get_events_stream_page`].  A matching epoch makes post-v34 cursors
+    /// authoritative after its current evidence boundary, including on a
+    /// database upgraded from an unknowable legacy rowid history or rotated to
+    /// bound a sparse interval ledger; a mismatch fails closed.
+    pub async fn check_event_retention_in_epoch(
+        &self,
+        after_id: i64,
+        through_id: i64,
+        cursor_epoch: &str,
+    ) -> Result<EventRetentionCheck> {
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.check_event_retention_in_epoch_with_cx(
+            &cx,
+            after_id,
+            through_id,
+            cursor_epoch,
+        )
+        .await
+    }
+
+    /// Cx-first sibling of [`check_event_retention_in_epoch`].
+    pub async fn check_event_retention_in_epoch_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        after_id: i64,
+        through_id: i64,
+        cursor_epoch: &str,
+    ) -> Result<EventRetentionCheck> {
+        Self::checkpoint_storage_operation(cx, "check_event_retention_in_epoch")?;
+        validate_event_retention_cursor_epoch(cursor_epoch, "event retention cursor epoch")?;
+        let db_path = Arc::clone(&self.db_path);
+        let cursor_epoch = cursor_epoch.to_string();
+        Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Task join error", move || {
+            pooled_backend(db_path.as_str(), |backend| {
+                check_event_retention_backend(
+                    backend,
+                    after_id,
+                    through_id,
+                    Some(&cursor_epoch),
+                )
             })
         })
         .await
@@ -8461,6 +8693,77 @@ pub struct EventStreamQuery {
     pub until: Option<i64>,
 }
 
+/// Cheap durable summary accompanying cursor-stream pages.
+///
+/// `generation` advances once for every committed non-empty retention batch.
+/// Callers can cache it: when it is unchanged, no new event-deletion evidence
+/// has appeared since their previous reconciliation.  `max_event_id` is a
+/// durable high-water mark and never moves backwards, even after a full prune.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EventRetentionSnapshot {
+    pub cursor_epoch: String,
+    pub legacy_history_complete: bool,
+    pub generation: i64,
+    pub evidence_from_event_id: i64,
+    pub max_event_id: i64,
+    pub deleted_event_count: i64,
+    pub last_deleted_at: Option<i64>,
+}
+
+/// One exact, inclusive range of event IDs deleted by retention.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EventRetentionInterval {
+    pub start_id: i64,
+    pub end_id: i64,
+    pub first_generation: i64,
+    pub last_generation: i64,
+    pub first_deleted_at: i64,
+    pub last_deleted_at: i64,
+}
+
+/// Authoritative answer for a requested resume interval `(after_id, through_id]`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum EventRetentionStatus {
+    /// The entire checked interval is covered by the ledger and contains no
+    /// event ID deleted by retention.
+    CompleteNoPruning,
+    /// The earliest known deleted interval intersecting the checked range.
+    Pruned { interval: EventRetentionInterval },
+    /// No known deletion intersects the range, but part of it predates the
+    /// current evidence boundary after a v34 upgrade or bounded-ledger epoch
+    /// rotation. Callers must not guess.
+    LegacyHistoryUnavailable { evidence_from_event_id: i64 },
+    /// The cursor belongs to a different retention epoch. IDs alone are not
+    /// safe across an upgrade or bounded-ledger rotation.
+    CursorEpochMismatch,
+    /// The cursor is numerically beyond the durable allocator's high-water
+    /// mark. It is not a retention gap, but it is also not a proven current
+    /// cursor.
+    CursorAheadOfHighWater { max_event_id: i64 },
+}
+
+/// Durable retention reconciliation result for one cursor interval.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EventRetentionCheck {
+    pub requested_after_id: i64,
+    pub requested_through_id: i64,
+    /// The inclusive upper bound actually checked.  Requests beyond the
+    /// allocation high-water mark are clamped to `snapshot.max_event_id`.
+    pub checked_through_id: i64,
+    pub snapshot: EventRetentionSnapshot,
+    pub status: EventRetentionStatus,
+}
+
+/// Cursor page plus the retention generation observed in the same SQLite
+/// statement.  The sentinel summary row makes this a single-query operation,
+/// including when filters produce an empty page.
+#[derive(Debug, Clone)]
+pub struct EventStreamPage {
+    pub events: Vec<StoredEvent>,
+    pub retention: EventRetentionSnapshot,
+}
+
 /// Query options for export operations (shared across all export data kinds)
 #[derive(Debug, Clone, Default)]
 pub struct ExportQuery {
@@ -9668,6 +9971,7 @@ fn fail_undispatched_write_command(cmd: WriteCommand, message: String) -> bool {
         | WriteCommand::PurgeNotificationHistory { respond, .. }
         | WriteCommand::DeleteEventsBefore { respond, .. }
         | WriteCommand::DeleteEventsByTier { respond, .. }
+        | WriteCommand::DeleteEventsByRetentionRule { respond, .. }
         | WriteCommand::PruneSessionCheckpoints { respond, .. } => {
             respond_oneshot_best_effort(respond, writer_panic_error(&message));
         }
@@ -12660,6 +12964,23 @@ fn dispatch_write_command_raw(
             );
             respond_oneshot_best_effort(respond, result);
         }
+        WriteCommand::DeleteEventsByRetentionRule {
+            before_ts,
+            tier,
+            excluded_tiers,
+            batch_size,
+            respond,
+        } => {
+            let respond = WriterResultResponder::new(respond);
+            let result = delete_events_by_retention_rule_backend(
+                backend,
+                before_ts,
+                tier.as_ref(),
+                &excluded_tiers,
+                batch_size,
+            );
+            respond_oneshot_best_effort(respond, result);
+        }
         WriteCommand::InsertPaneBookmark { record, respond } => {
             let respond = WriterResultResponder::new(respond);
             let result = insert_pane_bookmark_backend(backend, &record);
@@ -13979,9 +14300,11 @@ fn record_event_backend(
     let pane_id_i64 = u64_to_i64(event.pane_id, "pane_id")?;
     let inserted_row = backend
         .query_row_typed(
-            "INSERT INTO events (pane_id, rule_id, agent_type, event_type, severity, confidence,
+            "INSERT INTO events (id, pane_id, rule_id, agent_type, event_type, severity, confidence,
              extracted, matched_text, segment_id, detected_at, dedupe_key)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+             SELECT max_event_id + 1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11
+             FROM event_retention_state
+             WHERE singleton = 1 AND max_event_id < 9223372036854775807
              ON CONFLICT(dedupe_key) DO NOTHING
              RETURNING id",
             &[
@@ -14007,28 +14330,56 @@ fn record_event_backend(
         return Ok(EventRecordOutcome::new(event_id, true));
     }
 
-    let Some(dedupe_key) = dedupe_key else {
-        return Err(StorageError::Database(
-            "non-deduplicated event insert returned no id".to_string(),
-        )
-        .into());
-    };
+    if let Some(dedupe_key) = dedupe_key {
+        let existing_row = backend
+            .query_row_typed(
+                "SELECT id FROM events
+                 JOIN event_retention_state AS retention
+                   ON retention.singleton = 1
+                  AND retention.max_event_id >= events.id
+                 WHERE events.dedupe_key = ?1",
+                &[ToSqlValue::Text(dedupe_key)],
+            )
+            .map_err(|err| storage_backend_error("Failed to resolve deduplicated event", err))?;
+        if let Some(existing_row) = existing_row {
+            let event_id = RowReader::new(&existing_row)
+                .i64(0)
+                .map_err(|err| storage_backend_error("Deduplicated event id", err))?;
+            return Ok(EventRecordOutcome::new(event_id, false));
+        }
+    }
 
-    let existing_row = backend
+    let allocator_row = backend
         .query_row_typed(
-            "SELECT id FROM events WHERE dedupe_key = ?1",
-            &[ToSqlValue::Text(dedupe_key)],
+            "SELECT max_event_id FROM event_retention_state WHERE singleton = 1",
+            &[],
         )
-        .map_err(|err| storage_backend_error("Failed to resolve deduplicated event", err))?
+        .map_err(|err| storage_backend_error("Validate event retention allocator", err))?
         .ok_or_else(|| {
             StorageError::Database(
-                "event dedupe conflict did not resolve to an existing row".to_string(),
+                "event retention allocator state is missing; refusing an ambiguous event insert"
+                    .to_string(),
             )
         })?;
-    let event_id = RowReader::new(&existing_row)
+    let max_event_id = RowReader::new(&allocator_row)
         .i64(0)
-        .map_err(|err| storage_backend_error("Deduplicated event id", err))?;
-    Ok(EventRecordOutcome::new(event_id, false))
+        .map_err(|err| storage_backend_error("Event retention allocator high-water", err))?;
+    if max_event_id < 0 {
+        return Err(StorageError::Database(
+            "event retention allocator high-water mark is negative".to_string(),
+        )
+        .into());
+    }
+    if max_event_id == i64::MAX {
+        return Err(StorageError::Database(
+            "event ID allocator is exhausted at i64::MAX".to_string(),
+        )
+        .into());
+    }
+    Err(StorageError::Database(
+        "event insert returned no id and no dedupe conflict was present".to_string(),
+    )
+    .into())
 }
 
 /// Mark event as handled through the storage backend.
@@ -16774,37 +17125,64 @@ fn list_pane_bookmarks_by_tag_backend(
 }
 
 fn prune_segments_backend(backend: &dyn StorageBackend, before_ts: i64) -> Result<usize> {
-    let deleted_rows = backend
-        .query_map_typed(
-            "DELETE FROM output_segments WHERE captured_at < ?1 RETURNING id",
+    backend
+        .execute("BEGIN IMMEDIATE")
+        .map_err(|err| storage_backend_error("Begin segment retention transaction", err))?;
+    let tx_result = (|| -> Result<usize> {
+        execute_typed(
+            backend,
+            "UPDATE events SET segment_id = NULL
+             WHERE segment_id IN (
+                 SELECT id FROM output_segments WHERE captured_at < ?1
+             )",
             &[ToSqlValue::Integer(before_ts)],
         )
-        .map_err(|err| storage_backend_error("Failed to prune segments", err))?;
-    let deleted = deleted_rows.len();
+        .map_err(|err| storage_backend_error("Detach retained event segments", err))?;
+        let deleted_rows = backend
+            .query_map_typed(
+                "DELETE FROM output_segments WHERE captured_at < ?1 RETURNING id",
+                &[ToSqlValue::Integer(before_ts)],
+            )
+            .map_err(|err| storage_backend_error("Failed to prune segments", err))?;
+        let deleted = deleted_rows.len();
 
-    // [ft-znu6v] Rewind stranded FTS progress after pruning.
-    //
-    // `append_segment_backend` assigns `seq = COALESCE(MAX(seq) + 1, 0)`,
-    // so after a full prune a live pane's
-    // next append restarts at seq=0. If a progress row still carries
-    // the pre-prune high-water mark, the strict `seq > last_indexed_seq`
-    // branch in `get_unindexed_segments_backend` would never
-    // surface the reset-chain rows. This is especially damaging under
-    // deferred-FTS (`defer_fts_triggers=true`), where the output_segments_fts
-    // delete triggers have been dropped and the normal cascade does not
-    // clean stale FTS state either.
-    //
-    // Drop any progress row whose `last_indexed_seq` no longer maps to a
-    // surviving row for that pane. The COALESCE(..., -1) treats the
-    // "no remaining rows for pane" case as `max_seq = -1`, so any
-    // recorded `last_indexed_seq >= 0` triggers the delete. A subsequent
-    // `sync_fts_for_pane_backend` sees `had_prior_progress = false` and takes
-    // the inclusive `WHERE pane_id = ?1` branch, picking up seq=0.
-    if deleted > 0 {
-        rewind_stranded_fts_progress_backend(backend)?;
+        // [ft-znu6v] Rewind stranded FTS progress after pruning.
+        //
+        // `append_segment_backend` assigns `seq = COALESCE(MAX(seq) + 1, 0)`,
+        // so after a full prune a live pane's next append restarts at seq=0.
+        // If a progress row still carries the pre-prune high-water mark, the
+        // strict `seq > last_indexed_seq` branch in
+        // `get_unindexed_segments_backend` would never surface the reset-chain
+        // rows. This is especially damaging under deferred FTS
+        // (`defer_fts_triggers=true`), where the output_segments_fts delete
+        // triggers have been dropped and the normal cascade does not clean
+        // stale FTS state either.
+        //
+        // Drop any progress row whose `last_indexed_seq` no longer maps to a
+        // surviving row for that pane. The COALESCE(..., -1) treats the "no
+        // remaining rows for pane" case as `max_seq = -1`, so any recorded
+        // `last_indexed_seq >= 0` triggers the delete. A subsequent
+        // `sync_fts_for_pane_backend` sees `had_prior_progress = false` and
+        // takes the inclusive `WHERE pane_id = ?1` branch, picking up seq=0.
+        if deleted > 0 {
+            rewind_stranded_fts_progress_backend(backend)?;
+        }
+        Ok(deleted)
+    })();
+
+    match tx_result {
+        Ok(deleted) => match backend.execute("COMMIT") {
+            Ok(_) => Ok(deleted),
+            Err(error) => {
+                let _ = backend.execute("ROLLBACK");
+                Err(storage_backend_error("Commit segment retention transaction", error).into())
+            }
+        },
+        Err(error) => {
+            let _ = backend.execute("ROLLBACK");
+            Err(error)
+        }
     }
-
-    Ok(deleted)
 }
 
 /// Drop any `fts_pane_progress` row whose `last_indexed_seq` no longer maps to a
@@ -16871,21 +17249,67 @@ fn delete_oldest_segments_backend(backend: &dyn StorageBackend, limit: usize) ->
     if limit == 0 {
         return Ok(0);
     }
-    let deleted_rows = backend
-        .query_map_typed(
-            "DELETE FROM output_segments WHERE id IN (
-                 SELECT id FROM output_segments ORDER BY captured_at ASC, id ASC LIMIT ?1
-             ) RETURNING id",
-            &[ToSqlValue::Integer(
-                i64::try_from(limit).unwrap_or(i64::MAX),
-            )],
+    let limit = usize_to_i64(limit, "segment size-eviction batch size")?;
+    backend
+        .execute("BEGIN IMMEDIATE")
+        .map_err(|err| storage_backend_error("Begin segment size-eviction transaction", err))?;
+    let tx_result = (|| -> Result<usize> {
+        backend
+            .execute(
+                "CREATE TEMP TABLE IF NOT EXISTS segment_retention_delete_batch (
+                     id INTEGER PRIMARY KEY
+                 )",
+            )
+            .map_err(|err| storage_backend_error("Create segment delete batch", err))?;
+        backend
+            .execute("DELETE FROM segment_retention_delete_batch")
+            .map_err(|err| storage_backend_error("Clear segment delete batch", err))?;
+        execute_typed(
+            backend,
+            "INSERT INTO segment_retention_delete_batch (id)
+             SELECT id FROM output_segments
+             ORDER BY captured_at ASC, id ASC LIMIT ?1",
+            &[ToSqlValue::Integer(limit)],
         )
-        .map_err(|err| storage_backend_error("Failed to evict oldest segments", err))?;
-    let deleted = deleted_rows.len();
-    if deleted > 0 {
-        rewind_stranded_fts_progress_backend(backend)?;
+        .map_err(|err| storage_backend_error("Select oldest segment delete batch", err))?;
+        execute_typed(
+            backend,
+            "UPDATE events SET segment_id = NULL
+             WHERE segment_id IN (SELECT id FROM segment_retention_delete_batch)",
+            &[],
+        )
+        .map_err(|err| storage_backend_error("Detach size-evicted event segments", err))?;
+        let deleted_rows = backend
+            .query_map_typed(
+                "DELETE FROM output_segments
+                 WHERE id IN (SELECT id FROM segment_retention_delete_batch)
+                 RETURNING id",
+                &[],
+            )
+            .map_err(|err| storage_backend_error("Failed to evict oldest segments", err))?;
+        let deleted = deleted_rows.len();
+        if deleted > 0 {
+            rewind_stranded_fts_progress_backend(backend)?;
+        }
+        backend
+            .execute("DELETE FROM segment_retention_delete_batch")
+            .map_err(|err| storage_backend_error("Clear committed segment delete batch", err))?;
+        Ok(deleted)
+    })();
+    match tx_result {
+        Ok(deleted) => match backend.execute("COMMIT") {
+            Ok(_) => Ok(deleted),
+            Err(error) => {
+                let _ = backend.execute("ROLLBACK");
+                Err(storage_backend_error("Commit segment size-eviction transaction", error)
+                    .into())
+            }
+        },
+        Err(error) => {
+            let _ = backend.execute("ROLLBACK");
+            Err(error)
+        }
     }
-    Ok(deleted)
 }
 
 /// Enforce a size-based retention cap by evicting the oldest output segments
@@ -17518,7 +17942,7 @@ fn count_events_before_backend(backend: &dyn StorageBackend, before_ts: i64) -> 
     let count = count_table_where(
         backend,
         "events",
-        "detected_at < ?1",
+        "detected_at < ?1 AND delivery_lease_token IS NULL",
         &[ToSqlValue::Integer(before_ts)],
     )
     .map_err(|err| storage_backend_error("Failed to count events", err))?;
@@ -17548,6 +17972,29 @@ fn count_events_by_tier_backend(
             )
         })?;
     count_query_row_to_usize(&row, "Failed to count events by tier row")
+}
+
+fn count_events_by_retention_rule_backend(
+    backend: &dyn StorageBackend,
+    before_ts: i64,
+    tier: Option<&RetentionTier>,
+    excluded_tiers: &[RetentionTier],
+) -> Result<usize> {
+    let (sql, params) = build_retention_rule_query(
+        "SELECT COUNT(*) FROM events",
+        before_ts,
+        tier,
+        excluded_tiers,
+    );
+    let row = backend
+        .query_row_typed(&sql, &params)
+        .map_err(|err| storage_backend_error("Count ordered event retention rule", err))?
+        .ok_or_else(|| {
+            StorageError::Database(
+                "ordered event retention count returned no row".to_string(),
+            )
+        })?;
+    count_query_row_to_usize(&row, "Ordered event retention count row")
 }
 
 fn count_audit_actions_before_backend(
@@ -17592,35 +18039,44 @@ fn count_notification_history_before_backend(
     count_i64_to_usize(count, "Failed to count notification history row")
 }
 
+const EVENT_RETENTION_DELETE_BATCH_MAX: usize = 8_192;
+
+/// Maximum number of exact deletion intervals retained in one cursor epoch.
+///
+/// Sparse tier rules can otherwise produce one interval per deleted event.
+/// 65,536 rows keeps the table and its `end_id` index in the low tens of MiB
+/// even with SQLite page overhead.  Crossing the bound rotates the opaque
+/// cursor epoch and advances the evidence boundary in the same delete
+/// transaction, so committed state stays bounded without claiming that old
+/// holes remain reconstructible.
+const EVENT_RETENTION_INTERVAL_ROW_MAX: usize = 65_536;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RetentionIntervalRow {
+    start_id: i64,
+    end_id: i64,
+    first_generation: i64,
+    last_generation: i64,
+    first_deleted_at: i64,
+    last_deleted_at: i64,
+}
+
+fn bounded_event_retention_batch_size(requested: usize) -> usize {
+    requested.min(EVENT_RETENTION_DELETE_BATCH_MAX)
+}
+
 fn delete_events_before_backend(
     backend: &dyn StorageBackend,
     before_ts: i64,
     batch_size: usize,
 ) -> Result<usize> {
-    if batch_size == 0 {
-        return Ok(0);
-    }
-
-    let mut total_deleted = 0usize;
-    loop {
-        let deleted = backend
-            .query_map_typed(
-                "DELETE FROM events WHERE id IN (\
-                 SELECT id FROM events WHERE detected_at < ?1 LIMIT ?2) \
-                 RETURNING 1",
-                &[
-                    ToSqlValue::Integer(before_ts),
-                    ToSqlValue::Integer(batch_size as i64),
-                ],
-            )
-            .map_err(|err| storage_backend_error("Failed to delete events", err))?
-            .len();
-        total_deleted += deleted;
-        if deleted < batch_size {
-            break;
-        }
-    }
-    Ok(total_deleted)
+    delete_events_with_retention_ledger_backend(
+        backend,
+        "SELECT id FROM events WHERE detected_at < ?",
+        &[ToSqlValue::Integer(before_ts)],
+        batch_size,
+        "flat event retention",
+    )
 }
 
 fn delete_events_by_tier_backend(
@@ -17631,32 +18087,571 @@ fn delete_events_by_tier_backend(
     handled: Option<bool>,
     batch_size: usize,
 ) -> Result<usize> {
-    if batch_size == 0 {
-        return Ok(0);
-    }
-
-    let (inner_query, params) = build_tier_query(
+    let (candidate_query, params) = build_tier_query(
         "SELECT id FROM events",
         before_ts,
         severities,
         event_types,
         handled,
     );
-    let delete_sql =
-        format!("DELETE FROM events WHERE id IN ({inner_query} LIMIT {batch_size}) RETURNING 1");
+    delete_events_with_retention_ledger_backend(
+        backend,
+        &candidate_query,
+        &params,
+        batch_size,
+        "tiered event retention",
+    )
+}
+
+fn delete_events_by_retention_rule_backend(
+    backend: &dyn StorageBackend,
+    before_ts: i64,
+    tier: Option<&RetentionTier>,
+    excluded_tiers: &[RetentionTier],
+    batch_size: usize,
+) -> Result<usize> {
+    let (candidate_query, params) = build_retention_rule_query(
+        "SELECT id FROM events",
+        before_ts,
+        tier,
+        excluded_tiers,
+    );
+    delete_events_with_retention_ledger_backend(
+        backend,
+        &candidate_query,
+        &params,
+        batch_size,
+        "ordered event retention rule",
+    )
+}
+
+fn delete_events_with_retention_ledger_backend(
+    backend: &dyn StorageBackend,
+    candidate_query: &str,
+    candidate_params: &[ToSqlValue<'_>],
+    requested_batch_size: usize,
+    operation: &str,
+) -> Result<usize> {
+    let batch_size = bounded_event_retention_batch_size(requested_batch_size);
+    if batch_size == 0 {
+        return Ok(0);
+    }
+    let batch_size_i64 = usize_to_i64(batch_size, "event retention batch size")?;
 
     let mut total_deleted = 0usize;
     loop {
-        let deleted = backend
-            .query_map_typed(&delete_sql, &params)
-            .map_err(|err| storage_backend_error("Failed to delete events by tier", err))?
-            .len();
-        total_deleted += deleted;
+        let deleted = delete_event_retention_batch_backend(
+            backend,
+            candidate_query,
+            candidate_params,
+            batch_size_i64,
+            operation,
+            EVENT_RETENTION_INTERVAL_ROW_MAX,
+        )?;
+        total_deleted = total_deleted.checked_add(deleted).ok_or_else(|| {
+            StorageError::Database(format!("{operation} deleted-row count overflow"))
+        })?;
         if deleted < batch_size {
-            break;
+            return Ok(total_deleted);
         }
     }
-    Ok(total_deleted)
+}
+
+fn delete_event_retention_batch_backend(
+    backend: &dyn StorageBackend,
+    candidate_query: &str,
+    candidate_params: &[ToSqlValue<'_>],
+    batch_size: i64,
+    operation: &str,
+    interval_row_limit: usize,
+) -> Result<usize> {
+    backend
+        .execute("BEGIN IMMEDIATE")
+        .map_err(|err| storage_backend_error("Begin event retention transaction", err))?;
+
+    let tx_result = (|| -> Result<usize> {
+        let now = now_ms();
+        let stale_authorizations = count_table_where(
+            backend,
+            "event_retention_delete_authorizations",
+            "1=1",
+            &[],
+        )
+        .map_err(|err| storage_backend_error("Check event retention delete batch", err))?;
+        if stale_authorizations != 0 {
+            return Err(StorageError::Database(format!(
+                "event retention delete authorization table was non-empty outside a batch: {stale_authorizations} rows"
+            ))
+            .into());
+        }
+        let mut params = candidate_params.to_vec();
+        params.push(ToSqlValue::Integer(batch_size));
+        let candidate_sql = format!(
+            "{candidate_query}
+             AND delivery_lease_token IS NULL
+             ORDER BY id ASC LIMIT ?"
+        );
+        let candidate_rows = backend
+            .query_map_typed(&candidate_sql, &params)
+            .map_err(|err| storage_backend_error("Select event retention candidates", err))?;
+        let mut candidate_ids = Vec::with_capacity(candidate_rows.len());
+        for row in &candidate_rows {
+            let id = RowReader::new(row)
+                .i64(0)
+                .map_err(|err| storage_backend_error("Event retention candidate id", err))?;
+            if id <= 0 || candidate_ids.last().is_some_and(|previous| *previous >= id) {
+                return Err(StorageError::Database(format!(
+                    "{operation} returned a non-positive or non-increasing event id: {id}"
+                ))
+                .into());
+            }
+            candidate_ids.push(id);
+        }
+        if candidate_ids.is_empty() {
+            return Ok(0);
+        }
+
+        let id_rows = candidate_ids
+            .iter()
+            .map(|id| vec![ToSqlValue::Integer(*id)])
+            .collect::<Vec<_>>();
+        backend
+            .execute_many(
+                "INSERT INTO event_retention_delete_authorizations (event_id) VALUES (?1)",
+                &id_rows,
+            )
+            .map_err(|err| storage_backend_error("Populate event retention delete batch", err))?;
+
+        // Preserve workflow history while removing the restrictive FK edge.
+        // This is the transactional equivalent of ON DELETE SET NULL for the
+        // legacy schema and prevents one referenced event from aborting an
+        // otherwise-valid retention batch.
+        backend
+            .execute(
+                "UPDATE workflow_executions SET trigger_event_id = NULL
+                 WHERE trigger_event_id IN (
+                     SELECT event_id FROM event_retention_delete_authorizations
+                 )",
+            )
+            .map_err(|err| storage_backend_error("Detach retained workflow trigger events", err))?;
+
+        let deleted_rows = backend
+            .query_map_typed(
+                "DELETE FROM events
+                 WHERE id IN (SELECT event_id FROM event_retention_delete_authorizations)
+                 RETURNING id",
+                &[],
+            )
+            .map_err(|err| storage_backend_error("Delete retained events", err))?;
+        let mut deleted_ids = Vec::with_capacity(deleted_rows.len());
+        for row in &deleted_rows {
+            deleted_ids.push(
+                RowReader::new(row)
+                    .i64(0)
+                    .map_err(|err| storage_backend_error("Deleted event id", err))?,
+            );
+        }
+        deleted_ids.sort_unstable();
+        if deleted_ids != candidate_ids {
+            return Err(StorageError::Database(format!(
+                "{operation} candidate/delete mismatch: selected {} ids but deleted {}",
+                candidate_ids.len(),
+                deleted_ids.len()
+            ))
+            .into());
+        }
+
+        let deleted_count = usize_to_i64(candidate_ids.len(), "event retention deleted count")?;
+        let generation_row = backend
+            .query_row_typed(
+                "UPDATE event_retention_state
+                 SET generation = generation + 1,
+                     deleted_event_count = deleted_event_count + ?1,
+                     last_deleted_at = CASE
+                         WHEN last_deleted_at IS NULL OR last_deleted_at < ?2 THEN ?2
+                         ELSE last_deleted_at
+                     END
+                 WHERE singleton = 1
+                   AND generation < 9223372036854775807
+                   AND deleted_event_count <= 9223372036854775807 - ?1
+                 RETURNING generation, evidence_from_event_id",
+                &[
+                    ToSqlValue::Integer(deleted_count),
+                    ToSqlValue::Integer(now),
+                ],
+            )
+            .map_err(|err| storage_backend_error("Advance event retention generation", err))?
+            .ok_or_else(|| {
+                StorageError::Database(
+                    "event retention state is missing or its counters are exhausted".to_string(),
+                )
+            })?;
+        let generation = RowReader::new(&generation_row)
+            .i64(0)
+            .map_err(|err| storage_backend_error("Event retention generation", err))?;
+        let evidence_from_event_id = RowReader::new(&generation_row)
+            .i64(1)
+            .map_err(|err| storage_backend_error("Event retention evidence boundary", err))?;
+        if evidence_from_event_id <= 0 {
+            return Err(StorageError::Database(format!(
+                "event retention evidence boundary is invalid: {evidence_from_event_id}"
+            ))
+            .into());
+        }
+        // After a bounded-ledger epoch rotation, IDs below the new evidence
+        // boundary are deliberately unknowable. A long-running cleanup may
+        // still delete such legacy rows in later batches. Do not re-materialize
+        // those old holes in the new epoch: they cannot make a current-epoch
+        // cursor less complete, and retaining them would cause needless
+        // repeated rotations under sparse tier rules.
+        let authoritative_start = candidate_ids
+            .partition_point(|event_id| *event_id < evidence_from_event_id);
+        record_event_retention_intervals_backend(
+            backend,
+            &candidate_ids[authoritative_start..],
+            generation,
+            now,
+        )?;
+        enforce_event_retention_interval_bound_backend(backend, interval_row_limit)?;
+
+        backend
+            .execute("DELETE FROM event_retention_delete_authorizations")
+            .map_err(|err| storage_backend_error("Clear committed event delete batch", err))?;
+        Ok(candidate_ids.len())
+    })();
+
+    match tx_result {
+        Ok(deleted) => match backend.execute("COMMIT") {
+            Ok(_) => Ok(deleted),
+            Err(commit_error) => {
+                let _ = backend.execute("ROLLBACK");
+                Err(storage_backend_error("Commit event retention transaction", commit_error)
+                    .into())
+            }
+        },
+        Err(error) => {
+            let _ = backend.execute("ROLLBACK");
+            Err(error)
+        }
+    }
+}
+
+/// Enforce the per-epoch exact-interval ceiling after a complete deletion
+/// batch has been materialized.  Rotation deliberately happens only after the
+/// batch is complete: rotating in the middle would let later rows from the same
+/// old-epoch deletion masquerade as evidence in the new epoch. The caller must
+/// hold the same `BEGIN IMMEDIATE` transaction that deleted the events.
+fn enforce_event_retention_interval_bound_backend(
+    backend: &dyn StorageBackend,
+    interval_row_limit: usize,
+) -> Result<bool> {
+    let interval_rows = count_table_where(backend, "event_retention_intervals", "1=1", &[])
+        .map_err(|err| storage_backend_error("Count event retention intervals", err))?;
+    let interval_rows = count_i64_to_usize(interval_rows, "Event retention interval count")?;
+    if interval_rows <= interval_row_limit {
+        return Ok(false);
+    }
+
+    let snapshot = event_retention_snapshot_backend(backend)?;
+    if snapshot.max_event_id == i64::MAX {
+        return Err(StorageError::Database(format!(
+            "event retention interval ceiling {interval_row_limit} exceeded at the exhausted event ID high-water mark; refusing deletion because a successor evidence boundary cannot be represented"
+        ))
+        .into());
+    }
+    let stale_rotation_authorizations = count_table_where(
+        backend,
+        "event_retention_rotation_authorizations",
+        "1=1",
+        &[],
+    )
+    .map_err(|err| storage_backend_error("Check event retention rotation authorization", err))?;
+    if stale_rotation_authorizations != 0 {
+        return Err(StorageError::Database(format!(
+            "event retention rotation authorization table was non-empty outside rotation: {stale_rotation_authorizations} rows"
+        ))
+        .into());
+    }
+    backend
+        .execute(
+            "INSERT INTO event_retention_rotation_authorizations (singleton) VALUES (1)",
+        )
+        .map_err(|err| storage_backend_error("Authorize event retention epoch rotation", err))?;
+    let rotated = backend
+        .query_row_typed(
+            "UPDATE event_retention_state
+             SET cursor_epoch = lower(hex(randomblob(16))),
+                 legacy_history_complete = 0,
+                 evidence_from_event_id = max_event_id + 1
+             WHERE singleton = 1 AND max_event_id < 9223372036854775807
+             RETURNING cursor_epoch",
+            &[],
+        )
+        .map_err(|err| storage_backend_error("Rotate event retention cursor epoch", err))?
+        .ok_or_else(|| {
+            StorageError::Database(
+                "event retention epoch rotation lost its singleton state".to_string(),
+            )
+        })?;
+    let rotated_epoch = RowReader::new(&rotated)
+        .string(0)
+        .map_err(|err| storage_backend_error("Rotated event retention cursor epoch", err))?;
+    validate_event_retention_cursor_epoch(
+        &rotated_epoch,
+        "rotated event retention cursor epoch",
+    )?;
+    if rotated_epoch == snapshot.cursor_epoch {
+        return Err(StorageError::Database(
+            "event retention epoch rotation generated the existing cursor epoch; refusing to clear authoritative intervals"
+                .to_string(),
+        )
+        .into());
+    }
+    backend
+        .execute("DELETE FROM event_retention_intervals")
+        .map_err(|err| storage_backend_error("Clear rotated event retention intervals", err))?;
+    backend
+        .execute("DELETE FROM event_retention_rotation_authorizations")
+        .map_err(|err| storage_backend_error("Clear event retention rotation authorization", err))?;
+    let remaining = count_table_where(backend, "event_retention_intervals", "1=1", &[])
+        .map_err(|err| storage_backend_error("Verify rotated retention intervals", err))?;
+    if remaining != 0 {
+        return Err(StorageError::Database(format!(
+            "event retention epoch rotation left {remaining} stale interval rows"
+        ))
+        .into());
+    }
+    Ok(true)
+}
+
+fn event_ids_to_retention_intervals(
+    ids: &[i64],
+    generation: i64,
+    deleted_at: i64,
+) -> Result<Vec<RetentionIntervalRow>> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut intervals = Vec::new();
+    let mut start = ids[0];
+    let mut end = ids[0];
+    if start <= 0 {
+        return Err(StorageError::Database(format!(
+            "event retention cannot record non-positive id {start}"
+        ))
+        .into());
+    }
+    for &id in &ids[1..] {
+        if id <= end {
+            return Err(StorageError::Database(format!(
+                "event retention ids must be strictly increasing: {end}, {id}"
+            ))
+            .into());
+        }
+        if end.checked_add(1) == Some(id) {
+            end = id;
+            continue;
+        }
+        intervals.push(RetentionIntervalRow {
+            start_id: start,
+            end_id: end,
+            first_generation: generation,
+            last_generation: generation,
+            first_deleted_at: deleted_at,
+            last_deleted_at: deleted_at,
+        });
+        start = id;
+        end = id;
+    }
+    intervals.push(RetentionIntervalRow {
+        start_id: start,
+        end_id: end,
+        first_generation: generation,
+        last_generation: generation,
+        first_deleted_at: deleted_at,
+        last_deleted_at: deleted_at,
+    });
+    Ok(intervals)
+}
+
+fn record_event_retention_intervals_backend(
+    backend: &dyn StorageBackend,
+    deleted_ids: &[i64],
+    generation: i64,
+    deleted_at: i64,
+) -> Result<()> {
+    let new_intervals = event_ids_to_retention_intervals(deleted_ids, generation, deleted_at)?;
+    if new_intervals.is_empty() {
+        return Ok(());
+    }
+
+    backend
+        .execute(
+            "CREATE TEMP TABLE IF NOT EXISTS event_retention_new_intervals (
+                 start_id INTEGER PRIMARY KEY,
+                 end_id INTEGER NOT NULL
+             )",
+        )
+        .map_err(|err| storage_backend_error("Create new retention interval batch", err))?;
+    backend
+        .execute("DELETE FROM event_retention_new_intervals")
+        .map_err(|err| storage_backend_error("Clear new retention interval batch", err))?;
+    let new_rows = new_intervals
+        .iter()
+        .map(|interval| {
+            vec![
+                ToSqlValue::Integer(interval.start_id),
+                ToSqlValue::Integer(interval.end_id),
+            ]
+        })
+        .collect::<Vec<_>>();
+    backend
+        .execute_many(
+            "INSERT INTO event_retention_new_intervals (start_id, end_id)
+             VALUES (?1, ?2)",
+            &new_rows,
+        )
+        .map_err(|err| storage_backend_error("Populate new retention interval batch", err))?;
+
+    let neighbor_limit = new_intervals
+        .len()
+        .checked_mul(2)
+        .and_then(|value| value.checked_add(1))
+        .ok_or_else(|| {
+            StorageError::Database("event retention neighbor bound overflow".to_string())
+        })?;
+    let neighbor_limit_i64 = usize_to_i64(neighbor_limit, "event retention neighbor bound")?;
+    let neighbor_rows = backend
+        .query_map_typed(
+            "SELECT existing.start_id, existing.end_id,
+                    existing.first_generation, existing.last_generation,
+                    existing.first_deleted_at, existing.last_deleted_at
+             FROM event_retention_intervals AS existing
+             WHERE EXISTS (
+                 SELECT 1 FROM event_retention_new_intervals AS new
+                 WHERE existing.end_id >= CASE
+                           WHEN new.start_id > 1 THEN new.start_id - 1 ELSE 1
+                       END
+                   AND existing.start_id <= CASE
+                           WHEN new.end_id < 9223372036854775807 THEN new.end_id + 1
+                           ELSE 9223372036854775807
+                       END
+             )
+             ORDER BY existing.start_id ASC
+             LIMIT ?1",
+            &[ToSqlValue::Integer(neighbor_limit_i64)],
+        )
+        .map_err(|err| storage_backend_error("Query adjacent retention intervals", err))?;
+    if neighbor_rows.len() == neighbor_limit {
+        return Err(StorageError::Database(
+            "event retention interval ledger is overlapping or otherwise non-canonical"
+                .to_string(),
+        )
+        .into());
+    }
+
+    let mut combined = Vec::with_capacity(new_intervals.len() + neighbor_rows.len());
+    combined.extend(new_intervals);
+    for row in &neighbor_rows {
+        let reader = RowReader::new(row);
+        combined.push(RetentionIntervalRow {
+            start_id: reader
+                .i64(0)
+                .map_err(|err| storage_backend_error("Retention neighbor start", err))?,
+            end_id: reader
+                .i64(1)
+                .map_err(|err| storage_backend_error("Retention neighbor end", err))?,
+            first_generation: reader.i64(2).map_err(|err| {
+                storage_backend_error("Retention neighbor first generation", err)
+            })?,
+            last_generation: reader.i64(3).map_err(|err| {
+                storage_backend_error("Retention neighbor last generation", err)
+            })?,
+            first_deleted_at: reader.i64(4).map_err(|err| {
+                storage_backend_error("Retention neighbor first deletion time", err)
+            })?,
+            last_deleted_at: reader.i64(5).map_err(|err| {
+                storage_backend_error("Retention neighbor last deletion time", err)
+            })?,
+        });
+    }
+    combined.sort_unstable_by_key(|interval| interval.start_id);
+
+    let mut merged: Vec<RetentionIntervalRow> = Vec::with_capacity(combined.len());
+    for interval in combined {
+        if interval.start_id <= 0
+            || interval.end_id < interval.start_id
+            || interval.first_generation <= 0
+            || interval.last_generation < interval.first_generation
+            || interval.last_deleted_at < interval.first_deleted_at
+        {
+            return Err(StorageError::Database(format!(
+                "invalid event retention interval encountered: {interval:?}"
+            ))
+            .into());
+        }
+        let Some(previous) = merged.last_mut() else {
+            merged.push(interval);
+            continue;
+        };
+        if interval.start_id <= previous.end_id {
+            return Err(StorageError::Database(format!(
+                "overlapping event retention intervals: {previous:?} and {interval:?}"
+            ))
+            .into());
+        }
+        if previous.end_id.checked_add(1) == Some(interval.start_id) {
+            previous.end_id = interval.end_id;
+            previous.first_generation = previous.first_generation.min(interval.first_generation);
+            previous.last_generation = previous.last_generation.max(interval.last_generation);
+            previous.first_deleted_at = previous.first_deleted_at.min(interval.first_deleted_at);
+            previous.last_deleted_at = previous.last_deleted_at.max(interval.last_deleted_at);
+        } else {
+            merged.push(interval);
+        }
+    }
+
+    backend
+        .execute(
+            "DELETE FROM event_retention_intervals
+             WHERE EXISTS (
+                 SELECT 1 FROM event_retention_new_intervals AS new
+                 WHERE event_retention_intervals.end_id >= CASE
+                           WHEN new.start_id > 1 THEN new.start_id - 1 ELSE 1
+                       END
+                   AND event_retention_intervals.start_id <= CASE
+                           WHEN new.end_id < 9223372036854775807 THEN new.end_id + 1
+                           ELSE 9223372036854775807
+                       END
+             )",
+        )
+        .map_err(|err| storage_backend_error("Remove compacted retention intervals", err))?;
+    let merged_rows = merged
+        .iter()
+        .map(|interval| {
+            vec![
+                ToSqlValue::Integer(interval.start_id),
+                ToSqlValue::Integer(interval.end_id),
+                ToSqlValue::Integer(interval.first_generation),
+                ToSqlValue::Integer(interval.last_generation),
+                ToSqlValue::Integer(interval.first_deleted_at),
+                ToSqlValue::Integer(interval.last_deleted_at),
+            ]
+        })
+        .collect::<Vec<_>>();
+    backend
+        .execute_many(
+            "INSERT INTO event_retention_intervals (
+                 start_id, end_id, first_generation, last_generation,
+                 first_deleted_at, last_deleted_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            &merged_rows,
+        )
+        .map_err(|err| storage_backend_error("Insert compacted retention intervals", err))?;
+    backend
+        .execute("DELETE FROM event_retention_new_intervals")
+        .map_err(|err| storage_backend_error("Clear new retention interval batch", err))?;
+    Ok(())
 }
 
 /// Build a tier-filtered query clause with positional parameters.
@@ -17667,37 +18662,82 @@ fn build_tier_query(
     event_types: &[String],
     handled: Option<bool>,
 ) -> (String, Vec<ToSqlValue<'static>>) {
-    let mut sql = format!("{select_prefix} WHERE detected_at < ?");
-    let mut params: Vec<ToSqlValue<'static>> = vec![ToSqlValue::Integer(before_ts)];
+    let tier = RetentionTier {
+        name: "ad-hoc".to_string(),
+        retention_days: 0,
+        severities: severities.to_vec(),
+        event_types: event_types.to_vec(),
+        handled,
+    };
+    build_retention_rule_query(select_prefix, before_ts, Some(&tier), &[])
+}
 
-    if !severities.is_empty() {
-        let placeholders: Vec<String> = severities.iter().map(|_| "?".to_string()).collect();
-        sql.push_str(&format!(" AND severity IN ({})", placeholders.join(",")));
-        for s in severities {
-            params.push(ToSqlValue::OwnedText(s.clone()));
-        }
+fn build_retention_rule_query(
+    select_prefix: &str,
+    before_ts: i64,
+    tier: Option<&RetentionTier>,
+    excluded_tiers: &[RetentionTier],
+) -> (String, Vec<ToSqlValue<'static>>) {
+    let mut sql =
+        format!("{select_prefix} WHERE detected_at < ? AND delivery_lease_token IS NULL");
+    let mut params = vec![ToSqlValue::Integer(before_ts)];
+    if let Some(tier) = tier {
+        let predicate = retention_tier_match_predicate(tier, &mut params);
+        sql.push_str(" AND (");
+        sql.push_str(&predicate);
+        sql.push(')');
     }
-
-    if !event_types.is_empty() {
-        let conditions: Vec<String> = event_types
-            .iter()
-            .map(|_| "event_type LIKE ?".to_string())
-            .collect();
-        sql.push_str(&format!(" AND ({})", conditions.join(" OR ")));
-        for et in event_types {
-            params.push(ToSqlValue::OwnedText(format!("{et}%")));
-        }
+    for excluded in excluded_tiers {
+        let predicate = retention_tier_match_predicate(excluded, &mut params);
+        sql.push_str(" AND NOT (");
+        sql.push_str(&predicate);
+        sql.push(')');
     }
-
-    if let Some(want_handled) = handled {
-        if want_handled {
-            sql.push_str(" AND handled_at IS NOT NULL");
-        } else {
-            sql.push_str(" AND handled_at IS NULL");
-        }
-    }
-
     (sql, params)
+}
+
+fn retention_tier_match_predicate(
+    tier: &RetentionTier,
+    params: &mut Vec<ToSqlValue<'static>>,
+) -> String {
+    let mut clauses = Vec::new();
+    if !tier.severities.is_empty() {
+        let conditions = tier
+            .severities
+            .iter()
+            .map(|severity| {
+                params.push(ToSqlValue::OwnedText(severity.clone()));
+                "severity = ? COLLATE NOCASE".to_string()
+            })
+            .collect::<Vec<_>>();
+        clauses.push(format!("({})", conditions.join(" OR ")));
+    }
+    if !tier.event_types.is_empty() {
+        let conditions = tier
+            .event_types
+            .iter()
+            .map(|event_type| {
+                params.push(ToSqlValue::OwnedText(event_type.clone()));
+                params.push(ToSqlValue::OwnedText(event_type.clone()));
+                // Equality remains BINARY/case-sensitive and treats %, _, and
+                // backslash literally, matching Rust's `str::starts_with`.
+                "substr(event_type, 1, length(?)) = ? COLLATE BINARY".to_string()
+            })
+            .collect::<Vec<_>>();
+        clauses.push(format!("({})", conditions.join(" OR ")));
+    }
+    if let Some(want_handled) = tier.handled {
+        clauses.push(if want_handled {
+            "handled_at IS NOT NULL".to_string()
+        } else {
+            "handled_at IS NULL".to_string()
+        });
+    }
+    if clauses.is_empty() {
+        "1=1".to_string()
+    } else {
+        clauses.join(" AND ")
+    }
 }
 
 fn notification_history_record_from_backend_row(
@@ -20761,19 +21801,45 @@ fn query_events_backend(
         .collect()
 }
 
-fn query_events_stream_backend(
-    backend: &dyn StorageBackend,
-    query: &EventStreamQuery,
-) -> Result<Vec<StoredEvent>> {
-    let mut sql = String::from(
-        "SELECT id, pane_id, rule_id, agent_type, event_type, severity, confidence,
-         extracted, matched_text, segment_id, detected_at, dedupe_key, handled_at,
-         handled_by_workflow_id, handled_status
-         FROM events WHERE 1=1",
-    );
+const EVENT_STREAM_DEFAULT_LIMIT: usize = 100;
+/// Storage-level allocation guard shared by both cursor-stream APIs. Current
+/// production callers cap pages at 1,000; 4,096 leaves deliberate headroom
+/// without allowing an unchecked library caller to request `usize::MAX` rows.
+const EVENT_STREAM_RESULT_LIMIT_MAX: usize = 4_096;
+const EVENT_RETENTION_CURSOR_EPOCH_HEX_LEN: usize = 32;
+
+fn validate_event_retention_cursor_epoch(epoch: &str, context: &str) -> Result<()> {
+    let canonical = epoch.len() == EVENT_RETENTION_CURSOR_EPOCH_HEX_LEN
+        && epoch
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
+    if !canonical {
+        return Err(StorageError::Database(format!(
+            "{context} must be exactly {EVENT_RETENTION_CURSOR_EPOCH_HEX_LEN} lowercase hexadecimal characters"
+        ))
+        .into());
+    }
+    Ok(())
+}
+
+const EVENT_STREAM_COLUMNS: &str =
+    "id, pane_id, rule_id, agent_type, event_type, severity, confidence, \
+     extracted, matched_text, segment_id, detected_at, dedupe_key, handled_at, \
+     handled_by_workflow_id, handled_status";
+
+fn build_event_stream_suffix<'a>(
+    query: &'a EventStreamQuery,
+) -> Result<(String, Vec<ToSqlValue<'a>>)> {
+    let mut sql = String::from(" WHERE 1=1");
     let mut params = Vec::new();
 
     if let Some(after_id) = query.after_id {
+        if after_id < 0 {
+            return Err(StorageError::Database(format!(
+                "event stream cursor must be non-negative: {after_id}"
+            ))
+            .into());
+        }
         sql.push_str(" AND id > ?");
         params.push(ToSqlValue::Integer(after_id));
     }
@@ -20811,8 +21877,25 @@ fn query_events_stream_backend(
     }
 
     sql.push_str(" ORDER BY id ASC LIMIT ?");
-    let limit_i64 = usize_to_i64(query.limit.unwrap_or(100), "limit")?;
+    let limit = query.limit.unwrap_or(EVENT_STREAM_DEFAULT_LIMIT);
+    if limit > EVENT_STREAM_RESULT_LIMIT_MAX {
+        return Err(StorageError::Database(format!(
+            "event stream limit {limit} exceeds storage maximum {EVENT_STREAM_RESULT_LIMIT_MAX}"
+        ))
+        .into());
+    }
+    let limit_i64 = usize_to_i64(limit, "event stream limit")?;
     params.push(ToSqlValue::Integer(limit_i64));
+
+    Ok((sql, params))
+}
+
+fn query_events_stream_backend(
+    backend: &dyn StorageBackend,
+    query: &EventStreamQuery,
+) -> Result<Vec<StoredEvent>> {
+    let (suffix, params) = build_event_stream_suffix(query)?;
+    let sql = format!("SELECT {EVENT_STREAM_COLUMNS} FROM events{suffix}");
 
     let rows = backend
         .query_map_cells(&sql, &params)
@@ -20821,6 +21904,291 @@ fn query_events_stream_backend(
     rows.iter()
         .map(|row| stored_event_from_backend_cells(row))
         .collect()
+}
+
+fn event_retention_snapshot_from_cells(
+    row: &[SqlCell],
+    start: usize,
+) -> Result<EventRetentionSnapshot> {
+    let reader = CellRowReader::new(row);
+    let snapshot = EventRetentionSnapshot {
+        cursor_epoch: reader
+            .string(start)
+            .map_err(|err| storage_backend_error("Event retention cursor epoch", err))?,
+        legacy_history_complete: reader
+            .bool(start + 1)
+            .map_err(|err| storage_backend_error("Event retention legacy completeness", err))?,
+        generation: reader
+            .i64(start + 2)
+            .map_err(|err| storage_backend_error("Event retention generation", err))?,
+        evidence_from_event_id: reader
+            .i64(start + 3)
+            .map_err(|err| storage_backend_error("Event retention evidence boundary", err))?,
+        max_event_id: reader
+            .i64(start + 4)
+            .map_err(|err| storage_backend_error("Event retention high-water mark", err))?,
+        deleted_event_count: reader
+            .i64(start + 5)
+            .map_err(|err| storage_backend_error("Event retention deleted count", err))?,
+        last_deleted_at: reader
+            .optional_i64(start + 6)
+            .map_err(|err| storage_backend_error("Event retention last deletion time", err))?,
+    };
+    let counters_consistent = if snapshot.generation == 0 {
+        snapshot.deleted_event_count == 0 && snapshot.last_deleted_at.is_none()
+    } else {
+        snapshot.deleted_event_count > 0 && snapshot.last_deleted_at.is_some()
+    };
+    validate_event_retention_cursor_epoch(
+        &snapshot.cursor_epoch,
+        "stored event retention cursor epoch",
+    )?;
+    if snapshot.generation < 0
+        || snapshot.evidence_from_event_id <= 0
+        || snapshot.max_event_id < snapshot.evidence_from_event_id.saturating_sub(1)
+        || snapshot.deleted_event_count < 0
+        || snapshot.deleted_event_count < snapshot.generation
+        || snapshot.last_deleted_at.is_some_and(|timestamp| timestamp < 0)
+        || !counters_consistent
+        || (snapshot.legacy_history_complete && snapshot.evidence_from_event_id != 1)
+    {
+        return Err(StorageError::Database(format!(
+            "event retention state is corrupt or internally inconsistent: {snapshot:?}"
+        ))
+        .into());
+    }
+    Ok(snapshot)
+}
+
+fn event_retention_snapshot_backend(
+    backend: &dyn StorageBackend,
+) -> Result<EventRetentionSnapshot> {
+    let row = backend
+        .query_row_cells(
+            "SELECT cursor_epoch, legacy_history_complete, generation,
+             evidence_from_event_id, max_event_id, deleted_event_count, last_deleted_at
+             FROM event_retention_state WHERE singleton = 1",
+            &[],
+        )
+        .map_err(|err| storage_backend_error("Query event retention snapshot", err))?
+        .ok_or_else(|| {
+            StorageError::Database(
+                "event_retention_state singleton row is missing; refusing to infer retention"
+                    .to_string(),
+            )
+        })?;
+    event_retention_snapshot_from_cells(&row, 0)
+}
+
+fn validate_event_retention_interval(
+    interval: &EventRetentionInterval,
+    snapshot: &EventRetentionSnapshot,
+) -> Result<()> {
+    let span = interval
+        .end_id
+        .checked_sub(interval.start_id)
+        .and_then(|delta| delta.checked_add(1));
+    if interval.start_id <= 0
+        || interval.end_id < interval.start_id
+        || interval.first_generation <= 0
+        || interval.last_generation < interval.first_generation
+        || interval.last_generation > snapshot.generation
+        || interval.first_deleted_at < 0
+        || interval.last_deleted_at < interval.first_deleted_at
+        || snapshot
+            .last_deleted_at
+            .is_none_or(|last_deleted_at| interval.last_deleted_at > last_deleted_at)
+        || interval.end_id > snapshot.max_event_id
+        || span.is_none_or(|span| span > snapshot.deleted_event_count)
+    {
+        return Err(StorageError::Database(format!(
+            "event retention interval is corrupt or inconsistent with its snapshot: interval={interval:?}, snapshot={snapshot:?}"
+        ))
+        .into());
+    }
+    Ok(())
+}
+
+fn query_events_stream_page_backend(
+    backend: &dyn StorageBackend,
+    query: &EventStreamQuery,
+) -> Result<EventStreamPage> {
+    let (suffix, params) = build_event_stream_suffix(query)?;
+    let sql = format!(
+        "WITH event_page AS (
+             SELECT {EVENT_STREAM_COLUMNS} FROM events{suffix}
+         )
+         SELECT 0 AS row_kind,
+                id, pane_id, rule_id, agent_type, event_type, severity, confidence,
+                extracted, matched_text, segment_id, detected_at, dedupe_key, handled_at,
+                handled_by_workflow_id, handled_status,
+                NULL AS cursor_epoch, NULL AS legacy_history_complete,
+                NULL AS retention_generation, NULL AS evidence_from_event_id,
+                NULL AS max_event_id, NULL AS deleted_event_count, NULL AS last_deleted_at
+         FROM event_page
+         UNION ALL
+         SELECT 1 AS row_kind,
+                NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+                NULL, NULL, NULL, NULL, NULL,
+                cursor_epoch, legacy_history_complete, generation,
+                evidence_from_event_id, max_event_id, deleted_event_count, last_deleted_at
+         FROM event_retention_state WHERE singleton = 1
+         ORDER BY row_kind ASC, id ASC"
+    );
+    let rows = backend
+        .query_map_cells(&sql, &params)
+        .map_err(|err| storage_backend_error("Query events stream page", err))?;
+
+    let mut events = Vec::new();
+    let mut retention = None;
+    for row in &rows {
+        let row_kind = CellRowReader::new(row)
+            .i64(0)
+            .map_err(|err| storage_backend_error("Event stream page row kind", err))?;
+        match row_kind {
+            0 => {
+                let event_cells = row.get(1..16).ok_or_else(|| {
+                    StorageError::Database(format!(
+                        "event stream page event row has {} columns; expected at least 16",
+                        row.len()
+                    ))
+                })?;
+                events.push(stored_event_from_backend_cells(event_cells)?);
+            }
+            1 => {
+                if retention.is_some() {
+                    return Err(StorageError::Database(
+                        "event stream page returned duplicate retention summary rows".to_string(),
+                    )
+                    .into());
+                }
+                retention = Some(event_retention_snapshot_from_cells(row, 16)?);
+            }
+            other => {
+                return Err(StorageError::Database(format!(
+                    "event stream page returned unknown row kind {other}"
+                ))
+                .into());
+            }
+        }
+    }
+
+    let retention = retention.ok_or_else(|| {
+        StorageError::Database(
+            "event stream page omitted the retention summary; refusing to infer gaps".to_string(),
+        )
+    })?;
+    Ok(EventStreamPage { events, retention })
+}
+
+fn check_event_retention_backend(
+    backend: &dyn StorageBackend,
+    after_id: i64,
+    through_id: i64,
+    cursor_epoch: Option<&str>,
+) -> Result<EventRetentionCheck> {
+    if let Some(epoch) = cursor_epoch {
+        validate_event_retention_cursor_epoch(epoch, "event retention cursor epoch")?;
+    }
+    if after_id < 0 {
+        return Err(StorageError::Database(format!(
+            "event retention cursor must be non-negative: {after_id}"
+        ))
+        .into());
+    }
+    if through_id < after_id {
+        return Err(StorageError::Database(format!(
+            "event retention range is reversed: after_id={after_id}, through_id={through_id}"
+        ))
+        .into());
+    }
+    let row = backend
+        .query_row_cells(
+            "SELECT s.cursor_epoch, s.legacy_history_complete, s.generation,
+                    s.evidence_from_event_id, s.max_event_id,
+                    s.deleted_event_count, s.last_deleted_at,
+                    i.start_id, i.end_id, i.first_generation, i.last_generation,
+                    i.first_deleted_at, i.last_deleted_at
+             FROM event_retention_state AS s
+             LEFT JOIN event_retention_intervals AS i
+               ON i.start_id = (
+                   SELECT candidate.start_id
+                   FROM event_retention_intervals AS candidate
+                   WHERE candidate.end_id > ?1
+                   ORDER BY candidate.end_id ASC
+                   LIMIT 1
+               )
+             WHERE s.singleton = 1",
+            &[ToSqlValue::Integer(after_id)],
+        )
+        .map_err(|err| storage_backend_error("Check event retention interval", err))?
+        .ok_or_else(|| {
+            StorageError::Database(
+                "event_retention_state singleton row is missing; refusing to infer retention"
+                    .to_string(),
+            )
+        })?;
+
+    let snapshot = event_retention_snapshot_from_cells(&row, 0)?;
+    let checked_through_id = through_id.min(snapshot.max_event_id);
+    let reader = CellRowReader::new(&row);
+    let interval = if reader.is_null(7) {
+        None
+    } else {
+        Some(EventRetentionInterval {
+            start_id: reader
+                .i64(7)
+                .map_err(|err| storage_backend_error("Event retention interval start", err))?,
+            end_id: reader
+                .i64(8)
+                .map_err(|err| storage_backend_error("Event retention interval end", err))?,
+            first_generation: reader.i64(9).map_err(|err| {
+                storage_backend_error("Event retention interval first generation", err)
+            })?,
+            last_generation: reader.i64(10).map_err(|err| {
+                storage_backend_error("Event retention interval last generation", err)
+            })?,
+            first_deleted_at: reader.i64(11).map_err(|err| {
+                storage_backend_error("Event retention interval first deletion time", err)
+            })?,
+            last_deleted_at: reader.i64(12).map_err(|err| {
+                storage_backend_error("Event retention interval last deletion time", err)
+            })?,
+        })
+    };
+    if let Some(interval) = &interval {
+        validate_event_retention_interval(interval, &snapshot)?;
+    }
+
+    let non_empty = checked_through_id > after_id;
+    let status = if cursor_epoch.is_some_and(|epoch| epoch != snapshot.cursor_epoch.as_str()) {
+        EventRetentionStatus::CursorEpochMismatch
+    } else if !snapshot.legacy_history_complete
+        && (cursor_epoch.is_none()
+            || after_id < snapshot.evidence_from_event_id.saturating_sub(1))
+    {
+        EventRetentionStatus::LegacyHistoryUnavailable {
+            evidence_from_event_id: snapshot.evidence_from_event_id,
+        }
+    } else if after_id > snapshot.max_event_id {
+        EventRetentionStatus::CursorAheadOfHighWater {
+            max_event_id: snapshot.max_event_id,
+        }
+    } else if let Some(interval) = interval.filter(|interval| {
+        non_empty && interval.start_id <= checked_through_id && interval.end_id > after_id
+    }) {
+        EventRetentionStatus::Pruned { interval }
+    } else {
+        EventRetentionStatus::CompleteNoPruning
+    };
+
+    Ok(EventRetentionCheck {
+        requested_after_id: after_id,
+        requested_through_id: through_id,
+        checked_through_id,
+        snapshot,
+        status,
+    })
 }
 
 // =============================================================================
@@ -22417,6 +23785,817 @@ fn seed_pane_backend(backend: &dyn StorageBackend, pane_id: i64, now_ms: i64) {
         ],
     )
     .unwrap();
+}
+
+fn seed_retention_event_backend(
+    backend: &dyn StorageBackend,
+    pane_id: u64,
+    severity: &str,
+    event_type: &str,
+    detected_at: i64,
+    segment_id: Option<i64>,
+) -> i64 {
+    record_event_backend(
+        backend,
+        &StoredEvent {
+            id: 0,
+            pane_id,
+            rule_id: format!("retention-{event_type}-{detected_at}"),
+            agent_type: "test".to_string(),
+            event_type: event_type.to_string(),
+            severity: severity.to_string(),
+            confidence: 1.0,
+            extracted: None,
+            matched_text: None,
+            segment_id,
+            detected_at,
+            dedupe_key: None,
+            handled_at: None,
+            handled_by_workflow_id: None,
+            handled_status: None,
+        },
+    )
+    .unwrap()
+    .event_id()
+}
+
+#[test]
+fn event_retention_flat_delete_records_exact_intervals_and_prevents_id_reuse() {
+    let backend = memory_backend();
+    seed_pane_backend(&backend, 1, 1);
+    assert_eq!(seed_retention_event_backend(&backend, 1, "info", "one", 10, None), 1);
+    assert_eq!(seed_retention_event_backend(&backend, 1, "info", "two", 20, None), 2);
+    assert_eq!(seed_retention_event_backend(&backend, 1, "info", "three", 100, None), 3);
+
+    assert_eq!(delete_events_before_backend(&backend, 50, 1).unwrap(), 2);
+    let snapshot = event_retention_snapshot_backend(&backend).unwrap();
+    assert!(snapshot.legacy_history_complete);
+    assert_eq!(snapshot.generation, 2, "one generation per bounded batch");
+    assert_eq!(snapshot.deleted_event_count, 2);
+    assert_eq!(snapshot.max_event_id, 3);
+    let check = check_event_retention_backend(&backend, 0, 3, None).unwrap();
+    assert!(matches!(
+        check.status,
+        EventRetentionStatus::Pruned {
+            interval: EventRetentionInterval { start_id: 1, end_id: 2, .. }
+        }
+    ));
+
+    let page = query_events_stream_page_backend(
+        &backend,
+        &EventStreamQuery { after_id: Some(2), limit: Some(10), ..Default::default() },
+    )
+    .unwrap();
+    assert_eq!(page.events.iter().map(|event| event.id).collect::<Vec<_>>(), vec![3]);
+    assert_eq!(page.retention, snapshot);
+
+    assert_eq!(delete_events_before_backend(&backend, 200, 10).unwrap(), 1);
+    let intervals = backend
+        .query_map_typed(
+            "SELECT start_id, end_id FROM event_retention_intervals ORDER BY start_id",
+            &[],
+        )
+        .unwrap();
+    assert_eq!(intervals, vec![vec!["1".to_string(), "3".to_string()]]);
+    assert!(
+        backend.execute("DELETE FROM event_retention_intervals").is_err(),
+        "exact deletion evidence must not be erasable outside epoch rotation"
+    );
+    assert_eq!(seed_retention_event_backend(&backend, 1, "info", "four", 300, None), 4);
+    assert!(
+        execute_typed(
+            &backend,
+            "UPDATE events SET id = 5 WHERE id = 4",
+            &[],
+        )
+        .is_err(),
+        "allocated event IDs must be immutable"
+    );
+    assert!(
+        backend.execute("DELETE FROM events WHERE id = 4").is_err(),
+        "ad-hoc event deletion must fail closed outside the ledger transaction"
+    );
+    assert!(
+        backend.execute("DELETE FROM panes WHERE pane_id = 1").is_err(),
+        "pane cascades must not create an unledgered event hole"
+    );
+}
+
+#[test]
+fn event_retention_sparse_tier_hole_is_not_confused_with_filtered_ids() {
+    let backend = memory_backend();
+    seed_pane_backend(&backend, 1, 1);
+    seed_retention_event_backend(&backend, 1, "info", "keep-a", 10, None);
+    seed_retention_event_backend(&backend, 1, "WARNING", "delete", 11, None);
+    seed_retention_event_backend(&backend, 1, "info", "keep-b", 12, None);
+
+    assert_eq!(
+        delete_events_by_tier_backend(
+            &backend,
+            100,
+            &["warning".to_string()],
+            &[],
+            None,
+            10,
+        )
+        .unwrap(),
+        1
+    );
+    let check = check_event_retention_backend(&backend, 1, 3, None).unwrap();
+    assert!(matches!(
+        check.status,
+        EventRetentionStatus::Pruned {
+            interval: EventRetentionInterval { start_id: 2, end_id: 2, .. }
+        }
+    ));
+    assert_eq!(
+        check_event_retention_backend(&backend, 2, 3, None).unwrap().status,
+        EventRetentionStatus::CompleteNoPruning,
+        "a retained but filter-skipped id is not deletion evidence"
+    );
+}
+
+#[test]
+fn event_retention_legacy_epoch_boundaries_and_invalid_ranges_fail_closed() {
+    let backend = memory_backend();
+    let upgraded_epoch = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    seed_pane_backend(&backend, 1, 1);
+    for id in 1..=3 {
+        assert_eq!(
+            seed_retention_event_backend(
+                &backend,
+                1,
+                "info",
+                &format!("legacy-fixture-{id}"),
+                id,
+                None,
+            ),
+            id
+        );
+    }
+    assert_eq!(
+        delete_event_retention_batch_backend(
+            &backend,
+            "SELECT id FROM events WHERE id = 1",
+            &[],
+            10,
+            "legacy rotation fixture",
+            EVENT_RETENTION_INTERVAL_ROW_MAX,
+        )
+        .unwrap(),
+        1
+    );
+    assert_eq!(
+        count_table_where(&backend, "event_retention_intervals", "1=1", &[]).unwrap(),
+        1
+    );
+    backend
+        .execute(
+            "INSERT INTO event_retention_rotation_authorizations (singleton) VALUES (1)",
+        )
+        .unwrap();
+    backend
+        .execute(
+            "UPDATE event_retention_state
+             SET cursor_epoch = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+                 legacy_history_complete = 0,
+                 evidence_from_event_id = 4
+             WHERE singleton = 1",
+        )
+        .unwrap();
+    backend
+        .execute("DELETE FROM event_retention_rotation_authorizations")
+        .unwrap();
+    assert_eq!(
+        count_table_where(&backend, "event_retention_intervals", "1=1", &[]).unwrap(),
+        0,
+        "an authorized epoch change must clear old intervals at the schema boundary"
+    );
+    assert!(
+        backend
+            .execute(
+                "UPDATE event_retention_state
+                 SET cursor_epoch = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'
+                 WHERE singleton = 1",
+            )
+            .is_err(),
+        "a cursor epoch cannot change outside its interval-clearing rotation"
+    );
+    assert!(
+        backend
+            .execute(
+                "UPDATE event_retention_state
+                 SET evidence_from_event_id = 5
+                 WHERE singleton = 1",
+            )
+            .is_err(),
+        "an evidence boundary cannot detach from its cursor epoch"
+    );
+    assert!(
+        backend
+            .execute(
+                "UPDATE event_retention_state
+                 SET legacy_history_complete = 1, evidence_from_event_id = 1
+                 WHERE singleton = 1",
+            )
+            .is_err(),
+        "unknown legacy history must never be promoted back to complete"
+    );
+
+    assert!(matches!(
+        check_event_retention_backend(&backend, 3, 3, None).unwrap().status,
+        EventRetentionStatus::LegacyHistoryUnavailable { evidence_from_event_id: 4 }
+    ));
+    assert!(matches!(
+        check_event_retention_backend(&backend, 0, 3, Some(upgraded_epoch))
+            .unwrap()
+            .status,
+        EventRetentionStatus::LegacyHistoryUnavailable { evidence_from_event_id: 4 }
+    ));
+    assert_eq!(
+        check_event_retention_backend(&backend, 3, 9, Some(upgraded_epoch))
+            .unwrap()
+            .status,
+        EventRetentionStatus::CompleteNoPruning,
+        "a matching-epoch cursor at the evidence boundary is authoritative"
+    );
+    assert_eq!(
+        check_event_retention_backend(
+            &backend,
+            3,
+            3,
+            Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+        )
+            .unwrap()
+            .status,
+        EventRetentionStatus::CursorEpochMismatch
+    );
+    assert!(matches!(
+        check_event_retention_backend(&backend, 4, 4, Some(upgraded_epoch))
+            .unwrap()
+            .status,
+        EventRetentionStatus::CursorAheadOfHighWater { max_event_id: 3 }
+    ));
+    assert!(check_event_retention_backend(&backend, -1, 0, None).is_err());
+    assert!(check_event_retention_backend(&backend, 2, 1, None).is_err());
+}
+
+#[test]
+fn event_retention_missing_or_corrupt_singleton_is_never_inferred() {
+    let missing = memory_backend();
+    missing
+        .execute_batch(
+            "DROP TRIGGER event_retention_state_delete_guard;
+             DELETE FROM event_retention_state;",
+        )
+        .unwrap();
+    assert!(event_retention_snapshot_backend(&missing).is_err());
+    assert!(check_event_retention_backend(&missing, 0, 0, None).is_err());
+    assert!(
+        query_events_stream_page_backend(&missing, &EventStreamQuery::default()).is_err()
+    );
+    seed_pane_backend(&missing, 1, 1);
+    assert!(
+        record_event_backend(
+            &missing,
+            &StoredEvent {
+                id: 0,
+                pane_id: 1,
+                rule_id: "missing-state".to_string(),
+                agent_type: "test".to_string(),
+                event_type: "test".to_string(),
+                severity: "info".to_string(),
+                confidence: 1.0,
+                extracted: None,
+                matched_text: None,
+                segment_id: None,
+                detected_at: 1,
+                dedupe_key: None,
+                handled_at: None,
+                handled_by_workflow_id: None,
+                handled_status: None,
+            },
+        )
+        .is_err()
+    );
+
+    let corrupt = memory_backend();
+    corrupt
+        .execute_batch(
+            "DROP TRIGGER event_retention_state_rotation_guard;
+             PRAGMA ignore_check_constraints = ON;
+             UPDATE event_retention_state SET cursor_epoch = '' WHERE singleton = 1;
+             PRAGMA ignore_check_constraints = OFF;",
+        )
+        .unwrap();
+    assert!(event_retention_snapshot_backend(&corrupt).is_err());
+
+    let corrupt_timestamp = memory_backend();
+    corrupt_timestamp
+        .execute_batch(
+            "PRAGMA ignore_check_constraints = ON;
+             UPDATE event_retention_state
+             SET generation = 1, deleted_event_count = 1, last_deleted_at = -1
+             WHERE singleton = 1;
+             PRAGMA ignore_check_constraints = OFF;",
+        )
+        .unwrap();
+    assert!(event_retention_snapshot_backend(&corrupt_timestamp).is_err());
+
+    let corrupt_counters = memory_backend();
+    corrupt_counters
+        .execute_batch(
+            "PRAGMA ignore_check_constraints = ON;
+             UPDATE event_retention_state
+             SET generation = 2, deleted_event_count = 1, last_deleted_at = 1
+             WHERE singleton = 1;
+             PRAGMA ignore_check_constraints = OFF;",
+        )
+        .unwrap();
+    assert!(event_retention_snapshot_backend(&corrupt_counters).is_err());
+}
+
+#[test]
+fn event_retention_cursor_tokens_and_stream_page_limits_are_hard_bounded() {
+    let canonical = "0123456789abcdef0123456789abcdef";
+    validate_event_retention_cursor_epoch(canonical, "test epoch").unwrap();
+    let backend = memory_backend();
+    let huge = "a".repeat(1_000_000);
+    for invalid in [
+        "".to_string(),
+        "a".repeat(31),
+        "a".repeat(33),
+        "g".repeat(32),
+        "A".repeat(32),
+        huge,
+    ] {
+        assert!(
+            validate_event_retention_cursor_epoch(&invalid, "test epoch").is_err(),
+            "noncanonical cursor epoch of {} bytes must fail before cloning",
+            invalid.len()
+        );
+        assert!(check_event_retention_backend(&backend, 0, 0, Some(&invalid)).is_err());
+    }
+
+    for limit in [None, Some(EVENT_STREAM_RESULT_LIMIT_MAX)] {
+        let query = EventStreamQuery { limit, ..Default::default() };
+        assert!(query_events_stream_backend(&backend, &query).is_ok());
+        assert!(query_events_stream_page_backend(&backend, &query).is_ok());
+    }
+    for limit in [EVENT_STREAM_RESULT_LIMIT_MAX + 1, usize::MAX] {
+        let query = EventStreamQuery { limit: Some(limit), ..Default::default() };
+        assert!(query_events_stream_backend(&backend, &query).is_err());
+        assert!(query_events_stream_page_backend(&backend, &query).is_err());
+    }
+    let negative_cursor = EventStreamQuery {
+        after_id: Some(-1),
+        ..Default::default()
+    };
+    assert!(query_events_stream_backend(&backend, &negative_cursor).is_err());
+    assert!(query_events_stream_page_backend(&backend, &negative_cursor).is_err());
+}
+
+#[test]
+fn event_retention_interval_ceiling_rotates_epoch_at_limit_plus_one() {
+    let backend = memory_backend();
+    let original = event_retention_snapshot_backend(&backend).unwrap();
+    backend
+        .execute(
+            "UPDATE event_retention_state
+             SET generation = 3, max_event_id = 5,
+                 deleted_event_count = 3, last_deleted_at = 30
+             WHERE singleton = 1",
+        )
+        .unwrap();
+    backend
+        .execute_batch(
+            "INSERT INTO event_retention_intervals (
+                 start_id, end_id, first_generation, last_generation,
+                 first_deleted_at, last_deleted_at
+             ) VALUES
+                 (1, 1, 1, 1, 10, 10),
+                 (3, 3, 2, 2, 20, 20);",
+        )
+        .unwrap();
+    backend.execute("BEGIN IMMEDIATE").unwrap();
+    assert!(!enforce_event_retention_interval_bound_backend(&backend, 2).unwrap());
+    backend.execute("COMMIT").unwrap();
+    assert_eq!(
+        event_retention_snapshot_backend(&backend).unwrap().cursor_epoch,
+        original.cursor_epoch,
+        "the exact ceiling must not rotate"
+    );
+
+    backend
+        .execute(
+            "INSERT INTO event_retention_intervals (
+                 start_id, end_id, first_generation, last_generation,
+                 first_deleted_at, last_deleted_at
+             ) VALUES (5, 5, 3, 3, 30, 30)",
+        )
+        .unwrap();
+    backend.execute("BEGIN IMMEDIATE").unwrap();
+    assert!(enforce_event_retention_interval_bound_backend(&backend, 2).unwrap());
+    backend.execute("COMMIT").unwrap();
+    let rotated = event_retention_snapshot_backend(&backend).unwrap();
+    assert_ne!(rotated.cursor_epoch, original.cursor_epoch);
+    assert!(!rotated.legacy_history_complete);
+    assert_eq!(rotated.evidence_from_event_id, 6);
+    assert_eq!((rotated.max_event_id, rotated.generation), (5, 3));
+    assert_eq!(rotated.deleted_event_count, 3);
+    assert_eq!(
+        count_table_where(&backend, "event_retention_intervals", "1=1", &[]).unwrap(),
+        0
+    );
+    assert_eq!(
+        check_event_retention_backend(&backend, 5, 5, Some(&original.cursor_epoch))
+            .unwrap()
+            .status,
+        EventRetentionStatus::CursorEpochMismatch
+    );
+    assert_eq!(
+        check_event_retention_backend(&backend, 5, 5, Some(&rotated.cursor_epoch))
+            .unwrap()
+            .status,
+        EventRetentionStatus::CompleteNoPruning
+    );
+    assert!(matches!(
+        check_event_retention_backend(&backend, 0, 5, Some(&rotated.cursor_epoch))
+            .unwrap()
+            .status,
+        EventRetentionStatus::LegacyHistoryUnavailable { evidence_from_event_id: 6 }
+    ));
+}
+
+#[test]
+fn event_retention_rotation_at_exhausted_highwater_rolls_back_the_delete() {
+    let backend = memory_backend();
+    seed_pane_backend(&backend, 1, 1);
+    execute_typed(
+        &backend,
+        "INSERT INTO events (
+             id, pane_id, rule_id, agent_type, event_type, severity,
+             confidence, detected_at
+         ) VALUES (?1, 1, 'max-id', 'test', 'test', 'info', 1.0, 10)",
+        &[ToSqlValue::Integer(i64::MAX)],
+    )
+    .unwrap();
+    let exhausted_insert = record_event_backend(
+        &backend,
+        &StoredEvent {
+            id: 0,
+            pane_id: 1,
+            rule_id: "after-max-id".to_string(),
+            agent_type: "test".to_string(),
+            event_type: "test".to_string(),
+            severity: "info".to_string(),
+            confidence: 1.0,
+            extracted: None,
+            matched_text: None,
+            segment_id: None,
+            detected_at: 11,
+            dedupe_key: None,
+            handled_at: None,
+            handled_by_workflow_id: None,
+            handled_status: None,
+        },
+    )
+    .expect_err("the event allocator must fail explicitly at i64::MAX");
+    assert!(exhausted_insert.to_string().contains("allocator is exhausted"));
+    let before = event_retention_snapshot_backend(&backend).unwrap();
+    let error = delete_event_retention_batch_backend(
+        &backend,
+        "SELECT id FROM events WHERE detected_at < ?",
+        &[ToSqlValue::Integer(100)],
+        10,
+        "high-water rotation test",
+        0,
+    )
+    .expect_err("rotation without a representable successor boundary must fail");
+    assert!(error.to_string().contains("successor evidence boundary"));
+    assert_eq!(count_events_backend(&backend).unwrap(), 1);
+    assert_eq!(event_retention_snapshot_backend(&backend).unwrap(), before);
+    assert_eq!(
+        count_table_where(&backend, "event_retention_intervals", "1=1", &[]).unwrap(),
+        0
+    );
+}
+
+#[test]
+fn event_retention_rotation_does_not_reledger_preboundary_cleanup_batches() {
+    let backend = memory_backend();
+    seed_pane_backend(&backend, 1, 1);
+    for id in 1..=5 {
+        assert_eq!(
+            seed_retention_event_backend(&backend, 1, "info", &format!("event-{id}"), id, None),
+            id
+        );
+    }
+
+    assert_eq!(
+        delete_event_retention_batch_backend(
+            &backend,
+            "SELECT id FROM events WHERE id IN (1, 3)",
+            &[],
+            10,
+            "initial sparse rotation",
+            1,
+        )
+        .unwrap(),
+        2
+    );
+    let rotated = event_retention_snapshot_backend(&backend).unwrap();
+    assert_eq!(rotated.evidence_from_event_id, 6);
+    assert_eq!(
+        count_table_where(&backend, "event_retention_intervals", "1=1", &[]).unwrap(),
+        0
+    );
+
+    assert_eq!(
+        delete_event_retention_batch_backend(
+            &backend,
+            "SELECT id FROM events WHERE id = 5",
+            &[],
+            10,
+            "post-rotation legacy cleanup",
+            1,
+        )
+        .unwrap(),
+        1
+    );
+    let after_legacy_cleanup = event_retention_snapshot_backend(&backend).unwrap();
+    assert_eq!(after_legacy_cleanup.cursor_epoch, rotated.cursor_epoch);
+    assert_eq!(after_legacy_cleanup.generation, rotated.generation + 1);
+    assert_eq!(
+        count_table_where(&backend, "event_retention_intervals", "1=1", &[]).unwrap(),
+        0,
+        "pre-boundary deletions must not consume the new epoch's interval budget"
+    );
+}
+
+#[test]
+fn event_retention_materialized_intervals_are_validated_fail_closed() {
+    let cases = [
+        ("nonpositive start", 0, 1, 1, 1, 1, 1),
+        ("reversed ids", 2, 1, 1, 1, 1, 1),
+        ("nonpositive generation", 1, 1, 0, 1, 1, 1),
+        ("reversed generations", 1, 1, 2, 1, 1, 1),
+        ("reversed timestamps", 1, 1, 1, 1, 2, 1),
+        ("negative timestamp", 1, 1, 1, 1, -1, 1),
+        ("timestamp beyond snapshot", 1, 1, 1, 1, 1, 2),
+        ("future generation", 1, 1, 1, 11, 1, 1),
+        ("beyond highwater", 11, 11, 1, 1, 1, 1),
+    ];
+    for (label, start, end, first_generation, last_generation, first_at, last_at) in cases {
+        let backend = memory_backend();
+        backend
+            .execute(
+                "UPDATE event_retention_state
+                 SET generation = 10, max_event_id = 10,
+                     deleted_event_count = 10, last_deleted_at = 1
+                 WHERE singleton = 1",
+            )
+            .unwrap();
+        backend.execute("PRAGMA ignore_check_constraints = ON").unwrap();
+        execute_typed(
+            &backend,
+            "INSERT INTO event_retention_intervals (
+                 start_id, end_id, first_generation, last_generation,
+                 first_deleted_at, last_deleted_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            &[
+                ToSqlValue::Integer(start),
+                ToSqlValue::Integer(end),
+                ToSqlValue::Integer(first_generation),
+                ToSqlValue::Integer(last_generation),
+                ToSqlValue::Integer(first_at),
+                ToSqlValue::Integer(last_at),
+            ],
+        )
+        .unwrap();
+        backend.execute("PRAGMA ignore_check_constraints = OFF").unwrap();
+        assert!(
+            check_event_retention_backend(&backend, 0, 10, None).is_err(),
+            "corrupt interval case {label} must fail closed"
+        );
+    }
+}
+
+#[test]
+fn event_retention_rollback_keeps_event_and_ledger_atomic() {
+    let backend = memory_backend();
+    seed_pane_backend(&backend, 1, 1);
+    seed_retention_event_backend(&backend, 1, "info", "rollback", 10, None);
+    backend
+        .execute_batch(
+            "CREATE TRIGGER fail_retention_ledger
+             BEFORE INSERT ON event_retention_intervals
+             BEGIN SELECT RAISE(ABORT, 'injected ledger failure'); END;",
+        )
+        .unwrap();
+    assert!(delete_events_before_backend(&backend, 100, 10).is_err());
+    assert_eq!(count_events_backend(&backend).unwrap(), 1);
+    let snapshot = event_retention_snapshot_backend(&backend).unwrap();
+    assert_eq!(snapshot.generation, 0);
+    assert_eq!(snapshot.deleted_event_count, 0);
+}
+
+#[test]
+fn event_retention_protects_leases_and_detaches_workflow_provenance() {
+    let backend = memory_backend();
+    seed_pane_backend(&backend, 1, 1);
+    let leased_id = seed_retention_event_backend(&backend, 1, "info", "leased", 10, None);
+    let workflow_id = seed_retention_event_backend(&backend, 1, "info", "workflow", 11, None);
+    let lease = reserve_event_delivery_backend_at(&backend, leased_id, "owner", 100, 1).unwrap();
+    assert!(matches!(lease, EventDeliveryReservation::Acquired(_)));
+    execute_typed(
+        &backend,
+        "INSERT INTO workflow_executions (
+             id, workflow_name, pane_id, trigger_event_id, current_step, status,
+             started_at, updated_at
+         ) VALUES (?1, ?2, ?3, ?4, 0, 'completed', ?5, ?5)",
+        &[
+            ToSqlValue::Text("workflow-1"),
+            ToSqlValue::Text("test"),
+            ToSqlValue::Integer(1),
+            ToSqlValue::Integer(workflow_id),
+            ToSqlValue::Integer(20),
+        ],
+    )
+    .unwrap();
+
+    assert_eq!(delete_events_before_backend(&backend, 100, 10).unwrap(), 1);
+    assert_eq!(
+        backend
+            .query_scalar("SELECT trigger_event_id FROM workflow_executions WHERE id = 'workflow-1'")
+            .unwrap(),
+        Some(String::new()),
+        "workflow row survives with a NULL trigger link"
+    );
+    assert_eq!(count_events_backend(&backend).unwrap(), 1, "leased event survives");
+    assert!(release_event_delivery_backend(&backend, leased_id, "owner").unwrap());
+    assert_eq!(delete_events_before_backend(&backend, 100, 10).unwrap(), 1);
+}
+
+#[test]
+fn retention_policy_sql_matches_ordered_rust_semantics_and_literal_prefixes() {
+    let backend = memory_backend();
+    seed_pane_backend(&backend, 1, 1);
+    seed_retention_event_backend(&backend, 1, "WARNING", "rate%literal", 10, None);
+    seed_retention_event_backend(&backend, 1, "info", "rateXliteral", 10, None);
+    seed_retention_event_backend(&backend, 1, "info", "Other", 10, None);
+
+    let keep_warning = RetentionTier {
+        name: "keep-warning".to_string(),
+        retention_days: 0,
+        severities: vec!["warning".to_string()],
+        event_types: vec![],
+        handled: None,
+    };
+    let literal_prefix = RetentionTier {
+        name: "literal".to_string(),
+        retention_days: 1,
+        severities: vec![],
+        event_types: vec!["rate%".to_string()],
+        handled: None,
+    };
+    assert_eq!(
+        count_events_by_retention_rule_backend(
+            &backend,
+            100,
+            Some(&literal_prefix),
+            std::slice::from_ref(&keep_warning),
+        )
+        .unwrap(),
+        0,
+        "earlier case-insensitive severity rule protects the literal-prefix match"
+    );
+    assert_eq!(
+        count_events_by_retention_rule_backend(
+            &backend,
+            100,
+            None,
+            &[keep_warning, literal_prefix],
+        )
+        .unwrap(),
+        2,
+        "wildcard-looking prefix is literal and unmatched rows reach fallback"
+    );
+}
+
+#[test]
+fn retention_policy_handled_branch_deletes_only_its_first_match_partition() {
+    let backend = memory_backend();
+    seed_pane_backend(&backend, 1, 1);
+    let handled_id = seed_retention_event_backend(&backend, 1, "info", "handled", 10, None);
+    let unhandled_id = seed_retention_event_backend(&backend, 1, "info", "unhandled", 10, None);
+    execute_typed(
+        &backend,
+        "UPDATE events SET handled_at = 20 WHERE id = ?1",
+        &[ToSqlValue::Integer(handled_id)],
+    )
+    .unwrap();
+    let handled_tier = RetentionTier {
+        name: "handled-info".to_string(),
+        retention_days: 1,
+        severities: vec!["INFO".to_string()],
+        event_types: vec![],
+        handled: Some(true),
+    };
+    assert_eq!(
+        delete_events_by_retention_rule_backend(
+            &backend,
+            100,
+            Some(&handled_tier),
+            &[],
+            10,
+        )
+        .unwrap(),
+        1
+    );
+    assert_eq!(
+        backend
+            .query_scalar("SELECT id FROM events")
+            .unwrap(),
+        Some(unhandled_id.to_string())
+    );
+}
+
+#[test]
+fn segment_retention_atomically_nulls_surviving_event_source_link() {
+    let backend = memory_backend();
+    seed_pane_backend(&backend, 1, 1);
+    let segment = insert_output_segment_with_seq_backend(
+        &backend,
+        1,
+        0,
+        "segment",
+        None,
+        None,
+        10,
+        "test",
+    )
+    .unwrap();
+    let event_id = seed_retention_event_backend(
+        &backend,
+        1,
+        "info",
+        "segment-link",
+        20,
+        Some(segment.id),
+    );
+    assert_eq!(prune_segments_backend(&backend, 11).unwrap(), 1);
+    assert_eq!(
+        backend
+            .query_scalar(&format!("SELECT segment_id FROM events WHERE id = {event_id}"))
+            .unwrap(),
+        Some(String::new())
+    );
+
+    let size_segment = insert_output_segment_with_seq_backend(
+        &backend,
+        1,
+        1,
+        "size-segment",
+        None,
+        None,
+        20,
+        "test",
+    )
+    .unwrap();
+    let size_event_id = seed_retention_event_backend(
+        &backend,
+        1,
+        "info",
+        "size-segment-link",
+        30,
+        Some(size_segment.id),
+    );
+    assert_eq!(delete_oldest_segments_backend(&backend, 1).unwrap(), 1);
+    assert_eq!(
+        backend
+            .query_scalar(&format!("SELECT segment_id FROM events WHERE id = {size_event_id}"))
+            .unwrap(),
+        Some(String::new()),
+        "size-based eviction must detach the same foreign key atomically"
+    );
+}
+
+#[test]
+fn event_retention_batch_bound_handles_extreme_requested_size() {
+    assert_eq!(bounded_event_retention_batch_size(0), 0);
+    assert_eq!(
+        bounded_event_retention_batch_size(usize::MAX),
+        EVENT_RETENTION_DELETE_BATCH_MAX
+    );
+
+    let backend = memory_backend();
+    assert_eq!(delete_events_before_backend(&backend, i64::MAX, usize::MAX).unwrap(), 0);
+    assert_eq!(
+        event_retention_snapshot_backend(&backend).unwrap().generation,
+        0,
+        "an empty bounded batch must not manufacture a retention generation"
+    );
 }
 
 /// Exactness guard for the segment-write hot path: `append_segment_backend`

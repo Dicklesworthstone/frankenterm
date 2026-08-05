@@ -26,9 +26,10 @@ fn insert_test_event(
     detected_at: i64,
 ) -> i64 {
     conn.execute(
-        "INSERT INTO events (pane_id, rule_id, agent_type, event_type, severity,
+        "INSERT INTO events (id, pane_id, rule_id, agent_type, event_type, severity,
              confidence, detected_at)
-             VALUES (?1, ?2, 'claude_code', ?3, ?4, 0.9, ?5)",
+             SELECT max_event_id + 1, ?1, ?2, 'claude_code', ?3, ?4, 0.9, ?5
+             FROM event_retention_state WHERE singleton = 1",
         params![pane_id as i64, rule_id, event_type, severity, detected_at],
     )
     .unwrap();

@@ -57,7 +57,11 @@
 /// Bumped 32 → 33 to add expiring, token-owned event-delivery leases. These
 /// leases let stream consumers reserve an unhandled event, flush it downstream,
 /// and only then atomically finalize `handled_at` without a crash-loss window.
-pub const SCHEMA_VERSION: i32 = 33;
+/// Bumped 33 → 34 to make event-retention holes authoritative: a durable
+/// cursor epoch and high-water mark identify the history whose deletions can be
+/// proven, while canonical inclusive intervals record every committed deletion
+/// inside the current epoch's authoritative evidence range.
+pub const SCHEMA_VERSION: i32 = 34;
 
 /// [ft-ih4tm] Idempotent re-creation of the three `output_segments` FTS
 /// triggers. Called when a database is opened with
@@ -251,6 +255,218 @@ CREATE INDEX IF NOT EXISTS idx_events_detected ON events(detected_at);
 CREATE INDEX IF NOT EXISTS idx_events_severity ON events(severity, detected_at);
 CREATE INDEX IF NOT EXISTS idx_events_triage_state
     ON events(triage_state) WHERE triage_state IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_events_segment_id
+    ON events(segment_id) WHERE segment_id IS NOT NULL;
+
+-- Durable, exact evidence for event-retention holes.  A missing row in
+-- `events` is not by itself proof of retention: cursor streams can skip IDs
+-- because of pane, handled-state, or other filters.  Cleanup records only IDs
+-- it actually deletes in the interval table, in the same transaction as the
+-- DELETE.  Intervals are disjoint and maximally coalesced by the writer.
+--
+-- `evidence_from_event_id` is 1 on a fresh database.  A v33 upgrade initializes
+-- it to one past the greatest then-live event ID and marks legacy history
+-- incomplete because deletions performed by older binaries cannot be
+-- reconstructed honestly.  `cursor_epoch` prevents IDs reused across that
+-- upgrade boundary from aliasing an old durable cursor.  The writer also
+-- rotates the epoch and advances the evidence boundary if the exact interval
+-- ledger reaches its bounded row ceiling.
+CREATE TABLE IF NOT EXISTS event_retention_state (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    cursor_epoch TEXT NOT NULL CHECK (
+        length(cursor_epoch) = 32
+        AND cursor_epoch NOT GLOB '*[^0-9a-f]*'
+    ),
+    legacy_history_complete INTEGER NOT NULL CHECK (legacy_history_complete IN (0, 1)),
+    generation INTEGER NOT NULL DEFAULT 0 CHECK (generation >= 0),
+    evidence_from_event_id INTEGER NOT NULL CHECK (evidence_from_event_id > 0),
+    max_event_id INTEGER NOT NULL DEFAULT 0
+        CHECK (max_event_id >= 0 AND max_event_id >= evidence_from_event_id - 1),
+    deleted_event_count INTEGER NOT NULL DEFAULT 0 CHECK (deleted_event_count >= 0),
+    last_deleted_at INTEGER CHECK (last_deleted_at IS NULL OR last_deleted_at >= 0),
+    CHECK (legacy_history_complete = 0 OR evidence_from_event_id = 1),
+    CHECK (deleted_event_count >= generation),
+    CHECK (
+        (generation = 0 AND deleted_event_count = 0 AND last_deleted_at IS NULL)
+        OR (generation > 0 AND deleted_event_count > 0 AND last_deleted_at IS NOT NULL)
+    )
+);
+
+INSERT OR IGNORE INTO event_retention_state (
+    singleton, cursor_epoch, legacy_history_complete,
+    generation, evidence_from_event_id, max_event_id,
+    deleted_event_count, last_deleted_at
+) VALUES (1, lower(hex(randomblob(16))), 1, 0, 1, 0, 0, NULL);
+
+CREATE TABLE IF NOT EXISTS event_retention_intervals (
+    start_id INTEGER PRIMARY KEY CHECK (start_id > 0),
+    end_id INTEGER NOT NULL CHECK (end_id >= start_id),
+    first_generation INTEGER NOT NULL CHECK (first_generation > 0),
+    last_generation INTEGER NOT NULL CHECK (last_generation >= first_generation),
+    first_deleted_at INTEGER NOT NULL CHECK (first_deleted_at >= 0),
+    last_deleted_at INTEGER NOT NULL CHECK (last_deleted_at >= first_deleted_at)
+);
+
+-- Supports the hot resume lookup: first deleted interval whose end is after
+-- the caller's cursor.  The insert/update guards below enforce disjoint,
+-- maximally coalesced ordering.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_event_retention_intervals_end
+    ON event_retention_intervals(end_id);
+
+-- Empty outside a retention transaction.  The DELETE guard below makes pane
+-- cascades and ad-hoc SQL fail closed instead of creating an unrecorded cursor
+-- hole.  The writer fills these exact IDs, records their intervals, and clears
+-- the authorizations before committing the same transaction.
+CREATE TABLE IF NOT EXISTS event_retention_delete_authorizations (
+    event_id INTEGER PRIMARY KEY CHECK (event_id > 0)
+);
+
+-- Also empty outside the bounded-ledger rotation transaction. Without this
+-- guard, an unrelated `DELETE FROM event_retention_intervals` could erase
+-- authoritative hole evidence and turn a real loss into false completeness.
+CREATE TABLE IF NOT EXISTS event_retention_rotation_authorizations (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1)
+);
+
+CREATE TRIGGER IF NOT EXISTS event_retention_state_delete_guard
+BEFORE DELETE ON event_retention_state
+BEGIN
+    SELECT RAISE(ABORT, 'event retention state is permanent');
+END;
+
+-- These values are trust boundaries, not mutable counters that may be
+-- rewound.  In particular, lowering the evidence boundary or changing legacy
+-- history from incomplete to complete could turn an unknowable resume range
+-- into a false no-pruning answer; lowering the high-water mark could permit ID
+-- reuse.  Legitimate writers only advance these fields (epoch rotation changes
+-- complete -> incomplete), so fail closed on every reverse transition.
+CREATE TRIGGER IF NOT EXISTS event_retention_state_monotonic_guard
+BEFORE UPDATE ON event_retention_state
+WHEN NEW.generation < OLD.generation
+  OR NEW.evidence_from_event_id < OLD.evidence_from_event_id
+  OR NEW.max_event_id < OLD.max_event_id
+  OR NEW.deleted_event_count < OLD.deleted_event_count
+  OR (
+      OLD.last_deleted_at IS NOT NULL
+      AND (NEW.last_deleted_at IS NULL OR NEW.last_deleted_at < OLD.last_deleted_at)
+  )
+  OR (OLD.legacy_history_complete = 0 AND NEW.legacy_history_complete = 1)
+BEGIN
+    SELECT RAISE(ABORT, 'event retention authority cannot move backwards');
+END;
+
+-- Epoch, evidence-boundary, and legacy-completeness changes are one atomic
+-- authority transition.  They may occur only during the exact rotation that
+-- also clears the old epoch's interval rows.  This prevents standalone SQL
+-- from minting a cursor token whose evidence does not match its epoch.
+CREATE TRIGGER IF NOT EXISTS event_retention_state_rotation_guard
+BEFORE UPDATE ON event_retention_state
+WHEN (
+        NEW.cursor_epoch != OLD.cursor_epoch
+        OR NEW.evidence_from_event_id != OLD.evidence_from_event_id
+        OR NEW.legacy_history_complete != OLD.legacy_history_complete
+     )
+ AND (
+        NOT EXISTS (
+            SELECT 1 FROM event_retention_rotation_authorizations
+            WHERE singleton = 1
+        )
+        OR NEW.cursor_epoch = OLD.cursor_epoch
+        OR NEW.legacy_history_complete != 0
+        OR OLD.max_event_id >= 9223372036854775807
+        OR NEW.evidence_from_event_id != OLD.max_event_id + 1
+        OR NEW.generation != OLD.generation
+        OR NEW.max_event_id != OLD.max_event_id
+        OR NEW.deleted_event_count != OLD.deleted_event_count
+        OR NEW.last_deleted_at IS NOT OLD.last_deleted_at
+     )
+BEGIN
+    SELECT RAISE(ABORT, 'event retention epoch rotation must be atomic and authorized');
+END;
+
+-- Make interval invalidation a schema invariant rather than relying solely on
+-- one Rust call site.  The authorization row is still present while this
+-- AFTER trigger runs, so the interval-delete guard accepts this exact clear;
+-- statement/transaction rollback restores both state and intervals on error.
+CREATE TRIGGER IF NOT EXISTS event_retention_state_rotation_clear_intervals
+AFTER UPDATE OF cursor_epoch ON event_retention_state
+WHEN NEW.cursor_epoch != OLD.cursor_epoch
+BEGIN
+    DELETE FROM event_retention_intervals;
+END;
+
+CREATE TRIGGER IF NOT EXISTS event_retention_intervals_insert_guard
+BEFORE INSERT ON event_retention_intervals
+WHEN EXISTS (
+    SELECT 1 FROM event_retention_intervals AS existing
+    WHERE existing.end_id >= CASE
+              WHEN NEW.start_id > 1 THEN NEW.start_id - 1 ELSE 1
+          END
+      AND existing.start_id <= CASE
+              WHEN NEW.end_id < 9223372036854775807 THEN NEW.end_id + 1
+              ELSE 9223372036854775807
+          END
+)
+BEGIN
+    SELECT RAISE(ABORT, 'event retention intervals must be disjoint and non-adjacent');
+END;
+
+CREATE TRIGGER IF NOT EXISTS event_retention_intervals_update_guard
+BEFORE UPDATE ON event_retention_intervals
+BEGIN
+    SELECT RAISE(ABORT, 'event retention intervals are replace-only');
+END;
+
+CREATE TRIGGER IF NOT EXISTS event_retention_intervals_delete_guard
+BEFORE DELETE ON event_retention_intervals
+WHEN NOT EXISTS (SELECT 1 FROM event_retention_delete_authorizations)
+ AND NOT EXISTS (
+     SELECT 1 FROM event_retention_rotation_authorizations WHERE singleton = 1
+ )
+BEGIN
+    SELECT RAISE(ABORT, 'event retention interval deletion requires an authorized batch or epoch rotation');
+END;
+
+-- SQLite may reuse rowids after the largest event is deleted (and starts again
+-- at 1 after a full prune).  Reuse would make a durable deletion interval lie
+-- about the new row, so reject any insert that does not advance the durable
+-- high-water mark.  The production writer allocates max_event_id + 1.
+CREATE TRIGGER IF NOT EXISTS events_monotonic_id_guard
+BEFORE INSERT ON events
+WHEN NOT EXISTS (
+         SELECT 1 FROM event_retention_state WHERE singleton = 1
+     )
+     OR NEW.id <= COALESCE((
+         SELECT max_event_id FROM event_retention_state WHERE singleton = 1
+     ), 9223372036854775807)
+BEGIN
+    SELECT RAISE(ABORT, 'events.id must advance the durable event high-water mark');
+END;
+
+CREATE TRIGGER IF NOT EXISTS events_monotonic_id_advance
+AFTER INSERT ON events
+BEGIN
+    UPDATE event_retention_state
+    SET max_event_id = NEW.id
+    WHERE singleton = 1;
+END;
+
+CREATE TRIGGER IF NOT EXISTS events_id_update_guard
+BEFORE UPDATE OF id ON events
+WHEN NEW.id != OLD.id
+BEGIN
+    SELECT RAISE(ABORT, 'events.id is immutable once allocated');
+END;
+
+CREATE TRIGGER IF NOT EXISTS events_retention_delete_guard
+BEFORE DELETE ON events
+WHEN NOT EXISTS (
+    SELECT 1 FROM event_retention_delete_authorizations
+    WHERE event_id = OLD.id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'event deletion requires transactional retention evidence');
+END;
 
 -- Event labels (many-to-one) for triage and filtering (bd-1yk8)
 CREATE TABLE IF NOT EXISTS event_labels (
@@ -334,6 +550,8 @@ CREATE TABLE IF NOT EXISTS workflow_executions (
 CREATE INDEX IF NOT EXISTS idx_workflows_pane ON workflow_executions(pane_id);
 CREATE INDEX IF NOT EXISTS idx_workflows_status ON workflow_executions(status);
 CREATE INDEX IF NOT EXISTS idx_workflows_started ON workflow_executions(started_at);
+CREATE INDEX IF NOT EXISTS idx_workflows_trigger_event_id
+    ON workflow_executions(trigger_event_id) WHERE trigger_event_id IS NOT NULL;
 
 -- Workflow step logs: execution history for audit and debugging
 CREATE TABLE IF NOT EXISTS workflow_step_logs (

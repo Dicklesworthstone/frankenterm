@@ -1677,6 +1677,203 @@ pub(crate) static MIGRATIONS: &[Migration] = &[
             ",
         ),
     },
+    Migration {
+        version: 34,
+        description: "Add transactional event-retention interval evidence and monotonic event IDs",
+        up_sql: r"
+        CREATE TABLE IF NOT EXISTS event_retention_state (
+            singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+            cursor_epoch TEXT NOT NULL CHECK (
+                length(cursor_epoch) = 32
+                AND cursor_epoch NOT GLOB '*[^0-9a-f]*'
+            ),
+            legacy_history_complete INTEGER NOT NULL CHECK (legacy_history_complete IN (0, 1)),
+            generation INTEGER NOT NULL DEFAULT 0 CHECK (generation >= 0),
+            evidence_from_event_id INTEGER NOT NULL CHECK (evidence_from_event_id > 0),
+            max_event_id INTEGER NOT NULL DEFAULT 0
+                CHECK (max_event_id >= 0 AND max_event_id >= evidence_from_event_id - 1),
+            deleted_event_count INTEGER NOT NULL DEFAULT 0 CHECK (deleted_event_count >= 0),
+            last_deleted_at INTEGER CHECK (last_deleted_at IS NULL OR last_deleted_at >= 0),
+            CHECK (legacy_history_complete = 0 OR evidence_from_event_id = 1),
+            CHECK (deleted_event_count >= generation),
+            CHECK (
+                (generation = 0 AND deleted_event_count = 0 AND last_deleted_at IS NULL)
+                OR (generation > 0 AND deleted_event_count > 0 AND last_deleted_at IS NOT NULL)
+            )
+        );
+
+        INSERT OR IGNORE INTO event_retention_state (
+            singleton, cursor_epoch, legacy_history_complete,
+            generation, evidence_from_event_id, max_event_id,
+            deleted_event_count, last_deleted_at
+        )
+        SELECT
+            1,
+            lower(hex(randomblob(16))),
+            0,
+            0,
+            CASE
+                WHEN MAX(id) IS NULL THEN 1
+                WHEN MAX(id) >= 9223372036854775807 THEN 9223372036854775807
+                ELSE MAX(id) + 1
+            END,
+            COALESCE(MAX(id), 0),
+            0,
+            NULL
+        FROM events;
+
+        CREATE INDEX IF NOT EXISTS idx_events_segment_id
+            ON events(segment_id) WHERE segment_id IS NOT NULL;
+        CREATE INDEX IF NOT EXISTS idx_workflows_trigger_event_id
+            ON workflow_executions(trigger_event_id) WHERE trigger_event_id IS NOT NULL;
+
+        CREATE TABLE IF NOT EXISTS event_retention_intervals (
+            start_id INTEGER PRIMARY KEY CHECK (start_id > 0),
+            end_id INTEGER NOT NULL CHECK (end_id >= start_id),
+            first_generation INTEGER NOT NULL CHECK (first_generation > 0),
+            last_generation INTEGER NOT NULL CHECK (last_generation >= first_generation),
+            first_deleted_at INTEGER NOT NULL CHECK (first_deleted_at >= 0),
+            last_deleted_at INTEGER NOT NULL CHECK (last_deleted_at >= first_deleted_at)
+        );
+
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_event_retention_intervals_end
+            ON event_retention_intervals(end_id);
+
+        CREATE TABLE IF NOT EXISTS event_retention_delete_authorizations (
+            event_id INTEGER PRIMARY KEY CHECK (event_id > 0)
+        );
+
+        CREATE TABLE IF NOT EXISTS event_retention_rotation_authorizations (
+            singleton INTEGER PRIMARY KEY CHECK (singleton = 1)
+        );
+
+        CREATE TRIGGER IF NOT EXISTS event_retention_state_delete_guard
+        BEFORE DELETE ON event_retention_state
+        BEGIN
+            SELECT RAISE(ABORT, 'event retention state is permanent');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS event_retention_state_monotonic_guard
+        BEFORE UPDATE ON event_retention_state
+        WHEN NEW.generation < OLD.generation
+          OR NEW.evidence_from_event_id < OLD.evidence_from_event_id
+          OR NEW.max_event_id < OLD.max_event_id
+          OR NEW.deleted_event_count < OLD.deleted_event_count
+          OR (
+              OLD.last_deleted_at IS NOT NULL
+              AND (NEW.last_deleted_at IS NULL OR NEW.last_deleted_at < OLD.last_deleted_at)
+          )
+          OR (OLD.legacy_history_complete = 0 AND NEW.legacy_history_complete = 1)
+        BEGIN
+            SELECT RAISE(ABORT, 'event retention authority cannot move backwards');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS event_retention_state_rotation_guard
+        BEFORE UPDATE ON event_retention_state
+        WHEN (
+                NEW.cursor_epoch != OLD.cursor_epoch
+                OR NEW.evidence_from_event_id != OLD.evidence_from_event_id
+                OR NEW.legacy_history_complete != OLD.legacy_history_complete
+             )
+         AND (
+                NOT EXISTS (
+                    SELECT 1 FROM event_retention_rotation_authorizations
+                    WHERE singleton = 1
+                )
+                OR NEW.cursor_epoch = OLD.cursor_epoch
+                OR NEW.legacy_history_complete != 0
+                OR OLD.max_event_id >= 9223372036854775807
+                OR NEW.evidence_from_event_id != OLD.max_event_id + 1
+                OR NEW.generation != OLD.generation
+                OR NEW.max_event_id != OLD.max_event_id
+                OR NEW.deleted_event_count != OLD.deleted_event_count
+                OR NEW.last_deleted_at IS NOT OLD.last_deleted_at
+             )
+        BEGIN
+            SELECT RAISE(ABORT, 'event retention epoch rotation must be atomic and authorized');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS event_retention_state_rotation_clear_intervals
+        AFTER UPDATE OF cursor_epoch ON event_retention_state
+        WHEN NEW.cursor_epoch != OLD.cursor_epoch
+        BEGIN
+            DELETE FROM event_retention_intervals;
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS event_retention_intervals_insert_guard
+        BEFORE INSERT ON event_retention_intervals
+        WHEN EXISTS (
+            SELECT 1 FROM event_retention_intervals AS existing
+            WHERE existing.end_id >= CASE
+                      WHEN NEW.start_id > 1 THEN NEW.start_id - 1 ELSE 1
+                  END
+              AND existing.start_id <= CASE
+                      WHEN NEW.end_id < 9223372036854775807 THEN NEW.end_id + 1
+                      ELSE 9223372036854775807
+                  END
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'event retention intervals must be disjoint and non-adjacent');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS event_retention_intervals_update_guard
+        BEFORE UPDATE ON event_retention_intervals
+        BEGIN
+            SELECT RAISE(ABORT, 'event retention intervals are replace-only');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS event_retention_intervals_delete_guard
+        BEFORE DELETE ON event_retention_intervals
+        WHEN NOT EXISTS (SELECT 1 FROM event_retention_delete_authorizations)
+         AND NOT EXISTS (
+             SELECT 1 FROM event_retention_rotation_authorizations WHERE singleton = 1
+         )
+        BEGIN
+            SELECT RAISE(ABORT, 'event retention interval deletion requires an authorized batch or epoch rotation');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS events_monotonic_id_guard
+        BEFORE INSERT ON events
+        WHEN NOT EXISTS (
+                 SELECT 1 FROM event_retention_state WHERE singleton = 1
+             )
+             OR NEW.id <= COALESCE((
+                 SELECT max_event_id FROM event_retention_state WHERE singleton = 1
+             ), 9223372036854775807)
+        BEGIN
+            SELECT RAISE(ABORT, 'events.id must advance the durable event high-water mark');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS events_monotonic_id_advance
+        AFTER INSERT ON events
+        BEGIN
+            UPDATE event_retention_state
+            SET max_event_id = NEW.id
+            WHERE singleton = 1;
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS events_id_update_guard
+        BEFORE UPDATE OF id ON events
+        WHEN NEW.id != OLD.id
+        BEGIN
+            SELECT RAISE(ABORT, 'events.id is immutable once allocated');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS events_retention_delete_guard
+        BEFORE DELETE ON events
+        WHEN NOT EXISTS (
+            SELECT 1 FROM event_retention_delete_authorizations
+            WHERE event_id = OLD.id
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'event deletion requires transactional retention evidence');
+        END;
+        ",
+        // Retention deletions are irreversible.  Dropping their evidence on a
+        // schema rollback would turn known data loss back into a silent cursor
+        // skip, so v34 deliberately establishes a new forward-only floor.
+        down_sql: None,
+    },
 ];
 
 // =============================================================================
@@ -2692,11 +2889,11 @@ pub(crate) fn build_migration_plan(from_version: i32, to_version: i32) -> Result
         });
     }
 
-    // Downgrade contract (ft-ftwck): v1, v30, and v32 are deliberately
+    // Downgrade contract (ft-ftwck): v1, v30, v32, and v34 are deliberately
     // forward-only (down_sql: None), so the lowest reachable downgrade target
-    // is the HIGHEST forward-only version. Reversible migrations may form a
-    // tail above that floor: v33 currently makes head -> v32 reachable, while
-    // every target below v32 must still fail closed at the forward-only step.
+    // is the HIGHEST forward-only version.  v34 protects durable retention-loss
+    // evidence from being discarded by a rollback; there is currently no
+    // reversible tail above that floor.
     let mut steps = Vec::new();
     for migration in MIGRATIONS.iter().rev() {
         if migration.version <= to_version || migration.version > from_version {
@@ -3818,6 +4015,186 @@ mod tests {
     }
 
     #[test]
+    fn event_retention_v34_upgrade_starts_a_new_fail_closed_cursor_epoch() {
+        let conn = Connection::open_in_memory().expect("open in-memory sqlite");
+        conn.execute_batch(
+            "CREATE TABLE events (id INTEGER PRIMARY KEY, segment_id INTEGER);
+             CREATE TABLE workflow_executions (trigger_event_id INTEGER);
+             CREATE TABLE schema_version (
+                 version INTEGER NOT NULL,
+                 applied_at INTEGER NOT NULL,
+                 description TEXT
+             );
+             INSERT INTO events (id) VALUES (7), (9);
+             PRAGMA user_version = 33;",
+        )
+        .expect("create pre-v34 fixture");
+        let step = MigrationStep {
+            migration_version: 34,
+            resulting_version: 34,
+            description: "test v34 retention evidence upgrade",
+            direction: MigrationDirection::Up,
+        };
+        apply_migration_step(&conn, &step).expect("apply v34 migration");
+
+        let state = conn
+            .query_row(
+                "SELECT cursor_epoch, legacy_history_complete,
+                        evidence_from_event_id, max_event_id, generation,
+                        deleted_event_count, last_deleted_at
+                 FROM event_retention_state WHERE singleton = 1",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, i64>(5)?,
+                        row.get::<_, Option<i64>>(6)?,
+                    ))
+                },
+            )
+            .expect("read v34 state");
+        assert_eq!(state.0.len(), 32, "epoch is a 128-bit hex token");
+        assert_eq!(state.1, 0, "legacy deletion history is unknowable");
+        assert_eq!(state.2, 10);
+        assert_eq!(state.3, 9);
+        assert_eq!((state.4, state.5, state.6), (0, 0, None));
+        assert!(
+            conn.execute("INSERT INTO events (id) VALUES (8)", []).is_err(),
+            "upgraded epoch must reject a non-advancing id"
+        );
+        conn.execute("INSERT INTO events (id) VALUES (10)", [])
+            .expect("first advancing id in new epoch");
+        assert!(
+            conn.execute(
+                "UPDATE event_retention_state SET max_event_id = 9 WHERE singleton = 1",
+                [],
+            )
+            .is_err(),
+            "the durable high-water mark must not be rewound"
+        );
+
+        let empty = Connection::open_in_memory().expect("open empty v33 sqlite");
+        empty
+            .execute_batch(
+                "CREATE TABLE events (id INTEGER PRIMARY KEY, segment_id INTEGER);
+                 CREATE TABLE workflow_executions (trigger_event_id INTEGER);
+                 CREATE TABLE schema_version (
+                     version INTEGER NOT NULL,
+                     applied_at INTEGER NOT NULL,
+                     description TEXT
+                 );
+                 PRAGMA user_version = 33;",
+            )
+            .expect("create empty pre-v34 fixture");
+        apply_migration_step(&empty, &step).expect("upgrade empty v33 fixture");
+        let empty_state = empty
+            .query_row(
+                "SELECT legacy_history_complete, evidence_from_event_id, max_event_id
+                 FROM event_retention_state WHERE singleton = 1",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .expect("read empty-upgrade retention state");
+        assert_eq!(
+            empty_state,
+            (0, 1, 0),
+            "an empty v33 table still cannot prove that legacy IDs were never deleted"
+        );
+    }
+
+    #[test]
+    fn event_retention_v34_is_forward_only_and_interval_shape_is_enforced() {
+        let migration = MIGRATIONS
+            .iter()
+            .find(|migration| migration.version == 34)
+            .expect("v34 migration");
+        assert!(migration.down_sql.is_none());
+        assert!(build_migration_plan(34, 33).is_err());
+
+        let conn = Connection::open_in_memory().expect("open fresh sqlite");
+        initialize_schema(&conn).expect("initialize v34 schema");
+        let state = conn
+            .query_row(
+                "SELECT length(cursor_epoch), legacy_history_complete,
+                        evidence_from_event_id, max_event_id
+                 FROM event_retention_state WHERE singleton = 1",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                },
+            )
+            .expect("read fresh state");
+        assert_eq!(state, (32, 1, 1, 0));
+        assert!(
+            conn.execute(
+                "UPDATE event_retention_state
+                 SET cursor_epoch = 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA'
+                 WHERE singleton = 1",
+                [],
+            )
+            .is_err(),
+            "cursor epochs must remain canonical lowercase 128-bit hex"
+        );
+        assert!(
+            conn.execute(
+                "UPDATE event_retention_state
+                 SET cursor_epoch = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+                 WHERE singleton = 1",
+                [],
+            )
+            .is_err(),
+            "a canonical epoch still cannot change outside an authorized atomic rotation"
+        );
+
+        conn.execute(
+            "INSERT INTO event_retention_intervals (
+                 start_id, end_id, first_generation, last_generation,
+                 first_deleted_at, last_deleted_at
+             ) VALUES (1, 10, 1, 1, 100, 100)",
+            [],
+        )
+        .expect("insert canonical interval");
+        for (start, end) in [(5, 15), (11, 12)] {
+            assert!(
+                conn.execute(
+                    "INSERT INTO event_retention_intervals (
+                         start_id, end_id, first_generation, last_generation,
+                         first_deleted_at, last_deleted_at
+                     ) VALUES (?1, ?2, 2, 2, 101, 101)",
+                    rusqlite::params![start, end],
+                )
+                .is_err(),
+                "overlapping or adjacent interval [{start},{end}] must fail"
+            );
+        }
+        assert!(
+            conn.execute("DELETE FROM event_retention_intervals", [])
+                .is_err(),
+            "interval evidence may only change inside an authorized retention transaction"
+        );
+        assert!(
+            conn.execute("DELETE FROM event_retention_state WHERE singleton = 1", [])
+                .is_err(),
+            "singleton state must be permanent"
+        );
+    }
+
+    #[test]
     fn fresh_schema_and_v32_upgrade_have_identical_event_column_descriptors_and_order() {
         fn events_table_info(
             conn: &Connection,
@@ -3859,9 +4236,40 @@ mod tests {
 
         let upgraded = Connection::open_in_memory().expect("open upgrade sqlite");
         initialize_schema(&upgraded).expect("initialize upgrade fixture");
-        let down = build_migration_plan(SCHEMA_VERSION, 32)
-            .expect("build current-head -> v32 fixture plan");
-        apply_migration_plan(&upgraded, &down).expect("construct exact v32 fixture");
+        // v34 is deliberately forward-only because rolling it back would
+        // discard deletion evidence.  Construct the empty v32 fixture by
+        // removing only the additive v34 objects and applying v33's reversible
+        // column teardown, rather than asking the production planner to cross
+        // the forward-only boundary.
+        upgraded
+            .execute_batch(
+                "DROP TRIGGER IF EXISTS events_retention_delete_guard;
+                 DROP TRIGGER IF EXISTS events_id_update_guard;
+                 DROP TRIGGER IF EXISTS events_monotonic_id_advance;
+                 DROP TRIGGER IF EXISTS events_monotonic_id_guard;
+                 DROP TRIGGER IF EXISTS event_retention_intervals_delete_guard;
+                 DROP TRIGGER IF EXISTS event_retention_intervals_update_guard;
+                 DROP TRIGGER IF EXISTS event_retention_intervals_insert_guard;
+                 DROP TRIGGER IF EXISTS event_retention_state_rotation_clear_intervals;
+                 DROP TRIGGER IF EXISTS event_retention_state_rotation_guard;
+                 DROP TRIGGER IF EXISTS event_retention_state_monotonic_guard;
+                 DROP TRIGGER IF EXISTS event_retention_state_delete_guard;
+                 DROP INDEX IF EXISTS idx_events_segment_id;
+                 DROP INDEX IF EXISTS idx_workflows_trigger_event_id;
+                 DROP TABLE IF EXISTS event_retention_delete_authorizations;
+                 DROP TABLE IF EXISTS event_retention_rotation_authorizations;
+                 DROP TABLE IF EXISTS event_retention_intervals;
+                 DROP TABLE IF EXISTS event_retention_state;",
+            )
+            .expect("remove additive v34 objects from fixture");
+        let v33 = MIGRATIONS
+            .iter()
+            .find(|migration| migration.version == 33)
+            .expect("v33 migration");
+        upgraded
+            .execute_batch(v33.down_sql.expect("v33 down SQL"))
+            .expect("remove v33 columns from fixture");
+        set_user_version(&upgraded, 32).expect("stamp v32 fixture");
         for column in [
             "delivery_lease_token",
             "delivery_lease_acquired_at",
