@@ -585,6 +585,26 @@ fn release_fixture_events(db_path: &PathBuf, leases: &[EventDeliveryLease]) {
     });
 }
 
+fn mark_fixture_event_handled(db_path: &PathBuf, event_id: i64) {
+    let runtime = RuntimeBuilder::current_thread()
+        .build()
+        .expect("build runtime");
+    runtime.block_on(async {
+        let storage = StorageHandle::new(&db_path.to_string_lossy())
+            .await
+            .expect("open storage");
+        storage
+            .mark_event_handled(
+                event_id,
+                Some("fixture.concurrent-handler".to_string()),
+                "handled",
+            )
+            .await
+            .expect("mark fixture event handled");
+        storage.shutdown().await.expect("shutdown storage");
+    });
+}
+
 fn wait_for_event_delivery_lease(
     db_path: &PathBuf,
     event_id: i64,
@@ -612,6 +632,16 @@ fn wait_for_event_delivery_lease(
         );
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
+}
+
+fn epoch_ms_i64() -> i64 {
+    i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("test clock after Unix epoch")
+            .as_millis(),
+    )
+    .expect("test epoch milliseconds fit i64")
 }
 
 fn call_events(harness: &mut TestHarness, args: Value) -> Value {
@@ -1189,6 +1219,79 @@ fn mcp_conformance_foreign_hole_outlives_met_mask_until_exact_refetch() {
 }
 
 #[test]
+fn mcp_conformance_exact_hole_refetch_does_not_substitute_next_unhandled_row() {
+    let mut harness = new_harness();
+    seed_many_events(
+        &harness,
+        vec![
+            make_event_with(1, "rule.a", FIXTURE_TS),
+            make_event_with(2, "rule.b", FIXTURE_TS + 1),
+        ],
+    );
+    let _competing_lease = reserve_fixture_event_id(
+        &harness.db_path,
+        1,
+        std::time::Duration::from_secs(10),
+    );
+
+    let db_path = harness.db_path.clone();
+    let mut await_client = spawn_client(Some(db_path.clone()));
+    let waiter = std::thread::spawn(move || {
+        let envelope = parse_tool_envelope(
+            &await_client
+                .call_tool(
+                    "wa.await_event",
+                    json!({
+                        "all": ["rule:rule.a", "rule:rule.b"],
+                        "cursor": 0,
+                        "pane": FIXTURE_PANE_ID,
+                        "timeout_secs": 5,
+                        "poll_interval_ms": 10,
+                        "claim": true
+                    }),
+                )
+                .expect("call exact-refetch await"),
+        );
+        await_client
+            .call_tool("wa.events", json!({"limit": 1}))
+            .expect("exact-refetch delivery barrier");
+        envelope
+    });
+
+    wait_for_event_delivery_lease(&db_path, 2, std::time::Duration::from_secs(5));
+    // This clears id=1's lease and makes it invisible to the exact unhandled
+    // refetch. The query's first row is now id=2, which must not be mistaken
+    // for id=1 merely because it is the next row after cursor 0.
+    mark_fixture_event_handled(&db_path, 1);
+    seed_many_events_at(
+        &db_path,
+        vec![make_event_with(3, "rule.a", FIXTURE_TS + 2)],
+    );
+
+    let acquired = waiter.join().expect("join exact-refetch waiter");
+    assert_success_envelope_shape(&acquired);
+    assert_eq!(acquired["data"]["final_cursor"], Value::from(3));
+    assert_eq!(
+        acquired["data"]["events"]
+            .as_array()
+            .expect("exact-refetch matched events")
+            .iter()
+            .map(|event| event["id"].as_i64().expect("event id"))
+            .collect::<Vec<_>>(),
+        vec![2, 3],
+        "handled id=1 must be dropped without substituting id=2 as its refetch"
+    );
+    let events = load_fixture_events(&db_path);
+    assert_eq!(events.len(), 3);
+    assert_eq!(
+        events[0].handled_by_workflow_id.as_deref(),
+        Some("fixture.concurrent-handler")
+    );
+    assert!(events[1].handled_at.is_some());
+    assert!(events[2].handled_at.is_some());
+}
+
+#[test]
 fn mcp_conformance_blocked_hole_cap_fails_closed_across_pages() {
     const BLOCKED_CAP: i64 = 500;
     let mut harness = new_harness();
@@ -1283,6 +1386,87 @@ fn mcp_conformance_storage_paths_are_redacted_from_event_tool_errors() {
         assert!(!serialized.contains(secret_marker));
         assert!(!serialized.contains(invalid_db_path_text.as_ref()));
     }
+}
+
+#[test]
+fn mcp_conformance_no_cursor_boundary_precedes_delayed_storage_open() {
+    let mut harness = new_harness();
+    // Initialize schema and pane metadata before taking the deliberate writer
+    // lock. The awaited event itself is inserted while the handler is blocked
+    // opening storage.
+    seed_many_events(&harness, Vec::new());
+    let lock_connection =
+        rusqlite::Connection::open(&harness.db_path).expect("open delayed-open lock connection");
+    lock_connection
+        .busy_timeout(std::time::Duration::from_secs(5))
+        .expect("configure delayed-open busy timeout");
+    lock_connection
+        .execute_batch("BEGIN IMMEDIATE")
+        .expect("hold delayed-open writer lock");
+
+    let db_path = harness.db_path.clone();
+    let mut await_client = spawn_client(Some(db_path));
+    let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
+    let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
+    let waiter = std::thread::spawn(move || {
+        started_tx.send(()).expect("signal delayed-open call start");
+        let result = await_client
+            .call_tool(
+                "wa.await_event",
+                json!({
+                    "any": ["rule:rule.open_window"],
+                    "pane": FIXTURE_PANE_ID,
+                    "timeout_secs": 2,
+                    "poll_interval_ms": 10
+                }),
+            )
+            .map(|contents| parse_tool_envelope(&contents))
+            .map_err(|error| error.to_string());
+        let _ = result_tx.send(result);
+    });
+    started_rx
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .expect("delayed-open request thread started");
+    // Give the in-memory server a generous scheduling window to enter the
+    // storage-open path held by the transaction above.
+    std::thread::sleep(std::time::Duration::from_secs(1));
+    assert!(
+        matches!(
+            result_rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ),
+        "delayed-open fixture must hold the request before it can respond"
+    );
+
+    let detected_during_open_ms = epoch_ms_i64();
+    lock_connection
+        .execute(
+            "INSERT INTO events (
+                pane_id, rule_id, agent_type, event_type, severity, confidence,
+                matched_text, detected_at, dedupe_key
+             ) VALUES (?1, ?2, 'codex', 'usage_limit', 'warning', 0.5, ?3, ?4, ?5)",
+            rusqlite::params![
+                i64::try_from(FIXTURE_PANE_ID).expect("fixture pane id fits i64"),
+                "rule.open_window",
+                "detected while storage open was blocked",
+                detected_during_open_ms,
+                "wa-events-delayed-open"
+            ],
+        )
+        .expect("insert event during delayed storage open");
+    lock_connection
+        .execute_batch("COMMIT")
+        .expect("release delayed-open writer lock");
+
+    let envelope = result_rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("delayed-open request completed after lock release")
+        .expect("delayed-open MCP call succeeded");
+    waiter.join().expect("join delayed-open waiter");
+    assert_success_envelope_shape(&envelope);
+    assert_eq!(envelope["data"]["satisfied"], Value::Bool(true));
+    assert_eq!(envelope["data"]["timed_out"], Value::Bool(false));
+    assert_eq!(envelope["data"]["events"][0]["id"], Value::from(1));
 }
 
 #[test]
