@@ -27,8 +27,9 @@
 //!    Inactive/Suspended.
 //! 2. **Command handoff** — `gated_write!`/`gated_writeln!` with debug
 //!    assertions that output is not suppressed.
-//! 3. **Crash/panic handler** — checks `is_output_suppressed()` before
-//!    writing; may force-write if terminal restoration is needed.
+//! 3. **Crash/panic handler** — the crash-bundle layer writes no terminal
+//!    output. The shared fatal reporter is privacy-bounded, but hook-time
+//!    output still precedes RAII unwind restoration and is not renderer output.
 //!
 //! ## Prohibited
 //!
@@ -44,8 +45,8 @@
 //!   inline screen modes.
 //! - [`logging::init_logging`](crate::logging::init_logging) can be called
 //!   with [`TuiAwareWriter`] to suppress stderr during TUI.
-//! - [`crash::install_panic_hook`](crate::crash::install_panic_hook)
-//!   checks the gate before writing panic output.
+//! - [`crash::install_panic_hook`](crate::crash::install_panic_hook) persists a
+//!   silent bounded bundle and delegates operator-visible reporting.
 //!
 //! # Deletion criterion
 //!

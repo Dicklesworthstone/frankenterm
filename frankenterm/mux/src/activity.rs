@@ -1,5 +1,6 @@
 //! Keeps track of the number of user-initiated activities
 use crate::Mux;
+use frankenterm_sigpipe::{catch_recoverable, RecoverablePanicSite};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
@@ -288,12 +289,15 @@ impl ActivityPruneState {
                 Arc::clone(&active.claim)
             };
 
-            let schedule_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe({
-                let owner = owner.clone();
-                let state = Arc::clone(self);
-                let claim = Arc::clone(&claim);
-                move || state.spawn_claimed_dispatch(owner, claim)
-            }));
+            let schedule_result = catch_recoverable(
+                RecoverablePanicSite::MuxActivityScheduler,
+                std::panic::AssertUnwindSafe({
+                    let owner = owner.clone();
+                    let state = Arc::clone(self);
+                    let claim = Arc::clone(&claim);
+                    move || state.spawn_claimed_dispatch(owner, claim)
+                }),
+            );
             if schedule_result.is_err() {
                 log::error!("activity prune scheduler panicked; retaining bounded recovery intent");
                 // The future normally drops while the scheduler panic unwinds,

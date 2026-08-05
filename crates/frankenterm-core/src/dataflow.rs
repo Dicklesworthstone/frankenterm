@@ -50,10 +50,11 @@
 //! assert_eq!(graph.get_value(should_restart), Some(&Value::Bool(true)));
 //! ```
 
+use frankenterm_sigpipe::{catch_recoverable, RecoverablePanicSite};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
-use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -744,7 +745,10 @@ impl DataflowGraph {
         for sid in sink_ids {
             if changed_nodes.contains(&sid) {
                 if let (Some(node), Some(callback)) = (self.nodes.get(&sid), self.sinks.get(&sid)) {
-                    match catch_unwind(AssertUnwindSafe(|| callback(&node.value))) {
+                    match catch_recoverable(
+                        RecoverablePanicSite::CoreDataflowCallback,
+                        AssertUnwindSafe(|| callback(&node.value)),
+                    ) {
                         Ok(()) => {
                             sink_callbacks_fired += 1;
                             trace!(
@@ -840,7 +844,10 @@ impl DataflowGraph {
         for sid in sink_ids {
             if changed_nodes.contains(&sid) {
                 if let (Some(node), Some(callback)) = (self.nodes.get(&sid), self.sinks.get(&sid)) {
-                    match catch_unwind(AssertUnwindSafe(|| callback(&node.value))) {
+                    match catch_recoverable(
+                        RecoverablePanicSite::CoreDataflowCallback,
+                        AssertUnwindSafe(|| callback(&node.value)),
+                    ) {
                         Ok(()) => {
                             trace!(
                                 node_id = sid.0,

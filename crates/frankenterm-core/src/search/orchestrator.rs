@@ -43,6 +43,7 @@ use super::{
     EmbedError, Embedder, EmbedderInfo, EmbedderTier, FusedResult, HashEmbedder,
     HybridSearchService, SearchMode, TwoTierMetrics,
 };
+use frankenterm_sigpipe::{catch_recoverable, RecoverablePanicSite};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::sync::Arc;
@@ -749,7 +750,7 @@ impl SearchOrchestrator {
 
     /// Bridge fusion: delegates to frankensearch with weight-aware RRF scoring.
     fn fuse_bridge(&self, input: &LegacySearchInput) -> OrchestrationResult {
-        let bridge_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let run_bridge = || {
             let svc = HybridSearchService::new()
                 .with_mode(SearchMode::from(self.config.mode))
                 .with_rrf_k(self.config.rrf_k)
@@ -758,7 +759,20 @@ impl SearchOrchestrator {
                 .with_rrf_weights(self.config.lexical_weight, self.config.semantic_weight);
 
             svc.fuse(&input.lexical_ranked, &input.semantic_ranked, input.top_k)
-        }));
+        };
+        // A bridge panic is recoverable only when this orchestrator is
+        // configured to take the legacy fallback. Without that fallback there
+        // is no recovery action: execute directly so the ordinary fatal hook
+        // reports the panic exactly once instead of suppressing and rethrowing
+        // a payload that the sanitized recovery API intentionally discards.
+        let bridge_result = if self.config.fallback_to_legacy {
+            catch_recoverable(
+                RecoverablePanicSite::CoreSearchBridge,
+                std::panic::AssertUnwindSafe(run_bridge),
+            )
+        } else {
+            Ok(run_bridge())
+        };
 
         let mm = self.migration_metrics();
 
@@ -787,7 +801,8 @@ impl SearchOrchestrator {
                     lexical_enabled: mm.lexical_enabled,
                 },
             },
-            Err(_) if self.config.fallback_to_legacy => {
+            Err(_) => {
+                debug_assert!(self.config.fallback_to_legacy);
                 let mut result = self.fuse_legacy(input);
                 result.metrics.fallback_occurred = true;
                 result.metrics.fallback_reason =
@@ -795,7 +810,6 @@ impl SearchOrchestrator {
                 result.metrics.backend = "bridge(fallback->legacy)".to_string();
                 result
             }
-            Err(panic_payload) => std::panic::resume_unwind(panic_payload),
         }
     }
 

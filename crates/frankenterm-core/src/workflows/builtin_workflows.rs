@@ -298,12 +298,10 @@ impl HandleCompaction {
         loop {
             polls += 1;
 
-            let activity_map = storage
-                .get_last_activity_by_pane()
+            let last_activity_ms = storage
+                .pane_last_output_at(pane_id)
                 .await
                 .map_err(|e| format!("Failed to read pane activity: {e}"))?;
-
-            let last_activity_ms = activity_map.get(&pane_id).copied();
 
             // If we have no activity recorded, treat as stable enough to proceed.
             if last_activity_ms.is_none() {
@@ -1666,6 +1664,83 @@ mod tests {
         let err = HandleCompaction::stabilization_deadline_after(Instant::now(), Duration::MAX)
             .expect_err("Duration::MAX should not fit in an Instant deadline");
         assert!(err.contains("too large"));
+    }
+
+    #[test]
+    fn v35_compaction_stabilization_preserves_target_pane_activity_semantics() {
+        use crate::runtime_async::CompatRuntime;
+
+        let runtime = crate::runtime_async::RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .expect("workflow stabilization test runtime");
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let db_path = temp_dir.path().join("stabilization-activity.db");
+        let db_path_str = db_path.to_string_lossy().to_string();
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            runtime.block_on(async {
+                let storage = std::sync::Arc::new(
+                    crate::storage::StorageHandle::new(&db_path_str)
+                        .await
+                        .expect("storage"),
+                );
+                let now = crate::storage::now_ms();
+                storage
+                    .upsert_pane(crate::storage::PaneRecord {
+                        pane_id: 42,
+                        pane_uuid: Some("pane-42".to_string()),
+                        domain: "local".to_string(),
+                        window_id: None,
+                        tab_id: None,
+                        title: Some("codex".to_string()),
+                        cwd: None,
+                        tty_name: None,
+                        first_seen_at: now,
+                        last_seen_at: now,
+                        observed: true,
+                        ignore_reason: None,
+                        last_decision_at: None,
+                    })
+                    .await
+                    .expect("seed pane");
+
+                let empty = HandleCompaction::wait_for_stable_output(
+                    storage.clone(),
+                    42,
+                    1,
+                    0,
+                )
+                .await
+                .expect("an empty target pane is immediately stable");
+                assert_eq!(empty.polls, 1);
+                assert_eq!(empty.last_activity_ms, None);
+
+                let segment = storage
+                    .append_segment(42, "recent activity", None)
+                    .await
+                    .expect("append target-pane activity");
+                let error = HandleCompaction::wait_for_stable_output(
+                    storage.clone(),
+                    42,
+                    u64::MAX,
+                    0,
+                )
+                .await
+                .expect_err("recent target-pane activity must honor the zero timeout");
+                assert!(error.contains("Stabilization timeout"));
+                assert!(error.contains(&segment.captured_at.to_string()));
+
+                storage.shutdown().await.expect("shutdown storage");
+            });
+        }));
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(runtime)));
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::runtime_async::clear_runtime_handle();
+        }));
+        if let Err(payload) = result {
+            std::panic::resume_unwind(payload);
+        }
     }
 
     // ========================================================================

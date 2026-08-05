@@ -111,7 +111,10 @@ impl<T> Drop for Promise<T> {
         if let Some(waker) = waker {
             // Destructors must not propagate an executor-provided waker panic:
             // a second panic during unwinding would abort the process.
-            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| waker.wake()));
+            let _ = frankenterm_sigpipe::catch_recoverable(
+                frankenterm_sigpipe::RecoverablePanicSite::PromiseWaker,
+                std::panic::AssertUnwindSafe(|| waker.wake()),
+            );
         }
     }
 }

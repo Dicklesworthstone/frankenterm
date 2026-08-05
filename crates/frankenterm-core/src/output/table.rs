@@ -4,6 +4,110 @@
 //! alignment, column widths, and optional ANSI colors.
 
 use super::format::{OutputFormat, Style};
+use finl_unicode::grapheme_clusters::Graphemes;
+use termwiz::cell::{grapheme_column_width, unicode_column_width};
+
+// Unicode does not impose a useful upper bound on the number of combining
+// scalars in one grapheme cluster. Keep terminal-cell truncation from becoming
+// an unbounded byte-output path while retaining ample room for ordinary emoji
+// ZWJ sequences and combining scripts.
+const MAX_BYTES_PER_DISPLAY_CELL: usize = 256;
+
+// Table cells are sometimes wrapped by `Style` before they reach this module.
+// Preserve only those exact, balanced wrappers.  Treat every other escape
+// sequence as untrusted input so OSC hyperlinks/title changes, arbitrary CSI,
+// nested controls, and unterminated styling can never be re-emitted merely
+// because the visible text happened to fit its column.
+const SAFE_STYLE_PREFIXES: &[&str] = &[
+    "\x1b[1m", "\x1b[2m", "\x1b[3m", "\x1b[4m", "\x1b[31m", "\x1b[32m", "\x1b[33m",
+    "\x1b[34m", "\x1b[35m", "\x1b[36m", "\x1b[37m", "\x1b[90m", "\x1b[91m",
+    "\x1b[92m", "\x1b[93m", "\x1b[94m", "\x1b[96m",
+];
+const SAFE_STYLE_RESET: &str = "\x1b[0m";
+
+pub(super) fn visible_width(text: &str) -> usize {
+    unicode_column_width(text, None)
+}
+
+pub(super) fn is_untrusted_display_control(character: char) -> bool {
+    character.is_control()
+        || matches!(
+            character,
+            '\u{061c}'
+                | '\u{200e}'
+                | '\u{200f}'
+                | '\u{202a}'..='\u{202e}'
+                | '\u{2066}'..='\u{2069}'
+        )
+}
+
+fn replace_untrusted_display_controls(text: &str) -> String {
+    text.chars()
+        .map(|character| {
+            if is_untrusted_display_control(character) {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect()
+}
+
+fn has_exact_safe_style_wrapper(text: &str) -> bool {
+    let Some(inner_with_reset) = SAFE_STYLE_PREFIXES
+        .iter()
+        .find_map(|prefix| text.strip_prefix(*prefix))
+    else {
+        return false;
+    };
+    let Some(inner) = inner_with_reset.strip_suffix(SAFE_STYLE_RESET) else {
+        return false;
+    };
+
+    !inner.contains('\x1b') && !inner.chars().any(is_untrusted_display_control)
+}
+
+pub(super) fn sanitize_terminal_text(text: &str) -> String {
+    let stripped = strip_ansi(text);
+    if stripped.chars().any(is_untrusted_display_control) {
+        replace_untrusted_display_controls(&stripped)
+    } else {
+        stripped
+    }
+}
+
+pub(super) fn prefix_within_width(text: &str, max_width: usize) -> &str {
+    if max_width == 0 {
+        return "";
+    }
+
+    let mut byte_end = 0usize;
+    let mut width = 0usize;
+    let max_bytes = max_width.saturating_mul(MAX_BYTES_PER_DISPLAY_CELL);
+    for grapheme in Graphemes::new(text) {
+        let grapheme_width = grapheme_column_width(grapheme, None);
+        // A zero-cell grapheme at a table boundary can combine with or
+        // otherwise alter the preceding separator even though it consumes no
+        // advertised width. Ordinary combining text and emoji ZWJ sequences
+        // remain intact because their complete grapheme has positive width;
+        // only a disconnected/invisible cluster terminates the safe prefix.
+        if grapheme_width == 0 {
+            break;
+        }
+        let Some(next_width) = width.checked_add(grapheme_width) else {
+            break;
+        };
+        let Some(next_byte_end) = byte_end.checked_add(grapheme.len()) else {
+            break;
+        };
+        if next_width > max_width || next_byte_end > max_bytes {
+            break;
+        }
+        width = next_width;
+        byte_end = next_byte_end;
+    }
+    &text[..byte_end]
+}
 
 /// Column alignment
 #[derive(Debug, Clone, Copy, Default)]
@@ -116,13 +220,13 @@ impl Table {
         let mut widths: Vec<usize> = self
             .columns
             .iter()
-            .map(|col| col.header.len().max(col.min_width))
+            .map(|col| visible_width(&sanitize_terminal_text(&col.header)).max(col.min_width))
             .collect();
 
         // Account for row content
         for row in &self.rows {
             for (i, cell) in row.iter().enumerate() {
-                let cell_len = strip_ansi(cell).len();
+                let cell_len = visible_width(&sanitize_terminal_text(cell));
                 widths[i] = widths[i].max(cell_len);
             }
         }
@@ -139,18 +243,51 @@ impl Table {
 
     /// Format a cell with the given width and alignment
     fn format_cell(cell: &str, width: usize, alignment: Alignment) -> String {
-        let visible_len = strip_ansi(cell).len();
-
-        if visible_len >= width {
-            // Truncate if needed
-            let stripped = strip_ansi(cell);
-            if stripped.len() > width && width > 3 {
-                return format!("{}...", &stripped[..width - 3]);
-            }
-            return cell.to_string();
+        if width == 0 {
+            return String::new();
         }
 
-        let padding = width - visible_len;
+        let preserve_safe_style = has_exact_safe_style_wrapper(cell);
+        let stripped = strip_ansi(cell);
+        let had_untrusted_controls = stripped.chars().any(is_untrusted_display_control);
+        let stripped = if had_untrusted_controls {
+            replace_untrusted_display_controls(&stripped)
+        } else {
+            stripped
+        };
+        let visible_len = visible_width(&stripped);
+        let bounded_prefix = prefix_within_width(&stripped, width);
+
+        if bounded_prefix.len() != stripped.len() {
+            let truncated = if width > 3 {
+                let mut truncated = prefix_within_width(&stripped, width - 3).to_string();
+                truncated.push_str("...");
+                truncated
+            } else {
+                bounded_prefix.to_string()
+            };
+            let truncated_width = visible_width(&truncated);
+            return Self::align_cell(&truncated, width, truncated_width, alignment);
+        }
+
+        if visible_len >= width {
+            return if preserve_safe_style {
+                cell.to_string()
+            } else {
+                stripped
+            };
+        }
+
+        let cell = if preserve_safe_style {
+            cell
+        } else {
+            stripped.as_str()
+        };
+        Self::align_cell(cell, width, visible_len, alignment)
+    }
+
+    fn align_cell(cell: &str, width: usize, visible_len: usize, alignment: Alignment) -> String {
+        let padding = width.saturating_sub(visible_len);
         match alignment {
             Alignment::Left => format!("{cell}{}", " ".repeat(padding)),
             Alignment::Right => format!("{}{cell}", " ".repeat(padding)),
@@ -241,25 +378,87 @@ impl Table {
 /// Strip ANSI escape codes from a string
 #[must_use]
 pub fn strip_ansi(s: &str) -> String {
-    let mut result = String::with_capacity(s.len());
-    let mut chars = s.chars().peekable();
+    #[derive(Clone, Copy)]
+    enum State {
+        Ground,
+        Escape,
+        EscapeIntermediate,
+        Csi,
+        Osc,
+        OscEscape,
+        ControlString,
+        ControlStringEscape,
+    }
 
-    while let Some(c) = chars.next() {
-        if c == '\x1b' {
-            // Skip escape sequence
-            if chars.peek() == Some(&'[') {
-                chars.next(); // consume '['
-                // Skip until we hit a letter (the command character)
-                while let Some(&next) = chars.peek() {
-                    chars.next();
-                    if next.is_ascii_alphabetic() {
-                        break;
-                    }
+    let mut result = String::with_capacity(s.len());
+    let mut state = State::Ground;
+    for c in s.chars() {
+        state = match state {
+            State::Ground => match c {
+                '\x1b' => State::Escape,
+                '\u{0090}' | '\u{0098}' | '\u{009e}' | '\u{009f}' => State::ControlString,
+                '\u{009b}' => State::Csi,
+                '\u{009d}' => State::Osc,
+                '\u{009c}' => State::Ground,
+                _ => {
+                    result.push(c);
+                    State::Ground
+                }
+            },
+            State::Escape => match c {
+                '[' => State::Csi,
+                ']' => State::Osc,
+                'P' | 'X' | '^' | '_' => State::ControlString,
+                '\x18' | '\x1a' => State::Ground,
+                '\u{20}'..='\u{2f}' => State::EscapeIntermediate,
+                _ => State::Ground,
+            },
+            State::EscapeIntermediate => match c {
+                '\x18' | '\x1a' => State::Ground,
+                '\u{20}'..='\u{2f}' => State::EscapeIntermediate,
+                _ => State::Ground,
+            },
+            State::Csi => match c {
+                '\x1b' => State::Escape,
+                '\x18' | '\x1a' => State::Ground,
+                '\u{40}'..='\u{7e}' => State::Ground,
+                _ => State::Csi,
+            },
+            State::Osc => match c {
+                '\x07' | '\u{009c}' => State::Ground,
+                '\x1b' => State::OscEscape,
+                '\x18' | '\x1a' => State::Ground,
+                _ => State::Osc,
+            },
+            State::OscEscape => {
+                if c == '\\' {
+                    State::Ground
+                } else if matches!(c, '\x18' | '\x1a') {
+                    State::Ground
+                } else if c == '\x1b' {
+                    State::OscEscape
+                } else {
+                    State::Osc
                 }
             }
-        } else {
-            result.push(c);
-        }
+            State::ControlString => match c {
+                '\u{009c}' => State::Ground,
+                '\x1b' => State::ControlStringEscape,
+                '\x18' | '\x1a' => State::Ground,
+                _ => State::ControlString,
+            },
+            State::ControlStringEscape => {
+                if c == '\\' {
+                    State::Ground
+                } else if matches!(c, '\x18' | '\x1a') {
+                    State::Ground
+                } else if c == '\x1b' {
+                    State::ControlStringEscape
+                } else {
+                    State::ControlString
+                }
+            }
+        };
     }
 
     result
@@ -292,6 +491,16 @@ mod tests {
         assert_eq!(strip_ansi("plain"), "plain");
         assert_eq!(strip_ansi("\x1b[31mred\x1b[0m"), "red");
         assert_eq!(strip_ansi("\x1b[1m\x1b[32mbold green\x1b[0m"), "bold green");
+        assert_eq!(strip_ansi("a\x1b[1~b"), "ab");
+        assert_eq!(strip_ansi("\x1b(Bascii"), "ascii");
+        assert_eq!(
+            strip_ansi("\x1b]8;;https://example.invalid\x1b\\link\x1b]8;;\x1b\\"),
+            "link"
+        );
+        assert_eq!(strip_ansi("\x1bPprivate payload\x1b\\shown"), "shown");
+        assert_eq!(strip_ansi("prefix\x1b[31"), "prefix");
+        assert_eq!(strip_ansi("hidden\x1b]title\x18visible"), "hiddenvisible");
+        assert_eq!(strip_ansi("a\u{009b}31mb"), "ab");
     }
 
     #[test]
@@ -442,10 +651,10 @@ mod tests {
     }
 
     #[test]
-    fn format_cell_truncation_width_3_no_ellipsis() {
-        // Width <= 3 means no room for "..." so just return cell as-is
+    fn format_cell_truncation_width_3_uses_a_bounded_prefix() {
+        // Width <= 3 has no room for an ellipsis, but still honors the bound.
         let result = Table::format_cell("abcdefg", 3, Alignment::Left);
-        assert_eq!(result, "abcdefg");
+        assert_eq!(result, "abc");
     }
 
     #[test]
@@ -456,6 +665,68 @@ mod tests {
     }
 
     #[test]
+    fn format_cell_unicode_truncation_and_padding_preserve_boundaries() {
+        assert_eq!(
+            Table::format_cell("héllo-world", 7, Alignment::Left),
+            "héll..."
+        );
+        assert_eq!(
+            Table::format_cell("é", 3, Alignment::Right),
+            "  é",
+            "padding must use terminal-cell width rather than UTF-8 bytes"
+        );
+        assert_eq!(Table::format_cell("表ab", 3, Alignment::Left), "表a");
+        assert_eq!(visible_width(&Table::format_cell("表ab", 3, Alignment::Left)), 3);
+
+        let combining_spam = "\u{0301}".repeat(1_024);
+        assert_eq!(
+            Table::format_cell(&combining_spam, 4, Alignment::Left),
+            "... "
+        );
+        assert_eq!(
+            Table::format_cell("\u{0301}", 4, Alignment::Left),
+            "... ",
+            "an orphan combining mark must not attach to the preceding separator"
+        );
+        assert_eq!(
+            Table::format_cell("a\u{0301}", 2, Alignment::Left),
+            "a\u{0301} ",
+            "a combining mark attached to a positive-width base remains intact"
+        );
+    }
+
+    #[test]
+    fn format_cell_neutralizes_untrusted_single_line_controls() {
+        assert_eq!(
+            Table::format_cell("\x1b[31mline one\nline two\u{202e}x\x1b[0m", 25, Alignment::Left),
+            "line one line two x      "
+        );
+    }
+
+    #[test]
+    fn format_cell_preserves_only_exact_balanced_project_style_wrappers() {
+        assert_eq!(
+            Table::format_cell("\x1b[32mOK\x1b[0m", 4, Alignment::Left),
+            "\x1b[32mOK\x1b[0m  "
+        );
+        assert_eq!(
+            Table::format_cell("\x1b]0;stolen title\x07OK", 4, Alignment::Left),
+            "OK  ",
+            "OSC must never be restored after width calculation"
+        );
+        assert_eq!(
+            Table::format_cell("\x1b[31mred without reset", 20, Alignment::Left),
+            "red without reset   ",
+            "unterminated styling must not leak into following output"
+        );
+        assert_eq!(
+            Table::format_cell("\x1b[32msafe\x1b]8;;https://example.invalid\x07x\x1b[0m", 8, Alignment::Left),
+            "safex   ",
+            "a safe-looking outer wrapper must not bless nested controls"
+        );
+    }
+
+    #[test]
     fn format_cell_empty_string() {
         let result = Table::format_cell("", 5, Alignment::Left);
         assert_eq!(result, "     ");
@@ -463,9 +734,9 @@ mod tests {
 
     #[test]
     fn format_cell_zero_width() {
-        // Visible len (0) >= width (0), so returns cell as-is
-        let result = Table::format_cell("", 0, Alignment::Left);
-        assert_eq!(result, "");
+        assert_eq!(Table::format_cell("", 0, Alignment::Left), "");
+        assert_eq!(Table::format_cell("hidden", 0, Alignment::Left), "");
+        assert_eq!(Table::format_cell("\x1b[31m", 0, Alignment::Left), "");
     }
 
     // =====================================================================
@@ -504,9 +775,10 @@ mod tests {
 
     #[test]
     fn strip_ansi_escape_without_bracket() {
-        // ESC not followed by '[' — just the ESC is consumed, rest preserved
+        // ESC X is the ANSI Start of String control; without a terminator its
+        // payload is untrusted control data and is stripped through EOF.
         let result = strip_ansi("\x1bXhello");
-        assert_eq!(result, "Xhello");
+        assert_eq!(result, "");
     }
 
     #[test]

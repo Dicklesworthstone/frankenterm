@@ -34,8 +34,8 @@ use crate::backpressure::{
     BackpressureConfig, BackpressureManager, BackpressureMetrics, QueueDepths,
 };
 use crate::config::{
-    CaptureBudgetConfig, HotReloadableConfig, PaneFilterConfig, PanePriorityConfig, PatternsConfig,
-    SnapshotConfig, SnapshotSchedulingMode,
+    CaptureBudgetConfig, CompiledRetentionPolicy, HotReloadableConfig, PaneFilterConfig,
+    PanePriorityConfig, PatternsConfig, SnapshotConfig, SnapshotSchedulingMode, StorageConfig,
 };
 use crate::capture_authority::{
     ActivePaneIdentity, CaptureAuthority, CaptureLease, CapturePersistenceGuard, CaptureRevision,
@@ -85,7 +85,7 @@ use crate::sharding::{ShardId, try_decode_sharded_pane_id};
 use crate::spsc_ring_buffer::{SpscConsumer, SpscProducer, channel as spsc_channel};
 #[cfg(feature = "native-wezterm")]
 use crate::storage::PaneRecord;
-use crate::storage::{MaintenanceRecord, StorageHandle, StoredEvent};
+use crate::storage::{MaintenanceRecord, SizeEvictionOutcome, StorageHandle, StoredEvent};
 #[cfg(all(feature = "vendored", unix))]
 use crate::tailer::StreamingBridge;
 use crate::tailer::{
@@ -135,6 +135,140 @@ fn runtime_deadline_after(now: Instant, duration: Duration, label: &str) -> Inst
         now.checked_add(Duration::from_secs(365 * 24 * 60 * 60))
             .unwrap_or(now)
     })
+}
+
+const RETENTION_MAINTENANCE_CADENCE: Duration = Duration::from_secs(60 * 60);
+const RETENTION_MAINTENANCE_RETRY_DELAY: Duration = Duration::from_secs(60);
+
+#[derive(Debug)]
+struct RetentionMaintenanceSchedule {
+    due: bool,
+    last_success: Instant,
+    last_attempt: Option<Instant>,
+}
+
+impl RetentionMaintenanceSchedule {
+    fn new(now: Instant) -> Self {
+        Self {
+            // Startup configuration must take effect without waiting an hour.
+            due: true,
+            last_success: now,
+            last_attempt: None,
+        }
+    }
+
+    fn mark_due(&mut self) {
+        self.due = true;
+        // A new operator policy supersedes any retry delay from an older
+        // failed attempt and is eligible on this maintenance turn.
+        self.last_attempt = None;
+    }
+
+    fn should_attempt(&self, now: Instant) -> bool {
+        if self.due {
+            return self.last_attempt.is_none_or(|last_attempt| {
+                now.saturating_duration_since(last_attempt)
+                    >= RETENTION_MAINTENANCE_RETRY_DELAY
+            });
+        }
+        now.saturating_duration_since(self.last_success) >= RETENTION_MAINTENANCE_CADENCE
+    }
+
+    fn finish_attempt(&mut self, now: Instant, succeeded: bool) {
+        self.last_attempt = Some(now);
+        if succeeded {
+            self.due = false;
+            self.last_success = now;
+        } else {
+            // Failed or cancelled cleanup is still due, but should not spin:
+            // `should_attempt` enforces the bounded retry delay above.
+            self.due = true;
+        }
+    }
+}
+
+/// Completion-based cadence shared by periodic maintenance lanes whose
+/// success and failure both receive the full configured throttle interval.
+#[derive(Debug, Clone, Copy)]
+struct CompletionTimedSchedule {
+    last_completion: Instant,
+}
+
+impl CompletionTimedSchedule {
+    const fn new(last_completion: Instant) -> Self {
+        Self { last_completion }
+    }
+
+    fn should_run(self, now: Instant, interval: Duration) -> bool {
+        !interval.is_zero()
+            && now.saturating_duration_since(self.last_completion) >= interval
+    }
+
+    fn finish(&mut self, completion: Instant) {
+        self.last_completion = completion;
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SizeRetentionReceiptStatus {
+    Completed,
+    InterruptedPartial,
+}
+
+impl SizeRetentionReceiptStatus {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Completed => "completed",
+            Self::InterruptedPartial => "interrupted_partial",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PendingSizeRetentionReceipt {
+    outcome: SizeEvictionOutcome,
+    status: SizeRetentionReceiptStatus,
+    retention_max_mb: u32,
+}
+
+fn size_retention_receipt_record(
+    pending: PendingSizeRetentionReceipt,
+    timestamp: i64,
+) -> MaintenanceRecord {
+    let attempt_status = pending.status.as_str();
+    let metadata = serde_json::json!({
+        "schema": "size_retention_receipt.v1",
+        "attempt_status": attempt_status,
+        "retention_max_mb": pending.retention_max_mb,
+        "deleted_segments": pending.outcome.deleted_segments,
+        "used_bytes_before": pending.outcome.used_bytes_before,
+        "used_bytes_after": pending.outcome.used_bytes_after,
+        "over_limit_after": pending.outcome.over_limit_after,
+    })
+    .to_string();
+    MaintenanceRecord {
+        id: 0,
+        event_type: "size_retention".to_string(),
+        message: Some(format!(
+            "Size retention {attempt_status} after {} durable segment deletions",
+            pending.outcome.deleted_segments
+        )),
+        metadata: Some(metadata),
+        timestamp,
+    }
+}
+
+async fn record_size_retention_receipt(
+    storage: &StorageHandle,
+    pending: PendingSizeRetentionReceipt,
+) -> Result<i64> {
+    let receipt_cx = crate::cx::Cx::for_request_with_budget(crate::cx::Budget::MINIMAL);
+    storage
+        .record_maintenance_with_cx(
+            &receipt_cx,
+            size_retention_receipt_record(pending, epoch_ms()),
+        )
+        .await
 }
 
 async fn persist_captured_segment_for_runtime(
@@ -826,14 +960,17 @@ pub struct RuntimeConfig {
     /// Channel buffer size for internal queues
     pub channel_buffer: usize,
     /// Maximum concurrent capture operations
-    pub max_concurrent_captures: usize,
+    pub max_concurrent_captures: u32,
     /// Data retention period in days
     pub retention_days: u32,
+    /// Validated, first-match-preserving event-retention policy compiled from
+    /// the startup storage configuration.
+    pub retention_policy: Arc<CompiledRetentionPolicy>,
     /// Maximum size of storage in MB (0 = unlimited)
     pub retention_max_mb: u32,
     /// Database checkpoint interval in seconds
     pub checkpoint_interval_secs: u32,
-    /// Periodic cache compaction and vacuum policy
+    /// Periodic cache/page-stat reporting and manual-VACUUM advisory policy
     pub gc: CacheGcSettings,
     /// Vendored mux socket paths used for pane-delta streaming subscriptions.
     ///
@@ -864,6 +1001,9 @@ impl Default for RuntimeConfig {
             channel_buffer: 1024,
             max_concurrent_captures: 10,
             retention_days: 30,
+            retention_policy: StorageConfig::default()
+                .compile_retention_policy()
+                .expect("the built-in retention policy must be valid"),
             retention_max_mb: 0,
             checkpoint_interval_secs: 60,
             gc: CacheGcSettings::default(),
@@ -873,6 +1013,31 @@ impl Default for RuntimeConfig {
             trauma_guard: crate::config::TraumaGuardConfig::default(),
         }
     }
+}
+
+fn initial_hot_reloadable_config(config: &RuntimeConfig) -> HotReloadableConfig {
+    HotReloadableConfig {
+        log_level: "info".to_string(), // Default, will be overridden
+        poll_interval_ms: duration_ms_u64(config.capture_interval),
+        min_poll_interval_ms: duration_ms_u64(config.min_capture_interval),
+        max_concurrent_captures: config.max_concurrent_captures,
+        pane_priorities: config.pane_priorities.clone(),
+        capture_budgets: config.capture_budgets.clone(),
+        retention_days: config.retention_days,
+        retention_max_mb: config.retention_max_mb,
+        checkpoint_interval_secs: config.checkpoint_interval_secs,
+        retention_policy: Arc::clone(&config.retention_policy),
+        gc: config.gc,
+        patterns: config.patterns.clone(),
+        workflows_enabled: vec![],
+        auto_run_allowlist: vec![],
+        trauma_guard: config.trauma_guard.clone(),
+    }
+}
+
+fn capture_concurrency_usize(value: u32) -> usize {
+    usize::try_from(value)
+        .expect("FrankenTerm's supported targets have a usize wide enough to represent u32")
 }
 
 #[cfg(all(feature = "vendored", unix))]
@@ -2843,27 +3008,10 @@ impl ObservationRuntime {
         let metrics = Arc::new(RuntimeMetrics::default());
         metrics.started_at.set(epoch_ms_u64());
 
-        // Initialize hot-reload config channel with current values
-        let hot_config = HotReloadableConfig {
-            log_level: "info".to_string(), // Default, will be overridden
-            poll_interval_ms: duration_ms_u64(config.capture_interval),
-            min_poll_interval_ms: duration_ms_u64(config.min_capture_interval),
-            max_concurrent_captures: config.max_concurrent_captures as u32,
-            pane_priorities: config.pane_priorities.clone(),
-            capture_budgets: config.capture_budgets.clone(),
-            retention_days: config.retention_days,
-            retention_max_mb: config.retention_max_mb,
-            checkpoint_interval_secs: config.checkpoint_interval_secs,
-            // ft-tkke8: RuntimeConfig does not carry tiers, so seed with the
-            // documented defaults (matching StorageConfig::default). Operator
-            // overrides arrive via the HotReloadableConfig reload channel.
-            retention_tiers: crate::config::default_retention_tiers(),
-            gc: config.gc,
-            patterns: config.patterns.clone(),
-            workflows_enabled: vec![],
-            auto_run_allowlist: vec![],
-            trauma_guard: config.trauma_guard.clone(),
-        };
+        // Seed the hot-reload channel from the exact validated startup policy;
+        // waiting for a later file-change notification would silently run the
+        // built-in tier defaults during the most important first cleanup.
+        let hot_config = initial_hot_reloadable_config(&config);
         let (config_tx, config_rx) = watch::channel(hot_config);
 
         Self {
@@ -3427,6 +3575,7 @@ impl ObservationRuntime {
         let scheduler_snapshot = Arc::clone(&self.scheduler_snapshot);
 
         let initial_retention_days = self.config.retention_days;
+        let initial_retention_policy = Arc::clone(&self.config.retention_policy);
         let initial_retention_max_mb = self.config.retention_max_mb;
         let initial_checkpoint_secs = self.config.checkpoint_interval_secs;
         let initial_cache_gc_settings = self.config.gc;
@@ -3434,26 +3583,34 @@ impl ObservationRuntime {
         let loop_cx = runtime_loop_cx();
         spawn_runtime_task(&loop_cx, move |loop_cx| async move {
             let mut retention_days = initial_retention_days;
+            let mut retention_policy = initial_retention_policy;
             let mut retention_max_mb = initial_retention_max_mb;
             let mut checkpoint_secs = initial_checkpoint_secs;
             let mut cache_gc_settings = initial_cache_gc_settings;
-            // ft-tkke8: tiered retention rules. RuntimeConfig carries no tiers,
-            // so seed with the documented defaults (matching the hot-reload
-            // channel seed in ObservationRuntime::new) and refresh from each
-            // hot-reload below.
-            let mut retention_tiers = crate::config::default_retention_tiers();
-            let mut last_health_snapshot = Instant::now()
+            let initial_health_completion = Instant::now()
                 .checked_sub(Duration::from_secs(60))
                 .unwrap_or_else(Instant::now);
             let health_interval = Duration::from_secs(30);
+            let mut health_schedule =
+                CompletionTimedSchedule::new(initial_health_completion);
 
             // Run maintenance every minute, but only do expensive ops when needed.
             // Keep first tick immediate to preserve prior interval behavior.
             let maintenance_interval = Duration::from_secs(60);
             let mut first_tick = true;
-            let mut last_retention_check = Instant::now();
-            let mut last_checkpoint = Instant::now();
-            let mut last_cache_gc = Instant::now();
+            let mut retention_schedule = RetentionMaintenanceSchedule::new(Instant::now());
+            let mut checkpoint_schedule = CompletionTimedSchedule::new(Instant::now());
+            let mut cache_gc_schedule = CompletionTimedSchedule::new(Instant::now());
+            // A receipt failure must not erase the exact durable size-eviction
+            // outcome. Retain it across maintenance attempts and do not admit
+            // further size deletions until the bounded receipt succeeds.
+            let mut pending_size_retention_receipt = None::<PendingSizeRetentionReceipt>;
+            // The tiered cleanup path likewise returns the exact immutable
+            // maintenance record when persistence fails. Preserve it across
+            // ticks and publish it before admitting another age-retention
+            // mutation, whose later zero-delete receipt would not be an
+            // equivalent audit record for the prior durable prefix.
+            let mut pending_cleanup_receipt = None::<MaintenanceRecord>;
             let backpressure_manager = BackpressureManager::new(BackpressureConfig::default());
             let memory_pressure_monitor =
                 MemoryPressureMonitor::new(MemoryPressureConfig::default());
@@ -3494,6 +3651,7 @@ impl ObservationRuntime {
                 // Check for config updates
                 if config_update_pending(&config_rx) {
                     let new_config = config_take_update(&mut config_rx);
+                    let mut retention_changed = false;
                     if new_config.retention_days != retention_days {
                         info!(
                             old = retention_days,
@@ -3501,14 +3659,16 @@ impl ObservationRuntime {
                             "Retention policy updated"
                         );
                         retention_days = new_config.retention_days;
+                        retention_changed = true;
                     }
-                    if new_config.retention_tiers != retention_tiers {
+                    if new_config.retention_policy.as_ref() != retention_policy.as_ref() {
                         info!(
-                            old = retention_tiers.len(),
-                            new = new_config.retention_tiers.len(),
+                            old = retention_policy.tiers().len(),
+                            new = new_config.retention_policy.tiers().len(),
                             "Retention tiers updated"
                         );
-                        retention_tiers.clone_from(&new_config.retention_tiers);
+                        retention_policy = Arc::clone(&new_config.retention_policy);
+                        retention_changed = true;
                     }
                     if new_config.retention_max_mb != retention_max_mb {
                         info!(
@@ -3517,6 +3677,7 @@ impl ObservationRuntime {
                             "Size-based retention cap updated"
                         );
                         retention_max_mb = new_config.retention_max_mb;
+                        retention_changed = true;
                     }
                     if new_config.checkpoint_interval_secs != checkpoint_secs {
                         info!(
@@ -3534,44 +3695,154 @@ impl ObservationRuntime {
                         );
                         cache_gc_settings = new_config.gc;
                     }
+                    if retention_changed {
+                        retention_schedule.mark_due();
+                    }
                 }
 
                 let now = Instant::now();
 
-                // Run retention cleanup every hour (or if just started/updated)
-                if now.duration_since(last_retention_check) >= Duration::from_secs(3600) {
+                // Run retention cleanup every hour and immediately on startup
+                // or a policy/size-cap update. Failed or cancelled attempts
+                // remain due, with a one-maintenance-tick retry delay.
+                if retention_schedule.should_attempt(now) {
+                    // Treat age- and size-retention as one policy epoch: if
+                    // either component fails, retry both so a later success
+                    // certifies the complete active policy. This can repeat a
+                    // successful component, but never more than once per
+                    // maintenance interval because the aggregate schedule
+                    // applies RETENTION_MAINTENANCE_RETRY_DELAY after failure.
+                    let mut retention_succeeded = true;
+                    if let Some(pending) = pending_cleanup_receipt.clone() {
+                        let receipt_cx = crate::cx::Cx::for_request_with_budget(
+                            crate::cx::Budget::MINIMAL,
+                        );
+                        match storage
+                            .record_maintenance_with_cx(&receipt_cx, pending)
+                            .await
+                        {
+                            Ok(maintenance_id) => {
+                                pending_cleanup_receipt = None;
+                                info!(
+                                    maintenance_id,
+                                    "Retried pending tiered-cleanup audit receipt"
+                                );
+                            }
+                            Err(error) => {
+                                retention_succeeded = false;
+                                error!(
+                                    error = %error,
+                                    "Pending tiered-cleanup audit receipt still failed; deferring new age-retention cleanup"
+                                );
+                            }
+                        }
+                    }
+                    if let Some(pending) = pending_size_retention_receipt {
+                        match record_size_retention_receipt(&storage, pending).await {
+                            Ok(maintenance_id) => {
+                                pending_size_retention_receipt = None;
+                                info!(
+                                    maintenance_id,
+                                    deleted_segments = pending.outcome.deleted_segments,
+                                    attempt_status = pending.status.as_str(),
+                                    "Retried pending size-retention audit receipt"
+                                );
+                            }
+                            Err(error) => {
+                                retention_succeeded = false;
+                                error!(
+                                    error = %error,
+                                    deleted_segments = pending.outcome.deleted_segments,
+                                    attempt_status = pending.status.as_str(),
+                                    "Pending size-retention audit receipt still failed; deferring new size eviction"
+                                );
+                            }
+                        }
+                    }
                     // ft-tkke8: tier-aware cleanup. This previously called the
                     // flat storage.retention_cleanup(cutoff) (output_segments
                     // only) plus a separate audit purge, ignoring
                     // config.retention_tiers entirely — so a configured tier
                     // policy (e.g. keep critical 90d, info 7d) was silently
                     // dropped and everything pruned at the flat retention_days.
-                    // cleanup_apply_with_cx evaluates per-tier event retention
+                    // The compiled cleanup path evaluates per-tier event retention
                     // AND prunes output_segments / audit_actions / usage_metrics
                     // / notification_history at the global cutoff, threading the
                     // loop Cx for cancellation. Run whenever a flat retention OR
                     // any tier rule is active.
-                    if retention_days > 0 || !retention_tiers.is_empty() {
-                        let cleanup_config = crate::config::StorageConfig {
-                            retention_days,
-                            retention_tiers: retention_tiers.clone(),
-                            ..crate::config::StorageConfig::default()
-                        };
-                        match crate::cleanup::cleanup_apply_with_cx(
+                    if pending_cleanup_receipt.is_none()
+                        && (retention_days > 0 || !retention_policy.tiers().is_empty())
+                    {
+                        let outcome = crate::cleanup::cleanup_apply_with_compiled_retention_with_cx(
                             &loop_cx,
                             &storage,
-                            &cleanup_config,
+                            retention_days,
+                            Arc::clone(&retention_policy),
                         )
-                        .await
+                        .await;
+                        if let crate::cleanup::CleanupAuditStatus::Failed {
+                            pending_record, ..
+                        } = &outcome.audit
                         {
-                            Ok(plan) => {
+                            // Preserve failed receipts for completed, cancelled,
+                            // and failed cleanup attempts alike. Interrupted
+                            // attempts only require a receipt when their plan
+                            // contains a durable deletion prefix.
+                            pending_cleanup_receipt = Some(pending_record.clone());
+                        }
+                        match (&outcome.termination, &outcome.audit) {
+                            (
+                                crate::cleanup::CleanupTermination::Completed,
+                                crate::cleanup::CleanupAuditStatus::Recorded { .. },
+                            ) => {
                                 debug!(
-                                    deleted = plan.total_deleted,
-                                    tables = plan.tables.len(),
+                                    deleted = outcome.plan.total_deleted,
+                                    tables = outcome.plan.tables.len(),
                                     "Tiered retention cleanup completed"
                                 );
                             }
-                            Err(e) => error!(error = %e, "Retention cleanup failed"),
+                            (
+                                crate::cleanup::CleanupTermination::Completed,
+                                crate::cleanup::CleanupAuditStatus::Failed { error, .. },
+                            ) => {
+                                retention_succeeded = false;
+                                error!(
+                                    error = %error,
+                                    deleted = outcome.plan.total_deleted,
+                                    "Retention cleanup completed but its audit receipt failed"
+                                );
+                            }
+                            (
+                                crate::cleanup::CleanupTermination::Cancelled { error },
+                                _audit,
+                            ) => {
+                                retention_succeeded = false;
+                                warn!(
+                                    error = %error,
+                                    deleted = outcome.plan.total_deleted,
+                                    "Retention cleanup cancelled with a truthful durable prefix"
+                                );
+                            }
+                            (
+                                crate::cleanup::CleanupTermination::Failed { error },
+                                _audit,
+                            ) => {
+                                retention_succeeded = false;
+                                error!(
+                                    error = %error,
+                                    deleted = outcome.plan.total_deleted,
+                                    "Retention cleanup failed with a truthful durable prefix"
+                                );
+                            }
+                            (
+                                crate::cleanup::CleanupTermination::Completed,
+                                crate::cleanup::CleanupAuditStatus::NotRequired,
+                            ) => {
+                                retention_succeeded = false;
+                                error!(
+                                    "Retention cleanup completed without its required audit receipt"
+                                );
+                            }
                         }
                     }
 
@@ -3580,12 +3851,12 @@ impl ObservationRuntime {
                     // Runs independently of retention_days so an operator who
                     // sets only a size cap (retention_days=0, retention_max_mb>0)
                     // still gets a bounded database instead of unbounded growth.
-                    if retention_max_mb > 0 {
+                    if retention_max_mb > 0 && pending_size_retention_receipt.is_none() {
                         match storage
-                            .enforce_size_limit_with_cx(&loop_cx, retention_max_mb)
+                            .enforce_size_limit_progress_with_cx(&loop_cx, retention_max_mb)
                             .await
                         {
-                            Ok(outcome) => {
+                            crate::storage::DurableMutationProgress::Complete(outcome) => {
                                 if outcome.deleted_segments > 0 {
                                     info!(
                                         deleted_segments = outcome.deleted_segments,
@@ -3593,27 +3864,75 @@ impl ObservationRuntime {
                                         cap_mb = retention_max_mb,
                                         "Size-based retention evicted oldest segments"
                                     );
+                                    let pending = PendingSizeRetentionReceipt {
+                                        outcome,
+                                        status: SizeRetentionReceiptStatus::Completed,
+                                        retention_max_mb,
+                                    };
+                                    if let Err(error) =
+                                        record_size_retention_receipt(&storage, pending).await
+                                    {
+                                        retention_succeeded = false;
+                                        pending_size_retention_receipt = Some(pending);
+                                        error!(
+                                            error = %error,
+                                            deleted_segments = outcome.deleted_segments,
+                                            "Completed size retention but its audit receipt failed"
+                                        );
+                                    }
                                 }
                                 if outcome.over_limit_after {
                                     warn!(
                                         cap_mb = retention_max_mb,
                                         used_bytes_after = outcome.used_bytes_after,
                                         "Database still over size cap after eviction \
-                                         (non-segment data dominates or per-pass budget exhausted)"
+                                         (non-segment data dominates)"
                                     );
                                 }
                             }
-                            Err(e) => error!(error = %e, "Size-based retention failed"),
+                            crate::storage::DurableMutationProgress::Interrupted {
+                                durable,
+                                error,
+                            } => {
+                                retention_succeeded = false;
+                                let deleted_segments =
+                                    durable.map_or(0, |outcome| outcome.deleted_segments);
+                                let mut receipt_error = None;
+                                if let Some(outcome) =
+                                    durable.filter(|value| value.deleted_segments > 0)
+                                {
+                                    let pending = PendingSizeRetentionReceipt {
+                                        outcome,
+                                        status: SizeRetentionReceiptStatus::InterruptedPartial,
+                                        retention_max_mb,
+                                    };
+                                    if let Err(receipt_failure) =
+                                        record_size_retention_receipt(&storage, pending).await
+                                    {
+                                        pending_size_retention_receipt = Some(pending);
+                                        receipt_error = Some(receipt_failure.to_string());
+                                    }
+                                }
+                                error!(
+                                    error = %error,
+                                    deleted_segments,
+                                    receipt_error = ?receipt_error,
+                                    "Size-based retention interrupted"
+                                );
+                            }
                         }
                     }
-                    last_retention_check = now;
+                    // Cadence and retry delays are measured from completion,
+                    // not the stale pre-I/O tick instant. Large cleanup passes
+                    // must not shorten the next hourly/retry window.
+                    retention_schedule.finish_attempt(Instant::now(), retention_succeeded);
                 }
 
                 // Run WAL checkpoint + PRAGMA optimize (lightweight)
-                if checkpoint_secs > 0
-                    && now.duration_since(last_checkpoint)
-                        >= Duration::from_secs(u64::from(checkpoint_secs))
-                {
+                if checkpoint_schedule.should_run(
+                    Instant::now(),
+                    Duration::from_secs(u64::from(checkpoint_secs)),
+                ) {
                     match storage.checkpoint().await {
                         Ok(result) => {
                             debug!(
@@ -3627,19 +3946,23 @@ impl ObservationRuntime {
                         }
                     }
 
-                    last_checkpoint = now;
+                    // Throttle both success and failure from the actual
+                    // completion boundary. Slow I/O must not shorten the next
+                    // interval, and failures must not be retried every tick.
+                    checkpoint_schedule.finish(Instant::now());
                 }
 
                 if cache_gc_settings.enabled
-                    && cache_gc_settings.interval_seconds > 0
-                    && now.duration_since(last_cache_gc)
-                        >= Duration::from_secs(cache_gc_settings.interval_seconds)
+                    && cache_gc_schedule.should_run(
+                        Instant::now(),
+                        Duration::from_secs(cache_gc_settings.interval_seconds),
+                    )
                 {
                     let mut page_count = 0_i64;
                     let mut free_pages = 0_i64;
                     let mut free_ratio = 0.0_f64;
-                    let mut vacuumed = false;
-                    let mut vacuum_error = None::<String>;
+                    let mut manual_vacuum_advised = false;
+                    let mut page_stats_error = None::<String>;
 
                     match storage.database_page_stats().await {
                         Ok(stats) => {
@@ -3647,24 +3970,14 @@ impl ObservationRuntime {
                             free_pages = stats.free_pages;
                             free_ratio = stats.free_ratio();
 
-                            if should_vacuum(
+                            manual_vacuum_advised = should_vacuum(
                                 stats.page_count,
                                 stats.free_pages,
                                 cache_gc_settings.vacuum_threshold,
-                            ) {
-                                match storage.vacuum().await {
-                                    Ok(()) => {
-                                        vacuumed = true;
-                                    }
-                                    Err(err) => {
-                                        vacuum_error = Some(err.to_string());
-                                        error!(error = %err, "Cache GC vacuum failed");
-                                    }
-                                }
-                            }
+                            );
                         }
                         Err(err) => {
-                            vacuum_error = Some(err.to_string());
+                            page_stats_error = Some(err.to_string());
                             error!(error = %err, "Cache GC failed to read database page stats");
                         }
                     }
@@ -3679,12 +3992,16 @@ impl ObservationRuntime {
                         "page_count": page_count,
                         "free_pages": free_pages,
                         "free_ratio": free_ratio,
-                        "vacuumed": vacuumed,
-                        "vacuum_threshold": cache_gc_settings.vacuum_threshold,
-                        "vacuum_error": vacuum_error,
+                        // Periodic automatic VACUUM is intentionally disabled:
+                        // it rewrites the database and can monopolize the
+                        // single writer during large ongoing sessions.
+                        "automatic_vacuum": false,
+                        "manual_vacuum_advised": manual_vacuum_advised,
+                        "manual_vacuum_advisory_threshold": cache_gc_settings.vacuum_threshold,
+                        "page_stats_error": page_stats_error,
                         "log_report": cache_gc_settings.log_report,
                     });
-                    let _ = storage
+                    if let Err(error) = storage
                         .record_maintenance(MaintenanceRecord {
                             id: 0,
                             event_type: "cache_gc".to_string(),
@@ -3692,26 +4009,29 @@ impl ObservationRuntime {
                             metadata: Some(metadata.to_string()),
                             timestamp: epoch_ms(),
                         })
-                        .await;
+                        .await
+                    {
+                        error!(error = %error, "Failed to record database cache GC advisory");
+                    }
 
                     if cache_gc_settings.log_report {
                         info!(
                             free_ratio,
-                            vacuumed,
+                            manual_vacuum_advised,
                             "Database cache GC cycle completed"
                         );
                     } else {
                         debug!(
                             free_ratio,
-                            vacuumed,
+                            manual_vacuum_advised,
                             "Database cache GC cycle completed"
                         );
                     }
 
-                    last_cache_gc = now;
+                    cache_gc_schedule.finish(Instant::now());
                 }
 
-                if now.duration_since(last_health_snapshot) >= health_interval {
+                if health_schedule.should_run(Instant::now(), health_interval) {
                     let (health_panes, leak_risk_inventory, worst_pane_budget) = {
                         let reg = registry.read().await;
                         let cursors = cursors.read().await;
@@ -4009,7 +4329,10 @@ impl ObservationRuntime {
                     RuntimeLockMemoryTelemetrySnapshot::update_global(
                         metrics.lock_memory_snapshot(),
                     );
-                    last_health_snapshot = now;
+                    // Health work includes several locks, storage probes, mux
+                    // probes, and coordinator I/O; cadence starts only once
+                    // that complete snapshot has actually been published.
+                    health_schedule.finish(Instant::now());
                 }
             }
         })
@@ -4610,7 +4933,7 @@ impl ObservationRuntime {
             min_interval: self.config.min_capture_interval,
             max_interval: self.config.capture_interval,
             backoff_multiplier: 1.5,
-            max_concurrent: self.config.max_concurrent_captures,
+            max_concurrent: capture_concurrency_usize(self.config.max_concurrent_captures),
             overlap_size,
             send_timeout: Duration::from_millis(100),
             capture_timeout: Duration::from_secs(2),
@@ -4805,7 +5128,9 @@ impl ObservationRuntime {
                             min_interval: Duration::from_millis(new_config.min_poll_interval_ms),
                             max_interval: Duration::from_millis(new_config.poll_interval_ms),
                             backoff_multiplier: 1.5,
-                            max_concurrent: new_config.max_concurrent_captures as usize,
+                            max_concurrent: capture_concurrency_usize(
+                                new_config.max_concurrent_captures,
+                            ),
                             overlap_size, // Use captured overlap_size
                             send_timeout: Duration::from_millis(100),
                             capture_timeout: Duration::from_secs(2),
@@ -13867,15 +14192,262 @@ mod tests {
     }
 
     #[test]
+    fn runtime_capture_concurrency_preserves_u32_upper_boundary_exactly() {
+        let config = RuntimeConfig {
+            max_concurrent_captures: u32::MAX,
+            ..RuntimeConfig::default()
+        };
+        let hot = initial_hot_reloadable_config(&config);
+        assert_eq!(hot.max_concurrent_captures, u32::MAX);
+        assert_eq!(
+            capture_concurrency_usize(config.max_concurrent_captures),
+            usize::try_from(u32::MAX).expect("supported target usize width")
+        );
+    }
+
+    #[test]
     fn runtime_config_default_retention_days() {
         let config = RuntimeConfig::default();
         assert_eq!(config.retention_days, 30);
     }
 
     #[test]
+    fn runtime_startup_hot_config_preserves_custom_compiled_retention_policy() {
+        let custom_tiers = vec![crate::config::RetentionTier {
+            name: "startup-custom".to_string(),
+            retention_days: 123,
+            severities: vec!["critical".to_string()],
+            event_types: vec!["agent.".to_string()],
+            handled: Some(false),
+        }];
+        let storage_config = StorageConfig {
+            retention_tiers: custom_tiers.clone(),
+            ..StorageConfig::default()
+        };
+        let config = RuntimeConfig {
+            retention_policy: storage_config
+                .compile_retention_policy()
+                .expect("compile custom startup policy"),
+            ..RuntimeConfig::default()
+        };
+
+        let hot = initial_hot_reloadable_config(&config);
+        assert_eq!(hot.retention_policy.tiers(), custom_tiers);
+    }
+
+    #[test]
+    fn hot_reload_retention_policy_rejects_invalid_tiers_before_publish() {
+        let mut config = crate::config::Config::default();
+        config.storage.retention_tiers = vec![crate::config::RetentionTier {
+            name: " ".to_string(),
+            retention_days: 7,
+            severities: Vec::new(),
+            event_types: Vec::new(),
+            handled: None,
+        }];
+        let error = HotReloadableConfig::from_config(&config)
+            .expect_err("blank tier names must fail closed before channel publication");
+        assert!(error.to_string().contains("name must not be empty"));
+    }
+
+    #[test]
+    fn runtime_config_debug_never_reflects_retention_policy_content() {
+        let secret = "runtime-debug-secret-filter-marker";
+        let storage_config = StorageConfig {
+            retention_tiers: vec![crate::config::RetentionTier {
+                name: "runtime-debug-secret-name".to_string(),
+                retention_days: 9,
+                severities: vec![secret.to_string()],
+                event_types: Vec::new(),
+                handled: None,
+            }],
+            ..StorageConfig::default()
+        };
+        let config = RuntimeConfig {
+            retention_policy: storage_config
+                .compile_retention_policy()
+                .expect("compile debug redaction policy"),
+            ..RuntimeConfig::default()
+        };
+        let debug = format!("{config:?}");
+        assert!(!debug.contains(secret));
+        assert!(!debug.contains("runtime-debug-secret-name"));
+        assert!(debug.contains("canonical_filters"));
+    }
+
+    #[test]
+    fn retention_maintenance_is_immediate_but_failed_attempts_do_not_busy_loop() {
+        let start = Instant::now();
+        let mut schedule = RetentionMaintenanceSchedule::new(start);
+        assert!(schedule.should_attempt(start), "startup cleanup is due");
+
+        schedule.finish_attempt(start, false);
+        assert!(schedule.due, "a failed startup cleanup remains due");
+        assert!(
+            !schedule.should_attempt(start),
+            "failure must not retry in the same maintenance turn"
+        );
+        let before_retry = start
+            .checked_add(RETENTION_MAINTENANCE_RETRY_DELAY - Duration::from_millis(1))
+            .expect("test instant range");
+        assert!(!schedule.should_attempt(before_retry));
+        let retry_at = start
+            .checked_add(RETENTION_MAINTENANCE_RETRY_DELAY)
+            .expect("test instant range");
+        assert!(schedule.should_attempt(retry_at));
+
+        schedule.finish_attempt(retry_at, true);
+        assert!(!schedule.due);
+        let before_cadence = retry_at
+            .checked_add(RETENTION_MAINTENANCE_CADENCE - Duration::from_millis(1))
+            .expect("test instant range");
+        assert!(!schedule.should_attempt(before_cadence));
+        let cadence_at = retry_at
+            .checked_add(RETENTION_MAINTENANCE_CADENCE)
+            .expect("test instant range");
+        assert!(schedule.should_attempt(cadence_at));
+
+        schedule.finish_attempt(cadence_at, true);
+        schedule.mark_due();
+        assert!(
+            schedule.should_attempt(cadence_at),
+            "a retention policy or size-cap update bypasses the hourly cadence"
+        );
+
+        let long_start = cadence_at;
+        let long_completion = long_start
+            .checked_add(Duration::from_secs(20 * 60))
+            .expect("test long-attempt instant range");
+        schedule.finish_attempt(long_completion, true);
+        let old_start_based_hour = long_start
+            .checked_add(RETENTION_MAINTENANCE_CADENCE)
+            .expect("test old start-based cadence instant");
+        assert!(
+            !schedule.should_attempt(old_start_based_hour),
+            "a long cleanup must receive the full cadence after completion"
+        );
+        let completion_based_hour = long_completion
+            .checked_add(RETENTION_MAINTENANCE_CADENCE)
+            .expect("test completion-based cadence instant");
+        assert!(schedule.should_attempt(completion_based_hour));
+
+        let failed_completion = completion_based_hour
+            .checked_add(Duration::from_secs(20 * 60))
+            .expect("test failed-attempt completion instant");
+        schedule.finish_attempt(failed_completion, false);
+        assert!(!schedule.should_attempt(failed_completion));
+        assert!(
+            schedule.should_attempt(
+                failed_completion
+                    .checked_add(RETENTION_MAINTENANCE_RETRY_DELAY)
+                    .expect("test completion-based retry instant")
+            ),
+            "failed long work retries only after the delay measured from completion"
+        );
+    }
+
+    #[test]
+    fn periodic_maintenance_cadence_starts_at_completion_and_honors_interval_changes() {
+        let start = Instant::now();
+        let ten_minutes = Duration::from_secs(10 * 60);
+        let mut schedule = CompletionTimedSchedule::new(start);
+        assert!(!schedule.should_run(start, ten_minutes));
+
+        let operation_start = start
+            .checked_add(ten_minutes)
+            .expect("test due instant");
+        assert!(schedule.should_run(operation_start, ten_minutes));
+        let long_completion = operation_start
+            .checked_add(Duration::from_secs(7 * 60))
+            .expect("test completion instant");
+        schedule.finish(long_completion);
+        assert!(
+            !schedule.should_run(
+                operation_start
+                    .checked_add(ten_minutes)
+                    .expect("old start-based instant"),
+                ten_minutes,
+            ),
+            "long maintenance must retain the full interval after completion"
+        );
+        assert!(schedule.should_run(
+            long_completion
+                .checked_add(ten_minutes)
+                .expect("completion-based due instant"),
+            ten_minutes,
+        ));
+
+        let shorter = Duration::from_secs(60);
+        assert!(
+            schedule.should_run(
+                long_completion
+                    .checked_add(shorter)
+                    .expect("shortened interval due instant"),
+                shorter,
+            ),
+            "a shortened hot-reload interval is measured from the last completion"
+        );
+        assert!(!schedule.should_run(
+            long_completion
+                .checked_add(Duration::from_secs(24 * 60 * 60))
+                .expect("disabled interval probe"),
+            Duration::ZERO,
+        ));
+    }
+
+    #[test]
     fn runtime_config_default_retention_max_mb_unlimited() {
         let config = RuntimeConfig::default();
         assert_eq!(config.retention_max_mb, 0);
+    }
+
+    #[test]
+    fn size_retention_receipts_are_exact_bounded_and_status_specific() {
+        let outcome = SizeEvictionOutcome {
+            deleted_segments: 17,
+            used_bytes_before: 9_000_000,
+            used_bytes_after: 4_000_000,
+            over_limit_after: false,
+        };
+        for (status, expected_status) in [
+            (SizeRetentionReceiptStatus::Completed, "completed"),
+            (
+                SizeRetentionReceiptStatus::InterruptedPartial,
+                "interrupted_partial",
+            ),
+        ] {
+            let record = size_retention_receipt_record(
+                PendingSizeRetentionReceipt {
+                    outcome,
+                    status,
+                    retention_max_mb: 4,
+                },
+                123_456,
+            );
+            assert_eq!(record.event_type, "size_retention");
+            assert_eq!(record.timestamp, 123_456);
+            let message = record.message.expect("size receipt message");
+            assert!(message.contains(expected_status));
+            assert!(message.contains("17 durable segment deletions"));
+            assert!(message.len() < 160, "receipt message must remain bounded");
+
+            let metadata: serde_json::Value = serde_json::from_str(
+                record.metadata.as_deref().expect("size receipt metadata"),
+            )
+            .expect("parse fixed-shape size receipt");
+            assert_eq!(metadata["schema"], "size_retention_receipt.v1");
+            assert_eq!(metadata["attempt_status"], expected_status);
+            assert_eq!(metadata["retention_max_mb"], 4);
+            assert_eq!(metadata["deleted_segments"], 17);
+            assert_eq!(metadata["used_bytes_before"], 9_000_000);
+            assert_eq!(metadata["used_bytes_after"], 4_000_000);
+            assert_eq!(metadata["over_limit_after"], false);
+            assert_eq!(
+                metadata.as_object().expect("receipt object").len(),
+                7,
+                "the receipt schema must remain fixed and content-free"
+            );
+        }
     }
 
     #[test]

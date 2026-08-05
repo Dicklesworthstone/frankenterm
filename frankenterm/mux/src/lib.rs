@@ -71,6 +71,7 @@ use config::keyassignment::SpawnTabDomain;
 use config::{configuration, ExitBehavior, GuiPosition};
 use domain::{Domain, DomainId, DomainState, SplitSource};
 use filedescriptor::{poll, pollfd, socketpair, AsRawSocketDescriptor, FileDescriptor, POLLIN};
+use frankenterm_sigpipe::{catch_recoverable, RecoverablePanicSite};
 use frankenterm_term::{Alert, Clipboard, ClipboardSelection, DownloadHandler, TerminalSize};
 #[cfg(unix)]
 use libc::{c_int, SOL_SOCKET, SO_RCVBUF, SO_SNDBUF};
@@ -3245,7 +3246,11 @@ impl PaneRetirementCompletion {
     fn complete(self, mux: Option<&Mux>) {
         if self.kill {
             log::debug!("killing pane {}", self.pane_id);
-            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.pane.kill())).is_err()
+            if catch_recoverable(
+                RecoverablePanicSite::MuxPaneRetirement,
+                std::panic::AssertUnwindSafe(|| self.pane.kill()),
+            )
+            .is_err()
             {
                 log::error!(
                     "pane {} panicked while being killed; completing removal lifecycle",
@@ -4942,9 +4947,10 @@ impl Mux {
                     drop(activity);
                 }
                 PendingWindowAction::FocusLost(pane) => {
-                    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        pane.focus_changed(false);
-                    }))
+                    if catch_recoverable(
+                        RecoverablePanicSite::MuxPaneCallback,
+                        std::panic::AssertUnwindSafe(|| pane.focus_changed(false)),
+                    )
                     .is_err()
                     {
                         log::error!(
@@ -4994,9 +5000,10 @@ impl Mux {
 
         let mut dead_subscribers = Vec::new();
         for (id, subscriber) in subscribers {
-            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                subscriber(envelope.clone())
-            })) {
+            match catch_recoverable(
+                RecoverablePanicSite::MuxSubscriber,
+                std::panic::AssertUnwindSafe(|| subscriber(envelope.clone())),
+            ) {
                 Ok(true) => {} // subscriber still alive
                 Ok(false) => dead_subscribers.push(id),
                 Err(_) => {

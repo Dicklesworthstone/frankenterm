@@ -9,9 +9,10 @@ use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use futures::FutureExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+use frankenterm_sigpipe::{RecoverablePanicSite, catch_recoverable_future};
 
 use crate::Result;
 use crate::circuit_breaker::{CircuitBreakerStatus, CircuitStateKind};
@@ -89,6 +90,15 @@ pub const MAX_GLOBAL_PANE_ID: u64 = (1u64 << 63) - 1;
 /// here prevents a compensating task from outliving its useful recovery window
 /// even if a custom backend ignores Cx budgets.
 const PANE_CREATION_ROLLBACK_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Bounded, content-free errors for the two audited rollback panic phases.
+/// Never include the original panic payload here: backend implementations may
+/// panic with credentials, pane contents, paths, or other caller-controlled
+/// text.
+const PANE_CREATION_ROLLBACK_OPERATION_PANIC: &str =
+    "WA-SHARDING-ROLLBACK-PANIC: pane-creation rollback operation panicked";
+const PANE_CREATION_ROLLBACK_JOIN_PANIC: &str =
+    "WA-SHARDING-ROLLBACK-PANIC: pane-creation rollback join panicked";
 
 /// Identifier for a mux shard.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -742,20 +752,8 @@ impl ShardedWeztermClient {
         }
     }
 
-    fn pane_creation_rollback_panic_error(
-        phase: &str,
-        payload: Box<dyn std::any::Any + Send>,
-    ) -> crate::Error {
-        let panic_detail = if let Some(message) = payload.downcast_ref::<&'static str>() {
-            (*message).to_string()
-        } else if let Some(message) = payload.downcast_ref::<String>() {
-            message.clone()
-        } else {
-            "non-string panic payload".to_string()
-        };
-        crate::Error::Wezterm(WeztermError::CommandFailed(format!(
-            "pane-creation rollback {phase} panicked: {panic_detail}"
-        )))
+    fn pane_creation_rollback_panic_error(message: &'static str) -> crate::Error {
+        crate::Error::Wezterm(WeztermError::CommandFailed(message.to_string()))
     }
 
     async fn run_pane_creation_rollback_catching_panic(
@@ -763,18 +761,15 @@ impl ShardedWeztermClient {
         handle: &WeztermHandle,
         local_pane_id: u64,
     ) -> Result<()> {
-        let rollback = std::panic::AssertUnwindSafe(Self::run_bounded_pane_creation_rollback(
-            cleanup_cx,
-            handle,
-            local_pane_id,
-        ))
-        .catch_unwind()
+        let rollback = catch_recoverable_future(
+            RecoverablePanicSite::ShardingRollback,
+            Self::run_bounded_pane_creation_rollback(cleanup_cx, handle, local_pane_id),
+        )
         .await;
         match rollback {
             Ok(result) => result,
-            Err(payload) => Err(Self::pane_creation_rollback_panic_error(
-                "operation",
-                payload,
+            Err(_panic) => Err(Self::pane_creation_rollback_panic_error(
+                PANE_CREATION_ROLLBACK_OPERATION_PANIC,
             )),
         }
     }
@@ -808,11 +803,15 @@ impl ShardedWeztermClient {
                     // compensator. If the creator future itself is dropped,
                     // dropping asupersync's JoinHandle detaches rather than
                     // aborts, so the independently bounded rollback survives.
-                    match std::panic::AssertUnwindSafe(join).catch_unwind().await {
+                    match catch_recoverable_future(
+                        RecoverablePanicSite::ShardingRollback,
+                        join,
+                    )
+                    .await
+                    {
                         Ok(result) => result,
-                        Err(payload) => Err(Self::pane_creation_rollback_panic_error(
-                            "join",
-                            payload,
+                        Err(_panic) => Err(Self::pane_creation_rollback_panic_error(
+                            PANE_CREATION_ROLLBACK_JOIN_PANIC,
                         )),
                     }
                 }
@@ -1178,7 +1177,7 @@ impl ShardedWeztermClient {
             .watchdog_warnings()
     }
 
-    async fn route_for_global_pane_id(&self, pane_id: u64) -> Result<PaneRoute> {
+    fn route_for_global_pane_id(&self, pane_id: u64) -> Result<PaneRoute> {
         self.telemetry.route_lookups.fetch_add(1, Ordering::Relaxed);
         if let Some(route) = self.pane_routes.get(pane_id) {
             return Ok(route);
@@ -1196,17 +1195,12 @@ impl ShardedWeztermClient {
     ///
     /// Resolution is a synchronous decode of the self-describing global id;
     /// no backend discovery or blocking I/O is needed on a cold cache miss.
-    async fn route_for_global_pane_id_with_cx(
+    fn route_for_global_pane_id_with_cx(
         &self,
         _cx: &crate::cx::Cx,
         pane_id: u64,
     ) -> Result<PaneRoute> {
-        self.telemetry.route_lookups.fetch_add(1, Ordering::Relaxed);
-        if let Some(route) = self.pane_routes.get(pane_id) {
-            return Ok(route);
-        }
-
-        self.resolve_uncached_pane_route(pane_id)
+        self.route_for_global_pane_id(pane_id)
     }
 
     fn resolve_uncached_pane_route(&self, pane_id: u64) -> Result<PaneRoute> {
@@ -1298,7 +1292,7 @@ impl WeztermInterface for ShardedWeztermClient {
 
     fn get_pane(&self, pane_id: u64) -> WeztermFuture<'_, PaneInfo> {
         Box::pin(async move {
-            let route = self.route_for_global_pane_id(pane_id).await?;
+            let route = self.route_for_global_pane_id(pane_id)?;
             let backend = self.backend_for_id(route.shard_id)?;
             let mut pane = backend
                 .handle
@@ -1321,7 +1315,7 @@ impl WeztermInterface for ShardedWeztermClient {
 
     fn get_text(&self, pane_id: u64, escapes: bool) -> WeztermFuture<'_, String> {
         Box::pin(async move {
-            let route = self.route_for_global_pane_id(pane_id).await?;
+            let route = self.route_for_global_pane_id(pane_id)?;
             let backend = self.backend_for_id(route.shard_id)?;
             backend
                 .handle
@@ -1333,7 +1327,7 @@ impl WeztermInterface for ShardedWeztermClient {
 
     fn get_semantic_zones(&self, pane_id: u64) -> WeztermFuture<'_, MuxSemanticSnapshot> {
         Box::pin(async move {
-            let route = self.route_for_global_pane_id(pane_id).await?;
+            let route = self.route_for_global_pane_id(pane_id)?;
             let backend = self.backend_for_id(route.shard_id)?;
             backend
                 .handle
@@ -1348,7 +1342,7 @@ impl WeztermInterface for ShardedWeztermClient {
     fn send_text(&self, pane_id: u64, text: &str) -> WeztermFuture<'_, ()> {
         let text = text.to_string();
         Box::pin(async move {
-            let route = self.route_for_global_pane_id(pane_id).await?;
+            let route = self.route_for_global_pane_id(pane_id)?;
             let backend = self.backend_for_id(route.shard_id)?;
             backend
                 .handle
@@ -1361,7 +1355,7 @@ impl WeztermInterface for ShardedWeztermClient {
     fn send_text_no_paste(&self, pane_id: u64, text: &str) -> WeztermFuture<'_, ()> {
         let text = text.to_string();
         Box::pin(async move {
-            let route = self.route_for_global_pane_id(pane_id).await?;
+            let route = self.route_for_global_pane_id(pane_id)?;
             let backend = self.backend_for_id(route.shard_id)?;
             backend
                 .handle
@@ -1382,7 +1376,7 @@ impl WeztermInterface for ShardedWeztermClient {
     ) -> WeztermFuture<'_, ()> {
         let text = text.to_string();
         Box::pin(async move {
-            let route = self.route_for_global_pane_id(pane_id).await?;
+            let route = self.route_for_global_pane_id(pane_id)?;
             let backend = self.backend_for_id(route.shard_id)?;
             backend
                 .handle
@@ -1397,7 +1391,7 @@ impl WeztermInterface for ShardedWeztermClient {
     fn send_control(&self, pane_id: u64, control_char: &str) -> WeztermFuture<'_, ()> {
         let control_char = control_char.to_string();
         Box::pin(async move {
-            let route = self.route_for_global_pane_id(pane_id).await?;
+            let route = self.route_for_global_pane_id(pane_id)?;
             let backend = self.backend_for_id(route.shard_id)?;
             backend
                 .handle
@@ -1477,7 +1471,7 @@ impl WeztermInterface for ShardedWeztermClient {
     ) -> WeztermFuture<'_, u64> {
         let cwd = cwd.map(ToString::to_string);
         Box::pin(async move {
-            let route = self.route_for_global_pane_id(pane_id).await?;
+            let route = self.route_for_global_pane_id(pane_id)?;
             let backend = self.backend_for_id(route.shard_id)?;
             let local_new = backend
                 .handle
@@ -1507,7 +1501,7 @@ impl WeztermInterface for ShardedWeztermClient {
 
     fn activate_pane(&self, pane_id: u64) -> WeztermFuture<'_, ()> {
         Box::pin(async move {
-            let route = self.route_for_global_pane_id(pane_id).await?;
+            let route = self.route_for_global_pane_id(pane_id)?;
             let backend = self.backend_for_id(route.shard_id)?;
             backend
                 .handle
@@ -1525,7 +1519,7 @@ impl WeztermInterface for ShardedWeztermClient {
         direction: MoveDirection,
     ) -> WeztermFuture<'_, Option<u64>> {
         Box::pin(async move {
-            let route = self.route_for_global_pane_id(pane_id).await?;
+            let route = self.route_for_global_pane_id(pane_id)?;
             let backend = self.backend_for_id(route.shard_id)?;
             let next_local = backend
                 .handle
@@ -1553,7 +1547,7 @@ impl WeztermInterface for ShardedWeztermClient {
 
     fn kill_pane(&self, pane_id: u64) -> WeztermFuture<'_, ()> {
         Box::pin(async move {
-            let route = self.route_for_global_pane_id(pane_id).await?;
+            let route = self.route_for_global_pane_id(pane_id)?;
             let backend = self.backend_for_id(route.shard_id)?;
             backend
                 .handle
@@ -1569,7 +1563,7 @@ impl WeztermInterface for ShardedWeztermClient {
 
     fn zoom_pane(&self, pane_id: u64, zoom: bool) -> WeztermFuture<'_, ()> {
         Box::pin(async move {
-            let route = self.route_for_global_pane_id(pane_id).await?;
+            let route = self.route_for_global_pane_id(pane_id)?;
             let backend = self.backend_for_id(route.shard_id)?;
             backend
                 .handle
@@ -1609,7 +1603,7 @@ impl WeztermInterface for ShardedWeztermClient {
         pane_id: u64,
     ) -> WeztermFuture<'_, PaneTieredScrollbackSummary> {
         Box::pin(async move {
-            let route = self.route_for_global_pane_id(pane_id).await?;
+            let route = self.route_for_global_pane_id(pane_id)?;
             let backend = self.backend_for_id(route.shard_id)?;
             backend
                 .handle
@@ -1648,7 +1642,7 @@ impl WeztermInterface for ShardedWeztermClient {
         pane_id: u64,
     ) -> WeztermFuture<'a, PaneInfo> {
         Box::pin(async move {
-            let route = self.route_for_global_pane_id_with_cx(cx, pane_id).await?;
+            let route = self.route_for_global_pane_id_with_cx(cx, pane_id)?;
             let backend = self.backend_for_id(route.shard_id)?;
             let mut pane = backend
                 .handle
@@ -1676,7 +1670,7 @@ impl WeztermInterface for ShardedWeztermClient {
         escapes: bool,
     ) -> WeztermFuture<'a, String> {
         Box::pin(async move {
-            let route = self.route_for_global_pane_id_with_cx(cx, pane_id).await?;
+            let route = self.route_for_global_pane_id_with_cx(cx, pane_id)?;
             let backend = self.backend_for_id(route.shard_id)?;
             backend
                 .handle
@@ -1692,7 +1686,7 @@ impl WeztermInterface for ShardedWeztermClient {
         pane_id: u64,
     ) -> WeztermFuture<'a, MuxSemanticSnapshot> {
         Box::pin(async move {
-            let route = self.route_for_global_pane_id_with_cx(cx, pane_id).await?;
+            let route = self.route_for_global_pane_id_with_cx(cx, pane_id)?;
             let backend = self.backend_for_id(route.shard_id)?;
             backend
                 .handle
@@ -1712,7 +1706,7 @@ impl WeztermInterface for ShardedWeztermClient {
     ) -> WeztermFuture<'a, ()> {
         let text = text.to_string();
         Box::pin(async move {
-            let route = self.route_for_global_pane_id_with_cx(cx, pane_id).await?;
+            let route = self.route_for_global_pane_id_with_cx(cx, pane_id)?;
             let backend = self.backend_for_id(route.shard_id)?;
             backend
                 .handle
@@ -1730,7 +1724,7 @@ impl WeztermInterface for ShardedWeztermClient {
     ) -> WeztermFuture<'a, ()> {
         let text = text.to_string();
         Box::pin(async move {
-            let route = self.route_for_global_pane_id_with_cx(cx, pane_id).await?;
+            let route = self.route_for_global_pane_id_with_cx(cx, pane_id)?;
             let backend = self.backend_for_id(route.shard_id)?;
             backend
                 .handle
@@ -1752,7 +1746,7 @@ impl WeztermInterface for ShardedWeztermClient {
     ) -> WeztermFuture<'a, ()> {
         let text = text.to_string();
         Box::pin(async move {
-            let route = self.route_for_global_pane_id_with_cx(cx, pane_id).await?;
+            let route = self.route_for_global_pane_id_with_cx(cx, pane_id)?;
             let backend = self.backend_for_id(route.shard_id)?;
             backend
                 .handle
@@ -1778,7 +1772,7 @@ impl WeztermInterface for ShardedWeztermClient {
     ) -> WeztermFuture<'a, ()> {
         let control_char = control_char.to_string();
         Box::pin(async move {
-            let route = self.route_for_global_pane_id_with_cx(cx, pane_id).await?;
+            let route = self.route_for_global_pane_id_with_cx(cx, pane_id)?;
             let backend = self.backend_for_id(route.shard_id)?;
             backend
                 .handle
@@ -1796,7 +1790,7 @@ impl WeztermInterface for ShardedWeztermClient {
         pane_id: u64,
     ) -> WeztermFuture<'a, PaneTieredScrollbackSummary> {
         Box::pin(async move {
-            let route = self.route_for_global_pane_id_with_cx(cx, pane_id).await?;
+            let route = self.route_for_global_pane_id_with_cx(cx, pane_id)?;
             let backend = self.backend_for_id(route.shard_id)?;
             backend
                 .handle
@@ -1819,7 +1813,7 @@ impl WeztermInterface for ShardedWeztermClient {
         pane_id: u64,
     ) -> WeztermFuture<'a, ()> {
         Box::pin(async move {
-            let route = self.route_for_global_pane_id_with_cx(cx, pane_id).await?;
+            let route = self.route_for_global_pane_id_with_cx(cx, pane_id)?;
             let backend = self.backend_for_id(route.shard_id)?;
             backend
                 .handle
@@ -1837,7 +1831,7 @@ impl WeztermInterface for ShardedWeztermClient {
         pane_id: u64,
     ) -> WeztermFuture<'a, ()> {
         Box::pin(async move {
-            let route = self.route_for_global_pane_id_with_cx(cx, pane_id).await?;
+            let route = self.route_for_global_pane_id_with_cx(cx, pane_id)?;
             let backend = self.backend_for_id(route.shard_id)?;
             backend
                 .handle
@@ -1858,7 +1852,7 @@ impl WeztermInterface for ShardedWeztermClient {
         zoom: bool,
     ) -> WeztermFuture<'a, ()> {
         Box::pin(async move {
-            let route = self.route_for_global_pane_id_with_cx(cx, pane_id).await?;
+            let route = self.route_for_global_pane_id_with_cx(cx, pane_id)?;
             let backend = self.backend_for_id(route.shard_id)?;
             backend
                 .handle
@@ -1930,7 +1924,7 @@ impl WeztermInterface for ShardedWeztermClient {
         percent: Option<u8>,
     ) -> WeztermFuture<'a, u64> {
         Box::pin(async move {
-            let route = self.route_for_global_pane_id_with_cx(cx, pane_id).await?;
+            let route = self.route_for_global_pane_id_with_cx(cx, pane_id)?;
             let backend = self.backend_for_id(route.shard_id)?;
             let local_new = backend
                 .handle
@@ -2024,6 +2018,7 @@ mod tests {
         created_local_pane_id: u64,
         cancel_after_cx_creation: bool,
         fail_cleanup: bool,
+        cleanup_panics_remaining: AtomicUsize,
     }
 
     impl CreationBoundaryBackend {
@@ -2046,6 +2041,7 @@ mod tests {
                 created_local_pane_id,
                 cancel_after_cx_creation,
                 fail_cleanup,
+                cleanup_panics_remaining: AtomicUsize::new(0),
             }
         }
 
@@ -2061,6 +2057,14 @@ mod tests {
             Self::new(Self::OVERSIZED_LOCAL_PANE_ID, true, false)
         }
 
+        fn oversized_with_one_cleanup_panic() -> Self {
+            let backend = Self::oversized(false);
+            backend
+                .cleanup_panics_remaining
+                .store(1, Ordering::Relaxed);
+            backend
+        }
+
         fn cancel_after_creation_if_requested(&self, cx: &crate::cx::Cx) {
             if self.cancel_after_cx_creation {
                 cx.cancel_with(
@@ -2071,6 +2075,11 @@ mod tests {
         }
 
         fn cleanup_result(&self) -> Result<()> {
+            if self.cleanup_panics_remaining.swap(0, Ordering::AcqRel) > 0 {
+                std::panic::panic_any(String::from(
+                    "rollback-secret-sentinel-that-must-never-be-reflected",
+                ));
+            }
             if self.fail_cleanup {
                 Err(crate::Error::Wezterm(WeztermError::CommandFailed(
                     Self::CLEANUP_FAILURE.to_string(),
@@ -2537,7 +2546,7 @@ mod tests {
             .unwrap();
             let pane_id = try_encode_sharded_pane_id(ShardId(1), 22).unwrap();
 
-            let route = client.route_for_global_pane_id(pane_id).await.unwrap();
+            let route = client.route_for_global_pane_id(pane_id).unwrap();
             assert_eq!(route.shard_id, ShardId(1));
             assert_eq!(route.local_pane_id, 22);
             assert_eq!(shard0.list_calls.load(Ordering::Relaxed), 0);
@@ -2562,7 +2571,6 @@ mod tests {
             let cx = crate::cx::for_request();
             let cx_route = cx_client
                 .route_for_global_pane_id_with_cx(&cx, pane_id)
-                .await
                 .unwrap();
             assert_eq!(cx_route, route);
             assert_eq!(cx_shard0.list_calls.load(Ordering::Relaxed), 0);
@@ -3312,6 +3320,44 @@ mod tests {
                 "kill_pane_with_fresh_cleanup_cx",
             );
             assert_cx_cleanup(&cx_backend);
+        });
+    }
+
+    #[cfg(panic = "unwind")]
+    #[test]
+    fn rollback_panic_is_bounded_nonreflecting_and_later_cleanup_recovers() {
+        run_async_test(async {
+            let backend = Arc::new(CreationBoundaryBackend::oversized_with_one_cleanup_panic());
+            let handle: WeztermHandle = backend.clone();
+            let client = ShardedWeztermClient::new(
+                vec![ShardBackend::new(ShardId(0), "panic-boundary", handle)],
+                AssignmentStrategy::RoundRobin,
+            )
+            .expect("construct panic-boundary sharded client");
+
+            let first_error = client
+                .spawn_with_hints(None, None, None)
+                .await
+                .expect_err("the unencodable pane and panicking rollback must fail closed");
+            let first_rendered = first_error.to_string();
+            assert!(first_rendered.contains("WA-SHARDING-ROLLBACK-PANIC"));
+            assert!(first_rendered.contains("rollback operation panicked"));
+            assert!(
+                !first_rendered.contains("rollback-secret-sentinel"),
+                "panic payload text must never reach the returned error: {first_rendered}"
+            );
+
+            let second_error = client
+                .spawn_with_hints(None, None, None)
+                .await
+                .expect_err("the second unencodable pane still fails after successful cleanup");
+            assert_unmasked_codec_error(&second_error);
+            assert_eq!(backend.ambient_kills.load(Ordering::Relaxed), 0);
+            assert_eq!(backend.cx_kills.load(Ordering::Relaxed), 2);
+            assert_eq!(
+                backend.cx_last_killed.load(Ordering::Relaxed),
+                CreationBoundaryBackend::OVERSIZED_LOCAL_PANE_ID
+            );
         });
     }
 

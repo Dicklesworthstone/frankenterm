@@ -1640,12 +1640,20 @@ fn days_in_month(year: u64, month: u64) -> u64 {
 /// Truncate a string with ellipsis
 #[must_use]
 pub fn truncate(s: &str, max_len: usize) -> String {
-    if s.len() <= max_len {
-        s.to_string()
+    // Renderer inputs often originate in captured pane text or persisted
+    // diagnostics. Strip terminal control sequences before measuring or
+    // emitting them so a short (and therefore otherwise untruncated) value
+    // cannot smuggle cursor, title, or hyperlink controls into CLI output.
+    let plain = super::table::sanitize_terminal_text(s);
+    if super::table::prefix_within_width(&plain, max_len).len() == plain.len() {
+        plain
     } else if max_len > 3 {
-        format!("{}...", &s[..max_len - 3])
+        let mut truncated =
+            super::table::prefix_within_width(&plain, max_len - 3).to_string();
+        truncated.push_str("...");
+        truncated
     } else {
-        s[..max_len].to_string()
+        super::table::prefix_within_width(&plain, max_len).to_string()
     }
 }
 
@@ -3208,6 +3216,27 @@ mod tests {
         assert_eq!(truncate("hello", 10), "hello");
         assert_eq!(truncate("hello world", 8), "hello...");
         assert_eq!(truncate("hi", 2), "hi");
+        assert_eq!(truncate("héllo wörld", 7), "héll...");
+        assert_eq!(truncate("😀abc", 3), "😀a");
+        assert_eq!(truncate("表ab", 3), "表a");
+        assert_eq!(truncate("👨‍👩‍👧‍👦abc", 3), "👨‍👩‍👧‍👦a");
+        assert_eq!(truncate("hello", 0), "");
+        assert_eq!(truncate("\x1b[31mred\x1b[0m", 20), "red");
+        assert_eq!(
+            truncate("\x1b]8;;https://example.invalid\x1b\\link\x1b]8;;\x1b\\", 20),
+            "link"
+        );
+        assert_eq!(truncate("line one\nline two\tend", 80), "line one line two end");
+        assert_eq!(truncate("safe\u{202e}spoof", 80), "safe spoof");
+
+        let combining_spam = "\u{0301}".repeat(1_024);
+        assert_eq!(
+            truncate(&combining_spam, 4),
+            "...",
+            "a visually zero-width grapheme must not bypass the byte budget"
+        );
+        assert_eq!(truncate("\u{0301}", 4), "...");
+        assert_eq!(truncate("a\u{0301}", 2), "a\u{0301}");
     }
 
     #[test]

@@ -2,7 +2,12 @@
 //!
 //! This module focuses on two goals:
 //! 1. Reclaim excess `HashMap` capacity after churn (pane create/destroy loops).
-//! 2. Decide when SQLite free-page fragmentation warrants a full `VACUUM`.
+//! 2. Report when SQLite free-page fragmentation may warrant an explicit,
+//!    operator-requested `VACUUM`.
+//!
+//! Periodic automatic `VACUUM` is intentionally outside this module's runtime
+//! contract: it rewrites the database and can monopolize the single writer
+//! during large ongoing sessions.
 
 use std::collections::{HashMap, HashSet};
 use std::hash::BuildHasher;
@@ -18,7 +23,8 @@ pub struct CacheGcSettings {
     /// GC cadence in seconds.
     #[serde(alias = "interval_secs")]
     pub interval_seconds: u64,
-    /// Vacuum trigger threshold over free-page ratio (0.0..=1.0).
+    /// Advisory threshold over free-page ratio (0.0..=1.0) for an explicit
+    /// operator-run `VACUUM`. Periodic GC reports but never executes it.
     pub vacuum_threshold: f64,
     /// Emit an info-level report after each GC cycle.
     pub log_report: bool,
@@ -108,7 +114,8 @@ pub fn free_page_ratio(page_count: i64, free_pages: i64) -> f64 {
     bounded_free as f64 / page_count as f64
 }
 
-/// Should we run full `VACUUM` given current page stats and threshold?
+/// Should an operator be advised to run full `VACUUM` given current page
+/// stats and threshold? This diagnostic policy never performs the operation.
 #[must_use]
 pub fn should_vacuum(page_count: i64, free_pages: i64, threshold: f64) -> bool {
     free_page_ratio(page_count, free_pages) > normalized_vacuum_threshold(threshold)

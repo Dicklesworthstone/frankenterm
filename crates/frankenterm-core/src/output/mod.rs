@@ -41,6 +41,6 @@ pub use renderers::{
     PaneTableRenderer, Render, RenderContext, ResizeDashboardSnapshot, RuleDetail,
     RuleDetailRenderer, RuleListItem, RuleTestMatch, RulesListRenderer, RulesTestRenderer,
     SearchResultRenderer, SearchSuggestRenderer, Summary, TimelineRenderer, WorkflowResult,
-    WorkflowResultRenderer, WorkflowStepResult,
+    WorkflowResultRenderer, WorkflowStepResult, truncate,
 };
 pub use table::{Alignment, Column, Table, strip_ansi};

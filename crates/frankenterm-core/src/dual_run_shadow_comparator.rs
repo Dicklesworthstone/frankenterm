@@ -835,10 +835,11 @@ impl DriftTriageWorkflow {
 
 /// Truncate a string to max_len, appending "..." if truncated.
 fn truncate(s: &str, max_len: usize) -> String {
-    if s.len() <= max_len {
+    if s.chars().count() <= max_len {
         s.to_string()
     } else {
-        format!("{}...", &s[..max_len])
+        let prefix: String = s.chars().take(max_len).collect();
+        format!("{prefix}...")
     }
 }
 
@@ -1397,5 +1398,13 @@ mod tests {
         assert!(DualRunPriority::Blocking < DualRunPriority::High);
         assert!(DualRunPriority::High < DualRunPriority::Medium);
         assert!(DualRunPriority::Medium < DualRunPriority::Low);
+    }
+
+    #[test]
+    fn diagnostic_truncation_preserves_utf8_boundaries() {
+        assert_eq!(truncate("plain", 8), "plain");
+        assert_eq!(truncate("héllo", 3), "hél...");
+        assert_eq!(truncate("😀abc", 1), "😀...");
+        assert_eq!(truncate("text", 0), "...");
     }
 }

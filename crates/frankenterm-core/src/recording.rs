@@ -14,6 +14,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::runtime_async::Mutex;
+use frankenterm_sigpipe::{catch_recoverable, RecoverablePanicSite};
 use serde::{Deserialize, Serialize};
 
 use crate::Result;
@@ -381,12 +382,12 @@ impl Drop for FrameWriter {
     /// swallowed: Drop cannot fail, and the underlying file may already
     /// be gone in the shutdown path.
     ///
-    /// SAFETY against double-panic abort (ft-7bcox): wrap finalization in
-    /// `catch_unwind`. If `self.finalize()` itself panics — for example
+    /// SAFETY against double-panic abort (ft-7bcox): wrap finalization in the
+    /// canonical marked recovery boundary. If `self.finalize()` itself panics — for example
     /// because the inner allocator OOMs while encoding a queued frame,
     /// or a future custom `Write` impl panics on bad state — and Drop
     /// is running during another unwind, Rust's panic-during-unwind
-    /// rule aborts the process. `catch_unwind` swallows the inner
+    /// rule aborts the process. `catch_recoverable` contains the inner
     /// panic so only the outer panic propagates. The `AssertUnwindSafe`
     /// wrap is sound here because: (i) we discard the closure's
     /// `Result`, (ii) we never observe `&mut self` again after the
@@ -394,9 +395,12 @@ impl Drop for FrameWriter {
     /// `self.buffer` / `self.writer`, both of which are about to be
     /// dropped anyway.
     fn drop(&mut self) {
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _ = self.finalize();
-        }));
+        let _ = catch_recoverable(
+            RecoverablePanicSite::CoreRecordingFinalize,
+            std::panic::AssertUnwindSafe(|| {
+                let _ = self.finalize();
+            }),
+        );
     }
 }
 

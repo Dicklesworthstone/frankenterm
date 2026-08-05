@@ -17,6 +17,7 @@ use config::keyassignment::{SpawnCommand, SpawnTabDomain};
 use config::{configuration, ExecDomain, SerialDomain, ValueOrFunc, WslDomain};
 use downcast_rs::{impl_downcast, Downcast};
 use frankenterm_term::TerminalSize;
+use frankenterm_sigpipe::{catch_recoverable, RecoverablePanicSite};
 use parking_lot::Mutex;
 use portable_pty::{
     native_pty_system, CommandBuilder, ExitStatus, MasterPty, PtyPair, PtySize, PtySystem,
@@ -87,9 +88,10 @@ impl Drop for PreparedSplitPane {
         if !self.armed {
             return;
         }
-        let rollback = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            self.registration.retire_if_current()
-        }));
+        let rollback = catch_recoverable(
+            RecoverablePanicSite::MuxRegistrationRollback,
+            std::panic::AssertUnwindSafe(|| self.registration.retire_if_current()),
+        );
         match rollback {
             Ok(true) => {}
             Ok(false) => {

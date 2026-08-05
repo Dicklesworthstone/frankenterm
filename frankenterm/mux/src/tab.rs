@@ -8,13 +8,16 @@ use crate::{
 use bintree::PathBranch;
 use config::configuration;
 use config::keyassignment::PaneDirection;
+use frankenterm_sigpipe::{catch_recoverable, RecoverablePanicSite};
 use frankenterm_term::{StableRowIndex, TerminalSize};
 use parking_lot::Mutex;
 use rangeset::intersects_range;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::convert::TryFrom;
-use std::panic::{catch_unwind, AssertUnwindSafe};
+#[cfg(test)]
+use std::panic::catch_unwind;
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use url::Url;
 
@@ -521,14 +524,50 @@ fn observe_ordered_panes_bounded(
 
     for (pane_index, pane) in panes.into_iter().enumerate() {
         let identity = pane_identity(&pane);
-        let pane_id = match catch_unwind(AssertUnwindSafe(|| pane.pane_id())) {
-            Ok(pane_id) => pane_id,
+        let observation = match catch_recoverable(
+            RecoverablePanicSite::MuxPaneCallback,
+            AssertUnwindSafe(|| {
+                let pane_id = pane.pane_id();
+                let tree_entry = if pane_index < tree_leaf_count {
+                    // Pane implementations are arbitrary external code. Observe
+                    // every field needed by the wire entry inside the same unwind
+                    // boundary, before taking the final topology/focus coherence
+                    // cut. Assembly after that cut must be callback-free.
+                    let dims = pane.get_dimensions();
+                    let working_dir = pane
+                        .get_current_working_dir(CachePolicy::AllowStale)
+                        .map(Into::into);
+                    let cursor_pos = pane.get_cursor_position();
+                    Some(OrderedPaneEntryObservation {
+                        pane_id,
+                        title: pane.get_title(),
+                        size: TerminalSize {
+                            cols: dims.cols,
+                            rows: dims.viewport_rows,
+                            pixel_height: dims.pixel_height,
+                            pixel_width: dims.pixel_width,
+                            dpi: dims.dpi,
+                        },
+                        working_dir,
+                        alt_screen_active: pane.is_alt_screen_active(),
+                        cursor_pos,
+                        physical_top: dims.physical_top,
+                        tty_name: pane.tty_name(),
+                    })
+                } else {
+                    None
+                };
+                (pane_id, tree_entry)
+            }),
+        ) {
+            Ok(observation) => observation,
             Err(_) => {
                 anyhow::bail!(
                     "a pane callback panicked while tab {tab_id} was being observed for ordered encoding"
                 );
             }
         };
+        let (pane_id, tree_entry) = observation;
         if pane_ids.insert(identity, pane_id).is_some() {
             anyhow::bail!(
                 "an exact pane identity appears more than once while tab {tab_id} is being observed for ordered encoding"
@@ -542,35 +581,10 @@ fn observe_ordered_panes_bounded(
             }
         }
 
-        if pane_index >= tree_leaf_count {
+        let Some(tree_entry) = tree_entry else {
             continue;
-        }
-
-        // Pane implementations are arbitrary external code. Observe every
-        // field needed by the wire entry before taking the final topology and
-        // focus coherence cut; assembly after that cut must be callback-free.
-        let dims = pane.get_dimensions();
-        let working_dir = pane
-            .get_current_working_dir(CachePolicy::AllowStale)
-            .map(Into::into);
-        let cursor_pos = pane.get_cursor_position();
-        let entry = OrderedPaneEntryObservation {
-            pane_id,
-            title: pane.get_title(),
-            size: TerminalSize {
-                cols: dims.cols,
-                rows: dims.viewport_rows,
-                pixel_height: dims.pixel_height,
-                pixel_width: dims.pixel_width,
-                dpi: dims.dpi,
-            },
-            working_dir,
-            alt_screen_active: pane.is_alt_screen_active(),
-            cursor_pos,
-            physical_top: dims.physical_top,
-            tty_name: pane.tty_name(),
         };
-        if tree_entries.insert(identity, entry).is_some() {
+        if tree_entries.insert(identity, tree_entry).is_some() {
             anyhow::bail!(
                 "an exact tree-pane identity appears more than once while tab {tab_id} is being observed for ordered encoding"
             );
@@ -682,7 +696,12 @@ impl DeferredTabCallbacks {
         };
         if focus_changed {
             if let Some(prior) = prior_focus {
-                if catch_unwind(AssertUnwindSafe(|| prior.focus_changed(false))).is_err() {
+                if catch_recoverable(
+                    RecoverablePanicSite::MuxPaneCallback,
+                    AssertUnwindSafe(|| prior.focus_changed(false)),
+                )
+                .is_err()
+                {
                     log::error!(
                         "pane focus-loss callback panicked for exact pane identity {:p}",
                         Arc::as_ptr(&prior)
@@ -690,7 +709,12 @@ impl DeferredTabCallbacks {
                 }
             }
             if let Some(current) = current_focus {
-                if catch_unwind(AssertUnwindSafe(|| current.focus_changed(true))).is_err() {
+                if catch_recoverable(
+                    RecoverablePanicSite::MuxPaneCallback,
+                    AssertUnwindSafe(|| current.focus_changed(true)),
+                )
+                .is_err()
+                {
                     log::error!(
                         "pane focus-gain callback panicked for exact pane identity {:p}",
                         Arc::as_ptr(&current)
@@ -2878,7 +2902,12 @@ fn execute_pane_resize_work(work: Vec<(Arc<dyn Pane>, TerminalSize)>) {
 }
 
 fn invoke_pane_resize(pane: &Arc<dyn Pane>, pane_size: TerminalSize) {
-    if catch_unwind(AssertUnwindSafe(|| pane.resize(pane_size))).is_err() {
+    if catch_recoverable(
+        RecoverablePanicSite::MuxPaneCallback,
+        AssertUnwindSafe(|| pane.resize(pane_size)),
+    )
+    .is_err()
+    {
         log::error!(
             "pane resize callback panicked for exact pane identity {:p}",
             Arc::as_ptr(pane)
@@ -3502,7 +3531,10 @@ impl Tab {
         panes
             .into_iter()
             .map(|pane| {
-                let pane_id = match catch_unwind(AssertUnwindSafe(|| pane.pane_id())) {
+                let pane_id = match catch_recoverable(
+                    RecoverablePanicSite::MuxPaneCallback,
+                    AssertUnwindSafe(|| pane.pane_id()),
+                ) {
                     Ok(pane_id) => Some(pane_id),
                     Err(_) => {
                         log::error!(
@@ -3577,7 +3609,10 @@ impl Tab {
             .iter()
             .filter_map(|observed| {
                 let pane_id = observed.pane_id?;
-                match catch_unwind(AssertUnwindSafe(|| observed.pane.is_dead())) {
+                match catch_recoverable(
+                    RecoverablePanicSite::MuxPaneCallback,
+                    AssertUnwindSafe(|| observed.pane.is_dead()),
+                ) {
                     Ok(true) => Some(ExactPaneRemovalCandidate {
                         pane: Arc::clone(&observed.pane),
                         pane_id,
@@ -3618,7 +3653,10 @@ impl Tab {
                 .as_ref()
                 .is_some_and(|current| Arc::ptr_eq(current, &observed.pane));
             let should_remove = if registered_exact {
-                match catch_unwind(AssertUnwindSafe(|| observed.pane.is_dead())) {
+                match catch_recoverable(
+                    RecoverablePanicSite::MuxPaneCallback,
+                    AssertUnwindSafe(|| observed.pane.is_dead()),
+                ) {
                     Ok(dead) => {
                         log::trace!("prune_dead_panes: pane_id={pane_id} dead={dead} in_mux=true");
                         dead
@@ -3632,15 +3670,18 @@ impl Tab {
                 }
             } else {
                 let detached_operation_in_flight =
-                    match catch_unwind(AssertUnwindSafe(|| {
-                        observed
-                            .pane
-                            .mux_registration_slot()
-                            .load()
-                            .is_some_and(|registration| {
-                                registration.guards_detached_topology(mux, &observed.pane)
-                            })
-                    })) {
+                    match catch_recoverable(
+                        RecoverablePanicSite::MuxPaneCallback,
+                        AssertUnwindSafe(|| {
+                            observed
+                                .pane
+                                .mux_registration_slot()
+                                .load()
+                                .is_some_and(|registration| {
+                                    registration.guards_detached_topology(mux, &observed.pane)
+                                })
+                        }),
+                    ) {
                         Ok(in_flight) => in_flight,
                         Err(_) => {
                             log::error!(
@@ -3670,9 +3711,10 @@ impl Tab {
             }
 
             let expected_registration = if registered_exact {
-                match catch_unwind(AssertUnwindSafe(|| {
-                    mux.capture_pane_registration(&observed.pane)
-                })) {
+                match catch_recoverable(
+                    RecoverablePanicSite::MuxPaneCallback,
+                    AssertUnwindSafe(|| mux.capture_pane_registration(&observed.pane)),
+                ) {
                     Ok(registration) => registration,
                     Err(_) => {
                         log::error!(
@@ -3719,9 +3761,10 @@ impl Tab {
             let Some(pane_id) = observed.pane_id else {
                 continue;
             };
-            let expected_registration = match catch_unwind(AssertUnwindSafe(|| {
-                mux.capture_pane_registration(&observed.pane)
-            })) {
+            let expected_registration = match catch_recoverable(
+                RecoverablePanicSite::MuxPaneCallback,
+                AssertUnwindSafe(|| mux.capture_pane_registration(&observed.pane)),
+            ) {
                 Ok(registration) => registration,
                 Err(_) => {
                     log::error!(
@@ -3803,9 +3846,10 @@ impl Tab {
 
     pub fn can_close_without_prompting(&self, reason: CloseReason) -> bool {
         self.snapshot_panes_callback_free().into_iter().all(|pane| {
-            match catch_unwind(AssertUnwindSafe(|| {
-                pane.can_close_without_prompting(reason)
-            })) {
+            match catch_recoverable(
+                RecoverablePanicSite::MuxPaneCallback,
+                AssertUnwindSafe(|| pane.can_close_without_prompting(reason)),
+            ) {
                 Ok(can_close) => can_close,
                 Err(_) => {
                     log::error!(
@@ -3824,7 +3868,10 @@ impl Tab {
         // whole tab if the zoomed pane is dead. A panicking liveness callback
         // is conservatively treated as live.
         self.snapshot_panes_callback_free().into_iter().all(|pane| {
-            match catch_unwind(AssertUnwindSafe(|| pane.is_dead())) {
+            match catch_recoverable(
+                RecoverablePanicSite::MuxPaneCallback,
+                AssertUnwindSafe(|| pane.is_dead()),
+            ) {
                 Ok(dead) => dead,
                 Err(_) => {
                     log::error!(
@@ -3864,7 +3911,10 @@ impl Tab {
         }
         if let Some(focused_id) = floating_focus {
             for pane in floating {
-                match catch_unwind(AssertUnwindSafe(|| pane.pane_id())) {
+                match catch_recoverable(
+                    RecoverablePanicSite::MuxPaneCallback,
+                    AssertUnwindSafe(|| pane.pane_id()),
+                ) {
                     Ok(pane_id) if pane_id == focused_id => return Some(pane),
                     Ok(_) => {}
                     Err(_) => {
@@ -7357,6 +7407,17 @@ mod test {
         );
     }
 
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum OrderedObservationCallback {
+        PaneId,
+        Dimensions,
+        WorkingDirectory,
+        CursorPosition,
+        Title,
+        AltScreen,
+        TtyName,
+    }
+
     struct FakePane {
         id: PaneId,
         size: Mutex<TerminalSize>,
@@ -7367,6 +7428,7 @@ mod test {
         mux_registration: Arc<crate::PaneRegistrationSlot>,
         dead: bool,
         panic_in_is_dead: bool,
+        panic_in_ordered_observation: Option<OrderedObservationCallback>,
         callback_probe: Option<Arc<dyn Fn() + Send + Sync>>,
         pane_id_probe: Option<Arc<dyn Fn() + Send + Sync>>,
         kills: std::sync::atomic::AtomicUsize,
@@ -7384,6 +7446,7 @@ mod test {
                 mux_registration: Arc::new(crate::PaneRegistrationSlot::default()),
                 dead: false,
                 panic_in_is_dead: false,
+                panic_in_ordered_observation: None,
                 callback_probe: None,
                 pane_id_probe: None,
                 kills: std::sync::atomic::AtomicUsize::new(0),
@@ -7401,6 +7464,7 @@ mod test {
                 mux_registration: Arc::new(crate::PaneRegistrationSlot::default()),
                 dead: false,
                 panic_in_is_dead: false,
+                panic_in_ordered_observation: None,
                 callback_probe: None,
                 pane_id_probe: None,
                 kills: std::sync::atomic::AtomicUsize::new(0),
@@ -7422,6 +7486,7 @@ mod test {
                 mux_registration: Arc::new(crate::PaneRegistrationSlot::default()),
                 dead: false,
                 panic_in_is_dead: false,
+                panic_in_ordered_observation: None,
                 callback_probe: None,
                 pane_id_probe: None,
                 kills: std::sync::atomic::AtomicUsize::new(0),
@@ -7444,6 +7509,7 @@ mod test {
                 mux_registration: Arc::new(crate::PaneRegistrationSlot::default()),
                 dead: false,
                 panic_in_is_dead: false,
+                panic_in_ordered_observation: None,
                 callback_probe: None,
                 pane_id_probe: None,
                 kills: std::sync::atomic::AtomicUsize::new(0),
@@ -7467,6 +7533,7 @@ mod test {
                 mux_registration: Arc::new(crate::PaneRegistrationSlot::default()),
                 dead,
                 panic_in_is_dead,
+                panic_in_ordered_observation: None,
                 callback_probe: Some(callback_probe),
                 pane_id_probe: None,
                 kills: std::sync::atomic::AtomicUsize::new(0),
@@ -7488,15 +7555,47 @@ mod test {
                 mux_registration: Arc::new(crate::PaneRegistrationSlot::default()),
                 dead: false,
                 panic_in_is_dead: false,
+                panic_in_ordered_observation: None,
                 callback_probe: None,
                 pane_id_probe: Some(pane_id_probe),
                 kills: std::sync::atomic::AtomicUsize::new(0),
             })
         }
+
+        fn new_with_ordered_observation_panic(
+            id: PaneId,
+            size: TerminalSize,
+            callback: OrderedObservationCallback,
+        ) -> Arc<dyn Pane> {
+            Arc::new(Self {
+                id,
+                size: Mutex::new(size),
+                domain_id: 1,
+                constraints: PaneConstraints::default(),
+                priority: CollapsePriority::default(),
+                writes: Mutex::new(Vec::new()),
+                mux_registration: Arc::new(crate::PaneRegistrationSlot::default()),
+                dead: false,
+                panic_in_is_dead: false,
+                panic_in_ordered_observation: Some(callback),
+                callback_probe: None,
+                pane_id_probe: None,
+                kills: std::sync::atomic::AtomicUsize::new(0),
+            })
+        }
+
+        fn panic_if_ordered_observation_callback(&self, callback: OrderedObservationCallback) {
+            assert_ne!(
+                self.panic_in_ordered_observation,
+                Some(callback),
+                "injected ordered pane observation panic for {callback:?}"
+            );
+        }
     }
 
     impl Pane for FakePane {
         fn pane_id(&self) -> PaneId {
+            self.panic_if_ordered_observation_callback(OrderedObservationCallback::PaneId);
             if let Some(probe) = &self.pane_id_probe {
                 probe();
             }
@@ -7508,6 +7607,9 @@ mod test {
         }
 
         fn get_cursor_position(&self) -> StableCursorPosition {
+            self.panic_if_ordered_observation_callback(
+                OrderedObservationCallback::CursorPosition,
+            );
             StableCursorPosition::default()
         }
 
@@ -7546,6 +7648,7 @@ mod test {
         }
 
         fn get_dimensions(&self) -> RenderableDimensions {
+            self.panic_if_ordered_observation_callback(OrderedObservationCallback::Dimensions);
             if let Some(probe) = &self.callback_probe {
                 probe();
             }
@@ -7572,6 +7675,7 @@ mod test {
         }
 
         fn get_title(&self) -> String {
+            self.panic_if_ordered_observation_callback(OrderedObservationCallback::Title);
             format!("fake-pane-{}", self.id)
         }
         fn send_paste(&self, _text: &str) -> anyhow::Result<()> {
@@ -7632,9 +7736,17 @@ mod test {
             false
         }
         fn is_alt_screen_active(&self) -> bool {
+            self.panic_if_ordered_observation_callback(OrderedObservationCallback::AltScreen);
             false
         }
         fn get_current_working_dir(&self, _policy: CachePolicy) -> Option<Url> {
+            self.panic_if_ordered_observation_callback(
+                OrderedObservationCallback::WorkingDirectory,
+            );
+            None
+        }
+        fn tty_name(&self) -> Option<String> {
+            self.panic_if_ordered_observation_callback(OrderedObservationCallback::TtyName);
             None
         }
     }
@@ -9166,40 +9278,65 @@ mod test {
     }
 
     #[test]
-    fn flat_codec_snapshot_rolls_back_arena_when_pane_observation_panics() {
+    fn flat_codec_snapshot_contains_every_pane_observation_panic_and_preserves_arena() {
         let size = TerminalSize::default();
-        let tab = Tab::new(&size);
-        let armed = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let armed_for_probe = Arc::clone(&armed);
-        let probe: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
-            assert!(
-                !armed_for_probe.load(std::sync::atomic::Ordering::Acquire),
-                "injected Pane observation panic"
-            );
-        });
-        tab.assign_pane(&FakePane::new(601, size));
-        tab.split_and_insert(
-            0,
-            SplitRequest::default(),
-            FakePane::new_with_callback_probe(602, size, false, false, probe),
-        )
-        .expect("test split before arming callback panic");
+        let callbacks = [
+            OrderedObservationCallback::PaneId,
+            OrderedObservationCallback::Dimensions,
+            OrderedObservationCallback::WorkingDirectory,
+            OrderedObservationCallback::CursorPosition,
+            OrderedObservationCallback::Title,
+            OrderedObservationCallback::AltScreen,
+            OrderedObservationCallback::TtyName,
+        ];
 
-        let prefix = PaneArenaNode::Leaf(pane_arena_test_entry(997, false, false));
-        let mut arena = vec![prefix.clone()];
-        armed.store(true, std::sync::atomic::Ordering::Release);
-        let result = catch_unwind(AssertUnwindSafe(|| {
-            let _ = tab.append_codec_pane_arena_in_window(
-                90,
-                "panic-workspace",
-                &mut arena,
-                64,
-                16,
-                TEST_ORDERED_PANE_CENSUS_WORK,
+        for (index, callback) in callbacks.iter().copied().enumerate() {
+            let tab = Tab::new(&size);
+            tab.assign_pane(&FakePane::new_with_ordered_observation_panic(
+                601_usize.saturating_add(index),
+                size,
+                callback,
+            ));
+            let prefix = PaneArenaNode::Leaf(pane_arena_test_entry(997, false, false));
+            let mut arena = vec![prefix.clone()];
+            let prior_capacity = arena.capacity();
+
+            let result = catch_unwind(AssertUnwindSafe(|| {
+                tab.append_codec_pane_arena_in_window(
+                    90,
+                    "panic-workspace",
+                    &mut arena,
+                    64,
+                    16,
+                    TEST_ORDERED_PANE_CENSUS_WORK,
+                )
+            }));
+            let error = result
+                .unwrap_or_else(|_| {
+                    panic!(
+                        "{:?} panic escaped the mux observation boundary",
+                        callback
+                    )
+                })
+                .expect_err("a panicking pane callback must fail the ordered snapshot");
+
+            assert!(
+                format!("{error:#}").contains("a pane callback panicked while tab"),
+                "unexpected contained error for {:?}: {:#}",
+                callback,
+                error
             );
-        }));
-        assert!(result.is_err(), "the injected pane panic must propagate");
-        assert_eq!(arena, [prefix]);
+            assert_eq!(
+                arena,
+                [prefix],
+                "arena changed after {callback:?} panic"
+            );
+            assert_eq!(
+                arena.capacity(),
+                prior_capacity,
+                "arena allocation changed after {callback:?} panic"
+            );
+        }
     }
 
     #[test]

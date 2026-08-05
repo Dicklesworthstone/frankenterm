@@ -19,6 +19,7 @@ use async_trait::async_trait;
 use config::configuration;
 use crossbeam::channel::{bounded, Receiver, Sender, TrySendError};
 use filedescriptor::FileDescriptor;
+use frankenterm_sigpipe::{catch_recoverable, RecoverablePanicSite};
 use frankenterm_term::TerminalSize;
 use lru::LruCache;
 use parking_lot::Mutex;
@@ -823,9 +824,12 @@ impl TmuxPaneOutputLane {
         std::thread::Builder::new()
             .name(format!("tmux-output-{domain_id}"))
             .spawn(move || {
-                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    run_tmux_pane_output_lane(owner, ready_rx, &worker_active);
-                }));
+                let outcome = catch_recoverable(
+                    RecoverablePanicSite::MuxTmuxCallback,
+                    std::panic::AssertUnwindSafe(|| {
+                        run_tmux_pane_output_lane(owner, ready_rx, &worker_active);
+                    }),
+                );
                 if outcome.is_err() {
                     if let Some(owner) = panic_owner.upgrade() {
                         log::error!(
@@ -3119,9 +3123,12 @@ impl TmuxIoLane {
         let spawn_result = std::thread::Builder::new()
             .name(thread_name)
             .spawn(move || {
-                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    run_tmux_io_supervisor(owner, control_rx);
-                }));
+                let outcome = catch_recoverable(
+                    RecoverablePanicSite::MuxTmuxCallback,
+                    std::panic::AssertUnwindSafe(|| {
+                        run_tmux_io_supervisor(owner, control_rx);
+                    }),
+                );
                 if outcome.is_err() {
                     log::error!("tmux I/O supervisor for domain {domain_id} panicked");
                     if let Some(domain) = failure_owner.upgrade() {
@@ -3232,9 +3239,10 @@ fn run_tmux_io_writer(
         {
             return;
         }
-        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            execute_tmux_io_write(&owner, &job)
-        }))
+        let outcome = catch_recoverable(
+            RecoverablePanicSite::MuxTmuxCallback,
+            std::panic::AssertUnwindSafe(|| execute_tmux_io_write(&owner, &job)),
+        )
         .unwrap_or(TmuxIoWriteOutcome::Panicked);
         if progress
             .send(TmuxIoWriteProgress::Finished {
@@ -5313,9 +5321,10 @@ impl TmuxDomainState {
             .increment(1);
             return true;
         }
-        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            cmd.process_result(self.domain_id, response)
-        })) {
+        match catch_recoverable(
+            RecoverablePanicSite::MuxTmuxCallback,
+            std::panic::AssertUnwindSafe(|| cmd.process_result(self.domain_id, response)),
+        ) {
             Ok(Ok(())) if !response.error => {}
             Ok(Ok(())) => {
                 log::error!(

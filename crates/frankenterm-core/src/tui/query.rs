@@ -115,6 +115,20 @@ fn infer_pane_state(info: &PaneInfo) -> String {
     "unknown".to_string()
 }
 
+fn apply_pane_storage_aggregates(
+    panes: &mut [PaneView],
+    unhandled_by_pane: &std::collections::HashMap<u64, u32>,
+    last_activity_by_pane: &std::collections::HashMap<u64, Option<i64>>,
+) {
+    for pane in panes {
+        pane.unhandled_event_count = *unhandled_by_pane.get(&pane.pane_id).unwrap_or(&0);
+        pane.last_activity_ts = last_activity_by_pane
+            .get(&pane.pane_id)
+            .copied()
+            .flatten();
+    }
+}
+
 /// Event information for TUI display
 #[derive(Debug, Clone)]
 pub struct EventView {
@@ -450,18 +464,62 @@ impl QueryClient for ProductionQueryClient {
             if let Some(storage) = storage {
                 // ft-xbnl0.2.3 tick 256: cx-first TUI pane-aggregation reads.
                 let agg_cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+                let pane_ids = pane_views
+                    .iter()
+                    .map(|pane| pane.pane_id)
+                    .collect::<Vec<_>>();
+                let live_pane_unhandled = async {
+                    let mut counts = std::collections::HashMap::with_capacity(pane_ids.len());
+                    for pane_id_chunk in
+                        pane_ids.chunks(crate::storage::STORAGE_BULK_ID_INPUT_MAX)
+                    {
+                        counts.extend(
+                            storage
+                                .count_unhandled_events_by_pane_bulk_with_cx(
+                                    &agg_cx,
+                                    pane_id_chunk,
+                                )
+                                .await?,
+                        );
+                    }
+                    Ok::<_, crate::Error>(counts)
+                };
+                let live_pane_activity = async {
+                    let mut activity = std::collections::HashMap::with_capacity(pane_ids.len());
+                    for pane_id_chunk in
+                        pane_ids.chunks(crate::storage::STORAGE_BULK_ID_INPUT_MAX)
+                    {
+                        activity.extend(
+                            storage
+                                .pane_last_output_at_bulk_with_cx(&agg_cx, pane_id_chunk)
+                                .await?,
+                        );
+                    }
+                    Ok::<_, crate::Error>(activity)
+                };
                 let (unhandled_res, last_activity_res) = crate::runtime_async::join!(
-                    storage.count_unhandled_events_by_pane_with_cx(&agg_cx),
-                    storage.get_last_activity_by_pane_with_cx(&agg_cx)
+                    live_pane_unhandled,
+                    live_pane_activity
                 );
-                let unhandled_by_pane = unhandled_res.unwrap_or_default();
-                let last_activity_by_pane = last_activity_res.unwrap_or_default();
-
-                for pane in &mut pane_views {
-                    pane.unhandled_event_count =
-                        *unhandled_by_pane.get(&pane.pane_id).unwrap_or(&0_u32);
-                    pane.last_activity_ts = last_activity_by_pane.get(&pane.pane_id).copied();
-                }
+                let unhandled_by_pane = unhandled_res.unwrap_or_else(|error| {
+                    tracing::warn!(
+                        error = %error,
+                        "TUI pane refresh could not load unhandled-event counts"
+                    );
+                    std::collections::HashMap::new()
+                });
+                let last_activity_by_pane = last_activity_res.unwrap_or_else(|error| {
+                    tracing::warn!(
+                        error = %error,
+                        "TUI pane refresh could not load live-pane activity"
+                    );
+                    std::collections::HashMap::new()
+                });
+                apply_pane_storage_aggregates(
+                    &mut pane_views,
+                    &unhandled_by_pane,
+                    &last_activity_by_pane,
+                );
             }
 
             Ok(pane_views)
@@ -488,32 +546,65 @@ impl QueryClient for ProductionQueryClient {
         };
 
         let rows = self.runtime.block_on(async {
-            // ft-xbnl0.2.3 tick 255: cx-first TUI event query + annotation loop.
+            // ft-interactive-systems-performance-4tenz.15: load annotations in
+            // bounded snapshots instead of issuing one storage read per event.
             let query_cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             let events = storage
                 .get_events_with_cx(&query_cx, query)
                 .await
                 .map_err(|e| QueryError::StorageError(e.to_string()))?;
 
-            let mut rows = Vec::with_capacity(events.len());
-            for event in events {
-                let annotations = match storage
-                    .get_event_annotations_with_cx(&query_cx, event.id)
+            let event_ids = events.iter().map(|event| event.id).collect::<Vec<_>>();
+            let mut annotations_by_event =
+                std::collections::HashMap::with_capacity(event_ids.len());
+            for (page_index, event_id_chunk) in event_ids
+                .chunks(crate::storage::STORAGE_BULK_ID_INPUT_MAX)
+                .enumerate()
+            {
+                match storage
+                    .get_event_annotations_bulk_with_cx(&query_cx, event_id_chunk)
                     .await
                 {
-                    Ok(Some(annotations)) => annotations,
-                    Ok(None) => crate::storage::EventAnnotations::default(),
-                    Err(err) => {
-                        tracing::warn!(
-                            error = %err,
-                            event_id = event.id,
-                            "Failed to load event annotations for TUI",
-                        );
-                        crate::storage::EventAnnotations::default()
+                    Ok(page) => {
+                        // `get_event_annotations_bulk_with_cx` checkpoints at
+                        // the start of every call, so each page is also an
+                        // explicit cancellation/fairness boundary.
+                        for (event_id, annotations) in page {
+                            if annotations_by_event
+                                .insert(event_id, annotations)
+                                .is_some()
+                            {
+                                return Err(QueryError::StorageError(format!(
+                                    "bulk annotation paging returned duplicate event ID {event_id}"
+                                )));
+                            }
+                        }
                     }
-                };
-                rows.push((event, annotations));
+                    Err(error) => {
+                        // Preserve the prior fail-soft behavior: only this
+                        // bounded page defaults, while successful pages remain
+                        // visible and output ordering stays event-query order.
+                        tracing::warn!(
+                            error = %error,
+                            page_index,
+                            event_count = event_id_chunk.len(),
+                            first_event_id = ?event_id_chunk.first().copied(),
+                            last_event_id = ?event_id_chunk.last().copied(),
+                            "TUI event refresh could not load one annotation page",
+                        );
+                    }
+                }
             }
+
+            let rows = events
+                .into_iter()
+                .map(|event| {
+                    let annotations = annotations_by_event
+                        .remove(&event.id)
+                        .unwrap_or_default();
+                    (event, annotations)
+                })
+                .collect::<Vec<_>>();
             Ok::<_, QueryError>(rows)
         })?;
 
@@ -586,17 +677,18 @@ impl QueryClient for ProductionQueryClient {
         // Recent crash bundle
         if let Some(bundle) = latest_crash_bundle(&self.workspace_layout.crash_dir) {
             let detail = if let Some(ref report) = bundle.report {
-                let msg = if report.message.len() > 100 {
-                    format!("{}...", &report.message[..97])
-                } else {
-                    report.message.clone()
-                };
-                format!(
-                    "{msg} (at {})",
-                    report.location.as_deref().unwrap_or("unknown")
-                )
+                let message = sanitize_historical_crash_text(&report.message, 100);
+                let location = report
+                    .location
+                    .as_deref()
+                    .map(sanitize_historical_crash_location)
+                    .unwrap_or_else(|| "unknown".to_string());
+                format!("{message} (at {location})")
             } else if let Some(ref manifest) = bundle.manifest {
-                format!("crash at {}", manifest.created_at)
+                format!(
+                    "crash at {}",
+                    sanitize_historical_crash_text(&manifest.created_at, 40)
+                )
             } else {
                 "crash bundle found".to_string()
             };
@@ -1011,6 +1103,77 @@ fn epoch_ms() -> i64 {
         .unwrap_or(0)
 }
 
+fn is_untrusted_display_control(character: char) -> bool {
+    character.is_control()
+        || matches!(
+            character,
+            '\u{061c}'
+                | '\u{200e}'
+                | '\u{200f}'
+                | '\u{202a}'..='\u{202e}'
+                | '\u{2066}'..='\u{2069}'
+        )
+}
+
+/// Normalize historical crash-bundle strings before putting them in the TUI.
+///
+/// Older bundles can contain caller-controlled panic payloads, terminal
+/// escape sequences, embedded newlines, and directional controls. Strip ANSI
+/// first, replace every remaining display control with a space, then apply the
+/// shared Unicode/cell-safe truncator so multibyte text can never panic or
+/// overflow the detail column.
+fn scrub_historical_crash_text(value: &str) -> String {
+    let stripped = crate::output::strip_ansi(value);
+    stripped
+        .chars()
+        .map(|character| {
+            if is_untrusted_display_control(character) {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect::<String>()
+}
+
+fn sanitize_historical_crash_text(value: &str, max_width: usize) -> String {
+    let scrubbed = scrub_historical_crash_text(value);
+    crate::output::truncate(scrubbed.trim(), max_width)
+}
+
+fn sanitize_historical_crash_location(value: &str) -> String {
+    const MAX_LOCATION_WIDTH: usize = 80;
+    let scrubbed = scrub_historical_crash_text(value);
+    let location = scrubbed.trim();
+
+    if let Some(rest) = location.strip_prefix("line:")
+        && let Some((line, column)) = rest.split_once(":column:")
+        && line.parse::<u32>().is_ok()
+        && column.parse::<u32>().is_ok()
+    {
+        return format!("line:{line}:column:{column}");
+    }
+
+    // Legacy reports used `path:line:column`. Preserve the useful coordinates
+    // without reflecting an absolute/local path into the operator display.
+    let mut suffixes = location.rsplitn(3, ':');
+    let column = suffixes.next();
+    let line = suffixes.next();
+    if let (Some(column), Some(line)) = (column, line)
+        && line.parse::<u32>().is_ok()
+        && column.parse::<u32>().is_ok()
+    {
+        return format!("line:{line}:column:{column}");
+    }
+
+    let basename = location
+        .rsplit(['/', '\\'])
+        .next()
+        .filter(|component| !component.is_empty())
+        .unwrap_or("unknown");
+    crate::output::truncate(basename, MAX_LOCATION_WIDTH)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1117,6 +1280,43 @@ mod tests {
     }
 
     #[test]
+    fn historical_crash_detail_is_terminal_safe_unicode_safe_and_bounded() {
+        let message = format!(
+            "\x1b[31m{}\x1b[0m\nspoofed\u{202e}direction",
+            "猫".repeat(80)
+        );
+        let sanitized = sanitize_historical_crash_text(&message, 100);
+        assert!(!sanitized.contains('\x1b'));
+        assert!(!sanitized.contains('\n'));
+        assert!(!sanitized.contains('\u{202e}'));
+        assert!(sanitized.ends_with("..."));
+        assert_eq!(
+            crate::output::truncate(&sanitized, 100),
+            sanitized,
+            "sanitized detail must already fit the shared display-width bound"
+        );
+
+        assert_eq!(
+            sanitize_historical_crash_location(
+                "\x1b[31m/Users/private/project/secret.rs:42:7\x1b[0m\n"
+            ),
+            "line:42:column:7"
+        );
+        assert_eq!(
+            sanitize_historical_crash_location("line:8:column:9"),
+            "line:8:column:9"
+        );
+        assert_eq!(
+            sanitize_historical_crash_location(&format!(
+                "/{}/secret.rs:123:45",
+                "private/".repeat(100)
+            )),
+            "line:123:column:45",
+            "location parsing must retain a bounded coordinate even after a long legacy path"
+        );
+    }
+
+    #[test]
     fn production_health_reads_storage_counters() {
         let runtime = crate::runtime_async::RuntimeBuilder::current_thread()
             .enable_all()
@@ -1190,6 +1390,278 @@ mod tests {
         assert_eq!(health.event_count, 1);
         assert_eq!(health.last_capture_ts, Some(last_capture_ts));
         assert_eq!(health.pane_count, 1);
+
+        drop(client);
+        runtime.block_on(async {
+            storage.shutdown().await.expect("shutdown storage");
+        });
+    }
+
+    #[test]
+    fn v35_production_list_panes_pages_live_aggregates_at_the_bulk_limit() {
+        let runtime = crate::runtime_async::RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .expect("build query paging test runtime");
+        let temp_dir = tempfile::tempdir().expect("temp workspace");
+        let last_pane_id =
+            u64::try_from(crate::storage::STORAGE_BULK_ID_INPUT_MAX + 1).unwrap();
+
+        let (
+            layout,
+            storage,
+            first_page_pane_id,
+            overflow_page_pane_id,
+            first_activity,
+            overflow_activity,
+            wezterm,
+        ) = runtime.block_on(async {
+            let layout = crate::config::WorkspaceLayout::new(
+                temp_dir.path().to_path_buf(),
+                &crate::config::StorageConfig::default(),
+                &crate::config::IpcConfig::default(),
+            );
+            std::fs::create_dir_all(&layout.ft_dir).expect("create .ft dir");
+            let db_path = layout.db_path.to_string_lossy().to_string();
+            let storage = StorageHandle::new(&db_path).await.expect("open storage");
+            let mock = std::sync::Arc::new(crate::wezterm::MockWezterm::new());
+            for pane_id in 1..=last_pane_id {
+                mock.add_default_pane(pane_id).await;
+            }
+            let pane_order = crate::wezterm::WeztermInterface::list_panes(mock.as_ref())
+                .await
+                .expect("read stable mock pane order");
+            assert_eq!(
+                pane_order.len(),
+                crate::storage::STORAGE_BULK_ID_INPUT_MAX + 1
+            );
+            // The map is not mutated between this read and the production
+            // read, so its iteration order remains stable. Seed the first ID
+            // beyond one full chunk to prove that chunk is not dropped.
+            let first_page_pane_id = pane_order.first().expect("first mock pane").pane_id;
+            let overflow_page_pane_id = pane_order
+                .get(crate::storage::STORAGE_BULK_ID_INPUT_MAX)
+                .expect("first pane beyond one full bulk chunk")
+                .pane_id;
+
+            let now = epoch_ms();
+            for pane_id in [first_page_pane_id, overflow_page_pane_id] {
+                storage
+                    .upsert_pane(crate::storage::PaneRecord {
+                        pane_id,
+                        pane_uuid: None,
+                        domain: "local".to_string(),
+                        window_id: Some(0),
+                        tab_id: Some(0),
+                        title: Some(format!("paged-pane-{pane_id}")),
+                        cwd: None,
+                        tty_name: None,
+                        first_seen_at: now,
+                        last_seen_at: now,
+                        observed: true,
+                        ignore_reason: None,
+                        last_decision_at: None,
+                    })
+                    .await
+                    .expect("upsert paged pane");
+            }
+            let first_segment = storage
+                .append_segment(first_page_pane_id, "first page activity", None)
+                .await
+                .expect("append first-page segment");
+            let overflow_segment = storage
+                .append_segment(overflow_page_pane_id, "overflow page activity", None)
+                .await
+                .expect("append overflow-page segment");
+            storage
+                .record_event(crate::storage::StoredEvent {
+                    id: 0,
+                    pane_id: overflow_page_pane_id,
+                    rule_id: "paged.overflow-pane".to_string(),
+                    agent_type: "test".to_string(),
+                    event_type: "paged".to_string(),
+                    severity: "info".to_string(),
+                    confidence: 1.0,
+                    extracted: None,
+                    matched_text: None,
+                    segment_id: Some(overflow_segment.id),
+                    detected_at: overflow_segment.captured_at,
+                    dedupe_key: None,
+                    handled_at: None,
+                    handled_by_workflow_id: None,
+                    handled_status: None,
+                })
+                .await
+                .expect("record overflow-page event");
+
+            let wezterm: crate::wezterm::WeztermHandle = mock;
+            (
+                layout,
+                storage,
+                first_page_pane_id,
+                overflow_page_pane_id,
+                first_segment.captured_at,
+                overflow_segment.captured_at,
+                wezterm,
+            )
+        });
+
+        let client =
+            ProductionQueryClient::with_storage_and_wezterm(layout, storage.clone(), wezterm);
+        let panes = client.list_panes().expect("list paged live panes");
+        assert_eq!(
+            panes.len(),
+            crate::storage::STORAGE_BULK_ID_INPUT_MAX + 1
+        );
+        assert_eq!(
+            panes
+                .get(crate::storage::STORAGE_BULK_ID_INPUT_MAX)
+                .map(|pane| pane.pane_id),
+            Some(overflow_page_pane_id),
+            "the seeded overflow pane must exercise the second bulk chunk"
+        );
+        assert_eq!(
+            panes
+                .iter()
+                .find(|pane| pane.pane_id == first_page_pane_id)
+                .and_then(|pane| pane.last_activity_ts),
+            Some(first_activity)
+        );
+        assert_eq!(
+            panes
+                .iter()
+                .find(|pane| pane.pane_id == overflow_page_pane_id)
+                .and_then(|pane| pane.last_activity_ts),
+            Some(overflow_activity)
+        );
+        assert_eq!(
+            panes
+                .iter()
+                .find(|pane| pane.pane_id == first_page_pane_id)
+                .map(|pane| pane.unhandled_event_count),
+            Some(0)
+        );
+        assert_eq!(
+            panes
+                .iter()
+                .find(|pane| pane.pane_id == overflow_page_pane_id)
+                .map(|pane| pane.unhandled_event_count),
+            Some(1)
+        );
+
+        drop(client);
+        runtime.block_on(async {
+            storage.shutdown().await.expect("shutdown storage");
+        });
+    }
+
+    #[test]
+    fn v35_performance_campaign_tui_annotations_page_past_bulk_cap() {
+        let runtime = crate::runtime_async::RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .expect("build annotation paging test runtime");
+        let temp_dir = tempfile::tempdir().expect("temp workspace");
+        let layout = crate::config::WorkspaceLayout::new(
+            temp_dir.path().to_path_buf(),
+            &crate::config::StorageConfig::default(),
+            &crate::config::IpcConfig::default(),
+        );
+        std::fs::create_dir_all(&layout.ft_dir).expect("create .ft dir");
+
+        // Seed one row beyond the storage bulk-read cap without spending the
+        // test's wall-clock budget on thousands of writer round trips. Event
+        // IDs are inserted monotonically so the durable high-water triggers
+        // exercise the same invariant as the production event writer.
+        let event_count = crate::storage::STORAGE_BULK_ID_INPUT_MAX + 1;
+        let event_count_i64 = i64::try_from(event_count).expect("event count fits i64");
+        let connection = rusqlite::Connection::open(&layout.db_path).expect("open seed database");
+        crate::storage::migrations::initialize_schema(&connection).expect("initialize schema");
+        connection
+            .execute(
+                "INSERT INTO panes (
+                     pane_id, domain, first_seen_at, last_seen_at, observed
+                 ) VALUES (1, 'local', 1, 1, 1)",
+                [],
+            )
+            .expect("seed pane");
+        connection
+            .execute(
+                "WITH RECURSIVE event_ids(id) AS (
+                     VALUES(1)
+                     UNION ALL
+                     SELECT id + 1 FROM event_ids WHERE id < ?1
+                 )
+                 INSERT INTO events (
+                     id, pane_id, rule_id, agent_type, event_type, severity,
+                     confidence, matched_text, detected_at
+                 )
+                 SELECT id, 1, 'bulk.annotation', 'test', 'bulk', 'info',
+                        1.0, 'event-' || id, id
+                 FROM event_ids
+                 ORDER BY id ASC",
+                [event_count_i64],
+            )
+            .expect("seed ordered events");
+        connection
+            .execute(
+                "UPDATE events
+                 SET triage_state = 'overflow-page',
+                     triage_updated_at = 10,
+                     triage_updated_by = 'test'
+                 WHERE id = 1",
+                [],
+            )
+            .expect("seed overflow-page triage state");
+        connection
+            .execute(
+                "INSERT INTO event_notes (event_id, note, updated_at, updated_by)
+                 VALUES (1, 'annotation past bulk cap', 11, 'test')",
+                [],
+            )
+            .expect("seed overflow-page note");
+        connection
+            .execute(
+                "INSERT INTO event_labels (event_id, label, created_at, created_by)
+                 VALUES (1, 'overflow', 12, 'test'),
+                        (?1, 'first-page', 12, 'test')",
+                [event_count_i64],
+            )
+            .expect("seed annotations on both pages");
+        drop(connection);
+
+        let storage = runtime.block_on(async {
+            StorageHandle::new(layout.db_path.to_string_lossy().as_ref())
+                .await
+                .expect("open production storage")
+        });
+        let wezterm: crate::wezterm::WeztermHandle =
+            std::sync::Arc::new(crate::wezterm::MockWezterm::new());
+        let client =
+            ProductionQueryClient::with_storage_and_wezterm(layout, storage.clone(), wezterm);
+        let events = client
+            .list_events(&EventFilters {
+                limit: event_count,
+                ..EventFilters::default()
+            })
+            .expect("list events with paged annotations");
+
+        assert_eq!(events.len(), event_count);
+        assert_eq!(events.first().map(|event| event.id), Some(event_count_i64));
+        assert_eq!(events.last().map(|event| event.id), Some(1));
+        assert!(events.windows(2).all(|pair| pair[0].id > pair[1].id));
+        assert_eq!(events[0].labels, vec!["first-page"]);
+        let overflow = events.last().expect("overflow-page event");
+        assert_eq!(overflow.triage_state.as_deref(), Some("overflow-page"));
+        assert_eq!(
+            overflow.note.as_deref(),
+            Some("annotation past bulk cap")
+        );
+        assert_eq!(overflow.labels, vec!["overflow"]);
+        let unannotated = events.get(1).expect("unannotated event");
+        assert!(unannotated.triage_state.is_none());
+        assert!(unannotated.note.is_none());
+        assert!(unannotated.labels.is_empty());
 
         drop(client);
         runtime.block_on(async {
@@ -1447,6 +1919,38 @@ mod tests {
         assert_eq!(view.pane_state, "unknown");
         assert!(view.last_activity_ts.is_none());
         assert_eq!(view.unhandled_event_count, 0);
+    }
+
+    #[test]
+    fn v35_pane_storage_aggregates_preserve_missing_and_empty_activity_semantics() {
+        let mut first = PaneView::from(&make_pane_info());
+        let mut second = first.clone();
+        second.pane_id = 2;
+        second.last_activity_ts = Some(999);
+        second.unhandled_event_count = 999;
+        let mut third = first.clone();
+        third.pane_id = 3;
+        third.last_activity_ts = Some(999);
+        third.unhandled_event_count = 999;
+        first.last_activity_ts = Some(999);
+        first.unhandled_event_count = 999;
+        let mut panes = vec![first, second, third];
+
+        let unhandled_by_pane = std::collections::HashMap::from([(1, 7), (2, 0)]);
+        let last_activity_by_pane =
+            std::collections::HashMap::from([(1, Some(123)), (2, None)]);
+        apply_pane_storage_aggregates(
+            &mut panes,
+            &unhandled_by_pane,
+            &last_activity_by_pane,
+        );
+
+        assert_eq!(panes[0].unhandled_event_count, 7);
+        assert_eq!(panes[0].last_activity_ts, Some(123));
+        assert_eq!(panes[1].unhandled_event_count, 0);
+        assert_eq!(panes[1].last_activity_ts, None);
+        assert_eq!(panes[2].unhandled_event_count, 0);
+        assert_eq!(panes[2].last_activity_ts, None);
     }
 
     #[test]

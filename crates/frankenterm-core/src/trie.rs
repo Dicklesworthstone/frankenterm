@@ -269,6 +269,9 @@ impl Trie {
                 None => break,
             }
         }
+        while longest > 0 && !key.is_char_boundary(longest) {
+            longest -= 1;
+        }
         key[..longest].to_string()
     }
 
@@ -285,6 +288,9 @@ impl Trie {
                 }
                 None => break,
             }
+        }
+        while depth > 0 && !key.is_char_boundary(depth) {
+            depth -= 1;
         }
         key[..depth].to_string()
     }
@@ -778,6 +784,23 @@ mod tests {
         let mut t = Trie::new();
         t.insert("hello");
         assert_eq!(t.longest_shared_prefix(""), "");
+    }
+
+    #[test]
+    fn longest_shared_prefix_never_returns_partial_utf8_codepoint() {
+        let mut t = Trie::new();
+        t.insert("éclair");
+
+        assert_eq!(t.longest_shared_prefix("être"), "");
+        assert_eq!(t.longest_shared_prefix("école"), "éc");
+    }
+
+    #[test]
+    fn longest_complete_prefix_ignores_invalid_byte_key_boundary() {
+        let mut t = Trie::new();
+        t.insert_bytes(&[0xc3]);
+
+        assert_eq!(t.longest_common_prefix("éclair"), "");
     }
 
     #[test]

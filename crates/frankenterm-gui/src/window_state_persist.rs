@@ -801,6 +801,7 @@ pub fn reconcile_overlay(
 
     let mut live_by_identity = HashMap::with_capacity(live.len());
     for slot in live {
+        validate_stable_tab_slot(*slot)?;
         if live_by_identity.insert(slot.identity(), *slot).is_some() {
             return Err(PersistenceFailure::invalid(
                 "live layout contains duplicate stable tab identities",
@@ -6482,9 +6483,18 @@ mod tests {
     }
 
     #[test]
-    fn remote_overlay_rejects_reserved_authority_identities() {
+    fn remote_overlay_and_live_reconcile_reject_reserved_authority_identities() {
         let binding = DomainBindingId::from_bytes([0x21; 16]);
         let session = StableMuxSessionId::from_bytes([0x31; 16]);
+        let valid_local = local_slot(0x40);
+        let valid_overlay = MixedDomainLayoutOverlay::new(
+            LayoutWindowId::from_bytes([0x42; 16]),
+            "default",
+            1,
+            vec![valid_local],
+            Some(valid_local),
+        )
+        .expect("valid local-only overlay");
         let cases = [
             (
                 StableTabSlot::remote(
@@ -6527,6 +6537,18 @@ mod tests {
             assert!(
                 error.to_string().contains(expected_reason),
                 "unexpected rejection: {error}"
+            );
+
+            let error = reconcile_overlay(
+                &valid_overlay,
+                std::slice::from_ref(&slot),
+                &BTreeSet::new(),
+            )
+            .expect_err("reserved live identity must fail before reconciliation");
+            assert_eq!(error.code(), PersistenceFailureCode::Invalid);
+            assert!(
+                error.to_string().contains(expected_reason),
+                "unexpected live-slot rejection: {error}"
             );
         }
     }

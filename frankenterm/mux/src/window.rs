@@ -2,6 +2,7 @@ use crate::pane::CloseReason;
 use crate::tab::{TabStackEntry, TabStackError, TabStackId, TabStackState};
 use crate::{Mux, MuxNotification, Pane, Tab, TabId, DEFAULT_WORKSPACE};
 use config::GuiPosition;
+use frankenterm_sigpipe::{catch_recoverable, RecoverablePanicSite};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::Arc;
@@ -753,9 +754,10 @@ impl Window {
     fn enqueue_focus_lost(&self, pane: Arc<dyn Pane>) {
         if let Some(mux) = self.owner.upgrade() {
             mux.enqueue_window_focus_lost(pane);
-        } else if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            pane.focus_changed(false);
-        }))
+        } else if catch_recoverable(
+            RecoverablePanicSite::MuxWindowCallback,
+            std::panic::AssertUnwindSafe(|| pane.focus_changed(false)),
+        )
         .is_err()
         {
             log::error!(

@@ -3059,10 +3059,10 @@ unsafe extern "system" fn wnd_proc(
             .unwrap_or_else(|| DefWindowProcW(hwnd, msg, wparam, lparam))
     }) {
         Ok(result) => result,
-        Err(e) => {
-            log::error!("caught {:?}", e);
-            std::process::exit(1)
-        }
+        // This is a fatal FFI no-unwind fence, not a recovery boundary. The
+        // project hook has already emitted the one privacy-bounded report;
+        // never reflect the payload or emit a duplicate message here.
+        Err(_) => std::process::exit(1),
     }
 }
 
