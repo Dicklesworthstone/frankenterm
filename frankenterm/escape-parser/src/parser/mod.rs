@@ -1387,13 +1387,18 @@ mod test {
 
     #[test]
     fn xtgettcap_trailing_separator_ignores_empty_name() {
+        let mut p = Parser::new();
+        let actions = p.parse_as_vec(b"\x1bP+q544e;\x1b\\");
         assert_eq!(
-            round_trip_parse("\x1bP+q544e;\x1b\\"),
             vec![
                 Action::XtGetTcap(vec!["TN".to_string()]),
                 Action::Esc(Esc::Code(EscCode::StringTerminator)),
-            ]
+            ],
+            actions,
         );
+        // The action model intentionally carries no empty capability name, so
+        // encoding produces the canonical request without a trailing separator.
+        assert_eq!("\x1bP+q544e\x1b\\", encode(&actions));
     }
 
     #[test]
