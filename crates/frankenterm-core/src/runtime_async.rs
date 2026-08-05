@@ -23,6 +23,213 @@ pub const RAW_TOKIO_RUNTIME_BUILDER_QUARANTINE_V1: &[&str] = &[];
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 
+/// Stable project-owned waker passed to async primitives that would otherwise
+/// retain and later invoke an executor-provided waker outside FrankenTerm's
+/// panic-containment boundary.
+///
+/// Each published downstream waker is single-consumer: completion, abort, or
+/// drop takes it exactly once. The slot is compared and updated under the
+/// mutex, but caller-owned wakers are cloned, retired, and invoked only after
+/// unlocking; no caller `RawWaker` callback can run while the slot is held.
+struct ContainedForwardingWaker {
+    downstream: std::sync::Mutex<Option<std::task::Waker>>,
+    lock_poisoned_count: &'static std::sync::atomic::AtomicU64,
+    panic_site: frankenterm_sigpipe::RecoverablePanicSite,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ContainedWakerRegistrationError;
+
+impl std::fmt::Display for ContainedWakerRegistrationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("caller waker registration failed")
+    }
+}
+
+impl ContainedForwardingWaker {
+    fn new(
+        lock_poisoned_count: &'static std::sync::atomic::AtomicU64,
+        panic_site: frankenterm_sigpipe::RecoverablePanicSite,
+    ) -> (Arc<Self>, std::task::Waker) {
+        let state = Arc::new(Self {
+            downstream: std::sync::Mutex::new(None),
+            lock_poisoned_count,
+            panic_site,
+        });
+        let proxy = std::task::Waker::from(Arc::clone(&state));
+        (state, proxy)
+    }
+
+    fn lock_downstream_recovering(
+        &self,
+    ) -> std::sync::MutexGuard<'_, Option<std::task::Waker>> {
+        self.downstream.lock().unwrap_or_else(|poison| {
+            self.lock_poisoned_count
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            poison.into_inner()
+        })
+    }
+
+    /// Publish the current caller waker as one linearized slot update.
+    ///
+    /// Registration uses a compare/clone/recheck transaction. The initial
+    /// comparison avoids steady-state clones; the clone runs outside the lock
+    /// inside panic quarantine; and the second comparison linearizes the slot
+    /// update against completion or abort that raced with the clone.
+    /// `Waker::will_wake` only compares RawWaker identity and invokes no vtable
+    /// callback, so it is the sole caller-waker operation performed while
+    /// holding the slot lock.
+    fn register(
+        &self,
+        downstream: &std::task::Waker,
+    ) -> Result<(), ContainedWakerRegistrationError> {
+        self.register_with(downstream, std::task::Waker::clone)
+    }
+
+    fn register_with(
+        &self,
+        downstream: &std::task::Waker,
+        clone_downstream: impl FnOnce(&std::task::Waker) -> std::task::Waker,
+    ) -> Result<(), ContainedWakerRegistrationError> {
+        {
+            let slot = self.lock_downstream_recovering();
+            if slot
+                .as_ref()
+                .is_some_and(|current| current.will_wake(downstream))
+            {
+                return Ok(());
+            }
+        }
+
+        let candidate = match frankenterm_sigpipe::catch_recoverable(
+            self.panic_site,
+            std::panic::AssertUnwindSafe(|| clone_downstream(downstream)),
+        ) {
+            Ok(candidate) => candidate,
+            Err(_panic) => {
+                // A previous registration is no longer valid for this poll.
+                // Retire it before returning a finite, content-free failure;
+                // callers must not poll the primitive without a current waker.
+                self.clear();
+                return Err(ContainedWakerRegistrationError);
+            }
+        };
+
+        let mut slot = self.lock_downstream_recovering();
+        if slot
+            .as_ref()
+            .is_some_and(|current| current.will_wake(downstream))
+        {
+            drop(slot);
+            self.dispose(candidate);
+            return Ok(());
+        }
+        let retired = slot.replace(candidate);
+        drop(slot);
+        if let Some(retired) = retired {
+            self.dispose(retired);
+        }
+        Ok(())
+    }
+
+    fn clear(&self) {
+        let retired = {
+            let mut slot = self.lock_downstream_recovering();
+            slot.take()
+        };
+        if let Some(retired) = retired {
+            self.dispose(retired);
+        }
+    }
+
+    fn forward_one(&self) {
+        let downstream = {
+            let mut slot = self.lock_downstream_recovering();
+            slot.take()
+        };
+        if let Some(downstream) = downstream {
+            let _ = frankenterm_sigpipe::catch_recoverable(
+                self.panic_site,
+                std::panic::AssertUnwindSafe(|| downstream.wake()),
+            );
+        }
+    }
+
+    fn dispose(&self, downstream: std::task::Waker) {
+        Self::dispose_at(self.panic_site, downstream);
+    }
+
+    fn dispose_at(
+        panic_site: frankenterm_sigpipe::RecoverablePanicSite,
+        downstream: std::task::Waker,
+    ) {
+        let _ = frankenterm_sigpipe::catch_recoverable(
+            panic_site,
+            std::panic::AssertUnwindSafe(|| drop(downstream)),
+        );
+    }
+}
+
+impl std::task::Wake for ContainedForwardingWaker {
+    fn wake(self: Arc<Self>) {
+        self.forward_one();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.forward_one();
+    }
+}
+
+impl Drop for ContainedForwardingWaker {
+    fn drop(&mut self) {
+        // Normal terminal and wrapper-drop paths clear the slot first. This
+        // final backstop guarantees that even a future maintenance regression
+        // cannot let a residual caller RawWaker drop escape state destruction.
+        let panic_site = self.panic_site;
+        let lock_poisoned_count = self.lock_poisoned_count;
+        let downstream = match self.downstream.get_mut() {
+            Ok(slot) => slot.take(),
+            Err(poison) => {
+                lock_poisoned_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                poison.into_inner().take()
+            }
+        };
+        if let Some(downstream) = downstream {
+            Self::dispose_at(panic_site, downstream);
+        }
+    }
+}
+
+/// Clears a forwarding slot before the wrapped pending future is dropped.
+/// Declare this guard after that future so Rust's reverse local-drop order
+/// retires the downstream waker before the primitive releases its proxy.
+struct ClearContainedWakerOnDrop {
+    state: Arc<ContainedForwardingWaker>,
+}
+
+impl ClearContainedWakerOnDrop {
+    fn new(state: Arc<ContainedForwardingWaker>) -> Self {
+        Self { state }
+    }
+
+    fn register(
+        &self,
+        downstream: &std::task::Waker,
+    ) -> Result<(), ContainedWakerRegistrationError> {
+        self.state.register(downstream)
+    }
+
+    fn clear(&self) {
+        self.state.clear();
+    }
+}
+
+impl Drop for ClearContainedWakerOnDrop {
+    fn drop(&mut self) {
+        self.clear();
+    }
+}
+
 // Thread-local storage for the asupersync `RuntimeHandle`, installed by
 // `Runtime::block_on` and consumed by `task::spawn` to provide ambient
 // runtime context (analogous to tokio's internal CONTEXT thread-local).
@@ -473,7 +680,6 @@ pub mod mpsc {
     }
 }
 
-/// MPSC channel aliases for the active runtime.
 /// Watch channel aliases for the active runtime.
 ///
 /// Under asupersync the receiver's `changed(cx)` method observes
@@ -495,13 +701,10 @@ pub mod watch {
     pub use asupersync::channel::watch::{Receiver, RecvError, SendError, Sender, channel};
 }
 
-/// Watch channel aliases for the active runtime.
 /// Broadcast channel aliases for the active runtime.
 ///
-/// When `asupersync-runtime` is enabled, provides wrapper types around
-/// `asupersync::channel::broadcast` that acquire a `Cx` internally, keeping
-/// the tokio-compatible call-site signatures so that existing callers
-/// (event bus, telemetry, etc.) need no changes.
+/// Provides wrapper types around `asupersync::channel::broadcast` that acquire
+/// a `Cx` internally while retaining the established call-site signatures.
 pub mod broadcast {
     use asupersync::channel::broadcast as inner;
 
@@ -689,19 +892,35 @@ pub mod broadcast {
     }
 }
 
-/// Broadcast channel aliases for the active runtime (tokio fallback).
 /// Oneshot channel aliases for the active runtime.
 ///
-/// When `asupersync-runtime` is enabled, provides wrapper types around
-/// `asupersync::channel::oneshot` that acquire a `Cx` internally, keeping
-/// the tokio-compatible `Sender::send(value)` signature so that existing
-/// call sites (e.g. the ~30 `respond.send(result)` calls in `storage.rs`)
-/// need no changes.
+/// Provides wrapper types around `asupersync::channel::oneshot` that acquire a
+/// `Cx` internally while retaining the established `Sender::send(value)`
+/// signature.
 ///
 /// `Receiver` does **not** impl `Future` under asupersync — callers that
 /// previously used `rx.await` must go through [`oneshot_recv`] instead.
 pub mod oneshot {
     use asupersync::channel::oneshot as inner;
+
+    pub(super) static RECEIVER_WAKER_LOCK_POISONED_COUNT: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(0);
+
+    /// Returns the number of recovered oneshot receiver forwarding-slot
+    /// poison events observed by this process.
+    ///
+    /// Caller `RawWaker` callbacks run outside the slot lock, so a non-zero
+    /// value indicates historical poison or an internal invariant failure that
+    /// should be investigated.
+    #[must_use]
+    pub fn receiver_waker_lock_poisoned_count() -> u64 {
+        RECEIVER_WAKER_LOCK_POISONED_COUNT.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reset_receiver_waker_lock_poisoned_count_for_test() {
+        RECEIVER_WAKER_LOCK_POISONED_COUNT.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
 
     /// Compatibility error type matching tokio's `oneshot::error::RecvError`.
     #[derive(Debug)]
@@ -774,22 +993,12 @@ pub mod oneshot {
     }
 }
 
-/// Oneshot channel aliases for the active runtime (tokio fallback).
-/// Async notification primitive for the active runtime.
+/// Async notification primitive backed by asupersync.
 pub mod notify {
     pub use asupersync::sync::Notify;
 }
 
-/// Async notification primitive for the active runtime.
-///
-/// Note: this remains tokio-backed only for non-asupersync builds; production
-/// migration targets should route through the active runtime backend here.
-/// Task primitives used during runtime migration.
-///
-/// When `asupersync-runtime` is enabled, spawns on the asupersync runtime
-/// via the thread-local handle installed by `Runtime::block_on`. Otherwise,
-/// delegates to tokio.
-/// Task primitives for the asupersync runtime backend.
+/// Task primitives for the asupersync runtime.
 ///
 /// Provides API-compatible wrappers around asupersync's spawn/join
 /// infrastructure, using the thread-local `ASUPERSYNC_HANDLE` installed
@@ -800,9 +1009,9 @@ pub mod task {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::task::{Context, Poll};
 
-    // ─── br-ft-iaxog: JoinHandle abort_waker Mutex poison recovery ──
+    // ─── br-ft-iaxog: JoinHandle downstream-waker poison recovery ──
     //
-    // Pre-fix the four production lock-sites on JoinHandle.abort_waker
+    // Pre-fix the production lock-sites on JoinHandle's caller-waker slot
     // (poll-store, poll-abort-clear, poll-success-clear, abort-wake)
     // used `.expect("abort waker mutex poisoned")`. The hot-path site
     // is `poll()`, called by the executor on EVERY task wakeup — a
@@ -810,12 +1019,12 @@ pub mod task {
     // poll into a re-panic, killing the executor and bringing down the
     // entire runtime.
     //
-    // Post-fix: `lock_abort_waker_recovering()` recovers via
+    // Post-fix: `ContainedForwardingWaker` recovers via
     // `PoisonError::into_inner()` and bumps this counter. Recovery
-    // cost: an inconsistent waker Option (a stale Waker stored, a
-    // Waker dropped before being woken). Wakers are designed to be
-    // safely droppable; a stale Waker is wasted memory but causes no
-    // runtime defect. Cascade cost (status quo): runtime death.
+    // cost: an inconsistent waker Option (a stale Waker stored, or a
+    // notification dropped). That can cause a bounded spurious or delayed
+    // poll, and the counter makes it visible; the pre-fix cascade cost was
+    // runtime death.
     //
     // Same observability defect family as ft-luav8 / ft-skec1 /
     // ft-tpdl5 / ft-wzk10 / ft-4socw / ft-4pxzi / ft-as3w7 /
@@ -823,9 +1032,9 @@ pub mod task {
     // prevent runtime cascade when possible (the recovery).
     static JOIN_HANDLE_LOCK_POISONED_COUNT: AtomicU64 = AtomicU64::new(0);
 
-    /// Read the current count of recovered JoinHandle abort_waker
+    /// Read the current count of recovered JoinHandle downstream-waker
     /// Mutex-poison events. Non-zero values mean a prior thread
-    /// panicked while holding a JoinHandle abort_waker; the runtime
+    /// panicked while holding a JoinHandle downstream-waker slot; the runtime
     /// continued after recovering via `PoisonError::into_inner()`
     /// instead of cascading.
     #[must_use]
@@ -837,19 +1046,6 @@ pub mod task {
     #[cfg(test)]
     pub(crate) fn reset_join_handle_lock_poisoned_count_for_test() {
         JOIN_HANDLE_LOCK_POISONED_COUNT.store(0, Ordering::Relaxed);
-    }
-
-    /// Acquire the abort_waker Mutex, recovering from poison via
-    /// [`std::sync::PoisonError::into_inner`] and bumping the
-    /// `JOIN_HANDLE_LOCK_POISONED_COUNT` observability counter on
-    /// recovery. [ft-iaxog]
-    fn lock_abort_waker_recovering(
-        m: &std::sync::Mutex<Option<std::task::Waker>>,
-    ) -> std::sync::MutexGuard<'_, Option<std::task::Waker>> {
-        m.lock().unwrap_or_else(|poison| {
-            JOIN_HANDLE_LOCK_POISONED_COUNT.fetch_add(1, Ordering::Relaxed);
-            poison.into_inner()
-        })
     }
 
     /// Error type returned when a spawned task fails.
@@ -886,44 +1082,52 @@ pub mod task {
     /// Uses `Pin<Box<_>>` internally to avoid unsafe pin projection while
     /// maintaining `#![forbid(unsafe_code)]` compliance.
     ///
-    /// The `aborted` flag is an `Arc<AtomicBool>` shared between the
-    /// `JoinHandle` and any clones used internally. When `abort()` is
-    /// called, the flag is set to `true` and subsequent polls immediately
-    /// return `Err(JoinError)` instead of polling the inner future.
+    /// The `aborted` flag commits abort authority before the downstream
+    /// wake. When `abort()` is called, subsequent polls immediately return
+    /// `Err(JoinError)` instead of polling the inner future.
     pub struct JoinHandle<T> {
         inner: Pin<Box<asupersync::runtime::JoinHandle<T>>>,
-        aborted: std::sync::Arc<std::sync::atomic::AtomicBool>,
-        abort_waker: std::sync::Arc<std::sync::Mutex<Option<std::task::Waker>>>,
+        aborted: std::sync::atomic::AtomicBool,
+        forwarding: std::sync::Arc<super::ContainedForwardingWaker>,
+        completion_waker: std::task::Waker,
     }
 
     impl<T> Future for JoinHandle<T> {
         type Output = Result<T, JoinError>;
 
         fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-            {
-                // br-ft-iaxog: HOT PATH — every executor poll hits this.
-                let mut stored = lock_abort_waker_recovering(&self.abort_waker);
-                let should_replace = stored
-                    .as_ref()
-                    .is_none_or(|waker| !waker.will_wake(cx.waker()));
-                if should_replace {
-                    *stored = Some(cx.waker().clone());
-                }
-            }
-
             if self.aborted.load(std::sync::atomic::Ordering::Acquire) {
-                // br-ft-iaxog: abort path waker clear.
-                lock_abort_waker_recovering(&self.abort_waker).take();
+                self.forwarding.clear();
                 return Poll::Ready(Err(JoinError::new("task aborted")));
             }
-            let inner_poll = frankenterm_sigpipe::catch_recoverable(
-                frankenterm_sigpipe::RecoverablePanicSite::CoreAsyncTaskJoin,
-                std::panic::AssertUnwindSafe(|| self.inner.as_mut().poll(cx)),
-            );
+
+            // Publish the caller waker before polling the inner join. The
+            // asupersync handle sees only `completion_waker`, whose identity
+            // remains stable across every poll and whose callback is contained.
+            let registration = self.forwarding.register(cx.waker());
+            // Close the narrow register-vs-abort race: abort commits its
+            // authority flag before taking the same downstream slot.
+            if self.aborted.load(std::sync::atomic::Ordering::Acquire) {
+                self.forwarding.clear();
+                return Poll::Ready(Err(JoinError::new("task aborted")));
+            }
+            if let Err(error) = registration {
+                return Poll::Ready(Err(JoinError::new(error.to_string())));
+            }
+
+            let inner_poll = {
+                let this = self.as_mut().get_mut();
+                let completion_waker = &this.completion_waker;
+                let inner = &mut this.inner;
+                let mut completion_cx = Context::from_waker(completion_waker);
+                frankenterm_sigpipe::catch_recoverable(
+                    frankenterm_sigpipe::RecoverablePanicSite::CoreAsyncTaskJoin,
+                    std::panic::AssertUnwindSafe(|| inner.as_mut().poll(&mut completion_cx)),
+                )
+            };
             match inner_poll {
                 Ok(Poll::Ready(value)) => {
-                    // br-ft-iaxog: success path waker clear.
-                    lock_abort_waker_recovering(&self.abort_waker).take();
+                    self.forwarding.clear();
                     Poll::Ready(Ok(value))
                 }
                 Ok(Poll::Pending) => Poll::Pending,
@@ -934,7 +1138,7 @@ pub mod task {
                     // no caller has to catch an opaque task payload itself.
                     // The payload is disposed by `catch_recoverable`; retain
                     // only a finite, content-free failure class.
-                    lock_abort_waker_recovering(&self.abort_waker).take();
+                    self.forwarding.clear();
                     Poll::Ready(Err(JoinError::new("task failed at join boundary")))
                 }
             }
@@ -956,18 +1160,19 @@ pub mod task {
         pub fn abort(&self) {
             self.aborted
                 .store(true, std::sync::atomic::Ordering::Release);
-            // br-ft-iaxog: abort wake site.
-            if let Some(waker) = lock_abort_waker_recovering(&self.abort_waker).take() {
-                // Abort authority is already committed and the stored waker
-                // has been retired. An executor-provided `Wake`
-                // implementation may still panic; contain that callback so
-                // it cannot unwind through the cancelling caller or undo the
-                // next-poll cancellation result.
-                let _ = frankenterm_sigpipe::catch_recoverable(
-                    frankenterm_sigpipe::RecoverablePanicSite::CoreAsyncTaskJoin,
-                    std::panic::AssertUnwindSafe(|| waker.wake()),
-                );
-            }
+            // Abort authority is committed before contending with completion
+            // for the same one-shot downstream slot. Exactly one side can
+            // take it, and invocation is contained by the forwarding state.
+            self.forwarding.forward_one();
+        }
+    }
+
+    impl<T> Drop for JoinHandle<T> {
+        fn drop(&mut self) {
+            // The detached asupersync task may still hold the stable proxy.
+            // Retire caller state before dropping the inner handle so a later
+            // detached completion observes an empty downstream slot.
+            self.forwarding.clear();
         }
     }
 
@@ -1180,10 +1385,15 @@ pub mod task {
             future: Box::pin(future),
         };
         let inner = handle.spawn(wrapped);
+        let (forwarding, completion_waker) = super::ContainedForwardingWaker::new(
+            &JOIN_HANDLE_LOCK_POISONED_COUNT,
+            frankenterm_sigpipe::RecoverablePanicSite::CoreAsyncTaskJoin,
+        );
         JoinHandle {
             inner: Box::pin(inner),
-            aborted: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            abort_waker: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            aborted: std::sync::atomic::AtomicBool::new(false),
+            forwarding,
+            completion_waker,
         }
     }
 
@@ -1206,10 +1416,15 @@ pub mod task {
             future: Box::pin(async move { task(child_cx).await }),
         };
         let inner = handle.spawn(wrapped);
+        let (forwarding, completion_waker) = super::ContainedForwardingWaker::new(
+            &JOIN_HANDLE_LOCK_POISONED_COUNT,
+            frankenterm_sigpipe::RecoverablePanicSite::CoreAsyncTaskJoin,
+        );
         JoinHandle {
             inner: Box::pin(inner),
-            aborted: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            abort_waker: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            aborted: std::sync::atomic::AtomicBool::new(false),
+            forwarding,
+            completion_waker,
         }
     }
 
@@ -1422,13 +1637,11 @@ pub mod unix {
         }
     }
 
-    /// ft-xbnl0.2.3 Cx-first sibling of [`next_line`] (asupersync
-    /// path). Mirrors the non-asupersync variant: pre-flight
-    /// `cx.checkpoint()` folded into `io::ErrorKind::Interrupted`
-    /// so cancelled line-reading loops bail before the next
-    /// `lines.next()` poll. The underlying asupersync stream
-    /// doesn't itself observe cx here — this seam gates entry to
-    /// the wait.
+    /// ft-xbnl0.2.3 Cx-first sibling of [`next_line`]. Performs a pre-flight
+    /// `cx.checkpoint()` folded into `io::ErrorKind::Interrupted` so cancelled
+    /// line-reading loops bail before the next `lines.next()` poll. The
+    /// underlying asupersync stream does not itself observe cx here; this seam
+    /// gates entry to the wait.
     pub async fn next_line_with_cx<T>(
         cx: &crate::cx::Cx,
         lines: &mut LineReader<T>,
@@ -2225,12 +2438,12 @@ pub trait CompatRuntime {
         F: Future<Output = ()> + Send + 'static;
 }
 
-/// Runtime wrapper for the active runtime backend.
+/// Runtime wrapper for asupersync.
 pub struct Runtime {
     inner: asupersync::runtime::Runtime,
 }
 
-/// Runtime wrapper for the active runtime backend.
+/// Asupersync implementation of the project runtime lifecycle trait.
 impl CompatRuntime for Runtime {
     fn block_on<F>(&self, future: F) -> F::Output
     where
@@ -2354,7 +2567,7 @@ impl RuntimeBuilder {
     }
 }
 
-/// Sleep for the specified duration using the active runtime backend.
+/// Sleep for the specified duration using asupersync.
 pub async fn sleep(duration: Duration) {
     let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
     let _ = sleep_with_cx(&cx, duration).await;
@@ -2387,7 +2600,7 @@ pub async fn sleep_with_cx(cx: &crate::cx::Cx, duration: Duration) -> Result<(),
         .map_err(|err| err.to_string())
 }
 
-/// Runs `future` with a timeout using the active runtime backend.
+/// Runs `future` with a timeout using asupersync.
 pub async fn timeout<F>(duration: Duration, future: F) -> Result<F::Output, String>
 where
     F: Future,
@@ -2682,7 +2895,7 @@ pub fn watch_has_changed<T>(rx: &watch::Receiver<T>) -> bool {
 }
 
 /// Borrows the latest watch value and clones it while marking the update as
-/// consumed where required by the active runtime backend.
+/// consumed as required by asupersync.
 pub fn watch_borrow_and_update_clone<T: Clone>(rx: &mut watch::Receiver<T>) -> T {
     rx.borrow_and_clone()
 }
@@ -2700,10 +2913,10 @@ pub async fn watch_changed<T: Send + Sync>(
     }
 }
 
-/// Send a value on a broadcast channel using the active runtime backend.
+/// Send a value on an asupersync-backed broadcast channel.
 ///
-/// Under `asupersync-runtime`, the wrapper `Sender` acquires a `Cx`
-/// internally for the two-phase reserve/commit send.
+/// The wrapper `Sender` acquires a `Cx` internally for the two-phase
+/// reserve/commit send.
 pub fn broadcast_send<T: Clone>(
     tx: &broadcast::Sender<T>,
     value: T,
@@ -2711,10 +2924,9 @@ pub fn broadcast_send<T: Clone>(
     tx.send(value)
 }
 
-/// Receive a value from a broadcast channel using the active runtime backend.
+/// Receive a value from an asupersync-backed broadcast channel.
 ///
-/// Under `asupersync-runtime`, the wrapper `Receiver` acquires a `Cx`
-/// internally for the async recv.
+/// The wrapper `Receiver` acquires a `Cx` internally for the async recv.
 pub async fn broadcast_recv<T: Clone>(
     rx: &mut broadcast::Receiver<T>,
 ) -> Result<T, broadcast::RecvError> {
@@ -2784,21 +2996,19 @@ pub fn broadcast_receiver_count<T: Clone>(tx: &broadcast::Sender<T>) -> usize {
     tx.receiver_count()
 }
 
-/// Send a value on a oneshot channel using the active runtime backend.
+/// Send a value on an asupersync-backed oneshot channel.
 ///
 /// Returns `Err(message)` if the receiver was dropped.
-/// Under `asupersync-runtime`, the wrapper `Sender` acquires a `Cx`
-/// internally, so this helper's signature is unchanged.
+/// The wrapper `Sender` acquires a `Cx` internally.
 pub fn oneshot_send<T>(tx: oneshot::Sender<T>, value: T) -> Result<(), String> {
     tx.send(value)
         .map_err(|_| "sending on a closed oneshot channel".to_string())
 }
 
-/// Receive from a oneshot channel using the active runtime backend.
+/// Receive from an asupersync-backed oneshot channel.
 ///
-/// Consumes the receiver. Under `asupersync-runtime`, acquires a `Cx`
-/// and calls the asupersync `.recv()` method. Under tokio, awaits the
-/// receiver directly (since tokio `Receiver` impls `Future`).
+/// Consumes the receiver, acquires a `Cx`, and calls the asupersync `.recv()`
+/// method through FrankenTerm's contained forwarding-waker boundary.
 pub async fn oneshot_recv<T>(rx: oneshot::Receiver<T>) -> Result<T, String> {
     {
         let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
@@ -2834,14 +3044,229 @@ pub async fn oneshot_recv_with_cx<T>(
     cx: &crate::cx::Cx,
     rx: oneshot::Receiver<T>,
 ) -> Result<T, String> {
-    let mut inner_rx = rx.inner;
-    inner_rx.recv(cx).await.map_err(|e| e.to_string())
+    let mut inner = rx.inner;
+    // Build the containment boundary lazily. Creating, sending, or dropping a
+    // channel that is never received should not pay for an extra Arc, Mutex,
+    // and Waker allocation; only a receive operation can publish a caller
+    // waker to the underlying primitive.
+    let (forwarding, proxy_waker) = ContainedForwardingWaker::new(
+        &oneshot::RECEIVER_WAKER_LOCK_POISONED_COUNT,
+        frankenterm_sigpipe::RecoverablePanicSite::CoreAsyncTaskJoin,
+    );
+    let mut receive = std::pin::pin!(inner.recv(cx));
+    // This guard is intentionally declared after `receive`: cancellation
+    // drops it first, retiring the caller waker before asupersync drops its
+    // pending receive future and releases the stable proxy registration.
+    let clear_on_drop = ClearContainedWakerOnDrop::new(forwarding);
+
+    let received = std::future::poll_fn(|caller_cx| {
+        if let Err(error) = clear_on_drop.register(caller_cx.waker()) {
+            return std::task::Poll::Ready(Err(error));
+        }
+        let mut proxy_cx = std::task::Context::from_waker(&proxy_waker);
+        let result = receive.as_mut().poll(&mut proxy_cx);
+        match result {
+            std::task::Poll::Ready(result) => {
+                clear_on_drop.clear();
+                std::task::Poll::Ready(Ok(result))
+            }
+            std::task::Poll::Pending => std::task::Poll::Pending,
+        }
+    })
+    .await
+    .map_err(|error| error.to_string())?;
+    received.map_err(|error| error.to_string())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use proptest::prelude::*;
+
+    struct RuntimeAsyncWakeProbe {
+        wake_count: std::sync::atomic::AtomicUsize,
+        panic_on_wake: bool,
+    }
+
+    impl RuntimeAsyncWakeProbe {
+        fn new(panic_on_wake: bool) -> std::sync::Arc<Self> {
+            std::sync::Arc::new(Self {
+                wake_count: std::sync::atomic::AtomicUsize::new(0),
+                panic_on_wake,
+            })
+        }
+
+        fn count(&self) -> usize {
+            self.wake_count
+                .load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn record_wake(&self) {
+            self.wake_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            assert!(!self.panic_on_wake, "synthetic caller waker panic");
+        }
+    }
+
+    impl std::task::Wake for RuntimeAsyncWakeProbe {
+        fn wake(self: std::sync::Arc<Self>) {
+            self.record_wake();
+        }
+
+        fn wake_by_ref(self: &std::sync::Arc<Self>) {
+            self.record_wake();
+        }
+    }
+
+    fn probe_waker(
+        panic_on_wake: bool,
+    ) -> (std::sync::Arc<RuntimeAsyncWakeProbe>, std::task::Waker) {
+        let probe = RuntimeAsyncWakeProbe::new(panic_on_wake);
+        let waker = std::task::Waker::from(std::sync::Arc::clone(&probe));
+        (probe, waker)
+    }
+
+    #[cfg(panic = "unwind")]
+    struct RuntimeAsyncDropPanickingWake {
+        drop_count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[cfg(panic = "unwind")]
+    impl std::task::Wake for RuntimeAsyncDropPanickingWake {
+        fn wake(self: std::sync::Arc<Self>) {}
+
+        fn wake_by_ref(self: &std::sync::Arc<Self>) {}
+    }
+
+    #[cfg(panic = "unwind")]
+    impl Drop for RuntimeAsyncDropPanickingWake {
+        fn drop(&mut self) {
+            self.drop_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            panic!("synthetic caller waker drop panic");
+        }
+    }
+
+    #[cfg(panic = "unwind")]
+    fn drop_panicking_waker() -> (
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        std::task::Waker,
+    ) {
+        let drop_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let waker = std::task::Waker::from(std::sync::Arc::new(
+            RuntimeAsyncDropPanickingWake {
+                drop_count: std::sync::Arc::clone(&drop_count),
+            },
+        ));
+        (drop_count, waker)
+    }
+
+    #[cfg(panic = "unwind")]
+    #[test]
+    fn contained_forwarding_clone_failure_is_finite_and_clears_stale_registration() {
+        static LOCK_POISONED_COUNT: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(0);
+        let (forwarding, _proxy) = ContainedForwardingWaker::new(
+            &LOCK_POISONED_COUNT,
+            frankenterm_sigpipe::RecoverablePanicSite::CoreAsyncTaskJoin,
+        );
+        let (stale_probe, stale_waker) = probe_waker(false);
+        assert_eq!(forwarding.register(&stale_waker), Ok(()));
+
+        // Negative-evidence boundary: safe `Wake` construction fixes the
+        // RawWaker clone callback to Arc::clone, and this crate forbids unsafe
+        // code, so no safe Waker can inject a clone panic end-to-end. This seam
+        // is the exact production compare/clone/recheck path with only its
+        // clone operation supplied for deterministic fault injection.
+        let replacement = futures::task::noop_waker();
+        let registration = forwarding.register_with(&replacement, |_| {
+            panic!("synthetic caller waker clone panic");
+        });
+        let error = registration.expect_err("synthetic clone panic must fail registration");
+        assert_eq!(error, ContainedWakerRegistrationError);
+        assert_eq!(error.to_string(), "caller waker registration failed");
+
+        forwarding.forward_one();
+        assert_eq!(
+            stale_probe.count(),
+            0,
+            "failed registration must retire rather than wake the stale caller"
+        );
+        assert_eq!(
+            LOCK_POISONED_COUNT.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "caller clone callback must run without holding the slot lock"
+        );
+    }
+
+    #[cfg(panic = "unwind")]
+    #[test]
+    fn contained_forwarding_replacement_contains_retired_waker_drop_panic() {
+        static LOCK_POISONED_COUNT: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(0);
+        let (forwarding, _proxy) = ContainedForwardingWaker::new(
+            &LOCK_POISONED_COUNT,
+            frankenterm_sigpipe::RecoverablePanicSite::CoreAsyncTaskJoin,
+        );
+        let (drop_count, drop_panicking) = drop_panicking_waker();
+        assert_eq!(forwarding.register(&drop_panicking), Ok(()));
+        drop(drop_panicking);
+
+        let replacement = futures::task::noop_waker();
+        assert_eq!(forwarding.register(&replacement), Ok(()));
+        assert_eq!(
+            drop_count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "retired caller waker must be disposed exactly once inside quarantine"
+        );
+        assert_eq!(
+            LOCK_POISONED_COUNT.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "retired caller drop callback must run without holding the slot lock"
+        );
+        forwarding.clear();
+    }
+
+    #[cfg(panic = "unwind")]
+    #[test]
+    fn contained_forwarding_state_drop_contains_residual_waker_during_outer_unwind() {
+        static LOCK_POISONED_COUNT: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(0);
+        let (forwarding, proxy) = ContainedForwardingWaker::new(
+            &LOCK_POISONED_COUNT,
+            frankenterm_sigpipe::RecoverablePanicSite::CoreAsyncTaskJoin,
+        );
+        let (drop_count, drop_panicking) = drop_panicking_waker();
+        assert_eq!(forwarding.register(&drop_panicking), Ok(()));
+        drop(drop_panicking);
+
+        let outer = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _proxy_dropped_last = proxy;
+            let _forwarding_dropped_first = forwarding;
+            panic!("synthetic outer panic while dropping forwarding state");
+        }));
+        assert!(outer.is_err(), "the original outer panic must remain visible");
+        assert_eq!(
+            drop_count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "state destruction must quarantine one residual caller-waker drop"
+        );
+        assert_eq!(
+            LOCK_POISONED_COUNT.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "state destruction must dispose the residual waker without a lock"
+        );
+    }
+
+    async fn drive_spawned_task_to_completion(completed: &std::sync::atomic::AtomicBool) {
+        for _ in 0..256 {
+            if completed.load(std::sync::atomic::Ordering::SeqCst) {
+                return;
+            }
+            task::yield_now().await;
+        }
+        panic!("spawned task did not complete within the deterministic yield budget");
+    }
 
     // ft-yqd3w: the four `surface_contract_*` self-tests that used to live
     // here (entries_are_unique / replacements_are_explicit /
@@ -5274,6 +5699,171 @@ mod tests {
         });
     }
 
+    fn oneshot_waker_poison_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|poison| poison.into_inner())
+    }
+
+    #[test]
+    fn oneshot_receiver_waker_poison_counter_is_observable_and_clean() {
+        let _guard = oneshot_waker_poison_test_lock();
+        oneshot::reset_receiver_waker_lock_poisoned_count_for_test();
+        let (tx, rx) = oneshot::channel::<u32>();
+        let mut receive = Box::pin(oneshot_recv(rx));
+        let noop = futures::task::noop_waker();
+        let mut caller_cx = std::task::Context::from_waker(&noop);
+        assert!(matches!(
+            receive.as_mut().poll(&mut caller_cx),
+            std::task::Poll::Pending
+        ));
+        assert_eq!(tx.send(40), Ok(()));
+        assert!(matches!(
+            receive.as_mut().poll(&mut caller_cx),
+            std::task::Poll::Ready(Ok(40))
+        ));
+        assert_eq!(
+            oneshot::receiver_waker_lock_poisoned_count(),
+            0,
+            "clean oneshot forwarding must not report a poisoned slot"
+        );
+    }
+
+    #[cfg(panic = "unwind")]
+    #[test]
+    fn oneshot_send_contains_panicking_receiver_waker_and_remains_receivable() {
+        let (tx, rx) = oneshot::channel::<u32>();
+        let mut receive = Box::pin(oneshot_recv(rx));
+        let (probe, panicking_waker) = probe_waker(true);
+        let mut panicking_cx = std::task::Context::from_waker(&panicking_waker);
+        assert!(matches!(
+            receive.as_mut().poll(&mut panicking_cx),
+            std::task::Poll::Pending
+        ));
+
+        let send = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| tx.send(41)));
+        assert!(matches!(send, Ok(Ok(()))));
+        assert_eq!(probe.count(), 1);
+
+        let noop = futures::task::noop_waker();
+        let mut noop_cx = std::task::Context::from_waker(&noop);
+        assert!(matches!(
+            receive.as_mut().poll(&mut noop_cx),
+            std::task::Poll::Ready(Ok(41))
+        ));
+    }
+
+    #[test]
+    fn oneshot_receiver_waker_replacement_wakes_only_latest_caller() {
+        let (tx, rx) = oneshot::channel::<u32>();
+        let mut receive = Box::pin(oneshot_recv(rx));
+        let (probe_a, waker_a) = probe_waker(false);
+        let (probe_b, waker_b) = probe_waker(false);
+        let mut cx_a = std::task::Context::from_waker(&waker_a);
+        let mut cx_b = std::task::Context::from_waker(&waker_b);
+
+        assert!(matches!(
+            receive.as_mut().poll(&mut cx_a),
+            std::task::Poll::Pending
+        ));
+        assert!(matches!(
+            receive.as_mut().poll(&mut cx_b),
+            std::task::Poll::Pending
+        ));
+        assert_eq!(tx.send(42), Ok(()));
+        assert_eq!(probe_a.count(), 0);
+        assert_eq!(probe_b.count(), 1);
+
+        let noop = futures::task::noop_waker();
+        let mut noop_cx = std::task::Context::from_waker(&noop);
+        assert!(matches!(
+            receive.as_mut().poll(&mut noop_cx),
+            std::task::Poll::Ready(Ok(42))
+        ));
+    }
+
+    #[test]
+    fn dropping_pending_oneshot_receive_never_wakes_stale_caller() {
+        let (tx, rx) = oneshot::channel::<u32>();
+        let mut receive = Box::pin(oneshot_recv(rx));
+        let (probe, waker) = probe_waker(false);
+        let mut cx = std::task::Context::from_waker(&waker);
+        assert!(matches!(
+            receive.as_mut().poll(&mut cx),
+            std::task::Poll::Pending
+        ));
+
+        drop(receive);
+        assert_eq!(tx.send(43), Err(43));
+        assert_eq!(probe.count(), 0);
+    }
+
+    #[cfg(panic = "unwind")]
+    #[test]
+    fn oneshot_send_during_outer_unwind_cannot_double_panic() {
+        struct SendOnDrop {
+            sender: Option<oneshot::Sender<u32>>,
+        }
+
+        impl Drop for SendOnDrop {
+            fn drop(&mut self) {
+                if let Some(sender) = self.sender.take() {
+                    let _ = sender.send(44);
+                }
+            }
+        }
+
+        let (tx, rx) = oneshot::channel::<u32>();
+        let mut receive = Box::pin(oneshot_recv(rx));
+        let (probe, panicking_waker) = probe_waker(true);
+        let mut panicking_cx = std::task::Context::from_waker(&panicking_waker);
+        assert!(matches!(
+            receive.as_mut().poll(&mut panicking_cx),
+            std::task::Poll::Pending
+        ));
+
+        let outer = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _send_on_drop = SendOnDrop { sender: Some(tx) };
+            panic!("synthetic outer panic");
+        }));
+        assert!(outer.is_err(), "the original outer panic must remain visible");
+        assert_eq!(probe.count(), 1);
+
+        let noop = futures::task::noop_waker();
+        let mut noop_cx = std::task::Context::from_waker(&noop);
+        assert!(matches!(
+            receive.as_mut().poll(&mut noop_cx),
+            std::task::Poll::Ready(Ok(44))
+        ));
+    }
+
+    #[cfg(panic = "unwind")]
+    #[test]
+    fn oneshot_receive_drop_contains_caller_waker_drop_during_outer_unwind() {
+        let (tx, rx) = oneshot::channel::<u32>();
+        let mut receive = Box::pin(oneshot_recv(rx));
+        let (drop_count, drop_panicking) = drop_panicking_waker();
+        {
+            let mut caller_cx = std::task::Context::from_waker(&drop_panicking);
+            assert!(matches!(
+                receive.as_mut().poll(&mut caller_cx),
+                std::task::Poll::Pending
+            ));
+        }
+        drop(drop_panicking);
+
+        let outer = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _receive_dropped_during_unwind = receive;
+            panic!("synthetic outer panic while dropping oneshot receive");
+        }));
+        assert!(outer.is_err(), "the original outer panic must remain visible");
+        assert_eq!(
+            drop_count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "caller waker drop panic must be quarantined exactly once"
+        );
+        assert_eq!(tx.send(45), Err(45));
+    }
+
     // ========================================================================
     // Process module tests
     // ========================================================================
@@ -5738,6 +6328,147 @@ mod tests {
         });
     }
 
+    #[cfg(panic = "unwind")]
+    #[test]
+    fn task_completion_contains_panicking_caller_waker_then_repolls_ready() {
+        let rt = RuntimeBuilder::current_thread().build().unwrap();
+        rt.block_on(async {
+            let (tx, rx) = futures::channel::oneshot::channel::<u32>();
+            let completed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let completed_by_task = std::sync::Arc::clone(&completed);
+            let mut handle = Box::pin(task::spawn(async move {
+                let value = rx.await.expect("completion gate sender");
+                completed_by_task.store(true, std::sync::atomic::Ordering::SeqCst);
+                value
+            }));
+            let (probe, panicking_waker) = probe_waker(true);
+            let mut panicking_cx = std::task::Context::from_waker(&panicking_waker);
+            assert!(matches!(
+                handle.as_mut().poll(&mut panicking_cx),
+                std::task::Poll::Pending
+            ));
+
+            tx.send(51).expect("open completion gate");
+            drive_spawned_task_to_completion(&completed).await;
+            assert_eq!(probe.count(), 1);
+
+            let noop = futures::task::noop_waker();
+            let mut noop_cx = std::task::Context::from_waker(&noop);
+            assert!(matches!(
+                handle.as_mut().poll(&mut noop_cx),
+                std::task::Poll::Ready(Ok(51))
+            ));
+        });
+    }
+
+    #[test]
+    fn task_completion_waker_replacement_wakes_only_latest_caller() {
+        let rt = RuntimeBuilder::current_thread().build().unwrap();
+        rt.block_on(async {
+            let (tx, rx) = futures::channel::oneshot::channel::<u32>();
+            let completed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let completed_by_task = std::sync::Arc::clone(&completed);
+            let mut handle = Box::pin(task::spawn(async move {
+                let value = rx.await.expect("completion gate sender");
+                completed_by_task.store(true, std::sync::atomic::Ordering::SeqCst);
+                value
+            }));
+            let (probe_a, waker_a) = probe_waker(false);
+            let (probe_b, waker_b) = probe_waker(false);
+            let mut cx_a = std::task::Context::from_waker(&waker_a);
+            let mut cx_b = std::task::Context::from_waker(&waker_b);
+            assert!(matches!(
+                handle.as_mut().poll(&mut cx_a),
+                std::task::Poll::Pending
+            ));
+            assert!(matches!(
+                handle.as_mut().poll(&mut cx_b),
+                std::task::Poll::Pending
+            ));
+
+            tx.send(52).expect("open completion gate");
+            drive_spawned_task_to_completion(&completed).await;
+            assert_eq!(probe_a.count(), 0);
+            assert_eq!(probe_b.count(), 1);
+
+            let noop = futures::task::noop_waker();
+            let mut noop_cx = std::task::Context::from_waker(&noop);
+            assert!(matches!(
+                handle.as_mut().poll(&mut noop_cx),
+                std::task::Poll::Ready(Ok(52))
+            ));
+        });
+    }
+
+    #[test]
+    fn dropping_pending_task_handle_never_wakes_stale_caller_on_detached_completion() {
+        let rt = RuntimeBuilder::current_thread().build().unwrap();
+        rt.block_on(async {
+            let (tx, rx) = futures::channel::oneshot::channel::<u32>();
+            let completed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let completed_by_task = std::sync::Arc::clone(&completed);
+            let mut handle = Box::pin(task::spawn(async move {
+                let value = rx.await.expect("completion gate sender");
+                completed_by_task.store(true, std::sync::atomic::Ordering::SeqCst);
+                value
+            }));
+            let (probe, waker) = probe_waker(false);
+            let mut cx = std::task::Context::from_waker(&waker);
+            assert!(matches!(
+                handle.as_mut().poll(&mut cx),
+                std::task::Poll::Pending
+            ));
+
+            drop(handle);
+            tx.send(53).expect("open completion gate");
+            drive_spawned_task_to_completion(&completed).await;
+            assert_eq!(probe.count(), 0);
+        });
+    }
+
+    #[cfg(panic = "unwind")]
+    #[test]
+    fn task_abort_and_later_detached_completion_emit_no_second_stale_wake() {
+        let rt = RuntimeBuilder::current_thread().build().unwrap();
+        rt.block_on(async {
+            let (tx, rx) = futures::channel::oneshot::channel::<u32>();
+            let completed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let completed_by_task = std::sync::Arc::clone(&completed);
+            let mut handle = Box::pin(task::spawn(async move {
+                let value = rx.await.expect("completion gate sender");
+                completed_by_task.store(true, std::sync::atomic::Ordering::SeqCst);
+                value
+            }));
+            let (probe, panicking_waker) = probe_waker(true);
+            let mut panicking_cx = std::task::Context::from_waker(&panicking_waker);
+            assert!(matches!(
+                handle.as_mut().poll(&mut panicking_cx),
+                std::task::Poll::Pending
+            ));
+
+            let abort = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                handle.as_ref().get_ref().abort();
+            }));
+            assert!(abort.is_ok(), "abort wake must remain contained");
+            assert_eq!(probe.count(), 1);
+
+            let noop = futures::task::noop_waker();
+            let mut noop_cx = std::task::Context::from_waker(&noop);
+            assert!(matches!(
+                handle.as_mut().poll(&mut noop_cx),
+                std::task::Poll::Ready(Err(ref error)) if error.is_cancelled()
+            ));
+
+            tx.send(54).expect("open detached completion gate");
+            drive_spawned_task_to_completion(&completed).await;
+            assert_eq!(
+                probe.count(),
+                1,
+                "detached completion must not re-wake the retired abort caller"
+            );
+        });
+    }
+
     #[test]
     fn task_spawn_blocking_returns_join_handle() {
         let rt = RuntimeBuilder::current_thread().build().unwrap();
@@ -5767,17 +6498,16 @@ mod tests {
         });
     }
 
-    // ─── br-ft-iaxog: JoinHandle abort_waker poison recovery ─────────
+    // ─── br-ft-iaxog: JoinHandle downstream-waker poison recovery ────
     //
-    // Pre-fix every JoinHandle production lock-site used
+    // Pre-fix every JoinHandle downstream-waker lock-site used
     // `.expect("abort waker mutex poisoned")`. The hot-path site at
     // `JoinHandle::poll` is called by the executor on EVERY task
-    // wakeup — a panic in any thread holding the abort_waker Mutex
+    // wakeup — a panic in any thread holding the downstream Mutex
     // killed the executor.
     //
-    // Post-fix: lock_abort_waker_recovering() recovers via
-    // PoisonError::into_inner() and bumps
-    // JOIN_HANDLE_LOCK_POISONED_COUNT.
+    // Post-fix: ContainedForwardingWaker recovers via
+    // PoisonError::into_inner() and bumps JOIN_HANDLE_LOCK_POISONED_COUNT.
     //
     // Counter is process-wide; tests serialize via a Mutex test-lock.
 
@@ -5821,17 +6551,10 @@ mod tests {
         );
     }
 
-    // Note: forcing a poisoned abort_waker in a deterministic test
-    // requires reaching into JoinHandle internals (the Mutex is
-    // private). The unit-level helper `lock_abort_waker_recovering`
-    // is exhaustively exercised by every spawned task (covered by
-    // the existing task_* tests + the negative test above), and the
-    // recovery path is structurally identical to the pattern shipped
-    // for cancellation.rs (ft-h2vyr) which has end-to-end tests with
-    // panic-injection. Adding a panic-injection test here would
-    // require either (a) exposing a test-only constructor on
-    // JoinHandle that takes an external Mutex, or (b) a broader
-    // refactor of asupersync's spawn primitive — both deferred.
+    // The shared forwarding state is exercised by every spawned task and
+    // oneshot receive. Its lock never clones, wakes, or drops caller wakers;
+    // poison recovery remains the fail-soft defense for an already poisoned
+    // slot.
 
     // ========================================================================
     // join! macro tests
