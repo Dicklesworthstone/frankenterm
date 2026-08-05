@@ -488,9 +488,21 @@ fn fail_closed_after_payload_disposal_poison() -> ! {
 }
 
 fn saturating_increment(counter: &AtomicU64) {
-    let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-        Some(current.saturating_add(1))
-    });
+    let mut current = counter.load(Ordering::Relaxed);
+    loop {
+        if current == u64::MAX {
+            return;
+        }
+        match counter.compare_exchange_weak(
+            current,
+            current + 1,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return,
+            Err(observed) => current = observed,
+        }
+    }
 }
 
 /// Process-local count of panics contained by [`catch_recoverable`].
