@@ -179,7 +179,8 @@ fn run_nested_drop_panic_during_unwind() {
         }
     }
 
-    let _ = catch_recoverable(
+    let before = frankenterm_sigpipe::recovered_panics_total();
+    let outer = catch_recoverable(
         RecoverablePanicSite::CoreAsyncTaskJoin,
         std::panic::AssertUnwindSafe(|| {
             let _future = catch_recoverable_future(
@@ -189,7 +190,12 @@ fn run_nested_drop_panic_during_unwind() {
             std::panic::panic_any(String::from("outer-recoverable-panic"));
         }),
     );
-    unreachable!("a destructor panic during unwinding must abort fail-closed");
+    assert!(outer.is_err());
+    let recovered_delta = frankenterm_sigpipe::recovered_panics_total().saturating_sub(before);
+    println!(
+        "nested-drop-contained marker={} recovered_delta={recovered_delta}",
+        frankenterm_sigpipe::is_recoverable_panic()
+    );
 }
 
 fn run_nested_sync_drop_panic_during_unwind() {
@@ -206,14 +212,20 @@ fn run_nested_sync_drop_panic_during_unwind() {
         }
     }
 
-    let _ = catch_recoverable(
+    let before = frankenterm_sigpipe::recovered_panics_total();
+    let outer = catch_recoverable(
         RecoverablePanicSite::CoreAsyncTaskJoin,
         std::panic::AssertUnwindSafe(|| {
             let _drop_calls_recoverable = DropCallsRecoverableBoundary;
             std::panic::panic_any(String::from("outer-recoverable-panic"));
         }),
     );
-    unreachable!("a synchronous destructor panic during unwinding must abort fail-closed");
+    assert!(outer.is_err());
+    let recovered_delta = frankenterm_sigpipe::recovered_panics_total().saturating_sub(before);
+    println!(
+        "nested-sync-drop-contained marker={} recovered_delta={recovered_delta}",
+        frankenterm_sigpipe::is_recoverable_panic()
+    );
 }
 
 fn install_probe_gui_hook() {

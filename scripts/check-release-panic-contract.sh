@@ -372,54 +372,37 @@ if compgen -G "$payload_twice_root/crashes/ft_crash_*" >/dev/null; then
 fi
 assert_no_secret "$payload_twice_root"
 
-# Rust cannot catch a second panic that begins while a thread is already
-# unwinding. An outer recovery marker must therefore be overridden while a
-# wrapped future is torn down, so the fatal destructor panic reaches the crash
-# and base hooks before the runtime aborts.
+# A nested catch boundary can stop a destructor panic before it escapes into an
+# already-active outer unwind. The wrapper must contain both panics without
+# reflecting either payload or producing fatal-report artifacts.
 nested_drop_root="$EVIDENCE_ROOT/nested-drop-panic"
 mkdir -p "$nested_drop_root/crashes"
-set +e
-(
-  ulimit -c 0
-  exec env FT_PANIC_PROBE_CRASH_DIR="$nested_drop_root/crashes" \
-    "$INTERACTIVE_PROBE" nested-drop-panic
-) >"$nested_drop_root.stdout" 2>"$nested_drop_root.stderr"
-nested_drop_status=$?
-set -e
-if [[ $nested_drop_status -ne 134 ]]; then
-  echo "nested destructor panic exited $nested_drop_status instead of 134" >&2
+FT_PANIC_PROBE_CRASH_DIR="$nested_drop_root/crashes" \
+  "$INTERACTIVE_PROBE" nested-drop-panic >"$nested_drop_root.stdout" \
+  2>"$nested_drop_root.stderr"
+grep -F -x -q 'nested-drop-contained marker=false recovered_delta=2' \
+  "$nested_drop_root.stdout"
+assert_empty_file "$nested_drop_root.stderr"
+if compgen -G "$nested_drop_root/crashes/ft_crash_*" >/dev/null; then
+  echo "contained nested future destructor panic created a crash bundle" >&2
   exit 1
 fi
-assert_empty_file "$nested_drop_root.stdout"
-grep -F -q \
-  'FrankenTerm: fatal internal error; diagnostic details were suppressed' \
-  "$nested_drop_root.stderr"
-assert_one_sanitized_crash_bundle "$nested_drop_root/crashes"
 assert_no_secret "$nested_drop_root"
 
-# Synchronous Drop implementations use catch_recoverable for best-effort
-# cleanup too. During an already-active unwind that boundary must not claim a
-# recovery it cannot perform; otherwise the inevitable double-panic abort is
-# silent because every hook sees the false recoverable marker.
+# Synchronous Drop implementations use the same audited boundary and must get
+# the same containment and privacy behavior during an outer unwind.
 nested_sync_drop_root="$EVIDENCE_ROOT/nested-sync-drop-panic"
 mkdir -p "$nested_sync_drop_root/crashes"
-set +e
-(
-  ulimit -c 0
-  exec env FT_PANIC_PROBE_CRASH_DIR="$nested_sync_drop_root/crashes" \
-    "$INTERACTIVE_PROBE" nested-sync-drop-panic
-) >"$nested_sync_drop_root.stdout" 2>"$nested_sync_drop_root.stderr"
-nested_sync_drop_status=$?
-set -e
-if [[ $nested_sync_drop_status -ne 134 ]]; then
-  echo "nested synchronous destructor panic exited $nested_sync_drop_status instead of 134" >&2
+FT_PANIC_PROBE_CRASH_DIR="$nested_sync_drop_root/crashes" \
+  "$INTERACTIVE_PROBE" nested-sync-drop-panic >"$nested_sync_drop_root.stdout" \
+  2>"$nested_sync_drop_root.stderr"
+grep -F -x -q 'nested-sync-drop-contained marker=false recovered_delta=2' \
+  "$nested_sync_drop_root.stdout"
+assert_empty_file "$nested_sync_drop_root.stderr"
+if compgen -G "$nested_sync_drop_root/crashes/ft_crash_*" >/dev/null; then
+  echo "contained nested synchronous destructor panic created a crash bundle" >&2
   exit 1
 fi
-assert_empty_file "$nested_sync_drop_root.stdout"
-grep -F -q \
-  'FrankenTerm: fatal internal error; diagnostic details were suppressed' \
-  "$nested_sync_drop_root.stderr"
-assert_one_sanitized_crash_bundle "$nested_sync_drop_root/crashes"
 assert_no_secret "$nested_sync_drop_root"
 
 fatal_root="$EVIDENCE_ROOT/uncaught"
