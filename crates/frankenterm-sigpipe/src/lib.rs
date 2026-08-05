@@ -194,7 +194,6 @@ pub struct FatalReportClaim {
 
 impl FatalReportClaim {
     /// Attempt to own the one fatal report for the current hook invocation.
-    #[must_use]
     pub fn enter() -> Self {
         let previous_depth = FATAL_REPORT_DEPTH
             .try_with(|depth| {
@@ -234,7 +233,6 @@ impl Drop for FatalReportClaim {
 
 impl RecoverablePanicBoundary {
     /// Enter a recoverable boundary when unwinding is executable.
-    #[must_use]
     fn enter() -> Self {
         #[cfg(panic = "unwind")]
         let previous_depth = RECOVERABLE_PANIC_DEPTH
@@ -270,10 +268,10 @@ impl Drop for RecoverablePanicBoundary {
 pub fn is_recoverable_panic() -> bool {
     #[cfg(panic = "unwind")]
     {
-        return RECOVERABLE_PANIC_DEPTH
+        RECOVERABLE_PANIC_DEPTH
             .try_with(|depth| depth.get())
             .unwrap_or(0)
-            > 0;
+            > 0
     }
 
     #[cfg(not(panic = "unwind"))]
@@ -490,7 +488,7 @@ fn fail_closed_after_payload_disposal_poison() -> ! {
 }
 
 fn saturating_increment(counter: &AtomicU64) {
-    let _ = counter.try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+    let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
         Some(current.saturating_add(1))
     });
 }
