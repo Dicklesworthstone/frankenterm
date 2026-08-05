@@ -108,13 +108,19 @@ fn env_value_is_falsey(value: &str) -> bool {
 struct GetTcapBuilder {
     current: Vec<u8>,
     names: Vec<String>,
-    discarding: bool,
+    discarding_current: bool,
+    discarding_all: bool,
 }
 
 impl GetTcapBuilder {
     fn flush(&mut self) {
-        if self.discarding {
+        if self.discarding_all {
             self.current.clear();
+            return;
+        }
+        if self.discarding_current {
+            self.current.clear();
+            self.discarding_current = false;
             return;
         }
         if self.current.is_empty() {
@@ -125,7 +131,7 @@ impl GetTcapBuilder {
                 "XtGetTcap names exceeded {} limit; discarding further names",
                 MAX_TCAP_NAMES,
             );
-            self.discarding = true;
+            self.discarding_all = true;
             self.current.clear();
             return;
         }
@@ -139,8 +145,17 @@ impl GetTcapBuilder {
     pub fn push(&mut self, data: u8) {
         if data == b';' {
             self.flush();
-        } else if !self.discarding && self.current.len() < MAX_TCAP_CURRENT_BYTES {
-            self.current.push(data);
+        } else if !self.discarding_all && !self.discarding_current {
+            if self.current.len() < MAX_TCAP_CURRENT_BYTES {
+                self.current.push(data);
+            } else {
+                log::warn!(
+                    "XtGetTcap name exceeded {} byte limit; discarding the overlong name",
+                    MAX_TCAP_CURRENT_BYTES,
+                );
+                self.current.clear();
+                self.discarding_current = true;
+            }
         }
     }
 
@@ -585,11 +600,10 @@ impl<'a, F: FnMut(Action)> VTActor for Performer<'a, F> {
     }
 
     fn dcs_put(&mut self, data: u8) {
+        if self.state.discarding_short_dcs {
+            return;
+        }
         if self.state.dcs.is_some() {
-            if self.state.discarding_short_dcs {
-                return;
-            }
-
             let mut over_limit = false;
             if let Some(dcs) = self.state.dcs.as_mut() {
                 if dcs.data.len() < MAX_SHORT_DCS_BYTES {
@@ -601,8 +615,9 @@ impl<'a, F: FnMut(Action)> VTActor for Performer<'a, F> {
 
             if over_limit {
                 self.state.discarding_short_dcs = true;
+                self.state.dcs.take();
                 log::warn!(
-                    "short DCS payload exceeded {} bytes; discarding until DCS terminator",
+                    "short DCS payload exceeded {} bytes; discarding the command until DCS terminator",
                     MAX_SHORT_DCS_BYTES
                 );
             }
@@ -634,7 +649,10 @@ impl<'a, F: FnMut(Action)> VTActor for Performer<'a, F> {
     }
 
     fn dcs_unhook(&mut self) {
-        self.state.discarding_short_dcs = false;
+        if core::mem::take(&mut self.state.discarding_short_dcs) {
+            self.state.dcs.take();
+            return;
+        }
         if let Some(dcs) = self.state.dcs.take() {
             (self.callback)(Action::DeviceControl(
                 DeviceControlMode::ShortDeviceControl(Box::new(dcs)),
@@ -1380,19 +1398,21 @@ mod test {
             }
         }
 
-        assert_eq!(2, short_dcs.len());
-        assert_eq!(MAX_SHORT_DCS_BYTES, short_dcs[0].data.len());
-        assert_eq!(b"OK".to_vec(), short_dcs[1].data);
+        assert_eq!(1, short_dcs.len());
+        assert_eq!(b"OK".to_vec(), short_dcs[0].data);
     }
 
     #[test]
-    fn overlong_xtgettcap_current_is_capped() {
+    fn overlong_xtgettcap_current_is_discarded_without_poisoning_later_names() {
         let mut p = Parser::new();
         let mut seq = Vec::with_capacity(MAX_TCAP_CURRENT_BYTES + 512);
         // DCS +q  starts XtGetTcap mode
         seq.extend_from_slice(b"\x1bP+q");
         // Push more bytes than the per-name cap without a semicolon separator
         seq.extend(std::iter::repeat_n(b'4', MAX_TCAP_CURRENT_BYTES + 128));
+        // The overlong name is discarded, while a later bounded name in the
+        // same request must still be decoded normally.
+        seq.extend_from_slice(b";544e");
         // Terminate the DCS
         seq.extend_from_slice(b"\x1b\\");
         // Parse a subsequent well-formed XtGetTcap to verify recovery
@@ -1407,12 +1427,10 @@ mod test {
         }
 
         assert_eq!(2, tcap_results.len());
-        // First XtGetTcap: the single name should be capped at MAX_TCAP_CURRENT_BYTES
+        // Truncation could turn an overlong attacker-controlled name into a
+        // different valid capability. Drop that name completely instead.
         assert_eq!(1, tcap_results[0].len());
-        // The decoded hex output is half the input byte count (2 hex chars per output byte).
-        // Since we're pushing raw hex chars that may or may not decode cleanly,
-        // just verify the result is bounded.
-        assert!(tcap_results[0][0].len() <= MAX_TCAP_CURRENT_BYTES);
+        assert_eq!("TN", tcap_results[0][0]);
         // Second XtGetTcap: verify parser recovered correctly
         assert_eq!(vec!["TN".to_string()], tcap_results[1]);
     }
