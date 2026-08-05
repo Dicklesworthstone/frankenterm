@@ -7695,17 +7695,17 @@ fn process_connector_outbound_runtime_event(
         Ok(result) => {
             if result.deduplicated {
                 debug!(
-                    correlation_id = %result.correlation_id,
-                    event_type = %outbound_event.event_type,
+                    pane_id = ?outbound_event.pane_id,
+                    source = %outbound_event.source,
                     "connector outbound event deduplicated"
                 );
             }
         }
         Err(_error) => {
             warn!(
-                event_type = %outbound_event.event_type,
+                pane_id = ?outbound_event.pane_id,
                 source = %outbound_event.source,
-                error = %err,
+                error_class = "connector_outbound_bridge_rejected",
                 "connector outbound bridge rejected runtime event"
             );
             return;
@@ -8189,7 +8189,7 @@ fn record_pane_tiered_scrollback_summary_result(
         Ok(summary) => {
             fetch.summaries.insert(pane_id, summary);
         }
-        Err(err) => {
+        Err(_error) => {
             fetch.note_error(pane_id);
             debug!(
                 pane_id,

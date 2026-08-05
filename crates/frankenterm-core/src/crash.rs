@@ -222,7 +222,7 @@ fn claim_bounded_crash_bundle_log_slot(
 ) -> Option<u64> {
     let terminal = warning_limit.saturating_add(1);
     counter
-        .fetch_update(
+        .try_update(
             std::sync::atomic::Ordering::Relaxed,
             std::sync::atomic::Ordering::Relaxed,
             |current| (current < terminal).then(|| current.saturating_add(1)),
@@ -2533,7 +2533,11 @@ fn discover_crash_bundles_bounded(
 
         let path = crash_dir.join(entry.file_name());
         let modified = crash_bundle_candidate_modified(
-            entry.metadata().and_then(|metadata| metadata.modified()),
+            entry.metadata().and_then(|metadata| {
+                metadata
+                    .modified()
+                    .map(cap_std::time::SystemTime::into_std)
+            }),
             &mut metadata_unreadable,
         );
         if let Some((timestamp, process_sequence)) = crash_bundle_name_key(&path) {

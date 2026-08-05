@@ -6559,7 +6559,7 @@ async fn complete_mcp_await_event_deliveries_with_storage(
                             storage_reusable = false;
                             break 'remaining_batches;
                         }
-                        Err(batch_error) => {
+                        Err(_batch_error) => {
                             tracing::warn!(
                                 error_class = "event_delivery_bulk_mutation_failed",
                                 delivery_count = lease_batch.len(),
@@ -8964,7 +8964,7 @@ fn mcp_load_submit_profile(
         Err(_error) => {
             tracing::warn!(
                 error_class = "wa_send_submit_profile_unavailable",
-                agent_type_hash = %intent_hash_hex(agent_type),
+                agent_type = %agent_type,
                 "Failed to load submit profile pattern engine for wa.send; verified-submit will fail open"
             );
             None
