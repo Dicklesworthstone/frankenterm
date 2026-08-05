@@ -93,6 +93,8 @@ static CRASH_BUNDLE_PARSE_DROP_COUNT: std::sync::atomic::AtomicU64 =
 const CRASH_BUNDLE_PARSE_DROP_LOG_LIMIT: u64 = 16;
 static CRASH_BUNDLE_PARSE_DROP_LOG_COUNT: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
+#[cfg(test)]
+static CRASH_BUNDLE_PARSE_DROP_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Total fail-closed compatibility requests whose bounded search could not
 /// produce an authoritative answer. Typed `discover_*` callers receive the
@@ -13067,8 +13069,6 @@ not-json
 #[cfg(test)]
 mod e2e_crash_recovery {
     use super::*;
-
-    static CRASH_BUNDLE_PARSE_DROP_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// Simulate a full watcher lifecycle: start, run for N "ticks", crash.
     /// Returns the pane states at the time of crash (for checkpointing).
