@@ -854,6 +854,7 @@ required-features = ["distributed"]
 [[test]]
 name = "integration_native_events"
 path = "tests/integration_native_events.rs"
+required-features = ["native-wezterm"]
 
 [[test]]
 name = "round7_fts_promote"
