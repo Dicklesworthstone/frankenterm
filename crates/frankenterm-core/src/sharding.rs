@@ -724,6 +724,7 @@ impl ShardedWeztermClient {
         cleanup_op: &'static str,
         backend: &ShardBackend,
         local_pane_id: u64,
+        cleanup_error: &crate::Error,
     ) -> crate::Error {
         // `try_encode_sharded_pane_id` currently returns this exact typed
         // shape. Keep the codec failure first and in the same error variant so
@@ -736,8 +737,21 @@ impl ShardedWeztermClient {
             crate::Error::Wezterm(WeztermError::CommandFailed(detail)) => detail,
             other => other.to_string(),
         };
+        let cleanup_class = match cleanup_error {
+            crate::Error::Wezterm(WeztermError::CommandFailed(detail))
+                if detail == PANE_CREATION_ROLLBACK_OPERATION_PANIC =>
+            {
+                PANE_CREATION_ROLLBACK_OPERATION_PANIC
+            }
+            crate::Error::Wezterm(WeztermError::CommandFailed(detail))
+                if detail == PANE_CREATION_ROLLBACK_JOIN_PANIC =>
+            {
+                PANE_CREATION_ROLLBACK_JOIN_PANIC
+            }
+            _ => "cleanup_failed",
+        };
         crate::Error::Wezterm(WeztermError::CommandFailed(format!(
-            "{primary_detail}; best-effort rollback after {creation_op} failed: {cleanup_op} for local pane {local_pane_id} on shard {} (cleanup_failed)",
+            "{primary_detail}; best-effort rollback after {creation_op} failed: {cleanup_op} for local pane {local_pane_id} on shard {} ({cleanup_class})",
             backend.id
         )))
     }
@@ -755,12 +769,13 @@ impl ShardedWeztermClient {
 
         match Self::rollback_unencodable_pane_with_fresh_cx(backend, local_pane_id).await {
             Ok(()) => Err(primary),
-            Err(_) => Err(Self::codec_error_with_cleanup_failure(
+            Err(cleanup_error) => Err(Self::codec_error_with_cleanup_failure(
                 primary,
                 creation_op,
                 "kill_pane_with_fresh_cleanup_cx",
                 backend,
                 local_pane_id,
+                &cleanup_error,
             )),
         }
     }
