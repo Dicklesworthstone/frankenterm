@@ -916,13 +916,27 @@ pub mod task {
                 lock_abort_waker_recovering(&self.abort_waker).take();
                 return Poll::Ready(Err(JoinError::new("task aborted")));
             }
-            match self.inner.as_mut().poll(cx) {
-                Poll::Ready(value) => {
+            let inner_poll = frankenterm_sigpipe::catch_recoverable(
+                frankenterm_sigpipe::RecoverablePanicSite::CoreAsyncTaskJoin,
+                std::panic::AssertUnwindSafe(|| self.inner.as_mut().poll(cx)),
+            );
+            match inner_poll {
+                Ok(Poll::Ready(value)) => {
                     // br-ft-iaxog: success path waker clear.
                     lock_abort_waker_recovering(&self.abort_waker).take();
                     Poll::Ready(Ok(value))
                 }
-                Poll::Pending => Poll::Pending,
+                Ok(Poll::Pending) => Poll::Pending,
+                Err(_panic) => {
+                    // Asupersync resumes the task panic while its join handle
+                    // is polled. Convert it at this canonical boundary so the
+                    // advertised `Result<T, JoinError>` contract is real and
+                    // no caller has to catch an opaque task payload itself.
+                    // The payload is disposed by `catch_recoverable`; retain
+                    // only a finite, content-free failure class.
+                    lock_abort_waker_recovering(&self.abort_waker).take();
+                    Poll::Ready(Err(JoinError::new("task failed at join boundary")))
+                }
             }
         }
     }
@@ -5731,6 +5745,25 @@ mod tests {
             let handle: task::JoinHandle<String> = task::spawn_blocking(|| "hello".to_string());
             let val = handle.await.expect("join");
             assert_eq!(val, "hello");
+        });
+    }
+
+    #[cfg(panic = "unwind")]
+    #[test]
+    fn task_panic_becomes_content_free_join_error() {
+        let rt = RuntimeBuilder::current_thread().build().unwrap();
+        rt.block_on(async {
+            let result = task::spawn(async {
+                panic!("task-secret-that-must-not-reach-the-join-error");
+            })
+            .await;
+            let Err(error) = result else {
+                panic!("panicking task must fail its JoinHandle");
+            };
+
+            assert_eq!(error.to_string(), "JoinError: task failed at join boundary");
+            assert!(!error.is_cancelled());
+            assert!(!error.to_string().contains("task-secret"));
         });
     }
 
