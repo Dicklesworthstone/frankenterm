@@ -406,8 +406,17 @@ impl Error {
             Self::Json(_) | Self::Pattern(_) | Self::Config(_) | Self::SetupError(_) => {
                 NetworkErrorKind::Permanent
             }
+            Self::Storage(
+                StorageError::InvalidEventDeliveryLeaseBatch(_)
+                | StorageError::LeaseTokenConflict { .. },
+            ) => {
+                NetworkErrorKind::Permanent
+            }
             Self::Policy(_) => NetworkErrorKind::Degraded,
-            Self::Storage(StorageError::ReservationConflict { .. }) => NetworkErrorKind::Degraded,
+            Self::Storage(
+                StorageError::ReservationConflict { .. }
+                | StorageError::LeaseOwnershipConflict { .. },
+            ) => NetworkErrorKind::Degraded,
             Self::Storage(_) | Self::Workflow(_) => NetworkErrorKind::Transient,
         }
     }
@@ -566,6 +575,27 @@ impl WeztermError {
     }
 }
 
+/// Finite validation failures for an event-delivery lease batch.
+#[derive(Error, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EventDeliveryLeaseBatchError {
+    #[error("batch has {actual} pairs; maximum is {maximum}")]
+    TooManyPairs { actual: usize, maximum: usize },
+    #[error("event id must be positive")]
+    NonPositiveEventId,
+    #[error("lease token must not be empty")]
+    EmptyToken,
+    #[error("lease token has {actual} bytes; maximum is {maximum}")]
+    TokenTooLong { actual: usize, maximum: usize },
+    #[error("handled timestamp must be non-negative")]
+    NegativeHandledAt,
+    #[error("delivery status must not be empty")]
+    EmptyStatus,
+    #[error("delivery status has {actual} bytes; maximum is {maximum}")]
+    StatusTooLong { actual: usize, maximum: usize },
+    #[error("workflow id has {actual} bytes; maximum is {maximum}")]
+    WorkflowIdTooLong { actual: usize, maximum: usize },
+}
+
 /// Storage-specific errors
 #[derive(Error, Debug)]
 pub enum StorageError {
@@ -574,6 +604,21 @@ pub enum StorageError {
 
     #[error("Pane {pane_id} already has active reservation (id={existing_id})")]
     ReservationConflict { pane_id: u64, existing_id: i64 },
+
+    /// A bounded delivery argument violated a finite validation rule.
+    #[error("Invalid event delivery lease input: {0}")]
+    InvalidEventDeliveryLeaseBatch(EventDeliveryLeaseBatchError),
+
+    /// One input batch supplied distinct lease tokens for the same event.
+    /// This is a logical caller conflict, not a database-writer failure.
+    #[error("Event delivery lease batch has conflicting tokens for event {event_id}")]
+    LeaseTokenConflict { event_id: i64 },
+
+    /// A compare-and-swap delivery mutation no longer owns every requested
+    /// lease. This is a logical concurrency result, not evidence that the
+    /// shared database writer is unhealthy.
+    #[error("Event delivery lease ownership conflict: updated {updated} of {expected} exact pairs")]
+    LeaseOwnershipConflict { updated: usize, expected: usize },
 
     #[error("Sequence discontinuity: expected {expected}, got {actual}")]
     SequenceDiscontinuity { expected: u64, actual: u64 },
@@ -618,6 +663,20 @@ impl StorageError {
             .command("List reservations", "ft reservations")
             .alternative(
                 "Wait for the existing reservation to expire or release it before retrying.",
+            ),
+            Self::InvalidEventDeliveryLeaseBatch(_) => Remediation::new(
+                "The event-delivery lease input is invalid and was not submitted to storage.",
+            )
+            .alternative("Rebuild the request using valid, bounded lease fields before retrying."),
+            Self::LeaseTokenConflict { .. } => Remediation::new(
+                "One event appeared with more than one lease token in the same batch.",
+            )
+            .alternative("Rebuild the batch with at most one exact token for each event."),
+            Self::LeaseOwnershipConflict { .. } => Remediation::new(
+                "Event delivery ownership changed before the requested mutation completed.",
+            )
+            .alternative(
+                "Retry each still-current lease independently or acquire a fresh lease before retrying.",
             ),
             Self::SequenceDiscontinuity { expected, actual } => Remediation::new(format!(
                 "Output sequence gap detected (expected {expected}, got {actual})."
@@ -841,6 +900,14 @@ mod tests {
                 pane_id: 7,
                 existing_id: 11,
             }),
+            Error::Storage(StorageError::InvalidEventDeliveryLeaseBatch(
+                EventDeliveryLeaseBatchError::EmptyToken,
+            )),
+            Error::Storage(StorageError::LeaseTokenConflict { event_id: 17 }),
+            Error::Storage(StorageError::LeaseOwnershipConflict {
+                updated: 1,
+                expected: 2,
+            }),
             Error::Storage(StorageError::SequenceDiscontinuity {
                 expected: 1,
                 actual: 2,
@@ -1061,6 +1128,27 @@ mod tests {
         };
         let msg = seq.to_string();
         assert!(msg.contains("5") && msg.contains("8"));
+
+        let token_conflict = StorageError::LeaseTokenConflict { event_id: 17 };
+        assert!(token_conflict.to_string().contains("event 17"));
+        let ownership_conflict = StorageError::LeaseOwnershipConflict {
+            updated: 1,
+            expected: 2,
+        };
+        assert!(
+            ownership_conflict
+                .to_string()
+                .contains("updated 1 of 2 exact pairs")
+        );
+
+        let invalid_batch = StorageError::InvalidEventDeliveryLeaseBatch(
+            EventDeliveryLeaseBatchError::TooManyPairs {
+                actual: 65,
+                maximum: 64,
+            },
+        );
+        assert!(invalid_batch.to_string().contains("65"));
+        assert!(invalid_batch.to_string().contains("64"));
     }
 
     // --- From conversions ---
@@ -1108,6 +1196,24 @@ mod tests {
             "Should mention upgrading: {}",
             text
         );
+    }
+
+    #[test]
+    fn delivery_lease_conflict_remediations_preserve_distinct_authority() {
+        let token = StorageError::LeaseTokenConflict { event_id: 17 }
+            .remediation()
+            .render_plain();
+        assert!(token.contains("at most one exact token"));
+        assert!(!token.contains("ownership changed"));
+
+        let ownership = StorageError::LeaseOwnershipConflict {
+            updated: 1,
+            expected: 2,
+        }
+        .remediation()
+        .render_plain();
+        assert!(ownership.contains("ownership changed"));
+        assert!(ownership.contains("fresh lease"));
     }
 
     #[test]
@@ -1532,6 +1638,18 @@ mod tests {
             existing_id: 9,
         });
         assert_eq!(err.error_kind(), NetworkErrorKind::Degraded);
+    }
+
+    #[test]
+    fn top_level_lease_ownership_conflict_is_degraded() {
+        use crate::network_reliability::NetworkErrorKind;
+        let err = Error::Storage(StorageError::LeaseOwnershipConflict {
+            updated: 1,
+            expected: 2,
+        });
+        assert_eq!(err.error_kind(), NetworkErrorKind::Degraded);
+        let token_err = Error::Storage(StorageError::LeaseTokenConflict { event_id: 17 });
+        assert_eq!(token_err.error_kind(), NetworkErrorKind::Permanent);
     }
 
     #[test]

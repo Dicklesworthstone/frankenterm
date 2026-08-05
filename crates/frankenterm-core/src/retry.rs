@@ -566,7 +566,10 @@ pub fn is_retryable(error: &Error) -> bool {
         // Storage errors - only generic database errors are retryable (lock conflicts)
         Error::Storage(e) => match e {
             StorageError::Database(_) => true, // Might be transient lock conflict
+            StorageError::InvalidEventDeliveryLeaseBatch(_) => false, // Caller must rebuild input
             StorageError::ReservationConflict { .. } => false, // Another owner must release first
+            StorageError::LeaseTokenConflict { .. } => false, // Input authority is contradictory
+            StorageError::LeaseOwnershipConflict { .. } => false, // Must reacquire exact authority
             StorageError::SequenceDiscontinuity { .. } => false, // Logic error
             StorageError::MigrationFailed(_) => false, // Persistent issue
             StorageError::SchemaTooNew { .. } => false, // Version mismatch
@@ -1785,6 +1788,30 @@ mod tests {
                 pane_id: 5,
                 existing_id: 12,
             }
+        )));
+    }
+
+    #[test]
+    fn not_retryable_storage_lease_ownership_conflict() {
+        use crate::error::StorageError;
+        assert!(!is_retryable(&Error::Storage(
+            StorageError::LeaseOwnershipConflict {
+                updated: 1,
+                expected: 2,
+            }
+        )));
+        assert!(!is_retryable(&Error::Storage(
+            StorageError::LeaseTokenConflict { event_id: 17 }
+        )));
+    }
+
+    #[test]
+    fn not_retryable_invalid_event_delivery_lease_batch() {
+        use crate::error::{EventDeliveryLeaseBatchError, StorageError};
+        assert!(!is_retryable(&Error::Storage(
+            StorageError::InvalidEventDeliveryLeaseBatch(
+                EventDeliveryLeaseBatchError::EmptyToken,
+            )
         )));
     }
 

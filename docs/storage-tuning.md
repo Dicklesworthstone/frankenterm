@@ -189,6 +189,10 @@ file. Use it only when:
 VACUUM blocks all access while running. For large databases, schedule it
 during maintenance windows.
 
+The periodic `[gc]` cycle only samples page statistics and emits an advisory
+when the configured free-page threshold is crossed. It never starts VACUUM
+automatically.
+
 ### Schema migrations
 
 ```bash
@@ -247,7 +251,11 @@ storage.retention_cleanup(before_ts_epoch_ms).await?;
 
 The retention system is documented separately in the retention tiers
 policy. Cleanup events are logged to the `maintenance_log` table for
-auditing.
+auditing. The global retention window also prunes only the explicitly
+allowlisted high-frequency `cache_gc` and `fleet_scrollback_coordinator`
+advisories from that table, in bounded FIFO batches. Cleanup receipts
+(`retention_cleanup`, `tiered_cleanup`, and `size_retention`) and unknown future
+event classes remain fail-safe retained.
 
 ## Collecting Performance Evidence
 
@@ -274,7 +282,7 @@ For reference, these are the tables relevant to storage tuning:
 | `fts_index_state` | Singleton: FTS version, last rebuild timestamp |
 | `fts_pane_progress` | Per-pane FTS sync progress (last indexed sequence) |
 | `events` | Detected events (matches, patterns, annotations) |
-| `maintenance_log` | Audit log for startup, shutdown, vacuum, cleanup |
+| `maintenance_log` | Maintenance advisories plus retained cleanup/retention audit receipts |
 | `reservations` | Pane reservation tracking |
 
 ## Troubleshooting

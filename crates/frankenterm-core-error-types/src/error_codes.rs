@@ -532,6 +532,63 @@ pub static FT_2050: ErrorCodeDef = ErrorCodeDef {
     doc_link: None,
 };
 
+/// FT-2051: Invalid event-delivery lease input
+pub static FT_2051: ErrorCodeDef = ErrorCodeDef {
+    code: "FT-2051",
+    category: ErrorCategory::Storage,
+    title: "Invalid event-delivery lease input",
+    description: "An event-delivery lease request violated a finite input contract and was rejected before storage mutation.",
+    causes: &[
+        "The batch contains too many event/token pairs",
+        "An event ID, lease token, handled timestamp, status, or workflow ID is invalid",
+        "A lease token or finalization label exceeds its byte limit",
+    ],
+    recovery_steps: &[
+        RecoveryStep::text("Rebuild the request with positive event IDs and non-empty exact lease tokens"),
+        RecoveryStep::text("Page batches at the advertised maximum and keep tokens and labels within their byte limits"),
+        RecoveryStep::text("Do not retry the unchanged invalid request"),
+    ],
+    doc_link: None,
+};
+
+/// FT-2052: Contradictory event-delivery lease tokens
+pub static FT_2052: ErrorCodeDef = ErrorCodeDef {
+    code: "FT-2052",
+    category: ErrorCategory::Storage,
+    title: "Contradictory event-delivery lease tokens",
+    description: "One atomic event-delivery request supplied more than one ownership token for the same event, so no mutation was attempted.",
+    causes: &[
+        "Stale and successor leases were combined in one batch",
+        "The caller assembled duplicate event IDs from different ownership epochs",
+        "Lease authority was merged without comparing exact tokens",
+    ],
+    recovery_steps: &[
+        RecoveryStep::text("Rebuild the batch with at most one exact token for each event"),
+        RecoveryStep::text("Discard stale ownership and acquire a fresh lease when authority is uncertain"),
+        RecoveryStep::text("Do not retry the contradictory batch unchanged"),
+    ],
+    doc_link: None,
+};
+
+/// FT-2053: Event-delivery lease ownership changed
+pub static FT_2053: ErrorCodeDef = ErrorCodeDef {
+    code: "FT-2053",
+    category: ErrorCategory::Storage,
+    title: "Event-delivery lease ownership changed",
+    description: "At least one exact event/token pair no longer owned its unhandled event, so the atomic batch was rolled back without a partial mutation.",
+    causes: &[
+        "A lease expired and a successor acquired the event",
+        "Another delivery path already finalized or released the event",
+        "The event was removed before compare-and-swap completion",
+    ],
+    recovery_steps: &[
+        RecoveryStep::text("Retry only leases whose exact ownership is still current"),
+        RecoveryStep::text("Acquire a fresh lease for events whose ownership changed"),
+        RecoveryStep::with_command("Inspect recent event state", "ft robot events --limit 20"),
+    ],
+    doc_link: None,
+};
+
 // --- Pattern Errors (WA-3xxx) ---
 
 /// WA-3001: Invalid regex
@@ -1073,6 +1130,9 @@ pub static ERROR_CATALOG: LazyLock<HashMap<&'static str, &'static ErrorCodeDef>>
         m.insert("FT-2030", &FT_2030);
         m.insert("FT-2040", &FT_2040);
         m.insert("FT-2050", &FT_2050);
+        m.insert("FT-2051", &FT_2051);
+        m.insert("FT-2052", &FT_2052);
+        m.insert("FT-2053", &FT_2053);
         // Pattern errors
         m.insert("FT-3001", &FT_3001);
         m.insert("FT-3002", &FT_3002);
@@ -1859,6 +1919,36 @@ mod tests {
             def.recovery_steps
                 .iter()
                 .any(|step| format!("{step:?}").contains("ft reservations"))
+        );
+    }
+
+    #[test]
+    fn event_delivery_lease_codes_preserve_distinct_recovery_contracts() {
+        let invalid = get_error_code("FT-2051").expect("invalid lease-input code");
+        let contradictory = get_error_code("FT-2052").expect("contradictory-token code");
+        let ownership = get_error_code("FT-2053").expect("ownership-change code");
+
+        assert_eq!(invalid.category, ErrorCategory::Storage);
+        assert!(invalid.title.contains("Invalid"));
+        assert!(
+            invalid
+                .recovery_steps
+                .iter()
+                .any(|step| step.description.contains("byte limits"))
+        );
+        assert!(contradictory.title.contains("Contradictory"));
+        assert!(
+            contradictory
+                .recovery_steps
+                .iter()
+                .any(|step| step.description.contains("one exact token"))
+        );
+        assert!(ownership.title.contains("ownership changed"));
+        assert!(
+            ownership
+                .recovery_steps
+                .iter()
+                .any(|step| step.description.contains("fresh lease"))
         );
     }
 

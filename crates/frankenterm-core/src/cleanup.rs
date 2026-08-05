@@ -499,6 +499,21 @@ pub async fn cleanup_preview(
         })?;
     }
 
+    // High-frequency operational advisories use the global retention window.
+    // The storage predicate is an explicit allowlist: cleanup/retention
+    // receipts and future maintenance event classes remain fail-safe retained.
+    if config.retention_days > 0 {
+        let count = storage
+            .count_operational_maintenance_before(global_cutoff_ms)
+            .await?;
+        append_cleanup_summary(&mut plan, CleanupTableSummary {
+            table: "maintenance_log (operational)".to_string(),
+            eligible_rows: count,
+            deleted_rows: 0,
+            retention_days: config.retention_days,
+        })?;
+    }
+
     Ok(plan)
 }
 
@@ -584,6 +599,21 @@ pub async fn cleanup_preview_with_cx(
             .await?;
         append_cleanup_summary(&mut plan, CleanupTableSummary {
             table: "notification_history".to_string(),
+            eligible_rows: count,
+            deleted_rows: 0,
+            retention_days: config.retention_days,
+        })?;
+    }
+
+    if config.retention_days > 0 {
+        cx.checkpoint().map_err(|err| {
+            cleanup_cancelled("cleanup_preview.operational_maintenance", err)
+        })?;
+        let count = storage
+            .count_operational_maintenance_before_with_cx(cx, global_cutoff_ms)
+            .await?;
+        append_cleanup_summary(&mut plan, CleanupTableSummary {
+            table: "maintenance_log (operational)".to_string(),
             eligible_rows: count,
             deleted_rows: 0,
             retention_days: config.retention_days,
@@ -894,6 +924,58 @@ pub(crate) async fn cleanup_apply_with_compiled_retention_with_cx(
         let (deleted, error) = durable_delete_step(progress);
         if let Err(aggregate_error) = append_cleanup_summary(&mut plan, CleanupTableSummary {
             table: "notification_history".to_string(),
+            eligible_rows: count,
+            deleted_rows: deleted,
+            retention_days,
+        }) {
+            return finish_cleanup_apply_outcome(
+                storage,
+                plan,
+                cleanup_termination_from_error(aggregate_error),
+            )
+            .await;
+        }
+        if let Some(error) = error {
+            return finish_cleanup_apply_outcome(
+                storage,
+                plan,
+                cleanup_termination_from_error(error),
+            )
+            .await;
+        }
+    }
+
+    if retention_days > 0 {
+        if let Err(error) = cx.checkpoint().map_err(|err| {
+            cleanup_cancelled("cleanup_apply.operational_maintenance", err)
+        }) {
+            return finish_cleanup_apply_outcome(
+                storage,
+                plan,
+                cleanup_termination_from_error(error),
+            )
+            .await;
+        }
+        let count = match storage
+            .count_operational_maintenance_before_with_cx(cx, global_cutoff_ms)
+            .await
+        {
+            Ok(count) => count,
+            Err(error) => {
+                return finish_cleanup_apply_outcome(
+                    storage,
+                    plan,
+                    cleanup_termination_from_error(error),
+                )
+                .await;
+            }
+        };
+        let progress = storage
+            .purge_operational_maintenance_before_progress_with_cx(cx, global_cutoff_ms)
+            .await;
+        let (deleted, error) = durable_delete_step(progress);
+        if let Err(aggregate_error) = append_cleanup_summary(&mut plan, CleanupTableSummary {
+            table: "maintenance_log (operational)".to_string(),
             eligible_rows: count,
             deleted_rows: deleted,
             retention_days,
@@ -1587,6 +1669,95 @@ mod tests {
             assert!(!plan.dry_run);
             assert_eq!(plan.total_eligible, 0);
             assert_eq!(plan.total_deleted, 0);
+
+            teardown(storage, &db_path).await;
+        });
+    }
+
+    #[test]
+    fn cleanup_bounds_operational_maintenance_and_preserves_audit_receipts() {
+        run_async_test(async {
+            let (storage, db_path) = setup_storage("operational_maintenance").await;
+            let now = now_ms();
+            let old = now - 60 * 86_400_000;
+            for event_type in [
+                "cache_gc",
+                "fleet_scrollback_coordinator",
+                "retention_cleanup",
+                "tiered_cleanup",
+                "size_retention",
+                "future_maintenance_class",
+            ] {
+                storage
+                    .record_maintenance(MaintenanceRecord {
+                        id: 0,
+                        event_type: event_type.to_string(),
+                        message: None,
+                        metadata: None,
+                        timestamp: old,
+                    })
+                    .await
+                    .expect("seed maintenance row");
+            }
+            storage
+                .record_maintenance(MaintenanceRecord {
+                    id: 0,
+                    event_type: "cache_gc".to_string(),
+                    message: None,
+                    metadata: None,
+                    timestamp: now,
+                })
+                .await
+                .expect("seed recent operational row");
+
+            let config = StorageConfig {
+                retention_days: 30,
+                retention_tiers: Vec::new(),
+                ..StorageConfig::default()
+            };
+            let preview = cleanup_preview(&storage, &config).await.expect("preview");
+            let preview_summary = preview
+                .tables
+                .iter()
+                .find(|summary| summary.table == "maintenance_log (operational)")
+                .expect("operational maintenance preview summary");
+            assert_eq!(preview_summary.eligible_rows, 2);
+            assert_eq!(preview_summary.deleted_rows, 0);
+
+            let applied = cleanup_apply(&storage, &config).await.expect("apply");
+            let applied_summary = applied
+                .tables
+                .iter()
+                .find(|summary| summary.table == "maintenance_log (operational)")
+                .expect("operational maintenance apply summary");
+            assert_eq!(applied_summary.eligible_rows, 2);
+            assert_eq!(applied_summary.deleted_rows, 2);
+
+            let connection = rusqlite::Connection::open(&db_path)
+                .expect("open operational-maintenance fixture connection");
+            let old_operational: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM maintenance_log
+                     WHERE timestamp < ?1
+                       AND event_type IN ('cache_gc', 'fleet_scrollback_coordinator')",
+                    [now - 30 * 86_400_000],
+                    |row| row.get(0),
+                )
+                .expect("count old operational rows");
+            assert_eq!(old_operational, 0);
+            let retained_audit_classes: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM maintenance_log
+                     WHERE timestamp = ?1
+                       AND event_type IN (
+                         'retention_cleanup', 'tiered_cleanup', 'size_retention',
+                         'future_maintenance_class'
+                       )",
+                    [old],
+                    |row| row.get(0),
+                )
+                .expect("count fail-safe retained maintenance rows");
+            assert_eq!(retained_audit_classes, 4);
 
             teardown(storage, &db_path).await;
         });

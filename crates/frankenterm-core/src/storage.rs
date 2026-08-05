@@ -46,7 +46,7 @@ use frankenterm_core_audit_types::storage_audit::AuditFieldRedactor;
 use frankenterm_sigpipe::{RecoverablePanicSite, catch_recoverable};
 use serde::{Deserialize, Serialize};
 
-use crate::error::{Result, StorageError};
+use crate::error::{EventDeliveryLeaseBatchError, Result, StorageError};
 use crate::capture_authority::CapturePersistenceHold;
 use crate::config::{
     CompiledRetentionPolicy, RetentionTier, compile_retention_policy_tiers,
@@ -98,6 +98,15 @@ pub const STORAGE_BULK_ID_INPUT_MAX: usize = 4_096;
 
 /// Maximum number of downstream-delivery leases changed by one atomic batch.
 pub const EVENT_DELIVERY_LEASE_BULK_MAX: usize = 64;
+/// Maximum UTF-8 bytes accepted for one event-delivery ownership token.
+/// Production tokens are currently 79 ASCII bytes; the wider ceiling leaves
+/// room for a future format without allowing a public bulk call to clone,
+/// sort, and JSON-encode attacker-sized strings.
+pub const EVENT_DELIVERY_LEASE_TOKEN_MAX_BYTES: usize = 256;
+/// Maximum UTF-8 bytes persisted as one event-delivery status label.
+pub const EVENT_DELIVERY_STATUS_MAX_BYTES: usize = 256;
+/// Maximum UTF-8 bytes persisted as one event-delivery workflow identity.
+pub const EVENT_DELIVERY_WORKFLOW_ID_MAX_BYTES: usize = 1_024;
 
 // Keep hot-path SQL in one place so execution and EXPLAIN-plan regression
 // tests cannot silently drift apart.
@@ -400,6 +409,7 @@ enum AuxiliaryRetentionTable {
     AuditActions,
     UsageMetrics,
     NotificationHistory,
+    OperationalMaintenance,
 }
 
 impl AuxiliaryRetentionTable {
@@ -408,6 +418,7 @@ impl AuxiliaryRetentionTable {
             Self::AuditActions => "purge_audit_actions_before",
             Self::UsageMetrics => "purge_usage_metrics",
             Self::NotificationHistory => "purge_notification_history",
+            Self::OperationalMaintenance => "purge_operational_maintenance_before",
         }
     }
 }
@@ -1052,6 +1063,13 @@ enum WriteCommand {
         record: MaintenanceRecord,
         respond: oneshot::Sender<Result<i64>>,
     },
+    /// Purge old high-frequency operational maintenance telemetry while
+    /// preserving retention and cleanup receipts.
+    PurgeOperationalMaintenance {
+        before_ts: i64,
+        batch_size: usize,
+        respond: oneshot::Sender<Result<usize>>,
+    },
     /// Record a secret scan report
     RecordSecretScanReport {
         record: SecretScanReportRecord,
@@ -1355,6 +1373,7 @@ impl std::fmt::Debug for WriteCommand {
             Self::ConsumeApprovalTokenByCode { .. } => "ConsumeApprovalTokenByCode",
             Self::ConsumeApprovalTokenById { .. } => "ConsumeApprovalTokenById",
             Self::RecordMaintenance { .. } => "RecordMaintenance",
+            Self::PurgeOperationalMaintenance { .. } => "PurgeOperationalMaintenance",
             Self::RecordSecretScanReport { .. } => "RecordSecretScanReport",
             Self::InsertSavedSearch { .. } => "InsertSavedSearch",
             Self::UpdateSavedSearchRun { .. } => "UpdateSavedSearchRun",
@@ -3095,6 +3114,8 @@ impl StorageHandle {
     /// another path, or the row no longer exists; callers must not advance a
     /// durable delivery cursor in that case. A successful finalization stamps
     /// `handled_at` at serialized writer dispatch, after any bounded-queue wait.
+    /// Workflow identifiers and status labels are rejected before enqueue when
+    /// they exceed their finite byte limits.
     pub async fn finalize_event_delivery(
         &self,
         lease: &EventDeliveryLease,
@@ -3115,6 +3136,7 @@ impl StorageHandle {
         status: &str,
     ) -> Result<bool> {
         Self::checkpoint_storage_operation(cx, "finalize_event_delivery")?;
+        validate_event_delivery_finalize_fields(0, workflow_id.as_deref(), status)?;
         let (tx, rx) = oneshot::channel();
         self.write_tx
             .send_with_cx(
@@ -3167,8 +3189,9 @@ impl StorageHandle {
     /// If any pair is stale or missing, the entire batch rolls back. Exact
     /// duplicate pairs are harmless; distinct tokens for one event are
     /// rejected before enqueue. The input is capped at
-    /// [`EVENT_DELIVERY_LEASE_BULK_MAX`]. `handled_at_ms` must be a
-    /// non-negative timestamp captured after downstream delivery acknowledgement.
+    /// [`EVENT_DELIVERY_LEASE_BULK_MAX`], with per-token, workflow-id, and
+    /// status byte caps. `handled_at_ms` must be a non-negative timestamp
+    /// captured after downstream delivery acknowledgement.
     pub async fn finalize_event_delivery_leases_bulk(
         &self,
         leases: &[(i64, String)],
@@ -3198,7 +3221,7 @@ impl StorageHandle {
         status: &str,
     ) -> Result<usize> {
         Self::checkpoint_storage_operation(cx, "finalize_event_delivery_leases_bulk")?;
-        validate_event_delivery_bulk_finalize(handled_at_ms, status)?;
+        validate_event_delivery_finalize_fields(handled_at_ms, workflow_id, status)?;
         let leases = canonical_event_delivery_lease_pairs(leases)?;
         if leases.is_empty() {
             Self::checkpoint_storage_operation(
@@ -3815,6 +3838,50 @@ impl StorageHandle {
             .await
             .map_err(|error| Self::writer_send_error("record_maintenance", error))?;
         Self::recv_writer_response(rx).await
+    }
+
+    /// Purge old high-frequency operational maintenance telemetry.
+    ///
+    /// Only `cache_gc` and `fleet_scrollback_coordinator` rows are eligible.
+    /// Cleanup and retention receipts (`retention_cleanup`, `tiered_cleanup`,
+    /// and `size_retention`) remain durable audit evidence regardless of the
+    /// cutoff. Deletion runs in bounded writer turns and yields through the
+    /// FIFO tail between full batches.
+    pub async fn purge_operational_maintenance_before(
+        &self,
+        before_ts: i64,
+    ) -> Result<usize> {
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.purge_operational_maintenance_before_with_cx(&cx, before_ts)
+            .await
+    }
+
+    /// Cx-first sibling of [`Self::purge_operational_maintenance_before`].
+    pub async fn purge_operational_maintenance_before_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        before_ts: i64,
+    ) -> Result<usize> {
+        self.purge_auxiliary_history_with_cx(
+            cx,
+            before_ts,
+            AuxiliaryRetentionTable::OperationalMaintenance,
+        )
+        .await
+    }
+
+    /// Cancellation-aware durable-prefix form used by cleanup orchestration.
+    pub(crate) async fn purge_operational_maintenance_before_progress_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        before_ts: i64,
+    ) -> DurableMutationProgress<usize> {
+        self.purge_auxiliary_history_progress_with_cx(
+            cx,
+            before_ts,
+            AuxiliaryRetentionTable::OperationalMaintenance,
+        )
+        .await
     }
 
     /// Record a secret scan report (checkpoint + payload).
@@ -4967,6 +5034,13 @@ impl StorageHandle {
                         respond: tx,
                     }
                 }
+                AuxiliaryRetentionTable::OperationalMaintenance => {
+                    WriteCommand::PurgeOperationalMaintenance {
+                        before_ts,
+                        batch_size: AUXILIARY_RETENTION_DELETE_BATCH_MAX,
+                        respond: tx,
+                    }
+                }
             };
             if let Err(error) = self
                 .write_tx
@@ -5293,6 +5367,34 @@ impl StorageHandle {
             move || {
                 pooled_backend(db_path.as_str(), |backend| {
                     count_notification_history_before_backend(backend, before_ts)
+                })
+            },
+        )
+        .await
+    }
+
+    /// Count old high-frequency operational maintenance rows without counting
+    /// cleanup or retention receipts.
+    pub async fn count_operational_maintenance_before(&self, before_ts: i64) -> Result<usize> {
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.count_operational_maintenance_before_with_cx(&cx, before_ts)
+            .await
+    }
+
+    /// Cx-first sibling of [`Self::count_operational_maintenance_before`].
+    pub async fn count_operational_maintenance_before_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        before_ts: i64,
+    ) -> Result<usize> {
+        Self::checkpoint_storage_operation(cx, "count_operational_maintenance_before")?;
+        let db_path = Arc::clone(&self.db_path);
+        Self::spawn_blocking_storage_with_cx_with_join_error(
+            cx,
+            "Spawn blocking failed",
+            move || {
+                pooled_backend(db_path.as_str(), |backend| {
+                    count_operational_maintenance_before_backend(backend, before_ts)
                 })
             },
         )
@@ -10062,6 +10164,7 @@ impl StorageIoWriterGate {
         let config = self.scheduler.config().clone();
         self.scheduler = StorageIoScheduler::new(config);
         self.next_ordering_sequence_by_stream.clear();
+        self.next_work_id = 1;
     }
 
     fn reset_after_scheduler_loss(&mut self) {
@@ -10075,6 +10178,7 @@ impl StorageIoWriterGate {
         let config = self.scheduler.config().clone();
         self.scheduler = StorageIoScheduler::new(config);
         self.next_ordering_sequence_by_stream.clear();
+        self.next_work_id = 1;
     }
 
     fn work_item_for_command(&mut self, cmd: &WriteCommand) -> Option<StorageIoWorkItem> {
@@ -11054,6 +11158,7 @@ fn fail_undispatched_write_command(cmd: WriteCommand, message: String) -> bool {
             respond_oneshot_best_effort(respond, writer_panic_error(&message));
         }
         WriteCommand::PurgeAuditActions { respond, .. }
+        | WriteCommand::PurgeOperationalMaintenance { respond, .. }
         | WriteCommand::DeleteSavedSearch { respond, .. }
         | WriteCommand::PruneSegments { respond, .. }
         | WriteCommand::ExpireStaleReservations { respond }
@@ -11816,6 +11921,18 @@ mod writer_io_scheduler_tests {
         let ordering = dispatched.item.ordering.unwrap();
         assert_eq!(ordering.stream, "pane:11");
         assert_eq!(ordering.sequence, 0);
+    }
+
+    #[test]
+    fn writer_io_gate_recovery_resets_the_bounded_work_id_epoch() {
+        let mut gate = tiny_writer_gate();
+        gate.next_work_id = u64::MAX;
+        gate.reset_after_panic();
+        assert_eq!(gate.next_work_id, 1);
+
+        gate.next_work_id = u64::MAX;
+        gate.reset_after_scheduler_loss();
+        assert_eq!(gate.next_work_id, 1);
     }
 
     #[test]
@@ -13971,6 +14088,15 @@ fn dispatch_write_command_raw(
             let result = record_maintenance_backend(backend, &record);
             respond_oneshot_best_effort(respond, result);
         }
+        WriteCommand::PurgeOperationalMaintenance {
+            before_ts,
+            batch_size,
+            respond,
+        } => {
+            let respond = WriterResultResponder::new(respond);
+            let result = purge_operational_maintenance_backend(backend, before_ts, batch_size);
+            respond_oneshot_best_effort(respond, result);
+        }
         WriteCommand::RecordSecretScanReport { record, respond } => {
             let respond = WriterResultResponder::new(respond);
             let result = record_secret_scan_report_backend(backend, &record);
@@ -15780,12 +15906,8 @@ fn finalize_event_delivery_backend_at(
     workflow_id: Option<&str>,
     status: &str,
 ) -> Result<bool> {
-    if event_id <= 0 || token.is_empty() || handled_at_ms < 0 {
-        return Err(StorageError::Database(format!(
-            "invalid event delivery finalization: event_id={event_id}, handled_at_ms={handled_at_ms}"
-        ))
-        .into());
-    }
+    validate_event_delivery_lease_pair(event_id, token)?;
+    validate_event_delivery_finalize_fields(handled_at_ms, workflow_id, status)?;
     let updated = backend
         .query_row_typed(
             "UPDATE events
@@ -15818,12 +15940,7 @@ fn release_event_delivery_backend(
     event_id: i64,
     token: &str,
 ) -> Result<bool> {
-    if event_id <= 0 || token.is_empty() {
-        return Err(StorageError::Database(format!(
-            "invalid event delivery release: event_id={event_id}"
-        ))
-        .into());
-    }
+    validate_event_delivery_lease_pair(event_id, token)?;
     let updated = backend
         .query_row_typed(
             "UPDATE events
@@ -15840,16 +15957,65 @@ fn release_event_delivery_backend(
     Ok(updated.is_some())
 }
 
-fn validate_event_delivery_bulk_finalize(handled_at_ms: i64, status: &str) -> Result<()> {
+fn validate_event_delivery_lease_pair(event_id: i64, token: &str) -> Result<()> {
+    if event_id <= 0 {
+        return Err(StorageError::InvalidEventDeliveryLeaseBatch(
+            EventDeliveryLeaseBatchError::NonPositiveEventId,
+        )
+        .into());
+    }
+    if token.is_empty() {
+        return Err(StorageError::InvalidEventDeliveryLeaseBatch(
+            EventDeliveryLeaseBatchError::EmptyToken,
+        )
+        .into());
+    }
+    if token.len() > EVENT_DELIVERY_LEASE_TOKEN_MAX_BYTES {
+        return Err(StorageError::InvalidEventDeliveryLeaseBatch(
+            EventDeliveryLeaseBatchError::TokenTooLong {
+                actual: token.len(),
+                maximum: EVENT_DELIVERY_LEASE_TOKEN_MAX_BYTES,
+            },
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn validate_event_delivery_finalize_fields(
+    handled_at_ms: i64,
+    workflow_id: Option<&str>,
+    status: &str,
+) -> Result<()> {
     if handled_at_ms < 0 {
-        return Err(StorageError::Database(format!(
-            "bulk event delivery handled_at_ms must be non-negative: {handled_at_ms}"
-        ))
+        return Err(StorageError::InvalidEventDeliveryLeaseBatch(
+            EventDeliveryLeaseBatchError::NegativeHandledAt,
+        )
         .into());
     }
     if status.is_empty() {
-        return Err(StorageError::Database(
-            "bulk event delivery status must not be empty".to_string(),
+        return Err(StorageError::InvalidEventDeliveryLeaseBatch(
+            EventDeliveryLeaseBatchError::EmptyStatus,
+        )
+        .into());
+    }
+    if status.len() > EVENT_DELIVERY_STATUS_MAX_BYTES {
+        return Err(StorageError::InvalidEventDeliveryLeaseBatch(
+            EventDeliveryLeaseBatchError::StatusTooLong {
+                actual: status.len(),
+                maximum: EVENT_DELIVERY_STATUS_MAX_BYTES,
+            },
+        )
+        .into());
+    }
+    if let Some(workflow_id) = workflow_id
+        && workflow_id.len() > EVENT_DELIVERY_WORKFLOW_ID_MAX_BYTES
+    {
+        return Err(StorageError::InvalidEventDeliveryLeaseBatch(
+            EventDeliveryLeaseBatchError::WorkflowIdTooLong {
+                actual: workflow_id.len(),
+                maximum: EVENT_DELIVERY_WORKFLOW_ID_MAX_BYTES,
+            },
         )
         .into());
     }
@@ -15860,20 +16026,16 @@ fn canonical_event_delivery_lease_pairs(
     leases: &[(i64, String)],
 ) -> Result<Vec<(i64, String)>> {
     if leases.len() > EVENT_DELIVERY_LEASE_BULK_MAX {
-        return Err(StorageError::Database(format!(
-            "event delivery lease batch has {} pairs; maximum is {EVENT_DELIVERY_LEASE_BULK_MAX}",
-            leases.len()
-        ))
+        return Err(StorageError::InvalidEventDeliveryLeaseBatch(
+            EventDeliveryLeaseBatchError::TooManyPairs {
+                actual: leases.len(),
+                maximum: EVENT_DELIVERY_LEASE_BULK_MAX,
+            },
+        )
         .into());
     }
     for (event_id, token) in leases {
-        if *event_id <= 0 || token.is_empty() {
-            return Err(StorageError::Database(format!(
-                "invalid event delivery lease pair: event_id={event_id}, token_empty={}",
-                token.is_empty()
-            ))
-            .into());
-        }
+        validate_event_delivery_lease_pair(*event_id, token)?;
     }
 
     let mut canonical = leases.to_vec();
@@ -15883,10 +16045,9 @@ fn canonical_event_delivery_lease_pairs(
         .windows(2)
         .find(|pair| pair[0].0 == pair[1].0)
     {
-        return Err(StorageError::Database(format!(
-            "event delivery lease batch contains conflicting tokens for event {}",
-            conflict[0].0
-        ))
+        return Err(StorageError::LeaseTokenConflict {
+            event_id: conflict[0].0,
+        }
         .into());
     }
     Ok(canonical)
@@ -15933,11 +16094,10 @@ fn validate_event_delivery_bulk_returned_ids(
         .map(|(event_id, _)| *event_id)
         .collect::<Vec<_>>();
     if returned_ids != expected_ids {
-        return Err(StorageError::Database(format!(
-            "{operation} lease ownership conflict: updated {} of {} exact pairs",
-            returned_ids.len(),
-            expected_ids.len()
-        ))
+        return Err(StorageError::LeaseOwnershipConflict {
+            updated: returned_ids.len(),
+            expected: expected_ids.len(),
+        }
         .into());
     }
     Ok(())
@@ -15955,37 +16115,73 @@ where
     backend.execute("BEGIN IMMEDIATE").map_err(|err| {
         storage_backend_error(&format!("Begin {operation} transaction"), err)
     })?;
-    let transaction_result = mutation(backend).and_then(|rows| {
-        validate_event_delivery_bulk_returned_ids(&rows, leases, operation)?;
-        Ok(leases.len())
-    });
+    // The outer writer-dispatch boundary contains panics, but it cannot repair
+    // a transaction whose BEGIN already succeeded. Catch the complete
+    // mutation/validation/COMMIT region here so every recovered unwind first
+    // drives the same explicit rollback path as an ordinary error. Otherwise
+    // the long-lived writer connection remains inside an open transaction and
+    // every later bulk command fails or accidentally joins stale work.
+    let transaction_result = catch_recoverable(
+        RecoverablePanicSite::StorageWriter,
+        std::panic::AssertUnwindSafe(|| {
+            mutation(backend)
+                .and_then(|rows| {
+                    validate_event_delivery_bulk_returned_ids(&rows, leases, operation)?;
+                    Ok(leases.len())
+                })
+                .and_then(|updated| {
+                    backend
+                        .execute("COMMIT")
+                        .map(|_| updated)
+                        .map_err(|error| {
+                            storage_backend_error(
+                                &format!("Commit {operation} transaction"),
+                                error,
+                            )
+                            .into()
+                        })
+                })
+        }),
+    );
 
-    match transaction_result {
-        Ok(updated) => match backend.execute("COMMIT") {
-            Ok(_) => Ok(updated),
-            Err(error) => {
-                if let Err(rollback_error) = backend.execute("ROLLBACK") {
-                    tracing::error!(
-                        operation,
-                        error = %rollback_error,
-                        "event delivery bulk rollback after commit failure also failed"
-                    );
-                }
-                Err(storage_backend_error(&format!("Commit {operation} transaction"), error)
-                    .into())
-            }
-        },
-        Err(error) => {
-            if let Err(rollback_error) = backend.execute("ROLLBACK") {
-                tracing::error!(
-                    operation,
-                    error = %rollback_error,
-                    "event delivery bulk rollback failed"
-                );
-            }
-            Err(error)
+    let transaction_error = match transaction_result {
+        Ok(Ok(updated)) => return Ok(updated),
+        Ok(Err(error)) => error,
+        Err(_) => {
+            STORAGE_WRITER_PANICS_TOTAL.fetch_add(1, AtomicOrdering::Relaxed);
+            tracing::error!(
+                operation,
+                writer_panics_total = storage_writer_panics_total(),
+                error_code = "WA-STORAGE-WRITER-PANIC",
+                "storage writer recovered from an event-delivery bulk transaction panic"
+            );
+            StorageError::Database(
+                "storage writer recovered from event-delivery bulk transaction panic \
+                 (WA-STORAGE-WRITER-PANIC)"
+                    .to_string(),
+            )
+            .into()
         }
+    };
+
+    if let Err(rollback_error) = backend.execute("ROLLBACK") {
+        tracing::error!(
+            operation,
+            error = %rollback_error,
+            "event delivery bulk rollback failed"
+        );
+        // A logical ownership conflict is safe for exact per-lease fallback
+        // only after the all-or-rollback invariant has been re-established.
+        // If rollback itself fails, return a writer error so callers invalidate
+        // this storage epoch instead of issuing more mutations into an
+        // indeterminate transaction.
+        return Err(storage_backend_error(
+            &format!("Rollback {operation} transaction after mutation failure"),
+            rollback_error,
+        )
+        .into());
     }
+    Err(transaction_error)
 }
 
 fn finalize_event_delivery_leases_bulk_backend(
@@ -15995,7 +16191,7 @@ fn finalize_event_delivery_leases_bulk_backend(
     workflow_id: Option<&str>,
     status: &str,
 ) -> Result<usize> {
-    validate_event_delivery_bulk_finalize(handled_at_ms, status)?;
+    validate_event_delivery_finalize_fields(handled_at_ms, workflow_id, status)?;
     let leases = canonical_event_delivery_lease_pairs(leases)?;
     if leases.is_empty() {
         return Ok(0);
@@ -17872,6 +18068,46 @@ fn record_maintenance_backend(
         .map_err(|err| storage_backend_error("Maintenance id", err).into())
 }
 
+/// Delete one bounded batch of high-frequency operational maintenance rows.
+///
+/// This is deliberately an allowlist rather than "everything except known
+/// receipts": future maintenance event types default to retained until their
+/// authority and retention contract are reviewed. In particular, cleanup and
+/// size-retention receipts are never eligible here.
+fn purge_operational_maintenance_backend(
+    backend: &dyn StorageBackend,
+    before_ts: i64,
+    requested_batch_size: usize,
+) -> Result<usize> {
+    let batch_size = requested_batch_size.min(AUXILIARY_RETENTION_DELETE_BATCH_MAX);
+    if batch_size == 0 {
+        return Ok(0);
+    }
+    let deleted = backend
+        .query_map_typed(
+            "DELETE FROM maintenance_log
+             WHERE id IN (
+                 SELECT id FROM maintenance_log
+                 WHERE timestamp < ?1
+                   AND event_type IN ('cache_gc', 'fleet_scrollback_coordinator')
+                 ORDER BY timestamp ASC, id ASC
+                 LIMIT ?2
+             )
+             RETURNING id",
+            &[
+                ToSqlValue::Integer(before_ts),
+                ToSqlValue::Integer(usize_to_i64(
+                    batch_size,
+                    "operational maintenance purge batch size",
+                )?),
+            ],
+        )
+        .map_err(|err| {
+            storage_backend_error("Failed to purge operational maintenance history", err)
+        })?;
+    Ok(deleted.len())
+}
+
 fn record_secret_scan_report_backend(
     backend: &dyn StorageBackend,
     record: &SecretScanReportRecord,
@@ -18663,18 +18899,42 @@ fn list_pane_bookmarks_by_tag_backend(
     backend: &dyn StorageBackend,
     tag: &str,
 ) -> Result<Vec<PaneBookmarkRecord>> {
-    // Use JSON containment check: tags column is a JSON array.
-    let pattern = format!("%\"{tag}\"%");
+    // Match decoded JSON array elements exactly.  A LIKE pattern is not a
+    // containment check: `%` and `_` in a tag become wildcards, and quotes or
+    // backslashes are escaped in the stored JSON representation.  Include
+    // malformed, non-NULL values in the result set so the shared decoder can
+    // emit its parse-drop telemetry; the Rust-side exact check below then
+    // excludes them from the filtered result.
     let rows = backend
         .query_map_typed(
             "SELECT id, pane_id, alias, tags, description, created_at, updated_at
-             FROM pane_bookmarks WHERE tags LIKE ?1 ORDER BY alias ASC",
-            &[ToSqlValue::Text(&pattern)],
+             FROM pane_bookmarks
+             WHERE CASE
+                 WHEN tags IS NULL THEN 0
+                 WHEN json_valid(tags) = 0 THEN 1
+                 WHEN json_type(tags) <> 'array' THEN 1
+                 ELSE EXISTS (
+                     SELECT 1
+                     FROM json_each(tags) AS tag_entry
+                     WHERE tag_entry.type <> 'text'
+                        OR CAST(tag_entry.value AS BLOB) = CAST(?1 AS BLOB)
+                 )
+             END
+             ORDER BY alias ASC",
+            &[ToSqlValue::Text(tag)],
         )
         .map_err(|err| storage_backend_error("Failed to list pane bookmarks by tag", err))?;
-    rows.iter()
-        .map(|row| pane_bookmark_from_backend_row(row))
-        .collect()
+    rows.iter().try_fold(Vec::new(), |mut matches, row| {
+        let bookmark = pane_bookmark_from_backend_row(row)?;
+        if bookmark
+            .tags
+            .as_ref()
+            .is_some_and(|tags| tags.iter().any(|candidate| candidate == tag))
+        {
+            matches.push(bookmark);
+        }
+        Ok(matches)
+    })
 }
 
 /// Maximum output segments removed by one time-retention writer command.
@@ -19997,6 +20257,22 @@ fn count_notification_history_before_backend(
     )
     .map_err(|err| storage_backend_error("Failed to count notification history", err))?;
     count_i64_to_usize(count, "Failed to count notification history row")
+}
+
+fn count_operational_maintenance_before_backend(
+    backend: &dyn StorageBackend,
+    before_ts: i64,
+) -> Result<usize> {
+    let count = count_table_where(
+        backend,
+        "maintenance_log",
+        "timestamp < ?1 AND event_type IN ('cache_gc', 'fleet_scrollback_coordinator')",
+        &[ToSqlValue::Integer(before_ts)],
+    )
+    .map_err(|err| {
+        storage_backend_error("Failed to count operational maintenance history", err)
+    })?;
+    count_i64_to_usize(count, "Failed to count operational maintenance row")
 }
 
 const EVENT_RETENTION_DELETE_BATCH_MAX: usize = 8_192;
@@ -26636,7 +26912,15 @@ fn event_delivery_lease_batches_are_exact_atomic_and_bounded() {
         None,
         "delivered",
     );
-    assert!(stale_finalize.is_err(), "one stale token must reject the batch");
+    assert!(
+        matches!(
+            stale_finalize,
+            Err(crate::Error::Storage(
+                StorageError::LeaseOwnershipConflict { .. }
+            ))
+        ),
+        "one stale token must return the typed logical conflict"
+    );
     for (event_id, token) in [(third, "token-3"), (fourth, "token-4")] {
         let row = backend
             .query_row_cells(
@@ -26650,11 +26934,15 @@ fn event_delivery_lease_batches_are_exact_atomic_and_bounded() {
         assert_eq!(reader.string(1).unwrap(), token, "lease ownership must survive rollback");
     }
 
-    assert!(canonical_event_delivery_lease_pairs(&[
-        (third, "token-3".to_string()),
-        (third, "other-owner".to_string()),
-    ])
-    .is_err());
+    assert!(matches!(
+        canonical_event_delivery_lease_pairs(&[
+            (third, "token-3".to_string()),
+            (third, "other-owner".to_string()),
+        ]),
+        Err(crate::Error::Storage(
+            StorageError::LeaseTokenConflict { .. }
+        ))
+    ));
     let stale_release = release_event_delivery_leases_bulk_backend(
         &backend,
         &[
@@ -26662,7 +26950,15 @@ fn event_delivery_lease_batches_are_exact_atomic_and_bounded() {
             (fourth, "wrong-token".to_string()),
         ],
     );
-    assert!(stale_release.is_err(), "one stale release must reject the batch");
+    assert!(
+        matches!(
+            stale_release,
+            Err(crate::Error::Storage(
+                StorageError::LeaseOwnershipConflict { .. }
+            ))
+        ),
+        "one stale release must return the typed logical conflict"
+    );
     assert_eq!(
         release_event_delivery_leases_bulk_backend(
             &backend,
@@ -26698,23 +26994,86 @@ fn event_delivery_lease_batches_are_exact_atomic_and_bounded() {
     assert!(canonical_event_delivery_lease_pairs(&over_limit).is_err());
     let duplicate_over_limit =
         vec![(1, "token-1".to_string()); EVENT_DELIVERY_LEASE_BULK_MAX + 1];
-    assert!(canonical_event_delivery_lease_pairs(&duplicate_over_limit).is_err());
-    assert!(canonical_event_delivery_lease_pairs(&[(0, "token".to_string())]).is_err());
-    assert!(canonical_event_delivery_lease_pairs(&[(1, String::new())]).is_err());
+    assert!(matches!(
+        canonical_event_delivery_lease_pairs(&duplicate_over_limit),
+        Err(crate::Error::Storage(
+            StorageError::InvalidEventDeliveryLeaseBatch(
+                EventDeliveryLeaseBatchError::TooManyPairs { .. }
+            )
+        ))
+    ));
+    assert!(matches!(
+        canonical_event_delivery_lease_pairs(&[(0, "token".to_string())]),
+        Err(crate::Error::Storage(
+            StorageError::InvalidEventDeliveryLeaseBatch(
+                EventDeliveryLeaseBatchError::NonPositiveEventId
+            )
+        ))
+    ));
+    assert!(matches!(
+        canonical_event_delivery_lease_pairs(&[(1, String::new())]),
+        Err(crate::Error::Storage(
+            StorageError::InvalidEventDeliveryLeaseBatch(EventDeliveryLeaseBatchError::EmptyToken)
+        ))
+    ));
+    assert!(matches!(
+        canonical_event_delivery_lease_pairs(&[(
+            1,
+            "t".repeat(EVENT_DELIVERY_LEASE_TOKEN_MAX_BYTES + 1),
+        )]),
+        Err(crate::Error::Storage(
+            StorageError::InvalidEventDeliveryLeaseBatch(
+                EventDeliveryLeaseBatchError::TokenTooLong { .. }
+            )
+        ))
+    ));
     assert_eq!(
         finalize_event_delivery_leases_bulk_backend(&backend, &[], 1, None, "delivered").unwrap(),
         0
     );
     assert_eq!(release_event_delivery_leases_bulk_backend(&backend, &[]).unwrap(), 0);
-    assert!(finalize_event_delivery_leases_bulk_backend(
-        &backend,
-        &[],
-        -1,
-        None,
-        "delivered"
-    )
-    .is_err());
-    assert!(finalize_event_delivery_leases_bulk_backend(&backend, &[], 1, None, "").is_err());
+    assert!(matches!(
+        finalize_event_delivery_leases_bulk_backend(&backend, &[], -1, None, "delivered"),
+        Err(crate::Error::Storage(
+            StorageError::InvalidEventDeliveryLeaseBatch(
+                EventDeliveryLeaseBatchError::NegativeHandledAt
+            )
+        ))
+    ));
+    assert!(matches!(
+        finalize_event_delivery_leases_bulk_backend(&backend, &[], 1, None, ""),
+        Err(crate::Error::Storage(
+            StorageError::InvalidEventDeliveryLeaseBatch(EventDeliveryLeaseBatchError::EmptyStatus)
+        ))
+    ));
+    assert!(matches!(
+        finalize_event_delivery_leases_bulk_backend(
+            &backend,
+            &[],
+            1,
+            None,
+            &"s".repeat(EVENT_DELIVERY_STATUS_MAX_BYTES + 1),
+        ),
+        Err(crate::Error::Storage(
+            StorageError::InvalidEventDeliveryLeaseBatch(
+                EventDeliveryLeaseBatchError::StatusTooLong { .. }
+            )
+        ))
+    ));
+    assert!(matches!(
+        finalize_event_delivery_leases_bulk_backend(
+            &backend,
+            &[],
+            1,
+            Some(&"w".repeat(EVENT_DELIVERY_WORKFLOW_ID_MAX_BYTES + 1)),
+            "delivered",
+        ),
+        Err(crate::Error::Storage(
+            StorageError::InvalidEventDeliveryLeaseBatch(
+                EventDeliveryLeaseBatchError::WorkflowIdTooLong { .. }
+            )
+        ))
+    ));
 
     let plan_leases_json = event_delivery_lease_pairs_json(&[
         (third, "token-3".to_string()),
@@ -26751,6 +27110,39 @@ fn event_delivery_lease_batches_are_exact_atomic_and_bounded() {
     assert!(
         !release_plan.contains("SCAN events"),
         "bulk release must remain bounded by the lease batch:\n{release_plan}"
+    );
+}
+
+#[test]
+fn event_delivery_bulk_transaction_panic_rolls_back_before_returning() {
+    let backend = crate::storage_backend_trait::MockBackend::new();
+    let leases = vec![(17, "token-17".to_string())];
+    let result = execute_event_delivery_bulk_transaction(
+        &backend,
+        &leases,
+        "synthetic event delivery bulk panic",
+        |_backend| -> Result<Vec<Vec<SqlCell>>> {
+            std::panic::panic_any("EVENT-DELIVERY-PRIVATE-PANIC-PAYLOAD");
+        },
+    );
+
+    let error = result.expect_err("contained transaction panic must fail the command");
+    assert!(
+        error
+            .to_string()
+            .contains("WA-STORAGE-WRITER-PANIC"),
+        "contained panic must retain the finite storage-writer code: {error}"
+    );
+    assert!(
+        !error
+            .to_string()
+            .contains("EVENT-DELIVERY-PRIVATE-PANIC-PAYLOAD"),
+        "panic payload must not escape the canonical recovery boundary"
+    );
+    assert_eq!(
+        backend.executed(),
+        vec!["BEGIN IMMEDIATE".to_string(), "ROLLBACK".to_string()],
+        "a recovered unwind after BEGIN must roll its transaction back"
     );
 }
 
@@ -30507,10 +30899,11 @@ async fn exercise_bounded_auxiliary_retention(table: AuxiliaryRetentionTable) {
     let eligible = AUXILIARY_RETENTION_DELETE_BATCH_MAX + 2;
     let last_id = i64::try_from(eligible).expect("fixture count fits i64");
     let cutoff = 10_000i64;
-    let (table_name, timestamp_column, seed_sql) = match table {
+    let (table_name, timestamp_column, eligible_predicate, seed_sql) = match table {
         AuxiliaryRetentionTable::AuditActions => (
             "audit_actions",
             "ts",
+            "1 = 1",
             "WITH RECURSIVE ids(id) AS (
                  VALUES(1) UNION ALL SELECT id + 1 FROM ids WHERE id < ?1
              )
@@ -30522,6 +30915,7 @@ async fn exercise_bounded_auxiliary_retention(table: AuxiliaryRetentionTable) {
         AuxiliaryRetentionTable::UsageMetrics => (
             "usage_metrics",
             "timestamp",
+            "1 = 1",
             "WITH RECURSIVE ids(id) AS (
                  VALUES(1) UNION ALL SELECT id + 1 FROM ids WHERE id < ?1
              )
@@ -30533,6 +30927,7 @@ async fn exercise_bounded_auxiliary_retention(table: AuxiliaryRetentionTable) {
         AuxiliaryRetentionTable::NotificationHistory => (
             "notification_history",
             "timestamp",
+            "1 = 1",
             "WITH RECURSIVE ids(id) AS (
                  VALUES(1) UNION ALL SELECT id + 1 FROM ids WHERE id < ?1
              )
@@ -30540,6 +30935,22 @@ async fn exercise_bounded_auxiliary_retention(table: AuxiliaryRetentionTable) {
                  id, timestamp, channel, title, body, severity, status, created_at
              )
              SELECT id, 100 + id, 'test', 'title', 'body', 'info', 'sent', 100 + id
+             FROM ids",
+        ),
+        AuxiliaryRetentionTable::OperationalMaintenance => (
+            "maintenance_log",
+            "timestamp",
+            "event_type IN ('cache_gc', 'fleet_scrollback_coordinator')",
+            "WITH RECURSIVE ids(id) AS (
+                 VALUES(1) UNION ALL SELECT id + 1 FROM ids WHERE id < ?1
+             )
+             INSERT INTO maintenance_log (id, event_type, timestamp)
+             SELECT id,
+                    CASE WHEN id % 2 = 0
+                         THEN 'cache_gc'
+                         ELSE 'fleet_scrollback_coordinator'
+                    END,
+                    100 + id
              FROM ids",
         ),
     };
@@ -30558,6 +30969,7 @@ async fn exercise_bounded_auxiliary_retention(table: AuxiliaryRetentionTable) {
                     AuxiliaryRetentionTable::NotificationHistory => {
                         ", channel, title, body, severity, status, created_at"
                     }
+                    AuxiliaryRetentionTable::OperationalMaintenance => ", event_type"
                 },
                 match table {
                     AuxiliaryRetentionTable::AuditActions => ", 'test', 'test', 'allow', 'success'",
@@ -30565,11 +30977,44 @@ async fn exercise_bounded_auxiliary_retention(table: AuxiliaryRetentionTable) {
                     AuxiliaryRetentionTable::NotificationHistory => {
                         ", 'test', 'title', 'body', 'info', 'sent', ?2"
                     }
+                    AuxiliaryRetentionTable::OperationalMaintenance => ", 'cache_gc'"
                 }
             ),
             rusqlite::params![last_id + 1, cutoff],
         )
         .expect("seed exact-cutoff boundary row");
+
+    if matches!(table, AuxiliaryRetentionTable::OperationalMaintenance) {
+        connection
+            .execute(
+                "INSERT INTO maintenance_log (id, event_type, timestamp)
+                 VALUES (?1, 'retention_cleanup', 50),
+                        (?2, 'tiered_cleanup', 50),
+                        (?3, 'size_retention', 50)",
+                rusqlite::params![last_id + 100, last_id + 101, last_id + 102],
+            )
+            .expect("seed protected maintenance receipts");
+    }
+
+    let counted = with_test_storage_backend(&mut connection, |backend| match table {
+        AuxiliaryRetentionTable::AuditActions => {
+            count_audit_actions_before_backend(backend, cutoff)
+        }
+        AuxiliaryRetentionTable::UsageMetrics => {
+            count_usage_metrics_before_backend(backend, cutoff)
+        }
+        AuxiliaryRetentionTable::NotificationHistory => {
+            count_notification_history_before_backend(backend, cutoff)
+        }
+        AuxiliaryRetentionTable::OperationalMaintenance => {
+            count_operational_maintenance_before_backend(backend, cutoff)
+        }
+    })
+    .expect("count auxiliary retention candidates");
+    assert_eq!(
+        counted, eligible,
+        "counting and deletion must share the exact strict-cutoff predicate"
+    );
 
     // Zero-sized backend requests are no-ops and cannot accidentally become
     // an unbounded SQLite LIMIT.
@@ -30583,6 +31028,9 @@ async fn exercise_bounded_auxiliary_retention(table: AuxiliaryRetentionTable) {
         AuxiliaryRetentionTable::NotificationHistory => {
             purge_notification_history_backend(backend, cutoff, 0)
         }
+        AuxiliaryRetentionTable::OperationalMaintenance => {
+            purge_operational_maintenance_backend(backend, cutoff, 0)
+        }
     })
     .expect("zero auxiliary batch");
     assert_eq!(zero_deleted, 0);
@@ -30592,7 +31040,7 @@ async fn exercise_bounded_auxiliary_retention(table: AuxiliaryRetentionTable) {
             "CREATE TRIGGER assert_auxiliary_retention_yield
              BEFORE INSERT ON panes
              WHEN NEW.pane_id = 777
-              AND (SELECT COUNT(*) FROM {table_name}) != 3
+              AND (SELECT COUNT(*) FROM {table_name} WHERE {eligible_predicate}) != 3
              BEGIN
                  SELECT RAISE(ABORT, 'auxiliary purge monopolized writer FIFO');
              END;"
@@ -30616,6 +31064,13 @@ async fn exercise_bounded_auxiliary_retention(table: AuxiliaryRetentionTable) {
         },
         AuxiliaryRetentionTable::NotificationHistory => {
             WriteCommand::PurgeNotificationHistory {
+                before_ts: cutoff,
+                batch_size: AUXILIARY_RETENTION_DELETE_BATCH_MAX,
+                respond: purge_tx,
+            }
+        }
+        AuxiliaryRetentionTable::OperationalMaintenance => {
+            WriteCommand::PurgeOperationalMaintenance {
                 before_ts: cutoff,
                 batch_size: AUXILIARY_RETENTION_DELETE_BATCH_MAX,
                 respond: purge_tx,
@@ -30693,12 +31148,16 @@ async fn exercise_bounded_auxiliary_retention(table: AuxiliaryRetentionTable) {
                     AuxiliaryRetentionTable::NotificationHistory => {
                         ", channel, title, body, severity, status, created_at"
                     }
+                    AuxiliaryRetentionTable::OperationalMaintenance => ", event_type"
                 },
                 match table {
                     AuxiliaryRetentionTable::AuditActions => ", 'test', 'test', 'allow', 'success'",
                     AuxiliaryRetentionTable::UsageMetrics => ", 'test', 1, 50",
                     AuxiliaryRetentionTable::NotificationHistory => {
                         ", 'test', 'title', 'body', 'info', 'sent', 50"
+                    }
+                    AuxiliaryRetentionTable::OperationalMaintenance => {
+                        ", 'fleet_scrollback_coordinator'"
                     }
                 }
             ),
@@ -30711,11 +31170,28 @@ async fn exercise_bounded_auxiliary_retention(table: AuxiliaryRetentionTable) {
         .expect("resume auxiliary purge");
     assert_eq!(resumed, 3);
     let remaining: i64 = connection
-        .query_row(&format!("SELECT COUNT(*) FROM {table_name}"), [], |row| {
-            row.get(0)
-        })
+        .query_row(
+            &format!("SELECT COUNT(*) FROM {table_name} WHERE {eligible_predicate}"),
+            [],
+            |row| row.get(0),
+        )
         .expect("count auxiliary survivors");
     assert_eq!(remaining, 1, "only the exact-cutoff boundary survives");
+
+    if matches!(table, AuxiliaryRetentionTable::OperationalMaintenance) {
+        let protected_receipts: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM maintenance_log
+                 WHERE event_type IN ('retention_cleanup', 'tiered_cleanup', 'size_retention')",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count protected maintenance receipts");
+        assert_eq!(
+            protected_receipts, 3,
+            "operational retention must never delete cleanup audit receipts"
+        );
+    }
 
     storage.shutdown().await.expect("shutdown auxiliary storage");
 }
@@ -30738,6 +31214,13 @@ fn v35_usage_metric_retention_is_bounded_and_fifo_fair() {
 fn v35_notification_retention_is_bounded_and_fifo_fair() {
     run_storage_async_test(exercise_bounded_auxiliary_retention(
         AuxiliaryRetentionTable::NotificationHistory,
+    ));
+}
+
+#[test]
+fn operational_maintenance_retention_is_bounded_fifo_fair_and_receipt_safe() {
+    run_storage_async_test(exercise_bounded_auxiliary_retention(
+        AuxiliaryRetentionTable::OperationalMaintenance,
     ));
 }
 
@@ -33260,7 +33743,13 @@ fn storage_tick138_pane_bookmark_cluster_roundtrip() {
             id: 0,
             pane_id: 21,
             alias: "alpha".to_string(),
-            tags: Some(vec!["primary".to_string(), "tick138".to_string()]),
+            tags: Some(vec![
+                "primary".to_string(),
+                "tick138".to_string(),
+                "literal%_".to_string(),
+                "quote\"slash\\tag".to_string(),
+                "nul\0tag".to_string(),
+            ]),
             description: Some("first bookmark".to_string()),
             created_at: 1_700_000_000_000,
             updated_at: 1_700_000_000_000,
@@ -33275,7 +33764,13 @@ fn storage_tick138_pane_bookmark_cluster_roundtrip() {
             id: 0,
             pane_id: 22,
             alias: "beta".to_string(),
-            tags: Some(vec!["secondary".to_string(), "tick138".to_string()]),
+            tags: Some(vec![
+                "secondary".to_string(),
+                "tick138".to_string(),
+                "literalAX".to_string(),
+                "quoteXslash\\tag".to_string(),
+                "nul\0other".to_string(),
+            ]),
             description: None,
             created_at: 1_700_000_000_100,
             updated_at: 1_700_000_000_100,
@@ -33309,11 +33804,46 @@ fn storage_tick138_pane_bookmark_cluster_roundtrip() {
         assert_eq!(primary_only.len(), 1);
         assert_eq!(primary_only[0].alias, "alpha");
 
+        let different_case = storage
+            .list_pane_bookmarks_by_tag_with_cx(&cx, "PRIMARY")
+            .await
+            .unwrap();
+        assert!(
+            different_case.is_empty(),
+            "tag identity is byte-exact and case-sensitive"
+        );
+
         let tick138_both = storage
             .list_pane_bookmarks_by_tag_with_cx(&cx, "tick138")
             .await
             .unwrap();
         assert_eq!(tick138_both.len(), 2);
+
+        // SQL LIKE metacharacters are literal tag bytes, not wildcards.
+        let literal_metacharacters = storage
+            .list_pane_bookmarks_by_tag_with_cx(&cx, "literal%_")
+            .await
+            .unwrap();
+        assert_eq!(literal_metacharacters.len(), 1);
+        assert_eq!(literal_metacharacters[0].alias, "alpha");
+
+        // Filtering compares decoded JSON strings, so characters escaped in
+        // the stored JSON representation remain searchable.
+        let json_escaped = storage
+            .list_pane_bookmarks_by_tag_with_cx(&cx, "quote\"slash\\tag")
+            .await
+            .unwrap();
+        assert_eq!(json_escaped.len(), 1);
+        assert_eq!(json_escaped[0].alias, "alpha");
+
+        // BLOB equality preserves embedded NUL bytes instead of inheriting a
+        // text-collation terminator quirk.
+        let embedded_nul = storage
+            .list_pane_bookmarks_by_tag_with_cx(&cx, "nul\0tag")
+            .await
+            .unwrap();
+        assert_eq!(embedded_nul.len(), 1);
+        assert_eq!(embedded_nul[0].alias, "alpha");
 
         // 5. delete_pane_bookmark_with_cx
         let deleted = storage
