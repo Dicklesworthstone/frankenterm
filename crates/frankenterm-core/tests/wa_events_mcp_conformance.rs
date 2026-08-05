@@ -1147,7 +1147,7 @@ fn mcp_conformance_retried_hole_across_large_backlog_preserves_order_and_cursor(
 
 #[test]
 fn mcp_conformance_foreign_hole_outlives_met_mask_until_exact_refetch() {
-    let mut harness = new_harness();
+    let harness = new_harness();
     seed_many_events(
         &harness,
         vec![
@@ -1220,7 +1220,7 @@ fn mcp_conformance_foreign_hole_outlives_met_mask_until_exact_refetch() {
 
 #[test]
 fn mcp_conformance_exact_hole_refetch_does_not_substitute_next_unhandled_row() {
-    let mut harness = new_harness();
+    let harness = new_harness();
     seed_many_events(
         &harness,
         vec![
@@ -1390,7 +1390,7 @@ fn mcp_conformance_storage_paths_are_redacted_from_event_tool_errors() {
 
 #[test]
 fn mcp_conformance_no_cursor_boundary_precedes_delayed_storage_open() {
-    let mut harness = new_harness();
+    let harness = new_harness();
     // Initialize schema and pane metadata before taking the deliberate writer
     // lock. The awaited event itself is inserted while the handler is blocked
     // opening storage.
