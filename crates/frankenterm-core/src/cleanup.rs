@@ -42,15 +42,16 @@ pub enum CleanupTermination {
 /// Result of writing the one maintenance receipt owned by a cleanup attempt.
 #[derive(Debug)]
 pub enum CleanupAuditStatus {
-    /// No row was durably changed and the attempt did not complete normally.
+    /// No cleanup deletion was admitted: the caller was already cancelled or
+    /// the in-progress receipt could not be confirmed open.
     NotRequired,
     Recorded { maintenance_id: i64 },
     Failed {
         error: crate::Error,
-        /// The exact immutable receipt that failed to persist. Runtime
-        /// maintenance retains and retries this record before admitting a new
-        /// age-retention mutation, so the durable deletion prefix cannot lose
-        /// its audit evidence.
+        /// The exact finalization that failed to update the already-durable
+        /// in-progress receipt. Its positive ID targets that same row on retry;
+        /// each committed delete batch has already advanced the row inside its
+        /// transaction, so caller-local response loss cannot erase evidence.
         pending_record: MaintenanceRecord,
     },
 }
@@ -338,7 +339,7 @@ fn cleanup_termination_from_error(error: crate::Error) -> CleanupTermination {
 }
 
 fn append_cleanup_summary(plan: &mut CleanupPlan, summary: CleanupTableSummary) -> crate::Result<()> {
-    plan.total_eligible = plan
+    let total_eligible = plan
         .total_eligible
         .checked_add(summary.eligible_rows)
         .ok_or_else(|| {
@@ -346,7 +347,7 @@ fn append_cleanup_summary(plan: &mut CleanupPlan, summary: CleanupTableSummary) 
                 "cleanup eligible-row aggregate overflow".to_string(),
             )
         })?;
-    plan.total_deleted = plan
+    let total_deleted = plan
         .total_deleted
         .checked_add(summary.deleted_rows)
         .ok_or_else(|| {
@@ -354,30 +355,17 @@ fn append_cleanup_summary(plan: &mut CleanupPlan, summary: CleanupTableSummary) 
                 "cleanup deleted-row aggregate overflow".to_string(),
             )
         })?;
+    plan.total_eligible = total_eligible;
+    plan.total_deleted = total_deleted;
     plan.tables.push(summary);
     Ok(())
 }
 
-async fn finish_cleanup_apply_outcome(
-    storage: &StorageHandle,
-    plan: CleanupPlan,
-    termination: CleanupTermination,
-) -> CleanupApplyOutcome {
-    let completed = matches!(termination, CleanupTermination::Completed);
-    let receipt_required = completed || plan.total_deleted > 0;
-    if !receipt_required {
-        return CleanupApplyOutcome {
-            plan,
-            termination,
-            audit: CleanupAuditStatus::NotRequired,
-        };
-    }
-
-    let attempt_status = match &termination {
-        CleanupTermination::Completed => "completed",
-        CleanupTermination::Cancelled { .. } => "cancelled_partial",
-        CleanupTermination::Failed { .. } => "failed_partial",
-    };
+fn cleanup_receipt_record(
+    maintenance_id: i64,
+    attempt_status: &str,
+    plan: &CleanupPlan,
+) -> MaintenanceRecord {
     // Deliberately omit tier names, filters, cancellation reasons, and error
     // strings. This fixed-shape aggregate is bounded and content-free.
     let metadata = serde_json::json!({
@@ -388,19 +376,50 @@ async fn finish_cleanup_apply_outcome(
         "deleted_rows": plan.total_deleted,
     })
     .to_string();
-    let receipt_cx =
-        crate::cx::Cx::for_request_with_budget(crate::cx::Budget::MINIMAL);
-    let pending_record = MaintenanceRecord {
-        id: 0,
+    MaintenanceRecord {
+        id: maintenance_id,
         event_type: "tiered_cleanup".to_string(),
-        message: Some(format!(
-            "Cleanup {attempt_status}: {} rows deleted across {} recorded tables",
-            plan.total_deleted,
-            plan.tables.len()
-        )),
+        message: Some(if attempt_status == "in_progress" {
+            format!(
+                "Cleanup in progress: {} durable rows deleted",
+                plan.total_deleted
+            )
+        } else {
+            format!(
+                "Cleanup {attempt_status}: {} rows deleted across {} recorded tables",
+                plan.total_deleted,
+                plan.tables.len()
+            )
+        }),
         metadata: Some(metadata),
         timestamp: now_ms(),
+    }
+}
+
+async fn begin_cleanup_apply_receipt(storage: &StorageHandle) -> crate::Result<i64> {
+    let receipt_cx = crate::cx::Cx::for_request_with_budget(crate::cx::Budget::MINIMAL);
+    storage
+        .record_maintenance_with_cx(
+            &receipt_cx,
+            cleanup_receipt_record(0, "in_progress", &CleanupPlan::default()),
+        )
+        .await
+}
+
+async fn finish_cleanup_apply_outcome(
+    storage: &StorageHandle,
+    maintenance_id: i64,
+    plan: CleanupPlan,
+    termination: CleanupTermination,
+) -> CleanupApplyOutcome {
+    let attempt_status = match &termination {
+        CleanupTermination::Completed => "completed",
+        CleanupTermination::Cancelled { .. } => "cancelled_partial",
+        CleanupTermination::Failed { .. } => "failed_partial",
     };
+    let receipt_cx =
+        crate::cx::Cx::for_request_with_budget(crate::cx::Budget::MINIMAL);
+    let pending_record = cleanup_receipt_record(maintenance_id, attempt_status, &plan);
     let receipt = storage
         .record_maintenance_with_cx(&receipt_cx, pending_record.clone())
         .await;
@@ -644,10 +663,10 @@ pub async fn cleanup_apply(
 ///     (bounded by the next checkpoint at each `if
 ///     config.retention_days > 0 { ... }` block).
 ///
-/// The typed internal outcome records one fixed-shape maintenance receipt for
-/// every completed attempt and every interrupted attempt with a durable
-/// prefix. The receipt uses a fresh bounded Cx, and receipt failure remains
-/// distinct from cleanup completion/cancellation instead of being discarded.
+/// The typed internal outcome opens one fixed-shape maintenance receipt before
+/// mutation, advances its durable-prefix count inside every delete transaction,
+/// and finalizes the same row. Receipt failure therefore fails closed before a
+/// delete or leaves an exact in-progress ledger for retry/recovery.
 ///
 /// Identical scan + delete logic to [`cleanup_apply`] for
 /// uncancelled cx.
@@ -682,24 +701,32 @@ pub(crate) async fn cleanup_apply_with_compiled_retention_with_cx(
         .checkpoint()
         .map_err(|err| cleanup_cancelled("cleanup_apply", err))
     {
-        return finish_cleanup_apply_outcome(
-            storage,
-            CleanupPlan {
+        return CleanupApplyOutcome {
+            plan: CleanupPlan {
                 dry_run: false,
                 ..Default::default()
             },
-            cleanup_termination_from_error(error),
-        )
-        .await;
+            termination: cleanup_termination_from_error(error),
+            audit: CleanupAuditStatus::NotRequired,
+        };
     }
-
-    let now = now_ms();
-    let global_cutoff_ms = retention_cutoff_ms(now, retention_days);
 
     let mut plan = CleanupPlan {
         dry_run: false,
         ..Default::default()
     };
+    let maintenance_id = match begin_cleanup_apply_receipt(storage).await {
+        Ok(maintenance_id) => maintenance_id,
+        Err(error) => {
+            return CleanupApplyOutcome {
+                plan,
+                termination: cleanup_termination_from_error(error),
+                audit: CleanupAuditStatus::NotRequired,
+            };
+        }
+    };
+    let now = now_ms();
+    let global_cutoff_ms = retention_cutoff_ms(now, retention_days);
 
     // ft-xbnl0.2.3 tick 132: route through cx-first helpers + storage.
     let events_step = apply_events_by_tier_progress_with_cx(
@@ -708,6 +735,7 @@ pub(crate) async fn cleanup_apply_with_compiled_retention_with_cx(
         retention_days,
         retention_policy,
         now,
+        maintenance_id,
     )
     .await;
     let (events_summaries, events_error) = match events_step {
@@ -718,6 +746,7 @@ pub(crate) async fn cleanup_apply_with_compiled_retention_with_cx(
         if let Err(error) = append_cleanup_summary(&mut plan, summary) {
             return finish_cleanup_apply_outcome(
                 storage,
+                maintenance_id,
                 plan,
                 cleanup_termination_from_error(error),
             )
@@ -727,6 +756,7 @@ pub(crate) async fn cleanup_apply_with_compiled_retention_with_cx(
     if let Some(error) = events_error {
         return finish_cleanup_apply_outcome(
             storage,
+            maintenance_id,
             plan,
             cleanup_termination_from_error(error),
         )
@@ -740,6 +770,7 @@ pub(crate) async fn cleanup_apply_with_compiled_retention_with_cx(
         {
             return finish_cleanup_apply_outcome(
                 storage,
+                maintenance_id,
                 plan,
                 cleanup_termination_from_error(error),
             )
@@ -753,6 +784,7 @@ pub(crate) async fn cleanup_apply_with_compiled_retention_with_cx(
             Err(error) => {
                 return finish_cleanup_apply_outcome(
                     storage,
+                    maintenance_id,
                     plan,
                     cleanup_termination_from_error(error),
                 )
@@ -760,7 +792,11 @@ pub(crate) async fn cleanup_apply_with_compiled_retention_with_cx(
             }
         };
         let progress = storage
-            .prune_segments_before_progress_with_cx(cx, global_cutoff_ms)
+            .prune_segments_before_progress_with_cx(
+                cx,
+                global_cutoff_ms,
+                Some(maintenance_id),
+            )
             .await;
         let (deleted, error) = durable_delete_step(progress);
         if let Err(aggregate_error) = append_cleanup_summary(&mut plan, CleanupTableSummary {
@@ -771,6 +807,7 @@ pub(crate) async fn cleanup_apply_with_compiled_retention_with_cx(
         }) {
             return finish_cleanup_apply_outcome(
                 storage,
+                maintenance_id,
                 plan,
                 cleanup_termination_from_error(aggregate_error),
             )
@@ -779,6 +816,7 @@ pub(crate) async fn cleanup_apply_with_compiled_retention_with_cx(
         if let Some(error) = error {
             return finish_cleanup_apply_outcome(
                 storage,
+                maintenance_id,
                 plan,
                 cleanup_termination_from_error(error),
             )
@@ -793,6 +831,7 @@ pub(crate) async fn cleanup_apply_with_compiled_retention_with_cx(
         {
             return finish_cleanup_apply_outcome(
                 storage,
+                maintenance_id,
                 plan,
                 cleanup_termination_from_error(error),
             )
@@ -806,6 +845,7 @@ pub(crate) async fn cleanup_apply_with_compiled_retention_with_cx(
             Err(error) => {
                 return finish_cleanup_apply_outcome(
                     storage,
+                    maintenance_id,
                     plan,
                     cleanup_termination_from_error(error),
                 )
@@ -813,7 +853,11 @@ pub(crate) async fn cleanup_apply_with_compiled_retention_with_cx(
             }
         };
         let progress = storage
-            .purge_audit_actions_before_progress_with_cx(cx, global_cutoff_ms)
+            .purge_audit_actions_before_progress_with_cx(
+                cx,
+                global_cutoff_ms,
+                Some(maintenance_id),
+            )
             .await;
         let (deleted, error) = durable_delete_step(progress);
         if let Err(aggregate_error) = append_cleanup_summary(&mut plan, CleanupTableSummary {
@@ -824,6 +868,7 @@ pub(crate) async fn cleanup_apply_with_compiled_retention_with_cx(
         }) {
             return finish_cleanup_apply_outcome(
                 storage,
+                maintenance_id,
                 plan,
                 cleanup_termination_from_error(aggregate_error),
             )
@@ -832,6 +877,7 @@ pub(crate) async fn cleanup_apply_with_compiled_retention_with_cx(
         if let Some(error) = error {
             return finish_cleanup_apply_outcome(
                 storage,
+                maintenance_id,
                 plan,
                 cleanup_termination_from_error(error),
             )
@@ -846,6 +892,7 @@ pub(crate) async fn cleanup_apply_with_compiled_retention_with_cx(
         {
             return finish_cleanup_apply_outcome(
                 storage,
+                maintenance_id,
                 plan,
                 cleanup_termination_from_error(error),
             )
@@ -859,6 +906,7 @@ pub(crate) async fn cleanup_apply_with_compiled_retention_with_cx(
             Err(error) => {
                 return finish_cleanup_apply_outcome(
                     storage,
+                    maintenance_id,
                     plan,
                     cleanup_termination_from_error(error),
                 )
@@ -866,7 +914,11 @@ pub(crate) async fn cleanup_apply_with_compiled_retention_with_cx(
             }
         };
         let progress = storage
-            .purge_usage_metrics_progress_with_cx(cx, global_cutoff_ms)
+            .purge_usage_metrics_progress_with_cx(
+                cx,
+                global_cutoff_ms,
+                Some(maintenance_id),
+            )
             .await;
         let (deleted, error) = durable_delete_step(progress);
         if let Err(aggregate_error) = append_cleanup_summary(&mut plan, CleanupTableSummary {
@@ -877,6 +929,7 @@ pub(crate) async fn cleanup_apply_with_compiled_retention_with_cx(
         }) {
             return finish_cleanup_apply_outcome(
                 storage,
+                maintenance_id,
                 plan,
                 cleanup_termination_from_error(aggregate_error),
             )
@@ -885,6 +938,7 @@ pub(crate) async fn cleanup_apply_with_compiled_retention_with_cx(
         if let Some(error) = error {
             return finish_cleanup_apply_outcome(
                 storage,
+                maintenance_id,
                 plan,
                 cleanup_termination_from_error(error),
             )
@@ -899,6 +953,7 @@ pub(crate) async fn cleanup_apply_with_compiled_retention_with_cx(
         {
             return finish_cleanup_apply_outcome(
                 storage,
+                maintenance_id,
                 plan,
                 cleanup_termination_from_error(error),
             )
@@ -912,6 +967,7 @@ pub(crate) async fn cleanup_apply_with_compiled_retention_with_cx(
             Err(error) => {
                 return finish_cleanup_apply_outcome(
                     storage,
+                    maintenance_id,
                     plan,
                     cleanup_termination_from_error(error),
                 )
@@ -919,7 +975,11 @@ pub(crate) async fn cleanup_apply_with_compiled_retention_with_cx(
             }
         };
         let progress = storage
-            .purge_notification_history_progress_with_cx(cx, global_cutoff_ms)
+            .purge_notification_history_progress_with_cx(
+                cx,
+                global_cutoff_ms,
+                Some(maintenance_id),
+            )
             .await;
         let (deleted, error) = durable_delete_step(progress);
         if let Err(aggregate_error) = append_cleanup_summary(&mut plan, CleanupTableSummary {
@@ -930,6 +990,7 @@ pub(crate) async fn cleanup_apply_with_compiled_retention_with_cx(
         }) {
             return finish_cleanup_apply_outcome(
                 storage,
+                maintenance_id,
                 plan,
                 cleanup_termination_from_error(aggregate_error),
             )
@@ -938,6 +999,7 @@ pub(crate) async fn cleanup_apply_with_compiled_retention_with_cx(
         if let Some(error) = error {
             return finish_cleanup_apply_outcome(
                 storage,
+                maintenance_id,
                 plan,
                 cleanup_termination_from_error(error),
             )
@@ -951,6 +1013,7 @@ pub(crate) async fn cleanup_apply_with_compiled_retention_with_cx(
         }) {
             return finish_cleanup_apply_outcome(
                 storage,
+                maintenance_id,
                 plan,
                 cleanup_termination_from_error(error),
             )
@@ -964,6 +1027,7 @@ pub(crate) async fn cleanup_apply_with_compiled_retention_with_cx(
             Err(error) => {
                 return finish_cleanup_apply_outcome(
                     storage,
+                    maintenance_id,
                     plan,
                     cleanup_termination_from_error(error),
                 )
@@ -971,7 +1035,11 @@ pub(crate) async fn cleanup_apply_with_compiled_retention_with_cx(
             }
         };
         let progress = storage
-            .purge_operational_maintenance_before_progress_with_cx(cx, global_cutoff_ms)
+            .purge_operational_maintenance_before_progress_with_cx(
+                cx,
+                global_cutoff_ms,
+                Some(maintenance_id),
+            )
             .await;
         let (deleted, error) = durable_delete_step(progress);
         if let Err(aggregate_error) = append_cleanup_summary(&mut plan, CleanupTableSummary {
@@ -982,6 +1050,7 @@ pub(crate) async fn cleanup_apply_with_compiled_retention_with_cx(
         }) {
             return finish_cleanup_apply_outcome(
                 storage,
+                maintenance_id,
                 plan,
                 cleanup_termination_from_error(aggregate_error),
             )
@@ -990,6 +1059,7 @@ pub(crate) async fn cleanup_apply_with_compiled_retention_with_cx(
         if let Some(error) = error {
             return finish_cleanup_apply_outcome(
                 storage,
+                maintenance_id,
                 plan,
                 cleanup_termination_from_error(error),
             )
@@ -997,7 +1067,13 @@ pub(crate) async fn cleanup_apply_with_compiled_retention_with_cx(
         }
     }
 
-    finish_cleanup_apply_outcome(storage, plan, CleanupTermination::Completed).await
+    finish_cleanup_apply_outcome(
+        storage,
+        maintenance_id,
+        plan,
+        CleanupTermination::Completed,
+    )
+    .await
 }
 
 fn compiled_retention_cutoffs(
@@ -1075,6 +1151,29 @@ fn event_cleanup_summaries(
     Ok(summaries)
 }
 
+/// Preserve committed event-deletion accounting when per-branch shapes cannot
+/// be reconciled. The original classification error is still returned to stop
+/// the cleanup pass, while this content-free aggregate keeps the durable prefix
+/// visible to the attempt receipt.
+fn fallback_event_cleanup_summary(
+    fallback_retention_days: u32,
+    eligible_by_branch: &[usize],
+    deleted_by_branch: &[usize],
+) -> CleanupTableSummary {
+    CleanupTableSummary {
+        table: "events (aggregate fallback)".to_string(),
+        eligible_rows: eligible_by_branch
+            .iter()
+            .copied()
+            .fold(0usize, usize::saturating_add),
+        deleted_rows: deleted_by_branch
+            .iter()
+            .copied()
+            .fold(0usize, usize::saturating_add),
+        retention_days: fallback_retention_days,
+    }
+}
+
 /// Preview events eligible for cleanup, grouped by retention tier.
 async fn preview_events_by_tier(
     storage: &StorageHandle,
@@ -1126,6 +1225,7 @@ async fn apply_events_by_tier_progress_with_cx(
     retention_days: u32,
     retention_policy: std::sync::Arc<CompiledRetentionPolicy>,
     now: i64,
+    maintenance_id: i64,
 ) -> CleanupStep<Vec<CleanupTableSummary>> {
     let cutoffs = compiled_retention_cutoffs(&retention_policy, now, retention_days);
     let eligible = match storage
@@ -1150,6 +1250,7 @@ async fn apply_events_by_tier_progress_with_cx(
             std::sync::Arc::clone(&retention_policy),
             cutoffs,
             DELETE_BATCH_SIZE,
+            Some(maintenance_id),
         )
         .await;
     let (deleted, error) = match progress {
@@ -1168,7 +1269,11 @@ async fn apply_events_by_tier_progress_with_cx(
         Ok(summaries) => summaries,
         Err(error) => {
             return CleanupStep::Interrupted {
-                durable: Vec::new(),
+                durable: vec![fallback_event_cleanup_summary(
+                    retention_days,
+                    &eligible,
+                    &deleted,
+                )],
                 error,
             };
         }
@@ -1300,6 +1405,36 @@ mod tests {
         assert!(json.contains("\"total_eligible\": 210"));
         assert!(json.contains("\"total_deleted\": 210"));
         assert!(json.contains("\"dry_run\": false"));
+    }
+
+    #[test]
+    fn append_cleanup_summary_is_atomic_on_aggregate_overflow() {
+        let mut plan = CleanupPlan {
+            total_eligible: 7,
+            total_deleted: usize::MAX,
+            ..Default::default()
+        };
+        let result = append_cleanup_summary(&mut plan, CleanupTableSummary {
+            table: "events".to_string(),
+            eligible_rows: 1,
+            deleted_rows: 1,
+            retention_days: 30,
+        });
+
+        assert!(result.is_err());
+        assert_eq!(plan.total_eligible, 7);
+        assert_eq!(plan.total_deleted, usize::MAX);
+        assert!(plan.tables.is_empty());
+    }
+
+    #[test]
+    fn event_accounting_fallback_preserves_committed_aggregate() {
+        let summary = fallback_event_cleanup_summary(30, &[5, 7], &[2, 3, 4]);
+
+        assert_eq!(summary.table, "events (aggregate fallback)");
+        assert_eq!(summary.eligible_rows, 12);
+        assert_eq!(summary.deleted_rows, 9);
+        assert_eq!(summary.retention_days, 30);
     }
 
     fn swarm_janitor_candidate(
@@ -1954,7 +2089,7 @@ mod tests {
     }
 
     #[test]
-    fn cleanup_receipt_failure_is_distinct_from_completed_durable_cleanup() {
+    fn cleanup_finalization_failure_preserves_transactional_durable_ledger() {
         run_async_test(async {
             let (storage, db_path) = setup_storage("receipt_failure_distinct").await;
             storage
@@ -1966,8 +2101,9 @@ mod tests {
             connection
                 .execute_batch(
                     "CREATE TRIGGER fail_tiered_cleanup_receipt
-                     BEFORE INSERT ON maintenance_log
+                     BEFORE UPDATE ON maintenance_log
                      WHEN NEW.event_type = 'tiered_cleanup'
+                       AND instr(NEW.metadata, '\"attempt_status\":\"completed\"') > 0
                      BEGIN
                          SELECT RAISE(ABORT, 'injected receipt failure');
                      END;",
@@ -1989,6 +2125,19 @@ mod tests {
             assert_eq!(outcome.plan.total_deleted, 1);
             assert_eq!(storage.count_events_before(i64::MAX).await.unwrap(), 0);
 
+            let open_metadata: String = connection
+                .query_row(
+                    "SELECT metadata FROM maintenance_log
+                     WHERE event_type = 'tiered_cleanup'",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("read transactionally advanced cleanup ledger");
+            let open_metadata: serde_json::Value = serde_json::from_str(&open_metadata)
+                .expect("parse transactionally advanced cleanup ledger");
+            assert_eq!(open_metadata["attempt_status"], "in_progress");
+            assert_eq!(open_metadata["deleted_rows"], 1);
+
             let pending_record = match outcome.audit {
                 CleanupAuditStatus::Failed { pending_record, .. } => pending_record,
                 other => panic!("expected a retryable failed receipt, got {other:?}"),
@@ -2003,14 +2152,29 @@ mod tests {
             assert_eq!(metadata["attempt_status"], "completed");
             assert_eq!(metadata["deleted_rows"], 1);
             assert_eq!(metadata["eligible_rows"], 1);
+            assert!(pending_record.id > 0, "retry must update the open receipt row");
 
             connection
                 .execute_batch("DROP TRIGGER fail_tiered_cleanup_receipt")
                 .expect("remove injected receipt failure");
-            storage
-                .record_maintenance(pending_record)
+            let idempotent_retry = pending_record.clone();
+            let mut undercounted_retry = pending_record;
+            let mut undercounted_metadata = metadata.clone();
+            undercounted_metadata
+                .as_object_mut()
+                .expect("pending receipt metadata object")
+                .insert("deleted_rows".to_string(), serde_json::Value::from(0));
+            undercounted_retry.metadata = Some(undercounted_metadata.to_string());
+            let finalized_id = storage
+                .record_maintenance(undercounted_retry)
                 .await
-                .expect("the exact retained receipt must be retryable");
+                .expect("the durable ledger must repair a caller-local undercount");
+            assert_eq!(finalized_id, idempotent_retry.id);
+            let repeated_id = storage
+                .record_maintenance(idempotent_retry)
+                .await
+                .expect("a lost finalization response must be safely retryable");
+            assert_eq!(repeated_id, finalized_id);
             let persisted_metadata: String = connection
                 .query_row(
                     "SELECT metadata FROM maintenance_log WHERE event_type = 'tiered_cleanup'",
@@ -2024,7 +2188,135 @@ mod tests {
                 metadata,
                 "retry must preserve the exact durable-prefix accounting"
             );
+            let receipt_count: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM maintenance_log
+                     WHERE event_type = 'tiered_cleanup'",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("count idempotently finalized receipts");
+            assert_eq!(receipt_count, 1);
 
+            teardown(storage, &db_path).await;
+        });
+    }
+
+    #[test]
+    fn cleanup_fails_closed_before_delete_when_receipt_cannot_open() {
+        run_async_test(async {
+            let (storage, db_path) = setup_storage("receipt_open_failure").await;
+            storage
+                .record_event(make_event(1, "info", "receipt-open-failure"))
+                .await
+                .unwrap();
+            let connection = rusqlite::Connection::open(&db_path)
+                .expect("open cleanup receipt-open-failure fixture");
+            connection
+                .execute_batch(
+                    "CREATE TRIGGER fail_tiered_cleanup_receipt_open
+                     BEFORE INSERT ON maintenance_log
+                     WHEN NEW.event_type = 'tiered_cleanup'
+                     BEGIN
+                         SELECT RAISE(ABORT, 'injected receipt open failure');
+                     END;",
+                )
+                .expect("install receipt open-failure trigger");
+            let config = StorageConfig {
+                retention_days: 1,
+                retention_tiers: Vec::new(),
+                ..StorageConfig::default()
+            };
+
+            let outcome = cleanup_apply_with_compiled_retention_with_cx(
+                &crate::cx::for_testing(),
+                &storage,
+                config.retention_days,
+                config.compile_retention_policy().unwrap(),
+            )
+            .await;
+
+            assert!(matches!(outcome.termination, CleanupTermination::Failed { .. }));
+            assert!(matches!(outcome.audit, CleanupAuditStatus::NotRequired));
+            assert_eq!(outcome.plan.total_deleted, 0);
+            assert_eq!(storage.count_events_before(i64::MAX).await.unwrap(), 1);
+            let receipt_rows: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM maintenance_log
+                     WHERE event_type = 'tiered_cleanup'",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("count failed-open cleanup receipts");
+            assert_eq!(receipt_rows, 0);
+
+            connection
+                .execute_batch("DROP TRIGGER fail_tiered_cleanup_receipt_open")
+                .expect("remove receipt open-failure trigger");
+            teardown(storage, &db_path).await;
+        });
+    }
+
+    #[test]
+    fn cleanup_rolls_back_delete_when_durable_ledger_cannot_advance() {
+        run_async_test(async {
+            let (storage, db_path) = setup_storage("receipt_advance_failure").await;
+            storage
+                .record_event(make_event(1, "info", "receipt-advance-failure"))
+                .await
+                .unwrap();
+            let connection = rusqlite::Connection::open(&db_path)
+                .expect("open cleanup receipt-advance-failure fixture");
+            connection
+                .execute_batch(
+                    "CREATE TRIGGER fail_tiered_cleanup_receipt_advance
+                     BEFORE UPDATE ON maintenance_log
+                     WHEN NEW.event_type = 'tiered_cleanup'
+                       AND instr(NEW.metadata, '\"attempt_status\":\"in_progress\"') > 0
+                       AND json_extract(NEW.metadata, '$.deleted_rows') > 0
+                     BEGIN
+                         SELECT RAISE(ABORT, 'injected receipt advance failure');
+                     END;",
+                )
+                .expect("install receipt advance-failure trigger");
+            let config = StorageConfig {
+                retention_days: 1,
+                retention_tiers: Vec::new(),
+                ..StorageConfig::default()
+            };
+
+            let outcome = cleanup_apply_with_compiled_retention_with_cx(
+                &crate::cx::for_testing(),
+                &storage,
+                config.retention_days,
+                config.compile_retention_policy().unwrap(),
+            )
+            .await;
+
+            assert!(matches!(outcome.termination, CleanupTermination::Failed { .. }));
+            assert!(matches!(outcome.audit, CleanupAuditStatus::Recorded { .. }));
+            assert_eq!(outcome.plan.total_deleted, 0);
+            assert_eq!(
+                storage.count_events_before(i64::MAX).await.unwrap(),
+                1,
+                "the event delete must roll back with its failed receipt advance"
+            );
+            let metadata: String = connection
+                .query_row(
+                    "SELECT metadata FROM maintenance_log
+                     WHERE event_type = 'tiered_cleanup'",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("read failed cleanup receipt");
+            let metadata: serde_json::Value =
+                serde_json::from_str(&metadata).expect("parse failed cleanup receipt");
+            assert_eq!(metadata["attempt_status"], "failed_partial");
+            assert_eq!(metadata["deleted_rows"], 0);
+
+            connection
+                .execute_batch("DROP TRIGGER fail_tiered_cleanup_receipt_advance")
+                .expect("remove receipt advance-failure trigger");
             teardown(storage, &db_path).await;
         });
     }

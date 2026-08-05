@@ -1030,6 +1030,7 @@ enum WriteCommand {
     PurgeAuditActions {
         before_ts: i64,
         batch_size: usize,
+        cleanup_receipt_id: Option<i64>,
         respond: oneshot::Sender<Result<usize>>,
     },
     /// Insert an approval token
@@ -1058,7 +1059,8 @@ enum WriteCommand {
         workspace_id: String,
         respond: oneshot::Sender<Result<Option<ApprovalTokenRecord>>>,
     },
-    /// Record a maintenance event
+    /// Record a maintenance event. `id == 0` inserts a new row; a positive ID
+    /// idempotently finalizes the matching open tiered-cleanup receipt.
     RecordMaintenance {
         record: MaintenanceRecord,
         respond: oneshot::Sender<Result<i64>>,
@@ -1068,6 +1070,7 @@ enum WriteCommand {
     PurgeOperationalMaintenance {
         before_ts: i64,
         batch_size: usize,
+        cleanup_receipt_id: Option<i64>,
         respond: oneshot::Sender<Result<usize>>,
     },
     /// Record a secret scan report
@@ -1114,6 +1117,7 @@ enum WriteCommand {
     PruneSegments {
         before_ts: i64,
         batch_size: usize,
+        cleanup_receipt_id: Option<i64>,
         respond: oneshot::Sender<Result<usize>>,
     },
     /// Enforce a size-based retention cap (`storage.retention_max_mb`) by
@@ -1189,6 +1193,7 @@ enum WriteCommand {
     PurgeUsageMetrics {
         before_ts: i64,
         batch_size: usize,
+        cleanup_receipt_id: Option<i64>,
         respond: oneshot::Sender<Result<usize>>,
     },
     /// Record a notification in the history log
@@ -1219,6 +1224,7 @@ enum WriteCommand {
     PurgeNotificationHistory {
         before_ts: i64,
         batch_size: usize,
+        cleanup_receipt_id: Option<i64>,
         respond: oneshot::Sender<Result<usize>>,
     },
     /// Delete events older than a cutoff (flat, no tier filters)
@@ -1242,6 +1248,7 @@ enum WriteCommand {
         policy: Arc<CompiledRetentionPolicy>,
         cutoffs: Arc<[Option<i64>]>,
         batch_size: usize,
+        cleanup_receipt_id: Option<i64>,
         respond: oneshot::Sender<Result<CompiledRetentionDeleteBatch>>,
     },
     /// Insert a pane bookmark
@@ -3803,16 +3810,19 @@ impl StorageHandle {
         &self,
         cx: &crate::cx::Cx,
         before_ts: i64,
+        cleanup_receipt_id: Option<i64>,
     ) -> DurableMutationProgress<usize> {
         self.purge_auxiliary_history_progress_with_cx(
             cx,
             before_ts,
             AuxiliaryRetentionTable::AuditActions,
+            cleanup_receipt_id,
         )
         .await
     }
 
-    /// Record a maintenance event
+    /// Record a maintenance event. `id == 0` inserts; a positive ID
+    /// idempotently finalizes that open tiered-cleanup receipt.
     pub async fn record_maintenance(&self, record: MaintenanceRecord) -> Result<i64> {
         let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
         self.record_maintenance_with_cx(&cx, record).await
@@ -3875,11 +3885,13 @@ impl StorageHandle {
         &self,
         cx: &crate::cx::Cx,
         before_ts: i64,
+        cleanup_receipt_id: Option<i64>,
     ) -> DurableMutationProgress<usize> {
         self.purge_auxiliary_history_progress_with_cx(
             cx,
             before_ts,
             AuxiliaryRetentionTable::OperationalMaintenance,
+            cleanup_receipt_id,
         )
         .await
     }
@@ -4415,7 +4427,7 @@ impl StorageHandle {
         cx: &crate::cx::Cx,
         before_ts: i64,
     ) -> Result<usize> {
-        self.prune_segments_before_progress_with_cx(cx, before_ts)
+        self.prune_segments_before_progress_with_cx(cx, before_ts, None)
             .await
             .into_legacy_result()
     }
@@ -4425,6 +4437,7 @@ impl StorageHandle {
         &self,
         cx: &crate::cx::Cx,
         before_ts: i64,
+        cleanup_receipt_id: Option<i64>,
     ) -> DurableMutationProgress<usize> {
         let mut total_deleted = 0usize;
         loop {
@@ -4442,6 +4455,7 @@ impl StorageHandle {
                     WriteCommand::PruneSegments {
                         before_ts,
                         batch_size: SEGMENT_RETENTION_DELETE_BATCH_MAX,
+                        cleanup_receipt_id,
                         respond: tx,
                     },
                 )
@@ -4737,11 +4751,13 @@ impl StorageHandle {
         &self,
         cx: &crate::cx::Cx,
         before_ts: i64,
+        cleanup_receipt_id: Option<i64>,
     ) -> DurableMutationProgress<usize> {
         self.purge_auxiliary_history_progress_with_cx(
             cx,
             before_ts,
             AuxiliaryRetentionTable::UsageMetrics,
+            cleanup_receipt_id,
         )
         .await
     }
@@ -4980,11 +4996,13 @@ impl StorageHandle {
         &self,
         cx: &crate::cx::Cx,
         before_ts: i64,
+        cleanup_receipt_id: Option<i64>,
     ) -> DurableMutationProgress<usize> {
         self.purge_auxiliary_history_progress_with_cx(
             cx,
             before_ts,
             AuxiliaryRetentionTable::NotificationHistory,
+            cleanup_receipt_id,
         )
         .await
     }
@@ -4995,7 +5013,7 @@ impl StorageHandle {
         before_ts: i64,
         table: AuxiliaryRetentionTable,
     ) -> Result<usize> {
-        self.purge_auxiliary_history_progress_with_cx(cx, before_ts, table)
+        self.purge_auxiliary_history_progress_with_cx(cx, before_ts, table, None)
             .await
             .into_legacy_result()
     }
@@ -5005,6 +5023,7 @@ impl StorageHandle {
         cx: &crate::cx::Cx,
         before_ts: i64,
         table: AuxiliaryRetentionTable,
+        cleanup_receipt_id: Option<i64>,
     ) -> DurableMutationProgress<usize> {
         let operation = table.operation();
         let mut total_deleted = 0usize;
@@ -5020,17 +5039,20 @@ impl StorageHandle {
                 AuxiliaryRetentionTable::AuditActions => WriteCommand::PurgeAuditActions {
                     before_ts,
                     batch_size: AUXILIARY_RETENTION_DELETE_BATCH_MAX,
+                    cleanup_receipt_id,
                     respond: tx,
                 },
                 AuxiliaryRetentionTable::UsageMetrics => WriteCommand::PurgeUsageMetrics {
                     before_ts,
                     batch_size: AUXILIARY_RETENTION_DELETE_BATCH_MAX,
+                    cleanup_receipt_id,
                     respond: tx,
                 },
                 AuxiliaryRetentionTable::NotificationHistory => {
                     WriteCommand::PurgeNotificationHistory {
                         before_ts,
                         batch_size: AUXILIARY_RETENTION_DELETE_BATCH_MAX,
+                        cleanup_receipt_id,
                         respond: tx,
                     }
                 }
@@ -5038,6 +5060,7 @@ impl StorageHandle {
                     WriteCommand::PurgeOperationalMaintenance {
                         before_ts,
                         batch_size: AUXILIARY_RETENTION_DELETE_BATCH_MAX,
+                        cleanup_receipt_id,
                         respond: tx,
                     }
                 }
@@ -5706,6 +5729,7 @@ impl StorageHandle {
         policy: Arc<CompiledRetentionPolicy>,
         cutoffs: Arc<[Option<i64>]>,
         batch_size: usize,
+        cleanup_receipt_id: Option<i64>,
     ) -> DurableMutationProgress<Vec<usize>> {
         if let Err(error) = validate_compiled_retention_cutoffs(&policy, &cutoffs) {
             return DurableMutationProgress::Interrupted {
@@ -5738,6 +5762,7 @@ impl StorageHandle {
                         policy: Arc::clone(&policy),
                         cutoffs: Arc::clone(&cutoffs),
                         batch_size,
+                        cleanup_receipt_id,
                         respond: tx,
                     },
                 )
@@ -14032,13 +14057,18 @@ fn dispatch_write_command_raw(
         WriteCommand::PurgeAuditActions {
             before_ts,
             batch_size,
+            cleanup_receipt_id,
             respond,
         } => {
             let respond = WriterResultResponder::new(respond);
             // br-ft-l1jgo: routes through the writer backend trait surface.
             // Replaces the legacy
             // purge_audit_actions direct-rusqlite path.
-            let result = purge_audit_actions_backend(backend, before_ts, batch_size);
+            let result = run_auxiliary_cleanup_receipt_transaction_backend(
+                backend,
+                cleanup_receipt_id,
+                || purge_audit_actions_backend(backend, before_ts, batch_size),
+            );
             respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::InsertApprovalToken { token, respond } => {
@@ -14091,10 +14121,15 @@ fn dispatch_write_command_raw(
         WriteCommand::PurgeOperationalMaintenance {
             before_ts,
             batch_size,
+            cleanup_receipt_id,
             respond,
         } => {
             let respond = WriterResultResponder::new(respond);
-            let result = purge_operational_maintenance_backend(backend, before_ts, batch_size);
+            let result = run_auxiliary_cleanup_receipt_transaction_backend(
+                backend,
+                cleanup_receipt_id,
+                || purge_operational_maintenance_backend(backend, before_ts, batch_size),
+            );
             respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::RecordSecretScanReport { record, respond } => {
@@ -14153,10 +14188,16 @@ fn dispatch_write_command_raw(
         WriteCommand::PruneSegments {
             before_ts,
             batch_size,
+            cleanup_receipt_id,
             respond,
         } => {
             let respond = WriterResultResponder::new(respond);
-            let result = prune_segments_backend(backend, before_ts, batch_size);
+            let result = prune_segments_with_cleanup_receipt_backend(
+                backend,
+                before_ts,
+                batch_size,
+                cleanup_receipt_id,
+            );
             respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::EnforceSizeLimit { max_mb, respond } => {
@@ -14254,10 +14295,15 @@ fn dispatch_write_command_raw(
         WriteCommand::PurgeUsageMetrics {
             before_ts,
             batch_size,
+            cleanup_receipt_id,
             respond,
         } => {
             let respond = WriterResultResponder::new(respond);
-            let result = purge_usage_metrics_backend(backend, before_ts, batch_size);
+            let result = run_auxiliary_cleanup_receipt_transaction_backend(
+                backend,
+                cleanup_receipt_id,
+                || purge_usage_metrics_backend(backend, before_ts, batch_size),
+            );
             respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::RecordNotification { record, respond } => {
@@ -14299,10 +14345,15 @@ fn dispatch_write_command_raw(
         WriteCommand::PurgeNotificationHistory {
             before_ts,
             batch_size,
+            cleanup_receipt_id,
             respond,
         } => {
             let respond = WriterResultResponder::new(respond);
-            let result = purge_notification_history_backend(backend, before_ts, batch_size);
+            let result = run_auxiliary_cleanup_receipt_transaction_backend(
+                backend,
+                cleanup_receipt_id,
+                || purge_notification_history_backend(backend, before_ts, batch_size),
+            );
             respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::DeleteEventsBefore {
@@ -14335,14 +14386,16 @@ fn dispatch_write_command_raw(
             policy,
             cutoffs,
             batch_size,
+            cleanup_receipt_id,
             respond,
         } => {
             let respond = WriterResultResponder::new(respond);
-            let result = delete_events_by_compiled_retention_policy_backend(
+            let result = delete_events_by_compiled_retention_policy_with_cleanup_receipt_backend(
                 backend,
                 &policy,
                 &cutoffs,
                 batch_size,
+                cleanup_receipt_id,
             );
             respond_oneshot_best_effort(respond, result);
         }
@@ -18007,6 +18060,176 @@ fn mark_action_undone_backend(
     Ok(changed.is_some())
 }
 
+const TIERED_CLEANUP_RECEIPT_SCHEMA: &str = "tiered_cleanup_receipt.v1";
+
+fn parse_tiered_cleanup_receipt_metadata(metadata: &str) -> Result<serde_json::Value> {
+    let value: serde_json::Value = serde_json::from_str(metadata).map_err(|_| {
+        StorageError::Database("tiered cleanup receipt metadata is not valid JSON".to_string())
+    })?;
+    let object = value.as_object().ok_or_else(|| {
+        StorageError::Database("tiered cleanup receipt metadata is not an object".to_string())
+    })?;
+    let expected_keys = [
+        "schema",
+        "attempt_status",
+        "tables_recorded",
+        "eligible_rows",
+        "deleted_rows",
+    ];
+    if object.len() != expected_keys.len()
+        || expected_keys.iter().any(|key| !object.contains_key(*key))
+        || object.get("schema").and_then(serde_json::Value::as_str)
+            != Some(TIERED_CLEANUP_RECEIPT_SCHEMA)
+        || ["tables_recorded", "eligible_rows", "deleted_rows"]
+            .iter()
+            .any(|key| object.get(*key).and_then(serde_json::Value::as_u64).is_none())
+    {
+        return Err(StorageError::Database(
+            "tiered cleanup receipt metadata has an invalid fixed shape".to_string(),
+        )
+        .into());
+    }
+    Ok(value)
+}
+
+fn tiered_cleanup_receipt_status(metadata: &serde_json::Value) -> Result<&str> {
+    metadata
+        .get("attempt_status")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            StorageError::Database(
+                "tiered cleanup receipt attempt status is invalid".to_string(),
+            )
+            .into()
+        })
+}
+
+fn tiered_cleanup_receipt_count(metadata: &serde_json::Value, field: &str) -> Result<u64> {
+    metadata
+        .get(field)
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| {
+            StorageError::Database(format!(
+                "tiered cleanup receipt {field} is invalid"
+            ))
+            .into()
+        })
+}
+
+/// Advance the authoritative durable-prefix count while the caller's delete
+/// transaction is still open. Any receipt failure therefore rolls back the
+/// corresponding deletion instead of creating an unaudited crash window.
+fn advance_tiered_cleanup_receipt_backend(
+    backend: &dyn StorageBackend,
+    maintenance_id: i64,
+    deleted_delta: usize,
+) -> Result<()> {
+    if maintenance_id <= 0 {
+        return Err(StorageError::Database(
+            "tiered cleanup receipt id must be positive".to_string(),
+        )
+        .into());
+    }
+    let row = backend
+        .query_row_typed(
+            "SELECT metadata FROM maintenance_log
+             WHERE id = ?1 AND event_type = 'tiered_cleanup'",
+            &[ToSqlValue::Integer(maintenance_id)],
+        )
+        .map_err(|err| storage_backend_error("Read tiered cleanup receipt", err))?
+        .ok_or_else(|| {
+            StorageError::Database("tiered cleanup receipt row is missing".to_string())
+        })?;
+    let metadata_text = RowReader::new(&row)
+        .optional_string(0)
+        .map_err(|err| storage_backend_error("Tiered cleanup receipt metadata", err))?
+        .ok_or_else(|| {
+            StorageError::Database("tiered cleanup receipt metadata is missing".to_string())
+        })?;
+    let mut metadata = parse_tiered_cleanup_receipt_metadata(&metadata_text)?;
+    if tiered_cleanup_receipt_status(&metadata)? != "in_progress" {
+        return Err(StorageError::Database(
+            "tiered cleanup receipt is not open for durable progress".to_string(),
+        )
+        .into());
+    }
+    let deleted_delta = u64::try_from(deleted_delta).map_err(|_| {
+        StorageError::Database("tiered cleanup deleted-row delta is out of range".to_string())
+    })?;
+    let deleted_rows = tiered_cleanup_receipt_count(&metadata, "deleted_rows")?
+        .checked_add(deleted_delta)
+        .ok_or_else(|| {
+            StorageError::Database("tiered cleanup deleted-row total overflow".to_string())
+        })?;
+    let object = metadata.as_object_mut().ok_or_else(|| {
+        StorageError::Database("validated tiered cleanup receipt lost object shape".to_string())
+    })?;
+    object.insert(
+        "deleted_rows".to_string(),
+        serde_json::Value::from(deleted_rows),
+    );
+    let encoded = canonical_json_string(&metadata)?;
+    let message = format!("Cleanup in progress: {deleted_rows} durable rows deleted");
+    let updated = backend
+        .query_row_typed(
+            "UPDATE maintenance_log
+             SET message = ?1, metadata = ?2
+             WHERE id = ?3 AND event_type = 'tiered_cleanup'
+             RETURNING id",
+            &[
+                ToSqlValue::Text(&message),
+                ToSqlValue::Text(&encoded),
+                ToSqlValue::Integer(maintenance_id),
+            ],
+        )
+        .map_err(|err| storage_backend_error("Advance tiered cleanup receipt", err))?;
+    if updated.is_none() {
+        return Err(StorageError::Database(
+            "tiered cleanup receipt disappeared during progress update".to_string(),
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn run_auxiliary_cleanup_receipt_transaction_backend<F>(
+    backend: &dyn StorageBackend,
+    cleanup_receipt_id: Option<i64>,
+    mutation: F,
+) -> Result<usize>
+where
+    F: FnOnce() -> Result<usize>,
+{
+    let Some(cleanup_receipt_id) = cleanup_receipt_id else {
+        return mutation();
+    };
+    backend.execute("BEGIN IMMEDIATE").map_err(|err| {
+        storage_backend_error("Begin auxiliary cleanup receipt transaction", err)
+    })?;
+    let tx_result = (|| -> Result<usize> {
+        let deleted = mutation()?;
+        advance_tiered_cleanup_receipt_backend(backend, cleanup_receipt_id, deleted)?;
+        Ok(deleted)
+    })();
+    match tx_result {
+        Ok(deleted) => match backend.execute("COMMIT") {
+            Ok(_) => Ok(deleted),
+            Err(error) => {
+                let _ = backend.execute("ROLLBACK");
+                Err(storage_backend_error(
+                    "Commit auxiliary cleanup receipt transaction",
+                    error,
+                )
+                .into())
+            }
+        },
+        Err(error) => {
+            let _ = backend.execute("ROLLBACK");
+            Err(error)
+        }
+    }
+}
+
 /// Purge audit actions before a cutoff timestamp (synchronous)
 /// br-ft-l1jgo writer-thread migration: replaces the legacy
 /// legacy direct-rusqlite purge helper. Routes the DELETE through the trait surface using
@@ -18046,6 +18269,132 @@ fn purge_audit_actions_backend(
     Ok(returned.len())
 }
 
+fn update_tiered_cleanup_receipt_backend(
+    backend: &dyn StorageBackend,
+    record: &MaintenanceRecord,
+    timestamp: i64,
+) -> Result<i64> {
+    let requested_text = record.metadata.as_deref().ok_or_else(|| {
+        StorageError::Database("final tiered cleanup receipt metadata is missing".to_string())
+    })?;
+    let mut requested = parse_tiered_cleanup_receipt_metadata(requested_text)?;
+    let requested_status = tiered_cleanup_receipt_status(&requested)?.to_string();
+    if !matches!(
+        requested_status.as_str(),
+        "completed" | "cancelled_partial" | "failed_partial"
+    ) {
+        return Err(StorageError::Database(
+            "final tiered cleanup receipt status is invalid".to_string(),
+        )
+        .into());
+    }
+    let requested_deleted = tiered_cleanup_receipt_count(&requested, "deleted_rows")?;
+    let requested_tables = tiered_cleanup_receipt_count(&requested, "tables_recorded")?;
+    let requested_eligible = tiered_cleanup_receipt_count(&requested, "eligible_rows")?;
+
+    let row = backend
+        .query_row_typed(
+            "SELECT metadata FROM maintenance_log
+             WHERE id = ?1 AND event_type = 'tiered_cleanup'",
+            &[ToSqlValue::Integer(record.id)],
+        )
+        .map_err(|err| storage_backend_error("Read open tiered cleanup receipt", err))?
+        .ok_or_else(|| {
+            StorageError::Database("open tiered cleanup receipt row is missing".to_string())
+        })?;
+    let existing_text = RowReader::new(&row)
+        .optional_string(0)
+        .map_err(|err| storage_backend_error("Open tiered cleanup receipt metadata", err))?
+        .ok_or_else(|| {
+            StorageError::Database("open tiered cleanup receipt metadata is missing".to_string())
+        })?;
+    let existing = parse_tiered_cleanup_receipt_metadata(&existing_text)?;
+    let existing_status = tiered_cleanup_receipt_status(&existing)?;
+    let authoritative_deleted = tiered_cleanup_receipt_count(&existing, "deleted_rows")?;
+
+    if existing_status != "in_progress" {
+        let idempotent_retry = existing_status == requested_status
+            && tiered_cleanup_receipt_count(&existing, "tables_recorded")? == requested_tables
+            && tiered_cleanup_receipt_count(&existing, "eligible_rows")? == requested_eligible
+            && authoritative_deleted >= requested_deleted;
+        if idempotent_retry {
+            return Ok(record.id);
+        }
+        return Err(StorageError::Database(
+            "tiered cleanup receipt was already finalized differently".to_string(),
+        )
+        .into());
+    }
+    if requested_deleted > authoritative_deleted {
+        return Err(StorageError::Database(
+            "tiered cleanup finalization exceeds its durable deletion ledger".to_string(),
+        )
+        .into());
+    }
+
+    // The transactionally advanced ledger is authoritative. A caller can
+    // undercount when a writer response is lost after commit, so merge the
+    // durable count rather than weakening the receipt to caller-local state.
+    let requested_object = requested.as_object_mut().ok_or_else(|| {
+        StorageError::Database("validated tiered cleanup receipt lost object shape".to_string())
+    })?;
+    requested_object.insert(
+        "deleted_rows".to_string(),
+        serde_json::Value::from(authoritative_deleted),
+    );
+    let encoded = canonical_json_string(&requested)?;
+    let message = format!(
+        "Cleanup {requested_status}: {authoritative_deleted} rows deleted across {requested_tables} recorded tables"
+    );
+    let updated = backend
+        .query_row_typed(
+            "UPDATE maintenance_log
+             SET message = ?1, metadata = ?2, timestamp = ?3
+             WHERE id = ?4 AND event_type = 'tiered_cleanup'
+             RETURNING id",
+            &[
+                ToSqlValue::Text(&message),
+                ToSqlValue::Text(&encoded),
+                ToSqlValue::Integer(timestamp),
+                ToSqlValue::Integer(record.id),
+            ],
+        )
+        .map_err(|err| storage_backend_error("Finalize tiered cleanup receipt", err))?
+        .ok_or_else(|| {
+            StorageError::Database(
+                "tiered cleanup receipt disappeared during finalization".to_string(),
+            )
+        })?;
+    RowReader::new(&updated)
+        .i64(0)
+        .map_err(|err| storage_backend_error("Final tiered cleanup receipt id", err).into())
+}
+
+fn finalize_tiered_cleanup_receipt_transaction_backend(
+    backend: &dyn StorageBackend,
+    record: &MaintenanceRecord,
+    timestamp: i64,
+) -> Result<i64> {
+    backend.execute("BEGIN IMMEDIATE").map_err(|err| {
+        storage_backend_error("Begin tiered cleanup receipt finalization", err)
+    })?;
+    let result = update_tiered_cleanup_receipt_backend(backend, record, timestamp);
+    match result {
+        Ok(maintenance_id) => match backend.execute("COMMIT") {
+            Ok(_) => Ok(maintenance_id),
+            Err(error) => {
+                let _ = backend.execute("ROLLBACK");
+                Err(storage_backend_error("Commit tiered cleanup receipt finalization", error)
+                    .into())
+            }
+        },
+        Err(error) => {
+            let _ = backend.execute("ROLLBACK");
+            Err(error)
+        }
+    }
+}
+
 fn record_maintenance_backend(
     backend: &dyn StorageBackend,
     record: &MaintenanceRecord,
@@ -18055,6 +18404,19 @@ fn record_maintenance_backend(
     } else {
         record.timestamp
     };
+
+    if record.id < 0 {
+        return Err(StorageError::Database("maintenance id cannot be negative".to_string()).into());
+    }
+    if record.id > 0 {
+        if record.event_type != "tiered_cleanup" {
+            return Err(StorageError::Database(
+                "only tiered cleanup receipts support maintenance-row finalization".to_string(),
+            )
+            .into());
+        }
+        return finalize_tiered_cleanup_receipt_transaction_backend(backend, record, ts);
+    }
 
     let row = backend
         .query_row_typed(
@@ -19048,10 +19410,25 @@ fn clear_segment_delete_batch_tables_backend(backend: &dyn StorageBackend) -> Re
     Ok(())
 }
 
+#[cfg(test)]
 fn prune_segments_backend(
     backend: &dyn StorageBackend,
     before_ts: i64,
     requested_batch_size: usize,
+) -> Result<usize> {
+    prune_segments_with_cleanup_receipt_backend(
+        backend,
+        before_ts,
+        requested_batch_size,
+        None,
+    )
+}
+
+fn prune_segments_with_cleanup_receipt_backend(
+    backend: &dyn StorageBackend,
+    before_ts: i64,
+    requested_batch_size: usize,
+    cleanup_receipt_id: Option<i64>,
 ) -> Result<usize> {
     let batch_size = bounded_segment_retention_batch_size(requested_batch_size);
     if batch_size == 0 {
@@ -19132,6 +19509,9 @@ fn prune_segments_backend(
             rewind_stranded_fts_progress_for_affected_panes_backend(backend)?;
         }
         clear_segment_delete_batch_tables_backend(backend)?;
+        if let Some(cleanup_receipt_id) = cleanup_receipt_id {
+            advance_tiered_cleanup_receipt_backend(backend, cleanup_receipt_id, deleted)?;
+        }
         Ok(deleted)
     })();
 
@@ -20441,11 +20821,28 @@ fn delete_events_by_compiled_retention_branch_backend(
     )
 }
 
+#[cfg(test)]
 fn delete_events_by_compiled_retention_policy_backend(
     backend: &dyn StorageBackend,
     policy: &CompiledRetentionPolicy,
     cutoffs: &[Option<i64>],
     requested_batch_size: usize,
+) -> Result<CompiledRetentionDeleteBatch> {
+    delete_events_by_compiled_retention_policy_with_cleanup_receipt_backend(
+        backend,
+        policy,
+        cutoffs,
+        requested_batch_size,
+        None,
+    )
+}
+
+fn delete_events_by_compiled_retention_policy_with_cleanup_receipt_backend(
+    backend: &dyn StorageBackend,
+    policy: &CompiledRetentionPolicy,
+    cutoffs: &[Option<i64>],
+    requested_batch_size: usize,
+    cleanup_receipt_id: Option<i64>,
 ) -> Result<CompiledRetentionDeleteBatch> {
     let batch_size = bounded_event_retention_batch_size(requested_batch_size);
     validate_compiled_retention_cutoffs(policy, cutoffs)?;
@@ -20467,6 +20864,7 @@ fn delete_events_by_compiled_retention_policy_backend(
         "compiled all-branch event retention policy",
         EVENT_RETENTION_INTERVAL_ROW_MAX,
         Some(cutoffs.len()),
+        cleanup_receipt_id,
     )?;
     Ok(CompiledRetentionDeleteBatch {
         deleted_by_branch: result.deleted_by_branch.ok_or_else(|| {
@@ -20513,6 +20911,7 @@ fn delete_events_with_retention_ledger_backend(
         operation,
         EVENT_RETENTION_INTERVAL_ROW_MAX,
         None,
+        None,
     )
     .map(|result| result.deleted)
 }
@@ -20540,6 +20939,7 @@ fn delete_event_retention_batch_backend(
         operation,
         interval_row_limit,
         None,
+        None,
     )
     .map(|result| result.deleted)
 }
@@ -20551,6 +20951,7 @@ fn delete_event_retention_batch_from_query_backend(
     operation: &str,
     interval_row_limit: usize,
     branch_count: Option<usize>,
+    cleanup_receipt_id: Option<i64>,
 ) -> Result<EventRetentionDeleteBatchResult> {
     backend
         .execute("BEGIN IMMEDIATE")
@@ -20723,6 +21124,13 @@ fn delete_event_retention_batch_from_query_backend(
         backend
             .execute("DELETE FROM event_retention_delete_authorizations")
             .map_err(|err| storage_backend_error("Clear committed event delete batch", err))?;
+        if let Some(cleanup_receipt_id) = cleanup_receipt_id {
+            advance_tiered_cleanup_receipt_backend(
+                backend,
+                cleanup_receipt_id,
+                candidate_ids.len(),
+            )?;
+        }
         Ok(EventRetentionDeleteBatchResult {
             deleted: candidate_ids.len(),
             deleted_by_branch,
@@ -29979,6 +30387,7 @@ fn v35_performance_campaign_segment_retention_writer_yields_and_preserves_fts() 
                 WriteCommand::PruneSegments {
                     before_ts: i64::MAX,
                     batch_size: 1,
+                    cleanup_receipt_id: None,
                     respond: prune_tx,
                 },
             )
@@ -30634,7 +31043,7 @@ fn durable_mutation_progress_reports_exact_prefix_for_each_retention_family() {
         let segment_cx = crate::cx::for_testing();
         segment_storage.cancel_after_next_committed_batch_for_test("prune_segments_before");
         let segment_progress = segment_storage
-            .prune_segments_before_progress_with_cx(&segment_cx, i64::MAX)
+            .prune_segments_before_progress_with_cx(&segment_cx, i64::MAX, None)
             .await;
         match segment_progress {
             DurableMutationProgress::Interrupted { durable, error } => {
@@ -30675,7 +31084,7 @@ fn durable_mutation_progress_reports_exact_prefix_for_each_retention_family() {
         audit_storage
             .cancel_after_next_committed_batch_for_test("purge_audit_actions_before");
         let audit_progress = audit_storage
-            .purge_audit_actions_before_progress_with_cx(&audit_cx, i64::MAX)
+            .purge_audit_actions_before_progress_with_cx(&audit_cx, i64::MAX, None)
             .await;
         match audit_progress {
             DurableMutationProgress::Interrupted { durable, error } => {
@@ -31083,17 +31492,20 @@ async fn exercise_bounded_auxiliary_retention(table: AuxiliaryRetentionTable) {
         AuxiliaryRetentionTable::AuditActions => WriteCommand::PurgeAuditActions {
             before_ts: cutoff,
             batch_size: AUXILIARY_RETENTION_DELETE_BATCH_MAX,
+            cleanup_receipt_id: None,
             respond: purge_tx,
         },
         AuxiliaryRetentionTable::UsageMetrics => WriteCommand::PurgeUsageMetrics {
             before_ts: cutoff,
             batch_size: AUXILIARY_RETENTION_DELETE_BATCH_MAX,
+            cleanup_receipt_id: None,
             respond: purge_tx,
         },
         AuxiliaryRetentionTable::NotificationHistory => {
             WriteCommand::PurgeNotificationHistory {
                 before_ts: cutoff,
                 batch_size: AUXILIARY_RETENTION_DELETE_BATCH_MAX,
+                cleanup_receipt_id: None,
                 respond: purge_tx,
             }
         }
@@ -31101,6 +31513,7 @@ async fn exercise_bounded_auxiliary_retention(table: AuxiliaryRetentionTable) {
             WriteCommand::PurgeOperationalMaintenance {
                 before_ts: cutoff,
                 batch_size: AUXILIARY_RETENTION_DELETE_BATCH_MAX,
+                cleanup_receipt_id: None,
                 respond: purge_tx,
             }
         }
