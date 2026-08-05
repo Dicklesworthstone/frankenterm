@@ -12,7 +12,7 @@
 #
 # How to render:
 #   1. cargo install --locked vhs        # if not already installed
-#   2. cargo build --release             # so the demo points at a real binary
+#   2. cargo build --profile release-interactive  # use the shipped panic contract
 #   3. vhs scripts/demo.tape             # writes assets/demo.gif
 #
 # Conventions:

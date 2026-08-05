@@ -611,6 +611,12 @@ SQLite + WAL + FTS5 is the right default because:
 
 ### 5.2 SQLite Schema
 
+> **Historical planning schema:** this section preserves the initial design and
+> is not executable migration authority. Use
+> `crates/frankenterm-core/src/storage/schema_ddl.rs` and
+> `crates/frankenterm-core/src/storage/migrations.rs` for the current tables,
+> indexes, and schema version.
+
 ```sql
 -- Enable WAL mode for better concurrent access
 PRAGMA journal_mode = WAL;

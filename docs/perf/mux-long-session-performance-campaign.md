@@ -447,13 +447,39 @@ target.
 - a four-hour screen gates expensive 24h/72h certification, but does not replace
   it.
 
+### Panic-containment negative-evidence ledger
+
+The shipped interactive profile is unwind-capable, but that alone does not
+make a raw `catch_unwind` a valid recovery contract. The production audit for
+`ft-interactive-systems-performance-4tenz.13.1/.13.2` classifies the retained
+boundaries as follows:
+
+- mux pane, focus, resize, retirement, subscriber, tmux, registration,
+  storage-writer, MCP completion/request, core dataflow/recording/search/task,
+  sharding rollback, and promise-waker recovery all route through
+  `frankenterm_sigpipe::catch_recoverable` or its per-poll future counterpart;
+- the raw catch inside `frankenterm-sigpipe` is the canonical implementation,
+  not a bypass;
+- the Windows `wnd_proc` catch is a documented fatal no-unwind FFI fence that
+  exits instead of continuing; and
+- remaining direct catches are test-only panic/poison harnesses. They are not
+  evidence for shipped recovery.
+
+Re-run `git grep -n -E 'catch_unwind|\.catch_unwind\(' -- '*.rs'` whenever a
+new production boundary is added. A new continue-serving match must either use
+the canonical helper with a finite site or document why it is fatal/rethrowing.
+
 ## 7. Measurement and keep-gate protocol
 
 The `running-the-gauntlet-on-your-rust-port` and
 `extreme-software-optimization` disciplines apply:
 
 1. Build/profile with `release-perf`, debuginfo line tables, and forced frame
-   pointers where the profiler requires them.
+   pointers where the profiler requires them. `release-perf` inherits directly
+   from the built-in `release` profile and repeats `panic = "unwind"`
+   explicitly, matching the shipped interactive panic contract without custom
+   profile chaining. Do not compare it to an aborting GUI/mux artifact or treat
+   unit-profile catch behavior as release recovery proof.
 2. Capture a fresh live-workload profile. A code optimization is admissible
    only if the target contributes at least 0.1% self-time, explains a material
    queue/lock wait or tail stage, or has an independently quantified resource

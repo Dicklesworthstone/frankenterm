@@ -144,8 +144,8 @@ check_prerequisites() {
     # Find wa binary
     if [[ -x "$PROJECT_ROOT/target/debug/wa" ]]; then
         FT_BIN="$PROJECT_ROOT/target/debug/wa"
-    elif [[ -x "$PROJECT_ROOT/target/release/ft" ]]; then
-        FT_BIN="$PROJECT_ROOT/target/release/ft"
+    elif [[ -x "$PROJECT_ROOT/target/release-interactive/ft" ]]; then
+        FT_BIN="$PROJECT_ROOT/target/release-interactive/ft"
     else
         log_skip "wa binary not found (some scenarios will be skipped)"
     fi

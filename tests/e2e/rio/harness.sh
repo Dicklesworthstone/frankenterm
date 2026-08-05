@@ -254,7 +254,7 @@ assert_jsonl_count() {
 
 # ── FrankenTerm binary helpers ──────────────────────────────────
 ft_bin() {
-    local bin="${PROJECT_ROOT}/target/release/ft"
+    local bin="${PROJECT_ROOT}/target/release-interactive/ft"
     if [[ ! -x "$bin" ]]; then
         bin="${PROJECT_ROOT}/target/debug/ft"
     fi

@@ -10,7 +10,7 @@ Distributed mode is feature-gated at compile time.
 
 ```bash
 # Build from source with distributed mode enabled
-cargo build -p frankenterm --release --features distributed
+cargo build -p frankenterm --profile release-interactive --features distributed
 ```
 
 If `distributed` is not compiled in, distributed runtime behavior is unavailable.

@@ -29,7 +29,7 @@ RCH_BIN="${RCH_BIN:-rch}"
 SKIP_BUILD=false
 OUTPUT_DIR="$PROJECT_ROOT"
 TARGET_TRIPLE="${FT_ATOMIC_BUILD_TARGET:-}"
-BUILD_PROFILE="release"
+BUILD_PROFILE="release-interactive"
 FEATURE_CONTRACT="workspace-default-members-default-features-v1"
 
 while [[ $# -gt 0 ]]; do
@@ -165,10 +165,11 @@ run_rch() {
 run_rch_bundle_build() {
     (
         cd "$PROJECT_ROOT"
-        run_rch exec -- env \
+        RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 \
+        run_rch --no-self-healing exec -- env \
             CARGO_TARGET_DIR="$CARGO_TARGET_DIR_REL" \
             FT_ATOMIC_BUILD_IDENTITY="$FT_ATOMIC_BUILD_IDENTITY" \
-            cargo build --release --target "$TARGET_TRIPLE" \
+            cargo build --profile "$BUILD_PROFILE" --target "$TARGET_TRIPLE" \
             --bin frankenterm-gui \
             --bin frankenterm-mux-server \
             --bin ft \
@@ -176,75 +177,22 @@ run_rch_bundle_build() {
     )
 }
 
-run_rch_gui_prereq_check() {
-    (
-        cd "$PROJECT_ROOT"
-        run_rch exec -- sh -lc '
-            case "$(uname -s)" in
-                Linux)
-                    if ! command -v pkg-config >/dev/null 2>&1; then
-                        echo "FT_GUI_REMOTE_PREREQ_MISSING:pkg-config" >&2
-                        exit 41
-                    fi
-                    if ! pkg-config --exists x11; then
-                        echo "FT_GUI_REMOTE_PREREQ_MISSING:x11" >&2
-                        pkg-config --print-errors --exists x11 || true
-                        exit 42
-                    fi
-                    if ! pkg-config --exists xcb-image; then
-                        echo "FT_GUI_REMOTE_PREREQ_MISSING:xcb-image" >&2
-                        pkg-config --print-errors --exists xcb-image || true
-                        exit 43
-                    fi
-                    if ! pkg-config --exists xkbcommon-x11; then
-                        echo "FT_GUI_REMOTE_PREREQ_MISSING:xkbcommon-x11" >&2
-                        pkg-config --print-errors --exists xkbcommon-x11 || true
-                        exit 44
-                    fi
-                    ;;
-            esac
-        '
-    )
-}
-
-ensure_remote_gui_prereqs() {
-    local preflight_log="$PROJECT_ROOT/target/e2e/gui-bootstrap/bundle-build-preflight.log"
+build_remote_bundle_with_diagnostics() {
+    local preflight_log="$PROJECT_ROOT/target/e2e/gui-bootstrap/bundle-build.log"
     mkdir -p "$(dirname "$preflight_log")"
     : > "$preflight_log"
 
-    if run_rch_gui_prereq_check > >(tee "$preflight_log") 2> >(tee -a "$preflight_log" >&2); then
+    # RCH deliberately rejects arbitrary `sh -lc` prerequisite probes
+    # (RCH-E301). The exact fail-closed Cargo build is both the authoritative
+    # prerequisite check and artifact producer: native build scripts diagnose
+    # missing metadata, while success proves all three processes linked.
+    if run_rch_bundle_build > >(tee "$preflight_log") 2> >(tee -a "$preflight_log" >&2); then
         return 0
     fi
 
-    if grep -q 'FT_GUI_REMOTE_PREREQ_MISSING:x11' "$preflight_log"; then
-        echo "Error: remote worker is missing X11 development metadata required for frankenterm-gui"
-        echo "frankenterm/window has a hard x11 dependency on Linux; provision x11 dev packages on the RCH workers."
-        echo "See $preflight_log for the remote preflight output."
-        return 1
-    fi
-
-    if grep -q 'FT_GUI_REMOTE_PREREQ_MISSING:xcb-image' "$preflight_log"; then
-        echo "Error: remote worker is missing xcb-image development metadata required for frankenterm-gui"
-        echo "frankenterm/window links against xcb-image on Linux; provision libxcb-image0-dev on the RCH workers."
-        echo "See $preflight_log for the remote preflight output."
-        return 1
-    fi
-
-    if grep -q 'FT_GUI_REMOTE_PREREQ_MISSING:xkbcommon-x11' "$preflight_log"; then
-        echo "Error: remote worker is missing xkbcommon-x11 development metadata required for frankenterm-gui"
-        echo "frankenterm/window links against xkbcommon-x11 on Linux; provision libxkbcommon-x11-dev on the RCH workers."
-        echo "See $preflight_log for the remote preflight output."
-        return 1
-    fi
-
-    if grep -q 'FT_GUI_REMOTE_PREREQ_MISSING:pkg-config' "$preflight_log"; then
-        echo "Error: remote worker is missing pkg-config"
-        echo "See $preflight_log for the remote preflight output."
-        return 1
-    fi
-
-    echo "Error: remote GUI prerequisite check failed before cargo build"
-    echo "See $preflight_log for the remote preflight output."
+    echo "Error: strict-remote GUI/mux/CLI bundle build failed."
+    echo "On Linux workers, verify pkg-config plus x11, xcb-image, and xkbcommon-x11 development metadata."
+    echo "See $preflight_log for the authoritative remote Cargo output."
     return 1
 }
 
@@ -258,7 +206,7 @@ require_rch() {
 
 probe_rch_workers() {
     local probe_json
-    probe_json="$(run_rch workers probe --json --all)"
+    probe_json="$(RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 run_rch --no-self-healing workers probe --json --all)"
     python3 - "$probe_json" <<'PY'
 import json
 import sys
@@ -293,15 +241,14 @@ if [ "$SKIP_BUILD" = false ]; then
         echo "Error: no reachable RCH workers detected; refusing local cargo fallback"
         exit 1
     fi
-    if ! ensure_remote_gui_prereqs; then
+    echo "Building frankenterm-gui, frankenterm-mux-server, and bundled ft via rch ($BUILD_PROFILE, panic=unwind)..."
+    if ! build_remote_bundle_with_diagnostics; then
         exit 1
     fi
-    echo "Building frankenterm-gui, frankenterm-mux-server, and ft via rch (release)..."
-    run_rch_bundle_build
 fi
 
 # --- Locate binaries ---
-BINARY_DIR="$CARGO_TARGET_DIR/$TARGET_TRIPLE/release"
+BINARY_DIR="$CARGO_TARGET_DIR/$TARGET_TRIPLE/$BUILD_PROFILE"
 GUI_BINARY="$BINARY_DIR/frankenterm-gui"
 MUX_SERVER_BINARY="$BINARY_DIR/frankenterm-mux-server"
 FT_BINARY="$BINARY_DIR/ft"
@@ -514,7 +461,10 @@ bash "$ATOMIC_MANIFEST_TOOL" generate \
     --contract render-application.version="$RENDER_PROTOCOL_VERSION" \
     --contract core-wire.version="$CORE_WIRE_PROTOCOL_VERSION" \
     --contract storage.schema="$STORAGE_SCHEMA_VERSION" \
-    --contract application.bundle-id="$BUNDLE_ID"
+    --contract application.bundle-id="$BUNDLE_ID" \
+    --contract panic.gui=unwind \
+    --contract panic.mux-server=unwind \
+    --contract panic.bundled-cli=unwind
 
 bash "$ATOMIC_MANIFEST_TOOL" verify \
     --root "$APP_BUNDLE" \
@@ -525,10 +475,10 @@ echo "Done! $APP_BUNDLE"
 echo "Atomic manifest: $ATOMIC_MANIFEST"
 echo ""
 echo "  Contents/MacOS/:"
-ls -lh "$APP_BUNDLE/Contents/MacOS/" | tail -n +2
+find "$APP_BUNDLE/Contents/MacOS" -mindepth 1 -maxdepth 1 -print
 echo ""
 echo "  Resources:"
-ls "$APP_BUNDLE/Contents/Resources/"
+find "$APP_BUNDLE/Contents/Resources" -mindepth 1 -maxdepth 1 -print
 echo ""
 echo "To launch:  open $APP_BUNDLE"
 echo "To use ft:  $APP_BUNDLE/Contents/MacOS/ft --version"

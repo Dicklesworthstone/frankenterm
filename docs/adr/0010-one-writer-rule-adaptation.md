@@ -85,15 +85,19 @@ alt-screen, with cursor hidden.
 
 **Mitigation chain:**
 1. `std::panic::set_hook` installed by `crash::install_panic_hook()`
-2. Panic hook writes crash bundle to disk (size-bounded, redacted)
-3. `SessionGuard` drop runs `leave()` which restores terminal state
-4. Output gate transitions to Inactive
-5. Panic hook output (if any) goes to restored stderr
+2. Panic hook writes a silent crash bundle to disk (size-bounded, redacted)
+3. Hook-time operator reporting occurs before Rust begins unwinding
+4. `SessionGuard` drop runs `leave()` which restores terminal state
+5. Output gate transitions to Inactive
 
-**Gap:** With `panic = "abort"` in release, `SessionGuard::drop()` runs in the panic
-hook's scope, not during unwinding.  The current hook must explicitly call
-`leave()` before writing to stderr.  Evidence: unit tests in `terminal_session.rs`
-verify that `MockTerminalSession` records `leave()` on drop.
+**Current boundary:** Shipped and conventional release artifacts unwind, so
+`SessionGuard::drop()` runs and restores the terminal. Panic hooks execute
+*before* that unwind, however: hook-time stderr must not assume the guard has
+already restored the terminal. The crash-bundle layer is silent, bounded, and
+privacy-redacted; after-unwind ordering for the single generic terminal report
+is tracked separately from the profile contract. Evidence: unit tests in
+`terminal_session.rs` verify that `MockTerminalSession` records `leave()` on
+drop.
 
 **Validation:** `#[test] fn session_guard_calls_leave_on_drop()` in terminal_session.rs.
 

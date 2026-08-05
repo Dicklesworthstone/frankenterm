@@ -20,8 +20,12 @@ Option A (app bundle release):
 Option B (build from source):
 
 ```bash
-cargo build --release -p frankenterm-gui
+cargo build --profile release-interactive -p frankenterm-gui
 ```
+
+`release-interactive` is required for shipped CLI, GUI, and mux-server builds;
+the ordinary `release` profile also unwinds as a fail-safe default. Only the
+explicit `release-abort-probe` negative-control profile disables recovery.
 
 ### 2. Create your GUI config
 
@@ -43,7 +47,7 @@ frankenterm-gui
 From the build tree:
 
 ```bash
-./target/release/frankenterm-gui
+./target/release-interactive/frankenterm-gui
 ```
 
 ### 4. Verify ft integration
@@ -306,7 +310,7 @@ ft mcp serve
 Distributed mode is optional and off by default.
 
 ```bash
-cargo build -p frankenterm --release --features distributed
+cargo build -p frankenterm --profile release-interactive --features distributed
 ```
 
 Follow [docs/distributed-security-spec.md](./distributed-security-spec.md) for TLS/token/mTLS setup and `ft doctor` verification.

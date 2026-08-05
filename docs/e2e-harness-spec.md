@@ -262,7 +262,7 @@ Before running scenarios, the harness validates prerequisites:
 
 1. **Compatibility backend bridge installed (current: WezTerm)** - `wezterm --version` succeeds
 2. **Compatibility backend bridge mux available** - Can spawn and list panes
-3. **ft binary built** - `cargo build --release` or binary exists
+3. **ft binary built** - `cargo build --profile release-interactive` or binary exists
 4. **Artifacts writable** - Can create artifacts directory
 5. **Temp space available** - At least 100MB free in temp
 6. **Required features** - Check `ft --version` for feature flags
@@ -274,7 +274,7 @@ E2E Harness Self-Check
 ======================
 [PASS] Backend bridge installed (WezTerm): 20250101-120000-abc123
 [PASS] Backend bridge mux operational: spawned test pane
-[PASS] ft binary: ./target/release/ft (0.1.0)
+[PASS] ft binary: ./target/release-interactive/ft (0.1.0)
 [PASS] Artifacts directory: writable
 [PASS] Temp space: 50GB available
 [PASS] Feature flags: all required features present
@@ -290,7 +290,7 @@ E2E Harness Self-Check
 [PASS] Backend bridge installed (WezTerm): 20250101-120000-abc123
 [FAIL] Backend bridge mux operational: cannot connect to mux server
        Hint: Start the active compatibility backend bridge (WezTerm) with `wezterm start --mux`
-[PASS] ft binary: ./target/release/ft (0.1.0)
+[PASS] ft binary: ./target/release-interactive/ft (0.1.0)
 
 Self-check failed. Fix issues above before running E2E tests.
 Exit code: 2

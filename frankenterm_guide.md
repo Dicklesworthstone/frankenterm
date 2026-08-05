@@ -775,6 +775,12 @@ pub struct PaneSize {
 
 ### 6.1 Schema Design
 
+> **Historical design sketch:** the block below documents the original storage
+> model; it is not executable migration authority and intentionally does not
+> track later schema versions or indexes. The live source of truth is
+> `crates/frankenterm-core/src/storage/schema_ddl.rs` together with
+> `crates/frankenterm-core/src/storage/migrations.rs`.
+
 ```rust
 // src/storage/schema.rs
 pub const SCHEMA: &str = r#"

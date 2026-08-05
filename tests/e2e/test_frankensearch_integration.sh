@@ -19,8 +19,8 @@ resolve_ft_bin() {
     if [[ -n "$FT_BIN" && -x "$FT_BIN" ]]; then
         return 0
     fi
-    if [[ -x "$PROJECT_ROOT/target/release/ft" ]]; then
-        FT_BIN="$PROJECT_ROOT/target/release/ft"
+    if [[ -x "$PROJECT_ROOT/target/release-interactive/ft" ]]; then
+        FT_BIN="$PROJECT_ROOT/target/release-interactive/ft"
         return 0
     fi
     if [[ -x "$PROJECT_ROOT/target/debug/ft" ]]; then

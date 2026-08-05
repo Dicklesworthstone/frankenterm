@@ -13,7 +13,7 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 RCH_BIN="${RCH_BIN:-rch}"
 GUI_TARGET_DIR="${GUI_TARGET_DIR:-$PROJECT_ROOT/target/e2e-gui-bootstrap}"
-BUILD_PROFILE="${BUILD_PROFILE:-release}"
+BUILD_PROFILE="${BUILD_PROFILE:-release-interactive}"
 GUI_TARGET_DIR_REL=""
 GUI_TARGET_DIR_IN_REPO=0
 GUI_BIN=""
@@ -59,7 +59,7 @@ Options:
 Environment:
   RCH_BIN              rch executable (default: rch)
   GUI_TARGET_DIR       Cargo target dir for build artifacts
-  BUILD_PROFILE        Cargo profile (default: release)
+  BUILD_PROFILE        Cargo profile (default: release-interactive)
   RUN_GUI_LAUNCH       Set to 1 to run GUI launch smoke step
   LAUNCH_TIMEOUT_SECS  GUI smoke timeout seconds (default: 3)
 EOF
@@ -186,92 +186,32 @@ run_rch_gui_build() {
   (
     cd "$PROJECT_ROOT"
     if [[ "$DRY_RUN" -eq 1 ]]; then
-      log "[DRY-RUN] $RCH_BIN exec -- env CARGO_TARGET_DIR=$GUI_TARGET_DIR_REL cargo build --profile $BUILD_PROFILE --bin frankenterm-gui --manifest-path Cargo.toml"
+      log "[DRY-RUN] RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 $RCH_BIN --no-self-healing exec -- env CARGO_TARGET_DIR=$GUI_TARGET_DIR_REL cargo build --profile $BUILD_PROFILE --bin frankenterm-gui --manifest-path Cargo.toml"
       return 0
     fi
-    run_rch exec -- env CARGO_TARGET_DIR="$GUI_TARGET_DIR_REL" \
+    RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 \
+    run_rch --no-self-healing exec -- env CARGO_TARGET_DIR="$GUI_TARGET_DIR_REL" \
       cargo build --profile "$BUILD_PROFILE" --bin frankenterm-gui --manifest-path Cargo.toml
   )
 }
 
-run_rch_gui_prereq_check() {
-  (
-    cd "$PROJECT_ROOT"
-    run_rch exec -- sh -lc '
-      case "$(uname -s)" in
-        Linux)
-          if ! command -v pkg-config >/dev/null 2>&1; then
-            echo "FT_GUI_REMOTE_PREREQ_MISSING:pkg-config" >&2
-            exit 41
-          fi
-          if ! pkg-config --exists x11; then
-            echo "FT_GUI_REMOTE_PREREQ_MISSING:x11" >&2
-            pkg-config --print-errors --exists x11 || true
-            exit 42
-          fi
-          if ! pkg-config --exists xcb-image; then
-            echo "FT_GUI_REMOTE_PREREQ_MISSING:xcb-image" >&2
-            pkg-config --print-errors --exists xcb-image || true
-            exit 43
-          fi
-          if ! pkg-config --exists xkbcommon-x11; then
-            echo "FT_GUI_REMOTE_PREREQ_MISSING:xkbcommon-x11" >&2
-            pkg-config --print-errors --exists xkbcommon-x11 || true
-            exit 44
-          fi
-          ;;
-      esac
-    '
-  )
-}
+build_remote_gui_with_diagnostics() {
+  local build_log="$LOG_DIR/gui-build.log"
+  : > "$build_log"
 
-ensure_remote_gui_prereqs() {
-  local preflight_log="$LOG_DIR/gui-build-preflight.log"
-  : > "$preflight_log"
-
-  if run_rch_gui_prereq_check > >(tee "$preflight_log") 2> >(tee -a "$preflight_log" >&2); then
+  # RCH deliberately rejects arbitrary `sh -lc` prerequisite probes
+  # (RCH-E301). The exact fail-closed Cargo build is both the authoritative
+  # prerequisite check and artifact producer; native build scripts diagnose
+  # missing metadata, and success proves the GUI linked on a remote worker.
+  if run_rch_gui_build > >(tee "$build_log") 2> >(tee -a "$build_log" >&2); then
     return 0
   fi
 
-  if grep -q 'FT_GUI_REMOTE_PREREQ_MISSING:x11' "$preflight_log"; then
-    BUILD_STEP_STATUS="failed"
-    BUILD_STEP_DETAIL="build step failed (remote worker missing pkg-config x11 / x11.pc)"
-    log "Remote worker is missing X11 development metadata required for frankenterm-gui."
-    log "frankenterm/window has a hard x11 dependency on Linux; provision x11 dev packages on the RCH workers."
-    log "See $preflight_log for the remote preflight output."
-    return 1
-  fi
-
-  if grep -q 'FT_GUI_REMOTE_PREREQ_MISSING:xcb-image' "$preflight_log"; then
-    BUILD_STEP_STATUS="failed"
-    BUILD_STEP_DETAIL="build step failed (remote worker missing pkg-config xcb-image / xcb-image.pc)"
-    log "Remote worker is missing xcb-image development metadata required for frankenterm-gui."
-    log "frankenterm/window links against xcb-image on Linux; provision libxcb-image0-dev on the RCH workers."
-    log "See $preflight_log for the remote preflight output."
-    return 1
-  fi
-
-  if grep -q 'FT_GUI_REMOTE_PREREQ_MISSING:xkbcommon-x11' "$preflight_log"; then
-    BUILD_STEP_STATUS="failed"
-    BUILD_STEP_DETAIL="build step failed (remote worker missing pkg-config xkbcommon-x11 / xkbcommon-x11.pc)"
-    log "Remote worker is missing xkbcommon-x11 development metadata required for frankenterm-gui."
-    log "frankenterm/window links against xkbcommon-x11 on Linux; provision libxkbcommon-x11-dev on the RCH workers."
-    log "See $preflight_log for the remote preflight output."
-    return 1
-  fi
-
-  if grep -q 'FT_GUI_REMOTE_PREREQ_MISSING:pkg-config' "$preflight_log"; then
-    BUILD_STEP_STATUS="failed"
-    BUILD_STEP_DETAIL="build step failed (remote worker missing pkg-config)"
-    log "Remote worker is missing pkg-config, so frankenterm-gui Linux prerequisites cannot be checked."
-    log "See $preflight_log for the remote preflight output."
-    return 1
-  fi
-
   BUILD_STEP_STATUS="failed"
-  BUILD_STEP_DETAIL="build step failed (remote GUI prerequisite check failed)"
-  log "Remote GUI prerequisite check failed before cargo build."
-  log "See $preflight_log for the remote preflight output."
+  BUILD_STEP_DETAIL="build step failed (strict-remote GUI cargo build returned non-zero)"
+  log "Strict-remote frankenterm-gui build failed."
+  log "On Linux workers, verify pkg-config plus x11, xcb-image, and xkbcommon-x11 development metadata."
+  log "See $build_log for the authoritative remote Cargo output."
   return 1
 }
 
@@ -375,17 +315,12 @@ build_gui() {
     log "See $RCH_PROBE_LOG for probe details."
     return 1
   fi
-  if ! ensure_remote_gui_prereqs; then
-    return 1
-  fi
-  if run_rch_gui_build; then
+  if build_remote_gui_with_diagnostics; then
     BUILD_STEP_STATUS="success"
     BUILD_STEP_DETAIL=""
     return 0
   fi
 
-  BUILD_STEP_STATUS="failed"
-  BUILD_STEP_DETAIL="build step failed (rch cargo build returned non-zero)"
   return 1
 }
 

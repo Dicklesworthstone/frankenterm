@@ -386,7 +386,7 @@ run_self_check() {
     fi
 
     # Check 3: ft binary
-    local ft_binary="$PROJECT_ROOT/target/release/ft"
+    local ft_binary="$PROJECT_ROOT/target/release-interactive/ft"
     if [[ -x "$ft_binary" ]]; then
         local binary_version
         binary_version=$("$ft_binary" --version 2>/dev/null | head -1 || echo "unknown")
@@ -400,7 +400,7 @@ run_self_check() {
             check_pass "ft binary (debug): $ft_binary ($binary_version)"
         else
             check_fail "ft binary not found"
-            echo "       Hint: Run 'cargo build --release' or 'cargo build'"
+            echo "       Hint: Run 'cargo build --profile release-interactive' or 'cargo build'"
             all_passed=false
         fi
     fi
@@ -2090,8 +2090,8 @@ EOF
 FT_BINARY=""
 
 find_ft_binary() {
-    if [[ -x "$PROJECT_ROOT/target/release/ft" ]]; then
-        FT_BINARY="$PROJECT_ROOT/target/release/ft"
+    if [[ -x "$PROJECT_ROOT/target/release-interactive/ft" ]]; then
+        FT_BINARY="$PROJECT_ROOT/target/release-interactive/ft"
     elif [[ -x "$PROJECT_ROOT/target/debug/ft" ]]; then
         FT_BINARY="$PROJECT_ROOT/target/debug/ft"
     else

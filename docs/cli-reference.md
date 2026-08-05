@@ -344,6 +344,11 @@ timeout, a matching event, or terminating a long-lived child process. Each of
 `--any` and `--all` accepts at most 16 conditions, and each condition is bounded
 to 256 UTF-8 bytes.
 
+Terminal error records preserve a resume token only as one complete canonical
+cursor/epoch/scope triple. If no complete canonical token is available, all
+three fields are `null`; partial or malformed caller input is never reflected
+as apparent cursor authority.
+
 Rule matches inside a composite await are request-local latches. The published
 resume cursor advances across irrelevant rows, then holds immediately before
 the first rule occurrence needed by a still-incomplete composite. A timeout or

@@ -79,11 +79,13 @@ The one-writer rule applies in both modes:
 The ftui lifecycle must guarantee terminal restoration:
 - `enter()` sets up terminal mode (raw, alternate if needed)
 - `exit()` restores terminal to pre-enter state
-- Panic hook calls `exit()` before unwinding
+- `SessionGuard` calls `exit()` while a shipped-profile panic unwinds
 - Signal handler calls `exit()` on SIGINT/SIGTERM
 
-Current ft uses `panic = "abort"` in release. The cleanup hook must run
-before abort via `std::panic::set_hook`.
+Shipped FrankenTerm processes and the fail-safe conventional release profile
+use `panic = "unwind"`, so `SessionGuard::drop()` performs terminal restoration
+during unwinding. The explicitly named `release-abort-probe` exists only for
+the panic-contract negative control and is never an interactive artifact.
 
 ## Consequences
 

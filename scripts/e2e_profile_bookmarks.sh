@@ -10,7 +10,7 @@
 #   4. Round-trip: profile apply + bookmark add, list --json, remove --json
 #
 # Requirements:
-#   - wa/ft binary present (build via rch; script checks target/release/ft or target/debug/wa)
+#   - wa/ft binary present (build via rch; script checks target/release-interactive/ft or target/debug/wa)
 #   - jq for JSON validation
 #
 # No WezTerm runtime required — all operations are CLI-only against temp dirs.
@@ -28,7 +28,7 @@ TESTS_FAILED=0
 
 find_ft_binary() {
     local candidates=(
-        "$PROJECT_ROOT/target/release/ft"
+        "$PROJECT_ROOT/target/release-interactive/ft"
         "$PROJECT_ROOT/target/debug/wa"
     )
     for candidate in "${candidates[@]}"; do
@@ -37,7 +37,7 @@ find_ft_binary() {
             return 0
         fi
     done
-    echo "Error: wa binary not found. Build via rch first; this script checks target/release/ft or target/debug/wa." >&2
+    echo "Error: wa binary not found. Build via rch first; this script checks target/release-interactive/ft or target/debug/wa." >&2
     exit 1
 }
 

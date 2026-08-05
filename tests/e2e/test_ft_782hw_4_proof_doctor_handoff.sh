@@ -135,7 +135,7 @@ find_ft_binary() {
     "${target_dir}/debug/ft"
     "${target_dir}/release/ft"
     "${ROOT_DIR}/target/debug/ft"
-    "${ROOT_DIR}/target/release/ft"
+    "${ROOT_DIR}/target/release-interactive/ft"
   )
 
   local candidate

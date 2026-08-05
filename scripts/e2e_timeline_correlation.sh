@@ -144,7 +144,7 @@ find_ft_binary() {
     )
     if [[ "$target_dir" != "$PROJECT_ROOT/target" ]]; then
         candidates+=(
-            "$PROJECT_ROOT/target/release/ft"
+            "$PROJECT_ROOT/target/release-interactive/ft"
             "$PROJECT_ROOT/target/debug/ft"
         )
     fi

@@ -707,10 +707,10 @@ build_from_source() {
   # Build only the ft CLI (not the GUI/mux-server) for the broadest
   # platform coverage. Users who want the macOS .app should install
   # from the .app bundle (separate flow) or build the workspace
-  # directly: `cargo build --release` after cloning.
+  # directly: `cargo build --profile release-interactive` after cloning.
   # Friendly error wrapping: a bare `set -e` exit on cargo failure would
   # not give the user any actionable diagnosis.
-  if ! ( cd "$TMP/src" && cargo build --release -p frankenterm --bin ft ); then
+  if ! ( cd "$TMP/src" && cargo build --profile release-interactive -p frankenterm --bin ft ); then
     err "Source build failed."
     err "Common causes:"
     err "  - Missing system deps on Linux: pkg-config, libcairo2-dev,"
@@ -720,7 +720,7 @@ build_from_source() {
     err "  - Old Rust toolchain (FrankenTerm needs Rust 1.85+)."
     exit 1
   fi
-  local bin="$TMP/src/target/release/ft"
+  local bin="$TMP/src/target/release-interactive/ft"
   [ -x "$bin" ] || { err "Build did not produce $bin"; exit 1; }
   install -m 0755 "$bin" "$DEST/ft"
   ok "Installed to $DEST/ft (source build)"

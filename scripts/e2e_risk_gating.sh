@@ -83,7 +83,7 @@ log_info() {
 # Find the wa binary
 find_ft_binary() {
     local candidates=(
-        "$PROJECT_ROOT/target/release/ft"
+        "$PROJECT_ROOT/target/release-interactive/ft"
         "$PROJECT_ROOT/target/debug/wa"
     )
 

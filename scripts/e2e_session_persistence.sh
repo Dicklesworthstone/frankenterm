@@ -13,7 +13,7 @@
 #   - CLI commands (ft session list/show/delete/doctor) work correctly
 #
 # Requirements:
-#   - ft binary present (build via rch; script checks target/debug/ft or target/release/ft)
+#   - ft binary present (build via rch; script checks target/debug/ft or target/release-interactive/ft)
 #   - jq for JSON parsing
 #   - sqlite3 for database inspection
 #   - WezTerm mux server (optional; tests requiring it are skipped if unavailable)
@@ -262,10 +262,10 @@ check_prerequisites() {
 
     if [[ -x "$PROJECT_ROOT/target/debug/ft" ]]; then
         FT_BIN="$PROJECT_ROOT/target/debug/ft"
-    elif [[ -x "$PROJECT_ROOT/target/release/ft" ]]; then
-        FT_BIN="$PROJECT_ROOT/target/release/ft"
+    elif [[ -x "$PROJECT_ROOT/target/release-interactive/ft" ]]; then
+        FT_BIN="$PROJECT_ROOT/target/release-interactive/ft"
     else
-        echo -e "${RED}ERROR:${NC} ft binary not found. Build via rch first; this script checks target/debug/ft or target/release/ft." >&2
+        echo -e "${RED}ERROR:${NC} ft binary not found. Build via rch first; this script checks target/debug/ft or target/release-interactive/ft." >&2
         exit 5
     fi
     log_pass "P.1: ft binary found: $FT_BIN"

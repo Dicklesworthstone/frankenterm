@@ -261,6 +261,11 @@
     },
     "error": {
       "type": "object",
+      "allOf": [
+        {
+          "$ref": "#/$defs/cursor_state"
+        }
+      ],
       "required": [
         "type",
         "terminal",
@@ -332,7 +337,23 @@
         "message": { "type": "string", "minLength": 1 }
       },
       "oneOf": [
-        { "required": ["expected_cursor_scope"] },
+        {
+          "required": ["expected_cursor_scope"],
+          "properties": {
+            "reason": { "const": "cursor_scope_mismatch" }
+          },
+          "not": {
+            "anyOf": [
+              { "required": ["checked_through"] },
+              { "required": ["current_cursor_epoch"] },
+              { "required": ["current_cursor_scope"] },
+              { "required": ["evidence_from_event_id"] },
+              { "required": ["max_event_id"] },
+              { "required": ["deleted_interval"] },
+              { "required": ["candidate_cursor"] }
+            ]
+          }
+        },
         {
           "required": [
             "checked_through",
@@ -340,7 +361,18 @@
             "current_cursor_scope",
             "evidence_from_event_id",
             "max_event_id"
-          ]
+          ],
+          "properties": {
+            "reason": {
+              "enum": [
+                "retention_pruned",
+                "legacy_history_unavailable",
+                "cursor_epoch_mismatch",
+                "cursor_ahead_of_high_water"
+              ]
+            }
+          },
+          "not": { "required": ["expected_cursor_scope"] }
         }
       ],
       "allOf": [
@@ -376,6 +408,10 @@
         "any": { "type": "array", "maxItems": 16, "items": { "$ref": "#/$defs/condition_status" } },
         "all": { "type": "array", "maxItems": 16, "items": { "$ref": "#/$defs/condition_status" } }
       },
+      "anyOf": [
+        { "properties": { "any": { "minItems": 1 } } },
+        { "properties": { "all": { "minItems": 1 } } }
+      ],
       "oneOf": [
         {
           "required": ["satisfied", "timed_out"],

@@ -740,6 +740,10 @@ Transport:
 ## Appendix B: SQLite schema draft (concrete)
 
 Notes:
+- This is the original planning draft, not executable migration authority.
+  Current schema and index definitions live in
+  `crates/frankenterm-core/src/storage/schema_ddl.rs` and
+  `crates/frankenterm-core/src/storage/migrations.rs`.
 - WAL mode always.
 - Keep tables append-heavy; avoid write amplification.
 - Keep “facts” in dedicated tables so workflows don’t re-parse transcripts.

@@ -12,7 +12,7 @@
 #   - No secrets leak into logs/artifacts
 #
 # Requirements:
-#   - wa/ft binary present (build via rch; script checks target/debug/wa or target/release/ft)
+#   - wa/ft binary present (build via rch; script checks target/debug/wa or target/release-interactive/ft)
 #   - jq for JSON manipulation
 #   - sqlite3 for test data population
 # =============================================================================
@@ -221,10 +221,10 @@ check_prerequisites() {
 
     if [[ -x "$PROJECT_ROOT/target/debug/wa" ]]; then
         FT_BIN="$PROJECT_ROOT/target/debug/wa"
-    elif [[ -x "$PROJECT_ROOT/target/release/ft" ]]; then
-        FT_BIN="$PROJECT_ROOT/target/release/ft"
+    elif [[ -x "$PROJECT_ROOT/target/release-interactive/ft" ]]; then
+        FT_BIN="$PROJECT_ROOT/target/release-interactive/ft"
     else
-        echo -e "${RED}ERROR:${NC} wa binary not found. Build via rch first; this script checks target/debug/wa or target/release/ft." >&2
+        echo -e "${RED}ERROR:${NC} wa binary not found. Build via rch first; this script checks target/debug/wa or target/release-interactive/ft." >&2
         exit 5
     fi
     log_pass "P.1: wa binary found: $FT_BIN"

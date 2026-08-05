@@ -24,7 +24,7 @@
 
 ```bash
 # Build with legacy TUI instead of ftui
-cargo build --release --features tui
+cargo build --profile release-interactive --features tui
 # (omit --features ftui)
 ```
 

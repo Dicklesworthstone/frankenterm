@@ -7,7 +7,7 @@
 #   Validate CLI-driven profile management and rollback safety.
 #
 # Requirements:
-#   - wa/ft binary present (build via rch; script checks target/release/ft or target/debug/wa)
+#   - wa/ft binary present (build via rch; script checks target/release-interactive/ft or target/debug/wa)
 #   - jq for JSON validation
 # =============================================================================
 
@@ -23,7 +23,7 @@ TESTS_FAILED=0
 
 find_ft_binary() {
     local candidates=(
-        "$PROJECT_ROOT/target/release/ft"
+        "$PROJECT_ROOT/target/release-interactive/ft"
         "$PROJECT_ROOT/target/debug/wa"
     )
 
@@ -34,7 +34,7 @@ find_ft_binary() {
         fi
     done
 
-    echo "Error: wa binary not found. Build via rch first; this script checks target/release/ft or target/debug/wa." >&2
+    echo "Error: wa binary not found. Build via rch first; this script checks target/release-interactive/ft or target/debug/wa." >&2
     exit 1
 }
 

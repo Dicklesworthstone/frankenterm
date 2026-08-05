@@ -21,7 +21,7 @@
 #        # Drive the swarm through ~3 minutes of real work so it hits
 #        # at least one rate limit and produces ≥1 ft auto-detect event.
 #   2. Confirm `ft status` shows ≥1 detection ready to demo.
-#   3. cargo build --release --bin ft
+#   3. cargo build --profile release-interactive --bin ft
 #   4. vhs scripts/demo-full.tape  # writes assets/demo-full.gif
 #
 # Conventions match scripts/demo.tape (1280×720, Catppuccin Mocha, 14pt).
