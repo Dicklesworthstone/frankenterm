@@ -23020,6 +23020,7 @@ const WATCH_EVENTS_CLAIM_WORKFLOW_ID: &str = "robot.watch_events";
 const WATCH_EVENTS_CLAIM_STATUS: &str = "claimed";
 const WATCH_EVENTS_CLAIM_LEASE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
 const WATCH_EVENTS_BATCH_LIMIT_MAX: usize = 1_000;
+const WATCH_EVENTS_BATCH_LIMIT_ERROR: &str = "Invalid --limit: must be in 1..=1000";
 const WATCH_EVENTS_POLL_INTERVAL_MS_MIN: u64 = 10;
 
 fn watch_events_unhandled_only(unhandled: bool, claim: bool) -> bool {
@@ -23030,7 +23031,7 @@ fn validate_watch_events_limit(limit: usize) -> Result<(), &'static str> {
     if (1..=WATCH_EVENTS_BATCH_LIMIT_MAX).contains(&limit) {
         Ok(())
     } else {
-        Err("Invalid --limit: must be in 1..=1000")
+        Err(WATCH_EVENTS_BATCH_LIMIT_ERROR)
     }
 }
 
@@ -24516,7 +24517,7 @@ mod watch_events_tests {
     fn watch_events_limit_enforces_documented_hard_bounds() {
         assert_eq!(
             validate_watch_events_limit(0),
-            Err("Invalid --limit: must be in 1..=1000")
+            Err(WATCH_EVENTS_BATCH_LIMIT_ERROR)
         );
         assert_eq!(validate_watch_events_limit(1), Ok(()));
         assert_eq!(
@@ -24525,7 +24526,7 @@ mod watch_events_tests {
         );
         assert_eq!(
             validate_watch_events_limit(WATCH_EVENTS_BATCH_LIMIT_MAX + 1),
-            Err("Invalid --limit: must be in 1..=1000")
+            Err(WATCH_EVENTS_BATCH_LIMIT_ERROR)
         );
     }
 
@@ -24850,6 +24851,7 @@ mod watch_events_tests {
             let finalization_lost_id = event_ids[5];
             let mut lost_output = Vec::new();
             let stolen_database_path = database_path.clone();
+            let delivery_started_at = std::time::Instant::now();
             let lost = deliver_claimed_watch_event(
                 &storage,
                 finalization_lost_id,
@@ -24877,10 +24879,15 @@ mod watch_events_tests {
             )
             .await
             .expect("lost token-CAS is a typed at-least-once outcome");
-            assert!(matches!(
-                lost,
-                WatchEventClaimDelivery::FinalizationLost { .. }
-            ));
+            let delivery_finished_at = std::time::Instant::now();
+            let lost_flushed_at = match lost {
+                WatchEventClaimDelivery::FinalizationLost { flushed_at } => flushed_at,
+                other => panic!("expected finalization-loss outcome, got {other:?}"),
+            };
+            assert!(
+                (delivery_started_at..=delivery_finished_at).contains(&lost_flushed_at),
+                "the typed loss outcome must preserve its pre-finalization flush time"
+            );
             assert!(!lost_output.is_empty(), "the consumer received the record");
             let stored = storage
                 .get_events_stream(watch_claim_query(finalization_lost_id - 1))

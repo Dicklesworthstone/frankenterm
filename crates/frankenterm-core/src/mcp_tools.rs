@@ -3944,6 +3944,7 @@ const MCP_AWAIT_EVENT_POLL_INTERVAL_MS_MIN: u64 = 10;
 const MCP_AWAIT_EVENT_POLL_INTERVAL_MS_MAX: u64 = 30_000;
 const MCP_AWAIT_EVENT_CONDITION_SET_MAX: usize = 16;
 const MCP_AWAIT_EVENT_BATCH_LIMIT: usize = 500;
+const MCP_AWAIT_EVENT_BLOCKED_EVENT_MAX: usize = MCP_AWAIT_EVENT_BATCH_LIMIT;
 pub(crate) const MCP_AWAIT_EVENT_DELIVERY_FINALIZE_GRACE_SECS: u64 = 30;
 const MCP_AWAIT_EVENT_CANCEL_POLL_INTERVAL: std::time::Duration =
     std::time::Duration::from_millis(50);
@@ -4160,10 +4161,12 @@ fn mcp_await_event_apply_match_mask(met: &mut [bool], mask: u16) {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 struct McpAwaitBlockedEvent {
-    event: crate::storage::StoredEvent,
+    event_id: i64,
     expires_at_ms: i64,
+    matching_any: u16,
+    matching_all: u16,
 }
 
 fn mcp_await_event_safe_cursor(
@@ -4172,11 +4175,50 @@ fn mcp_await_event_safe_cursor(
 ) -> Option<i64> {
     blocked_events
         .iter()
-        .map(|blocked| blocked.event.id)
+        .map(|blocked| blocked.event_id)
         .min()
         .map_or(scan_after_id, |first_blocked_id| {
             Some(first_blocked_id.saturating_sub(1))
         })
+}
+
+async fn mcp_await_event_refetch_exact_unhandled_event(
+    storage: &StorageHandle,
+    cx: &crate::cx::Cx,
+    event_id: i64,
+    pane_id: Option<u64>,
+) -> crate::Result<Option<crate::storage::StoredEvent>> {
+    let events = storage
+        .get_events_stream_with_cx(
+            cx,
+            EventStreamQuery {
+                after_id: Some(event_id.saturating_sub(1)),
+                limit: Some(1),
+                pane_id,
+                rule_id: None,
+                event_type: None,
+                triage_state: None,
+                label: None,
+                unhandled_only: true,
+                since: None,
+                until: None,
+            },
+        )
+        .await?;
+    Ok(events.into_iter().next().filter(|event| event.id == event_id))
+}
+
+fn mcp_await_event_blocked_capacity_error() -> McpToolError {
+    McpToolError::new(
+        MCP_ERR_STORAGE,
+        format!(
+            "wa.await_event cannot safely track more than {MCP_AWAIT_EVENT_BLOCKED_EVENT_MAX} concurrently leased matching events"
+        ),
+        Some(
+            "Retry from the same cursor after competing event-delivery claims complete."
+                .to_string(),
+        ),
+    )
 }
 
 fn mcp_await_event_is_satisfied(any_met: &[bool], all_met: &[bool]) -> bool {
@@ -4502,6 +4544,11 @@ impl ToolHandler for WaAwaitEventTool {
 
     fn call(&self, ctx: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
         let start = Instant::now();
+        // Capture the no-cursor lower bound at request entry. Storage opening
+        // may block on SQLite initialization or another writer; taking this
+        // timestamp after open would permanently exclude events detected in
+        // that interval.
+        let request_boundary_ms = mcp_now_ms_i64();
 
         let params: AwaitEventParams = if arguments.is_null() {
             AwaitEventParams::default()
@@ -4629,13 +4676,13 @@ impl ToolHandler for WaAwaitEventTool {
             .map_err(|e| McpError::internal_error(format!("MCP runtime init failed: {e}")))?;
 
         let (result, delivery_leases): (
-            crate::Result<McpAwaitEventData>,
+            std::result::Result<McpAwaitEventData, McpToolError>,
             Vec<EventDeliveryLease>,
         ) = runtime.block_on(async {
             let mut delivery_leases = Vec::new();
             let cx = request_cx;
             if let Err(error) = mcp_await_event_checkpoint(&cx) {
-                return (Err(error), delivery_leases);
+                return (Err(McpToolError::from_error(error)), delivery_leases);
             }
             let storage_result =
                 StorageHandle::new_with_cx(&cx, &db_path.to_string_lossy()).await;
@@ -4648,15 +4695,14 @@ impl ToolHandler for WaAwaitEventTool {
                         );
                     }
                 }
-                return (Err(error), delivery_leases);
+                return (Err(McpToolError::from_error(error)), delivery_leases);
             }
             let storage = match storage_result {
                 Ok(storage) => storage,
-                Err(err) => return (Err(err), delivery_leases),
+                Err(err) => return (Err(McpToolError::from_error(err)), delivery_leases),
             };
             let redactor = crate::redactor::Redactor::new();
             let started = Instant::now();
-            let start_ms = mcp_now_ms_i64();
             let timeout = std::time::Duration::from_secs(params.timeout_secs);
             let poll = std::time::Duration::from_millis(params.poll_interval_ms);
             // `scan_after_id` is a monotonic query high-watermark. Temporarily
@@ -4669,13 +4715,15 @@ impl ToolHandler for WaAwaitEventTool {
             let mut any_met = vec![false; any_conditions.len()];
             let mut all_met = vec![false; all_conditions.len()];
             let mut matched_events = Vec::new();
-            let mut blocked_events = Vec::<McpAwaitBlockedEvent>::new();
-            let mut blocked_retry_scratch = Vec::<McpAwaitBlockedEvent>::new();
+            let mut blocked_events =
+                Vec::<McpAwaitBlockedEvent>::with_capacity(MCP_AWAIT_EVENT_BLOCKED_EVENT_MAX);
+            let mut blocked_retry_scratch =
+                Vec::<McpAwaitBlockedEvent>::with_capacity(MCP_AWAIT_EVENT_BLOCKED_EVENT_MAX);
             let mut retry_blocked_events = true;
 
-            let operation: crate::Result<McpAwaitEventData> = async {
+            let operation: std::result::Result<McpAwaitEventData, McpToolError> = async {
                 let (satisfied, timed_out) = loop {
-                    mcp_await_event_checkpoint(&cx)?;
+                    mcp_await_event_checkpoint(&cx).map_err(McpToolError::from_error)?;
                     if started.elapsed() >= timeout {
                         break (false, true);
                     }

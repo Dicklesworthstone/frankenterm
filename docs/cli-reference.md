@@ -334,6 +334,9 @@ poll cadence, and each private heartbeat returns the follower to the SQLite
 drain. `--heartbeat-interval-ms 0` disables user-visible heartbeat records,
 not this private durability wakeup.
 
+`--limit` is the per-poll batch size and must be in `1..=1000`; values outside
+that hard bound fail before FrankenTerm opens watch-event storage.
+
 `ft robot send` keeps the default fast path unless the caller asks for delivery
 proof. `--verify-submit` returns a submitted-level `submit` receipt; `--submit-level`
 selects `write`, `composer`, `submitted`, or `working`. The receipt records the
