@@ -2280,6 +2280,7 @@ fn collect_ordered_list_panes_snapshot_with_stage_observer(
                     &mut pane_nodes,
                     codec::MAX_ORDERED_PANE_TREE_DEPTH,
                     tab_node_ceiling,
+                    codec::MAX_ORDERED_PANE_CENSUS_WORK_PER_TREE,
                 )?);
                 observer(ListPanesSnapshotStage::TabTreeCaptured);
             }

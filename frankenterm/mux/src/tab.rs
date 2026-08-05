@@ -2874,11 +2874,11 @@ impl Tab {
     /// a recursive [`PaneNode`] or a temporary `Box` per split. The tab lock
     /// is held only while its existing mux tree is projected into an iterative
     /// callback-free capture; pane observations happen afterward. The caller
-    /// supplies the protocol depth/node ceilings so the dependency-lower mux
-    /// crate does not own wire policy. The remaining per-tab node budget also
-    /// caps the exact-identity census across hidden stack members, floating
-    /// panes, and zoom state, none of which may allocate or trigger callbacks
-    /// beyond the tree that the wire format can represent.
+    /// supplies the protocol depth/node ceilings and a stable per-tab census
+    /// work ceiling so the dependency-lower mux crate does not own wire policy.
+    /// The census ceiling is intentionally independent of the arena prefix:
+    /// the same tab cannot become invalid merely because earlier tabs consumed
+    /// more of the whole-snapshot node budget.
     pub fn append_codec_pane_arena_in_window(
         &self,
         window_id: WindowId,
@@ -2886,6 +2886,7 @@ impl Tab {
         arena: &mut Vec<PaneArenaNode>,
         max_depth: usize,
         max_total_nodes: usize,
+        max_census_work: usize,
     ) -> anyhow::Result<PaneArenaTree> {
         const SNAPSHOT_ATTEMPTS: usize = 3;
         let arena_start = arena.len();
@@ -2902,9 +2903,9 @@ impl Tab {
                 .snapshot_panes_callback_free_bounded(
                     max_depth,
                     max_tree_nodes,
-                    max_tree_nodes,
+                    max_census_work,
                 )?;
-            let observed = Self::observe_panes(callback_free_snapshot);
+            let observed = Self::observe_panes_bounded(callback_free_snapshot.panes)?;
             let pane_ids = build_callback_pane_id_snapshot(self.tab_id, &observed)?;
 
             let captured = {
@@ -2912,14 +2913,18 @@ impl Tab {
                 let current = inner.snapshot_panes_callback_free_bounded(
                     max_depth,
                     max_tree_nodes,
-                    max_tree_nodes,
+                    max_census_work,
                 )?;
-                if !callback_snapshot_matches(&current, &pane_ids)? {
+                if !callback_snapshot_matches(&current.panes, &pane_ids)? {
                     None
                 } else {
+                    let active = inner.raw_active_pane_callback_free_with_tree_active(
+                        &pane_ids,
+                        current.tree_active,
+                    );
                     Some(capture_pane_arena_tree(
                         inner.pane.as_ref(),
-                        inner.raw_active_pane_callback_free(&pane_ids),
+                        Some(active),
                         inner.zoomed.as_ref().map(Arc::clone),
                         pane_ids,
                         inner.title.clone(),
@@ -3301,6 +3306,28 @@ impl Tab {
                 ObservedPane { pane, pane_id }
             })
             .collect()
+    }
+
+    fn observe_panes_bounded(
+        panes: Vec<Arc<dyn Pane>>,
+    ) -> anyhow::Result<Vec<ObservedPane>> {
+        let mut observed = Vec::new();
+        observed
+            .try_reserve_exact(panes.len())
+            .map_err(|error| anyhow::anyhow!("reserve bounded pane observations: {error}"))?;
+        for pane in panes {
+            let pane_id = match catch_unwind(AssertUnwindSafe(|| pane.pane_id())) {
+                Ok(pane_id) => Some(pane_id),
+                Err(_) => {
+                    log::error!(
+                        "Pane::pane_id panicked during bounded ordered snapshot observation"
+                    );
+                    None
+                }
+            };
+            observed.push(ObservedPane { pane, pane_id });
+        }
+        Ok(observed)
     }
 
     fn apply_exact_removal_plan(
@@ -4668,18 +4695,32 @@ impl TabInner {
     /// Fallibly census one ordered-snapshot tab before invoking pane code.
     ///
     /// The tree limit counts every `Tree` node, including `Empty`; the census
-    /// limit counts unique pane identities across the tree, hidden stack
-    /// members, floating panes, and the zoom carrier. Both are deliberately
+    /// limit counts every raw carrier visited across tree leaves, stack
+    /// containers and members, floating panes, and the zoom carrier; it also
+    /// caps the smaller set of unique pane identities. Both are deliberately
     /// enforced while `Tab::inner` is held and before `Pane::pane_id` or any
     /// rendering callback can run. This prevents a topology that will be
-    /// rejected by the wire contract from first consuming an unbounded native
-    /// stack or callback/identity snapshot.
+    /// rejected by the wire contract from first consuming unbounded native
+    /// traversal, callback, or identity-snapshot work.
     fn snapshot_panes_callback_free_bounded(
         &self,
         max_depth: usize,
         max_tree_nodes: usize,
         max_census_work: usize,
-    ) -> anyhow::Result<Vec<Arc<dyn Pane>>> {
+    ) -> anyhow::Result<BoundedCallbackFreePaneCensus> {
+        let tree = self.pane.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "tab {} ordered pane snapshot has no pane tree; empty tabs lack size authority",
+                self.id
+            )
+        })?;
+        if matches!(tree, Tree::Empty) {
+            anyhow::bail!(
+                "tab {} ordered pane snapshot has an empty root; empty tabs lack size authority",
+                self.id
+            );
+        }
+
         let initial_census_capacity = max_census_work.min(64);
         let mut owners = HashMap::new();
         owners
@@ -4695,21 +4736,20 @@ impl TabInner {
             .map_err(|error| anyhow::anyhow!("reserve ordered pane tree identities: {error}"))?;
         let mut census_work = 0_usize;
 
-        if let Some(tree) = &self.pane {
-            let mut pending = Vec::new();
-            pending
-                .try_reserve_exact(max_depth.saturating_mul(2).min(128).min(max_tree_nodes))
-                .map_err(|error| anyhow::anyhow!("reserve ordered pane census traversal: {error}"))?;
-            reserve_pane_arena_stack_push(
-                &mut pending,
-                1,
-                max_tree_nodes,
-                "ordered pane census traversal",
-            )?;
-            pending.push((tree, 1_usize));
-            let mut tree_nodes = 0_usize;
+        let mut pending = Vec::new();
+        pending
+            .try_reserve_exact(max_depth.saturating_mul(2).min(128).min(max_tree_nodes))
+            .map_err(|error| anyhow::anyhow!("reserve ordered pane census traversal: {error}"))?;
+        reserve_pane_arena_stack_push(
+            &mut pending,
+            1,
+            max_tree_nodes,
+            "ordered pane census traversal",
+        )?;
+        pending.push((tree, 1_usize));
+        let mut tree_nodes = 0_usize;
 
-            while let Some((tree, depth)) = pending.pop() {
+        while let Some((tree, depth)) = pending.pop() {
                 if depth > max_depth {
                     anyhow::bail!(
                         "tab {} pane tree depth {depth} exceeds ordered snapshot limit {max_depth}",
@@ -4726,7 +4766,7 @@ impl TabInner {
                     );
                 }
 
-                match tree {
+            match tree {
                     Tree::Empty => {}
                     Tree::Leaf(pane) => {
                         admit_ordered_pane_census_work(
@@ -4758,7 +4798,17 @@ impl TabInner {
                         )?;
                         tree_leaf_identities.push(pane_identity(pane));
                     }
-                    Tree::Node { left, right, .. } => {
+                    Tree::Node {
+                        left,
+                        right,
+                        data,
+                    } => {
+                        if data.is_none() {
+                            anyhow::bail!(
+                                "tab {} ordered pane tree has an uninitialized split node",
+                                self.id
+                            );
+                        }
                         let next_depth = depth.checked_add(1).ok_or_else(|| {
                             anyhow::anyhow!("tab {} ordered pane tree depth overflows usize", self.id)
                         })?;
@@ -4791,10 +4841,41 @@ impl TabInner {
                         )?;
                         pending.push((right, next_depth));
                         pending.push((left, next_depth));
-                    }
                 }
             }
         }
+
+        if tree_leaf_identities.is_empty() {
+            anyhow::bail!(
+                "tab {} ordered pane tree contains no pane leaves",
+                self.id
+            );
+        }
+        let active_identity = tree_leaf_identities.get(self.active).copied().ok_or_else(|| {
+            anyhow::anyhow!(
+                "tab {} ordered active pane index {} is beyond {} tree leaves",
+                self.id,
+                self.active,
+                tree_leaf_identities.len()
+            )
+        })?;
+        if owners.get(&active_identity)
+            != Some(&CallbackFreePaneOwner::TreeLeaf(self.active))
+        {
+            anyhow::bail!(
+                "tab {} ordered active pane index {} does not own its tree leaf",
+                self.id,
+                self.active
+            );
+        }
+        let tree_active = panes.get(self.active).cloned().ok_or_else(|| {
+            anyhow::anyhow!(
+                "tab {} ordered active pane index {} disappeared from its census",
+                self.id,
+                self.active
+            )
+        })?;
+        debug_assert_eq!(pane_identity(&tree_active), active_identity);
 
         for (slot_index, stack) in &self.pane_stacks {
             admit_ordered_pane_census_work(
@@ -4896,7 +4977,7 @@ impl TabInner {
             }
         }
 
-        Ok(panes)
+        Ok(BoundedCallbackFreePaneCensus { panes, tree_active })
     }
 
     fn raw_tree_active_pane(&self) -> Option<Arc<dyn Pane>> {
@@ -4922,6 +5003,25 @@ impl TabInner {
             }
         }
         self.raw_tree_active_pane()
+    }
+
+    fn raw_active_pane_callback_free_with_tree_active(
+        &self,
+        pane_ids: &HashMap<PaneIdentity, PaneId>,
+        tree_active: Arc<dyn Pane>,
+    ) -> Arc<dyn Pane> {
+        if let Some(zoomed) = &self.zoomed {
+            return Arc::clone(zoomed);
+        }
+        if let Some(focused_id) = self.floating_focus {
+            if let Some(focused) = self.floating_panes.iter().find(|floating| {
+                floating.visible
+                    && pane_ids.get(&pane_identity(&floating.pane)) == Some(&focused_id)
+            }) {
+                return Arc::clone(&focused.pane);
+            }
+        }
+        tree_active
     }
 
     fn reindex_pane_stacks_callback_free(&mut self) {
@@ -6791,6 +6891,8 @@ mod test {
     use termwiz::surface::{SequenceNo, SEQ_ZERO};
     use url::Url;
 
+    const TEST_ORDERED_PANE_CENSUS_WORK: usize = 32_767;
+
     /// Ensure the global Mux singleton is initialized for tests that trigger
     /// focus-change notifications (e.g. floating pane and top-level split tests).
     fn ensure_mux_initialized() {
@@ -7000,6 +7102,7 @@ mod test {
         dead: bool,
         panic_in_is_dead: bool,
         callback_probe: Option<Arc<dyn Fn() + Send + Sync>>,
+        pane_id_probe: Option<Arc<dyn Fn() + Send + Sync>>,
         kills: std::sync::atomic::AtomicUsize,
     }
 
@@ -7016,6 +7119,7 @@ mod test {
                 dead: false,
                 panic_in_is_dead: false,
                 callback_probe: None,
+                pane_id_probe: None,
                 kills: std::sync::atomic::AtomicUsize::new(0),
             })
         }
@@ -7032,6 +7136,7 @@ mod test {
                 dead: false,
                 panic_in_is_dead: false,
                 callback_probe: None,
+                pane_id_probe: None,
                 kills: std::sync::atomic::AtomicUsize::new(0),
             })
         }
@@ -7052,6 +7157,7 @@ mod test {
                 dead: false,
                 panic_in_is_dead: false,
                 callback_probe: None,
+                pane_id_probe: None,
                 kills: std::sync::atomic::AtomicUsize::new(0),
             })
         }
@@ -7073,6 +7179,7 @@ mod test {
                 dead: false,
                 panic_in_is_dead: false,
                 callback_probe: None,
+                pane_id_probe: None,
                 kills: std::sync::atomic::AtomicUsize::new(0),
             })
         }
@@ -7095,6 +7202,28 @@ mod test {
                 dead,
                 panic_in_is_dead,
                 callback_probe: Some(callback_probe),
+                pane_id_probe: None,
+                kills: std::sync::atomic::AtomicUsize::new(0),
+            })
+        }
+
+        fn new_with_pane_id_probe(
+            id: PaneId,
+            size: TerminalSize,
+            pane_id_probe: Arc<dyn Fn() + Send + Sync>,
+        ) -> Arc<dyn Pane> {
+            Arc::new(Self {
+                id,
+                size: Mutex::new(size),
+                domain_id: 1,
+                constraints: PaneConstraints::default(),
+                priority: CollapsePriority::default(),
+                writes: Mutex::new(Vec::new()),
+                mux_registration: Arc::new(crate::PaneRegistrationSlot::default()),
+                dead: false,
+                panic_in_is_dead: false,
+                callback_probe: None,
+                pane_id_probe: Some(pane_id_probe),
                 kills: std::sync::atomic::AtomicUsize::new(0),
             })
         }
@@ -7102,6 +7231,9 @@ mod test {
 
     impl Pane for FakePane {
         fn pane_id(&self) -> PaneId {
+            if let Some(probe) = &self.pane_id_probe {
+                probe();
+            }
             self.id
         }
 
@@ -7997,6 +8129,7 @@ mod test {
                 &mut actual_nodes,
                 64,
                 1_024,
+                TEST_ORDERED_PANE_CENSUS_WORK,
             )
             .expect("direct flat projection");
 
@@ -8020,7 +8153,14 @@ mod test {
         let mut arena = vec![prefix.clone()];
 
         let tree = tab
-            .append_codec_pane_arena_in_window(88, "offset-workspace", &mut arena, 64, 16)
+            .append_codec_pane_arena_in_window(
+                88,
+                "offset-workspace",
+                &mut arena,
+                64,
+                16,
+                TEST_ORDERED_PANE_CENSUS_WORK,
+            )
             .expect("offset flat projection");
 
         assert_eq!(arena.first(), Some(&prefix));
@@ -8051,6 +8191,7 @@ mod test {
                 &mut depth_limited,
                 2,
                 16,
+                TEST_ORDERED_PANE_CENSUS_WORK,
             )
             .expect_err("depth-three tree must exceed a depth-two ceiling");
         assert!(format!("{depth_error:#}").contains("depth 3"));
@@ -8064,6 +8205,7 @@ mod test {
                 &mut node_limited,
                 64,
                 5,
+                TEST_ORDERED_PANE_CENSUS_WORK,
             )
             .expect_err("five tree nodes plus one prefix must exceed a five-node ceiling");
         assert!(format!("{node_error:#}").contains("more than 4 nodes"));
@@ -8117,6 +8259,7 @@ mod test {
                 &mut arena,
                 64,
                 256,
+                TEST_ORDERED_PANE_CENSUS_WORK,
             )
             .expect_err("depth-66 tree must fail during callback-free admission");
 
@@ -8202,6 +8345,7 @@ mod test {
                 &mut arena,
                 64,
                 4,
+                3,
             )
             .expect_err("four exact pane identities must exceed a three-entry census");
 
@@ -8240,6 +8384,7 @@ mod test {
                 &mut exact_arena,
                 64,
                 16,
+                TEST_ORDERED_PANE_CENSUS_WORK,
             )
             .expect_err("one exact pane identity cannot occupy two tree leaves");
         assert!(
@@ -8261,6 +8406,7 @@ mod test {
                 &mut numeric_arena,
                 64,
                 16,
+                TEST_ORDERED_PANE_CENSUS_WORK,
             )
             .expect_err("one numeric pane id cannot identify two exact pane objects");
         assert!(
@@ -8300,6 +8446,7 @@ mod test {
                 &mut arena,
                 64,
                 16,
+                TEST_ORDERED_PANE_CENSUS_WORK,
             );
         }));
         assert!(result.is_err(), "the injected pane panic must propagate");
