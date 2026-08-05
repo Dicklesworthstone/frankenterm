@@ -34,6 +34,7 @@ use std::sync::Arc;
 struct ContainedForwardingWaker {
     downstream: std::sync::Mutex<Option<std::task::Waker>>,
     lock_poisoned_count: &'static std::sync::atomic::AtomicU64,
+    callback_panic_count: &'static std::sync::atomic::AtomicU64,
     panic_site: frankenterm_sigpipe::RecoverablePanicSite,
 }
 
@@ -49,11 +50,13 @@ impl std::fmt::Display for ContainedWakerRegistrationError {
 impl ContainedForwardingWaker {
     fn new(
         lock_poisoned_count: &'static std::sync::atomic::AtomicU64,
+        callback_panic_count: &'static std::sync::atomic::AtomicU64,
         panic_site: frankenterm_sigpipe::RecoverablePanicSite,
     ) -> (Arc<Self>, std::task::Waker) {
         let state = Arc::new(Self {
             downstream: std::sync::Mutex::new(None),
             lock_poisoned_count,
+            callback_panic_count,
             panic_site,
         });
         let proxy = std::task::Waker::from(Arc::clone(&state));
@@ -64,8 +67,7 @@ impl ContainedForwardingWaker {
         &self,
     ) -> std::sync::MutexGuard<'_, Option<std::task::Waker>> {
         self.downstream.lock().unwrap_or_else(|poison| {
-            self.lock_poisoned_count
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            saturating_increment_counter(self.lock_poisoned_count);
             poison.into_inner()
         })
     }
@@ -107,6 +109,7 @@ impl ContainedForwardingWaker {
         ) {
             Ok(candidate) => candidate,
             Err(_panic) => {
+                saturating_increment_counter(self.callback_panic_count);
                 // A previous registration is no longer valid for this poll.
                 // Retire it before returning a finite, content-free failure;
                 // callers must not poll the primitive without a current waker.
@@ -148,25 +151,34 @@ impl ContainedForwardingWaker {
             slot.take()
         };
         if let Some(downstream) = downstream {
-            let _ = frankenterm_sigpipe::catch_recoverable(
+            if frankenterm_sigpipe::catch_recoverable(
                 self.panic_site,
                 std::panic::AssertUnwindSafe(|| downstream.wake()),
-            );
+            )
+            .is_err()
+            {
+                saturating_increment_counter(self.callback_panic_count);
+            }
         }
     }
 
     fn dispose(&self, downstream: std::task::Waker) {
-        Self::dispose_at(self.panic_site, downstream);
+        Self::dispose_at(self.panic_site, self.callback_panic_count, downstream);
     }
 
     fn dispose_at(
         panic_site: frankenterm_sigpipe::RecoverablePanicSite,
+        callback_panic_count: &'static std::sync::atomic::AtomicU64,
         downstream: std::task::Waker,
     ) {
-        let _ = frankenterm_sigpipe::catch_recoverable(
+        if frankenterm_sigpipe::catch_recoverable(
             panic_site,
             std::panic::AssertUnwindSafe(|| drop(downstream)),
-        );
+        )
+        .is_err()
+        {
+            saturating_increment_counter(callback_panic_count);
+        }
     }
 }
 
@@ -187,16 +199,72 @@ impl Drop for ContainedForwardingWaker {
         // cannot let a residual caller RawWaker drop escape state destruction.
         let panic_site = self.panic_site;
         let lock_poisoned_count = self.lock_poisoned_count;
+        let callback_panic_count = self.callback_panic_count;
         let downstream = match self.downstream.get_mut() {
             Ok(slot) => slot.take(),
             Err(poison) => {
-                lock_poisoned_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                saturating_increment_counter(lock_poisoned_count);
                 poison.into_inner().take()
             }
         };
         if let Some(downstream) = downstream {
-            Self::dispose_at(panic_site, downstream);
+            Self::dispose_at(panic_site, callback_panic_count, downstream);
         }
+    }
+}
+
+fn saturating_increment_counter(counter: &std::sync::atomic::AtomicU64) {
+    let mut current = counter.load(std::sync::atomic::Ordering::Relaxed);
+    loop {
+        if current == u64::MAX {
+            return;
+        }
+        match counter.compare_exchange_weak(
+            current,
+            current + 1,
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+        ) {
+            Ok(_) => return,
+            Err(observed) => current = observed,
+        }
+    }
+}
+
+/// Reusable stable proxy boundary for a channel receiver. The boundary is
+/// created lazily by each wrapper only when an operation can actually retain a
+/// task waker, then reused for subsequent waits on that receiver.
+struct ContainedWakerBoundary {
+    forwarding: Arc<ContainedForwardingWaker>,
+    proxy: std::task::Waker,
+}
+
+impl ContainedWakerBoundary {
+    fn new(
+        lock_poisoned_count: &'static std::sync::atomic::AtomicU64,
+        callback_panic_count: &'static std::sync::atomic::AtomicU64,
+    ) -> Self {
+        let (forwarding, proxy) = ContainedForwardingWaker::new(
+            lock_poisoned_count,
+            callback_panic_count,
+            frankenterm_sigpipe::RecoverablePanicSite::CoreChannelWaker,
+        );
+        Self { forwarding, proxy }
+    }
+
+    fn register(
+        &self,
+        downstream: &std::task::Waker,
+    ) -> Result<(), ContainedWakerRegistrationError> {
+        self.forwarding.register(downstream)
+    }
+
+    fn clear(&self) {
+        self.forwarding.clear();
+    }
+
+    fn proxy(&self) -> &std::task::Waker {
+        &self.proxy
     }
 }
 
@@ -652,9 +720,461 @@ impl OwnedSemaphorePermit {
 /// pattern as `DistributedHttpClient::race_with_cx_cancel`, tick
 /// 387). See `docs/ft-xbnl0-2-4-completion-evidence.md` §2.6.1.
 pub mod mpsc {
-    pub use asupersync::channel::mpsc::{
-        Receiver, RecvError, SendError, SendPermit, Sender, channel,
-    };
+    use asupersync::channel::mpsc as inner;
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+
+    pub use inner::{MpscTelemetrySnapshot, RecvError, SendError};
+
+    static RETAINED_WAKER_LOCK_POISONED_COUNT: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(0);
+    static RETAINED_WAKER_CALLBACK_PANIC_COUNT: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(0);
+
+    /// Number of recovered forwarding-slot poison events for MPSC waiters.
+    #[must_use]
+    pub fn retained_waker_lock_poisoned_count() -> u64 {
+        RETAINED_WAKER_LOCK_POISONED_COUNT.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Number of caller waker clone, wake, or drop panics contained at the
+    /// canonical MPSC boundary.
+    #[must_use]
+    pub fn retained_waker_callback_panic_count() -> u64 {
+        RETAINED_WAKER_CALLBACK_PANIC_COUNT.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reset_retained_waker_counters_for_test() {
+        RETAINED_WAKER_LOCK_POISONED_COUNT.store(0, std::sync::atomic::Ordering::Relaxed);
+        RETAINED_WAKER_CALLBACK_PANIC_COUNT.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn new_waker_boundary() -> super::ContainedWakerBoundary {
+        super::ContainedWakerBoundary::new(
+            &RETAINED_WAKER_LOCK_POISONED_COUNT,
+            &RETAINED_WAKER_CALLBACK_PANIC_COUNT,
+        )
+    }
+
+    /// Creates a bounded MPSC channel.
+    #[must_use]
+    pub fn channel<T>(capacity: usize) -> (Sender<T>, Receiver<T>) {
+        let (sender, receiver) = inner::channel(capacity);
+        (
+            Sender { inner: sender },
+            Receiver {
+                inner: receiver,
+                retained_waker: None,
+            },
+        )
+    }
+
+    /// Project-owned sending side of a bounded MPSC channel.
+    pub struct Sender<T> {
+        inner: inner::Sender<T>,
+    }
+
+    impl<T> std::fmt::Debug for Sender<T> {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter
+                .debug_struct("mpsc::Sender")
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl<T> Clone for Sender<T> {
+        fn clone(&self) -> Self {
+            Self {
+                inner: self.inner.clone(),
+            }
+        }
+    }
+
+    impl<T> Sender<T> {
+        /// Reserves one channel slot. A stable trusted waker proxy is allocated
+        /// only if this future is actually polled.
+        #[must_use]
+        pub fn reserve<'a>(&'a self, cx: &'a crate::cx::Cx) -> Reserve<'a, T> {
+            Reserve {
+                inner: self.inner.reserve(cx),
+                retained_waker: None,
+            }
+        }
+
+        /// Reserves and sends one value.
+        pub async fn send(
+            &self,
+            cx: &crate::cx::Cx,
+            value: T,
+        ) -> Result<(), SendError<T>> {
+            match self.reserve(cx).await {
+                Ok(permit) => permit.try_send(value),
+                Err(SendError::Disconnected(())) => Err(SendError::Disconnected(value)),
+                Err(SendError::Full(())) => Err(SendError::Full(value)),
+                Err(SendError::Cancelled(())) => Err(SendError::Cancelled(value)),
+            }
+        }
+
+        pub fn try_reserve(&self) -> Result<SendPermit<'_, T>, SendError<()>> {
+            self.inner
+                .try_reserve()
+                .map(|inner| SendPermit { inner })
+        }
+
+        pub fn try_send(&self, value: T) -> Result<(), SendError<T>> {
+            self.inner.try_send(value)
+        }
+
+        #[must_use]
+        pub fn is_closed(&self) -> bool {
+            self.inner.is_closed()
+        }
+
+        pub fn wake_receiver(&self) {
+            self.inner.wake_receiver();
+        }
+
+        #[must_use]
+        pub fn capacity(&self) -> usize {
+            self.inner.capacity()
+        }
+
+        #[must_use]
+        pub fn telemetry_snapshot(&self, channel_id: u64) -> MpscTelemetrySnapshot {
+            self.inner.telemetry_snapshot(channel_id)
+        }
+
+        pub fn send_evict_oldest(&self, value: T) -> Result<Option<T>, SendError<T>> {
+            self.inner.send_evict_oldest(value)
+        }
+
+        pub fn send_evict_oldest_where<F>(
+            &self,
+            value: T,
+            predicate: F,
+        ) -> Result<Option<T>, SendError<T>>
+        where
+            F: FnMut(&T) -> bool,
+        {
+            self.inner.send_evict_oldest_where(value, predicate)
+        }
+
+        #[must_use]
+        pub fn downgrade(&self) -> WeakSender<T> {
+            WeakSender {
+                inner: self.inner.downgrade(),
+            }
+        }
+    }
+
+    /// Weak reference to a bounded MPSC sender.
+    pub struct WeakSender<T> {
+        inner: inner::WeakSender<T>,
+    }
+
+    impl<T> std::fmt::Debug for WeakSender<T> {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter
+                .debug_struct("mpsc::WeakSender")
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl<T> Clone for WeakSender<T> {
+        fn clone(&self) -> Self {
+            Self {
+                inner: self.inner.clone(),
+            }
+        }
+    }
+
+    impl<T> WeakSender<T> {
+        #[must_use]
+        pub fn upgrade(&self) -> Option<Sender<T>> {
+            self.inner.upgrade().map(|inner| Sender { inner })
+        }
+    }
+
+    /// Future returned by [`Sender::reserve`].
+    pub struct Reserve<'a, T> {
+        inner: inner::Reserve<'a, T>,
+        retained_waker: Option<super::ContainedWakerBoundary>,
+    }
+
+    impl<'a, T> Future for Reserve<'a, T> {
+        type Output = Result<SendPermit<'a, T>, SendError<()>>;
+
+        fn poll(self: Pin<&mut Self>, caller_cx: &mut Context<'_>) -> Poll<Self::Output> {
+            let this = self.get_mut();
+            let boundary = this.retained_waker.get_or_insert_with(new_waker_boundary);
+            if boundary.register(caller_cx.waker()).is_err() {
+                return Poll::Ready(Err(SendError::Cancelled(())));
+            }
+
+            let mut proxy_cx = Context::from_waker(boundary.proxy());
+            match Pin::new(&mut this.inner).poll(&mut proxy_cx) {
+                Poll::Ready(Ok(inner)) => {
+                    boundary.clear();
+                    Poll::Ready(Ok(SendPermit { inner }))
+                }
+                Poll::Ready(Err(error)) => {
+                    boundary.clear();
+                    Poll::Ready(Err(error))
+                }
+                Poll::Pending => Poll::Pending,
+            }
+        }
+    }
+
+    impl<T> Drop for Reserve<'_, T> {
+        fn drop(&mut self) {
+            if let Some(boundary) = &self.retained_waker {
+                boundary.clear();
+            }
+        }
+    }
+
+    /// A reserved MPSC send slot.
+    #[must_use = "SendPermit must be consumed via send() or abort()"]
+    pub struct SendPermit<'a, T> {
+        inner: inner::SendPermit<'a, T>,
+    }
+
+    impl<T> std::fmt::Debug for SendPermit<'_, T> {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter
+                .debug_struct("mpsc::SendPermit")
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl<T> SendPermit<'_, T> {
+        pub fn send(self, value: T) -> asupersync::Outcome<(), SendError<T>> {
+            self.inner.send(value)
+        }
+
+        pub fn try_send(self, value: T) -> Result<(), SendError<T>> {
+            self.inner.try_send(value)
+        }
+
+        pub fn abort(self) {
+            self.inner.abort();
+        }
+
+        #[must_use]
+        pub fn telemetry_snapshot(&self, channel_id: u64) -> MpscTelemetrySnapshot {
+            self.inner.telemetry_snapshot(channel_id)
+        }
+    }
+
+    /// Project-owned receiving side of a bounded MPSC channel.
+    pub struct Receiver<T> {
+        inner: inner::Receiver<T>,
+        retained_waker: Option<super::ContainedWakerBoundary>,
+    }
+
+    impl<T> std::fmt::Debug for Receiver<T> {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter
+                .debug_struct("mpsc::Receiver")
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl<T> Receiver<T> {
+        pub fn close(&mut self) {
+            if let Some(boundary) = &self.retained_waker {
+                boundary.clear();
+            }
+            self.inner.close();
+        }
+
+        #[must_use]
+        pub fn recv<'a, Caps>(
+            &'a mut self,
+            cx: &'a crate::cx::Cx<Caps>,
+        ) -> Recv<'a, T, Caps> {
+            let Self {
+                inner,
+                retained_waker,
+            } = self;
+            let boundary = retained_waker.get_or_insert_with(new_waker_boundary);
+            Recv {
+                inner: inner.recv(cx),
+                boundary,
+            }
+        }
+
+        #[must_use]
+        pub fn recv_many<'a, Caps>(
+            &'a mut self,
+            cx: &'a crate::cx::Cx<Caps>,
+            buffer: &'a mut Vec<T>,
+            limit: usize,
+        ) -> RecvMany<'a, T, Caps> {
+            let Self {
+                inner,
+                retained_waker,
+            } = self;
+            let boundary = retained_waker.get_or_insert_with(new_waker_boundary);
+            RecvMany {
+                inner: inner.recv_many(cx, buffer, limit),
+                boundary,
+            }
+        }
+
+        pub fn poll_recv<Caps>(
+            &mut self,
+            cx: &crate::cx::Cx<Caps>,
+            caller_cx: &mut Context<'_>,
+        ) -> Poll<Result<T, RecvError>> {
+            let Self {
+                inner,
+                retained_waker,
+            } = self;
+            let boundary = retained_waker.get_or_insert_with(new_waker_boundary);
+            if boundary.register(caller_cx.waker()).is_err() {
+                return Poll::Ready(Err(RecvError::Cancelled));
+            }
+            let mut proxy_cx = Context::from_waker(boundary.proxy());
+            let result = inner.poll_recv(cx, &mut proxy_cx);
+            if result.is_ready() {
+                boundary.clear();
+            }
+            result
+        }
+
+        pub fn poll_recv_many<Caps>(
+            &mut self,
+            cx: &crate::cx::Cx<Caps>,
+            buffer: &mut Vec<T>,
+            limit: usize,
+            caller_cx: &mut Context<'_>,
+        ) -> Poll<Result<usize, RecvError>> {
+            let Self {
+                inner,
+                retained_waker,
+            } = self;
+            let boundary = retained_waker.get_or_insert_with(new_waker_boundary);
+            if boundary.register(caller_cx.waker()).is_err() {
+                return Poll::Ready(Err(RecvError::Cancelled));
+            }
+            let mut proxy_cx = Context::from_waker(boundary.proxy());
+            let result = inner.poll_recv_many(cx, buffer, limit, &mut proxy_cx);
+            if result.is_ready() {
+                boundary.clear();
+            }
+            result
+        }
+
+        pub fn try_recv(&mut self) -> Result<T, RecvError> {
+            let result = self.inner.try_recv();
+            if !matches!(&result, Err(RecvError::Empty)) {
+                if let Some(boundary) = &self.retained_waker {
+                    boundary.clear();
+                }
+            }
+            result
+        }
+
+        #[must_use]
+        pub fn is_closed(&self) -> bool {
+            self.inner.is_closed()
+        }
+
+        #[must_use]
+        pub fn has_messages(&self) -> bool {
+            self.inner.has_messages()
+        }
+
+        #[must_use]
+        pub fn len(&self) -> usize {
+            self.inner.len()
+        }
+
+        #[must_use]
+        pub fn is_empty(&self) -> bool {
+            self.inner.is_empty()
+        }
+
+        #[must_use]
+        pub fn capacity(&self) -> usize {
+            self.inner.capacity()
+        }
+
+        #[must_use]
+        pub fn telemetry_snapshot(&self, channel_id: u64) -> MpscTelemetrySnapshot {
+            self.inner.telemetry_snapshot(channel_id)
+        }
+    }
+
+    impl<T> Drop for Receiver<T> {
+        fn drop(&mut self) {
+            if let Some(boundary) = &self.retained_waker {
+                boundary.clear();
+            }
+        }
+    }
+
+    /// Future returned by [`Receiver::recv`].
+    pub struct Recv<'a, T, Caps = asupersync::cx::cap::All> {
+        inner: inner::Recv<'a, T, Caps>,
+        boundary: &'a super::ContainedWakerBoundary,
+    }
+
+    impl<T, Caps> Future for Recv<'_, T, Caps> {
+        type Output = Result<T, RecvError>;
+
+        fn poll(self: Pin<&mut Self>, caller_cx: &mut Context<'_>) -> Poll<Self::Output> {
+            let this = self.get_mut();
+            if this.boundary.register(caller_cx.waker()).is_err() {
+                return Poll::Ready(Err(RecvError::Cancelled));
+            }
+            let mut proxy_cx = Context::from_waker(this.boundary.proxy());
+            let result = Pin::new(&mut this.inner).poll(&mut proxy_cx);
+            if result.is_ready() {
+                this.boundary.clear();
+            }
+            result
+        }
+    }
+
+    impl<T, Caps> Drop for Recv<'_, T, Caps> {
+        fn drop(&mut self) {
+            self.boundary.clear();
+        }
+    }
+
+    /// Future returned by [`Receiver::recv_many`].
+    pub struct RecvMany<'a, T, Caps = asupersync::cx::cap::All> {
+        inner: inner::RecvMany<'a, T, Caps>,
+        boundary: &'a super::ContainedWakerBoundary,
+    }
+
+    impl<T, Caps> Future for RecvMany<'_, T, Caps> {
+        type Output = Result<usize, RecvError>;
+
+        fn poll(self: Pin<&mut Self>, caller_cx: &mut Context<'_>) -> Poll<Self::Output> {
+            let this = self.get_mut();
+            if this.boundary.register(caller_cx.waker()).is_err() {
+                return Poll::Ready(Err(RecvError::Cancelled));
+            }
+            let mut proxy_cx = Context::from_waker(this.boundary.proxy());
+            let result = Pin::new(&mut this.inner).poll(&mut proxy_cx);
+            if result.is_ready() {
+                this.boundary.clear();
+            }
+            result
+        }
+    }
+
+    impl<T, Caps> Drop for RecvMany<'_, T, Caps> {
+        fn drop(&mut self) {
+            self.boundary.clear();
+        }
+    }
 
     /// Compatibility alias for `try_send` errors, matching the tokio
     /// `TrySendError` API surface (`Full` / `Closed`).
@@ -698,7 +1218,240 @@ pub mod mpsc {
 /// `DistributedHttpClient::race_with_cx_cancel`, tick 387). See
 /// `docs/ft-xbnl0-2-4-completion-evidence.md` §2.6.1.
 pub mod watch {
-    pub use asupersync::channel::watch::{Receiver, RecvError, SendError, Sender, channel};
+    use asupersync::channel::watch as inner;
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+
+    pub use inner::{ModifyError, RecvError, Ref, SendError, WatchTelemetrySnapshot};
+
+    static RETAINED_WAKER_LOCK_POISONED_COUNT: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(0);
+    static RETAINED_WAKER_CALLBACK_PANIC_COUNT: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(0);
+
+    /// Number of recovered forwarding-slot poison events for watch waiters.
+    #[must_use]
+    pub fn retained_waker_lock_poisoned_count() -> u64 {
+        RETAINED_WAKER_LOCK_POISONED_COUNT.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Number of caller waker clone, wake, or drop panics contained at the
+    /// canonical watch boundary.
+    #[must_use]
+    pub fn retained_waker_callback_panic_count() -> u64 {
+        RETAINED_WAKER_CALLBACK_PANIC_COUNT.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reset_retained_waker_counters_for_test() {
+        RETAINED_WAKER_LOCK_POISONED_COUNT.store(0, std::sync::atomic::Ordering::Relaxed);
+        RETAINED_WAKER_CALLBACK_PANIC_COUNT.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn new_waker_boundary() -> super::ContainedWakerBoundary {
+        super::ContainedWakerBoundary::new(
+            &RETAINED_WAKER_LOCK_POISONED_COUNT,
+            &RETAINED_WAKER_CALLBACK_PANIC_COUNT,
+        )
+    }
+
+    /// Creates a watch channel.
+    #[must_use]
+    pub fn channel<T>(initial: T) -> (Sender<T>, Receiver<T>) {
+        let (sender, receiver) = inner::channel(initial);
+        (
+            Sender { inner: sender },
+            Receiver {
+                inner: receiver,
+                retained_waker: None,
+            },
+        )
+    }
+
+    /// Project-owned watch sender.
+    pub struct Sender<T> {
+        inner: inner::Sender<T>,
+    }
+
+    impl<T> std::fmt::Debug for Sender<T> {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter
+                .debug_struct("watch::Sender")
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl<T> Sender<T> {
+        pub fn send(&self, value: T) -> Result<(), SendError<T>> {
+            self.inner.send(value)
+        }
+
+        pub fn send_modify<F>(&self, mutation: F) -> Result<(), ModifyError>
+        where
+            T: Clone,
+            F: FnOnce(&mut T),
+        {
+            self.inner.send_modify(mutation)
+        }
+
+        #[must_use]
+        pub fn borrow(&self) -> Ref<'_, T> {
+            self.inner.borrow()
+        }
+
+        #[must_use]
+        pub fn subscribe(&self) -> Receiver<T> {
+            Receiver {
+                inner: self.inner.subscribe(),
+                retained_waker: None,
+            }
+        }
+
+        #[must_use]
+        pub fn receiver_count(&self) -> usize {
+            self.inner.receiver_count()
+        }
+
+        #[must_use]
+        pub fn is_closed(&self) -> bool {
+            self.inner.is_closed()
+        }
+
+        #[must_use]
+        pub fn telemetry_snapshot(&self, channel_id: u64) -> WatchTelemetrySnapshot {
+            self.inner.telemetry_snapshot(channel_id)
+        }
+    }
+
+    /// Project-owned watch receiver. Its stable proxy is allocated on the
+    /// first `changed` operation and then reused by that receiver.
+    pub struct Receiver<T> {
+        inner: inner::Receiver<T>,
+        retained_waker: Option<super::ContainedWakerBoundary>,
+    }
+
+    impl<T> std::fmt::Debug for Receiver<T> {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter
+                .debug_struct("watch::Receiver")
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl<T> Clone for Receiver<T> {
+        fn clone(&self) -> Self {
+            Self {
+                inner: self.inner.clone(),
+                retained_waker: None,
+            }
+        }
+    }
+
+    impl<T> Receiver<T> {
+        #[must_use]
+        pub fn changed<'a, 'b, Caps>(
+            &'a mut self,
+            cx: &'b crate::cx::Cx<Caps>,
+        ) -> ChangedFuture<'a, 'b, T, Caps> {
+            let Self {
+                inner,
+                retained_waker,
+            } = self;
+            let boundary = retained_waker.get_or_insert_with(new_waker_boundary);
+            ChangedFuture {
+                inner: inner.changed(cx),
+                boundary,
+            }
+        }
+
+        #[must_use]
+        pub fn borrow(&self) -> Ref<'_, T> {
+            self.inner.borrow()
+        }
+
+        #[must_use]
+        pub fn borrow_and_update(&mut self) -> Ref<'_, T> {
+            self.inner.borrow_and_update()
+        }
+
+        #[must_use]
+        pub fn borrow_and_clone(&self) -> T
+        where
+            T: Clone,
+        {
+            self.inner.borrow_and_clone()
+        }
+
+        #[must_use]
+        pub fn borrow_and_update_clone(&mut self) -> T
+        where
+            T: Clone,
+        {
+            self.inner.borrow_and_update_clone()
+        }
+
+        pub fn mark_seen(&mut self) {
+            self.inner.mark_seen();
+        }
+
+        #[must_use]
+        pub fn has_changed(&self) -> bool {
+            self.inner.has_changed()
+        }
+
+        #[must_use]
+        pub fn is_closed(&self) -> bool {
+            self.inner.is_closed()
+        }
+
+        #[must_use]
+        pub fn seen_version(&self) -> u64 {
+            self.inner.seen_version()
+        }
+
+        #[must_use]
+        pub fn telemetry_snapshot(&self, channel_id: u64) -> WatchTelemetrySnapshot {
+            self.inner.telemetry_snapshot(channel_id)
+        }
+    }
+
+    impl<T> Drop for Receiver<T> {
+        fn drop(&mut self) {
+            if let Some(boundary) = &self.retained_waker {
+                boundary.clear();
+            }
+        }
+    }
+
+    /// Future returned by [`Receiver::changed`].
+    pub struct ChangedFuture<'a, 'b, T, Caps = asupersync::cx::cap::All> {
+        inner: inner::ChangedFuture<'a, 'b, T, Caps>,
+        boundary: &'a super::ContainedWakerBoundary,
+    }
+
+    impl<T, Caps> Future for ChangedFuture<'_, '_, T, Caps> {
+        type Output = Result<(), RecvError>;
+
+        fn poll(self: Pin<&mut Self>, caller_cx: &mut Context<'_>) -> Poll<Self::Output> {
+            let this = self.get_mut();
+            if this.boundary.register(caller_cx.waker()).is_err() {
+                return Poll::Ready(Err(RecvError::Cancelled));
+            }
+            let mut proxy_cx = Context::from_waker(this.boundary.proxy());
+            let result = Pin::new(&mut this.inner).poll(&mut proxy_cx);
+            if result.is_ready() {
+                this.boundary.clear();
+            }
+            result
+        }
+    }
+
+    impl<T, Caps> Drop for ChangedFuture<'_, '_, T, Caps> {
+        fn drop(&mut self) {
+            self.boundary.clear();
+        }
+    }
 }
 
 /// Broadcast channel aliases for the active runtime.
@@ -707,6 +1460,38 @@ pub mod watch {
 /// a `Cx` internally while retaining the established call-site signatures.
 pub mod broadcast {
     use asupersync::channel::broadcast as inner;
+    use std::future::Future;
+
+    static RETAINED_WAKER_LOCK_POISONED_COUNT: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(0);
+    static RETAINED_WAKER_CALLBACK_PANIC_COUNT: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(0);
+
+    /// Number of recovered forwarding-slot poison events for broadcast waiters.
+    #[must_use]
+    pub fn retained_waker_lock_poisoned_count() -> u64 {
+        RETAINED_WAKER_LOCK_POISONED_COUNT.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Number of caller waker clone, wake, or drop panics contained at the
+    /// canonical broadcast boundary.
+    #[must_use]
+    pub fn retained_waker_callback_panic_count() -> u64 {
+        RETAINED_WAKER_CALLBACK_PANIC_COUNT.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reset_retained_waker_counters_for_test() {
+        RETAINED_WAKER_LOCK_POISONED_COUNT.store(0, std::sync::atomic::Ordering::Relaxed);
+        RETAINED_WAKER_CALLBACK_PANIC_COUNT.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn new_waker_boundary() -> super::ContainedWakerBoundary {
+        super::ContainedWakerBoundary::new(
+            &RETAINED_WAKER_LOCK_POISONED_COUNT,
+            &RETAINED_WAKER_CALLBACK_PANIC_COUNT,
+        )
+    }
 
     /// Error returned when sending fails (no active receivers).
     #[derive(Debug)]
@@ -813,6 +1598,7 @@ pub mod broadcast {
         pub fn subscribe(&self) -> Receiver<T> {
             Receiver {
                 inner: self.inner.subscribe(),
+                retained_waker: None,
             }
         }
 
@@ -836,6 +1622,7 @@ pub mod broadcast {
     /// acquires a `Cx` internally for async recv.
     pub struct Receiver<T> {
         inner: inner::Receiver<T>,
+        retained_waker: Option<super::ContainedWakerBoundary>,
     }
 
     impl<T> std::fmt::Debug for Receiver<T> {
@@ -849,6 +1636,15 @@ pub mod broadcast {
         fn clone(&self) -> Self {
             Self {
                 inner: self.inner.clone(),
+                retained_waker: None,
+            }
+        }
+    }
+
+    impl<T> Drop for Receiver<T> {
+        fn drop(&mut self) {
+            if let Some(boundary) = &self.retained_waker {
+                boundary.clear();
             }
         }
     }
@@ -867,7 +1663,32 @@ pub mod broadcast {
         /// through the provided capability context instead of being pulled
         /// from thread-local state.
         pub async fn recv_with_cx(&mut self, cx: &crate::cx::Cx) -> Result<T, RecvError> {
-            self.inner.recv(cx).await.map_err(|e| match e {
+            let Self {
+                inner,
+                retained_waker,
+            } = self;
+            let boundary = retained_waker.get_or_insert_with(new_waker_boundary);
+            let mut receive = std::pin::pin!(inner.recv(cx));
+            // Declared after `receive` so cancellation clears the caller slot
+            // before the underlying future removes and drops its trusted proxy.
+            let clear_on_drop = super::ClearContainedWakerOnDrop::new(std::sync::Arc::clone(
+                &boundary.forwarding,
+            ));
+            let received = std::future::poll_fn(|caller_cx| {
+                if clear_on_drop.register(caller_cx.waker()).is_err() {
+                    return std::task::Poll::Ready(Err(RecvError::Cancelled));
+                }
+                let mut proxy_cx = std::task::Context::from_waker(boundary.proxy());
+                match receive.as_mut().poll(&mut proxy_cx) {
+                    std::task::Poll::Ready(result) => {
+                        clear_on_drop.clear();
+                        std::task::Poll::Ready(Ok(result))
+                    }
+                    std::task::Poll::Pending => std::task::Poll::Pending,
+                }
+            })
+            .await?;
+            received.map_err(|e| match e {
                 inner::RecvError::Lagged(n) => RecvError::Lagged(n),
                 inner::RecvError::Closed => RecvError::Closed,
                 inner::RecvError::Cancelled => RecvError::Cancelled,
@@ -888,7 +1709,13 @@ pub mod broadcast {
     /// Creates a new broadcast channel with the given capacity.
     pub fn channel<T: Clone>(capacity: usize) -> (Sender<T>, Receiver<T>) {
         let (tx, rx) = inner::channel(capacity);
-        (Sender { inner: tx }, Receiver { inner: rx })
+        (
+            Sender { inner: tx },
+            Receiver {
+                inner: rx,
+                retained_waker: None,
+            },
+        )
     }
 }
 
@@ -905,6 +1732,8 @@ pub mod oneshot {
 
     pub(super) static RECEIVER_WAKER_LOCK_POISONED_COUNT: std::sync::atomic::AtomicU64 =
         std::sync::atomic::AtomicU64::new(0);
+    pub(super) static RECEIVER_WAKER_CALLBACK_PANIC_COUNT: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(0);
 
     /// Returns the number of recovered oneshot receiver forwarding-slot
     /// poison events observed by this process.
@@ -917,9 +1746,17 @@ pub mod oneshot {
         RECEIVER_WAKER_LOCK_POISONED_COUNT.load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// Returns the number of caller waker callback panics contained while
+    /// receiving from oneshot channels.
+    #[must_use]
+    pub fn receiver_waker_callback_panic_count() -> u64 {
+        RECEIVER_WAKER_CALLBACK_PANIC_COUNT.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     #[cfg(test)]
     pub(crate) fn reset_receiver_waker_lock_poisoned_count_for_test() {
         RECEIVER_WAKER_LOCK_POISONED_COUNT.store(0, std::sync::atomic::Ordering::Relaxed);
+        RECEIVER_WAKER_CALLBACK_PANIC_COUNT.store(0, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Compatibility error type matching tokio's `oneshot::error::RecvError`.
@@ -1031,6 +1868,7 @@ pub mod task {
     // ft-h2vyr — make silent state loss visible (the counter), and
     // prevent runtime cascade when possible (the recovery).
     static JOIN_HANDLE_LOCK_POISONED_COUNT: AtomicU64 = AtomicU64::new(0);
+    static JOIN_HANDLE_WAKER_CALLBACK_PANIC_COUNT: AtomicU64 = AtomicU64::new(0);
 
     /// Read the current count of recovered JoinHandle downstream-waker
     /// Mutex-poison events. Non-zero values mean a prior thread
@@ -1042,10 +1880,18 @@ pub mod task {
         JOIN_HANDLE_LOCK_POISONED_COUNT.load(Ordering::Relaxed)
     }
 
+    /// Read the number of caller waker callback panics contained by task join
+    /// forwarding boundaries.
+    #[must_use]
+    pub fn join_handle_waker_callback_panic_count() -> u64 {
+        JOIN_HANDLE_WAKER_CALLBACK_PANIC_COUNT.load(Ordering::Relaxed)
+    }
+
     /// Test-only: reset the counter to zero.
     #[cfg(test)]
     pub(crate) fn reset_join_handle_lock_poisoned_count_for_test() {
         JOIN_HANDLE_LOCK_POISONED_COUNT.store(0, Ordering::Relaxed);
+        JOIN_HANDLE_WAKER_CALLBACK_PANIC_COUNT.store(0, Ordering::Relaxed);
     }
 
     /// Error type returned when a spawned task fails.
@@ -1387,6 +2233,7 @@ pub mod task {
         let inner = handle.spawn(wrapped);
         let (forwarding, completion_waker) = super::ContainedForwardingWaker::new(
             &JOIN_HANDLE_LOCK_POISONED_COUNT,
+            &JOIN_HANDLE_WAKER_CALLBACK_PANIC_COUNT,
             frankenterm_sigpipe::RecoverablePanicSite::CoreAsyncTaskJoin,
         );
         JoinHandle {
@@ -1418,6 +2265,7 @@ pub mod task {
         let inner = handle.spawn(wrapped);
         let (forwarding, completion_waker) = super::ContainedForwardingWaker::new(
             &JOIN_HANDLE_LOCK_POISONED_COUNT,
+            &JOIN_HANDLE_WAKER_CALLBACK_PANIC_COUNT,
             frankenterm_sigpipe::RecoverablePanicSite::CoreAsyncTaskJoin,
         );
         JoinHandle {
@@ -3051,7 +3899,8 @@ pub async fn oneshot_recv_with_cx<T>(
     // waker to the underlying primitive.
     let (forwarding, proxy_waker) = ContainedForwardingWaker::new(
         &oneshot::RECEIVER_WAKER_LOCK_POISONED_COUNT,
-        frankenterm_sigpipe::RecoverablePanicSite::CoreAsyncTaskJoin,
+        &oneshot::RECEIVER_WAKER_CALLBACK_PANIC_COUNT,
+        frankenterm_sigpipe::RecoverablePanicSite::CoreChannelWaker,
     );
     let mut receive = std::pin::pin!(inner.recv(cx));
     // This guard is intentionally declared after `receive`: cancellation
@@ -3162,12 +4011,81 @@ mod tests {
     }
 
     #[cfg(panic = "unwind")]
+    struct MpscReentrantDropWake {
+        sender: mpsc::Sender<u8>,
+        completed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[cfg(panic = "unwind")]
+    impl std::task::Wake for MpscReentrantDropWake {
+        fn wake(self: std::sync::Arc<Self>) {}
+
+        fn wake_by_ref(self: &std::sync::Arc<Self>) {}
+    }
+
+    #[cfg(panic = "unwind")]
+    impl Drop for MpscReentrantDropWake {
+        fn drop(&mut self) {
+            let accepted = self.sender.try_send(73).is_ok();
+            self.completed
+                .store(accepted, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[cfg(panic = "unwind")]
+    struct WatchReentrantDropWake {
+        sender: watch::Sender<u8>,
+        completed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[cfg(panic = "unwind")]
+    impl std::task::Wake for WatchReentrantDropWake {
+        fn wake(self: std::sync::Arc<Self>) {}
+
+        fn wake_by_ref(self: &std::sync::Arc<Self>) {}
+    }
+
+    #[cfg(panic = "unwind")]
+    impl Drop for WatchReentrantDropWake {
+        fn drop(&mut self) {
+            let accepted = self.sender.send(83).is_ok();
+            self.completed
+                .store(accepted, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[cfg(panic = "unwind")]
+    struct BroadcastReentrantDropWake {
+        sender: broadcast::Sender<u8>,
+        completed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[cfg(panic = "unwind")]
+    impl std::task::Wake for BroadcastReentrantDropWake {
+        fn wake(self: std::sync::Arc<Self>) {}
+
+        fn wake_by_ref(self: &std::sync::Arc<Self>) {}
+    }
+
+    #[cfg(panic = "unwind")]
+    impl Drop for BroadcastReentrantDropWake {
+        fn drop(&mut self) {
+            let accepted = self.sender.send(97).is_ok();
+            self.completed
+                .store(accepted, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[cfg(panic = "unwind")]
     #[test]
     fn contained_forwarding_clone_failure_is_finite_and_clears_stale_registration() {
         static LOCK_POISONED_COUNT: std::sync::atomic::AtomicU64 =
             std::sync::atomic::AtomicU64::new(0);
+        static CALLBACK_PANIC_COUNT: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(0);
         let (forwarding, _proxy) = ContainedForwardingWaker::new(
             &LOCK_POISONED_COUNT,
+            &CALLBACK_PANIC_COUNT,
             frankenterm_sigpipe::RecoverablePanicSite::CoreAsyncTaskJoin,
         );
         let (stale_probe, stale_waker) = probe_waker(false);
@@ -3197,6 +4115,54 @@ mod tests {
             0,
             "caller clone callback must run without holding the slot lock"
         );
+        assert_eq!(
+            CALLBACK_PANIC_COUNT.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "clone panic must increment the finite callback counter"
+        );
+    }
+
+    #[cfg(panic = "unwind")]
+    #[test]
+    fn contained_forwarding_proxy_contains_wake_and_wake_by_ref_panics() {
+        static LOCK_POISONED_COUNT: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(0);
+        static CALLBACK_PANIC_COUNT: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(0);
+        let (forwarding, proxy) = ContainedForwardingWaker::new(
+            &LOCK_POISONED_COUNT,
+            &CALLBACK_PANIC_COUNT,
+            frankenterm_sigpipe::RecoverablePanicSite::CoreChannelWaker,
+        );
+
+        let (wake_probe, wake_waker) = probe_waker(true);
+        forwarding.register(&wake_waker).expect("register wake probe");
+        let wake_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            proxy.clone().wake();
+        }));
+        assert!(wake_result.is_ok(), "proxy wake must contain caller panic");
+        assert_eq!(wake_probe.count(), 1);
+
+        let (wake_by_ref_probe, wake_by_ref_waker) = probe_waker(true);
+        forwarding
+            .register(&wake_by_ref_waker)
+            .expect("register wake-by-ref probe");
+        let wake_by_ref_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            proxy.wake_by_ref();
+        }));
+        assert!(
+            wake_by_ref_result.is_ok(),
+            "proxy wake_by_ref must contain caller panic"
+        );
+        assert_eq!(wake_by_ref_probe.count(), 1);
+        assert_eq!(
+            CALLBACK_PANIC_COUNT.load(std::sync::atomic::Ordering::SeqCst),
+            2
+        );
+        assert_eq!(
+            LOCK_POISONED_COUNT.load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
     }
 
     #[cfg(panic = "unwind")]
@@ -3204,8 +4170,11 @@ mod tests {
     fn contained_forwarding_replacement_contains_retired_waker_drop_panic() {
         static LOCK_POISONED_COUNT: std::sync::atomic::AtomicU64 =
             std::sync::atomic::AtomicU64::new(0);
+        static CALLBACK_PANIC_COUNT: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(0);
         let (forwarding, _proxy) = ContainedForwardingWaker::new(
             &LOCK_POISONED_COUNT,
+            &CALLBACK_PANIC_COUNT,
             frankenterm_sigpipe::RecoverablePanicSite::CoreAsyncTaskJoin,
         );
         let (drop_count, drop_panicking) = drop_panicking_waker();
@@ -3224,6 +4193,11 @@ mod tests {
             0,
             "retired caller drop callback must run without holding the slot lock"
         );
+        assert_eq!(
+            CALLBACK_PANIC_COUNT.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "retired caller drop panic must increment the finite callback counter"
+        );
         forwarding.clear();
     }
 
@@ -3232,8 +4206,11 @@ mod tests {
     fn contained_forwarding_state_drop_contains_residual_waker_during_outer_unwind() {
         static LOCK_POISONED_COUNT: std::sync::atomic::AtomicU64 =
             std::sync::atomic::AtomicU64::new(0);
+        static CALLBACK_PANIC_COUNT: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(0);
         let (forwarding, proxy) = ContainedForwardingWaker::new(
             &LOCK_POISONED_COUNT,
+            &CALLBACK_PANIC_COUNT,
             frankenterm_sigpipe::RecoverablePanicSite::CoreAsyncTaskJoin,
         );
         let (drop_count, drop_panicking) = drop_panicking_waker();
@@ -3255,6 +4232,11 @@ mod tests {
             LOCK_POISONED_COUNT.load(std::sync::atomic::Ordering::SeqCst),
             0,
             "state destruction must dispose the residual waker without a lock"
+        );
+        assert_eq!(
+            CALLBACK_PANIC_COUNT.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "residual caller drop panic must increment the finite callback counter"
         );
     }
 
@@ -3972,6 +4954,333 @@ mod tests {
             assert_eq!(broadcast_recv(&mut rx1).await.expect("r1"), 7);
             assert_eq!(broadcast_recv(&mut rx2).await.expect("r2"), 7);
         });
+    }
+
+    #[cfg(panic = "unwind")]
+    #[test]
+    fn mpsc_wait_surfaces_contain_hostile_wakes_and_repoll_replacement() {
+        let cx = asupersync::Cx::for_testing();
+
+        let (tx, mut rx) = mpsc::channel(2);
+        let mut receive = Box::pin(rx.recv(&cx));
+        let (drop_count, drop_panicking) = drop_panicking_waker();
+        let mut first_cx = std::task::Context::from_waker(&drop_panicking);
+        assert!(receive.as_mut().poll(&mut first_cx).is_pending());
+        drop(first_cx);
+        drop(drop_panicking);
+
+        let (replacement_probe, replacement_waker) = probe_waker(false);
+        let mut replacement_cx = std::task::Context::from_waker(&replacement_waker);
+        assert!(receive.as_mut().poll(&mut replacement_cx).is_pending());
+        assert_eq!(
+            drop_count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "repoll replacement must dispose the retired caller waker"
+        );
+        tx.try_send(11).expect("wake contained receiver");
+        assert_eq!(replacement_probe.count(), 1);
+        assert!(matches!(
+            receive.as_mut().poll(&mut replacement_cx),
+            std::task::Poll::Ready(Ok(11))
+        ));
+        drop(receive);
+
+        let callback_before = mpsc::retained_waker_callback_panic_count();
+        let mut batch = Vec::new();
+        let mut receive_many = Box::pin(rx.recv_many(&cx, &mut batch, 8));
+        let (hostile_batch_probe, hostile_batch_waker) = probe_waker(true);
+        let mut hostile_batch_cx = std::task::Context::from_waker(&hostile_batch_waker);
+        assert!(receive_many
+            .as_mut()
+            .poll(&mut hostile_batch_cx)
+            .is_pending());
+        tx.try_send(12).expect("wake contained batch receiver");
+        assert_eq!(hostile_batch_probe.count(), 1);
+        assert!(
+            mpsc::retained_waker_callback_panic_count() >= callback_before.saturating_add(1)
+        );
+        let (_, normal_batch_waker) = probe_waker(false);
+        let mut normal_batch_cx = std::task::Context::from_waker(&normal_batch_waker);
+        assert!(matches!(
+            receive_many.as_mut().poll(&mut normal_batch_cx),
+            std::task::Poll::Ready(Ok(1))
+        ));
+        drop(receive_many);
+        assert_eq!(batch, vec![12]);
+
+        let callback_before = mpsc::retained_waker_callback_panic_count();
+        let (hostile_poll_probe, hostile_poll_waker) = probe_waker(true);
+        let mut hostile_poll_cx = std::task::Context::from_waker(&hostile_poll_waker);
+        assert!(rx.poll_recv(&cx, &mut hostile_poll_cx).is_pending());
+        tx.try_send(13).expect("wake contained direct poll receiver");
+        assert_eq!(hostile_poll_probe.count(), 1);
+        assert!(
+            mpsc::retained_waker_callback_panic_count() >= callback_before.saturating_add(1)
+        );
+        let (_, normal_poll_waker) = probe_waker(false);
+        let mut normal_poll_cx = std::task::Context::from_waker(&normal_poll_waker);
+        assert!(matches!(
+            rx.poll_recv(&cx, &mut normal_poll_cx),
+            std::task::Poll::Ready(Ok(13))
+        ));
+
+        let mut direct_batch = Vec::new();
+        let (hostile_many_probe, hostile_many_waker) = probe_waker(true);
+        let mut hostile_many_cx = std::task::Context::from_waker(&hostile_many_waker);
+        assert!(rx
+            .poll_recv_many(&cx, &mut direct_batch, 4, &mut hostile_many_cx)
+            .is_pending());
+        tx.try_send(14)
+            .expect("wake contained direct batch receiver");
+        assert_eq!(hostile_many_probe.count(), 1);
+        let (_, normal_many_waker) = probe_waker(false);
+        let mut normal_many_cx = std::task::Context::from_waker(&normal_many_waker);
+        assert!(matches!(
+            rx.poll_recv_many(&cx, &mut direct_batch, 4, &mut normal_many_cx),
+            std::task::Poll::Ready(Ok(1))
+        ));
+        assert_eq!(direct_batch, vec![14]);
+    }
+
+    #[cfg(panic = "unwind")]
+    #[test]
+    fn mpsc_capacity_and_close_wakes_do_not_strand_later_waiters() {
+        let cx = asupersync::Cx::for_testing();
+
+        let (capacity_tx, mut capacity_rx) = mpsc::channel(1);
+        capacity_tx.try_send(0).expect("fill capacity channel");
+        let mut capacity_first = Box::pin(capacity_tx.reserve(&cx));
+        let mut capacity_second = Box::pin(capacity_tx.reserve(&cx));
+        let (capacity_hostile_probe, capacity_hostile_waker) = probe_waker(true);
+        let (capacity_later_probe, capacity_later_waker) = probe_waker(false);
+        let mut capacity_hostile_cx =
+            std::task::Context::from_waker(&capacity_hostile_waker);
+        let mut capacity_later_cx = std::task::Context::from_waker(&capacity_later_waker);
+        assert!(capacity_first
+            .as_mut()
+            .poll(&mut capacity_hostile_cx)
+            .is_pending());
+        assert!(capacity_second
+            .as_mut()
+            .poll(&mut capacity_later_cx)
+            .is_pending());
+        assert_eq!(capacity_rx.try_recv(), Ok(0));
+        assert_eq!(capacity_hostile_probe.count(), 1);
+        let (_, capacity_repoll_waker) = probe_waker(false);
+        let mut capacity_repoll_cx =
+            std::task::Context::from_waker(&capacity_repoll_waker);
+        let first_permit = match capacity_first
+            .as_mut()
+            .poll(&mut capacity_repoll_cx)
+        {
+            std::task::Poll::Ready(Ok(permit)) => permit,
+            other => panic!("head capacity waiter did not acquire: {other:?}"),
+        };
+        first_permit.abort();
+        assert_eq!(
+            capacity_later_probe.count(),
+            1,
+            "releasing the first reservation must wake the later waiter"
+        );
+        let second_permit = match capacity_second
+            .as_mut()
+            .poll(&mut capacity_later_cx)
+        {
+            std::task::Poll::Ready(Ok(permit)) => permit,
+            other => panic!("later capacity waiter was stranded: {other:?}"),
+        };
+        second_permit.abort();
+
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.try_send(1).expect("fill channel");
+
+        let mut first = Box::pin(tx.reserve(&cx));
+        let mut second = Box::pin(tx.reserve(&cx));
+        let (hostile_probe, hostile_waker) = probe_waker(true);
+        let (normal_probe, normal_waker) = probe_waker(false);
+        let mut hostile_cx = std::task::Context::from_waker(&hostile_waker);
+        let mut normal_cx = std::task::Context::from_waker(&normal_waker);
+        assert!(first.as_mut().poll(&mut hostile_cx).is_pending());
+        assert!(second.as_mut().poll(&mut normal_cx).is_pending());
+
+        let callback_before = mpsc::retained_waker_callback_panic_count();
+        let close_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| rx.close()));
+        assert!(close_result.is_ok(), "close must contain every waiter callback");
+        assert_eq!(hostile_probe.count(), 1);
+        assert_eq!(normal_probe.count(), 1, "later waiter must still be woken");
+        assert!(
+            mpsc::retained_waker_callback_panic_count() >= callback_before.saturating_add(1)
+        );
+        assert!(matches!(
+            first.as_mut().poll(&mut hostile_cx),
+            std::task::Poll::Ready(Err(mpsc::SendError::Disconnected(())))
+        ));
+        assert!(matches!(
+            second.as_mut().poll(&mut normal_cx),
+            std::task::Poll::Ready(Err(mpsc::SendError::Disconnected(())))
+        ));
+    }
+
+    #[cfg(panic = "unwind")]
+    #[test]
+    fn watch_and_broadcast_multi_receiver_wake_loops_survive_hostile_waiters() {
+        let cx = asupersync::Cx::for_testing();
+
+        let (watch_tx, mut watch_rx1) = watch::channel(0u8);
+        let mut watch_rx2 = watch_tx.subscribe();
+        let mut watch_first = Box::pin(watch_rx1.changed(&cx));
+        let mut watch_second = Box::pin(watch_rx2.changed(&cx));
+        let (watch_hostile_probe, watch_hostile_waker) = probe_waker(true);
+        let (watch_normal_probe, watch_normal_waker) = probe_waker(false);
+        let mut watch_hostile_cx = std::task::Context::from_waker(&watch_hostile_waker);
+        let mut watch_normal_cx = std::task::Context::from_waker(&watch_normal_waker);
+        assert!(watch_first
+            .as_mut()
+            .poll(&mut watch_hostile_cx)
+            .is_pending());
+        assert!(watch_second
+            .as_mut()
+            .poll(&mut watch_normal_cx)
+            .is_pending());
+        let watch_before = watch::retained_waker_callback_panic_count();
+        let watch_send = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            watch_tx.send(1)
+        }));
+        assert!(matches!(watch_send, Ok(Ok(()))));
+        assert_eq!(watch_hostile_probe.count(), 1);
+        assert_eq!(watch_normal_probe.count(), 1);
+        assert!(
+            watch::retained_waker_callback_panic_count() >= watch_before.saturating_add(1)
+        );
+        assert!(watch_first
+            .as_mut()
+            .poll(&mut watch_hostile_cx)
+            .is_ready());
+        assert!(watch_second
+            .as_mut()
+            .poll(&mut watch_normal_cx)
+            .is_ready());
+
+        let (broadcast_tx, mut broadcast_rx1) = broadcast::channel(4);
+        let mut broadcast_rx2 = broadcast_tx.subscribe();
+        let mut broadcast_first = Box::pin(broadcast_rx1.recv_with_cx(&cx));
+        let mut broadcast_second = Box::pin(broadcast_rx2.recv_with_cx(&cx));
+        let (broadcast_hostile_probe, broadcast_hostile_waker) = probe_waker(true);
+        let (broadcast_normal_probe, broadcast_normal_waker) = probe_waker(false);
+        let mut broadcast_hostile_cx =
+            std::task::Context::from_waker(&broadcast_hostile_waker);
+        let mut broadcast_normal_cx =
+            std::task::Context::from_waker(&broadcast_normal_waker);
+        assert!(broadcast_first
+            .as_mut()
+            .poll(&mut broadcast_hostile_cx)
+            .is_pending());
+        assert!(broadcast_second
+            .as_mut()
+            .poll(&mut broadcast_normal_cx)
+            .is_pending());
+        let broadcast_before = broadcast::retained_waker_callback_panic_count();
+        let broadcast_send = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            broadcast_tx.send_with_cx(&cx, 2)
+        }));
+        assert!(matches!(broadcast_send, Ok(Ok(2))));
+        assert_eq!(broadcast_hostile_probe.count(), 1);
+        assert_eq!(broadcast_normal_probe.count(), 1);
+        assert!(
+            broadcast::retained_waker_callback_panic_count()
+                >= broadcast_before.saturating_add(1)
+        );
+        assert!(matches!(
+            broadcast_first
+                .as_mut()
+                .poll(&mut broadcast_hostile_cx),
+            std::task::Poll::Ready(Ok(2))
+        ));
+        assert!(matches!(
+            broadcast_second
+                .as_mut()
+                .poll(&mut broadcast_normal_cx),
+            std::task::Poll::Ready(Ok(2))
+        ));
+    }
+
+    #[cfg(panic = "unwind")]
+    #[test]
+    fn pending_channel_future_drops_allow_reentrant_waker_destructors() {
+        let cx = asupersync::Cx::for_testing();
+
+        let (mpsc_tx, mut mpsc_rx) = mpsc::channel(1);
+        let mpsc_completed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mpsc_waker = std::task::Waker::from(std::sync::Arc::new(MpscReentrantDropWake {
+            sender: mpsc_tx,
+            completed: std::sync::Arc::clone(&mpsc_completed),
+        }));
+        let mut mpsc_future = Box::pin(mpsc_rx.recv(&cx));
+        let mut mpsc_cx = std::task::Context::from_waker(&mpsc_waker);
+        assert!(mpsc_future.as_mut().poll(&mut mpsc_cx).is_pending());
+        drop(mpsc_cx);
+        drop(mpsc_waker);
+        drop(mpsc_future);
+        assert!(mpsc_completed.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(mpsc_rx.try_recv(), Ok(73));
+
+        let (watch_tx, mut watch_rx) = watch::channel(0u8);
+        let watch_completed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let watch_waker = std::task::Waker::from(std::sync::Arc::new(WatchReentrantDropWake {
+            sender: watch_tx,
+            completed: std::sync::Arc::clone(&watch_completed),
+        }));
+        let mut watch_future = Box::pin(watch_rx.changed(&cx));
+        let mut watch_cx = std::task::Context::from_waker(&watch_waker);
+        assert!(watch_future.as_mut().poll(&mut watch_cx).is_pending());
+        drop(watch_cx);
+        drop(watch_waker);
+        drop(watch_future);
+        assert!(watch_completed.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(*watch_rx.borrow(), 83);
+
+        let (broadcast_tx, mut broadcast_rx) = broadcast::channel(2);
+        let broadcast_completed =
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let broadcast_waker =
+            std::task::Waker::from(std::sync::Arc::new(BroadcastReentrantDropWake {
+                sender: broadcast_tx,
+                completed: std::sync::Arc::clone(&broadcast_completed),
+            }));
+        let mut broadcast_future = Box::pin(broadcast_rx.recv_with_cx(&cx));
+        let mut broadcast_cx = std::task::Context::from_waker(&broadcast_waker);
+        assert!(broadcast_future
+            .as_mut()
+            .poll(&mut broadcast_cx)
+            .is_pending());
+        drop(broadcast_cx);
+        drop(broadcast_waker);
+        drop(broadcast_future);
+        assert!(broadcast_completed.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(broadcast_rx.try_recv(), Ok(97));
+    }
+
+    #[cfg(panic = "unwind")]
+    #[test]
+    fn pending_mpsc_drop_contains_nested_waker_panic_during_outer_unwind() {
+        let cx = asupersync::Cx::for_testing();
+        let (tx, mut rx) = mpsc::channel::<u8>(1);
+        let (drop_count, drop_panicking) = drop_panicking_waker();
+        let outer = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut receive = Box::pin(rx.recv(&cx));
+            let mut caller_cx = std::task::Context::from_waker(&drop_panicking);
+            assert!(receive.as_mut().poll(&mut caller_cx).is_pending());
+            drop(caller_cx);
+            drop(drop_panicking);
+            let _keep_sender_live = tx;
+            panic!("synthetic authoritative outer panic");
+        }));
+        assert!(outer.is_err(), "the authoritative outer panic must remain visible");
+        assert_eq!(
+            drop_count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "nested caller-waker destructor panic must be contained exactly once"
+        );
     }
 
     // ========================================================================

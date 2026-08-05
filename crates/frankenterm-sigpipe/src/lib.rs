@@ -88,6 +88,8 @@ pub enum RecoverablePanicSite {
     CoreSearchBridge,
     /// A structured asynchronous task join that converts panic to task error.
     CoreAsyncTaskJoin,
+    /// A caller waker retained behind a project-owned channel proxy.
+    CoreChannelWaker,
     /// A shard compensation/rollback future or join.
     ShardingRollback,
     /// A promise waker isolated from the promise state machine.
@@ -123,6 +125,7 @@ impl RecoverablePanicSite {
             Self::CoreRecordingFinalize => "core.recording_finalize",
             Self::CoreSearchBridge => "core.search_bridge",
             Self::CoreAsyncTaskJoin => "core.async_task_join",
+            Self::CoreChannelWaker => "core.channel_waker",
             Self::ShardingRollback => "sharding.rollback",
             Self::PromiseWaker => "promise.waker",
             Self::PromisePayload => "promise.payload",
@@ -774,6 +777,7 @@ mod tests {
             RecoverablePanicSite::CoreRecordingFinalize,
             RecoverablePanicSite::CoreSearchBridge,
             RecoverablePanicSite::CoreAsyncTaskJoin,
+            RecoverablePanicSite::CoreChannelWaker,
             RecoverablePanicSite::ShardingRollback,
             RecoverablePanicSite::PromiseWaker,
             RecoverablePanicSite::PromisePayload,
