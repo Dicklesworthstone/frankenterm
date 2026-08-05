@@ -22,6 +22,7 @@
 //! the prior generation or the new generation, never a partially decoded
 //! topology mutation.
 
+use frankenterm_sigpipe::{catch_recoverable, RecoverablePanicSite};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet, VecDeque};
@@ -63,6 +64,7 @@ pub enum PersistenceFailureCode {
     OverlayCasConflict,
     RetiredOverlay,
     AmbiguousGeneration,
+    WorkerPanicked,
     WorkerStopped,
 }
 
@@ -107,6 +109,8 @@ pub enum PersistenceFailure {
     RetiredOverlay { last_revision: u64 },
     #[error("two different persisted states claim generation {revision}")]
     AmbiguousGeneration { revision: u64 },
+    #[error("persistence worker recovered from an internal panic")]
+    WorkerPanicked,
     #[error("persistence worker stopped")]
     WorkerStopped,
 }
@@ -133,12 +137,13 @@ impl PersistenceFailure {
             Self::AmbiguousGeneration { .. } => {
                 PersistenceFailureCode::AmbiguousGeneration
             }
+            Self::WorkerPanicked => PersistenceFailureCode::WorkerPanicked,
             Self::WorkerStopped => PersistenceFailureCode::WorkerStopped,
         }
     }
 
     const fn may_have_published_generation(&self) -> bool {
-        matches!(self, Self::Io { .. })
+        matches!(self, Self::Io { .. } | Self::WorkerPanicked)
     }
 
     fn io(operation: &'static str, error: io::Error) -> Self {
@@ -1453,6 +1458,7 @@ enum TestWorkerCommitEvent {
 enum TestWorkerCommitAction {
     Run(WriteInterruption),
     ReturnDefinite(PersistenceFailure),
+    Panic,
 }
 
 #[cfg(test)]
@@ -1466,6 +1472,7 @@ enum TestWorkerCommitResult {
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum TestWorkerDirectiveAction {
     ContinueWake,
+    PanicBeforeWake,
     Commit(TestWorkerCommitAction),
     ContinueAfterCommit,
 }
@@ -1518,13 +1525,19 @@ impl TestWorkerCommitControl {
         {
             return false;
         }
-        matches!(
-            self.directives.recv(),
+        match self.directives.recv() {
             Ok(TestWorkerCommitDirective {
                 epoch,
                 action: TestWorkerDirectiveAction::ContinueWake,
-            }) if epoch == self.waiting_epoch
-        )
+            }) if epoch == self.waiting_epoch => true,
+            Ok(TestWorkerCommitDirective {
+                epoch,
+                action: TestWorkerDirectiveAction::PanicBeforeWake,
+            }) if epoch == self.waiting_epoch => {
+                panic!("intentional controlled persistence worker-loop panic")
+            }
+            _ => false,
+        }
     }
 
     fn enter_commit(
@@ -1805,14 +1818,169 @@ type BindingWaiters = BTreeMap<
     Vec<flume::Sender<BindingResult>>,
 >;
 
-fn take_waiters(
-    shared: &CoordinatorShared,
-) -> (Vec<FlushWaiter>, BindingWaiters) {
+/// Owns one exact admitted waiter cohort outside the coordinator mutex.
+///
+/// Any unexpected unwind before an ordinary response is terminalized fails
+/// the still-owned cohort explicitly. This prevents the whole-worker recovery
+/// boundary from degrading a typed persistence result into a bare disconnected
+/// channel after the cohort has left `CoordinatorPending`.
+struct AdmittedWaiters {
+    flush: Vec<FlushWaiter>,
+    bindings: BindingWaiters,
+}
+
+struct AdmittedFlushWaiter {
+    waiter: Option<FlushWaiter>,
+}
+
+impl AdmittedFlushWaiter {
+    fn new(waiter: FlushWaiter) -> Self {
+        Self {
+            waiter: Some(waiter),
+        }
+    }
+
+    fn waiter(&self) -> &FlushWaiter {
+        self.waiter
+            .as_ref()
+            .expect("admitted flush waiter is unresolved")
+    }
+
+    fn respond(mut self, result: CommitResult) {
+        let waiter = self
+            .waiter
+            .as_ref()
+            .expect("admitted flush waiter is unresolved");
+        let _ = waiter.sender.try_send(result);
+        self.waiter = None;
+    }
+}
+
+impl Drop for AdmittedFlushWaiter {
+    fn drop(&mut self) {
+        let Some(waiter) = self.waiter.take() else {
+            return;
+        };
+        let _ = waiter
+            .sender
+            .try_send(Err(PersistenceFailure::WorkerPanicked));
+    }
+}
+
+struct AdmittedBindingWaiter {
+    sender: Option<flume::Sender<BindingResult>>,
+}
+
+impl AdmittedBindingWaiter {
+    fn new(sender: flume::Sender<BindingResult>) -> Self {
+        Self {
+            sender: Some(sender),
+        }
+    }
+
+    fn respond(mut self, result: BindingResult) {
+        let sender = self
+            .sender
+            .as_ref()
+            .expect("admitted binding waiter is unresolved");
+        let _ = sender.try_send(result);
+        self.sender = None;
+    }
+}
+
+impl Drop for AdmittedBindingWaiter {
+    fn drop(&mut self) {
+        let Some(sender) = self.sender.take() else {
+            return;
+        };
+        let _ = sender.try_send(Err(PersistenceFailure::WorkerPanicked));
+    }
+}
+
+impl AdmittedWaiters {
+    fn new(mut flush: Vec<FlushWaiter>, mut bindings: BindingWaiters) -> Self {
+        // Pending vectors are append-only admission queues. Reverse them once
+        // so the O(1) guarded `pop` operations below preserve the original
+        // oldest-first response order instead of silently turning it into
+        // LIFO under a large waiter cohort.
+        flush.reverse();
+        for waiters in bindings.values_mut() {
+            waiters.reverse();
+        }
+        Self { flush, bindings }
+    }
+
+    fn take_from(shared: &CoordinatorShared) -> Self {
+        let mut pending = lock_pending(&shared.pending);
+        let flush = std::mem::take(&mut pending.flush_waiters);
+        let bindings = std::mem::take(&mut pending.binding_waiters);
+        pending.waiter_count = 0;
+        drop(pending);
+        Self::new(flush, bindings)
+    }
+
+    fn respond_failure(mut self, failure: &PersistenceFailure) {
+        while let Some((_, waiter)) = self.next_binding() {
+            waiter.respond(Err(failure.clone()));
+        }
+        while let Some(waiter) = self.next_flush() {
+            let result = waiter.waiter().transaction_failure_result(failure);
+            waiter.respond(result);
+        }
+    }
+
+    fn flush_in_admission_order(&self) -> impl Iterator<Item = &FlushWaiter> {
+        self.flush.iter().rev()
+    }
+
+    fn next_flush(&mut self) -> Option<AdmittedFlushWaiter> {
+        self.flush.pop().map(AdmittedFlushWaiter::new)
+    }
+
+    fn next_binding(
+        &mut self,
+    ) -> Option<(PrivacySafeTargetFingerprint, AdmittedBindingWaiter)> {
+        loop {
+            let fingerprint = *self.bindings.keys().next()?;
+            let sender = self
+                .bindings
+                .get_mut(&fingerprint)
+                .and_then(Vec::pop);
+            if self
+                .bindings
+                .get(&fingerprint)
+                .is_some_and(Vec::is_empty)
+            {
+                self.bindings.remove(&fingerprint);
+            }
+            if let Some(sender) = sender {
+                return Some((fingerprint, AdmittedBindingWaiter::new(sender)));
+            }
+        }
+    }
+}
+
+impl Drop for AdmittedWaiters {
+    fn drop(&mut self) {
+        if self.flush.is_empty() && self.bindings.is_empty() {
+            return;
+        }
+        while let Some((_, waiter)) = self.next_binding() {
+            drop(waiter);
+        }
+        while let Some(waiter) = self.next_flush() {
+            drop(waiter);
+        }
+    }
+}
+
+fn drain_pending_waiters(shared: &CoordinatorShared, failure: &PersistenceFailure) {
     let mut pending = lock_pending(&shared.pending);
     let flush_waiters = std::mem::take(&mut pending.flush_waiters);
     let binding_waiters = std::mem::take(&mut pending.binding_waiters);
     pending.waiter_count = 0;
-    (flush_waiters, binding_waiters)
+    drop(pending);
+    AdmittedWaiters::new(flush_waiters, binding_waiters).respond_failure(failure);
 }
 
 fn acknowledge_committed_batch(
@@ -1863,19 +2031,25 @@ fn acknowledge_committed_batch(
     flush_outcome
 }
 
-fn respond_transaction_failure(
-    failure: &PersistenceFailure,
-    flush_waiters: Vec<FlushWaiter>,
-    binding_waiters: BindingWaiters,
-) {
-    for waiters in binding_waiters.into_values() {
-        for waiter in waiters {
-            let _ = waiter.send(Err(failure.clone()));
+fn run_persistence_transaction<T>(
+    transaction: impl FnOnce() -> T,
+) -> Result<T, PersistenceFailure> {
+    match catch_recoverable(
+        RecoverablePanicSite::StorageWriter,
+        std::panic::AssertUnwindSafe(transaction),
+    ) {
+        Ok(result) => Ok(result),
+        Err(_) => {
+            // A panic may occur after the inactive journal slot has reached
+            // durable storage. Classify it as uncertain publication so the
+            // worker preserves this exact frozen batch as retry debt and
+            // fences every successor behind its recovery.
+            log::error!(
+                "window-state: persistence transaction panic recovered; fencing successors behind exact retry"
+            );
+            metrics::counter!("gui.window_state.persistence_transaction_panic").increment(1);
+            Err(PersistenceFailure::WorkerPanicked)
         }
-    }
-    for waiter in flush_waiters {
-        let result = waiter.transaction_failure_result(failure);
-        let _ = waiter.sender.send(result);
     }
 }
 
@@ -1909,6 +2083,9 @@ fn controlled_worker_commit(
             interruption,
         ),
         TestWorkerCommitAction::ReturnDefinite(failure) => Err(failure),
+        TestWorkerCommitAction::Panic => {
+            panic!("intentional controlled persistence transaction panic")
+        },
     };
     if control.commit_finished(phase, &result) {
         Some(result)
@@ -1951,19 +2128,18 @@ fn controlled_worker_receive_wake(
     receiver.recv().is_ok()
 }
 
-fn persistence_worker(shared: Arc<CoordinatorShared>, receiver: flume::Receiver<()>) {
-    #[cfg(test)]
-    let mut worker_commit_control = {
-        let mut pending = lock_pending(&shared.pending);
-        pending.worker_commit_control.take()
-    };
+fn persistence_worker_loop(
+    shared: &CoordinatorShared,
+    receiver: &flume::Receiver<()>,
+    #[cfg(test)] worker_commit_control: &mut Option<TestWorkerCommitControl>,
+) {
     let mut retry_batch = None;
     while {
         #[cfg(test)]
         {
             controlled_worker_receive_wake(
-                &mut worker_commit_control,
-                &receiver,
+                &mut *worker_commit_control,
+                receiver,
                 retry_batch.is_some(),
             )
         }
@@ -1994,16 +2170,24 @@ fn persistence_worker(shared: Arc<CoordinatorShared>, receiver: flume::Receiver<
 
         if let Some(batch) = retry_batch.take() {
             #[cfg(test)]
-            let retry_result = match controlled_worker_exact_retry(
-                &shared,
-                &batch,
-                &mut worker_commit_control,
-            ) {
-                Some(result) => result,
-                None => break,
+            let retry_result = match run_persistence_transaction(|| {
+                controlled_worker_exact_retry(
+                    shared,
+                    &batch,
+                    &mut *worker_commit_control,
+                )
+            }) {
+                Ok(Some(result)) => result,
+                Ok(None) => break,
+                Err(failure) => Err(failure),
             };
             #[cfg(not(test))]
-            let retry_result = resolve_exact_retry(&shared, &batch);
+            let retry_result = match run_persistence_transaction(|| {
+                resolve_exact_retry(shared, &batch)
+            }) {
+                Ok(result) => result,
+                Err(failure) => Err(failure),
+            };
             match retry_result {
                 Ok(()) => {}
                 Err(failure) => {
@@ -2017,67 +2201,91 @@ fn persistence_worker(shared: Arc<CoordinatorShared>, receiver: flume::Receiver<
                         "window-state: exact in-flight retry rejected ({:?})",
                         failure.code()
                     );
-                    let (flush_waiters, binding_waiters) = take_waiters(&shared);
-                    respond_transaction_failure(&failure, flush_waiters, binding_waiters);
+                    AdmittedWaiters::take_from(shared).respond_failure(&failure);
                     continue;
                 }
             }
         }
 
-        let (batch, flush_waiters, binding_waiters) = {
+        let (batch, mut waiters) = {
             let mut pending = lock_pending(&shared.pending);
             let batch = pending.batch.clone();
             let flush_waiters = std::mem::take(&mut pending.flush_waiters);
             let binding_waiters = std::mem::take(&mut pending.binding_waiters);
             pending.waiter_count = 0;
-            (batch, flush_waiters, binding_waiters)
+            drop(pending);
+            (
+                batch,
+                AdmittedWaiters::new(flush_waiters, binding_waiters),
+            )
         };
 
         #[cfg(test)]
-        let result = match controlled_worker_commit(
-            &shared,
-            &batch,
-            &mut worker_commit_control,
-            TestWorkerCommitPhase::Pending,
-        ) {
-            Some(result) => result,
-            None => {
-                respond_transaction_failure(
-                    &PersistenceFailure::WorkerStopped,
-                    flush_waiters,
-                    binding_waiters,
-                );
+        let result = match run_persistence_transaction(|| {
+            controlled_worker_commit(
+                shared,
+                &batch,
+                &mut *worker_commit_control,
+                TestWorkerCommitPhase::Pending,
+            )
+        }) {
+            Ok(Some(result)) => result,
+            Ok(None) => {
+                waiters.respond_failure(&PersistenceFailure::WorkerStopped);
                 break;
             }
+            Err(failure) => Err(failure),
         };
         #[cfg(not(test))]
-        let result = commit_batch(&shared.primary_path, &batch, WriteInterruption::None);
+        let result = match run_persistence_transaction(|| {
+            commit_batch(&shared.primary_path, &batch, WriteInterruption::None)
+        }) {
+            Ok(result) => result,
+            Err(failure) => Err(failure),
+        };
         match result {
             Ok(committed) => {
-                let flush_outcome = acknowledge_committed_batch(&shared, &batch, &committed);
-                let reported_semantic_sequence = flush_waiters.iter().find_map(|waiter| {
-                    waiter.reported_semantic_sequence(flush_outcome.as_ref())
-                });
+                let flush_outcome = acknowledge_committed_batch(shared, &batch, &committed);
+                let reported_semantic_sequence = waiters
+                    .flush_in_admission_order()
+                    .find_map(|waiter| {
+                        waiter.reported_semantic_sequence(flush_outcome.as_ref())
+                    });
                 if let Some(sequence) = reported_semantic_sequence {
                     lock_pending(&shared.pending).clear_reported_semantic_failure(sequence);
                 }
-                for (fingerprint, waiters) in binding_waiters {
-                    let binding = if let Some(binding) = committed.bindings.get(&fingerprint) {
-                        Ok(*binding)
-                    } else if let Some(failure) = committed.rejected_bindings.get(&fingerprint) {
-                        Err(failure.clone())
-                    } else {
-                        Err(PersistenceFailure::corrupt(
-                            "binding commit succeeded without its requested identity",
-                        ))
-                    };
-                    for waiter in waiters {
-                        let _ = waiter.send(binding.clone());
+                let mut binding_result = None;
+                while let Some((fingerprint, waiter)) = waiters.next_binding() {
+                    let needs_result = binding_result
+                        .as_ref()
+                        .is_none_or(|(cached, _)| *cached != fingerprint);
+                    if needs_result {
+                        let result = if let Some(binding) = committed.bindings.get(&fingerprint) {
+                            Ok(*binding)
+                        } else if let Some(failure) =
+                            committed.rejected_bindings.get(&fingerprint)
+                        {
+                            Err(failure.clone())
+                        } else {
+                            Err(PersistenceFailure::corrupt(
+                                "binding commit succeeded without its requested identity",
+                            ))
+                        };
+                        binding_result = Some((fingerprint, result));
                     }
+                    let Some((_, binding)) = binding_result.as_ref() else {
+                        waiter.respond(Err(PersistenceFailure::corrupt(
+                            "binding result cache was empty after refresh",
+                        )));
+                        continue;
+                    };
+                    waiter.respond(binding.clone());
                 }
-                for waiter in flush_waiters {
-                    let result = waiter.result(flush_outcome.as_ref(), committed.receipt);
-                    let _ = waiter.sender.send(result);
+                while let Some(waiter) = waiters.next_flush() {
+                    let result = waiter
+                        .waiter()
+                        .result(flush_outcome.as_ref(), committed.receipt);
+                    waiter.respond(result);
                 }
             }
             Err(failure) => {
@@ -2088,27 +2296,64 @@ fn persistence_worker(shared: Arc<CoordinatorShared>, receiver: flume::Receiver<
                     "window-state: persistence commit rejected ({:?})",
                     failure.code()
                 );
-                respond_transaction_failure(&failure, flush_waiters, binding_waiters);
+                waiters.respond_failure(&failure);
             }
         }
     }
+}
 
-    let mut pending = lock_pending(&shared.pending);
-    for waiters in std::mem::take(&mut pending.binding_waiters).into_values() {
-        for waiter in waiters {
-            let _ = waiter.send(Err(PersistenceFailure::WorkerStopped));
-        }
-    }
-    for waiter in std::mem::take(&mut pending.flush_waiters) {
-        let _ = waiter
-            .sender
-            .send(Err(PersistenceFailure::WorkerStopped));
-    }
-    pending.waiter_count = 0;
-    drop(pending);
+fn persistence_worker(shared: Arc<CoordinatorShared>, receiver: flume::Receiver<()>) {
+    #[cfg(test)]
+    let mut worker_commit_control = {
+        let mut pending = lock_pending(&shared.pending);
+        pending.worker_commit_control.take()
+    };
+
+    #[cfg(test)]
+    let outcome = catch_recoverable(
+        RecoverablePanicSite::StorageWriter,
+        std::panic::AssertUnwindSafe(|| {
+            persistence_worker_loop(&shared, &receiver, &mut worker_commit_control);
+        }),
+    );
+    #[cfg(not(test))]
+    let outcome = catch_recoverable(
+        RecoverablePanicSite::StorageWriter,
+        std::panic::AssertUnwindSafe(|| {
+            persistence_worker_loop(&shared, &receiver);
+        }),
+    );
+
+    // Close admission before draining. Otherwise a caller can successfully
+    // enqueue between the final drain and this function dropping `receiver`,
+    // stranding a waiter after the worker has already decided to stop.
+    drop(receiver);
+    let worker_panicked = outcome.is_err();
+    let terminal_failure = if worker_panicked {
+        PersistenceFailure::WorkerPanicked
+    } else {
+        PersistenceFailure::WorkerStopped
+    };
+    drain_pending_waiters(&shared, &terminal_failure);
+
     #[cfg(test)]
     if let Some(control) = worker_commit_control.as_ref() {
         control.report_stopped();
+    }
+
+    // Terminalize caller-visible liveness before optional observability. A
+    // custom logger or metrics recorder must never be able to strand an
+    // admitted receiver after this worker has already closed admission.
+    if worker_panicked {
+        let _ = catch_recoverable(
+            RecoverablePanicSite::StorageWriter,
+            std::panic::AssertUnwindSafe(|| {
+                log::error!(
+                    "window-state: persistence worker panic recovered; stopping the writer and failing admitted waiters"
+                );
+                metrics::counter!("gui.window_state.persistence_worker_panic").increment(1);
+            }),
+        );
     }
 }
 
@@ -3929,7 +4174,8 @@ const fn overlay_preflight_failure_precedence(failure: &PersistenceFailure) -> u
         PersistenceFailure::UnsupportedVersion { .. } => 9,
         PersistenceFailure::AmbiguousGeneration { .. } => 10,
         PersistenceFailure::Io { .. } => 11,
-        PersistenceFailure::WorkerStopped => 12,
+        PersistenceFailure::WorkerPanicked => 12,
+        PersistenceFailure::WorkerStopped => 13,
     }
 }
 
@@ -5234,6 +5480,10 @@ pub fn save_for_workspace(workspace: &str, window_state: WindowState) {
 }
 
 /// Queue a validated mixed-domain layout overlay on the default worker.
+///
+/// This is a storage primitive, not GUI lifecycle wiring: it does not derive
+/// stable identities from live mux tabs, observe tab-order changes, or apply a
+/// reconciled overlay when a native window is reopened.
 pub fn queue_layout_overlay(
     base_revision: Option<u64>,
     overlay: MixedDomainLayoutOverlay,
@@ -5422,6 +5672,13 @@ mod tests {
 
         fn continue_wake(&self, waiting_epoch: u64) {
             self.send_directive(waiting_epoch, TestWorkerDirectiveAction::ContinueWake);
+        }
+
+        fn panic_before_wake(&self, waiting_epoch: u64) {
+            self.send_directive(
+                waiting_epoch,
+                TestWorkerDirectiveAction::PanicBeforeWake,
+            );
         }
 
         fn release_commit(&self, commit_epoch: u64, action: TestWorkerCommitAction) {
@@ -9689,6 +9946,387 @@ mod tests {
                 commit_epoch: 7,
             }
         );
+    }
+
+    #[test]
+    fn controlled_worker_panic_reports_typed_failure_and_fences_successor() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("window-state.json");
+        let window = window_id(11_055_100);
+        let fingerprint = PrivacySafeTargetFingerprint::from_bytes([0x83; 32]);
+        let worker = ControlledPersistenceWorker::open(path.clone());
+        worker.expect_waiting(1, false);
+
+        let mut initial = PendingBatch::default();
+        initial
+            .queue_overlay_live(None, local_overlay(window, 1, 82))
+            .expect("queue panicking transaction overlay");
+        let (initial_flush, initial_binding) =
+            worker.admit_batch_with_flush_and_binding(initial, fingerprint);
+        worker.continue_wake(1);
+        let entered = worker.expect_commit(1, TestWorkerCommitPhase::Pending);
+        assert_eq!(entered.overlay_mutations[&window].desired_revision(), 1);
+        worker.release_commit(1, TestWorkerCommitAction::Panic);
+
+        assert_eq!(
+            initial_flush
+                .recv_timeout(CONTROLLED_WORKER_WATCHDOG)
+                .expect("panicking transaction flush result")
+                .expect_err("a recovered panic cannot acknowledge durability")
+                .code(),
+            PersistenceFailureCode::WorkerPanicked
+        );
+        assert_eq!(
+            initial_binding
+                .recv_timeout(CONTROLLED_WORKER_WATCHDOG)
+                .expect("panicking transaction binding result")
+                .expect_err("a recovered panic cannot publish binding authority")
+                .code(),
+            PersistenceFailureCode::WorkerPanicked
+        );
+
+        // The worker must not spin and must not let a later revision bypass
+        // the exact frozen transaction whose publication status is unknown.
+        worker.expect_waiting(2, true);
+        worker
+            .writer()
+            .queue_overlay(Some(1), local_overlay(window, 2, 83))
+            .expect("queue successor behind recovered panic");
+        let successor_flush = worker.writer().flush().expect("successor flush");
+        worker.continue_wake(2);
+
+        let retry = worker.expect_commit(2, TestWorkerCommitPhase::ExactRetry);
+        assert_eq!(retry.overlay_mutations[&window].desired_revision(), 1);
+        worker.release_commit(2, TestWorkerCommitAction::Panic);
+        assert_eq!(
+            successor_flush
+                .recv_timeout(CONTROLLED_WORKER_WATCHDOG)
+                .expect("panicking exact-retry successor result")
+                .expect_err("a retry panic cannot release its successor fence")
+                .code(),
+            PersistenceFailureCode::WorkerPanicked
+        );
+
+        // A panic while resolving existing retry debt must retain that same
+        // frozen predecessor. It must neither downgrade the debt to an
+        // ordinary pending batch nor allow the queued successor to bypass it.
+        worker.expect_waiting(3, true);
+        let recovery_flush = worker.writer().flush().expect("recovery flush");
+        worker.continue_wake(3);
+        let repeated_retry = worker.expect_commit(3, TestWorkerCommitPhase::ExactRetry);
+        assert_eq!(
+            repeated_retry.overlay_mutations[&window].desired_revision(),
+            1
+        );
+        worker.release_commit(
+            3,
+            TestWorkerCommitAction::Run(WriteInterruption::None),
+        );
+        assert!(matches!(
+            worker.expect_commit_finished(3, TestWorkerCommitPhase::ExactRetry),
+            TestWorkerCommitResult::Committed(_)
+        ));
+        worker.continue_after_commit(3);
+
+        let successor = worker.expect_commit(4, TestWorkerCommitPhase::Pending);
+        assert_eq!(
+            successor.overlay_mutations[&window].desired_revision(),
+            2
+        );
+        worker.release_commit(
+            4,
+            TestWorkerCommitAction::Run(WriteInterruption::None),
+        );
+        let successor_receipt = match worker
+            .expect_commit_finished(4, TestWorkerCommitPhase::Pending)
+        {
+            TestWorkerCommitResult::Committed(receipt) => receipt,
+            TestWorkerCommitResult::Failed(code) => {
+                panic!("successor after recovered panic failed: {code:?}")
+            }
+        };
+        worker.continue_after_commit(4);
+        assert_eq!(
+            recovery_flush
+                .recv_timeout(CONTROLLED_WORKER_WATCHDOG)
+                .expect("recovery flush result")
+                .expect("successor commits after exact predecessor retry"),
+            successor_receipt
+        );
+        worker.expect_waiting(4, false);
+
+        let snapshot = load_snapshot_at(&path).expect("load recovered panic authority");
+        assert_eq!(
+            snapshot
+                .overlay(window)
+                .expect("successor overlay remains live")
+                .local_revision(),
+            2
+        );
+        assert!(snapshot.binding_for(fingerprint).is_some());
+        let pending = lock_pending(&worker.writer().shared.pending);
+        assert!(pending.batch.overlay_mutations.is_empty());
+        assert!(pending.batch.ensure_bindings.is_empty());
+        assert!(pending.flush_waiters.is_empty());
+        assert!(pending.binding_waiters.is_empty());
+        assert_eq!(pending.waiter_count, 0);
+        drop(pending);
+
+        assert_eq!(
+            worker.stop_and_join(),
+            TestWorkerStopped {
+                waiting_epoch: 4,
+                commit_epoch: 4,
+            }
+        );
+    }
+
+    #[test]
+    fn whole_worker_panic_drains_pending_waiters_before_stopping() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("window-state.json");
+        let window = window_id(11_055_101);
+        let fingerprint = PrivacySafeTargetFingerprint::from_bytes([0x84; 32]);
+        let worker = ControlledPersistenceWorker::open(path.clone());
+        worker.expect_waiting(1, false);
+
+        let mut batch = PendingBatch::default();
+        batch
+            .queue_overlay_live(None, local_overlay(window, 1, 84))
+            .expect("queue before worker-loop panic");
+        let (flush, binding) =
+            worker.admit_batch_with_flush_and_binding(batch, fingerprint);
+        let shared = Arc::clone(&worker.writer().shared);
+
+        // Panic before the blocking receive, outside the narrower journal
+        // transaction boundary. The whole-worker guard must still translate
+        // every admitted response and leave the unacknowledged batch intact.
+        worker.panic_before_wake(1);
+        assert_eq!(
+            flush
+                .recv_timeout(CONTROLLED_WORKER_WATCHDOG)
+                .expect("whole-worker panic flush result")
+                .expect_err("whole-worker panic cannot acknowledge durability")
+                .code(),
+            PersistenceFailureCode::WorkerPanicked
+        );
+        assert_eq!(
+            binding
+                .recv_timeout(CONTROLLED_WORKER_WATCHDOG)
+                .expect("whole-worker panic binding result")
+                .expect_err("whole-worker panic cannot publish binding authority")
+                .code(),
+            PersistenceFailureCode::WorkerPanicked
+        );
+        let post_panic_admission = match worker.writer().flush() {
+            Ok(_) => panic!("stopped worker accepted a post-panic waiter"),
+            Err(failure) => failure,
+        };
+        assert_eq!(
+            post_panic_admission.code(),
+            PersistenceFailureCode::WorkerStopped,
+            "receiver closure must precede the terminal pending-waiter drain"
+        );
+        assert_eq!(
+            worker.wait_stopped_and_join(),
+            TestWorkerStopped {
+                waiting_epoch: 1,
+                commit_epoch: 0,
+            }
+        );
+
+        assert!(!path.exists());
+        let pending = lock_pending(&shared.pending);
+        assert!(pending.batch.overlay_mutations.contains_key(&window));
+        assert!(pending.batch.ensure_bindings.contains(&fingerprint));
+        assert!(pending.flush_waiters.is_empty());
+        assert!(pending.binding_waiters.is_empty());
+        assert_eq!(pending.waiter_count, 0);
+    }
+
+    #[test]
+    fn admitted_waiter_guard_translates_unwind_after_cohort_snapshot() {
+        let (flush_sender, flush) = flume::bounded(1);
+        let (remaining_flush_sender, remaining_flush) = flume::bounded(1);
+        let (binding_sender, binding) = flume::bounded(1);
+        let (remaining_binding_sender, remaining_binding) = flume::bounded(1);
+        let fingerprint = PrivacySafeTargetFingerprint::from_bytes([0x85; 32]);
+        let mut bindings = BindingWaiters::new();
+        bindings.insert(
+            fingerprint,
+            vec![remaining_binding_sender, binding_sender],
+        );
+
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut waiters = AdmittedWaiters::new(
+                vec![
+                    FlushWaiter::new(remaining_flush_sender),
+                    FlushWaiter::new(flush_sender),
+                ],
+                bindings,
+            );
+            let _in_flight_binding = waiters
+                .next_binding()
+                .expect("take one in-flight binding waiter")
+                .1;
+            let _in_flight_flush = waiters
+                .next_flush()
+                .expect("take one in-flight flush waiter");
+            panic!("intentional unwind after waiter cohort snapshot");
+        }));
+        assert!(outcome.is_err());
+        for receiver in [flush, remaining_flush] {
+            assert_eq!(
+                receiver
+                    .recv_timeout(CONTROLLED_WORKER_WATCHDOG)
+                    .expect("guarded flush unwind result")
+                    .expect_err("unwind cannot acknowledge a flush")
+                    .code(),
+                PersistenceFailureCode::WorkerPanicked
+            );
+        }
+        for receiver in [binding, remaining_binding] {
+            assert_eq!(
+                receiver
+                    .recv_timeout(CONTROLLED_WORKER_WATCHDOG)
+                    .expect("guarded binding unwind result")
+                    .expect_err("unwind cannot publish a binding")
+                    .code(),
+                PersistenceFailureCode::WorkerPanicked
+            );
+        }
+    }
+
+    #[test]
+    fn admitted_waiter_guard_preserves_fifo_completion_order() {
+        let (first_flush_sender, first_flush_result) = flume::bounded(1);
+        let (second_flush_sender, second_flush_result) = flume::bounded(1);
+        let (first_binding_sender, first_binding_result) = flume::bounded(1);
+        let (second_binding_sender, second_binding_result) = flume::bounded(1);
+        let fingerprint = PrivacySafeTargetFingerprint::from_bytes([0x86; 32]);
+        let first_binding = DomainBindingId::from_bytes([0x31; 16]);
+        let second_binding = DomainBindingId::from_bytes([0x32; 16]);
+        let mut bindings = BindingWaiters::new();
+        bindings.insert(
+            fingerprint,
+            vec![first_binding_sender, second_binding_sender],
+        );
+        let mut waiters = AdmittedWaiters::new(
+            vec![
+                FlushWaiter::new(first_flush_sender),
+                FlushWaiter::new(second_flush_sender),
+            ],
+            bindings,
+        );
+
+        waiters
+            .next_binding()
+            .expect("first admitted binding waiter")
+            .1
+            .respond(Ok(first_binding));
+        waiters
+            .next_binding()
+            .expect("second admitted binding waiter")
+            .1
+            .respond(Ok(second_binding));
+        waiters
+            .next_flush()
+            .expect("first admitted flush waiter")
+            .respond(Ok(CommitReceipt {
+                store_revision: 1,
+                wrote_new_generation: true,
+                committed_updates: 1,
+                coalesced_updates: 0,
+                rejected_updates: 0,
+            }));
+        waiters
+            .next_flush()
+            .expect("second admitted flush waiter")
+            .respond(Ok(CommitReceipt {
+                store_revision: 2,
+                wrote_new_generation: true,
+                committed_updates: 1,
+                coalesced_updates: 0,
+                rejected_updates: 0,
+            }));
+
+        assert_eq!(
+            first_binding_result
+                .recv_timeout(CONTROLLED_WORKER_WATCHDOG)
+                .expect("first binding"),
+            Ok(first_binding)
+        );
+        assert_eq!(
+            second_binding_result
+                .recv_timeout(CONTROLLED_WORKER_WATCHDOG)
+                .expect("second binding"),
+            Ok(second_binding)
+        );
+        assert_eq!(
+            first_flush_result
+                .recv_timeout(CONTROLLED_WORKER_WATCHDOG)
+                .expect("first flush")
+                .expect("first receipt")
+                .store_revision,
+            1
+        );
+        assert_eq!(
+            second_flush_result
+                .recv_timeout(CONTROLLED_WORKER_WATCHDOG)
+                .expect("second flush")
+                .expect("second receipt")
+                .store_revision,
+            2
+        );
+    }
+
+    #[test]
+    fn terminal_drain_recovers_poisoned_pending_mutex_without_stranding_waiters() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (flush_sender, flush) = flume::bounded(1);
+        let (binding_sender, binding) = flume::bounded(1);
+        let fingerprint = PrivacySafeTargetFingerprint::from_bytes([0x86; 32]);
+        let shared = Arc::new(CoordinatorShared {
+            primary_path: temp.path().join("window-state.json"),
+            pending: Mutex::new(CoordinatorPending {
+                flush_waiters: vec![FlushWaiter::new(flush_sender)],
+                binding_waiters: BTreeMap::from([(fingerprint, vec![binding_sender])]),
+                waiter_count: 2,
+                ..CoordinatorPending::default()
+            }),
+        });
+
+        let poisoned = Arc::clone(&shared);
+        let outcome = catch_recoverable(
+            RecoverablePanicSite::StorageWriter,
+            std::panic::AssertUnwindSafe(|| {
+                let _pending = poisoned.pending.lock().expect("lock before poison");
+                panic!("intentional coordinator mutex poison");
+            }),
+        );
+        assert!(outcome.is_err());
+
+        drain_pending_waiters(&shared, &PersistenceFailure::WorkerPanicked);
+        assert_eq!(
+            flush
+                .recv_timeout(CONTROLLED_WORKER_WATCHDOG)
+                .expect("poisoned-mutex flush result")
+                .expect_err("terminal drain cannot acknowledge a flush")
+                .code(),
+            PersistenceFailureCode::WorkerPanicked
+        );
+        assert_eq!(
+            binding
+                .recv_timeout(CONTROLLED_WORKER_WATCHDOG)
+                .expect("poisoned-mutex binding result")
+                .expect_err("terminal drain cannot publish a binding")
+                .code(),
+            PersistenceFailureCode::WorkerPanicked
+        );
+        let pending = lock_pending(&shared.pending);
+        assert!(pending.flush_waiters.is_empty());
+        assert!(pending.binding_waiters.is_empty());
+        assert_eq!(pending.waiter_count, 0);
     }
 
     #[test]

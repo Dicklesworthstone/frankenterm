@@ -447,6 +447,11 @@ pub struct ShardHealthReport {
 }
 
 impl ShardHealthReport {
+    /// Maximum number of per-shard warnings admitted to one live watchdog
+    /// snapshot. The optional final entry reports how many additional
+    /// unhealthy shards were omitted.
+    const WATCHDOG_WARNING_LIMIT: usize = 64;
+
     /// Return shard entries that are not healthy.
     #[must_use]
     pub fn unhealthy_shards(&self) -> Vec<&ShardHealthEntry> {
@@ -457,23 +462,51 @@ impl ShardHealthReport {
     }
 
     /// Render human-readable warnings suitable for watchdog snapshots.
+    ///
+    /// Backend labels and errors are deliberately excluded. Both can contain
+    /// caller-controlled pane text, paths, credentials, or arbitrarily large
+    /// strings. The watchdog surface needs stable operational classification,
+    /// not a second copy of backend diagnostics. Every per-shard line is
+    /// therefore content-free and bounded by fixed-width enum/numeric fields,
+    /// while the number of lines is capped independently of configured shard
+    /// count.
     #[must_use]
     pub fn watchdog_warnings(&self) -> Vec<String> {
-        self.unhealthy_shards()
-            .into_iter()
-            .map(|entry| {
-                let detail = entry.error.as_deref().unwrap_or("no error details");
-                format!(
-                    "Shard {} ({}) {} (circuit={:?}, pane_count={:?}): {}",
-                    entry.shard_id.0,
-                    entry.label,
-                    entry.status,
-                    entry.circuit.state,
-                    entry.pane_count,
-                    detail
-                )
-            })
-            .collect()
+        let mut warnings = Vec::with_capacity(
+            self.shards
+                .len()
+                .min(Self::WATCHDOG_WARNING_LIMIT.saturating_add(1)),
+        );
+        let mut omitted = 0usize;
+        for entry in self
+            .shards
+            .iter()
+            .filter(|entry| entry.status != HealthStatus::Healthy)
+        {
+            if warnings.len() >= Self::WATCHDOG_WARNING_LIMIT {
+                omitted = omitted.saturating_add(1);
+                continue;
+            }
+            warnings.push(format!(
+                "Shard {} unhealthy (status={}, circuit={:?}, pane_count={:?}, backend_error={})",
+                entry.shard_id.0,
+                entry.status,
+                entry.circuit.state,
+                entry.pane_count,
+                if entry.error.is_some() {
+                    "present"
+                } else {
+                    "absent"
+                }
+            ));
+        }
+        if omitted > 0 {
+            warnings.push(format!(
+                "Shard watchdog omitted {omitted} additional unhealthy shard(s) after bounded limit {}",
+                Self::WATCHDOG_WARNING_LIMIT
+            ));
+        }
+        warnings
     }
 }
 
@@ -3531,8 +3564,10 @@ mod tests {
 
         let warnings = report.watchdog_warnings();
         assert_eq!(warnings.len(), 1);
-        assert!(warnings[0].contains("Shard 1 (s1)"));
-        assert!(warnings[0].contains("timeout"));
+        assert!(warnings[0].contains("Shard 1 unhealthy"));
+        assert!(warnings[0].contains("backend_error=present"));
+        assert!(!warnings[0].contains("s1"));
+        assert!(!warnings[0].contains("timeout"));
     }
 
     #[test]
@@ -3652,11 +3687,13 @@ mod tests {
 
             let warnings = report.watchdog_warnings();
             assert_eq!(warnings.len(), 1);
-            assert!(warnings[0].contains("Shard 1 (failing)"));
+            assert!(warnings[0].contains("Shard 1 unhealthy"));
+            assert!(!warnings[0].contains("failing"));
 
             let trait_warnings = client.watchdog_warnings().await.unwrap();
             assert_eq!(trait_warnings.len(), 1);
-            assert!(trait_warnings[0].contains("Shard 1 (failing)"));
+            assert!(trait_warnings[0].contains("Shard 1 unhealthy"));
+            assert!(!trait_warnings[0].contains("failing"));
         });
     }
 
@@ -4503,7 +4540,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn watchdog_warnings_includes_no_error_detail() {
+    fn watchdog_warnings_classifies_absent_error_without_reflecting_backend_text() {
         let report = ShardHealthReport {
             timestamp_ms: 1000,
             overall: HealthStatus::Critical,
@@ -4518,7 +4555,45 @@ mod tests {
         };
         let warnings = report.watchdog_warnings();
         assert_eq!(warnings.len(), 1);
-        assert!(warnings[0].contains("no error details"));
+        assert!(warnings[0].contains("backend_error=absent"));
+        assert!(!warnings[0].contains("s0"));
+    }
+
+    #[test]
+    fn watchdog_warnings_are_content_free_and_count_bounded() {
+        let shard_count = ShardHealthReport::WATCHDOG_WARNING_LIMIT + 2;
+        let shards = (0..shard_count)
+            .map(|index| ShardHealthEntry {
+                shard_id: ShardId(index),
+                label: format!("private-label-{index}-{}", "x".repeat(4_096)),
+                status: HealthStatus::Critical,
+                pane_count: None,
+                circuit: CircuitBreakerStatus::default(),
+                error: Some(format!("secret-error-{index}-{}", "y".repeat(4_096))),
+            })
+            .collect();
+        let report = ShardHealthReport {
+            timestamp_ms: 1_000,
+            overall: HealthStatus::Critical,
+            shards,
+        };
+
+        let warnings = report.watchdog_warnings();
+        assert_eq!(
+            warnings.len(),
+            ShardHealthReport::WATCHDOG_WARNING_LIMIT + 1
+        );
+        assert!(warnings[..ShardHealthReport::WATCHDOG_WARNING_LIMIT]
+            .iter()
+            .all(|warning| warning.len() < 256));
+        assert!(warnings.iter().all(|warning| !warning.contains("private-label")));
+        assert!(warnings.iter().all(|warning| !warning.contains("secret-error")));
+        assert_eq!(
+            warnings.last().map(String::as_str),
+            Some(
+                "Shard watchdog omitted 2 additional unhealthy shard(s) after bounded limit 64"
+            )
+        );
     }
 
     // -----------------------------------------------------------------------

@@ -755,7 +755,7 @@ impl Window {
         if let Some(mux) = self.owner.upgrade() {
             mux.enqueue_window_focus_lost(pane);
         } else if catch_recoverable(
-            RecoverablePanicSite::MuxWindowCallback,
+            RecoverablePanicSite::MuxPaneCallback,
             std::panic::AssertUnwindSafe(|| pane.focus_changed(false)),
         )
         .is_err()

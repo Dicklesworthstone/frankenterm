@@ -346,6 +346,11 @@ pub const fn panic_recovery_is_executable() -> bool {
 /// [`RecoveredPanic`] is returned. If payload disposal itself panics, one
 /// secondary object may be quarantined process-wide and future recovery fails
 /// closed instead of accumulating opaque leaks.
+///
+/// If this function is entered from a destructor while the thread is already
+/// unwinding, non-panicking cleanup may still complete, but a second panic is
+/// necessarily fatal. In that case the operation runs with fatal hook
+/// visibility instead of a false recoverable marker.
 pub fn catch_recoverable<F, R>(
     site: RecoverablePanicSite,
     operation: F,
@@ -364,6 +369,23 @@ fn catch_recoverable_internal<F, R>(
 where
     F: FnOnce() -> R + UnwindSafe,
 {
+    if std::thread::panicking() {
+        // A second panic that starts while an outer unwind is already active
+        // aborts the process before catch_unwind can hand control back to us.
+        // This situation occurs in Drop-based best-effort cleanup. Running the
+        // operation behind the ordinary recoverable marker would therefore
+        // suppress every project hook without actually providing recovery,
+        // turning a necessarily fatal double panic into a silent abort.
+        //
+        // Match RecoverableFuture::drop: allow non-panicking cleanup to finish,
+        // but override any still-live outer recovery marker so a nested panic
+        // reaches the sanitized fatal hooks before the runtime aborts.
+        let fatal_boundary = ForceFatalPanicBoundary::enter();
+        let value = operation();
+        drop(fatal_boundary);
+        return Ok(value);
+    }
+
     let boundary = RecoverablePanicBoundary::enter();
     let result = std::panic::catch_unwind(AssertUnwindSafe(operation));
     drop(boundary);
@@ -697,6 +719,57 @@ mod tests {
         drop(outer_fatal);
         assert_eq!(is_recoverable_panic(), cfg!(panic = "unwind"));
         drop(recoverable);
+        assert!(!is_recoverable_panic());
+    }
+
+    #[cfg(panic = "unwind")]
+    #[test]
+    fn synchronous_cleanup_during_outer_unwind_is_not_marked_recoverable() {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
+
+        struct CleanupProbe {
+            ran: Arc<AtomicBool>,
+            saw_recoverable_marker: Arc<AtomicBool>,
+            returned_normally: Arc<AtomicBool>,
+        }
+
+        impl Drop for CleanupProbe {
+            fn drop(&mut self) {
+                let result = catch_recoverable(
+                    RecoverablePanicSite::CoreRecordingFinalize,
+                    AssertUnwindSafe(|| {
+                        self.ran.store(true, Ordering::Relaxed);
+                        self.saw_recoverable_marker
+                            .store(is_recoverable_panic(), Ordering::Relaxed);
+                    }),
+                );
+                self.returned_normally
+                    .store(result.is_ok(), Ordering::Relaxed);
+            }
+        }
+
+        let ran = Arc::new(AtomicBool::new(false));
+        let saw_recoverable_marker = Arc::new(AtomicBool::new(true));
+        let returned_normally = Arc::new(AtomicBool::new(false));
+        let outer = std::panic::catch_unwind(AssertUnwindSafe({
+            let ran = Arc::clone(&ran);
+            let saw_recoverable_marker = Arc::clone(&saw_recoverable_marker);
+            let returned_normally = Arc::clone(&returned_normally);
+            move || {
+                let _probe = CleanupProbe {
+                    ran,
+                    saw_recoverable_marker,
+                    returned_normally,
+                };
+                panic!("outer-unwind-test-sentinel");
+            }
+        }));
+
+        assert!(outer.is_err());
+        assert!(ran.load(Ordering::Relaxed));
+        assert!(!saw_recoverable_marker.load(Ordering::Relaxed));
+        assert!(returned_normally.load(Ordering::Relaxed));
         assert!(!is_recoverable_panic());
     }
 

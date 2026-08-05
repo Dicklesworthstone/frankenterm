@@ -16,9 +16,10 @@
 //! ```
 
 use std::backtrace::Backtrace;
-use std::collections::{HashMap, HashSet};
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::OnceLock;
@@ -26,6 +27,10 @@ use std::sync::RwLock;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt};
+#[cfg(unix)]
+use cap_fs_ext::OpenOptionsSyncExt;
+use cap_std::fs::{Dir as CapDir, OpenOptions as CapOpenOptions};
 use serde::{Deserialize, Serialize};
 
 use crate::policy::Redactor;
@@ -67,16 +72,35 @@ static GLOBAL_CRASH_TERMINAL_SESSION_MARKERS: OnceLock<
 /// corrupted, here's why".
 ///
 /// File-not-found is NOT counted (the file just doesn't exist);
-/// only file-present-but-fails-to-{read,parse} bumps the counter.
-/// Each phase tag (`manifest_read_fail` | `manifest_parse_fail` |
-/// `report_read_fail` | `report_parse_fail`) is structured into the
-/// `tracing::warn` record so operators can discriminate filesystem
-/// permission issues from schema drift.
+/// only file-present-but-fails-to-{read,parse} bumps the counter. The first
+/// [`CRASH_BUNDLE_PARSE_DROP_LOG_LIMIT`] failures include a finite phase tag;
+/// later failures remain visible in this counter without producing an
+/// unbounded warning storm. Neither paths nor backend error strings are
+/// reflected into the log.
 ///
 /// Same observability shape as ft-bn6qi epoch_clock_anomaly_count,
 /// ft-yygus policy_decision_context_serde_drop_count, ft-zkthg
 /// workflows_serde_drop_count.
 static CRASH_BUNDLE_PARSE_DROP_COUNT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Cap warning emission independently of the total drop counter. Historical
+/// crash directories are untrusted input; thousands of malformed files must
+/// not turn one TUI refresh into a log storm.
+const CRASH_BUNDLE_PARSE_DROP_LOG_LIMIT: u64 = 16;
+static CRASH_BUNDLE_PARSE_DROP_LOG_COUNT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Total fail-closed compatibility requests whose bounded search could not
+/// produce an authoritative answer. Typed `discover_*` callers receive the
+/// incompleteness directly and do not increment this wrapper-level counter.
+/// Keep it distinct from payload parse drops: a clean directory can still
+/// exceed a candidate or result window.
+static CRASH_BUNDLE_DISCOVERY_INCOMPLETE_COUNT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+/// Cap repeated refresh warnings while retaining the total counter above.
+const CRASH_BUNDLE_DISCOVERY_INCOMPLETE_LOG_LIMIT: u64 = 16;
+static CRASH_BUNDLE_DISCOVERY_INCOMPLETE_LOG_COUNT: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
 /// Process-local nonce for disjoint crash-bundle staging and final paths.
@@ -132,27 +156,276 @@ pub fn crash_bundle_parse_drop_count() -> u64 {
     CRASH_BUNDLE_PARSE_DROP_COUNT.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Cumulative fail-closed `list`/`latest` compatibility results withheld
+/// because bounded discovery could not prove their answer authoritative.
+#[must_use]
+pub fn crash_bundle_discovery_incomplete_count() -> u64 {
+    CRASH_BUNDLE_DISCOVERY_INCOMPLETE_COUNT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// br-ft-94cdu: test helper to reset the parse-drop counter.
 #[cfg(test)]
 pub(crate) fn reset_crash_bundle_parse_drop_count_for_test() {
     CRASH_BUNDLE_PARSE_DROP_COUNT.store(0, std::sync::atomic::Ordering::Relaxed);
+    CRASH_BUNDLE_PARSE_DROP_LOG_COUNT.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(test)]
+fn reset_crash_bundle_discovery_incomplete_count_for_test() {
+    CRASH_BUNDLE_DISCOVERY_INCOMPLETE_COUNT.store(0, std::sync::atomic::Ordering::Relaxed);
+    CRASH_BUNDLE_DISCOVERY_INCOMPLETE_LOG_COUNT.store(0, std::sync::atomic::Ordering::Relaxed);
 }
 
 #[inline]
 fn record_crash_bundle_parse_drop(
-    bundle_path: &Path,
+    _bundle_path: &Path,
     phase: &'static str,
-    error: &dyn std::fmt::Display,
+    _error: &dyn std::fmt::Display,
 ) {
-    CRASH_BUNDLE_PARSE_DROP_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    tracing::warn!(
-        target: "ft.crash.bundle",
-        event = "crash_bundle_parse_drop",
-        bundle_path = %bundle_path.display(),
-        phase = phase,
-        error = %error,
-        "crash bundle file present but could not be parsed (br-ft-94cdu)"
+    let dropped = CRASH_BUNDLE_PARSE_DROP_COUNT
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        .saturating_add(1);
+    let log_index = claim_bounded_crash_bundle_log_slot(
+        &CRASH_BUNDLE_PARSE_DROP_LOG_COUNT,
+        CRASH_BUNDLE_PARSE_DROP_LOG_LIMIT,
     );
+    if log_index.is_some_and(|index| index <= CRASH_BUNDLE_PARSE_DROP_LOG_LIMIT) {
+        tracing::warn!(
+            target: "ft.crash.bundle",
+            event = "crash_bundle_parse_drop",
+            phase,
+            dropped,
+            "crash bundle payload was rejected (br-ft-94cdu)"
+        );
+    } else if log_index == Some(CRASH_BUNDLE_PARSE_DROP_LOG_LIMIT.saturating_add(1)) {
+        tracing::warn!(
+            target: "ft.crash.bundle",
+            event = "crash_bundle_parse_drop_suppressed",
+            dropped,
+            log_limit = CRASH_BUNDLE_PARSE_DROP_LOG_LIMIT,
+            "further crash bundle parse-drop warnings are suppressed"
+        );
+    }
+}
+
+/// Claim one of a finite number of process-lifetime warning slots.
+///
+/// The counter stops at `warning_limit + 1`: the first `warning_limit` slots
+/// carry individual warnings and the last slot carries one suppression notice.
+/// A plain `fetch_add` would keep wrapping forever after warning emission had
+/// stopped, contradict the counter's finite-emission meaning, and made the
+/// suppression-bound regression test fail after more than one suppressed
+/// event.
+fn claim_bounded_crash_bundle_log_slot(
+    counter: &std::sync::atomic::AtomicU64,
+    warning_limit: u64,
+) -> Option<u64> {
+    let terminal = warning_limit.saturating_add(1);
+    counter
+        .fetch_update(
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+            |current| (current < terminal).then(|| current.saturating_add(1)),
+        )
+        .ok()
+        .map(|previous| previous.saturating_add(1))
+}
+
+#[inline]
+fn record_crash_bundle_discovery_incomplete(
+    surface: &'static str,
+    completeness: &CrashBundleDiscoveryCompleteness,
+    directory_entries_examined: usize,
+    ranked_candidates: usize,
+    unranked_candidates: usize,
+    payload_files_opened: usize,
+    payload_bytes_read: u64,
+) {
+    let incomplete = CRASH_BUNDLE_DISCOVERY_INCOMPLETE_COUNT
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        .saturating_add(1);
+    let log_index = claim_bounded_crash_bundle_log_slot(
+        &CRASH_BUNDLE_DISCOVERY_INCOMPLETE_LOG_COUNT,
+        CRASH_BUNDLE_DISCOVERY_INCOMPLETE_LOG_LIMIT,
+    );
+    if log_index.is_some_and(|index| index <= CRASH_BUNDLE_DISCOVERY_INCOMPLETE_LOG_LIMIT) {
+        tracing::warn!(
+            target: "ft.crash.bundle",
+            event = "crash_bundle_discovery_incomplete",
+            surface,
+            completeness = ?completeness,
+            incomplete,
+            directory_entries_examined,
+            ranked_candidates,
+            unranked_candidates,
+            payload_files_opened,
+            payload_bytes_read,
+            "crash-bundle result is withheld because bounded discovery was incomplete"
+        );
+    } else if log_index
+        == Some(CRASH_BUNDLE_DISCOVERY_INCOMPLETE_LOG_LIMIT.saturating_add(1))
+    {
+        tracing::warn!(
+            target: "ft.crash.bundle",
+            event = "crash_bundle_discovery_incomplete_suppressed",
+            incomplete,
+            log_limit = CRASH_BUNDLE_DISCOVERY_INCOMPLETE_LOG_LIMIT,
+            "further crash-bundle discovery-incomplete warnings are suppressed"
+        );
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct CrashBundlePayloadReadStats {
+    files_opened: usize,
+    bytes_read: u64,
+    authority_unreadable: bool,
+}
+
+fn crash_bundle_io_error_withholds_authority(error: &std::io::Error) -> bool {
+    !matches!(
+        error.kind(),
+        std::io::ErrorKind::NotFound
+            | std::io::ErrorKind::InvalidData
+            | std::io::ErrorKind::InvalidInput
+            | std::io::ErrorKind::NotADirectory
+            | std::io::ErrorKind::IsADirectory
+            | std::io::ErrorKind::FilesystemLoop
+    )
+}
+
+#[cfg(test)]
+fn open_crash_bundle_dir_nofollow(bundle_path: &Path) -> std::io::Result<CapDir> {
+    let parent = bundle_path.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "crash bundle directory has no parent",
+        )
+    })?;
+    let name = bundle_path.file_name().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "crash bundle directory has no leaf name",
+        )
+    })?;
+    let parent_dir = CapDir::open_ambient_dir(parent, cap_std::ambient_authority())?;
+    parent_dir.open_dir_nofollow(name)
+}
+
+fn open_regular_crash_bundle_payload(
+    bundle_dir: &CapDir,
+    relative: &Path,
+) -> std::io::Result<cap_std::fs::File> {
+    if relative.components().count() != 1 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "crash bundle payload must be one regular-file leaf",
+        ));
+    }
+    // Type-check without following before open. This rejects a FIFO or
+    // symlink deterministically and avoids relying on platform-specific open
+    // errors to distinguish hostile leaves from genuinely unreadable files.
+    if !bundle_dir.symlink_metadata(relative)?.file_type().is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "crash bundle payload is not a regular file",
+        ));
+    }
+    let mut options = CapOpenOptions::new();
+    options.read(true).follow(FollowSymlinks::No);
+    #[cfg(unix)]
+    options.nonblock(true);
+    let file = bundle_dir.open_with(relative, &options)?;
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "crash bundle payload is not a regular file",
+        ));
+    }
+    Ok(file)
+}
+
+fn read_optional_json_from_bundle_dir_bounded<T: serde::de::DeserializeOwned>(
+    bundle_dir: &CapDir,
+    bundle_path: &Path,
+    file_path: &Path,
+    read_fail_phase: &'static str,
+    parse_fail_phase: &'static str,
+    max_bytes: u64,
+    stats: &mut CrashBundlePayloadReadStats,
+) -> Option<T> {
+    let relative = match file_path.strip_prefix(bundle_path) {
+        Ok(relative) => relative,
+        Err(error) => {
+            record_crash_bundle_parse_drop(bundle_path, read_fail_phase, &error);
+            return None;
+        }
+    };
+    let mut file = match open_regular_crash_bundle_payload(bundle_dir, relative) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(error) => {
+            stats.authority_unreadable |= crash_bundle_io_error_withholds_authority(&error);
+            record_crash_bundle_parse_drop(bundle_path, read_fail_phase, &error);
+            return None;
+        }
+    };
+    stats.files_opened = stats.files_opened.saturating_add(1);
+    let mut raw = Vec::new();
+    let read_result = (&mut file)
+        .take(max_bytes.saturating_add(1))
+        .read_to_end(&mut raw);
+    stats.bytes_read = stats
+        .bytes_read
+        .saturating_add(u64::try_from(raw.len()).unwrap_or(u64::MAX));
+    if let Err(error) = read_result {
+        stats.authority_unreadable = true;
+        record_crash_bundle_parse_drop(bundle_path, read_fail_phase, &error);
+        return None;
+    }
+    if u64::try_from(raw.len()).unwrap_or(u64::MAX) > max_bytes {
+        let error = std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "crash bundle payload exceeds its byte limit",
+        );
+        record_crash_bundle_parse_drop(bundle_path, read_fail_phase, &error);
+        return None;
+    }
+    match serde_json::from_slice::<T>(&raw) {
+        Ok(parsed) => Some(parsed),
+        Err(error) => {
+            record_crash_bundle_parse_drop(bundle_path, parse_fail_phase, &error);
+            None
+        }
+    }
+}
+
+#[cfg(test)]
+fn read_optional_json_bundle_file_bounded<T: serde::de::DeserializeOwned>(
+    bundle_path: &Path,
+    file_path: &Path,
+    read_fail_phase: &'static str,
+    parse_fail_phase: &'static str,
+    max_bytes: u64,
+    stats: &mut CrashBundlePayloadReadStats,
+) -> Option<T> {
+    let bundle_dir = match open_crash_bundle_dir_nofollow(bundle_path) {
+        Ok(bundle_dir) => bundle_dir,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(error) => {
+            record_crash_bundle_parse_drop(bundle_path, read_fail_phase, &error);
+            return None;
+        }
+    };
+    read_optional_json_from_bundle_dir_bounded(
+        &bundle_dir,
+        bundle_path,
+        file_path,
+        read_fail_phase,
+        parse_fail_phase,
+        max_bytes,
+        stats,
+    )
 }
 
 /// br-ft-94cdu: read+parse a JSON file, treating file-not-found as
@@ -160,29 +433,27 @@ fn record_crash_bundle_parse_drop(
 /// counter bumps with discriminating phase tags. Returns
 /// `Ok(Some(T))` on success, `Ok(None)` if the file is missing,
 /// and `Ok(None)` on read/parse error after recording the drop.
+#[cfg(test)]
 fn read_optional_json_bundle_file<T: serde::de::DeserializeOwned>(
     bundle_path: &Path,
     file_path: &Path,
     read_fail_phase: &'static str,
     parse_fail_phase: &'static str,
 ) -> Option<T> {
-    if !file_path.exists() {
-        return None;
-    }
-    let raw = match fs::read_to_string(file_path) {
-        Ok(s) => s,
-        Err(err) => {
-            record_crash_bundle_parse_drop(bundle_path, read_fail_phase, &err);
-            return None;
-        }
+    let max_bytes = if file_path.file_name().and_then(|name| name.to_str()) == Some("manifest.json")
+    {
+        MAX_CRASH_MANIFEST_JSON_READ_BYTES
+    } else {
+        MAX_CRASH_REPORT_JSON_READ_BYTES
     };
-    match serde_json::from_str::<T>(&raw) {
-        Ok(parsed) => Some(parsed),
-        Err(err) => {
-            record_crash_bundle_parse_drop(bundle_path, parse_fail_phase, &err);
-            None
-        }
-    }
+    read_optional_json_bundle_file_bounded(
+        bundle_path,
+        file_path,
+        read_fail_phase,
+        parse_fail_phase,
+        max_bytes,
+        &mut CrashBundlePayloadReadStats::default(),
+    )
 }
 
 /// Maximum backtrace string length included in crash bundles (64 KiB).
@@ -212,6 +483,13 @@ const MAX_CRASH_DIAGNOSTIC_FIELD_WIDTH: usize = 256;
 
 /// Maximum crash bundle size in bytes (1 MiB) — a privacy/size budget.
 const MAX_BUNDLE_SIZE: usize = 1024 * 1024;
+
+/// Generated manifests contain only a small fixed file inventory. Historical
+/// or attacker-created manifests above 64 KiB are never valid for discovery.
+const MAX_CRASH_MANIFEST_JSON_READ_BYTES: u64 = 64 * 1024;
+/// A generated report is bounded well below this by its 64 KiB backtrace plus
+/// fixed diagnostic fields. Keep historical reads finite with room for JSON.
+const MAX_CRASH_REPORT_JSON_READ_BYTES: u64 = 128 * 1024;
 
 /// Cheap lifecycle inventory for leak and retention triage.
 ///
@@ -1835,6 +2113,316 @@ pub struct CrashBundleSummary {
     pub report: Option<CrashReport>,
 }
 
+/// Maximum number of name-rankable candidates whose payloads may be opened by
+/// one latest-bundle discovery. At the per-file caps above, the hard aggregate
+/// read ceiling is below 8 MiB (40 × (64 KiB + 128 KiB), plus one byte per
+/// file used for oversize detection, including the unranked fallback window).
+const LATEST_CRASH_BUNDLE_CANDIDATE_WINDOW: usize = 32;
+/// Public list requests retain at most this many results. Without a hard cap,
+/// an adversarial `usize::MAX` request could turn the heap itself into the
+/// unbounded operation this path is designed to avoid. At the maximum request,
+/// the ranked result-plus-invalid slack and the legacy fallback can inspect at
+/// most 104 candidates (208 payload opens and less than 20 MiB of payload
+/// bytes, including oversize sentinels).
+const MAX_CRASH_BUNDLE_LIST_RESULTS: usize = 64;
+/// Extra ranked candidates inspected when malformed payloads occupy the newest
+/// names. Discovery reports incompleteness instead of scanning indefinitely if
+/// this reserve is exhausted before the requested result count is satisfied.
+const CRASH_BUNDLE_LIST_INVALID_CANDIDATE_SLACK: usize = 32;
+/// Malformed historical names cannot be ranked by their encoded timestamp.
+/// Inspect only a small modification-time window and report incompleteness if
+/// more exist rather than claiming that a bounded fallback is authoritative.
+const LATEST_CRASH_BUNDLE_UNRANKED_WINDOW: usize = 8;
+
+/// Finite reason why a bounded discovery result is not authoritative.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CrashBundleDiscoveryIncompleteReason {
+    /// At least one directory entry or its file type could not be inspected.
+    DirectoryEntryUnreadable,
+    /// A matching directory's modification time could not be read, so an
+    /// mtime-dependent tie-break or legacy-name rank could not be proven.
+    CandidateMetadataUnreadable,
+    /// A retained candidate or one of its payloads could not be opened or read;
+    /// unlike malformed bytes, this does not prove that the candidate is invalid.
+    CandidatePayloadUnreadable,
+    /// Every retained ranked candidate was invalid and older candidates were
+    /// excluded by the ranked payload-work window.
+    RankedCandidateWindowExhausted,
+    /// More legacy or malformed names existed than the bounded fallback window
+    /// can inspect authoritatively.
+    UnrankedCandidateWindowExceeded,
+    /// The caller requested more results than the hard bounded result cap.
+    RequestedLimitExceeded,
+}
+
+/// Whether bounded latest-bundle discovery produced an authoritative answer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CrashBundleDiscoveryCompleteness {
+    /// All candidates capable of changing the answer were inspected.
+    Complete,
+    /// The bounded search could not prove that its candidate was newest.
+    Incomplete {
+        /// Finite reasons why the result is not authoritative.
+        reasons: Vec<CrashBundleDiscoveryIncompleteReason>,
+    },
+}
+
+impl CrashBundleDiscoveryCompleteness {
+    /// Return true only when bounded discovery proved its answer authoritative.
+    #[must_use]
+    pub const fn is_complete(&self) -> bool {
+        matches!(self, Self::Complete)
+    }
+}
+
+/// Bounded latest-bundle discovery result. Callers that need to label a bundle
+/// as authoritative must require [`CrashBundleDiscoveryCompleteness::Complete`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LatestCrashBundleDiscovery {
+    /// Best candidate found within the bounded search, if any.
+    pub bundle: Option<CrashBundleSummary>,
+    /// Whether callers may treat `bundle` or its absence as authoritative.
+    pub completeness: CrashBundleDiscoveryCompleteness,
+    /// Directory entries consumed from the streaming enumeration.
+    pub directory_entries_examined: usize,
+    /// Generated names whose timestamp and optional process suffix were valid.
+    pub ranked_candidates: usize,
+    /// Legacy or malformed names requiring payload/modification-time fallback.
+    pub unranked_candidates: usize,
+    /// Payload files successfully opened during bounded discovery.
+    pub payload_files_opened: usize,
+    /// Payload bytes read, including the one-byte oversize sentinel.
+    pub payload_bytes_read: u64,
+}
+
+/// Typed result for a bounded multi-bundle discovery request.
+///
+/// `bundles` is a best candidate prefix even when `completeness` is
+/// `Incomplete`; only callers that explicitly want best-effort diagnostics
+/// should consume it in that state. Authority-bearing callers must require
+/// [`CrashBundleDiscoveryCompleteness::Complete`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CrashBundleListDiscovery {
+    /// Best candidate prefix retained by the bounded search.
+    pub bundles: Vec<CrashBundleSummary>,
+    /// Whether the returned prefix and its length are authoritative.
+    pub completeness: CrashBundleDiscoveryCompleteness,
+    /// Result count requested by the caller.
+    pub requested_limit: usize,
+    /// Result count actually permitted by the hard discovery cap.
+    pub effective_limit: usize,
+    /// Directory entries consumed from the streaming enumeration.
+    pub directory_entries_examined: usize,
+    /// Generated names whose timestamp and optional process suffix were valid.
+    pub ranked_candidates: usize,
+    /// Legacy or malformed names requiring payload/modification-time fallback.
+    pub unranked_candidates: usize,
+    /// Payload files successfully opened during bounded discovery.
+    pub payload_files_opened: usize,
+    /// Payload bytes read, including the one-byte oversize sentinel.
+    pub payload_bytes_read: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct RankedCrashBundleCandidate {
+    timestamp: String,
+    modified: Option<SystemTime>,
+    process_sequence: Option<(u32, u64)>,
+    path: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct UnrankedCrashBundleCandidate {
+    modified: Option<SystemTime>,
+    path: PathBuf,
+}
+
+#[derive(Debug)]
+struct LoadedCrashBundleCandidate {
+    summary: CrashBundleSummary,
+    authority_timestamp: Option<String>,
+    modified: Option<SystemTime>,
+    process_sequence: Option<(u32, u64)>,
+}
+
+fn retain_newest_candidate<T: Ord>(heap: &mut BinaryHeap<Reverse<T>>, candidate: T, limit: usize) {
+    if limit == 0 {
+        return;
+    }
+    if heap.len() < limit {
+        heap.push(Reverse(candidate));
+        return;
+    }
+    if heap.peek().is_some_and(|oldest_retained| {
+        candidate.cmp(&oldest_retained.0).is_gt()
+    }) {
+        heap.pop();
+        heap.push(Reverse(candidate));
+    }
+}
+
+fn crash_bundle_candidate_modified(
+    modified: std::io::Result<SystemTime>,
+    metadata_unreadable: &mut bool,
+) -> Option<SystemTime> {
+    match modified {
+        Ok(modified) => Some(modified),
+        Err(_) => {
+            *metadata_unreadable = true;
+            None
+        }
+    }
+}
+
+fn crash_bundle_name_key(path: &Path) -> Option<(String, Option<(u32, u64)>)> {
+    let name = path.file_name()?.to_str()?;
+    let suffix = name.strip_prefix("ft_crash_")?;
+    let timestamp = suffix.get(..15)?;
+    let bytes = timestamp.as_bytes();
+    if bytes.get(8) != Some(&b'_')
+        || bytes
+            .iter()
+            .enumerate()
+            .any(|(index, byte)| index != 8 && !byte.is_ascii_digit())
+    {
+        return None;
+    }
+    let year: u16 = timestamp.get(0..4)?.parse().ok()?;
+    let month: u8 = timestamp.get(4..6)?.parse().ok()?;
+    let day: u8 = timestamp.get(6..8)?.parse().ok()?;
+    let hour: u8 = timestamp.get(9..11)?.parse().ok()?;
+    let minute: u8 = timestamp.get(11..13)?.parse().ok()?;
+    let second: u8 = timestamp.get(13..15)?.parse().ok()?;
+    if year == 0 {
+        return None;
+    }
+    let leap_year =
+        year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400));
+    let days_in_month = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap_year => 29,
+        2 => 28,
+        _ => return None,
+    };
+    if !(1..=days_in_month).contains(&day)
+        || hour > 23
+        || minute > 59
+        || second > 59
+    {
+        return None;
+    }
+    let process_suffix = suffix.get(15..)?;
+    let process_sequence = if process_suffix.is_empty() {
+        None
+    } else {
+        let (process_id, sequence) = process_suffix.strip_prefix("_p")?.rsplit_once('_')?;
+        Some((process_id.parse().ok()?, sequence.parse().ok()?))
+    };
+    Some((timestamp.to_string(), process_sequence))
+}
+
+fn crash_bundle_timestamp_iso8601(timestamp: &str) -> Option<String> {
+    Some(format!(
+        "{}-{}-{}T{}:{}:{}Z",
+        timestamp.get(0..4)?,
+        timestamp.get(4..6)?,
+        timestamp.get(6..8)?,
+        timestamp.get(9..11)?,
+        timestamp.get(11..13)?,
+        timestamp.get(13..15)?,
+    ))
+}
+
+fn read_crash_bundle_summary_from_dir_bounded(
+    bundle_dir: &CapDir,
+    path: PathBuf,
+    expected_timestamp: Option<&str>,
+    stats: &mut CrashBundlePayloadReadStats,
+) -> Option<CrashBundleSummary> {
+    let manifest_path = path.join("manifest.json");
+    let mut manifest = read_optional_json_from_bundle_dir_bounded::<CrashManifest>(
+        bundle_dir,
+        &path,
+        &manifest_path,
+        "manifest_read_fail",
+        "manifest_parse_fail",
+        MAX_CRASH_MANIFEST_JSON_READ_BYTES,
+        stats,
+    );
+    let report_path = path.join("crash_report.json");
+    let mut report = read_optional_json_from_bundle_dir_bounded::<CrashReport>(
+        bundle_dir,
+        &path,
+        &report_path,
+        "report_read_fail",
+        "report_parse_fail",
+        MAX_CRASH_REPORT_JSON_READ_BYTES,
+        stats,
+    );
+
+    if let Some(timestamp) = expected_timestamp {
+        if manifest.as_ref().is_some_and(|manifest| {
+            crash_bundle_timestamp_iso8601(timestamp).as_deref()
+                != Some(manifest.created_at.as_str())
+        }) {
+            let error = std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "crash manifest timestamp does not match its generated directory name",
+            );
+            record_crash_bundle_parse_drop(&path, "manifest_name_mismatch", &error);
+            manifest = None;
+        }
+        if report
+            .as_ref()
+            .is_some_and(|report| format_timestamp(report.timestamp) != timestamp)
+        {
+            let error = std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "crash report timestamp does not match its generated directory name",
+            );
+            record_crash_bundle_parse_drop(&path, "report_name_mismatch", &error);
+            report = None;
+        }
+    }
+
+    if manifest.is_none() && report.is_none() {
+        None
+    } else {
+        Some(CrashBundleSummary {
+            path,
+            manifest,
+            report,
+        })
+    }
+}
+
+fn read_crash_bundle_summary_from_root_bounded(
+    crash_root: &CapDir,
+    path: PathBuf,
+    expected_timestamp: Option<&str>,
+    stats: &mut CrashBundlePayloadReadStats,
+) -> Option<CrashBundleSummary> {
+    let name = path.file_name()?;
+    let bundle_dir = match crash_root.open_dir_nofollow(name) {
+        Ok(bundle_dir) => bundle_dir,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(error) => {
+            stats.authority_unreadable |= crash_bundle_io_error_withholds_authority(&error);
+            record_crash_bundle_parse_drop(&path, "bundle_dir_open_fail", &error);
+            return None;
+        }
+    };
+    read_crash_bundle_summary_from_dir_bounded(
+        &bundle_dir,
+        path,
+        expected_timestamp,
+        stats,
+    )
+}
+
 fn crash_bundle_process_sequence(path: &Path) -> Option<(u32, u64)> {
     let name = path.file_name()?.to_str()?;
     let (process_prefix, sequence) = name.rsplit_once('_')?;
@@ -1842,109 +2430,313 @@ fn crash_bundle_process_sequence(path: &Path) -> Option<(u32, u64)> {
     Some((process_id.parse().ok()?, sequence.parse().ok()?))
 }
 
-/// List crash bundles in `crash_dir`, sorted newest first.
-///
-/// Scans for directories matching `ft_crash_*`, parses their manifests
-/// and crash reports, and returns up to `limit` results.  Invalid or
-/// unreadable bundles are silently skipped.
-#[must_use]
-pub fn list_crash_bundles(crash_dir: &Path, limit: usize) -> Vec<CrashBundleSummary> {
-    if limit == 0 {
-        return Vec::new();
-    }
-    let Ok(entries) = fs::read_dir(crash_dir) else {
-        return Vec::new();
-    };
-
-    let bundles: Vec<CrashBundleSummary> = entries
-        .filter_map(Result::ok)
-        .filter(|e| {
-            e.file_type().is_ok_and(|ft| ft.is_dir())
-                && e.file_name()
-                    .to_str()
-                    .is_some_and(|n| n.starts_with("ft_crash_"))
-        })
-        .filter_map(|e| {
-            let path = e.path();
-            // br-ft-94cdu: route through the parse-drop helper so a
-            // corrupted bundle (file present but malformed) is
-            // visible via crash_bundle_parse_drop_count() rather
-            // than silently filtered.
-            let manifest_path = path.join("manifest.json");
-            let manifest = read_optional_json_bundle_file::<CrashManifest>(
-                &path,
-                &manifest_path,
-                "manifest_read_fail",
-                "manifest_parse_fail",
-            );
-            let report_path = path.join("crash_report.json");
-            let report = read_optional_json_bundle_file::<CrashReport>(
-                &path,
-                &report_path,
-                "report_read_fail",
-                "report_parse_fail",
-            );
-
-            // Skip bundles without at least a manifest or report
-            if manifest.is_none() && report.is_none() {
-                return None;
-            }
-
-            Some(CrashBundleSummary {
-                path,
-                manifest,
-                report,
-            })
-        })
-        .collect();
-
-    // Read each sort key once. Re-running metadata syscalls from the sort
-    // comparator turns a directory with many retained bundles into O(n log n)
-    // filesystem traffic and can observe inconsistent keys mid-sort.
-    let mut ordered_bundles: Vec<_> = bundles
-        .into_iter()
-        .map(|bundle| {
-            let modified = fs::metadata(&bundle.path)
-                .and_then(|metadata| metadata.modified())
-                .ok();
-            let process_sequence = crash_bundle_process_sequence(&bundle.path);
-            (bundle, modified, process_sequence)
-        })
-        .collect();
-
-    // Sort newest first by report timestamp. Fatal hooks can write more than
-    // once in one second, so equal timestamps use directory modification time,
-    // then the process/sequence suffix, and finally path order. Keeping one
-    // lexicographic key for every pair is important: a conditional same-PID
-    // comparator could violate transitivity across three processes. Directory
-    // enumeration order is never authority for `latest`.
-    ordered_bundles.sort_by(
-        |(a, modified_a, process_sequence_a), (b, modified_b, process_sequence_b)| {
-            let ts_a = a.report.as_ref().map_or(0, |r| r.timestamp);
-            let ts_b = b.report.as_ref().map_or(0, |r| r.timestamp);
-            let timestamp_order = ts_b.cmp(&ts_a);
-            if timestamp_order != std::cmp::Ordering::Equal {
-                return timestamp_order;
-            }
-
-            modified_b
-                .cmp(modified_a)
-                .then_with(|| process_sequence_b.cmp(process_sequence_a))
-                .then_with(|| b.path.cmp(&a.path))
-        },
-    );
-
-    ordered_bundles.truncate(limit);
-    ordered_bundles
-        .into_iter()
-        .map(|(bundle, _, _)| bundle)
-        .collect()
+fn compare_loaded_crash_bundle_order(
+    a: &LoadedCrashBundleCandidate,
+    b: &LoadedCrashBundleCandidate,
+) -> std::cmp::Ordering {
+    b.authority_timestamp
+        .cmp(&a.authority_timestamp)
+        .then_with(|| b.modified.cmp(&a.modified))
+        .then_with(|| b.process_sequence.cmp(&a.process_sequence))
+        .then_with(|| b.summary.path.cmp(&a.summary.path))
 }
 
-/// Get the most recent crash bundle, if any.
+fn unranked_crash_bundle_authority_timestamp(summary: &CrashBundleSummary) -> Option<String> {
+    summary
+        .report
+        .as_ref()
+        .map(|report| format_timestamp(report.timestamp))
+}
+
+fn discover_crash_bundles_bounded(
+    crash_dir: &Path,
+    requested_limit: usize,
+    maximum_results: usize,
+    ranked_candidate_window: usize,
+) -> CrashBundleListDiscovery {
+    let effective_limit = requested_limit.min(maximum_results);
+    let mut result = CrashBundleListDiscovery {
+        bundles: Vec::new(),
+        completeness: CrashBundleDiscoveryCompleteness::Complete,
+        requested_limit,
+        effective_limit,
+        directory_entries_examined: 0,
+        ranked_candidates: 0,
+        unranked_candidates: 0,
+        payload_files_opened: 0,
+        payload_bytes_read: 0,
+    };
+    if requested_limit == 0 {
+        return result;
+    }
+
+    let mut incomplete_reasons = Vec::new();
+    if requested_limit > maximum_results {
+        incomplete_reasons.push(CrashBundleDiscoveryIncompleteReason::RequestedLimitExceeded);
+    }
+    let crash_root = match CapDir::open_ambient_dir(crash_dir, cap_std::ambient_authority()) {
+        Ok(crash_root) => crash_root,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if !incomplete_reasons.is_empty() {
+                result.completeness = CrashBundleDiscoveryCompleteness::Incomplete {
+                    reasons: incomplete_reasons,
+                };
+            }
+            return result;
+        }
+        Err(_) => {
+            incomplete_reasons
+                .push(CrashBundleDiscoveryIncompleteReason::DirectoryEntryUnreadable);
+            result.completeness =
+                CrashBundleDiscoveryCompleteness::Incomplete { reasons: incomplete_reasons };
+            return result;
+        }
+    };
+    let entries = match crash_root.entries() {
+        Ok(entries) => entries,
+        Err(_) => {
+            incomplete_reasons
+                .push(CrashBundleDiscoveryIncompleteReason::DirectoryEntryUnreadable);
+            result.completeness =
+                CrashBundleDiscoveryCompleteness::Incomplete { reasons: incomplete_reasons };
+            return result;
+        }
+    };
+
+    let mut ranked = BinaryHeap::new();
+    let mut unranked = BinaryHeap::new();
+    let mut entry_unreadable = false;
+    let mut metadata_unreadable = false;
+    for entry in entries {
+        result.directory_entries_examined = result.directory_entries_examined.saturating_add(1);
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => {
+                entry_unreadable = true;
+                continue;
+            }
+        };
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(_) => {
+                entry_unreadable = true;
+                continue;
+            }
+        };
+        if !file_type.is_dir()
+            || !entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.starts_with("ft_crash_"))
+        {
+            continue;
+        }
+
+        let path = crash_dir.join(entry.file_name());
+        let modified = crash_bundle_candidate_modified(
+            entry.metadata().and_then(|metadata| metadata.modified()),
+            &mut metadata_unreadable,
+        );
+        if let Some((timestamp, process_sequence)) = crash_bundle_name_key(&path) {
+            result.ranked_candidates = result.ranked_candidates.saturating_add(1);
+            retain_newest_candidate(
+                &mut ranked,
+                RankedCrashBundleCandidate {
+                    timestamp,
+                    modified,
+                    process_sequence,
+                    path,
+                },
+                ranked_candidate_window,
+            );
+        } else {
+            result.unranked_candidates = result.unranked_candidates.saturating_add(1);
+            retain_newest_candidate(
+                &mut unranked,
+                UnrankedCrashBundleCandidate { modified, path },
+                LATEST_CRASH_BUNDLE_UNRANKED_WINDOW,
+            );
+        }
+    }
+
+    let mut payload_stats = CrashBundlePayloadReadStats::default();
+    let mut loaded = Vec::with_capacity(
+        effective_limit.saturating_add(LATEST_CRASH_BUNDLE_UNRANKED_WINDOW),
+    );
+    let mut ranked_candidates = ranked
+        .into_iter()
+        .map(|candidate| candidate.0)
+        .collect::<Vec<_>>();
+    ranked_candidates.sort_unstable_by(|a, b| b.cmp(a));
+    let mut ranked_loaded = 0_usize;
+    for candidate in ranked_candidates {
+        if ranked_loaded >= effective_limit {
+            break;
+        }
+        let authority_timestamp = candidate.timestamp.clone();
+        if let Some(summary) = read_crash_bundle_summary_from_root_bounded(
+            &crash_root,
+            candidate.path,
+            Some(&candidate.timestamp),
+            &mut payload_stats,
+        ) {
+            loaded.push(LoadedCrashBundleCandidate {
+                summary,
+                authority_timestamp: Some(authority_timestamp),
+                modified: candidate.modified,
+                process_sequence: candidate.process_sequence,
+            });
+            ranked_loaded = ranked_loaded.saturating_add(1);
+        }
+    }
+
+    let mut unranked_candidates = unranked
+        .into_iter()
+        .map(|candidate| candidate.0)
+        .collect::<Vec<_>>();
+    unranked_candidates.sort_unstable_by(|a, b| b.cmp(a));
+    for candidate in unranked_candidates {
+        if let Some(summary) = read_crash_bundle_summary_from_root_bounded(
+            &crash_root,
+            candidate.path,
+            None,
+            &mut payload_stats,
+        )
+        {
+            let process_sequence = crash_bundle_process_sequence(&summary.path);
+            loaded.push(LoadedCrashBundleCandidate {
+                authority_timestamp: unranked_crash_bundle_authority_timestamp(&summary),
+                summary,
+                modified: candidate.modified,
+                process_sequence,
+            });
+        }
+    }
+
+    loaded.sort_by(compare_loaded_crash_bundle_order);
+    loaded.truncate(effective_limit);
+    result.bundles = loaded
+        .into_iter()
+        .map(|candidate| candidate.summary)
+        .collect();
+    result.payload_files_opened = payload_stats.files_opened;
+    result.payload_bytes_read = payload_stats.bytes_read;
+
+    if entry_unreadable {
+        incomplete_reasons.push(CrashBundleDiscoveryIncompleteReason::DirectoryEntryUnreadable);
+    }
+    if metadata_unreadable {
+        incomplete_reasons
+            .push(CrashBundleDiscoveryIncompleteReason::CandidateMetadataUnreadable);
+    }
+    if payload_stats.authority_unreadable {
+        incomplete_reasons
+            .push(CrashBundleDiscoveryIncompleteReason::CandidatePayloadUnreadable);
+    }
+    if ranked_loaded < effective_limit
+        && result.ranked_candidates > ranked_candidate_window
+    {
+        incomplete_reasons
+            .push(CrashBundleDiscoveryIncompleteReason::RankedCandidateWindowExhausted);
+    }
+    if result.unranked_candidates > LATEST_CRASH_BUNDLE_UNRANKED_WINDOW {
+        incomplete_reasons
+            .push(CrashBundleDiscoveryIncompleteReason::UnrankedCandidateWindowExceeded);
+    }
+    if !incomplete_reasons.is_empty() {
+        result.completeness = CrashBundleDiscoveryCompleteness::Incomplete {
+            reasons: incomplete_reasons,
+        };
+    }
+    result
+}
+
+/// Discover up to `limit` crash bundles with bounded payload work.
+///
+/// Directory enumeration remains O(entry count), because no correct filesystem
+/// query can identify the newest names without examining every name. Selection
+/// memory, payload-file count, and payload bytes are hard bounded. A request
+/// above 64 results or a candidate set that exhausts a fallback window returns
+/// a typed incomplete result rather than silently claiming an authoritative
+/// prefix.
+#[must_use]
+pub fn discover_crash_bundles(crash_dir: &Path, limit: usize) -> CrashBundleListDiscovery {
+    let effective_limit = limit.min(MAX_CRASH_BUNDLE_LIST_RESULTS);
+    discover_crash_bundles_bounded(
+        crash_dir,
+        limit,
+        MAX_CRASH_BUNDLE_LIST_RESULTS,
+        effective_limit.saturating_add(CRASH_BUNDLE_LIST_INVALID_CANDIDATE_SLACK),
+    )
+}
+
+/// List crash bundles in `crash_dir`, sorted newest first.
+///
+/// This compatibility wrapper is fail closed: it returns results only when the
+/// typed bounded search proves the whole requested prefix authoritative. Use
+/// [`discover_crash_bundles`] when a diagnostic surface can explicitly display
+/// and consume an incomplete best-effort prefix.
+#[must_use]
+pub fn list_crash_bundles(crash_dir: &Path, limit: usize) -> Vec<CrashBundleSummary> {
+    let discovery = discover_crash_bundles(crash_dir, limit);
+    if discovery.completeness.is_complete() {
+        discovery.bundles
+    } else {
+        record_crash_bundle_discovery_incomplete(
+            "list",
+            &discovery.completeness,
+            discovery.directory_entries_examined,
+            discovery.ranked_candidates,
+            discovery.unranked_candidates,
+            discovery.payload_files_opened,
+            discovery.payload_bytes_read,
+        );
+        Vec::new()
+    }
+}
+
+/// Discover the most recent crash bundle with bounded payload work.
+///
+/// Generated directory names are the timestamp authority and payload
+/// timestamps must agree. The returned candidate is best effort when
+/// `completeness` is incomplete; authority-bearing callers must check it.
+#[must_use]
+pub fn discover_latest_crash_bundle(crash_dir: &Path) -> LatestCrashBundleDiscovery {
+    let mut discovery = discover_crash_bundles_bounded(
+        crash_dir,
+        1,
+        1,
+        LATEST_CRASH_BUNDLE_CANDIDATE_WINDOW,
+    );
+    LatestCrashBundleDiscovery {
+        bundle: discovery.bundles.pop(),
+        completeness: discovery.completeness,
+        directory_entries_examined: discovery.directory_entries_examined,
+        ranked_candidates: discovery.ranked_candidates,
+        unranked_candidates: discovery.unranked_candidates,
+        payload_files_opened: discovery.payload_files_opened,
+        payload_bytes_read: discovery.payload_bytes_read,
+    }
+}
+
+/// Get the most recent crash bundle, if exact bounded discovery can prove it.
 #[must_use]
 pub fn latest_crash_bundle(crash_dir: &Path) -> Option<CrashBundleSummary> {
-    list_crash_bundles(crash_dir, 1).into_iter().next()
+    let discovery = discover_latest_crash_bundle(crash_dir);
+    if discovery.completeness.is_complete() {
+        discovery.bundle
+    } else {
+        record_crash_bundle_discovery_incomplete(
+            "latest",
+            &discovery.completeness,
+            discovery.directory_entries_examined,
+            discovery.ranked_candidates,
+            discovery.unranked_candidates,
+            discovery.payload_files_opened,
+            discovery.payload_bytes_read,
+        );
+        None
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -9162,6 +9954,409 @@ mod tests {
 
         let latest = latest_crash_bundle(crash_dir).unwrap();
         assert_eq!(latest.report.as_ref().unwrap().message, "newer");
+    }
+
+    #[test]
+    fn latest_discovery_keeps_selection_memory_bounded_across_10k_names() {
+        let mut heap = BinaryHeap::new();
+        for sequence in 0_u64..10_000 {
+            retain_newest_candidate(
+                &mut heap,
+                RankedCrashBundleCandidate {
+                    timestamp: "20260805_120000".to_string(),
+                    modified: Some(UNIX_EPOCH),
+                    process_sequence: Some((7, sequence)),
+                    path: PathBuf::from(format!(
+                        "ft_crash_20260805_120000_p7_{sequence}"
+                    )),
+                },
+                LATEST_CRASH_BUNDLE_CANDIDATE_WINDOW,
+            );
+        }
+        assert_eq!(heap.len(), LATEST_CRASH_BUNDLE_CANDIDATE_WINDOW);
+        let sequences = heap
+            .into_iter()
+            .map(|candidate| candidate.0.process_sequence.unwrap().1)
+            .collect::<Vec<_>>();
+        assert_eq!(sequences.iter().copied().min(), Some(9_968));
+        assert_eq!(sequences.iter().copied().max(), Some(9_999));
+    }
+
+    #[test]
+    fn crash_bundle_name_key_rejects_impossible_gregorian_dates() {
+        assert!(
+            crash_bundle_name_key(Path::new("ft_crash_20240229_235959_p7_1")).is_some(),
+            "Gregorian leap day must remain rankable"
+        );
+        assert!(crash_bundle_name_key(Path::new("ft_crash_20250229_120000_p7_1")).is_none());
+        assert!(crash_bundle_name_key(Path::new("ft_crash_20260431_120000_p7_1")).is_none());
+        assert!(crash_bundle_name_key(Path::new("ft_crash_20261301_120000_p7_1")).is_none());
+        assert!(crash_bundle_name_key(Path::new("ft_crash_00000101_120000_p7_1")).is_none());
+    }
+
+    #[test]
+    fn candidate_metadata_failure_is_explicitly_incomplete_authority() {
+        let mut metadata_unreadable = false;
+        let modified = crash_bundle_candidate_modified(
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "synthetic metadata denial",
+            )),
+            &mut metadata_unreadable,
+        );
+        assert!(modified.is_none());
+        assert!(metadata_unreadable);
+    }
+
+    #[test]
+    fn candidate_payload_io_classification_distinguishes_invalid_from_unreadable() {
+        assert!(crash_bundle_io_error_withholds_authority(
+            &std::io::Error::new(std::io::ErrorKind::PermissionDenied, "synthetic denial")
+        ));
+        assert!(crash_bundle_io_error_withholds_authority(
+            &std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "synthetic short read")
+        ));
+        assert!(!crash_bundle_io_error_withholds_authority(
+            &std::io::Error::new(std::io::ErrorKind::InvalidData, "synthetic malformed payload")
+        ));
+        assert!(!crash_bundle_io_error_withholds_authority(
+            &std::io::Error::new(std::io::ErrorKind::NotFound, "synthetic absence")
+        ));
+    }
+
+    #[test]
+    fn bounded_list_zero_limit_opens_no_payloads() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut report = test_report();
+        report.timestamp = 2_000;
+        write_crash_bundle(tmp.path(), &report, None, None).unwrap();
+
+        let discovery = discover_crash_bundles(tmp.path(), 0);
+        assert!(discovery.completeness.is_complete());
+        assert!(discovery.bundles.is_empty());
+        assert_eq!(discovery.directory_entries_examined, 0);
+        assert_eq!(discovery.payload_files_opened, 0);
+        assert_eq!(discovery.payload_bytes_read, 0);
+    }
+
+    #[test]
+    fn bounded_list_reports_requested_limit_cap_even_for_empty_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let discovery = discover_crash_bundles(
+            tmp.path(),
+            MAX_CRASH_BUNDLE_LIST_RESULTS.saturating_add(1),
+        );
+        assert_eq!(discovery.effective_limit, MAX_CRASH_BUNDLE_LIST_RESULTS);
+        assert_eq!(
+            discovery.completeness,
+            CrashBundleDiscoveryCompleteness::Incomplete {
+                reasons: vec![CrashBundleDiscoveryIncompleteReason::RequestedLimitExceeded],
+            }
+        );
+        assert_eq!(discovery.payload_files_opened, 0);
+    }
+
+    #[test]
+    fn bounded_list_never_scans_unbounded_corrupt_payloads() {
+        let _guard = CRASH_BUNDLE_PARSE_DROP_TEST_LOCK
+            .lock()
+            .expect("crash bundle parse-drop test lock");
+        reset_crash_bundle_parse_drop_count_for_test();
+        let tmp = tempfile::tempdir().unwrap();
+        let ranked_window = 1_usize.saturating_add(CRASH_BUNDLE_LIST_INVALID_CANDIDATE_SLACK);
+        for sequence in 0_u64..100 {
+            let timestamp = 1_000_u64.saturating_add(sequence);
+            let path = tmp.path().join(format!(
+                "ft_crash_{}_p9_{sequence}",
+                format_timestamp(timestamp)
+            ));
+            fs::create_dir(&path).unwrap();
+            fs::write(path.join("manifest.json"), b"{").unwrap();
+            fs::write(path.join("crash_report.json"), b"{").unwrap();
+        }
+
+        let discovery = discover_crash_bundles(tmp.path(), 1);
+        assert!(discovery.bundles.is_empty());
+        assert_eq!(discovery.ranked_candidates, 100);
+        assert_eq!(discovery.payload_files_opened, ranked_window * 2);
+        assert_eq!(
+            crash_bundle_parse_drop_count(),
+            u64::try_from(ranked_window * 2).unwrap()
+        );
+        assert_eq!(
+            CRASH_BUNDLE_PARSE_DROP_LOG_COUNT.load(std::sync::atomic::Ordering::Relaxed),
+            CRASH_BUNDLE_PARSE_DROP_LOG_LIMIT.saturating_add(1),
+            "individual warnings plus one suppression notice are the finite log budget"
+        );
+        assert_eq!(
+            discovery.completeness,
+            CrashBundleDiscoveryCompleteness::Incomplete {
+                reasons: vec![
+                    CrashBundleDiscoveryIncompleteReason::RankedCandidateWindowExhausted,
+                ],
+            }
+        );
+    }
+
+    #[test]
+    fn latest_ranked_manifest_only_bundle_is_not_demoted_to_older_report() {
+        let _guard = CRASH_BUNDLE_PARSE_DROP_TEST_LOCK
+            .lock()
+            .expect("crash bundle parse-drop test lock");
+        reset_crash_bundle_parse_drop_count_for_test();
+        let tmp = tempfile::tempdir().unwrap();
+        let mut older = test_report();
+        older.timestamp = 1_000;
+        write_crash_bundle(tmp.path(), &older, None, None).unwrap();
+        let mut newer = test_report();
+        newer.timestamp = 2_000;
+        let newer_path = write_crash_bundle(tmp.path(), &newer, None, None).unwrap();
+        fs::write(newer_path.join("crash_report.json"), b"{").unwrap();
+
+        let discovery = discover_latest_crash_bundle(tmp.path());
+        assert!(discovery.completeness.is_complete());
+        let bundle = discovery.bundle.expect("newest manifest remains authoritative");
+        assert_eq!(bundle.path, newer_path);
+        assert!(bundle.manifest.is_some());
+        assert!(bundle.report.is_none());
+        assert_eq!(discovery.payload_files_opened, 2);
+    }
+
+    #[test]
+    fn incomplete_discovery_warning_emission_is_finitely_capped() {
+        let _guard = CRASH_BUNDLE_PARSE_DROP_TEST_LOCK
+            .lock()
+            .expect("crash bundle parse-drop test lock");
+        reset_crash_bundle_discovery_incomplete_count_for_test();
+        let completeness = CrashBundleDiscoveryCompleteness::Incomplete {
+            reasons: vec![CrashBundleDiscoveryIncompleteReason::RequestedLimitExceeded],
+        };
+        let calls = CRASH_BUNDLE_DISCOVERY_INCOMPLETE_LOG_LIMIT.saturating_add(9);
+        for _ in 0..calls {
+            record_crash_bundle_discovery_incomplete(
+                "test",
+                &completeness,
+                0,
+                0,
+                0,
+                0,
+                0,
+            );
+        }
+        assert_eq!(crash_bundle_discovery_incomplete_count(), calls);
+        assert_eq!(
+            CRASH_BUNDLE_DISCOVERY_INCOMPLETE_LOG_COUNT
+                .load(std::sync::atomic::Ordering::Relaxed),
+            CRASH_BUNDLE_DISCOVERY_INCOMPLETE_LOG_LIMIT.saturating_add(1)
+        );
+    }
+
+    #[test]
+    fn latest_discovery_does_not_open_oversized_older_payload() {
+        let _guard = CRASH_BUNDLE_PARSE_DROP_TEST_LOCK
+            .lock()
+            .expect("crash bundle parse-drop test lock");
+        reset_crash_bundle_parse_drop_count_for_test();
+        let tmp = tempfile::tempdir().unwrap();
+        let mut older = test_report();
+        older.timestamp = 1_000;
+        older.message = "older".to_string();
+        let older_path = write_crash_bundle(tmp.path(), &older, None, None).unwrap();
+        fs::write(
+            older_path.join("crash_report.json"),
+            vec![b'x'; usize::try_from(MAX_CRASH_REPORT_JSON_READ_BYTES).unwrap() + 1_024],
+        )
+        .unwrap();
+
+        let mut newer = test_report();
+        newer.timestamp = 2_000;
+        newer.message = "newer".to_string();
+        write_crash_bundle(tmp.path(), &newer, None, None).unwrap();
+
+        let discovery = discover_latest_crash_bundle(tmp.path());
+        assert!(discovery.completeness.is_complete());
+        assert_eq!(discovery.payload_files_opened, 2);
+        assert!(
+            discovery.payload_bytes_read
+                <= MAX_CRASH_MANIFEST_JSON_READ_BYTES + MAX_CRASH_REPORT_JSON_READ_BYTES
+        );
+        assert_eq!(
+            discovery.bundle.unwrap().report.unwrap().message,
+            "newer"
+        );
+        assert_eq!(crash_bundle_parse_drop_count(), 0);
+    }
+
+    #[test]
+    fn latest_discovery_skips_corrupt_newest_with_bounded_reads() {
+        let _guard = CRASH_BUNDLE_PARSE_DROP_TEST_LOCK
+            .lock()
+            .expect("crash bundle parse-drop test lock");
+        reset_crash_bundle_parse_drop_count_for_test();
+        let tmp = tempfile::tempdir().unwrap();
+        let mut older = test_report();
+        older.timestamp = 1_000;
+        older.message = "older".to_string();
+        write_crash_bundle(tmp.path(), &older, None, None).unwrap();
+        let mut newer = test_report();
+        newer.timestamp = 2_000;
+        let newer_path = write_crash_bundle(tmp.path(), &newer, None, None).unwrap();
+        fs::write(newer_path.join("manifest.json"), b"{").unwrap();
+        fs::write(newer_path.join("crash_report.json"), b"{").unwrap();
+
+        let discovery = discover_latest_crash_bundle(tmp.path());
+        assert!(discovery.completeness.is_complete());
+        assert_eq!(discovery.payload_files_opened, 4);
+        assert_eq!(
+            discovery.bundle.unwrap().report.unwrap().message,
+            "older"
+        );
+        assert_eq!(crash_bundle_parse_drop_count(), 2);
+    }
+
+    #[test]
+    fn latest_discovery_reports_ranked_window_exhaustion() {
+        let _guard = CRASH_BUNDLE_PARSE_DROP_TEST_LOCK
+            .lock()
+            .expect("crash bundle parse-drop test lock");
+        reset_crash_bundle_parse_drop_count_for_test();
+        let tmp = tempfile::tempdir().unwrap();
+        let mut valid = test_report();
+        valid.timestamp = 500;
+        valid.message = "outside-window".to_string();
+        write_crash_bundle(tmp.path(), &valid, None, None).unwrap();
+        for sequence in 0_u64..33 {
+            let timestamp = 1_000_u64 + sequence;
+            let path = tmp.path().join(format!(
+                "ft_crash_{}_p9_{sequence}",
+                format_timestamp(timestamp)
+            ));
+            fs::create_dir(&path).unwrap();
+            fs::write(path.join("manifest.json"), b"{").unwrap();
+            fs::write(path.join("crash_report.json"), b"{").unwrap();
+        }
+
+        let discovery = discover_latest_crash_bundle(tmp.path());
+        assert_eq!(discovery.ranked_candidates, 34);
+        assert_eq!(discovery.payload_files_opened, 64);
+        assert!(discovery.bundle.is_none());
+        assert_eq!(
+            discovery.completeness,
+            CrashBundleDiscoveryCompleteness::Incomplete {
+                reasons: vec![
+                    CrashBundleDiscoveryIncompleteReason::RankedCandidateWindowExhausted,
+                ],
+            }
+        );
+        assert!(latest_crash_bundle(tmp.path()).is_none());
+    }
+
+    #[test]
+    fn latest_discovery_reports_too_many_unranked_names() {
+        let tmp = tempfile::tempdir().unwrap();
+        for index in 0..=LATEST_CRASH_BUNDLE_UNRANKED_WINDOW {
+            fs::create_dir(tmp.path().join(format!("ft_crash_legacy_{index}"))).unwrap();
+        }
+        let discovery = discover_latest_crash_bundle(tmp.path());
+        assert_eq!(
+            discovery.completeness,
+            CrashBundleDiscoveryCompleteness::Incomplete {
+                reasons: vec![
+                    CrashBundleDiscoveryIncompleteReason::UnrankedCandidateWindowExceeded,
+                ],
+            }
+        );
+        assert_eq!(discovery.payload_files_opened, 0);
+    }
+
+    #[test]
+    fn bounded_crash_payload_read_rejects_oversize_before_allocation_growth() {
+        let _guard = CRASH_BUNDLE_PARSE_DROP_TEST_LOCK
+            .lock()
+            .expect("crash bundle parse-drop test lock");
+        reset_crash_bundle_parse_drop_count_for_test();
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("manifest.json");
+        fs::write(
+            &path,
+            vec![b'x'; usize::try_from(MAX_CRASH_MANIFEST_JSON_READ_BYTES).unwrap() + 1_024],
+        )
+        .unwrap();
+        let mut stats = CrashBundlePayloadReadStats::default();
+        let result = read_optional_json_bundle_file_bounded::<CrashManifest>(
+            tmp.path(),
+            &path,
+            "manifest_read_fail",
+            "manifest_parse_fail",
+            MAX_CRASH_MANIFEST_JSON_READ_BYTES,
+            &mut stats,
+        );
+        assert!(result.is_none());
+        assert_eq!(stats.files_opened, 1);
+        assert_eq!(stats.bytes_read, MAX_CRASH_MANIFEST_JSON_READ_BYTES + 1);
+        assert_eq!(crash_bundle_parse_drop_count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_crash_payload_read_never_follows_symlink_leaves() {
+        use std::os::unix::fs::symlink;
+
+        let _guard = CRASH_BUNDLE_PARSE_DROP_TEST_LOCK
+            .lock()
+            .expect("crash bundle parse-drop test lock");
+        reset_crash_bundle_parse_drop_count_for_test();
+        let tmp = tempfile::tempdir().unwrap();
+        let bundle = tmp.path().join("ft_crash_20260805_120000_p7_1");
+        fs::create_dir(&bundle).unwrap();
+        let outside = tmp.path().join("outside.json");
+        fs::write(&outside, serde_json::to_vec(&test_report()).unwrap()).unwrap();
+        symlink(&outside, bundle.join("crash_report.json")).unwrap();
+
+        let discovery = discover_latest_crash_bundle(tmp.path());
+        assert!(discovery.completeness.is_complete());
+        assert!(discovery.bundle.is_none());
+        assert_eq!(discovery.payload_files_opened, 0);
+        assert_eq!(crash_bundle_parse_drop_count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn crash_bundle_capability_never_follows_replaced_directory_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tmp.path().join("outside_bundle");
+        fs::create_dir(&outside).unwrap();
+        let candidate = tmp.path().join("ft_crash_20260805_120000_p7_1");
+        symlink(&outside, &candidate).unwrap();
+        assert!(open_crash_bundle_dir_nofollow(&candidate).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_crash_payload_read_rejects_fifo_without_blocking() {
+        let _guard = CRASH_BUNDLE_PARSE_DROP_TEST_LOCK
+            .lock()
+            .expect("crash bundle parse-drop test lock");
+        reset_crash_bundle_parse_drop_count_for_test();
+        let tmp = tempfile::tempdir().unwrap();
+        let fifo = tmp.path().join("manifest.json");
+        let status = Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("invoke mkfifo for hostile crash payload");
+        assert!(status.success());
+        let started = Instant::now();
+        let result = read_optional_json_bundle_file::<CrashManifest>(
+            tmp.path(),
+            &fifo,
+            "manifest_read_fail",
+            "manifest_parse_fail",
+        );
+        assert!(result.is_none());
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(crash_bundle_parse_drop_count(), 1);
     }
 
     // -----------------------------------------------------------------------

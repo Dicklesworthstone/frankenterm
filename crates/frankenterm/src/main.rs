@@ -8254,13 +8254,15 @@ impl<T> RobotResponse<T> {
         elapsed_ms: u64,
     ) -> Self {
         let msg = msg.into();
-        let hint = hint.map(|hint| redact_for_output(&hint));
+        let error = bounded_terminal_diagnostic(&msg, 4_096, 16 * 1_024);
+        let error_code = bounded_terminal_preview(code, 256, 1_024);
+        let hint = hint.map(|hint| bounded_terminal_diagnostic(&hint, 4_096, 16 * 1_024));
         Self {
             ok: false,
             data: None,
             error_data: None,
-            error: Some(redact_for_output(&msg)),
-            error_code: Some(code.to_string()),
+            error: Some(error),
+            error_code: Some(error_code),
             hint,
             elapsed_ms,
             version: frankenterm_core::VERSION.to_string(),
@@ -8277,6 +8279,8 @@ impl<T> RobotResponse<T> {
         elapsed_ms: u64,
     ) -> Self {
         let mut response = Self::error_with_code(code, msg, hint, elapsed_ms);
+        let mut error_data = error_data;
+        sanitize_diagnostic_json_strings(&mut error_data);
         response.error_data = Some(error_data);
         response
     }
@@ -16468,10 +16472,40 @@ fn shell_single_quote(value: &str) -> String {
     }
 }
 
-fn redact_for_output(text: &str) -> String {
+fn output_redactor() -> &'static frankenterm_core::policy::Redactor {
     static REDACTOR: LazyLock<frankenterm_core::policy::Redactor> =
         LazyLock::new(frankenterm_core::policy::Redactor::new);
-    REDACTOR.redact(text)
+    &REDACTOR
+}
+
+fn redact_for_output(text: &str) -> String {
+    let normalized = frankenterm_core::output::normalize_terminal_text_for_redaction(text);
+    output_redactor().redact(&normalized)
+}
+
+fn redact_single_line_for_output(text: &str) -> String {
+    let sanitized = frankenterm_core::output::sanitize_terminal_text(text);
+    output_redactor().redact(&sanitized)
+}
+
+fn redact_pane_text_for_output(text: &str, preserve_terminal_escapes: bool) -> String {
+    if !preserve_terminal_escapes {
+        return redact_for_output(text);
+    }
+
+    let ansi_stripped = frankenterm_core::output::strip_ansi(text);
+    let normalized = frankenterm_core::output::normalize_terminal_text_for_redaction(text);
+    let redacted_normalized = output_redactor().redact(&normalized);
+    if redacted_normalized != normalized || ansi_stripped != normalized {
+        // An escape sequence may have split a secret that is only recognizable
+        // after normalization, or a non-ANSI display control may have been
+        // removed only by normalization. Security wins over the requested
+        // escape-preserving view for this payload; otherwise stripping escapes
+        // downstream could reconstruct a token or retain a spoofing control.
+        redacted_normalized
+    } else {
+        output_redactor().redact(text)
+    }
 }
 
 const TERMINAL_TEXT_INPUT_MAX_BYTES: usize = 64 * 1024;
@@ -16485,9 +16519,12 @@ fn bounded_terminal_diagnostic(text: &str, max_columns: usize, max_bytes: usize)
         );
     }
 
-    let redacted = redact_for_output(text);
-    let bounded =
-        frankenterm_core::output::truncate_bounded(&redacted, max_columns, max_bytes);
+    let bounded = frankenterm_core::output::sanitize_redact_truncate_bounded(
+        text,
+        max_columns,
+        max_bytes,
+        |sanitized| output_redactor().redact(sanitized),
+    );
     if bounded.trim().is_empty() {
         frankenterm_core::output::truncate_bounded(
             "diagnostic unavailable",
@@ -16508,8 +16545,229 @@ fn bounded_terminal_preview(text: &str, max_columns: usize, max_bytes: usize) ->
         );
     }
 
-    let redacted = redact_for_output(text);
-    frankenterm_core::output::truncate_bounded(&redacted, max_columns, max_bytes)
+    frankenterm_core::output::sanitize_redact_truncate_bounded(
+        text,
+        max_columns,
+        max_bytes,
+        |sanitized| output_redactor().redact(sanitized),
+    )
+}
+
+fn bounded_search_failure(raw_error: &str) -> String {
+    bounded_prefixed_diagnostic("Search failed: ", raw_error, 600, 600)
+}
+
+fn bounded_prefixed_diagnostic(
+    prefix: &str,
+    detail: &str,
+    max_columns: usize,
+    max_bytes: usize,
+) -> String {
+    let Some(combined_len) = prefix.len().checked_add(detail.len()) else {
+        return frankenterm_core::output::truncate_bounded(
+            "diagnostic unavailable",
+            max_columns,
+            max_bytes,
+        );
+    };
+    if combined_len > TERMINAL_TEXT_INPUT_MAX_BYTES {
+        return frankenterm_core::output::truncate_bounded(
+            "diagnostic unavailable",
+            max_columns,
+            max_bytes,
+        );
+    }
+
+    let mut message = String::with_capacity(combined_len);
+    message.push_str(prefix);
+    message.push_str(detail);
+    bounded_terminal_diagnostic(&message, max_columns, max_bytes)
+}
+
+struct BoundedDiagnosticBuffer {
+    text: String,
+    overflowed: bool,
+}
+
+impl std::fmt::Write for BoundedDiagnosticBuffer {
+    fn write_str(&mut self, value: &str) -> std::fmt::Result {
+        let Some(next_len) = self.text.len().checked_add(value.len()) else {
+            self.overflowed = true;
+            return Err(std::fmt::Error);
+        };
+        if next_len > TERMINAL_TEXT_INPUT_MAX_BYTES {
+            self.overflowed = true;
+            return Err(std::fmt::Error);
+        }
+        self.text.push_str(value);
+        Ok(())
+    }
+}
+
+fn bounded_display_diagnostic(
+    prefix: &str,
+    detail: &(impl std::fmt::Display + ?Sized),
+    max_columns: usize,
+    max_bytes: usize,
+) -> String {
+    bounded_format_diagnostic(format_args!("{prefix}{detail}"), max_columns, max_bytes)
+}
+
+fn bounded_format_diagnostic(
+    arguments: std::fmt::Arguments<'_>,
+    max_columns: usize,
+    max_bytes: usize,
+) -> String {
+    let mut buffer = BoundedDiagnosticBuffer {
+        text: String::new(),
+        overflowed: false,
+    };
+    if std::fmt::write(&mut buffer, arguments).is_err() || buffer.overflowed {
+        return frankenterm_core::output::truncate_bounded(
+            "diagnostic unavailable",
+            max_columns,
+            max_bytes,
+        );
+    }
+    bounded_terminal_diagnostic(&buffer.text, max_columns, max_bytes)
+}
+
+fn serialize_error_envelope(error: &str) -> Result<String, serde_json::Error> {
+    serde_json::to_string_pretty(&serde_json::json!({
+        "ok": false,
+        "error": error,
+        "version": frankenterm_core::VERSION,
+    }))
+}
+
+fn serialize_simple_display_error(detail: &(impl std::fmt::Display + ?Sized)) -> String {
+    let error = bounded_display_diagnostic("", detail, 600, 600);
+    serialize_prepared_simple_error(&error)
+}
+
+fn serialize_prepared_simple_error(error: &str) -> String {
+    serde_json::to_string(&serde_json::json!({ "error": error }))
+        .unwrap_or_else(|_| r#"{"error":"error response serialization failed"}"#.to_string())
+}
+
+fn sanitize_diagnostic_json_strings(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::String(text) => {
+            *text = bounded_terminal_preview(text, 4_096, 16 * 1_024);
+        }
+        serde_json::Value::Array(values) => {
+            for value in values {
+                sanitize_diagnostic_json_strings(value);
+            }
+        }
+        serde_json::Value::Object(fields) => {
+            for value in fields.values_mut() {
+                sanitize_diagnostic_json_strings(value);
+            }
+        }
+        serde_json::Value::Null
+        | serde_json::Value::Bool(_)
+        | serde_json::Value::Number(_) => {}
+    }
+}
+
+fn diagnostic_json_value_for_output(
+    value: &impl serde::Serialize,
+) -> Result<serde_json::Value, serde_json::Error> {
+    let mut value = serde_json::to_value(value)?;
+    sanitize_diagnostic_json_strings(&mut value);
+    Ok(value)
+}
+
+fn emit_bounded_error(
+    output_format: frankenterm_core::output::OutputFormat,
+    raw_message: &str,
+) -> String {
+    let message = bounded_terminal_diagnostic(raw_message, 600, 600);
+    emit_error_message(output_format, &message);
+    message
+}
+
+fn emit_bounded_prefixed_error(
+    output_format: frankenterm_core::output::OutputFormat,
+    prefix: &str,
+    detail: &str,
+) -> String {
+    let message = bounded_prefixed_diagnostic(prefix, detail, 600, 600);
+    emit_error_message(output_format, &message);
+    message
+}
+
+fn emit_bounded_display_error(
+    output_format: frankenterm_core::output::OutputFormat,
+    prefix: &str,
+    detail: &(impl std::fmt::Display + ?Sized),
+) -> String {
+    let message = bounded_display_diagnostic(prefix, detail, 600, 600);
+    emit_error_message(output_format, &message);
+    message
+}
+
+fn emit_bounded_format_error(
+    output_format: frankenterm_core::output::OutputFormat,
+    arguments: std::fmt::Arguments<'_>,
+) -> String {
+    let message = bounded_format_diagnostic(arguments, 600, 600);
+    emit_error_message(output_format, &message);
+    message
+}
+
+fn emit_error_message(
+    output_format: frankenterm_core::output::OutputFormat,
+    message: &str,
+) {
+    if output_format.is_json() {
+        match serialize_error_envelope(message) {
+            Ok(encoded) => println!("{encoded}"),
+            Err(error) => {
+                tracing::error!(%error, "failed to serialize CLI error envelope");
+                println!(r#"{"ok":false,"error":"error response serialization failed"}"#);
+            }
+        }
+    } else {
+        eprintln!("Error: {message}");
+    }
+}
+
+fn emit_bounded_error_with_hint(emit_json: bool, raw_message: &str, raw_hint: Option<&str>) {
+    let message = bounded_terminal_diagnostic(raw_message, 4_096, 16 * 1_024);
+    let hint = raw_hint.map(|value| bounded_terminal_preview(value, 4_096, 16 * 1_024));
+    emit_prepared_error_with_hint(emit_json, &message, hint.as_deref());
+}
+
+fn emit_bounded_display_error_with_hint(
+    emit_json: bool,
+    prefix: &str,
+    detail: &(impl std::fmt::Display + ?Sized),
+    raw_hint: Option<&str>,
+) {
+    let message = bounded_display_diagnostic(prefix, detail, 4_096, 16 * 1_024);
+    let hint = raw_hint.map(|value| bounded_terminal_preview(value, 4_096, 16 * 1_024));
+    emit_prepared_error_with_hint(emit_json, &message, hint.as_deref());
+}
+
+fn emit_prepared_error_with_hint(emit_json: bool, message: &str, hint: Option<&str>) {
+    if emit_json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "ok": false,
+                "error": message,
+                "hint": hint,
+                "version": frankenterm_core::VERSION,
+            })
+        );
+    } else {
+        eprintln!("Error: {message}");
+        if let Some(hint) = hint {
+            eprintln!("{hint}");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -16525,47 +16783,163 @@ fn bounded_terminal_helpers_preserve_empty_preview_and_bound_fallbacks() {
     let preview = bounded_terminal_preview(secret, 60, 512);
     assert!(!preview.contains("AKIAIOSFODNN7EXAMPLE"));
     assert!(preview.contains("[REDACTED]"));
+    let ansi_split_secret = bounded_terminal_preview(
+        "send AKIAIOSF\x1b[31mODNN7EXAMPLE",
+        60,
+        512,
+    );
+    assert!(!ansi_split_secret.contains("AKIAIOSFODNN7EXAMPLE"));
+    assert!(ansi_split_secret.contains("[REDACTED]"));
     assert_eq!(
         bounded_terminal_preview("\x1b]0;title\x07safe\nname", 60, 512),
         "safe name"
     );
+    assert_eq!(
+        bounded_terminal_preview("safe\u{2028}line\u{202e}spoof\u{206a}shape", 80, 512),
+        "safe line spoof shape"
+    );
+    assert_eq!(bounded_terminal_preview("héllo", 3, 3), "hé");
+    assert_eq!(bounded_terminal_preview("😀abc", 3, 4), "😀");
 
     let oversized = "x".repeat(TERMINAL_TEXT_INPUT_MAX_BYTES + 1);
     assert_eq!(bounded_terminal_preview(&oversized, 4, 4), "p...");
     assert_eq!(bounded_terminal_diagnostic(&oversized, 3, 3), "dia");
+    assert_eq!(
+        bounded_display_diagnostic("failure: ", oversized.as_str(), 600, 600),
+        "diagnostic unavailable"
+    );
+}
+
+#[cfg(test)]
+#[test]
+fn send_text_summary_is_bounded_and_normalizes_before_redaction() {
+    let engine = frankenterm_core::policy::PolicyEngine::new(10, 100, false);
+    let split_secret = bounded_send_text_summary(
+        &engine,
+        "send AKIAIOSF\x1b[31mODNN7EXAMPLE\nnext",
+    );
+    assert_eq!(split_secret, "send [REDACTED] next");
+
+    let oversized = "x".repeat(TERMINAL_TEXT_INPUT_MAX_BYTES + 1);
+    let summary = bounded_send_text_summary(&engine, &oversized);
+    assert_eq!(
+        summary,
+        format!("payload omitted: {} bytes", oversized.len())
+    );
+    assert!(!summary.contains("xxxx"));
+}
+
+#[cfg(test)]
+#[test]
+fn output_redaction_normalizes_ansi_split_secrets_without_breaking_explicit_escape_views() {
+    let split_secret = "AKIAIOSF\x1b[31mODNN7EXAMPLE";
+    let redacted = redact_for_output(split_secret);
+    assert_eq!(redacted, "[REDACTED]");
+    assert_eq!(redact_for_output("first\n\tsecond"), "first\n\tsecond");
+    assert_eq!(
+        redact_single_line_for_output("first\n\tsecond"),
+        "first  second"
+    );
+
+    let styled_safe_text = "safe \x1b[31mred\x1b[0m text";
+    assert_eq!(
+        redact_pane_text_for_output(styled_safe_text, true),
+        styled_safe_text
+    );
+    assert_eq!(
+        redact_pane_text_for_output(split_secret, true),
+        "[REDACTED]"
+    );
+    assert_eq!(
+        redact_pane_text_for_output("safe\u{202e}spoof", true),
+        "safe spoof"
+    );
+    assert_eq!(
+        redact_pane_text_for_output("first\nsecond", false),
+        "first\nsecond"
+    );
+}
+
+#[cfg(test)]
+#[test]
+fn search_failure_output_is_bounded_redacted_terminal_safe_and_valid_json() {
+    let message = bounded_search_failure(
+        "bad \"quote\"\nsecret AKIAIOSF\x1b[31mODNN7EXAMPLE\u{202e}tail",
+    );
+    assert!(message.contains("bad \"quote\" secret"));
+    assert!(!message.contains("AKIAIOSFODNN7EXAMPLE"));
+    assert!(message.contains("[REDACTED]"));
+    assert!(!message.contains('\x1b'));
+    assert!(!message.contains('\n'));
+    assert!(!message.contains('\u{202e}'));
+    assert!(message.len() <= 600);
+
+    let encoded = serialize_error_envelope(&message).expect("fixed error envelope is serializable");
+    let decoded: serde_json::Value =
+        serde_json::from_str(&encoded).expect("error envelope is valid JSON");
+    assert_eq!(decoded["ok"], false);
+    assert_eq!(decoded["error"], message);
+    assert_eq!(decoded["version"], frankenterm_core::VERSION);
+
+    let simple = serialize_simple_display_error(
+        "quoted \"failure\" AKIAIOSF\x1b[31mODNN7EXAMPLE\nnext",
+    );
+    let simple: serde_json::Value =
+        serde_json::from_str(&simple).expect("simple error response is valid JSON");
+    let simple_error = simple["error"].as_str().expect("simple error string");
+    assert!(simple_error.contains("quoted \"failure\""));
+    assert!(simple_error.contains("[REDACTED]"));
+    assert!(!simple_error.contains("AKIAIOSFODNN7EXAMPLE"));
+    assert!(!simple_error.contains('\n'));
+
+    let prefix_len = "Search failed: ".len();
+    let admitted = "x".repeat(TERMINAL_TEXT_INPUT_MAX_BYTES - prefix_len);
+    assert!(bounded_search_failure(&admitted).starts_with("Search failed:"));
+    let oversized = "x".repeat(TERMINAL_TEXT_INPUT_MAX_BYTES - prefix_len + 1);
+    let omitted = bounded_search_failure(&oversized);
+    assert_eq!(omitted, "diagnostic unavailable");
+    assert!(omitted.len() <= 600);
 }
 
 fn redact_wait_pattern_for_output(pattern: &str) -> String {
-    redact_for_output(pattern)
+    bounded_terminal_preview(pattern, 400, 1_600)
 }
 
 fn redact_pane_state_fields_for_output(states: &mut [PaneState]) {
     for state in states {
         if let Some(title) = state.title.as_mut() {
-            let redacted = redact_for_output(title);
+            let redacted = redact_single_line_for_output(title);
             *title = redacted;
         }
         if let Some(cwd) = state.cwd.as_mut() {
-            let redacted = redact_for_output(cwd);
+            let redacted = redact_single_line_for_output(cwd);
             *cwd = redacted;
         }
         if let Some(ignore_reason) = state.ignore_reason.as_mut() {
-            let redacted = redact_for_output(ignore_reason);
+            let redacted = redact_single_line_for_output(ignore_reason);
             *ignore_reason = redacted;
         }
     }
 }
 
-fn redact_pane_text_results_for_output(results: &mut BTreeMap<u64, RobotPaneTextResult>) {
+fn redact_pane_text_results_for_output(
+    results: &mut BTreeMap<u64, RobotPaneTextResult>,
+    preserve_terminal_escapes: bool,
+) {
     for result in results.values_mut() {
         match result {
             RobotPaneTextResult::Ok { text, .. } => {
-                *text = redact_for_output(text);
+                *text = redact_pane_text_for_output(text, preserve_terminal_escapes);
             }
-            RobotPaneTextResult::Error { message, hint, .. } => {
-                *message = redact_for_output(message);
+            RobotPaneTextResult::Error {
+                code,
+                message,
+                hint,
+            } => {
+                *code = bounded_terminal_preview(code, 256, 1_024);
+                *message = bounded_terminal_diagnostic(message, 4_096, 16 * 1_024);
                 if let Some(hint) = hint.as_mut() {
-                    *hint = redact_for_output(hint);
+                    *hint = bounded_terminal_preview(hint, 4_096, 16 * 1_024);
                 }
             }
         }
@@ -16887,10 +17261,29 @@ fn search_lints_have_errors(lints: &[frankenterm_core::storage::SearchLint]) -> 
         .any(|lint| lint.severity == frankenterm_core::storage::SearchLintSeverity::Error)
 }
 
+fn search_lints_for_output(
+    lints: &[frankenterm_core::storage::SearchLint],
+) -> Vec<frankenterm_core::storage::SearchLint> {
+    lints
+        .iter()
+        .cloned()
+        .map(|mut lint| {
+            lint.code = bounded_terminal_preview(&lint.code, 64, 256);
+            lint.message = bounded_terminal_diagnostic(&lint.message, 400, 800);
+            lint.suggestion = lint
+                .suggestion
+                .as_deref()
+                .map(|suggestion| bounded_terminal_preview(suggestion, 400, 800));
+            lint
+        })
+        .collect()
+}
+
 fn format_search_lints_plain(lints: &[frankenterm_core::storage::SearchLint]) -> String {
+    let lints = search_lints_for_output(lints);
     let mut output = String::new();
     output.push_str("Query lint findings:\n");
-    for lint in lints {
+    for lint in &lints {
         let severity = match lint.severity {
             frankenterm_core::storage::SearchLintSeverity::Error => "error",
             frankenterm_core::storage::SearchLintSeverity::Warning => "warning",
@@ -16916,7 +17309,13 @@ async fn resolve_bookmark_pane_ids(
         let resolved = storage
             .get_pane_bookmark_by_alias(alias)
             .await
-            .map_err(|e| format!("Failed to resolve bookmark alias \"{alias}\": {e}"))?;
+            .map_err(|e| {
+                bounded_format_diagnostic(
+                    format_args!("Failed to resolve bookmark alias \"{alias}\": {e}"),
+                    600,
+                    600,
+                )
+            })?;
         let mut alias_ids = HashSet::new();
         if let Some(record) = resolved {
             alias_ids.insert(record.pane_id);
@@ -16930,7 +17329,13 @@ async fn resolve_bookmark_pane_ids(
         let records = storage
             .list_pane_bookmarks_by_tag(tag)
             .await
-            .map_err(|e| format!("Failed to resolve bookmark tag \"{tag}\": {e}"))?;
+            .map_err(|e| {
+                bounded_format_diagnostic(
+                    format_args!("Failed to resolve bookmark tag \"{tag}\": {e}"),
+                    600,
+                    600,
+                )
+            })?;
         let tag_ids: HashSet<u64> = records.into_iter().map(|record| record.pane_id).collect();
         pane_ids = Some(match pane_ids {
             Some(existing_ids) => existing_ids.intersection(&tag_ids).copied().collect(),
@@ -16941,6 +17346,89 @@ async fn resolve_bookmark_pane_ids(
     Ok(pane_ids)
 }
 
+#[derive(Debug, serde::Serialize)]
+struct SavedSearchOutput {
+    id: String,
+    name: String,
+    query: String,
+    pane_id: Option<u64>,
+    limit: i64,
+    since_mode: String,
+    since_ms: Option<i64>,
+    schedule_interval_ms: Option<i64>,
+    enabled: bool,
+    last_run_at: Option<i64>,
+    last_result_count: Option<i64>,
+    last_error: Option<String>,
+    created_at: i64,
+    updated_at: i64,
+}
+
+fn saved_searches_for_output(
+    searches: &[frankenterm_core::storage::SavedSearchRecord],
+) -> Vec<SavedSearchOutput> {
+    searches.iter().map(saved_search_for_output).collect()
+}
+
+fn saved_search_for_output(
+    search: &frankenterm_core::storage::SavedSearchRecord,
+) -> SavedSearchOutput {
+    SavedSearchOutput {
+        id: bounded_terminal_preview(&search.id, 128, 512),
+        name: bounded_terminal_preview(&search.name, 200, 800),
+        query: bounded_terminal_preview(&search.query, 400, 1_600),
+        pane_id: search.pane_id,
+        limit: search.limit,
+        since_mode: bounded_terminal_preview(&search.since_mode, 64, 256),
+        since_ms: search.since_ms,
+        schedule_interval_ms: search.schedule_interval_ms,
+        enabled: search.enabled,
+        last_run_at: search.last_run_at,
+        last_result_count: search.last_result_count,
+        last_error: search
+            .last_error
+            .as_deref()
+            .map(|error| bounded_terminal_diagnostic(error, 600, 600)),
+        created_at: search.created_at,
+        updated_at: search.updated_at,
+    }
+}
+
+#[derive(Debug, serde::Serialize)]
+struct PaneBookmarkOutput {
+    id: i64,
+    pane_id: u64,
+    alias: String,
+    tags: Option<Vec<String>>,
+    description: Option<String>,
+    created_at: i64,
+    updated_at: i64,
+}
+
+fn pane_bookmarks_for_output(
+    bookmarks: &[frankenterm_core::storage::PaneBookmarkRecord],
+) -> Vec<PaneBookmarkOutput> {
+    bookmarks
+        .iter()
+        .map(|bookmark| PaneBookmarkOutput {
+            id: bookmark.id,
+            pane_id: bookmark.pane_id,
+            alias: bounded_terminal_preview(&bookmark.alias, 200, 800),
+            tags: bookmark.tags.as_ref().map(|tags| {
+                tags.iter()
+                    .map(|tag| bounded_terminal_preview(tag, 100, 400))
+                    .collect()
+            }),
+            description: bookmark
+                .description
+                .as_deref()
+                .map(|description| bounded_terminal_preview(description, 600, 1_200)),
+            created_at: bookmark.created_at,
+            updated_at: bookmark.updated_at,
+        })
+        .collect()
+}
+
 fn format_saved_searches_plain(
     searches: &[frankenterm_core::storage::SavedSearchRecord],
 ) -> String {
@@ -16948,9 +17436,10 @@ fn format_saved_searches_plain(
         return "No saved searches.\n".to_string();
     }
 
+    let searches = saved_searches_for_output(searches);
     let mut output = String::new();
     output.push_str(&format!("Saved searches ({}):\n", searches.len()));
-    for search in searches {
+    for search in &searches {
         let pane = search
             .pane_id
             .map(|id| id.to_string())
@@ -16968,11 +17457,12 @@ fn format_saved_searches_plain(
             .schedule_interval_ms
             .map(|v| v.to_string())
             .unwrap_or_else(|| "-".to_string());
-        let query = redact_for_output(&search.query);
+        let query_literal = serde_json::to_string(&search.query)
+            .unwrap_or_else(|_| "\"query unavailable\"".to_string());
         output.push_str(&format!(
-            "  - {}: query=\"{}\" pane={} limit={} since_mode={} schedule_ms={} enabled={} last_run_at={} last_count={}\n",
+            "  - {}: query={} pane={} limit={} since_mode={} schedule_ms={} enabled={} last_run_at={} last_count={}\n",
             search.name,
-            query,
+            query_literal,
             pane,
             search.limit,
             search.since_mode,
@@ -16986,6 +17476,68 @@ fn format_saved_searches_plain(
         }
     }
     output
+}
+
+#[cfg(test)]
+#[test]
+fn saved_search_output_view_is_bounded_redacted_and_does_not_mutate_storage_record() {
+    let split_secret = "AKIAIOSF\x1b[31mODNN7EXAMPLE";
+    let mut stored = frankenterm_core::storage::SavedSearchRecord::new(
+        format!("name {split_secret}"),
+        format!("query \"quoted\" \\\n{split_secret}{}", "q".repeat(2_000)),
+        None,
+        100,
+        "last\u{202e}_run".to_string(),
+        None,
+    );
+    stored.id = format!("id-{split_secret}");
+    stored.last_error = Some(format!("bad\n{split_secret}{}", "e".repeat(2_000)));
+    let original = stored.clone();
+
+    let public = saved_searches_for_output(std::slice::from_ref(&stored));
+    let view = &public[0];
+    let json = serde_json::to_string(view).expect("saved-search output view serializes");
+    assert!(!json.contains("AKIAIOSFODNN7EXAMPLE"));
+    assert!(!json.contains("\\u001b"));
+    assert!(!json.contains("\\n"));
+    assert!(view.id.len() <= 512);
+    assert!(view.name.len() <= 800);
+    assert!(view.query.len() <= 1_600);
+    assert!(view.since_mode.len() <= 256);
+    assert!(view.last_error.as_deref().unwrap_or_default().len() <= 600);
+    assert_eq!(stored.id, original.id);
+    assert_eq!(stored.name, original.name);
+    assert_eq!(stored.query, original.query);
+    assert_eq!(stored.since_mode, original.since_mode);
+    assert_eq!(stored.last_error, original.last_error);
+
+    let plain = format_saved_searches_plain(std::slice::from_ref(&stored));
+    assert!(plain.contains(r#"query="query \"quoted\" \\ "#));
+}
+
+#[cfg(test)]
+#[test]
+fn bookmark_output_view_escapes_json_and_scrubs_all_text_fields() {
+    let split_secret = "AKIAIOSF\x1b[31mODNN7EXAMPLE";
+    let stored = frankenterm_core::storage::PaneBookmarkRecord {
+        id: 7,
+        pane_id: 9,
+        alias: format!("quoted \"alias\" {split_secret}"),
+        tags: Some(vec![format!("tag\n{split_secret}")]),
+        description: Some(format!("description\u{202e}{split_secret}")),
+        created_at: 1,
+        updated_at: 2,
+    };
+
+    let public = pane_bookmarks_for_output(std::slice::from_ref(&stored));
+    let encoded = serde_json::to_string(&public).expect("bookmark output view serializes");
+    let decoded: serde_json::Value =
+        serde_json::from_str(&encoded).expect("bookmark output is valid JSON");
+    assert_eq!(decoded[0]["alias"], "quoted \"alias\" [REDACTED]");
+    assert_eq!(decoded[0]["tags"][0], "tag [REDACTED]");
+    assert_eq!(decoded[0]["description"], "description [REDACTED]");
+    assert!(stored.alias.contains('\x1b'));
+    assert!(stored.tags.as_ref().unwrap()[0].contains('\n'));
 }
 
 async fn evaluate_robot_approve(
@@ -17618,7 +18170,7 @@ async fn derive_osc_state_from_storage(
     let segments = storage
         .get_segments(pane_id, SEND_OSC_SEGMENT_LIMIT)
         .await
-        .map_err(|e| format!("failed to read segments: {e}"))?;
+        .map_err(|e| bounded_display_diagnostic("failed to read segments: ", &e, 400, 1_600))?;
     if segments.is_empty() {
         return Ok(None);
     }
@@ -17656,12 +18208,19 @@ async fn fetch_pane_state_from_ipc(
             if let Some(data) = response.data {
                 serde_json::from_value::<IpcPaneState>(data)
                     .map(Some)
-                    .map_err(|e| format!("invalid pane state payload: {e}"))
+                    .map_err(|e| {
+                        bounded_display_diagnostic(
+                            "invalid pane state payload: ",
+                            &e,
+                            400,
+                            1_600,
+                        )
+                    })
             } else {
                 Ok(None)
             }
         }
-        Err(err) => Err(err.to_string()),
+        Err(err) => Err(bounded_display_diagnostic("", &err, 400, 1_600)),
     }
 }
 
@@ -17697,7 +18256,12 @@ async fn resolve_pane_capabilities(
     if let Some(storage) = storage {
         match derive_osc_state_from_storage(storage, pane_id).await {
             Ok(state) => osc_state = state,
-            Err(err) => warnings.push(format!("OSC 133 state unavailable: {err}")),
+            Err(err) => warnings.push(bounded_prefixed_diagnostic(
+                "OSC 133 state unavailable: ",
+                &err,
+                400,
+                1_600,
+            )),
         }
     } else {
         warnings.push("Storage unavailable; prompt state unknown.".to_string());
@@ -17718,7 +18282,11 @@ async fn resolve_pane_capabilities(
                 }
                 if !state.known {
                     let reason = state.reason.as_deref().unwrap_or("unknown");
-                    warnings.push(format!("Watcher has no state for this pane ({reason})."));
+                    warnings.push(bounded_format_diagnostic(
+                        format_args!("Watcher has no state for this pane ({reason})."),
+                        400,
+                        1_600,
+                    ));
                 } else if state.observed == Some(false) {
                     warnings.push(
                         "Pane is not observed by watcher; state may be incomplete.".to_string(),
@@ -17752,7 +18320,12 @@ async fn resolve_pane_capabilities(
                 warnings.push("Watcher IPC returned no pane state.".to_string());
             }
             Err(err) => {
-                warnings.push(format!("Watcher IPC unavailable: {err}"));
+                warnings.push(bounded_prefixed_diagnostic(
+                    "Watcher IPC unavailable: ",
+                    &err,
+                    400,
+                    1_600,
+                ));
             }
         }
     } else {
@@ -17805,6 +18378,59 @@ fn build_mux_send_policy_input(
     input
 }
 
+fn bounded_send_text_summary(
+    engine: &frankenterm_core::policy::PolicyEngine,
+    text: &str,
+) -> String {
+    if text.len() > TERMINAL_TEXT_INPUT_MAX_BYTES {
+        return format!("payload omitted: {} bytes", text.len());
+    }
+    frankenterm_core::output::sanitize_redact_truncate_bounded(
+        text,
+        400,
+        1_600,
+        |normalized| engine.redact_secrets(normalized),
+    )
+}
+
+fn requested_submit_guarantee_level(
+    verify_submit: bool,
+    submit_level: Option<SubmitGuaranteeLevelArg>,
+) -> Option<frankenterm_core::robot_types::SubmitGuaranteeLevel> {
+    submit_level
+        .map(Into::into)
+        .or_else(|| {
+            verify_submit
+                .then_some(frankenterm_core::robot_types::SubmitGuaranteeLevel::Submitted)
+        })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_send_command_summary(
+    command_name: &str,
+    pane_id: u64,
+    text_bytes: usize,
+    dry_run: bool,
+    no_paste: bool,
+    no_newline: bool,
+    has_wait_for: bool,
+    wait_for_regex: bool,
+    timeout_secs: u64,
+    has_approval_code: bool,
+    verify_submit: bool,
+    submit_level: Option<SubmitGuaranteeLevelArg>,
+) -> String {
+    let submit_level = submit_level
+        .map(|level| {
+            let core_level: frankenterm_core::robot_types::SubmitGuaranteeLevel = level.into();
+            core_level.as_str()
+        })
+        .unwrap_or("none");
+    format!(
+        "{command_name} pane_id={pane_id} text_bytes={text_bytes} dry_run={dry_run} no_paste={no_paste} no_newline={no_newline} wait_for={has_wait_for} wait_for_regex={wait_for_regex} timeout_secs={timeout_secs} approval_code={has_approval_code} verify_submit={verify_submit} submit_level={submit_level}"
+    )
+}
+
 // Dry-run report construction needs target, policy, command, and wait metadata for a single envelope.
 #[allow(clippy::too_many_arguments)]
 fn build_send_dry_run_report(
@@ -17831,14 +18457,14 @@ fn build_send_dry_run_report(
     let domain = pane_info
         .map(|info| info.inferred_domain())
         .unwrap_or_else(|| "unknown".to_string());
+    let domain = bounded_terminal_preview(&domain, 400, 1_600);
     if let Some(info) = pane_info {
-        let mut target =
-            TargetResolution::new(pane_id, domain.clone()).with_is_active(info.is_active);
+        let mut target = TargetResolution::new(pane_id, domain).with_is_active(info.is_active);
         if let Some(title) = &info.title {
-            target = target.with_title(title.clone());
+            target = target.with_title(bounded_terminal_preview(title, 400, 1_600));
         }
         if let Some(cwd) = &info.cwd {
-            target = target.with_cwd(cwd.clone());
+            target = target.with_cwd(bounded_terminal_preview(cwd, 400, 1_600));
         }
         ctx.set_target(target);
     } else {
@@ -17869,7 +18495,7 @@ fn build_send_dry_run_report(
     .with_command_gate_config(config.safety.command_gate.clone())
     .with_policy_rules(config.safety.rules.clone());
 
-    let summary = engine.redact_secrets(text);
+    let summary = bounded_send_text_summary(&engine, text);
     let input = build_mux_send_policy_input(
         pane_id,
         pane_info,
@@ -17960,7 +18586,11 @@ fn build_send_dry_run_report(
     ctx.add_action(create_send_action(1, pane_id, text.len()));
     if let Some(pattern) = wait_for {
         let timeout_ms = timeout_secs.saturating_mul(1000);
-        ctx.add_action(create_wait_for_action(2, pattern, timeout_ms));
+        ctx.add_action(create_wait_for_action(
+            2,
+            redact_wait_pattern_for_output(pattern),
+            timeout_ms,
+        ));
     }
 
     if no_paste {
@@ -17968,6 +18598,41 @@ fn build_send_dry_run_report(
     }
 
     ctx.take_report()
+}
+
+fn send_dry_run_report_for_output(
+    mut report: frankenterm_core::dry_run::DryRunReport,
+) -> frankenterm_core::dry_run::DryRunReport {
+    report.command = bounded_terminal_preview(&report.command, 400, 1_600);
+
+    if let Some(target) = report.target_resolution.as_mut() {
+        target.domain = bounded_terminal_preview(&target.domain, 400, 1_600);
+        for field in [&mut target.title, &mut target.cwd, &mut target.agent_type] {
+            if let Some(value) = field.as_mut() {
+                *value = bounded_terminal_preview(value, 400, 1_600);
+            }
+        }
+    }
+    if let Some(policy) = report.policy_evaluation.as_mut() {
+        for check in &mut policy.checks {
+            check.name = bounded_terminal_preview(&check.name, 128, 512);
+            check.message = bounded_terminal_diagnostic(&check.message, 400, 1_600);
+            if let Some(details) = check.details.as_mut() {
+                *details = bounded_terminal_diagnostic(details, 400, 1_600);
+            }
+        }
+    }
+    for action in &mut report.expected_actions {
+        action.description = bounded_terminal_diagnostic(&action.description, 400, 1_600);
+        if let Some(metadata) = action.metadata.as_mut() {
+            sanitize_diagnostic_json_strings(metadata);
+        }
+    }
+    for warning in &mut report.warnings {
+        *warning = bounded_terminal_diagnostic(warning, 400, 1_600);
+    }
+
+    report
 }
 
 // Prepare-send plans preserve CLI request fields as explicit plan inputs.
@@ -22574,7 +23239,8 @@ fn format_send_result_human(
     let _ = writeln!(output, "Send result");
     let _ = writeln!(output, "  Pane: {}", data.pane_id);
     let _ = writeln!(output, "  Status: {status}");
-    let _ = writeln!(output, "  Text: {redacted_text}");
+    let display_text = bounded_terminal_preview(redacted_text, 400, 1_600);
+    let _ = writeln!(output, "  Text: {display_text}");
 
     if data.no_paste {
         let _ = writeln!(output, "  Mode: no-paste");
@@ -22584,14 +23250,18 @@ fn format_send_result_human(
     }
 
     if let Some(rule_id) = data.injection.rule_id() {
+        let rule_id = bounded_terminal_preview(rule_id, 200, 800);
         let _ = writeln!(output, "  Rule: {rule_id}");
     }
     if let Some(reason) = reason {
+        let reason = bounded_terminal_diagnostic(reason, 400, 1_600);
         let _ = writeln!(output, "  Reason: {reason}");
     }
     if let Some(approval) = approval {
-        let _ = writeln!(output, "  Approval: {}", approval.summary);
-        let _ = writeln!(output, "  Command: {}", approval.command);
+        let summary = bounded_terminal_diagnostic(&approval.summary, 400, 1_600);
+        let command = bounded_terminal_preview(&approval.command, 400, 1_600);
+        let _ = writeln!(output, "  Approval: {summary}");
+        let _ = writeln!(output, "  Command: {command}");
     }
     if let Some(audit_id) = data.injection.audit_action_id() {
         let _ = writeln!(output, "  Audit ID: {audit_id}");
@@ -22604,21 +23274,24 @@ fn format_send_result_human(
             "timed out"
         };
         let regex = if wait_for.is_regex { " (regex)" } else { "" };
+        let pattern = bounded_terminal_preview(&wait_for.pattern, 400, 1_600);
         let _ = writeln!(
             output,
             "  Wait-for{regex}: {} ({status}, {} ms, {} polls)",
-            wait_for.pattern, wait_for.elapsed_ms, wait_for.polls
+            pattern, wait_for.elapsed_ms, wait_for.polls
         );
     } else if redacted_wait_for.is_some() && !data.injection.is_allowed() {
         let _ = writeln!(output, "  Wait-for: skipped (send not executed)");
     }
 
     if let Some(err) = data.verification_error.as_deref() {
+        let err = bounded_terminal_diagnostic(err, 400, 1_600);
         let _ = writeln!(output, "  Verification: {err}");
     }
     if let Some(submit) = &data.submit {
         let _ = writeln!(output, "  Submit: {}", submit.state.as_str());
         if let Some(profile_id) = submit.profile_id.as_deref() {
+            let profile_id = bounded_terminal_preview(profile_id, 200, 800);
             let _ = writeln!(output, "  Submit profile: {profile_id}");
         }
     }
@@ -23438,7 +24111,7 @@ fn watch_checkpoint(cx: &frankenterm_core::cx::Cx, operation: &str) -> std::io::
             .filter(|message| !message.is_empty())
             .map(|message| bounded_terminal_diagnostic(&message, 512, 2_048));
         let detail = reason.map_or_else(
-            || bounded_terminal_diagnostic(&error.to_string(), 512, 2_048),
+            || bounded_display_diagnostic("", &error, 512, 2_048),
             |message| format!("capability context cancelled; reason: {message}"),
         );
         std::io::Error::new(
@@ -35317,26 +35990,25 @@ fn maybe_trigger_e2e_watcher_panic_once(layout: &frankenterm_core::config::Works
     panic!("ft-e2e: intentional watcher panic (one-shot)");
 }
 
-fn bounded_utf8_string(mut value: String, max_bytes: usize) -> String {
-    if value.len() <= max_bytes {
-        return value;
-    }
-
-    let mut boundary = max_bytes;
-    while boundary > 0 && !value.is_char_boundary(boundary) {
-        boundary -= 1;
-    }
-    value.truncate(boundary);
-    value
+fn retain_live_saved_search_state<T>(
+    state: &mut HashMap<String, T>,
+    live_search_ids: &HashSet<&str>,
+) {
+    state.retain(|id, _| live_search_ids.contains(id.as_str()));
 }
 
 #[cfg(test)]
 #[test]
-fn bounded_utf8_string_never_splits_a_codepoint() {
-    assert_eq!(bounded_utf8_string("héllo".to_string(), 3), "hé");
-    assert_eq!(bounded_utf8_string("😀abc".to_string(), 3), "");
-    assert_eq!(bounded_utf8_string("😀abc".to_string(), 4), "😀");
-    assert_eq!(bounded_utf8_string("text".to_string(), 0), "");
+fn saved_search_scheduler_state_drops_deleted_search_ids() {
+    let mut state = HashMap::from([
+        ("live".to_string(), 1_u32),
+        ("deleted".to_string(), 2_u32),
+    ]);
+    let live_search_ids = HashSet::from(["live"]);
+
+    retain_live_saved_search_state(&mut state, &live_search_ids);
+
+    assert_eq!(state, HashMap::from([("live".to_string(), 1_u32)]));
 }
 
 async fn run_saved_search_scheduler(
@@ -35344,13 +36016,11 @@ async fn run_saved_search_scheduler(
     event_bus: Arc<frankenterm_core::events::EventBus>,
     shutdown_flag: Arc<std::sync::atomic::AtomicBool>,
 ) {
-    use std::collections::HashMap;
     use std::sync::atomic::Ordering;
     use std::time::Duration;
 
     use frankenterm_core::events::Event;
     use frankenterm_core::patterns::{AgentType, Detection, Severity};
-    use frankenterm_core::policy::Redactor;
     use frankenterm_core::storage::{
         SAVED_SEARCH_SINCE_MODE_FIXED, SAVED_SEARCH_SINCE_MODE_LAST_RUN, SavedSearchRecord,
         SearchOptions, StoredEvent,
@@ -35368,7 +36038,7 @@ async fn run_saved_search_scheduler(
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default();
-        i64::try_from(ts.as_millis()).unwrap_or(0)
+        i64::try_from(ts.as_millis()).unwrap_or(i64::MAX)
     }
 
     fn clamp_schedule_interval(ms: i64) -> i64 {
@@ -35411,7 +36081,6 @@ async fn run_saved_search_scheduler(
         usize::try_from(value).ok()
     }
 
-    let redactor = Redactor::new();
     let mut consecutive_errors_by_id: HashMap<String, u32> = HashMap::new();
     let mut next_allowed_run_at_by_id: HashMap<String, i64> = HashMap::new();
     let mut last_alert_at_by_id: HashMap<String, i64> = HashMap::new();
@@ -35438,6 +36107,22 @@ async fn run_saved_search_scheduler(
             }
         };
 
+        // Scheduler state is process-local and keyed by durable search IDs.
+        // Reconcile it on every successful inventory refresh so delete/recreate
+        // churn cannot retain cooldown or backoff entries for dead searches
+        // throughout a long-running session. Borrowing IDs from `searches`
+        // avoids cloning the inventory just to bound these maps.
+        if !consecutive_errors_by_id.is_empty()
+            || !next_allowed_run_at_by_id.is_empty()
+            || !last_alert_at_by_id.is_empty()
+        {
+            let live_search_ids: HashSet<&str> =
+                searches.iter().map(|search| search.id.as_str()).collect();
+            retain_live_saved_search_state(&mut consecutive_errors_by_id, &live_search_ids);
+            retain_live_saved_search_state(&mut next_allowed_run_at_by_id, &live_search_ids);
+            retain_live_saved_search_state(&mut last_alert_at_by_id, &live_search_ids);
+        }
+
         let mut any_scheduled = false;
         let mut next_wake_at = now.saturating_add(DEFAULT_IDLE_SLEEP_MS);
 
@@ -35445,9 +36130,6 @@ async fn run_saved_search_scheduler(
             if shutdown_flag.load(Ordering::SeqCst) {
                 break;
             }
-            let search_id = search.id.clone();
-            let search_name = bounded_terminal_preview(&search.name, 200, 800);
-            let search_query = search.query.clone();
             if !search.enabled {
                 continue;
             }
@@ -35465,7 +36147,7 @@ async fn run_saved_search_scheduler(
 
             // Backoff gate (typically for invalid query / persistent DB errors).
             let next_allowed_run_at = next_allowed_run_at_by_id
-                .get(&search_id)
+                .get(&search.id)
                 .copied()
                 .unwrap_or(0);
             if next_allowed_run_at > now {
@@ -35479,6 +36161,7 @@ async fn run_saved_search_scheduler(
                 continue;
             }
 
+            let search_id = search.id.as_str();
             let since_ms = compute_since_ms(&search);
             let options = SearchOptions {
                 pane_id: search.pane_id,
@@ -35497,23 +36180,24 @@ async fn run_saved_search_scheduler(
                 .await
             {
                 Ok(results) => {
-                    consecutive_errors_by_id.remove(&search_id);
-                    next_allowed_run_at_by_id.remove(&search_id);
+                    consecutive_errors_by_id.remove(search_id);
+                    next_allowed_run_at_by_id.remove(search_id);
                     results
                 }
                 Err(err) => {
                     let entry = consecutive_errors_by_id
-                        .entry(search_id.clone())
+                        .entry(search.id.clone())
                         .or_insert(0);
                     *entry = entry.saturating_add(1);
                     let backoff_ms = backoff_ms_for_errors(*entry);
                     let next_allowed = now.saturating_add(backoff_ms);
-                    next_allowed_run_at_by_id.insert(search_id.clone(), next_allowed);
+                    next_allowed_run_at_by_id.insert(search.id.clone(), next_allowed);
                     next_wake_at = next_wake_at.min(next_allowed);
 
-                    let message = bounded_terminal_preview(&err.to_string(), 600, 600);
+                    let message = bounded_display_diagnostic("", &err, 600, 600);
+                    let search_name = bounded_terminal_preview(&search.name, 200, 800);
                     if let Err(update_err) = storage
-                        .update_saved_search_run(&search_id, now, None, Some(message.clone()))
+                        .update_saved_search_run(search_id, now, None, Some(message.clone()))
                         .await
                     {
                         tracing::warn!(
@@ -35533,13 +36217,13 @@ async fn run_saved_search_scheduler(
                 }
             };
 
-            #[allow(clippy::cast_possible_truncation)]
-            let match_count: i64 = results.len() as i64;
+            let match_count = i64::try_from(results.len()).unwrap_or(i64::MAX);
 
             if let Err(update_err) = storage
-                .update_saved_search_run(&search_id, now, Some(match_count), None)
+                .update_saved_search_run(search_id, now, Some(match_count), None)
                 .await
             {
+                let search_name = bounded_terminal_preview(&search.name, 200, 800);
                 tracing::warn!(
                     search = %search_name,
                     error = %update_err,
@@ -35552,11 +36236,11 @@ async fn run_saved_search_scheduler(
             }
 
             // Enforce a simple alert cooldown per saved search to avoid notification storms.
-            let last_alert_at = last_alert_at_by_id.get(&search_id).copied().unwrap_or(0);
+            let last_alert_at = last_alert_at_by_id.get(search_id).copied().unwrap_or(0);
             if now.saturating_sub(last_alert_at) < ALERT_MIN_INTERVAL_MS {
                 continue;
             }
-            last_alert_at_by_id.insert(search_id.clone(), now);
+            last_alert_at_by_id.insert(search.id.clone(), now);
 
             // For unscoped searches, bind the alert to the first match's pane.
             let pane_id_for_event = search
@@ -35571,9 +36255,10 @@ async fn run_saved_search_scheduler(
             let snippet = results
                 .first()
                 .and_then(|r| r.snippet.as_deref())
-                .map(|s| bounded_utf8_string(redactor.redact(s), 280))
+                .map(|s| bounded_terminal_preview(s, 280, 280))
                 .filter(|s| !s.trim().is_empty());
 
+            let search_name = bounded_terminal_preview(&search.name, 200, 800);
             let extracted = {
                 let mut map = serde_json::Map::new();
                 map.insert(
@@ -35582,10 +36267,7 @@ async fn run_saved_search_scheduler(
                 );
                 map.insert(
                     "query".to_string(),
-                    serde_json::Value::String(bounded_utf8_string(
-                        redactor.redact(&search_query),
-                        400,
-                    )),
+                    serde_json::Value::String(bounded_terminal_preview(&search.query, 400, 400)),
                 );
                 map.insert("scope".to_string(), serde_json::Value::String(scope));
                 map.insert(
@@ -37001,7 +37683,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                             &states,
                                             &mut pane_text,
                                         );
-                                        redact_pane_text_results_for_output(&mut pane_text);
+                                        redact_pane_text_results_for_output(&mut pane_text, escapes);
                                         let data = RobotStateWithTextData {
                                             panes: states,
                                             tail_lines: tail,
@@ -37480,7 +38162,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                         .await;
                                         let data = RobotGetTextData {
                                             pane_id,
-                                            text: redact_for_output(&text),
+                                            text: redact_pane_text_for_output(&text, escapes),
                                             tail_lines: tail,
                                             escapes_included: escapes,
                                             truncated,
@@ -37640,7 +38322,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                         tail,
                                     )
                                     .await;
-                                    redact_pane_text_results_for_output(&mut fetched);
+                                    redact_pane_text_results_for_output(&mut fetched, escapes);
 
                                     for (pane_id, pane_result) in fetched {
                                         let status = match &pane_result {
@@ -37691,51 +38373,27 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             timeout_secs,
                             wait_for_regex,
                         } => {
-                            use std::fmt::Write as _;
-
                             let no_paste = false;
                             let no_newline = false;
-                            let redacted_text = redact_for_output(&text);
                             let redacted_wait_for = wait_for
                                 .as_ref()
                                 .map(|pattern| redact_wait_pattern_for_output(pattern));
-                            let mut command = if dry_run {
-                                format!("ft robot send {pane_id} \"{redacted_text}\" --dry-run")
-                            } else {
-                                format!("ft robot send {pane_id} \"{redacted_text}\"")
-                            };
-                            if let Some(pattern) = &redacted_wait_for {
-                                let _ = write!(command, " --wait-for \"{pattern}\"");
-                                if wait_for_regex {
-                                    command.push_str(" --wait-for-regex");
-                                }
-                                let _ = write!(command, " --timeout-secs {timeout_secs}");
-                            }
-                            if let Some(code) = &approval_code {
-                                let _ = write!(command, " --approval-code {code}");
-                            }
-                            if no_paste {
-                                command.push_str(" --no-paste");
-                            }
-                            if no_newline {
-                                command.push_str(" --no-newline");
-                            }
-                            let submit_guarantee_level = submit_level
-                                .map(Into::into)
-                                .or_else(|| {
-                                    verify_submit.then_some(
-                                        frankenterm_core::robot_types::SubmitGuaranteeLevel::Submitted,
-                                    )
-                                });
-                            if verify_submit {
-                                command.push_str(" --verify-submit");
-                            }
-                            if let Some(level) = submit_level {
-                                let core_level:
-                                    frankenterm_core::robot_types::SubmitGuaranteeLevel =
-                                    level.into();
-                                let _ = write!(command, " --submit-level {}", core_level.as_str());
-                            }
+                            let submit_guarantee_level =
+                                requested_submit_guarantee_level(verify_submit, submit_level);
+                            let command = build_send_command_summary(
+                                "ft robot send",
+                                pane_id,
+                                text.len(),
+                                dry_run,
+                                no_paste,
+                                no_newline,
+                                wait_for.is_some(),
+                                wait_for_regex,
+                                timeout_secs,
+                                approval_code.is_some(),
+                                verify_submit,
+                                submit_level,
+                            );
                             let command_ctx =
                                 frankenterm_core::dry_run::CommandContext::new(command, dry_run);
                             let wait_matcher = match wait_for.as_ref() {
@@ -37792,8 +38450,9 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                     frankenterm_core::policy::ActorKind::Robot,
                                 );
                                 report.warnings.extend(resolution.warnings);
+                                let public_report = send_dry_run_report_for_output(report);
                                 let response =
-                                    RobotResponse::success(report.redacted(), elapsed_ms(start));
+                                    RobotResponse::success(public_report, elapsed_ms(start));
                                 print_robot_response(&response, format, stats)?;
                             } else {
                                 use frankenterm_core::policy::{
@@ -37885,7 +38544,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                 .await;
                                 let capabilities = resolution.capabilities;
 
-                                let summary = engine.redact_secrets(&text);
+                                let summary = bounded_send_text_summary(&engine, &text);
                                 let input = build_mux_send_policy_input(
                                     pane_id,
                                     Some(&pane_info),
@@ -38189,7 +38848,9 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                         );
                                     }
                                 }
-                                let response = RobotResponse::success(data, elapsed_ms(start));
+                                let public_data = diagnostic_json_value_for_output(&data)?;
+                                let response =
+                                    RobotResponse::success(public_data, elapsed_ms(start));
                                 print_robot_response(&response, format, stats)?;
                             }
                         }
@@ -46296,14 +46957,12 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
             let layout = match config.workspace_layout(Some(&workspace_root)) {
                 Ok(l) => l,
                 Err(e) => {
-                    if output_format.is_json() {
-                        println!(
-                            r#"{{"ok": false, "error": "Failed to get workspace layout: {}", "version": "{}"}}"#,
-                            e,
-                            frankenterm_core::VERSION
-                        );
-                    } else {
-                        eprintln!("Error: Failed to get workspace layout: {e}");
+                    emit_bounded_display_error(
+                        output_format,
+                        "Failed to get workspace layout: ",
+                        &e,
+                    );
+                    if !output_format.is_json() {
                         eprintln!("Check --workspace or FT_WORKSPACE");
                     }
                     std::process::exit(1);
@@ -46321,14 +46980,8 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
             {
                 Ok(s) => s,
                 Err(e) => {
-                    if output_format.is_json() {
-                        println!(
-                            r#"{{"ok": false, "error": "Failed to open storage: {}", "version": "{}"}}"#,
-                            e,
-                            frankenterm_core::VERSION
-                        );
-                    } else {
-                        eprintln!("Error: Failed to open storage: {e}");
+                    emit_bounded_display_error(output_format, "Failed to open storage: ", &e);
+                    if !output_format.is_json() {
                         eprintln!("Is the database initialized? Run 'ft watch' first.");
                     }
                     std::process::exit(1);
@@ -46379,15 +47032,11 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                 }
                             }
                             Err(e) => {
-                                if output_format.is_json() {
-                                    println!(
-                                        r#"{{"ok": false, "error": "FTS verify failed: {}", "version": "{}"}}"#,
-                                        e,
-                                        frankenterm_core::VERSION
-                                    );
-                                } else {
-                                    eprintln!("Error: FTS verify failed: {e}");
-                                }
+                                emit_bounded_display_error(
+                                    output_format,
+                                    "FTS verify failed: ",
+                                    &e,
+                                );
                                 std::process::exit(1);
                             }
                         }
@@ -46399,7 +47048,10 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         let config = frankenterm_core::storage::FtsSyncConfig::default();
                         // ft-xbnl0.2.3 tick 271: cx-first FTS rebuild.
                         match storage.rebuild_fts_with_cx(&storage_cx, config).await {
-                            Ok(result) => {
+                            Ok(mut result) => {
+                                for warning in &mut result.warnings {
+                                    *warning = bounded_terminal_diagnostic(warning, 600, 600);
+                                }
                                 if output_format.is_json() {
                                     let payload = serde_json::json!({
                                         "ok": true,
@@ -46426,15 +47078,11 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                 }
                             }
                             Err(e) => {
-                                if output_format.is_json() {
-                                    println!(
-                                        r#"{{"ok": false, "error": "FTS rebuild failed: {}", "version": "{}"}}"#,
-                                        e,
-                                        frankenterm_core::VERSION
-                                    );
-                                } else {
-                                    eprintln!("Error: FTS rebuild failed: {e}");
-                                }
+                                emit_bounded_display_error(
+                                    output_format,
+                                    "FTS rebuild failed: ",
+                                    &e,
+                                );
                                 std::process::exit(1);
                             }
                         }
@@ -46448,24 +47096,18 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     since,
                 }) => {
                     if limit == 0 {
-                        if output_format.is_json() {
-                            println!(
-                                r#"{{"ok": false, "error": "Limit must be greater than 0.", "version": "{}"}}"#,
-                                frankenterm_core::VERSION
-                            );
-                        } else {
-                            eprintln!("Error: Limit must be greater than 0.");
-                        }
+                        emit_bounded_error(output_format, "Limit must be greater than 0.");
                         std::process::exit(1);
                     }
 
                     let lints = frankenterm_core::storage::lint_fts_query(&query);
                     if search_lints_have_errors(&lints) {
                         if output_format.is_json() {
+                            let public_lints = search_lints_for_output(&lints);
                             let payload = serde_json::json!({
                                 "ok": false,
                                 "error": "Invalid search query.",
-                                "lint": lints,
+                                "lint": public_lints,
                                 "version": frankenterm_core::VERSION,
                             });
                             println!(
@@ -46487,28 +47129,20 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         .await
                     {
                         Ok(Some(_)) => {
-                            if output_format.is_json() {
-                                println!(
-                                    r#"{{"ok": false, "error": "Saved search already exists: {}", "version": "{}"}}"#,
-                                    name,
-                                    frankenterm_core::VERSION
-                                );
-                            } else {
-                                eprintln!("Error: Saved search already exists: {name}");
-                            }
+                            emit_bounded_prefixed_error(
+                                output_format,
+                                "Saved search already exists: ",
+                                &name,
+                            );
                             std::process::exit(1);
                         }
                         Ok(None) => {}
                         Err(e) => {
-                            if output_format.is_json() {
-                                println!(
-                                    r#"{{"ok": false, "error": "Failed to load saved searches: {}", "version": "{}"}}"#,
-                                    e,
-                                    frankenterm_core::VERSION
-                                );
-                            } else {
-                                eprintln!("Error: Failed to load saved searches: {e}");
-                            }
+                            emit_bounded_display_error(
+                                output_format,
+                                "Failed to load saved searches: ",
+                                &e,
+                            );
                             std::process::exit(1);
                         }
                     }
@@ -46522,27 +47156,29 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     } else {
                         frankenterm_core::storage::SAVED_SEARCH_SINCE_MODE_LAST_RUN
                     };
+                    let display_name = bounded_terminal_preview(&name, 200, 800);
                     let record = frankenterm_core::storage::SavedSearchRecord::new(
-                        name.clone(),
-                        query.clone(),
+                        name,
+                        query,
                         pane,
                         limit_i64,
                         since_mode.to_string(),
                         since,
                     );
+                    let public_record = saved_search_for_output(&record);
 
                     // ft-xbnl0.2.3 tick 239: cx-first storage write.
                     let storage_cx = frankenterm_core::cx::Cx::current()
                         .unwrap_or_else(frankenterm_core::cx::for_request);
                     match storage
-                        .insert_saved_search_with_cx(&storage_cx, record.clone())
+                        .insert_saved_search_with_cx(&storage_cx, record)
                         .await
                     {
                         Ok(()) => {
                             if output_format.is_json() {
                                 let payload = serde_json::json!({
                                     "ok": true,
-                                    "saved_search": record,
+                                    "saved_search": public_record,
                                     "version": frankenterm_core::VERSION,
                                 });
                                 println!(
@@ -46550,19 +47186,15 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                     serde_json::to_string_pretty(&payload).unwrap_or_default()
                                 );
                             } else {
-                                println!("Saved search '{name}' created.");
+                                println!("Saved search '{display_name}' created.");
                             }
                         }
                         Err(e) => {
-                            if output_format.is_json() {
-                                println!(
-                                    r#"{{"ok": false, "error": "Failed to save search: {}", "version": "{}"}}"#,
-                                    e,
-                                    frankenterm_core::VERSION
-                                );
-                            } else {
-                                eprintln!("Error: Failed to save search: {e}");
-                            }
+                            emit_bounded_display_error(
+                                output_format,
+                                "Failed to save search: ",
+                                &e,
+                            );
                             std::process::exit(1);
                         }
                     }
@@ -46577,10 +47209,12 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             match storage.list_saved_searches_with_cx(&storage_cx).await {
                                 Ok(searches) => {
                                     if output_format.is_json() {
+                                        let public_searches = saved_searches_for_output(&searches);
+                                        let total = public_searches.len();
                                         let payload = serde_json::json!({
                                             "ok": true,
-                                            "saved_searches": searches,
-                                            "total": searches.len(),
+                                            "saved_searches": public_searches,
+                                            "total": total,
                                             "version": frankenterm_core::VERSION,
                                         });
                                         println!(
@@ -46593,15 +47227,11 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                     }
                                 }
                                 Err(e) => {
-                                    if output_format.is_json() {
-                                        println!(
-                                            r#"{{"ok": false, "error": "Failed to list saved searches: {}", "version": "{}"}}"#,
-                                            e,
-                                            frankenterm_core::VERSION
-                                        );
-                                    } else {
-                                        eprintln!("Error: Failed to list saved searches: {e}");
-                                    }
+                                    emit_bounded_display_error(
+                                        output_format,
+                                        "Failed to list saved searches: ",
+                                        &e,
+                                    );
                                     std::process::exit(1);
                                 }
                             }
@@ -46613,27 +47243,19 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             {
                                 Ok(Some(search)) => search,
                                 Ok(None) => {
-                                    if output_format.is_json() {
-                                        println!(
-                                            r#"{{"ok": false, "error": "Saved search not found: {}", "version": "{}"}}"#,
-                                            name,
-                                            frankenterm_core::VERSION
-                                        );
-                                    } else {
-                                        eprintln!("Error: Saved search not found: {name}");
-                                    }
+                                    emit_bounded_prefixed_error(
+                                        output_format,
+                                        "Saved search not found: ",
+                                        &name,
+                                    );
                                     std::process::exit(1);
                                 }
                                 Err(e) => {
-                                    if output_format.is_json() {
-                                        println!(
-                                            r#"{{"ok": false, "error": "Failed to load saved search: {}", "version": "{}"}}"#,
-                                            e,
-                                            frankenterm_core::VERSION
-                                        );
-                                    } else {
-                                        eprintln!("Error: Failed to load saved search: {e}");
-                                    }
+                                    emit_bounded_display_error(
+                                        output_format,
+                                        "Failed to load saved search: ",
+                                        &e,
+                                    );
                                     std::process::exit(1);
                                 }
                             };
@@ -46664,10 +47286,11 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                 }
 
                                 if output_format.is_json() {
+                                    let public_lints = search_lints_for_output(&lints);
                                     let payload = serde_json::json!({
                                         "ok": false,
                                         "error": "Invalid search query.",
-                                        "lint": lints,
+                                        "lint": public_lints,
                                         "version": frankenterm_core::VERSION,
                                     });
                                     println!(
@@ -46685,9 +47308,12 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             }
 
                             let limit = if saved.limit > 0 {
-                                saved.limit as usize
+                                usize::try_from(saved.limit).unwrap_or(usize::MAX)
                             } else {
-                                frankenterm_core::storage::SAVED_SEARCH_DEFAULT_LIMIT as usize
+                                usize::try_from(
+                                    frankenterm_core::storage::SAVED_SEARCH_DEFAULT_LIMIT,
+                                )
+                                .unwrap_or(usize::MAX)
                             };
                             let since = if saved.since_mode
                                 == frankenterm_core::storage::SAVED_SEARCH_SINCE_MODE_FIXED
@@ -46717,12 +47343,15 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                 .search_with_results_with_cx(&storage_cx, &saved.query, options)
                                 .await
                             {
-                                Ok(results) => {
+                                Ok(mut results) => {
+                                    redact_search_results_for_output(&mut results);
                                     if let Err(e) = storage
                                         .update_saved_search_run(
                                             &saved.id,
                                             now_ms_i64,
-                                            Some(results.len() as i64),
+                                            Some(
+                                                i64::try_from(results.len()).unwrap_or(i64::MAX),
+                                            ),
                                             None,
                                         )
                                         .await
@@ -46733,12 +47362,18 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                     let ctx = RenderContext::new(output_format)
                                         .verbose(cli.verbose)
                                         .limit(limit);
-                                    let output =
-                                        SearchResultRenderer::render(&results, &saved.query, &ctx);
+                                    let display_query =
+                                        bounded_terminal_preview(&saved.query, 400, 1_600);
+                                    let output = SearchResultRenderer::render(
+                                        &results,
+                                        &display_query,
+                                        &ctx,
+                                    );
                                     print!("{output}");
                                 }
                                 Err(e) => {
-                                    let error_msg = format!("Search failed: {e}");
+                                    let raw_error = e.to_string();
+                                    let error_msg = bounded_search_failure(&raw_error);
                                     if let Err(e) = storage
                                         .update_saved_search_run(
                                             &saved.id,
@@ -46752,15 +47387,11 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                     }
 
                                     if output_format.is_json() {
-                                        println!(
-                                            r#"{{"ok": false, "error": "Search failed: {}", "version": "{}"}}"#,
-                                            e,
-                                            frankenterm_core::VERSION
-                                        );
+                                        println!("{}", serialize_error_envelope(&error_msg)?);
                                     } else {
-                                        eprintln!("Error: Search failed: {e}");
-                                        if e.to_string().contains("fts5")
-                                            || e.to_string().contains("syntax")
+                                        eprintln!("Error: {error_msg}");
+                                        if raw_error.contains("fts5")
+                                            || raw_error.contains("syntax")
                                         {
                                             eprintln!("Check your FTS query syntax.");
                                         }
@@ -46771,14 +47402,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         }
                         SavedSearchCommands::Schedule { name, interval_ms } => {
                             if interval_ms < 1000 {
-                                if output_format.is_json() {
-                                    println!(
-                                        r#"{{"ok": false, "error": "interval_ms must be >= 1000", "version": "{}"}}"#,
-                                        frankenterm_core::VERSION
-                                    );
-                                } else {
-                                    eprintln!("Error: interval_ms must be >= 1000");
-                                }
+                                emit_bounded_error(output_format, "interval_ms must be >= 1000");
                                 std::process::exit(1);
                             }
 
@@ -46788,27 +47412,19 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             {
                                 Ok(Some(search)) => search,
                                 Ok(None) => {
-                                    if output_format.is_json() {
-                                        println!(
-                                            r#"{{"ok": false, "error": "Saved search not found: {}", "version": "{}"}}"#,
-                                            name,
-                                            frankenterm_core::VERSION
-                                        );
-                                    } else {
-                                        eprintln!("Error: Saved search not found: {name}");
-                                    }
+                                    emit_bounded_prefixed_error(
+                                        output_format,
+                                        "Saved search not found: ",
+                                        &name,
+                                    );
                                     std::process::exit(1);
                                 }
                                 Err(e) => {
-                                    if output_format.is_json() {
-                                        println!(
-                                            r#"{{"ok": false, "error": "Failed to load saved search: {}", "version": "{}"}}"#,
-                                            e,
-                                            frankenterm_core::VERSION
-                                        );
-                                    } else {
-                                        eprintln!("Error: Failed to load saved search: {e}");
-                                    }
+                                    emit_bounded_display_error(
+                                        output_format,
+                                        "Failed to load saved search: ",
+                                        &e,
+                                    );
                                     std::process::exit(1);
                                 }
                             };
@@ -46817,15 +47433,11 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                 .update_saved_search_schedule(&saved.id, true, Some(interval_ms))
                                 .await
                             {
-                                if output_format.is_json() {
-                                    println!(
-                                        r#"{{"ok": false, "error": "Failed to update schedule: {}", "version": "{}"}}"#,
-                                        e,
-                                        frankenterm_core::VERSION
-                                    );
-                                } else {
-                                    eprintln!("Error: Failed to update schedule: {e}");
-                                }
+                                emit_bounded_display_error(
+                                    output_format,
+                                    "Failed to update schedule: ",
+                                    &e,
+                                );
                                 std::process::exit(1);
                             }
 
@@ -46835,34 +47447,27 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             {
                                 Ok(Some(search)) => search,
                                 Ok(None) => {
-                                    if output_format.is_json() {
-                                        println!(
-                                            r#"{{"ok": false, "error": "Saved search not found: {}", "version": "{}"}}"#,
-                                            name,
-                                            frankenterm_core::VERSION
-                                        );
-                                    } else {
-                                        eprintln!("Error: Saved search not found: {name}");
-                                    }
+                                    emit_bounded_prefixed_error(
+                                        output_format,
+                                        "Saved search not found: ",
+                                        &name,
+                                    );
                                     std::process::exit(1);
                                 }
                                 Err(e) => {
-                                    if output_format.is_json() {
-                                        println!(
-                                            r#"{{"ok": false, "error": "Failed to load saved search: {}", "version": "{}"}}"#,
-                                            e,
-                                            frankenterm_core::VERSION
-                                        );
-                                    } else {
-                                        eprintln!("Error: Failed to load saved search: {e}");
-                                    }
+                                    emit_bounded_display_error(
+                                        output_format,
+                                        "Failed to load saved search: ",
+                                        &e,
+                                    );
                                     std::process::exit(1);
                                 }
                             };
                             if output_format.is_json() {
+                                let public_record = saved_search_for_output(&updated);
                                 let payload = serde_json::json!({
                                     "ok": true,
-                                    "saved_search": updated,
+                                    "saved_search": public_record,
                                     "version": frankenterm_core::VERSION,
                                 });
                                 println!(
@@ -46870,7 +47475,10 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                     serde_json::to_string_pretty(&payload).unwrap_or_default()
                                 );
                             } else {
-                                println!("Scheduled saved search '{name}' every {interval_ms}ms.");
+                                let display_name = bounded_terminal_preview(&name, 200, 800);
+                                println!(
+                                    "Scheduled saved search '{display_name}' every {interval_ms}ms."
+                                );
                             }
                         }
                         SavedSearchCommands::Unschedule { name } => {
@@ -46880,27 +47488,19 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             {
                                 Ok(Some(search)) => search,
                                 Ok(None) => {
-                                    if output_format.is_json() {
-                                        println!(
-                                            r#"{{"ok": false, "error": "Saved search not found: {}", "version": "{}"}}"#,
-                                            name,
-                                            frankenterm_core::VERSION
-                                        );
-                                    } else {
-                                        eprintln!("Error: Saved search not found: {name}");
-                                    }
+                                    emit_bounded_prefixed_error(
+                                        output_format,
+                                        "Saved search not found: ",
+                                        &name,
+                                    );
                                     std::process::exit(1);
                                 }
                                 Err(e) => {
-                                    if output_format.is_json() {
-                                        println!(
-                                            r#"{{"ok": false, "error": "Failed to load saved search: {}", "version": "{}"}}"#,
-                                            e,
-                                            frankenterm_core::VERSION
-                                        );
-                                    } else {
-                                        eprintln!("Error: Failed to load saved search: {e}");
-                                    }
+                                    emit_bounded_display_error(
+                                        output_format,
+                                        "Failed to load saved search: ",
+                                        &e,
+                                    );
                                     std::process::exit(1);
                                 }
                             };
@@ -46909,15 +47509,11 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                 .update_saved_search_schedule(&saved.id, false, None)
                                 .await
                             {
-                                if output_format.is_json() {
-                                    println!(
-                                        r#"{{"ok": false, "error": "Failed to update schedule: {}", "version": "{}"}}"#,
-                                        e,
-                                        frankenterm_core::VERSION
-                                    );
-                                } else {
-                                    eprintln!("Error: Failed to update schedule: {e}");
-                                }
+                                emit_bounded_display_error(
+                                    output_format,
+                                    "Failed to update schedule: ",
+                                    &e,
+                                );
                                 std::process::exit(1);
                             }
 
@@ -46927,34 +47523,27 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             {
                                 Ok(Some(search)) => search,
                                 Ok(None) => {
-                                    if output_format.is_json() {
-                                        println!(
-                                            r#"{{"ok": false, "error": "Saved search not found: {}", "version": "{}"}}"#,
-                                            name,
-                                            frankenterm_core::VERSION
-                                        );
-                                    } else {
-                                        eprintln!("Error: Saved search not found: {name}");
-                                    }
+                                    emit_bounded_prefixed_error(
+                                        output_format,
+                                        "Saved search not found: ",
+                                        &name,
+                                    );
                                     std::process::exit(1);
                                 }
                                 Err(e) => {
-                                    if output_format.is_json() {
-                                        println!(
-                                            r#"{{"ok": false, "error": "Failed to load saved search: {}", "version": "{}"}}"#,
-                                            e,
-                                            frankenterm_core::VERSION
-                                        );
-                                    } else {
-                                        eprintln!("Error: Failed to load saved search: {e}");
-                                    }
+                                    emit_bounded_display_error(
+                                        output_format,
+                                        "Failed to load saved search: ",
+                                        &e,
+                                    );
                                     std::process::exit(1);
                                 }
                             };
                             if output_format.is_json() {
+                                let public_record = saved_search_for_output(&updated);
                                 let payload = serde_json::json!({
                                     "ok": true,
-                                    "saved_search": updated,
+                                    "saved_search": public_record,
                                     "version": frankenterm_core::VERSION,
                                 });
                                 println!(
@@ -46962,7 +47551,8 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                     serde_json::to_string_pretty(&payload).unwrap_or_default()
                                 );
                             } else {
-                                println!("Unscheduled saved search '{name}'.");
+                                let display_name = bounded_terminal_preview(&name, 200, 800);
+                                println!("Unscheduled saved search '{display_name}'.");
                             }
                         }
                         SavedSearchCommands::Enable { name } => {
@@ -46972,27 +47562,19 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             {
                                 Ok(Some(search)) => search,
                                 Ok(None) => {
-                                    if output_format.is_json() {
-                                        println!(
-                                            r#"{{"ok": false, "error": "Saved search not found: {}", "version": "{}"}}"#,
-                                            name,
-                                            frankenterm_core::VERSION
-                                        );
-                                    } else {
-                                        eprintln!("Error: Saved search not found: {name}");
-                                    }
+                                    emit_bounded_prefixed_error(
+                                        output_format,
+                                        "Saved search not found: ",
+                                        &name,
+                                    );
                                     std::process::exit(1);
                                 }
                                 Err(e) => {
-                                    if output_format.is_json() {
-                                        println!(
-                                            r#"{{"ok": false, "error": "Failed to load saved search: {}", "version": "{}"}}"#,
-                                            e,
-                                            frankenterm_core::VERSION
-                                        );
-                                    } else {
-                                        eprintln!("Error: Failed to load saved search: {e}");
-                                    }
+                                    emit_bounded_display_error(
+                                        output_format,
+                                        "Failed to load saved search: ",
+                                        &e,
+                                    );
                                     std::process::exit(1);
                                 }
                             };
@@ -47000,16 +47582,10 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             let interval = match saved.schedule_interval_ms {
                                 Some(v) => v,
                                 None => {
-                                    if output_format.is_json() {
-                                        println!(
-                                            r#"{{"ok": false, "error": "Saved search has no schedule interval; use 'ft search saved schedule'.", "version": "{}"}}"#,
-                                            frankenterm_core::VERSION
-                                        );
-                                    } else {
-                                        eprintln!(
-                                            "Error: Saved search has no schedule interval; use 'ft search saved schedule'."
-                                        );
-                                    }
+                                    emit_bounded_error(
+                                        output_format,
+                                        "Saved search has no schedule interval; use 'ft search saved schedule'.",
+                                    );
                                     std::process::exit(1);
                                 }
                             };
@@ -47018,15 +47594,11 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                 .update_saved_search_schedule(&saved.id, true, Some(interval))
                                 .await
                             {
-                                if output_format.is_json() {
-                                    println!(
-                                        r#"{{"ok": false, "error": "Failed to update schedule: {}", "version": "{}"}}"#,
-                                        e,
-                                        frankenterm_core::VERSION
-                                    );
-                                } else {
-                                    eprintln!("Error: Failed to update schedule: {e}");
-                                }
+                                emit_bounded_display_error(
+                                    output_format,
+                                    "Failed to update schedule: ",
+                                    &e,
+                                );
                                 std::process::exit(1);
                             }
 
@@ -47036,34 +47608,27 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             {
                                 Ok(Some(search)) => search,
                                 Ok(None) => {
-                                    if output_format.is_json() {
-                                        println!(
-                                            r#"{{"ok": false, "error": "Saved search not found: {}", "version": "{}"}}"#,
-                                            name,
-                                            frankenterm_core::VERSION
-                                        );
-                                    } else {
-                                        eprintln!("Error: Saved search not found: {name}");
-                                    }
+                                    emit_bounded_prefixed_error(
+                                        output_format,
+                                        "Saved search not found: ",
+                                        &name,
+                                    );
                                     std::process::exit(1);
                                 }
                                 Err(e) => {
-                                    if output_format.is_json() {
-                                        println!(
-                                            r#"{{"ok": false, "error": "Failed to load saved search: {}", "version": "{}"}}"#,
-                                            e,
-                                            frankenterm_core::VERSION
-                                        );
-                                    } else {
-                                        eprintln!("Error: Failed to load saved search: {e}");
-                                    }
+                                    emit_bounded_display_error(
+                                        output_format,
+                                        "Failed to load saved search: ",
+                                        &e,
+                                    );
                                     std::process::exit(1);
                                 }
                             };
                             if output_format.is_json() {
+                                let public_record = saved_search_for_output(&updated);
                                 let payload = serde_json::json!({
                                     "ok": true,
-                                    "saved_search": updated,
+                                    "saved_search": public_record,
                                     "version": frankenterm_core::VERSION,
                                 });
                                 println!(
@@ -47071,7 +47636,8 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                     serde_json::to_string_pretty(&payload).unwrap_or_default()
                                 );
                             } else {
-                                println!("Enabled scheduling for saved search '{name}'.");
+                                let display_name = bounded_terminal_preview(&name, 200, 800);
+                                println!("Enabled scheduling for saved search '{display_name}'.");
                             }
                         }
                         SavedSearchCommands::Disable { name } => {
@@ -47081,27 +47647,19 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             {
                                 Ok(Some(search)) => search,
                                 Ok(None) => {
-                                    if output_format.is_json() {
-                                        println!(
-                                            r#"{{"ok": false, "error": "Saved search not found: {}", "version": "{}"}}"#,
-                                            name,
-                                            frankenterm_core::VERSION
-                                        );
-                                    } else {
-                                        eprintln!("Error: Saved search not found: {name}");
-                                    }
+                                    emit_bounded_prefixed_error(
+                                        output_format,
+                                        "Saved search not found: ",
+                                        &name,
+                                    );
                                     std::process::exit(1);
                                 }
                                 Err(e) => {
-                                    if output_format.is_json() {
-                                        println!(
-                                            r#"{{"ok": false, "error": "Failed to load saved search: {}", "version": "{}"}}"#,
-                                            e,
-                                            frankenterm_core::VERSION
-                                        );
-                                    } else {
-                                        eprintln!("Error: Failed to load saved search: {e}");
-                                    }
+                                    emit_bounded_display_error(
+                                        output_format,
+                                        "Failed to load saved search: ",
+                                        &e,
+                                    );
                                     std::process::exit(1);
                                 }
                             };
@@ -47114,15 +47672,11 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                 )
                                 .await
                             {
-                                if output_format.is_json() {
-                                    println!(
-                                        r#"{{"ok": false, "error": "Failed to update schedule: {}", "version": "{}"}}"#,
-                                        e,
-                                        frankenterm_core::VERSION
-                                    );
-                                } else {
-                                    eprintln!("Error: Failed to update schedule: {e}");
-                                }
+                                emit_bounded_display_error(
+                                    output_format,
+                                    "Failed to update schedule: ",
+                                    &e,
+                                );
                                 std::process::exit(1);
                             }
 
@@ -47132,34 +47686,27 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             {
                                 Ok(Some(search)) => search,
                                 Ok(None) => {
-                                    if output_format.is_json() {
-                                        println!(
-                                            r#"{{"ok": false, "error": "Saved search not found: {}", "version": "{}"}}"#,
-                                            name,
-                                            frankenterm_core::VERSION
-                                        );
-                                    } else {
-                                        eprintln!("Error: Saved search not found: {name}");
-                                    }
+                                    emit_bounded_prefixed_error(
+                                        output_format,
+                                        "Saved search not found: ",
+                                        &name,
+                                    );
                                     std::process::exit(1);
                                 }
                                 Err(e) => {
-                                    if output_format.is_json() {
-                                        println!(
-                                            r#"{{"ok": false, "error": "Failed to load saved search: {}", "version": "{}"}}"#,
-                                            e,
-                                            frankenterm_core::VERSION
-                                        );
-                                    } else {
-                                        eprintln!("Error: Failed to load saved search: {e}");
-                                    }
+                                    emit_bounded_display_error(
+                                        output_format,
+                                        "Failed to load saved search: ",
+                                        &e,
+                                    );
                                     std::process::exit(1);
                                 }
                             };
                             if output_format.is_json() {
+                                let public_record = saved_search_for_output(&updated);
                                 let payload = serde_json::json!({
                                     "ok": true,
-                                    "saved_search": updated,
+                                    "saved_search": public_record,
                                     "version": frankenterm_core::VERSION,
                                 });
                                 println!(
@@ -47167,7 +47714,8 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                     serde_json::to_string_pretty(&payload).unwrap_or_default()
                                 );
                             } else {
-                                println!("Disabled scheduling for saved search '{name}'.");
+                                let display_name = bounded_terminal_preview(&name, 200, 800);
+                                println!("Disabled scheduling for saved search '{display_name}'.");
                             }
                         }
                         SavedSearchCommands::Delete { name } => {
@@ -47180,23 +47728,20 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             {
                                 Ok(deleted) => {
                                     if deleted == 0 {
-                                        if output_format.is_json() {
-                                            println!(
-                                                r#"{{"ok": false, "error": "Saved search not found: {}", "version": "{}"}}"#,
-                                                name,
-                                                frankenterm_core::VERSION
-                                            );
-                                        } else {
-                                            eprintln!("Error: Saved search not found: {name}");
-                                        }
+                                        emit_bounded_prefixed_error(
+                                            output_format,
+                                            "Saved search not found: ",
+                                            &name,
+                                        );
                                         std::process::exit(1);
                                     }
 
+                                    let display_name = bounded_terminal_preview(&name, 200, 800);
                                     if output_format.is_json() {
                                         let payload = serde_json::json!({
                                             "ok": true,
                                             "deleted": true,
-                                            "name": name,
+                                            "name": &display_name,
                                             "version": frankenterm_core::VERSION,
                                         });
                                         println!(
@@ -47205,19 +47750,15 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                                 .unwrap_or_default()
                                         );
                                     } else {
-                                        println!("Deleted saved search '{name}'.");
+                                        println!("Deleted saved search '{display_name}'.");
                                     }
                                 }
                                 Err(e) => {
-                                    if output_format.is_json() {
-                                        println!(
-                                            r#"{{"ok": false, "error": "Failed to delete saved search: {}", "version": "{}"}}"#,
-                                            e,
-                                            frankenterm_core::VERSION
-                                        );
-                                    } else {
-                                        eprintln!("Error: Failed to delete saved search: {e}");
-                                    }
+                                    emit_bounded_display_error(
+                                        output_format,
+                                        "Failed to delete saved search: ",
+                                        &e,
+                                    );
                                     std::process::exit(1);
                                 }
                             }
@@ -47228,25 +47769,21 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     let partial = query.as_deref().unwrap_or("");
                     let suggestions =
                         frankenterm_core::storage::search_query_suggestions(partial, limit);
+                    let display_partial = bounded_terminal_preview(partial, 400, 1_600);
                     let ctx = RenderContext::new(output_format)
                         .limit(limit)
                         .verbose(cli.verbose);
                     println!(
                         "{}",
-                        SearchSuggestRenderer::render(&suggestions, partial, &ctx)
+                        SearchSuggestRenderer::render(&suggestions, &display_partial, &ctx)
                     );
                 }
                 None => {
                     let query = match query {
                         Some(q) => q,
                         None => {
-                            if output_format.is_json() {
-                                println!(
-                                    r#"{{"ok": false, "error": "Missing search query.", "version": "{}"}}"#,
-                                    frankenterm_core::VERSION
-                                );
-                            } else {
-                                eprintln!("Error: Missing search query.");
+                            emit_bounded_error(output_format, "Missing search query.");
+                            if !output_format.is_json() {
                                 eprintln!("Try: ft search \"error\"");
                             }
                             std::process::exit(1);
@@ -47262,15 +47799,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     {
                         Ok(ids) => ids,
                         Err(err) => {
-                            if output_format.is_json() {
-                                println!(
-                                    r#"{{"ok": false, "error": "{}", "version": "{}"}}"#,
-                                    err,
-                                    frankenterm_core::VERSION
-                                );
-                            } else {
-                                eprintln!("Error: {err}");
-                            }
+                            emit_bounded_error(output_format, &err);
                             std::process::exit(1);
                         }
                     };
@@ -47281,7 +47810,13 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         pane_ids.retain(|pane_id| *pane_id == filter_pane_id);
                     }
 
-                    let redacted_query = redact_for_output(&query);
+                    let redacted_query = bounded_terminal_preview(&query, 400, 1_600);
+                    let display_bookmark = bookmark
+                        .as_deref()
+                        .map(|value| bounded_terminal_preview(value, 200, 800));
+                    let display_bookmark_tag = bookmark_tag
+                        .as_deref()
+                        .map(|value| bounded_terminal_preview(value, 100, 400));
                     tracing::info!(
                         "Searching for '{}' (mode={:?}, limit={}, pane={:?}, zone={:?}, since={:?}, until={:?}, bookmark={:?}, bookmark_tag={:?})",
                         redacted_query,
@@ -47291,8 +47826,8 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         zone,
                         since,
                         until,
-                        bookmark,
-                        bookmark_tag
+                        display_bookmark,
+                        display_bookmark_tag
                     );
 
                     let parsed = match frankenterm_core::query_contract::parse_unified_search_query(
@@ -47311,18 +47846,25 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     ) {
                         Ok(parsed) => parsed,
                         Err(err) => {
+                            let error_message =
+                                bounded_terminal_diagnostic(err.message(), 600, 600);
+                            let error_code = bounded_terminal_preview(err.code(), 64, 256);
+                            let hint = err
+                                .hint()
+                                .map(|hint| bounded_terminal_preview(hint, 400, 800));
                             if output_format.is_json() {
                                 let mut payload = serde_json::json!({
                                     "ok": false,
-                                    "error": err.message(),
-                                    "error_code": err.code(),
+                                    "error": error_message,
+                                    "error_code": error_code,
                                     "version": frankenterm_core::VERSION,
                                 });
-                                if let Some(hint) = err.hint() {
+                                if let Some(hint) = hint.as_ref() {
                                     payload["hint"] = serde_json::json!(hint);
                                 }
                                 if let Some(lints) = err.lints() {
-                                    payload["lint"] = serde_json::to_value(lints)
+                                    let public_lints = search_lints_for_output(lints);
+                                    payload["lint"] = serde_json::to_value(&public_lints)
                                         .unwrap_or(serde_json::Value::Null);
                                 }
                                 println!(
@@ -47330,11 +47872,11 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                     serde_json::to_string_pretty(&payload).unwrap_or_default()
                                 );
                             } else {
-                                eprintln!("Error: {}", err.message());
+                                eprintln!("Error: {error_message}");
                                 if let Some(lints) = err.lints() {
                                     eprint!("{}", format_search_lints_plain(lints));
                                 }
-                                if let Some(hint) = err.hint() {
+                                if let Some(hint) = hint.as_ref() {
                                     eprintln!("Hint: {hint}");
                                 }
                             }
@@ -47347,7 +47889,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     let canonical = parsed.query;
                     let policy_summary = format!(
                         "search query={} mode={} pane={:?}",
-                        redact_for_output(&canonical.query),
+                        bounded_terminal_preview(&canonical.query, 400, 1_600),
                         canonical.mode.as_str(),
                         pane
                     );
@@ -47365,10 +47907,11 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     {
                         Ok(authorized) => authorized,
                         Err(e) => {
+                            let error = bounded_terminal_diagnostic(&e, 600, 600);
                             if output_format.is_json() {
                                 let payload = serde_json::json!({
                                     "ok": false,
-                                    "error": e,
+                                    "error": error,
                                     "error_code": "robot.approval_error",
                                     "version": frankenterm_core::VERSION,
                                     "elapsed_ms": 0,
@@ -47379,7 +47922,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                     serde_json::to_string_pretty(&payload).unwrap_or_default()
                                 );
                             } else {
-                                eprintln!("Error: {e}");
+                                eprintln!("Error: {error}");
                             }
                             std::process::exit(1);
                         }
@@ -47405,6 +47948,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             .reason()
                             .unwrap_or("Search denied by policy")
                             .to_string();
+                        let reason = bounded_terminal_diagnostic(&reason, 600, 600);
                         let approval_hint = if policy_decision.requires_approval() {
                             policy_approval_command(&policy_decision).or_else(|| {
                                 Some(
@@ -47414,7 +47958,8 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             })
                         } else {
                             None
-                        };
+                        }
+                        .map(|hint| bounded_terminal_preview(&hint, 400, 800));
                         if output_format.is_json() {
                             let mut payload = serde_json::json!({
                                 "ok": false,
@@ -47457,21 +48002,11 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         let query_vector = match embedder.embed(&canonical.query) {
                             Ok(vector) => vector,
                             Err(err) => {
-                                if output_format.is_json() {
-                                    let payload = serde_json::json!({
-                                        "ok": false,
-                                        "error": format!("Failed to embed query for semantic search: {err}"),
-                                        "version": frankenterm_core::VERSION,
-                                    });
-                                    println!(
-                                        "{}",
-                                        serde_json::to_string_pretty(&payload).unwrap_or_default()
-                                    );
-                                } else {
-                                    eprintln!(
-                                        "Error: Failed to embed query for semantic search: {err}"
-                                    );
-                                }
+                                emit_bounded_display_error(
+                                    output_format,
+                                    "Failed to embed query for semantic search: ",
+                                    &err,
+                                );
                                 std::process::exit(1);
                             }
                         };
@@ -47562,15 +48097,11 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                         match storage.search_with_results_with_cx(&storage_cx, &query_for_storage, options).await {
                                             Ok(results) => results,
                                             Err(e) => {
-                                                if output_format.is_json() {
-                                                    println!(
-                                                        r#"{{"ok": false, "error": "Search failed: {}", "version": "{}"}}"#,
-                                                        e,
-                                                        frankenterm_core::VERSION
-                                                    );
-                                                } else {
-                                                    eprintln!("Error: Search failed: {e}");
-                                                }
+                                                emit_bounded_display_error(
+                                                    output_format,
+                                                    "Search failed: ",
+                                                    &e,
+                                                );
                                                 std::process::exit(1);
                                             }
                                         }
@@ -47604,15 +48135,11 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                                 })
                                                 .collect(),
                                             Err(e) => {
-                                                if output_format.is_json() {
-                                                    println!(
-                                                        r#"{{"ok": false, "error": "Search failed: {}", "version": "{}"}}"#,
-                                                        e,
-                                                        frankenterm_core::VERSION
-                                                    );
-                                                } else {
-                                                    eprintln!("Error: Search failed: {e}");
-                                                }
+                                                emit_bounded_display_error(
+                                                    output_format,
+                                                    "Search failed: ",
+                                                    &e,
+                                                );
                                                 std::process::exit(1);
                                             }
                                         }
@@ -47705,11 +48232,10 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             let ctx = RenderContext::new(output_format)
                                 .verbose(cli.verbose)
                                 .limit(canonical.limit);
-                            let output = SearchResultRenderer::render(
-                                &results,
-                                &redact_for_output(&canonical.query),
-                                &ctx,
-                            );
+                            let display_query =
+                                bounded_terminal_preview(&canonical.query, 400, 1_600);
+                            let output =
+                                SearchResultRenderer::render(&results, &display_query, &ctx);
                             print!("{output}");
                         }
                         Err(e) => {
@@ -47724,19 +48250,16 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                 "error",
                             )
                             .await;
-                            if output_format.is_json() {
-                                println!(
-                                    r#"{{"ok": false, "error": "Search failed: {}", "version": "{}"}}"#,
-                                    e,
-                                    frankenterm_core::VERSION
-                                );
-                            } else {
-                                eprintln!("Error: Search failed: {e}");
-                                if e.to_string().contains("fts5")
-                                    || e.to_string().contains("syntax")
-                                {
-                                    eprintln!("Check your FTS query syntax.");
-                                }
+                            let raw_error = e.to_string();
+                            emit_bounded_prefixed_error(
+                                output_format,
+                                "Search failed: ",
+                                &raw_error,
+                            );
+                            if !output_format.is_json()
+                                && (raw_error.contains("fts5") || raw_error.contains("syntax"))
+                            {
+                                eprintln!("Check your FTS query syntax.");
                             }
                             std::process::exit(1);
                         }
@@ -47753,7 +48276,13 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
             let panes = match wezterm.list_panes_with_cx(&cx).await {
                 Ok(panes) => panes,
                 Err(e) => {
-                    eprintln!("Failed to list panes: {e}");
+                    let error = bounded_display_diagnostic(
+                        "Failed to list panes: ",
+                        &e,
+                        600,
+                        600,
+                    );
+                    eprintln!("{error}");
                     return Err(e.into());
                 }
             };
@@ -47836,21 +48365,20 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                     }
                                 }
                             } else {
-                                eprintln!(
-                                    "Error: {}",
-                                    response
-                                        .error
-                                        .clone()
-                                        .unwrap_or_else(|| "request failed".to_string())
-                                );
+                                let raw_error =
+                                    response.error.as_deref().unwrap_or("request failed");
+                                let error = bounded_terminal_diagnostic(raw_error, 600, 600);
+                                eprintln!("Error: {error}");
                                 if let Some(hint) = response.hint {
+                                    let hint = bounded_terminal_preview(&hint, 400, 800);
                                     eprintln!("Hint: {hint}");
                                 }
                                 std::process::exit(1);
                             }
                         }
                         Err(err) => {
-                            eprintln!("Error: {err}");
+                            let error = bounded_display_diagnostic("", &err, 600, 600);
+                            eprintln!("Error: {error}");
                             eprintln!("Hint: start the watcher with `ft watch` in this workspace.");
                             std::process::exit(1);
                         }
@@ -47873,7 +48401,9 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                 {
                     Ok(s) => s,
                     Err(e) => {
-                        eprintln!("Error: Failed to open storage: {e}");
+                        let error =
+                            bounded_display_diagnostic("Failed to open storage: ", &e, 600, 600);
+                        eprintln!("Error: {error}");
                         std::process::exit(1);
                     }
                 };
@@ -47886,6 +48416,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         description,
                         json,
                     } => {
+                        let display_alias = bounded_terminal_preview(&alias, 200, 800);
                         let tags_vec = tags.map(|t| {
                             t.split(',')
                                 .map(|s| s.trim().to_string())
@@ -47896,7 +48427,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         let record = frankenterm_core::storage::PaneBookmarkRecord {
                             id: 0,
                             pane_id,
-                            alias: alias.clone(),
+                            alias,
                             tags: tags_vec,
                             description,
                             created_at: now,
@@ -47911,22 +48442,25 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         {
                             Ok(id) => {
                                 if json {
-                                    println!(
-                                        r#"{{"ok": true, "id": {}, "alias": "{}"}}"#,
-                                        id, alias
-                                    );
+                                    let response = serde_json::json!({
+                                        "ok": true,
+                                        "id": id,
+                                        "alias": display_alias,
+                                    });
+                                    println!("{}", serde_json::to_string_pretty(&response)?);
                                 } else {
-                                    println!("Bookmarked pane {pane_id} as \"{alias}\"");
+                                    println!("Bookmarked pane {pane_id} as \"{display_alias}\"");
                                 }
                             }
                             Err(e) => {
-                                let msg = format!("{e}");
-                                if msg.contains("UNIQUE constraint") {
+                                let raw_message = e.to_string();
+                                let message = bounded_terminal_diagnostic(&raw_message, 600, 600);
+                                if raw_message.contains("UNIQUE constraint") {
                                     eprintln!(
-                                        "Error: alias \"{alias}\" already exists. Remove it first."
+                                        "Error: alias \"{display_alias}\" already exists. Remove it first."
                                     );
                                 } else {
-                                    eprintln!("Error: {e}");
+                                    eprintln!("Error: {message}");
                                 }
                                 std::process::exit(1);
                             }
@@ -47945,11 +48479,14 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         };
                         match bookmarks {
                             Ok(list) => {
+                                let list = pane_bookmarks_for_output(&list);
                                 if json {
                                     println!("{}", serde_json::to_string_pretty(&list)?);
                                 } else if list.is_empty() {
                                     if let Some(ref tag) = tag {
-                                        println!("No bookmarks with tag \"{tag}\"");
+                                        let display_tag =
+                                            bounded_terminal_preview(tag, 100, 400);
+                                        println!("No bookmarks with tag \"{display_tag}\"");
                                     } else {
                                         println!(
                                             "No bookmarks. Add one with: ft panes bookmark add <pane_id> --alias <name>"
@@ -47981,7 +48518,8 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                 }
                             }
                             Err(e) => {
-                                eprintln!("Error: {e}");
+                                let error = bounded_display_diagnostic("", &e, 600, 600);
+                                eprintln!("Error: {error}");
                                 std::process::exit(1);
                             }
                         }
@@ -47995,18 +48533,25 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             .await
                         {
                             Ok(true) => {
+                                let display_alias = bounded_terminal_preview(&alias, 200, 800);
                                 if json {
-                                    println!(r#"{{"ok": true, "alias": "{}"}}"#, alias);
+                                    let response = serde_json::json!({
+                                        "ok": true,
+                                        "alias": display_alias,
+                                    });
+                                    println!("{}", serde_json::to_string_pretty(&response)?);
                                 } else {
-                                    println!("Removed bookmark \"{alias}\"");
+                                    println!("Removed bookmark \"{display_alias}\"");
                                 }
                             }
                             Ok(false) => {
-                                eprintln!("Error: bookmark \"{alias}\" not found");
+                                let display_alias = bounded_terminal_preview(&alias, 200, 800);
+                                eprintln!("Error: bookmark \"{display_alias}\" not found");
                                 std::process::exit(1);
                             }
                             Err(e) => {
-                                eprintln!("Error: {e}");
+                                let error = bounded_display_diagnostic("", &e, 600, 600);
+                                eprintln!("Error: {error}");
                                 std::process::exit(1);
                             }
                         }
@@ -48023,22 +48568,26 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                 .unwrap_or_else(frankenterm_core::cx::for_request);
             match wezterm.get_pane_with_cx(&cx, pane_id).await {
                 Ok(pane) => {
+                    let domain = bounded_terminal_preview(pane.effective_domain(), 200, 800);
                     println!("Pane {}", pane.pane_id);
                     println!(
                         "  Tab: {}  Window: {}  Domain: {}",
                         pane.tab_id,
                         pane.window_id,
-                        pane.effective_domain()
+                        domain
                     );
                     if let Some(title) = &pane.title {
+                        let title = bounded_terminal_preview(title, 400, 1_600);
                         println!("  Title: {title}");
                     }
                     if let Some(ws) = &pane.workspace {
-                        println!("  Workspace: {ws}");
+                        let workspace = bounded_terminal_preview(ws, 400, 1_600);
+                        println!("  Workspace: {workspace}");
                     }
                     let cwd_info = pane.parsed_cwd();
                     if !cwd_info.path.is_empty() {
-                        println!("  CWD: {}", cwd_info.path);
+                        let cwd = bounded_terminal_preview(&cwd_info.path, 400, 1_600);
+                        println!("  CWD: {cwd}");
                     }
                     println!(
                         "  Size: {}x{}",
@@ -48055,6 +48604,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         println!("  Zoomed: yes");
                     }
                     if let Some(tty) = &pane.tty_name {
+                        let tty = bounded_terminal_preview(tty, 200, 800);
                         println!("  TTY: {tty}");
                     }
                     if output {
@@ -48063,16 +48613,23 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         match wezterm.get_text_with_cx(&cx, pane_id, false).await {
                             Ok(text) => {
                                 println!("\n--- Output ---");
-                                print!("{text}");
+                                print!("{}", redact_pane_text_for_output(&text, false));
                             }
                             Err(e) => {
-                                eprintln!("Failed to get pane output: {e}");
+                                let error = bounded_display_diagnostic(
+                                    "Failed to get pane output: ",
+                                    &e,
+                                    600,
+                                    600,
+                                );
+                                eprintln!("{error}");
                             }
                         }
                     }
                 }
                 Err(e) => {
-                    eprintln!("Error: {e}");
+                    let error = bounded_display_diagnostic("", &e, 600, 600);
+                    eprintln!("Error: {error}");
                     std::process::exit(1);
                 }
             }
@@ -48085,8 +48642,8 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
             no_newline,
             dry_run,
             approval_code,
-            verify_submit: _,
-            submit_level: _,
+            verify_submit,
+            submit_level,
             wait_for,
             timeout_secs,
             wait_for_regex,
@@ -48097,58 +48654,35 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
             let emit_json = matches!(output_format, OutputFormat::Json)
                 || (matches!(output_format, OutputFormat::Auto)
                     && !std::io::stdout().is_terminal());
-            let redacted_text = redact_for_output(&text);
-            let redacted_wait_for = wait_for.as_ref().map(|p| redact_for_output(p));
-
-            let mut command = if dry_run {
-                format!("ft send --pane {pane_id} \"{redacted_text}\" --dry-run")
-            } else {
-                format!("ft send --pane {pane_id} \"{redacted_text}\"")
-            };
-            if no_paste {
-                command.push_str(" --no-paste");
-            }
-            if no_newline {
-                command.push_str(" --no-newline");
-            }
-            if let Some(pattern) = &redacted_wait_for {
-                command.push_str(" --wait-for \"");
-                command.push_str(pattern);
-                command.push('"');
-                if wait_for_regex {
-                    command.push_str(" --wait-for-regex");
-                }
-                command.push_str(&format!(" --timeout-secs {timeout_secs}"));
-            }
-            if let Some(code) = &approval_code {
-                command.push_str(&format!(" --approval-code {code}"));
-            }
+            let redacted_wait_for = wait_for
+                .as_ref()
+                .map(|pattern| redact_wait_pattern_for_output(pattern));
+            let submit_guarantee_level =
+                requested_submit_guarantee_level(verify_submit, submit_level);
+            let command = build_send_command_summary(
+                "ft send",
+                pane_id,
+                text.len(),
+                dry_run,
+                no_paste,
+                no_newline,
+                wait_for.is_some(),
+                wait_for_regex,
+                timeout_secs,
+                approval_code.is_some(),
+                verify_submit,
+                submit_level,
+            );
             let command_ctx = frankenterm_core::dry_run::CommandContext::new(command, dry_run);
-            let emit_error = |message: &str, hint: Option<&str>| {
-                if emit_json {
-                    println!(
-                        "{}",
-                        serde_json::json!({
-                            "ok": false,
-                            "error": message,
-                            "hint": hint,
-                            "version": frankenterm_core::VERSION,
-                        })
-                    );
-                } else {
-                    eprintln!("Error: {message}");
-                    if let Some(hint) = hint {
-                        eprintln!("{hint}");
-                    }
-                }
-            };
             let wait_matcher = match wait_for.as_ref() {
                 Some(pattern) => {
                     match frankenterm_core::wezterm::compile_wait_matcher(pattern, wait_for_regex) {
                         Ok(matcher) => Some(matcher),
                         Err(e) => {
-                            emit_error(
-                                &format!("Invalid wait-for regex: {e}"),
+                            emit_bounded_display_error_with_hint(
+                                emit_json,
+                                "Invalid wait-for regex: ",
+                                &e,
                                 Some("Check the regex syntax."),
                             );
                             return Ok(());
@@ -48188,17 +48722,22 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     frankenterm_core::policy::ActorKind::Human,
                 );
                 report.warnings.extend(resolution.warnings);
+                let public_report = send_dry_run_report_for_output(report);
                 if emit_json {
-                    println!("{}", serde_json::to_string_pretty(&report.redacted())?);
+                    println!("{}", serde_json::to_string_pretty(&public_report)?);
                 } else {
-                    println!("{}", frankenterm_core::dry_run::format_human(&report));
+                    println!(
+                        "{}",
+                        frankenterm_core::dry_run::format_human(&public_report)
+                    );
                 }
             } else {
+                let redacted_text = bounded_terminal_preview(&text, 400, 1_600);
                 tracing::info!(
-                    "Sending to pane {} (no_paste={}): {}",
                     pane_id,
                     no_paste,
-                    redacted_text
+                    text_bytes = text.len(),
+                    "Sending text to pane"
                 );
 
                 let db_path = layout.db_path.to_string_lossy();
@@ -48211,8 +48750,10 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                 {
                     Ok(s) => s,
                     Err(e) => {
-                        emit_error(
-                            &format!("Failed to open storage: {e}"),
+                        emit_bounded_display_error_with_hint(
+                            emit_json,
+                            "Failed to open storage: ",
+                            &e,
                             Some("Is the database initialized? Run 'ft watch' first."),
                         );
                         return Ok(());
@@ -48227,17 +48768,26 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     Ok(info) => info,
                     Err(e) => {
                         let (_code, hint) = map_wezterm_error_to_robot(&e);
-                        emit_error(&format!("{e}"), hint.as_deref());
+                        emit_bounded_display_error_with_hint(
+                            emit_json,
+                            "",
+                            &e,
+                            hint.as_deref(),
+                        );
                         return Ok(());
                     }
                 };
                 let domain = pane_info.inferred_domain();
                 let submit_agent_type = infer_send_submit_agent_type(&pane_info);
-                let submit_profile = load_send_submit_profile(
-                    &config,
-                    resolved_config_path.as_deref(),
-                    submit_agent_type,
-                );
+                let submit_profile = submit_guarantee_level
+                    .filter(|level| level.requires_submit_profile())
+                    .and_then(|_| {
+                        load_send_submit_profile(
+                            &config,
+                            resolved_config_path.as_deref(),
+                            submit_agent_type,
+                        )
+                    });
                 let use_verified_submit_path = submit_profile.is_some() && !no_newline;
                 let verified_submit_text = (use_verified_submit_path && !text.trim().is_empty())
                     .then(|| {
@@ -48264,7 +48814,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                 .await;
                 let capabilities = resolution.capabilities;
 
-                let summary = engine.redact_secrets(&text);
+                let summary = bounded_send_text_summary(&engine, &text);
                 let input = build_mux_send_policy_input(
                     pane_id,
                     Some(&pane_info),
@@ -48291,7 +48841,8 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                 {
                     Ok(updated) => updated,
                     Err(e) => {
-                        emit_error(
+                        emit_bounded_error_with_hint(
+                            emit_json,
                             &e,
                             Some(
                                 "Retry the original command with the exact --approval-code issued for this action.",
@@ -48450,10 +49001,10 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     }
                 }
 
-                let effective_submit_profile = use_verified_submit_path
-                    .then_some(())
-                    .and(submit_profile.as_ref());
-                let submit_verification = if injection.is_allowed() {
+                let submit_verification = if injection.is_allowed()
+                    && submit_guarantee_level
+                        .is_some_and(|level| level.requires_submit_profile())
+                {
                     let polls = wait_for_data
                         .as_ref()
                         .map_or(0, |data| data.polls)
@@ -48465,7 +49016,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             pane_id,
                             outbound_submit_text,
                             submit_agent_type,
-                            effective_submit_profile,
+                            submit_profile.as_ref(),
                             submit_before_text.as_deref(),
                             1,
                             polls,
@@ -48476,7 +49027,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     None
                 };
 
-                let submit = Some({
+                let submit = submit_guarantee_level.map(|guarantee_level| {
                     let allowed_without_verification_state = if no_newline {
                         frankenterm_core::robot_types::SubmitReceiptState::StuckInComposer
                     } else {
@@ -48490,7 +49041,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         submit_verification.as_ref(),
                         elapsed_ms(start),
                         allowed_without_verification_state,
-                        frankenterm_core::robot_types::SubmitGuaranteeLevel::Submitted,
+                        guarantee_level,
                     );
                     if let Some(error) =
                         frankenterm_core::verified_submit::submit_guarantee_failure_message(
@@ -48541,7 +49092,8 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                 };
 
                 if emit_json {
-                    println!("{}", serde_json::to_string_pretty(&data)?);
+                    let public_data = diagnostic_json_value_for_output(&data)?;
+                    println!("{}", serde_json::to_string_pretty(&public_data)?);
                 } else {
                     println!(
                         "{}",
@@ -48591,7 +49143,8 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
             {
                 Ok(authorized) => authorized,
                 Err(e) => {
-                    eprintln!("Error: {e}");
+                    let error = bounded_display_diagnostic("", &e, 600, 600);
+                    eprintln!("Error: {error}");
                     std::process::exit(1);
                 }
             };
@@ -48616,12 +49169,14 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     .reason()
                     .unwrap_or("Read denied by policy")
                     .to_string();
+                let reason = bounded_terminal_diagnostic(&reason, 600, 600);
                 eprintln!("Error: {reason}");
                 if let Some(hint) = policy_approval_command(&policy_decision).or_else(|| {
                     policy_decision.requires_approval().then(|| {
                         "Human approval is required before reading this output.".to_string()
                     })
                 }) {
+                    let hint = bounded_terminal_preview(&hint, 600, 600);
                     eprintln!("Hint: {hint}");
                 }
                 std::process::exit(1);
@@ -48648,7 +49203,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         "success",
                     )
                     .await;
-                    print!("{}", redact_for_output(&output));
+                    print!("{}", redact_pane_text_for_output(&output, escapes));
                 }
                 Err(e) => {
                     record_read_search_policy_audit(
@@ -48662,7 +49217,8 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         "error",
                     )
                     .await;
-                    eprintln!("Error: {e}");
+                    let error = bounded_display_diagnostic("", &e, 600, 600);
+                    eprintln!("Error: {error}");
                     std::process::exit(1);
                 }
             }
@@ -49402,14 +49958,12 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     {
                         Ok(storage) => storage,
                         Err(e) => {
-                            if output_format.is_json() {
-                                println!(
-                                    r#"{{"ok": false, "error": "Failed to open storage: {}", "version": "{}"}}"#,
-                                    e,
-                                    frankenterm_core::VERSION
-                                );
-                            } else {
-                                eprintln!("Error: Failed to open storage: {e}");
+                            emit_bounded_display_error(
+                                output_format,
+                                "Failed to open storage: ",
+                                &e,
+                            );
+                            if !output_format.is_json() {
                                 eprintln!("Is the database initialized? Run 'ft watch' first.");
                             }
                             std::process::exit(1);
@@ -49425,15 +49979,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     {
                         Ok(ids) => ids,
                         Err(err) => {
-                            if output_format.is_json() {
-                                println!(
-                                    r#"{{"ok": false, "error": "{}", "version": "{}"}}"#,
-                                    err,
-                                    frankenterm_core::VERSION
-                                );
-                            } else {
-                                eprintln!("Error: {err}");
-                            }
+                            emit_bounded_error(output_format, &err);
                             std::process::exit(1);
                         }
                     };
@@ -49669,17 +50215,15 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             }
                             std::process::exit(1);
                         }
-                        if output_format.is_json() {
-                            println!(
-                                r#"{{"ok": false, "error": "Failed to list panes: {}", "version": "{}"}}"#,
-                                e,
-                                frankenterm_core::VERSION
-                            );
-                        } else {
-                            eprintln!("Error: Failed to list panes: {e}");
+                        emit_bounded_display_error(
+                            output_format,
+                            "Failed to list panes: ",
+                            &e,
+                        );
+                        if !output_format.is_json() {
                             eprintln!("Is the active backend bridge (current: WezTerm) running?");
-                            std::process::exit(1);
                         }
+                        std::process::exit(1);
                     }
                 }
             }
@@ -51083,15 +51627,20 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     println!("{formatted}");
                 }
             } else {
+                let error =
+                    bounded_prefixed_diagnostic("Unknown explanation id: ", &id, 600, 600);
+                let hint = "Use 'ft why --list' to see available templates.";
                 if output_format.is_json() {
-                    println!(
-                        r#"{{"ok": false, "error": "Unknown explanation id: {}", "hint": "Use 'ft why --list' to see available templates.", "version": "{}"}}"#,
-                        id,
-                        frankenterm_core::VERSION
-                    );
+                    let response = serde_json::json!({
+                        "ok": false,
+                        "error": error,
+                        "hint": hint,
+                        "version": frankenterm_core::VERSION,
+                    });
+                    println!("{}", serde_json::to_string_pretty(&response)?);
                 } else {
-                    eprintln!("Error: Unknown explanation id: {id}");
-                    eprintln!("Use 'ft why --list' to see available templates.");
+                    eprintln!("Error: {error}");
+                    eprintln!("{hint}");
                 }
                 std::process::exit(1);
             }
@@ -51353,7 +51902,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                 .with_command_gate_config(config.safety.command_gate.clone())
                 .with_policy_rules(config.safety.rules.clone());
 
-                let summary = engine.redact_secrets(&text);
+                let summary = bounded_send_text_summary(&engine, &text);
                 let input = build_mux_send_policy_input(
                     pane_id,
                     Some(&pane_info),
@@ -51962,7 +52511,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     .with_command_gate_config(config.safety.command_gate.clone())
                     .with_policy_rules(config.safety.rules.clone());
 
-                    let summary = engine.redact_secrets(&text);
+                    let summary = bounded_send_text_summary(&engine, &text);
                     let input = build_mux_send_policy_input(
                         pane_id,
                         Some(&pane_info),
@@ -53343,14 +53892,12 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                 let layout = match config.workspace_layout(Some(&workspace_root)) {
                     Ok(l) => l,
                     Err(e) => {
-                        if output_format.is_json() {
-                            println!(
-                                r#"{{"ok": false, "error": "Failed to get workspace layout: {}", "version": "{}"}}"#,
-                                e,
-                                frankenterm_core::VERSION
-                            );
-                        } else {
-                            eprintln!("Error: Failed to get workspace layout: {e}");
+                        emit_bounded_display_error(
+                            output_format,
+                            "Failed to get workspace layout: ",
+                            &e,
+                        );
+                        if !output_format.is_json() {
                             eprintln!("Check --workspace or FT_WORKSPACE");
                         }
                         std::process::exit(1);
@@ -53368,14 +53915,12 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                 {
                     Ok(s) => s,
                     Err(e) => {
-                        if output_format.is_json() {
-                            println!(
-                                r#"{{"ok": false, "error": "Failed to open storage: {}", "version": "{}"}}"#,
-                                e,
-                                frankenterm_core::VERSION
-                            );
-                        } else {
-                            eprintln!("Error: Failed to open storage: {e}");
+                        emit_bounded_display_error(
+                            output_format,
+                            "Failed to open storage: ",
+                            &e,
+                        );
+                        if !output_format.is_json() {
                             eprintln!("Is the database initialized? Run 'ft watch' first.");
                         }
                         std::process::exit(1);
@@ -53434,15 +53979,11 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         print!("{output}");
                     }
                     Err(e) => {
-                        if output_format.is_json() {
-                            println!(
-                                r#"{{"ok": false, "error": "Failed to query audit trail: {}", "version": "{}"}}"#,
-                                e,
-                                frankenterm_core::VERSION
-                            );
-                        } else {
-                            eprintln!("Error: Failed to query audit trail: {e}");
-                        }
+                        emit_bounded_display_error(
+                            output_format,
+                            "Failed to query audit trail: ",
+                            &e,
+                        );
                         std::process::exit(1);
                     }
                 }
@@ -53477,17 +54018,14 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
 
             let wants_json_error =
                 matches!(export_format.as_deref(), Some("json")) || output_format.is_json();
+            let error_output_format = if wants_json_error {
+                OutputFormat::Json
+            } else {
+                output_format
+            };
 
             let fail = |message: &str| -> ! {
-                if wants_json_error {
-                    println!(
-                        r#"{{"ok": false, "error": "{}", "version": "{}"}}"#,
-                        message,
-                        frankenterm_core::VERSION
-                    );
-                } else {
-                    eprintln!("Error: {message}");
-                }
+                emit_bounded_error(error_output_format, message);
                 std::process::exit(1);
             };
 
@@ -53660,15 +54198,12 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
             let wants_json_error = output_format.is_json();
 
             let fail = |message: &str| -> ! {
-                if wants_json_error {
-                    println!(
-                        r#"{{"ok": false, "error": "{}", "version": "{}"}}"#,
-                        message,
-                        frankenterm_core::VERSION
-                    );
+                let error_output_format = if wants_json_error {
+                    OutputFormat::Json
                 } else {
-                    eprintln!("Error: {message}");
-                }
+                    output_format
+                };
+                emit_bounded_error(error_output_format, message);
                 std::process::exit(1);
             };
 
@@ -54110,7 +54645,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             } else {
                                 serde_json::to_string(&receipt)
                             }
-                            .unwrap_or_else(|e| format!("{{\"error\":\"{e}\"}}"));
+                            .unwrap_or_else(|e| serialize_simple_display_error(&e));
                             println!("{rendered}");
                         }
                         _ => {
@@ -54177,7 +54712,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             } else {
                                 serde_json::to_string(&receipt)
                             }
-                            .unwrap_or_else(|e| format!("{{\"error\":\"{e}\"}}"));
+                            .unwrap_or_else(|e| serialize_simple_display_error(&e));
                             println!("{rendered}");
                         }
                         _ => {
@@ -54293,16 +54828,16 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                 frankenterm_core::crash::latest_crash_bundle(&layout.crash_dir)
             {
                 let detail = if let Some(ref report) = bundle.report {
-                    let msg =
-                        frankenterm_core::output::truncate_bounded(&report.message, 80, 512);
-                    let loc = frankenterm_core::output::truncate_bounded(
+                    let msg = bounded_terminal_diagnostic(&report.message, 80, 512);
+                    let loc = bounded_terminal_diagnostic(
                         report.location.as_deref().unwrap_or("unknown location"),
                         120,
                         512,
                     );
                     format!("{msg} (at {loc})")
                 } else if let Some(ref manifest) = bundle.manifest {
-                    format!("crash at {}", manifest.created_at)
+                    let created_at = bounded_terminal_diagnostic(&manifest.created_at, 64, 256);
+                    format!("crash at {created_at}")
                 } else {
                     "crash bundle found".to_string()
                 };
@@ -56362,7 +56897,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             "{}",
                             registry
                                 .render_json(&filter)
-                                .unwrap_or_else(|e| { format!("{{\"error\": \"{e}\"}}") })
+                                .unwrap_or_else(|e| serialize_simple_display_error(&e))
                         );
                     } else {
                         print!("{}", registry.render_table(&filter));
@@ -57255,16 +57790,17 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     frankenterm_core::crash::latest_crash_bundle(&layout.crash_dir)
                 {
                     let detail = if let Some(ref report) = bundle.report {
-                        let msg =
-                            frankenterm_core::output::truncate_bounded(&report.message, 100, 512);
-                        let location = frankenterm_core::output::truncate_bounded(
+                        let msg = bounded_terminal_diagnostic(&report.message, 100, 512);
+                        let location = bounded_terminal_diagnostic(
                             report.location.as_deref().unwrap_or("unknown"),
                             120,
                             512,
                         );
                         format!("{msg} (at {location})")
                     } else if let Some(ref manifest) = bundle.manifest {
-                        format!("crash at {}", manifest.created_at)
+                        let created_at =
+                            bounded_terminal_diagnostic(&manifest.created_at, 64, 256);
+                        format!("crash at {created_at}")
                     } else {
                         "crash bundle found".to_string()
                     };
@@ -58028,14 +58564,12 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
             {
                 Ok(s) => s,
                 Err(e) => {
-                    if output_format.is_json() {
-                        println!(
-                            r#"{{"ok": false, "error": "Failed to open storage: {}", "version": "{}"}}"#,
-                            e,
-                            frankenterm_core::VERSION
-                        );
-                    } else {
-                        eprintln!("Error: Failed to open storage: {e}");
+                    emit_bounded_display_error(
+                        output_format,
+                        "Failed to open storage: ",
+                        &e,
+                    );
+                    if !output_format.is_json() {
                         eprintln!("Is the database initialized? Run 'ft watch' first.");
                     }
                     std::process::exit(1);
@@ -58966,15 +59500,11 @@ async fn handle_why_recent(
     let layout = match config.workspace_layout(Some(workspace_root)) {
         Ok(l) => l,
         Err(e) => {
-            if output_format.is_json() {
-                println!(
-                    r#"{{"ok": false, "error": "Failed to get workspace layout: {}", "version": "{}"}}"#,
-                    e,
-                    frankenterm_core::VERSION
-                );
-            } else {
-                eprintln!("Error: Failed to get workspace layout: {e}");
-            }
+            emit_bounded_display_error(
+                output_format,
+                "Failed to get workspace layout: ",
+                &e,
+            );
             std::process::exit(1);
         }
     };
@@ -58989,14 +59519,8 @@ async fn handle_why_recent(
     {
         Ok(s) => s,
         Err(e) => {
-            if output_format.is_json() {
-                println!(
-                    r#"{{"ok": false, "error": "Failed to open storage: {}", "version": "{}"}}"#,
-                    e,
-                    frankenterm_core::VERSION
-                );
-            } else {
-                eprintln!("Error: Failed to open storage: {e}");
+            emit_bounded_display_error(output_format, "Failed to open storage: ", &e);
+            if !output_format.is_json() {
                 eprintln!("Is the database initialized? Run 'ft watch' first.");
             }
             std::process::exit(1);
@@ -59027,29 +59551,22 @@ async fn handle_why_recent(
                 if let Some(record) = actions.iter().find(|a| a.id == record_id) {
                     render_why_decision(record, output_format, verbose);
                 } else {
-                    if output_format.is_json() {
-                        println!(
-                            r#"{{"ok": false, "error": "Decision record {} not found", "version": "{}"}}"#,
-                            record_id,
-                            frankenterm_core::VERSION
-                        );
-                    } else {
-                        eprintln!("Error: Decision record {record_id} not found");
+                    emit_bounded_format_error(
+                        output_format,
+                        format_args!("Decision record {record_id} not found"),
+                    );
+                    if !output_format.is_json() {
                         eprintln!("Use 'ft why --recent' to see recent decisions.");
                     }
                     std::process::exit(1);
                 }
             }
             Err(e) => {
-                if output_format.is_json() {
-                    println!(
-                        r#"{{"ok": false, "error": "Failed to query audit trail: {}", "version": "{}"}}"#,
-                        e,
-                        frankenterm_core::VERSION
-                    );
-                } else {
-                    eprintln!("Error: Failed to query audit trail: {e}");
-                }
+                emit_bounded_display_error(
+                    output_format,
+                    "Failed to query audit trail: ",
+                    &e,
+                );
                 std::process::exit(1);
             }
         }
@@ -59073,14 +59590,18 @@ async fn handle_why_recent(
         Ok(actions) => {
             if actions.is_empty() {
                 let filter_desc = effective_filter.as_deref().unwrap_or("any");
+                let display_filter_desc = bounded_terminal_preview(filter_desc, 64, 256);
                 if output_format.is_json() {
-                    println!(
-                        r#"{{"ok": true, "decisions": [], "count": 0, "filter": "{}", "version": "{}"}}"#,
-                        filter_desc,
-                        frankenterm_core::VERSION
-                    );
+                    let response = serde_json::json!({
+                        "ok": true,
+                        "decisions": [],
+                        "count": 0,
+                        "filter": display_filter_desc,
+                        "version": frankenterm_core::VERSION,
+                    });
+                    println!("{}", serde_json::to_string_pretty(&response).unwrap_or_default());
                 } else {
-                    println!("No recent {filter_desc} decisions found.");
+                    println!("No recent {display_filter_desc} decisions found.");
                     if pane.is_some() {
                         println!("Try without --pane to see all decisions.");
                     }
@@ -59151,15 +59672,11 @@ async fn handle_why_recent(
             }
         }
         Err(e) => {
-            if output_format.is_json() {
-                println!(
-                    r#"{{"ok": false, "error": "Failed to query audit trail: {}", "version": "{}"}}"#,
-                    e,
-                    frankenterm_core::VERSION
-                );
-            } else {
-                eprintln!("Error: Failed to query audit trail: {e}");
-            }
+            emit_bounded_display_error(
+                output_format,
+                "Failed to query audit trail: ",
+                &e,
+            );
             std::process::exit(1);
         }
     }
@@ -61391,7 +61908,7 @@ async fn handle_db_command(
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&report)
-                        .unwrap_or_else(|e| format!("{{\"error\": \"{e}\"}}"))
+                        .unwrap_or_else(|e| serialize_simple_display_error(&e))
                 );
             } else {
                 println!("Database: {}", report.db_path);
@@ -61476,7 +61993,7 @@ async fn handle_db_command(
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&report)
-                        .unwrap_or_else(|e| format!("{{\"error\": \"{e}\"}}"))
+                        .unwrap_or_else(|e| serialize_simple_display_error(&e))
                 );
             } else {
                 if let Some(backup) = &report.backup_path {
@@ -61528,10 +62045,7 @@ async fn handle_db_command(
                 Ok(r) => r,
                 Err(err) => {
                     if output_format == OutputFormat::Json {
-                        println!(
-                            "{{\"error\": \"{}\"}}",
-                            err.to_string().replace('"', "\\\"")
-                        );
+                        println!("{}", serialize_simple_display_error(&err));
                     } else {
                         eprintln!("ft db stats failed: {err}");
                     }
@@ -61543,7 +62057,7 @@ async fn handle_db_command(
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&report)
-                        .unwrap_or_else(|e| format!("{{\"error\": \"{e}\"}}"))
+                        .unwrap_or_else(|e| serialize_simple_display_error(&e))
                 );
             } else {
                 println!("Database: {}", report.db_path);
@@ -67857,7 +68371,7 @@ async fn handle_auth_command(
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&outcome)
-                        .unwrap_or_else(|e| format!("{{\"error\": \"{e}\"}}"))
+                        .unwrap_or_else(|e| serialize_simple_display_error(&e))
                 );
             } else {
                 match &outcome {
@@ -67962,7 +68476,7 @@ async fn handle_auth_command(
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&statuses)
-                        .unwrap_or_else(|e| format!("{{\"error\": \"{e}\"}}"))
+                        .unwrap_or_else(|e| serialize_simple_display_error(&e))
                 );
             } else {
                 for status in &statuses {
@@ -76662,7 +77176,7 @@ recorder_backend = "frankensqlite"
             ),
         ]);
 
-        redact_pane_text_results_for_output(&mut pane_text);
+        redact_pane_text_results_for_output(&mut pane_text, false);
 
         let json = serde_json::to_string(&pane_text).expect("serialize pane text results");
         assert!(
@@ -76700,6 +77214,51 @@ recorder_backend = "frankensqlite"
             json.contains("[REDACTED]"),
             "expected redaction marker in robot error response"
         );
+    }
+
+    #[test]
+    fn robot_error_response_is_bounded_and_single_record_safe() {
+        let code = format!("robot.bad\n\x1b]0;title\x07{}", "c".repeat(2_000));
+        let message = format!(
+            "failure AKIAIOSF\x1b[31mODNN7EXAMPLE\n{}",
+            "m".repeat(30_000)
+        );
+        let hint = format!("hint\u{202e}\n{}", "h".repeat(30_000));
+
+        let response = RobotResponse::<serde_json::Value>::error_with_code(
+            &code,
+            message,
+            Some(hint),
+            1,
+        );
+        let error = response.error.as_deref().expect("error field");
+        let error_code = response.error_code.as_deref().expect("error code field");
+        let hint = response.hint.as_deref().expect("hint field");
+
+        assert!(error.len() <= 16 * 1_024);
+        assert!(hint.len() <= 16 * 1_024);
+        assert!(error_code.len() <= 1_024);
+        for field in [error, error_code, hint] {
+            assert!(!field.contains('\x1b'));
+            assert!(!field.contains('\n'));
+            assert!(!field.contains('\u{202e}'));
+        }
+        assert!(!error.contains("AKIAIOSFODNN7EXAMPLE"));
+        assert!(error.contains("[REDACTED]"));
+
+        let response = RobotResponse::<serde_json::Value>::error_with_code_and_data(
+            "robot.bad",
+            "failed",
+            None,
+            serde_json::json!({
+                "nested": ["AKIAIOSF\u{1b}[31mODNN7EXAMPLE\nspoof\u{202e}tail"]
+            }),
+            1,
+        );
+        let nested = response.error_data.as_ref().expect("error data")["nested"][0]
+            .as_str()
+            .expect("nested diagnostic");
+        assert_eq!(nested, "[REDACTED] spoof tail");
     }
 
     #[test]
@@ -81487,6 +82046,55 @@ log_level = "debug"
         assert!(output.contains("Audit ID: 7"));
     }
 
+    #[test]
+    fn send_result_outputs_normalize_nested_hostile_diagnostics() {
+        let hostile = "AKIAIOSF\x1b[31mODNN7EXAMPLE\nspoof\u{202e}tail";
+        let injection = frankenterm_core::policy::InjectionResult::Error {
+            decision: frankenterm_core::policy::PolicyDecision::Allow {
+                rule_id: Some(hostile.to_string()),
+                context: None,
+            },
+            error: hostile.to_string(),
+            pane_id: 1,
+            action: frankenterm_core::policy::ActionKind::SendText,
+            audit_action_id: None,
+        };
+        let data = HumanSendData {
+            pane_id: 1,
+            injection,
+            wait_for: Some(RobotWaitForData {
+                pane_id: 1,
+                pattern: hostile.to_string(),
+                matched: false,
+                elapsed_ms: 1,
+                polls: 1,
+                is_regex: true,
+            }),
+            verification_error: Some(hostile.to_string()),
+            submit: None,
+            no_paste: false,
+            no_newline: false,
+        };
+
+        let human = format_send_result_human(&data, hostile, Some(hostile));
+        assert!(!human.contains("AKIAIOSFODNN7EXAMPLE"));
+        assert!(human.contains("[REDACTED]"));
+        assert!(!human.contains('\x1b'));
+        assert!(!human.contains('\u{202e}'));
+
+        let json = diagnostic_json_value_for_output(&data).expect("public send value");
+        let error = json["injection"]["error"].as_str().expect("error field");
+        let verification = json["verification_error"]
+            .as_str()
+            .expect("verification field");
+        for field in [error, verification] {
+            assert_eq!(field, "[REDACTED] spoof tail");
+            assert!(!field.contains('\x1b'));
+            assert!(!field.contains('\n'));
+            assert!(!field.contains('\u{202e}'));
+        }
+    }
+
     fn make_send_submit_report(
         state: frankenterm_core::robot_types::SubmitReceiptState,
     ) -> frankenterm_core::verified_submit::VerifiedSubmitReport {
@@ -81767,9 +82375,113 @@ log_level = "debug"
             frankenterm_core::policy::ActorKind::Human,
         );
 
-        let redacted = report.redacted();
-        assert!(redacted.command.contains("[REDACTED]"));
-        assert!(!redacted.command.contains("sk-abc"));
+        let public = send_dry_run_report_for_output(report);
+        assert!(public.command.contains("[REDACTED]"));
+        assert!(!public.command.contains("sk-abc"));
+    }
+
+    #[test]
+    fn send_dry_run_public_report_bounds_and_sanitizes_every_text_surface() {
+        use frankenterm_core::dry_run::{
+            ActionType, DryRunReport, PlannedAction, PolicyCheck, PolicyEvaluation,
+            TargetResolution,
+        };
+
+        let hostile = "AKIAIOSF\x1b[31mODNN7EXAMPLE\nspoof\u{202e}tail";
+        let mut policy = PolicyEvaluation::new();
+        policy.add_check(
+            PolicyCheck::failed(hostile, hostile).with_details(hostile),
+        );
+        let report = DryRunReport {
+            command: hostile.to_string(),
+            target_resolution: Some(
+                TargetResolution::new(7, hostile)
+                    .with_title(hostile)
+                    .with_cwd(hostile)
+                    .with_agent_type(hostile),
+            ),
+            policy_evaluation: Some(policy),
+            expected_actions: vec![PlannedAction::new(1, ActionType::SendText, hostile)],
+            warnings: vec![hostile.to_string()],
+        };
+
+        let public = send_dry_run_report_for_output(report);
+        let target = public.target_resolution.as_ref().expect("target");
+        let check = &public.policy_evaluation.as_ref().expect("policy").checks[0];
+        let fields = [
+            public.command.as_str(),
+            target.domain.as_str(),
+            target.title.as_deref().expect("title"),
+            target.cwd.as_deref().expect("cwd"),
+            target.agent_type.as_deref().expect("agent type"),
+            check.name.as_str(),
+            check.message.as_str(),
+            check.details.as_deref().expect("details"),
+            public.expected_actions[0].description.as_str(),
+            public.warnings[0].as_str(),
+        ];
+        for field in fields {
+            assert!(!field.contains("AKIAIOSFODNN7EXAMPLE"));
+            assert!(field.contains("[REDACTED]"));
+            assert!(!field.contains('\x1b'));
+            assert!(!field.contains('\n'));
+            assert!(!field.contains('\u{202e}'));
+            assert!(field.len() <= 1_600);
+        }
+    }
+
+    #[test]
+    fn send_command_summary_never_reflects_payload_or_credentials() {
+        use frankenterm_core::robot_types::SubmitGuaranteeLevel;
+
+        assert_eq!(requested_submit_guarantee_level(false, None), None);
+        assert_eq!(
+            requested_submit_guarantee_level(true, None),
+            Some(SubmitGuaranteeLevel::Submitted)
+        );
+        assert_eq!(
+            requested_submit_guarantee_level(
+                true,
+                Some(SubmitGuaranteeLevelArg::Working),
+            ),
+            Some(SubmitGuaranteeLevel::Working),
+            "an explicit level must take precedence over the shorthand flag"
+        );
+
+        let payload = format!(
+            "private customer payload AKIAIOSF\x1b[31mODNN7EXAMPLE {}",
+            "x".repeat(100_000)
+        );
+        let summary = build_send_command_summary(
+            "ft robot send",
+            7,
+            payload.len(),
+            true,
+            false,
+            true,
+            true,
+            true,
+            30,
+            true,
+            true,
+            Some(SubmitGuaranteeLevelArg::Submitted),
+        );
+
+        assert!(summary.len() < 512);
+        assert!(summary.contains("pane_id=7"));
+        assert!(summary.contains(&format!("text_bytes={}", payload.len())));
+        assert!(summary.contains("wait_for=true"));
+        assert!(summary.contains("approval_code=true"));
+        assert!(summary.contains("submit_level=submitted"));
+        assert!(!summary.contains("private customer payload"));
+        assert!(!summary.contains("AKIAIOSF"));
+        assert!(!summary.contains("ODNN7EXAMPLE"));
+
+        let command_ctx = frankenterm_core::dry_run::CommandContext::new(&summary, true);
+        let report = command_ctx.dry_run_context().report;
+        assert_eq!(report.command, summary);
+        assert!(!report.command.contains("private customer payload"));
+        assert!(!report.command.contains("AKIAIOSF"));
     }
 
     // ========================================================================
@@ -91807,6 +92519,32 @@ A  docs/new-proof.md\n";
                 _ => panic!("expected RobotCommands::Send"),
             },
             _ => panic!("expected Robot command"),
+        }
+    }
+
+    #[test]
+    fn cli_human_send_accepts_verified_submit_level() {
+        let cli = Cli::try_parse_from([
+            "ft",
+            "send",
+            "2",
+            "echo hi",
+            "--verify-submit",
+            "--submit-level",
+            "working",
+        ])
+        .expect("human send should accept verified-submit level");
+
+        match cli.command.map(|command| *command) {
+            Some(Commands::Send {
+                verify_submit,
+                submit_level,
+                ..
+            }) => {
+                assert!(verify_submit);
+                assert_eq!(submit_level, Some(SubmitGuaranteeLevelArg::Working));
+            }
+            _ => panic!("expected Commands::Send"),
         }
     }
 

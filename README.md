@@ -1304,7 +1304,7 @@ retention_days = 30
 [gc]
 enabled = true
 interval_seconds = 3600
-vacuum_threshold = 0.20           # VACUUM when >20% pages free
+vacuum_threshold = 0.20           # Advise explicit VACUUM when >20% pages are free
 log_report = true
 
 [vendored]
@@ -1551,7 +1551,7 @@ frankenterm/                              # 77 workspace members (auto-stamped)
 | **Scan pipeline** (`scan_pipeline.rs`) | SIMD metrics, AC pattern trigger, zstd compression | Pattern engine (triggers), Storage (compressed bytes) | Persistence decisions, action execution |
 | **Pattern engine** (`patterns.rs`) | Rule packs, Bloom prefilter, anchor evaluation, regex execution, BOCPD | Event bus (detections), Storage (read-only) | Sending input, mutating panes |
 | **Event bus** (`events.rs`) | Bounded broadcast of typed events, fanout to subscribers, backpressure | All subscribers | Persistence (subscribers persist if needed) |
-| **Storage** (`storage/`) | SQLite schema + migrations, FTS5 indexing, single-writer lock, GC + VACUUM, backup/restore | All readers | Pattern matching, workflow execution |
+| **Storage** (`storage/`) | SQLite schema + migrations, FTS5 indexing, single-writer lock, page-stat advisories + explicit VACUUM, backup/restore | All readers | Pattern matching, workflow execution |
 | **Search** (`search/`) | Lexical (FTS5), semantic (embeddings), hybrid (RRF fusion), index daemon | Storage (read), embedder daemon | Pattern matching, workflow execution |
 | **Policy engine** (`policy.rs`) | Capability gates, rate limits, approval tokens, audit trail writes, secret redaction | Storage (audit writes), Event bus (denials) | Direct pane I/O |
 | **Workflow engine** (`workflows/`) | Engine + runner + lock + handlers + trigger-policy allowlists | Event bus (subscribe to triggers), Policy gate, Pane I/O | Pattern detection |
@@ -2409,7 +2409,7 @@ version authority.
 | `mux_sessions` + `agent_sessions` + `panes` | Live mux/session/pane registry. |
 | `notification_history` + `event_labels` + `event_notes` + `event_mutes` | Notification dedup history and event annotation. |
 | `output_gaps` + `segment_embeddings` + `fts_index_state` + `fts_pane_progress` | Capture gaps, semantic embeddings, FTS5 index health. |
-| `saved_searches` + `pane_bookmarks` + `accounts` + `action_undo` + `secret_scan_reports` + `usage_metrics` + `maintenance_log` | Operator-facing surfaces (saved queries, bookmarks, accounts, undo log, secret-scan reports, usage metrics, GC log). |
+| `saved_searches` + `pane_bookmarks` + `accounts` + `action_undo` + `secret_scan_reports` + `usage_metrics` + `maintenance_log` | Operator-facing surfaces (saved queries, bookmarks, accounts, undo log, secret-scan reports, usage metrics, bounded operational advisories, and retained cleanup receipts). |
 | `ft_meta` | Single-row table holding `schema_version`, `min_compatible_ft`, `created_by_ft`. |
 
 ### Why SQLite specifically
@@ -2427,7 +2427,7 @@ A filesystem lock (`fs2`) ensures at most one watcher writes. The lock metadata 
 
 ### GC and VACUUM
 
-The `[gc]` config controls periodic compaction. The cycle (configurable, default hourly) checks free-page ratio and runs `VACUUM` when more than `vacuum_threshold` (default 20%) of pages are free. Each cycle emits a report with reclaimed slots/bytes (`log_report = true` by default).
+The `[gc]` config controls periodic page-stat reporting. The cycle (configurable, default hourly) checks the free-page ratio and advises an explicit operator-run `VACUUM` when more than `vacuum_threshold` (default 20%) of pages are free. It never runs a full `VACUUM` automatically because that database rewrite can monopolize FrankenTerm's single writer during a large active session. Each cycle emits a bounded advisory report (`log_report = true` by default); global retention deletes only old `cache_gc` and `fleet_scrollback_coordinator` advisories in finite FIFO batches while preserving cleanup receipts and unknown maintenance classes.
 
 ### Schema migration safety
 
@@ -4036,7 +4036,7 @@ If admission is denied because telemetry is missing (rather than critical), the 
 
 ### Is my terminal output stored permanently?
 
-By default, output is retained for 30 days (configurable via `storage.retention_days`). Data is stored locally in SQLite at `~/.local/share/ft/ft.db`. Long-running watchers also run periodic cache compaction and optional SQLite `VACUUM` based on the `[gc]` settings. Backup and restore is supported via `ft backup export` / `ft backup import`.
+By default, output is retained for 30 days (configurable via `storage.retention_days`). Data is stored locally in SQLite at `~/.local/share/ft/ft.db`. Long-running watchers periodically sample SQLite page statistics and report when an explicit operator-run `VACUUM` may be useful; they do not automatically monopolize the single writer with a full database rewrite. Backup and restore is supported via `ft backup export` / `ft backup import`.
 
 ### Does ft send data anywhere?
 

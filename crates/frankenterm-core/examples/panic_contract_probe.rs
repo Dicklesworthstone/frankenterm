@@ -59,6 +59,7 @@ fn main() {
         Some("payload-drop-once") => run_pathological_payload_drop(false),
         Some("payload-drop-twice") => run_pathological_payload_drop(true),
         Some("nested-drop-panic") => run_nested_drop_panic_during_unwind(),
+        Some("nested-sync-drop-panic") => run_nested_sync_drop_panic_during_unwind(),
         Some("suite") => run_release_contract_suite(),
         // The checker supplies stdout as the write end of a pipe with no read
         // end. This must be a real std-printing EPIPE, not a forged payload.
@@ -71,7 +72,7 @@ fn main() {
         }
         _ => {
             eprintln!(
-                "usage: panic_contract_probe <caught SITE|uncaught|uncaught-epipe-spoof|gui-uncaught|gui-uncaught-epipe-spoof|gui-caught-epipe-spoof|payload-drop-once|payload-drop-twice|nested-drop-panic|epipe|gui-epipe|marker|suite>"
+                "usage: panic_contract_probe <caught SITE|uncaught|uncaught-epipe-spoof|gui-uncaught|gui-uncaught-epipe-spoof|gui-caught-epipe-spoof|payload-drop-once|payload-drop-twice|nested-drop-panic|nested-sync-drop-panic|epipe|gui-epipe|marker|suite>"
             );
             std::process::exit(2);
         }
@@ -189,6 +190,30 @@ fn run_nested_drop_panic_during_unwind() {
         }),
     );
     unreachable!("a destructor panic during unwinding must abort fail-closed");
+}
+
+fn run_nested_sync_drop_panic_during_unwind() {
+    struct DropCallsRecoverableBoundary;
+
+    impl Drop for DropCallsRecoverableBoundary {
+        fn drop(&mut self) {
+            let _ = catch_recoverable(
+                RecoverablePanicSite::CoreRecordingFinalize,
+                std::panic::AssertUnwindSafe(|| {
+                    std::panic::panic_any(String::from(SECRET_SENTINEL));
+                }),
+            );
+        }
+    }
+
+    let _ = catch_recoverable(
+        RecoverablePanicSite::CoreAsyncTaskJoin,
+        std::panic::AssertUnwindSafe(|| {
+            let _drop_calls_recoverable = DropCallsRecoverableBoundary;
+            std::panic::panic_any(String::from("outer-recoverable-panic"));
+        }),
+    );
+    unreachable!("a synchronous destructor panic during unwinding must abort fail-closed");
 }
 
 fn install_probe_gui_hook() {

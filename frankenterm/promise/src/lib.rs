@@ -90,7 +90,14 @@ impl<T> Promise<T> {
         };
 
         if let Some(waker) = waker {
-            waker.wake();
+            // Completion is already committed under the mutex. An
+            // executor-provided waker panic must not unwind through the
+            // producer and cannot invalidate the ready result; isolate it at
+            // the same audited boundary used by the broken-promise Drop path.
+            let _ = frankenterm_sigpipe::catch_recoverable(
+                frankenterm_sigpipe::RecoverablePanicSite::PromiseWaker,
+                std::panic::AssertUnwindSafe(|| waker.wake()),
+            );
         }
         true
     }
@@ -109,8 +116,11 @@ impl<T> Drop for Promise<T> {
         };
 
         if let Some(waker) = waker {
-            // Destructors must not propagate an executor-provided waker panic:
-            // a second panic during unwinding would abort the process.
+            // Outside an outer unwind, isolate an executor-provided waker
+            // panic from the already-committed broken-promise state. During
+            // an outer unwind, Rust cannot recover a second panic; the shared
+            // helper force-enables fatal reporting instead of falsely marking
+            // that nested panic recoverable before the runtime aborts.
             let _ = frankenterm_sigpipe::catch_recoverable(
                 frankenterm_sigpipe::RecoverablePanicSite::PromiseWaker,
                 std::panic::AssertUnwindSafe(|| waker.wake()),
@@ -453,7 +463,7 @@ mod tests {
         ));
 
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| p.ok(5)));
-        assert!(result.is_err());
+        assert!(matches!(result, Ok(true)));
 
         let waker = noop_waker();
         let mut cx = Context::from_waker(&waker);

@@ -468,7 +468,7 @@ impl DriftTriageWorkflow {
         let ntm_stderr = dual.ntm.stderr.trim_end();
         let ft_stderr = dual.ft.stderr.trim_end();
         let stderr_match = ntm_stderr == ft_stderr;
-        if !stderr_match && !ntm_stderr.is_empty() && !ft_stderr.is_empty() {
+        if !stderr_match {
             divergences.push(FieldDivergence {
                 field: "stderr".to_string(),
                 ntm_value: bounded_run_diagnostic(ntm_stderr),
@@ -491,7 +491,14 @@ impl DriftTriageWorkflow {
         // Performance comparison
         let ntm_ms = dual.ntm.duration_ms;
         let ft_ms = dual.ft.duration_ms;
-        let delta_ms = ft_ms as i64 - ntm_ms as i64;
+        let delta_ms_i128 = i128::from(ft_ms) - i128::from(ntm_ms);
+        let delta_ms = i64::try_from(delta_ms_i128).unwrap_or_else(|_| {
+            if delta_ms_i128.is_negative() {
+                i64::MIN
+            } else {
+                i64::MAX
+            }
+        });
         let speedup_ratio = if ntm_ms > 0 {
             ntm_ms as f64 / ft_ms.max(1) as f64
         } else {
@@ -848,13 +855,16 @@ fn bounded_run_diagnostic(text: &str) -> String {
 
     static REDACTOR: std::sync::LazyLock<crate::policy::Redactor> =
         std::sync::LazyLock::new(crate::policy::Redactor::new);
-    let redacted = REDACTOR.redact(text);
-    let bounded = crate::output::truncate_bounded(
-        &redacted,
+    // Normalize first: otherwise an escape sequence can split a secret token,
+    // evade the redactor, and then disappear during truncation to reconstruct
+    // the secret in the emitted diagnostic.
+    let bounded = crate::output::sanitize_redact_truncate_bounded(
+        text,
         DUAL_RUN_DIAGNOSTIC_OUTPUT_MAX,
         DUAL_RUN_DIAGNOSTIC_OUTPUT_MAX,
+        |sanitized| REDACTOR.redact(sanitized),
     );
-    if bounded.is_empty() && !text.is_empty() {
+    if bounded.trim().is_empty() && !text.is_empty() {
         "diagnostic omitted: no display-safe content".to_string()
     } else {
         bounded
@@ -1034,6 +1044,27 @@ mod tests {
     }
 
     #[test]
+    fn compare_one_sided_stderr_mismatch_is_not_reported_as_a_match() {
+        let mut wf = DriftTriageWorkflow::with_defaults();
+        let ntm = make_capture("ntm", "output", 0, 100);
+        let mut ft = make_capture("ft", "output", 0, 100);
+        ft.stderr = "warning".to_string();
+        let dual = make_dual("stderr-one-sided", ntm, ft, DualRunPriority::Low);
+
+        let verdict = wf.compare(&dual);
+
+        assert!(!verdict.semantic.stderr_match);
+        assert_eq!(verdict.match_status, MatchStatus::IntentionalDelta);
+        let divergence = verdict
+            .divergences
+            .iter()
+            .find(|divergence| divergence.field == "stderr")
+            .expect("one-sided stderr mismatch must produce a divergence");
+        assert_eq!(divergence.ntm_value, "");
+        assert_eq!(divergence.ft_value, "warning");
+    }
+
+    #[test]
     fn compare_execution_failure() {
         let mut wf = DriftTriageWorkflow::with_defaults();
         let mut ft_capture = make_capture("ft", "", 1, 0);
@@ -1075,6 +1106,26 @@ mod tests {
         let verdict = wf.compare(&dual);
         assert!(!verdict.performance.within_threshold);
         assert!(verdict.divergences.iter().any(|d| d.field == "duration_ms"));
+    }
+
+    #[test]
+    fn compare_extreme_duration_delta_saturates_without_overflow() {
+        let mut wf = DriftTriageWorkflow::new(0, 0, 3);
+        let positive = make_dual(
+            "positive-duration-overflow",
+            make_capture("ntm", "ok", 0, 0),
+            make_capture("ft", "ok", 0, u64::MAX),
+            DualRunPriority::Low,
+        );
+        assert_eq!(wf.compare(&positive).performance.delta_ms, i64::MAX);
+
+        let negative = make_dual(
+            "negative-duration-overflow",
+            make_capture("ntm", "ok", 0, u64::MAX),
+            make_capture("ft", "ok", 0, 0),
+            DualRunPriority::Low,
+        );
+        assert_eq!(wf.compare(&negative).performance.delta_ms, i64::MIN);
     }
 
     #[test]
@@ -1429,9 +1480,18 @@ mod tests {
             bounded_run_diagnostic("\x1b]0;hidden\x07"),
             "diagnostic omitted: no display-safe content"
         );
+        assert_eq!(
+            bounded_run_diagnostic("\n\t\u{202e}\u{206a}"),
+            "diagnostic omitted: no display-safe content"
+        );
 
         let secret = "token AKIAIOSFODNN7EXAMPLE";
         let bounded = bounded_run_diagnostic(secret);
+        assert!(!bounded.contains("AKIAIOSFODNN7EXAMPLE"));
+        assert!(bounded.contains("[REDACTED]"));
+
+        let ansi_split_secret = "token AKIAIOSF\x1b[31mODNN7EXAMPLE";
+        let bounded = bounded_run_diagnostic(ansi_split_secret);
         assert!(!bounded.contains("AKIAIOSFODNN7EXAMPLE"));
         assert!(bounded.contains("[REDACTED]"));
 

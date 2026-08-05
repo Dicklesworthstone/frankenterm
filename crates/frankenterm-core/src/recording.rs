@@ -263,9 +263,9 @@ impl FrameWriter {
     /// is only set to `true` after the worker reports successful
     /// completion, so callers can distinguish "transient timeout
     /// — retryable" from "permanently flushed". On `Disconnected`
-    /// (worker panicked / exited without sending) the file handle
-    /// is unrecoverable, so we mark `finalized` to prevent further
-    /// usage and surface the broken-pipe error.
+    /// (the worker exited unexpectedly outside its audited flush boundary)
+    /// the file handle is unrecoverable, so we mark `finalized` to prevent
+    /// further usage and surface the broken-pipe error.
     pub fn finalize_with_timeout(&mut self, timeout: Duration) -> Result<()> {
         self.finalize_with_timeout_after_worker_delay(timeout, None)
     }
@@ -306,15 +306,47 @@ impl FrameWriter {
         };
 
         let (sender, receiver) = std::sync::mpsc::sync_channel(1);
-        std::thread::spawn(move || {
-            if let Some(delay) = worker_delay {
-                std::thread::sleep(delay);
+        // Keep ownership recoverable until thread admission succeeds. A plain
+        // `thread::spawn` panics on admission failure and permanently loses
+        // the only buffered frames/file handle despite this method's fallible
+        // API. The shared slot lets the error path restore both for a retry.
+        let pending_parts = Arc::new(std::sync::Mutex::new(Some((buffer, writer))));
+        let worker_parts = Arc::clone(&pending_parts);
+        let spawn_result = std::thread::Builder::new()
+            .name("ft-recording-finalize".to_string())
+            .spawn(move || {
+                let parts = worker_parts
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take();
+                let result = match parts {
+                    Some((buffer, writer)) => run_frame_writer_finalize_operation(|| {
+                        flush_frame_writer_parts(buffer, writer)
+                    }),
+                    None => Err(std::io::Error::other(
+                        "FrameWriter finalize worker lost pending state",
+                    )),
+                };
+                // br-ft-x2oyy: intentional best-effort completion signal;
+                // send fails only after the receiver is no longer observed.
+                let _ = sender.send(result);
+            });
+        if let Err(spawn_error) = spawn_result {
+            let recovered = pending_parts
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            if let Some((buffer, writer)) = recovered {
+                self.buffer = buffer;
+                self.writer = Some(writer);
+            } else {
+                // No worker can exist after failed admission. Treat a missing
+                // slot as terminal corruption instead of pretending a later
+                // empty finalize succeeded.
+                self.finalized = true;
             }
-            let result = flush_frame_writer_parts(buffer, writer);
-            // br-ft-x2oyy: intentional best-effort completion signal; send
-            // fails only if finalize timed out and dropped the receiver.
-            let _ = sender.send(result);
-        });
+            return Err(crate::Error::Io(spawn_error));
+        }
 
         self.await_finalize_receiver(receiver, timeout)
     }
@@ -357,9 +389,10 @@ impl FrameWriter {
                 )))
             }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                // Worker panicked / exited without sending. The file
-                // handle is gone. Mark finalized so the writer
-                // cannot be reused; surface the broken-pipe error.
+                // The worker exited unexpectedly outside its audited flush
+                // boundary and did not send. The file handle is gone. Mark
+                // finalized so the writer cannot be reused; surface the
+                // broken-pipe error.
                 self.finalized = true;
                 Err(crate::Error::Io(std::io::Error::new(
                     ErrorKind::BrokenPipe,
@@ -382,18 +415,15 @@ impl Drop for FrameWriter {
     /// swallowed: Drop cannot fail, and the underlying file may already
     /// be gone in the shutdown path.
     ///
-    /// SAFETY against double-panic abort (ft-7bcox): wrap finalization in the
-    /// canonical marked recovery boundary. If `self.finalize()` itself panics — for example
-    /// because the inner allocator OOMs while encoding a queued frame,
-    /// or a future custom `Write` impl panics on bad state — and Drop
-    /// is running during another unwind, Rust's panic-during-unwind
-    /// rule aborts the process. `catch_recoverable` contains the inner
-    /// panic so only the outer panic propagates. The `AssertUnwindSafe`
-    /// wrap is sound here because: (i) we discard the closure's
-    /// `Result`, (ii) we never observe `&mut self` again after the
-    /// closure returns, (iii) the only state that survives is
-    /// `self.buffer` / `self.writer`, both of which are about to be
-    /// dropped anyway.
+    /// The canonical recovery helper contains a finalization panic when this
+    /// destructor runs normally. If an outer unwind is already active, Rust
+    /// cannot recover a second panic; the helper deliberately removes the
+    /// recoverable marker and lets the fatal hook report that nested failure
+    /// before the runtime aborts. Healthy finalization is still attempted in
+    /// both cases. The `AssertUnwindSafe` wrap is sound here because: (i) we
+    /// discard the closure's `Result`, (ii) we never observe `&mut self` again
+    /// after the closure returns, and (iii) the only surviving state is
+    /// `self.buffer` / `self.writer`, both of which are about to be dropped.
     fn drop(&mut self) {
         let _ = catch_recoverable(
             RecoverablePanicSite::CoreRecordingFinalize,
@@ -401,6 +431,20 @@ impl Drop for FrameWriter {
                 let _ = self.finalize();
             }),
         );
+    }
+}
+
+fn run_frame_writer_finalize_operation(
+    operation: impl FnOnce() -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    match catch_recoverable(
+        RecoverablePanicSite::CoreRecordingFinalize,
+        std::panic::AssertUnwindSafe(operation),
+    ) {
+        Ok(result) => result,
+        Err(_) => Err(std::io::Error::other(
+            "FrameWriter finalize worker panicked",
+        )),
     }
 }
 
@@ -1691,20 +1735,10 @@ mod tests {
 
     #[test]
     fn frame_writer_drop_completes_during_panic_unwind_without_aborting() {
-        // ft-7bcox: the FrameWriter Drop impl flushes a BufWriter; if that
-        // flush panics WHILE we're already unwinding (e.g., the caller
-        // panicked mid-recording and Drop runs as the stack unwinds),
-        // Rust's panic-during-unwind rule aborts the process. The Drop
-        // impl wraps its body in std::panic::catch_unwind so a flush
-        // panic stays swallowed and only the outer panic propagates.
-        //
-        // Test the integration: panic inside a closure that owns a live
-        // FrameWriter with buffered frames. Drop runs during unwind. If
-        // the catch_unwind wrap is missing AND flush panics, the test
-        // process aborts — `result` is never observed, the test runner
-        // reports a SIGABRT, and we lose the assertion below. The test
-        // PASSING (we get back to assert!) is the proof that Drop did
-        // not abort.
+        // A healthy finalization remains safe and useful while an outer panic
+        // is unwinding. A *panicking* finalizer cannot be recovered in that
+        // state; the subprocess panic-contract tests cover the required fatal
+        // reporting path for that nested-panic case.
         let dir = tempdir().unwrap();
         let path = dir.path().join("panic-during-drop.war");
 
@@ -1733,10 +1767,9 @@ mod tests {
              test process would have died before reaching this assertion"
         );
 
-        // Drop's catch_unwind only swallows panics from flush; it still
-        // gives flush a chance to run the happy path. With the buffered
-        // frame above and a healthy filesystem, the file should contain
-        // the frame's bytes after the unwind completes.
+        // Drop still gives healthy finalization a chance to run. With the
+        // buffered frame above, the file should contain the frame's bytes
+        // after the outer unwind is caught.
         let bytes = std::fs::read(&path).unwrap();
         assert_eq!(
             bytes.len(),
@@ -1746,28 +1779,33 @@ mod tests {
     }
 
     #[test]
-    fn frame_writer_drop_catch_unwind_swallows_inner_panic() {
-        // Standalone fence on the catch_unwind + AssertUnwindSafe idiom
-        // the Drop impl uses. If a future refactor accidentally drops
-        // the AssertUnwindSafe wrap or replaces catch_unwind with an
-        // unwind-propagating call, the inner panic would escape and
-        // (during a real Drop unwind) abort the process. This test
-        // exercises the same idiom on a deliberately-panicking closure
-        // and asserts the panic is captured rather than propagated —
-        // the contract the Drop impl relies on.
-        use std::panic::{AssertUnwindSafe, catch_unwind};
-
+    fn frame_writer_recovery_boundary_contains_panic_outside_unwind() {
         let mut sentinel = 0_i32;
-        let result = catch_unwind(AssertUnwindSafe(|| {
-            sentinel = 42;
-            panic!("simulated flush panic during unwind");
-        }));
+        let result = catch_recoverable(
+            RecoverablePanicSite::CoreRecordingFinalize,
+            std::panic::AssertUnwindSafe(|| {
+                sentinel = 42;
+                panic!("simulated finalization panic outside outer unwind");
+            }),
+        );
 
         assert!(result.is_err(), "inner panic must be captured");
         assert_eq!(
             sentinel, 42,
             "the closure ran far enough to mutate captured state before panicking"
         );
+    }
+
+    #[test]
+    fn frame_writer_worker_panic_is_content_free_io_failure() {
+        let error = run_frame_writer_finalize_operation(|| -> std::io::Result<()> {
+            panic!("recording-secret-that-must-not-be-reflected");
+        })
+        .expect_err("worker panic must become a finalize error");
+
+        assert_eq!(error.kind(), ErrorKind::Other);
+        assert_eq!(error.to_string(), "FrameWriter finalize worker panicked");
+        assert!(!error.to_string().contains("recording-secret"));
     }
 
     #[test]

@@ -1123,6 +1123,24 @@ fn is_untrusted_display_control(character: char) -> bool {
         )
 }
 
+/// Hard ceiling on historical crash text inspected by one TUI refresh.
+///
+/// Legacy bundles can contain multi-megabyte panic payloads. The visible
+/// columns below are only a few hundred bytes, so scanning and allocating the
+/// complete payload would add attacker-controlled refresh latency without
+/// improving the operator display.
+const MAX_HISTORICAL_CRASH_SANITIZE_INPUT_BYTES: usize = 4 * 1_024;
+
+fn bounded_historical_crash_prefix(value: &str) -> &str {
+    let mut end = value
+        .len()
+        .min(MAX_HISTORICAL_CRASH_SANITIZE_INPUT_BYTES);
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    &value[..end]
+}
+
 /// Normalize historical crash-bundle strings before putting them in the TUI.
 ///
 /// Older bundles can contain caller-controlled panic payloads, terminal
@@ -1131,7 +1149,7 @@ fn is_untrusted_display_control(character: char) -> bool {
 /// shared Unicode/cell-safe truncator so multibyte text can never panic or
 /// overflow the detail column.
 fn scrub_historical_crash_text(value: &str) -> String {
-    let stripped = crate::output::strip_ansi(value);
+    let stripped = crate::output::strip_ansi(bounded_historical_crash_prefix(value));
     stripped
         .chars()
         .map(|character| {
@@ -1330,6 +1348,10 @@ mod tests {
             MAX_HISTORICAL_CRASH_MESSAGE_BYTES,
         );
         assert!(byte_bounded.len() <= MAX_HISTORICAL_CRASH_MESSAGE_BYTES);
+
+        let oversized_printable = "sensitive".repeat(10_000);
+        let scrubbed = scrub_historical_crash_text(&oversized_printable);
+        assert!(scrubbed.len() <= MAX_HISTORICAL_CRASH_SANITIZE_INPUT_BYTES);
 
         assert_eq!(
             sanitize_historical_crash_location(

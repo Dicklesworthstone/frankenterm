@@ -25,6 +25,8 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock, RwLock as StdRwLock};
 use std::time::{Duration, Instant};
 
+use futures::stream::{FuturesUnordered, StreamExt};
+
 use crate::Error;
 use crate::sharded_counter::{ShardedCounter, ShardedGauge, ShardedMax};
 
@@ -139,6 +141,56 @@ fn runtime_deadline_after(now: Instant, duration: Duration, label: &str) -> Inst
 
 const RETENTION_MAINTENANCE_CADENCE: Duration = Duration::from_secs(60 * 60);
 const RETENTION_MAINTENANCE_RETRY_DELAY: Duration = Duration::from_secs(60);
+const MAX_RUNTIME_WATCHDOG_WARNINGS: usize = 32;
+const MAX_RUNTIME_WATCHDOG_WARNING_INPUT_BYTES: usize = 64 * 1024;
+const MAX_RUNTIME_WATCHDOG_WARNING_WIDTH: usize = 256;
+const MAX_RUNTIME_WATCHDOG_WARNING_BYTES: usize = 1024;
+
+static RUNTIME_HEALTH_REDACTOR: std::sync::LazyLock<Redactor> =
+    std::sync::LazyLock::new(Redactor::new);
+
+fn utf8_prefix_at_most(value: &str, max_bytes: usize) -> &str {
+    if value.len() <= max_bytes {
+        return value;
+    }
+
+    let mut end = max_bytes;
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    &value[..end]
+}
+
+/// Admit backend-provided watchdog diagnostics into the crash-health snapshot
+/// through finite count, input, display-width, byte, terminal-control, and
+/// secret-redaction bounds. The mux/backend boundary is not trusted to return
+/// small or content-free strings.
+fn append_bounded_watchdog_warnings(target: &mut Vec<String>, source: Vec<String>) {
+    let source_len = source.len();
+    let retained = if source_len > MAX_RUNTIME_WATCHDOG_WARNINGS {
+        MAX_RUNTIME_WATCHDOG_WARNINGS.saturating_sub(1)
+    } else {
+        MAX_RUNTIME_WATCHDOG_WARNINGS
+    };
+
+    target.extend(source.into_iter().take(retained).map(|warning| {
+        let bounded_input =
+            utf8_prefix_at_most(&warning, MAX_RUNTIME_WATCHDOG_WARNING_INPUT_BYTES);
+        crate::output::sanitize_redact_truncate_bounded(
+            bounded_input,
+            MAX_RUNTIME_WATCHDOG_WARNING_WIDTH,
+            MAX_RUNTIME_WATCHDOG_WARNING_BYTES,
+            |normalized| RUNTIME_HEALTH_REDACTOR.redact(normalized),
+        )
+    }));
+
+    if source_len > MAX_RUNTIME_WATCHDOG_WARNINGS {
+        target.push(format!(
+            "{} additional mux watchdog warnings omitted",
+            source_len.saturating_sub(retained)
+        ));
+    }
+}
 
 #[derive(Debug)]
 struct RetentionMaintenanceSchedule {
@@ -207,6 +259,34 @@ impl CompletionTimedSchedule {
     fn finish(&mut self, completion: Instant) {
         self.last_completion = completion;
     }
+}
+
+/// Last fleet-coordinator state durably represented in the maintenance log.
+///
+/// The live health snapshot still updates on every health cycle.  This compact
+/// signature exists solely to keep the audit table off the 30-second hot path:
+/// a normal no-op tick is not a new maintenance event, while pressure-state
+/// transitions, telemetry-coverage transitions, and actual reclamation work
+/// remain durable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FleetCoordinatorMaintenanceState {
+    pressure: crate::fleet_memory_controller::FleetPressureTier,
+    telemetry_blind: bool,
+    telemetry_partial: bool,
+    recommended_actions: usize,
+}
+
+fn fleet_coordinator_maintenance_is_noteworthy(
+    previous: Option<FleetCoordinatorMaintenanceState>,
+    current: FleetCoordinatorMaintenanceState,
+    pages_evicted: u64,
+    bytes_reclaimed: u64,
+    targets_applied: usize,
+) -> bool {
+    previous != Some(current)
+        || pages_evicted > 0
+        || bytes_reclaimed > 0
+        || targets_applied > 0
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -363,7 +443,7 @@ async fn semantic_zone_type_for_captured_segment(
         .await
     {
         Ok(snapshot) => Some(snapshot),
-        Err(err) => {
+        Err(_error) => {
             debug!(
                 pane_id = captured.pane_id,
                 error = %err,
@@ -3627,6 +3707,10 @@ impl ObservationRuntime {
                 CoordinatorConfig::default(),
                 FleetMemoryConfig::default(),
             );
+            let mut last_fleet_coordinator_maintenance_state =
+                None::<FleetCoordinatorMaintenanceState>;
+            let mut last_fleet_coordinator_observed_state =
+                None::<FleetCoordinatorMaintenanceState>;
 
             loop {
                 if !first_tick
@@ -3971,7 +4055,7 @@ impl ObservationRuntime {
                     let mut free_pages = 0_i64;
                     let mut free_ratio = 0.0_f64;
                     let mut manual_vacuum_advised = false;
-                    let mut page_stats_error = None::<String>;
+                    let mut page_stats_available = true;
 
                     match storage.database_page_stats().await {
                         Ok(stats) => {
@@ -3985,9 +4069,12 @@ impl ObservationRuntime {
                                 cache_gc_settings.vacuum_threshold,
                             );
                         }
-                        Err(err) => {
-                            page_stats_error = Some(err.to_string());
-                            error!(error = %err, "Cache GC failed to read database page stats");
+                        Err(_error) => {
+                            page_stats_available = false;
+                            error!(
+                                error_class = "database_page_stats_unavailable",
+                                "Cache GC failed to read database page stats"
+                            );
                         }
                     }
 
@@ -4007,7 +4094,7 @@ impl ObservationRuntime {
                         "automatic_vacuum": false,
                         "manual_vacuum_advised": manual_vacuum_advised,
                         "manual_vacuum_advisory_threshold": cache_gc_settings.vacuum_threshold,
-                        "page_stats_error": page_stats_error,
+                        "page_stats_available": page_stats_available,
                         "log_report": cache_gc_settings.log_report,
                     });
                     if let Err(error) = storage
@@ -4128,10 +4215,12 @@ impl ObservationRuntime {
                         ));
                     }
                     match wezterm_handle.watchdog_warnings().await {
-                        Ok(wezterm_warnings) => warnings.extend(wezterm_warnings),
-                        Err(err) => {
-                            warnings.push(format!("WezTerm health warning probe failed: {err}"));
+                        Ok(wezterm_warnings) => {
+                            append_bounded_watchdog_warnings(&mut warnings, wezterm_warnings);
                         }
+                        Err(_error) => warnings.push(
+                            "Mux health warning probe failed: backend_unavailable".to_string(),
+                        ),
                     }
                     let backpressure_tier = classify_backpressure_tier(
                         capture_depth,
@@ -4213,8 +4302,12 @@ impl ObservationRuntime {
                         );
                     }
 
-                    // Record fleet coordinator evaluation as a maintenance
-                    // event so it shows up in diagnostics and audit trail.
+                    // Persist only state transitions and actual reclamation
+                    // activity. The live health snapshot below still records
+                    // every evaluation, but writing a full maintenance row on
+                    // every 30-second no-op tick permanently amplified the
+                    // single-writer workload and grew the table/index without
+                    // bound during long-running sessions.
                     {
                         let telem = fleet_coordinator.telemetry_snapshot();
                         let telemetry_blind =
@@ -4224,62 +4317,100 @@ impl ObservationRuntime {
                         let blind_reason = telemetry_blind.then_some(
                             "vendored tiered scrollback telemetry unavailable; runtime is operating without mux-side pane telemetry",
                         );
+                        let pane_status_error_samples = tiered_scrollback_fetch.error_samples();
+                        let current_state = FleetCoordinatorMaintenanceState {
+                            pressure: fleet_eval.compound_tier,
+                            telemetry_blind,
+                            telemetry_partial,
+                            recommended_actions: fleet_eval.actions.len(),
+                        };
+                        let observed_state_changed =
+                            last_fleet_coordinator_observed_state != Some(current_state);
 
-                        if telemetry_blind {
+                        if observed_state_changed && telemetry_blind {
                             warn!(
                                 observed_panes = observed_pane_count,
                                 pane_status_errors = tiered_scrollback_fetch.errors,
-                                error_samples = ?tiered_scrollback_fetch.error_samples,
+                                error_samples = ?pane_status_error_samples,
                                 "Tiered scrollback telemetry is blind; vendored mux compatibility or health has degraded"
                             );
-                        } else if telemetry_partial {
+                        } else if observed_state_changed && telemetry_partial {
                             warn!(
                                 observed_panes = observed_pane_count,
                                 pane_status_snapshots = tiered_scrollback_fetch.summaries.len(),
                                 pane_status_errors = tiered_scrollback_fetch.errors,
-                                error_samples = ?tiered_scrollback_fetch.error_samples,
+                                error_samples = ?pane_status_error_samples,
                                 "Tiered scrollback telemetry is partially unavailable"
                             );
                         }
+                        last_fleet_coordinator_observed_state = Some(current_state);
 
-                        let metadata = serde_json::json!({
-                            "compound_tier": format!("{:?}", fleet_eval.compound_tier),
-                            "pages_evicted": fleet_eval.pages_evicted,
-                            "bytes_reclaimed": fleet_eval.bytes_reclaimed,
-                            "targets_applied": fleet_eval.targets_applied,
-                            "actions": fleet_eval.actions.len(),
-                            "observed_panes": observed_panes,
-                            "pane_status_snapshots": tiered_scrollback_fetch.summaries.len(),
-                            "pane_scrollback_snapshots": pane_scrollback_snapshot_count,
-                            "pane_status_errors": tiered_scrollback_fetch.errors,
-                            "pane_status_error_samples": tiered_scrollback_fetch.error_samples,
-                            "tiered_scrollback_telemetry_blind": telemetry_blind,
-                            "tiered_scrollback_telemetry_partial": telemetry_partial,
-                            "tiered_scrollback_blind_reason": blind_reason,
-                            "cumulative_ticks": telem.ticks,
-                            "cumulative_elevated_ticks": telem.elevated_ticks,
-                            "cumulative_pages_evicted": telem.pages_evicted,
-                            "cumulative_bytes_reclaimed": telem.bytes_reclaimed,
-                        });
-                        let _ = storage
-                            .record_maintenance(MaintenanceRecord {
-                                id: 0,
-                                event_type: "fleet_scrollback_coordinator".to_string(),
-                                message: Some(if telemetry_blind {
-                                    format!(
-                                        "Fleet coordinator tick: tier={:?}, evicted={} pages; tiered scrollback telemetry blind",
-                                        fleet_eval.compound_tier, fleet_eval.pages_evicted,
-                                    )
-                                } else {
-                                    format!(
-                                        "Fleet coordinator tick: tier={:?}, evicted={} pages",
-                                        fleet_eval.compound_tier, fleet_eval.pages_evicted,
-                                    )
-                                }),
-                                metadata: Some(metadata.to_string()),
-                                timestamp: epoch_ms(),
-                            })
-                            .await;
+                        let audit_state_changed =
+                            last_fleet_coordinator_maintenance_state != Some(current_state);
+                        let actions = fleet_eval.actions.len();
+                        if fleet_coordinator_maintenance_is_noteworthy(
+                            last_fleet_coordinator_maintenance_state,
+                            current_state,
+                            fleet_eval.pages_evicted,
+                            fleet_eval.bytes_reclaimed,
+                            fleet_eval.targets_applied,
+                        ) {
+                            let audit_reason = if audit_state_changed {
+                                "state_transition"
+                            } else {
+                                "reclamation_activity"
+                            };
+                            let metadata = serde_json::json!({
+                                "audit_reason": audit_reason,
+                                "compound_tier": format!("{:?}", fleet_eval.compound_tier),
+                                "pages_evicted": fleet_eval.pages_evicted,
+                                "bytes_reclaimed": fleet_eval.bytes_reclaimed,
+                                "targets_applied": fleet_eval.targets_applied,
+                                "actions": actions,
+                                "observed_panes": observed_panes,
+                                "pane_status_snapshots": tiered_scrollback_fetch.summaries.len(),
+                                "pane_scrollback_snapshots": pane_scrollback_snapshot_count,
+                                "pane_status_errors": tiered_scrollback_fetch.errors,
+                                "pane_status_error_samples": pane_status_error_samples,
+                                "tiered_scrollback_telemetry_blind": telemetry_blind,
+                                "tiered_scrollback_telemetry_partial": telemetry_partial,
+                                "tiered_scrollback_blind_reason": blind_reason,
+                                "cumulative_ticks": telem.ticks,
+                                "cumulative_elevated_ticks": telem.elevated_ticks,
+                                "cumulative_pages_evicted": telem.pages_evicted,
+                                "cumulative_bytes_reclaimed": telem.bytes_reclaimed,
+                            });
+                            match storage
+                                .record_maintenance(MaintenanceRecord {
+                                    id: 0,
+                                    event_type: "fleet_scrollback_coordinator".to_string(),
+                                    message: Some(if telemetry_blind {
+                                        format!(
+                                            "Fleet coordinator {audit_reason}: tier={:?}, evicted={} pages; tiered scrollback telemetry blind",
+                                            fleet_eval.compound_tier, fleet_eval.pages_evicted,
+                                        )
+                                    } else {
+                                        format!(
+                                            "Fleet coordinator {audit_reason}: tier={:?}, evicted={} pages",
+                                            fleet_eval.compound_tier, fleet_eval.pages_evicted,
+                                        )
+                                    }),
+                                    metadata: Some(metadata.to_string()),
+                                    timestamp: epoch_ms(),
+                                })
+                                .await
+                            {
+                                Ok(_) => {
+                                    last_fleet_coordinator_maintenance_state = Some(current_state);
+                                }
+                                Err(_error) => {
+                                    warn!(
+                                        error_class = "maintenance_record_failed",
+                                        "Failed to record fleet coordinator maintenance transition"
+                                    );
+                                }
+                            }
+                        }
                     }
                     // ── end fleet coordinator tick ──────────────────────────
 
@@ -7981,15 +8112,40 @@ fn build_fleet_pressure_signals(
 struct PaneTieredScrollbackFetch {
     summaries: HashMap<u64, PaneTieredScrollbackSummary>,
     errors: usize,
-    error_samples: Vec<String>,
+    error_sample_pane_ids: Vec<u64>,
 }
 
+/// Bound maintenance telemetry fan-out below the default mux-pool pipeline
+/// depth while avoiding one serial round trip per pane. This is deliberately
+/// independent of host core count: the work is mux I/O, and a finite cap keeps
+/// a large fleet's health pass from competing with interactive traffic.
+const PANE_TIERED_SCROLLBACK_FETCH_CONCURRENCY: usize = 16;
+
 impl PaneTieredScrollbackFetch {
-    fn note_error(&mut self, pane_id: u64, err: &impl std::fmt::Display) {
+    fn note_error(&mut self, pane_id: u64) {
         self.errors = self.errors.saturating_add(1);
-        if self.error_samples.len() < 4 {
-            self.error_samples.push(format!("pane {pane_id}: {err}"));
+        // Concurrent probes may finish in any order. Retain the four smallest
+        // failing pane identities so persisted diagnostics remain stable and
+        // do not depend on scheduler timing.
+        match self.error_sample_pane_ids.binary_search(&pane_id) {
+            Ok(_) => {}
+            Err(index) if index < 4 => {
+                self.error_sample_pane_ids.insert(index, pane_id);
+                self.error_sample_pane_ids.truncate(4);
+            }
+            Err(_) => {}
         }
+    }
+
+    fn error_samples(&self) -> Vec<String> {
+        // Never reflect backend error text: it can contain paths, pane
+        // content, or arbitrarily large caller-controlled strings. Pane ids
+        // plus a finite failure class retain enough information to locate the
+        // failing probes.
+        self.error_sample_pane_ids
+            .iter()
+            .map(|pane_id| format!("pane {pane_id}: summary_unavailable"))
+            .collect()
     }
 
     fn telemetry_blind(&self, pane_count: usize) -> bool {
@@ -8011,10 +8167,10 @@ fn record_pane_tiered_scrollback_summary_result(
             fetch.summaries.insert(pane_id, summary);
         }
         Err(err) => {
-            fetch.note_error(pane_id, &err);
+            fetch.note_error(pane_id);
             debug!(
                 pane_id,
-                error = %err,
+                error_class = "pane_summary_unavailable",
                 "failed to collect tiered scrollback summary"
             );
         }
@@ -8027,12 +8183,29 @@ async fn collect_pane_tiered_scrollback_summaries(
     pane_ids: &[u64],
 ) -> PaneTieredScrollbackFetch {
     let mut fetch = PaneTieredScrollbackFetch::default();
+    let mut remaining = pane_ids.iter().copied();
+    let probe = |pane_id| {
+        let wezterm_handle = Arc::clone(wezterm_handle);
+        async move {
+            let result = wezterm_handle
+                .pane_tiered_scrollback_summary_with_cx(runtime_cx, pane_id)
+                .await;
+            (pane_id, result)
+        }
+    };
+    let mut pending = FuturesUnordered::new();
+    for pane_id in remaining
+        .by_ref()
+        .take(PANE_TIERED_SCROLLBACK_FETCH_CONCURRENCY)
+    {
+        pending.push(probe(pane_id));
+    }
 
-    for &pane_id in pane_ids {
-        let result = wezterm_handle
-            .pane_tiered_scrollback_summary_with_cx(runtime_cx, pane_id)
-            .await;
+    while let Some((pane_id, result)) = pending.next().await {
         record_pane_tiered_scrollback_summary_result(&mut fetch, pane_id, result);
+        if let Some(next_pane_id) = remaining.next() {
+            pending.push(probe(next_pane_id));
+        }
     }
 
     fetch
@@ -8595,8 +8768,12 @@ impl RuntimeHandle {
             ));
         }
         match self.wezterm_handle.watchdog_warnings().await {
-            Ok(wezterm_warnings) => warnings.extend(wezterm_warnings),
-            Err(err) => warnings.push(format!("WezTerm health warning probe failed: {err}")),
+            Ok(wezterm_warnings) => {
+                append_bounded_watchdog_warnings(&mut warnings, wezterm_warnings);
+            }
+            Err(_error) => {
+                warnings.push("Mux health warning probe failed: backend_unavailable".to_string());
+            }
         }
         if let Some(resize_watchdog) = evaluate_resize_watchdog(epoch_ms_u64()) {
             if let Some(line) = resize_watchdog.warning_line() {
@@ -13112,12 +13289,18 @@ mod tests {
     #[test]
     fn pane_tiered_scrollback_fetch_marks_blind_when_all_samples_fail() {
         let mut fetch = PaneTieredScrollbackFetch::default();
-        fetch.note_error(7, &"mux circuit breaker open");
-        fetch.note_error(9, &"codec mismatch");
+        fetch.note_error(7);
+        fetch.note_error(9);
 
         assert!(fetch.telemetry_blind(2));
         assert!(!fetch.telemetry_partial(2));
-        assert_eq!(fetch.error_samples.len(), 2);
+        assert_eq!(
+            fetch.error_samples(),
+            [
+                "pane 7: summary_unavailable".to_string(),
+                "pane 9: summary_unavailable".to_string(),
+            ]
+        );
     }
 
     #[test]
@@ -13126,30 +13309,155 @@ mod tests {
         fetch
             .summaries
             .insert(11, PaneTieredScrollbackSummary::default());
-        fetch.note_error(12, &"mux telemetry unavailable");
+        fetch.note_error(12);
 
         assert!(!fetch.telemetry_blind(2));
         assert!(fetch.telemetry_partial(2));
     }
 
     #[test]
-    fn pane_tiered_scrollback_fetch_treats_missing_summary_as_blind_error() {
+    fn pane_tiered_scrollback_fetch_never_reflects_backend_error_text() {
+        let secret = "backend-secret-that-must-not-enter-maintenance-metadata";
         let mut fetch = PaneTieredScrollbackFetch::default();
         record_pane_tiered_scrollback_summary_result(
             &mut fetch,
             7,
             Err(crate::Error::Wezterm(
-                crate::error::WeztermError::CommandFailed(
-                    "backend returned no tiered scrollback summary".to_string(),
-                ),
+                crate::error::WeztermError::CommandFailed(secret.to_string()),
             )),
         );
 
         assert!(fetch.telemetry_blind(1));
         assert!(!fetch.telemetry_partial(1));
-        assert_eq!(fetch.error_samples.len(), 1);
-        assert!(fetch.error_samples[0].contains("pane 7:"));
-        assert!(fetch.error_samples[0].contains("backend returned no tiered scrollback summary"));
+        let error_samples = fetch.error_samples();
+        assert_eq!(
+            error_samples,
+            vec!["pane 7: summary_unavailable".to_string()]
+        );
+        assert!(!error_samples[0].contains(secret));
+    }
+
+    #[test]
+    fn pane_tiered_scrollback_error_samples_are_bounded_and_order_stable() {
+        let mut fetch = PaneTieredScrollbackFetch::default();
+        for pane_id in [90, 7, 42, 3, 11, 1, 7] {
+            fetch.note_error(pane_id);
+        }
+
+        assert_eq!(fetch.errors, 7);
+        assert_eq!(
+            fetch.error_samples(),
+            [
+                "pane 1: summary_unavailable".to_string(),
+                "pane 3: summary_unavailable".to_string(),
+                "pane 7: summary_unavailable".to_string(),
+                "pane 11: summary_unavailable".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn backend_watchdog_warnings_are_count_bounded_sanitized_and_redacted() {
+        let mut source = vec![format!(
+            "pass\u{1b}[31mword={}\nsecond line",
+            "secret-value".repeat(8 * 1024)
+        )];
+        source.extend((1..40).map(|index| format!("warning {index}")));
+
+        let mut warnings = Vec::new();
+        append_bounded_watchdog_warnings(&mut warnings, source);
+
+        assert_eq!(warnings.len(), MAX_RUNTIME_WATCHDOG_WARNINGS);
+        assert_eq!(
+            warnings.last().map(String::as_str),
+            Some("9 additional mux watchdog warnings omitted")
+        );
+        assert!(warnings[0].len() <= MAX_RUNTIME_WATCHDOG_WARNING_BYTES);
+        assert!(!warnings[0].contains("secret-value"));
+        assert!(!warnings[0].contains('\u{1b}'));
+        assert!(!warnings[0].contains('\n'));
+    }
+
+    #[test]
+    fn watchdog_warning_input_prefix_preserves_utf8_boundaries() {
+        let value = "abcé";
+        assert_eq!(utf8_prefix_at_most(value, 4), "abc");
+        assert_eq!(utf8_prefix_at_most(value, value.len()), value);
+    }
+
+    #[test]
+    fn fleet_coordinator_maintenance_skips_stable_noop_ticks() {
+        let normal = FleetCoordinatorMaintenanceState {
+            pressure: crate::fleet_memory_controller::FleetPressureTier::Normal,
+            telemetry_blind: false,
+            telemetry_partial: false,
+            recommended_actions: 0,
+        };
+
+        assert!(fleet_coordinator_maintenance_is_noteworthy(
+            None, normal, 0, 0, 0,
+        ));
+        assert!(!fleet_coordinator_maintenance_is_noteworthy(
+            Some(normal),
+            normal,
+            0,
+            0,
+            0,
+        ));
+    }
+
+    #[test]
+    fn fleet_coordinator_maintenance_keeps_transitions_and_activity() {
+        let normal = FleetCoordinatorMaintenanceState {
+            pressure: crate::fleet_memory_controller::FleetPressureTier::Normal,
+            telemetry_blind: false,
+            telemetry_partial: false,
+            recommended_actions: 0,
+        };
+        let blind = FleetCoordinatorMaintenanceState {
+            telemetry_blind: true,
+            ..normal
+        };
+
+        assert!(fleet_coordinator_maintenance_is_noteworthy(
+            Some(normal),
+            blind,
+            0,
+            0,
+            0,
+        ));
+        assert!(fleet_coordinator_maintenance_is_noteworthy(
+            Some(normal),
+            normal,
+            1,
+            0,
+            0,
+        ));
+        assert!(fleet_coordinator_maintenance_is_noteworthy(
+            Some(normal),
+            normal,
+            0,
+            1,
+            0,
+        ));
+        assert!(fleet_coordinator_maintenance_is_noteworthy(
+            Some(normal),
+            normal,
+            0,
+            0,
+            1,
+        ));
+        let actions_changed = FleetCoordinatorMaintenanceState {
+            recommended_actions: 1,
+            ..normal
+        };
+        assert!(fleet_coordinator_maintenance_is_noteworthy(
+            Some(normal),
+            actions_changed,
+            0,
+            0,
+            0,
+        ));
     }
 
     #[test]
