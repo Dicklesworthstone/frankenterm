@@ -2322,9 +2322,10 @@ pub enum CrashBundleDiscoveryIncompleteReason {
     UnrankedCandidateWindowExceeded,
     /// The caller requested more results than the hard bounded result cap.
     RequestedLimitExceeded,
-    /// The crash root or a retained bundle directory changed identity or
-    /// metadata while discovery was in progress. The bounded result therefore
-    /// cannot represent one stable filesystem view.
+    /// The crash root, a retained bundle directory, or one of its payload
+    /// files changed identity, metadata, or bytes while discovery was in
+    /// progress. The bounded result therefore cannot represent one stable
+    /// filesystem view.
     FilesystemChangedDuringDiscovery,
 }
 
