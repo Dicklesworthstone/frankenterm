@@ -60,7 +60,7 @@ pub struct ShardingTelemetrySnapshot {
     pub pane_listings: u64,
     pub health_reports: u64,
     pub route_lookups: u64,
-    /// Discovery snapshots skipped because a newer point mutation committed.
+    /// Discovery snapshots skipped after a newer point mutation or generation exhaustion.
     pub route_snapshot_conflicts: u64,
 }
 
@@ -607,6 +607,16 @@ impl ShardedWeztermClient {
         self.pane_route_generation.load(Ordering::Acquire)
     }
 
+    fn advance_pane_route_generation_locked(&self) {
+        let current = self.pane_route_generation.load(Ordering::Relaxed);
+        if let Some(next) = current.checked_add(1) {
+            self.pane_route_generation.store(next, Ordering::Release);
+        }
+        // `u64::MAX` is a permanent exhausted sentinel. Point mutations still
+        // update the cache under the commit mutex, while full snapshots fail
+        // closed below; wrapping to zero would let an ancient snapshot match.
+    }
+
     fn insert_pane_route(&self, pane_id: u64, route: PaneRoute) {
         let _commit = self.lock_pane_route_commit();
         self.pane_routes.insert(pane_id, route);
@@ -614,7 +624,7 @@ impl ShardedWeztermClient {
         // creation/navigation. Even an identical cached value represents a
         // newer backend generation that an older discovery snapshot must not
         // erase.
-        self.pane_route_generation.fetch_add(1, Ordering::Release);
+        self.advance_pane_route_generation_locked();
     }
 
     fn remove_pane_route(&self, pane_id: u64) {
@@ -622,20 +632,21 @@ impl ShardedWeztermClient {
         self.pane_routes.remove(pane_id);
         // A successful backend kill is newer truth even when this cache did
         // not contain the route (cold ids decode without cache insertion).
-        self.pane_route_generation.fetch_add(1, Ordering::Release);
+        self.advance_pane_route_generation_locked();
     }
 
     /// Publish a full discovery snapshot only if no point update committed
-    /// after discovery began. Without this generation fence, a slow listing
-    /// can erase a newly spawned pane route or resurrect a route removed by a
-    /// concurrent successful kill.
+    /// after discovery began and the generation remains representable.
+    /// Without this generation fence, a slow listing can erase a newly spawned
+    /// pane route or resurrect a route removed by a concurrent successful kill.
     fn publish_pane_route_snapshot(
         &self,
         expected_generation: u64,
         routes: HashMap<u64, PaneRoute>,
     ) -> bool {
         let _commit = self.lock_pane_route_commit();
-        if self.pane_route_generation.load(Ordering::Acquire) != expected_generation {
+        let current_generation = self.pane_route_generation.load(Ordering::Acquire);
+        if current_generation == u64::MAX || current_generation != expected_generation {
             self.telemetry
                 .route_snapshot_conflicts
                 .fetch_add(1, Ordering::Relaxed);
@@ -643,7 +654,7 @@ impl ShardedWeztermClient {
         }
 
         self.pane_routes.replace_all(routes);
-        self.pane_route_generation.fetch_add(1, Ordering::Release);
+        self.advance_pane_route_generation_locked();
         true
     }
 
@@ -2612,9 +2623,30 @@ mod tests {
             !client.pane_routes.contains(killed_id),
             "stale snapshot must not publish an uncached route after a successful kill"
         );
+
+        let exhausted_id = try_encode_sharded_pane_id(ShardId(0), 13).unwrap();
+        client
+            .pane_route_generation
+            .store(u64::MAX, Ordering::Release);
+        client.insert_pane_route(
+            exhausted_id,
+            PaneRoute {
+                shard_id: ShardId(0),
+                local_pane_id: 13,
+            },
+        );
+        assert_eq!(client.pane_route_generation(), u64::MAX);
+        assert!(
+            !client.publish_pane_route_snapshot(u64::MAX, HashMap::new()),
+            "an exhausted generation must reject every full snapshot instead of wrapping"
+        );
+        assert!(
+            client.pane_routes.contains(exhausted_id),
+            "generation exhaustion must preserve newer point-mutation routing truth"
+        );
         assert_eq!(
             client.telemetry().snapshot().route_snapshot_conflicts,
-            2
+            3
         );
     }
 
