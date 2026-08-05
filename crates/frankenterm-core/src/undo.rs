@@ -625,7 +625,9 @@ impl UndoExecutor {
 /// execution_id available" — operators saw "undo did nothing"
 /// without knowing whether the action was never recorded for undo
 /// or the record exists but is corrupted. Different remediation
-/// paths.
+/// paths. Automatic strategies now surface a failed result and refuse all
+/// inferred-target fallback when this counter increments; the historical
+/// counter name remains stable for telemetry consumers.
 ///
 /// `None` (NULL undo_payload column) is NOT counted (legitimate
 /// absence — the action wasn't undoable). Only payload-present-
@@ -750,6 +752,15 @@ mod tests {
 
     use crate::storage::{AuditActionRecord, PaneRecord, WorkflowRecord, now_ms};
     use crate::wezterm::{MockWezterm, WeztermInterface};
+    use std::sync::{Mutex, MutexGuard};
+
+    static UNDO_PAYLOAD_PARSE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn undo_payload_parse_test_guard() -> MutexGuard<'static, ()> {
+        UNDO_PAYLOAD_PARSE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
 
     fn run_async_test<F>(future: F)
     where
@@ -1253,6 +1264,7 @@ mod tests {
 
     #[test]
     fn parse_undo_payload_invalid_json() {
+        let _counter_guard = undo_payload_parse_test_guard();
         let undo = ActionUndoRecord {
             audit_action_id: 1,
             undoable: true,
@@ -2142,6 +2154,7 @@ mod tests {
 
     #[test]
     fn malformed_explicit_payload_fails_closed_without_inferred_pane_mutation() {
+        let _counter_guard = undo_payload_parse_test_guard();
         run_async_test(async {
             let temp = tempfile::TempDir::new().expect("tempdir");
             let db_path = temp.path().join("undo-pane-close-malformed-payload.db");
@@ -2454,6 +2467,7 @@ mod tests {
 
     #[test]
     fn parse_undo_payload_empty_string() {
+        let _counter_guard = undo_payload_parse_test_guard();
         let undo = ActionUndoRecord {
             audit_action_id: 1,
             undoable: true,
@@ -3047,6 +3061,7 @@ mod tests {
 
     #[test]
     fn parse_undo_payload_whitespace_only() {
+        let _counter_guard = undo_payload_parse_test_guard();
         let undo = ActionUndoRecord {
             audit_action_id: 1,
             undoable: true,
@@ -3091,6 +3106,7 @@ mod tests {
 
     #[test]
     fn parse_undo_payload_null_does_not_bump_counter_ft_4ymqn() {
+        let _counter_guard = undo_payload_parse_test_guard();
         // NULL undo_payload is legitimate absence (action wasn't
         // undoable); the counter must NOT bump.
         super::reset_undo_payload_parse_drop_count_for_test();
@@ -3101,6 +3117,7 @@ mod tests {
 
     #[test]
     fn parse_undo_payload_well_formed_does_not_bump_counter_ft_4ymqn() {
+        let _counter_guard = undo_payload_parse_test_guard();
         super::reset_undo_payload_parse_drop_count_for_test();
         let undo = make_undo_record(1, Some(r#"{"execution_id":"e-1"}"#));
         assert!(parse_undo_payload(&undo).is_some());
@@ -3109,6 +3126,7 @@ mod tests {
 
     #[test]
     fn parse_undo_payload_malformed_bumps_counter_ft_4ymqn() {
+        let _counter_guard = undo_payload_parse_test_guard();
         // br-ft-4ymqn: a malformed undo payload bumps the counter
         // exactly once. Multiple drops accumulate.
         super::reset_undo_payload_parse_drop_count_for_test();

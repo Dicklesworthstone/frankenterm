@@ -1906,32 +1906,23 @@ impl WorkflowRunner {
                             self.config.max_retries_per_step, current_step
                         );
 
-                        // Update execution to failed
-                        if let Err(e) = self
-                            .fail_execution_with_cx(cx, execution_id, &reason)
-                            .await
-                        {
-                            tracing::warn!(
-                                execution_id,
-                                error = %e,
-                                "Failed to fail execution"
-                            );
-                        }
-
-                        // Mark trigger event as handled (with failed status)
-                        if let Err(e) = self
-                            .mark_trigger_event_handled_with_cx(cx, execution_id, "failed")
-                            .await
-                        {
-                            tracing::warn!(
-                                execution_id,
-                                error = %e,
-                                "Failed to mark trigger event as handled"
-                            );
-                        }
-
                         // Cleanup and release lock
                         workflow.cleanup(&mut ctx).await;
+
+                        if let Err(error) = self
+                            .persist_aborted_execution_with_cx(
+                                cx,
+                                execution_id,
+                                &reason,
+                                "failed",
+                            )
+                            .await
+                        {
+                            return workflow_execution_error(
+                                execution_id,
+                                format!("{reason}; failure settlement failed: {error}"),
+                            );
+                        }
 
                         if let Err(error) = record_workflow_terminal_action_with_cx(
                             cx,
@@ -2022,32 +2013,18 @@ impl WorkflowRunner {
                 StepResult::Abort { reason } => {
                     let elapsed_ms = elapsed_ms(start_time);
 
-                    // Update execution to failed
-                    if let Err(e) = self
-                        .fail_execution_with_cx(cx, execution_id, &reason)
-                        .await
-                    {
-                        tracing::warn!(
-                            execution_id,
-                            error = %e,
-                            "Failed to fail execution"
-                        );
-                    }
-
-                    // Mark trigger event as handled (with aborted status)
-                    if let Err(e) = self
-                        .mark_trigger_event_handled_with_cx(cx, execution_id, "aborted")
-                        .await
-                    {
-                        tracing::warn!(
-                            execution_id,
-                            error = %e,
-                            "Failed to mark trigger event as handled"
-                        );
-                    }
-
                     // Cleanup and release lock
                     workflow.cleanup(&mut ctx).await;
+
+                    if let Err(error) = self
+                        .persist_aborted_execution_with_cx(cx, execution_id, &reason, "aborted")
+                        .await
+                    {
+                        return workflow_execution_error(
+                            execution_id,
+                            format!("{reason}; abort settlement failed: {error}"),
+                        );
+                    }
 
                     if let Err(error) = record_workflow_terminal_action_with_cx(
                         cx,
@@ -2498,32 +2475,25 @@ impl WorkflowRunner {
                                 "Text injection denied by policy"
                             );
 
-                            // Update execution to failed
-                            if let Err(e) = self
-                                .fail_execution_with_cx(cx, execution_id, &abort_reason)
-                                .await
-                            {
-                                tracing::warn!(
-                                    execution_id,
-                                    error = %e,
-                                    "Failed to fail execution"
-                                );
-                            }
-
-                            // Mark trigger event as handled (with denied status)
-                            if let Err(e) = self
-                                .mark_trigger_event_handled_with_cx(cx, execution_id, "denied")
-                                .await
-                            {
-                                tracing::warn!(
-                                    execution_id,
-                                    error = %e,
-                                    "Failed to mark trigger event as handled"
-                                );
-                            }
-
                             // Cleanup and release lock
                             workflow.cleanup(&mut ctx).await;
+
+                            if let Err(error) = self
+                                .persist_aborted_execution_with_cx(
+                                    cx,
+                                    execution_id,
+                                    &abort_reason,
+                                    "denied",
+                                )
+                                .await
+                            {
+                                return workflow_execution_error(
+                                    execution_id,
+                                    format!(
+                                        "{abort_reason}; policy-denial settlement failed: {error}"
+                                    ),
+                                );
+                            }
 
                             if let Err(error) = record_workflow_terminal_action_with_cx(
                                 cx,
@@ -2580,36 +2550,25 @@ impl WorkflowRunner {
                                 "Text injection requires approval"
                             );
 
-                            // Update execution to failed (approval not auto-granted for workflows)
-                            if let Err(e) = self
-                                .fail_execution_with_cx(cx, execution_id, &abort_reason)
-                                .await
-                            {
-                                tracing::warn!(
-                                    execution_id,
-                                    error = %e,
-                                    "Failed to fail execution"
-                                );
-                            }
+                            // Cleanup and release lock
+                            workflow.cleanup(&mut ctx).await;
 
-                            // Mark trigger event as handled (with requires_approval status)
-                            if let Err(e) = self
-                                .mark_trigger_event_handled_with_cx(
+                            if let Err(error) = self
+                                .persist_aborted_execution_with_cx(
                                     cx,
                                     execution_id,
+                                    &abort_reason,
                                     "requires_approval",
                                 )
                                 .await
                             {
-                                tracing::warn!(
+                                return workflow_execution_error(
                                     execution_id,
-                                    error = %e,
-                                    "Failed to mark trigger event as handled"
+                                    format!(
+                                        "{abort_reason}; approval settlement failed: {error}"
+                                    ),
                                 );
                             }
-
-                            // Cleanup and release lock
-                            workflow.cleanup(&mut ctx).await;
 
                             if let Err(error) = record_workflow_terminal_action_with_cx(
                                 cx,
@@ -2651,32 +2610,26 @@ impl WorkflowRunner {
                                 "Text injection failed after policy allowed"
                             );
 
-                            // Update execution to failed
-                            if let Err(e) = self
-                                .fail_execution_with_cx(cx, execution_id, &abort_reason)
-                                .await
-                            {
-                                tracing::warn!(
-                                    execution_id,
-                                    error = %e,
-                                    "Failed to fail execution"
-                                );
-                            }
-
-                            // Mark trigger event as handled (with error status)
-                            if let Err(e) = self
-                                .mark_trigger_event_handled_with_cx(cx, execution_id, "error")
-                                .await
-                            {
-                                tracing::warn!(
-                                    execution_id,
-                                    error = %e,
-                                    "Failed to mark trigger event as handled"
-                                );
-                            }
-
                             // Cleanup and release lock
                             workflow.cleanup(&mut ctx).await;
+
+                            if let Err(settlement_error) = self
+                                .persist_aborted_execution_with_cx(
+                                    cx,
+                                    execution_id,
+                                    &abort_reason,
+                                    "error",
+                                )
+                                .await
+                            {
+                                return workflow_execution_error(
+                                    execution_id,
+                                    format!(
+                                        "{abort_reason}; injection-error settlement failed: \
+                                         {settlement_error}"
+                                    ),
+                                );
+                            }
 
                             if let Err(error) = record_workflow_terminal_action_with_cx(
                                 cx,
@@ -3466,10 +3419,21 @@ impl WorkflowRunner {
         reason: &str,
         handled_status: &str,
     ) -> crate::Result<()> {
-        self.fail_execution_with_cx(cx, execution_id, reason)
-            .await?;
-        self.mark_trigger_event_handled_with_cx(cx, execution_id, handled_status)
-            .await
+        let failure_result = self.fail_execution_with_cx(cx, execution_id, reason).await;
+        let trigger_result = self
+            .mark_trigger_event_handled_with_cx(cx, execution_id, handled_status)
+            .await;
+        match (failure_result, trigger_result) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(error), Ok(())) => Err(error),
+            (Ok(()), Err(error)) => Err(error),
+            (Err(failure_error), Err(trigger_error)) => Err(crate::Error::Workflow(
+                crate::error::WorkflowError::Aborted(format!(
+                    "workflow failure-state persistence failed: {failure_error}; trigger \
+                     settlement failed: {trigger_error}"
+                )),
+            )),
+        }
     }
 
     /// Persists failure and its usage metric with an explicit Cx.

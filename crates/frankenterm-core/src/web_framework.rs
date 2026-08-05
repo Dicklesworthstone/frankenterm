@@ -458,7 +458,7 @@ mod tests {
     use crate::runtime_async::{CompatRuntime, RuntimeBuilder};
     use std::cell::Cell;
     use std::net::SocketAddr;
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
     #[test]
     fn wildcard_listener_wake_addresses_use_matching_loopback_family() {
@@ -490,7 +490,7 @@ mod tests {
                 connection_checks.set(connection_checks.get() + 1);
                 3
             },
-            Instant::now() + Duration::from_secs(1),
+            Duration::from_secs(1),
             Duration::from_millis(10),
             |_| {
                 timer_calls.set(timer_calls.get() + 1);
@@ -507,5 +507,32 @@ mod tests {
         );
         assert_eq!(connection_checks.get(), 1);
         assert_eq!(timer_calls.get(), 1, "timer failure must not spin or retry");
+    }
+
+    #[test]
+    fn zero_connection_drain_poll_interval_is_rejected_without_spinning() {
+        let timer_calls = Cell::new(0_u32);
+        let runtime = RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let outcome = runtime.block_on(wait_for_connections_to_drain_with(
+            || 2,
+            Duration::from_secs(1),
+            Duration::ZERO,
+            |_| {
+                timer_calls.set(timer_calls.get() + 1);
+                std::future::ready(Ok(()))
+            },
+        ));
+
+        assert_eq!(
+            outcome,
+            ConnectionDrainOutcome::TimerFailed {
+                remaining_connections: 2,
+                error: "connection-drain poll interval must be non-zero".to_string(),
+            }
+        );
+        assert_eq!(timer_calls.get(), 0);
     }
 }
