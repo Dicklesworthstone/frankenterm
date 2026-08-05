@@ -5678,6 +5678,7 @@ mod tests {
         });
     }
 
+    #[cfg(panic = "unwind")]
     #[test]
     fn task_abort_contains_panicking_waker_and_preserves_cancellation() {
         use std::sync::Arc;
