@@ -95,8 +95,9 @@ use crate::robot_types::{
 };
 use crate::runtime_async::{CompatRuntime, RuntimeBuilder as CompatRuntimeBuilder};
 use crate::storage::{
-    EVENT_DELIVERY_LEASE_BULK_MAX, EventDeliveryLease, EventDeliveryReservation,
-    EventRetentionCheck, EventRetentionStatus, EventStreamPage, EventStreamQuery,
+    EVENT_DELIVERY_LEASE_BULK_MAX, EVENT_DELIVERY_LEASE_TOKEN_MAX_BYTES, EventDeliveryLease,
+    EventDeliveryReservation, EventRetentionCheck, EventRetentionStatus, EventStreamPage,
+    EventStreamQuery,
 };
 use crate::workflows::ManualWorkflowRunOutcome;
 
@@ -172,6 +173,14 @@ fn mcp_search_output_policy_input(summary: &str) -> PolicyInput {
 /// for instance), low enough to reject obvious DoS attempts before
 /// the payload reaches the injector / policy / wezterm pipeline.
 pub const MAX_SEND_TEXT_BYTES: usize = 4 * 1024 * 1024;
+
+/// Maximum raw input scanned to construct an operator-visible `wa.send`
+/// summary or diagnostic. The send payload itself retains its separate 4 MiB
+/// interactive-paste contract; inputs above this smaller ceiling receive a
+/// fixed content-free summary instead of another full-payload clone/scan.
+const MCP_SEND_OUTPUT_INPUT_MAX_BYTES: usize = 64 * 1024;
+const MCP_SEND_OUTPUT_MAX_COLUMNS: usize = 400;
+const MCP_SEND_OUTPUT_MAX_BYTES: usize = 1_600;
 
 /// Hard cap for MCP wait pattern strings before substring matching or regex
 /// compilation.
@@ -2389,20 +2398,21 @@ pub(super) struct WaStateTool {
 }
 
 fn redact_mcp_pane_state_fields(states: &mut [McpPaneState]) {
-    static REDACTOR: LazyLock<crate::redactor::Redactor> =
-        LazyLock::new(crate::redactor::Redactor::new);
-
     for state in states {
+        if let Some(pane_uuid) = state.pane_uuid.as_mut() {
+            *pane_uuid = redact_mcp_single_line_output_secrets(pane_uuid);
+        }
+        state.domain = redact_mcp_single_line_output_secrets(&state.domain);
         if let Some(title) = state.title.as_mut() {
-            let redacted = REDACTOR.redact(title);
+            let redacted = redact_mcp_single_line_output_secrets(title);
             *title = redacted;
         }
         if let Some(cwd) = state.cwd.as_mut() {
-            let redacted = REDACTOR.redact(cwd);
+            let redacted = redact_mcp_single_line_output_secrets(cwd);
             *cwd = redacted;
         }
         if let Some(ignore_reason) = state.ignore_reason.as_mut() {
-            let redacted = REDACTOR.redact(ignore_reason);
+            let redacted = redact_mcp_single_line_output_secrets(ignore_reason);
             *ignore_reason = redacted;
         }
     }
@@ -2466,10 +2476,81 @@ fn redact_cass_view_result(result: &mut CassViewResult) {
 /// typed string fields, or via [`redact_json_value_in_place`] for structured
 /// `#[serde(flatten)]` passthrough maps (ft-7lh4k). It is NOT an automatic
 /// whole-response filter.
+static MCP_OUTPUT_REDACTOR: LazyLock<crate::redactor::Redactor> =
+    LazyLock::new(crate::redactor::Redactor::new);
+
 fn redact_mcp_output_secrets(text: &str) -> String {
-    static REDACTOR: LazyLock<crate::redactor::Redactor> =
-        LazyLock::new(crate::redactor::Redactor::new);
-    REDACTOR.redact(text)
+    // Normalize first: otherwise an attacker can splice ANSI/control bytes
+    // through a secret-shaped token, evade pattern matching, and rely on the
+    // client terminal to reconstruct the visible token. MCP text fields do
+    // not carry a raw-terminal contract; wa.get_text(escapes=true) is the one
+    // explicit escape-preserving surface and is intentionally handled by its
+    // separate policy path.
+    let normalized = crate::output::normalize_terminal_text_for_redaction(text);
+    MCP_OUTPUT_REDACTOR.redact(&normalized)
+}
+
+fn redact_mcp_single_line_output_secrets(text: &str) -> String {
+    let normalized = crate::output::sanitize_terminal_text(text);
+    MCP_OUTPUT_REDACTOR.redact(&normalized)
+}
+
+fn bounded_mcp_send_text_summary(engine: &PolicyEngine, text: &str) -> String {
+    if text.len() > MCP_SEND_OUTPUT_INPUT_MAX_BYTES {
+        return format!("payload omitted: {} bytes", text.len());
+    }
+    crate::output::sanitize_redact_truncate_bounded(
+        text,
+        MCP_SEND_OUTPUT_MAX_COLUMNS,
+        MCP_SEND_OUTPUT_MAX_BYTES,
+        |normalized| engine.redact_secrets(normalized),
+    )
+}
+
+fn bounded_mcp_send_response_text(text: &str) -> String {
+    if text.len() > MCP_SEND_OUTPUT_INPUT_MAX_BYTES {
+        return "diagnostic unavailable: input exceeds safety limit".to_string();
+    }
+    crate::output::sanitize_redact_truncate_bounded(
+        text,
+        MCP_SEND_OUTPUT_MAX_COLUMNS,
+        MCP_SEND_OUTPUT_MAX_BYTES,
+        |normalized| MCP_OUTPUT_REDACTOR.redact(normalized),
+    )
+}
+
+fn bound_mcp_send_data_output(data: &mut McpSendData) {
+    match &mut data.injection {
+        InjectionResult::Allowed { summary, .. }
+        | InjectionResult::Denied { summary, .. }
+        | InjectionResult::RequiresApproval { summary, .. } => {
+            *summary = bounded_mcp_send_response_text(summary);
+        }
+        InjectionResult::Error { error, .. } => {
+            *error = bounded_mcp_send_response_text(error);
+        }
+    }
+    if let Some(wait_for) = data.wait_for.as_mut() {
+        wait_for.pattern = bounded_mcp_send_response_text(&wait_for.pattern);
+    }
+    if let Some(error) = data.verification_error.as_mut() {
+        *error = bounded_mcp_send_response_text(error);
+    }
+}
+
+fn redact_mcp_pane_text_with_escape_contract(
+    text: &str,
+    escapes_included: bool,
+    redact: impl Fn(&str) -> String,
+) -> String {
+    let ansi_stripped = crate::output::strip_ansi(text);
+    let normalized = crate::output::normalize_terminal_text_for_redaction(text);
+    let normalized_redacted = redact(&normalized);
+    if escapes_included && normalized_redacted == normalized && ansi_stripped == normalized {
+        redact(text)
+    } else {
+        normalized_redacted
+    }
 }
 
 /// Recursively redact every JSON string in `value` in place, routing each
@@ -2879,9 +2960,20 @@ impl ToolHandler for WaGetTextTool {
                 let (text, truncated, truncation_info) =
                     apply_tail_truncation(&full_text, params.tail);
 
+                // Preserve the documented raw-escape contract when no secret
+                // is present, but detect secrets against escape-stripped text
+                // so ANSI cannot splice a credential into pieces. If
+                // normalization reveals a secret, privacy takes precedence
+                // and the response uses the normalized redacted form.
+                let redacted_text = redact_mcp_pane_text_with_escape_contract(
+                    &text,
+                    params.escapes,
+                    |candidate| engine.redact_secrets(candidate),
+                );
+
                 Ok(McpGetTextData {
                     pane_id: params.pane_id,
-                    text: engine.redact_secrets(&text),
+                    text: redacted_text,
                     tail_lines: params.tail,
                     escapes_included: params.escapes,
                     truncated,
@@ -3822,8 +3914,7 @@ impl ToolHandler for WaSearchTool {
                 }
             });
 
-        let redactor = crate::redactor::Redactor::new();
-        let redacted_query = redactor.redact(&canonical.query);
+        let redacted_query = redact_mcp_output_secrets(&canonical.query);
 
         match result {
             Ok(SearchExecution::Lexical(results)) => {
@@ -3836,11 +3927,13 @@ impl ToolHandler for WaSearchTool {
                         seq: r.segment.seq,
                         captured_at: r.segment.captured_at,
                         score: r.score,
-                        snippet: r.snippet.map(|snippet| redactor.redact(&snippet)),
+                        snippet: r
+                            .snippet
+                            .map(|snippet| redact_mcp_output_secrets(&snippet)),
                         content: if snippets_enabled {
                             None
                         } else {
-                            Some(redactor.redact(&r.segment.content))
+                            Some(redact_mcp_output_secrets(&r.segment.content))
                         },
                         semantic_score: None,
                         fusion_rank: None,
@@ -3892,11 +3985,13 @@ impl ToolHandler for WaSearchTool {
                             seq: result.segment.seq,
                             captured_at: result.segment.captured_at,
                             score: hit.fusion_score,
-                            snippet: result.snippet.map(|snippet| redactor.redact(&snippet)),
+                            snippet: result
+                                .snippet
+                                .map(|snippet| redact_mcp_output_secrets(&snippet)),
                             content: if snippets_enabled {
                                 None
                             } else {
-                                Some(redactor.redact(&result.segment.content))
+                                Some(redact_mcp_output_secrets(&result.segment.content))
                             },
                             semantic_score: hit.semantic_score,
                             fusion_rank: Some(hit.fusion_rank),
@@ -4214,6 +4309,48 @@ enum McpAwaitEventCompletionWorkerPhase {
     ServingRequests = 6,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum McpAwaitEventCompletionPreflightRejection {
+    InvalidLease {
+        event_id: i64,
+        token_empty: bool,
+        token_too_long: bool,
+    },
+    ContradictoryTokens { event_id: i64 },
+}
+
+fn mcp_await_event_completion_preflight_rejection(
+    leases: &[EventDeliveryLease],
+) -> Option<McpAwaitEventCompletionPreflightRejection> {
+    if let Some(lease) = leases
+        .iter()
+        .find(|lease| {
+            lease.event_id() <= 0
+                || lease.token().is_empty()
+                || lease.token().len() > EVENT_DELIVERY_LEASE_TOKEN_MAX_BYTES
+        })
+    {
+        return Some(McpAwaitEventCompletionPreflightRejection::InvalidLease {
+            event_id: lease.event_id(),
+            token_empty: lease.token().is_empty(),
+            token_too_long: lease.token().len() > EVENT_DELIVERY_LEASE_TOKEN_MAX_BYTES,
+        });
+    }
+
+    let mut lease_pairs = leases
+        .iter()
+        .map(|lease| (lease.event_id(), lease.token()))
+        .collect::<Vec<_>>();
+    lease_pairs.sort_unstable();
+    lease_pairs.dedup();
+    lease_pairs
+        .windows(2)
+        .find(|pair| pair[0].0 == pair[1].0)
+        .map(|pair| McpAwaitEventCompletionPreflightRejection::ContradictoryTokens {
+            event_id: pair[0].0,
+        })
+}
+
 impl McpAwaitEventCompletionWorkerPhase {
     fn load(phase: &AtomicU8) -> Self {
         match phase.load(Ordering::Acquire) {
@@ -4262,6 +4399,10 @@ struct McpAwaitEventDeliveryCompletionStats {
     completion_attempts_finished: AtomicU64,
     completion_attempts_storage_reusable: AtomicU64,
     completion_attempts_storage_unusable: AtomicU64,
+    completion_jobs_rejected_invalid_lease: AtomicU64,
+    completion_leases_rejected_invalid_lease: AtomicU64,
+    completion_jobs_rejected_contradictory_tokens: AtomicU64,
+    completion_leases_rejected_contradictory_tokens: AtomicU64,
     completion_panics: AtomicU64,
     #[cfg(test)]
     completion_stalls: AtomicU64,
@@ -4311,6 +4452,30 @@ impl McpAwaitEventDeliveryCompletionStats {
             u64::try_from(job_count.saturating_sub(1)).unwrap_or(u64::MAX),
             Ordering::Relaxed,
         );
+    }
+
+    fn record_completion_preflight_rejection(
+        &self,
+        rejection: McpAwaitEventCompletionPreflightRejection,
+        job_count: usize,
+        lease_count: usize,
+    ) {
+        let jobs = u64::try_from(job_count).unwrap_or(u64::MAX);
+        let leases = u64::try_from(lease_count).unwrap_or(u64::MAX);
+        match rejection {
+            McpAwaitEventCompletionPreflightRejection::InvalidLease { .. } => {
+                self.completion_jobs_rejected_invalid_lease
+                    .fetch_add(jobs, Ordering::Relaxed);
+                self.completion_leases_rejected_invalid_lease
+                    .fetch_add(leases, Ordering::Relaxed);
+            }
+            McpAwaitEventCompletionPreflightRejection::ContradictoryTokens { .. } => {
+                self.completion_jobs_rejected_contradictory_tokens
+                    .fetch_add(jobs, Ordering::Relaxed);
+                self.completion_leases_rejected_contradictory_tokens
+                    .fetch_add(leases, Ordering::Relaxed);
+            }
+        }
     }
 
     fn record_reconnect_backoff(&self, wait: std::time::Duration) {
@@ -4378,6 +4543,10 @@ struct McpAwaitEventDeliveryCompletionStatsSnapshot {
     completion_attempts_finished: u64,
     completion_attempts_storage_reusable: u64,
     completion_attempts_storage_unusable: u64,
+    completion_jobs_rejected_invalid_lease: u64,
+    completion_leases_rejected_invalid_lease: u64,
+    completion_jobs_rejected_contradictory_tokens: u64,
+    completion_leases_rejected_contradictory_tokens: u64,
     completion_panics: u64,
     completion_stalls: u64,
     completion_jobs: u64,
@@ -4456,6 +4625,18 @@ impl McpAwaitEventDeliveryCompletionStats {
                 .load(Ordering::Relaxed),
             completion_attempts_storage_unusable: self
                 .completion_attempts_storage_unusable
+                .load(Ordering::Relaxed),
+            completion_jobs_rejected_invalid_lease: self
+                .completion_jobs_rejected_invalid_lease
+                .load(Ordering::Relaxed),
+            completion_leases_rejected_invalid_lease: self
+                .completion_leases_rejected_invalid_lease
+                .load(Ordering::Relaxed),
+            completion_jobs_rejected_contradictory_tokens: self
+                .completion_jobs_rejected_contradictory_tokens
+                .load(Ordering::Relaxed),
+            completion_leases_rejected_contradictory_tokens: self
+                .completion_leases_rejected_contradictory_tokens
                 .load(Ordering::Relaxed),
             completion_panics: self.completion_panics.load(Ordering::Relaxed),
             completion_stalls: self.completion_stalls.load(Ordering::Relaxed),
@@ -5780,6 +5961,8 @@ fn run_mcp_await_event_delivery_completion_worker(
                 let completion_ready = Arc::clone(&ready);
                 let completion_lifecycle_gate = Arc::clone(&lifecycle_gate);
                 let completion_epoch = storage_epoch;
+                let completion_preflight_rejection =
+                    mcp_await_event_completion_preflight_rejection(&leases);
                 completion_in_flight = true;
                 McpAwaitEventCompletionWorkerPhase::CompletingDelivery.store(&phase);
                 runtime.spawn_detached(async move {
@@ -5798,7 +5981,40 @@ fn run_mcp_await_event_delivery_completion_worker(
                         }
                     }
 
-                    let storage_reusable = if synthetic_epoch_failure {
+                    let storage_reusable = if let Some(rejection) =
+                        completion_preflight_rejection
+                    {
+                        completion_stats.record_completion_preflight_rejection(
+                            rejection,
+                            job_count,
+                            leases.len(),
+                        );
+                        match rejection {
+                            McpAwaitEventCompletionPreflightRejection::InvalidLease {
+                                event_id,
+                                token_empty,
+                                token_too_long,
+                            } => tracing::error!(
+                                event_id,
+                                token_empty,
+                                token_too_long,
+                                job_count,
+                                lease_count = leases.len(),
+                                ?outcome,
+                                "MCP event-delivery completion rejected an invalid lease batch before mutation; lease expiry remains the recovery authority"
+                            ),
+                            McpAwaitEventCompletionPreflightRejection::ContradictoryTokens {
+                                event_id,
+                            } => tracing::error!(
+                                event_id,
+                                job_count,
+                                lease_count = leases.len(),
+                                ?outcome,
+                                "MCP event-delivery completion rejected contradictory tokens before mutation; lease expiry remains the recovery authority"
+                            ),
+                        }
+                        true
+                    } else if synthetic_epoch_failure {
                         tracing::warn!(
                             job_count,
                             ?outcome,
@@ -5841,19 +6057,19 @@ fn run_mcp_await_event_delivery_completion_worker(
                             .completion_attempts_storage_unusable
                             .fetch_add(1, Ordering::Relaxed);
                     }
-                    // Publish the terminal count only after the exact outcome
-                    // counters are durable in this stats snapshot.  Tests and
-                    // diagnostics use an Acquire load of `finished` as the
-                    // completion record's release/acquire handoff.
-                    completion_stats
-                        .completion_attempts_finished
-                        .fetch_add(1, Ordering::Release);
                     if !storage_reusable {
                         let _lifecycle_guard = completion_lifecycle_gate
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner);
                         completion_ready.store(false, Ordering::Release);
                     }
+                    // Publish the terminal count only after the exact outcome
+                    // counters and any storage-epoch invalidation are visible.
+                    // Tests and diagnostics use an Acquire load of `finished`
+                    // as the completion record's release/acquire handoff.
+                    completion_stats
+                        .completion_attempts_finished
+                        .fetch_add(1, Ordering::Release);
                     let _ = completion_finished_tx.send(
                         McpAwaitEventServiceTaskFinished::Completion {
                             storage_epoch: completion_epoch,
@@ -6095,6 +6311,32 @@ async fn complete_mcp_await_event_deliveries_with_storage(
     outcome: FrameworkResponseDeliveryOutcome,
 ) -> bool {
     if leases.is_empty() {
+        return true;
+    }
+
+    if let Some(rejection) = mcp_await_event_completion_preflight_rejection(&leases) {
+        match rejection {
+            McpAwaitEventCompletionPreflightRejection::InvalidLease {
+                event_id,
+                token_empty,
+                token_too_long,
+            } => tracing::error!(
+                event_id,
+                token_empty,
+                token_too_long,
+                lease_count = leases.len(),
+                ?outcome,
+                "MCP event-delivery completion rejected an invalid lease batch before mutation; lease expiry remains the recovery authority"
+            ),
+            McpAwaitEventCompletionPreflightRejection::ContradictoryTokens { event_id } => {
+                tracing::error!(
+                    event_id,
+                    lease_count = leases.len(),
+                    ?outcome,
+                    "MCP event-delivery completion rejected contradictory tokens before mutation; lease expiry remains the recovery authority"
+                );
+            }
+        }
         return true;
     }
 
@@ -8979,7 +9221,7 @@ impl ToolHandler for WaSendTool {
                 config.safety.require_prompt_active,
                 Arc::clone(&policy_rate_limiter),
             );
-            let summary = engine.redact_secrets(&params.text);
+            let summary = bounded_mcp_send_text_summary(&engine, &params.text);
 
             let mut input = mcp_send_text_policy_input(
                 params.pane_id,
@@ -8999,7 +9241,9 @@ impl ToolHandler for WaSendTool {
             let redacted_wait_for = params
                 .wait_for
                 .as_ref()
-                .map(|pattern| redact_mcp_wait_pattern_for_output(pattern));
+                .map(|pattern| {
+                    bounded_mcp_send_response_text(&redact_mcp_wait_pattern_for_output(pattern))
+                });
             let wait_matcher = match params.wait_for.as_ref() {
                 Some(pattern) => Some(crate::wezterm::compile_wait_matcher(
                     pattern,
@@ -9064,6 +9308,27 @@ impl ToolHandler for WaSendTool {
                     action,
                     audit_action_id,
                 };
+            }
+
+            // `PolicyGatedInjector` serves multiple non-MCP callers and keeps
+            // its legacy full-text audit summary. The MCP response must use
+            // the normalization-first, bounded summary computed above so an
+            // ANSI-split token or multi-megabyte paste cannot escape through
+            // `data.injection.summary` or force another large response clone.
+            match &mut injection {
+                InjectionResult::Allowed {
+                    summary: output_summary,
+                    ..
+                }
+                | InjectionResult::Denied {
+                    summary: output_summary,
+                    ..
+                }
+                | InjectionResult::RequiresApproval {
+                    summary: output_summary,
+                    ..
+                } => output_summary.clone_from(&summary),
+                InjectionResult::Error { .. } => {}
             }
 
             let mut submit = None;
@@ -9201,7 +9466,8 @@ impl ToolHandler for WaSendTool {
         });
 
         match result {
-            Ok(data) => {
+            Ok(mut data) => {
+                bound_mcp_send_data_output(&mut data);
                 let envelope = McpEnvelope::success(data, elapsed_ms(start));
                 envelope_to_content(envelope)
             }
@@ -9210,7 +9476,7 @@ impl ToolHandler for WaSendTool {
                 // The wait_for compile error (and any other error from this
                 // block) is reflected verbatim into the message; redact
                 // secret-shaped tokens before they reach the MCP client.
-                let message = redact_mcp_output_secrets(&err.to_string());
+                let message = bounded_mcp_send_response_text(&err.to_string());
                 let envelope = McpEnvelope::<()>::error(code, message, hint, elapsed_ms(start));
                 envelope_to_content(envelope)
             }
@@ -16578,6 +16844,47 @@ mod tests {
                 pane_id: 7,
                 existing_id: 11,
             }),
+            crate::Error::Storage(crate::StorageError::LeaseOwnershipConflict {
+                updated: 1,
+                expected: 2,
+            }),
+            crate::Error::Storage(crate::StorageError::LeaseTokenConflict { event_id: 17 }),
+            crate::Error::Storage(crate::StorageError::InvalidEventDeliveryLeaseBatch(
+                crate::error::EventDeliveryLeaseBatchError::TooManyPairs {
+                    actual: 65,
+                    maximum: 64,
+                },
+            )),
+            crate::Error::Storage(crate::StorageError::InvalidEventDeliveryLeaseBatch(
+                crate::error::EventDeliveryLeaseBatchError::NonPositiveEventId,
+            )),
+            crate::Error::Storage(crate::StorageError::InvalidEventDeliveryLeaseBatch(
+                crate::error::EventDeliveryLeaseBatchError::EmptyToken,
+            )),
+            crate::Error::Storage(crate::StorageError::InvalidEventDeliveryLeaseBatch(
+                crate::error::EventDeliveryLeaseBatchError::TokenTooLong {
+                    actual: 257,
+                    maximum: 256,
+                },
+            )),
+            crate::Error::Storage(crate::StorageError::InvalidEventDeliveryLeaseBatch(
+                crate::error::EventDeliveryLeaseBatchError::NegativeHandledAt,
+            )),
+            crate::Error::Storage(crate::StorageError::InvalidEventDeliveryLeaseBatch(
+                crate::error::EventDeliveryLeaseBatchError::EmptyStatus,
+            )),
+            crate::Error::Storage(crate::StorageError::InvalidEventDeliveryLeaseBatch(
+                crate::error::EventDeliveryLeaseBatchError::StatusTooLong {
+                    actual: 257,
+                    maximum: 256,
+                },
+            )),
+            crate::Error::Storage(crate::StorageError::InvalidEventDeliveryLeaseBatch(
+                crate::error::EventDeliveryLeaseBatchError::WorkflowIdTooLong {
+                    actual: 1_025,
+                    maximum: 1_024,
+                },
+            )),
             crate::Error::Storage(crate::StorageError::SequenceDiscontinuity {
                 expected: 8,
                 actual: 9,
@@ -17747,6 +18054,145 @@ mod tests {
                 .unwrap_or_else(std::sync::PoisonError::into_inner),
             vec![(super::McpAwaitEventCompletionBatchPhase::BulkAttempt, 1)],
             "a closed writer invalidates the epoch and must not be hammered by per-lease retries"
+        );
+    }
+
+    #[test]
+    fn await_event_contradictory_tokens_do_not_mutate_or_restart_storage_epoch() {
+        let (_dir, db_path) = temp_db_path();
+        let event_id = seed_event(db_path.as_ref().as_path());
+        let runtime = CompatRuntimeBuilder::current_thread().build().unwrap();
+        let (stale_lease, successor_lease) = runtime.block_on(async {
+            let storage = StorageHandle::new(&db_path.to_string_lossy()).await.unwrap();
+            let stale_lease = match storage
+                .reserve_event_delivery(event_id, std::time::Duration::from_millis(1))
+                .await
+                .unwrap()
+            {
+                crate::storage::EventDeliveryReservation::Acquired(lease) => lease,
+                other => panic!("expected expiring lease, got {other:?}"),
+            };
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            let successor_lease = match storage
+                .reserve_event_delivery(event_id, std::time::Duration::from_secs(60))
+                .await
+                .unwrap()
+            {
+                crate::storage::EventDeliveryReservation::Acquired(lease) => lease,
+                other => panic!("expected successor lease, got {other:?}"),
+            };
+            storage.shutdown().await.unwrap();
+            (stale_lease, successor_lease)
+        });
+
+        let executor = super::McpAwaitEventDeliveryCompletionExecutor::new(Arc::clone(&db_path))
+            .expect("contradictory-token completion service must start");
+        let stats = executor.stats_for_test();
+        assert!(executor.wait_until_ready_for_test(std::time::Duration::from_secs(5)));
+        assert!(executor.try_submit(
+            vec![stale_lease.clone(), successor_lease.clone()],
+            super::FrameworkResponseDeliveryOutcome::DeliveryAcknowledged,
+        ));
+        let settled = wait_for_completion_stats(
+            &stats,
+            "contradictory-token completion preflight",
+            |snapshot| snapshot.completion_attempts_finished == 1,
+        );
+        assert_eq!(settled.completion_batches, 1);
+        assert_eq!(settled.completion_jobs, 1);
+        assert_eq!(settled.completion_leases, 2);
+        assert_eq!(settled.completion_attempts_storage_reusable, 1);
+        assert_eq!(settled.completion_attempts_storage_unusable, 0);
+        assert_eq!(settled.completion_jobs_rejected_invalid_lease, 0);
+        assert_eq!(settled.completion_leases_rejected_invalid_lease, 0);
+        assert_eq!(settled.completion_jobs_rejected_contradictory_tokens, 1);
+        assert_eq!(settled.completion_leases_rejected_contradictory_tokens, 2);
+        assert_eq!(settled.storage_reconnects, 0);
+        assert!(executor.wait_until_ready_for_test(std::time::Duration::from_secs(1)));
+
+        runtime.block_on(async {
+            let storage = StorageHandle::new(&db_path.to_string_lossy()).await.unwrap();
+            assert!(
+                !storage.release_event_delivery(&stale_lease).await.unwrap(),
+                "predecessor token must not displace the current owner"
+            );
+            assert!(
+                storage
+                    .release_event_delivery(&successor_lease)
+                    .await
+                    .unwrap(),
+                "preflight rejection must leave the successor lease untouched"
+            );
+            let probe = match storage
+                .reserve_event_delivery(event_id, std::time::Duration::from_secs(60))
+                .await
+                .unwrap()
+            {
+                crate::storage::EventDeliveryReservation::Acquired(lease) => lease,
+                other => panic!("released successor must be immediately retryable, got {other:?}"),
+            };
+            assert!(storage.release_event_delivery(&probe).await.unwrap());
+            storage.shutdown().await.unwrap();
+        });
+
+        drop(executor);
+        let stopped = wait_for_completion_stats(&stats, "contradictory-token shutdown", |snapshot| {
+            snapshot.worker_stops == 1
+        });
+        assert_eq!(stopped.storage_shutdowns, 1);
+    }
+
+    #[test]
+    fn await_event_invalid_lease_preflight_has_distinct_bounded_counters() {
+        let (_dir, db_path) = temp_db_path();
+        let executor = super::McpAwaitEventDeliveryCompletionExecutor::new(db_path)
+            .expect("invalid-lease completion service must start");
+        let stats = executor.stats_for_test();
+        assert!(executor.wait_until_ready_for_test(std::time::Duration::from_secs(5)));
+        assert!(executor.try_submit(
+            vec![crate::storage::EventDeliveryLease::new(
+                0,
+                String::new(),
+                0,
+                i64::MAX,
+            )],
+            super::FrameworkResponseDeliveryOutcome::Failed,
+        ));
+        let rejected = wait_for_completion_stats(
+            &stats,
+            "invalid-lease completion preflight",
+            |snapshot| snapshot.completion_attempts_finished == 1,
+        );
+        assert_eq!(rejected.completion_attempts_storage_reusable, 1);
+        assert_eq!(rejected.completion_attempts_storage_unusable, 0);
+        assert_eq!(rejected.completion_jobs_rejected_invalid_lease, 1);
+        assert_eq!(rejected.completion_leases_rejected_invalid_lease, 1);
+        assert_eq!(rejected.completion_jobs_rejected_contradictory_tokens, 0);
+        assert_eq!(rejected.completion_leases_rejected_contradictory_tokens, 0);
+        assert_eq!(rejected.storage_reconnects, 0);
+        assert!(executor.wait_until_ready_for_test(std::time::Duration::from_secs(1)));
+        drop(executor);
+        let stopped = wait_for_completion_stats(&stats, "invalid-lease shutdown", |snapshot| {
+            snapshot.worker_stops == 1
+        });
+        assert_eq!(stopped.storage_shutdowns, 1);
+    }
+
+    #[test]
+    fn await_event_preflight_rejects_oversized_opaque_token_before_sorting() {
+        let leases = vec![crate::storage::EventDeliveryLease::new(
+            17,
+            "t".repeat(crate::storage::EVENT_DELIVERY_LEASE_TOKEN_MAX_BYTES + 1),
+            0,
+            i64::MAX,
+        )];
+        assert_eq!(
+            super::mcp_await_event_completion_preflight_rejection(&leases),
+            Some(super::McpAwaitEventCompletionPreflightRejection::InvalidLease {
+                event_id: 17,
+                token_empty: false,
+                token_too_long: true,
+            })
         );
     }
 
@@ -22138,10 +22584,10 @@ exit 17",
         );
         let mut states = vec![McpPaneState {
             pane_id: 42,
-            pane_uuid: None,
+            pane_uuid: Some(format!("uuid-{redaction_fixture}")),
             tab_id: 7,
             window_id: 3,
-            domain: "local".to_string(),
+            domain: format!("domain-{redaction_fixture}"),
             title: Some(format!("codex {redaction_fixture}")),
             cwd: Some(format!("file:///tmp/{redaction_fixture}")),
             observed: true,
@@ -22159,6 +22605,36 @@ exit 17",
             json.contains("[REDACTED]"),
             "expected redaction marker in wa.state JSON"
         );
+    }
+
+    #[test]
+    fn wa_state_redaction_normalizes_ansi_split_secrets_and_display_controls() {
+        let secret = redaction_test_token();
+        let split_at = secret.len() / 2;
+        let hostile = format!(
+            "{}\x1b[31m{}\x1b[0m\u{202e}\n",
+            &secret[..split_at],
+            &secret[split_at..]
+        );
+        let mut states = vec![McpPaneState {
+            pane_id: 42,
+            pane_uuid: Some(hostile.clone()),
+            tab_id: 7,
+            window_id: 3,
+            domain: hostile.clone(),
+            title: Some(hostile.clone()),
+            cwd: Some(hostile.clone()),
+            observed: true,
+            ignore_reason: Some(hostile),
+        }];
+
+        redact_mcp_pane_state_fields(&mut states);
+
+        let json = serde_json::to_string(&states).expect("serialize hostile pane state");
+        assert!(!json.contains(&secret));
+        assert!(!json.contains("\\u001b"));
+        assert!(!json.contains('\u{202e}'));
+        assert!(json.matches("[REDACTED]").count() >= 5);
     }
 
     #[test]
@@ -22718,6 +23194,131 @@ exit 17",
             redacted.contains("[REDACTED]"),
             "expected redaction marker in MCP wait-for pattern output"
         );
+    }
+
+    #[test]
+    fn mcp_output_redaction_normalizes_ansi_split_secrets_and_controls_first() {
+        let secret = redaction_test_token();
+        let split_at = secret.len() / 2;
+        let hostile = format!(
+            "prefix {}\x1b[38;5;196m{}\x1b[0m\u{202e}\nnext",
+            &secret[..split_at],
+            &secret[split_at..]
+        );
+
+        let redacted = redact_mcp_output_secrets(&hostile);
+
+        assert!(!redacted.contains(&secret));
+        assert!(redacted.contains("[REDACTED]"));
+        assert!(!redacted.contains('\x1b'));
+        assert!(!redacted.contains('\u{202e}'));
+        assert!(redacted.contains('\n'), "pane/search layout must be retained");
+    }
+
+    #[test]
+    fn wa_send_summary_normalizes_split_secrets_and_omits_oversized_payloads() {
+        let cfg = Config::default();
+        let limiter = build_mcp_shared_rate_limiter(&cfg);
+        let engine = build_policy_engine_with_shared_rate_limiter(&cfg, false, limiter);
+        let secret = redaction_test_token();
+        let split_at = secret.len() / 2;
+        let hostile = format!(
+            "{}\x1b[31m{}\x1b[0m\u{202e}\ntrailing",
+            &secret[..split_at],
+            &secret[split_at..]
+        );
+
+        let summary = super::bounded_mcp_send_text_summary(&engine, &hostile);
+        assert!(!summary.contains(&secret));
+        assert!(summary.contains("[REDACTED]"));
+        assert!(!summary.contains('\x1b'));
+        assert!(!summary.contains('\u{202e}'));
+        assert!(summary.len() <= super::MCP_SEND_OUTPUT_MAX_BYTES);
+
+        let oversized = "x".repeat(super::MCP_SEND_OUTPUT_INPUT_MAX_BYTES + 1);
+        assert_eq!(
+            super::bounded_mcp_send_text_summary(&engine, &oversized),
+            format!("payload omitted: {} bytes", oversized.len())
+        );
+    }
+
+    #[test]
+    fn wa_send_response_bounds_injection_wait_and_verification_fields() {
+        let secret = redaction_test_token();
+        let split_at = secret.len() / 2;
+        let hostile = format!(
+            "{}\x1b[31m{}\x1b[0m\u{202e}{}",
+            &secret[..split_at],
+            &secret[split_at..],
+            "x".repeat(2_000)
+        );
+        let mut data = super::McpSendData {
+            pane_id: 17,
+            injection: super::InjectionResult::Allowed {
+                decision: super::PolicyDecision::allow_with_rule("test.wa_send_output"),
+                summary: hostile.clone(),
+                pane_id: 17,
+                action: ActionKind::SendText,
+                audit_action_id: None,
+            },
+            wait_for: Some(super::McpWaitForData {
+                pane_id: 17,
+                pattern: hostile.clone(),
+                matched: false,
+                elapsed_ms: 1,
+                polls: 1,
+                is_regex: false,
+            }),
+            verification_error: Some(hostile),
+            submit: None,
+            dry_run: false,
+        };
+
+        super::bound_mcp_send_data_output(&mut data);
+        let json = serde_json::to_string(&data).expect("serialize bounded wa.send response");
+        assert!(!json.contains(&secret));
+        assert!(!json.contains("\\u001b"));
+        assert!(!json.contains('\u{202e}'));
+        let value: serde_json::Value =
+            serde_json::from_str(&json).expect("parse bounded wa.send response");
+        for field in [
+            value["injection"]["summary"].as_str(),
+            value["wait_for"]["pattern"].as_str(),
+            value["verification_error"].as_str(),
+        ] {
+            assert!(
+                field.is_some_and(|field| field.len() <= super::MCP_SEND_OUTPUT_MAX_BYTES)
+            );
+        }
+    }
+
+    #[test]
+    fn get_text_escape_contract_preserves_safe_escapes_but_not_split_secrets() {
+        let redactor = crate::redactor::Redactor::new();
+        let styled = "\x1b[31mordinary output\x1b[0m";
+        assert_eq!(
+            redact_mcp_pane_text_with_escape_contract(styled, true, |candidate| {
+                redactor.redact(candidate)
+            }),
+            styled,
+            "escapes=true must preserve non-secret terminal bytes"
+        );
+
+        let secret = redaction_test_token();
+        let split_at = secret.len() / 2;
+        let hostile = format!(
+            "{}\x1b[31m{}\x1b[0m",
+            &secret[..split_at],
+            &secret[split_at..]
+        );
+        let protected = redact_mcp_pane_text_with_escape_contract(
+            &hostile,
+            true,
+            |candidate| redactor.redact(candidate),
+        );
+        assert!(!protected.contains(&secret));
+        assert!(!protected.contains('\x1b'));
+        assert!(protected.contains("[REDACTED]"));
     }
 
     #[test]

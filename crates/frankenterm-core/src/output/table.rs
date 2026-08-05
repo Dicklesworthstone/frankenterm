@@ -56,6 +56,22 @@ fn replace_untrusted_display_controls(text: &str) -> String {
         .collect()
 }
 
+fn is_untrusted_non_layout_control(character: char) -> bool {
+    is_untrusted_display_control(character) && !matches!(character, '\n' | '\t')
+}
+
+fn replace_untrusted_non_layout_controls(text: &str) -> String {
+    text.chars()
+        .map(|character| {
+            if is_untrusted_non_layout_control(character) {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect()
+}
+
 fn has_exact_safe_style_wrapper(text: &str) -> bool {
     let Some(inner_with_reset) = SAFE_STYLE_PREFIXES
         .iter()
@@ -70,7 +86,27 @@ fn has_exact_safe_style_wrapper(text: &str) -> bool {
     !inner.contains('\x1b') && !inner.chars().any(is_untrusted_display_control)
 }
 
-pub(super) fn sanitize_terminal_text(text: &str) -> String {
+/// Remove terminal escape sequences and replace display-affecting controls
+/// with ordinary spaces, while retaining newlines and tabs that are part of a
+/// machine-facing pane/search payload's text layout.
+///
+/// Secret redaction should run on this normalized text so escape sequences
+/// cannot split a token and have it reconstructed later.
+#[must_use]
+pub fn normalize_terminal_text_for_redaction(text: &str) -> String {
+    let stripped = strip_ansi(text);
+    if stripped.chars().any(is_untrusted_non_layout_control) {
+        replace_untrusted_non_layout_controls(&stripped)
+    } else {
+        stripped
+    }
+}
+
+/// Produce single-line terminal-safe text by removing escape sequences and
+/// replacing every display-affecting control, including layout controls, with
+/// an ordinary space.
+#[must_use]
+pub fn sanitize_terminal_text(text: &str) -> String {
     let stripped = strip_ansi(text);
     if stripped.chars().any(is_untrusted_display_control) {
         replace_untrusted_display_controls(&stripped)
@@ -420,6 +456,7 @@ pub fn strip_ansi(s: &str) -> String {
                 }
             },
             State::Escape => match c {
+                '\x1b' => State::Escape,
                 '[' => State::Csi,
                 ']' => State::Osc,
                 'P' | 'X' | '^' | '_' => State::ControlString,
@@ -428,6 +465,7 @@ pub fn strip_ansi(s: &str) -> String {
                 _ => State::Ground,
             },
             State::EscapeIntermediate => match c {
+                '\x1b' => State::Escape,
                 '\x18' | '\x1a' => State::Ground,
                 '\u{20}'..='\u{2f}' => State::EscapeIntermediate,
                 _ => State::Ground,
@@ -515,6 +553,29 @@ mod tests {
         assert_eq!(strip_ansi("prefix\x1b[31"), "prefix");
         assert_eq!(strip_ansi("hidden\x1b]title\x18visible"), "hiddenvisible");
         assert_eq!(strip_ansi("a\u{009b}31mb"), "ab");
+        assert_eq!(
+            strip_ansi("shown\x1b\x1b]0;hidden title\x07tail"),
+            "showntail",
+            "a repeated ESC restarts escape parsing instead of exposing OSC payload"
+        );
+        assert_eq!(
+            strip_ansi("shown\x1b(\x1bPprivate payload\x1b\\tail"),
+            "showntail",
+            "ESC in an intermediate sequence restarts escape parsing"
+        );
+    }
+
+    #[test]
+    fn redaction_normalization_preserves_layout_but_single_line_sanitization_does_not() {
+        let input = "first\n\tsecond\x1b[31mred\x1b[0m\u{202e}tail\rreturn";
+        assert_eq!(
+            normalize_terminal_text_for_redaction(input),
+            "first\n\tsecondred tail return"
+        );
+        assert_eq!(
+            sanitize_terminal_text(input),
+            "first  secondred tail return"
+        );
     }
 
     #[test]

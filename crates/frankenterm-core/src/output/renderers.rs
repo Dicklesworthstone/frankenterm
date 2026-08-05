@@ -1654,15 +1654,36 @@ pub fn truncate(s: &str, max_len: usize) -> String {
 #[must_use]
 pub fn truncate_bounded(s: &str, max_width: usize, max_bytes: usize) -> String {
     let plain = super::table::sanitize_terminal_text(s);
-    if super::table::prefix_within_width_and_bytes(&plain, max_width, max_bytes).len()
-        == plain.len()
-    {
-        return plain;
+    truncate_prepared_bounded(&plain, max_width, max_bytes)
+}
+
+/// Normalize untrusted terminal text, redact the normalized view, and enforce
+/// grapheme-column and byte ceilings without scanning it through the terminal
+/// sanitizer a second time.
+///
+/// The callback must only replace text (the secret redactor contract); it must
+/// not introduce terminal controls. Keeping the prepared-string truncator
+/// private prevents callers from accidentally labeling raw text as safe.
+#[must_use]
+pub fn sanitize_redact_truncate_bounded(
+    s: &str,
+    max_width: usize,
+    max_bytes: usize,
+    redact: impl FnOnce(&str) -> String,
+) -> String {
+    let normalized = super::table::sanitize_terminal_text(s);
+    let redacted = redact(&normalized);
+    truncate_prepared_bounded(&redacted, max_width, max_bytes)
+}
+
+fn truncate_prepared_bounded(s: &str, max_width: usize, max_bytes: usize) -> String {
+    if super::table::prefix_within_width_and_bytes(s, max_width, max_bytes).len() == s.len() {
+        return s.to_string();
     }
 
     if max_width > 3 && max_bytes > 3 {
         let mut truncated = super::table::prefix_within_width_and_bytes(
-            &plain,
+            s,
             max_width - 3,
             max_bytes - 3,
         )
@@ -1670,7 +1691,7 @@ pub fn truncate_bounded(s: &str, max_width: usize, max_bytes: usize) -> String {
         truncated.push_str("...");
         truncated
     } else {
-        super::table::prefix_within_width_and_bytes(&plain, max_width, max_bytes).to_string()
+        super::table::prefix_within_width_and_bytes(s, max_width, max_bytes).to_string()
     }
 }
 
@@ -3276,6 +3297,25 @@ mod tests {
         let long_zwj = format!("👩{}x", "\u{200d}👩".repeat(80));
         let bounded = truncate_bounded(&long_zwj, 8, 32);
         assert_eq!(bounded, "...");
+    }
+
+    #[test]
+    fn canonical_bounded_redaction_normalizes_before_matching() {
+        let redactor = crate::policy::Redactor::new();
+        let bounded = sanitize_redact_truncate_bounded(
+            "AKIAIOSF\x1b[31mODNN7EXAMPLE\nprivate\u{202e}tail",
+            32,
+            48,
+            |normalized| redactor.redact(normalized),
+        );
+
+        assert!(!bounded.contains("AKIAIOSFODNN7EXAMPLE"));
+        assert!(bounded.contains("[REDACTED]"));
+        assert!(!bounded.contains('\x1b'));
+        assert!(!bounded.contains('\n'));
+        assert!(!bounded.contains('\u{202e}'));
+        assert!(bounded.len() <= 48);
+        assert!(super::super::table::visible_width(&bounded) <= 32);
     }
 
     #[test]

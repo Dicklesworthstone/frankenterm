@@ -19,6 +19,14 @@ use crate::robot_types::{
 };
 use crate::wezterm::{MuxSemanticSnapshot, MuxSemanticZone, MuxSemanticZoneKind};
 
+fn redact_dom_output(text: &str, redactor: &Redactor) -> String {
+    // DOM strings are machine-facing terminal output. Normalize before secret
+    // detection so an ANSI sequence cannot split a token that a downstream
+    // consumer reconstructs by stripping escapes.
+    let normalized = crate::output::normalize_terminal_text_for_redaction(text);
+    redactor.redact(&normalized)
+}
+
 /// Convert a mux semantic zone into the robot envelope zone, redacting text.
 #[must_use]
 pub fn dom_zone_from_mux(zone: &MuxSemanticZone, redactor: &Redactor) -> DomSemanticZone {
@@ -33,7 +41,7 @@ pub fn dom_zone_from_mux(zone: &MuxSemanticZone, redactor: &Redactor) -> DomSema
         end_y: zone.end_y,
         end_x: zone.end_x,
         semantic_type,
-        text: redactor.redact(&zone.text),
+        text: redact_dom_output(&zone.text, redactor),
     }
 }
 
@@ -47,13 +55,14 @@ pub fn dom_unavailable(
     reason: impl Into<String>,
     redactor: &Redactor,
 ) -> DomData {
+    let reason = reason.into();
     DomData {
         pane_id,
         query,
         source: "unavailable".to_string(),
         confidence: 0.0,
         semantic_data_unavailable: true,
-        unavailable_reason: Some(redactor.redact(&reason.into())),
+        unavailable_reason: Some(redact_dom_output(&reason, redactor)),
         requested_command_index,
         zones,
         command: None,
@@ -95,7 +104,7 @@ fn redacted_grid_rows(rows: &[DomGridRowData], redactor: &Redactor) -> Vec<DomGr
         .iter()
         .map(|row| DomGridRowData {
             y: row.y,
-            text: redactor.redact(&row.text),
+            text: redact_dom_output(&row.text, redactor),
             last_changed_seq: row.last_changed_seq,
         })
         .collect::<Vec<_>>();
@@ -510,6 +519,50 @@ mod tests {
             "secret must be redacted in zone text"
         );
         assert!(cmd.text.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn ansi_split_secrets_are_normalized_before_dom_redaction() {
+        let r = Redactor::new();
+        let split_secret = "AKIAIOSF\x1b[31mODNN7EXAMPLE";
+
+        let semantic_zone = dom_zone_from_mux(
+            &zone(MuxSemanticZoneKind::Output, 0, split_secret),
+            &r,
+        );
+        assert_eq!(semantic_zone.text, "[REDACTED]");
+
+        let unavailable = dom_unavailable(
+            9,
+            DomQueryKind::Zones,
+            None,
+            Vec::new(),
+            format!("unavailable because {split_secret}"),
+            &r,
+        );
+        let reason = unavailable
+            .unavailable_reason
+            .expect("unavailable reason is retained");
+        assert!(!reason.contains("AKIAIOSFODNN7EXAMPLE"));
+        assert!(reason.contains("[REDACTED]"));
+
+        let grid = DomGridSnapshot {
+            alt_screen: false,
+            sequence: 1,
+            oldest_retained_seq: 1,
+            cursor_x: 0,
+            cursor_y: 0,
+            rows: vec![grid_row(0, split_secret, 1)],
+        };
+        let data = build_dom_grid_data(
+            9,
+            DomGridQueryKind::BottomRows,
+            &grid,
+            Some(1),
+            None,
+            &r,
+        );
+        assert_eq!(data.rows[0].text, "[REDACTED]");
     }
 
     fn grid_row(y: isize, text: &str, seq: u64) -> DomGridRowData {

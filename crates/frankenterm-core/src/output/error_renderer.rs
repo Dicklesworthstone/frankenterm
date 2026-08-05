@@ -50,7 +50,10 @@ impl ErrorRenderer {
             },
             Error::Storage(e) => match e {
                 StorageError::Database(_) => "FT-2001",
+                StorageError::InvalidEventDeliveryLeaseBatch(_) => "FT-2051",
                 StorageError::ReservationConflict { .. } => "FT-2050",
+                StorageError::LeaseTokenConflict { .. } => "FT-2052",
+                StorageError::LeaseOwnershipConflict { .. } => "FT-2053",
                 StorageError::SequenceDiscontinuity { .. } => "FT-2010",
                 StorageError::MigrationFailed(_) => "FT-2002",
                 StorageError::SchemaTooNew { .. } => "FT-2003",
@@ -485,6 +488,14 @@ mod tests {
         let samples = vec![
             Error::Wezterm(WeztermError::CliNotFound),
             Error::Storage(StorageError::Database("db".to_string())),
+            Error::Storage(StorageError::InvalidEventDeliveryLeaseBatch(
+                crate::error::EventDeliveryLeaseBatchError::EmptyToken,
+            )),
+            Error::Storage(StorageError::LeaseTokenConflict { event_id: 17 }),
+            Error::Storage(StorageError::LeaseOwnershipConflict {
+                updated: 1,
+                expected: 2,
+            }),
             Error::Pattern(PatternError::InvalidRule("rule".to_string())),
             Error::Workflow(WorkflowError::NotFound("missing".to_string())),
             Error::Config(ConfigError::ValidationError("bad".to_string())),
@@ -556,11 +567,32 @@ mod tests {
             "FT-2001"
         );
         assert_eq!(
+            ErrorRenderer::error_code(&Error::Storage(
+                StorageError::InvalidEventDeliveryLeaseBatch(
+                    crate::error::EventDeliveryLeaseBatchError::EmptyToken,
+                ),
+            )),
+            "FT-2051"
+        );
+        assert_eq!(
             ErrorRenderer::error_code(&Error::Storage(StorageError::ReservationConflict {
                 pane_id: 9,
                 existing_id: 17,
             })),
             "FT-2050"
+        );
+        assert_eq!(
+            ErrorRenderer::error_code(&Error::Storage(StorageError::LeaseOwnershipConflict {
+                updated: 1,
+                expected: 2,
+            })),
+            "FT-2053"
+        );
+        assert_eq!(
+            ErrorRenderer::error_code(&Error::Storage(StorageError::LeaseTokenConflict {
+                event_id: 17,
+            })),
+            "FT-2052"
         );
         assert_eq!(
             ErrorRenderer::error_code(&Error::Storage(StorageError::SequenceDiscontinuity {

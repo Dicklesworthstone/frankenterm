@@ -41,6 +41,10 @@ pub use renderers::{
     PaneTableRenderer, Render, RenderContext, ResizeDashboardSnapshot, RuleDetail,
     RuleDetailRenderer, RuleListItem, RuleTestMatch, RulesListRenderer, RulesTestRenderer,
     SearchResultRenderer, SearchSuggestRenderer, Summary, TimelineRenderer, WorkflowResult,
-    WorkflowResultRenderer, WorkflowStepResult, truncate, truncate_bounded,
+    WorkflowResultRenderer, WorkflowStepResult, sanitize_redact_truncate_bounded, truncate,
+    truncate_bounded,
 };
-pub use table::{Alignment, Column, Table, strip_ansi};
+pub use table::{
+    Alignment, Column, Table, normalize_terminal_text_for_redaction, sanitize_terminal_text,
+    strip_ansi,
+};

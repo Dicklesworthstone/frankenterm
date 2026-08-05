@@ -1,20 +1,23 @@
 # Pane-content read-path redaction matrix
 
 **Bead:** ft-h8da2 — audit every path that serves pane-sourced content out of
-`frankenterm-core` and confirm it runs through `Redactor::redact` (or an
-equivalent policy-engine wrapper).
+`frankenterm-core` and confirm terminal text is normalized before it runs
+through `Redactor::redact` (or an equivalent policy-engine wrapper).
 
 **Design invariant:** current local and distributed capture paths redact pane
 content before `output_segments` persistence (`storage::redact_segment_for_persistence`
 and the distributed aggregator ingest choke point). **Every** outbound read path
-still redacts with the current live catalog as defense in depth. A single miss
+still normalizes terminal control sequences and redacts with the current live
+catalog as defense in depth. Normalization must happen first: otherwise ANSI
+can split a token that is reconstructed after escape stripping. A single miss
 is a secret leak; this matrix is the regression benchmark.
 
-## Matrix (as of 2026-04-23)
+## Matrix (as of 2026-08-05)
 
 Column meanings:
-- **Redacts?** `✓` = path invokes `Redactor::redact` (or
-  `PolicyEngine::redact_secrets`, which wraps it); `✗` = leak confirmed;
+- **Redacts?** `✓` = path normalizes terminal text and then invokes
+  `Redactor::redact` (or `PolicyEngine::redact_secrets`, which wraps it);
+  `✗` = leak confirmed;
   `n/a` = path does not carry pane-sourced free text.
 - **Evidence:** specific `file:line` call site that does (or does not) redact.
 
@@ -22,23 +25,30 @@ Column meanings:
 
 | Read path | Field(s) | Redacts? | Evidence |
 |-----------|----------|----------|----------|
-| `wa.get_text` | `data.text` (full pane scrollback) | ✓ | `mcp_tools.rs:1203` `engine.redact_secrets(&text)` |
-| `wa.search` | `data.results[].content`, `data.results[].snippet`, `data.query` | ✓ | `mcp_tools.rs:1601-1619` `Redactor::new()` + `.redact` on each |
-| `wa.state` | `data[].title`, `data[].cwd` | ✓ | The `wa.state` handler now redacts the assembled `McpPaneState` list immediately before serializing the envelope, covering both live panes and distributed panes merged from storage. |
+| `wa.get_text` | `data.text` (full pane scrollback) | ✓ | `mcp_tools.rs::redact_mcp_pane_text_with_escape_contract` checks the escape-normalized view before redaction. With the explicit `escapes=true` contract, requested raw escape bytes are preserved; if normalization reveals a split secret, the response fails closed to normalized redacted text. Regression: `get_text_escape_contract_preserves_safe_escapes_but_not_split_secrets`. |
+| `wa.search` | `data.results[].content`, `data.results[].snippet`, `data.query` | ✓ | Every field routes through `mcp_tools.rs::redact_mcp_output_secrets`, which calls `output::normalize_terminal_text_for_redaction` before the live `Redactor`, preserving search-text layout while removing escape/control ambiguity. |
+| `wa.state` | `data[].pane_uuid`, `data[].domain`, `data[].title`, `data[].cwd`, `data[].ignore_reason` | ✓ | `mcp_tools.rs::redact_mcp_pane_state_fields` funnels the assembled live/distributed state through `redact_mcp_output_secrets` immediately before serialization. |
 | `wa.events` | `data.events[].matched_text`, `data.events[].extracted` | ✓ | Redacted at write time in `runtime.rs:detection_to_stored_event` (Redactor + `redact_json_leaves` on matched_text + extracted string leaves) before persisting `StoredEvent`. All consumers (MCP wa.events, robot events, web /events, replay, storage queries) now see clean rows. Matrix line numbers and "emission only" claim were stale; fixed under ft-xt93w redaction gap audit. |
 | `wa.events_annotate` / `_triage` / `_label` | echoes back the note/label the caller wrote | indirect ✓ | `storage::set_event_note_sync` at `:12603` redacts on write; wa.events_annotate re-reads the stored (already-redacted) value. |
-| `wa.send` (reflects `text` back to caller on dry-run) | `data.injection.summary` | ✓ | Goes through `PolicyGatedInjector` → `policy::Redactor` before audit + summary emission. |
-| `wa.dom` | `data.zones[].text`, `data.command.text`, `data.output.text`, `data.unavailable_reason` (OSC-133 semantic-zone free text) | ✓ | Built via the shared pure core builder `robot_dom::build_dom_data(&snapshot, &redactor)` at `mcp_tools.rs:2970` (`redactor = Redactor::new()` at `:2850`); zone text redacted in `robot_dom.rs:36` `dom_zone_from_mux` (`redactor.redact(&zone.text)`), and the `command` / `output` text fields are cloned from that already-redacted `zones` vector (`robot_dom.rs:201,257-308`); `unavailable_reason` redacted at `robot_dom.rs:56`. `exit_code` is numeric (`n/a`). Unit test: `robot_dom::tests::zone_text_is_redacted`. |
+| `wa.send` (reflects input-derived diagnostics) | `data.injection.summary`, `data.injection.error`, `data.wait_for.pattern`, `data.verification_error` | ✓ | `mcp_tools.rs::bounded_mcp_send_text_summary` applies a 64 KiB preflight and the shared normalization-redaction-truncation pipeline with a 400-column / 1,600-byte cap; the non-dry path replaces the injector's legacy summary with that safe value. `bound_mcp_send_data_output` applies the same response boundary to injection errors/summaries, wait patterns, and verification errors immediately before serialization. Regressions: `wa_send_summary_normalizes_split_secrets_and_omits_oversized_payloads` and `wa_send_response_bounds_injection_wait_and_verification_fields`. |
+| `wa.dom` | `data.zones[].text`, `data.command.text`, `data.output.text`, `data.unavailable_reason` (OSC-133 semantic-zone free text) | ✓ | The shared pure `robot_dom` builder routes zone, grid-row, and unavailable-reason text through `redact_dom_output`, which normalizes before redaction; command/output fields derive from those protected zones. `exit_code` is numeric (`n/a`). Regressions: `zone_text_is_redacted` and `ansi_split_secrets_are_normalized_before_dom_redaction`. |
 
 ### Robot CLI surfaces (`crates/frankenterm/src/main.rs`)
 
 | Read path | Field(s) | Redacts? | Evidence |
 |-----------|----------|----------|----------|
-| `ft robot state` (no `--include-text`) | `data[].title`, `data[].cwd` | ✓ | The robot-state handler now redacts pane `title` / `cwd` immediately before serializing the response envelope, matching the web `/panes` behavior. |
-| `ft robot state --include-text` | `data.pane_text[pane_id]` | ✓ | Text flows through `get_pane_text` → `REDACTOR.redact(text)` helper at `main.rs:6867-6869`. |
-| `ft robot get-text` | pane text payload | ✓ | Same static `REDACTOR` helper at `main.rs:6867-6869`. |
-| `ft robot search` | `results[].snippet`, `results[].content` | ✓ | Goes through the same `wa.search` code path via the shared handler. |
-| `ft robot dom` (`zones` / `last-command` / `output-of`) | `data.zones[].text`, `data.command.text`, `data.output.text` (OSC-133 semantic zones) | ✓ | Same shared pure core builder via `build_robot_dom_data` → `robot_dom::build_dom_data(&snapshot, &Redactor::new())` at `main.rs:23865-23871`; byte-equal with the `wa.dom` MCP envelope. The unavailable path uses `robot_dom::dom_unavailable(&Redactor::new())` at `main.rs:23847-23854`. |
+| `ft robot state` (no `--include-text`) | `data[].title`, `data[].cwd`, `data[].ignore_reason` | ✓ | `main.rs::redact_pane_state_fields_for_output` routes metadata through the single-line `redact_single_line_for_output` chokepoint (`sanitize_terminal_text` followed by live-catalog redaction). |
+| `ft robot state --include-text` | `data.pane_text[pane_id]` | ✓ | `redact_pane_text_results_for_output` uses the same fail-closed escape contract as get-text: explicitly requested raw escapes survive only when the normalized view contains no newly detectable secret. |
+| `ft robot get-text` | pane text payload | ✓ | `main.rs::redact_pane_text_for_output` preserves explicitly requested raw escapes, but emits normalized redacted text whenever normalization reveals a split secret. Regression: `output_redaction_normalizes_ansi_split_secrets_without_breaking_explicit_escape_views`. |
+| `ft robot search` | `query`, `results[].snippet`, `results[].content`, `results[].highlight` | ✓ | Query and result fields route through `main.rs::redact_for_output`, which normalizes before redaction. |
+| `ft robot dom` (`zones` / `last-command` / `output-of`) | `data.zones[].text`, `data.command.text`, `data.output.text`, `data.unavailable_reason` | ✓ | Same shared `robot_dom` pure builder and `redact_dom_output` normalization chokepoint as `wa.dom`; the unavailable path uses it too. |
+
+### Human CLI pane-read surfaces (`crates/frankenterm/src/main.rs`)
+
+| Read path | Field(s) | Redacts? | Evidence |
+|-----------|----------|----------|----------|
+| `ft show <pane> --output` | pane metadata and output | ✓ | Metadata is single-line bounded before display; output routes through `redact_pane_text_for_output(..., false)`, which normalizes before redaction while preserving text layout. |
+| `ft get-text` | pane text payload | ✓ | The human get-text handler routes the selected/tail-truncated payload through `redact_pane_text_for_output`. With `--escapes`, requested ANSI bytes survive only when normalization neither reveals a secret nor removes a non-ANSI display control; otherwise it fails closed to normalized redacted text. |
 
 ### Web API (`crates/frankenterm-core/src/web/`)
 
@@ -65,8 +75,14 @@ Column meanings:
 
 ## Actionable findings from this audit
 
-- No open findings remain in the audited rows above as of `ft-yj375`; `wa.state` and `ft robot state` now redact pane `title` / `cwd` at the serving handler.
-- `ft-5puf0` (Contract-Doctor gap G3): audited the `wa.dom` / `ft robot dom` OSC-133 semantic-zone read path — it was missing from this matrix but NOT a leak. Both the MCP tool and robot CLI route through the single shared pure builder `frankenterm_core::robot_dom::build_dom_data` with a live `Redactor::new()`; zone/command/output text is redacted at `robot_dom.rs:36` and all command/output fields derive from the already-redacted `zones` vector. Added the two rows above. Code-resident proof: `robot_dom::tests::zone_text_is_redacted` (RCH re-run deferred while the lane is flaky).
+- No open source-level findings remain in the reviewed MCP, robot CLI, and
+  human CLI output chokepoints. These paths normalize before redaction,
+  including state/search/DOM/send fields and escape-preserving get-text paths;
+  bounded diagnostic surfaces also apply explicit input and output ceilings.
+  Escape-preserving paths retain explicitly requested raw escape bytes but fail
+  closed to normalized redacted text when the normalized view reveals an
+  ANSI-split secret. Runtime and compiler proof remain separate from this
+  source-level matrix.
 - Policy-denial audit wiring (ft-h90rh / ft-rsqap / ft-mw1zb): 11 of 12 deny paths now also persist to `policy_denied_audit`. Only `wa.send` is deliberately routed through `PolicyGatedInjector` (which already writes to `audit_actions`); adding a second audit stream would double-count. See `docs/security/policy-denial-audit-wiring-matrix.md`.
 
 ## Regression discipline
