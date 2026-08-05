@@ -1178,7 +1178,11 @@ impl TelemetryCollector {
                 true
             }
             SpawnBlockingWithCxError::RuntimeFailure { .. } => {
-                warn!(pid, %error, "Telemetry blocking probe runtime failure");
+                warn!(
+                    pid,
+                    error_class = "telemetry_blocking_probe_runtime_failure",
+                    "Telemetry blocking probe runtime failure"
+                );
                 self.registry.increment_counter("telemetry.sample_failure");
                 self.registry
                     .increment_counter("telemetry.resource_probe.runtime_failure");
