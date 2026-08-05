@@ -408,16 +408,36 @@ impl Error {
             }
             Self::Storage(
                 StorageError::InvalidEventDeliveryLeaseBatch(_)
-                | StorageError::LeaseTokenConflict { .. },
+                | StorageError::LeaseTokenConflict { .. }
+                | StorageError::WriterBackendEpochPoisoned
+                | StorageError::BackendEpochPoisoned
+                | StorageError::MigrationEpochPoisoned
+                | StorageError::WriterClosed
+                | StorageError::SequenceDiscontinuity { .. }
+                | StorageError::MigrationFailed(_)
+                | StorageError::SchemaTooNew { .. }
+                | StorageError::WaTooOld { .. }
+                | StorageError::FtsQueryError(_)
+                | StorageError::Corruption { .. }
+                | StorageError::NotFound(_),
             ) => {
                 NetworkErrorKind::Permanent
+            }
+            Self::Storage(StorageError::SubmitIdempotency(error)) => {
+                if error.is_retryable() {
+                    NetworkErrorKind::Transient
+                } else {
+                    NetworkErrorKind::Permanent
+                }
             }
             Self::Policy(_) => NetworkErrorKind::Degraded,
             Self::Storage(
                 StorageError::ReservationConflict { .. }
                 | StorageError::LeaseOwnershipConflict { .. },
             ) => NetworkErrorKind::Degraded,
-            Self::Storage(_) | Self::Workflow(_) => NetworkErrorKind::Transient,
+            Self::Storage(StorageError::Database(_)) | Self::Workflow(_) => {
+                NetworkErrorKind::Transient
+            }
         }
     }
 }
@@ -609,10 +629,28 @@ pub enum StorageError {
     #[error("Storage writer backend epoch is poisoned; reopen storage before retrying")]
     WriterBackendEpochPoisoned,
 
+    /// A non-writer storage backend reported an indeterminate transaction
+    /// epoch. The loan/connection is terminal and must not be returned to a
+    /// pool or reused.
+    #[error("Storage backend epoch is poisoned; reopen storage before retrying")]
+    BackendEpochPoisoned,
+
     /// A schema-migration transaction could not prove rollback after failure.
     /// The migration connection is terminal and must not be reused.
     #[error("Storage migration connection epoch is poisoned; reopen storage before retrying")]
     MigrationEpochPoisoned,
+
+    /// The dedicated writer completed an orderly shutdown. Reusing the old
+    /// handle cannot succeed; callers must open a fresh storage handle.
+    #[error("Storage writer is closed; reopen storage before retrying")]
+    WriterClosed,
+
+    /// Durable verified-submit claim/replay failure with a finite,
+    /// content-free store-local taxonomy.
+    #[error(transparent)]
+    SubmitIdempotency(
+        #[from] crate::submit_idempotency_store::SubmitIdempotencyError,
+    ),
 
     #[error("Pane {pane_id} already has active reservation (id={existing_id})")]
     ReservationConflict { pane_id: u64, existing_id: i64 },
@@ -673,12 +711,34 @@ impl StorageError {
             .alternative(
                 "Reopen FrankenTerm storage before retrying; the stopped writer connection is not reusable.",
             ),
+            Self::BackendEpochPoisoned => Remediation::new(
+                "A storage backend connection reached an indeterminate transaction state.",
+            )
+            .command("Diagnostics", "ft doctor")
+            .alternative(
+                "Reopen FrankenTerm storage before retrying; the poisoned connection is not reusable.",
+            ),
             Self::MigrationEpochPoisoned => Remediation::new(
                 "Storage migration stopped after an indeterminate transaction outcome.",
             )
             .command("Diagnostics", "ft doctor")
             .alternative(
                 "Reopen FrankenTerm storage before retrying; the stopped migration connection is not reusable.",
+            ),
+            Self::WriterClosed => Remediation::new(
+                "The storage writer has already completed an orderly shutdown.",
+            )
+            .alternative("Open a fresh FrankenTerm storage handle before issuing more work."),
+            Self::SubmitIdempotency(error) if error.is_retryable() => Remediation::new(
+                "The durable submit-idempotency store is temporarily unavailable.",
+            )
+            .alternative("Retry after the storage lock or open failure clears."),
+            Self::SubmitIdempotency(_) => Remediation::new(
+                "The durable submit-idempotency request or store authority is invalid.",
+            )
+            .command("Diagnostics", "ft doctor")
+            .alternative(
+                "Correct the caller key, request conflict, capacity, path, or schema condition before retrying.",
             ),
             Self::ReservationConflict {
                 pane_id,
@@ -923,7 +983,12 @@ mod tests {
             }),
             Error::Storage(StorageError::Database("db error".to_string())),
             Error::Storage(StorageError::WriterBackendEpochPoisoned),
+            Error::Storage(StorageError::BackendEpochPoisoned),
             Error::Storage(StorageError::MigrationEpochPoisoned),
+            Error::Storage(StorageError::WriterClosed),
+            Error::Storage(StorageError::SubmitIdempotency(
+                crate::submit_idempotency_store::SubmitIdempotencyError::SchemaMismatch,
+            )),
             Error::Storage(StorageError::ReservationConflict {
                 pane_id: 7,
                 existing_id: 11,

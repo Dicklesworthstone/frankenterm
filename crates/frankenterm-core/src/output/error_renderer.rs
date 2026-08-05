@@ -52,6 +52,9 @@ impl ErrorRenderer {
                 StorageError::Database(_) => "FT-2001",
                 StorageError::WriterBackendEpochPoisoned => "FT-2005",
                 StorageError::MigrationEpochPoisoned => "FT-2006",
+                StorageError::BackendEpochPoisoned => "FT-2007",
+                StorageError::WriterClosed => "FT-2008",
+                StorageError::SubmitIdempotency(_) => "FT-2054",
                 StorageError::InvalidEventDeliveryLeaseBatch(_) => "FT-2051",
                 StorageError::ReservationConflict { .. } => "FT-2050",
                 StorageError::LeaseTokenConflict { .. } => "FT-2052",
@@ -579,6 +582,24 @@ mod tests {
                 StorageError::MigrationEpochPoisoned,
             )),
             "FT-2006"
+        );
+        assert_eq!(
+            ErrorRenderer::error_code(&Error::Storage(
+                StorageError::BackendEpochPoisoned,
+            )),
+            "FT-2007"
+        );
+        assert_eq!(
+            ErrorRenderer::error_code(&Error::Storage(StorageError::WriterClosed)),
+            "FT-2008"
+        );
+        assert_eq!(
+            ErrorRenderer::error_code(&Error::Storage(
+                StorageError::SubmitIdempotency(
+                    crate::submit_idempotency_store::SubmitIdempotencyError::SchemaMismatch,
+                ),
+            )),
+            "FT-2054"
         );
         assert_eq!(
             ErrorRenderer::error_code(&Error::Storage(

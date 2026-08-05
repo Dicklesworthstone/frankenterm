@@ -471,6 +471,42 @@ pub static FT_2006: ErrorCodeDef = ErrorCodeDef {
     doc_link: None,
 };
 
+/// FT-2007: Generic storage backend epoch poisoned
+pub static FT_2007: ErrorCodeDef = ErrorCodeDef {
+    code: "FT-2007",
+    category: ErrorCategory::Storage,
+    title: "Storage backend must be reopened",
+    description: "A storage backend outside the dedicated writer reached an indeterminate transaction state. The connection or pooled loan was discarded and must not be reused.",
+    causes: &[
+        "A backend transaction reported poison",
+        "Commit or rollback could not establish a reusable connection state",
+        "A backend callback panicked during transactional work",
+    ],
+    recovery_steps: &[
+        RecoveryStep::text("Reopen the affected storage connection before retrying"),
+        RecoveryStep::with_command("Run diagnostics", "ft doctor"),
+        RecoveryStep::text("Inspect storage telemetry if backend poison recurs"),
+    ],
+    doc_link: None,
+};
+
+/// FT-2008: Storage writer closed cleanly
+pub static FT_2008: ErrorCodeDef = ErrorCodeDef {
+    code: "FT-2008",
+    category: ErrorCategory::Storage,
+    title: "Storage writer is closed",
+    description: "The storage writer completed an orderly shutdown, so the old handle cannot admit more work.",
+    causes: &[
+        "A command raced an orderly storage shutdown",
+        "A caller retained a storage handle after shutdown completed",
+    ],
+    recovery_steps: &[
+        RecoveryStep::text("Open a fresh storage handle before issuing more work"),
+        RecoveryStep::with_command("Run diagnostics", "ft doctor"),
+    ],
+    doc_link: None,
+};
+
 /// WA-2010: Sequence discontinuity
 pub static FT_2010: ErrorCodeDef = ErrorCodeDef {
     code: "FT-2010",
@@ -625,6 +661,26 @@ pub static FT_2053: ErrorCodeDef = ErrorCodeDef {
         RecoveryStep::text("Retry only leases whose exact ownership is still current"),
         RecoveryStep::text("Acquire a fresh lease for events whose ownership changed"),
         RecoveryStep::with_command("Inspect recent event state", "ft robot events --limit 20"),
+    ],
+    doc_link: None,
+};
+
+/// FT-2054: Durable verified-submit idempotency failure
+pub static FT_2054: ErrorCodeDef = ErrorCodeDef {
+    code: "FT-2054",
+    category: ErrorCategory::Storage,
+    title: "Verified-submit idempotency rejected",
+    description: "The dedicated durable submit-idempotency store rejected a claim, transition, or replay using a finite fail-closed classification.",
+    causes: &[
+        "A caller key was reused with different request semantics",
+        "The idempotency store schema, path, or record authority is invalid",
+        "The bounded idempotency store reached its configured capacity",
+        "The store is temporarily busy or could not be opened",
+    ],
+    recovery_steps: &[
+        RecoveryStep::text("Correct deterministic request, schema, path, or capacity failures before retrying"),
+        RecoveryStep::text("Retry only a typed busy or transient open failure"),
+        RecoveryStep::with_command("Run diagnostics", "ft doctor"),
     ],
     doc_link: None,
 };
@@ -1167,6 +1223,8 @@ pub static ERROR_CATALOG: LazyLock<HashMap<&'static str, &'static ErrorCodeDef>>
         m.insert("FT-2004", &FT_2004);
         m.insert("FT-2005", &FT_2005);
         m.insert("FT-2006", &FT_2006);
+        m.insert("FT-2007", &FT_2007);
+        m.insert("FT-2008", &FT_2008);
         m.insert("FT-2010", &FT_2010);
         m.insert("FT-2020", &FT_2020);
         m.insert("FT-2030", &FT_2030);
@@ -1175,6 +1233,7 @@ pub static ERROR_CATALOG: LazyLock<HashMap<&'static str, &'static ErrorCodeDef>>
         m.insert("FT-2051", &FT_2051);
         m.insert("FT-2052", &FT_2052);
         m.insert("FT-2053", &FT_2053);
+        m.insert("FT-2054", &FT_2054);
         // Pattern errors
         m.insert("FT-3001", &FT_3001);
         m.insert("FT-3002", &FT_3002);
@@ -1974,6 +2033,27 @@ mod tests {
                 .iter()
                 .any(|step| step.description.contains("Reopen"))
         );
+    }
+
+    #[test]
+    fn ft_2007_and_ft_2008_require_fresh_storage_authority() {
+        for code in ["FT-2007", "FT-2008"] {
+            let def = get_error_code(code).expect("storage lifecycle code");
+            assert_eq!(def.category, ErrorCategory::Storage);
+            assert!(
+                def.recovery_steps
+                    .iter()
+                    .any(|step| step.description.contains("Open") || step.description.contains("open"))
+            );
+        }
+    }
+
+    #[test]
+    fn ft_2054_is_finite_submit_idempotency_guidance() {
+        let def = get_error_code("FT-2054").expect("submit idempotency code");
+        assert_eq!(def.category, ErrorCategory::Storage);
+        assert!(def.title.contains("idempotency"));
+        assert!(def.recovery_steps.len() >= 2);
     }
 
     #[test]

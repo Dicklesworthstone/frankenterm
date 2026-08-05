@@ -567,7 +567,10 @@ pub fn is_retryable(error: &Error) -> bool {
         Error::Storage(e) => match e {
             StorageError::Database(_) => true, // Might be transient lock conflict
             StorageError::WriterBackendEpochPoisoned => false, // Must reopen the storage handle
+            StorageError::BackendEpochPoisoned => false, // Must reopen/discard the backend loan
             StorageError::MigrationEpochPoisoned => false, // Must reopen the migration connection
+            StorageError::WriterClosed => false, // Must open a fresh storage handle
+            StorageError::SubmitIdempotency(error) => error.is_retryable(),
             StorageError::InvalidEventDeliveryLeaseBatch(_) => false, // Caller must rebuild input
             StorageError::ReservationConflict { .. } => false, // Another owner must release first
             StorageError::LeaseTokenConflict { .. } => false, // Input authority is contradictory
@@ -1785,6 +1788,53 @@ mod tests {
         assert!(!is_retryable(&Error::Storage(
             StorageError::MigrationEpochPoisoned,
         )));
+    }
+
+    #[test]
+    fn generic_backend_epoch_poison_and_clean_close_require_reopen() {
+        use crate::error::StorageError;
+        assert!(!is_retryable(&Error::Storage(
+            StorageError::BackendEpochPoisoned,
+        )));
+        assert!(!is_retryable(&Error::Storage(StorageError::WriterClosed)));
+    }
+
+    #[test]
+    fn submit_idempotency_retryability_is_finite_and_typed() {
+        use crate::error::StorageError;
+        use crate::submit_idempotency_store::SubmitIdempotencyError;
+
+        for retryable in [
+            SubmitIdempotencyError::Busy,
+            SubmitIdempotencyError::OpenFailed,
+        ] {
+            assert!(is_retryable(&Error::Storage(
+                StorageError::SubmitIdempotency(retryable),
+            )));
+        }
+        for permanent in [
+            SubmitIdempotencyError::InvalidBinding,
+            SubmitIdempotencyError::EmptyCallerKey,
+            SubmitIdempotencyError::SymlinkRejected,
+            SubmitIdempotencyError::LegacyStorePresent,
+            SubmitIdempotencyError::DirectoryUnavailable,
+            SubmitIdempotencyError::ConfigurationFailed,
+            SubmitIdempotencyError::SchemaMismatch,
+            SubmitIdempotencyError::RequestConflict,
+            SubmitIdempotencyError::CapacityExceeded,
+            SubmitIdempotencyError::EntropyUnavailable,
+            SubmitIdempotencyError::ClaimFailed,
+            SubmitIdempotencyError::TransitionFailed,
+            SubmitIdempotencyError::MissingClaim,
+            SubmitIdempotencyError::InvalidTransition,
+            SubmitIdempotencyError::RecordCorrupt,
+            SubmitIdempotencyError::ReceiptOversize,
+            SubmitIdempotencyError::ReceiptInvalid,
+        ] {
+            assert!(!is_retryable(&Error::Storage(
+                StorageError::SubmitIdempotency(permanent),
+            )));
+        }
     }
 
     #[test]
