@@ -86,6 +86,7 @@ pub(super) fn augment_tool_schema_with_format(input_schema: &mut serde_json::Val
         });
 }
 
+#[cfg(test)]
 pub(super) fn encode_mcp_contents(
     contents: Vec<Content>,
     format: McpOutputFormat,
