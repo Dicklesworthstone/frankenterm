@@ -5040,29 +5040,25 @@ mod tests {
     fn shard_health_entry_serde_roundtrip() {
         let entry = ShardHealthEntry {
             shard_id: ShardId(2),
-            label: "test".to_string(),
             status: HealthStatus::Degraded,
             pane_count: None,
             circuit: CircuitBreakerStatus::default(),
-            error: Some("timeout".to_string()),
+            probe_outcome: ShardHealthProbeOutcome::Failed(ShardBackendErrorClass::Other),
         };
         let json = serde_json::to_string(&entry).unwrap();
         let back: ShardHealthEntry = serde_json::from_str(&json).unwrap();
         assert_eq!(back.shard_id, ShardId(2));
-        assert!(back.label.is_empty());
         assert_eq!(back.status, HealthStatus::Degraded);
-        assert_eq!(back.pane_count, None);
-        assert_eq!(back.error.as_deref(), Some("other"));
-        assert!(!json.contains("test"));
-        assert!(!json.contains("timeout"));
+        assert!(back.pane_count.is_none());
+        assert_eq!(back.probe_outcome, entry.probe_outcome);
         let projection: Value = serde_json::from_str(&json).unwrap();
         assert_eq!(projection["probe_outcome"]["state"], "failed");
         assert_eq!(projection["probe_outcome"]["error_class"], "other");
     }
 
     #[test]
-    fn shard_health_entry_decoder_rejects_oversized_sequence_from_size_hint() {
-        let sequence = std::iter::repeat(0_u8).take(MAX_CONFIGURED_SHARDS + 1);
+    fn shard_health_entries_decoder_rejects_oversized_sequence_from_size_hint() {
+        let sequence = 0..(MAX_CONFIGURED_SHARDS + 1);
         let deserializer = serde::de::value::SeqDeserializer::<
             _,
             serde::de::value::Error,
@@ -5142,7 +5138,6 @@ mod tests {
             let client = ShardedWeztermClient::new(
                 vec![ShardBackend::new(
                     ShardId(0),
-                    "s0",
                     shard0.clone() as WeztermHandle,
                 )],
                 AssignmentStrategy::RoundRobin,
@@ -5170,8 +5165,8 @@ mod tests {
 
             let client = ShardedWeztermClient::new(
                 vec![
-                    ShardBackend::new(ShardId(0), "s0", shard0.clone() as WeztermHandle),
-                    ShardBackend::new(ShardId(1), "s1", shard1.clone() as WeztermHandle),
+                    ShardBackend::new(ShardId(0), shard0.clone() as WeztermHandle),
+                    ShardBackend::new(ShardId(1), shard1.clone() as WeztermHandle),
                 ],
                 AssignmentStrategy::RoundRobin,
             )
@@ -5200,7 +5195,7 @@ mod tests {
             shard0.add_default_pane(1).await;
 
             let client = ShardedWeztermClient::new(
-                vec![ShardBackend::new(ShardId(0), "s0", shard0 as WeztermHandle)],
+                vec![ShardBackend::new(ShardId(0), shard0 as WeztermHandle)],
                 AssignmentStrategy::RoundRobin,
             )
             .unwrap();
@@ -5224,7 +5219,7 @@ mod tests {
             shard0.add_default_pane(1).await;
 
             let client = ShardedWeztermClient::new(
-                vec![ShardBackend::new(ShardId(0), "s0", shard0 as WeztermHandle)],
+                vec![ShardBackend::new(ShardId(0), shard0 as WeztermHandle)],
                 AssignmentStrategy::RoundRobin,
             )
             .unwrap();
@@ -5250,7 +5245,6 @@ mod tests {
             let client = ShardedWeztermClient::new(
                 vec![ShardBackend::new(
                     ShardId(0),
-                    "s0",
                     shard0 as WeztermHandle,
                 )],
                 AssignmentStrategy::RoundRobin,
@@ -5275,7 +5269,6 @@ mod tests {
             let failing_client = ShardedWeztermClient::new(
                 vec![ShardBackend::new(
                     ShardId(0),
-                    "failing",
                     crate::wezterm::mock_wezterm_handle_failing(),
                 )],
                 AssignmentStrategy::RoundRobin,
@@ -5314,7 +5307,6 @@ mod tests {
             let client = ShardedWeztermClient::new(
                 vec![ShardBackend::new(
                     ShardId(0),
-                    "s0",
                     healthy as WeztermHandle,
                 )],
                 AssignmentStrategy::RoundRobin,
@@ -5333,7 +5325,7 @@ mod tests {
             shard0.add_default_pane(3).await;
 
             let client = ShardedWeztermClient::new(
-                vec![ShardBackend::new(ShardId(0), "s0", shard0 as WeztermHandle)],
+                vec![ShardBackend::new(ShardId(0), shard0 as WeztermHandle)],
                 AssignmentStrategy::RoundRobin,
             )
             .unwrap();
@@ -5351,7 +5343,7 @@ mod tests {
             shard0.add_default_pane(3).await;
 
             let client = ShardedWeztermClient::new(
-                vec![ShardBackend::new(ShardId(0), "s0", shard0 as WeztermHandle)],
+                vec![ShardBackend::new(ShardId(0), shard0 as WeztermHandle)],
                 AssignmentStrategy::RoundRobin,
             )
             .unwrap();
@@ -5368,7 +5360,7 @@ mod tests {
             shard0.add_default_pane(42).await;
 
             let client = ShardedWeztermClient::new(
-                vec![ShardBackend::new(ShardId(0), "s0", shard0 as WeztermHandle)],
+                vec![ShardBackend::new(ShardId(0), shard0 as WeztermHandle)],
                 AssignmentStrategy::RoundRobin,
             )
             .unwrap();
@@ -5389,7 +5381,7 @@ mod tests {
             shard0.add_default_pane(1).await;
 
             let client = ShardedWeztermClient::new(
-                vec![ShardBackend::new(ShardId(0), "s0", shard0 as WeztermHandle)],
+                vec![ShardBackend::new(ShardId(0), shard0 as WeztermHandle)],
                 AssignmentStrategy::RoundRobin,
             )
             .unwrap();
@@ -5406,7 +5398,7 @@ mod tests {
             shard0.add_default_pane(1).await;
 
             let client = ShardedWeztermClient::new(
-                vec![ShardBackend::new(ShardId(0), "s0", shard0 as WeztermHandle)],
+                vec![ShardBackend::new(ShardId(0), shard0 as WeztermHandle)],
                 AssignmentStrategy::RoundRobin,
             )
             .unwrap();
@@ -5437,23 +5429,21 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn watchdog_warnings_classifies_absent_error_without_reflecting_backend_text() {
+    fn watchdog_warnings_classifies_complete_unhealthy_probe() {
         let report = ShardHealthReport {
             timestamp_ms: 1000,
             overall: HealthStatus::Critical,
             shards: vec![ShardHealthEntry {
                 shard_id: ShardId(0),
-                label: "s0".to_string(),
                 status: HealthStatus::Critical,
                 pane_count: None,
                 circuit: CircuitBreakerStatus::default(),
-                error: None,
+                probe_outcome: ShardHealthProbeOutcome::Complete,
             }],
         };
         let warnings = report.watchdog_warnings();
         assert_eq!(warnings.len(), 1);
         assert!(warnings[0].contains("probe=complete"));
-        assert!(!warnings[0].contains("s0"));
     }
 
     #[test]
@@ -5462,11 +5452,10 @@ mod tests {
         let shards = (0..shard_count)
             .map(|index| ShardHealthEntry {
                 shard_id: ShardId(index),
-                label: format!("private-label-{index}-{}", "x".repeat(4_096)),
                 status: HealthStatus::Critical,
                 pane_count: None,
                 circuit: CircuitBreakerStatus::default(),
-                error: Some(format!("secret-error-{index}-{}", "y".repeat(4_096))),
+                probe_outcome: ShardHealthProbeOutcome::Failed(ShardBackendErrorClass::Other),
             })
             .collect();
         let report = ShardHealthReport {
@@ -5483,20 +5472,19 @@ mod tests {
         assert!(warnings[..ShardHealthReport::WATCHDOG_WARNING_LIMIT]
             .iter()
             .all(|warning| warning.len() < 256));
-        assert!(warnings.iter().all(|warning| !warning.contains("private-label")));
-        assert!(warnings.iter().all(|warning| !warning.contains("secret-error")));
         assert!(warnings[..ShardHealthReport::WATCHDOG_WARNING_LIMIT]
             .iter()
             .all(|warning| warning.contains("probe=other")));
         let json = serde_json::to_string(&report).unwrap();
-        assert!(!json.contains("private-label"));
-        assert!(!json.contains("secret-error"));
         assert!(json.len() < 128 * 1_024);
         let roundtrip: ShardHealthReport = serde_json::from_str(&json).unwrap();
         assert!(roundtrip
             .shards
             .iter()
-            .all(|entry| entry.label.is_empty() && entry.error.as_deref() == Some("other")));
+            .all(|entry| {
+                entry.probe_outcome
+                    == ShardHealthProbeOutcome::Failed(ShardBackendErrorClass::Other)
+            }));
         assert_eq!(
             warnings.last().map(String::as_str),
             Some(
