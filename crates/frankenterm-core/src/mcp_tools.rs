@@ -7594,8 +7594,11 @@ impl ToolHandler for WaEventsTool {
             }
             .await;
 
-            if let Err(error) = storage.shutdown().await {
-                tracing::warn!(error = %error, "wa.events storage shutdown failed");
+            if let Err(_error) = storage.shutdown().await {
+                tracing::warn!(
+                    error_class = "wa_events_storage_shutdown_failed",
+                    "wa.events storage shutdown failed"
+                );
             }
             operation
         });
@@ -9053,8 +9056,11 @@ async fn attach_mcp_submit_receipt_to_audit(
 
     let verification_summary = match serde_json::to_string(receipt) {
         Ok(summary) => summary,
-        Err(error) => {
-            tracing::warn!(%error, "Failed to serialize wa.send submit receipt");
+        Err(_error) => {
+            tracing::warn!(
+                error_class = "wa_send_submit_receipt_serialization_failed",
+                "Failed to serialize wa.send submit receipt"
+            );
             return;
         }
     };

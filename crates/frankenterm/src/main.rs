@@ -16724,8 +16724,11 @@ fn emit_error_message(
     if output_format.is_json() {
         match serialize_error_envelope(message) {
             Ok(encoded) => println!("{encoded}"),
-            Err(error) => {
-                tracing::error!(%error, "failed to serialize CLI error envelope");
+            Err(_error) => {
+                tracing::error!(
+                    error_class = "cli_error_envelope_serialization_failed",
+                    "failed to serialize CLI error envelope"
+                );
                 println!(r#"{"ok":false,"error":"error response serialization failed"}"#);
             }
         }
