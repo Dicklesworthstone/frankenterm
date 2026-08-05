@@ -3800,7 +3800,8 @@ enum RobotCommands {
 
         /// Atomically reserve each persisted event, write and flush it, then
         /// mark it handled. A crash leaves an expiring lease for redelivery;
-        /// write/flush failures release immediately. Live-only pane lifecycle
+        /// write/flush failures attempt immediate release and fall back to lease
+        /// expiry if storage is unavailable. Live-only pane lifecycle
         /// notifications are not claimable.
         #[arg(long)]
         claim: bool,
@@ -3809,7 +3810,7 @@ enum RobotCommands {
         #[arg(long)]
         cursor: Option<i64>,
 
-        /// Max events fetched per poll batch
+        /// Max events fetched per poll batch (1..=1000)
         #[arg(long, default_value = "100")]
         limit: usize,
 
@@ -23018,18 +23019,74 @@ fn watch_event_passes_filters(
 const WATCH_EVENTS_CLAIM_WORKFLOW_ID: &str = "robot.watch_events";
 const WATCH_EVENTS_CLAIM_STATUS: &str = "claimed";
 const WATCH_EVENTS_CLAIM_LEASE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+const WATCH_EVENTS_BATCH_LIMIT_MAX: usize = 1_000;
+const WATCH_EVENTS_POLL_INTERVAL_MS_MIN: u64 = 10;
 
 fn watch_events_unhandled_only(unhandled: bool, claim: bool) -> bool {
     unhandled || claim
 }
 
+fn validate_watch_events_limit(limit: usize) -> Result<(), &'static str> {
+    if (1..=WATCH_EVENTS_BATCH_LIMIT_MAX).contains(&limit) {
+        Ok(())
+    } else {
+        Err("Invalid --limit: must be in 1..=1000")
+    }
+}
+
+/// Heartbeat cadence requested from the watcher for the private IPC stream.
+///
+/// The stream heartbeat doubles as the wakeup that returns a caught-up follower
+/// to its ordered SQLite drain. It is therefore independent of whether the user
+/// asked to *emit* heartbeat records and may never be slower than the configured
+/// durable poll cadence. [`relay_ipc_event_line`] still applies the user's
+/// output-heartbeat setting before writing anything to stdout.
+#[cfg(unix)]
+fn watch_ipc_durable_poll_heartbeat_interval_ms(
+    output_heartbeat_interval_ms: u64,
+    poll_interval_ms: u64,
+) -> u64 {
+    let durable_poll_interval_ms = poll_interval_ms.max(WATCH_EVENTS_POLL_INTERVAL_MS_MIN);
+    if output_heartbeat_interval_ms == 0 {
+        durable_poll_interval_ms
+    } else {
+        output_heartbeat_interval_ms.min(durable_poll_interval_ms)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WatchEventClaimDelivery {
-    Delivered,
+    Delivered {
+        flushed_at: std::time::Instant,
+    },
     PipeClosed,
     LeasedUntil { expires_at_ms: i64 },
     AlreadyHandledOrMissing,
-    FinalizationLost,
+    FinalizationLost {
+        flushed_at: std::time::Instant,
+    },
+}
+
+impl WatchEventClaimDelivery {
+    fn flushed_at(self) -> Option<std::time::Instant> {
+        match self {
+            Self::Delivered { flushed_at } | Self::FinalizationLost { flushed_at } => {
+                Some(flushed_at)
+            }
+            Self::PipeClosed | Self::LeasedUntil { .. } | Self::AlreadyHandledOrMissing => None,
+        }
+    }
+}
+
+fn note_watch_claim_output_emitted(
+    delivery: WatchEventClaimDelivery,
+    last_emit: &mut std::time::Instant,
+    last_event_emit: &mut Option<std::time::Instant>,
+) {
+    if let Some(flushed_at) = delivery.flushed_at() {
+        *last_emit = flushed_at;
+        *last_event_emit = Some(flushed_at);
+    }
 }
 
 async fn pace_watch_event(
@@ -23113,9 +23170,11 @@ fn annotate_watch_event_claim_delivery(record: &mut serde_json::Value) -> std::i
 
 /// Reserve one event, write and flush its truthful pre-finalization record,
 /// then atomically mark it handled. A process crash leaves an expiring lease;
-/// a known output failure releases it immediately. Cursor ownership remains
-/// with the caller and must advance only for [`WatchEventClaimDelivery::Delivered`]
-/// or [`WatchEventClaimDelivery::AlreadyHandledOrMissing`].
+/// a known output failure attempts to release it immediately and falls back to
+/// expiry if storage cannot perform the release. Cursor ownership remains with
+/// the caller and must advance only for
+/// [`WatchEventClaimDelivery::Delivered`] or
+/// [`WatchEventClaimDelivery::AlreadyHandledOrMissing`].
 async fn deliver_claimed_watch_event<F>(
     storage: &frankenterm_core::storage::StorageHandle,
     event_id: i64,
@@ -23148,8 +23207,8 @@ where
         }
     };
 
-    match write_and_flush(&record) {
-        Ok(true) => {}
+    let flushed_at = match write_and_flush(&record) {
+        Ok(true) => std::time::Instant::now(),
         Ok(false) => {
             match storage.release_event_delivery(&lease).await {
                 Ok(true) => {}
@@ -23190,7 +23249,7 @@ where
                 }
             }
         }
-    }
+    };
 
     let finalized = storage
         .finalize_event_delivery(
@@ -23205,9 +23264,9 @@ where
             ))
         })?;
     Ok(if finalized {
-        WatchEventClaimDelivery::Delivered
+        WatchEventClaimDelivery::Delivered { flushed_at }
     } else {
-        WatchEventClaimDelivery::FinalizationLost
+        WatchEventClaimDelivery::FinalizationLost { flushed_at }
     })
 }
 
@@ -23603,6 +23662,12 @@ enum IpcRelayAction {
     /// dedupe-conflict payload identity are not SQLite cursor authorities. Keep
     /// the healthy subscription and re-enter the ordered durable DB drain.
     DurableWakeup,
+    /// A contract-valid private IPC heartbeat reached the follower. The
+    /// heartbeat may or may not have produced a user-visible record, depending
+    /// on the configured output cadence, but it always returns the follower to
+    /// the ordered durable drain so a commit-without-publication row cannot
+    /// starve behind an otherwise healthy idle subscription.
+    DurablePoll,
     /// A broadcast-lag gap record was emitted; the follower must re-drain the
     /// DB cursor to backfill the dropped-but-persisted events (ft-7h5da.4.2).
     Resync,
@@ -23630,6 +23695,7 @@ fn note_valid_ipc_stream_record(
             IpcRelayAction::Emitted
                 | IpcRelayAction::Skipped
                 | IpcRelayAction::DurableWakeup
+                | IpcRelayAction::DurablePoll
         )
     {
         return false;
@@ -24138,7 +24204,8 @@ fn ipc_relay_record_type(
 /// stream (ft-7h5da.4.1). Persisted events are low-latency wakeups only: the
 /// ordered DB cursor is the sole payload, identity, claim, and ordering
 /// authority. Cursorless lifecycle records remain direct best-effort output;
-/// heartbeats are re-emitted with the follower cursor; gaps trigger durable
+/// heartbeats trigger a durable poll and are re-emitted with the follower cursor
+/// only when the user-visible heartbeat deadline is due; gaps trigger durable
 /// backfill; malformed/unknown records abandon the stream fail-closed.
 #[cfg(unix)]
 async fn relay_ipc_event_line(
@@ -24208,17 +24275,21 @@ async fn relay_ipc_event_line(
             if let Err(fault) = validate_ipc_heartbeat_record(&value) {
                 return Ok(IpcRelayAction::ProtocolFault(fault));
             }
-            // Re-emit with the follower's own cursor (the server sends a null
-            // cursor since it doesn't track the follower's position).
-            let hb = watch_heartbeat_ndjson(*current_cursor, now_ms_i64());
-            let mut lock = stdout.lock();
-            let cont = write_ndjson_line(&mut lock, &hb)?;
-            drop(lock);
-            if !cont {
+            // The private server heartbeat runs no slower than the durable poll
+            // cadence. Preserve that wakeup even when output heartbeats are
+            // disabled, and emit a user-visible heartbeat only when its own
+            // deadline is due. The server sends a null cursor because it does
+            // not track the follower's durable position.
+            if !emit_watch_heartbeat_if_due(
+                stdout,
+                *current_cursor,
+                heartbeat_interval_ms,
+                heartbeat,
+                last_emit,
+            )? {
                 return Ok(IpcRelayAction::PipeClosed);
             }
-            note_watch_output_emitted(last_emit);
-            Ok(IpcRelayAction::Emitted)
+            Ok(IpcRelayAction::DurablePoll)
         }
         IpcRelayRecordType::Gap => {
             if let Err(fault) = validate_ipc_gap_record(&value) {
@@ -37604,6 +37675,18 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                 print_robot_response(&response, format, stats)?;
                                 return Ok(());
                             }
+                            if let Err(message) = validate_watch_events_limit(limit) {
+                                let response = RobotResponse::<serde_json::Value>::error_with_code(
+                                    ROBOT_ERR_INVALID_ARGS,
+                                    message.to_string(),
+                                    Some(format!(
+                                        "Choose a bounded poll batch between 1 and {WATCH_EVENTS_BATCH_LIMIT_MAX}."
+                                    )),
+                                    elapsed_ms(start),
+                                );
+                                print_robot_response(&response, format, stats)?;
+                                return Ok(());
+                            }
                             let severity = match normalize_watch_severity(severity.as_deref()) {
                                 Ok(severity) => severity,
                                 Err(message) => {
@@ -37656,9 +37739,17 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
 
                             let severity_filter = severity.as_deref();
                             let rule_glob = rule_id.as_deref();
-                            let batch_limit = limit.max(1);
+                            let batch_limit = limit;
                             let heartbeat = std::time::Duration::from_millis(heartbeat_interval_ms);
-                            let poll = std::time::Duration::from_millis(poll_interval_ms.max(10));
+                            let poll = std::time::Duration::from_millis(
+                                poll_interval_ms.max(WATCH_EVENTS_POLL_INTERVAL_MS_MIN),
+                            );
+                            #[cfg(unix)]
+                            let ipc_heartbeat_interval_ms =
+                                watch_ipc_durable_poll_heartbeat_interval_ms(
+                                    heartbeat_interval_ms,
+                                    poll_interval_ms,
+                                );
                             let redactor = frankenterm_core::redactor::Redactor::new();
                             let max_hz_interval = watch_max_hz_interval(max_hz);
                             let mut current_cursor = cursor;
@@ -37810,7 +37901,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                     let record = watch_event_ndjson(&redacted);
 
                                     if claim {
-                                        match deliver_claimed_watch_event(
+                                        let delivery = deliver_claimed_watch_event(
                                             &storage,
                                             redacted.id,
                                             record,
@@ -37819,13 +37910,15 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                                 write_ndjson_line(&mut lock, record)
                                             },
                                         )
-                                        .await?
-                                        {
-                                            WatchEventClaimDelivery::Delivered => {
+                                        .await?;
+                                        note_watch_claim_output_emitted(
+                                            delivery,
+                                            &mut last_emit,
+                                            &mut last_event_emit,
+                                        );
+                                        match delivery {
+                                            WatchEventClaimDelivery::Delivered { .. } => {
                                                 current_cursor = Some(redacted.id);
-                                                let now = std::time::Instant::now();
-                                                last_emit = now;
-                                                last_event_emit = Some(now);
                                             }
                                             WatchEventClaimDelivery::PipeClosed => break 'follow,
                                             WatchEventClaimDelivery::AlreadyHandledOrMissing => {
@@ -37839,7 +37932,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                                 claim_retry_hint_ms = Some(expires_at_ms);
                                                 break;
                                             }
-                                            WatchEventClaimDelivery::FinalizationLost => {
+                                            WatchEventClaimDelivery::FinalizationLost { .. } => {
                                                 // The record reached the consumer, but
                                                 // ownership changed before the CAS.
                                                 // Retain the cursor and immediately
@@ -37956,16 +38049,28 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                                         IpcRelayAction::PipeClosed => {
                                                             break 'follow;
                                                         }
-                                                        action @ IpcRelayAction::DurableWakeup => {
+                                                        action @ (IpcRelayAction::DurableWakeup
+                                                        | IpcRelayAction::DurablePoll) => {
                                                             if note_valid_ipc_stream_record(
                                                                 action,
                                                                 &mut ipc_stream_validated,
                                                                 &mut ipc_transport_gap_open,
                                                             ) {
+                                                                let detail = match action {
+                                                                    IpcRelayAction::DurableWakeup => {
+                                                                        "server produced a contract-valid persisted-event wakeup"
+                                                                    }
+                                                                    IpcRelayAction::DurablePoll => {
+                                                                        "server produced a contract-valid durable-poll heartbeat"
+                                                                    }
+                                                                    _ => unreachable!(
+                                                                        "match arm admits only durable poll actions"
+                                                                    ),
+                                                                };
                                                                 observe_ipc_fallback(
                                                                     &mut ipc_diagnostics,
                                                                     IpcFallbackObservation::StreamValidated,
-                                                                    "server produced a contract-valid persisted-event wakeup",
+                                                                    detail,
                                                                 );
                                                             }
                                                             // Keep the healthy subscription while the
@@ -38123,7 +38228,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                                 pane,
                                                 severity.clone(),
                                                 rule_id.clone(),
-                                                heartbeat_interval_ms,
+                                                ipc_heartbeat_interval_ms,
                                             )
                                             .await
                                         {
