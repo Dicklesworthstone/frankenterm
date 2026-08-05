@@ -7,6 +7,7 @@ use super::{
 use crate::mcp_framework::{
     FrameworkContent as Content, FrameworkMcpContext as McpContext, FrameworkMcpError as McpError,
     FrameworkMcpResult as McpResult, FrameworkTool as Tool, FrameworkToolHandler as ToolHandler,
+    FrameworkResponseDeliveryCoordinator,
 };
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -89,8 +90,19 @@ pub(super) fn encode_mcp_contents(
     contents: Vec<Content>,
     format: McpOutputFormat,
 ) -> McpResult<Vec<Content>> {
+    encode_mcp_contents_with_delivery_status(contents, format).0
+}
+
+/// Encode the final requested representation and report whether it faithfully
+/// represents the tool payload. TOON transcode failures are returned as the
+/// established FT-MCP error envelope, so the boolean is the signal that a
+/// prepared delivery must be released rather than armed.
+fn encode_mcp_contents_with_delivery_status(
+    contents: Vec<Content>,
+    format: McpOutputFormat,
+) -> (McpResult<Vec<Content>>, bool) {
     match format {
-        McpOutputFormat::Json => Ok(contents),
+        McpOutputFormat::Json => (Ok(contents), true),
         McpOutputFormat::Toon => {
             let mut encoded = Vec::with_capacity(contents.len());
             for content in contents {
@@ -99,12 +111,15 @@ pub(super) fn encode_mcp_contents(
                         let value = match serde_json::from_str::<serde_json::Value>(&text) {
                             Ok(value) => value,
                             Err(err) => {
-                                return envelope_to_content(McpEnvelope::<()>::error(
-                                    MCP_ERR_INTERNAL,
-                                    "Unable to transcode MCP payload to TOON",
-                                    Some(format!("Tool output was not valid JSON: {err}")),
-                                    0,
-                                ));
+                                return (
+                                    envelope_to_content(McpEnvelope::<()>::error(
+                                        MCP_ERR_INTERNAL,
+                                        "Unable to transcode MCP payload to TOON",
+                                        Some(format!("Tool output was not valid JSON: {err}")),
+                                        0,
+                                    )),
+                                    false,
+                                );
                             }
                         };
                         encoded.push(Content::Text {
@@ -114,7 +129,7 @@ pub(super) fn encode_mcp_contents(
                     other => encoded.push(other),
                 }
             }
-            Ok(encoded)
+            (Ok(encoded), true)
         }
     }
 }
@@ -126,11 +141,27 @@ pub(super) fn encode_mcp_contents(
 /// tool parameter structs do not need to change.
 pub(super) struct FormatAwareToolHandler<T: ToolHandler> {
     inner: T,
+    response_delivery: Option<Arc<FrameworkResponseDeliveryCoordinator>>,
 }
 
 impl<T: ToolHandler> FormatAwareToolHandler<T> {
     pub(super) fn new(inner: T) -> Self {
-        Self { inner }
+        Self {
+            inner,
+            response_delivery: None,
+        }
+    }
+
+    /// Construct a formatter that arms a prepared claim only after the final
+    /// requested JSON/TOON representation has been produced faithfully.
+    pub(super) fn new_with_response_delivery(
+        inner: T,
+        response_delivery: Arc<FrameworkResponseDeliveryCoordinator>,
+    ) -> Self {
+        Self {
+            inner,
+            response_delivery: Some(response_delivery),
+        }
     }
 }
 
@@ -155,8 +186,34 @@ impl<T: ToolHandler> ToolHandler for FormatAwareToolHandler<T> {
                 return envelope_to_content(envelope);
             }
         };
-        let contents = self.inner.call(ctx, arguments)?;
-        encode_mcp_contents(contents, format)
+        let contents = match self.inner.call(ctx, arguments) {
+            Ok(contents) => contents,
+            Err(err) => {
+                if let Some(response_delivery) = &self.response_delivery {
+                    response_delivery.fail_prepared();
+                }
+                return Err(err);
+            }
+        };
+        let (encoded, faithful) = encode_mcp_contents_with_delivery_status(contents, format);
+        match encoded {
+            Ok(contents) => {
+                if let Some(response_delivery) = &self.response_delivery {
+                    if faithful {
+                        let _ = response_delivery.activate_prepared();
+                    } else {
+                        response_delivery.fail_prepared();
+                    }
+                }
+                Ok(contents)
+            }
+            Err(err) => {
+                if let Some(response_delivery) = &self.response_delivery {
+                    response_delivery.fail_prepared();
+                }
+                Err(err)
+            }
+        }
     }
 }
 
@@ -340,17 +397,18 @@ fn classify_audited_tool_result(
 #[cfg(test)]
 mod tests {
     use super::{
-        AuditedToolHandler, MCP_OUTPUT_FORMAT_MAX_BYTES, McpOutputFormat,
+        AuditedToolHandler, FormatAwareToolHandler, MCP_OUTPUT_FORMAT_MAX_BYTES, McpOutputFormat,
         augment_tool_schema_with_format, classify_audited_tool_result, classify_tool_result,
         encode_mcp_contents, extract_mcp_output_format, parse_mcp_output_format,
     };
     use crate::mcp_framework::{
         FrameworkContent as Content, FrameworkMcpContext as McpContext,
-        FrameworkMcpResult as McpResult, FrameworkTool as Tool,
+        FrameworkMcpResult as McpResult, FrameworkResponseDeliveryCoordinator,
+        FrameworkResponseDeliveryOutcome, FrameworkTool as Tool,
         FrameworkToolHandler as ToolHandler,
     };
     use proptest::prelude::*;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
     use std::sync::atomic::{AtomicBool, Ordering};
 
     // ========================================================================
@@ -609,6 +667,83 @@ mod tests {
 
         let result = encode_mcp_contents(vec![], McpOutputFormat::Toon).unwrap();
         assert!(result.is_empty());
+    }
+
+    struct PreparedMalformedPayloadTool {
+        coordinator: Arc<FrameworkResponseDeliveryCoordinator>,
+        completion: Arc<Mutex<Option<FrameworkResponseDeliveryOutcome>>>,
+    }
+
+    impl ToolHandler for PreparedMalformedPayloadTool {
+        fn definition(&self) -> Tool {
+            Tool {
+                name: "test.prepared_malformed_payload".to_string(),
+                description: None,
+                input_schema: serde_json::json!({"type": "object"}),
+                output_schema: None,
+                icon: None,
+                version: None,
+                tags: Vec::new(),
+                annotations: None,
+            }
+        }
+
+        fn call(
+            &self,
+            _ctx: &McpContext,
+            _arguments: serde_json::Value,
+        ) -> McpResult<Vec<Content>> {
+            let completion = Arc::clone(&self.completion);
+            let action = Box::new(move |outcome| {
+                *completion
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(outcome);
+            });
+            if let Err(action) = self.coordinator.try_prepare(action) {
+                action(FrameworkResponseDeliveryOutcome::Failed);
+                panic!("test coordinator unexpectedly contained another delivery");
+            }
+            Ok(vec![Content::Text {
+                text: "not valid JSON for the requested TOON representation".to_string(),
+            }])
+        }
+    }
+
+    #[test]
+    fn format_aware_toon_transcode_failure_releases_prepared_delivery() {
+        let coordinator = Arc::new(FrameworkResponseDeliveryCoordinator::default());
+        let completion = Arc::new(Mutex::new(None));
+        let handler = FormatAwareToolHandler::new_with_response_delivery(
+            PreparedMalformedPayloadTool {
+                coordinator: Arc::clone(&coordinator),
+                completion: Arc::clone(&completion),
+            },
+            Arc::clone(&coordinator),
+        );
+
+        let contents = handler
+            .call(
+                &McpContext::new(fastmcp::Cx::for_testing(), 1),
+                serde_json::json!({"format": "toon"}),
+            )
+            .expect("TOON transcode failure should return the established error envelope");
+        let Content::Text { text } = &contents[0] else {
+            panic!("expected text error envelope");
+        };
+        let envelope: serde_json::Value =
+            serde_json::from_str(text).expect("transcode error envelope should be JSON");
+        assert_eq!(envelope["ok"], false);
+        assert_eq!(envelope["error_code"], crate::mcp_error::MCP_ERR_INTERNAL);
+        assert_eq!(
+            *completion
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            Some(FrameworkResponseDeliveryOutcome::Failed)
+        );
+        assert!(
+            !coordinator.activate_prepared(),
+            "failed final serialization must not leave an armable delivery"
+        );
     }
 
     proptest! {

@@ -508,7 +508,7 @@
           },
           "claim": {
             "default": false,
-            "description": "Mark matched emitted events handled by wa.await_event",
+            "description": "Atomically lease matched emitted events; finalize handled only after successful requested-format response delivery, and release leases on known delivery failure",
             "type": "boolean"
           },
           "cursor": {

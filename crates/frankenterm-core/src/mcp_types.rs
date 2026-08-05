@@ -278,6 +278,12 @@ pub(super) struct McpAwaitEventData {
     pub events: Vec<McpEventItem>,
     pub unhandled_only: bool,
     pub claim: bool,
+    /// Transport-boundary claim disposition. The event rows remain unhandled
+    /// while this payload is constructed and are finalized only after the
+    /// complete MCP response crosses the transport's sender-side delivery
+    /// boundary.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub claim_delivery: Option<&'static str>,
 }
 
 #[derive(Debug, Serialize)]

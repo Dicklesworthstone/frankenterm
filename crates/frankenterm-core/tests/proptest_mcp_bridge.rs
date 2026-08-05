@@ -13,11 +13,15 @@ fn as_btree_set(items: &[&str]) -> BTreeSet<String> {
     items.iter().map(|item| (*item).to_string()).collect()
 }
 
-fn tool_names(server: &frankenterm_core::mcp_framework::FrameworkServer) -> BTreeSet<String> {
+fn tool_names(
+    server: &frankenterm_core::mcp_framework::FrameworkDeliveryServer,
+) -> BTreeSet<String> {
     server.tools().into_iter().map(|tool| tool.name).collect()
 }
 
-fn resource_uris(server: &frankenterm_core::mcp_framework::FrameworkServer) -> BTreeSet<String> {
+fn resource_uris(
+    server: &frankenterm_core::mcp_framework::FrameworkDeliveryServer,
+) -> BTreeSet<String> {
     server
         .resources()
         .into_iter()
@@ -25,7 +29,9 @@ fn resource_uris(server: &frankenterm_core::mcp_framework::FrameworkServer) -> B
         .collect()
 }
 
-fn template_uris(server: &frankenterm_core::mcp_framework::FrameworkServer) -> BTreeSet<String> {
+fn template_uris(
+    server: &frankenterm_core::mcp_framework::FrameworkDeliveryServer,
+) -> BTreeSet<String> {
     server
         .resource_templates()
         .into_iter()

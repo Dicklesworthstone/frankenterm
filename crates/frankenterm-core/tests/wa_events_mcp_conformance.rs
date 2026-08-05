@@ -3,14 +3,89 @@
 use frankenterm_core::config::Config;
 use frankenterm_core::mcp::build_server_with_db;
 use frankenterm_core::mcp_framework::{
-    FrameworkContent, FrameworkTestClient, FrameworkTool, framework_create_memory_transport_pair,
+    FrameworkContent, FrameworkDeliveryAcknowledgingTransport, FrameworkJsonRpcMessage,
+    FrameworkTestClient, FrameworkTool, FrameworkTransport, FrameworkTransportError,
+    framework_create_memory_transport_pair,
 };
 use frankenterm_core::runtime_async::{CompatRuntime, RuntimeBuilder};
-use frankenterm_core::storage::{PaneRecord, StorageHandle, StoredEvent};
+use frankenterm_core::storage::{
+    EventDeliveryLease, EventDeliveryReservation, EventStreamQuery, PaneRecord, StorageHandle,
+    StoredEvent,
+};
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::fs;
 use std::path::PathBuf;
+
+struct FailResponseTransport<T> {
+    inner: T,
+    response_count: usize,
+    fail_on_response: usize,
+}
+
+impl<T> FailResponseTransport<T> {
+    fn new(inner: T, fail_on_response: usize) -> Self {
+        Self {
+            inner,
+            response_count: 0,
+            fail_on_response,
+        }
+    }
+}
+
+impl<T: FrameworkTransport> FrameworkTransport for FailResponseTransport<T> {
+    fn send(
+        &mut self,
+        cx: &frankenterm_core::cx::Cx,
+        message: &FrameworkJsonRpcMessage,
+    ) -> Result<(), FrameworkTransportError> {
+        if matches!(message, FrameworkJsonRpcMessage::Response(_)) {
+            self.response_count += 1;
+            if self.response_count == self.fail_on_response {
+                // Closing the memory endpoint makes the peer observe a terminal
+                // disconnect instead of waiting forever for the injected-lost
+                // response.
+                let _ = self.inner.close();
+                return Err(FrameworkTransportError::Io(std::io::Error::other(
+                    "injected MCP response write failure",
+                )));
+            }
+        }
+        self.inner.send(cx, message)
+    }
+
+    fn recv(
+        &mut self,
+        cx: &frankenterm_core::cx::Cx,
+    ) -> Result<FrameworkJsonRpcMessage, FrameworkTransportError> {
+        self.inner.recv(cx)
+    }
+
+    fn close(&mut self) -> Result<(), FrameworkTransportError> {
+        self.inner.close()
+    }
+}
+
+impl<T: FrameworkDeliveryAcknowledgingTransport> FrameworkDeliveryAcknowledgingTransport
+    for FailResponseTransport<T>
+{
+    fn send_with_delivery_ack(
+        &mut self,
+        cx: &frankenterm_core::cx::Cx,
+        message: &FrameworkJsonRpcMessage,
+    ) -> Result<(), FrameworkTransportError> {
+        if matches!(message, FrameworkJsonRpcMessage::Response(_)) {
+            self.response_count += 1;
+            if self.response_count == self.fail_on_response {
+                let _ = self.inner.close();
+                return Err(FrameworkTransportError::Io(std::io::Error::other(
+                    "injected MCP response write failure",
+                )));
+            }
+        }
+        self.inner.send_with_delivery_ack(cx, message)
+    }
+}
 
 const FIXTURE_TS: i64 = 1_700_000_000_123;
 const FIXTURE_PANE_ID: u64 = 7;
@@ -96,6 +171,14 @@ fn first_text_content(contents: &[FrameworkContent]) -> &str {
 
 fn parse_tool_envelope(contents: &[FrameworkContent]) -> Value {
     serde_json::from_str(first_text_content(contents)).expect("parse JSON envelope")
+}
+
+fn parse_toon_tool_envelope(contents: &[FrameworkContent]) -> Value {
+    let decoded =
+        toon_rust::try_decode(first_text_content(contents), None).expect("decode TOON envelope");
+    let json_text =
+        toon_rust::cli::json_stringify::json_stringify_lines(&decoded, 0).join("\n");
+    serde_json::from_str(&json_text).expect("TOON envelope should stringify back to JSON")
 }
 
 fn assert_schema_matches_manifest(tool_name: &str, actual_schema: &Value) {
@@ -281,11 +364,15 @@ fn make_event() -> StoredEvent {
 }
 
 fn seed_events_fixture(harness: &TestHarness) {
+    seed_events_fixture_at(&harness.db_path);
+}
+
+fn seed_events_fixture_at(db_path: &PathBuf) {
     let runtime = RuntimeBuilder::current_thread()
         .build()
         .expect("build runtime");
     runtime.block_on(async {
-        let storage = StorageHandle::new(&harness.db_path.to_string_lossy())
+        let storage = StorageHandle::new(&db_path.to_string_lossy())
             .await
             .expect("open storage");
         storage
@@ -384,6 +471,81 @@ fn seed_many_events(harness: &TestHarness, events: Vec<StoredEvent>) {
     });
 }
 
+fn load_fixture_events(db_path: &PathBuf) -> Vec<StoredEvent> {
+    let runtime = RuntimeBuilder::current_thread()
+        .build()
+        .expect("build runtime");
+    runtime.block_on(async {
+        let storage = StorageHandle::new(&db_path.to_string_lossy())
+            .await
+            .expect("open storage");
+        let events = storage
+            .get_events_stream(EventStreamQuery {
+                after_id: Some(0),
+                limit: Some(1_000),
+                pane_id: Some(FIXTURE_PANE_ID),
+                rule_id: None,
+                event_type: None,
+                triage_state: None,
+                label: None,
+                unhandled_only: false,
+                since: None,
+                until: None,
+            })
+            .await
+            .expect("query fixture events");
+        storage.shutdown().await.expect("shutdown storage");
+        events
+    })
+}
+
+fn reserve_fixture_event_id(
+    db_path: &PathBuf,
+    event_id: i64,
+    ttl: std::time::Duration,
+) -> EventDeliveryLease {
+    let runtime = RuntimeBuilder::current_thread()
+        .build()
+        .expect("build runtime");
+    runtime.block_on(async {
+        let storage = StorageHandle::new(&db_path.to_string_lossy())
+            .await
+            .expect("open storage");
+        let reservation = storage
+            .reserve_event_delivery(event_id, ttl)
+            .await
+            .expect("reserve fixture event");
+        storage.shutdown().await.expect("shutdown storage");
+        match reservation {
+            EventDeliveryReservation::Acquired(lease) => lease,
+            other => panic!("expected fixture delivery lease, got {other:?}"),
+        }
+    })
+}
+
+fn reserve_fixture_event(db_path: &PathBuf, ttl: std::time::Duration) -> EventDeliveryLease {
+    reserve_fixture_event_id(db_path, 1, ttl)
+}
+
+fn release_fixture_event(db_path: &PathBuf, lease: &EventDeliveryLease) {
+    let runtime = RuntimeBuilder::current_thread()
+        .build()
+        .expect("build runtime");
+    runtime.block_on(async {
+        let storage = StorageHandle::new(&db_path.to_string_lossy())
+            .await
+            .expect("open storage");
+        assert!(
+            storage
+                .release_event_delivery(lease)
+                .await
+                .expect("release fixture event"),
+            "fixture lease must still be owned"
+        );
+        storage.shutdown().await.expect("shutdown storage");
+    });
+}
+
 fn call_events(harness: &mut TestHarness, args: Value) -> Value {
     parse_tool_envelope(
         &harness
@@ -412,6 +574,14 @@ fn assert_await_event_success_data(envelope: &Value, claim: bool) {
     assert_eq!(data["final_cursor"], Value::from(1));
     assert_eq!(data["unhandled_only"], Value::Bool(claim));
     assert_eq!(data["claim"], Value::Bool(claim));
+    if claim {
+        assert_eq!(
+            data["claim_delivery"],
+            Value::String("finalize_after_delivery_ack".to_string())
+        );
+    } else {
+        assert!(data.get("claim_delivery").is_none());
+    }
     assert_eq!(data["any"][0]["condition"], "rule:codex.*");
     assert_eq!(data["any"][0]["met"], Value::Bool(true));
 
@@ -427,16 +597,12 @@ fn assert_await_event_success_data(envelope: &Value, claim: bool) {
         event["event_type"],
         Value::String("usage_limit".to_string())
     );
-    if claim {
-        assert!(event["handled_at"].is_number());
-        assert_eq!(
-            event["workflow_id"],
-            Value::String("mcp.wa.await_event".to_string())
-        );
-    } else {
-        assert!(event.get("handled_at").is_none());
-        assert!(event.get("workflow_id").is_none());
-    }
+    // The payload reflects the durable row as read before transport. A claim
+    // is finalized only after the complete response crosses the transport's
+    // sender-side delivery boundary, so
+    // these pre-finalize fields must never be fabricated.
+    assert!(event.get("handled_at").is_none());
+    assert!(event.get("workflow_id").is_none());
 }
 
 #[test]
@@ -561,6 +727,414 @@ fn mcp_conformance_wa_await_event_claim_marks_event_handled() {
         json!([]),
         "claimed event must no longer appear in unhandled wa.events results"
     );
+}
+
+#[test]
+fn mcp_conformance_wa_await_event_claim_toon_finalizes_after_transport() {
+    let mut harness = new_harness();
+    seed_events_fixture(&harness);
+
+    let contents = harness
+        .client
+        .call_tool(
+            "wa.await_event",
+            json!({
+                "any": ["rule:codex.*"],
+                "cursor": 0,
+                "pane": FIXTURE_PANE_ID,
+                "timeout_secs": 1,
+                "poll_interval_ms": 10,
+                "claim": true,
+                "format": "toon"
+            }),
+        )
+        .expect("call TOON wa.await_event claim");
+    let envelope = parse_toon_tool_envelope(&contents);
+    assert_success_envelope_shape(&envelope);
+    assert_await_event_success_data(&envelope, true);
+
+    // A memory-transport peer can receive the response after its channel send
+    // succeeds but while the server-side post-send finalizer is still running.
+    // The server loop is sequential, so a subsequent request is a deterministic
+    // barrier proving that finalization completed without weakening the
+    // at-least-once delivery contract.
+    let _barrier = call_events(&mut harness, json!({"limit": 1}));
+    let events = load_fixture_events(&harness.db_path);
+    assert_eq!(events.len(), 1);
+    assert!(events[0].handled_at.is_some());
+    assert_eq!(
+        events[0].handled_by_workflow_id.as_deref(),
+        Some("mcp.wa.await_event")
+    );
+}
+
+#[test]
+fn mcp_conformance_idless_long_poll_is_rejected_before_dispatch() {
+    let mut harness = new_harness();
+    seed_events_fixture(&harness);
+    let cx = frankenterm_core::cx::Cx::for_request();
+    let notification: FrameworkJsonRpcMessage = serde_json::from_value(json!({
+        "jsonrpc": "2.0",
+        "method": "tools/call",
+        "params": {
+            "name": "wa.await_event",
+            "arguments": {
+                "any": ["rule:never.matches"],
+                "cursor": 0,
+                "pane": FIXTURE_PANE_ID,
+                "timeout_secs": 300,
+                "poll_interval_ms": 30_000,
+                "claim": true
+            }
+        }
+    }))
+    .expect("construct id-less tools/call notification");
+
+    harness
+        .client
+        .transport_mut()
+        .send(&cx, &notification)
+        .expect("send claim-capable notification");
+    // The server processes transport messages sequentially. This ordinary
+    // request forces it past the notification and proves the notification's
+    // unresolved action was released before this response was written.
+    let barrier_started = std::time::Instant::now();
+    harness
+        .client
+        .list_tools()
+        .expect("send post-notification response barrier");
+    assert!(
+        barrier_started.elapsed() < std::time::Duration::from_secs(1),
+        "an id-less long poll must be rejected before it can monopolize the sequential server"
+    );
+
+    let events = load_fixture_events(&harness.db_path);
+    assert_eq!(events.len(), 1);
+    assert!(
+        events[0].handled_at.is_none(),
+        "an id-less tool call has no response boundary and must never dispatch/finalize"
+    );
+    let lease = reserve_fixture_event(&harness.db_path, std::time::Duration::from_secs(1));
+    release_fixture_event(&harness.db_path, &lease);
+}
+
+fn assert_await_event_claim_send_failure_releases_lease(
+    requested_format: Option<&str>,
+    db_name: &str,
+) {
+    let workspace = tempfile::tempdir().expect("create temp workspace");
+    let db_path = workspace.path().join(db_name);
+    let server = build_server_with_db(&Config::default(), Some(db_path.clone()))
+        .expect("build MCP server");
+    let (client_transport, server_transport) = framework_create_memory_transport_pair();
+    let server_thread = std::thread::spawn(move || {
+        // Response 1 is initialize. Response 2 is wa.await_event and is the
+        // injected transport failure whose staged lease must be released.
+        server.run_transport_returning(FailResponseTransport::new(server_transport, 2));
+    });
+    let mut client = FrameworkTestClient::new(client_transport);
+    client.initialize().expect("initialize MCP client");
+    seed_events_fixture_at(&db_path);
+
+    let mut arguments = json!({
+        "any": ["rule:codex.*"],
+        "cursor": 0,
+        "pane": FIXTURE_PANE_ID,
+        "timeout_secs": 1,
+        "poll_interval_ms": 10,
+        "claim": true
+    });
+    if let Some(format) = requested_format {
+        arguments["format"] = Value::String(format.to_string());
+    }
+    let error = client
+        .call_tool("wa.await_event", arguments)
+        .expect_err("injected response failure must disconnect the client");
+    assert!(
+        error.to_string().contains("closed") || error.to_string().contains("Closed"),
+        "unexpected transport failure: {error}"
+    );
+    server_thread.join().expect("join failed-response server");
+
+    let events = load_fixture_events(&db_path);
+    assert_eq!(events.len(), 1);
+    assert!(
+        events[0].handled_at.is_none(),
+        "failed response must not mark its event handled"
+    );
+
+    // Immediate reacquisition proves the known-failure path released the lease
+    // instead of merely relying on crash-expiry recovery.
+    let lease = reserve_fixture_event(&db_path, std::time::Duration::from_secs(1));
+    release_fixture_event(&db_path, &lease);
+}
+
+#[test]
+fn mcp_conformance_wa_await_event_claim_json_send_failure_releases_lease() {
+    assert_await_event_claim_send_failure_releases_lease(
+        Some("json"),
+        "mcp-json-send-failure.sqlite3",
+    );
+}
+
+#[test]
+fn mcp_conformance_wa_await_event_claim_toon_send_failure_releases_lease() {
+    assert_await_event_claim_send_failure_releases_lease(
+        Some("toon"),
+        "mcp-toon-send-failure.sqlite3",
+    );
+}
+
+#[test]
+fn mcp_conformance_wa_await_event_live_lease_retains_cursor_until_retry() {
+    let mut harness = new_harness();
+    seed_events_fixture(&harness);
+    let competing_lease =
+        reserve_fixture_event(&harness.db_path, std::time::Duration::from_secs(5));
+
+    let timed_out = call_await_event(
+        &mut harness,
+        json!({
+            "any": ["rule:codex.*"],
+            "cursor": 0,
+            "pane": FIXTURE_PANE_ID,
+            "timeout_secs": 1,
+            "poll_interval_ms": 10,
+            "claim": true
+        }),
+    );
+    assert_success_envelope_shape(&timed_out);
+    assert_eq!(timed_out["data"]["satisfied"], Value::Bool(false));
+    assert_eq!(timed_out["data"]["timed_out"], Value::Bool(true));
+    assert_eq!(timed_out["data"]["final_cursor"], Value::from(0));
+    assert_eq!(timed_out["data"]["events"], json!([]));
+
+    release_fixture_event(&harness.db_path, &competing_lease);
+    let retried = call_await_event(
+        &mut harness,
+        json!({
+            "any": ["rule:codex.*"],
+            "cursor": 0,
+            "pane": FIXTURE_PANE_ID,
+            "timeout_secs": 1,
+            "poll_interval_ms": 10,
+            "claim": true
+        }),
+    );
+    assert_success_envelope_shape(&retried);
+    assert_await_event_success_data(&retried, true);
+    let _delivery_barrier = call_events(&mut harness, json!({"limit": 1}));
+}
+
+#[test]
+fn mcp_conformance_wa_await_event_observes_early_lease_release_before_timeout() {
+    let mut harness = new_harness();
+    seed_events_fixture(&harness);
+    let competing_lease =
+        reserve_fixture_event(&harness.db_path, std::time::Duration::from_secs(5));
+    let release_db_path = harness.db_path.clone();
+    let releaser = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        release_fixture_event(&release_db_path, &competing_lease);
+    });
+
+    let acquired = call_await_event(
+        &mut harness,
+        json!({
+            "any": ["rule:codex.*"],
+            "cursor": 0,
+            "pane": FIXTURE_PANE_ID,
+            "timeout_secs": 2,
+            "poll_interval_ms": 20,
+            "claim": true
+        }),
+    );
+    releaser.join().expect("join early lease releaser");
+    assert_success_envelope_shape(&acquired);
+    assert_await_event_success_data(&acquired, true);
+    let _delivery_barrier = call_events(&mut harness, json!({"limit": 1}));
+}
+
+#[test]
+fn mcp_conformance_retried_hole_across_large_backlog_preserves_order_and_cursor() {
+    let mut harness = new_harness();
+    let mut backlog = Vec::with_capacity(502);
+    backlog.push(make_event_with(1, "rule.a", FIXTURE_TS));
+    for id in 2..=501 {
+        backlog.push(make_event_with(
+            id,
+            "noise.unmatched",
+            FIXTURE_TS + i64::try_from(id).expect("fixture id fits i64"),
+        ));
+    }
+    backlog.push(make_event_with(502, "rule.b", FIXTURE_TS + 502));
+    seed_many_events(&harness, backlog);
+    let competing_lease = reserve_fixture_event_id(
+        &harness.db_path,
+        1,
+        std::time::Duration::from_secs(5),
+    );
+    let release_db_path = harness.db_path.clone();
+    let releaser = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        release_fixture_event(&release_db_path, &competing_lease);
+    });
+
+    let acquired = call_await_event(
+        &mut harness,
+        json!({
+            "all": ["rule:rule.a", "rule:rule.b"],
+            "cursor": 0,
+            "pane": FIXTURE_PANE_ID,
+            "timeout_secs": 2,
+            "poll_interval_ms": 20,
+            "claim": true
+        }),
+    );
+    releaser.join().expect("join ordered-hole lease releaser");
+    assert_success_envelope_shape(&acquired);
+    assert_eq!(acquired["data"]["satisfied"], Value::Bool(true));
+    assert_eq!(acquired["data"]["timed_out"], Value::Bool(false));
+    assert_eq!(acquired["data"]["final_cursor"], Value::from(502));
+    assert_eq!(
+        acquired["data"]["events"]
+            .as_array()
+            .expect("ordered matched events")
+            .iter()
+            .map(|event| event["id"].as_i64().expect("event id"))
+            .collect::<Vec<_>>(),
+        vec![1, 502],
+        "acquisition order 502 then 1 must not leak into the ascending-ID response contract"
+    );
+    assert!(
+        acquired["data"]["all"]
+            .as_array()
+            .expect("all-condition statuses")
+            .iter()
+            .all(|condition| condition["met"] == Value::Bool(true))
+    );
+
+    let _delivery_barrier = call_events(&mut harness, json!({"limit": 1}));
+    let events = load_fixture_events(&harness.db_path);
+    assert_eq!(events.len(), 502);
+    assert!(events[0].handled_at.is_some());
+    assert!(events[501].handled_at.is_some());
+    assert!(
+        events[1..501]
+            .iter()
+            .all(|event| event.handled_at.is_none()),
+        "unmatched backlog rows must not be claimed"
+    );
+}
+
+#[test]
+fn mcp_conformance_live_lease_does_not_block_a_later_matching_event() {
+    let mut harness = new_harness();
+    seed_many_events(
+        &harness,
+        vec![
+            make_event_with(1, FIXTURE_RULE_ID, FIXTURE_TS),
+            make_event_with(2, FIXTURE_RULE_ID, FIXTURE_TS + 1),
+        ],
+    );
+    let competing_lease =
+        reserve_fixture_event(&harness.db_path, std::time::Duration::from_secs(5));
+
+    let claimed = call_await_event(
+        &mut harness,
+        json!({
+            "any": ["rule:codex.*"],
+            "cursor": 0,
+            "pane": FIXTURE_PANE_ID,
+            "timeout_secs": 1,
+            "poll_interval_ms": 10,
+            "claim": true
+        }),
+    );
+    assert_success_envelope_shape(&claimed);
+    assert_eq!(claimed["data"]["satisfied"], Value::Bool(true));
+    assert_eq!(claimed["data"]["events"].as_array().map(Vec::len), Some(1));
+    assert_eq!(claimed["data"]["events"][0]["id"], Value::from(2));
+    assert_eq!(
+        claimed["data"]["final_cursor"],
+        Value::from(0),
+        "the exposed cursor must remain before the still-leased id=1 hole"
+    );
+
+    let _delivery_barrier = call_events(&mut harness, json!({"limit": 1}));
+    let events = load_fixture_events(&harness.db_path);
+    assert!(events[0].handled_at.is_none());
+    assert!(events[1].handled_at.is_some());
+    release_fixture_event(&harness.db_path, &competing_lease);
+}
+
+#[test]
+fn mcp_conformance_wa_await_event_concurrent_claimers_emit_event_once() {
+    let workspace = tempfile::tempdir().expect("create temp workspace");
+    let db_path = workspace.path().join("mcp-concurrent-claims.sqlite3");
+    let mut client_a = spawn_client(Some(db_path.clone()));
+    let mut client_b = spawn_client(Some(db_path.clone()));
+    seed_events_fixture_at(&db_path);
+    let args = json!({
+        "any": ["rule:codex.*"],
+        "cursor": 0,
+        "pane": FIXTURE_PANE_ID,
+        "timeout_secs": 1,
+        "poll_interval_ms": 10,
+        "claim": true
+    });
+    let args_b = args.clone();
+
+    let claim_a = std::thread::spawn(move || {
+        let envelope = parse_tool_envelope(
+            &client_a
+                .call_tool("wa.await_event", args)
+                .expect("call concurrent claimant A"),
+        );
+        client_a
+            .call_tool("wa.events", json!({"limit": 1}))
+            .expect("claimant A delivery barrier");
+        envelope
+    });
+    let claim_b = std::thread::spawn(move || {
+        let envelope = parse_tool_envelope(
+            &client_b
+                .call_tool("wa.await_event", args_b)
+                .expect("call concurrent claimant B"),
+        );
+        client_b
+            .call_tool("wa.events", json!({"limit": 1}))
+            .expect("claimant B delivery barrier");
+        envelope
+    });
+    let envelope_a = claim_a.join().expect("join claimant A");
+    let envelope_b = claim_b.join().expect("join claimant B");
+
+    let emitted_a = envelope_a["data"]["events"]
+        .as_array()
+        .expect("claimant A events")
+        .len();
+    let emitted_b = envelope_b["data"]["events"]
+        .as_array()
+        .expect("claimant B events")
+        .len();
+    assert_eq!(
+        emitted_a + emitted_b,
+        1,
+        "atomic reservation must permit exactly one emitted claim"
+    );
+    assert_eq!(
+        [envelope_a, envelope_b]
+            .iter()
+            .filter(|envelope| envelope["data"]["satisfied"] == Value::Bool(true))
+            .count(),
+        1,
+        "exactly one concurrent claimant must satisfy on the single event"
+    );
+
+    let events = load_fixture_events(&db_path);
+    assert_eq!(events.len(), 1);
+    assert!(events[0].handled_at.is_some());
 }
 
 #[test]

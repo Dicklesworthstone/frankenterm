@@ -152,6 +152,10 @@ pub(crate) fn map_mcp_error(error: &Error) -> (&'static str, Option<String>) {
         Error::Storage(_) => (MCP_ERR_STORAGE, None),
         Error::Workflow(_) => (MCP_ERR_WORKFLOW, None),
         Error::Policy(_) => (MCP_ERR_POLICY, None),
+        Error::Cancelled(_) => (
+            MCP_ERR_TIMEOUT,
+            Some("Retry the request or increase its timeout budget.".to_string()),
+        ),
         Error::RuntimeOperation {
             operation: "mcp_bridge.build_server_with_db",
             ..
@@ -421,6 +425,17 @@ mod tests {
         let err = Error::Policy("denied".to_string());
         let (code, _) = map_mcp_error(&err);
         assert_eq!(code, MCP_ERR_POLICY);
+    }
+
+    #[test]
+    fn map_error_cancellation_is_a_retryable_timeout_not_storage_or_internal() {
+        let err = Error::Cancelled("request budget exhausted".to_string());
+        let (code, hint) = map_mcp_error(&err);
+        assert_eq!(code, MCP_ERR_TIMEOUT);
+        assert!(
+            hint.is_some_and(|hint| !hint.is_empty() && hint.contains("Retry")),
+            "cancellation must carry actionable retry guidance"
+        );
     }
 
     #[test]

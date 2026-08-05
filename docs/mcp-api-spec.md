@@ -63,6 +63,7 @@ legacy `wa://...` scheme for backward compatibility.
 | `wa.wait_for` | Wait for pattern match | `docs/json-schema/wa-robot-wait-for.json` |
 | `wa.search` | Unified lexical/semantic/hybrid search across captures | `docs/json-schema/wa-robot-search.json` |
 | `wa.events` | Query events | `docs/json-schema/wa-robot-events.json` |
+| `wa.await_event` | Long-poll for persisted events, with optional delivery claims | Inline (`McpAwaitEventData`) |
 | `wa.events_annotate` | Set/clear an event note | `docs/json-schema/wa-robot-event-mutation.json` |
 | `wa.events_triage` | Set/clear an event triage state | `docs/json-schema/wa-robot-event-mutation.json` |
 | `wa.events_label` | Add/remove/list event labels | `docs/json-schema/wa-robot-event-mutation.json` |
@@ -117,6 +118,12 @@ All tools accept an optional `format?: "json" | "toon"` parameter (default: `jso
 
 - `wa.events`
   - Params: `{ limit?: u64=20, pane?: u64, rule_id?: string, event_type?: string, triage_state?: string, label?: string, unhandled?: bool=false, since?: i64, would_handle?: bool=false, dry_run?: bool=false }`
+
+- `wa.await_event`
+  - Params: `{ any?: string[], all?: string[], timeout_secs?: u64=30, poll_interval_ms?: u64=250, cursor?: i64, pane?: u64, unhandled?: bool=false, claim?: bool=false }`
+  - Each condition set is bounded to 16 entries; currently supported conditions are `rule:<glob>`. `timeout_secs` is bounded to `1..=300`.
+  - With `claim=true`, matched rows are atomically leased. The response truthfully shows their pre-finalization handled state, and `claim_delivery="finalize_after_delivery_ack"` means the server token-CAS finalizes them only after the requested-format response crosses the transport's sender-side delivery boundary. Known serialization or delivery failure releases the leases; process death recovers through lease expiry.
+  - A foreign live lease retains the exposed cursor before that event, but does not prevent a monotonic scan from finding later claimable matches. Retried holes and later matches are returned in ascending event-ID order.
 
 - `wa.events_annotate`
   - Params: `{ event_id: i64, note?: string, clear?: bool=false, by?: string }`
@@ -199,6 +206,24 @@ All tools accept an optional `format?: "json" | "toon"` parameter (default: `jso
 
 - `wa.release`
   - Params: `{ reservation_id: string }`
+
+### Long-poll transport limitation
+
+The current FastMCP stdio loop processes one inbound message at a time. An
+active `wa.await_event` therefore queues unrelated requests on the same MCP
+connection until it matches, times out, or its request `Cx` is cancelled by the
+server. Use a dedicated MCP connection for long polls when other control calls
+must remain responsive.
+
+FastMCP's same sequential receive loop also cannot read a JSON-RPC
+`notifications/cancelled` message while its corresponding handler is still
+running. The notification is processed only after the long poll returns, so it
+is not currently a prompt client-side cancellation mechanism. FrankenTerm
+still threads and checks the request `Cx`, bounds cancellation polling to 50 ms
+once cancellation is visible inside the server, and gives storage-backed mode
+a 330-second framework deadline for the tool's 300-second maximum plus response
+delivery margin. Do not interpret direct `Cx` cancellation tests as proof of
+same-connection JSON-RPC cancellation.
 
 ## Resource List (v1)
 

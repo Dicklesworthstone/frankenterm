@@ -25,12 +25,31 @@ use super::{
     WaTxPlanTool, WaTxRollbackTool, WaTxRunTool, WaTxShowTool, WaWaitForTool, WaWorkflowRunTool,
     WaWorkflowStatusTool, WaWorkflowsResource, build_mcp_shared_rate_limiter,
 };
+use super::mcp_tools::{
+    MCP_AWAIT_EVENT_DELIVERY_FINALIZE_GRACE_SECS, MCP_AWAIT_EVENT_TIMEOUT_SECS_MAX,
+};
 use crate::mcp_framework::{
-    FrameworkServer as Server, framework_server_builder, run_framework_stdio_server,
+    FrameworkDeliveryServer as Server, FrameworkResponseDeliveryCoordinator,
+    framework_server_builder, run_framework_stdio_server,
 };
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+
+/// FastMCP's per-request budget must exceed the longest advertised
+/// `wa.await_event` poll (300s) and leave bounded time for final formatting and
+/// response delivery. The default 30s budget would violate the public schema.
+const MCP_FULL_SERVER_REQUEST_TIMEOUT_SECS: u64 =
+    MCP_AWAIT_EVENT_TIMEOUT_SECS_MAX + MCP_AWAIT_EVENT_DELIVERY_FINALIZE_GRACE_SECS;
+const MCP_DEGRADED_SERVER_REQUEST_TIMEOUT_SECS: u64 = 30;
+
+const fn mcp_server_request_timeout_secs(storage_backed: bool) -> u64 {
+    if storage_backed {
+        MCP_FULL_SERVER_REQUEST_TIMEOUT_SECS
+    } else {
+        MCP_DEGRADED_SERVER_REQUEST_TIMEOUT_SECS
+    }
+}
 
 /// br-ft-p4y8d: tool names exposed by the degraded MCP server.
 /// These are read-only diagnostics or use no storage at all. The
@@ -231,9 +250,12 @@ fn build_server_inner(config: &Config, db_path: Option<PathBuf>) -> Result<Serve
     let filter = config.ingest.panes.clone();
     let config = Arc::new(config.clone());
     let shared_rate_limiter = build_mcp_shared_rate_limiter(config.as_ref());
+    let request_timeout_secs = mcp_server_request_timeout_secs(db_path.is_some());
     let db_path = db_path.map(Arc::new);
+    let response_delivery = Arc::new(FrameworkResponseDeliveryCoordinator::default());
 
     let mut builder = framework_server_builder("wezterm-automata", crate::VERSION)
+        .request_timeout(request_timeout_secs)
         .instructions("ft MCP server (robot parity). See docs/mcp-api-spec.md.")
         .on_startup(|| -> std::result::Result<(), std::io::Error> {
             tracing::info!("MCP server starting");
@@ -357,11 +379,17 @@ fn build_server_inner(config: &Config, db_path: Option<PathBuf>) -> Result<Serve
                 "wa.events",
                 Arc::clone(db_path),
             )))
-            .tool(FormatAwareToolHandler::new(AuditedToolHandler::new(
-                WaAwaitEventTool::new(Arc::clone(db_path)),
-                "wa.await_event",
-                Arc::clone(db_path),
-            )))
+            .tool(FormatAwareToolHandler::new_with_response_delivery(
+                AuditedToolHandler::new(
+                    WaAwaitEventTool::new_with_response_delivery(
+                        Arc::clone(db_path),
+                        Arc::clone(&response_delivery),
+                    ),
+                    "wa.await_event",
+                    Arc::clone(db_path),
+                ),
+                Arc::clone(&response_delivery),
+            ))
             .tool(FormatAwareToolHandler::new(AuditedToolHandler::new(
                 WaEventsAnnotateTool::new_with_shared_rate_limiter(
                     Arc::clone(&config),
@@ -550,7 +578,7 @@ fn build_server_inner(config: &Config, db_path: Option<PathBuf>) -> Result<Serve
         builder = super::mcp_proxy::compose_proxy_tools(builder, config.as_ref(), db_path.clone())?;
     }
 
-    let server = builder.build();
+    let server = Server::new(builder.build(), response_delivery);
 
     Ok(server)
 }
@@ -598,6 +626,25 @@ pub fn mcp_bridge_counter_test_lock() -> std::sync::MutexGuard<'static, ()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn storage_backed_request_budget_exceeds_the_longest_await_and_degraded_stays_bounded() {
+        assert!(
+            mcp_server_request_timeout_secs(true)
+                >= MCP_AWAIT_EVENT_TIMEOUT_SECS_MAX
+                    + MCP_AWAIT_EVENT_DELIVERY_FINALIZE_GRACE_SECS,
+            "full MCP mode must leave response-delivery margin after the longest advertised await"
+        );
+        assert!(
+            mcp_server_request_timeout_secs(true) > MCP_AWAIT_EVENT_TIMEOUT_SECS_MAX,
+            "the framework deadline starts before wa.await_event's tool-local clock"
+        );
+        assert_eq!(
+            mcp_server_request_timeout_secs(false),
+            MCP_DEGRADED_SERVER_REQUEST_TIMEOUT_SECS,
+            "degraded mode has no wa.await_event and must retain the tighter DoS bound"
+        );
+    }
 
     /// br-ft-647cj: passing `db_path=None` to `build_server_with_db`
     /// is now an explicit error. The silent-degradation path was

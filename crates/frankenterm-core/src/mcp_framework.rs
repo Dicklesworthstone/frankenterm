@@ -41,11 +41,424 @@ pub use fastmcp::{
 #[cfg(feature = "mcp")]
 #[allow(unused_imports)]
 pub use fastmcp::{
+    JsonRpcMessage as FrameworkJsonRpcMessage,
+    Prompt as FrameworkPrompt,
     Resource as FrameworkResource, ResourceContent as FrameworkResourceContent,
     ResourceHandler as FrameworkResourceHandler, ResourceTemplate as FrameworkResourceTemplate,
+    ServerCapabilities as FrameworkServerCapabilities, ServerInfo as FrameworkServerInfo,
     Server as FrameworkServer, ServerBuilder as FrameworkServerBuilder,
     StdioTransport as FrameworkStdioTransport, ToolHandler as FrameworkToolHandler,
+    Transport as FrameworkTransport, TransportError as FrameworkTransportError,
 };
+
+#[cfg(feature = "mcp")]
+use std::sync::{Arc, Mutex};
+
+/// Outcome at the concrete MCP response-transport boundary.
+///
+/// `DeliveryAcknowledged` means the complete response crossed the transport's
+/// sender-side ownership boundary: production stdio wrote and flushed it, or
+/// an in-memory transport atomically handed it to the peer queue. It
+/// deliberately does **not** mean that the client process parsed, acknowledged,
+/// or acted on the response.
+#[cfg(feature = "mcp")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FrameworkResponseDeliveryOutcome {
+    DeliveryAcknowledged,
+    Failed,
+}
+
+#[cfg(feature = "mcp")]
+pub(crate) type FrameworkResponseDeliveryAction =
+    Box<dyn FnOnce(FrameworkResponseDeliveryOutcome) + Send + 'static>;
+
+#[cfg(feature = "mcp")]
+#[derive(Default)]
+enum FrameworkResponseDeliveryState {
+    #[default]
+    Idle,
+    /// The tool's canonical JSON envelope exists, but outer requested-format
+    /// serialization has not completed yet.
+    Prepared(FrameworkResponseDeliveryAction),
+    /// Final requested-format serialization succeeded; the next outgoing
+    /// response owns this completion action.
+    Armed(FrameworkResponseDeliveryAction),
+}
+
+/// Single-flight handoff between an MCP tool and the sequential response loop.
+///
+/// FastMCP's handler result does not carry a post-write callback and its
+/// `Middleware::on_response` hook runs before transport serialization.
+/// FrankenTerm exposes only FastMCP's sequential transport request loops, so
+/// exactly one tool response can be awaiting transport completion.
+/// This coordinator makes that invariant explicit and fails closed if it is
+/// ever violated rather than associating a delivery action with the wrong
+/// response.
+#[cfg(feature = "mcp")]
+#[derive(Default)]
+pub(crate) struct FrameworkResponseDeliveryCoordinator {
+    state: Mutex<FrameworkResponseDeliveryState>,
+}
+
+#[cfg(feature = "mcp")]
+impl FrameworkResponseDeliveryCoordinator {
+    /// Prepare an action after the tool's canonical JSON envelope exists.
+    ///
+    /// On collision the caller receives its action back and is responsible for
+    /// invoking it with `Failed` so any durable leases are released.
+    pub(crate) fn try_prepare(
+        &self,
+        action: FrameworkResponseDeliveryAction,
+    ) -> Result<(), FrameworkResponseDeliveryAction> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match &*state {
+            FrameworkResponseDeliveryState::Idle => {
+                *state = FrameworkResponseDeliveryState::Prepared(action);
+                Ok(())
+            }
+            FrameworkResponseDeliveryState::Prepared(_)
+            | FrameworkResponseDeliveryState::Armed(_) => Err(action),
+        }
+    }
+
+    /// Arm a prepared action only after final requested-format serialization.
+    /// Returns `false` when this call had no claimed delivery to arm.
+    #[must_use]
+    pub(crate) fn activate_prepared(&self) -> bool {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let previous = std::mem::take(&mut *state);
+        match previous {
+            FrameworkResponseDeliveryState::Prepared(action) => {
+                *state = FrameworkResponseDeliveryState::Armed(action);
+                true
+            }
+            other => {
+                *state = other;
+                false
+            }
+        }
+    }
+
+    /// Release a prepared action when final-format serialization cannot
+    /// faithfully produce the tool payload.
+    pub(crate) fn fail_prepared(&self) {
+        let action = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let previous = std::mem::take(&mut *state);
+            match previous {
+                FrameworkResponseDeliveryState::Prepared(action) => Some(action),
+                other => {
+                    *state = other;
+                    None
+                }
+            }
+        };
+        if let Some(action) = action {
+            action(FrameworkResponseDeliveryOutcome::Failed);
+        }
+    }
+
+    /// Fail whichever single-flight action is present. This is used only when
+    /// an invariant violation makes response/action association unknowable.
+    pub(crate) fn fail_all(&self) {
+        self.complete_next(FrameworkResponseDeliveryOutcome::Failed);
+    }
+
+    fn complete_next(&self, outcome: FrameworkResponseDeliveryOutcome) {
+        let completion = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match std::mem::take(&mut *state) {
+                FrameworkResponseDeliveryState::Idle => None,
+                FrameworkResponseDeliveryState::Prepared(action) => {
+                    // A response reached the transport without the formatter
+                    // arming it. Never finalize an incompletely serialized
+                    // payload.
+                    Some((action, FrameworkResponseDeliveryOutcome::Failed))
+                }
+                FrameworkResponseDeliveryState::Armed(action) => Some((action, outcome)),
+            }
+        };
+        if let Some((action, completion_outcome)) = completion {
+            action(completion_outcome);
+        }
+    }
+}
+
+/// Transport adapter that acknowledges the next armed tool delivery only
+/// after the concrete transport crosses its sender-side delivery boundary.
+#[cfg(feature = "mcp")]
+struct FrameworkDeliveryAwareTransport<T> {
+    inner: T,
+    coordinator: Arc<FrameworkResponseDeliveryCoordinator>,
+}
+
+#[cfg(feature = "mcp")]
+impl<T> FrameworkDeliveryAwareTransport<T> {
+    fn new(inner: T, coordinator: Arc<FrameworkResponseDeliveryCoordinator>) -> Self {
+        Self { inner, coordinator }
+    }
+}
+
+/// Transport contract required by claim-capable MCP server entrypoints.
+///
+/// A successful return from [`Self::send_with_delivery_ack`] must mean that
+/// the sender no longer owns buffered message bytes: they were either flushed
+/// to the concrete transport or atomically accepted by an in-memory receiving
+/// endpoint. The base FastMCP [`FrameworkTransport`] trait does not make this
+/// guarantee, so accepting arbitrary implementations would allow durable event
+/// claims to finalize while a response was still sitting in a sender-side
+/// buffer.
+///
+/// Custom transports must implement this trait explicitly and provide the
+/// stronger acknowledgment boundary. Merely implementing
+/// [`FrameworkTransport`] is intentionally insufficient.
+#[cfg(feature = "mcp")]
+pub trait FrameworkDeliveryAcknowledgingTransport: FrameworkTransport {
+    /// Send one message and return only after its delivery boundary is durable
+    /// from the sender's perspective.
+    ///
+    /// # Errors
+    ///
+    /// Returns a transport error when the complete message cannot cross the
+    /// implementation's documented sender-side ownership boundary.
+    fn send_with_delivery_ack(
+        &mut self,
+        cx: &crate::cx::Cx,
+        message: &FrameworkJsonRpcMessage,
+    ) -> Result<(), FrameworkTransportError>;
+}
+
+#[cfg(feature = "mcp")]
+impl<R, W> FrameworkDeliveryAcknowledgingTransport for fastmcp::StdioTransport<R, W>
+where
+    R: std::io::Read,
+    W: std::io::Write,
+{
+    fn send_with_delivery_ack(
+        &mut self,
+        cx: &crate::cx::Cx,
+        message: &FrameworkJsonRpcMessage,
+    ) -> Result<(), FrameworkTransportError> {
+        // FastMCP's StdioTransport::send writes the complete NDJSON record and
+        // explicitly flushes its writer before returning Ok.
+        FrameworkTransport::send(self, cx, message)
+    }
+}
+
+#[cfg(feature = "mcp")]
+impl FrameworkDeliveryAcknowledgingTransport for fastmcp::memory::MemoryTransport {
+    fn send_with_delivery_ack(
+        &mut self,
+        cx: &crate::cx::Cx,
+        message: &FrameworkJsonRpcMessage,
+    ) -> Result<(), FrameworkTransportError> {
+        // Channel send atomically transfers ownership to the peer's queue; the
+        // sender retains no private buffer after Ok.
+        FrameworkTransport::send(self, cx, message)
+    }
+}
+
+#[cfg(feature = "mcp")]
+impl<T: FrameworkDeliveryAcknowledgingTransport> FrameworkTransport
+    for FrameworkDeliveryAwareTransport<T>
+{
+    fn send(
+        &mut self,
+        cx: &crate::cx::Cx,
+        message: &FrameworkJsonRpcMessage,
+    ) -> Result<(), FrameworkTransportError> {
+        let response_is_error = matches!(
+            message,
+            FrameworkJsonRpcMessage::Response(response) if response.error.is_some()
+        );
+        let is_response = matches!(message, FrameworkJsonRpcMessage::Response(_));
+        let result = self.inner.send_with_delivery_ack(cx, message);
+
+        // Notifications and server-initiated requests are represented as
+        // JsonRpcMessage::Request and must not consume the staged action. In the
+        // sequential server loop, the next Response is the response produced by
+        // the tool that staged it.
+        if is_response {
+            let outcome = if result.is_ok() && !response_is_error {
+                FrameworkResponseDeliveryOutcome::DeliveryAcknowledged
+            } else {
+                FrameworkResponseDeliveryOutcome::Failed
+            };
+            self.coordinator.complete_next(outcome);
+        }
+
+        result
+    }
+
+    fn recv(
+        &mut self,
+        cx: &crate::cx::Cx,
+    ) -> Result<FrameworkJsonRpcMessage, FrameworkTransportError> {
+        loop {
+            // FastMCP dispatches JSON-RPC notifications but correctly emits no
+            // response for them. Fail any unresolved action before accepting
+            // the next inbound message so a later unrelated response can never
+            // consume an undelivered action.
+            self.coordinator
+                .complete_next(FrameworkResponseDeliveryOutcome::Failed);
+            let message = self.inner.recv(cx)?;
+            if matches!(
+                &message,
+                FrameworkJsonRpcMessage::Request(request)
+                    if request.id.is_none() && request.method == "tools/call"
+            ) {
+                // A tool invocation needs a response boundary for results,
+                // errors, audit truth, and claim completion. FastMCP assigns
+                // notifications the unbudgeted parent Cx, so dispatching an
+                // id-less long poll could also monopolize the sequential server
+                // indefinitely. Drop such invalid calls before handler dispatch.
+                tracing::warn!(
+                    method = "tools/call",
+                    "Ignoring id-less MCP tool invocation without a response boundary"
+                );
+                continue;
+            }
+            return Ok(message);
+        }
+    }
+
+    fn close(&mut self) -> Result<(), FrameworkTransportError> {
+        // A graceful close with an unsent response is a known delivery failure.
+        // A hard process death cannot run this path; the durable lease expiry is
+        // the recovery authority in that case.
+        self.coordinator
+            .complete_next(FrameworkResponseDeliveryOutcome::Failed);
+        self.inner.close()
+    }
+}
+
+#[cfg(feature = "mcp")]
+impl<T> Drop for FrameworkDeliveryAwareTransport<T> {
+    fn drop(&mut self) {
+        // FastMCP's returning loop exits directly when `recv` observes a closed
+        // transport and does not call `Transport::close`. Releasing from Drop
+        // covers that orderly unwind/drop path. An abrupt process death still
+        // relies on the durable lease expiry.
+        self.coordinator
+            .complete_next(FrameworkResponseDeliveryOutcome::Failed);
+    }
+}
+
+/// FrankenTerm's FastMCP server plus its response-delivery coordinator.
+///
+/// Only read-only catalog inspection is forwarded. In particular, this type
+/// deliberately does not expose FastMCP's `dispatch_request`: direct dispatch
+/// has no concrete write/flush boundary and therefore cannot safely complete a
+/// `wa.await_event --claim` delivery. Consuming transport entrypoints always
+/// install the acknowledgment-aware adapter.
+#[cfg(feature = "mcp")]
+pub struct FrameworkDeliveryServer {
+    inner: FrameworkServer,
+    coordinator: Arc<FrameworkResponseDeliveryCoordinator>,
+}
+
+#[cfg(feature = "mcp")]
+impl FrameworkDeliveryServer {
+    pub(crate) fn new(
+        inner: FrameworkServer,
+        coordinator: Arc<FrameworkResponseDeliveryCoordinator>,
+    ) -> Self {
+        Self { inner, coordinator }
+    }
+
+    /// Returns the immutable server identity advertised during initialization.
+    #[must_use]
+    pub fn info(&self) -> &FrameworkServerInfo {
+        self.inner.info()
+    }
+
+    /// Returns the immutable server capabilities advertised during initialization.
+    #[must_use]
+    pub fn capabilities(&self) -> &FrameworkServerCapabilities {
+        self.inner.capabilities()
+    }
+
+    /// Lists registered tool definitions without exposing handler dispatch.
+    #[must_use]
+    pub fn tools(&self) -> Vec<FrameworkTool> {
+        self.inner.tools()
+    }
+
+    /// Lists registered static resources without exposing resource dispatch.
+    #[must_use]
+    pub fn resources(&self) -> Vec<FrameworkResource> {
+        self.inner.resources()
+    }
+
+    /// Lists registered resource templates without exposing resource dispatch.
+    #[must_use]
+    pub fn resource_templates(&self) -> Vec<FrameworkResourceTemplate> {
+        self.inner.resource_templates()
+    }
+
+    /// Lists registered prompt definitions without exposing prompt dispatch.
+    #[must_use]
+    pub fn prompts(&self) -> Vec<FrameworkPrompt> {
+        self.inner.prompts()
+    }
+
+    /// Run forever on an acknowledgment-capable transport using a root request context.
+    pub fn run_transport<T>(self, transport: T) -> !
+    where
+        T: FrameworkDeliveryAcknowledgingTransport + Send + 'static,
+    {
+        self.inner.run_transport(FrameworkDeliveryAwareTransport::new(
+            transport,
+            self.coordinator,
+        ))
+    }
+
+    /// Run forever on an acknowledgment-capable transport with an explicit context.
+    pub fn run_transport_with_cx<T>(self, cx: &crate::cx::Cx, transport: T) -> !
+    where
+        T: FrameworkDeliveryAcknowledgingTransport + Send + 'static,
+    {
+        self.inner.run_transport_with_cx(
+            cx,
+            FrameworkDeliveryAwareTransport::new(transport, self.coordinator),
+        )
+    }
+
+    /// Run until the acknowledgment-capable transport closes, then return.
+    pub fn run_transport_returning<T>(self, transport: T)
+    where
+        T: FrameworkDeliveryAcknowledgingTransport + Send + 'static,
+    {
+        self.inner
+            .run_transport_returning(FrameworkDeliveryAwareTransport::new(
+                transport,
+                self.coordinator,
+            ));
+    }
+
+    /// Run with an explicit context until the transport closes, then return.
+    pub fn run_transport_returning_with_cx<T>(self, cx: &crate::cx::Cx, transport: T)
+    where
+        T: FrameworkDeliveryAcknowledgingTransport + Send + 'static,
+    {
+        self.inner.run_transport_returning_with_cx(
+            cx,
+            FrameworkDeliveryAwareTransport::new(transport, self.coordinator),
+        );
+    }
+}
 
 #[cfg(feature = "mcp")]
 #[allow(unused_imports)]
@@ -55,7 +468,9 @@ pub(crate) fn framework_server_builder(name: &str, version: &str) -> FrameworkSe
 
 #[cfg(feature = "mcp")]
 #[allow(unused_imports)]
-pub(crate) fn run_framework_stdio_server(server: FrameworkServer) -> FrameworkMcpResult<()> {
+pub(crate) fn run_framework_stdio_server(
+    server: FrameworkDeliveryServer,
+) -> FrameworkMcpResult<()> {
     let transport = FrameworkStdioTransport::stdio();
     server.run_transport(transport)
 }
