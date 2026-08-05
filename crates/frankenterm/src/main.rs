@@ -23023,6 +23023,10 @@ const WATCH_EVENTS_CLAIM_LEASE_TTL: std::time::Duration = std::time::Duration::f
 const WATCH_EVENTS_BATCH_LIMIT_MAX: usize = 1_000;
 const WATCH_EVENTS_BATCH_LIMIT_ERROR: &str = "Invalid --limit: must be in 1..=1000";
 const WATCH_EVENTS_POLL_INTERVAL_MS_MIN: u64 = 10;
+const WATCH_EVENTS_CANCELLATION_CHECK_INTERVAL: std::time::Duration =
+    std::time::Duration::from_millis(500);
+const WATCH_EVENTS_RETENTION_RECONCILE_INTERVAL: std::time::Duration =
+    std::time::Duration::from_secs(30);
 
 fn watch_events_unhandled_only(unhandled: bool, claim: bool) -> bool {
     unhandled || claim
@@ -23060,7 +23064,42 @@ fn watch_ipc_durable_poll_heartbeat_interval_ms(
 #[derive(Debug, PartialEq, Eq)]
 enum WatchIpcStreamRead {
     Line(Option<String>),
+    CancellationCheckpoint,
     DurablePollDeadline,
+}
+
+fn watch_checkpoint(cx: &frankenterm_core::cx::Cx, operation: &str) -> std::io::Result<()> {
+    cx.checkpoint().map_err(|error| {
+        std::io::Error::new(
+            std::io::ErrorKind::Interrupted,
+            format!("watch-events {operation} cancelled: {error}"),
+        )
+    })
+}
+
+#[cfg(unix)]
+fn watch_durable_poll_remaining(
+    started_at: std::time::Instant,
+    interval: std::time::Duration,
+) -> std::time::Duration {
+    interval.saturating_sub(std::time::Instant::now().saturating_duration_since(started_at))
+}
+
+#[cfg(unix)]
+fn watch_ipc_read_timeout(remaining: std::time::Duration) -> std::time::Duration {
+    remaining.min(WATCH_EVENTS_CANCELLATION_CHECK_INTERVAL)
+}
+
+#[cfg(unix)]
+fn watch_ipc_timeout_outcome(
+    durable_poll_started_at: std::time::Instant,
+    durable_poll_interval: std::time::Duration,
+) -> WatchIpcStreamRead {
+    if watch_durable_poll_remaining(durable_poll_started_at, durable_poll_interval).is_zero() {
+        WatchIpcStreamRead::DurablePollDeadline
+    } else {
+        WatchIpcStreamRead::CancellationCheckpoint
+    }
 }
 
 /// Bound one IPC read by the current storage-poll deadline.
@@ -23068,39 +23107,40 @@ enum WatchIpcStreamRead {
 /// The private server heartbeat is the cheap normal wakeup, but it is not an
 /// authority: a connected peer can stall without closing its socket or can
 /// continuously send ready-but-nonauthoritative records. The caller reuses one
-/// absolute deadline across the entire relay stint, so neither case can starve
-/// the ordered SQLite drain. Dropping a pending `Lines::next` future at the
-/// deadline is cancellation-safe because the line reader owns its partial
-/// buffer; the caller retains the stream and polls it again after the drain.
+/// overflow-free elapsed-time window across the entire relay stint, so neither
+/// case can starve the ordered SQLite drain. Dropping a pending `Lines::next`
+/// future at a cancellation checkpoint or durable-poll boundary is safe because
+/// the line reader owns its partial buffer; the caller retains the stream.
 #[cfg(unix)]
 async fn read_watch_ipc_line_until_durable_poll<F>(
     cx: &frankenterm_core::cx::Cx,
-    durable_poll_deadline: std::time::Instant,
+    durable_poll_started_at: std::time::Instant,
+    durable_poll_interval: std::time::Duration,
     read: F,
 ) -> std::io::Result<WatchIpcStreamRead>
 where
     F: std::future::Future<Output = std::io::Result<Option<String>>>,
 {
-    let remaining = durable_poll_deadline.saturating_duration_since(std::time::Instant::now());
+    watch_checkpoint(cx, "IPC read")?;
+    let remaining = watch_durable_poll_remaining(durable_poll_started_at, durable_poll_interval);
     if remaining.is_zero() {
-        cx.checkpoint().map_err(|error| {
-            std::io::Error::new(
-                std::io::ErrorKind::Interrupted,
-                format!("watch-events IPC read cancelled: {error}"),
-            )
-        })?;
+        watch_checkpoint(cx, "IPC read")?;
         return Ok(WatchIpcStreamRead::DurablePollDeadline);
     }
-    match frankenterm_core::runtime_async::timeout_with_cx(cx, remaining, read).await {
+    match frankenterm_core::runtime_async::timeout_with_cx(
+        cx,
+        watch_ipc_read_timeout(remaining),
+        read,
+    )
+    .await
+    {
         Ok(line) => line.map(WatchIpcStreamRead::Line),
         Err(_deadline) => {
-            cx.checkpoint().map_err(|error| {
-                std::io::Error::new(
-                    std::io::ErrorKind::Interrupted,
-                    format!("watch-events IPC read cancelled: {error}"),
-                )
-            })?;
-            Ok(WatchIpcStreamRead::DurablePollDeadline)
+            watch_checkpoint(cx, "IPC read")?;
+            Ok(watch_ipc_timeout_outcome(
+                durable_poll_started_at,
+                durable_poll_interval,
+            ))
         }
     }
 }
@@ -23141,6 +23181,7 @@ fn note_watch_claim_output_emitted(
 }
 
 async fn pace_watch_event(
+    cx: &frankenterm_core::cx::Cx,
     max_hz_interval: Option<std::time::Duration>,
     last_event_emit: Option<std::time::Instant>,
     stdout: &std::io::Stdout,
@@ -23175,10 +23216,31 @@ async fn pace_watch_event(
         if wait.is_zero() {
             continue;
         }
-        frankenterm_core::runtime_async::spawn_blocking(move || std::thread::sleep(wait))
-            .await
-            .map_err(|error| std::io::Error::other(format!("watch-events pacing failed: {error}")))?;
+        sleep_watch_delay_with_cx(cx, wait, "pacing").await?;
     }
+}
+
+/// Sleep without relying on a timer-capable runtime, while still bounding how
+/// long structured cancellation can remain unobserved. Slicing also prevents a
+/// pathological `u64::MAX` poll interval from stranding a blocking-pool worker
+/// for the lifetime of the process after cancellation.
+async fn sleep_watch_delay_with_cx(
+    cx: &frankenterm_core::cx::Cx,
+    delay: std::time::Duration,
+    operation: &str,
+) -> std::io::Result<()> {
+    let mut remaining = delay;
+    while !remaining.is_zero() {
+        watch_checkpoint(cx, operation)?;
+        let slice = remaining.min(WATCH_EVENTS_CANCELLATION_CHECK_INTERVAL);
+        frankenterm_core::runtime_async::spawn_blocking(move || std::thread::sleep(slice))
+            .await
+            .map_err(|error| {
+                std::io::Error::other(format!("watch-events {operation} failed: {error}"))
+            })?;
+        remaining = remaining.saturating_sub(slice);
+    }
+    watch_checkpoint(cx, operation)
 }
 
 fn watch_claim_retry_delay(
@@ -23227,6 +23289,7 @@ fn annotate_watch_event_claim_delivery(record: &mut serde_json::Value) -> std::i
 /// [`WatchEventClaimDelivery::Delivered`] or
 /// [`WatchEventClaimDelivery::AlreadyHandledOrMissing`].
 async fn deliver_claimed_watch_event<F>(
+    cx: &frankenterm_core::cx::Cx,
     storage: &frankenterm_core::storage::StorageHandle,
     event_id: i64,
     mut record: serde_json::Value,
@@ -23241,7 +23304,7 @@ where
     // local serialization-shape bug cannot strand a known lease until expiry.
     annotate_watch_event_claim_delivery(&mut record)?;
     let reservation = storage
-        .reserve_event_delivery(event_id, WATCH_EVENTS_CLAIM_LEASE_TTL)
+        .reserve_event_delivery_with_cx(cx, event_id, WATCH_EVENTS_CLAIM_LEASE_TTL)
         .await
         .map_err(|error| {
             std::io::Error::other(format!(
@@ -23261,7 +23324,7 @@ where
     let flushed_at = match write_and_flush(&record) {
         Ok(true) => std::time::Instant::now(),
         Ok(false) => {
-            match storage.release_event_delivery(&lease).await {
+            match storage.release_event_delivery_with_cx(cx, &lease).await {
                 Ok(true) => {}
                 Ok(false) => tracing::warn!(
                     event_id,
@@ -23281,7 +23344,7 @@ where
         Err(write_error) => {
             let error_kind = write_error.kind();
             let error_message = write_error.to_string();
-            match storage.release_event_delivery(&lease).await {
+            match storage.release_event_delivery_with_cx(cx, &lease).await {
                 Ok(true) => return Err(write_error),
                 Ok(false) => {
                     tracing::warn!(
@@ -23303,7 +23366,8 @@ where
     };
 
     let finalized = storage
-        .finalize_event_delivery(
+        .finalize_event_delivery_with_cx(
+            cx,
             &lease,
             Some(WATCH_EVENTS_CLAIM_WORKFLOW_ID.to_string()),
             WATCH_EVENTS_CLAIM_STATUS,
@@ -23554,15 +23618,71 @@ fn emit_watch_heartbeat_if_due(
 /// pane-filtered one.
 fn watch_cursor_expiry(requested: Option<i64>, oldest_retained: Option<i64>) -> Option<i64> {
     match (requested, oldest_retained) {
-        (Some(c), Some(oldest))
-            if oldest
-                .checked_sub(1)
-                .is_some_and(|last_pruned| c < last_pruned) =>
-        {
-            Some(oldest)
-        }
+        (Some(c), Some(oldest)) if c >= 0 && oldest > 0 && c < oldest - 1 => Some(oldest),
         _ => None,
     }
+}
+
+/// Reconcile retention initially, periodically while idle, and immediately
+/// whenever the filtered batch begins after a discontinuous event ID. The
+/// discontinuity probe catches a follower that fell behind prefix pruning
+/// before it emits a later row; the periodic probe also catches an empty
+/// filtered stream. Contiguous hot-path batches do not pay for an extra global
+/// oldest-row lookup on every loop.
+fn watch_retention_reconciliation_is_due(
+    cursor: Option<i64>,
+    first_batch_event_id: Option<i64>,
+    last_reconciled_at: Option<std::time::Instant>,
+    now: std::time::Instant,
+) -> bool {
+    let Some(cursor) = cursor else {
+        return false;
+    };
+    let Some(last_reconciled_at) = last_reconciled_at else {
+        return true;
+    };
+    let discontinuous_batch = first_batch_event_id.is_some_and(|first_id| {
+        cursor
+            .checked_add(1)
+            .is_some_and(|next_expected| first_id > next_expected)
+    });
+    discontinuous_batch
+        || now.saturating_duration_since(last_reconciled_at)
+            >= WATCH_EVENTS_RETENTION_RECONCILE_INTERVAL
+}
+
+fn validate_watch_oldest_retained_event_id(oldest: Option<i64>) -> Result<Option<i64>, String> {
+    match oldest {
+        Some(event_id) if event_id <= 0 => Err(format!(
+            "storage returned a non-positive oldest event id: {event_id}"
+        )),
+        _ => Ok(oldest),
+    }
+}
+
+async fn watch_oldest_retained_event_id(
+    cx: &frankenterm_core::cx::Cx,
+    storage: &frankenterm_core::storage::StorageHandle,
+) -> Result<Option<i64>, String> {
+    let query = frankenterm_core::storage::EventStreamQuery {
+        after_id: None,
+        limit: Some(1),
+        pane_id: None,
+        rule_id: None,
+        event_type: None,
+        triage_state: None,
+        label: None,
+        unhandled_only: false,
+        since: None,
+        until: None,
+    };
+    let oldest = storage
+        .get_events_stream_with_cx(cx, query)
+        .await
+        .map_err(|error| error.to_string())?
+        .first()
+        .map(|event| event.id);
+    validate_watch_oldest_retained_event_id(oldest)
 }
 
 /// Typed `cursor_expired` NDJSON record: the requested resume cursor fell behind
@@ -24232,6 +24352,19 @@ fn validate_ipc_gap_record(value: &serde_json::Value) -> Result<(), IpcRelayProt
     }
 }
 
+/// Replace the private server's deliberately-null cursor with the follower's
+/// authoritative durable position before the lag gap crosses the public NDJSON
+/// boundary. The server cannot know this cursor; the relay can and must expose
+/// it so every consumer-visible control record is a usable resume checkpoint.
+#[cfg(unix)]
+fn ipc_gap_with_follower_cursor(
+    mut value: serde_json::Value,
+    current_cursor: Option<i64>,
+) -> serde_json::Value {
+    value["cursor"] = current_cursor.map_or(serde_json::Value::Null, serde_json::Value::from);
+    value
+}
+
 #[cfg(unix)]
 fn decode_ipc_relay_record(
     line: &str,
@@ -24260,6 +24393,7 @@ fn ipc_relay_record_type(
 /// backfill; malformed/unknown records abandon the stream fail-closed.
 #[cfg(unix)]
 async fn relay_ipc_event_line(
+    cx: &frankenterm_core::cx::Cx,
     stdout: &std::io::Stdout,
     line: &str,
     current_cursor: &mut Option<i64>,
@@ -24296,6 +24430,7 @@ async fn relay_ipc_event_line(
             // Cursorless lifecycle signals are emitted directly and still
             // participate in the configured output-rate bound.
             if !pace_watch_event(
+                cx,
                 max_hz_interval,
                 *last_event_emit,
                 stdout,
@@ -24350,8 +24485,9 @@ async fn relay_ipc_event_line(
             // signal the relay loop to re-drain the DB cursor so the dropped
             // (but persisted) events are backfilled at-least-once
             // (ft-7h5da.4.2, no-silent-gaps).
+            let output = ipc_gap_with_follower_cursor(value, *current_cursor);
             let mut lock = stdout.lock();
-            let cont = write_ndjson_line(&mut lock, &value)?;
+            let cont = write_ndjson_line(&mut lock, &output)?;
             drop(lock);
             if !cont {
                 return Ok(IpcRelayAction::PipeClosed);
@@ -24365,6 +24501,7 @@ async fn relay_ipc_event_line(
 #[cfg(test)]
 mod watch_events_tests {
     use super::*;
+    use frankenterm_core::runtime_async::CompatRuntime;
     use frankenterm_core::storage::StoredEvent;
 
     fn ev(id: i64, rule_id: &str, severity: &str, matched: Option<&str>) -> StoredEvent {
@@ -24601,6 +24738,7 @@ mod watch_events_tests {
         );
 
         run_watch_claim_async(async move {
+            let cx = frankenterm_core::cx::for_testing();
             let stdout = std::io::stdout();
             let mut cursor = Some(7);
             let mut last_event_emit = None;
@@ -24614,6 +24752,7 @@ mod watch_events_tests {
             .to_string();
 
             let action = relay_ipc_event_line(
+                &cx,
                 &stdout,
                 &line,
                 &mut cursor,
@@ -24643,7 +24782,8 @@ mod watch_events_tests {
             let cx = frankenterm_core::cx::for_testing();
             let outcome = read_watch_ipc_line_until_durable_poll(
                 &cx,
-                std::time::Instant::now() + std::time::Duration::from_millis(5),
+                std::time::Instant::now(),
+                std::time::Duration::from_millis(5),
                 std::future::pending::<std::io::Result<Option<String>>>(),
             )
             .await
@@ -24653,7 +24793,8 @@ mod watch_events_tests {
 
             let ready = read_watch_ipc_line_until_durable_poll(
                 &cx,
-                std::time::Instant::now() + std::time::Duration::from_secs(1),
+                std::time::Instant::now(),
+                std::time::Duration::from_secs(1),
                 std::future::ready(Ok(Some("line".to_string()))),
             )
             .await
@@ -24664,13 +24805,15 @@ mod watch_events_tests {
 
     #[cfg(unix)]
     #[test]
-    fn ready_ipc_lines_cannot_extend_the_absolute_durable_poll_deadline() {
+    fn ready_ipc_lines_cannot_extend_the_durable_poll_window() {
         run_watch_claim_async(async move {
             let cx = frankenterm_core::cx::for_testing();
-            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(5);
+            let started_at = std::time::Instant::now();
+            let interval = std::time::Duration::from_millis(5);
             let first = read_watch_ipc_line_until_durable_poll(
                 &cx,
-                deadline,
+                started_at,
+                interval,
                 std::future::ready(Ok(Some("first".to_string()))),
             )
             .await
@@ -24682,18 +24825,75 @@ mod watch_events_tests {
 
             std::thread::sleep(std::time::Duration::from_millis(10));
             let second_read_was_polled = std::cell::Cell::new(false);
-            let second = read_watch_ipc_line_until_durable_poll(&cx, deadline, async {
-                second_read_was_polled.set(true);
-                Ok(Some("second".to_string()))
-            })
+            let second = read_watch_ipc_line_until_durable_poll(
+                &cx,
+                started_at,
+                interval,
+                async {
+                    second_read_was_polled.set(true);
+                    Ok(Some("second".to_string()))
+                },
+            )
             .await
-            .expect("expired absolute deadline is a normal durable-poll wakeup");
+            .expect("expired durable-poll window is a normal storage wakeup");
 
             assert_eq!(second, WatchIpcStreamRead::DurablePollDeadline);
             assert!(
                 !second_read_was_polled.get(),
                 "an already-expired relay stint must return to storage before polling another ready line"
             );
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn extreme_poll_interval_is_overflow_free_and_cancellation_bounded() {
+        let huge = std::time::Duration::from_millis(u64::MAX);
+        let started_at = std::time::Instant::now();
+
+        assert_eq!(
+            watch_ipc_read_timeout(huge),
+            WATCH_EVENTS_CANCELLATION_CHECK_INTERVAL,
+            "one stalled read may never inherit an effectively unbounded poll interval"
+        );
+        assert!(
+            watch_durable_poll_remaining(started_at, huge) > std::time::Duration::from_secs(60),
+            "an unrepresentable Instant deadline must remain a long elapsed window, not collapse to now"
+        );
+        assert_eq!(
+            watch_ipc_timeout_outcome(started_at, huge),
+            WatchIpcStreamRead::CancellationCheckpoint,
+            "the bounded read slice must not masquerade as the durable poll deadline"
+        );
+
+        run_watch_claim_async(async move {
+            let cx = frankenterm_core::cx::for_testing();
+            cx.cancel_with(
+                frankenterm_core::outcome::CancelKind::User,
+                Some("watch-events cancellation regression"),
+            );
+            let read_was_polled = std::cell::Cell::new(false);
+            let read_error = read_watch_ipc_line_until_durable_poll(
+                &cx,
+                std::time::Instant::now(),
+                huge,
+                async {
+                    read_was_polled.set(true);
+                    std::future::pending::<std::io::Result<Option<String>>>().await
+                },
+            )
+            .await
+            .expect_err("pre-cancelled IPC read must not wait for its poll interval");
+            assert_eq!(read_error.kind(), std::io::ErrorKind::Interrupted);
+            assert!(
+                !read_was_polled.get(),
+                "the pre-flight checkpoint must reject cancellation before polling the read"
+            );
+
+            let sleep_error = sleep_watch_delay_with_cx(&cx, huge, "test delay")
+                .await
+                .expect_err("pre-cancelled delay must not spawn a huge blocking sleep");
+            assert_eq!(sleep_error.kind(), std::io::ErrorKind::Interrupted);
         });
     }
 
@@ -24805,6 +25005,7 @@ mod watch_events_tests {
     fn claimed_delivery_is_flush_before_handle_and_releases_known_failures() {
         let (_directory, database_path, event_ids) = watch_claim_fixture(6);
         run_watch_claim_async(async move {
+            let cx = frankenterm_core::cx::for_testing();
             let storage = frankenterm_core::storage::StorageHandle::new(&database_path)
                 .await
                 .expect("open watch claim storage");
@@ -24812,6 +25013,7 @@ mod watch_events_tests {
             let success_id = event_ids[0];
             let mut success_output = Vec::new();
             let success = deliver_claimed_watch_event(
+                &cx,
                 &storage,
                 success_id,
                 ipc_persisted_event(success_id),
@@ -24844,6 +25046,7 @@ mod watch_events_tests {
 
             let write_failure_id = event_ids[1];
             let write_error = deliver_claimed_watch_event(
+                &cx,
                 &storage,
                 write_failure_id,
                 ipc_persisted_event(write_failure_id),
@@ -24871,6 +25074,7 @@ mod watch_events_tests {
 
             let broken_pipe_id = event_ids[2];
             let broken_pipe = deliver_claimed_watch_event(
+                &cx,
                 &storage,
                 broken_pipe_id,
                 ipc_persisted_event(broken_pipe_id),
@@ -24912,6 +25116,7 @@ mod watch_events_tests {
             let writer_called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             let writer_called_in_closure = std::sync::Arc::clone(&writer_called);
             let contended = deliver_claimed_watch_event(
+                &cx,
                 &storage,
                 contended_id,
                 ipc_persisted_event(contended_id),
@@ -24945,6 +25150,7 @@ mod watch_events_tests {
                 std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             let already_writer_called_in_closure = std::sync::Arc::clone(&already_writer_called);
             let already = deliver_claimed_watch_event(
+                &cx,
                 &storage,
                 already_handled_id,
                 ipc_persisted_event(already_handled_id),
@@ -24964,6 +25170,7 @@ mod watch_events_tests {
             let stolen_database_path = database_path.clone();
             let delivery_started_at = std::time::Instant::now();
             let lost = deliver_claimed_watch_event(
+                &cx,
                 &storage,
                 finalization_lost_id,
                 ipc_persisted_event(finalization_lost_id),
@@ -25717,6 +25924,7 @@ mod watch_events_tests {
     fn persisted_ipc_records_are_wakeups_until_the_ordered_db_drain_advances() {
         let (_directory, database_path, event_ids) = watch_claim_fixture(2);
         run_watch_claim_async(async move {
+            let cx = frankenterm_core::cx::for_testing();
             let stdout = std::io::stdout();
             let mut cursor = Some(0);
             let mut last_event_emit = None;
@@ -25727,6 +25935,7 @@ mod watch_events_tests {
                 let line = serde_json::to_string(&ipc_persisted_event(id))
                     .expect("serialize persisted IPC wakeup");
                 let action = relay_ipc_event_line(
+                    &cx,
                     &stdout,
                     &line,
                     &mut cursor,
@@ -25813,6 +26022,27 @@ mod watch_events_tests {
 
     #[cfg(unix)]
     #[test]
+    fn relayed_lag_gap_uses_the_follower_durable_cursor() {
+        let private_record = serde_json::json!({
+            "type": "gap",
+            "reason": "broadcast_lag",
+            "missed_count": 3,
+            "cursor": null,
+            "message": "three records were missed",
+        });
+        assert_eq!(validate_ipc_gap_record(&private_record), Ok(()));
+
+        let public_record = ipc_gap_with_follower_cursor(private_record.clone(), Some(73));
+        assert_eq!(public_record["cursor"], 73);
+        assert_eq!(public_record["reason"], "broadcast_lag");
+        assert_eq!(public_record["missed_count"], 3);
+
+        let no_checkpoint = ipc_gap_with_follower_cursor(private_record, None);
+        assert!(no_checkpoint["cursor"].is_null());
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn ipc_protocol_fault_gap_discloses_unrecoverable_live_signal_risk() {
         let gap = watch_ipc_protocol_fault_ndjson(
             Some(41),
@@ -25842,18 +26072,66 @@ mod watch_events_tests {
         assert_eq!(watch_cursor_expiry(None, Some(10)), None);
         assert_eq!(watch_cursor_expiry(Some(5), None), None);
 
-        // Boundary cursors must preserve the same ordering semantics without
-        // overflowing either side of the signed event-ID domain.
+        // Valid positive event IDs preserve ordering without overflowing the
+        // upper edge of the signed storage domain.
         assert_eq!(watch_cursor_expiry(Some(i64::MAX), Some(i64::MAX)), None);
+        assert_eq!(watch_cursor_expiry(Some(0), Some(i64::MAX)), Some(i64::MAX));
+        // Negative cursors and non-positive row IDs are outside the public and
+        // SQLite row-id contracts and must never authorize re-baselining.
         assert_eq!(watch_cursor_expiry(Some(i64::MIN), Some(i64::MIN)), None);
+        assert_eq!(watch_cursor_expiry(Some(i64::MIN), Some(10)), None);
+        assert_eq!(watch_cursor_expiry(Some(0), Some(i64::MIN)), None);
+    }
+
+    #[test]
+    fn retention_reconciliation_is_bounded_but_catches_discontinuous_batches() {
+        let reconciled_at = std::time::Instant::now();
+        let reconcile_due_at = reconciled_at + WATCH_EVENTS_RETENTION_RECONCILE_INTERVAL;
+        assert!(watch_retention_reconciliation_is_due(
+            Some(5),
+            Some(6),
+            None,
+            reconciled_at,
+        ));
+        assert!(!watch_retention_reconciliation_is_due(
+            Some(5),
+            Some(6),
+            Some(reconciled_at),
+            reconciled_at,
+        ));
+        assert!(watch_retention_reconciliation_is_due(
+            Some(5),
+            Some(10),
+            Some(reconciled_at),
+            reconciled_at,
+        ));
+        assert!(!watch_retention_reconciliation_is_due(
+            Some(5),
+            None,
+            Some(reconciled_at),
+            reconciled_at,
+        ));
+        assert!(watch_retention_reconciliation_is_due(
+            Some(5),
+            None,
+            Some(reconciled_at),
+            reconcile_due_at,
+        ));
+        assert!(!watch_retention_reconciliation_is_due(
+            None,
+            Some(10),
+            None,
+            reconciled_at,
+        ));
+
+        assert_eq!(validate_watch_oldest_retained_event_id(None), Ok(None));
+        assert_eq!(validate_watch_oldest_retained_event_id(Some(1)), Ok(Some(1)));
         assert_eq!(
-            watch_cursor_expiry(Some(i64::MIN), Some(i64::MIN + 1)),
-            None
+            validate_watch_oldest_retained_event_id(Some(i64::MAX)),
+            Ok(Some(i64::MAX))
         );
-        assert_eq!(
-            watch_cursor_expiry(Some(i64::MIN), Some(i64::MIN + 2)),
-            Some(i64::MIN + 2)
-        );
+        assert!(validate_watch_oldest_retained_event_id(Some(0)).is_err());
+        assert!(validate_watch_oldest_retained_event_id(Some(i64::MIN)).is_err());
     }
 
     #[test]
@@ -37987,6 +38265,9 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             let mut last_emit = std::time::Instant::now();
                             let mut last_event_emit: Option<std::time::Instant> = None;
                             let stdout = std::io::stdout();
+                            let cx = frankenterm_core::cx::Cx::current()
+                                .unwrap_or_else(frankenterm_core::cx::for_request);
+                            let mut last_retention_reconciled_at: Option<std::time::Instant> = None;
 
                             // ft-7h5da.4.1: live IPC transport state. Persisted
                             // EventBus records are low-latency wakeups only;
@@ -37998,9 +38279,6 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             // fallback. Unix-only optimization — other platforms
                             // always use the DB path.
                             #[cfg(unix)]
-                            let cx = frankenterm_core::cx::Cx::current()
-                                .unwrap_or_else(frankenterm_core::cx::for_request);
-                            #[cfg(unix)]
                             let mut ipc_stream: Option<
                                 frankenterm_core::ipc::IpcEventStream,
                             > = None;
@@ -38011,63 +38289,8 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             #[cfg(unix)]
                             let mut ipc_transport_gap_open = false;
 
-                            // ft-7h5da.4.2: typed cursor_expired. If --cursor
-                            // predates the oldest globally-retained event,
-                            // retention pruned the events in between; surface an
-                            // explicit cursor_expired record (never a silent
-                            // skip) and re-baseline to the oldest retained so the
-                            // follower still gets every retained event
-                            // at-least-once.
-                            if let Some(requested) = cursor {
-                                let oldest_query = frankenterm_core::storage::EventStreamQuery {
-                                    after_id: None,
-                                    limit: Some(1),
-                                    pane_id: None, // pruning is global
-                                    rule_id: None,
-                                    event_type: None,
-                                    triage_state: None,
-                                    label: None,
-                                    unhandled_only: false,
-                                    since: None,
-                                    until: None,
-                                };
-                                let oldest_events = match storage
-                                    .get_events_stream(oldest_query)
-                                    .await
-                                {
-                                    Ok(events) => events,
-                                    Err(error) => {
-                                        let response = RobotResponse::<serde_json::Value>::error_with_code(
-                                            ROBOT_ERR_STORAGE,
-                                            format!("Failed to establish the oldest retained event before cursor resumption: {error}"),
-                                            Some(
-                                                "Retry after storage recovers; the follower refused to guess whether retention pruned the requested cursor."
-                                                    .to_string(),
-                                            ),
-                                            elapsed_ms(start),
-                                        );
-                                        print_robot_response(&response, format, stats)?;
-                                        storage.shutdown().await.ok();
-                                        return Ok(());
-                                    }
-                                };
-                                let oldest = oldest_events.first().map(|event| event.id);
-                                if let Some(oldest) = watch_cursor_expiry(Some(requested), oldest) {
-                                    let rec = watch_cursor_expired_ndjson(requested, oldest);
-                                    let cont = {
-                                        let mut lock = stdout.lock();
-                                        write_ndjson_line(&mut lock, &rec)?
-                                    };
-                                    if !cont {
-                                        storage.shutdown().await.ok();
-                                        return Ok(());
-                                    }
-                                    note_watch_output_emitted(&mut last_emit);
-                                    current_cursor = Some(oldest - 1);
-                                }
-                            }
-
                             'follow: loop {
+                                watch_checkpoint(&cx, "durable drain")?;
                                 let query = frankenterm_core::storage::EventStreamQuery {
                                     after_id: current_cursor,
                                     limit: Some(batch_limit),
@@ -38080,7 +38303,10 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                     since: None,
                                     until: None,
                                 };
-                                let events = match storage.get_events_stream(query).await {
+                                let events = match storage
+                                    .get_events_stream_with_cx(&cx, query)
+                                    .await
+                                {
                                     Ok(e) => e,
                                     Err(e) => {
                                         let response =
@@ -38094,10 +38320,62 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                         break 'follow;
                                     }
                                 };
+                                let reconciliation_now = std::time::Instant::now();
+                                if watch_retention_reconciliation_is_due(
+                                    current_cursor,
+                                    events.first().map(|event| event.id),
+                                    last_retention_reconciled_at,
+                                    reconciliation_now,
+                                ) {
+                                    let oldest = match watch_oldest_retained_event_id(&cx, &storage)
+                                        .await
+                                    {
+                                        Ok(oldest) => oldest,
+                                        Err(error) => {
+                                            let response =
+                                                RobotResponse::<serde_json::Value>::error_with_code(
+                                                    ROBOT_ERR_STORAGE,
+                                                    format!(
+                                                        "Failed to reconcile the watch-events cursor with retention: {error}"
+                                                    ),
+                                                    Some(
+                                                        "Retry after storage recovers; the follower refused to guess whether retention pruned the durable cursor."
+                                                            .to_string(),
+                                                    ),
+                                                    elapsed_ms(start),
+                                                );
+                                            print_robot_response(&response, format, stats)?;
+                                            break 'follow;
+                                        }
+                                    };
+                                    last_retention_reconciled_at = Some(std::time::Instant::now());
+                                    if let Some(oldest) =
+                                        watch_cursor_expiry(current_cursor, oldest)
+                                    {
+                                        let requested = current_cursor
+                                            .expect("expiry requires a durable cursor");
+                                        let record =
+                                            watch_cursor_expired_ndjson(requested, oldest);
+                                        let continue_writing = {
+                                            let mut lock = stdout.lock();
+                                            write_ndjson_line(&mut lock, &record)?
+                                        };
+                                        if !continue_writing {
+                                            break 'follow;
+                                        }
+                                        note_watch_output_emitted(&mut last_emit);
+                                        // `watch_oldest_retained_event_id` rejects
+                                        // non-positive IDs, so this subtraction
+                                        // is both valid and overflow-free.
+                                        current_cursor = Some(oldest - 1);
+                                        continue 'follow;
+                                    }
+                                }
                                 let batch_len = events.len();
                                 let mut claim_retry_hint_ms = None;
 
                                 for event in events {
+                                    watch_checkpoint(&cx, "durable batch delivery")?;
                                     if !watch_event_passes_filters(
                                         &event,
                                         severity_filter,
@@ -38112,6 +38390,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                     // slow configured rate must never consume a
                                     // lease's ownership window while sleeping.
                                     if !pace_watch_event(
+                                        &cx,
                                         max_hz_interval,
                                         last_event_emit,
                                         &stdout,
@@ -38133,6 +38412,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
 
                                     if claim {
                                         let delivery = deliver_claimed_watch_event(
+                                            &cx,
                                             &storage,
                                             redacted.id,
                                             record,
@@ -38216,17 +38496,8 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                         heartbeat,
                                         last_emit.elapsed(),
                                     );
-                                    if !wait.is_zero() {
-                                        frankenterm_core::runtime_async::spawn_blocking(move || {
-                                            std::thread::sleep(wait);
-                                        })
-                                        .await
-                                        .map_err(|error| {
-                                            std::io::Error::other(format!(
-                                                "watch-events lease retry delay failed: {error}"
-                                            ))
-                                        })?;
-                                    }
+                                    sleep_watch_delay_with_cx(&cx, wait, "lease retry delay")
+                                        .await?;
                                     continue 'follow;
                                 }
                                 if !follow {
@@ -38263,17 +38534,32 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                         // loop to the durable drain, the watcher
                                         // closes the stream, or the consumer
                                         // closes the pipe.
-                                        let durable_poll_deadline = std::time::Instant::now()
-                                            .checked_add(poll)
-                                            .unwrap_or_else(std::time::Instant::now);
+                                        // Track elapsed time rather than adding
+                                        // the user duration to `Instant`: an
+                                        // extreme u64 millisecond interval can
+                                        // overflow `Instant::checked_add`, and
+                                        // treating that as "now" creates a hot
+                                        // SQLite polling loop.
+                                        let durable_poll_started_at = std::time::Instant::now();
                                         loop {
                                             match read_watch_ipc_line_until_durable_poll(
                                                 &cx,
-                                                durable_poll_deadline,
+                                                durable_poll_started_at,
+                                                poll,
                                                 stream.next_line_with_cx(&cx),
                                             )
                                             .await
                                             {
+                                                Ok(
+                                                    WatchIpcStreamRead::CancellationCheckpoint,
+                                                ) => {
+                                                    // The elapsed durable-poll
+                                                    // window is still open. The
+                                                    // helper has observed Cx;
+                                                    // retain the stream locally
+                                                    // and continue the same stint.
+                                                    continue;
+                                                }
                                                 Ok(WatchIpcStreamRead::DurablePollDeadline) => {
                                                     // A connected peer can stall without
                                                     // closing its socket or sending its private
@@ -38285,6 +38571,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                                 }
                                                 Ok(WatchIpcStreamRead::Line(Some(line))) => {
                                                     match relay_ipc_event_line(
+                                                        &cx,
                                                         &stdout,
                                                         &line,
                                                         &mut current_cursor,
@@ -38541,17 +38828,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                     heartbeat,
                                     last_emit.elapsed(),
                                 );
-                                if !wait.is_zero() {
-                                    frankenterm_core::runtime_async::spawn_blocking(move || {
-                                        std::thread::sleep(wait);
-                                    })
-                                    .await
-                                    .map_err(|error| {
-                                        std::io::Error::other(format!(
-                                            "watch-events idle poll delay failed: {error}"
-                                        ))
-                                    })?;
-                                }
+                                sleep_watch_delay_with_cx(&cx, wait, "idle poll delay").await?;
                             }
 
                             storage.shutdown().await.ok();

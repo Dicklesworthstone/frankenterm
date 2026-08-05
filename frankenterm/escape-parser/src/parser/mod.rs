@@ -1505,8 +1505,10 @@ mod test {
         }
 
         assert_eq!(2, tcap_results.len());
-        // First XtGetTcap: names should be capped at MAX_TCAP_NAMES
-        assert!(tcap_results[0].len() <= MAX_TCAP_NAMES);
+        // The first request accepts exactly the documented number of bounded
+        // names and discards every later name; a weaker <= assertion could pass
+        // after an accidental under-delivery regression.
+        assert_eq!(MAX_TCAP_NAMES, tcap_results[0].len());
         // Second XtGetTcap: parser recovered
         assert_eq!(vec!["TN".to_string()], tcap_results[1]);
     }
@@ -1514,13 +1516,13 @@ mod test {
     #[test]
     fn aggregate_xtgettcap_name_bytes_are_capped_and_parser_recovers() {
         let mut p = Parser::new();
-        let first_name_bytes = MAX_TCAP_TOTAL_BYTES - 2;
+        let first_name_bytes = MAX_TCAP_TOTAL_BYTES;
         let mut seq = Vec::with_capacity(MAX_TCAP_TOTAL_BYTES + 512);
         seq.extend_from_slice(b"\x1bP+q");
         seq.extend(std::iter::repeat_n(b'4', first_name_bytes));
-        // The first raw name fits, but accepting this second name would exceed
-        // the aggregate request budget. It and all remaining names in this DCS
-        // must be ignored without truncating either name into a new command.
+        // The exact aggregate boundary is valid. The first byte of the second
+        // name would exceed it, so that name and every remaining name in this
+        // DCS must be ignored without truncating anything into a new command.
         seq.extend_from_slice(b";544e;434f");
         seq.extend_from_slice(b"\x1b\\");
         // A fresh request must not inherit the discard state.
