@@ -3683,11 +3683,10 @@ impl ObservationRuntime {
             // outcome. Retain it across maintenance attempts and do not admit
             // further size deletions until the bounded receipt succeeds.
             let mut pending_size_retention_receipt = None::<PendingSizeRetentionReceipt>;
-            // The tiered cleanup path likewise returns the exact immutable
-            // maintenance record when persistence fails. Preserve it across
-            // ticks and publish it before admitting another age-retention
-            // mutation, whose later zero-delete receipt would not be an
-            // equivalent audit record for the prior durable prefix.
+            // The tiered cleanup path returns an exact finalization record when
+            // updating its transactionally advanced in-progress receipt fails.
+            // Preserve it across ticks and finalize that same positive row ID
+            // before admitting another age-retention mutation.
             let mut pending_cleanup_receipt = None::<MaintenanceRecord>;
             let backpressure_manager = BackpressureManager::new(BackpressureConfig::default());
             let memory_pressure_monitor =
@@ -3810,10 +3809,10 @@ impl ObservationRuntime {
                                     "Retried pending tiered-cleanup audit receipt"
                                 );
                             }
-                            Err(error) => {
+                            Err(_error) => {
                                 retention_succeeded = false;
                                 error!(
-                                    error = %error,
+                                    error_class = "tiered_cleanup_receipt_retry_failed",
                                     "Pending tiered-cleanup audit receipt still failed; deferring new age-retention cleanup"
                                 );
                             }
@@ -3830,10 +3829,10 @@ impl ObservationRuntime {
                                     "Retried pending size-retention audit receipt"
                                 );
                             }
-                            Err(error) => {
+                            Err(_error) => {
                                 retention_succeeded = false;
                                 error!(
-                                    error = %error,
+                                    error_class = "size_retention_receipt_retry_failed",
                                     deleted_segments = pending.outcome.deleted_segments,
                                     attempt_status = pending.status.as_str(),
                                     "Pending size-retention audit receipt still failed; deferring new size eviction"
@@ -3867,10 +3866,10 @@ impl ObservationRuntime {
                             pending_record, ..
                         } = &outcome.audit
                         {
-                            // Preserve failed receipts for completed, cancelled,
-                            // and failed cleanup attempts alike. Interrupted
-                            // attempts only require a receipt when their plan
-                            // contains a durable deletion prefix.
+                            // Preserve failed finalizations for completed,
+                            // cancelled, and failed attempts alike. The row is
+                            // already durable and transactionally owns every
+                            // committed deletion prefix; retry its positive ID.
                             pending_cleanup_receipt = Some(pending_record.clone());
                         }
                         match (&outcome.termination, &outcome.audit) {
@@ -3886,35 +3885,38 @@ impl ObservationRuntime {
                             }
                             (
                                 crate::cleanup::CleanupTermination::Completed,
-                                crate::cleanup::CleanupAuditStatus::Failed { error, .. },
+                                crate::cleanup::CleanupAuditStatus::Failed {
+                                    error: _error,
+                                    ..
+                                },
                             ) => {
                                 retention_succeeded = false;
                                 error!(
-                                    error = %error,
+                                    error_class = "tiered_cleanup_finalization_failed",
                                     deleted = outcome.plan.total_deleted,
                                     "Retention cleanup completed but its audit receipt failed"
                                 );
                             }
                             (
-                                crate::cleanup::CleanupTermination::Cancelled { error },
+                                crate::cleanup::CleanupTermination::Cancelled { error: _error },
                                 _audit,
                             ) => {
                                 retention_succeeded = false;
                                 warn!(
-                                    error = %error,
-                                    deleted = outcome.plan.total_deleted,
-                                    "Retention cleanup cancelled with a truthful durable prefix"
+                                    error_class = "tiered_cleanup_cancelled",
+                                    reported_deleted = outcome.plan.total_deleted,
+                                    "Retention cleanup cancelled; durable receipt owns committed prefix"
                                 );
                             }
                             (
-                                crate::cleanup::CleanupTermination::Failed { error },
+                                crate::cleanup::CleanupTermination::Failed { error: _error },
                                 _audit,
                             ) => {
                                 retention_succeeded = false;
                                 error!(
-                                    error = %error,
-                                    deleted = outcome.plan.total_deleted,
-                                    "Retention cleanup failed with a truthful durable prefix"
+                                    error_class = "tiered_cleanup_failed",
+                                    reported_deleted = outcome.plan.total_deleted,
+                                    "Retention cleanup failed; durable receipt owns committed prefix"
                                 );
                             }
                             (
@@ -3961,13 +3963,13 @@ impl ObservationRuntime {
                                         retention_max_mb,
                                         attempt_timestamp: size_retention_attempt_timestamp,
                                     };
-                                    if let Err(error) =
+                                    if let Err(_error) =
                                         record_size_retention_receipt(&storage, pending).await
                                     {
                                         retention_succeeded = false;
                                         pending_size_retention_receipt = Some(pending);
                                         error!(
-                                            error = %error,
+                                            error_class = "size_retention_receipt_failed",
                                             deleted_segments = outcome.deleted_segments,
                                             "Completed size retention but its audit receipt failed"
                                         );
@@ -3984,12 +3986,12 @@ impl ObservationRuntime {
                             }
                             crate::storage::DurableMutationProgress::Interrupted {
                                 durable,
-                                error,
+                                error: _error,
                             } => {
                                 retention_succeeded = false;
                                 let deleted_segments =
                                     durable.map_or(0, |outcome| outcome.deleted_segments);
-                                let mut receipt_error = None;
+                                let mut receipt_failed = false;
                                 if let Some(outcome) =
                                     durable.filter(|value| value.deleted_segments > 0)
                                 {
@@ -3999,17 +4001,17 @@ impl ObservationRuntime {
                                         retention_max_mb,
                                         attempt_timestamp: size_retention_attempt_timestamp,
                                     };
-                                    if let Err(receipt_failure) =
+                                    if let Err(_receipt_failure) =
                                         record_size_retention_receipt(&storage, pending).await
                                     {
                                         pending_size_retention_receipt = Some(pending);
-                                        receipt_error = Some(receipt_failure.to_string());
+                                        receipt_failed = true;
                                     }
                                 }
                                 error!(
-                                    error = %error,
+                                    error_class = "size_retention_interrupted",
                                     deleted_segments,
-                                    receipt_error = ?receipt_error,
+                                    receipt_failed,
                                     "Size-based retention interrupted"
                                 );
                             }
@@ -4034,8 +4036,11 @@ impl ObservationRuntime {
                                 "WAL checkpoint completed"
                             );
                         }
-                        Err(e) => {
-                            error!(error = %e, "WAL checkpoint failed");
+                        Err(_error) => {
+                            error!(
+                                error_class = "wal_checkpoint_failed",
+                                "WAL checkpoint failed"
+                            );
                         }
                     }
 
@@ -4097,7 +4102,7 @@ impl ObservationRuntime {
                         "page_stats_available": page_stats_available,
                         "log_report": cache_gc_settings.log_report,
                     });
-                    if let Err(error) = storage
+                    if let Err(_error) = storage
                         .record_maintenance(MaintenanceRecord {
                             id: 0,
                             event_type: "cache_gc".to_string(),
@@ -4107,7 +4112,15 @@ impl ObservationRuntime {
                         })
                         .await
                     {
-                        error!(error = %error, "Failed to record database cache GC advisory");
+                        error!(
+                            error_class = "cache_gc_maintenance_record_failed",
+                            page_count,
+                            free_pages,
+                            free_ratio,
+                            manual_vacuum_advised,
+                            page_stats_available,
+                            "Failed to record database cache GC advisory"
+                        );
                     }
 
                     if cache_gc_settings.log_report {
