@@ -80,6 +80,16 @@ pub mod mmap_store;
 
 const TIMELINE_PANE_ID_INLINE_LIMIT: usize = 96;
 
+/// Maximum number of identifiers accepted by one storage bulk-read call.
+///
+/// Bulk readers bind one canonical JSON array rather than one SQLite variable
+/// per identifier, so this is an allocation and latency bound rather than a
+/// database parameter limit.  Callers that need more must page deliberately.
+pub const STORAGE_BULK_ID_INPUT_MAX: usize = 4_096;
+
+/// Maximum number of downstream-delivery leases changed by one atomic batch.
+pub const EVENT_DELIVERY_LEASE_BULK_MAX: usize = 64;
+
 pub use frankenterm_core_audit_types::storage_audit::{
     ActionHistoryQuery, ActionHistoryRecord, ActionUndoRecord, AuditActionRecord, AuditQuery,
     AuditStreamPage, AuditStreamQuery, AuditStreamRecord, PolicyDeniedAuditRecord,
@@ -693,6 +703,19 @@ enum WriteCommand {
         token: String,
         respond: oneshot::Sender<Result<bool>>,
     },
+    /// Atomically finalize exact event-delivery lease pairs.
+    FinalizeEventDeliveriesBulk {
+        leases: Vec<(i64, String)>,
+        handled_at_ms: i64,
+        workflow_id: Option<String>,
+        status: String,
+        respond: oneshot::Sender<Result<usize>>,
+    },
+    /// Atomically release exact event-delivery lease pairs.
+    ReleaseEventDeliveriesBulk {
+        leases: Vec<(i64, String)>,
+        respond: oneshot::Sender<Result<usize>>,
+    },
     /// Set or clear triage state for an event.
     SetEventTriageState {
         event_id: i64,
@@ -1120,6 +1143,8 @@ impl std::fmt::Debug for WriteCommand {
             Self::ReserveEventDelivery { .. } => "ReserveEventDelivery",
             Self::FinalizeEventDelivery { .. } => "FinalizeEventDelivery",
             Self::ReleaseEventDelivery { .. } => "ReleaseEventDelivery",
+            Self::FinalizeEventDeliveriesBulk { .. } => "FinalizeEventDeliveriesBulk",
+            Self::ReleaseEventDeliveriesBulk { .. } => "ReleaseEventDeliveriesBulk",
             Self::SetEventTriageState { .. } => "SetEventTriageState",
             Self::SetEventNote { .. } => "SetEventNote",
             Self::AddEventLabel { .. } => "AddEventLabel",
@@ -2875,6 +2900,141 @@ impl StorageHandle {
         Self::recv_writer_response(rx).await
     }
 
+    /// Atomically finalize a bounded set of successfully flushed deliveries.
+    ///
+    /// Every `(event_id, lease_token)` pair must still own its unhandled event.
+    /// If any pair is stale or missing, the entire batch rolls back. Exact
+    /// duplicate pairs are harmless; distinct tokens for one event are
+    /// rejected before enqueue. The input is capped at
+    /// [`EVENT_DELIVERY_LEASE_BULK_MAX`]. `handled_at_ms` must be a
+    /// non-negative timestamp captured after downstream delivery acknowledgement.
+    pub async fn finalize_event_delivery_leases_bulk(
+        &self,
+        leases: &[(i64, String)],
+        handled_at_ms: i64,
+        workflow_id: Option<&str>,
+        status: &str,
+    ) -> Result<usize> {
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.finalize_event_delivery_leases_bulk_with_cx(
+            &cx,
+            leases,
+            handled_at_ms,
+            workflow_id,
+            status,
+        )
+        .await
+    }
+
+    /// Cancellation-aware sibling of
+    /// [`Self::finalize_event_delivery_leases_bulk`].
+    pub async fn finalize_event_delivery_leases_bulk_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        leases: &[(i64, String)],
+        handled_at_ms: i64,
+        workflow_id: Option<&str>,
+        status: &str,
+    ) -> Result<usize> {
+        Self::checkpoint_storage_operation(cx, "finalize_event_delivery_leases_bulk")?;
+        validate_event_delivery_bulk_finalize(handled_at_ms, status)?;
+        let leases = canonical_event_delivery_lease_pairs(leases)?;
+        if leases.is_empty() {
+            Self::checkpoint_storage_operation(
+                cx,
+                "finalize_event_delivery_leases_bulk completion",
+            )?;
+            return Ok(0);
+        }
+        let workflow_id = workflow_id.map(str::to_string);
+        let status = status.to_string();
+        let (tx, rx) = oneshot::channel();
+        self.write_tx
+            .send_with_cx(
+                cx,
+                WriteCommand::FinalizeEventDeliveriesBulk {
+                    leases,
+                    handled_at_ms,
+                    workflow_id,
+                    status,
+                    respond: tx,
+                },
+            )
+            .await
+            .map_err(|error| {
+                Self::writer_send_error("finalize_event_delivery_leases_bulk", error)
+            })?;
+        let result = Self::recv_writer_response(rx).await;
+        let completion_checkpoint = Self::checkpoint_storage_operation(
+            cx,
+            "finalize_event_delivery_leases_bulk completion",
+        );
+        match result {
+            Ok(finalized) => {
+                completion_checkpoint?;
+                Ok(finalized)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Atomically release a bounded set of delivery leases after a known
+    /// downstream failure.
+    ///
+    /// Every pair must still own its unhandled event. Any stale or missing pair
+    /// rolls the whole batch back; exact duplicates are harmless.
+    pub async fn release_event_delivery_leases_bulk(
+        &self,
+        leases: &[(i64, String)],
+    ) -> Result<usize> {
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.release_event_delivery_leases_bulk_with_cx(&cx, leases)
+            .await
+    }
+
+    /// Cancellation-aware sibling of
+    /// [`Self::release_event_delivery_leases_bulk`].
+    pub async fn release_event_delivery_leases_bulk_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        leases: &[(i64, String)],
+    ) -> Result<usize> {
+        Self::checkpoint_storage_operation(cx, "release_event_delivery_leases_bulk")?;
+        let leases = canonical_event_delivery_lease_pairs(leases)?;
+        if leases.is_empty() {
+            Self::checkpoint_storage_operation(
+                cx,
+                "release_event_delivery_leases_bulk completion",
+            )?;
+            return Ok(0);
+        }
+        let (tx, rx) = oneshot::channel();
+        self.write_tx
+            .send_with_cx(
+                cx,
+                WriteCommand::ReleaseEventDeliveriesBulk {
+                    leases,
+                    respond: tx,
+                },
+            )
+            .await
+            .map_err(|error| {
+                Self::writer_send_error("release_event_delivery_leases_bulk", error)
+            })?;
+        let result = Self::recv_writer_response(rx).await;
+        let completion_checkpoint = Self::checkpoint_storage_operation(
+            cx,
+            "release_event_delivery_leases_bulk completion",
+        );
+        match result {
+            Ok(released) => {
+                completion_checkpoint?;
+                Ok(released)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     /// Set or clear an event's triage state.
     ///
     /// Returns true if an event row was updated.
@@ -3044,6 +3204,41 @@ impl StorageHandle {
         Self::spawn_blocking_storage_with_cx(cx, move || {
             pooled_backend(db_path.as_str(), |backend| {
                 query_event_annotations_backend(backend, event_id)
+            })
+        })
+        .await
+    }
+
+    /// Fetch annotations for a bounded set of event IDs in one read snapshot.
+    ///
+    /// Duplicate IDs are harmless. Missing events are omitted from the map.
+    /// Input is capped at [`STORAGE_BULK_ID_INPUT_MAX`]; event IDs must be
+    /// positive.
+    pub async fn get_event_annotations_bulk(
+        &self,
+        event_ids: &[i64],
+    ) -> Result<HashMap<i64, EventAnnotations>> {
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.get_event_annotations_bulk_with_cx(&cx, event_ids)
+            .await
+    }
+
+    /// Cancellation-aware sibling of [`Self::get_event_annotations_bulk`].
+    pub async fn get_event_annotations_bulk_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        event_ids: &[i64],
+    ) -> Result<HashMap<i64, EventAnnotations>> {
+        Self::checkpoint_storage_operation(cx, "get_event_annotations_bulk")?;
+        let event_ids = canonical_event_annotation_ids(event_ids)?;
+        if event_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let db_path = Arc::clone(&self.db_path);
+
+        Self::spawn_blocking_storage_with_cx(cx, move || {
+            pooled_backend(db_path.as_str(), |backend| {
+                query_event_annotations_bulk_canonical_backend(backend, &event_ids)
             })
         })
         .await
@@ -6710,6 +6905,41 @@ impl StorageHandle {
         .await
     }
 
+    /// Fetch each existing pane's latest captured-output timestamp in one read
+    /// snapshot.
+    ///
+    /// Existing panes without output map to `None`; missing panes are omitted.
+    /// Duplicate IDs are harmless and input is capped at
+    /// [`STORAGE_BULK_ID_INPUT_MAX`].
+    pub async fn pane_last_output_at_bulk(
+        &self,
+        pane_ids: &[u64],
+    ) -> Result<HashMap<u64, Option<i64>>> {
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.pane_last_output_at_bulk_with_cx(&cx, pane_ids).await
+    }
+
+    /// Cancellation-aware sibling of [`Self::pane_last_output_at_bulk`].
+    pub async fn pane_last_output_at_bulk_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        pane_ids: &[u64],
+    ) -> Result<HashMap<u64, Option<i64>>> {
+        Self::checkpoint_storage_operation(cx, "pane_last_output_at_bulk")?;
+        let pane_ids = canonical_pane_activity_ids(pane_ids)?;
+        if pane_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let db_path = Arc::clone(&self.db_path);
+
+        Self::spawn_blocking_storage_with_cx(cx, move || {
+            pooled_backend(db_path.as_str(), |backend| {
+                query_pane_last_output_at_bulk_canonical_backend(backend, &pane_ids)
+            })
+        })
+        .await
+    }
+
     /// Get all panes
     pub async fn get_panes(&self) -> Result<Vec<PaneRecord>> {
         let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
@@ -9941,6 +10171,10 @@ fn fail_undispatched_write_command(cmd: WriteCommand, message: String) -> bool {
         | WriteCommand::DeleteAgentProfile { respond, .. } => {
             respond_oneshot_best_effort(respond, writer_panic_error(&message));
         }
+        WriteCommand::FinalizeEventDeliveriesBulk { respond, .. }
+        | WriteCommand::ReleaseEventDeliveriesBulk { respond, .. } => {
+            respond_oneshot_best_effort(respond, writer_panic_error(&message));
+        }
         WriteCommand::ConsumePreparedPlan { respond, .. } => {
             respond_oneshot_best_effort(respond, writer_panic_error(&message));
         }
@@ -12508,6 +12742,28 @@ fn dispatch_write_command_raw(
             let result = release_event_delivery_backend(backend, event_id, &token);
             respond_oneshot_best_effort(respond, result);
         }
+        WriteCommand::FinalizeEventDeliveriesBulk {
+            leases,
+            handled_at_ms,
+            workflow_id,
+            status,
+            respond,
+        } => {
+            let respond = WriterResultResponder::new(respond);
+            let result = finalize_event_delivery_leases_bulk_backend(
+                backend,
+                &leases,
+                handled_at_ms,
+                workflow_id.as_deref(),
+                &status,
+            );
+            respond_oneshot_best_effort(respond, result);
+        }
+        WriteCommand::ReleaseEventDeliveriesBulk { leases, respond } => {
+            let respond = WriterResultResponder::new(respond);
+            let result = release_event_delivery_leases_bulk_backend(backend, &leases);
+            respond_oneshot_best_effort(respond, result);
+        }
         WriteCommand::SetEventTriageState {
             event_id,
             triage_state,
@@ -14601,6 +14857,252 @@ fn release_event_delivery_backend(
     Ok(updated.is_some())
 }
 
+fn validate_event_delivery_bulk_finalize(handled_at_ms: i64, status: &str) -> Result<()> {
+    if handled_at_ms < 0 {
+        return Err(StorageError::Database(format!(
+            "bulk event delivery handled_at_ms must be non-negative: {handled_at_ms}"
+        ))
+        .into());
+    }
+    if status.is_empty() {
+        return Err(StorageError::Database(
+            "bulk event delivery status must not be empty".to_string(),
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn canonical_event_delivery_lease_pairs(
+    leases: &[(i64, String)],
+) -> Result<Vec<(i64, String)>> {
+    if leases.len() > EVENT_DELIVERY_LEASE_BULK_MAX {
+        return Err(StorageError::Database(format!(
+            "event delivery lease batch has {} pairs; maximum is {EVENT_DELIVERY_LEASE_BULK_MAX}",
+            leases.len()
+        ))
+        .into());
+    }
+    for (event_id, token) in leases {
+        if *event_id <= 0 || token.is_empty() {
+            return Err(StorageError::Database(format!(
+                "invalid event delivery lease pair: event_id={event_id}, token_empty={}",
+                token.is_empty()
+            ))
+            .into());
+        }
+    }
+
+    let mut canonical = leases.to_vec();
+    canonical.sort_unstable();
+    canonical.dedup();
+    if let Some(conflict) = canonical
+        .windows(2)
+        .find(|pair| pair[0].0 == pair[1].0)
+    {
+        return Err(StorageError::Database(format!(
+            "event delivery lease batch contains conflicting tokens for event {}",
+            conflict[0].0
+        ))
+        .into());
+    }
+    Ok(canonical)
+}
+
+fn event_delivery_lease_pairs_json(leases: &[(i64, String)]) -> Result<String> {
+    serde_json::to_string(leases).map_err(|error| {
+        StorageError::Database(format!(
+            "failed to encode event delivery lease batch: {error}"
+        ))
+        .into()
+    })
+}
+
+fn validate_event_delivery_bulk_returned_ids(
+    rows: &[Vec<SqlCell>],
+    leases: &[(i64, String)],
+    operation: &str,
+) -> Result<()> {
+    let mut returned_ids = Vec::with_capacity(rows.len());
+    for row in rows {
+        let reader = CellRowReader::new(row);
+        if reader.column_count() != 1 {
+            return Err(StorageError::Database(format!(
+                "{operation} RETURNING row has {} columns; expected 1",
+                reader.column_count()
+            ))
+            .into());
+        }
+        let event_id = reader
+            .i64(0)
+            .map_err(|err| storage_backend_error("Decode bulk lease event ID", err))?;
+        if event_id <= 0 {
+            return Err(StorageError::Database(format!(
+                "{operation} returned non-positive event ID {event_id}"
+            ))
+            .into());
+        }
+        returned_ids.push(event_id);
+    }
+    returned_ids.sort_unstable();
+    let expected_ids = leases
+        .iter()
+        .map(|(event_id, _)| *event_id)
+        .collect::<Vec<_>>();
+    if returned_ids != expected_ids {
+        return Err(StorageError::Database(format!(
+            "{operation} lease ownership conflict: updated {} of {} exact pairs",
+            returned_ids.len(),
+            expected_ids.len()
+        ))
+        .into());
+    }
+    Ok(())
+}
+
+fn execute_event_delivery_bulk_transaction<F>(
+    backend: &dyn StorageBackend,
+    leases: &[(i64, String)],
+    operation: &str,
+    mutation: F,
+) -> Result<usize>
+where
+    F: FnOnce(&dyn StorageBackend) -> Result<Vec<Vec<SqlCell>>>,
+{
+    backend.execute("BEGIN IMMEDIATE").map_err(|err| {
+        storage_backend_error(&format!("Begin {operation} transaction"), err)
+    })?;
+    let transaction_result = mutation(backend).and_then(|rows| {
+        validate_event_delivery_bulk_returned_ids(&rows, leases, operation)?;
+        Ok(leases.len())
+    });
+
+    match transaction_result {
+        Ok(updated) => match backend.execute("COMMIT") {
+            Ok(_) => Ok(updated),
+            Err(error) => {
+                if let Err(rollback_error) = backend.execute("ROLLBACK") {
+                    tracing::error!(
+                        operation,
+                        error = %rollback_error,
+                        "event delivery bulk rollback after commit failure also failed"
+                    );
+                }
+                Err(storage_backend_error(&format!("Commit {operation} transaction"), error)
+                    .into())
+            }
+        },
+        Err(error) => {
+            if let Err(rollback_error) = backend.execute("ROLLBACK") {
+                tracing::error!(
+                    operation,
+                    error = %rollback_error,
+                    "event delivery bulk rollback failed"
+                );
+            }
+            Err(error)
+        }
+    }
+}
+
+fn finalize_event_delivery_leases_bulk_backend(
+    backend: &dyn StorageBackend,
+    leases: &[(i64, String)],
+    handled_at_ms: i64,
+    workflow_id: Option<&str>,
+    status: &str,
+) -> Result<usize> {
+    validate_event_delivery_bulk_finalize(handled_at_ms, status)?;
+    let leases = canonical_event_delivery_lease_pairs(leases)?;
+    if leases.is_empty() {
+        return Ok(0);
+    }
+    let leases_json = event_delivery_lease_pairs_json(&leases)?;
+    execute_event_delivery_bulk_transaction(
+        backend,
+        &leases,
+        "event delivery bulk finalize",
+        |backend| {
+            backend
+                .query_map_cells(
+                    "WITH requested(event_id, token) AS (
+                         SELECT CAST(json_extract(lease_json.value, '$[0]') AS INTEGER),
+                                json_extract(lease_json.value, '$[1]')
+                         FROM json_each(?1) AS lease_json
+                         WHERE json_type(lease_json.value, '$[0]') = 'integer'
+                           AND json_type(lease_json.value, '$[1]') = 'text'
+                     )
+                     UPDATE events
+                     SET handled_at = ?2,
+                         handled_by_workflow_id = ?3,
+                         handled_status = ?4,
+                         delivery_lease_token = NULL,
+                         delivery_lease_acquired_at = NULL,
+                         delivery_lease_expires_at = NULL
+                     WHERE handled_at IS NULL
+                       AND EXISTS (
+                           SELECT 1 FROM requested
+                           WHERE requested.event_id = events.id
+                             AND requested.token = events.delivery_lease_token
+                       )
+                     RETURNING id",
+                    &[
+                        ToSqlValue::Text(&leases_json),
+                        ToSqlValue::Integer(handled_at_ms),
+                        ToSqlValue::optional_text(workflow_id),
+                        ToSqlValue::Text(status),
+                    ],
+                )
+                .map_err(|err| {
+                    storage_backend_error("Finalize event delivery lease batch", err).into()
+                })
+        },
+    )
+}
+
+fn release_event_delivery_leases_bulk_backend(
+    backend: &dyn StorageBackend,
+    leases: &[(i64, String)],
+) -> Result<usize> {
+    let leases = canonical_event_delivery_lease_pairs(leases)?;
+    if leases.is_empty() {
+        return Ok(0);
+    }
+    let leases_json = event_delivery_lease_pairs_json(&leases)?;
+    execute_event_delivery_bulk_transaction(
+        backend,
+        &leases,
+        "event delivery bulk release",
+        |backend| {
+            backend
+                .query_map_cells(
+                    "WITH requested(event_id, token) AS (
+                         SELECT CAST(json_extract(lease_json.value, '$[0]') AS INTEGER),
+                                json_extract(lease_json.value, '$[1]')
+                         FROM json_each(?1) AS lease_json
+                         WHERE json_type(lease_json.value, '$[0]') = 'integer'
+                           AND json_type(lease_json.value, '$[1]') = 'text'
+                     )
+                     UPDATE events
+                     SET delivery_lease_token = NULL,
+                         delivery_lease_acquired_at = NULL,
+                         delivery_lease_expires_at = NULL
+                     WHERE handled_at IS NULL
+                       AND EXISTS (
+                           SELECT 1 FROM requested
+                           WHERE requested.event_id = events.id
+                             AND requested.token = events.delivery_lease_token
+                       )
+                     RETURNING id",
+                    &[ToSqlValue::Text(&leases_json)],
+                )
+                .map_err(|err| {
+                    storage_backend_error("Release event delivery lease batch", err).into()
+                })
+        },
+    )
+}
+
 /// Set or clear triage state on an event row.
 ///
 /// Returns true if an event row was updated.
@@ -14733,79 +15235,181 @@ fn query_event_annotations_backend(
     backend: &dyn StorageBackend,
     event_id: i64,
 ) -> Result<Option<EventAnnotations>> {
-    let triage = backend
-        .query_row_typed(
-            "SELECT triage_state, triage_updated_at, triage_updated_by FROM events WHERE id = ?1",
-            &[ToSqlValue::Integer(event_id)],
+    let mut annotations = query_event_annotations_bulk_backend(backend, &[event_id])?;
+    Ok(annotations.remove(&event_id))
+}
+
+fn validate_bulk_id_input_len(kind: &str, len: usize) -> Result<()> {
+    if len > STORAGE_BULK_ID_INPUT_MAX {
+        return Err(StorageError::Database(format!(
+            "{kind} bulk input has {len} IDs; maximum is {STORAGE_BULK_ID_INPUT_MAX}"
+        ))
+        .into());
+    }
+    Ok(())
+}
+
+fn canonical_event_annotation_ids(event_ids: &[i64]) -> Result<Vec<i64>> {
+    validate_bulk_id_input_len("event annotations", event_ids.len())?;
+    if let Some(event_id) = event_ids.iter().copied().find(|event_id| *event_id <= 0) {
+        return Err(StorageError::Database(format!(
+            "event annotation ID must be positive: {event_id}"
+        ))
+        .into());
+    }
+
+    let mut canonical = event_ids.to_vec();
+    canonical.sort_unstable();
+    canonical.dedup();
+    Ok(canonical)
+}
+
+fn canonical_i64_id_json(ids: &[i64], kind: &str) -> Result<String> {
+    serde_json::to_string(ids).map_err(|error| {
+        StorageError::Database(format!("failed to encode {kind} bulk IDs: {error}")).into()
+    })
+}
+
+fn query_event_annotations_bulk_backend(
+    backend: &dyn StorageBackend,
+    event_ids: &[i64],
+) -> Result<HashMap<i64, EventAnnotations>> {
+    let event_ids = canonical_event_annotation_ids(event_ids)?;
+    query_event_annotations_bulk_canonical_backend(backend, &event_ids)
+}
+
+/// Query a validated, sorted, deduplicated event-ID slice in one SQLite read
+/// statement. A single JSON bind avoids the engine's positional-variable cap.
+fn query_event_annotations_bulk_canonical_backend(
+    backend: &dyn StorageBackend,
+    event_ids: &[i64],
+) -> Result<HashMap<i64, EventAnnotations>> {
+    if event_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let event_ids_json = canonical_i64_id_json(event_ids, "event annotation")?;
+    let rows = backend
+        .query_map_cells(
+            "WITH requested(event_id) AS (
+                 SELECT CAST(requested_json.value AS INTEGER)
+                 FROM json_each(?1) AS requested_json
+                 WHERE requested_json.type = 'integer'
+             )
+             SELECT events.id,
+                    events.triage_state,
+                    events.triage_updated_at,
+                    events.triage_updated_by,
+                    event_notes.note,
+                    event_notes.updated_at,
+                    event_notes.updated_by,
+                    event_labels.label
+             FROM requested
+             JOIN events ON events.id = requested.event_id
+             LEFT JOIN event_notes ON event_notes.event_id = events.id
+             LEFT JOIN event_labels ON event_labels.event_id = events.id
+             ORDER BY events.id ASC, event_labels.label ASC",
+            &[ToSqlValue::Text(&event_ids_json)],
         )
-        .map_err(|err| storage_backend_error("Failed to query triage state", err))?;
+        .map_err(|err| storage_backend_error("Bulk event annotations query failed", err))?;
 
-    let Some(triage) = triage else {
-        return Ok(None);
-    };
-    let triage = RowReader::new(&triage);
-    let triage_state = triage
-        .optional_string(0)
-        .map_err(|err| storage_backend_error("Decode triage state", err))?;
-    let triage_updated_at = triage
-        .optional_i64(1)
-        .map_err(|err| storage_backend_error("Decode triage updated_at", err))?;
-    let triage_updated_by = triage
-        .optional_string(2)
-        .map_err(|err| storage_backend_error("Decode triage updated_by", err))?;
-
-    let note_row = backend
-        .query_row_typed(
-            "SELECT note, updated_at, updated_by FROM event_notes WHERE event_id = ?1",
-            &[ToSqlValue::Integer(event_id)],
-        )
-        .map_err(|err| storage_backend_error("Failed to query event note", err))?;
-
-    let (note, note_updated_at, note_updated_by) = note_row
-        .as_ref()
-        .map(|row| {
-            let row = RowReader::new(row);
-            Ok::<_, StorageError>((
-                Some(
-                    row.string(0)
-                        .map_err(|err| storage_backend_error("Decode event note", err))?,
-                ),
-                Some(
-                    row.i64(1)
-                        .map_err(|err| storage_backend_error("Decode event note timestamp", err))?,
-                ),
-                row.optional_string(2)
-                    .map_err(|err| storage_backend_error("Decode event note updater", err))?,
+    let mut annotations = HashMap::with_capacity(event_ids.len().min(rows.len()));
+    for row in &rows {
+        let reader = CellRowReader::new(row);
+        if reader.column_count() != 8 {
+            return Err(StorageError::Database(format!(
+                "bulk event annotation row has {} columns; expected 8",
+                reader.column_count()
             ))
-        })
-        .transpose()?
-        .unwrap_or((None, None, None));
+            .into());
+        }
 
-    let label_rows = backend
-        .query_map_typed(
-            "SELECT label FROM event_labels WHERE event_id = ?1 ORDER BY label ASC",
-            &[ToSqlValue::Integer(event_id)],
-        )
-        .map_err(|err| storage_backend_error("Labels query failed", err))?;
+        let event_id = reader
+            .i64(0)
+            .map_err(|err| storage_backend_error("Decode bulk annotation event ID", err))?;
+        if event_ids.binary_search(&event_id).is_err() {
+            return Err(StorageError::Database(format!(
+                "bulk annotation query returned unrequested event ID {event_id}"
+            ))
+            .into());
+        }
 
-    let labels = label_rows
-        .iter()
-        .map(|row| {
-            RowReader::new(row)
-                .string(0)
-                .map_err(|err| storage_backend_error("Decode event label", err).into())
-        })
-        .collect::<Result<Vec<_>>>()?;
+        let row_annotations = EventAnnotations {
+            triage_state: reader
+                .optional_string(1)
+                .map_err(|err| storage_backend_error("Decode bulk triage state", err))?,
+            triage_updated_at: reader
+                .optional_i64(2)
+                .map_err(|err| storage_backend_error("Decode bulk triage timestamp", err))?,
+            triage_updated_by: reader
+                .optional_string(3)
+                .map_err(|err| storage_backend_error("Decode bulk triage updater", err))?,
+            note: reader
+                .optional_string(4)
+                .map_err(|err| storage_backend_error("Decode bulk event note", err))?,
+            note_updated_at: reader
+                .optional_i64(5)
+                .map_err(|err| storage_backend_error("Decode bulk note timestamp", err))?,
+            note_updated_by: reader
+                .optional_string(6)
+                .map_err(|err| storage_backend_error("Decode bulk note updater", err))?,
+            labels: Vec::new(),
+        };
+        for (label, timestamp) in [
+            ("triage_updated_at", row_annotations.triage_updated_at),
+            ("note_updated_at", row_annotations.note_updated_at),
+        ] {
+            if timestamp.is_some_and(|value| value < 0) {
+                return Err(StorageError::Database(format!(
+                    "bulk event annotation {label} is negative for event {event_id}"
+                ))
+                .into());
+            }
+        }
+        let label = reader
+            .optional_string(7)
+            .map_err(|err| storage_backend_error("Decode bulk event label", err))?;
 
-    Ok(Some(EventAnnotations {
-        triage_state,
-        triage_updated_at,
-        triage_updated_by,
-        note,
-        note_updated_at,
-        note_updated_by,
-        labels,
-    }))
+        use std::collections::hash_map::Entry;
+        match annotations.entry(event_id) {
+            Entry::Vacant(entry) => {
+                let mut row_annotations = row_annotations;
+                if let Some(label) = label {
+                    row_annotations.labels.push(label);
+                }
+                entry.insert(row_annotations);
+            }
+            Entry::Occupied(mut entry) => {
+                let existing = entry.get_mut();
+                let same_base = existing.triage_state == row_annotations.triage_state
+                    && existing.triage_updated_at == row_annotations.triage_updated_at
+                    && existing.triage_updated_by == row_annotations.triage_updated_by
+                    && existing.note == row_annotations.note
+                    && existing.note_updated_at == row_annotations.note_updated_at
+                    && existing.note_updated_by == row_annotations.note_updated_by;
+                if !same_base {
+                    return Err(StorageError::Database(format!(
+                        "bulk annotation rows disagree for event {event_id}"
+                    ))
+                    .into());
+                }
+                let Some(label) = label else {
+                    return Err(StorageError::Database(format!(
+                        "bulk annotation query returned duplicate unlabeled row for event {event_id}"
+                    ))
+                    .into());
+                };
+                if existing.labels.last().is_some_and(|previous| previous >= &label) {
+                    return Err(StorageError::Database(format!(
+                        "bulk annotation labels are duplicate or out of order for event {event_id}"
+                    ))
+                    .into());
+                }
+                existing.labels.push(label);
+            }
+        }
+    }
+
+    Ok(annotations)
 }
 
 /// Insert or update a persistent event mute.
@@ -21666,7 +22270,7 @@ fn query_unhandled_events_backend(
              handled_by_workflow_id, handled_status
              FROM events
              WHERE handled_at IS NULL
-             ORDER BY detected_at DESC
+             ORDER BY detected_at DESC, id DESC
              LIMIT ?1",
             &[ToSqlValue::Integer(limit_i64)],
         )
@@ -21700,9 +22304,22 @@ fn query_unhandled_event_counts(
         let count = reader
             .i64(1)
             .map_err(|err| storage_backend_error("Unhandled event count", err))?;
-        let pane_id = u64::try_from(pane_id).unwrap_or(0);
-        let count = u32::try_from(count).unwrap_or(u32::MAX);
-        result.insert(pane_id, count);
+        let pane_id = u64::try_from(pane_id).map_err(|_| {
+            StorageError::Database(format!(
+                "unhandled event count pane_id {pane_id} is out of u64 range"
+            ))
+        })?;
+        let count = u32::try_from(count).map_err(|_| {
+            StorageError::Database(format!(
+                "unhandled event count {count} for pane {pane_id} is out of u32 range"
+            ))
+        })?;
+        if result.insert(pane_id, count).is_some() {
+            return Err(StorageError::Database(format!(
+                "unhandled event count query returned duplicate pane {pane_id}"
+            ))
+            .into());
+        }
     }
 
     Ok(result)
@@ -21730,7 +22347,18 @@ fn query_last_activity_by_pane_backend(
         let last_activity = reader
             .i64(1)
             .map_err(|err| storage_backend_error("Last activity row timestamp", err))?;
-        result.insert(pane_id, last_activity);
+        if last_activity < 0 {
+            return Err(StorageError::Database(format!(
+                "pane {pane_id} has a negative last activity timestamp"
+            ))
+            .into());
+        }
+        if result.insert(pane_id, last_activity).is_some() {
+            return Err(StorageError::Database(format!(
+                "last activity query returned duplicate pane {pane_id}"
+            ))
+            .into());
+        }
     }
 
     Ok(result)
@@ -21788,7 +22416,7 @@ fn query_events_backend(
         params.push(ToSqlValue::Integer(until));
     }
 
-    sql.push_str(" ORDER BY detected_at DESC LIMIT ?");
+    sql.push_str(" ORDER BY detected_at DESC, id DESC LIMIT ?");
     let limit_i64 = usize_to_i64(query.limit.unwrap_or(20), "limit")?;
     params.push(ToSqlValue::Integer(limit_i64));
 
@@ -23108,18 +23736,29 @@ fn query_max_seq_backend(backend: &dyn StorageBackend, pane_id: u64) -> Result<O
             &[ToSqlValue::Integer(pane_id_i64)],
         )
         .map_err(|err| storage_backend_error("Query max seq", err))?;
-    let max = row.and_then(|cells| {
-        cells.into_iter().next().and_then(|cell| match cell {
-            SqlCell::Integer(v) => Some(v),
-            // SQL NULL (empty table or no matching pane_id) maps to None.
-            SqlCell::Null => None,
-            // MAX over an INTEGER column should never return REAL/TEXT/BLOB;
-            // treat unexpected types as "no value".
-            _ => None,
+    let row = row.ok_or_else(|| {
+        StorageError::Database("MAX(seq) query returned no aggregate row".to_string())
+    })?;
+    let reader = CellRowReader::new(&row);
+    if reader.column_count() != 1 {
+        return Err(StorageError::Database(format!(
+            "MAX(seq) query returned {} columns; expected 1",
+            reader.column_count()
+        ))
+        .into());
+    }
+    reader
+        .optional_i64(0)
+        .map_err(|err| storage_backend_error("Decode pane max seq", err))?
+        .map(|value| {
+            u64::try_from(value).map_err(|_| {
+                StorageError::Database(format!(
+                    "output_segments.seq value {value} is out of u64 range"
+                ))
+                .into()
+            })
         })
-    });
-    #[allow(clippy::cast_sign_loss)]
-    Ok(max.map(|v| v as u64))
+        .transpose()
 }
 
 /// ft-r0977: latest captured-segment timestamp (epoch ms) for a pane, or `None`
@@ -23136,13 +23775,124 @@ fn query_pane_last_output_at_backend(
             &[ToSqlValue::Integer(pane_id_i64)],
         )
         .map_err(|err| storage_backend_error("Query pane last output at", err))?;
-    Ok(row.and_then(|cells| {
-        cells.into_iter().next().and_then(|cell| match cell {
-            SqlCell::Integer(v) => Some(v),
-            // SQL NULL (no segments for this pane) maps to None.
-            _ => None,
-        })
-    }))
+    let row = row.ok_or_else(|| {
+        StorageError::Database("MAX(captured_at) query returned no aggregate row".to_string())
+    })?;
+    let reader = CellRowReader::new(&row);
+    if reader.column_count() != 1 {
+        return Err(StorageError::Database(format!(
+            "MAX(captured_at) query returned {} columns; expected 1",
+            reader.column_count()
+        ))
+        .into());
+    }
+    let captured_at = reader
+        .optional_i64(0)
+        .map_err(|err| storage_backend_error("Decode pane last output timestamp", err))?;
+    if captured_at.is_some_and(|value| value < 0) {
+        return Err(StorageError::Database(format!(
+            "pane {pane_id} has a negative last output timestamp"
+        ))
+        .into());
+    }
+    Ok(captured_at)
+}
+
+fn canonical_pane_activity_ids(pane_ids: &[u64]) -> Result<Vec<i64>> {
+    validate_bulk_id_input_len("pane activity", pane_ids.len())?;
+    let mut canonical = Vec::with_capacity(pane_ids.len());
+    for pane_id in pane_ids {
+        canonical.push(u64_to_i64(*pane_id, "pane_id")?);
+    }
+    canonical.sort_unstable();
+    canonical.dedup();
+    Ok(canonical)
+}
+
+#[cfg(test)]
+fn query_pane_last_output_at_bulk_backend(
+    backend: &dyn StorageBackend,
+    pane_ids: &[u64],
+) -> Result<HashMap<u64, Option<i64>>> {
+    let pane_ids = canonical_pane_activity_ids(pane_ids)?;
+    query_pane_last_output_at_bulk_canonical_backend(backend, &pane_ids)
+}
+
+/// Query a validated, sorted, deduplicated pane-ID slice in one SQLite read
+/// statement. Missing panes are omitted; existing panes with no segments
+/// retain an explicit `None` value.
+fn query_pane_last_output_at_bulk_canonical_backend(
+    backend: &dyn StorageBackend,
+    pane_ids: &[i64],
+) -> Result<HashMap<u64, Option<i64>>> {
+    if pane_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let pane_ids_json = canonical_i64_id_json(pane_ids, "pane activity")?;
+    let rows = backend
+        .query_map_cells(
+            "WITH requested(pane_id) AS (
+                 SELECT CAST(requested_json.value AS INTEGER)
+                 FROM json_each(?1) AS requested_json
+                 WHERE requested_json.type = 'integer'
+             )
+             SELECT panes.pane_id,
+                    (
+                        SELECT output_segments.captured_at
+                        FROM output_segments
+                        WHERE output_segments.pane_id = panes.pane_id
+                        ORDER BY output_segments.captured_at DESC
+                        LIMIT 1
+                    )
+             FROM requested
+             JOIN panes ON panes.pane_id = requested.pane_id
+             ORDER BY panes.pane_id ASC",
+            &[ToSqlValue::Text(&pane_ids_json)],
+        )
+        .map_err(|err| storage_backend_error("Bulk pane activity query failed", err))?;
+
+    let mut activity = HashMap::with_capacity(rows.len());
+    for row in &rows {
+        let reader = CellRowReader::new(row);
+        if reader.column_count() != 2 {
+            return Err(StorageError::Database(format!(
+                "bulk pane activity row has {} columns; expected 2",
+                reader.column_count()
+            ))
+            .into());
+        }
+        let pane_id_i64 = reader
+            .i64(0)
+            .map_err(|err| storage_backend_error("Decode bulk activity pane ID", err))?;
+        if pane_ids.binary_search(&pane_id_i64).is_err() {
+            return Err(StorageError::Database(format!(
+                "bulk activity query returned unrequested pane ID {pane_id_i64}"
+            ))
+            .into());
+        }
+        let pane_id = u64::try_from(pane_id_i64).map_err(|_| {
+            StorageError::Database(format!(
+                "bulk activity pane ID {pane_id_i64} is out of u64 range"
+            ))
+        })?;
+        let captured_at = reader
+            .optional_i64(1)
+            .map_err(|err| storage_backend_error("Decode bulk activity timestamp", err))?;
+        if captured_at.is_some_and(|value| value < 0) {
+            return Err(StorageError::Database(format!(
+                "pane {pane_id} has a negative last output timestamp"
+            ))
+            .into());
+        }
+        if activity.insert(pane_id, captured_at).is_some() {
+            return Err(StorageError::Database(format!(
+                "bulk activity query returned duplicate pane ID {pane_id}"
+            ))
+            .into());
+        }
+    }
+
+    Ok(activity)
 }
 
 fn pane_record_from_backend_cells(row: &[SqlCell]) -> Result<PaneRecord> {
@@ -23817,6 +24567,319 @@ fn seed_retention_event_backend(
     )
     .unwrap()
     .event_id()
+}
+
+#[test]
+fn event_annotations_bulk_supports_bounded_json_each_snapshot() {
+    let backend = memory_backend();
+    seed_pane_backend(&backend, 1, 1);
+    let first = seed_retention_event_backend(&backend, 1, "info", "first", 10, None);
+    let second = seed_retention_event_backend(&backend, 1, "warning", "second", 20, None);
+    let third = seed_retention_event_backend(&backend, 1, "critical", "third", 30, None);
+
+    assert!(set_event_triage_state_backend(&backend, first, Some("investigating"), Some("operator-a")).unwrap());
+    set_event_note_backend(&backend, first, Some("checked carefully"), Some("operator-b")).unwrap();
+    assert!(add_event_label_backend(&backend, first, "zulu", Some("operator-c")).unwrap());
+    assert!(add_event_label_backend(&backend, first, "alpha", Some("operator-c")).unwrap());
+    set_event_note_backend(&backend, second, Some(""), None).unwrap();
+    set_event_note_backend(&backend, third, Some("third note"), None).unwrap();
+
+    let annotations = query_event_annotations_bulk_backend(
+        &backend,
+        &[third, first, second, first],
+    )
+    .unwrap();
+    assert_eq!(annotations.len(), 3);
+    let first_annotations = annotations.get(&first).unwrap();
+    assert_eq!(first_annotations.triage_state.as_deref(), Some("investigating"));
+    assert_eq!(first_annotations.triage_updated_by.as_deref(), Some("operator-a"));
+    assert!(first_annotations.triage_updated_at.is_some());
+    assert_eq!(first_annotations.note.as_deref(), Some("checked carefully"));
+    assert_eq!(first_annotations.note_updated_by.as_deref(), Some("operator-b"));
+    assert!(first_annotations.note_updated_at.is_some());
+    assert_eq!(first_annotations.labels, vec!["alpha".to_string(), "zulu".to_string()]);
+    assert_eq!(annotations.get(&second).unwrap().labels, Vec::<String>::new());
+    assert_eq!(annotations.get(&second).unwrap().note.as_deref(), Some(""));
+    assert_eq!(annotations.get(&third).unwrap().note.as_deref(), Some("third note"));
+
+    let max_ids = (1..=i64::try_from(STORAGE_BULK_ID_INPUT_MAX).unwrap()).collect::<Vec<_>>();
+    let max_result = query_event_annotations_bulk_backend(&backend, &max_ids).unwrap();
+    assert_eq!(max_result.len(), 3, "the 4,096-ID boundary must execute as one JSON bind");
+
+    let over_limit = (1..=i64::try_from(STORAGE_BULK_ID_INPUT_MAX + 1).unwrap()).collect::<Vec<_>>();
+    assert!(query_event_annotations_bulk_backend(&backend, &over_limit).is_err());
+    let duplicate_over_limit = vec![first; STORAGE_BULK_ID_INPUT_MAX + 1];
+    assert!(query_event_annotations_bulk_backend(&backend, &duplicate_over_limit).is_err());
+    assert!(query_event_annotations_bulk_backend(&backend, &[0]).is_err());
+    assert!(query_event_annotations_bulk_backend(&backend, &[-1]).is_err());
+    assert!(query_event_annotations_bulk_backend(&backend, &[9_999]).unwrap().is_empty());
+
+    execute_typed(
+        &backend,
+        "UPDATE event_notes SET updated_at = -1 WHERE event_id = ?1",
+        &[ToSqlValue::Integer(second)],
+    )
+    .unwrap();
+    assert!(query_event_annotations_bulk_backend(&backend, &[second]).is_err());
+}
+
+#[test]
+fn pane_last_output_bulk_distinguishes_missing_empty_active_and_corrupt() {
+    let backend = memory_backend();
+    seed_pane_backend(&backend, 0, 1);
+    seed_pane_backend(&backend, 1, 1);
+    seed_pane_backend(&backend, 2, 1);
+    seed_segment_backend(&backend, 2, 0, "old", 100);
+    seed_segment_backend(&backend, 2, 1, "new", 200);
+
+    let activity = query_pane_last_output_at_bulk_backend(&backend, &[2, 0, 9_999, 1, 2]).unwrap();
+    assert_eq!(activity.len(), 3);
+    assert_eq!(activity.get(&0), Some(&None));
+    assert_eq!(activity.get(&1), Some(&None));
+    assert_eq!(activity.get(&2), Some(&Some(200)));
+    assert!(!activity.contains_key(&9_999), "missing panes must be omitted");
+
+    let max_ids = (0..u64::try_from(STORAGE_BULK_ID_INPUT_MAX).unwrap()).collect::<Vec<_>>();
+    let max_result = query_pane_last_output_at_bulk_backend(&backend, &max_ids).unwrap();
+    assert_eq!(max_result.len(), 3, "the 4,096-ID boundary must execute as one JSON bind");
+
+    let over_limit = (0..=u64::try_from(STORAGE_BULK_ID_INPUT_MAX).unwrap()).collect::<Vec<_>>();
+    assert!(query_pane_last_output_at_bulk_backend(&backend, &over_limit).is_err());
+    let duplicate_over_limit = vec![0; STORAGE_BULK_ID_INPUT_MAX + 1];
+    assert!(query_pane_last_output_at_bulk_backend(&backend, &duplicate_over_limit).is_err());
+    assert!(query_pane_last_output_at_bulk_backend(&backend, &[u64::MAX]).is_err());
+
+    seed_pane_backend(&backend, 3, 1);
+    seed_segment_backend(&backend, 3, 0, "invalid clock", -1);
+    assert!(query_pane_last_output_at_backend(&backend, 3).is_err());
+    assert!(query_pane_last_output_at_bulk_backend(&backend, &[3]).is_err());
+    assert!(query_last_activity_by_pane_backend(&backend).is_err());
+
+    seed_pane_backend(&backend, 4, 1);
+    seed_segment_backend(&backend, 4, -1, "invalid sequence", 1);
+    assert!(query_max_seq_backend(&backend, 4).is_err());
+
+    seed_pane_backend(&backend, 5, 1);
+    execute_typed(
+        &backend,
+        "INSERT INTO output_segments (pane_id, seq, content, content_len, captured_at)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        &[
+            ToSqlValue::Integer(5),
+            ToSqlValue::Integer(0),
+            ToSqlValue::Text("invalid timestamp"),
+            ToSqlValue::Integer(17),
+            ToSqlValue::Text("not-a-timestamp"),
+        ],
+    )
+    .unwrap();
+    assert!(query_pane_last_output_at_backend(&backend, 5).is_err());
+    assert!(query_pane_last_output_at_bulk_backend(&backend, &[5]).is_err());
+
+    seed_pane_backend(&backend, 6, 1);
+    execute_typed(
+        &backend,
+        "INSERT INTO output_segments (pane_id, seq, content, content_len, captured_at)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        &[
+            ToSqlValue::Integer(6),
+            ToSqlValue::Text("not-a-sequence"),
+            ToSqlValue::Text("invalid sequence type"),
+            ToSqlValue::Integer(21),
+            ToSqlValue::Integer(1),
+        ],
+    )
+    .unwrap();
+    assert!(query_max_seq_backend(&backend, 6).is_err());
+}
+
+#[test]
+fn newest_event_queries_break_timestamp_ties_by_descending_id() {
+    let backend = memory_backend();
+    seed_pane_backend(&backend, 1, 1);
+    for event_type in ["first", "second", "third"] {
+        seed_retention_event_backend(&backend, 1, "info", event_type, 100, None);
+    }
+
+    let query = EventQuery {
+        limit: Some(3),
+        ..EventQuery::default()
+    };
+    let queried_ids = query_events_backend(&backend, &query)
+        .unwrap()
+        .into_iter()
+        .map(|event| event.id)
+        .collect::<Vec<_>>();
+    assert_eq!(queried_ids, vec![3, 2, 1]);
+
+    let unhandled_ids = query_unhandled_events_backend(&backend, 3)
+        .unwrap()
+        .into_iter()
+        .map(|event| event.id)
+        .collect::<Vec<_>>();
+    assert_eq!(unhandled_ids, vec![3, 2, 1]);
+
+    seed_pane_backend(&backend, -1, 1);
+    execute_typed(
+        &backend,
+        "INSERT INTO events (
+             id, pane_id, rule_id, agent_type, event_type, severity,
+             confidence, detected_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        &[
+            ToSqlValue::Integer(4),
+            ToSqlValue::Integer(-1),
+            ToSqlValue::Text("invalid-pane"),
+            ToSqlValue::Text("test"),
+            ToSqlValue::Text("invalid-pane"),
+            ToSqlValue::Text("info"),
+            ToSqlValue::Real(1.0),
+            ToSqlValue::Integer(101),
+        ],
+    )
+    .unwrap();
+    assert!(query_unhandled_event_counts(&backend).is_err());
+}
+
+#[test]
+fn event_delivery_lease_batches_are_exact_atomic_and_bounded() {
+    let backend = memory_backend();
+    seed_pane_backend(&backend, 1, 1);
+    let first = seed_retention_event_backend(&backend, 1, "info", "first", 10, None);
+    let second = seed_retention_event_backend(&backend, 1, "info", "second", 20, None);
+    let third = seed_retention_event_backend(&backend, 1, "info", "third", 30, None);
+    let fourth = seed_retention_event_backend(&backend, 1, "info", "fourth", 40, None);
+    for (event_id, token) in [
+        (first, "token-1"),
+        (second, "token-2"),
+        (third, "token-3"),
+        (fourth, "token-4"),
+    ] {
+        assert!(matches!(
+            reserve_event_delivery_backend_at(&backend, event_id, token, 100, 1_000).unwrap(),
+            EventDeliveryReservation::Acquired(_)
+        ));
+    }
+
+    let finalized = finalize_event_delivery_leases_bulk_backend(
+        &backend,
+        &[
+            (second, "token-2".to_string()),
+            (first, "token-1".to_string()),
+            (first, "token-1".to_string()),
+        ],
+        500,
+        Some("workflow-bulk"),
+        "delivered",
+    )
+    .unwrap();
+    assert_eq!(finalized, 2, "exact duplicate pairs are idempotent input");
+    for event_id in [first, second] {
+        let row = backend
+            .query_row_cells(
+                "SELECT handled_at, handled_by_workflow_id, handled_status,
+                        delivery_lease_token
+                 FROM events WHERE id = ?1",
+                &[ToSqlValue::Integer(event_id)],
+            )
+            .unwrap()
+            .unwrap();
+        let reader = CellRowReader::new(&row);
+        assert_eq!(reader.i64(0).unwrap(), 500);
+        assert_eq!(reader.string(1).unwrap(), "workflow-bulk");
+        assert_eq!(reader.string(2).unwrap(), "delivered");
+        assert_eq!(reader.optional_string(3).unwrap(), None);
+    }
+
+    let stale_finalize = finalize_event_delivery_leases_bulk_backend(
+        &backend,
+        &[
+            (third, "token-3".to_string()),
+            (fourth, "wrong-token".to_string()),
+        ],
+        600,
+        None,
+        "delivered",
+    );
+    assert!(stale_finalize.is_err(), "one stale token must reject the batch");
+    for (event_id, token) in [(third, "token-3"), (fourth, "token-4")] {
+        let row = backend
+            .query_row_cells(
+                "SELECT handled_at, delivery_lease_token FROM events WHERE id = ?1",
+                &[ToSqlValue::Integer(event_id)],
+            )
+            .unwrap()
+            .unwrap();
+        let reader = CellRowReader::new(&row);
+        assert_eq!(reader.optional_i64(0).unwrap(), None, "partial finalize must roll back");
+        assert_eq!(reader.string(1).unwrap(), token, "lease ownership must survive rollback");
+    }
+
+    assert!(canonical_event_delivery_lease_pairs(&[
+        (third, "token-3".to_string()),
+        (third, "other-owner".to_string()),
+    ])
+    .is_err());
+    let stale_release = release_event_delivery_leases_bulk_backend(
+        &backend,
+        &[
+            (third, "token-3".to_string()),
+            (fourth, "wrong-token".to_string()),
+        ],
+    );
+    assert!(stale_release.is_err(), "one stale release must reject the batch");
+    assert_eq!(
+        release_event_delivery_leases_bulk_backend(
+            &backend,
+            &[
+                (fourth, "token-4".to_string()),
+                (third, "token-3".to_string()),
+                (third, "token-3".to_string()),
+            ],
+        )
+        .unwrap(),
+        2
+    );
+    for event_id in [third, fourth] {
+        let row = backend
+            .query_row_cells(
+                "SELECT handled_at, delivery_lease_token FROM events WHERE id = ?1",
+                &[ToSqlValue::Integer(event_id)],
+            )
+            .unwrap()
+            .unwrap();
+        let reader = CellRowReader::new(&row);
+        assert_eq!(reader.optional_i64(0).unwrap(), None);
+        assert_eq!(reader.optional_string(1).unwrap(), None);
+    }
+
+    let at_limit = (1..=i64::try_from(EVENT_DELIVERY_LEASE_BULK_MAX).unwrap())
+        .map(|event_id| (event_id, format!("token-{event_id}")))
+        .collect::<Vec<_>>();
+    assert_eq!(canonical_event_delivery_lease_pairs(&at_limit).unwrap().len(), 64);
+    let over_limit = (1..=i64::try_from(EVENT_DELIVERY_LEASE_BULK_MAX + 1).unwrap())
+        .map(|event_id| (event_id, format!("token-{event_id}")))
+        .collect::<Vec<_>>();
+    assert!(canonical_event_delivery_lease_pairs(&over_limit).is_err());
+    let duplicate_over_limit =
+        vec![(1, "token-1".to_string()); EVENT_DELIVERY_LEASE_BULK_MAX + 1];
+    assert!(canonical_event_delivery_lease_pairs(&duplicate_over_limit).is_err());
+    assert!(canonical_event_delivery_lease_pairs(&[(0, "token".to_string())]).is_err());
+    assert!(canonical_event_delivery_lease_pairs(&[(1, String::new())]).is_err());
+    assert_eq!(
+        finalize_event_delivery_leases_bulk_backend(&backend, &[], 1, None, "delivered").unwrap(),
+        0
+    );
+    assert_eq!(release_event_delivery_leases_bulk_backend(&backend, &[]).unwrap(), 0);
+    assert!(finalize_event_delivery_leases_bulk_backend(
+        &backend,
+        &[],
+        -1,
+        None,
+        "delivered"
+    )
+    .is_err());
+    assert!(finalize_event_delivery_leases_bulk_backend(&backend, &[], 1, None, "").is_err());
 }
 
 #[test]
