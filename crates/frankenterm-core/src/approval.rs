@@ -877,6 +877,7 @@ impl<'a> ApprovalStore<'a> {
     /// normal approval consume path to run later.
     pub async fn record_pre_approval_cross_examination(
         &self,
+        cx: &crate::cx::Cx,
         input: &PolicyInput,
         transcript: &PreApprovalCrossExamination,
         correlation_id: Option<String>,
@@ -925,7 +926,9 @@ impl<'a> ApprovalStore<'a> {
             result: "recorded".to_string(),
         };
 
-        self.storage.record_audit_action_redacted(audit).await
+        self.storage
+            .record_audit_action_redacted_with_cx(cx, audit)
+            .await
     }
 
     async fn audit_approval_grant(
@@ -2760,6 +2763,7 @@ mod tests {
 
             let audit_id = store
                 .record_pre_approval_cross_examination(
+                    &crate::cx::for_request(),
                     &input,
                     &transcript,
                     Some("corr-pre-approval-cross-exam".to_string()),

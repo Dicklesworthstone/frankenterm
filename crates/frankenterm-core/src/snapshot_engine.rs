@@ -385,7 +385,7 @@ impl SnapshotEngine {
         options: SnapshotCaptureOptions,
     ) -> std::result::Result<SnapshotResult, SnapshotError> {
         let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-        self.capture_with_cx_options(&cx, panes, trigger, options)
+        self.capture_with_options_with_cx(&cx, panes, trigger, options)
             .await
     }
 
@@ -416,13 +416,13 @@ impl SnapshotEngine {
         panes: &[PaneInfo],
         trigger: SnapshotTrigger,
     ) -> std::result::Result<SnapshotResult, SnapshotError> {
-        self.capture_with_cx_options(cx, panes, trigger, SnapshotCaptureOptions::default())
+        self.capture_with_options_with_cx(cx, panes, trigger, SnapshotCaptureOptions::default())
             .await
     }
 
     /// Capture a full mux state snapshot bound to the caller's Cx and explicit
     /// per-call options.
-    pub async fn capture_with_cx_options(
+    pub async fn capture_with_options_with_cx(
         &self,
         cx: &crate::cx::Cx,
         panes: &[PaneInfo],

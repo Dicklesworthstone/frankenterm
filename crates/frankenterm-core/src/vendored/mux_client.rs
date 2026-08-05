@@ -2722,67 +2722,14 @@ impl DirectMuxClient {
         max_pipeline_depth: usize,
         pipeline_timeout: Duration,
     ) -> Result<Vec<GetPaneRenderChangesResponse>, DirectMuxError> {
-        if pane_ids.is_empty() {
-            return Ok(Vec::new());
-        }
-        validate_render_batch_panes(pane_ids)?;
-        self.get_pane_render_changes_batch_prevalidated(
+        let cx = ambient_mux_cx();
+        self.get_pane_render_changes_batch_with_cx(
+            &cx,
             pane_ids,
             max_pipeline_depth,
             pipeline_timeout,
         )
         .await
-    }
-
-    /// Pool-only render batch core after unique-pane prevalidation.
-    ///
-    /// The caller must reject duplicate pane IDs before acquiring a client.
-    pub(super) async fn get_pane_render_changes_batch_prevalidated(
-        &mut self,
-        pane_ids: &[u64],
-        max_pipeline_depth: usize,
-        pipeline_timeout: Duration,
-    ) -> Result<Vec<GetPaneRenderChangesResponse>, DirectMuxError> {
-        if pane_ids.is_empty() {
-            return Ok(Vec::new());
-        }
-        debug_assert!(validate_render_batch_panes(pane_ids).is_ok());
-        let usable = self.ensure_connection_usable();
-        self.settle_transport_result(
-            usable,
-            "render batch rejected by poisoned transport",
-            false,
-        )?;
-        let depth = max_pipeline_depth.max(1).min(pane_ids.len());
-        let capacity = self
-            .ensure_outstanding_request_slots(depth)
-            .map_err(DirectMuxError::proven_pre_write_rejection);
-        self.settle_transport_result(
-            capacity,
-            "render batch outstanding-request admission failure",
-            false,
-        )?;
-        let timeout_ms = duration_to_ms_u64(pipeline_timeout);
-        tracing::trace!(
-            connection_id = self.connection_id,
-            request_count = pane_ids.len(),
-            max_pipeline_depth = depth,
-            explicit_cx = false,
-            phase = "render_batch_start",
-            "starting mux render batch"
-        );
-        let mut guard = RenderBatchGuard::new(self, pane_ids, depth, false);
-        let result = Box::pin(timeout(pipeline_timeout, guard.run(depth))).await;
-        match result {
-            Ok(Ok(())) => guard.finish(),
-            Ok(Err(error)) => guard.fail_finish(error, "render batch execution failure"),
-            Err(_) => {
-                drop(guard);
-                let error = DirectMuxError::BatchTimeout { timeout_ms };
-                self.apply_error_disposition(&error, "render batch timeout", false);
-                Err(error)
-            }
-        }
     }
 
     /// Batch render-change requests using an explicit capability context.

@@ -99,6 +99,7 @@ WRAPPER_EXEMPTIONS: set[tuple[str, str]] = {
     ("workflows/context.rs", "send_ctrl_c"),
     ("workflows/context.rs", "send_ctrl_d"),
     ("workflows/context.rs", "send_ctrl_z"),
+    ("workflows/context.rs", "send_verified"),
     # workflows/engine.rs WorkflowEngine methods: each delegates to its
     # `_cx` sibling.
     ("workflows/engine.rs", "start"),
@@ -132,6 +133,7 @@ WRAPPER_EXEMPTIONS: set[tuple[str, str]] = {
     ("wezterm.rs", "list_panes"),
     ("wezterm.rs", "get_pane"),
     ("wezterm.rs", "get_text"),
+    ("wezterm.rs", "get_semantic_zones"),
     ("wezterm.rs", "pane_tiered_scrollback_summary"),
     ("wezterm.rs", "send_text"),
     ("wezterm.rs", "send_text_no_paste"),
@@ -170,6 +172,7 @@ WRAPPER_EXEMPTIONS: set[tuple[str, str]] = {
     ("vendored/mux_client.rs", "spawn_v2"),
     ("vendored/mux_client.rs", "split_pane"),
     ("vendored/mux_client.rs", "get_pane_render_changes"),
+    ("vendored/mux_client.rs", "get_semantic_zones"),
     ("vendored/mux_client.rs", "get_lines"),
     ("vendored/mux_client.rs", "write_to_pane"),
     ("vendored/mux_client.rs", "send_paste"),
@@ -195,6 +198,7 @@ WRAPPER_EXEMPTIONS: set[tuple[str, str]] = {
     ("vendored/mux_pool.rs", "split_pane"),
     ("vendored/mux_pool.rs", "get_lines"),
     ("vendored/mux_pool.rs", "get_pane_render_changes"),
+    ("vendored/mux_pool.rs", "get_semantic_zones"),
     ("vendored/mux_pool.rs", "get_pane_render_changes_batch"),
     ("vendored/mux_pool.rs", "write_to_pane"),
     ("vendored/mux_pool.rs", "send_paste"),
@@ -391,6 +395,39 @@ WRAPPER_EXEMPTIONS: set[tuple[str, str]] = {
     ("storage.rs", "acknowledge_notification"),
     ("storage.rs", "increment_notification_retry"),
     ("storage.rs", "purge_notification_history"),
+    # 2026-08-05 live-census reconciliation. These newer StorageHandle
+    # entry points all construct the ambient project Cx and immediately
+    # delegate to the exact `_with_cx` sibling. Keep the names explicit so
+    # the sibling audit fails loudly if either half is renamed or removed.
+    ("storage.rs", "append_segment_with_zone"),
+    ("storage.rs", "record_event_outcome"),
+    ("storage.rs", "reserve_event_delivery"),
+    ("storage.rs", "finalize_event_delivery"),
+    ("storage.rs", "release_event_delivery"),
+    ("storage.rs", "finalize_event_delivery_leases_bulk"),
+    ("storage.rs", "release_event_delivery_leases_bulk"),
+    ("storage.rs", "get_event_annotations_bulk"),
+    ("storage.rs", "update_audit_action_submit_receipt"),
+    ("storage.rs", "purge_operational_maintenance_before"),
+    ("storage.rs", "get_config_value"),
+    ("storage.rs", "set_config_value"),
+    ("storage.rs", "enforce_size_limit"),
+    ("storage.rs", "count_events_by_retention_rule"),
+    ("storage.rs", "count_operational_maintenance_before"),
+    ("storage.rs", "delete_events_by_retention_rule"),
+    ("storage.rs", "consume_approval_token_by_id"),
+    ("storage.rs", "get_events_stream_page"),
+    ("storage.rs", "get_event_retention_snapshot"),
+    ("storage.rs", "check_event_retention"),
+    ("storage.rs", "check_event_retention_in_epoch"),
+    ("storage.rs", "count_unhandled_events_by_pane_bulk"),
+    ("storage.rs", "list_approval_tokens"),
+    ("storage.rs", "get_approval_token_by_id"),
+    ("storage.rs", "pane_last_output_at"),
+    ("storage.rs", "pane_last_output_at_bulk"),
+    ("storage.rs", "upsert_limit_window"),
+    ("storage.rs", "get_limit_window"),
+    ("storage.rs", "list_active_limit_windows"),
     # ft-wb02g: runtime/concurrency cluster long-tail (32 sites).
     # simulation.rs: deterministic LabRuntime simulation harness; each
     # method delegates to its `_with_cx` sibling for cancel propagation
@@ -490,6 +527,7 @@ WRAPPER_EXEMPTIONS: set[tuple[str, str]] = {
     ("cass.rs", "search_sessions"),
     ("cass.rs", "query_session"),
     ("cass.rs", "query"),
+    ("cass.rs", "is_session_indexed"),
     ("cass.rs", "status"),
     ("cass.rs", "trigger_index"),
     # recorder_migration.rs: legacy-recorder M0..M5 phase helpers.
@@ -500,6 +538,7 @@ WRAPPER_EXEMPTIONS: set[tuple[str, str]] = {
     ("recorder_migration.rs", "run_m0_m2"),
     # snapshot_engine.rs: snapshot capture + retention/checkpoint.
     ("snapshot_engine.rs", "capture"),
+    ("snapshot_engine.rs", "capture_with_options"),
     ("snapshot_engine.rs", "cleanup"),
     ("snapshot_engine.rs", "run_periodic"),
     ("snapshot_engine.rs", "shutdown_checkpoint"),
@@ -544,6 +583,7 @@ WRAPPER_EXEMPTIONS: set[tuple[str, str]] = {
     ("events.rs", "recv"),
     ("export.rs", "export_jsonl"),
     ("ingest.rs", "persist_captured_segment"),
+    ("ingest.rs", "persist_captured_segment_with_zone"),
     ("memory_budget.rs", "run"),
     ("memory_pressure.rs", "run"),
     ("metrics.rs", "start"),
@@ -563,6 +603,7 @@ WRAPPER_EXEMPTIONS: set[tuple[str, str]] = {
     ("restore_process.rs", "execute"),
     ("restore_scrollback.rs", "inject"),
     ("storage_telemetry.rs", "append_batch_instrumented"),
+    ("workflows/builtin_workflows.rs", "record_limit_window_for_trigger"),
     ("survival.rs", "run"),
     ("telemetry.rs", "run"),
     ("ui_query.rs", "list_pane_bookmarks"),
@@ -691,6 +732,7 @@ def audit() -> dict:
         # Index function names per file so we can sanity-check the
         # WRAPPER_EXEMPTIONS allowlist.
         fn_names: set[str] = set()
+        covered_fn_names: set[str] = set()
         local_total = local_covered = local_uncovered = local_wrapper = 0
         local_uncovered_lines = []
         for line_no, name, sig in signature_blocks(path):
@@ -703,6 +745,7 @@ def audit() -> dict:
             if is_covered(sig):
                 results["covered_sites"] += 1
                 local_covered += 1
+                covered_fn_names.add(name)
                 continue
             if (rel, name) in WRAPPER_EXEMPTIONS:
                 results["wrapper_exempt_sites"] += 1
@@ -729,9 +772,17 @@ def audit() -> dict:
                     )
                     continue
                 expected_siblings = [f"{ename}_with_cx", f"{ename}_cx"]
-                if not any(s in fn_names for s in expected_siblings):
+                present_siblings = [s for s in expected_siblings if s in fn_names]
+                if not present_siblings:
                     results["wrapper_audit_errors"].append(
                         f"{rel}::{ename} wrapper-exempt but no _with_cx/_cx sibling found"
+                    )
+                    continue
+                if not any(s in covered_fn_names for s in present_siblings):
+                    siblings = ", ".join(present_siblings)
+                    results["wrapper_audit_errors"].append(
+                        f"{rel}::{ename} wrapper sibling is not Cx/RuntimeProof covered: "
+                        f"{siblings}"
                     )
         file_data[rel] = {
             "exempt_file": is_exempt_file,
