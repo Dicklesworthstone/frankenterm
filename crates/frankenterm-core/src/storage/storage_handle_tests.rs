@@ -1477,11 +1477,13 @@ fn writer_loop_does_not_dispatch_commands_queued_after_shutdown() {
 
     let backend = RusqliteBackend::new(conn);
     let queued_depth = AtomicUsize::new(3);
+    let terminal_state = AtomicU8::new(WRITER_TERMINAL_HEALTHY);
     writer_loop(
         &backend,
         &mut rx,
         &mut mmap_mirror,
         &queued_depth,
+        &terminal_state,
         false,
         None,
         false,
