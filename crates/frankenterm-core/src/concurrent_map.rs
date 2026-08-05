@@ -377,10 +377,7 @@ where
 
     /// Clear all entries.
     pub fn clear(&self) {
-        for shard in &self.shards {
-            let mut guard = shard.map.write().unwrap_or_else(record_poison_and_recover);
-            guard.clear();
-        }
+        self.replace_all(HashMap::new());
     }
 }
 
