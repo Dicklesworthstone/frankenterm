@@ -169,14 +169,14 @@ jobs:
           #      tikv-jemalloc-sys's autoconf build script can't produce
           #      executables under MSVC. System allocator instead.
           if [[ "${{ matrix.target }}" == *windows* ]]; then
-            cargo build --profile release-interactive --target ${{ matrix.target }} \
+            cargo build --locked --profile release-interactive --target ${{ matrix.target }} \
               -p frankenterm --bin ft \
               --no-default-features \
               --features browser,distributed,vendored,mcp,metrics,native-wezterm,semantic-search,subprocess-bridge,sync,ftui,tui-dashboard,tui-widgets,web,redis-session,asupersync-runtime
           else
             # `ft watch` and core task/storage paths contain audited recovery
             # boundaries, so every shipped CLI must share the unwind contract.
-            cargo build --profile release-interactive --target ${{ matrix.target }} \
+            cargo build --locked --profile release-interactive --target ${{ matrix.target }} \
               -p frankenterm --bin ft
           fi
 
@@ -186,7 +186,7 @@ jobs:
             # identity. The standalone archive and bundled copy of `ft` are the
             # same profile/identity, so a second build cannot silently mint
             # incompatible CLI bytes.
-            cargo build --profile "$FT_ATOMIC_BUILD_PROFILE" \
+            cargo build --locked --profile "$FT_ATOMIC_BUILD_PROFILE" \
               --target ${{ matrix.target }} \
               --bin frankenterm-gui \
               --bin frankenterm-mux-server \

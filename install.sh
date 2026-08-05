@@ -708,16 +708,22 @@ build_from_source() {
   # platform coverage. Users who want the macOS .app should install
   # from the .app bundle (separate flow) or build the workspace
   # directly: `cargo build --profile release-interactive` after cloning.
+  local panic_contract_tool="$TMP/src/scripts/check-release-panic-contract.sh"
+  if [ ! -f "$panic_contract_tool" ] || \
+     ! bash "$panic_contract_tool" --profiles-only; then
+    err "Source tree does not satisfy the shipped panic-profile contract."
+    exit 1
+  fi
   # Friendly error wrapping: a bare `set -e` exit on cargo failure would
   # not give the user any actionable diagnosis.
-  if ! ( cd "$TMP/src" && cargo build --profile release-interactive -p frankenterm --bin ft ); then
+  if ! ( cd "$TMP/src" && cargo build --locked --profile release-interactive -p frankenterm --bin ft ); then
     err "Source build failed."
     err "Common causes:"
     err "  - Missing system deps on Linux: pkg-config, libcairo2-dev,"
     err "    libx11-dev, libx11-xcb-dev, libxcb-util-dev, libxcb-image0-dev,"
     err "    libxkbcommon-dev, libxkbcommon-x11-dev."
     err "  - Out-of-disk during compile (cargo's target/ uses 10+ GB)."
-    err "  - Old Rust toolchain (FrankenTerm needs Rust 1.85+)."
+    err "  - Missing or stale nightly toolchain (see rust-toolchain.toml)."
     exit 1
   fi
   local bin="$TMP/src/target/release-interactive/ft"

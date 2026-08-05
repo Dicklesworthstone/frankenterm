@@ -1241,7 +1241,7 @@ jobs:
         run: sudo apt-get update -qq && sudo apt-get install -qq -y jq
 
       - name: Build ft (shipped interactive profile)
-        run: cargo build --profile release-interactive -p frankenterm
+        run: cargo build --locked --profile release-interactive -p frankenterm
 
       - name: E2E harness self-check
         run: scripts/e2e_test.sh --self-check --skip-self-check 2>&1 || true
@@ -1350,7 +1350,7 @@ jobs:
 
       - name: Build ft for Docker E2E
         if: matrix.mode == 'linux-real-docker'
-        run: cargo build --profile release-interactive -p frankenterm
+        run: cargo build --locked --profile release-interactive -p frankenterm
 
       - name: Run real Docker setup-remote E2E (Linux)
         if: matrix.mode == 'linux-real-docker'
@@ -1460,7 +1460,25 @@ jobs:
           ls -la "$OPENSSL_ROOT/lib"
 
       - name: Build shipped binary
-        run: cargo build --profile release-interactive --target ${{ matrix.target }}
+        run: cargo build --locked --profile release-interactive --target ${{ matrix.target }}
+
+      - name: Verify shipped panic contract as built subprocesses
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --locked --target "${{ matrix.target }}" \
+            --profile release-interactive \
+            -p frankenterm-core --example panic_contract_probe \
+            --no-default-features
+          cargo build --locked --target "${{ matrix.target }}" \
+            --profile release-abort-probe \
+            -p frankenterm-core --example panic_contract_probe \
+            --no-default-features
+          scripts/check-release-panic-contract.sh \
+            "target/${{ matrix.target }}/release-interactive/examples/panic_contract_probe" \
+            "target/${{ matrix.target }}/release-abort-probe/examples/panic_contract_probe"
+
       - uses: actions/upload-artifact@v7.0.1
         with:
           name: ft-${{ matrix.target }}

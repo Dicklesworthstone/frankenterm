@@ -5,7 +5,9 @@
 //! `release-abort-probe`, then executes the exact artifacts through
 //! `scripts/check-release-panic-contract.sh`.
 
-use frankenterm_sigpipe::{RecoverablePanicSite, catch_recoverable};
+use frankenterm_sigpipe::{
+    RecoverablePanicSite, catch_recoverable, catch_recoverable_future,
+};
 use std::path::PathBuf;
 
 const SECRET_SENTINEL: &str = "FT_PANIC_SECRET_SENTINEL_DO_NOT_REFLECT";
@@ -56,6 +58,7 @@ fn main() {
         Some("gui-caught-epipe-spoof") => run_caught(Some("epipe-spoof")),
         Some("payload-drop-once") => run_pathological_payload_drop(false),
         Some("payload-drop-twice") => run_pathological_payload_drop(true),
+        Some("nested-drop-panic") => run_nested_drop_panic_during_unwind(),
         Some("suite") => run_release_contract_suite(),
         // The checker supplies stdout as the write end of a pipe with no read
         // end. This must be a real std-printing EPIPE, not a forged payload.
@@ -68,7 +71,7 @@ fn main() {
         }
         _ => {
             eprintln!(
-                "usage: panic_contract_probe <caught SITE|uncaught|uncaught-epipe-spoof|gui-uncaught|gui-uncaught-epipe-spoof|gui-caught-epipe-spoof|payload-drop-once|payload-drop-twice|epipe|gui-epipe|marker|suite>"
+                "usage: panic_contract_probe <caught SITE|uncaught|uncaught-epipe-spoof|gui-uncaught|gui-uncaught-epipe-spoof|gui-caught-epipe-spoof|payload-drop-once|payload-drop-twice|nested-drop-panic|epipe|gui-epipe|marker|suite>"
             );
             std::process::exit(2);
         }
@@ -136,7 +139,10 @@ fn run_pathological_payload_drop(repeat_recovery: bool) {
     );
     assert!(first.is_err());
     let recovered_delta = frankenterm_sigpipe::recovered_panics_total().saturating_sub(before);
-    println!("first-payload-drop-contained marker=false recovered_delta={recovered_delta}");
+    println!(
+        "first-payload-drop-contained marker={} recovered_delta={recovered_delta}",
+        frankenterm_sigpipe::is_recoverable_panic()
+    );
     let _ = std::io::stdout().lock().flush();
 
     if repeat_recovery {
@@ -149,6 +155,40 @@ fn run_pathological_payload_drop(repeat_recovery: bool) {
         );
         unreachable!("poisoned recovery must fail closed");
     }
+}
+
+fn run_nested_drop_panic_during_unwind() {
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+
+    struct PendingFutureWithPanickingDrop;
+
+    impl Future for PendingFutureWithPanickingDrop {
+        type Output = ();
+
+        fn poll(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<Self::Output> {
+            Poll::Pending
+        }
+    }
+
+    impl Drop for PendingFutureWithPanickingDrop {
+        fn drop(&mut self) {
+            std::panic::panic_any(String::from(SECRET_SENTINEL));
+        }
+    }
+
+    let _ = catch_recoverable(
+        RecoverablePanicSite::CoreAsyncTaskJoin,
+        std::panic::AssertUnwindSafe(|| {
+            let _future = catch_recoverable_future(
+                RecoverablePanicSite::CoreAsyncTaskJoin,
+                PendingFutureWithPanickingDrop,
+            );
+            std::panic::panic_any(String::from("outer-recoverable-panic"));
+        }),
+    );
+    unreachable!("a destructor panic during unwinding must abort fail-closed");
 }
 
 fn install_probe_gui_hook() {

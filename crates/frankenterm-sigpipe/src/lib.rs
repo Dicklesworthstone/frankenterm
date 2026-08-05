@@ -36,6 +36,11 @@ use std::task::{Context, Poll};
 #[cfg(panic = "unwind")]
 thread_local! {
     static RECOVERABLE_PANIC_DEPTH: Cell<usize> = const { Cell::new(0) };
+    // Rust aborts when a second panic begins during an existing unwind before
+    // catch_unwind can regain control. Teardown performed in that state must
+    // temporarily override an outer recovery marker so project hooks report
+    // the necessarily fatal double panic.
+    static FORCE_FATAL_PANIC_DEPTH: Cell<usize> = const { Cell::new(0) };
 }
 
 static RECOVERED_PANICS_TOTAL: AtomicU64 = AtomicU64::new(0);
@@ -46,9 +51,10 @@ static RECOVERED_PANICS_TOTAL: AtomicU64 = AtomicU64::new(0);
 // object count cannot grow beyond one.
 static PAYLOAD_DISPOSAL_POISONED: AtomicBool = AtomicBool::new(false);
 static PAYLOAD_DISPOSAL_FATAL_REPORTED: AtomicBool = AtomicBool::new(false);
+static FATAL_REPORT_PROCESS_CLAIMED: AtomicBool = AtomicBool::new(false);
 
 thread_local! {
-    static FATAL_REPORT_CLAIMED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static FATAL_REPORT_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Audited production boundary that intentionally converts a panic into a
@@ -174,14 +180,30 @@ struct RecoverablePanicBoundary {
     not_send: PhantomData<Rc<()>>,
 }
 
-/// Nested hook-chain claim for the single fatal operator-visible report.
+/// Nested-safe override that makes project hooks treat a panic as fatal even
+/// when an outer audited recovery marker is still live.
+///
+/// This is used only while dropping a future during an existing unwind. Rust
+/// cannot recover a second panic in that state, so suppressing the hook would
+/// hide a process-fatal event.
+#[must_use = "the override must remain live for the complete fatal teardown"]
+struct ForceFatalPanicBoundary {
+    #[cfg(panic = "unwind")]
+    previous_depth: Option<usize>,
+    not_send: PhantomData<Rc<()>>,
+}
+
+/// Nested hook-chain and process-overlap claim for one fatal visible report.
 ///
 /// The outer project hook that can produce the most useful privacy-bounded
 /// report claims ownership, then delegates while this guard remains live.
-/// Inner hooks observe `is_owner() == false` and do not duplicate the report.
+/// Inner hooks and simultaneously panicking threads observe
+/// `is_owner() == false` and do not duplicate the report. The process claim is
+/// released with the outer guard so a later independent panic can report.
 #[must_use = "the claim must remain live while delegating to inner panic hooks"]
 pub struct FatalReportClaim {
     owner: bool,
+    previous_depth: Option<usize>,
     not_send: PhantomData<Rc<()>>,
 }
 
@@ -189,18 +211,20 @@ impl FatalReportClaim {
     /// Attempt to own the one fatal report for the current hook invocation.
     #[must_use]
     pub fn enter() -> Self {
-        let owner = FATAL_REPORT_CLAIMED
-            .try_with(|claimed| {
-                if claimed.get() {
-                    false
-                } else {
-                    claimed.set(true);
-                    true
-                }
+        let previous_depth = FATAL_REPORT_DEPTH
+            .try_with(|depth| {
+                let previous = depth.get();
+                depth.set(previous.saturating_add(1));
+                previous
             })
-            .unwrap_or(false);
+            .ok();
+        let owner = previous_depth == Some(0)
+            && FATAL_REPORT_PROCESS_CLAIMED
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok();
         Self {
             owner,
+            previous_depth,
             not_send: PhantomData,
         }
     }
@@ -214,8 +238,11 @@ impl FatalReportClaim {
 
 impl Drop for FatalReportClaim {
     fn drop(&mut self) {
+        if let Some(previous_depth) = self.previous_depth {
+            let _ = FATAL_REPORT_DEPTH.try_with(|depth| depth.set(previous_depth));
+        }
         if self.owner {
-            let _ = FATAL_REPORT_CLAIMED.try_with(|claimed| claimed.set(false));
+            FATAL_REPORT_PROCESS_CLAIMED.store(false, Ordering::Release);
         }
     }
 }
@@ -250,6 +277,35 @@ impl Drop for RecoverablePanicBoundary {
     }
 }
 
+impl ForceFatalPanicBoundary {
+    #[must_use]
+    fn enter() -> Self {
+        #[cfg(panic = "unwind")]
+        let previous_depth = FORCE_FATAL_PANIC_DEPTH
+            .try_with(|depth| {
+                let previous = depth.get();
+                depth.set(previous.saturating_add(1));
+                previous
+            })
+            .ok();
+
+        Self {
+            #[cfg(panic = "unwind")]
+            previous_depth,
+            not_send: PhantomData,
+        }
+    }
+}
+
+impl Drop for ForceFatalPanicBoundary {
+    fn drop(&mut self) {
+        #[cfg(panic = "unwind")]
+        if let Some(previous_depth) = self.previous_depth {
+            let _ = FORCE_FATAL_PANIC_DEPTH.try_with(|depth| depth.set(previous_depth));
+        }
+    }
+}
+
 /// Whether the current thread is unwinding through an explicitly audited
 /// recoverable boundary.
 ///
@@ -258,9 +314,13 @@ impl Drop for RecoverablePanicBoundary {
 pub fn is_recoverable_panic() -> bool {
     #[cfg(panic = "unwind")]
     {
-        return RECOVERABLE_PANIC_DEPTH
-            .try_with(|depth| depth.get() > 0)
-            .unwrap_or(false);
+        let recoverable_depth = RECOVERABLE_PANIC_DEPTH
+            .try_with(|depth| depth.get())
+            .unwrap_or(0);
+        let force_fatal_depth = FORCE_FATAL_PANIC_DEPTH
+            .try_with(|depth| depth.get())
+            .unwrap_or(0);
+        return recoverable_depth > 0 && force_fatal_depth == 0;
     }
 
     #[cfg(not(panic = "unwind"))]
@@ -389,6 +449,17 @@ impl<F> Drop for RecoverableFuture<F> {
     fn drop(&mut self) {
         let future = self.future.take();
         if future.is_some() {
+            if std::thread::panicking() {
+                // A second panic that starts during unwinding aborts before a
+                // catch_unwind boundary can recover it. Drop directly, with a
+                // fatal override around any still-live outer recovery marker,
+                // so a panicking destructor is reported instead of silently
+                // aborting under the recoverable-hook suppression contract.
+                let fatal_boundary = ForceFatalPanicBoundary::enter();
+                drop(future);
+                drop(fatal_boundary);
+                return;
+            }
             // Cancellation owns teardown just as completion does. Under abort
             // this remains fail-closed and cannot pretend to contain a panic.
             let _ = catch_recoverable(self.site, AssertUnwindSafe(|| drop(future)));
@@ -593,6 +664,8 @@ fn payload_is_std_broken_pipe_print(payload: &dyn std::any::Any) -> bool {
 mod tests {
     use super::*;
 
+    static FATAL_REPORT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn recoverable_boundary_is_nested_and_restores_exact_prior_depth() {
         assert_eq!(panic_recovery_is_executable(), cfg!(panic = "unwind"));
@@ -606,6 +679,24 @@ mod tests {
         }
         assert_eq!(is_recoverable_panic(), cfg!(panic = "unwind"));
         drop(outer);
+        assert!(!is_recoverable_panic());
+    }
+
+    #[test]
+    fn fatal_override_is_nested_and_restores_outer_recovery_marker() {
+        let recoverable = RecoverablePanicBoundary::enter();
+        assert_eq!(is_recoverable_panic(), cfg!(panic = "unwind"));
+        let outer_fatal = ForceFatalPanicBoundary::enter();
+        assert!(!is_recoverable_panic());
+        {
+            let inner_fatal = ForceFatalPanicBoundary::enter();
+            assert!(!is_recoverable_panic());
+            drop(inner_fatal);
+        }
+        assert!(!is_recoverable_panic());
+        drop(outer_fatal);
+        assert_eq!(is_recoverable_panic(), cfg!(panic = "unwind"));
+        drop(recoverable);
         assert!(!is_recoverable_panic());
     }
 
@@ -722,6 +813,9 @@ mod tests {
 
     #[test]
     fn fatal_report_claim_is_nested_and_reusable_across_hook_invocations() {
+        let _test_guard = FATAL_REPORT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let outer = FatalReportClaim::enter();
         assert!(outer.is_owner());
         let inner = FatalReportClaim::enter();
@@ -731,6 +825,35 @@ mod tests {
 
         let next_hook_invocation = FatalReportClaim::enter();
         assert!(next_hook_invocation.is_owner());
+    }
+
+    #[test]
+    fn fatal_report_claim_has_one_owner_across_simultaneous_threads() {
+        use std::sync::{Arc, Barrier};
+
+        let _test_guard = FATAL_REPORT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        const CONTENDERS: usize = 16;
+        let entered = Arc::new(Barrier::new(CONTENDERS));
+        let mut threads = Vec::with_capacity(CONTENDERS);
+        for _ in 0..CONTENDERS {
+            let entered = Arc::clone(&entered);
+            threads.push(std::thread::spawn(move || {
+                let claim = FatalReportClaim::enter();
+                entered.wait();
+                claim.is_owner()
+            }));
+        }
+
+        let owners: usize = threads
+            .into_iter()
+            .map(|thread| usize::from(thread.join().expect("fatal-report contender")))
+            .sum();
+        assert_eq!(owners, 1);
+
+        let later = FatalReportClaim::enter();
+        assert!(later.is_owner());
     }
 
     #[cfg(panic = "unwind")]
@@ -893,13 +1016,16 @@ mod tests {
 
     #[cfg(panic = "unwind")]
     #[test]
-    fn recoverable_future_cancellation_is_contained_during_outer_unwind() {
+    fn recoverable_future_cancellation_during_outer_unwind_is_not_marked_recoverable() {
         use std::sync::Arc;
         use std::sync::atomic::AtomicBool;
 
-        struct PendingFutureWithPanickingDrop(Arc<AtomicBool>);
+        struct PendingFutureWithObservedDrop {
+            drop_ran: Arc<AtomicBool>,
+            drop_was_marked_recoverable: Arc<AtomicBool>,
+        }
 
-        impl Future for PendingFutureWithPanickingDrop {
+        impl Future for PendingFutureWithObservedDrop {
             type Output = ();
 
             fn poll(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<Self::Output> {
@@ -907,25 +1033,35 @@ mod tests {
             }
         }
 
-        impl Drop for PendingFutureWithPanickingDrop {
+        impl Drop for PendingFutureWithObservedDrop {
             fn drop(&mut self) {
-                self.0.store(true, Ordering::Relaxed);
-                panic!("cancellation-drop-secret-sentinel");
+                self.drop_ran.store(true, Ordering::Relaxed);
+                self.drop_was_marked_recoverable
+                    .store(is_recoverable_panic(), Ordering::Relaxed);
             }
         }
 
         let inner_drop_ran = Arc::new(AtomicBool::new(false));
-        let observer = Arc::clone(&inner_drop_ran);
-        let outer = std::panic::catch_unwind(AssertUnwindSafe(|| {
-            let _future = catch_recoverable_future(
-                RecoverablePanicSite::CoreAsyncTaskJoin,
-                PendingFutureWithPanickingDrop(observer),
-            );
-            panic!("unrelated-outer-unwind");
-        }));
+        let drop_was_marked_recoverable = Arc::new(AtomicBool::new(true));
+        let outer = catch_recoverable(
+            RecoverablePanicSite::CoreAsyncTaskJoin,
+            AssertUnwindSafe(|| {
+                let _future = catch_recoverable_future(
+                    RecoverablePanicSite::CoreAsyncTaskJoin,
+                    PendingFutureWithObservedDrop {
+                        drop_ran: Arc::clone(&inner_drop_ran),
+                        drop_was_marked_recoverable: Arc::clone(
+                            &drop_was_marked_recoverable,
+                        ),
+                    },
+                );
+                panic!("unrelated-outer-unwind");
+            }),
+        );
 
         assert!(outer.is_err());
         assert!(inner_drop_ran.load(Ordering::Relaxed));
+        assert!(!drop_was_marked_recoverable.load(Ordering::Relaxed));
         assert!(!is_recoverable_panic());
     }
 

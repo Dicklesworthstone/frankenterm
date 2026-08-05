@@ -16474,6 +16474,67 @@ fn redact_for_output(text: &str) -> String {
     REDACTOR.redact(text)
 }
 
+const TERMINAL_TEXT_INPUT_MAX_BYTES: usize = 64 * 1024;
+
+fn bounded_terminal_diagnostic(text: &str, max_columns: usize, max_bytes: usize) -> String {
+    if text.len() > TERMINAL_TEXT_INPUT_MAX_BYTES {
+        return frankenterm_core::output::truncate_bounded(
+            "diagnostic unavailable",
+            max_columns,
+            max_bytes,
+        );
+    }
+
+    let redacted = redact_for_output(text);
+    let bounded =
+        frankenterm_core::output::truncate_bounded(&redacted, max_columns, max_bytes);
+    if bounded.trim().is_empty() {
+        frankenterm_core::output::truncate_bounded(
+            "diagnostic unavailable",
+            max_columns,
+            max_bytes,
+        )
+    } else {
+        bounded
+    }
+}
+
+fn bounded_terminal_preview(text: &str, max_columns: usize, max_bytes: usize) -> String {
+    if text.len() > TERMINAL_TEXT_INPUT_MAX_BYTES {
+        return frankenterm_core::output::truncate_bounded(
+            "preview omitted: input exceeds safety limit",
+            max_columns,
+            max_bytes,
+        );
+    }
+
+    let redacted = redact_for_output(text);
+    frankenterm_core::output::truncate_bounded(&redacted, max_columns, max_bytes)
+}
+
+#[cfg(test)]
+#[test]
+fn bounded_terminal_helpers_preserve_empty_preview_and_bound_fallbacks() {
+    assert_eq!(bounded_terminal_preview("", 60, 512), "");
+    assert_eq!(
+        bounded_terminal_diagnostic("", 80, 512),
+        "diagnostic unavailable"
+    );
+
+    let secret = "send AKIAIOSFODNN7EXAMPLE";
+    let preview = bounded_terminal_preview(secret, 60, 512);
+    assert!(!preview.contains("AKIAIOSFODNN7EXAMPLE"));
+    assert!(preview.contains("[REDACTED]"));
+    assert_eq!(
+        bounded_terminal_preview("\x1b]0;title\x07safe\nname", 60, 512),
+        "safe name"
+    );
+
+    let oversized = "x".repeat(TERMINAL_TEXT_INPUT_MAX_BYTES + 1);
+    assert_eq!(bounded_terminal_preview(&oversized, 4, 4), "p...");
+    assert_eq!(bounded_terminal_diagnostic(&oversized, 3, 3), "dia");
+}
+
 fn redact_wait_pattern_for_output(pattern: &str) -> String {
     redact_for_output(pattern)
 }
@@ -22761,8 +22822,8 @@ fn step_plan_metadata(step: &frankenterm_core::plan::StepPlan) -> serde_json::Va
                 "text_len".to_string(),
                 serde_json::Value::Number(text.len().into()),
             );
-            // Show truncated preview (redacted at report level)
-            let preview = frankenterm_core::output::truncate(text, 60);
+            // Bound and redact the preview before it enters report metadata.
+            let preview = bounded_terminal_preview(text, 60, 512);
             meta.insert(
                 "text_preview".to_string(),
                 serde_json::Value::String(preview),
@@ -23375,10 +23436,10 @@ fn watch_checkpoint(cx: &frankenterm_core::cx::Cx, operation: &str) -> std::io::
             .cancel_reason()
             .and_then(|reason| reason.message)
             .filter(|message| !message.is_empty())
-            .map(|message| redact_for_output(&message));
+            .map(|message| bounded_terminal_diagnostic(&message, 512, 2_048));
         let detail = reason.map_or_else(
-            || error.to_string(),
-            |message| format!("{error}; reason: {message}"),
+            || bounded_terminal_diagnostic(&error.to_string(), 512, 2_048),
+            |message| format!("capability context cancelled; reason: {message}"),
         );
         std::io::Error::new(
             std::io::ErrorKind::Interrupted,
@@ -24116,8 +24177,8 @@ fn watch_terminal_error_ndjson(
         "terminal": true,
         "retryable": retryable,
         "code": code,
-        "message": redact_for_output(&message),
-        "hint": hint.map(|hint| redact_for_output(&hint)),
+        "message": bounded_terminal_diagnostic(&message, 4_096, 16_384),
+        "hint": hint.map(|hint| bounded_terminal_diagnostic(&hint, 4_096, 16_384)),
         "cursor": cursor,
         "cursor_epoch": cursor_epoch,
         "cursor_scope": cursor_scope,
@@ -26002,6 +26063,25 @@ mod watch_events_tests {
             "the raw cancellation reason must not cross the watch output boundary: {rendered}"
         );
 
+        let hostile_cancelled = frankenterm_core::cx::for_testing();
+        let hostile_reason = format!(
+            "\x1b]0;stolen title\x07{}\nspoofed\u{2028}line\u{202e}direction\u{206a}shape",
+            "猫".repeat(5_000)
+        );
+        hostile_cancelled.cancel_with(
+            frankenterm_core::outcome::CancelKind::User,
+            Some(&hostile_reason),
+        );
+        let hostile_error = watch_checkpoint(&hostile_cancelled, "hostile cancellation")
+            .expect_err("hostile cancellation must fail safely")
+            .to_string();
+        assert!(!hostile_error.contains('\x1b'));
+        assert!(!hostile_error.contains('\n'));
+        assert!(!hostile_error.contains('\u{2028}'));
+        assert!(!hostile_error.contains('\u{202e}'));
+        assert!(!hostile_error.contains('\u{206a}'));
+        assert!(hostile_error.len() <= 2_200, "diagnostic was not byte-bounded");
+
         assert_eq!(
             watch_core_failure_source(&frankenterm_core::Error::Cancelled(
                 "storage cancelled".to_string()
@@ -26239,6 +26319,51 @@ mod watch_events_tests {
             !encoded.contains("AKIAIOSFODNN7EXAMPLE"),
             "stream error messages and hints must share the robot redaction boundary: {encoded}"
         );
+
+        let hostile = watch_terminal_error_ndjson(
+            ROBOT_ERR_INVALID_ARGS,
+            format!(
+                "\x1b]0;title\x07{}\nend\u{2028}line\u{202e}spoof\u{206a}shape",
+                "x".repeat(20_000)
+            ),
+            Some(format!("\x1bPprivate\x1b\\{}", "y".repeat(20_000))),
+            None,
+            None,
+            None,
+            false,
+        );
+        for field in ["message", "hint"] {
+            let value = hostile[field]
+                .as_str()
+                .expect("bounded terminal diagnostic string");
+            assert!(!value.contains('\x1b'));
+            assert!(!value.contains('\n'));
+            assert!(!value.contains('\u{2028}'));
+            assert!(!value.contains('\u{202e}'));
+            assert!(!value.contains('\u{206a}'));
+            assert!(value.len() <= 16_384, "{field} exceeded its byte bound");
+        }
+        let controls_only = watch_terminal_error_ndjson(
+            ROBOT_ERR_INVALID_ARGS,
+            "\x1b]0;hidden\x07",
+            None,
+            None,
+            None,
+            None,
+            false,
+        );
+        assert_eq!(controls_only["message"], "diagnostic unavailable");
+
+        let oversized = watch_terminal_error_ndjson(
+            ROBOT_ERR_INVALID_ARGS,
+            "z".repeat(64 * 1024 + 1),
+            None,
+            None,
+            None,
+            None,
+            false,
+        );
+        assert_eq!(oversized["message"], "diagnostic unavailable");
 
         for partial_or_malformed in [
             watch_terminal_error_ndjson(
@@ -35321,7 +35446,7 @@ async fn run_saved_search_scheduler(
                 break;
             }
             let search_id = search.id.clone();
-            let search_name = search.name.clone();
+            let search_name = bounded_terminal_preview(&search.name, 200, 800);
             let search_query = search.query.clone();
             if !search.enabled {
                 continue;
@@ -35386,7 +35511,7 @@ async fn run_saved_search_scheduler(
                     next_allowed_run_at_by_id.insert(search_id.clone(), next_allowed);
                     next_wake_at = next_wake_at.min(next_allowed);
 
-                    let message = bounded_utf8_string(err.to_string(), 600);
+                    let message = bounded_terminal_preview(&err.to_string(), 600, 600);
                     if let Err(update_err) = storage
                         .update_saved_search_run(&search_id, now, None, Some(message.clone()))
                         .await
@@ -54168,10 +54293,12 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                 frankenterm_core::crash::latest_crash_bundle(&layout.crash_dir)
             {
                 let detail = if let Some(ref report) = bundle.report {
-                    let msg = frankenterm_core::output::truncate(&report.message, 80);
-                    let loc = frankenterm_core::output::truncate(
+                    let msg =
+                        frankenterm_core::output::truncate_bounded(&report.message, 80, 512);
+                    let loc = frankenterm_core::output::truncate_bounded(
                         report.location.as_deref().unwrap_or("unknown location"),
                         120,
+                        512,
                     );
                     format!("{msg} (at {loc})")
                 } else if let Some(ref manifest) = bundle.manifest {
@@ -57128,10 +57255,12 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     frankenterm_core::crash::latest_crash_bundle(&layout.crash_dir)
                 {
                     let detail = if let Some(ref report) = bundle.report {
-                        let msg = frankenterm_core::output::truncate(&report.message, 100);
-                        let location = frankenterm_core::output::truncate(
+                        let msg =
+                            frankenterm_core::output::truncate_bounded(&report.message, 100, 512);
+                        let location = frankenterm_core::output::truncate_bounded(
                             report.location.as_deref().unwrap_or("unknown"),
                             120,
+                            512,
                         );
                         format!("{msg} (at {location})")
                     } else if let Some(ref manifest) = bundle.manifest {
@@ -67614,7 +67743,7 @@ fn truncate_id(id: &str, max: usize) -> String {
     // fixed-width terminal summaries. Share the hardened terminal-cell path so
     // ANSI, multiline/bidi controls, wide graphemes, and UTF-8 boundaries all
     // obey the same display contract as other CLI fields.
-    frankenterm_core::output::truncate(id, max)
+    frankenterm_core::output::truncate_bounded(id, max, max.saturating_mul(8))
 }
 
 #[cfg(test)]
@@ -67626,6 +67755,11 @@ fn truncate_id_is_bounded_and_preserves_utf8_boundaries() {
     assert_eq!(truncate_id("nonempty", 1), "n");
     assert_eq!(truncate_id("nonempty", 0), "");
     assert_eq!(truncate_id("\x1b]0;title\x07safe\u{202e}id", 20), "safe id");
+
+    let oversized_grapheme = format!("a{}", "\u{0301}".repeat(1_024));
+    let bounded = truncate_id(&oversized_grapheme, 8);
+    assert!(bounded.len() <= 64);
+    assert_eq!(bounded, "...");
 }
 
 /// Format epoch ms for display.

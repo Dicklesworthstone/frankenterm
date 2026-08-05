@@ -1,23 +1,121 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Execute already-built artifacts only. Cargo/profile selection belongs to the
-# strict remote caller so this script cannot silently rebuild under test/debug.
-if [[ $# -ne 2 ]]; then
-  echo "usage: $0 <release-interactive-probe> <release-abort-probe>" >&2
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+PROFILES_ONLY=false
+if [[ $# -eq 1 && "$1" == "--profiles-only" ]]; then
+  PROFILES_ONLY=true
+elif [[ $# -eq 2 ]]; then
+  # Execute already-built artifacts only. Cargo/profile selection belongs to
+  # the strict remote caller so this script cannot silently rebuild under
+  # test/debug.
+  INTERACTIVE_PROBE="$1"
+  ABORT_PROBE="$2"
+else
+  echo "usage: $0 --profiles-only" >&2
+  echo "   or: $0 <release-interactive-probe> <release-abort-probe>" >&2
   exit 2
 fi
 
-INTERACTIVE_PROBE="$1"
-ABORT_PROBE="$2"
-for probe in "$INTERACTIVE_PROBE" "$ABORT_PROBE"; do
-  if [[ ! -x "$probe" ]]; then
-    echo "panic-contract probe is not executable: $probe" >&2
-    exit 2
-  fi
-done
+# Machine-check the complete profile contract rather than trusting comments or
+# the behavior of one probe build. This also proves that no second explicitly
+# aborting profile can accidentally become a packaging candidate.
+python3 - "$REPO_ROOT/Cargo.toml" <<'PY'
+import pathlib
+import re
+import sys
 
-REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+manifest_path = pathlib.Path(sys.argv[1])
+manifest_text = manifest_path.read_text(encoding="utf-8")
+try:
+    import tomllib
+except ModuleNotFoundError:
+    # Apple still ships Python versions older than 3.11 on some supported
+    # hosts. Parse only the scalar profile tables this contract owns rather
+    # than turning a release-safety check into an ambient Python-package
+    # dependency.
+    profiles = {}
+    current = None
+    section_pattern = re.compile(r"^\[profile\.([A-Za-z0-9-]+)\]$")
+    for raw_line in manifest_text.splitlines():
+        line = raw_line.split("#", 1)[0].strip()
+        if not line:
+            continue
+        section = section_pattern.fullmatch(line)
+        if section:
+            current = profiles.setdefault(section.group(1), {})
+            continue
+        if line.startswith("["):
+            current = None
+            continue
+        if current is None or "=" not in line:
+            continue
+        key, raw_value = (part.strip() for part in line.split("=", 1))
+        if raw_value.startswith('"') and raw_value.endswith('"'):
+            value = raw_value[1:-1]
+        elif raw_value in {"true", "false"}:
+            value = raw_value == "true"
+        elif re.fullmatch(r"[0-9]+", raw_value):
+            value = int(raw_value)
+        else:
+            raise SystemExit(
+                f"unsupported scalar in fallback Cargo profile parser: {line!r}"
+            )
+        current[key] = value
+else:
+    profiles = tomllib.loads(manifest_text).get("profile", {})
+
+expected = {
+    "release": {
+        "opt-level": "z",
+        "lto": True,
+        "codegen-units": 1,
+        "panic": "unwind",
+        "strip": True,
+        "debug": False,
+    },
+    "release-interactive": {
+        "inherits": "release",
+        "panic": "unwind",
+    },
+    "release-abort-probe": {
+        "inherits": "release",
+        "panic": "abort",
+    },
+    "release-perf": {
+        "inherits": "release",
+        "opt-level": 3,
+        "lto": "thin",
+        "debug": "line-tables-only",
+        "panic": "unwind",
+        "strip": "none",
+    },
+}
+
+for profile_name, required in expected.items():
+    actual = profiles.get(profile_name)
+    if not isinstance(actual, dict):
+        raise SystemExit(f"missing required Cargo profile: {profile_name}")
+    for key, expected_value in required.items():
+        actual_value = actual.get(key)
+        if actual_value != expected_value:
+            raise SystemExit(
+                f"Cargo profile drift: profile.{profile_name}.{key}="
+                f"{actual_value!r}, expected {expected_value!r}"
+            )
+
+aborting = sorted(
+    name
+    for name, settings in profiles.items()
+    if isinstance(settings, dict) and settings.get("panic") == "abort"
+)
+if aborting != ["release-abort-probe"]:
+    raise SystemExit(
+        "release-abort-probe must be the only explicitly aborting profile; "
+        f"observed {aborting!r}"
+    )
+PY
+
 # shellcheck disable=SC2016
 # This is a literal ERE: `$` anchors and backticks are intentionally not shell
 # expansions.
@@ -47,11 +145,30 @@ if [[ $stale_shipped_profile_status -ne 1 ]]; then
   exit 1
 fi
 
+set +e
+stale_packaging_script_refs="$(
+  grep -n -E "$STALE_SHIPPED_PROFILE_PATTERN" \
+    "$REPO_ROOT/install.sh" \
+    "$REPO_ROOT/scripts/create-macos-bundle.sh"
+)"
+stale_packaging_script_status=$?
+set -e
+if [[ $stale_packaging_script_status -eq 0 ]]; then
+  echo "packaging scripts bypass release-interactive identity:" >&2
+  echo "$stale_packaging_script_refs" >&2
+  exit 1
+fi
+if [[ $stale_packaging_script_status -ne 1 ]]; then
+  echo "could not audit packaging-script profile selection" >&2
+  exit 1
+fi
+
 STALE_RELEASE_WORKFLOW_PATTERN='panic\.cli=abort|target/\$\{\{ matrix\.target \}\}/(release|release-abort-probe)/\$\{\{ matrix\.artifact \}\}|cargo build --release --target'
 set +e
 stale_release_workflow_refs="$(
   grep -n -E "$STALE_RELEASE_WORKFLOW_PATTERN" \
-    "$REPO_ROOT/.github/workflows/release.yml"
+    "$REPO_ROOT/.github/workflows/release.yml" \
+    "$REPO_ROOT/.github/workflows/ci.yml"
 )"
 stale_release_workflow_status=$?
 set -e
@@ -63,6 +180,29 @@ fi
 if [[ $stale_release_workflow_status -ne 1 ]]; then
   echo "could not audit shipped workflow profile selection" >&2
   exit 1
+fi
+
+if [[ "$PROFILES_ONLY" == true ]]; then
+  echo "PANIC_PROFILE_STATIC_CONTRACT_SUCCESS"
+  exit 0
+fi
+
+for probe in "$INTERACTIVE_PROBE" "$ABORT_PROBE"; do
+  if [[ ! -x "$probe" ]]; then
+    echo "panic-contract probe is not executable: $probe" >&2
+    exit 2
+  fi
+done
+
+interactive_profile="$(basename "$(dirname "$(dirname "$INTERACTIVE_PROBE")")")"
+abort_profile="$(basename "$(dirname "$(dirname "$ABORT_PROBE")")")"
+if [[ "$interactive_profile" != "release-interactive" ]]; then
+  echo "interactive probe is not the release-interactive artifact: $INTERACTIVE_PROBE" >&2
+  exit 2
+fi
+if [[ "$abort_profile" != "release-abort-probe" ]]; then
+  echo "abort probe is not the release-abort-probe artifact: $ABORT_PROBE" >&2
+  exit 2
 fi
 
 EVIDENCE_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/ft-panic-contract.XXXXXX")"
@@ -232,6 +372,31 @@ if compgen -G "$payload_twice_root/crashes/ft_crash_*" >/dev/null; then
 fi
 assert_no_secret "$payload_twice_root"
 
+# Rust cannot catch a second panic that begins while a thread is already
+# unwinding. An outer recovery marker must therefore be overridden while a
+# wrapped future is torn down, so the fatal destructor panic reaches the crash
+# and base hooks before the runtime aborts.
+nested_drop_root="$EVIDENCE_ROOT/nested-drop-panic"
+mkdir -p "$nested_drop_root/crashes"
+set +e
+(
+  ulimit -c 0
+  exec env FT_PANIC_PROBE_CRASH_DIR="$nested_drop_root/crashes" \
+    "$INTERACTIVE_PROBE" nested-drop-panic
+) >"$nested_drop_root.stdout" 2>"$nested_drop_root.stderr"
+nested_drop_status=$?
+set -e
+if [[ $nested_drop_status -ne 134 ]]; then
+  echo "nested destructor panic exited $nested_drop_status instead of 134" >&2
+  exit 1
+fi
+assert_empty_file "$nested_drop_root.stdout"
+grep -F -q \
+  'FrankenTerm: fatal internal error; diagnostic details were suppressed' \
+  "$nested_drop_root.stderr"
+assert_one_sanitized_crash_bundle "$nested_drop_root/crashes"
+assert_no_secret "$nested_drop_root"
+
 fatal_root="$EVIDENCE_ROOT/uncaught"
 fatal_crash_root="$fatal_root/crashes"
 mkdir -p "$fatal_crash_root"
@@ -357,6 +522,23 @@ assert_empty_file "$gui_epipe_root.stdout"
 assert_empty_file "$gui_epipe_root.stderr"
 if compgen -G "$gui_epipe_root/crashes/ft_crash_*" >/dev/null; then
   echo "GUI-chain EPIPE created a crash bundle" >&2
+  exit 1
+fi
+
+abort_epipe_root="$EVIDENCE_ROOT/abort-epipe"
+mkdir -p "$abort_epipe_root/crashes"
+: >"$abort_epipe_root.stdout"
+run_with_closed_stdout "$ABORT_PROBE" epipe "$abort_epipe_root/crashes" \
+  "$abort_epipe_root.stderr" "$abort_epipe_root.status"
+abort_epipe_status="$(<"$abort_epipe_root.status")"
+if [[ $abort_epipe_status -ne 141 ]]; then
+  echo "abort-profile EPIPE probe exited $abort_epipe_status instead of 141" >&2
+  exit 1
+fi
+assert_empty_file "$abort_epipe_root.stdout"
+assert_empty_file "$abort_epipe_root.stderr"
+if compgen -G "$abort_epipe_root/crashes/ft_crash_*" >/dev/null; then
+  echo "abort-profile EPIPE created a crash bundle" >&2
   exit 1
 fi
 

@@ -6,8 +6,8 @@
 //! into an operator-visible crash. The fix
 //! (`frankenterm_sigpipe::exit_quietly_on_broken_pipe`,
 //! installed at the top of every binary's `main`) recognizes broken-pipe
-//! write panics in a panic hook — which still runs before the abort — and
-//! exits with the conventional `128 + SIGPIPE = 141` instead.
+//! write panics in a panic hook — before unwinding or aborting — and exits
+//! with the conventional `128 + SIGPIPE = 141` instead.
 //!
 //! The test closes the pipe's read end *before* spawning the child, so the
 //! child's very first stdout write hits `EPIPE` deterministically — no race
@@ -72,6 +72,10 @@ fn ft_help_exits_cleanly_or_141_but_never_signals() {
         status.signal(),
         None,
         "ft --help must not die from a signal when stdout closes early; got {status:?}"
+    );
+    assert!(
+        matches!(status.code(), Some(0) | Some(141)),
+        "ft --help must exit successfully or with 128+SIGPIPE=141; got {status:?}"
     );
 }
 

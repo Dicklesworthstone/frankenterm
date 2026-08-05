@@ -1154,6 +1154,11 @@ fn terminate_with_error(err: anyhow::Error) -> ! {
 }
 
 fn main() {
+    // Install the privacy-bounded terminal hook before profiler or runtime
+    // initialization. The GUI notifier wraps this chain below; reversing the
+    // hook order would discard the notifier.
+    frankenterm_sigpipe::exit_quietly_on_broken_pipe();
+
     #[cfg(feature = "dhat-heap")]
     let _profiler = dhat::Profiler::new_heap();
 
@@ -1161,9 +1166,6 @@ fn main() {
     // identity without executing the GUI or creating a window.
     std::hint::black_box(FT_ATOMIC_COMPONENT_MARKER);
 
-    // Install the privacy-bounded terminal hook first. The GUI notifier wraps
-    // this chain below; reversing the order would discard the notifier.
-    frankenterm_sigpipe::exit_quietly_on_broken_pipe();
     config::designate_this_as_the_main_thread();
     config::assign_error_callback(mux::connui::show_configuration_error_message);
     notify_on_panic();

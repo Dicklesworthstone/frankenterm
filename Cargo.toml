@@ -623,15 +623,16 @@ panic = "abort"
 # Use thin LTO (not the shipped fat `lto=true`) so each A/B arm rebuilds fast on RCH workers;
 # relative before/after deltas stay valid because both arms use the identical profile.
 # Frame pointers (set via RUSTFLAGS="-C force-frame-pointers=yes" in the bench-AB driver) keep
-# flamegraphs attributable. Inherit directly from Cargo's built-in `release`
-# profile, then repeat the panic contract explicitly; this keeps the benchmark
-# identity portable without depending on custom-profile inheritance chaining.
+# flamegraphs attributable. Inherit directly from the workspace's canonical
+# `release` profile, then repeat the panic contract explicitly; this keeps the
+# benchmark identity portable without depending on custom-profile inheritance
+# chaining.
 inherits = "release"
 opt-level = 3
 lto = "thin"
 debug = "line-tables-only"
 panic = "unwind"
-# The inherited shipping profile strips symbols. That would discard the line
+# The inherited release profile strips symbols. That would discard the line
 # tables this measurement profile explicitly requests and make sampled stacks
 # needlessly opaque, so preserve them for attribution-quality A/B evidence.
 strip = "none"

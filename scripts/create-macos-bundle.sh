@@ -85,6 +85,15 @@ if [[ ! -f "$ATOMIC_MANIFEST_TOOL" ]]; then
     echo "Error: atomic component manifest tool not found at $ATOMIC_MANIFEST_TOOL"
     exit 1
 fi
+PANIC_CONTRACT_TOOL="$PROJECT_ROOT/scripts/check-release-panic-contract.sh"
+if [[ ! -f "$PANIC_CONTRACT_TOOL" ]]; then
+    echo "Error: release panic-contract checker not found at $PANIC_CONTRACT_TOOL"
+    exit 1
+fi
+if ! bash "$PANIC_CONTRACT_TOOL" --profiles-only; then
+    echo "Error: Cargo release profiles do not satisfy the shipped panic contract"
+    exit 1
+fi
 EXPECTED_BUILD_ID=$(bash "$ATOMIC_MANIFEST_TOOL" derive-build-id \
     --source-revision "$SOURCE_REVISION" \
     --version "$VERSION" \
@@ -169,7 +178,7 @@ run_rch_bundle_build() {
         run_rch --no-self-healing exec -- env \
             CARGO_TARGET_DIR="$CARGO_TARGET_DIR_REL" \
             FT_ATOMIC_BUILD_IDENTITY="$FT_ATOMIC_BUILD_IDENTITY" \
-            cargo build --profile "$BUILD_PROFILE" --target "$TARGET_TRIPLE" \
+            cargo build --locked --profile "$BUILD_PROFILE" --target "$TARGET_TRIPLE" \
             --bin frankenterm-gui \
             --bin frankenterm-mux-server \
             --bin ft \
@@ -186,7 +195,7 @@ build_remote_bundle_with_diagnostics() {
     # (RCH-E301). The exact fail-closed Cargo build is both the authoritative
     # prerequisite check and artifact producer: native build scripts diagnose
     # missing metadata, while success proves all three processes linked.
-    if run_rch_bundle_build > >(tee "$preflight_log") 2> >(tee -a "$preflight_log" >&2); then
+    if run_rch_bundle_build > >(tee -a "$preflight_log") 2> >(tee -a "$preflight_log" >&2); then
         return 0
     fi
 

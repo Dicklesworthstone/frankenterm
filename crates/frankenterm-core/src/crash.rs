@@ -8,9 +8,9 @@
 //! # Crash Bundle Layout
 //!
 //! ```text
-//! .ft/crash/ft_crash_YYYYMMDD_HHMMSS/
+//! .ft/crash/ft_crash_YYYYMMDD_HHMMSS_pPID_SEQUENCE/
 //! ├── manifest.json        # Bundle metadata (version, timestamp, schema)
-//! ├── crash_report.json    # Panic details (message, location, backtrace)
+//! ├── crash_report.json    # Generic fatal summary, line/column, bounded backtrace
 //! ├── environment_markers.json # Terminal/session crash triage markers
 //! └── health_snapshot.json # Last known HealthSnapshot (if available)
 //! ```
@@ -79,6 +79,53 @@ static GLOBAL_CRASH_TERMINAL_SESSION_MARKERS: OnceLock<
 static CRASH_BUNDLE_PARSE_DROP_COUNT: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+/// Process-local nonce for disjoint crash-bundle staging and final paths.
+///
+/// Fatal hooks can run concurrently on multiple threads. A shared
+/// `.{timestamp}.tmp` path lets one hook remove or rename another hook's
+/// in-flight evidence, so every attempt gets its own process/sequence identity.
+static CRASH_BUNDLE_WRITE_SEQUENCE: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Clone an optional diagnostic snapshot without ever waiting for its writer.
+///
+/// Panic hooks can run on the thread that currently owns a global snapshot's
+/// write lock. A blocking read from that hook would self-deadlock and prevent
+/// both the crash report and process termination. Poison means the writer is
+/// already gone, so its last value remains safe to clone; active contention is
+/// omitted from best-effort evidence.
+fn try_clone_diagnostic_snapshot<T: Clone>(lock: &RwLock<Option<T>>) -> Option<T> {
+    match lock.try_read() {
+        Ok(guard) => guard.clone(),
+        Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+            lock.clear_poison();
+            poisoned.into_inner().clone()
+        }
+        Err(std::sync::TryLockError::WouldBlock) => None,
+    }
+}
+
+fn clone_diagnostic_snapshot<T: Clone>(lock: &RwLock<Option<T>>) -> Option<T> {
+    match lock.read() {
+        Ok(guard) => guard.clone(),
+        Err(poisoned) => {
+            lock.clear_poison();
+            poisoned.into_inner().clone()
+        }
+    }
+}
+
+fn replace_diagnostic_snapshot<T>(lock: &RwLock<Option<T>>, value: Option<T>) {
+    let mut guard = match lock.write() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            lock.clear_poison();
+            poisoned.into_inner()
+        }
+    };
+    *guard = value;
+}
+
 /// br-ft-94cdu: cumulative count of crash-bundle parse failures.
 #[must_use]
 pub fn crash_bundle_parse_drop_count() -> u64 {
@@ -143,12 +190,25 @@ const MAX_BACKTRACE_LEN: usize = 64 * 1024;
 
 /// Maximum panic-message bytes retained in a redacted crash bundle.
 const MAX_CRASH_MESSAGE_LEN: usize = 8 * 1024;
+/// Maximum terminal cells retained when a crash message is rendered.
+const MAX_CRASH_MESSAGE_WIDTH: usize = 2 * 1024;
 
 /// Maximum source-location bytes retained in a redacted crash bundle.
 const MAX_CRASH_LOCATION_LEN: usize = 1024;
+/// Maximum terminal cells retained when a crash location is rendered.
+const MAX_CRASH_LOCATION_WIDTH: usize = 256;
 
 /// Maximum thread-name bytes retained in a redacted crash bundle.
 const MAX_CRASH_THREAD_NAME_LEN: usize = 256;
+/// Maximum terminal cells retained when a crash thread name is rendered.
+const MAX_CRASH_THREAD_NAME_WIDTH: usize = 64;
+
+/// Maximum number of warning lines retained from the last health snapshot.
+const MAX_CRASH_HEALTH_WARNINGS: usize = 64;
+/// Maximum bytes retained for one health warning or environment marker.
+const MAX_CRASH_DIAGNOSTIC_FIELD_LEN: usize = 1024;
+/// Maximum terminal cells retained for one health warning or environment marker.
+const MAX_CRASH_DIAGNOSTIC_FIELD_WIDTH: usize = 256;
 
 /// Maximum crash bundle size in bytes (1 MiB) — a privacy/size budget.
 const MAX_BUNDLE_SIZE: usize = 1024 * 1024;
@@ -387,21 +447,123 @@ impl CrashEnvironmentMarkers {
     }
 
     fn redacted(&self, redactor: &Redactor) -> Self {
+        let sanitize = |value: &str| {
+            crate::output::truncate_bounded(
+                &redactor.redact(value),
+                MAX_CRASH_DIAGNOSTIC_FIELD_WIDTH,
+                MAX_CRASH_DIAGNOSTIC_FIELD_LEN,
+            )
+        };
         Self {
-            gate_phase: self.gate_phase.clone(),
-            session_phase: self.session_phase.clone(),
-            screen_mode: self.screen_mode.clone(),
+            gate_phase: sanitize(&self.gate_phase),
+            session_phase: sanitize(&self.session_phase),
+            screen_mode: sanitize(&self.screen_mode),
             feature_flags: self.feature_flags.clone(),
-            terminal_type: redactor.redact(&self.terminal_type),
-            terminal_program: redactor.redact(&self.terminal_program),
-            backpressure_tier: redactor.redact(&self.backpressure_tier),
+            terminal_type: sanitize(&self.terminal_type),
+            terminal_program: sanitize(&self.terminal_program),
+            backpressure_tier: sanitize(&self.backpressure_tier),
         }
     }
 }
 
+#[derive(Serialize)]
+struct CrashHealthSnapshot<'a> {
+    timestamp: u64,
+    observed_panes: usize,
+    capture_queue_depth: usize,
+    write_queue_depth: usize,
+    last_seq_by_pane: &'a [(u64, i64)],
+    warnings: Vec<String>,
+    ingest_lag_avg_ms: f64,
+    ingest_lag_max_ms: u64,
+    db_writable: bool,
+    db_last_write_at: Option<u64>,
+    pane_priority_overrides: &'a [PanePriorityOverrideSnapshot],
+    scheduler: Option<&'a crate::tailer::SchedulerSnapshot>,
+    backpressure_tier: Option<String>,
+    last_activity_by_pane: &'a [(u64, u64)],
+    restart_count: u32,
+    last_crash_at: Option<u64>,
+    consecutive_crashes: u32,
+    current_backoff_ms: u64,
+    in_crash_loop: bool,
+    fleet_pressure_tier: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    swarm_capacity: Option<&'a crate::runtime_telemetry::SwarmCapacityOperatorSummary>,
+    leak_risk_inventory: &'a LeakRiskInventorySnapshot,
+}
+
+fn redacted_health_snapshot<'a>(
+    snapshot: &'a HealthSnapshot,
+    redactor: &Redactor,
+) -> CrashHealthSnapshot<'a> {
+    let warning_limit = if snapshot.warnings.len() > MAX_CRASH_HEALTH_WARNINGS {
+        MAX_CRASH_HEALTH_WARNINGS.saturating_sub(1)
+    } else {
+        MAX_CRASH_HEALTH_WARNINGS
+    };
+    let mut warnings: Vec<String> = snapshot
+        .warnings
+        .iter()
+        .take(warning_limit)
+        .map(|warning| {
+            crate::output::truncate_bounded(
+                &redactor.redact(warning),
+                MAX_CRASH_DIAGNOSTIC_FIELD_WIDTH,
+                MAX_CRASH_DIAGNOSTIC_FIELD_LEN,
+            )
+        })
+        .collect();
+    if snapshot.warnings.len() > MAX_CRASH_HEALTH_WARNINGS {
+        warnings.push(format!(
+            "{} additional health warnings omitted",
+            snapshot.warnings.len().saturating_sub(warning_limit)
+        ));
+    }
+    let backpressure_tier = snapshot.backpressure_tier.as_deref().map(|tier| {
+        crate::output::truncate_bounded(
+            &redactor.redact(tier),
+            MAX_CRASH_DIAGNOSTIC_FIELD_WIDTH,
+            MAX_CRASH_DIAGNOSTIC_FIELD_LEN,
+        )
+    });
+    let fleet_pressure_tier = snapshot.fleet_pressure_tier.as_deref().map(|tier| {
+        crate::output::truncate_bounded(
+            &redactor.redact(tier),
+            MAX_CRASH_DIAGNOSTIC_FIELD_WIDTH,
+            MAX_CRASH_DIAGNOSTIC_FIELD_LEN,
+        )
+    });
+    CrashHealthSnapshot {
+        timestamp: snapshot.timestamp,
+        observed_panes: snapshot.observed_panes,
+        capture_queue_depth: snapshot.capture_queue_depth,
+        write_queue_depth: snapshot.write_queue_depth,
+        last_seq_by_pane: &snapshot.last_seq_by_pane,
+        warnings,
+        ingest_lag_avg_ms: snapshot.ingest_lag_avg_ms,
+        ingest_lag_max_ms: snapshot.ingest_lag_max_ms,
+        db_writable: snapshot.db_writable,
+        db_last_write_at: snapshot.db_last_write_at,
+        pane_priority_overrides: &snapshot.pane_priority_overrides,
+        scheduler: snapshot.scheduler.as_ref(),
+        backpressure_tier,
+        last_activity_by_pane: &snapshot.last_activity_by_pane,
+        restart_count: snapshot.restart_count,
+        last_crash_at: snapshot.last_crash_at,
+        consecutive_crashes: snapshot.consecutive_crashes,
+        current_backoff_ms: snapshot.current_backoff_ms,
+        in_crash_loop: snapshot.in_crash_loop,
+        fleet_pressure_tier,
+        swarm_capacity: snapshot.swarm_capacity.as_ref(),
+        leak_risk_inventory: &snapshot.leak_risk_inventory,
+    }
+}
+
 fn crash_terminal_session_markers_global() -> Option<CrashTerminalSessionMarkers> {
-    let lock = GLOBAL_CRASH_TERMINAL_SESSION_MARKERS.get_or_init(|| RwLock::new(None));
-    lock.read().ok().and_then(|guard| guard.clone())
+    GLOBAL_CRASH_TERMINAL_SESSION_MARKERS
+        .get()
+        .and_then(try_clone_diagnostic_snapshot)
 }
 
 /// Publish the current TUI terminal-session markers for future crash bundles.
@@ -410,20 +572,19 @@ pub fn update_crash_terminal_session_markers(
     screen_mode: impl Into<String>,
 ) {
     let lock = GLOBAL_CRASH_TERMINAL_SESSION_MARKERS.get_or_init(|| RwLock::new(None));
-    if let Ok(mut guard) = lock.write() {
-        *guard = Some(CrashTerminalSessionMarkers {
+    replace_diagnostic_snapshot(
+        lock,
+        Some(CrashTerminalSessionMarkers {
             session_phase: session_phase.into(),
             screen_mode: screen_mode.into(),
-        });
-    }
+        }),
+    );
 }
 
 #[cfg(test)]
 pub(crate) fn clear_crash_terminal_session_markers_for_test() {
     let lock = GLOBAL_CRASH_TERMINAL_SESSION_MARKERS.get_or_init(|| RwLock::new(None));
-    if let Ok(mut guard) = lock.write() {
-        *guard = None;
-    }
+    replace_diagnostic_snapshot(lock, None);
 }
 
 fn crash_feature_flags() -> Vec<String> {
@@ -1248,15 +1409,23 @@ impl HealthSnapshot {
     /// Update the global health snapshot.
     pub fn update_global(snapshot: Self) {
         let lock = GLOBAL_HEALTH.get_or_init(|| RwLock::new(None));
-        if let Ok(mut guard) = lock.write() {
-            *guard = Some(snapshot);
-        }
+        replace_diagnostic_snapshot(lock, Some(snapshot));
     }
 
     /// Get the current global health snapshot.
     pub fn get_global() -> Option<Self> {
         let lock = GLOBAL_HEALTH.get_or_init(|| RwLock::new(None));
-        lock.read().ok().and_then(|guard| guard.clone())
+        clone_diagnostic_snapshot(lock)
+    }
+
+    /// Get the latest health snapshot without waiting for an active writer.
+    ///
+    /// This is reserved for panic-hook collection, where blocking on a lock
+    /// owned by the panicking thread would deadlock the process.
+    fn try_get_global_for_panic() -> Option<Self> {
+        GLOBAL_HEALTH
+            .get()
+            .and_then(try_clone_diagnostic_snapshot)
     }
 }
 
@@ -1336,8 +1505,9 @@ pub struct CrashManifest {
 ///
 /// Wraps the current project panic hook with one that writes a privacy-bounded
 /// crash bundle containing a generic message, bounded backtrace, and last known
-/// health snapshot. The bundle is written atomically (temp dir + rename) and
-/// all text content is passed through the [`Redactor`] before persistence.
+/// health snapshot. The bundle is written atomically (temp dir + rename);
+/// caller-controlled diagnostic fields are suppressed or passed through the
+/// [`Redactor`], terminal sanitizer, and explicit bounds before persistence.
 ///
 /// This layer never treats artifact persistence as user-visible reporting. It
 /// always delegates fatal panics so the next GUI/base hook emits exactly one
@@ -1364,31 +1534,27 @@ pub fn install_panic_hook(config: &CrashConfig) {
             return;
         }
 
-        // Capture backtrace early (before allocations that might fail)
-        let bt = if include_backtrace {
-            Some(Backtrace::force_capture())
-        } else {
-            None
-        };
-
-        // Never retain caller- or plugin-controlled panic payload text. The
-        // backtrace and privacy-bounded line/column retain diagnostic value.
-        let message = frankenterm_sigpipe::GENERIC_FATAL_REPORT.to_string();
-        let location = info
-            .location()
-            .map(|loc| format!("line:{}:column:{}", loc.line(), loc.column()));
-
         // Write a silent, privacy-bounded crash bundle if configured. Artifact
         // persistence is not an operator-visible report: regardless of write
         // success, delegation below lets the next GUI/base hook surface
         // exactly one generic notification.
         if let Some(ref dir) = crash_dir {
+            // Capture the backtrace only when there is an artifact sink. A
+            // hook configured without a crash directory must delegate without
+            // paying this substantial panic-path allocation cost.
+            let backtrace = include_backtrace.then(Backtrace::force_capture);
+
+            // Never retain caller- or plugin-controlled panic payload text.
+            // The backtrace and privacy-bounded line/column retain diagnostic
+            // value without reflecting the panic message or source path.
             let report = CrashReport {
-                message,
-                location,
-                backtrace: bt.map(|b| {
+                message: frankenterm_sigpipe::GENERIC_FATAL_REPORT.to_string(),
+                location: info
+                    .location()
+                    .map(|loc| format!("line:{}:column:{}", loc.line(), loc.column())),
+                backtrace: backtrace.map(|backtrace| {
                     truncate_utf8_with_marker(
-                        &b.to_string(),
+                        &backtrace.to_string(),
                         MAX_BACKTRACE_LEN,
                         "\n... [truncated]",
                     )
@@ -1401,8 +1567,9 @@ pub fn install_panic_hook(config: &CrashConfig) {
                 thread_name: None,
             };
 
-            let health = HealthSnapshot::get_global();
-            let resize_ctx = crate::resize_crash_forensics::ResizeCrashContext::get_global();
+            let health = HealthSnapshot::try_get_global_for_panic();
+            let resize_ctx =
+                crate::resize_crash_forensics::ResizeCrashContext::try_get_global_for_panic();
             let _ = write_crash_bundle(dir, &report, health.as_ref(), resize_ctx.as_ref());
         }
 
@@ -1432,19 +1599,51 @@ pub fn write_crash_bundle(
 
     // Build timestamped bundle directory name
     let ts_str = format_timestamp(report.timestamp);
-    let bundle_name = format!("ft_crash_{ts_str}");
-    let bundle_dir = crash_dir.join(&bundle_name);
+    let bundle_prefix = format!("ft_crash_{ts_str}");
+    fs::create_dir_all(crash_dir)?;
 
-    // Use a temp directory alongside the final location for atomic rename
-    let tmp_name = format!(".{bundle_name}.tmp");
-    let tmp_dir = crash_dir.join(&tmp_name);
+    // Use a unique, private staging directory alongside the final location.
+    // The process id separates simultaneously running FrankenTerm processes;
+    // the monotonic nonce separates hooks racing inside one process. Never
+    // reuse or remove a pre-existing staging path: it may contain evidence
+    // from an interrupted or still-running writer.
+    let process_id = std::process::id();
+    let mut staging_attempts = 0_u16;
+    let (tmp_dir, final_dir) = loop {
+        if staging_attempts >= 256 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "could not allocate a unique crash-bundle staging directory",
+            ));
+        }
+        staging_attempts += 1;
+        let sequence = CRASH_BUNDLE_WRITE_SEQUENCE.fetch_add(
+            1,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        let unique_name = format!("{bundle_prefix}_p{process_id}_{sequence}");
+        let candidate_final = crash_dir.join(&unique_name);
+        let candidate_tmp = crash_dir.join(format!(".{unique_name}.tmp"));
+        if candidate_final.exists() {
+            continue;
+        }
 
-    // Clean up any leftover temp directory
-    if tmp_dir.exists() {
-        fs::remove_dir_all(&tmp_dir)?;
-    }
+        #[cfg(unix)]
+        let create_result = {
+            use std::os::unix::fs::DirBuilderExt;
+            let mut builder = fs::DirBuilder::new();
+            builder.mode(0o700);
+            builder.create(&candidate_tmp)
+        };
+        #[cfg(not(unix))]
+        let create_result = fs::DirBuilder::new().create(&candidate_tmp);
 
-    fs::create_dir_all(&tmp_dir)?;
+        match create_result {
+            Ok(()) => break (candidate_tmp, candidate_final),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    };
 
     let mut files = Vec::new();
     let mut total_size: u64 = 0;
@@ -1463,16 +1662,16 @@ pub fn write_crash_bundle(
     // 1. Write crash_report.json (redacted)
     {
         let redacted_report = CrashReport {
-            message: truncate_utf8_with_marker(
+            message: crate::output::truncate_bounded(
                 &redactor.redact(&report.message),
+                MAX_CRASH_MESSAGE_WIDTH,
                 MAX_CRASH_MESSAGE_LEN,
-                "... [truncated]",
             ),
             location: report.location.as_ref().map(|location| {
-                truncate_utf8_with_marker(
+                crate::output::truncate_bounded(
                     &redactor.redact(location),
+                    MAX_CRASH_LOCATION_WIDTH,
                     MAX_CRASH_LOCATION_LEN,
-                    "... [truncated]",
                 )
             }),
             backtrace: report.backtrace.as_ref().map(|backtrace| {
@@ -1485,10 +1684,10 @@ pub fn write_crash_bundle(
             timestamp: report.timestamp,
             pid: report.pid,
             thread_name: report.thread_name.as_ref().map(|thread_name| {
-                truncate_utf8_with_marker(
+                crate::output::truncate_bounded(
                     &redactor.redact(thread_name),
+                    MAX_CRASH_THREAD_NAME_WIDTH,
                     MAX_CRASH_THREAD_NAME_LEN,
-                    "... [truncated]",
                 )
             }),
         };
@@ -1499,7 +1698,9 @@ pub fn write_crash_bundle(
 
     // 2. Write health_snapshot.json (if available)
     let has_health = if let Some(snap) = health {
-        let json = serde_json::to_string_pretty(snap).map_err(std::io::Error::other)?;
+        let redacted_health = redacted_health_snapshot(snap, &redactor);
+        let json =
+            serde_json::to_string_pretty(&redacted_health).map_err(std::io::Error::other)?;
         let bytes = json.as_bytes();
         maybe_write_bounded("health_snapshot.json", bytes)?
     } else {
@@ -1538,33 +1739,15 @@ pub fn write_crash_bundle(
         // manifest doesn't count toward the privacy budget
     }
 
-    // Atomic rename: tmp → final
-    // If bundle_dir already exists (rapid double-panic), append a counter
-    let final_dir = if bundle_dir.exists() {
-        let mut counter = 1u32;
-        loop {
-            let candidate = crash_dir.join(format!("{bundle_name}_{counter}"));
-            if !candidate.exists() {
-                break candidate;
-            }
-            counter += 1;
-            if counter > 100 {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::AlreadyExists,
-                    "too many crash bundles with same timestamp",
-                ));
-            }
-        }
-    } else {
-        bundle_dir
-    };
-
+    // Atomic rename: this writer's private staging directory → its private
+    // final directory. No existence check/rename race is shared with another
+    // writer in this process.
     fs::rename(&tmp_dir, &final_dir)?;
 
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = fs::set_permissions(&final_dir, fs::Permissions::from_mode(0o700));
+        fs::set_permissions(&final_dir, fs::Permissions::from_mode(0o700))?;
     }
 
     Ok(final_dir)
@@ -1575,15 +1758,26 @@ pub fn write_crash_bundle(
 // ---------------------------------------------------------------------------
 
 fn write_file_sync(path: &Path, data: &[u8]) -> std::io::Result<()> {
-    let mut f = fs::File::create(path)?;
-    f.write_all(data)?;
-    f.sync_all()?;
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut f = options.open(path)?;
 
+    // `mode(0o600)` applies at creation. Reassert it before writing as well so
+    // overwriting an older file cannot expose newly written crash evidence
+    // through permissive pre-existing mode bits.
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = f.set_permissions(fs::Permissions::from_mode(0o600));
+        f.set_permissions(fs::Permissions::from_mode(0o600))?;
     }
+
+    f.write_all(data)?;
+    f.sync_all()?;
 
     Ok(())
 }
@@ -1641,6 +1835,13 @@ pub struct CrashBundleSummary {
     pub report: Option<CrashReport>,
 }
 
+fn crash_bundle_process_sequence(path: &Path) -> Option<(u32, u64)> {
+    let name = path.file_name()?.to_str()?;
+    let (process_prefix, sequence) = name.rsplit_once('_')?;
+    let (_, process_id) = process_prefix.rsplit_once("_p")?;
+    Some((process_id.parse().ok()?, sequence.parse().ok()?))
+}
+
 /// List crash bundles in `crash_dir`, sorted newest first.
 ///
 /// Scans for directories matching `ft_crash_*`, parses their manifests
@@ -1648,11 +1849,14 @@ pub struct CrashBundleSummary {
 /// unreadable bundles are silently skipped.
 #[must_use]
 pub fn list_crash_bundles(crash_dir: &Path, limit: usize) -> Vec<CrashBundleSummary> {
+    if limit == 0 {
+        return Vec::new();
+    }
     let Ok(entries) = fs::read_dir(crash_dir) else {
         return Vec::new();
     };
 
-    let mut bundles: Vec<CrashBundleSummary> = entries
+    let bundles: Vec<CrashBundleSummary> = entries
         .filter_map(Result::ok)
         .filter(|e| {
             e.file_type().is_ok_and(|ft| ft.is_dir())
@@ -1694,15 +1898,47 @@ pub fn list_crash_bundles(crash_dir: &Path, limit: usize) -> Vec<CrashBundleSumm
         })
         .collect();
 
-    // Sort newest first by timestamp (from report or manifest)
-    bundles.sort_by(|a, b| {
-        let ts_a = a.report.as_ref().map_or(0, |r| r.timestamp);
-        let ts_b = b.report.as_ref().map_or(0, |r| r.timestamp);
-        ts_b.cmp(&ts_a)
-    });
+    // Read each sort key once. Re-running metadata syscalls from the sort
+    // comparator turns a directory with many retained bundles into O(n log n)
+    // filesystem traffic and can observe inconsistent keys mid-sort.
+    let mut ordered_bundles: Vec<_> = bundles
+        .into_iter()
+        .map(|bundle| {
+            let modified = fs::metadata(&bundle.path)
+                .and_then(|metadata| metadata.modified())
+                .ok();
+            let process_sequence = crash_bundle_process_sequence(&bundle.path);
+            (bundle, modified, process_sequence)
+        })
+        .collect();
 
-    bundles.truncate(limit);
-    bundles
+    // Sort newest first by report timestamp. Fatal hooks can write more than
+    // once in one second, so equal timestamps use directory modification time,
+    // then the process/sequence suffix, and finally path order. Keeping one
+    // lexicographic key for every pair is important: a conditional same-PID
+    // comparator could violate transitivity across three processes. Directory
+    // enumeration order is never authority for `latest`.
+    ordered_bundles.sort_by(
+        |(a, modified_a, process_sequence_a), (b, modified_b, process_sequence_b)| {
+            let ts_a = a.report.as_ref().map_or(0, |r| r.timestamp);
+            let ts_b = b.report.as_ref().map_or(0, |r| r.timestamp);
+            let timestamp_order = ts_b.cmp(&ts_a);
+            if timestamp_order != std::cmp::Ordering::Equal {
+                return timestamp_order;
+            }
+
+            modified_b
+                .cmp(modified_a)
+                .then_with(|| process_sequence_b.cmp(process_sequence_a))
+                .then_with(|| b.path.cmp(&a.path))
+        },
+    );
+
+    ordered_bundles.truncate(limit);
+    ordered_bundles
+        .into_iter()
+        .map(|(bundle, _, _)| bundle)
+        .collect()
 }
 
 /// Get the most recent crash bundle, if any.
@@ -8219,6 +8455,86 @@ mod tests {
     }
 
     #[test]
+    fn crash_bundle_sanitizes_health_warnings_and_environment_markers() {
+        let redactor = Redactor::new();
+        let api_key = [
+            "sk",
+            "-ant-api03-",
+            "secret123456789012345678901234567890ABCDEF",
+        ]
+        .concat();
+        let secret_prefix = ["sk", "-ant-api03"].concat();
+        let hostile = format!("{api_key}\n\u{1b}[31m{}", "x".repeat(2048));
+
+        let mut health = test_snapshot();
+        health.warnings = vec![hostile.clone(); MAX_CRASH_HEALTH_WARNINGS + 1];
+        health.backpressure_tier = Some(hostile.clone());
+        health.fleet_pressure_tier = Some(hostile.clone());
+        let bounded_health = redacted_health_snapshot(&health, &redactor);
+
+        let source_json = serde_json::to_value(&health).expect("source health JSON");
+        let bounded_json =
+            serde_json::to_value(&bounded_health).expect("bounded health JSON projection");
+        let source_keys: HashSet<_> = source_json
+            .as_object()
+            .expect("source health object")
+            .keys()
+            .collect();
+        let bounded_keys: HashSet<_> = bounded_json
+            .as_object()
+            .expect("bounded health object")
+            .keys()
+            .collect();
+        assert_eq!(bounded_keys, source_keys, "crash health schema drift");
+
+        assert_eq!(bounded_health.warnings.len(), MAX_CRASH_HEALTH_WARNINGS);
+        assert_eq!(
+            bounded_health.warnings.last().map(String::as_str),
+            Some("2 additional health warnings omitted")
+        );
+        for warning in &bounded_health.warnings {
+            assert!(warning.len() <= MAX_CRASH_DIAGNOSTIC_FIELD_LEN);
+            assert!(!warning.contains(&secret_prefix));
+            assert!(!warning.contains('\n'));
+            assert!(!warning.contains('\u{1b}'));
+        }
+        for tier in [
+            bounded_health.backpressure_tier.as_deref(),
+            bounded_health.fleet_pressure_tier.as_deref(),
+        ] {
+            let tier = tier.expect("bounded health tier");
+            assert!(tier.len() <= MAX_CRASH_DIAGNOSTIC_FIELD_LEN);
+            assert!(!tier.contains(&secret_prefix));
+            assert!(!tier.contains('\n'));
+            assert!(!tier.contains('\u{1b}'));
+        }
+
+        let markers = CrashEnvironmentMarkers {
+            gate_phase: hostile.clone(),
+            session_phase: hostile.clone(),
+            screen_mode: hostile.clone(),
+            feature_flags: vec!["tui".to_string()],
+            terminal_type: hostile.clone(),
+            terminal_program: hostile.clone(),
+            backpressure_tier: hostile,
+        }
+        .redacted(&redactor);
+        for marker in [
+            markers.gate_phase,
+            markers.session_phase,
+            markers.screen_mode,
+            markers.terminal_type,
+            markers.terminal_program,
+            markers.backpressure_tier,
+        ] {
+            assert!(marker.len() <= MAX_CRASH_DIAGNOSTIC_FIELD_LEN);
+            assert!(!marker.contains(&secret_prefix));
+            assert!(!marker.contains('\n'));
+            assert!(!marker.contains('\u{1b}'));
+        }
+    }
+
+    #[test]
     fn write_crash_bundle_handles_duplicate_timestamp() {
         let tmp = tempfile::tempdir().unwrap();
         let crash_dir = tmp.path().join("crash");
@@ -8244,6 +8560,53 @@ mod tests {
         assert_ne!(path1, path2);
         assert!(path1.exists());
         assert!(path2.exists());
+    }
+
+    #[test]
+    fn concurrent_crash_bundle_writers_never_share_staging_or_final_paths() {
+        use std::sync::{Arc, Barrier};
+
+        const WRITERS: usize = 8;
+        let tmp = tempfile::tempdir().unwrap();
+        let crash_dir = Arc::new(tmp.path().join("crash"));
+        let barrier = Arc::new(Barrier::new(WRITERS));
+        let mut writers = Vec::with_capacity(WRITERS);
+
+        for writer in 0..WRITERS {
+            let crash_dir = Arc::clone(&crash_dir);
+            let barrier = Arc::clone(&barrier);
+            writers.push(std::thread::spawn(move || {
+                let report = CrashReport {
+                    message: format!("concurrent writer {writer}"),
+                    location: None,
+                    backtrace: None,
+                    timestamp: 1_700_000_000,
+                    pid: std::process::id(),
+                    thread_name: None,
+                };
+                barrier.wait();
+                write_crash_bundle(&crash_dir, &report, None, None)
+            }));
+        }
+
+        let paths: HashSet<PathBuf> = writers
+            .into_iter()
+            .map(|writer| writer.join().expect("crash writer thread"))
+            .collect::<std::io::Result<_>>()
+            .expect("every concurrent crash bundle");
+        assert_eq!(paths.len(), WRITERS);
+        for path in &paths {
+            assert!(path.is_dir(), "missing completed bundle: {}", path.display());
+            assert!(path.join("crash_report.json").is_file());
+            assert!(path.join("manifest.json").is_file());
+        }
+
+        let hidden_staging_paths = fs::read_dir(crash_dir.as_ref())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with('.'))
+            .count();
+        assert_eq!(hidden_staging_paths, 0);
     }
 
     #[test]
@@ -8291,6 +8654,12 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
+            let bundle_perms = fs::metadata(&bundle_path).unwrap().permissions();
+            let bundle_mode = bundle_perms.mode() & 0o777;
+            assert_eq!(
+                bundle_mode, 0o700,
+                "crash bundle should be owner-only: {bundle_mode:o}"
+            );
             let crash_file = bundle_path.join("crash_report.json");
             let perms = fs::metadata(&crash_file).unwrap().permissions();
             let mode = perms.mode() & 0o777;
@@ -8299,6 +8668,43 @@ mod tests {
     }
 
     // -- Helper tests --
+
+    #[test]
+    fn panic_snapshot_clone_never_waits_for_an_active_writer() {
+        let lock = RwLock::new(Some(String::from("snapshot")));
+        let writer = lock.write().expect("local diagnostic snapshot writer");
+        assert!(try_clone_diagnostic_snapshot(&lock).is_none());
+        drop(writer);
+        assert_eq!(
+            try_clone_diagnostic_snapshot(&lock).as_deref(),
+            Some("snapshot")
+        );
+    }
+
+    #[test]
+    fn diagnostic_snapshot_helpers_recover_poison_without_losing_state() {
+        use std::sync::Arc;
+
+        let lock = Arc::new(RwLock::new(None));
+        let poison_lock = Arc::clone(&lock);
+        let poisoner = std::thread::spawn(move || {
+            let mut writer = poison_lock.write().expect("clean local snapshot lock");
+            *writer = Some(String::from("last-good"));
+            panic!("intentional local diagnostic snapshot poison");
+        });
+        assert!(poisoner.join().is_err());
+        assert_eq!(
+            try_clone_diagnostic_snapshot(&lock).as_deref(),
+            Some("last-good")
+        );
+        assert!(!lock.is_poisoned());
+
+        replace_diagnostic_snapshot(&lock, Some(String::from("replacement")));
+        assert_eq!(
+            clone_diagnostic_snapshot(&lock).as_deref(),
+            Some("replacement")
+        );
+    }
 
     #[test]
     fn format_timestamp_produces_valid_string() {
@@ -8449,16 +8855,16 @@ mod tests {
         let report_json = fs::read_to_string(bundle_path.join("crash_report.json")).unwrap();
         let bounded: CrashReport = serde_json::from_str(&report_json).unwrap();
         assert!(bounded.message.len() <= MAX_CRASH_MESSAGE_LEN);
-        assert!(bounded.message.ends_with("... [truncated]"));
+        assert!(bounded.message.ends_with("..."));
         let location = bounded.location.expect("bounded location retained");
         assert!(location.len() <= MAX_CRASH_LOCATION_LEN);
-        assert!(location.ends_with("... [truncated]"));
+        assert!(location.ends_with("..."));
         let backtrace = bounded.backtrace.expect("bounded backtrace retained");
         assert!(backtrace.len() <= MAX_BACKTRACE_LEN);
         assert!(backtrace.ends_with("\n... [truncated]"));
         let thread_name = bounded.thread_name.expect("bounded thread name retained");
         assert!(thread_name.len() <= MAX_CRASH_THREAD_NAME_LEN);
-        assert!(thread_name.ends_with("... [truncated]"));
+        assert!(thread_name.ends_with("..."));
     }
 
     #[test]
@@ -8477,6 +8883,7 @@ mod tests {
 
         let mut health = test_snapshot();
         health.warnings = vec!["x".repeat(MAX_BUNDLE_SIZE + 1024)];
+        health.last_seq_by_pane = vec![(u64::MAX, i64::MAX); MAX_BUNDLE_SIZE / 16];
 
         let resize = crate::resize_crash_forensics::ResizeCrashContextBuilder::new(42).build();
 
@@ -8665,6 +9072,34 @@ mod tests {
     }
 
     #[test]
+    fn list_crash_bundles_uses_sequence_for_same_process_and_second() {
+        let tmp = tempfile::tempdir().unwrap();
+        let crash_dir = tmp.path();
+
+        let mut first = test_report();
+        first.timestamp = 1000;
+        first.message = "first".to_string();
+        let first_path = write_crash_bundle(crash_dir, &first, None, None).unwrap();
+
+        let mut second = test_report();
+        second.timestamp = 1000;
+        second.message = "second".to_string();
+        let second_path = write_crash_bundle(crash_dir, &second, None, None).unwrap();
+
+        let (first_pid, first_sequence) =
+            crash_bundle_process_sequence(&first_path).expect("first process/sequence");
+        let (second_pid, second_sequence) =
+            crash_bundle_process_sequence(&second_path).expect("second process/sequence");
+        assert_eq!(first_pid, second_pid);
+        assert!(second_sequence > first_sequence);
+
+        let bundles = list_crash_bundles(crash_dir, 2);
+        assert_eq!(bundles.len(), 2);
+        assert_eq!(bundles[0].report.as_ref().unwrap().message, "second");
+        assert_eq!(bundles[1].report.as_ref().unwrap().message, "first");
+    }
+
+    #[test]
     fn list_crash_bundles_respects_limit() {
         let tmp = tempfile::tempdir().unwrap();
         let crash_dir = tmp.path();
@@ -8677,6 +9112,7 @@ mod tests {
 
         let bundles = list_crash_bundles(crash_dir, 3);
         assert_eq!(bundles.len(), 3);
+        assert!(list_crash_bundles(crash_dir, 0).is_empty());
     }
 
     #[test]

@@ -97,8 +97,8 @@ catch common omissions.
     `release` profile is also unwind-safe but is not the release identity. Never
     package the explicitly aborting `release-abort-probe`; run that negative
     control and the shipped-profile arm through the panic-contract subprocess
-    proof with strict remote RCH. Unit-profile catch tests do not prove shipped
-    recovery.
+    proof with strict remote RCH. Build every packaged artifact with `--locked`;
+    unit-profile catch tests do not prove shipped recovery.
 11. **Tag and push.** `git tag vX.Y.0 && git push origin vX.Y.0`.
    The release workflow at `.github/workflows/release.yml`
    handles the rest (binaries, checksums, GitHub release notes,
