@@ -290,7 +290,6 @@ fn crash_bundle_io_error_withholds_authority(error: &std::io::Error) -> bool {
             | std::io::ErrorKind::InvalidInput
             | std::io::ErrorKind::NotADirectory
             | std::io::ErrorKind::IsADirectory
-            | std::io::ErrorKind::FilesystemLoop
     )
 }
 
@@ -10015,6 +10014,9 @@ mod tests {
         ));
         assert!(crash_bundle_io_error_withholds_authority(
             &std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "synthetic short read")
+        ));
+        assert!(crash_bundle_io_error_withholds_authority(
+            &std::io::Error::other("synthetic unclassified failure")
         ));
         assert!(!crash_bundle_io_error_withholds_authority(
             &std::io::Error::new(std::io::ErrorKind::InvalidData, "synthetic malformed payload")
