@@ -1108,6 +1108,9 @@ fn claim_with_nonce_limits_and_time(
     {
         return Err(SubmitIdempotencyError::CapacityExceeded);
     }
+    if now < 0 {
+        return Err(SubmitIdempotencyError::ClaimFailed);
+    }
     let mut conn = open_store(ft_dir, StoreOpenMode::Create)?
         .ok_or(SubmitIdempotencyError::OpenFailed)?;
     let tx = map_sqlite(
@@ -1154,28 +1157,20 @@ fn claim_with_nonce_limits_and_time(
             let lease_expires = header
                 .lease_expires_unix_ms
                 .ok_or(SubmitIdempotencyError::RecordCorrupt)?;
-            if lease_expires > now {
+            let maximum_credible_expiry = now
+                .checked_add(MAX_OWNER_LEASE_FUTURE_MS)
+                .unwrap_or(i64::MAX);
+            if lease_expires > now && lease_expires <= maximum_credible_expiry {
                 map_sqlite(tx.commit(), SubmitIdempotencyError::ClaimFailed)?;
                 return Ok(ClaimOutcome::InFlight);
             }
-            let changed = map_sqlite(
-                tx.execute(
-                    "UPDATE verified_submit_idempotency SET state = ?2, lease_expires_unix_ms = NULL, updated_unix_ms = ?3 WHERE idempotency_key COLLATE BINARY = ?1 COLLATE BINARY AND state = ?4 AND generation = ?5 AND owner_nonce = ?6 AND lease_expires_unix_ms = ?7",
-                    params![
-                        binding.key(),
-                        STATE_IN_DOUBT,
-                        now,
-                        STATE_ACTIVE_OWNER,
-                        header.generation,
-                        &header.owner_nonce[..],
-                        lease_expires,
-                    ],
-                ),
+            expire_active_owner_locked(
+                &tx,
+                binding,
+                header,
+                now,
                 SubmitIdempotencyError::ClaimFailed,
             )?;
-            if changed != 1 {
-                return Err(SubmitIdempotencyError::ClaimFailed);
-            }
             map_sqlite(tx.commit(), SubmitIdempotencyError::ClaimFailed)?;
             Ok(ClaimOutcome::InDoubt)
         }

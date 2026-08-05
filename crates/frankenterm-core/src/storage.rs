@@ -17130,6 +17130,18 @@ fn restore_segment_redactor_snapshots(
     }
 }
 
+fn restore_segment_redactor_for_pane(
+    segment_redactors: &mut HashMap<u64, SegmentPersistRedactor>,
+    pane_id: u64,
+    snapshot: Option<SegmentPersistRedactor>,
+) {
+    if let Some(snapshot) = snapshot {
+        segment_redactors.insert(pane_id, snapshot);
+    } else {
+        segment_redactors.remove(&pane_id);
+    }
+}
+
 fn append_segment_commit_backend(
     backend: &dyn StorageBackend,
     pane_id: u64,
@@ -17168,12 +17180,9 @@ fn append_segment_commit_backend(
     if result
         .as_ref()
         .err()
-        .is_some_and(|error| !is_writer_backend_epoch_poisoned(error))
+        .is_some_and(|error| !is_backend_epoch_poisoned(error))
     {
-        restore_segment_redactor_snapshots(
-            segment_redactors,
-            HashMap::from([(pane_id, snapshot)]),
-        );
+        restore_segment_redactor_for_pane(segment_redactors, pane_id, snapshot);
     }
     result
 }
@@ -17197,7 +17206,7 @@ fn append_segment_group_commit_backend(
     if result
         .as_ref()
         .err()
-        .is_some_and(|error| !is_writer_backend_epoch_poisoned(error))
+        .is_some_and(|error| !is_backend_epoch_poisoned(error))
     {
         restore_segment_redactor_snapshots(segment_redactors, snapshots);
     }
