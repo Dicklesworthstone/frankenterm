@@ -4733,19 +4733,22 @@ impl ToolHandler for WaAwaitEventTool {
                         debug_assert!(blocked_retry_scratch.is_empty());
                         std::mem::swap(&mut blocked_events, &mut blocked_retry_scratch);
                         for blocked in blocked_retry_scratch.drain(..) {
-                            let matching_any = mcp_await_event_unmet_match_mask(
-                                &any_conditions,
-                                &any_met,
-                                &blocked.event,
-                            );
-                            let matching_all = mcp_await_event_unmet_match_mask(
-                                &all_conditions,
-                                &all_met,
-                                &blocked.event,
-                            );
-                            if matching_any == 0 && matching_all == 0 {
+                            // A cursor hole is independent of whether another
+                            // event has since satisfied the same condition. An
+                            // exact durable refetch proves handled/deleted state
+                            // without accidentally substituting the next row.
+                            let event_result = mcp_await_event_refetch_exact_unhandled_event(
+                                &storage,
+                                &cx,
+                                blocked.event_id,
+                                params.pane,
+                            )
+                            .await;
+                            mcp_await_event_checkpoint(&cx)
+                                .map_err(McpToolError::from_error)?;
+                            let Some(event) = event_result.map_err(McpToolError::from_error)? else {
                                 continue;
-                            }
+                            };
 
                             let remaining = timeout.saturating_sub(started.elapsed());
                             let lease_ttl = remaining.saturating_add(
@@ -4754,11 +4757,7 @@ impl ToolHandler for WaAwaitEventTool {
                                 ),
                             );
                             let reservation_result = storage
-                                .reserve_event_delivery_with_cx(
-                                    &cx,
-                                    blocked.event.id,
-                                    lease_ttl,
-                                )
+                                .reserve_event_delivery_with_cx(&cx, blocked.event_id, lease_ttl)
                                 .await;
                             let acquired_event = match reservation_result {
                                 Ok(EventDeliveryReservation::Acquired(lease)) => {
@@ -4766,32 +4765,44 @@ impl ToolHandler for WaAwaitEventTool {
                                     // cancellation after the writer CAS still
                                     // reaches the common release path.
                                     delivery_leases.push(lease);
-                                    mcp_await_event_checkpoint(&cx)?;
-                                    Some(blocked.event)
+                                    mcp_await_event_checkpoint(&cx)
+                                        .map_err(McpToolError::from_error)?;
+                                    Some(event)
                                 }
                                 Ok(EventDeliveryReservation::LeasedUntil { expires_at_ms }) => {
-                                    mcp_await_event_checkpoint(&cx)?;
+                                    mcp_await_event_checkpoint(&cx)
+                                        .map_err(McpToolError::from_error)?;
                                     blocked_events.push(McpAwaitBlockedEvent {
-                                        event: blocked.event,
+                                        event_id: blocked.event_id,
                                         expires_at_ms,
+                                        matching_any: blocked.matching_any,
+                                        matching_all: blocked.matching_all,
                                     });
                                     None
                                 }
                                 Ok(EventDeliveryReservation::AlreadyHandledOrMissing) => {
-                                    mcp_await_event_checkpoint(&cx)?;
+                                    mcp_await_event_checkpoint(&cx)
+                                        .map_err(McpToolError::from_error)?;
                                     None
                                 }
                                 Err(error) => {
-                                    mcp_await_event_checkpoint(&cx)?;
-                                    return Err(error);
+                                    mcp_await_event_checkpoint(&cx)
+                                        .map_err(McpToolError::from_error)?;
+                                    return Err(McpToolError::from_error(error));
                                 }
                             };
                             let Some(acquired_event) = acquired_event else {
                                 continue;
                             };
 
-                            mcp_await_event_apply_match_mask(&mut any_met, matching_any);
-                            mcp_await_event_apply_match_mask(&mut all_met, matching_all);
+                            mcp_await_event_apply_match_mask(
+                                &mut any_met,
+                                blocked.matching_any,
+                            );
+                            mcp_await_event_apply_match_mask(
+                                &mut all_met,
+                                blocked.matching_all,
+                            );
                             let item = mcp_event_item_from_stored_event(
                                 &storage,
                                 &cx,
@@ -4799,7 +4810,8 @@ impl ToolHandler for WaAwaitEventTool {
                                 &redactor,
                             )
                             .await;
-                            mcp_await_event_checkpoint(&cx)?;
+                            mcp_await_event_checkpoint(&cx)
+                                .map_err(McpToolError::from_error)?;
                             matched_events.push(item);
                         }
                         final_cursor =
@@ -4821,17 +4833,17 @@ impl ToolHandler for WaAwaitEventTool {
                         since: if scan_after_id.is_some() {
                             None
                         } else {
-                            Some(start_ms)
+                            Some(request_boundary_ms)
                         },
                         until: None,
                     };
                     let events_result = storage.get_events_stream_with_cx(&cx, query).await;
-                    mcp_await_event_checkpoint(&cx)?;
-                    let events = events_result?;
+                    mcp_await_event_checkpoint(&cx).map_err(McpToolError::from_error)?;
+                    let events = events_result.map_err(McpToolError::from_error)?;
                     let batch_len = events.len();
 
                     for event in events {
-                        scan_after_id = Some(event.id);
+                        let event_id = event.id;
                         let matching_any = mcp_await_event_unmet_match_mask(
                             &any_conditions,
                             &any_met,
@@ -4845,6 +4857,7 @@ impl ToolHandler for WaAwaitEventTool {
                         let event_matched = matching_any != 0 || matching_all != 0;
 
                         if !event_matched {
+                            scan_after_id = Some(event_id);
                             continue;
                         }
 
@@ -4856,39 +4869,63 @@ impl ToolHandler for WaAwaitEventTool {
                                 ),
                             );
                             let reservation_result = storage
-                                .reserve_event_delivery_with_cx(&cx, event.id, lease_ttl)
+                                .reserve_event_delivery_with_cx(&cx, event_id, lease_ttl)
                                 .await;
                             match reservation_result {
                                 Ok(EventDeliveryReservation::Acquired(lease)) => {
                                     delivery_leases.push(lease);
-                                    mcp_await_event_checkpoint(&cx)?;
+                                    mcp_await_event_checkpoint(&cx)
+                                        .map_err(McpToolError::from_error)?;
                                 }
                                 Ok(EventDeliveryReservation::LeasedUntil { expires_at_ms }) => {
-                                    mcp_await_event_checkpoint(&cx)?;
+                                    mcp_await_event_checkpoint(&cx)
+                                        .map_err(McpToolError::from_error)?;
+                                    if blocked_events.len()
+                                        >= MCP_AWAIT_EVENT_BLOCKED_EVENT_MAX
+                                    {
+                                        // Do not advance `scan_after_id` over a
+                                        // hole we cannot retain. The public
+                                        // error is deliberately path/detail
+                                        // free; the event ID stays in logs.
+                                        tracing::warn!(
+                                            event_id,
+                                            blocked_event_cap =
+                                                MCP_AWAIT_EVENT_BLOCKED_EVENT_MAX,
+                                            "wa.await_event blocked-event tracking saturated"
+                                        );
+                                        return Err(mcp_await_event_blocked_capacity_error());
+                                    }
                                     blocked_events.push(McpAwaitBlockedEvent {
-                                        event,
+                                        event_id,
                                         expires_at_ms,
+                                        matching_any,
+                                        matching_all,
                                     });
+                                    scan_after_id = Some(event_id);
                                     continue;
                                 }
                                 Ok(EventDeliveryReservation::AlreadyHandledOrMissing) => {
-                                    mcp_await_event_checkpoint(&cx)?;
+                                    mcp_await_event_checkpoint(&cx)
+                                        .map_err(McpToolError::from_error)?;
                                     // A concurrent handler completed it after our read. It is no
                                     // longer a delivery candidate, so moving past it is safe.
+                                    scan_after_id = Some(event_id);
                                     continue;
                                 }
                                 Err(error) => {
-                                    mcp_await_event_checkpoint(&cx)?;
-                                    return Err(error);
+                                    mcp_await_event_checkpoint(&cx)
+                                        .map_err(McpToolError::from_error)?;
+                                    return Err(McpToolError::from_error(error));
                                 }
                             }
                         }
 
+                        scan_after_id = Some(event_id);
                         mcp_await_event_apply_match_mask(&mut any_met, matching_any);
                         mcp_await_event_apply_match_mask(&mut all_met, matching_all);
                         let item =
                             mcp_event_item_from_stored_event(&storage, &cx, event, &redactor).await;
-                        mcp_await_event_checkpoint(&cx)?;
+                        mcp_await_event_checkpoint(&cx).map_err(McpToolError::from_error)?;
                         matched_events.push(item);
                         if mcp_await_event_is_satisfied(&any_met, &all_met) {
                             break;
@@ -4896,7 +4933,7 @@ impl ToolHandler for WaAwaitEventTool {
                     }
 
                     final_cursor = mcp_await_event_safe_cursor(scan_after_id, &blocked_events);
-                    mcp_await_event_checkpoint(&cx)?;
+                    mcp_await_event_checkpoint(&cx).map_err(McpToolError::from_error)?;
                     if mcp_await_event_is_satisfied(&any_met, &all_met) {
                         break (true, false);
                     }
@@ -4922,7 +4959,9 @@ impl ToolHandler for WaAwaitEventTool {
                         poll.min(std::time::Duration::from_millis(until_expiry_ms))
                     });
                     let wait = wait.min(remaining);
-                    mcp_await_event_wait_with_cx(&cx, wait).await?;
+                    mcp_await_event_wait_with_cx(&cx, wait)
+                        .await
+                        .map_err(McpToolError::from_error)?;
                     // Retry retained holes directly after the bounded wait;
                     // `scan_after_id` stays monotonic so the already-inspected
                     // tail is never replayed merely because one lease is live.
@@ -5023,9 +5062,12 @@ impl ToolHandler for WaAwaitEventTool {
                     delivery_leases,
                     FrameworkResponseDeliveryOutcome::Failed,
                 );
-                let (code, hint) = map_mcp_error(&err);
-                let envelope =
-                    McpEnvelope::<()>::error(code, err.to_string(), hint, elapsed_ms(start));
+                let envelope = McpEnvelope::<()>::error(
+                    err.code,
+                    err.message,
+                    err.hint,
+                    elapsed_ms(start),
+                );
                 envelope_to_content(envelope)
             }
         }
