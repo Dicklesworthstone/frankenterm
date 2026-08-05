@@ -1394,7 +1394,7 @@ mod test {
                 Action::XtGetTcap(vec!["TN".to_string()]),
                 Action::Esc(Esc::Code(EscCode::StringTerminator)),
             ],
-            actions,
+            actions
         );
         // The action model intentionally carries no empty capability name, so
         // encoding produces the canonical request without a trailing separator.
