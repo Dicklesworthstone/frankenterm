@@ -439,7 +439,148 @@ struct ObservedPane {
 
 struct BoundedCallbackFreePaneCensus {
     panes: Vec<Arc<dyn Pane>>,
+    tree_leaf_count: usize,
     tree_active: Arc<dyn Pane>,
+    coherence: OrderedPaneCoherence,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum OrderedPaneTreeCoherenceNode {
+    Empty,
+    Split(SplitDirectionAndSize),
+    Leaf(PaneIdentity),
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct OrderedPaneStackCoherence {
+    active_index: usize,
+    members: Vec<PaneIdentity>,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+struct OrderedFloatingPaneCoherence {
+    identity: PaneIdentity,
+    rect: FloatingPaneRect,
+    z_order: u32,
+    visible: bool,
+    pinned: bool,
+    opacity_bits: u32,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct OrderedPaneCoherence {
+    tree: Vec<OrderedPaneTreeCoherenceNode>,
+    active: usize,
+    stacks: HashMap<usize, OrderedPaneStackCoherence>,
+    floating: Vec<OrderedFloatingPaneCoherence>,
+    floating_focus: Option<PaneId>,
+    zoomed: Option<PaneIdentity>,
+    title: String,
+}
+
+struct OrderedPaneEntryObservation {
+    pane_id: PaneId,
+    title: String,
+    size: TerminalSize,
+    working_dir: Option<SerdeUrl>,
+    alt_screen_active: bool,
+    cursor_pos: StableCursorPosition,
+    physical_top: StableRowIndex,
+    tty_name: Option<String>,
+}
+
+struct OrderedPaneObservation {
+    pane_ids: HashMap<PaneIdentity, PaneId>,
+    tree_entries: HashMap<PaneIdentity, OrderedPaneEntryObservation>,
+}
+
+fn observe_ordered_panes_bounded(
+    tab_id: TabId,
+    panes: Vec<Arc<dyn Pane>>,
+    tree_leaf_count: usize,
+) -> anyhow::Result<OrderedPaneObservation> {
+    if tree_leaf_count > panes.len() {
+        anyhow::bail!(
+            "tab {tab_id} ordered pane observation expects {tree_leaf_count} tree leaves from {} exact panes",
+            panes.len()
+        );
+    }
+
+    let mut pane_ids = HashMap::new();
+    pane_ids
+        .try_reserve(panes.len())
+        .map_err(|error| anyhow::anyhow!("reserve ordered pane-id observations: {error}"))?;
+    let mut pane_id_owners = HashMap::new();
+    pane_id_owners
+        .try_reserve(panes.len())
+        .map_err(|error| anyhow::anyhow!("reserve ordered numeric pane-id owners: {error}"))?;
+    let mut tree_entries = HashMap::new();
+    tree_entries
+        .try_reserve(tree_leaf_count)
+        .map_err(|error| anyhow::anyhow!("reserve ordered tree-pane observations: {error}"))?;
+
+    for (pane_index, pane) in panes.into_iter().enumerate() {
+        let identity = pane_identity(&pane);
+        let pane_id = match catch_unwind(AssertUnwindSafe(|| pane.pane_id())) {
+            Ok(pane_id) => pane_id,
+            Err(_) => {
+                anyhow::bail!(
+                    "a pane callback panicked while tab {tab_id} was being observed for ordered encoding"
+                );
+            }
+        };
+        if pane_ids.insert(identity, pane_id).is_some() {
+            anyhow::bail!(
+                "an exact pane identity appears more than once while tab {tab_id} is being observed for ordered encoding"
+            );
+        }
+        if let Some(prior_identity) = pane_id_owners.insert(pane_id, identity) {
+            if prior_identity != identity {
+                anyhow::bail!(
+                    "pane id {pane_id} belongs to more than one exact pane identity while tab {tab_id} is being observed for ordered encoding"
+                );
+            }
+        }
+
+        if pane_index >= tree_leaf_count {
+            continue;
+        }
+
+        // Pane implementations are arbitrary external code. Observe every
+        // field needed by the wire entry before taking the final topology and
+        // focus coherence cut; assembly after that cut must be callback-free.
+        let dims = pane.get_dimensions();
+        let working_dir = pane
+            .get_current_working_dir(CachePolicy::AllowStale)
+            .map(Into::into);
+        let cursor_pos = pane.get_cursor_position();
+        let entry = OrderedPaneEntryObservation {
+            pane_id,
+            title: pane.get_title(),
+            size: TerminalSize {
+                cols: dims.cols,
+                rows: dims.viewport_rows,
+                pixel_height: dims.pixel_height,
+                pixel_width: dims.pixel_width,
+                dpi: dims.dpi,
+            },
+            working_dir,
+            alt_screen_active: pane.is_alt_screen_active(),
+            cursor_pos,
+            physical_top: dims.physical_top,
+            tty_name: pane.tty_name(),
+        };
+        if tree_entries.insert(identity, entry).is_some() {
+            anyhow::bail!(
+                "an exact tree-pane identity appears more than once while tab {tab_id} is being observed for ordered encoding"
+            );
+        }
+    }
+
+    Ok(OrderedPaneObservation {
+        pane_ids,
+        tree_entries,
+    })
 }
 
 fn build_callback_pane_id_snapshot(
@@ -951,7 +1092,7 @@ fn capture_pane_arena_tree(
     tree: Option<&Tree>,
     active: Option<Arc<dyn Pane>>,
     zoomed: Option<Arc<dyn Pane>>,
-    pane_ids: HashMap<PaneIdentity, PaneId>,
+    pane_ids: &HashMap<PaneIdentity, PaneId>,
     tab_title: String,
     arena_start: usize,
     max_depth: usize,
@@ -1021,13 +1162,14 @@ fn capture_pane_arena_tree(
                 match tree {
                     Tree::Empty => captured.push(CapturedPaneArenaNode::Empty),
                     Tree::Leaf(pane) => {
-                        let pane_id = pane_ids.get(&pane_identity(pane)).copied().ok_or_else(|| {
+                        let identity = pane_identity(pane);
+                        let pane_id = pane_ids.get(&identity).copied().ok_or_else(|| {
                             anyhow::anyhow!(
                                 "an exact pane identity disappeared from tab {tab_title:?} callback-free capture",
                             )
                         })?;
                         captured.push(CapturedPaneArenaNode::Leaf {
-                            pane: Arc::clone(pane),
+                            identity,
                             pane_id,
                             left_col,
                             top_row,
@@ -1165,6 +1307,35 @@ fn pane_entry(
     }
 }
 
+fn pane_entry_from_ordered_observation(
+    observed: &OrderedPaneEntryObservation,
+    tab_id: TabId,
+    window_id: WindowId,
+    is_active_pane: bool,
+    is_zoomed_pane: bool,
+    workspace: &str,
+    left_col: usize,
+    top_row: usize,
+) -> PaneEntry {
+    PaneEntry {
+        window_id,
+        tab_id,
+        pane_id: observed.pane_id,
+        title: observed.title.clone(),
+        is_active_pane,
+        is_zoomed_pane,
+        size: observed.size,
+        working_dir: observed.working_dir.clone(),
+        alt_screen_active: observed.alt_screen_active,
+        workspace: workspace.to_string(),
+        cursor_pos: observed.cursor_pos,
+        physical_top: observed.physical_top,
+        left_col,
+        top_row,
+        tty_name: observed.tty_name.clone(),
+    }
+}
+
 fn pane_tree(
     tree: &Tree,
     tab_id: TabId,
@@ -1291,7 +1462,7 @@ enum CapturedPaneArenaNode {
         node: SplitDirectionAndSize,
     },
     Leaf {
-        pane: Arc<dyn Pane>,
+        identity: PaneIdentity,
         pane_id: PaneId,
         left_col: usize,
         top_row: usize,
@@ -2905,36 +3076,59 @@ impl Tab {
                     max_tree_nodes,
                     max_census_work,
                 )?;
-            let observed = Self::observe_panes_bounded(callback_free_snapshot.panes)?;
-            let pane_ids = build_callback_pane_id_snapshot(self.tab_id, &observed)?;
+            let BoundedCallbackFreePaneCensus {
+                panes,
+                tree_leaf_count,
+                coherence,
+                ..
+            } = callback_free_snapshot;
+            // Keep callback failures provisional until the final callback-free
+            // census proves that the callbacks did not replace or rearrange
+            // the topology/focus authority that they were observing.
+            let observed = observe_ordered_panes_bounded(self.tab_id, panes, tree_leaf_count);
 
             let captured = {
                 let inner = self.inner.lock();
-                let current = inner.snapshot_panes_callback_free_bounded(
+                let current = match inner.snapshot_panes_callback_free_bounded(
                     max_depth,
                     max_tree_nodes,
                     max_census_work,
-                )?;
-                if !callback_snapshot_matches(&current.panes, &pane_ids)? {
-                    None
-                } else {
+                ) {
+                    Ok(current) => current,
+                    // A callback may transiently replace valid topology with
+                    // state that fails preflight. It is not authoritative
+                    // until a subsequent attempt observes it before invoking
+                    // pane code, so retry instead of leaking this post-callback
+                    // error across the coherence fence.
+                    Err(_) => continue,
+                };
+                if current.coherence != coherence {
+                    continue;
+                }
+
+                let observed = observed?;
+                if !callback_snapshot_matches(&current.panes, &observed.pane_ids)? {
+                    continue;
+                }
+                {
                     let active = inner.raw_active_pane_callback_free_with_tree_active(
-                        &pane_ids,
+                        &observed.pane_ids,
                         current.tree_active,
                     );
-                    Some(capture_pane_arena_tree(
+                    let captured = capture_pane_arena_tree(
                         inner.pane.as_ref(),
                         Some(active),
                         inner.zoomed.as_ref().map(Arc::clone),
-                        pane_ids,
+                        &observed.pane_ids,
                         inner.title.clone(),
                         arena.len(),
                         max_depth,
                         max_total_nodes,
-                    )?)
+                    )?;
+                    Some((captured, observed.tree_entries))
                 }
             };
-            let Some((captured, active, zoomed, tab_title)) = captured else {
+            let Some(((captured, active, zoomed, tab_title), tree_entries)) = captured else {
                 continue;
             };
 
@@ -2975,21 +3169,37 @@ impl Tab {
                         node,
                     },
                     CapturedPaneArenaNode::Leaf {
-                        pane,
+                        identity,
                         pane_id,
                         left_col,
                         top_row,
-                    } => PaneArenaNode::Leaf(pane_entry(
-                        &pane,
-                        pane_id,
-                        self.tab_id,
-                        window_id,
-                        active.as_ref(),
-                        zoomed.as_ref(),
-                        workspace,
-                        left_col,
-                        top_row,
-                    )),
+                    } => {
+                        let observed = tree_entries.get(&identity).ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "exact tree-pane identity {identity:p} lacks its pre-fence ordered observation"
+                            )
+                        })?;
+                        if observed.pane_id != pane_id {
+                            anyhow::bail!(
+                                "exact tree-pane identity {identity:p} changed numeric pane id from {} to {pane_id} during callback-free assembly",
+                                observed.pane_id
+                            );
+                        }
+                        PaneArenaNode::Leaf(pane_entry_from_ordered_observation(
+                            observed,
+                            self.tab_id,
+                            window_id,
+                            active
+                                .as_ref()
+                                .is_some_and(|pane| pane_identity(pane) == identity),
+                            zoomed
+                                .as_ref()
+                                .is_some_and(|pane| pane_identity(pane) == identity),
+                            workspace,
+                            left_col,
+                            top_row,
+                        ))
+                    }
                 });
             }
             append.commit();
@@ -3306,28 +3516,6 @@ impl Tab {
                 ObservedPane { pane, pane_id }
             })
             .collect()
-    }
-
-    fn observe_panes_bounded(
-        panes: Vec<Arc<dyn Pane>>,
-    ) -> anyhow::Result<Vec<ObservedPane>> {
-        let mut observed = Vec::new();
-        observed
-            .try_reserve_exact(panes.len())
-            .map_err(|error| anyhow::anyhow!("reserve bounded pane observations: {error}"))?;
-        for pane in panes {
-            let pane_id = match catch_unwind(AssertUnwindSafe(|| pane.pane_id())) {
-                Ok(pane_id) => Some(pane_id),
-                Err(_) => {
-                    log::error!(
-                        "Pane::pane_id panicked during bounded ordered snapshot observation"
-                    );
-                    None
-                }
-            };
-            observed.push(ObservedPane { pane, pane_id });
-        }
-        Ok(observed)
     }
 
     fn apply_exact_removal_plan(
@@ -4734,6 +4922,10 @@ impl TabInner {
         tree_leaf_identities
             .try_reserve_exact(initial_census_capacity.min(max_tree_nodes))
             .map_err(|error| anyhow::anyhow!("reserve ordered pane tree identities: {error}"))?;
+        let mut tree_coherence = Vec::new();
+        tree_coherence
+            .try_reserve_exact(max_tree_nodes.min(64))
+            .map_err(|error| anyhow::anyhow!("reserve ordered pane tree coherence: {error}"))?;
         let mut census_work = 0_usize;
 
         let mut pending = Vec::new();
@@ -4766,9 +4958,16 @@ impl TabInner {
                 );
             }
 
+            reserve_pane_arena_stack_push(
+                &mut tree_coherence,
+                1,
+                max_tree_nodes,
+                "ordered pane tree coherence",
+            )?;
             match tree {
-                Tree::Empty => {}
+                Tree::Empty => tree_coherence.push(OrderedPaneTreeCoherenceNode::Empty),
                 Tree::Leaf(pane) => {
+                    tree_coherence.push(OrderedPaneTreeCoherenceNode::Leaf(pane_identity(pane)));
                     admit_ordered_pane_census_work(
                         &mut census_work,
                         max_census_work,
@@ -4803,12 +5002,13 @@ impl TabInner {
                     right,
                     data,
                 } => {
-                    if data.is_none() {
-                        anyhow::bail!(
+                    let node = data.ok_or_else(|| {
+                        anyhow::anyhow!(
                             "tab {} ordered pane tree has an uninitialized split node",
                             self.id
-                        );
-                    }
+                        )
+                    })?;
+                    tree_coherence.push(OrderedPaneTreeCoherenceNode::Split(node));
                     let next_depth = depth.checked_add(1).ok_or_else(|| {
                         anyhow::anyhow!("tab {} ordered pane tree depth overflows usize", self.id)
                     })?;
@@ -4877,6 +5077,10 @@ impl TabInner {
         })?;
         debug_assert_eq!(pane_identity(&tree_active), active_identity);
 
+        let mut stack_coherence = HashMap::new();
+        stack_coherence
+            .try_reserve(self.pane_stacks.len().min(max_census_work))
+            .map_err(|error| anyhow::anyhow!("reserve ordered pane stack coherence: {error}"))?;
         for (slot_index, stack) in &self.pane_stacks {
             admit_ordered_pane_census_work(
                 &mut census_work,
@@ -4903,6 +5107,14 @@ impl TabInner {
                     self.id
                 )
             })?;
+            let mut members = Vec::new();
+            members
+                .try_reserve_exact(stack.len().min(max_census_work))
+                .map_err(|error| {
+                    anyhow::anyhow!(
+                        "reserve ordered pane stack {slot_index} member coherence: {error}"
+                    )
+                })?;
 
             for (stack_index, pane) in stack.panes().iter().enumerate() {
                 admit_ordered_pane_census_work(
@@ -4911,6 +5123,13 @@ impl TabInner {
                     self.id,
                 )?;
                 let identity = pane_identity(pane);
+                reserve_pane_arena_stack_push(
+                    &mut members,
+                    1,
+                    max_census_work,
+                    "ordered pane stack member coherence",
+                )?;
+                members.push(identity);
                 if stack_index == active_index {
                     if identity != expected_active
                         || owners.get(&identity)
@@ -4937,13 +5156,46 @@ impl TabInner {
                     );
                 }
             }
+            if stack_coherence
+                .insert(
+                    *slot_index,
+                    OrderedPaneStackCoherence {
+                        active_index,
+                        members,
+                    },
+                )
+                .is_some()
+            {
+                anyhow::bail!(
+                    "tab {} ordered pane census contains duplicate stack slot {slot_index}",
+                    self.id
+                );
+            }
         }
+        let mut floating_coherence = Vec::new();
+        floating_coherence
+            .try_reserve_exact(self.floating_panes.len().min(max_census_work))
+            .map_err(|error| anyhow::anyhow!("reserve ordered floating pane coherence: {error}"))?;
         for floating in &self.floating_panes {
             admit_ordered_pane_census_work(
                 &mut census_work,
                 max_census_work,
                 self.id,
             )?;
+            reserve_pane_arena_stack_push(
+                &mut floating_coherence,
+                1,
+                max_census_work,
+                "ordered floating pane coherence",
+            )?;
+            floating_coherence.push(OrderedFloatingPaneCoherence {
+                identity: pane_identity(&floating.pane),
+                rect: floating.rect,
+                z_order: floating.z_order,
+                visible: floating.visible,
+                pinned: floating.pinned,
+                opacity_bits: floating.opacity.to_bits(),
+            });
             if let Some(prior_owner) = push_bounded_callback_free_pane(
                 &mut owners,
                 &mut panes,
@@ -4977,7 +5229,21 @@ impl TabInner {
             }
         }
 
-        Ok(BoundedCallbackFreePaneCensus { panes, tree_active })
+        let tree_leaf_count = tree_leaf_identities.len();
+        Ok(BoundedCallbackFreePaneCensus {
+            panes,
+            tree_leaf_count,
+            tree_active,
+            coherence: OrderedPaneCoherence {
+                tree: tree_coherence,
+                active: self.active,
+                stacks: stack_coherence,
+                floating: floating_coherence,
+                floating_focus: self.floating_focus,
+                zoomed: self.zoomed.as_ref().map(pane_identity),
+                title: self.title.clone(),
+            },
+        })
     }
 
     fn raw_tree_active_pane(&self) -> Option<Arc<dyn Pane>> {
@@ -8449,7 +8715,7 @@ mod test {
         assert!(
             format!("{exact_error:#}").contains("exact pane identity appears more than once")
         );
-        assert_eq!(exact_arena, [prefix.clone()]);
+        assert_eq!(exact_arena.as_slice(), std::slice::from_ref(&prefix));
 
         let duplicate_numeric = Tab::new(&size);
         duplicate_numeric.inner.lock().pane = Some(Tree::Node {
@@ -8717,6 +8983,143 @@ mod test {
             panic!("retried one-pane snapshot must encode one leaf");
         };
         assert_eq!(entry.pane_id, 941);
+    }
+
+    #[test]
+    fn flat_codec_snapshot_retries_normal_rendering_getter_focus_change() {
+        let size = TerminalSize::default();
+        let tab = Arc::new(Tab::new(&size));
+        let getter_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let weak_tab = Arc::downgrade(&tab);
+        let getter_calls_for_probe = Arc::clone(&getter_calls);
+        let probe: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+            if getter_calls_for_probe.fetch_add(1, std::sync::atomic::Ordering::AcqRel) == 0 {
+                let tab = weak_tab.upgrade().expect("test retains tab");
+                tab.inner.lock().active = 1;
+            }
+        });
+        let first = FakePane::new_with_callback_probe(942, size, false, false, probe);
+        let second = FakePane::new(943, size);
+        tab.inner.lock().pane = Some(Tree::Node {
+            left: Box::new(Tree::Leaf(first)),
+            right: Box::new(Tree::Leaf(second)),
+            data: Some(SplitDirectionAndSize {
+                direction: SplitDirection::Horizontal,
+                first: size,
+                second: size,
+            }),
+        });
+        let mut arena = Vec::new();
+
+        let descriptor = tab
+            .append_codec_pane_arena_in_window(107, "render-focus-retry", &mut arena, 64, 16, 16)
+            .expect("one normal-return rendering getter focus change must retry to coherence");
+
+        assert_eq!(getter_calls.load(std::sync::atomic::Ordering::Acquire), 2);
+        assert_eq!(descriptor.node_count, 3);
+        let [
+            PaneArenaNode::Split { .. },
+            PaneArenaNode::Leaf(first),
+            PaneArenaNode::Leaf(second),
+        ] = arena.as_slice()
+        else {
+            panic!("retried split snapshot must retain canonical preorder");
+        };
+        assert_eq!(first.pane_id, 942);
+        assert!(!first.is_active_pane);
+        assert_eq!(second.pane_id, 943);
+        assert!(second.is_active_pane);
+    }
+
+    #[test]
+    fn flat_codec_snapshot_exhausts_normal_rendering_getter_tree_reorders() {
+        let size = TerminalSize::default();
+        let tab = Arc::new(Tab::new(&size));
+        let getter_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let weak_tab = Arc::downgrade(&tab);
+        let getter_calls_for_probe = Arc::clone(&getter_calls);
+        let probe: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+            getter_calls_for_probe.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            let tab = weak_tab.upgrade().expect("test retains tab");
+            let mut inner = tab.inner.lock();
+            let Some(Tree::Node { left, right, .. }) = inner.pane.as_mut() else {
+                panic!("test topology must remain split");
+            };
+            std::mem::swap(left, right);
+        });
+        let first = FakePane::new_with_callback_probe(944, size, false, false, probe);
+        let second = FakePane::new(945, size);
+        tab.inner.lock().pane = Some(Tree::Node {
+            left: Box::new(Tree::Leaf(first)),
+            right: Box::new(Tree::Leaf(second)),
+            data: Some(SplitDirectionAndSize {
+                direction: SplitDirection::Horizontal,
+                first: size,
+                second: size,
+            }),
+        });
+        let prefix = PaneArenaNode::Leaf(pane_arena_test_entry(993, false, false));
+        let mut arena = vec![prefix.clone()];
+        let prior_capacity = arena.capacity();
+
+        let error = tab
+            .append_codec_pane_arena_in_window(108, "render-tree-exhaust", &mut arena, 64, 16, 16)
+            .expect_err("every normal-return rendering getter tree reorder must exhaust retries");
+
+        assert!(format!("{error:#}").contains("all 3 flat codec snapshot attempts"));
+        assert_eq!(getter_calls.load(std::sync::atomic::Ordering::Acquire), 3);
+        assert_eq!(arena, [prefix]);
+        assert_eq!(arena.capacity(), prior_capacity);
+    }
+
+    #[test]
+    fn flat_codec_snapshot_retries_callback_time_identity_error_before_fence() {
+        let size = TerminalSize::default();
+        let tab = Arc::new(Tab::new(&size));
+        let replacement = FakePane::new(948, size);
+        let callback_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let weak_tab = Arc::downgrade(&tab);
+        let replacement_for_probe = Arc::clone(&replacement);
+        let callback_calls_for_probe = Arc::clone(&callback_calls);
+        let probe: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+            if callback_calls_for_probe.fetch_add(1, std::sync::atomic::Ordering::AcqRel) == 0 {
+                let tab = weak_tab.upgrade().expect("test retains tab");
+                let mut inner = tab.inner.lock();
+                let Some(Tree::Node { right, .. }) = inner.pane.as_mut() else {
+                    panic!("test topology must remain split");
+                };
+                **right = Tree::Leaf(Arc::clone(&replacement_for_probe));
+            }
+        });
+        let first = FakePane::new_with_pane_id_probe(947, size, probe);
+        let duplicate = FakePane::new(947, size);
+        tab.inner.lock().pane = Some(Tree::Node {
+            left: Box::new(Tree::Leaf(first)),
+            right: Box::new(Tree::Leaf(duplicate)),
+            data: Some(SplitDirectionAndSize {
+                direction: SplitDirection::Horizontal,
+                first: size,
+                second: size,
+            }),
+        });
+        let mut arena = Vec::new();
+
+        let descriptor = tab
+            .append_codec_pane_arena_in_window(109, "identity-error-retry", &mut arena, 64, 16, 16)
+            .expect("a callback-time duplicate-ID error from replaced topology must retry");
+
+        assert_eq!(callback_calls.load(std::sync::atomic::Ordering::Acquire), 2);
+        assert_eq!(descriptor.node_count, 3);
+        let [
+            PaneArenaNode::Split { .. },
+            PaneArenaNode::Leaf(first),
+            PaneArenaNode::Leaf(second),
+        ] = arena.as_slice()
+        else {
+            panic!("retried identity snapshot must retain canonical preorder");
+        };
+        assert_eq!(first.pane_id, 947);
+        assert_eq!(second.pane_id, 948);
     }
 
     #[test]
