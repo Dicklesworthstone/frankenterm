@@ -1979,16 +1979,36 @@ pub fn initialize_schema(conn: &Connection) -> Result<()> {
         .into());
     }
 
-    if current != 0 {
-        check_ft_version_compatibility(conn)?;
+    if current != 0 && needs_init {
+        return Err(StorageError::Corruption {
+            details: format!(
+                "schema version {current} is missing mandatory panes authority table"
+            ),
+        }
+        .into());
     }
 
     if current == SCHEMA_VERSION {
-        // Already up to date. Metadata repair can still write, so retain the
-        // same panic/rollback/epoch contract as a schema migration.
+        validate_current_ft_meta_authority(conn)?;
+        check_ft_version_compatibility(conn)?;
+        // The overwhelmingly common reopen path is read-only and must not
+        // acquire SQLite's singleton writer lock. If the optimistic probe
+        // finds drift, acquire BEGIN IMMEDIATE and then recheck under that
+        // authority before applying the repair atomically; another process may
+        // have repaired the row between the probe and lock acquisition.
+        if !ft_meta_needs_repair(conn, SCHEMA_VERSION)? {
+            return Ok(());
+        }
         return run_owned_migration_transaction(conn, "schema metadata", |transaction| {
-            ensure_ft_meta(transaction, SCHEMA_VERSION)
+            if ft_meta_needs_repair(transaction, SCHEMA_VERSION)? {
+                ensure_ft_meta(transaction, SCHEMA_VERSION)?;
+            }
+            Ok(())
         });
+    }
+
+    if current != 0 {
+        check_ft_version_compatibility(conn)?;
     }
 
     // Both the fresh-DB case (current == 0 && needs_init: no `panes` table
@@ -2795,6 +2815,7 @@ enum MigrationTransactionFault {
     Commit,
     Rollback,
     ClosureVerification,
+    AuthorityVerification,
 }
 
 #[cfg(test)]
@@ -2811,6 +2832,7 @@ fn set_migration_transaction_fault_for_test(fault: Option<MigrationTransactionFa
         Some(MigrationTransactionFault::Commit) => 2,
         Some(MigrationTransactionFault::Rollback) => 3,
         Some(MigrationTransactionFault::ClosureVerification) => 4,
+        Some(MigrationTransactionFault::AuthorityVerification) => 5,
     };
     MIGRATION_TRANSACTION_FAULT.with(|cell| cell.set(value));
 }
@@ -2823,6 +2845,7 @@ fn take_migration_transaction_fault(fault: MigrationTransactionFault) -> bool {
         MigrationTransactionFault::Commit => 2,
         MigrationTransactionFault::Rollback => 3,
         MigrationTransactionFault::ClosureVerification => 4,
+        MigrationTransactionFault::AuthorityVerification => 5,
     };
     MIGRATION_TRANSACTION_FAULT.with(|cell| {
         if cell.get() == expected {
@@ -2884,7 +2907,20 @@ fn take_migration_closure_verification_fault() -> bool {
     take_migration_transaction_fault(MigrationTransactionFault::ClosureVerification)
 }
 
+#[cfg(not(test))]
+const fn take_migration_authority_verification_fault() -> bool {
+    false
+}
+
+#[cfg(test)]
+fn take_migration_authority_verification_fault() -> bool {
+    take_migration_transaction_fault(MigrationTransactionFault::AuthorityVerification)
+}
+
 fn migration_connection_is_query_only(conn: &Connection) -> Result<bool> {
+    if take_migration_authority_verification_fault() {
+        return Err(poison_migration_connection_epoch(conn));
+    }
     match frankenterm_sigpipe::catch_recoverable(
         frankenterm_sigpipe::RecoverablePanicSite::StorageWriter,
         std::panic::AssertUnwindSafe(|| {
@@ -2892,10 +2928,17 @@ fn migration_connection_is_query_only(conn: &Connection) -> Result<bool> {
         }),
     ) {
         Ok(Ok(enabled)) => Ok(enabled != 0),
-        Ok(Err(_)) | Err(_) => Err(StorageError::MigrationFailed(
-            "failed to verify migration connection write authority".to_string(),
-        )
-        .into()),
+        Ok(Err(_)) | Err(_) => Err(poison_migration_connection_epoch(conn)),
+    }
+}
+
+fn migration_connection_is_autocommit(conn: &Connection) -> Result<bool> {
+    match frankenterm_sigpipe::catch_recoverable(
+        frankenterm_sigpipe::RecoverablePanicSite::StorageWriter,
+        std::panic::AssertUnwindSafe(|| conn.is_autocommit()),
+    ) {
+        Ok(is_autocommit) => Ok(is_autocommit),
+        Err(_) => Err(poison_migration_connection_epoch(conn)),
     }
 }
 
@@ -2911,8 +2954,11 @@ fn poison_migration_connection_epoch(conn: &Connection) -> crate::error::Error {
     StorageError::MigrationEpochPoisoned.into()
 }
 
-fn migration_transaction_closed(conn: &Connection) -> bool {
-    !take_migration_closure_verification_fault() && conn.is_autocommit()
+fn migration_transaction_closed(conn: &Connection) -> Result<bool> {
+    if take_migration_closure_verification_fault() {
+        return Err(poison_migration_connection_epoch(conn));
+    }
+    migration_connection_is_autocommit(conn)
 }
 
 fn rollback_migration_transaction(
@@ -2934,11 +2980,15 @@ fn rollback_migration_transaction(
         transaction.set_drop_behavior(DropBehavior::Ignore);
         return Err(poison_migration_connection_epoch(&transaction));
     }
-    if !migration_transaction_closed(&transaction) {
-        transaction.set_drop_behavior(DropBehavior::Ignore);
-        return Err(poison_migration_connection_epoch(&transaction));
+    // The transaction was closed explicitly. Disable rusqlite's default Drop
+    // rollback before any fallible verification so a poisoned verification
+    // path cannot issue a second backend control call while unwinding.
+    transaction.set_drop_behavior(DropBehavior::Ignore);
+    match migration_transaction_closed(&transaction) {
+        Ok(true) => Err(primary),
+        Ok(false) => Err(poison_migration_connection_epoch(&transaction)),
+        Err(error) => Err(error),
     }
-    Err(primary)
 }
 
 fn run_owned_migration_transaction(
@@ -2946,7 +2996,7 @@ fn run_owned_migration_transaction(
     context: &'static str,
     operation: impl FnOnce(&Transaction<'_>) -> Result<()>,
 ) -> Result<()> {
-    if !conn.is_autocommit() || migration_connection_is_query_only(conn)? {
+    if !migration_connection_is_autocommit(conn)? || migration_connection_is_query_only(conn)? {
         return Err(poison_migration_connection_epoch(conn));
     }
     if take_migration_begin_fault() {
@@ -2965,7 +3015,7 @@ fn run_owned_migration_transaction(
     let mut transaction = match begin {
         Ok(Ok(transaction)) => transaction,
         Ok(Err(_)) | Err(_) => {
-            if conn.is_autocommit() {
+            if migration_connection_is_autocommit(conn)? {
                 return Err(StorageError::MigrationFailed(format!(
                     "{context}: failed to begin migration transaction"
                 ))
@@ -3011,9 +3061,16 @@ fn run_owned_migration_transaction(
                     Ok(Ok(()))
                 );
             if commit_failed {
-                if transaction.is_autocommit() {
-                    transaction.set_drop_behavior(DropBehavior::Ignore);
-                    return Err(poison_migration_connection_epoch(&transaction));
+                // COMMIT may or may not have closed the transaction. Suppress
+                // implicit Drop control before the fallible authority probe;
+                // an explicitly open transaction is still rolled back below.
+                transaction.set_drop_behavior(DropBehavior::Ignore);
+                match migration_connection_is_autocommit(&transaction) {
+                    Ok(true) => {
+                        return Err(poison_migration_connection_epoch(&transaction));
+                    }
+                    Ok(false) => {}
+                    Err(error) => return Err(error),
                 }
                 return rollback_migration_transaction(
                     transaction,
@@ -3023,11 +3080,15 @@ fn run_owned_migration_transaction(
                     .into(),
                 );
             }
-            if !migration_transaction_closed(&transaction) {
-                transaction.set_drop_behavior(DropBehavior::Ignore);
-                return Err(poison_migration_connection_epoch(&transaction));
+            // COMMIT succeeded explicitly. Prevent Transaction::drop from
+            // issuing a redundant ROLLBACK, including when closure verification
+            // itself errors and fences this connection epoch.
+            transaction.set_drop_behavior(DropBehavior::Ignore);
+            match migration_transaction_closed(&transaction) {
+                Ok(true) => Ok(()),
+                Ok(false) => Err(poison_migration_connection_epoch(&transaction)),
+                Err(error) => Err(error),
             }
-            Ok(())
         }
     }
 }
@@ -3404,7 +3465,7 @@ pub fn get_schema_version(conn: &Connection) -> Result<Option<i32>> {
     .map_err(|e| StorageError::Database(e.to_string()).into())
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct FtMeta {
     pub(crate) schema_version: i32,
     pub(crate) min_compatible_ft: String,
@@ -3498,11 +3559,9 @@ fn ensure_ft_meta(conn: &Connection, schema_version: i32) -> Result<()> {
         ("min_compatible_wa", "created_by_wa")
     };
 
-    let now_ms = now_epoch_ms();
-    let mut current_ft = crate::VERSION.to_string();
-
     let existing = load_ft_meta(conn)?;
-    match existing {
+    let desired = canonical_ft_meta(existing.as_ref(), schema_version);
+    match existing.as_ref() {
         None => {
             conn.execute(
                 &format!(
@@ -3510,46 +3569,29 @@ fn ensure_ft_meta(conn: &Connection, schema_version: i32) -> Result<()> {
                      (id, schema_version, {col_min}, {col_created}, created_at) \
                      VALUES (1, ?1, ?2, ?3, ?4)"
                 ),
-                params![schema_version, current_ft, current_ft, now_ms],
+                params![
+                    desired.schema_version,
+                    desired.min_compatible_ft,
+                    desired.created_by_ft,
+                    desired.created_at
+                ],
             )
             .map_err(|e| StorageError::Database(e.to_string()))?;
         }
         Some(meta) => {
-            let mut min_compatible = meta.min_compatible_ft.clone();
-            if let (Some(current), Some(existing_min)) = (
-                FtVersion::parse(&current_ft),
-                FtVersion::parse(&meta.min_compatible_ft),
-            ) {
-                if current > existing_min {
-                    min_compatible.clone_from(&current_ft);
-                }
-            } else if meta.min_compatible_ft != current_ft {
-                min_compatible.clone_from(&current_ft);
-            }
-
-            let created_by = if meta.created_by_ft.is_empty() {
-                std::mem::take(&mut current_ft)
-            } else {
-                meta.created_by_ft.clone()
-            };
-            let created_at = if meta.created_at <= 0 {
-                now_ms
-            } else {
-                meta.created_at
-            };
-
-            if meta.schema_version != schema_version
-                || meta.min_compatible_ft != min_compatible
-                || meta.created_by_ft != created_by
-                || meta.created_at != created_at
-            {
+            if meta != &desired {
                 conn.execute(
                     &format!(
                         "UPDATE {meta_table} \
                          SET schema_version=?1, {col_min}=?2, {col_created}=?3, created_at=?4 \
                          WHERE id = 1"
                     ),
-                    params![schema_version, min_compatible, created_by, created_at],
+                    params![
+                        desired.schema_version,
+                        desired.min_compatible_ft,
+                        desired.created_by_ft,
+                        desired.created_at
+                    ],
                 )
                 .map_err(|e| StorageError::Database(e.to_string()))?;
             }
@@ -3557,6 +3599,72 @@ fn ensure_ft_meta(conn: &Connection, schema_version: i32) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn canonical_ft_meta(existing: Option<&FtMeta>, schema_version: i32) -> FtMeta {
+    let current_ft = crate::VERSION.to_string();
+    let Some(existing) = existing else {
+        return FtMeta {
+            schema_version,
+            min_compatible_ft: current_ft.clone(),
+            created_by_ft: current_ft,
+            created_at: now_epoch_ms(),
+        };
+    };
+
+    let min_compatible_ft = match (
+        FtVersion::parse(&current_ft),
+        FtVersion::parse(&existing.min_compatible_ft),
+    ) {
+        (Some(current), Some(existing_min)) if current <= existing_min => {
+            existing.min_compatible_ft.clone()
+        }
+        _ if existing.min_compatible_ft == current_ft => existing.min_compatible_ft.clone(),
+        _ => current_ft.clone(),
+    };
+    FtMeta {
+        schema_version,
+        min_compatible_ft,
+        created_by_ft: if existing.created_by_ft.is_empty() {
+            current_ft
+        } else {
+            existing.created_by_ft.clone()
+        },
+        created_at: if existing.created_at <= 0 {
+            now_epoch_ms()
+        } else {
+            existing.created_at
+        },
+    }
+}
+
+fn ft_meta_needs_repair(conn: &Connection, schema_version: i32) -> Result<bool> {
+    validate_current_ft_meta_authority(conn)?;
+    let existing = load_ft_meta(conn)?;
+    Ok(existing
+        .as_ref()
+        .is_none_or(|meta| meta != &canonical_ft_meta(Some(meta), schema_version)))
+}
+
+fn validate_current_ft_meta_authority(conn: &Connection) -> Result<()> {
+    let has_ft_meta = table_exists(conn, "ft_meta")?;
+    let has_wa_meta = table_exists(conn, "wa_meta")?;
+    match (has_ft_meta, has_wa_meta) {
+        (true, false) => Ok(()),
+        (false, false) => Err(StorageError::Corruption {
+            details: "current schema is missing mandatory ft_meta authority table".to_string(),
+        }
+        .into()),
+        (false, true) => Err(StorageError::Corruption {
+            details: "current schema retains legacy wa_meta without ft_meta authority".to_string(),
+        }
+        .into()),
+        (true, true) => Err(StorageError::Corruption {
+            details: "current schema has conflicting ft_meta and legacy wa_meta authorities"
+                .to_string(),
+        }
+        .into()),
+    }
 }
 
 fn check_ft_version_compatibility(conn: &Connection) -> Result<()> {
@@ -3896,6 +4004,135 @@ mod tests {
         })
         .expect("fresh connection epoch must permit retry");
         assert!(table_exists(&reopened, "closure_probe").unwrap());
+    }
+
+    #[test]
+    fn migration_authority_verification_fault_fences_same_connection() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("migration-authority.sqlite3");
+        let conn = Connection::open(&path).expect("open test database");
+        set_migration_transaction_fault_for_test(Some(
+            MigrationTransactionFault::AuthorityVerification,
+        ));
+
+        let error = run_owned_migration_transaction(&conn, "authority verification", |_| Ok(()))
+            .expect_err("unverifiable write authority must poison the connection epoch");
+        assert!(is_migration_epoch_poisoned(&error));
+        assert!(migration_connection_is_query_only(&conn).unwrap());
+        assert!(
+            conn.execute_batch("CREATE TABLE forbidden_after_authority_fault(id INTEGER)")
+                .is_err()
+        );
+        drop(conn);
+
+        let reopened = Connection::open(&path).expect("open fresh connection epoch");
+        assert!(!migration_connection_is_query_only(&reopened).unwrap());
+        run_owned_migration_transaction(&reopened, "authority verification", |transaction| {
+            execute_migration_test_sql(
+                transaction,
+                "CREATE TABLE allowed_after_reopen(id INTEGER)",
+            )
+        })
+        .expect("fresh connection must regain write authority");
+    }
+
+    #[test]
+    fn current_schema_noop_avoids_writer_lock_but_repair_requires_it() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("current-schema-lock.sqlite3");
+        let conn = Connection::open(&path).expect("open schema connection");
+        initialize_schema(&conn).expect("initialize current schema");
+        let holder = Connection::open(&path).expect("open competing writer");
+
+        holder
+            .execute_batch("BEGIN IMMEDIATE")
+            .expect("hold SQLite writer lock");
+        initialize_schema(&conn)
+            .expect("healthy current-schema reopen must remain read-only under writer lock");
+        holder.execute_batch("ROLLBACK").expect("release writer lock");
+
+        conn.execute("UPDATE ft_meta SET schema_version = 0 WHERE id = 1", [])
+            .expect("seed repairable metadata drift");
+        conn.busy_timeout(std::time::Duration::ZERO)
+            .expect("disable wait for deterministic lock proof");
+        holder
+            .execute_batch("BEGIN IMMEDIATE")
+            .expect("hold writer lock during repair");
+        initialize_schema(&conn).expect_err("metadata repair must acquire writer authority");
+        holder.execute_batch("ROLLBACK").expect("release repair lock");
+
+        initialize_schema(&conn).expect("repair succeeds after lock release");
+        assert_eq!(
+            load_ft_meta(&conn)
+                .expect("load repaired metadata")
+                .expect("metadata row")
+                .schema_version,
+            SCHEMA_VERSION
+        );
+    }
+
+    #[test]
+    fn current_schema_missing_ft_meta_authority_fails_closed() {
+        let conn = Connection::open_in_memory().expect("in-memory database");
+        initialize_schema(&conn).expect("initialize current schema");
+        conn.execute_batch("DROP TABLE ft_meta")
+            .expect("remove mandatory metadata authority in test fixture");
+
+        let error = initialize_schema(&conn)
+            .expect_err("a current-version stamp cannot authorize a missing ft_meta table");
+        assert!(matches!(
+            error,
+            crate::error::Error::Storage(StorageError::Corruption { details })
+                if details.contains("missing mandatory ft_meta")
+        ));
+    }
+
+    #[test]
+    fn nonzero_schema_missing_panes_authority_fails_closed() {
+        let conn = Connection::open_in_memory().expect("in-memory database");
+        initialize_schema(&conn).expect("initialize current schema");
+        conn.execute_batch("PRAGMA foreign_keys = OFF; DROP TABLE panes; PRAGMA foreign_keys = ON")
+            .expect("remove mandatory panes authority in test fixture");
+
+        let error = initialize_schema(&conn)
+            .expect_err("a nonzero version stamp cannot authorize a missing panes table");
+        assert!(matches!(
+            error,
+            crate::error::Error::Storage(StorageError::Corruption { details })
+                if details.contains("missing mandatory panes")
+        ));
+    }
+
+    #[test]
+    fn current_schema_legacy_only_metadata_authority_fails_closed() {
+        let conn = Connection::open_in_memory().expect("in-memory database");
+        initialize_schema(&conn).expect("initialize current schema");
+        conn.execute_batch("ALTER TABLE ft_meta RENAME TO wa_meta")
+            .expect("replace current metadata authority with legacy table in fixture");
+
+        let error = initialize_schema(&conn)
+            .expect_err("current schema must not accept legacy-only wa_meta authority");
+        assert!(matches!(
+            error,
+            crate::error::Error::Storage(StorageError::Corruption { details })
+                if details.contains("legacy wa_meta without ft_meta")
+        ));
+    }
+
+    #[test]
+    fn current_schema_dual_metadata_authority_fails_closed() {
+        let conn = Connection::open_in_memory().expect("in-memory database");
+        initialize_schema(&conn).expect("initialize current schema");
+        conn.execute_batch("CREATE TABLE wa_meta (id INTEGER PRIMARY KEY)")
+            .expect("seed conflicting legacy metadata authority");
+
+        let error = initialize_schema(&conn)
+            .expect_err("current schema must reject dual metadata authorities");
+        assert!(matches!(
+            error,
+            crate::error::Error::Storage(StorageError::Corruption { details })
+                if details.contains("conflicting ft_meta")
+        ));
     }
 
     #[test]

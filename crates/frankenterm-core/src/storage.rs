@@ -33,6 +33,8 @@ use std::collections::BTreeMap;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
+#[cfg(test)]
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::{
@@ -1336,6 +1338,11 @@ enum WriteCommand {
         message: &'static str,
         respond: oneshot::Sender<Result<()>>,
     },
+    /// Test-only shutdown whose flush boundary panics after installing the
+    /// unit responder. This exercises shutdown error propagation after the
+    /// responder's unwind guard has already acknowledged the command.
+    #[cfg(test)]
+    ShutdownPanicForTest { respond: oneshot::Sender<()> },
     /// Shutdown the writer thread (flush pending writes)
     Shutdown { respond: oneshot::Sender<()> },
 }
@@ -1420,6 +1427,8 @@ impl std::fmt::Debug for WriteCommand {
             Self::MarkSessionShutdownClean { .. } => "MarkSessionShutdownClean",
             #[cfg(test)]
             Self::PanicForTest { .. } => "PanicForTest",
+            #[cfg(test)]
+            Self::ShutdownPanicForTest { .. } => "ShutdownPanicForTest",
             Self::Shutdown { .. } => "Shutdown",
         };
         write!(f, "WriteCommand::{variant}")
@@ -1622,6 +1631,26 @@ impl WriterWakeup {
             return;
         }
         let _ = self.condvar.wait_timeout(guard, timeout);
+    }
+
+    fn wait_for_terminal_depth_change(
+        &self,
+        timeout: std::time::Duration,
+        queued_depth: &AtomicUsize,
+        terminal_admission_gate: &AtomicUsize,
+    ) -> bool {
+        let guard = self
+            .lock
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if queued_depth.load(AtomicOrdering::Acquire) == 0
+            && terminal_admission_gate.load(AtomicOrdering::Acquire)
+                == WRITER_TERMINAL_ADMISSION_CLOSED
+        {
+            return true;
+        }
+        let _ = self.condvar.wait_timeout(guard, timeout);
+        false
     }
 }
 
@@ -1935,11 +1964,157 @@ struct WriteCommandSender {
     inner: mpsc::Sender<WriteCommand>,
     queued_depth: Arc<AtomicUsize>,
     terminal_state: Arc<AtomicU8>,
+    terminal_admission_gate: Arc<AtomicUsize>,
     max_capacity: usize,
+    terminal_drain_wakeup: Arc<WriterWakeup>,
     /// [round-4 Q2] Present only when `writer_blocking_recv` is enabled; signals
     /// the condvar-parked writer after each successful enqueue. `None` keeps the
     /// legacy 1 ms-poll writer untouched (zero added cost on the send path).
     wakeup: Option<Arc<WriterWakeup>>,
+}
+
+struct WriterQueueAdmission<'a> {
+    queued_depth: &'a AtomicUsize,
+    terminal_drain_wakeup: &'a WriterWakeup,
+    transferred_to_receiver: bool,
+}
+
+/// One lock-free registration in the short window between a sender's terminal
+/// check and its exact queue-depth increment.
+///
+/// The high bit of `gate` is the terminal fence; the remaining bits count
+/// registrations that started before that fence. Closing the gate and waiting
+/// for the count to reach zero proves that no future sender can increment
+/// `queued_depth` after the drain's final zero decision. Normal sends pay two
+/// atomic operations and no mutex/condvar traffic.
+struct WriterTerminalAdmission<'a> {
+    gate: &'a AtomicUsize,
+    terminal_drain_wakeup: &'a WriterWakeup,
+}
+
+const WRITER_TERMINAL_ADMISSION_CLOSED: usize = 1usize << (usize::BITS - 1);
+const WRITER_TERMINAL_ADMISSION_COUNT_MASK: usize = WRITER_TERMINAL_ADMISSION_CLOSED - 1;
+
+impl<'a> WriterTerminalAdmission<'a> {
+    fn try_acquire(
+        gate: &'a AtomicUsize,
+        terminal_drain_wakeup: &'a WriterWakeup,
+    ) -> Option<Self> {
+        let mut state = gate.load(AtomicOrdering::Acquire);
+        loop {
+            if state & WRITER_TERMINAL_ADMISSION_CLOSED != 0 {
+                return None;
+            }
+            if state == WRITER_TERMINAL_ADMISSION_COUNT_MASK {
+                tracing::error!(
+                    event = "storage_writer_terminal_admission_overflow",
+                    "storage writer terminal-admission counter exhausted"
+                );
+                return None;
+            }
+            match gate.compare_exchange_weak(
+                state,
+                state + 1,
+                AtomicOrdering::AcqRel,
+                AtomicOrdering::Acquire,
+            ) {
+                Ok(_) => {
+                    return Some(Self {
+                        gate,
+                        terminal_drain_wakeup,
+                    });
+                }
+                Err(observed) => state = observed,
+            }
+        }
+    }
+}
+
+impl Drop for WriterTerminalAdmission<'_> {
+    fn drop(&mut self) {
+        let mut state = self.gate.load(AtomicOrdering::Acquire);
+        loop {
+            if state & WRITER_TERMINAL_ADMISSION_COUNT_MASK == 0 {
+                STORAGE_WRITER_QUEUE_ACCOUNTING_UNDERFLOWS_TOTAL
+                    .fetch_add(1, AtomicOrdering::Relaxed);
+                tracing::error!(
+                    event = "storage_writer_terminal_admission_underflow",
+                    writer_queue_accounting_underflows_total =
+                        storage_writer_queue_accounting_underflows_total(),
+                    "storage writer terminal admission attempted to retire at count zero"
+                );
+                return;
+            }
+            match self.gate.compare_exchange_weak(
+                state,
+                state - 1,
+                AtomicOrdering::AcqRel,
+                AtomicOrdering::Acquire,
+            ) {
+                Ok(previous) => {
+                    if previous & WRITER_TERMINAL_ADMISSION_CLOSED != 0 {
+                        self.terminal_drain_wakeup.notify();
+                    }
+                    return;
+                }
+                Err(observed) => state = observed,
+            }
+        }
+    }
+}
+
+fn close_writer_terminal_admissions(
+    gate: &AtomicUsize,
+    terminal_drain_wakeup: &WriterWakeup,
+) {
+    let previous = gate.fetch_or(WRITER_TERMINAL_ADMISSION_CLOSED, AtomicOrdering::AcqRel);
+    if previous & WRITER_TERMINAL_ADMISSION_CLOSED == 0 {
+        terminal_drain_wakeup.notify();
+    }
+}
+
+impl<'a> WriterQueueAdmission<'a> {
+    /// Register one in-flight queue admission behind the lock-free terminal
+    /// fence that stabilizes the drain's final depth-zero decision.
+    ///
+    /// Without this atomic registration, a sender that had already acquired a
+    /// permit could pause before incrementing `queued_depth`; the terminal
+    /// drain could then observe zero and return, after which the sender would
+    /// increment and discover the closed receiver. The command still could not
+    /// land, but the writer would have terminated before all admissions were
+    /// accounted for.
+    fn new_if_writer_healthy(
+        queued_depth: &'a AtomicUsize,
+        terminal_drain_wakeup: &'a WriterWakeup,
+        terminal_state: &AtomicU8,
+        terminal_admission_gate: &AtomicUsize,
+    ) -> Option<Self> {
+        let terminal_admission =
+            WriterTerminalAdmission::try_acquire(terminal_admission_gate, terminal_drain_wakeup)?;
+        if terminal_state.load(AtomicOrdering::Acquire) != WRITER_TERMINAL_HEALTHY {
+            return None;
+        }
+        queued_depth.fetch_add(1, AtomicOrdering::AcqRel);
+        drop(terminal_admission);
+        Some(Self {
+            queued_depth,
+            terminal_drain_wakeup,
+            transferred_to_receiver: false,
+        })
+    }
+
+    fn transfer_to_receiver(&mut self) {
+        self.transferred_to_receiver = true;
+    }
+}
+
+impl Drop for WriterQueueAdmission<'_> {
+    fn drop(&mut self) {
+        if !self.transferred_to_receiver {
+            WriteCommandSender::mark_command_dequeued(self.queued_depth);
+            self.terminal_drain_wakeup.notify();
+        }
+    }
 }
 
 const WRITER_TERMINAL_HEALTHY: u8 = 0;
@@ -2039,7 +2214,9 @@ impl WriteCommandSender {
             inner,
             queued_depth: Arc::new(AtomicUsize::new(0)),
             terminal_state: Arc::new(AtomicU8::new(WRITER_TERMINAL_HEALTHY)),
+            terminal_admission_gate: Arc::new(AtomicUsize::new(0)),
             max_capacity,
+            terminal_drain_wakeup: Arc::new(WriterWakeup::new()),
             wakeup: None,
         }
     }
@@ -2049,16 +2226,27 @@ impl WriteCommandSender {
         self.send_with_cx(&cx, command).await
     }
 
-    fn mark_command_dequeued(counter: &AtomicUsize) {
+    fn mark_command_dequeued(counter: &AtomicUsize) -> bool {
         let mut depth = counter.load(AtomicOrdering::Acquire);
-        while let Some(next) = depth.checked_sub(1) {
+        loop {
+            let Some(next) = depth.checked_sub(1) else {
+                STORAGE_WRITER_QUEUE_ACCOUNTING_UNDERFLOWS_TOTAL
+                    .fetch_add(1, AtomicOrdering::Relaxed);
+                tracing::error!(
+                    event = "storage_writer_queue_accounting_underflow",
+                    writer_queue_accounting_underflows_total =
+                        storage_writer_queue_accounting_underflows_total(),
+                    "storage writer queue accounting attempted to dequeue at depth zero"
+                );
+                return false;
+            };
             match counter.compare_exchange_weak(
                 depth,
                 next,
                 AtomicOrdering::AcqRel,
                 AtomicOrdering::Acquire,
             ) {
-                Ok(_) => break,
+                Ok(_) => return true,
                 Err(observed) => depth = observed,
             }
         }
@@ -2197,15 +2385,24 @@ impl WriteCommandSender {
             }
         };
 
-        if let Some(error) = self.terminal_send_error() {
+        let Some(mut admission) = WriterQueueAdmission::new_if_writer_healthy(
+            &self.queued_depth,
+            self.terminal_drain_wakeup.as_ref(),
+            self.terminal_state.as_ref(),
+            self.terminal_admission_gate.as_ref(),
+        ) else {
             drop(permit);
             drop(command);
-            return Err(error);
-        }
-
-        self.queued_depth.fetch_add(1, AtomicOrdering::AcqRel);
+            return Err(self
+                .terminal_send_error()
+                .unwrap_or(WriteCommandSendError::WriterBackendEpochPoisoned));
+        };
+        // A terminal transition after registration is safe: the drain cannot
+        // finish while this exact-depth slot remains outstanding, and receiver
+        // closure makes `try_send` fail if the command did not land first.
         match permit.try_send(command) {
             Ok(()) => {
+                admission.transfer_to_receiver();
                 // [round-4 Q2] Wake the condvar-parked writer once the command
                 // is actually visible on the channel. No-op when
                 // `writer_blocking_recv` is off (`wakeup` is `None`).
@@ -2215,7 +2412,7 @@ impl WriteCommandSender {
                 Ok(())
             }
             Err(err) => {
-                Self::mark_command_dequeued(&self.queued_depth);
+                drop(admission);
                 if matches!(&err, mpsc::SendError::Disconnected(_)) {
                     if let Some(error) = self.terminal_send_error() {
                         drop(err);
@@ -2558,9 +2755,17 @@ pub struct StorageHandle {
     /// durable writer batch and before continuation is enqueued.
     #[cfg(test)]
     test_cancel_after_batch: Arc<Mutex<Option<&'static str>>>,
+    #[cfg(test)]
+    test_cancel_shutdown_after_enqueue: Arc<AtomicBool>,
 }
 
 impl StorageHandle {
+    #[cfg(test)]
+    fn cancel_shutdown_after_enqueue_for_test(&self) {
+        self.test_cancel_shutdown_after_enqueue
+            .store(true, AtomicOrdering::Release);
+    }
+
     #[cfg(test)]
     pub(crate) fn cancel_after_next_committed_batch_for_test(
         &self,
@@ -2772,25 +2977,39 @@ impl StorageHandle {
     async fn recv_writer_shutdown_ack_with_cx(
         cx: &crate::cx::Cx,
         rx: oneshot::Receiver<()>,
-    ) -> bool {
-        if cx.is_cancel_requested() {
-            return false;
+    ) -> Result<bool> {
+        if cx.checkpoint().is_err() {
+            return Ok(false);
         }
         use futures::future::{Either, select};
         let ack = std::pin::pin!(crate::runtime_async::oneshot_recv(rx));
         let cancel_watcher = std::pin::pin!(async {
             loop {
-                let _ = crate::runtime_async::sleep_with_cx(
+                let sleep_result = crate::runtime_async::sleep_with_cx(
                     cx,
                     std::time::Duration::from_millis(50),
                 )
                 .await;
-                if cx.is_cancel_requested() {
-                    return;
+                // A finite budget can make sleep return immediately without
+                // first latching `is_cancel_requested`. Check the complete Cx
+                // contract after every wake so an expired deadline cannot turn
+                // this watcher into a non-yielding hot loop.
+                if cx.checkpoint().is_err() {
+                    return Ok(());
+                }
+                if let Err(error) = sleep_result {
+                    return Err(error);
                 }
             }
         });
-        matches!(select(ack, cancel_watcher).await, Either::Left(_))
+        match select(ack, cancel_watcher).await {
+            Either::Left(_) => Ok(true),
+            Either::Right((Ok(()), _)) => Ok(false),
+            Either::Right((Err(error), _)) => Err(StorageError::Database(format!(
+                "storage shutdown acknowledgment watcher failed: {error}"
+            ))
+            .into()),
+        }
     }
 
     async fn enqueue_writer_shutdown_cleanup(&self) -> oneshot::Receiver<()> {
@@ -2806,6 +3025,29 @@ impl StorageHandle {
             .send_with_cx(&cleanup_cx, WriteCommand::Shutdown { respond: tx })
             .await;
         rx
+    }
+
+    /// Validate the retained writer terminal state after a caller has observed
+    /// shutdown completion (or joined an already-terminated writer). A unit
+    /// shutdown responder is deliberately best-effort and may acknowledge from
+    /// its unwind guard, so the acknowledgment alone is not proof of a clean
+    /// backend epoch.
+    fn completed_writer_terminal_result(&self) -> Result<()> {
+        match self.write_tx.terminal_state.load(AtomicOrdering::Acquire) {
+            WRITER_TERMINAL_CLOSED_CLEANLY => Ok(()),
+            WRITER_TERMINAL_BACKEND_EPOCH_POISONED => {
+                Err(StorageError::WriterBackendEpochPoisoned.into())
+            }
+            WRITER_TERMINAL_HEALTHY => Err(StorageError::Database(
+                "storage writer completed shutdown without publishing a terminal state"
+                    .to_string(),
+            )
+            .into()),
+            unknown => Err(StorageError::Database(format!(
+                "storage writer published unknown terminal state {unknown}"
+            ))
+            .into()),
+        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`new`].
@@ -2954,7 +3196,10 @@ impl StorageHandle {
         let mut write_tx = WriteCommandSender::new(write_tx_raw, config.write_queue_size);
         write_tx.wakeup.clone_from(&writer_wakeup);
         let queued_depth_for_writer = Arc::clone(&write_tx.queued_depth);
+        let terminal_drain_wakeup_for_writer = Arc::clone(&write_tx.terminal_drain_wakeup);
         let terminal_state_for_writer = Arc::clone(&write_tx.terminal_state);
+        let terminal_admission_gate_for_writer =
+            Arc::clone(&write_tx.terminal_admission_gate);
         let mmap_runtime_for_writer = mmap_runtime.clone();
         let writer_wakeup_for_writer = writer_wakeup;
 
@@ -2969,7 +3214,9 @@ impl StorageHandle {
                     &mut write_rx,
                     &mut mmap_mirror,
                     &queued_depth_for_writer,
+                    &terminal_drain_wakeup_for_writer,
                     &terminal_state_for_writer,
+                    &terminal_admission_gate_for_writer,
                     group_commit_events,
                     writer_wakeup_for_writer.as_deref(),
                     group_commit_adaptive,
@@ -2991,6 +3238,8 @@ impl StorageHandle {
             ))),
             #[cfg(test)]
             test_cancel_after_batch: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            test_cancel_shutdown_after_enqueue: Arc::new(AtomicBool::new(false)),
         };
         register_storage_backend_provider(handle.db_path.as_str(), &handle.backend_provider);
         Ok(handle)
@@ -9235,7 +9484,8 @@ impl StorageHandle {
     /// Shutdown the storage handle
     ///
     /// Flushes all pending writes and waits for the writer thread to exit.
-    /// Safe to call multiple times - subsequent calls are no-ops.
+    /// Safe to call multiple times: a clean terminal result remains `Ok`, while
+    /// a poisoned writer keeps returning its typed terminal cause.
     ///
     /// br-ft-cdcbv: the writer-thread `JoinHandle::join()` runs on the
     /// blocking thread pool via `runtime_async::spawn_blocking` so the
@@ -9266,7 +9516,7 @@ impl StorageHandle {
                 .map_err(|()| StorageError::Database("Writer thread panicked".to_string()))?;
         }
 
-        Ok(())
+        self.completed_writer_terminal_result()
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`shutdown`].
@@ -9279,10 +9529,16 @@ impl StorageHandle {
     /// cx-cancelled caller bails fast while the background
     /// writer still winds down on its own.
     ///
-    /// Note: if the cx is cancelled before the thread join, the
-    /// writer_handle is left in place (take is skipped), so a
-    /// subsequent `shutdown()` or `shutdown_with_cx(fresh_cx)`
-    /// call will drive the join.
+    /// An `Ok(())` returned because the caller Cx stopped waiting is only a
+    /// prompt cancellation outcome; it is not evidence that the writer reached
+    /// a clean terminal state. Only the path below that actually completes its
+    /// retained join and terminal-state validation establishes completion for
+    /// this call.
+    ///
+    /// Note: if the cx stops the acknowledgment wait, the writer handle is left
+    /// in place (take is skipped), so a subsequent shutdown call can drive the
+    /// join. Once acknowledgment wins and the handle is taken, it is consumed
+    /// even if cancellation then wins the join wait.
     ///
     /// br-ft-cdcbv: the writer-thread join runs on the blocking
     /// thread pool via `runtime_async::spawn_blocking` so the
@@ -9290,12 +9546,23 @@ impl StorageHandle {
     /// is also select-raced against the caller's Cx cancellation
     /// watcher (50 ms poll period, matching
     /// `distributed::race_with_cx_cancel`'s pattern) so a mid-
-    /// flight cancel returns Ok promptly. The orphaned join
-    /// runs to completion in the background; the writer thread
-    /// terminates either way + the handle is consumed once.
+    /// flight cancel returns Ok promptly. An already-spawned join
+    /// runs to completion in the background; the writer thread itself
+    /// continues independently even if cancellation wins before spawn, and the
+    /// handle is consumed once.
     pub async fn shutdown_with_cx(&self, cx: &crate::cx::Cx) -> Result<()> {
         let rx = self.enqueue_writer_shutdown_cleanup().await;
-        if !Self::recv_writer_shutdown_ack_with_cx(cx, rx).await {
+        #[cfg(test)]
+        if self
+            .test_cancel_shutdown_after_enqueue
+            .swap(false, AtomicOrdering::AcqRel)
+        {
+            cx.cancel_with(
+                crate::outcome::CancelKind::User,
+                Some("deterministic cancellation after storage cleanup enqueue"),
+            );
+        }
+        if !Self::recv_writer_shutdown_ack_with_cx(cx, rx).await? {
             return Ok(());
         }
 
@@ -9305,50 +9572,38 @@ impl StorageHandle {
             .map_err(|_| StorageError::Database("Writer handle mutex poisoned".to_string()))?
             .take();
         if let Some(handle) = handle {
-            // Run the join on the blocking thread pool; select-
-            // race against a cx cancel-watcher so a cancelled
-            // caller bails fast while the writer still winds down
-            // independently. Same shape as
-            // distributed::race_with_cx_cancel (tick 387).
-            use futures::future::{Either, select};
-            let join_fut = std::pin::pin!(crate::runtime_async::spawn_blocking(move || {
+            // Use the canonical Cx-aware blocking seam. Its watcher runs a
+            // full checkpoint after every sleep wake/error, including budget
+            // deadline expiry that does not latch `is_cancel_requested`.
+            match crate::runtime_async::spawn_blocking_with_cx(cx, move || {
                 handle.join().map_err(|_| ())
-            }));
-            let cancel_watcher = std::pin::pin!(async {
-                loop {
-                    let _ = crate::runtime_async::sleep_with_cx(
-                        cx,
-                        std::time::Duration::from_millis(50),
-                    )
-                    .await;
-                    if cx.is_cancel_requested() {
-                        return;
-                    }
-                }
-            });
-            match select(join_fut, cancel_watcher).await {
-                Either::Left((Ok(Ok(())), _)) => {}
-                Either::Left((Ok(Err(())), _)) => {
+            })
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(())) => {
                     return Err(StorageError::Database("Writer thread panicked".to_string()).into());
                 }
-                Either::Left((Err(e), _)) => {
+                Err(
+                    SpawnBlockingWithCxError::CancelledBeforeSpawn { .. }
+                    | SpawnBlockingWithCxError::CancelledMidFlight { .. },
+                ) => {
+                    // This is a prompt caller-wait cancellation outcome, not a
+                    // claim that shutdown completed cleanly. The independent
+                    // cleanup command remains admitted and the writer keeps
+                    // winding down (or has already reached terminal state).
+                    return Ok(());
+                }
+                Err(e @ SpawnBlockingWithCxError::RuntimeFailure { .. }) => {
                     return Err(StorageError::Database(format!(
                         "Shutdown spawn_blocking error: {e}"
                     ))
                     .into());
                 }
-                Either::Right(((), _)) => {
-                    // Cancelled mid-join. The writer_handle is
-                    // already taken, so subsequent shutdown calls
-                    // skip the join arm; the orphaned blocking
-                    // task continues + drops its result when the
-                    // writer thread eventually exits.
-                    return Ok(());
-                }
             }
         }
 
-        Ok(())
+        self.completed_writer_terminal_result()
     }
 }
 
@@ -10249,6 +10504,7 @@ static STORAGE_WRITER_PANICS_TOTAL: AtomicU64 = AtomicU64::new(0);
 static STORAGE_WRITER_EPOCH_POISONS_TOTAL: AtomicU64 = AtomicU64::new(0);
 static STORAGE_WRITER_RESPONSE_PANICS_TOTAL: AtomicU64 = AtomicU64::new(0);
 static STORAGE_WRITER_WAKER_PANICS_TOTAL: AtomicU64 = AtomicU64::new(0);
+static STORAGE_WRITER_QUEUE_ACCOUNTING_UNDERFLOWS_TOTAL: AtomicU64 = AtomicU64::new(0);
 
 std::thread_local! {
     /// Dispatch-local poison signal. Transaction helpers sit below the raw
@@ -10315,6 +10571,17 @@ pub fn storage_writer_response_panics_total() -> u64 {
 #[must_use]
 pub fn storage_writer_waker_panics_total() -> u64 {
     STORAGE_WRITER_WAKER_PANICS_TOTAL.load(AtomicOrdering::Relaxed)
+}
+
+/// Cumulative count of attempted writer-queue accounting decrements at zero.
+///
+/// This covers both exact queued-depth ownership and the short terminal-gate
+/// registration. Any non-zero value indicates an internal admission/dequeue
+/// ownership bug; the counter is observable instead of silently saturating the
+/// exact-depth invariant or panicking the dedicated writer thread.
+#[must_use]
+pub fn storage_writer_queue_accounting_underflows_total() -> u64 {
+    STORAGE_WRITER_QUEUE_ACCOUNTING_UNDERFLOWS_TOTAL.load(AtomicOrdering::Relaxed)
 }
 
 #[cfg(test)]
@@ -10587,19 +10854,22 @@ fn restore_writer_savepoint(
     savepoint: WriterSavepoint,
     operation: &'static str,
 ) -> bool {
-    let rolled_back = match writer_transaction_control(
+    match writer_transaction_control(
         backend,
         savepoint.rollback_sql,
         operation,
         "rollback",
     ) {
-        WriterTransactionControlOutcome::Succeeded => true,
+        WriterTransactionControlOutcome::Succeeded => {}
         WriterTransactionControlOutcome::Failed(BackendError::TxPoisoned) => return false,
         WriterTransactionControlOutcome::Failed(_) | WriterTransactionControlOutcome::Panicked => {
-            false
+            // The savepoint's mutation state is indeterminate. RELEASE could
+            // commit the very partial mutation that rollback failed to undo,
+            // and it would be an impermissible backend call after poison.
+            return false;
         }
-    };
-    let released = match writer_transaction_control(
+    }
+    match writer_transaction_control(
         backend,
         savepoint.release_sql,
         operation,
@@ -10610,8 +10880,7 @@ fn restore_writer_savepoint(
         WriterTransactionControlOutcome::Failed(_) | WriterTransactionControlOutcome::Panicked => {
             false
         }
-    };
-    rolled_back && released
+    }
 }
 
 /// Panic-safe savepoint sibling of [`run_writer_transaction`].
@@ -10959,7 +11228,6 @@ fn dispatch_write_command_batch(
     backend: &dyn StorageBackend,
     mut batch: VecDeque<WriteCommand>,
     should_break: &mut bool,
-    terminal_state: &AtomicU8,
     mmap_mirror: &mut Option<mmap_store::MmapScrollbackStore>,
     segment_redactors: &mut HashMap<u64, SegmentPersistRedactor>,
     io_gate: &mut StorageIoWriterGate,
@@ -10969,9 +11237,7 @@ fn dispatch_write_command_batch(
 
     while let Some(cmd) = batch.pop_front() {
         if *should_break {
-            let failure = WriterFailure::Database(
-                "storage writer shut down before dispatch".to_string(),
-            );
+            let failure = WriterFailure::WriterClosed;
             *should_break |= fail_undispatched_write_command(cmd, &failure);
             if fail_undispatched_write_commands(batch, &failure) {
                 *should_break = true;
@@ -11027,14 +11293,6 @@ fn dispatch_write_command_batch(
             return Some(interruption);
         }
         if !*should_break {
-            if matches!(cmd, WriteCommand::Shutdown { .. }) {
-                // Publish the terminal state before the shutdown responder is
-                // acknowledged and before the receiver is closed. A sender
-                // racing capacity release therefore observes a typed clean
-                // close instead of reporting a successful enqueue into a
-                // writer that has already accepted shutdown.
-                terminal_state.store(WRITER_TERMINAL_CLOSED_CLEANLY, AtomicOrdering::Release);
-            }
             if let Some(interruption) = dispatch_write_command_raw_recovering(
                 backend,
                 cmd,
@@ -11054,9 +11312,7 @@ fn dispatch_write_command_batch(
                 return Some(interruption);
             }
         } else {
-            let failure = WriterFailure::Database(
-                "storage writer shut down before dispatch".to_string(),
-            );
+            let failure = WriterFailure::WriterClosed;
             *should_break |= fail_undispatched_write_command(cmd, &failure);
             if fail_undispatched_write_commands(batch, &failure) {
                 *should_break = true;
@@ -11474,12 +11730,29 @@ fn event_gap_group_commit_backend(
         return Ok(Vec::new());
     }
 
-    run_writer_transaction(
+    let mut gap_redactor_snapshots = SegmentRedactorSnapshots::new();
+    for pending in group {
+        if let PendingEventOrGap::Gap { pane_id, .. } = pending {
+            gap_redactor_snapshots
+                .entry(*pane_id)
+                .or_insert_with(|| segment_redactors.get(pane_id).cloned());
+        }
+    }
+
+    let result = run_writer_transaction(
         backend,
         WriterTransactionBeginMode::Deferred,
         "event/gap group commit",
         || event_gap_group_commit_inner(backend, group, mmap_mirror, segment_redactors),
-    )
+    );
+    if result
+        .as_ref()
+        .err()
+        .is_some_and(|error| !is_backend_epoch_poisoned(error))
+    {
+        restore_segment_redactor_snapshots(segment_redactors, gap_redactor_snapshots);
+    }
+    result
 }
 
 fn event_gap_group_commit_inner(
@@ -11966,6 +12239,11 @@ fn fail_undispatched_write_command(cmd: WriteCommand, failure: &WriterFailure) -
         WriteCommand::PanicForTest { respond, .. } => {
             respond_oneshot_best_effort(respond, failure.result());
         }
+        #[cfg(test)]
+        WriteCommand::ShutdownPanicForTest { respond } => {
+            respond_oneshot_best_effort(respond, ());
+            return true;
+        }
         WriteCommand::Shutdown { respond } => {
             respond_oneshot_best_effort(respond, ());
             return true;
@@ -11983,7 +12261,12 @@ fn dispatch_write_command_raw_recovering(
 ) -> Option<WriterDispatchInterruption> {
     let _writer_authority = WriterDispatchAuthority::enter();
     let _ = take_writer_backend_epoch_poisoned_signal();
-    let command_was_shutdown = matches!(cmd, WriteCommand::Shutdown { .. });
+    let command_was_shutdown = match &cmd {
+        WriteCommand::Shutdown { .. } => true,
+        #[cfg(test)]
+        WriteCommand::ShutdownPanicForTest { .. } => true,
+        _ => false,
+    };
     let outcome = catch_recoverable(
         RecoverablePanicSite::StorageWriter,
         std::panic::AssertUnwindSafe(|| {
@@ -12212,6 +12495,8 @@ fn storage_io_fts_rebuild_bytes(config: &FtsSyncConfig) -> u64 {
 fn close_and_drain_writer_queue(
     rx: &mut mpsc::Receiver<WriteCommand>,
     queued_depth: &AtomicUsize,
+    terminal_drain_wakeup: &WriterWakeup,
+    terminal_admission_gate: &AtomicUsize,
     failure: &WriterFailure,
 ) {
     if catch_recoverable(
@@ -12235,7 +12520,11 @@ fn close_and_drain_writer_queue(
                 let _ = fail_undispatched_write_command(command, failure);
             }
             Err(mpsc::RecvError::Empty) => {
-                if queued_depth.load(AtomicOrdering::Acquire) == 0 {
+                if terminal_drain_wakeup.wait_for_terminal_depth_change(
+                    std::time::Duration::from_millis(10),
+                    queued_depth,
+                    terminal_admission_gate,
+                ) {
                     break;
                 }
                 // A sender can be between incrementing the exact-depth
@@ -12243,13 +12532,15 @@ fn close_and_drain_writer_queue(
                 // closure makes that send fail, after which the sender
                 // decrements its slot. Do not publish writer termination
                 // while such a slot is still outstanding.
-                std::thread::yield_now();
             }
             Err(mpsc::RecvError::Disconnected | mpsc::RecvError::Cancelled) => {
-                if queued_depth.load(AtomicOrdering::Acquire) == 0 {
+                if terminal_drain_wakeup.wait_for_terminal_depth_change(
+                    std::time::Duration::from_millis(10),
+                    queued_depth,
+                    terminal_admission_gate,
+                ) {
                     break;
                 }
-                std::thread::yield_now();
             }
         }
     }
@@ -12273,7 +12564,9 @@ fn writer_loop(
     rx: &mut mpsc::Receiver<WriteCommand>,
     mmap_mirror: &mut Option<mmap_store::MmapScrollbackStore>,
     queued_depth: &AtomicUsize,
+    terminal_drain_wakeup: &WriterWakeup,
     terminal_state: &AtomicU8,
+    terminal_admission_gate: &AtomicUsize,
     group_commit_events: bool,
     writer_wakeup: Option<&WriterWakeup>,
     group_commit_adaptive: bool,
@@ -12380,7 +12673,6 @@ fn writer_loop(
                     backend,
                     batch,
                     &mut should_break,
-                    terminal_state,
                     mmap_mirror,
                     &mut segment_redactors,
                     &mut io_gate,
@@ -12396,12 +12688,22 @@ fn writer_loop(
                         WRITER_TERMINAL_BACKEND_EPOCH_POISONED,
                         AtomicOrdering::Release,
                     );
+                    close_writer_terminal_admissions(
+                        terminal_admission_gate,
+                        terminal_drain_wakeup,
+                    );
                     // Transaction state is indeterminate: disable projections
                     // and clear in-memory redaction state without issuing even
                     // one more backend call on this connection.
                     *mmap_mirror = None;
                     segment_redactors.clear();
-                    close_and_drain_writer_queue(rx, queued_depth, &failure);
+                    close_and_drain_writer_queue(
+                        rx,
+                        queued_depth,
+                        terminal_drain_wakeup,
+                        terminal_admission_gate,
+                        &failure,
+                    );
                     break 'main;
                 }
 
@@ -12412,10 +12714,23 @@ fn writer_loop(
                 }
 
                 if should_break {
+                    // Publish clean closure only after the shutdown dispatch
+                    // (including its flush boundary) returned successfully.
+                    // Publishing before dispatch allowed a concurrent sender
+                    // to observe a false clean cause when shutdown itself
+                    // panicked and the epoch was subsequently poisoned. The
+                    // terminal admission mutex prevents any post-publication
+                    // sender from registering after the drain's final zero.
                     terminal_state.store(WRITER_TERMINAL_CLOSED_CLEANLY, AtomicOrdering::Release);
+                    close_writer_terminal_admissions(
+                        terminal_admission_gate,
+                        terminal_drain_wakeup,
+                    );
                     close_and_drain_writer_queue(
                         rx,
                         queued_depth,
+                        terminal_drain_wakeup,
+                        terminal_admission_gate,
                         &WriterFailure::WriterClosed,
                     );
                     break 'main;
@@ -12601,6 +12916,7 @@ mod writer_epoch_transaction_tests {
     #[test]
     fn writer_transaction_helper_classifies_every_control_and_mutation_outcome() {
         let _guard = writer_panic_counter_test_lock();
+        let _writer_authority = WriterDispatchAuthority::enter();
         reset_storage_writer_recovery_counters_for_test();
 
         for mode in [FaultMode::Error, FaultMode::Panic] {
@@ -12809,6 +13125,7 @@ mod writer_epoch_transaction_tests {
     #[test]
     fn writer_savepoint_helper_verifies_rollback_and_release_before_reuse() {
         let _guard = writer_panic_counter_test_lock();
+        let _writer_authority = WriterDispatchAuthority::enter();
         reset_storage_writer_recovery_counters_for_test();
 
         for mode in [FaultMode::Error, FaultMode::Panic] {
@@ -12955,11 +13272,8 @@ mod writer_epoch_transaction_tests {
             assert_epoch_poisoned(&result);
             assert_eq!(
                 backend.calls(),
-                vec![
-                    "SAVEPOINT test_unit",
-                    "ROLLBACK TO SAVEPOINT test_unit",
-                    "RELEASE SAVEPOINT test_unit",
-                ]
+                vec!["SAVEPOINT test_unit", "ROLLBACK TO SAVEPOINT test_unit"],
+                "failed or panicked ROLLBACK TO must fence the epoch without a later RELEASE"
             );
             assert!(take_writer_backend_epoch_poisoned_signal());
         }
@@ -13026,7 +13340,9 @@ mod writer_epoch_transaction_tests {
             let (raw_tx, mut rx) = mpsc::channel::<WriteCommand>(WRITER_BATCH_CAP + 32);
             let sender = WriteCommandSender::new(raw_tx, WRITER_BATCH_CAP + 32);
             let terminal_state = Arc::clone(&sender.terminal_state);
+            let terminal_admission_gate = Arc::clone(&sender.terminal_admission_gate);
             let queued_depth = Arc::clone(&sender.queued_depth);
+            let terminal_drain_wakeup = Arc::clone(&sender.terminal_drain_wakeup);
 
             let (first_tx, first_rx) = oneshot::channel();
             sender
@@ -13063,7 +13379,9 @@ mod writer_epoch_transaction_tests {
                 &mut rx,
                 &mut mmap_mirror,
                 queued_depth.as_ref(),
+                terminal_drain_wakeup.as_ref(),
                 terminal_state.as_ref(),
+                terminal_admission_gate.as_ref(),
                 false,
                 None,
                 true,
@@ -13103,6 +13421,78 @@ mod writer_epoch_transaction_tests {
             assert!(matches!(
                 poisoned_send,
                 Err(WriteCommandSendError::WriterBackendEpochPoisoned)
+            ));
+        });
+    }
+
+    #[test]
+    fn clean_shutdown_drains_more_than_one_batch_and_zeroes_exact_depth() {
+        run_storage_async_test(async {
+            let backend = FaultBackend::new("NEVER", FaultMode::Error);
+            let capacity = WRITER_BATCH_CAP + 32;
+            let (raw_tx, mut rx) = mpsc::channel::<WriteCommand>(capacity);
+            let sender = WriteCommandSender::new(raw_tx, capacity);
+            let terminal_state = Arc::clone(&sender.terminal_state);
+            let terminal_admission_gate = Arc::clone(&sender.terminal_admission_gate);
+            let queued_depth = Arc::clone(&sender.queued_depth);
+            let terminal_drain_wakeup = Arc::clone(&sender.terminal_drain_wakeup);
+
+            let (shutdown_tx, shutdown_rx) = oneshot::channel();
+            sender
+                .send(WriteCommand::Shutdown {
+                    respond: shutdown_tx,
+                })
+                .await
+                .expect("queue clean shutdown");
+            let mut tail_receivers = Vec::new();
+            for _ in 0..(WRITER_BATCH_CAP + 8) {
+                let (respond, receive) = oneshot::channel();
+                sender
+                    .send(WriteCommand::Vacuum { respond })
+                    .await
+                    .expect("queue post-shutdown tail");
+                tail_receivers.push(receive);
+            }
+
+            let mut mmap_mirror = None;
+            writer_loop(
+                &backend,
+                &mut rx,
+                &mut mmap_mirror,
+                queued_depth.as_ref(),
+                terminal_drain_wakeup.as_ref(),
+                terminal_state.as_ref(),
+                terminal_admission_gate.as_ref(),
+                false,
+                None,
+                false,
+            );
+
+            crate::runtime_async::oneshot_recv(shutdown_rx)
+                .await
+                .expect("shutdown acknowledgment");
+            for receive in tail_receivers {
+                let result = crate::runtime_async::oneshot_recv(receive)
+                    .await
+                    .expect("drained tail response");
+                assert!(matches!(
+                    result,
+                    Err(crate::Error::Storage(StorageError::WriterClosed))
+                ));
+            }
+            assert_eq!(queued_depth.load(AtomicOrdering::Acquire), 0);
+            assert_eq!(
+                terminal_state.load(AtomicOrdering::Acquire),
+                WRITER_TERMINAL_CLOSED_CLEANLY
+            );
+            assert!(backend.calls().is_empty(), "no post-shutdown backend calls");
+            assert!(matches!(
+                sender
+                    .send(WriteCommand::Shutdown {
+                        respond: oneshot::channel().0,
+                    })
+                    .await,
+                Err(WriteCommandSendError::WriterClosedCleanly)
             ));
         });
     }
@@ -13297,6 +13687,44 @@ mod writer_epoch_transaction_tests {
         });
     }
 
+    #[test]
+    fn writer_capacity_waiter_racing_clean_close_cannot_enqueue() {
+        run_storage_async_test(async {
+            let (raw_tx, mut rx) = mpsc::channel::<WriteCommand>(1);
+            let sender = WriteCommandSender::new(raw_tx, 1);
+            let (queued_tx, _queued_rx) = oneshot::channel();
+            sender
+                .send(WriteCommand::Shutdown { respond: queued_tx })
+                .await
+                .expect("fill writer queue");
+
+            let cx = crate::cx::for_request();
+            let (waiting_tx, _waiting_rx) = oneshot::channel();
+            let mut waiting_send = Box::pin(sender.send_with_cx(
+                &cx,
+                WriteCommand::Shutdown {
+                    respond: waiting_tx,
+                },
+            ));
+            let noop_waker = std::task::Waker::from(Arc::new(NoopWake));
+            assert!(poll_writer_send(&mut waiting_send, &noop_waker).is_pending());
+
+            sender
+                .terminal_state
+                .store(WRITER_TERMINAL_CLOSED_CLEANLY, AtomicOrdering::Release);
+            rx.close();
+            assert!(matches!(
+                poll_writer_send(&mut waiting_send, &noop_waker),
+                std::task::Poll::Ready(Err(WriteCommandSendError::WriterClosedCleanly))
+            ));
+
+            let queued = rx.try_recv().expect("drain command visible before close");
+            WriteCommandSender::mark_command_dequeued(&sender.queued_depth);
+            drop(queued);
+            assert_eq!(sender.queued_depth.load(AtomicOrdering::Acquire), 0);
+        });
+    }
+
     struct PanicOnDrop;
 
     impl Drop for PanicOnDrop {
@@ -13337,7 +13765,7 @@ mod writer_epoch_transaction_tests {
             RecoverablePanicSite::StorageWriter,
             std::panic::AssertUnwindSafe(|| {
                 respond_oneshot_best_effort(
-                    WakerResponder {
+                    WakerResponder::<Result<()>> {
                         waker: hostile_waker.clone(),
                         marker: std::marker::PhantomData,
                     },
@@ -13361,7 +13789,7 @@ mod writer_epoch_transaction_tests {
             RecoverablePanicSite::StorageWriter,
             std::panic::AssertUnwindSafe(|| {
                 let _responder = NestedRawResponse {
-                    responder: Some(WakerResponder {
+                    responder: Some(WakerResponder::<Result<()>> {
                         waker: hostile_waker.clone(),
                         marker: std::marker::PhantomData,
                     }),
@@ -13382,7 +13810,7 @@ mod writer_epoch_transaction_tests {
             let hostile_waker = std::task::Waker::from(Arc::new(PanickingWake));
             let (second_tx, second_rx) = oneshot::channel::<Result<()>>();
             respond_oneshot_best_effort(
-                WakerResponder {
+                WakerResponder::<Result<()>> {
                     waker: hostile_waker,
                     marker: std::marker::PhantomData,
                 },
@@ -13726,6 +14154,139 @@ mod writer_io_scheduler_tests {
         assert_eq!(gate.next_work_id, 1);
     }
 
+    fn real_writer_backend_with_panes(pane_ids: &[u64]) -> RusqliteBackend {
+        let conn = rusqlite::Connection::open_in_memory().expect("open in-memory writer database");
+        initialize_schema(&conn).expect("initialize writer test schema");
+        let backend = RusqliteBackend::new(conn);
+        for &pane_id in pane_ids {
+            upsert_pane_backend(&backend, &e8hd7_pane(pane_id))
+                .expect("seed append rollback pane");
+        }
+        backend
+    }
+
+    fn sorted_segment_contents(backend: &dyn StorageBackend, pane_id: u64) -> Vec<String> {
+        let mut segments = query_segments_backend(backend, pane_id, 100)
+            .expect("query append rollback segments");
+        segments.sort_by_key(|segment| segment.seq);
+        segments
+            .into_iter()
+            .map(|segment| segment.content)
+            .collect()
+    }
+
+    #[test]
+    fn singleton_append_failure_after_retroactive_mask_restores_database_and_redactor() {
+        let backend = real_writer_backend_with_panes(&[71]);
+        let mut redactors = HashMap::<u64, SegmentPersistRedactor>::new();
+        append_segment_commit_backend(
+            &backend,
+            71,
+            "prefix sk-",
+            None,
+            None,
+            &mut redactors,
+        )
+        .expect("seed split-secret prefix");
+        let redactors_before = redactors.clone();
+
+        set_append_commit_fault_for_test(AppendCommitFaultForTest::SingletonAfterRedaction);
+        let error = append_segment_commit_backend(
+            &backend,
+            71,
+            "abcdefghijklmnopqrstuvwxyz suffix",
+            None,
+            None,
+            &mut redactors,
+        )
+        .expect_err("post-redaction singleton fault must roll back");
+
+        assert!(
+            matches!(&error, crate::Error::Storage(StorageError::Database(_))),
+            "a proven ordinary rollback remains an ordinary database error: {error}"
+        );
+        assert_eq!(
+            sorted_segment_contents(&backend, 71),
+            vec!["prefix sk-".to_string()],
+            "ROLLBACK must restore the prior row rewritten by retroactive masking and remove the new row"
+        );
+        assert_eq!(
+            redactors, redactors_before,
+            "ordinary rollback must restore the exact pre-transaction lookback"
+        );
+
+        append_segment_commit_backend(
+            &backend,
+            71,
+            "abcdefghijklmnopqrstuvwxyz suffix",
+            None,
+            None,
+            &mut redactors,
+        )
+        .expect("one-shot fault clears and restored lookback supports retry");
+        let persisted = sorted_segment_contents(&backend, 71).concat();
+        assert!(!persisted.contains("sk-abcdefghijklmnopqrstuvwxyz"));
+        assert!(persisted.contains(crate::redactor::REDACTED_MARKER));
+    }
+
+    #[test]
+    fn grouped_second_append_failure_restores_all_unique_redactors_and_rows() {
+        let backend = real_writer_backend_with_panes(&[81, 82]);
+        let mut redactors = HashMap::<u64, SegmentPersistRedactor>::new();
+        for pane_id in [81, 82] {
+            append_segment_commit_backend(
+                &backend,
+                pane_id,
+                "prefix sk-",
+                None,
+                None,
+                &mut redactors,
+            )
+            .expect("seed grouped split-secret prefix");
+        }
+        let redactors_before = redactors.clone();
+        let (first_tx, _first_rx) = oneshot::channel();
+        let (second_tx, _second_rx) = oneshot::channel();
+        let writes = vec![
+            PendingAppendSegmentWrite {
+                pane_id: 81,
+                content: "abcdefghijklmnopqrstuvwxyz first".to_string(),
+                content_hash: None,
+                zone_type: None,
+                capture_hold: None,
+                respond: WriterResultResponder::new(first_tx),
+            },
+            PendingAppendSegmentWrite {
+                pane_id: 82,
+                content: "abcdefghijklmnopqrstuvwxyz second".to_string(),
+                content_hash: None,
+                zone_type: None,
+                capture_hold: None,
+                respond: WriterResultResponder::new(second_tx),
+            },
+        ];
+
+        set_append_commit_fault_for_test(AppendCommitFaultForTest::GroupAfterRedaction(1));
+        let error = append_segment_group_commit_backend(&backend, &writes, &mut redactors)
+            .expect_err("fault after the second redactor mutation must roll back the group");
+
+        assert!(
+            matches!(&error, crate::Error::Storage(StorageError::Database(_))),
+            "a proven ordinary grouped rollback remains a database error: {error}"
+        );
+        for pane_id in [81, 82] {
+            assert_eq!(
+                sorted_segment_contents(&backend, pane_id),
+                vec!["prefix sk-".to_string()],
+                "group rollback must restore rewritten prior rows and remove every new row for pane {pane_id}"
+            );
+        }
+        assert_eq!(
+            redactors, redactors_before,
+            "group rollback must restore one exact snapshot per uniquely touched pane"
+        );
+    }
+
     #[test]
     fn writer_batch_group_commits_consecutive_append_segments_same_pane() {
         run_storage_async_test(async {
@@ -13967,6 +14528,129 @@ mod writer_io_scheduler_tests {
         }
     }
 
+    struct RawMutationPanicBackend {
+        inner: crate::storage_backend_trait::MockBackend,
+        calls: Mutex<Vec<&'static str>>,
+        mutation_count: AtomicUsize,
+        panic_started: AtomicBool,
+        post_panic_calls: AtomicUsize,
+    }
+
+    impl RawMutationPanicBackend {
+        fn new() -> Self {
+            Self {
+                inner: crate::storage_backend_trait::MockBackend::new(),
+                calls: Mutex::new(Vec::new()),
+                mutation_count: AtomicUsize::new(0),
+                panic_started: AtomicBool::new(false),
+                post_panic_calls: AtomicUsize::new(0),
+            }
+        }
+
+        fn note_call(&self, label: &'static str) {
+            if self.panic_started.load(AtomicOrdering::Acquire) {
+                self.post_panic_calls
+                    .fetch_add(1, AtomicOrdering::Relaxed);
+            }
+            self.calls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(label);
+        }
+
+        fn calls(&self) -> Vec<&'static str> {
+            self.calls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        }
+    }
+
+    impl StorageBackend for RawMutationPanicBackend {
+        fn execute(&self, sql: &str) -> std::result::Result<usize, BackendError> {
+            self.note_call("execute");
+            self.inner.execute(sql)
+        }
+
+        fn execute_batch(&self, sql: &str) -> std::result::Result<(), BackendError> {
+            self.note_call("execute_batch");
+            self.inner.execute_batch(sql)
+        }
+
+        fn set_busy_timeout(
+            &self,
+            timeout: std::time::Duration,
+        ) -> std::result::Result<(), BackendError> {
+            self.note_call("set_busy_timeout");
+            self.inner.set_busy_timeout(timeout)
+        }
+
+        fn query_scalar(&self, sql: &str) -> std::result::Result<Option<String>, BackendError> {
+            self.note_call("query_scalar");
+            self.inner.query_scalar(sql)
+        }
+
+        fn begin_transaction(
+            &self,
+        ) -> std::result::Result<crate::storage_backend_trait::TransactionGuard<'_>, BackendError>
+        {
+            self.note_call("begin_transaction");
+            self.inner.begin_transaction()
+        }
+
+        fn user_version(&self) -> std::result::Result<u32, BackendError> {
+            self.note_call("user_version");
+            self.inner.user_version()
+        }
+
+        fn set_user_version(&self, version: u32) -> std::result::Result<(), BackendError> {
+            self.note_call("set_user_version");
+            self.inner.set_user_version(version)
+        }
+
+        fn backend_name(&self) -> &'static str {
+            "raw_mutation_panic"
+        }
+
+        fn query_row_strings(
+            &self,
+            sql: &str,
+            params: &[&str],
+        ) -> std::result::Result<Option<Vec<String>>, BackendError> {
+            if sql.contains("UPDATE events SET handled_at") {
+                {
+                    self.calls
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .push("raw_mutation_then_panic");
+                }
+                self.mutation_count.fetch_add(1, AtomicOrdering::Relaxed);
+                self.panic_started.store(true, AtomicOrdering::Release);
+                std::panic::panic_any("INJECTED-RAW-BACKEND-MUTATION-PANIC");
+            }
+            self.note_call("query_row_strings");
+            self.inner.query_row_strings(sql, params)
+        }
+
+        fn query_map_strings(
+            &self,
+            sql: &str,
+            params: &[&str],
+        ) -> std::result::Result<Vec<Vec<String>>, BackendError> {
+            self.note_call("query_map_strings");
+            self.inner.query_map_strings(sql, params)
+        }
+
+        fn execute_many(
+            &self,
+            sql: &str,
+            param_rows: &[Vec<ToSqlValue<'_>>],
+        ) -> std::result::Result<usize, BackendError> {
+            self.note_call("execute_many");
+            self.inner.execute_many(sql, param_rows)
+        }
+    }
+
     #[test]
     fn writer_batch_group_commit_panic_rolls_back_open_transaction() {
         let _counter_guard = writer_panic_counter_test_lock();
@@ -14092,7 +14776,7 @@ mod writer_io_scheduler_tests {
     }
 
     #[test]
-    fn writer_batch_recovers_from_dispatch_panic_and_fails_undispatched_tail() {
+    fn writer_batch_makes_every_raw_dispatch_panic_terminal_and_fails_tail() {
         let _counter_guard = writer_panic_counter_test_lock();
         reset_storage_writer_panics_total_for_test();
 
@@ -14150,9 +14834,9 @@ mod writer_io_scheduler_tests {
             assert!(
                 interruption
                     .as_ref()
-                    .is_some_and(|interruption| !interruption.terminate_epoch)
+                    .is_some_and(|interruption| interruption.terminate_epoch)
             );
-            assert!(!should_break);
+            assert!(should_break);
             assert_eq!(storage_writer_panics_total(), 1);
             assert_eq!(gate.scheduler.aggregate_items(), 0);
             assert!(gate.next_ordering_sequence_by_stream.is_empty());
@@ -14160,93 +14844,133 @@ mod writer_io_scheduler_tests {
                 .await
                 .expect("panicking command should receive a typed panic error");
             let panic_error = panic_result.expect_err("panicking command should fail closed");
-            assert!(
-                panic_error
-                    .to_string()
-                    .contains("storage writer recovered from dispatch panic"),
-                "{panic_error}"
-            );
+            assert!(matches!(
+                &panic_error,
+                crate::Error::Storage(StorageError::WriterBackendEpochPoisoned)
+            ));
             assert!(!panic_error.to_string().contains("SECRET-DISPATCH-SENTINEL"));
             let tail_result = crate::runtime_async::oneshot_recv(tail_rx)
                 .await
                 .expect("undispatched tail command should receive a panic error");
             let tail_error = tail_result.expect_err("tail command should fail closed");
-            assert!(
-                tail_error
-                    .to_string()
-                    .contains("storage writer recovered from dispatch panic"),
-                "{tail_error}"
-            );
+            assert!(matches!(
+                tail_error,
+                crate::Error::Storage(StorageError::WriterBackendEpochPoisoned)
+            ));
             let reserve_result = crate::runtime_async::oneshot_recv(reserve_rx)
                 .await
                 .expect("undispatched reserve should receive a panic error");
             let reserve_error =
                 reserve_result.expect_err("undispatched reserve should fail closed");
-            assert!(
-                reserve_error
-                    .to_string()
-                    .contains("storage writer recovered from dispatch panic"),
-                "{reserve_error}"
-            );
+            assert!(matches!(
+                reserve_error,
+                crate::Error::Storage(StorageError::WriterBackendEpochPoisoned)
+            ));
             let finalize_result = crate::runtime_async::oneshot_recv(finalize_rx)
                 .await
                 .expect("undispatched finalize should receive a panic error");
             let finalize_error =
                 finalize_result.expect_err("undispatched finalize should fail closed");
-            assert!(
-                finalize_error
-                    .to_string()
-                    .contains("storage writer recovered from dispatch panic"),
-                "{finalize_error}"
-            );
+            assert!(matches!(
+                finalize_error,
+                crate::Error::Storage(StorageError::WriterBackendEpochPoisoned)
+            ));
             let release_result = crate::runtime_async::oneshot_recv(release_rx)
                 .await
                 .expect("undispatched release should receive a panic error");
             let release_error =
                 release_result.expect_err("undispatched release should fail closed");
-            assert!(
-                release_error
-                    .to_string()
-                    .contains("storage writer recovered from dispatch panic"),
-                "{release_error}"
+            assert!(matches!(
+                release_error,
+                crate::Error::Storage(StorageError::WriterBackendEpochPoisoned)
+            ));
+        });
+    }
+
+    #[test]
+    fn raw_backend_mutation_panic_stops_all_later_backend_and_adaptive_work() {
+        let _counter_guard = writer_panic_counter_test_lock();
+        reset_storage_writer_panics_total_for_test();
+
+        run_storage_async_test(async {
+            let backend = RawMutationPanicBackend::new();
+            let (raw_tx, mut rx) = mpsc::channel::<WriteCommand>(8);
+            let sender = WriteCommandSender::new(raw_tx, 8);
+            let terminal_state = Arc::clone(&sender.terminal_state);
+            let terminal_admission_gate = Arc::clone(&sender.terminal_admission_gate);
+            let queued_depth = Arc::clone(&sender.queued_depth);
+            let terminal_drain_wakeup = Arc::clone(&sender.terminal_drain_wakeup);
+            let (mutation_tx, mutation_rx) = oneshot::channel();
+            let (tail_tx, tail_rx) = oneshot::channel();
+            let (shutdown_tx, shutdown_rx) = oneshot::channel();
+
+            sender
+                .send(WriteCommand::MarkEventHandled {
+                    event_id: 42,
+                    workflow_id: None,
+                    status: "handled".to_string(),
+                    respond: mutation_tx,
+                })
+                .await
+                .expect("queue raw mutation panic");
+            sender
+                .send(WriteCommand::Vacuum { respond: tail_tx })
+                .await
+                .expect("queue later backend command");
+            sender
+                .send(WriteCommand::Shutdown {
+                    respond: shutdown_tx,
+                })
+                .await
+                .expect("queue shutdown tail");
+
+            let mut mmap_mirror = None;
+            writer_loop(
+                &backend,
+                &mut rx,
+                &mut mmap_mirror,
+                queued_depth.as_ref(),
+                terminal_drain_wakeup.as_ref(),
+                terminal_state.as_ref(),
+                terminal_admission_gate.as_ref(),
+                false,
+                None,
+                true,
             );
 
-            let (shutdown_tx, shutdown_rx) = oneshot::channel();
-            let (post_shutdown_tx, post_shutdown_rx) = oneshot::channel();
-            let mut shutdown_batch = VecDeque::new();
-            shutdown_batch.push_back(WriteCommand::Shutdown {
-                respond: shutdown_tx,
-            });
-            shutdown_batch.push_back(WriteCommand::MarkEventHandled {
-                event_id: 43,
-                workflow_id: None,
-                status: "must-not-run-after-shutdown".to_string(),
-                respond: post_shutdown_tx,
-            });
-            let interruption = dispatch_write_command_batch(
-                &backend,
-                shutdown_batch,
-                &mut should_break,
-                &mut mmap_mirror,
-                &mut segment_redactors,
-                &mut gate,
-                false,
-            );
-            assert!(interruption.is_none());
+            let mutation = crate::runtime_async::oneshot_recv(mutation_rx)
+                .await
+                .expect("panicking mutation response");
+            assert!(matches!(
+                mutation,
+                Err(crate::Error::Storage(
+                    StorageError::WriterBackendEpochPoisoned
+                ))
+            ));
+            let tail = crate::runtime_async::oneshot_recv(tail_rx)
+                .await
+                .expect("undispatched backend tail response");
+            assert!(matches!(
+                tail,
+                Err(crate::Error::Storage(
+                    StorageError::WriterBackendEpochPoisoned
+                ))
+            ));
             crate::runtime_async::oneshot_recv(shutdown_rx)
                 .await
-                .expect("writer should still process a later shutdown");
-            assert!(should_break);
-            let post_shutdown_result = crate::runtime_async::oneshot_recv(post_shutdown_rx)
-                .await
-                .expect("the first command after shutdown must receive a typed result");
-            let post_shutdown_error = post_shutdown_result
-                .expect_err("commands after shutdown must fail without being dispatched");
-            assert!(
-                post_shutdown_error
-                    .to_string()
-                    .contains("storage writer shut down before dispatch"),
-                "{post_shutdown_error}"
+                .expect("drained shutdown tail acknowledgment");
+
+            assert_eq!(backend.mutation_count.load(AtomicOrdering::Relaxed), 1);
+            assert_eq!(backend.calls(), vec!["raw_mutation_then_panic"]);
+            assert_eq!(
+                backend.post_panic_calls.load(AtomicOrdering::Relaxed),
+                0,
+                "no later raw command, adaptive observation, flush, or teardown callback may reuse the poisoned backend"
+            );
+            assert_eq!(queued_depth.load(AtomicOrdering::Acquire), 0);
+            assert_eq!(
+                terminal_state.load(AtomicOrdering::Acquire),
+                WRITER_TERMINAL_BACKEND_EPOCH_POISONED
             );
         });
     }
@@ -14558,6 +15282,61 @@ mod writer_io_scheduler_tests {
             let second = crate::runtime_async::oneshot_recv(rx2).await.expect("rx2");
             assert!(second.is_err(), "second grouped caller fails closed");
         });
+    }
+
+    #[test]
+    fn event_gap_group_ordinary_rollback_restores_gap_redactor_snapshot() {
+        let _ = take_writer_backend_epoch_poisoned_signal();
+        let backend = crate::storage_backend_trait::MockBackend::new();
+        backend.enqueue_row_response(Some(vec!["5".to_string()]));
+        backend.enqueue_row_response(Some(vec!["77".to_string()]));
+        backend.enqueue_row_response(None);
+
+        let (gap_tx, _gap_rx) = oneshot::channel();
+        let (event_tx, _event_rx) = oneshot::channel();
+        let group = vec![
+            PendingEventOrGap::Gap {
+                pane_id: 7,
+                reason: "capture gap before later failure".to_string(),
+                capture_hold: None,
+                respond: WriterResultResponder::new(gap_tx),
+            },
+            PendingEventOrGap::Event {
+                event: Box::new(sample_event(
+                    7,
+                    "later-failing-event",
+                    1_700_000_000_001,
+                    Some("later-failing-dedupe"),
+                )),
+                capture_hold: None,
+                respond: WriterResultResponder::new(event_tx),
+            },
+        ];
+        let mut mmap_mirror = None;
+        let expected_redactor = SegmentPersistRedactor {
+            lookback: "pre-gap raw lookback sk-".to_string(),
+        };
+        let mut segment_redactors = HashMap::from([(7, expected_redactor.clone())]);
+
+        let result = event_gap_group_commit_backend(
+            &backend,
+            &group,
+            &mut mmap_mirror,
+            &mut segment_redactors,
+        );
+
+        assert!(result.is_err(), "the later event mutation must fail the group");
+        assert_eq!(
+            backend.executed(),
+            vec!["BEGIN".to_string(), "ROLLBACK".to_string()],
+            "the gap SQL and later mutation share one proven ordinary rollback"
+        );
+        assert_eq!(
+            segment_redactors.get(&7),
+            Some(&expected_redactor),
+            "an ordinary group rollback must restore the exact pre-gap lookback"
+        );
+        assert!(!take_writer_backend_epoch_poisoned_signal());
     }
 
     struct CommitFailBackend {
@@ -16299,6 +17078,12 @@ fn dispatch_write_command_raw(
             let _respond = WriterResultResponder::new(respond);
             std::panic::panic_any(message);
         }
+        #[cfg(test)]
+        WriteCommand::ShutdownPanicForTest { respond } => {
+            let _respond = WriterShutdownResponder::new(respond);
+            flush_segment_redactors(backend, mmap_mirror, segment_redactors);
+            std::panic::panic_any("INJECTED-WRITER-SHUTDOWN-FLUSH-PANIC");
+        }
         WriteCommand::Shutdown { respond } => {
             let respond = WriterShutdownResponder::new(respond);
             flush_segment_redactors(backend, mmap_mirror, segment_redactors);
@@ -16327,11 +17112,76 @@ fn dispatch_write_command_raw(
 /// lookback holds *raw* (un-redacted) bytes so a credential whose body is split
 /// mid-token is re-detected in full, preserving the prior design's cross-append
 /// coverage.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 struct SegmentPersistRedactor {
     /// Trailing *raw* bytes of the appended stream, capped at
     /// [`SEGMENT_REDACTION_LOOKBACK_BYTES`]. In-memory only; never persisted.
     lookback: String,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AppendCommitFaultForTest {
+    SingletonAfterRedaction,
+    GroupAfterRedaction(usize),
+}
+
+#[cfg(test)]
+thread_local! {
+    /// One-shot append-transaction fault seam. The fault fires only after the
+    /// redactor has advanced its lookback and had an opportunity to rewrite a
+    /// prior row, so rollback tests exercise both durable and in-memory state.
+    static APPEND_COMMIT_FAULT_FOR_TEST: std::cell::Cell<Option<AppendCommitFaultForTest>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+fn set_append_commit_fault_for_test(fault: AppendCommitFaultForTest) {
+    APPEND_COMMIT_FAULT_FOR_TEST.with(|slot| slot.set(Some(fault)));
+}
+
+#[cfg(test)]
+fn maybe_fail_singleton_append_after_redaction_for_test() -> Result<()> {
+    APPEND_COMMIT_FAULT_FOR_TEST.with(|slot| match slot.take() {
+        Some(AppendCommitFaultForTest::SingletonAfterRedaction) => Err(StorageError::Database(
+            "injected singleton append failure after redaction".to_string(),
+        )
+        .into()),
+        other => {
+            slot.set(other);
+            Ok(())
+        }
+    })
+}
+
+#[cfg(not(test))]
+#[inline(always)]
+fn maybe_fail_singleton_append_after_redaction_for_test() -> Result<()> {
+    Ok(())
+}
+
+#[cfg(test)]
+fn maybe_fail_group_append_after_redaction_for_test(write_index: usize) -> Result<()> {
+    APPEND_COMMIT_FAULT_FOR_TEST.with(|slot| match slot.take() {
+        Some(AppendCommitFaultForTest::GroupAfterRedaction(fault_index))
+            if fault_index == write_index =>
+        {
+            Err(StorageError::Database(format!(
+                "injected append group failure after redaction at write {write_index}"
+            ))
+            .into())
+        }
+        other => {
+            slot.set(other);
+            Ok(())
+        }
+    })
+}
+
+#[cfg(not(test))]
+#[inline(always)]
+fn maybe_fail_group_append_after_redaction_for_test(_write_index: usize) -> Result<()> {
+    Ok(())
 }
 
 /// Lookback window for cross-append secret detection at persist time
@@ -17158,6 +18008,7 @@ fn append_segment_commit_backend(
         || {
             let (redacted_content, retained_tail_moved) =
                 redact_segment_for_persistence(backend, pane_id, content, segment_redactors)?;
+            maybe_fail_singleton_append_after_redaction_for_test()?;
             let persisted_hash = if redacted_content == content {
                 content_hash
             } else {
@@ -17235,13 +18086,14 @@ fn append_segment_group_commit_inner(
         semantic_embedder.info().name
     };
 
-    for write in writes {
+    for (write_index, write) in writes.iter().enumerate() {
         let (content, retained_tail_moved) = redact_segment_for_persistence(
             backend,
             write.pane_id,
             &write.content,
             segment_redactors,
         )?;
+        maybe_fail_group_append_after_redaction_for_test(write_index)?;
         let content_hash = if content == write.content {
             write.content_hash.as_deref()
         } else {
@@ -18894,8 +19746,23 @@ fn open_read_storage_backend(db_path: &str) -> Result<RusqliteBackend> {
     Ok(backend)
 }
 
+const fn storage_backend_error_class(error: &BackendError) -> &'static str {
+    match error {
+        BackendError::Connect(_) => "connect",
+        BackendError::Query(_) => "query",
+        BackendError::TxPoisoned => "transaction_poisoned",
+        BackendError::Schema(_) => "schema",
+        BackendError::Other(_) => "other",
+    }
+}
+
 fn storage_backend_error(context: &str, err: BackendError) -> StorageError {
     if matches!(&err, BackendError::TxPoisoned) {
+        tracing::error!(
+            context,
+            error_class = storage_backend_error_class(&err),
+            "storage backend epoch is poisoned"
+        );
         if writer_dispatch_authority_is_active() {
             mark_writer_backend_epoch_poisoned("storage backend operation", "backend");
             StorageError::WriterBackendEpochPoisoned
@@ -25241,6 +26108,39 @@ fn build_indexing_health_report(
 /// to repair stale postings that historical deferred-retention builds could
 /// leave behind when `output_segments` rowids were reused.
 const FTS_INDEX_VERSION: u32 = 2;
+const FTS_STARTUP_PANE_PAGE_SIZE: usize = 256;
+const FTS_STARTUP_WARNING_LIMIT: usize = 32;
+const FTS_STARTUP_WARNING_DETAIL_LIMIT: usize = FTS_STARTUP_WARNING_LIMIT - 1;
+
+#[cfg(test)]
+thread_local! {
+    static FTS_STARTUP_FORCE_PANE_FAILURE: std::cell::Cell<bool> = const {
+        std::cell::Cell::new(false)
+    };
+}
+
+#[cfg(test)]
+fn set_fts_startup_force_pane_failure_for_test(enabled: bool) {
+    FTS_STARTUP_FORCE_PANE_FAILURE.with(|fault| fault.set(enabled));
+}
+
+#[cfg(test)]
+fn fts_startup_pane_fault_for_test() -> Option<crate::Error> {
+    FTS_STARTUP_FORCE_PANE_FAILURE.with(|fault| {
+        fault.get().then(|| {
+            StorageError::Database(
+                "/private/sensitive/startup.sqlite3: injected pane failure".to_string(),
+            )
+            .into()
+        })
+    })
+}
+
+#[cfg(not(test))]
+#[inline(always)]
+fn fts_startup_pane_fault_for_test() -> Option<crate::Error> {
+    None
+}
 /// Sentinel version used when a rebuild was started but did not finish.
 ///
 /// `sync_fts_on_startup_backend()` treats any non-current version as a
@@ -26016,16 +26916,29 @@ fn sync_fts_for_pane_backend_impl(
     Ok((total_indexed, max_seq))
 }
 
-fn panes_needing_fts_sync_backend(backend: &dyn StorageBackend) -> Result<Vec<u64>> {
+fn panes_needing_fts_sync_page_backend(
+    backend: &dyn StorageBackend,
+    after_pane_id: Option<u64>,
+    limit: usize,
+) -> Result<Vec<u64>> {
+    let after_pane_id = after_pane_id.map_or(Ok(-1), |pane_id| {
+        u64_to_i64(pane_id, "FTS startup pane cursor")
+    })?;
+    let limit = usize_to_i64(limit.max(1), "FTS startup pane page limit")?;
     let rows = backend
         .query_map_cells(
             "SELECT s.pane_id
              FROM output_segments s
              LEFT JOIN fts_pane_progress p ON p.pane_id = s.pane_id
+             WHERE s.pane_id > ?1
              GROUP BY s.pane_id
              HAVING MAX(p.pane_id) IS NULL OR MAX(s.seq) > MAX(p.last_indexed_seq)
-             ORDER BY s.pane_id",
-            &[],
+             ORDER BY s.pane_id
+             LIMIT ?2",
+            &[
+                ToSqlValue::Integer(after_pane_id),
+                ToSqlValue::Integer(limit),
+            ],
         )
         .map_err(|err| storage_backend_error("Failed to query panes needing FTS sync", err))?;
 
@@ -26071,37 +26984,48 @@ fn full_fts_rebuild_backend(
                 })?;
             clear_fts_pane_progress_backend(backend)?;
 
-            let pane_ids = backend
-                .query_map_cells(
-                    "SELECT DISTINCT pane_id FROM output_segments ORDER BY pane_id",
-                    &[],
-                )
-                .map_err(|err| storage_backend_error("Failed to query panes", err))?
-                .iter()
-                .map(|row| {
-                    CellRowReader::new(row)
-                        .i64(0)
-                        .and_then(|value| backend_i64_to_u64(value, "output_segments.pane_id"))
-                        .map_err(|err| storage_backend_error("Failed to list panes", err).into())
-                })
-                .collect::<Result<Vec<_>>>()?;
-
             let mut total_indexed = 0u64;
-            for pane_id in &pane_ids {
-                let (indexed, _) =
-                    sync_fts_for_pane_backend(backend, *pane_id, config).map_err(|error| {
-                        if is_writer_backend_epoch_poisoned(&error) {
-                            error
-                        } else {
-                            StorageError::Database(format!(
-                                "FTS rebuild failed while indexing pane {pane_id}: {error}"
-                            ))
-                            .into()
-                        }
+            let mut panes_processed = 0u64;
+            let mut after_pane_id = None;
+            loop {
+                // Progress was cleared above, so this bounded keyset page is
+                // exactly the set of distinct output pane IDs after the cursor.
+                // Reusing the startup pager keeps full rebuild memory bounded
+                // too; startup must never materialize the entire fleet.
+                let pane_ids = panes_needing_fts_sync_page_backend(
+                    backend,
+                    after_pane_id,
+                    FTS_STARTUP_PANE_PAGE_SIZE,
+                )?;
+                if pane_ids.is_empty() {
+                    break;
+                }
+                let page_len = pane_ids.len();
+                for pane_id in pane_ids {
+                    after_pane_id = Some(pane_id);
+                    let (indexed, _) = sync_fts_for_pane_backend(backend, pane_id, config)
+                        .map_err(|error| {
+                            if is_backend_epoch_poisoned(&error) {
+                                error
+                            } else {
+                                StorageError::Database(format!(
+                                    "FTS rebuild failed while indexing pane {pane_id}: {error}"
+                                ))
+                                .into()
+                            }
+                        })?;
+                    total_indexed = total_indexed.checked_add(indexed).ok_or_else(|| {
+                        StorageError::Database(
+                            "FTS rebuild indexed-row count overflow".to_string(),
+                        )
                     })?;
-                total_indexed = total_indexed.checked_add(indexed).ok_or_else(|| {
-                    StorageError::Database("FTS rebuild indexed-row count overflow".to_string())
-                })?;
+                    panes_processed = panes_processed.checked_add(1).ok_or_else(|| {
+                        StorageError::Database("FTS rebuild pane count overflow".to_string())
+                    })?;
+                }
+                if page_len < FTS_STARTUP_PANE_PAGE_SIZE {
+                    break;
+                }
             }
 
             upsert_fts_index_state_backend(
@@ -26113,10 +27037,7 @@ fn full_fts_rebuild_backend(
                     updated_at: now,
                 },
             )?;
-            Ok((
-                total_indexed,
-                u64::try_from(pane_ids.len()).unwrap_or(u64::MAX),
-            ))
+            Ok((total_indexed, panes_processed))
         },
     )?;
 
@@ -26127,6 +27048,23 @@ fn full_fts_rebuild_backend(
         duration_ms: u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX),
         warnings: Vec::new(),
     })
+}
+
+const fn fts_startup_error_class(error: &crate::Error) -> &'static str {
+    match error {
+        crate::Error::Storage(StorageError::Database(_)) => "database",
+        crate::Error::Storage(StorageError::BackendEpochPoisoned) => "backend_epoch_poisoned",
+        crate::Error::Storage(StorageError::WriterBackendEpochPoisoned) => {
+            "writer_backend_epoch_poisoned"
+        }
+        crate::Error::Storage(StorageError::MigrationEpochPoisoned) => {
+            "migration_epoch_poisoned"
+        }
+        crate::Error::Storage(StorageError::WriterClosed) => "writer_closed",
+        crate::Error::Storage(_) => "storage",
+        crate::Error::Cancelled(_) => "cancelled",
+        _ => "operation",
+    }
 }
 
 fn sync_fts_on_startup_backend(
@@ -26162,22 +27100,62 @@ fn sync_fts_on_startup_backend(
         return full_fts_rebuild_backend(backend, config);
     }
 
-    let pane_ids = panes_needing_fts_sync_backend(backend)?;
     let mut total_indexed = 0u64;
-    let panes_processed = u64::try_from(pane_ids.len()).unwrap_or(u64::MAX);
-
-    for pane_id in pane_ids {
-        match sync_fts_for_pane_backend(backend, pane_id, config) {
-            Ok((indexed, _)) => {
-                total_indexed = total_indexed.checked_add(indexed).ok_or_else(|| {
-                    StorageError::Database(
-                        "incremental FTS sync indexed-row count overflow".to_string(),
-                    )
-                })?;
-            }
-            Err(err) if is_writer_backend_epoch_poisoned(&err) => return Err(err),
-            Err(err) => warnings.push(format!("Pane {pane_id} incremental sync failed: {err}")),
+    let mut panes_processed = 0u64;
+    let mut omitted_warnings = 0u64;
+    let mut after_pane_id = None;
+    loop {
+        let pane_ids = panes_needing_fts_sync_page_backend(
+            backend,
+            after_pane_id,
+            FTS_STARTUP_PANE_PAGE_SIZE,
+        )?;
+        if pane_ids.is_empty() {
+            break;
         }
+        let page_len = pane_ids.len();
+        for pane_id in pane_ids {
+            after_pane_id = Some(pane_id);
+            panes_processed = panes_processed.checked_add(1).ok_or_else(|| {
+                StorageError::Database("incremental FTS pane count overflow".to_string())
+            })?;
+            let sync_result = match fts_startup_pane_fault_for_test() {
+                Some(error) => Err(error),
+                None => sync_fts_for_pane_backend(backend, pane_id, config),
+            };
+            match sync_result {
+                Ok((indexed, _)) => {
+                    total_indexed = total_indexed.checked_add(indexed).ok_or_else(|| {
+                        StorageError::Database(
+                            "incremental FTS sync indexed-row count overflow".to_string(),
+                        )
+                    })?;
+                }
+                Err(err) if is_backend_epoch_poisoned(&err) => return Err(err),
+                Err(err) if warnings.len() < FTS_STARTUP_WARNING_DETAIL_LIMIT => {
+                    warnings.push(format!(
+                        "Pane {pane_id} incremental sync failed: error_class={}",
+                        fts_startup_error_class(&err)
+                    ));
+                }
+                Err(_) => {
+                    omitted_warnings = omitted_warnings.checked_add(1).ok_or_else(|| {
+                        StorageError::Database(
+                            "incremental FTS omitted-warning count overflow".to_string(),
+                        )
+                    })?;
+                }
+            }
+        }
+        if page_len < FTS_STARTUP_PANE_PAGE_SIZE {
+            break;
+        }
+    }
+
+    if omitted_warnings > 0 {
+        warnings.push(format!(
+            "{omitted_warnings} additional pane synchronization warnings omitted"
+        ));
     }
 
     let duration = start.elapsed();
@@ -28940,7 +29918,7 @@ fn newest_event_queries_break_timestamp_ties_by_descending_id() {
 }
 
 #[test]
-fn event_delivery_backend_error_class_is_finite_and_content_free() {
+fn storage_backend_error_class_is_finite_and_content_free() {
     let sensitive = "/private/database/path.sqlite: injected SQL detail";
     let cases = [
         (BackendError::Connect(sensitive.to_string()), "connect"),
@@ -28951,7 +29929,7 @@ fn event_delivery_backend_error_class_is_finite_and_content_free() {
     ];
 
     for (error, expected) in &cases {
-        let class = event_delivery_backend_error_class(error);
+        let class = storage_backend_error_class(error);
         assert_eq!(class, *expected);
         assert!(!class.contains(sensitive));
     }
@@ -29221,6 +30199,7 @@ fn event_delivery_lease_batches_are_exact_atomic_and_bounded() {
 #[test]
 fn event_delivery_bulk_transaction_panic_rolls_back_before_returning() {
     let _guard = writer_panic_counter_test_lock();
+    let _writer_authority = WriterDispatchAuthority::enter();
     let backend = crate::storage_backend_trait::MockBackend::new();
     let leases = vec![(17, "token-17".to_string())];
     let result = execute_event_delivery_bulk_transaction(
@@ -36811,6 +37790,87 @@ fn storage_shutdown_with_cx_fresh_cx_full_shutdown() {
 }
 
 #[test]
+fn storage_shutdown_with_cx_pre_cancel_still_enqueues_cleanup() {
+    run_storage_async_test(async {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let db_path = directory.path().join("shutdown-pre-cancel.sqlite3");
+        let storage = StorageHandle::new(&db_path.to_string_lossy()).await.unwrap();
+        let caller_cx = crate::cx::for_testing();
+        caller_cx.cancel_with(
+            crate::outcome::CancelKind::User,
+            Some("pre-cancel shutdown test"),
+        );
+
+        storage.shutdown_with_cx(&caller_cx).await.unwrap();
+        // A fresh caller drives the join after the cancelled caller declined
+        // to wait. If cleanup had inherited cancellation, this would enqueue a
+        // first Shutdown only now instead of observing the prior terminal one.
+        storage.shutdown().await.unwrap();
+        assert_eq!(
+            storage.write_tx.terminal_state.load(AtomicOrdering::Acquire),
+            WRITER_TERMINAL_CLOSED_CLEANLY
+        );
+    });
+}
+
+#[test]
+fn storage_shutdown_with_cx_mid_cancel_after_enqueue_still_completes_cleanup() {
+    run_storage_async_test(async {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let db_path = directory.path().join("shutdown-mid-cancel.sqlite3");
+        let storage = StorageHandle::new(&db_path.to_string_lossy()).await.unwrap();
+        let caller_cx = crate::cx::for_testing();
+        storage.cancel_shutdown_after_enqueue_for_test();
+
+        storage.shutdown_with_cx(&caller_cx).await.unwrap();
+        assert!(caller_cx.is_cancel_requested());
+        storage.shutdown().await.unwrap();
+        assert_eq!(
+            storage.write_tx.terminal_state.load(AtomicOrdering::Acquire),
+            WRITER_TERMINAL_CLOSED_CLEANLY
+        );
+    });
+}
+
+#[test]
+fn storage_shutdown_surfaces_raw_shutdown_panic_after_unit_ack_and_join() {
+    run_storage_async_test(async {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let db_path = directory.path().join("shutdown-raw-panic.sqlite3");
+        let storage = StorageHandle::new(&db_path.to_string_lossy()).await.unwrap();
+        let (panic_tx, panic_rx) = oneshot::channel();
+
+        storage
+            .write_tx
+            .send(WriteCommand::ShutdownPanicForTest { respond: panic_tx })
+            .await
+            .expect("queue raw shutdown panic command");
+        crate::runtime_async::oneshot_recv(panic_rx)
+            .await
+            .expect("shutdown unwind guard deliberately acknowledges unit response");
+
+        let cx = crate::cx::for_testing();
+        let error = storage
+            .shutdown_with_cx(&cx)
+            .await
+            .expect_err("a non-cancelled shutdown join must surface retained epoch poison");
+        assert!(matches!(
+            error,
+            crate::Error::Storage(StorageError::WriterBackendEpochPoisoned)
+        ));
+
+        let repeated = storage
+            .shutdown()
+            .await
+            .expect_err("repeated shutdown without a join handle retains the typed poison");
+        assert!(matches!(
+            repeated,
+            crate::Error::Storage(StorageError::WriterBackendEpochPoisoned)
+        ));
+    });
+}
+
+#[test]
 fn storage_handle_graceful_shutdown() {
     run_storage_async_test(async {
         let temp_dir = std::env::temp_dir();
@@ -37698,6 +38758,7 @@ use fts_async_flat_tests::{run_storage_async_test, run_storage_proptest_async};
 mod write_command_sender_tests {
     use super::{
         StorageError, StorageHandle, WriteCommand, WriteCommandSender, run_storage_async_test,
+        storage_writer_queue_accounting_underflows_total,
     };
     use crate::runtime_async::{mpsc, oneshot};
 
@@ -37760,6 +38821,15 @@ mod write_command_sender_tests {
             poisoned,
             crate::Error::Storage(StorageError::WriterBackendEpochPoisoned)
         ));
+
+        let closed = StorageHandle::writer_send_error(
+            "test_write",
+            super::WriteCommandSendError::WriterClosedCleanly,
+        );
+        assert!(matches!(
+            closed,
+            crate::Error::Storage(StorageError::WriterClosed)
+        ));
     }
 
     #[test]
@@ -37798,6 +38868,123 @@ mod write_command_sender_tests {
             );
         });
     }
+
+    #[test]
+    fn writer_queue_depth_underflow_is_observable_without_panicking() {
+        let depth = std::sync::atomic::AtomicUsize::new(0);
+        let before = storage_writer_queue_accounting_underflows_total();
+
+        assert!(
+            !WriteCommandSender::mark_command_dequeued(&depth),
+            "dequeue-at-zero must be reported to its direct caller"
+        );
+
+        assert_eq!(depth.load(std::sync::atomic::Ordering::Acquire), 0);
+        assert!(
+            storage_writer_queue_accounting_underflows_total() >= before.saturating_add(1),
+            "an impossible dequeue at zero must never silently saturate"
+        );
+    }
+
+    #[test]
+    fn terminal_drain_gate_rejects_admission_after_terminal_publication() {
+        let (tx, _rx) = mpsc::channel::<WriteCommand>(1);
+        let sender = WriteCommandSender::new(tx, 1);
+        sender.terminal_state.store(
+            super::WRITER_TERMINAL_CLOSED_CLEANLY,
+            std::sync::atomic::Ordering::Release,
+        );
+        super::close_writer_terminal_admissions(
+            sender.terminal_admission_gate.as_ref(),
+            sender.terminal_drain_wakeup.as_ref(),
+        );
+
+        assert!(
+            super::WriterQueueAdmission::new_if_writer_healthy(
+                sender.queued_depth.as_ref(),
+                sender.terminal_drain_wakeup.as_ref(),
+                sender.terminal_state.as_ref(),
+                sender.terminal_admission_gate.as_ref(),
+            )
+            .is_none(),
+            "a sender arriving after terminal publication must not register a depth slot"
+        );
+        assert_eq!(
+            sender
+                .queued_depth
+                .load(std::sync::atomic::Ordering::Acquire),
+            0
+        );
+        assert!(
+            sender
+                .terminal_drain_wakeup
+                .wait_for_terminal_depth_change(
+                    std::time::Duration::ZERO,
+                    &sender.queued_depth,
+                    &sender.terminal_admission_gate,
+                ),
+            "the drain's atomic admission fence must retain zero as a stable terminal decision"
+        );
+    }
+
+    #[test]
+    fn terminal_drain_waits_for_sender_paused_before_depth_increment() {
+        let (tx, _rx) = mpsc::channel::<WriteCommand>(1);
+        let sender = WriteCommandSender::new(tx, 1);
+        let paused_admission = super::WriterTerminalAdmission::try_acquire(
+            sender.terminal_admission_gate.as_ref(),
+            sender.terminal_drain_wakeup.as_ref(),
+        )
+        .expect("healthy writer admits the pre-depth registration");
+
+        sender.terminal_state.store(
+            super::WRITER_TERMINAL_CLOSED_CLEANLY,
+            std::sync::atomic::Ordering::Release,
+        );
+        super::close_writer_terminal_admissions(
+            sender.terminal_admission_gate.as_ref(),
+            sender.terminal_drain_wakeup.as_ref(),
+        );
+        assert!(
+            !sender
+                .terminal_drain_wakeup
+                .wait_for_terminal_depth_change(
+                    std::time::Duration::ZERO,
+                    &sender.queued_depth,
+                    &sender.terminal_admission_gate,
+                ),
+            "depth zero is not final while a pre-terminal sender can still increment it"
+        );
+
+        drop(paused_admission);
+        assert!(
+            sender
+                .terminal_drain_wakeup
+                .wait_for_terminal_depth_change(
+                    std::time::Duration::ZERO,
+                    &sender.queued_depth,
+                    &sender.terminal_admission_gate,
+                ),
+            "once the pre-terminal registration retires, closed gate plus depth zero is stable"
+        );
+    }
+
+    #[test]
+    fn shutdown_ack_waiter_stops_on_expired_budget_without_hot_loop() {
+        run_storage_async_test(async {
+            let budget = crate::cx::Budget::new()
+                .with_deadline(asupersync::types::Time::ZERO);
+            let cx = crate::cx::Cx::for_testing_with_budget(budget);
+            let (_respond, receive) = oneshot::channel();
+
+            assert!(
+                !StorageHandle::recv_writer_shutdown_ack_with_cx(&cx, receive)
+                    .await
+                    .expect("expired budget is a caller-stop outcome"),
+                "an expired budget must stop waiting without claiming an acknowledgment"
+            );
+        });
+    }
 }
 
 // =============================================================================
@@ -37814,10 +39001,10 @@ mod pool_telemetry_tests {
         run_storage_async_test, with_provider_read_backend,
     };
     use crate::storage_backend_trait::{
-        MockBackend, OpenConfig, RusqliteBackend, StorageBackend, ToSqlValue,
+        BackendError, MockBackend, OpenConfig, RusqliteBackend, StorageBackend, ToSqlValue,
     };
     use std::sync::Arc;
-    use std::sync::atomic::Ordering;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Mutex, OnceLock};
 
     fn pool_counter_test_lock() -> &'static Mutex<()> {
@@ -38047,6 +39234,90 @@ mod pool_telemetry_tests {
 
     struct MockBackendLoan {
         backend: MockBackend,
+    }
+
+    #[derive(Clone, Default)]
+    struct TrackingPoisonProvider {
+        backend: MockBackend,
+        successful_returns: Arc<AtomicUsize>,
+        discarded: Arc<AtomicUsize>,
+    }
+
+    struct TrackingPoisonLoan {
+        backend: MockBackend,
+        successful_returns: Arc<AtomicUsize>,
+        discarded: Arc<AtomicUsize>,
+        reusable: bool,
+    }
+
+    impl StorageBackendLoan for TrackingPoisonLoan {
+        fn backend(&self) -> &dyn StorageBackend {
+            &self.backend
+        }
+
+        fn mark_successful_use(&mut self) {
+            self.reusable = true;
+            self.successful_returns.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    impl Drop for TrackingPoisonLoan {
+        fn drop(&mut self) {
+            if !self.reusable {
+                self.discarded.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    impl StorageBackendProvider for TrackingPoisonProvider {
+        fn open_writer_backend(
+            &self,
+            _request: StorageWriterOpenRequest,
+        ) -> super::Result<Box<dyn StorageBackend>> {
+            Ok(Box::new(self.backend.clone()))
+        }
+
+        fn lend_read_backend<'a>(
+            &'a self,
+            _db_path: &str,
+        ) -> super::Result<Box<dyn StorageBackendLoan + 'a>> {
+            Ok(Box::new(TrackingPoisonLoan {
+                backend: self.backend.clone(),
+                successful_returns: Arc::clone(&self.successful_returns),
+                discarded: Arc::clone(&self.discarded),
+                reusable: false,
+            }))
+        }
+
+        fn provider_name(&self) -> &'static str {
+            "tracking-poison-provider"
+        }
+    }
+
+    #[test]
+    fn nonwriter_backend_poison_is_generic_and_discards_read_loan() {
+        let provider = TrackingPoisonProvider::default();
+        let writer_poison_count = super::storage_writer_epoch_poisons_total();
+        let _ = super::take_writer_backend_epoch_poisoned_signal();
+
+        let result: super::Result<()> =
+            with_provider_read_backend(&provider, "poisoned-read", |_| {
+                Err(super::storage_backend_error("read probe", BackendError::TxPoisoned).into())
+            });
+        assert!(matches!(
+            result,
+            Err(crate::Error::Storage(
+                crate::error::StorageError::BackendEpochPoisoned
+            ))
+        ));
+        assert_eq!(
+            super::storage_writer_epoch_poisons_total(),
+            writer_poison_count,
+            "a nonwriter poisoned loan has no authority to bump writer poison telemetry"
+        );
+        assert!(!super::writer_backend_epoch_poisoned_signal_is_set());
+        assert_eq!(provider.successful_returns.load(Ordering::Relaxed), 0);
+        assert_eq!(provider.discarded.load(Ordering::Relaxed), 1);
     }
 
     impl StorageBackendLoan for MockBackendLoan {

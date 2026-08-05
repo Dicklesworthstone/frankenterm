@@ -42,7 +42,19 @@ fn clear_fts_pane_progress_test(conn: &mut Connection) -> Result<()> {
 }
 
 fn panes_needing_fts_sync_test(conn: &mut Connection) -> Result<Vec<u64>> {
-    with_fts_backend(conn, panes_needing_fts_sync_backend)
+    with_fts_backend(conn, |backend| {
+        let mut panes = Vec::new();
+        let mut after = None;
+        loop {
+            let page = panes_needing_fts_sync_page_backend(backend, after, 3)?;
+            let Some(last) = page.last().copied() else {
+                break;
+            };
+            after = Some(last);
+            panes.extend(page);
+        }
+        Ok(panes)
+    })
 }
 
 fn full_fts_rebuild_test(conn: &mut Connection, config: &FtsSyncConfig) -> Result<FtsSyncResult> {
@@ -192,6 +204,64 @@ fn sync_fts_on_startup_initializes_state() {
     // State should be initialized
     let state = get_fts_index_state_test(&mut conn).unwrap().unwrap();
     assert_eq!(state.index_version, FTS_INDEX_VERSION);
+}
+
+#[test]
+fn startup_fts_failure_storm_pages_panes_and_bounds_content_free_warnings() {
+    let mut conn = Connection::open_in_memory().unwrap();
+    initialize_schema(&conn).unwrap();
+    apply_defer_fts_triggers(&conn);
+    let pane_count = FTS_STARTUP_PANE_PAGE_SIZE + 44;
+    for pane_id in 1..=pane_count {
+        let pane_id = u64::try_from(pane_id).unwrap();
+        insert_test_pane(&conn, pane_id);
+        insert_test_segment(&conn, pane_id, 0, "failure-storm-token");
+    }
+
+    set_fts_startup_force_pane_failure_for_test(true);
+    let result = sync_fts_on_startup_test(&mut conn, &FtsSyncConfig::default()).unwrap();
+    set_fts_startup_force_pane_failure_for_test(false);
+
+    assert_eq!(result.segments_indexed, 0);
+    assert_eq!(result.panes_processed, u64::try_from(pane_count).unwrap());
+    assert_eq!(result.warnings.len(), FTS_STARTUP_WARNING_LIMIT);
+    assert!(result.warnings[..FTS_STARTUP_WARNING_DETAIL_LIMIT]
+        .iter()
+        .all(|warning| warning.contains("error_class=database")));
+    assert!(result
+        .warnings
+        .iter()
+        .all(|warning| !warning.contains("/private/sensitive")));
+    assert_eq!(
+        result.warnings.last().unwrap(),
+        &format!(
+            "{} additional pane synchronization warnings omitted",
+            pane_count - FTS_STARTUP_WARNING_DETAIL_LIMIT
+        )
+    );
+}
+
+#[test]
+fn full_fts_rebuild_pages_more_than_one_startup_pane_batch() {
+    let mut conn = Connection::open_in_memory().unwrap();
+    initialize_schema(&conn).unwrap();
+    apply_defer_fts_triggers(&conn);
+    let pane_count = FTS_STARTUP_PANE_PAGE_SIZE + 7;
+    for pane_id in 1..=pane_count {
+        let pane_id = u64::try_from(pane_id).unwrap();
+        insert_test_pane(&conn, pane_id);
+        insert_test_segment(&conn, pane_id, 0, "paged-full-rebuild-token");
+    }
+
+    let result = full_fts_rebuild_test(&mut conn, &FtsSyncConfig::default()).unwrap();
+
+    assert!(result.full_rebuild);
+    assert_eq!(result.segments_indexed, u64::try_from(pane_count).unwrap());
+    assert_eq!(result.panes_processed, u64::try_from(pane_count).unwrap());
+    assert_eq!(
+        fts_match_count(&conn, "paged-full-rebuild-token"),
+        i64::try_from(pane_count).unwrap()
+    );
 }
 
 fn assert_short_fetch_byte_prefix_converges(insert_select_batch: bool) {
@@ -397,12 +467,24 @@ fn sync_all_panes_for_test(
 ) -> Result<u64> {
     with_fts_backend(conn, |backend| {
         let mut total_indexed = 0u64;
-        for pane_id in panes_needing_fts_sync_backend(backend)? {
-            let (indexed, _) =
-                sync_fts_for_pane_backend_with_mode(backend, pane_id, config, insert_select_batch)?;
-            total_indexed = total_indexed.checked_add(indexed).ok_or_else(|| {
-                StorageError::Database("test FTS indexed-row count overflow".to_string())
-            })?;
+        let mut after = None;
+        loop {
+            let page = panes_needing_fts_sync_page_backend(backend, after, 3)?;
+            let Some(last) = page.last().copied() else {
+                break;
+            };
+            after = Some(last);
+            for pane_id in page {
+                let (indexed, _) = sync_fts_for_pane_backend_with_mode(
+                    backend,
+                    pane_id,
+                    config,
+                    insert_select_batch,
+                )?;
+                total_indexed = total_indexed.checked_add(indexed).ok_or_else(|| {
+                    StorageError::Database("test FTS indexed-row count overflow".to_string())
+                })?;
+            }
         }
         Ok(total_indexed)
     })
