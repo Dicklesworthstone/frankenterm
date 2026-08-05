@@ -694,17 +694,19 @@ fn infer_priority_codex_over_claude() {
 
 fn make_health_entry(
     shard_id: usize,
-    label: &str,
     status: HealthStatus,
-    error: Option<&str>,
+    probe_outcome: ShardHealthProbeOutcome,
 ) -> ShardHealthEntry {
     ShardHealthEntry {
         shard_id: ShardId(shard_id),
-        label: label.to_string(),
         status,
-        pane_count: error.is_none().then_some(5),
+        pane_count: matches!(
+            probe_outcome,
+            ShardHealthProbeOutcome::Complete | ShardHealthProbeOutcome::Cancelled
+        )
+        .then_some(5),
         circuit: CircuitBreakerStatus::default(),
-        error: error.map(String::from),
+        probe_outcome,
     }
 }
 
@@ -712,11 +714,19 @@ fn make_health_entry(
 fn health_report_unhealthy_shards_filters_correctly() {
     let report = ShardHealthReport {
         timestamp_ms: 1000,
-        overall: HealthStatus::Degraded,
+        overall: HealthStatus::Critical,
         shards: vec![
-            make_health_entry(0, "healthy-shard", HealthStatus::Healthy, None),
-            make_health_entry(1, "degraded-shard", HealthStatus::Degraded, Some("slow")),
-            make_health_entry(2, "critical-shard", HealthStatus::Critical, Some("down")),
+            make_health_entry(0, HealthStatus::Healthy, ShardHealthProbeOutcome::Complete),
+            make_health_entry(
+                1,
+                HealthStatus::Degraded,
+                ShardHealthProbeOutcome::Failed(ShardBackendErrorClass::Other),
+            ),
+            make_health_entry(
+                2,
+                HealthStatus::Critical,
+                ShardHealthProbeOutcome::Failed(ShardBackendErrorClass::Other),
+            ),
         ],
     };
 
@@ -732,8 +742,8 @@ fn health_report_all_healthy_no_unhealthy() {
         timestamp_ms: 1000,
         overall: HealthStatus::Healthy,
         shards: vec![
-            make_health_entry(0, "s0", HealthStatus::Healthy, None),
-            make_health_entry(1, "s1", HealthStatus::Healthy, None),
+            make_health_entry(0, HealthStatus::Healthy, ShardHealthProbeOutcome::Complete),
+            make_health_entry(1, HealthStatus::Healthy, ShardHealthProbeOutcome::Complete),
         ],
     };
 
@@ -746,8 +756,12 @@ fn health_report_watchdog_warnings_format() {
         timestamp_ms: 1000,
         overall: HealthStatus::Hung,
         shards: vec![
-            make_health_entry(0, "good", HealthStatus::Healthy, None),
-            make_health_entry(1, "bad", HealthStatus::Hung, Some("connection refused")),
+            make_health_entry(0, HealthStatus::Healthy, ShardHealthProbeOutcome::Complete),
+            make_health_entry(
+                1,
+                HealthStatus::Hung,
+                ShardHealthProbeOutcome::Failed(ShardBackendErrorClass::Other),
+            ),
         ],
     };
 
@@ -757,8 +771,6 @@ fn health_report_watchdog_warnings_format() {
     assert!(warnings[0].contains("status=hung"));
     assert!(warnings[0].contains("circuit=closed"));
     assert!(warnings[0].contains("probe=other"));
-    assert!(!warnings[0].contains("bad"));
-    assert!(!warnings[0].contains("connection refused"));
     assert!(warnings[0].len() < 256);
 }
 
@@ -767,24 +779,31 @@ fn health_report_watchdog_warnings_empty_when_all_healthy() {
     let report = ShardHealthReport {
         timestamp_ms: 1000,
         overall: HealthStatus::Healthy,
-        shards: vec![make_health_entry(0, "s0", HealthStatus::Healthy, None)],
+        shards: vec![make_health_entry(
+            0,
+            HealthStatus::Healthy,
+            ShardHealthProbeOutcome::Complete,
+        )],
     };
 
     assert!(report.watchdog_warnings().is_empty());
 }
 
 #[test]
-fn health_report_without_backend_error_has_complete_probe_class() {
+fn health_report_complete_unhealthy_probe_has_complete_class() {
     let report = ShardHealthReport {
         timestamp_ms: 1000,
         overall: HealthStatus::Critical,
-        shards: vec![make_health_entry(0, "s0", HealthStatus::Critical, None)],
+        shards: vec![make_health_entry(
+            0,
+            HealthStatus::Critical,
+            ShardHealthProbeOutcome::Complete,
+        )],
     };
 
     let warnings = report.watchdog_warnings();
     assert_eq!(warnings.len(), 1);
     assert!(warnings[0].contains("probe=complete"));
-    assert!(!warnings[0].contains("s0"));
 }
 
 #[test]
@@ -805,8 +824,12 @@ fn health_report_serde_roundtrip() {
         timestamp_ms: 12345,
         overall: HealthStatus::Degraded,
         shards: vec![
-            make_health_entry(0, "alpha", HealthStatus::Healthy, None),
-            make_health_entry(1, "beta", HealthStatus::Degraded, Some("slow")),
+            make_health_entry(0, HealthStatus::Healthy, ShardHealthProbeOutcome::Complete),
+            make_health_entry(
+                1,
+                HealthStatus::Degraded,
+                ShardHealthProbeOutcome::Failed(ShardBackendErrorClass::Other),
+            ),
         ],
     };
 
@@ -816,13 +839,11 @@ fn health_report_serde_roundtrip() {
     assert_eq!(back.overall, HealthStatus::Degraded);
     assert_eq!(back.outcome(), ShardHealthReportOutcome::Complete);
     assert_eq!(back.shards.len(), 2);
-    assert!(back.shards.iter().all(|entry| entry.label.is_empty()));
-    assert_eq!(back.shards[0].probe_outcome(), ShardHealthProbeOutcome::Complete);
+    assert_eq!(back.shards[0].probe_outcome, ShardHealthProbeOutcome::Complete);
     assert_eq!(
-        back.shards[1].probe_outcome(),
+        back.shards[1].probe_outcome,
         ShardHealthProbeOutcome::Failed(ShardBackendErrorClass::Other)
     );
-    assert_eq!(back.shards[1].error.as_deref(), Some("other"));
 
     let projection: serde_json::Value = serde_json::from_str(&json).unwrap();
     assert_eq!(projection["outcome"], "complete");
@@ -833,9 +854,6 @@ fn health_report_serde_roundtrip() {
         projection["shards"][1]["probe_outcome"]["error_class"],
         "other"
     );
-    assert!(!json.contains("alpha"));
-    assert!(!json.contains("beta"));
-    assert!(!json.contains("slow"));
 }
 
 #[test]
@@ -846,36 +864,33 @@ fn cancelled_health_report_preserves_stable_typed_topology() {
         shards: vec![
             ShardHealthEntry {
                 shard_id: ShardId(0),
-                label: "completed-secret-label".to_owned(),
                 status: HealthStatus::Healthy,
                 pane_count: Some(4),
                 circuit: CircuitBreakerStatus::default(),
-                error: None,
+                probe_outcome: ShardHealthProbeOutcome::Complete,
             },
             ShardHealthEntry {
                 shard_id: ShardId(1),
-                label: "cancelled-secret-label".to_owned(),
                 status: HealthStatus::Degraded,
                 pane_count: Some(2),
                 circuit: CircuitBreakerStatus::default(),
-                error: Some("scan_cancelled".to_owned()),
+                probe_outcome: ShardHealthProbeOutcome::Cancelled,
             },
             ShardHealthEntry {
                 shard_id: ShardId(2),
-                label: "not-started-secret-label".to_owned(),
                 status: HealthStatus::Degraded,
                 pane_count: None,
                 circuit: CircuitBreakerStatus::default(),
-                error: Some("not_started".to_owned()),
+                probe_outcome: ShardHealthProbeOutcome::NotStarted,
             },
         ],
     };
 
     assert_eq!(report.outcome(), ShardHealthReportOutcome::Cancelled);
     assert_eq!(report.shards.len(), 3);
-    assert_eq!(report.shards[0].probe_outcome(), ShardHealthProbeOutcome::Complete);
-    assert_eq!(report.shards[1].probe_outcome(), ShardHealthProbeOutcome::Cancelled);
-    assert_eq!(report.shards[2].probe_outcome(), ShardHealthProbeOutcome::NotStarted);
+    assert_eq!(report.shards[0].probe_outcome, ShardHealthProbeOutcome::Complete);
+    assert_eq!(report.shards[1].probe_outcome, ShardHealthProbeOutcome::Cancelled);
+    assert_eq!(report.shards[2].probe_outcome, ShardHealthProbeOutcome::NotStarted);
 
     let warnings = report.watchdog_warnings();
     assert_eq!(warnings.len(), 2);
@@ -886,7 +901,6 @@ fn cancelled_health_report_preserves_stable_typed_topology() {
     assert!(warnings[1].contains("circuit=not_observed"));
 
     let json = serde_json::to_string(&report).unwrap();
-    assert!(!json.contains("secret-label"));
     let projection: serde_json::Value = serde_json::from_str(&json).unwrap();
     assert_eq!(projection["outcome"], "cancelled");
     let back: ShardHealthReport = serde_json::from_str(&json).unwrap();
@@ -895,17 +909,16 @@ fn cancelled_health_report_preserves_stable_typed_topology() {
 }
 
 #[test]
-fn hostile_health_report_projections_are_content_and_cardinality_bounded() {
+fn typed_health_report_projections_are_cardinality_bounded() {
     const SHARD_COUNT: usize = 70;
     const WARNING_LIMIT: usize = 64;
     let shards = (0..SHARD_COUNT)
         .map(|index| ShardHealthEntry {
             shard_id: ShardId(index),
-            label: format!("label-secret-{index}-{}", "x".repeat(4_096)),
             status: HealthStatus::Critical,
             pane_count: None,
             circuit: CircuitBreakerStatus::default(),
-            error: Some(format!("error-secret-{index}-{}", "y".repeat(4_096))),
+            probe_outcome: ShardHealthProbeOutcome::Failed(ShardBackendErrorClass::Other),
         })
         .collect();
     let report = ShardHealthReport {
@@ -923,26 +936,17 @@ fn hostile_health_report_projections_are_content_and_cardinality_bounded() {
         warnings.last().map(String::as_str),
         Some("Shard watchdog omitted 6 additional unhealthy shard(s) after bounded limit 64")
     );
-    assert!(warnings
-        .iter()
-        .all(|warning| !warning.contains("label-secret") && !warning.contains("error-secret")));
-
     let debug = format!("{report:?}");
     assert!(debug.contains("shard_count: 70"));
     assert!(debug.contains("omitted_shards: 54"));
-    assert!(!debug.contains("label-secret"));
-    assert!(!debug.contains("error-secret"));
     assert!(debug.len() < 16 * 1_024);
 
     let json = serde_json::to_string(&report).unwrap();
-    assert!(!json.contains("label-secret"));
-    assert!(!json.contains("error-secret"));
     assert!(json.len() < 128 * 1_024);
     let back: ShardHealthReport = serde_json::from_str(&json).unwrap();
     assert!(back.shards.iter().all(|entry| {
-        entry.label.is_empty()
-            && entry.probe_outcome()
-                == ShardHealthProbeOutcome::Failed(ShardBackendErrorClass::Other)
+        entry.probe_outcome
+            == ShardHealthProbeOutcome::Failed(ShardBackendErrorClass::Other)
     }));
 }
 
@@ -953,11 +957,10 @@ fn health_report_wire_rejects_conflicting_or_noncanonical_authority() {
         overall: HealthStatus::Degraded,
         shards: vec![ShardHealthEntry {
             shard_id: ShardId(0),
-            label: String::new(),
             status: HealthStatus::Degraded,
             pane_count: None,
             circuit: CircuitBreakerStatus::default(),
-            error: Some("not_started".to_owned()),
+            probe_outcome: ShardHealthProbeOutcome::NotStarted,
         }],
     };
     let valid_json = serde_json::to_string(&valid).unwrap();
@@ -970,6 +973,13 @@ fn health_report_wire_rejects_conflicting_or_noncanonical_authority() {
     let mut conflicting_overall = valid_value.clone();
     conflicting_overall["overall"] = serde_json::Value::String("healthy".to_owned());
     assert!(serde_json::from_value::<ShardHealthReport>(conflicting_overall).is_err());
+
+    let mut missing_report_outcome = valid_value.clone();
+    missing_report_outcome
+        .as_object_mut()
+        .unwrap()
+        .remove("outcome");
+    assert!(serde_json::from_value::<ShardHealthReport>(missing_report_outcome).is_err());
 
     let mut raw_error_injection = valid_value.clone();
     raw_error_injection["shards"][0]["error"] =
@@ -998,29 +1008,36 @@ fn health_report_wire_rejects_conflicting_or_noncanonical_authority() {
         timestamp_ms: 12_349,
         overall: HealthStatus::Healthy,
         shards: vec![
-            make_health_entry(0, "first", HealthStatus::Healthy, None),
-            make_health_entry(0, "second", HealthStatus::Healthy, None),
+            make_health_entry(0, HealthStatus::Healthy, ShardHealthProbeOutcome::Complete),
+            make_health_entry(0, HealthStatus::Healthy, ShardHealthProbeOutcome::Complete),
         ],
     };
     assert!(serde_json::to_string(&invalid_duplicate).is_err());
 
     let invalid_healthy_failure = ShardHealthEntry {
         shard_id: ShardId(0),
-        label: String::new(),
         status: HealthStatus::Healthy,
         pane_count: None,
         circuit: CircuitBreakerStatus::default(),
-        error: Some("command_failed".to_owned()),
+        probe_outcome: ShardHealthProbeOutcome::Failed(ShardBackendErrorClass::CommandFailed),
     };
     assert!(serde_json::to_string(&invalid_healthy_failure).is_err());
 
+    let invalid_complete_without_count = ShardHealthEntry {
+        shard_id: ShardId(0),
+        status: HealthStatus::Healthy,
+        pane_count: None,
+        circuit: CircuitBreakerStatus::default(),
+        probe_outcome: ShardHealthProbeOutcome::Complete,
+    };
+    assert!(serde_json::to_string(&invalid_complete_without_count).is_err());
+
     let invalid_out_of_range_entry = ShardHealthEntry {
         shard_id: ShardId(MAX_SHARD_ID + 1),
-        label: String::new(),
         status: HealthStatus::Healthy,
         pane_count: Some(1),
         circuit: CircuitBreakerStatus::default(),
-        error: None,
+        probe_outcome: ShardHealthProbeOutcome::Complete,
     };
     assert!(serde_json::to_string(&invalid_out_of_range_entry).is_err());
 
@@ -1028,7 +1045,13 @@ fn health_report_wire_rejects_conflicting_or_noncanonical_authority() {
         timestamp_ms: 12_350,
         overall: HealthStatus::Healthy,
         shards: (0..=MAX_CONFIGURED_SHARDS)
-            .map(|shard_id| make_health_entry(shard_id, "", HealthStatus::Healthy, None))
+            .map(|shard_id| {
+                make_health_entry(
+                    shard_id,
+                    HealthStatus::Healthy,
+                    ShardHealthProbeOutcome::Complete,
+                )
+            })
             .collect(),
     };
     assert!(serde_json::to_string(&oversized_report).is_err());

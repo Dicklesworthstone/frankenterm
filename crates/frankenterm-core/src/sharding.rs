@@ -530,7 +530,6 @@ impl ShardBackendErrorClass {
             Self::Other => "other",
         }
     }
-
 }
 
 impl std::fmt::Display for ShardBackendErrorClass {
@@ -799,10 +798,10 @@ impl ShardHealthReport {
 
     /// Render human-readable warnings suitable for watchdog snapshots.
     ///
-    /// Backend labels and errors are deliberately excluded. Both can contain
-    /// caller-controlled pane text, paths, credentials, or arbitrarily large
-    /// strings. The watchdog surface needs stable operational classification,
-    /// not a second copy of backend diagnostics. Every per-shard line is
+    /// Raw backend diagnostics are deliberately excluded because they can
+    /// contain caller-controlled pane text, paths, credentials, or arbitrarily
+    /// large strings. The watchdog surface needs stable operational
+    /// classification, not a second copy of backend diagnostics. Every line is
     /// therefore content-free and bounded by fixed-width enum/numeric fields,
     /// while the number of lines is capped independently of configured shard
     /// count.
@@ -1019,6 +1018,9 @@ fn validate_shard_health_entry(entry: &ShardHealthEntry) -> std::result::Result<
     ) && entry.pane_count.is_some()
     {
         return Err("an unobserved or failed shard health probe cannot report a pane count");
+    }
+    if entry.probe_outcome == ShardHealthProbeOutcome::Complete && entry.pane_count.is_none() {
+        return Err("a completed shard health probe must report a pane count");
     }
     Ok(())
 }
@@ -1280,10 +1282,10 @@ impl ShardedWeztermClient {
     ) -> crate::Error {
         // Keep the codec failure first and in the same error variant so
         // rollback trouble adds evidence without replacing the root cause.
-        // A backend label or ordinary cleanup error is just as untrusted as a
-        // panic payload: either can contain credentials, pane text, paths, or
-        // an arbitrarily large string. Retain only static operation classes
-        // and numeric routing identity in the compensator suffix.
+        // An ordinary cleanup error is just as untrusted as a panic payload:
+        // either can contain credentials, pane text, paths, or an arbitrarily
+        // large string. Retain only static operation classes and numeric
+        // routing identity in the compensator suffix.
         let primary_detail = format!(
             "local pane id {local_pane_id} exceeds {LOCAL_PANE_ID_BITS}-bit encoded capacity (max={LOCAL_PANE_ID_MASK})"
         );
@@ -4543,7 +4545,6 @@ mod tests {
             let client =
                 ShardedWeztermClient::new(backends, AssignmentStrategy::RoundRobin).unwrap();
             let client_debug = format!("{client:?}");
-            assert!(!client_debug.contains("health-label-secret-sentinel"));
             assert!(client_debug.len() < 512);
 
             let routed_error = client
@@ -5436,7 +5437,7 @@ mod tests {
             shards: vec![ShardHealthEntry {
                 shard_id: ShardId(0),
                 status: HealthStatus::Critical,
-                pane_count: None,
+                pane_count: Some(0),
                 circuit: CircuitBreakerStatus::default(),
                 probe_outcome: ShardHealthProbeOutcome::Complete,
             }],

@@ -172,6 +172,10 @@ fn arb_shard_health_entry() -> impl Strategy<Value = ShardHealthEntry> {
                     ShardHealthProbeOutcome::Failed(_) | ShardHealthProbeOutcome::NotStarted
                 ) {
                     pane_count = None;
+                } else if probe_outcome == ShardHealthProbeOutcome::Complete
+                    && pane_count.is_none()
+                {
+                    pane_count = Some(0);
                 }
                 ShardHealthEntry {
                     shard_id: ShardId(shard_id),
@@ -294,7 +298,7 @@ fn health_probe_wire_uses_typed_finite_outcomes_only() {
                     HealthStatus::Degraded
                 }
             },
-            pane_count: None,
+            pane_count: (expected == ShardHealthProbeOutcome::Complete).then_some(0),
             circuit: CircuitBreakerStatus::default(),
             probe_outcome: expected,
         };
