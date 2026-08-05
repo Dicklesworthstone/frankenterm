@@ -1308,7 +1308,7 @@ fn pane_entry(
 }
 
 fn pane_entry_from_ordered_observation(
-    observed: &OrderedPaneEntryObservation,
+    observed: OrderedPaneEntryObservation,
     tab_id: TabId,
     window_id: WindowId,
     is_active_pane: bool,
@@ -1321,18 +1321,18 @@ fn pane_entry_from_ordered_observation(
         window_id,
         tab_id,
         pane_id: observed.pane_id,
-        title: observed.title.clone(),
+        title: observed.title,
         is_active_pane,
         is_zoomed_pane,
         size: observed.size,
-        working_dir: observed.working_dir.clone(),
+        working_dir: observed.working_dir,
         alt_screen_active: observed.alt_screen_active,
         workspace: workspace.to_string(),
         cursor_pos: observed.cursor_pos,
         physical_top: observed.physical_top,
         left_col,
         top_row,
-        tty_name: observed.tty_name.clone(),
+        tty_name: observed.tty_name,
     }
 }
 
@@ -3128,7 +3128,7 @@ impl Tab {
                     Some((captured, observed.tree_entries))
                 }
             };
-            let Some(((captured, active, zoomed, tab_title), tree_entries)) = captured else {
+            let Some(((captured, active, zoomed, tab_title), mut tree_entries)) = captured else {
                 continue;
             };
 
@@ -3174,7 +3174,7 @@ impl Tab {
                         left_col,
                         top_row,
                     } => {
-                        let observed = tree_entries.get(&identity).ok_or_else(|| {
+                        let observed = tree_entries.remove(&identity).ok_or_else(|| {
                             anyhow::anyhow!(
                                 "exact tree-pane identity {identity:p} lacks its pre-fence ordered observation"
                             )
