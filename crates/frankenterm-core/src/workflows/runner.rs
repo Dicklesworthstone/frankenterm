@@ -2749,31 +2749,23 @@ impl WorkflowRunner {
                 .lock_manager
                 .held_lock_release_guard(pane_id, execution_id);
             let reason = format!("run_workflow cancelled pre-start: {err}");
-            let cleanup_cx = crate::cx::for_request();
-            if let Err(cleanup_err) = self
-                .fail_execution_with_cx(&cleanup_cx, execution_id, &reason)
-                .await
-            {
-                tracing::warn!(
+            let cleanup_result = self
+                .persist_cancelled_execution_with_fresh_cx(
+                    workflow.name(),
                     execution_id,
-                    error = %cleanup_err,
-                    "Failed to mark pre-start cancelled workflow as failed"
-                );
-            }
-            if let Err(cleanup_err) = self
-                .mark_trigger_event_handled_with_cx(&cleanup_cx, execution_id, "error")
+                    pane_id,
+                    &reason,
+                    start_step,
+                    None,
+                )
                 .await
-            {
-                tracing::warn!(
-                    execution_id,
-                    error = %cleanup_err,
-                    "Failed to mark trigger event handled after pre-start cancellation"
-                );
-            }
+                .map_err(|error| {
+                    format!("{reason}; independent cancellation cleanup failed: {error}")
+                });
             capacity_timer.finish_error(crate::runtime_telemetry::FailureClass::Safety);
             return WorkflowExecutionResult::Error {
                 execution_id: Some(execution_id.to_string()),
-                error: reason,
+                error: cleanup_result.err().unwrap_or(reason),
             };
         }
         let result = self
