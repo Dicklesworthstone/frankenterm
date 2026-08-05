@@ -2605,6 +2605,21 @@ fn bound_mcp_send_policy_decision_output(decision: &mut PolicyDecision) {
     }
 }
 
+fn bound_mcp_send_submit_receipt_output(receipt: &mut crate::robot_types::SubmitReceipt) {
+    if let Some(agent_type) = receipt.agent_type.as_mut() {
+        *agent_type = bounded_mcp_send_response_text(agent_type);
+    }
+    if let Some(profile_id) = receipt.profile_id.as_mut() {
+        *profile_id = bounded_mcp_send_response_text(profile_id);
+    }
+    if let Some(profile_version) = receipt.profile_version.as_mut() {
+        *profile_version = bounded_mcp_send_response_text(profile_version);
+    }
+    for rule_id in &mut receipt.evidence_rule_ids {
+        *rule_id = bounded_mcp_send_response_text(rule_id);
+    }
+}
+
 fn bound_mcp_send_data_output(data: &mut McpSendData) {
     match &mut data.injection {
         InjectionResult::Allowed {
@@ -2631,6 +2646,9 @@ fn bound_mcp_send_data_output(data: &mut McpSendData) {
     }
     if let Some(error) = data.verification_error.as_mut() {
         *error = bounded_mcp_send_response_text(error);
+    }
+    if let Some(submit) = data.submit.as_mut() {
+        bound_mcp_send_submit_receipt_output(submit);
     }
 }
 
@@ -23448,7 +23466,21 @@ exit 17",
                 is_regex: false,
             }),
             verification_error: Some(hostile),
-            submit: None,
+            submit: Some(crate::robot_types::SubmitReceipt {
+                state: crate::robot_types::SubmitReceiptState::Submitted,
+                guarantee_level: crate::robot_types::SubmitGuaranteeLevel::Submitted,
+                guarantee_met: true,
+                agent_type: Some(hostile.clone()),
+                profile_id: Some(hostile.clone()),
+                profile_version: Some(hostile.clone()),
+                attempts: 1,
+                evidence_rule_ids: vec![hostile.clone()],
+                elapsed_ms: 1,
+                polls: 1,
+                cursor_before: Some("pane:17:capture:sha256:safe-before".to_string()),
+                cursor_after: Some("pane:17:capture:sha256:safe-after".to_string()),
+                idempotency_key: "sha256:safe-idempotency-key".to_string(),
+            }),
             dry_run: false,
         };
 
@@ -23472,6 +23504,10 @@ exit 17",
             value["injection"]["decision"]["context"]["evidence"][0]["value"].as_str(),
             value["wait_for"]["pattern"].as_str(),
             value["verification_error"].as_str(),
+            value["submit"]["agent_type"].as_str(),
+            value["submit"]["profile_id"].as_str(),
+            value["submit"]["profile_version"].as_str(),
+            value["submit"]["evidence_rule_ids"][0].as_str(),
         ] {
             assert!(
                 field.is_some_and(|field| field.len() <= super::MCP_SEND_OUTPUT_MAX_BYTES)
