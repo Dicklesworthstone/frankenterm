@@ -172,15 +172,26 @@ impl GetTcapBuilder {
         if data == b';' {
             self.flush();
         } else if !self.discarding_all && !self.discarding_current {
-            if self.current.len() < MAX_TCAP_CURRENT_BYTES {
-                self.current.push(data);
-            } else {
+            if self.current.len() >= MAX_TCAP_CURRENT_BYTES {
                 log::warn!(
                     "XtGetTcap name exceeded {} byte limit; discarding the overlong name",
                     MAX_TCAP_CURRENT_BYTES,
                 );
                 self.current.clear();
                 self.discarding_current = true;
+            } else if self
+                .accepted_raw_name_bytes
+                .checked_add(self.current.len())
+                .is_none_or(|retained| retained >= MAX_TCAP_TOTAL_BYTES)
+            {
+                log::warn!(
+                    "XtGetTcap aggregate name input exceeded {} byte limit; discarding the current and further names",
+                    MAX_TCAP_TOTAL_BYTES,
+                );
+                self.current.clear();
+                self.discarding_all = true;
+            } else {
+                self.current.push(data);
             }
         }
     }
