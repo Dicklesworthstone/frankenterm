@@ -3763,7 +3763,11 @@ mod tests {
 
             let warnings = client.shard_watchdog_warnings_with_cx(&cx).await;
             assert_eq!(warnings.len(), 1);
-            assert!(warnings[0].contains("Shard 1 (failing)"));
+            assert!(warnings[0].contains("Shard 1 unhealthy"));
+            assert!(
+                !warnings[0].contains("failing"),
+                "Cx-first watchdog warnings must not reflect backend labels"
+            );
         });
     }
 
