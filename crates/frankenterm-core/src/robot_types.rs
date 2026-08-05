@@ -869,13 +869,49 @@ impl SubmitGuaranteeLevel {
             Self::Working => {
                 state == SubmitReceiptState::Submitted
                     && evidence_rule_ids.iter().any(|rule| {
-                        rule.contains(":working_state:")
-                            || rule.ends_with(":semantic_output_after_input")
-                            || rule.ends_with(":canary_semantic_output_after_input")
+                        is_canonical_submit_working_evidence(rule)
                     })
             }
         }
     }
+}
+
+fn is_canonical_submit_working_evidence(rule_id: &str) -> bool {
+    let Some(evidence) = rule_id.strip_prefix("submit_profile:") else {
+        return false;
+    };
+
+    for semantic_kind in [
+        "semantic_output_after_input",
+        "canary_semantic_output_after_input",
+    ] {
+        if let Some(profile_id) = evidence.strip_suffix(semantic_kind) {
+            let Some(profile_id) = profile_id.strip_suffix(':') else {
+                continue;
+            };
+            return is_canonical_submit_profile_id(profile_id);
+        }
+    }
+
+    let Some((profile_and_kind, index_text)) = evidence.rsplit_once(':') else {
+        return false;
+    };
+    let Some(profile_id) = profile_and_kind.strip_suffix(":working_state") else {
+        return false;
+    };
+    let Ok(index) = index_text.parse::<usize>() else {
+        return false;
+    };
+
+    is_canonical_submit_profile_id(profile_id) && index.to_string() == index_text
+}
+
+fn is_canonical_submit_profile_id(profile_id: &str) -> bool {
+    !profile_id.is_empty()
+        && !profile_id.contains(':')
+        && !profile_id.chars().any(char::is_whitespace)
+        && profile_id.contains('.')
+        && profile_id.split('.').all(|segment| !segment.is_empty())
 }
 
 fn default_submit_guarantee_met() -> bool {

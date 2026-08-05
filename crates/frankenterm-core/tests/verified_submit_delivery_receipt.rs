@@ -179,10 +179,37 @@ fn submit_guarantee_level_silent_success_and_fail_open_guards() {
         !Working.is_met_by(St::Submitted, none),
         "working needs evidence"
     );
-    let working_evidence = vec!["claude_code:working_state:busy".to_string()];
+    let working_evidence = vec!["submit_profile:claude_code.default:working_state:0".to_string()];
     assert!(Working.is_met_by(St::Submitted, &working_evidence));
     // ...and even with the evidence, a queued (not-yet-working) state is not `working`.
     assert!(!Working.is_met_by(St::QueuedBehindOperation, &working_evidence));
+
+    for forged_evidence in [
+        "claude_code.default:working_state:0",
+        "prefix:submit_profile:claude_code.default:working_state:0",
+        "submit_profile::working_state:0",
+        "submit_profile:claude_code.default:working_state:busy",
+        "submit_profile:claude_code.default:working_state:00",
+        "submit_profile:claude_code.default:working_state:0:trailing",
+        "claude_code.default:semantic_output_after_input",
+        "submit_profile::semantic_output_after_input",
+        "submit_profile:claude_code.default:semantic_output_after_input:trailing",
+    ] {
+        assert!(
+            !Working.is_met_by(St::Submitted, &[forged_evidence.to_string()]),
+            "non-canonical evidence must not satisfy working: {forged_evidence}"
+        );
+    }
+
+    for canonical_evidence in [
+        "submit_profile:claude_code.default:semantic_output_after_input",
+        "submit_profile:claude_code.default:canary_semantic_output_after_input",
+    ] {
+        assert!(
+            Working.is_met_by(St::Submitted, &[canonical_evidence.to_string()]),
+            "canonical semantic evidence must satisfy working: {canonical_evidence}"
+        );
+    }
 
     // Profile requirement: only `write` is profile-free.
     assert!(!Write.requires_submit_profile());

@@ -1390,6 +1390,13 @@ fn validate_submit_profile_identity(profile: &SubmitProfile) -> Result<()> {
         ))
         .into());
     }
+    if profile.id.contains(':') {
+        return Err(PatternError::InvalidRule(format!(
+            "submit profile id '{}' cannot contain the evidence delimiter ':'",
+            profile.id
+        ))
+        .into());
+    }
     if !profile.id.contains('.')
         || profile
             .id
@@ -6252,6 +6259,23 @@ rules:
         assert!(
             err.contains("crash_to_shell"),
             "error should name the missing anchor group: {err}"
+        );
+    }
+
+    #[test]
+    fn submit_profile_validation_rejects_evidence_delimiter_in_identity() {
+        let mut profile = builtin_codex_submit_profile();
+        profile.id = "codex.default:working_state".to_string();
+        let pack = PatternPack::new("custom:codex", "0.1.0", Vec::new())
+            .with_submit_profiles(vec![profile]);
+
+        let err = match PatternLibrary::new(vec![pack]) {
+            Ok(_) => panic!("ambiguous submit profile identity must fail validation"),
+            Err(err) => err.to_string(),
+        };
+        assert!(
+            err.contains("evidence delimiter"),
+            "error should identify the reserved delimiter: {err}"
         );
     }
 
