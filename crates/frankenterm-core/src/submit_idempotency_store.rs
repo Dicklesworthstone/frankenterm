@@ -1466,10 +1466,10 @@ pub fn claim(
     ft_dir: &Path,
     binding: &SubmitIdempotencyBinding,
 ) -> Result<ClaimOutcome, SubmitIdempotencyError> {
-    claim_with_nonce_limits_and_clock(
+    claim_with_nonce_factory_limits_and_clock(
         ft_dir,
         binding,
-        fresh_owner_nonce()?,
+        fresh_owner_nonce,
         PRODUCTION_LIMITS,
         now_unix_ms,
     )
@@ -1490,9 +1490,29 @@ fn claim_with_nonce_limits_and_clock<F>(
     binding: &SubmitIdempotencyBinding,
     owner_nonce: [u8; OWNER_NONCE_BYTES],
     limits: StoreLimits,
+    clock: F,
+) -> Result<ClaimOutcome, SubmitIdempotencyError>
+where
+    F: FnMut() -> i64,
+{
+    claim_with_nonce_factory_limits_and_clock(
+        ft_dir,
+        binding,
+        move || Ok(owner_nonce),
+        limits,
+        clock,
+    )
+}
+
+fn claim_with_nonce_factory_limits_and_clock<N, F>(
+    ft_dir: &Path,
+    binding: &SubmitIdempotencyBinding,
+    mut owner_nonce_factory: N,
+    limits: StoreLimits,
     mut clock: F,
 ) -> Result<ClaimOutcome, SubmitIdempotencyError>
 where
+    N: FnMut() -> Result<[u8; OWNER_NONCE_BYTES], SubmitIdempotencyError>,
     F: FnMut() -> i64,
 {
     validate_binding(binding)?;
@@ -1521,6 +1541,7 @@ where
     match read_header(&tx, binding, SubmitIdempotencyError::ClaimFailed)? {
         None => {
             ensure_new_record_capacity(&tx, binding, limits)?;
+            let owner_nonce = owner_nonce_factory()?;
             let lease_expires = now
                 .checked_add(OWNER_LEASE_DURATION_MS)
                 .ok_or(SubmitIdempotencyError::ClaimFailed)?;
@@ -1595,6 +1616,7 @@ where
         }
         Some(header) if header.state == STATE_RETRYABLE => {
             ensure_reclaim_capacity(&tx, limits)?;
+            let owner_nonce = owner_nonce_factory()?;
             let next_generation = header
                 .generation
                 .checked_add(1)
@@ -2164,6 +2186,20 @@ mod tests {
         }
     }
 
+    fn claim_without_entropy_at(
+        ft_dir: &Path,
+        binding: &SubmitIdempotencyBinding,
+        now: i64,
+    ) -> Result<ClaimOutcome, SubmitIdempotencyError> {
+        claim_with_nonce_factory_limits_and_clock(
+            ft_dir,
+            binding,
+            || Err(SubmitIdempotencyError::EntropyUnavailable),
+            PRODUCTION_LIMITS,
+            move || now,
+        )
+    }
+
     #[test]
     fn full_digest_keys_are_canonical_and_traversal_safe() {
         let generated = binding(42, "nonce");
@@ -2215,6 +2251,79 @@ mod tests {
         assert_eq!(
             lookup(dir.path(), &binding),
             Ok(Some(StoredSubmitState::Completed(original)))
+        );
+    }
+
+    #[test]
+    fn only_claim_outcomes_that_acquire_ownership_require_fresh_entropy() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let now = now_unix_ms();
+
+        let active = binding(7, "entropy-active");
+        let _active_token = claim_with_nonce_limits_and_time(
+            dir.path(),
+            &active,
+            [1; OWNER_NONCE_BYTES],
+            PRODUCTION_LIMITS,
+            now,
+        )
+        .expect("create active owner");
+        assert_eq!(
+            claim_without_entropy_at(dir.path(), &active, now + 1),
+            Ok(ClaimOutcome::InFlight)
+        );
+
+        let pending = binding(7, "entropy-pending");
+        let pending_token = claim_token(dir.path(), &pending);
+        mark_effect_applied_receipt_pending(dir.path(), &pending, pending_token)
+            .expect("mark pending");
+        assert_eq!(
+            claim_without_entropy_at(dir.path(), &pending, now + 1),
+            Ok(ClaimOutcome::EffectAppliedReceiptPending)
+        );
+
+        let in_doubt = binding(7, "entropy-in-doubt");
+        let in_doubt_token = claim_token(dir.path(), &in_doubt);
+        mark_in_doubt(dir.path(), &in_doubt, in_doubt_token).expect("mark in doubt");
+        assert_eq!(
+            claim_without_entropy_at(dir.path(), &in_doubt, now + 1),
+            Ok(ClaimOutcome::InDoubt)
+        );
+
+        let completed = binding(7, "entropy-completed");
+        let completed_receipt = receipt(&completed, SubmitReceiptState::Submitted);
+        let completed_token = claim_token(dir.path(), &completed);
+        complete_owned(
+            dir.path(),
+            &completed,
+            completed_token,
+            &completed_receipt,
+        );
+        assert_eq!(
+            claim_without_entropy_at(dir.path(), &completed, now + 1),
+            Ok(ClaimOutcome::Completed(completed_receipt))
+        );
+
+        let retryable = binding(7, "entropy-retryable");
+        let retryable_token = claim_token(dir.path(), &retryable);
+        mark_retryable(
+            dir.path(),
+            &retryable,
+            retryable_token,
+            RetryableReason::PolicyDenied,
+        )
+        .expect("mark retryable");
+        assert_eq!(
+            claim_without_entropy_at(dir.path(), &retryable, now + 1),
+            Err(SubmitIdempotencyError::EntropyUnavailable),
+            "reclaiming Retryable must still fail closed without fresh owner entropy"
+        );
+
+        let absent = binding(7, "entropy-absent");
+        assert_eq!(
+            claim_without_entropy_at(dir.path(), &absent, now + 1),
+            Err(SubmitIdempotencyError::EntropyUnavailable),
+            "creating a new owner must still fail closed without fresh entropy"
         );
     }
 
