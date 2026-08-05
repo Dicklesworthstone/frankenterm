@@ -65,7 +65,21 @@ use crate::event_templates::{RenderedEvent, render_event};
 use crate::events::{NotificationGate, NotifyDecision, event_identity_key};
 use crate::patterns::Detection;
 use crate::policy::Redactor;
+use crate::runtime_async::LockAcquireError;
 use crate::storage::{StorageHandle, StoredEvent};
+
+fn notification_lock_error(error: LockAcquireError) -> crate::Error {
+    match error {
+        LockAcquireError::Cancelled => {
+            crate::Error::runtime_cancelled("notification.mute_store", error.to_string())
+        }
+        LockAcquireError::TimedOut { .. }
+        | LockAcquireError::Poisoned
+        | LockAcquireError::PolledAfterCompletion => {
+            crate::Error::runtime_backend("notification.mute_store", error.to_string())
+        }
+    }
+}
 
 /// Unified notification payload for all senders.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -399,52 +413,21 @@ impl NotificationPipeline {
     }
 
     /// Gate and dispatch a detection event.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed runtime error if the mute-store lock cannot be acquired,
+    /// or propagates a storage cancellation/backend error from the mute query.
     pub async fn handle_detection(
         &mut self,
         detection: &Detection,
         pane_id: u64,
         pane_uuid: Option<&str>,
         event_id: Option<i64>,
-    ) -> NotificationOutcome {
-        if let Some(storage) = &self.mute_store {
-            let identity_key = event_identity_key(detection, pane_id, pane_uuid);
-            let now_ms = now_epoch_ms();
-            let storage_handle = { storage.read().await.clone() };
-            let muted = storage_handle
-                .is_event_muted(&identity_key, now_ms)
-                .await
-                .unwrap_or(false);
-            if muted {
-                return NotificationOutcome {
-                    decision: NotifyDecision::Filtered,
-                    deliveries: Vec::new(),
-                };
-            }
-        }
-
-        let decision = self.gate.should_notify(detection, pane_id, pane_uuid);
-        match decision {
-            NotifyDecision::Send {
-                suppressed_since_last,
-            } => {
-                let rendered = render_detection(detection, pane_id, event_id);
-                let payload = NotificationPayload::from_detection(
-                    detection,
-                    pane_id,
-                    &rendered,
-                    suppressed_since_last,
-                );
-                let deliveries = self.dispatch_payload(&payload).await;
-                NotificationOutcome {
-                    decision,
-                    deliveries,
-                }
-            }
-            _ => NotificationOutcome {
-                decision,
-                deliveries: Vec::new(),
-            },
-        }
+    ) -> crate::Result<NotificationOutcome> {
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.handle_detection_with_cx(&cx, detection, pane_id, pane_uuid, event_id)
+            .await
     }
 
     /// Gate and dispatch a detection event, bound to the caller's
@@ -457,9 +440,10 @@ impl NotificationPipeline {
     /// cloned before the DB read so the RwLock guard is not held across
     /// storage I/O.
     ///
-    /// The legacy [`handle_detection`](Self::handle_detection) entry
-    /// point is preserved for non-migrated callers; this is strictly
-    /// additive.
+    /// # Errors
+    ///
+    /// Returns a typed runtime error if the mute-store lock cannot be acquired,
+    /// or propagates a storage cancellation/backend error from the mute query.
     pub async fn handle_detection_with_cx(
         &mut self,
         cx: &crate::cx::Cx,
@@ -467,25 +451,28 @@ impl NotificationPipeline {
         pane_id: u64,
         pane_uuid: Option<&str>,
         event_id: Option<i64>,
-    ) -> NotificationOutcome {
+    ) -> crate::Result<NotificationOutcome> {
         if let Some(storage) = &self.mute_store {
             let identity_key = event_identity_key(detection, pane_id, pane_uuid);
             let now_ms = now_epoch_ms();
-            let storage_handle = storage.read_with_cx(cx).await.clone();
+            let storage_handle = storage
+                .read_with_cx(cx)
+                .await
+                .map_err(notification_lock_error)?
+                .clone();
             let muted = storage_handle
                 .is_event_muted_with_cx(cx, &identity_key, now_ms)
-                .await
-                .unwrap_or(false);
+                .await?;
             if muted {
-                return NotificationOutcome {
+                return Ok(NotificationOutcome {
                     decision: NotifyDecision::Filtered,
                     deliveries: Vec::new(),
-                };
+                });
             }
         }
 
         let decision = self.gate.should_notify(detection, pane_id, pane_uuid);
-        match decision {
+        Ok(match decision {
             NotifyDecision::Send {
                 suppressed_since_last,
             } => {
@@ -509,18 +496,10 @@ impl NotificationPipeline {
                 decision,
                 deliveries: Vec::new(),
             },
-        }
+        })
     }
 
-    async fn dispatch_payload(&self, payload: &NotificationPayload) -> Vec<NotificationDelivery> {
-        let mut deliveries = Vec::with_capacity(self.senders.len());
-        for sender in &self.senders {
-            deliveries.push(sender.send(payload).await);
-        }
-        deliveries
-    }
-
-    /// Cx-first `dispatch_payload` (ft-xbnl0.2.3). Threads caller cx
+    /// Cx-first payload dispatch (ft-xbnl0.2.3). Threads caller cx
     /// through `NotificationSender::send_with_cx` so each sender's
     /// cancellable I/O honors caller cancellation. The
     /// `handle_detection_with_cx` path uses this helper.
@@ -732,7 +711,8 @@ mod tests {
 
             let outcome = pipeline
                 .handle_detection(&test_detection(), 7, None, Some(42))
-                .await;
+                .await
+                .expect("notification pipeline");
 
             assert!(matches!(outcome.decision, NotifyDecision::Send { .. }));
             assert_eq!(outcome.deliveries.len(), 1);
@@ -758,7 +738,8 @@ mod tests {
 
             let outcome = pipeline
                 .handle_detection(&test_detection(), 7, None, None)
-                .await;
+                .await
+                .expect("notification pipeline");
 
             assert!(matches!(outcome.decision, NotifyDecision::Filtered));
             assert!(outcome.deliveries.is_empty());
@@ -781,10 +762,12 @@ mod tests {
 
             let _ = pipeline
                 .handle_detection(&test_detection(), 7, None, None)
-                .await;
+                .await
+                .expect("notification pipeline");
             let outcome = pipeline
                 .handle_detection(&test_detection(), 7, None, None)
-                .await;
+                .await
+                .expect("notification pipeline");
 
             assert!(matches!(
                 outcome.decision,
@@ -1091,7 +1074,8 @@ mod tests {
 
             let outcome = pipeline
                 .handle_detection(&test_detection(), 1, None, None)
-                .await;
+                .await
+                .expect("notification pipeline");
 
             assert!(matches!(outcome.decision, NotifyDecision::Send { .. }));
             assert_eq!(
@@ -1131,7 +1115,8 @@ mod tests {
 
             let outcome = pipeline
                 .handle_detection(&test_detection(), 1, None, None)
-                .await;
+                .await
+                .expect("notification pipeline");
 
             assert!(matches!(outcome.decision, NotifyDecision::Send { .. }));
             assert!(
@@ -1188,7 +1173,10 @@ mod tests {
             let mut pipeline =
                 NotificationPipeline::with_mute_store(gate, vec![Box::new(sender)], storage_arc);
 
-            let outcome = pipeline.handle_detection(&detection, 7, None, None).await;
+            let outcome = pipeline
+                .handle_detection(&detection, 7, None, None)
+                .await
+                .expect("notification pipeline");
 
             assert!(
                 matches!(outcome.decision, NotifyDecision::Filtered),
@@ -1253,7 +1241,8 @@ mod tests {
             let cx = crate::cx::for_request();
             let outcome = pipeline
                 .handle_detection_with_cx(&cx, &detection, 7, None, None)
-                .await;
+                .await
+                .expect("notification pipeline");
 
             assert!(
                 matches!(outcome.decision, NotifyDecision::Filtered),
@@ -1267,6 +1256,55 @@ mod tests {
             let _ = std::fs::remove_file(&db_path);
             let _ = std::fs::remove_file(format!("{db_str}-wal"));
             let _ = std::fs::remove_file(format!("{db_str}-shm"));
+        });
+    }
+
+    #[test]
+    fn pipeline_with_cx_pre_cancelled_mute_store_returns_typed_cancellation() {
+        run_async_test(async {
+            use crate::error::RuntimeOperationSource;
+            use crate::storage::StorageHandle;
+
+            let db_path = std::env::temp_dir().join(format!(
+                "wa_notif_cx_cancelled_mute_{}.db",
+                std::process::id()
+            ));
+            let db_str = db_path.to_string_lossy().to_string();
+            let storage = StorageHandle::new(&db_str).await.expect("open test db");
+
+            let filter = EventFilter::allow_all();
+            let gate = NotificationGate::from_config(
+                filter,
+                Duration::from_secs(60),
+                Duration::from_secs(60),
+            );
+            let sent = Arc::new(Mutex::new(Vec::new()));
+            let sender = MockSender::new("mock", Arc::clone(&sent));
+            let storage_arc = Arc::new(crate::runtime_async::RwLock::new(storage));
+            let mut pipeline =
+                NotificationPipeline::with_mute_store(gate, vec![Box::new(sender)], storage_arc);
+
+            let cx = crate::cx::for_testing();
+            cx.cancel_with(
+                crate::outcome::CancelKind::User,
+                Some("pre-cancel notification mute-store lock"),
+            );
+            let error = pipeline
+                .handle_detection_with_cx(&cx, &test_detection(), 7, None, None)
+                .await
+                .expect_err("pre-cancelled mute-store lock must fail");
+
+            assert!(
+                matches!(
+                    error,
+                    crate::Error::RuntimeOperation {
+                        operation: "notification.mute_store",
+                        source: RuntimeOperationSource::Cancelled(_),
+                    }
+                ),
+                "pre-cancelled mute-store lock must remain a typed cancellation"
+            );
+            assert!(sent.lock().unwrap().is_empty());
         });
     }
 
@@ -1309,7 +1347,8 @@ mod tests {
             let cx = crate::cx::for_request();
             let outcome = pipeline
                 .handle_detection_with_cx(&cx, &test_detection(), 7, None, Some(42))
-                .await;
+                .await
+                .expect("notification pipeline");
 
             assert!(
                 matches!(outcome.decision, NotifyDecision::Send { .. }),
@@ -1383,7 +1422,8 @@ mod tests {
 
             let outcome = pipeline
                 .handle_detection(&test_detection(), 1, None, None)
-                .await;
+                .await
+                .expect("notification pipeline");
 
             assert!(matches!(outcome.decision, NotifyDecision::Send { .. }));
             assert_eq!(outcome.deliveries.len(), 1);
@@ -1413,7 +1453,8 @@ mod tests {
 
             let outcome = pipeline
                 .handle_detection(&test_detection(), 1, None, None)
-                .await;
+                .await
+                .expect("notification pipeline");
 
             assert_eq!(outcome.deliveries.len(), 2);
             // First delivery fails
@@ -1442,7 +1483,8 @@ mod tests {
 
             let outcome = pipeline
                 .handle_detection(&test_detection(), 1, None, None)
-                .await;
+                .await
+                .expect("notification pipeline");
 
             // Error message should not contain the event payload or secrets
             let err = outcome.deliveries[0].error.as_deref().unwrap_or("");

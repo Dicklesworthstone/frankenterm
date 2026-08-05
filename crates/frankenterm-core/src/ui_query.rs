@@ -108,8 +108,8 @@ impl Default for RulesetProfileState {
 
 /// List all pane bookmarks for UI surfaces.
 pub async fn list_pane_bookmarks(storage: &StorageHandle) -> crate::Result<Vec<PaneBookmarkView>> {
-    let records = storage.list_pane_bookmarks().await?;
-    Ok(records.into_iter().map(PaneBookmarkView::from).collect())
+    let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+    list_pane_bookmarks_with_cx(&cx, storage).await
 }
 
 /// Cx-first [`list_pane_bookmarks`] (ft-xbnl0.2.3).
@@ -138,8 +138,8 @@ pub async fn list_pane_bookmarks_with_cx(
 
 /// List saved searches for UI surfaces.
 pub async fn list_saved_searches(storage: &StorageHandle) -> crate::Result<Vec<SavedSearchView>> {
-    let records = storage.list_saved_searches().await?;
-    Ok(records.into_iter().map(SavedSearchView::from).collect())
+    let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+    list_saved_searches_with_cx(&cx, storage).await
 }
 
 /// Cx-first [`list_saved_searches`] (ft-xbnl0.2.3).

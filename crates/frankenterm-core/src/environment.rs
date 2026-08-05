@@ -132,51 +132,8 @@ impl WeztermInfo {
         wezterm: Option<&WeztermHandle>,
         shell: &ShellInfo,
     ) -> (Self, Vec<PaneInfo>) {
-        let version = detect_wezterm_version();
-        let cli_available = version.is_some();
-        let socket_path = detect_wezterm_socket();
-
-        let mut panes = Vec::new();
-        let mut list_ok = false;
-
-        if cli_available {
-            let handle = wezterm.cloned().unwrap_or_else(default_wezterm_handle);
-            match handle.list_panes().await {
-                Ok(found) => {
-                    panes = found;
-                    list_ok = true;
-                }
-                Err(_) => {
-                    list_ok = false;
-                }
-            }
-        }
-
-        let osc_7 = list_ok
-            && panes.iter().any(|pane| {
-                pane.cwd
-                    .as_ref()
-                    .map(|cwd| !cwd.trim().is_empty())
-                    .unwrap_or(false)
-            });
-
-        let capabilities = WeztermCapabilities {
-            cli_available,
-            json_output: list_ok,
-            multiplexing: list_ok,
-            osc_133: shell.osc_133_enabled,
-            osc_7,
-            image_protocol: cli_available,
-        };
-
-        let info = Self {
-            version,
-            socket_path,
-            is_running: list_ok,
-            capabilities,
-        };
-
-        (info, panes)
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        Self::detect_with_cx(&cx, wezterm, shell).await
     }
 
     /// Cx-first [`Self::detect`] (ft-xbnl0.2.3). Routes the
@@ -275,20 +232,8 @@ impl SystemInfo {
 impl DetectedEnvironment {
     /// Detect the environment with an optional WezTerm handle.
     pub async fn detect(wezterm: Option<&WeztermHandle>) -> Self {
-        let shell = ShellInfo::detect();
-        let (wezterm_info, panes) = WeztermInfo::detect(wezterm, &shell).await;
-        let agents = detect_agents_from_panes(&panes);
-        let remotes = detect_remotes_from_panes(&panes);
-        let system = SystemInfo::detect();
-
-        Self {
-            wezterm: wezterm_info,
-            shell,
-            agents,
-            remotes,
-            system,
-            detected_at: Utc::now(),
-        }
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        Self::detect_with_cx(&cx, wezterm).await
     }
 
     /// Cx-first [`Self::detect`] (ft-xbnl0.2.3). Routes the

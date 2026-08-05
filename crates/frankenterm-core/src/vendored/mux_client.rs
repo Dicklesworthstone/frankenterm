@@ -1782,14 +1782,12 @@ impl Drop for RenderBatchGuard<'_> {
 
 impl DirectMuxClient {
     pub async fn connect(config: DirectMuxClientConfig) -> Result<Self, DirectMuxError> {
-        {
-            // Keep the ambient entry point for compatibility, but route the
-            // actual transport work through the explicit-Cx path so connect,
-            // handshake, and timeout boundaries inherit the caller's runtime
-            // budget/cancellation context instead of open-coding a fresh one.
-            let cx = ambient_mux_cx();
-            return Self::connect_with_cx(&cx, config).await;
-        }
+        // Keep the ambient entry point for compatibility, but route the
+        // actual transport work through the explicit-Cx path so connect,
+        // handshake, and timeout boundaries inherit the caller's runtime
+        // budget/cancellation context instead of open-coding a fresh one.
+        let cx = Cx::current().unwrap_or_else(cx::for_request);
+        Self::connect_with_cx(&cx, config).await
     }
 
     /// Connect using an explicit capability context.
@@ -1956,11 +1954,8 @@ impl DirectMuxClient {
     }
 
     pub async fn list_panes(&mut self) -> Result<ListPanesResponse, DirectMuxError> {
-        let response = self.send_request(Pdu::ListPanes(ListPanes {})).await?;
-        match response {
-            Pdu::ListPanesResponse(payload) => Ok(payload),
-            other => self.unexpected_response("ListPanesResponse", &other, false),
-        }
+        let cx = Cx::current().unwrap_or_else(cx::for_request);
+        self.list_panes_with_cx(&cx).await
     }
 
     /// List panes using an explicit capability context.
@@ -1979,7 +1974,7 @@ impl DirectMuxClient {
 
     /// Spawn a new mux pane/tab through the native mux protocol.
     pub async fn spawn_v2(&mut self, spawn: SpawnV2) -> Result<SpawnResponse, DirectMuxError> {
-        let cx = ambient_mux_cx();
+        let cx = Cx::current().unwrap_or_else(cx::for_request);
         self.spawn_v2_with_cx(&cx, spawn).await
     }
 
@@ -1998,7 +1993,7 @@ impl DirectMuxClient {
 
     /// Split an existing pane through the native mux protocol.
     pub async fn split_pane(&mut self, split: SplitPane) -> Result<SpawnResponse, DirectMuxError> {
-        let cx = ambient_mux_cx();
+        let cx = Cx::current().unwrap_or_else(cx::for_request);
         self.split_pane_with_cx(&cx, split).await
     }
 
@@ -2020,13 +2015,8 @@ impl DirectMuxClient {
         &mut self,
         pane_id: u64,
     ) -> Result<GetPaneRenderChangesResponse, DirectMuxError> {
-        let serial = self
-            .send_request_only(Pdu::GetPaneRenderChanges(GetPaneRenderChanges {
-                pane_id: pane_id as usize,
-            }))
-            .await?;
-        let response = self.await_response(serial).await;
-        self.settle_single_render_response(pane_id, response, false)
+        let cx = Cx::current().unwrap_or_else(cx::for_request);
+        self.get_pane_render_changes_with_cx(&cx, pane_id).await
     }
 
     /// Poll render changes using an explicit capability context.
@@ -2053,16 +2043,8 @@ impl DirectMuxClient {
         pane_id: u64,
         lines: Vec<std::ops::Range<isize>>,
     ) -> Result<GetLinesResponse, DirectMuxError> {
-        let response = self
-            .send_request(Pdu::GetLines(GetLines {
-                pane_id: pane_id as usize,
-                lines,
-            }))
-            .await?;
-        match response {
-            Pdu::GetLinesResponse(payload) => Ok(payload),
-            other => self.unexpected_response("GetLinesResponse", &other, false),
-        }
+        let cx = Cx::current().unwrap_or_else(cx::for_request);
+        self.get_lines_with_cx(&cx, pane_id, lines).await
     }
 
     /// Fetch pane lines using an explicit capability context.
@@ -2092,7 +2074,7 @@ impl DirectMuxClient {
         &mut self,
         pane_id: u64,
     ) -> Result<GetSemanticZonesResponse, DirectMuxError> {
-        let cx = ambient_mux_cx();
+        let cx = Cx::current().unwrap_or_else(cx::for_request);
         self.get_semantic_zones_with_cx(&cx, pane_id).await
     }
 
@@ -2122,16 +2104,8 @@ impl DirectMuxClient {
         pane_id: u64,
         data: Vec<u8>,
     ) -> Result<UnitResponse, DirectMuxError> {
-        let response = self
-            .send_request(Pdu::WriteToPane(WriteToPane {
-                pane_id: pane_id as usize,
-                data,
-            }))
-            .await?;
-        match response {
-            Pdu::UnitResponse(payload) => Ok(payload),
-            other => self.unexpected_response("UnitResponse", &other, false),
-        }
+        let cx = Cx::current().unwrap_or_else(cx::for_request);
+        self.write_to_pane_with_cx(&cx, pane_id, data).await
     }
 
     /// Write raw bytes to a pane using an explicit capability context.
@@ -2162,16 +2136,8 @@ impl DirectMuxClient {
         pane_id: u64,
         data: String,
     ) -> Result<UnitResponse, DirectMuxError> {
-        let response = self
-            .send_request(Pdu::SendPaste(SendPaste {
-                pane_id: pane_id as usize,
-                data,
-            }))
-            .await?;
-        match response {
-            Pdu::UnitResponse(payload) => Ok(payload),
-            other => self.unexpected_response("UnitResponse", &other, false),
-        }
+        let cx = Cx::current().unwrap_or_else(cx::for_request);
+        self.send_paste_with_cx(&cx, pane_id, data).await
     }
 
     /// Resize a pane through the mux session using the same PDU as a GUI client.
@@ -2181,7 +2147,7 @@ impl DirectMuxClient {
         pane_id: u64,
         size: TerminalSize,
     ) -> Result<UnitResponse, DirectMuxError> {
-        let cx = ambient_mux_cx();
+        let cx = Cx::current().unwrap_or_else(cx::for_request);
         self.resize_with_cx(&cx, containing_tab_id, pane_id, size)
             .await
     }
@@ -2212,7 +2178,7 @@ impl DirectMuxClient {
         direction: wezterm_config::keyassignment::PaneDirection,
         amount: usize,
     ) -> Result<UnitResponse, DirectMuxError> {
-        let cx = ambient_mux_cx();
+        let cx = Cx::current().unwrap_or_else(cx::for_request);
         self.adjust_pane_size_with_cx(&cx, pane_id, direction, amount)
             .await
     }
@@ -2236,25 +2202,15 @@ impl DirectMuxClient {
         .await
     }
 
-    async fn expect_unit_response(&mut self, request: Pdu) -> Result<UnitResponse, DirectMuxError> {
-        match self.send_request(request).await? {
-            Pdu::UnitResponse(payload) => Ok(payload),
-            other => self.unexpected_response("UnitResponse", &other, false),
-        }
-    }
-
     pub async fn create_floating_pane(
         &mut self,
         tab_id: usize,
         pane_id: u64,
         rect: FloatingPaneRect,
     ) -> Result<UnitResponse, DirectMuxError> {
-        self.expect_unit_response(Pdu::CreateFloatingPane(CreateFloatingPane {
-            tab_id,
-            pane_id: pane_id as usize,
-            rect,
-        }))
-        .await
+        let cx = Cx::current().unwrap_or_else(cx::for_request);
+        self.create_floating_pane_with_cx(&cx, tab_id, pane_id, rect)
+            .await
     }
 
     pub async fn move_floating_pane(
@@ -2262,11 +2218,8 @@ impl DirectMuxClient {
         pane_id: u64,
         rect: FloatingPaneRect,
     ) -> Result<UnitResponse, DirectMuxError> {
-        self.expect_unit_response(Pdu::MoveFloatingPane(MoveFloatingPane {
-            pane_id: pane_id as usize,
-            rect,
-        }))
-        .await
+        let cx = Cx::current().unwrap_or_else(cx::for_request);
+        self.move_floating_pane_with_cx(&cx, pane_id, rect).await
     }
 
     pub async fn set_floating_pane_z(
@@ -2274,11 +2227,9 @@ impl DirectMuxClient {
         pane_id: u64,
         z_order: u32,
     ) -> Result<UnitResponse, DirectMuxError> {
-        self.expect_unit_response(Pdu::SetFloatingPaneZ(SetFloatingPaneZ {
-            pane_id: pane_id as usize,
-            z_order,
-        }))
-        .await
+        let cx = Cx::current().unwrap_or_else(cx::for_request);
+        self.set_floating_pane_z_with_cx(&cx, pane_id, z_order)
+            .await
     }
 
     pub async fn toggle_floating_pane(
@@ -2286,21 +2237,17 @@ impl DirectMuxClient {
         pane_id: u64,
         visible: bool,
     ) -> Result<UnitResponse, DirectMuxError> {
-        self.expect_unit_response(Pdu::ToggleFloatingPane(ToggleFloatingPane {
-            pane_id: pane_id as usize,
-            visible,
-        }))
-        .await
+        let cx = Cx::current().unwrap_or_else(cx::for_request);
+        self.toggle_floating_pane_with_cx(&cx, pane_id, visible)
+            .await
     }
 
     pub async fn remove_floating_pane(
         &mut self,
         pane_id: u64,
     ) -> Result<UnitResponse, DirectMuxError> {
-        self.expect_unit_response(Pdu::RemoveFloatingPane(RemoveFloatingPane {
-            pane_id: pane_id as usize,
-        }))
-        .await
+        let cx = Cx::current().unwrap_or_else(cx::for_request);
+        self.remove_floating_pane_with_cx(&cx, pane_id).await
     }
 
     pub async fn swap_to_layout(
@@ -2308,11 +2255,9 @@ impl DirectMuxClient {
         tab_id: usize,
         layout_index: usize,
     ) -> Result<UnitResponse, DirectMuxError> {
-        self.expect_unit_response(Pdu::SwapToLayout(SwapToLayout {
-            tab_id,
-            layout_index,
-        }))
-        .await
+        let cx = Cx::current().unwrap_or_else(cx::for_request);
+        self.swap_to_layout_with_cx(&cx, tab_id, layout_index)
+            .await
     }
 
     pub async fn set_layout_cycle(
@@ -2320,11 +2265,9 @@ impl DirectMuxClient {
         tab_id: usize,
         layout_names: Vec<String>,
     ) -> Result<UnitResponse, DirectMuxError> {
-        self.expect_unit_response(Pdu::SetLayoutCycle(SetLayoutCycle {
-            tab_id,
-            layout_names,
-        }))
-        .await
+        let cx = Cx::current().unwrap_or_else(cx::for_request);
+        self.set_layout_cycle_with_cx(&cx, tab_id, layout_names)
+            .await
     }
 
     pub async fn cycle_stack(
@@ -2333,12 +2276,9 @@ impl DirectMuxClient {
         slot_index: usize,
         forward: bool,
     ) -> Result<UnitResponse, DirectMuxError> {
-        self.expect_unit_response(Pdu::CycleStack(CycleStack {
-            tab_id,
-            slot_index,
-            forward,
-        }))
-        .await
+        let cx = Cx::current().unwrap_or_else(cx::for_request);
+        self.cycle_stack_with_cx(&cx, tab_id, slot_index, forward)
+            .await
     }
 
     pub async fn select_stack_pane(
@@ -2347,12 +2287,9 @@ impl DirectMuxClient {
         slot_index: usize,
         pane_index: usize,
     ) -> Result<UnitResponse, DirectMuxError> {
-        self.expect_unit_response(Pdu::SelectStackPane(SelectStackPane {
-            tab_id,
-            slot_index,
-            pane_index,
-        }))
-        .await
+        let cx = Cx::current().unwrap_or_else(cx::for_request);
+        self.select_stack_pane_with_cx(&cx, tab_id, slot_index, pane_index)
+            .await
     }
 
     pub async fn update_pane_constraints(
@@ -2363,13 +2300,10 @@ impl DirectMuxClient {
         min_height: Option<usize>,
         max_height: Option<usize>,
     ) -> Result<UnitResponse, DirectMuxError> {
-        self.expect_unit_response(Pdu::UpdatePaneConstraints(UpdatePaneConstraints {
-            pane_id: pane_id as usize,
-            min_width,
-            max_width,
-            min_height,
-            max_height,
-        }))
+        let cx = Cx::current().unwrap_or_else(cx::for_request);
+        self.update_pane_constraints_with_cx(
+            &cx, pane_id, min_width, max_width, min_height, max_height,
+        )
         .await
     }
 
@@ -2676,7 +2610,7 @@ impl DirectMuxClient {
         max_pipeline_depth: usize,
         pipeline_timeout: Duration,
     ) -> Result<Vec<GetPaneRenderChangesResponse>, DirectMuxError> {
-        let cx = ambient_mux_cx();
+        let cx = Cx::current().unwrap_or_else(cx::for_request);
         self.get_pane_render_changes_batch_with_cx(
             &cx,
             pane_ids,
@@ -2783,17 +2717,9 @@ impl DirectMuxClient {
         max_pipeline_depth: usize,
         pipeline_timeout: Duration,
     ) -> Result<Vec<Pdu>, DirectMuxError> {
-        let timeout_ms = duration_to_ms_u64(pipeline_timeout);
-        let result = Box::pin(timeout(
-            pipeline_timeout,
-            self.batch_inner(requests, max_pipeline_depth.max(1)),
-        ))
-        .await;
-        let result = match result {
-            Ok(inner) => inner,
-            Err(_) => Err(DirectMuxError::BatchTimeout { timeout_ms }),
-        };
-        self.settle_transport_result(result, "request batch failure", false)
+        let cx = Cx::current().unwrap_or_else(cx::for_request);
+        self.batch_with_cx(&cx, requests, max_pipeline_depth, pipeline_timeout)
+            .await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`batch`].
@@ -2843,104 +2769,6 @@ impl DirectMuxClient {
         };
         self.apply_error_disposition(&error, "request batch failure", explicit_cx);
         Err(error)
-    }
-
-    async fn batch_inner(
-        &mut self,
-        requests: Vec<Pdu>,
-        max_pipeline_depth: usize,
-    ) -> Result<Vec<Pdu>, DirectMuxError> {
-        if requests.is_empty() {
-            return Ok(Vec::new());
-        }
-        self.ensure_connection_usable()?;
-        for request in &requests {
-            self.authorize_outbound_pdu(request)?;
-        }
-        self.ensure_outstanding_request_slots(requests.len().min(max_pipeline_depth))
-            .map_err(DirectMuxError::proven_pre_write_rejection)?;
-
-        tracing::trace!(
-            connection_id = self.connection_id,
-            request_count = requests.len(),
-            max_pipeline_depth,
-            phase = "batch_start",
-            "starting mux request batch"
-        );
-
-        if max_pipeline_depth <= 1 {
-            let mut responses = Vec::with_capacity(requests.len());
-            for request in requests {
-                responses.push(self.send_request(request).await?);
-            }
-            return Ok(responses);
-        }
-
-        let total = requests.len();
-        let mut requests = requests.into_iter().enumerate();
-        let mut in_flight = InFlightRequestSlots::with_capacity(max_pipeline_depth);
-        let mut responses: Vec<Option<Pdu>> = std::iter::repeat_with(|| None).take(total).collect();
-
-        while in_flight.len() < max_pipeline_depth {
-            let Some((request_idx, request)) = requests.next() else {
-                break;
-            };
-            let serial = match self.send_request_only(request).await {
-                Ok(serial) => serial,
-                Err(error) => {
-                    return self.fail_batch_scope(error, !in_flight.is_empty(), false);
-                }
-            };
-            if let Err(error) = in_flight.insert(serial, request_idx) {
-                return self.fail_batch_scope(error, true, false);
-            }
-        }
-
-        while !in_flight.is_empty() {
-            let decoded = self.read_next_pdu().await?;
-            if decoded.serial == 0 {
-                self.stash_unilateral_pdu(decoded.pdu)?;
-                continue;
-            }
-            if let Some(response_idx) = in_flight.take(decoded.serial) {
-                self.complete_response_serial(decoded.serial)?;
-                let response = match Self::response_from_pdu(decoded.pdu) {
-                    Ok(response) => response,
-                    Err(error) => {
-                        return self.fail_batch_scope(error, !in_flight.is_empty(), false);
-                    }
-                };
-                responses[response_idx] = Some(response);
-                if let Some((request_idx, request)) = requests.next() {
-                    let serial = match self.send_request_only(request).await {
-                        Ok(serial) => serial,
-                        Err(error) => {
-                            return self.fail_batch_scope(error, !in_flight.is_empty(), false);
-                        }
-                    };
-                    if let Err(error) = in_flight.insert(serial, request_idx) {
-                        return self.fail_batch_scope(error, true, false);
-                    }
-                }
-            } else {
-                self.stash_pending_response(decoded.serial, decoded.pdu)?;
-            }
-        }
-
-        let mut ordered = Vec::with_capacity(total);
-        for response in responses {
-            ordered.push(response.ok_or_else(|| {
-                DirectMuxError::Codec("pipeline batch completed with missing response".to_string())
-            })?);
-        }
-        tracing::trace!(
-            connection_id = self.connection_id,
-            response_count = ordered.len(),
-            max_pipeline_depth,
-            phase = "batch_complete",
-            "mux request batch completed"
-        );
-        Ok(ordered)
     }
 
     async fn batch_inner_with_cx(
@@ -3447,20 +3275,17 @@ impl DirectMuxClient {
         Ok(Some(pdu))
     }
 
-    async fn send_request(&mut self, pdu: Pdu) -> Result<Pdu, DirectMuxError> {
-        let serial = self.send_request_only(pdu).await?;
-        self.await_response(serial).await
-    }
-
     async fn send_request_with_cx(&mut self, cx: &Cx, pdu: Pdu) -> Result<Pdu, DirectMuxError> {
         let serial = self.send_request_only_with_cx(cx, pdu).await?;
         self.await_response_with_cx(cx, serial).await
     }
 
+    #[cfg(test)]
     async fn send_request_only(&mut self, pdu: Pdu) -> Result<u64, DirectMuxError> {
         self.send_request_only_tracking(pdu, None).await
     }
 
+    #[cfg(test)]
     async fn send_request_only_tracking(
         &mut self,
         pdu: Pdu,
@@ -3674,6 +3499,7 @@ impl DirectMuxClient {
         Ok(serial)
     }
 
+    #[cfg(test)]
     async fn await_response(&mut self, serial: u64) -> Result<Pdu, DirectMuxError> {
         let correlated = self.validate_response_serial(serial);
         self.settle_transport_result(
@@ -4226,6 +4052,7 @@ impl DirectMuxClient {
         Ok(())
     }
 
+    #[cfg(test)]
     async fn read_next_pdu(&mut self) -> Result<DecodedPdu, DirectMuxError> {
         self.read_next_pdu_with_retention_metadata()
             .await
@@ -4845,10 +4672,8 @@ impl PaneOutputSubscription {
 
     /// Receive the next delta. Returns `None` when the subscription ends.
     pub async fn next(&mut self) -> Option<PaneDelta> {
-        {
-            let cx = ambient_mux_cx();
-            self.next_with_cx(&cx).await
-        }
+        let cx = Cx::current().unwrap_or_else(cx::for_request);
+        self.next_with_cx(&cx).await
     }
 
     /// Cancel the subscription.
@@ -4866,11 +4691,12 @@ impl PaneOutputSubscription {
     ///
     /// This gives callers a deterministic shutdown path instead of relying on
     /// detached task teardown after `Drop`.
-    pub async fn shutdown(mut self) {
-        self.cancel();
-        if let Some(task) = self.task.take() {
-            join_subscription_task(task).await;
-        }
+    pub async fn shutdown(self) {
+        // Cleanup is already admitted once this consuming API is called. Use
+        // a fresh request context so an ambient parent cancellation cannot
+        // weaken shutdown's documented join-before-return postcondition.
+        let cx = cx::for_request();
+        self.shutdown_with_cx(&cx).await;
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`shutdown`].

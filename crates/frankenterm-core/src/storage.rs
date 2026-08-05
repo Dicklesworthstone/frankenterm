@@ -2818,7 +2818,8 @@ impl StorageHandle {
     /// # Errors
     /// Returns an error if the database cannot be opened or schema fails.
     pub async fn new(db_path: &str) -> Result<Self> {
-        Self::with_config(db_path, StorageConfig::default()).await
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        Self::new_with_cx(&cx, db_path).await
     }
 
     /// Return the database path backing this storage handle.
@@ -2970,10 +2971,6 @@ impl StorageHandle {
             .map_err(|_| StorageError::Database("Writer response channel closed".to_string()))?
     }
 
-    async fn recv_writer_shutdown_ack(rx: oneshot::Receiver<()>) {
-        let _ = crate::runtime_async::oneshot_recv(rx).await;
-    }
-
     async fn recv_writer_shutdown_ack_with_cx(
         cx: &crate::cx::Cx,
         rx: oneshot::Receiver<()>,
@@ -3105,7 +3102,8 @@ impl StorageHandle {
     /// dual-holding the connections inside one blocking closure can make
     /// contention surface as `SQLITE_BUSY` on the slower side.
     pub async fn with_config(db_path: &str, config: StorageConfig) -> Result<Self> {
-        Self::with_config_inner(db_path, config, None).await
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        Self::with_config_with_cx(&cx, db_path, config).await
     }
 
     #[cfg(test)]
@@ -3256,7 +3254,7 @@ impl StorageHandle {
         content_hash: Option<String>,
     ) -> Result<Segment> {
         let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-        self.append_segment_with_zone_with_cx(&cx, pane_id, content, content_hash, None)
+        self.append_segment_with_cx(&cx, pane_id, content, content_hash)
             .await
     }
 
@@ -5012,21 +5010,8 @@ impl StorageHandle {
 
     /// Run retention cleanup and log the maintenance event
     pub async fn retention_cleanup(&self, before_ts: i64) -> Result<usize> {
-        let deleted = self.prune_segments_before(before_ts).await?;
-        let metadata = serde_json::json!({
-            "deleted_segments": deleted,
-            "before_ts": before_ts,
-        })
-        .to_string();
-        let record = MaintenanceRecord {
-            id: 0,
-            event_type: "retention_cleanup".to_string(),
-            message: Some(format!("Deleted {deleted} output segments")),
-            metadata: Some(metadata),
-            timestamp: now_ms(),
-        };
-        let _ = self.record_maintenance(record).await?;
-        Ok(deleted)
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.retention_cleanup_with_cx(&cx, before_ts).await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`retention_cleanup`].
@@ -6423,13 +6408,8 @@ impl StorageHandle {
 
     /// Vacuum the database (explicit)
     pub async fn vacuum(&self) -> Result<()> {
-        let (tx, rx) = oneshot::channel();
-        self.write_tx
-            .send(WriteCommand::Vacuum { respond: tx })
-            .await
-            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
-
-        Self::recv_writer_response(rx).await
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.vacuum_with_cx(&cx).await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`vacuum`].
@@ -6449,13 +6429,8 @@ impl StorageHandle {
     /// Prefer this over `vacuum()` for periodic maintenance — it is
     /// non-blocking and much cheaper than a full VACUUM.
     pub async fn checkpoint(&self) -> Result<CheckpointResult> {
-        let (tx, rx) = oneshot::channel();
-        self.write_tx
-            .send(WriteCommand::Checkpoint { respond: tx })
-            .await
-            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
-
-        Self::recv_writer_response(rx).await
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.checkpoint_with_cx(&cx).await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`checkpoint`].
@@ -7164,16 +7139,9 @@ impl StorageHandle {
         session_id: String,
         retention: usize,
     ) -> Result<usize> {
-        let (tx, rx) = oneshot::channel();
-        self.write_tx
-            .send(WriteCommand::PruneSessionCheckpoints {
-                session_id,
-                retention,
-                respond: tx,
-            })
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.prune_session_checkpoints_with_cx(&cx, session_id, retention)
             .await
-            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
-        Self::recv_writer_response(rx).await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`prune_session_checkpoints`].
@@ -7351,10 +7319,8 @@ impl StorageHandle {
     ///
     /// Returns matching segments ordered by BM25 relevance score.
     pub async fn search(&self, query: &str) -> Result<Vec<Segment>> {
-        let results = self
-            .search_with_results(query, SearchOptions::default())
-            .await?;
-        Ok(results.into_iter().map(|r| r.segment).collect())
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.search_with_cx(&cx, query).await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`search`].
@@ -7375,8 +7341,8 @@ impl StorageHandle {
         query: &str,
         options: SearchOptions,
     ) -> Result<Vec<Segment>> {
-        let results = self.search_with_results(query, options).await?;
-        Ok(results.into_iter().map(|r| r.segment).collect())
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.search_with_options_with_cx(&cx, query, options).await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`search_with_options`].
@@ -7660,16 +7626,8 @@ impl StorageHandle {
         embedder_id: &str,
         vector: &[f32],
     ) -> Result<()> {
-        if vector.is_empty() {
-            return Err(
-                StorageError::Database("store_embedding_f32: vector is empty".to_string()).into(),
-            );
-        }
-        let bytes = encode_f32_embedding_blob(vector)?;
-        let dimension = i32::try_from(vector.len()).map_err(|_| {
-            StorageError::Database("store_embedding_f32: vector dimension exceeds i32".to_string())
-        })?;
-        self.store_embedding(segment_id, embedder_id, dimension, &bytes)
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.store_embedding_f32_with_cx(&cx, segment_id, embedder_id, vector)
             .await
     }
 
@@ -8748,27 +8706,31 @@ impl StorageHandle {
 
     /// Check if the storage is writable (writer thread is alive and responsive).
     ///
-    /// This is a lightweight health check that sends a ping to the writer thread.
+    /// This is a lightweight channel-state check. It does not enqueue a ping,
+    /// so `true` means the writer channel is still open rather than proving a
+    /// round-trip response from the writer thread.
     // Intentionally `async`: part of the storage async surface; the signature is
     // the public contract even though the current body is a sync channel check.
     #[allow(unknown_lints)]
     #[allow(clippy::unused_async_trait_impl)]
-    pub async fn is_writable(&self) -> bool {
-        // A simple check: if the channel is not closed, writer should be alive
-        // We can't easily send a ping without adding a new WriteCommand variant,
-        // so we check if the channel has capacity (indicates writer is processing)
-        !self.write_tx.is_closed()
+    ///
+    /// # Errors
+    ///
+    /// Returns the ambient capability-context cancellation error rather than
+    /// silently converting cancellation into a negative health observation.
+    pub async fn is_writable(&self) -> Result<bool> {
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.is_writable_with_cx(&cx).await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`is_writable`].
     ///
-    /// Health probe routed through a cx seam so a cancelled context
-    /// surfaces before the channel state is inspected. Note the underlying
-    /// check is infallible, so we return `Ok(bool)` and fold cancellation
-    /// into the error path.
+    /// Health probe routed through a cx seam so a cancelled context surfaces
+    /// before the channel state is inspected. The channel-state observation
+    /// itself is infallible; only the capability checkpoint can fail.
     pub async fn is_writable_with_cx(&self, cx: &crate::cx::Cx) -> Result<bool> {
         Self::checkpoint_storage_operation(cx, "is_writable")?;
-        Ok(self.is_writable().await)
+        Ok(!self.write_tx.is_closed())
     }
 
     // =========================================================================
@@ -9493,47 +9455,20 @@ impl StorageHandle {
     /// writes can push exit latency to hundreds of ms; a writer panic
     /// can stall the join indefinitely until the panic surfaces).
     pub async fn shutdown(&self) -> Result<()> {
-        let rx = self.enqueue_writer_shutdown_cleanup().await;
-
-        // Wait for acknowledgment
-        Self::recv_writer_shutdown_ack(rx).await;
-
-        // Wait for thread to finish (only the first caller does this)
-        let handle = self
-            .writer_handle
-            .lock()
-            .map_err(|_| StorageError::Database("Writer handle mutex poisoned".to_string()))?
-            .take();
-        if let Some(handle) = handle {
-            // Run the blocking thread join on the blocking thread
-            // pool so the async executor stays responsive. The
-            // inner Result distinguishes panic (Err(())) from
-            // clean exit (Ok(())); the outer Result is the
-            // spawn_blocking JoinError surface.
-            crate::runtime_async::spawn_blocking(move || handle.join().map_err(|_| ()))
-                .await
-                .map_err(|e| StorageError::Database(format!("Shutdown spawn_blocking error: {e}")))?
-                .map_err(|()| StorageError::Database("Writer thread panicked".to_string()))?;
-        }
-
-        self.completed_writer_terminal_result()
+        // Once shutdown is admitted, preserve the flush-and-join contract
+        // independently of cancellation in the surrounding request.
+        let cx = crate::cx::for_request();
+        self.shutdown_with_cx(&cx).await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`shutdown`].
     ///
     /// Always uses a fresh, non-cancellable cleanup capability to enqueue the
     /// shutdown command, so cancellation can never suppress teardown. The
-    /// caller's Cx controls only waiting for the acknowledgment and join.
-    /// Matches the `WatchdogHandle::join_with_cx` and
-    /// `PaneOutputSubscription::shutdown_with_cx` patterns: a
-    /// cx-cancelled caller bails fast while the background
-    /// writer still winds down on its own.
-    ///
-    /// An `Ok(())` returned because the caller Cx stopped waiting is only a
-    /// prompt cancellation outcome; it is not evidence that the writer reached
-    /// a clean terminal state. Only the path below that actually completes its
-    /// retained join and terminal-state validation establishes completion for
-    /// this call.
+    /// caller's Cx controls waiting for the acknowledgment and join. If that
+    /// wait is cancelled, this method returns [`crate::Error::Cancelled`];
+    /// `Ok(())` is reserved for a joined writer whose terminal state was
+    /// validated as clean.
     ///
     /// Note: if the cx stops the acknowledgment wait, the writer handle is left
     /// in place (take is skipped), so a subsequent shutdown call can drive the
@@ -9546,7 +9481,7 @@ impl StorageHandle {
     /// is also select-raced against the caller's Cx cancellation
     /// watcher (50 ms poll period, matching
     /// `distributed::race_with_cx_cancel`'s pattern) so a mid-
-    /// flight cancel returns Ok promptly. An already-spawned join
+    /// flight cancel returns a typed cancellation promptly. An already-spawned join
     /// runs to completion in the background; the writer thread itself
     /// continues independently even if cancellation wins before spawn, and the
     /// handle is consumed once.
@@ -9563,7 +9498,9 @@ impl StorageHandle {
             );
         }
         if !Self::recv_writer_shutdown_ack_with_cx(cx, rx).await? {
-            return Ok(());
+            return Err(crate::Error::Cancelled(
+                "storage shutdown cancelled before writer acknowledgment".to_string(),
+            ));
         }
 
         let handle = self
@@ -9588,11 +9525,9 @@ impl StorageHandle {
                     SpawnBlockingWithCxError::CancelledBeforeSpawn { .. }
                     | SpawnBlockingWithCxError::CancelledMidFlight { .. },
                 ) => {
-                    // This is a prompt caller-wait cancellation outcome, not a
-                    // claim that shutdown completed cleanly. The independent
-                    // cleanup command remains admitted and the writer keeps
-                    // winding down (or has already reached terminal state).
-                    return Ok(());
+                    return Err(crate::Error::Cancelled(
+                        "storage shutdown cancelled while joining writer".to_string(),
+                    ));
                 }
                 Err(e @ SpawnBlockingWithCxError::RuntimeFailure { .. }) => {
                     return Err(StorageError::Database(format!(
@@ -37798,7 +37733,11 @@ fn storage_shutdown_with_cx_pre_cancel_still_enqueues_cleanup() {
             Some("pre-cancel shutdown test"),
         );
 
-        storage.shutdown_with_cx(&caller_cx).await.unwrap();
+        let cancelled = storage
+            .shutdown_with_cx(&caller_cx)
+            .await
+            .expect_err("pre-cancelled shutdown wait must not report clean completion");
+        assert!(matches!(cancelled, crate::Error::Cancelled(_)));
         // A fresh caller drives the join after the cancelled caller declined
         // to wait. If cleanup had inherited cancellation, this would enqueue a
         // first Shutdown only now instead of observing the prior terminal one.
@@ -37819,7 +37758,11 @@ fn storage_shutdown_with_cx_mid_cancel_after_enqueue_still_completes_cleanup() {
         let caller_cx = crate::cx::for_testing();
         storage.cancel_shutdown_after_enqueue_for_test();
 
-        storage.shutdown_with_cx(&caller_cx).await.unwrap();
+        let cancelled = storage
+            .shutdown_with_cx(&caller_cx)
+            .await
+            .expect_err("mid-flight cancellation must not report clean completion");
+        assert!(matches!(cancelled, crate::Error::Cancelled(_)));
         assert!(caller_cx.is_cancel_requested());
         storage.shutdown().await.unwrap();
         assert_eq!(

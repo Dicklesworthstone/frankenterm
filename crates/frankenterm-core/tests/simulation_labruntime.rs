@@ -542,7 +542,7 @@ fn scenario_load_from_temp_file() {
 fn sandbox_creates_default_panes() {
     let rt = RuntimeFixture::current_thread();
     rt.block_on(async {
-        let sandbox = TutorialSandbox::new().await;
+        let sandbox = TutorialSandbox::new().await.expect("tutorial sandbox");
         assert_eq!(sandbox.mock().pane_count().await, 3);
 
         let p0 = sandbox.mock().pane_state(0).await.unwrap();
@@ -562,7 +562,7 @@ fn sandbox_creates_default_panes() {
 fn sandbox_initial_content() {
     let rt = RuntimeFixture::current_thread();
     rt.block_on(async {
-        let sandbox = TutorialSandbox::new().await;
+        let sandbox = TutorialSandbox::new().await.expect("tutorial sandbox");
 
         let t0 = sandbox.mock().get_text(0, false).await.unwrap();
         assert_eq!(t0, "$ ");
@@ -579,7 +579,7 @@ fn sandbox_initial_content() {
 fn sandbox_format_output_with_indicator() {
     let rt = RuntimeFixture::current_thread();
     rt.block_on(async {
-        let sandbox = TutorialSandbox::new().await;
+        let sandbox = TutorialSandbox::new().await.expect("tutorial sandbox");
         assert_eq!(sandbox.format_output("hello"), "[SANDBOX] hello");
     });
 }
@@ -592,7 +592,7 @@ fn sandbox_format_output_with_indicator() {
 fn sandbox_format_output_without_indicator() {
     let rt = RuntimeFixture::current_thread();
     rt.block_on(async {
-        let mut sandbox = TutorialSandbox::new().await;
+        let mut sandbox = TutorialSandbox::new().await.expect("tutorial sandbox");
         sandbox.set_show_indicator(false);
         assert_eq!(sandbox.format_output("hello"), "hello");
     });
@@ -606,7 +606,7 @@ fn sandbox_format_output_without_indicator() {
 fn sandbox_command_logging() {
     let rt = RuntimeFixture::current_thread();
     rt.block_on(async {
-        let mut sandbox = TutorialSandbox::new().await;
+        let mut sandbox = TutorialSandbox::new().await.expect("tutorial sandbox");
         assert!(sandbox.command_log().is_empty());
 
         sandbox.log_command("ft status", Some("basics.1"));
@@ -631,7 +631,7 @@ fn sandbox_command_logging() {
 fn sandbox_trigger_events() {
     let rt = RuntimeFixture::current_thread();
     rt.block_on(async {
-        let sandbox = TutorialSandbox::new().await;
+        let sandbox = TutorialSandbox::new().await.expect("tutorial sandbox");
         let count = sandbox.trigger_exercise_events().await.unwrap();
         assert_eq!(count, 2);
 
@@ -650,10 +650,13 @@ fn sandbox_trigger_events() {
 fn sandbox_check_expectations_after_events() {
     let rt = RuntimeFixture::current_thread();
     rt.block_on(async {
-        let sandbox = TutorialSandbox::new().await;
+        let sandbox = TutorialSandbox::new().await.expect("tutorial sandbox");
         sandbox.trigger_exercise_events().await.unwrap();
 
-        let (pass, fail, skip) = sandbox.check_all_expectations().await;
+        let (pass, fail, skip) = sandbox
+            .check_all_expectations()
+            .await
+            .expect("expectation checks");
         assert_eq!(pass, 2);
         assert_eq!(fail, 0);
         assert_eq!(skip, 0);
@@ -668,8 +671,11 @@ fn sandbox_check_expectations_after_events() {
 fn sandbox_check_expectations_before_events() {
     let rt = RuntimeFixture::current_thread();
     rt.block_on(async {
-        let sandbox = TutorialSandbox::new().await;
-        let (pass, fail, skip) = sandbox.check_all_expectations().await;
+        let sandbox = TutorialSandbox::new().await.expect("tutorial sandbox");
+        let (pass, fail, skip) = sandbox
+            .check_all_expectations()
+            .await
+            .expect("expectation checks");
         assert_eq!(pass, 0);
         assert_eq!(fail, 2);
         assert_eq!(skip, 0);
@@ -738,7 +744,10 @@ fn sandbox_empty_check_expectations() {
     let rt = RuntimeFixture::current_thread();
     rt.block_on(async {
         let sandbox = TutorialSandbox::empty();
-        let (pass, fail, skip) = sandbox.check_all_expectations().await;
+        let (pass, fail, skip) = sandbox
+            .check_all_expectations()
+            .await
+            .expect("expectation checks");
         assert_eq!(pass, 0);
         assert_eq!(fail, 0);
         assert_eq!(skip, 0);
@@ -965,13 +974,14 @@ events: []
 fn sandbox_check_event_expectation_returns_false() {
     let rt = RuntimeFixture::current_thread();
     rt.block_on(async {
-        let sandbox = TutorialSandbox::new().await;
+        let sandbox = TutorialSandbox::new().await.expect("tutorial sandbox");
         let result = sandbox
             .check_expectation(&ExpectationKind::Event {
                 event: "test".to_string(),
                 detected_at: None,
             })
-            .await;
+            .await
+            .expect("event expectation");
         assert!(!result);
     });
 }
@@ -984,13 +994,14 @@ fn sandbox_check_event_expectation_returns_false() {
 fn sandbox_check_workflow_expectation_returns_false() {
     let rt = RuntimeFixture::current_thread();
     rt.block_on(async {
-        let sandbox = TutorialSandbox::new().await;
+        let sandbox = TutorialSandbox::new().await.expect("tutorial sandbox");
         let result = sandbox
             .check_expectation(&ExpectationKind::Workflow {
                 workflow: "test".to_string(),
                 started_at: None,
             })
-            .await;
+            .await
+            .expect("workflow expectation");
         assert!(!result);
     });
 }
@@ -1003,14 +1014,15 @@ fn sandbox_check_workflow_expectation_returns_false() {
 fn sandbox_check_contains_nonexistent_pane() {
     let rt = RuntimeFixture::current_thread();
     rt.block_on(async {
-        let sandbox = TutorialSandbox::new().await;
-        let result = sandbox
+        let sandbox = TutorialSandbox::new().await.expect("tutorial sandbox");
+        let error = sandbox
             .check_expectation(&ExpectationKind::Contains {
                 pane: 999,
                 text: "anything".to_string(),
             })
-            .await;
-        assert!(!result);
+            .await
+            .expect_err("missing pane must remain a backend error");
+        assert!(error.to_string().contains("999"));
     });
 }
 
@@ -1022,13 +1034,14 @@ fn sandbox_check_contains_nonexistent_pane() {
 fn sandbox_check_contains_missing_text() {
     let rt = RuntimeFixture::current_thread();
     rt.block_on(async {
-        let sandbox = TutorialSandbox::new().await;
+        let sandbox = TutorialSandbox::new().await.expect("tutorial sandbox");
         let result = sandbox
             .check_expectation(&ExpectationKind::Contains {
                 pane: 0,
                 text: "this text does not exist".to_string(),
             })
-            .await;
+            .await
+            .expect("contains expectation");
         assert!(!result);
     });
 }
@@ -1041,13 +1054,14 @@ fn sandbox_check_contains_missing_text() {
 fn sandbox_check_contains_present_text() {
     let rt = RuntimeFixture::current_thread();
     rt.block_on(async {
-        let sandbox = TutorialSandbox::new().await;
+        let sandbox = TutorialSandbox::new().await.expect("tutorial sandbox");
         let result = sandbox
             .check_expectation(&ExpectationKind::Contains {
                 pane: 0,
                 text: "$ ".to_string(),
             })
-            .await;
+            .await
+            .expect("contains expectation");
         assert!(result);
     });
 }
@@ -1060,7 +1074,7 @@ fn sandbox_check_contains_present_text() {
 fn sandbox_indicator_toggle() {
     let rt = RuntimeFixture::current_thread();
     rt.block_on(async {
-        let mut sandbox = TutorialSandbox::new().await;
+        let mut sandbox = TutorialSandbox::new().await.expect("tutorial sandbox");
         assert_eq!(sandbox.format_output("x"), "[SANDBOX] x");
         sandbox.set_show_indicator(false);
         assert_eq!(sandbox.format_output("x"), "x");
@@ -1077,7 +1091,7 @@ fn sandbox_indicator_toggle() {
 fn sandbox_command_log_timestamps_are_monotonic() {
     let rt = RuntimeFixture::current_thread();
     rt.block_on(async {
-        let mut sandbox = TutorialSandbox::new().await;
+        let mut sandbox = TutorialSandbox::new().await.expect("tutorial sandbox");
         sandbox.log_command("cmd1", None);
         sandbox.log_command("cmd2", None);
         sandbox.log_command("cmd3", None);
@@ -1097,7 +1111,7 @@ fn sandbox_command_log_timestamps_are_monotonic() {
 fn sandbox_format_output_empty_text() {
     let rt = RuntimeFixture::current_thread();
     rt.block_on(async {
-        let sandbox = TutorialSandbox::new().await;
+        let sandbox = TutorialSandbox::new().await.expect("tutorial sandbox");
         assert_eq!(sandbox.format_output(""), "[SANDBOX] ");
     });
 }
@@ -1129,9 +1143,158 @@ expectations:
         let scenario = Scenario::from_yaml(yaml).unwrap();
         let sandbox = TutorialSandbox::with_scenario(scenario).await.unwrap();
 
-        let (pass, fail, skip) = sandbox.check_all_expectations().await;
+        let (pass, fail, skip) = sandbox
+            .check_all_expectations()
+            .await
+            .expect("expectation checks");
         assert_eq!(pass, 1);
         assert_eq!(fail, 0);
         assert_eq!(skip, 2);
+    });
+}
+
+// ===========================================================================
+// 43. cancelled_expectation_aggregate_does_not_report_failure
+// ===========================================================================
+
+#[test]
+fn cancelled_expectation_aggregate_does_not_report_failure() {
+    let rt = RuntimeFixture::current_thread();
+    rt.block_on(async {
+        let sandbox = TutorialSandbox::new().await.expect("tutorial sandbox");
+        let cx = frankenterm_core::cx::for_testing();
+        cx.cancel_with(
+            frankenterm_core::outcome::CancelKind::User,
+            Some("pre-cancel expectation aggregation"),
+        );
+
+        let error = sandbox
+            .check_all_expectations_with_cx(&cx)
+            .await
+            .expect_err("cancellation must not fabricate empty expectation counts");
+        assert!(
+            matches!(
+                error,
+                frankenterm_core::Error::RuntimeOperation {
+                    operation: "simulation.expectations.check_all",
+                    source: frankenterm_core::error::RuntimeOperationSource::Cancelled(_),
+                }
+            ),
+            "cancellation must remain a typed aggregate error"
+        );
+    });
+}
+
+// ===========================================================================
+// 44. cancelled_resize_timeline_returns_typed_error_without_mutation
+// ===========================================================================
+
+#[test]
+fn cancelled_resize_timeline_returns_typed_error_without_mutation() {
+    let rt = RuntimeFixture::current_thread();
+    rt.block_on(async {
+        let scenario = Scenario::from_yaml(BASIC_SCENARIO).unwrap();
+        let mock = MockWezterm::new();
+        scenario.setup(&mock).await.unwrap();
+        let content_before = mock.get_text(0, false).await.unwrap();
+        let cx = frankenterm_core::cx::for_testing();
+        cx.cancel_with(
+            frankenterm_core::outcome::CancelKind::User,
+            Some("pre-cancel resize timeline"),
+        );
+
+        let error = scenario
+            .execute_all_with_resize_timeline_with_cx(&cx, &mock)
+            .await
+            .expect_err("pre-cancelled resize timeline must fail");
+
+        assert!(
+            matches!(
+                &error,
+                frankenterm_core::Error::RuntimeOperation {
+                    operation: "simulation.execute_until_with_resize_timeline",
+                    source: frankenterm_core::error::RuntimeOperationSource::Cancelled(_),
+                }
+            ),
+            "resize timeline cancellation must remain typed: {error:?}"
+        );
+        assert_eq!(
+            mock.get_text(0, false).await.unwrap(),
+            content_before,
+            "pre-cancelled execution must not inject any event"
+        );
+    });
+}
+
+// ===========================================================================
+// 45. cancelled_scenario_execution_returns_typed_error_without_mutation
+// ===========================================================================
+
+#[test]
+fn cancelled_scenario_execution_returns_typed_error_without_mutation() {
+    let rt = RuntimeFixture::current_thread();
+    rt.block_on(async {
+        let scenario = Scenario::from_yaml(BASIC_SCENARIO).unwrap();
+        let mock = MockWezterm::new();
+        scenario.setup(&mock).await.unwrap();
+        let content_before = mock.get_text(0, false).await.unwrap();
+        let cx = frankenterm_core::cx::for_testing();
+        cx.cancel_with(
+            frankenterm_core::outcome::CancelKind::User,
+            Some("pre-cancel scenario execution"),
+        );
+
+        let error = scenario
+            .execute_all_with_cx(&cx, &mock)
+            .await
+            .expect_err("pre-cancelled scenario execution must fail");
+
+        assert!(
+            matches!(
+                &error,
+                frankenterm_core::Error::RuntimeOperation {
+                    operation: "simulation.execute_until",
+                    source: frankenterm_core::error::RuntimeOperationSource::Cancelled(_),
+                }
+            ),
+            "scenario cancellation must remain typed: {error:?}"
+        );
+        assert_eq!(
+            mock.get_text(0, false).await.unwrap(),
+            content_before,
+            "pre-cancelled execution must not inject any event"
+        );
+    });
+}
+
+// ===========================================================================
+// 46. cancelled_sandbox_constructor_returns_error
+// ===========================================================================
+
+#[test]
+fn cancelled_sandbox_constructor_returns_error() {
+    let rt = RuntimeFixture::current_thread();
+    rt.block_on(async {
+        let cx = frankenterm_core::cx::for_testing();
+        cx.cancel_with(
+            frankenterm_core::outcome::CancelKind::User,
+            Some("pre-cancel sandbox constructor"),
+        );
+
+        let error = match TutorialSandbox::new_with_cx(&cx).await {
+            Ok(_) => panic!("cancelled setup must not return a partial sandbox"),
+            Err(error) => error,
+        };
+
+        assert!(
+            matches!(
+                &error,
+                frankenterm_core::Error::RuntimeOperation {
+                    operation: "simulation.setup",
+                    source: frankenterm_core::error::RuntimeOperationSource::Cancelled(_),
+                }
+            ),
+            "sandbox-construction cancellation must remain typed: {error:?}"
+        );
     });
 }

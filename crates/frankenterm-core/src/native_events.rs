@@ -374,13 +374,9 @@ impl NativeEventListener {
     }
 
     pub async fn run(self, event_tx: mpsc::Sender<NativeEvent>, shutdown_flag: Arc<AtomicBool>) {
-        {
-            // ft-xbnl0.2.3: route the legacy entry point through the
-            // explicit-Cx accept loop so the listener keeps a single
-            // request-rooted cancellation chain for its full lifetime.
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            self.run_with_cx(&cx, event_tx, shutdown_flag).await;
-        }
+        // Keep one request-rooted cancellation chain for the full accept loop.
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.run_with_cx(&cx, event_tx, shutdown_flag).await;
     }
 
     /// Run the accept loop against the caller's asupersync capability

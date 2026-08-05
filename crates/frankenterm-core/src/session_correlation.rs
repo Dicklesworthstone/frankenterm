@@ -311,19 +311,16 @@ pub async fn correlate_with_cass(
     session_started_at_ms: i64,
     options: &CassCorrelationOptions,
 ) -> SessionCorrelation {
-    if options.override_session_id.is_some() {
-        return correlate_from_sessions(&[], session_started_at_ms, options);
-    }
-
-    match cass.search_sessions(project_path, Some(agent)).await {
-        Ok(sessions) => correlate_from_sessions(&sessions, session_started_at_ms, options),
-        Err(err) => SessionCorrelation::error(
-            err.to_string(),
-            vec!["cass_search_failed".to_string()],
-            window_start(session_started_at_ms, options),
-            window_end(session_started_at_ms, options),
-        ),
-    }
+    let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+    correlate_with_cass_with_cx(
+        &cx,
+        cass,
+        project_path,
+        agent,
+        session_started_at_ms,
+        options,
+    )
+    .await
 }
 
 /// Cx-first [`correlate_with_cass`] (ft-xbnl0.2.3). Routes the
@@ -366,43 +363,17 @@ pub async fn correlate_and_persist_for_pane(
     session_started_at_ms: i64,
     options: &CassCorrelationOptions,
 ) -> Result<SessionCorrelation, String> {
-    let window_start_ms = window_start(session_started_at_ms, options);
-    let window_end_ms = window_end(session_started_at_ms, options);
-
-    let correlation = if options.override_session_id.is_some() {
-        correlate_from_sessions(&[], session_started_at_ms, options)
-    } else {
-        let pane = storage.get_pane(pane_id).await.map_err(|e| e.to_string())?;
-
-        let project_path = pane
-            .as_ref()
-            .and_then(|record| record.cwd.as_ref())
-            .and_then(|cwd| resolve_project_path(cwd));
-
-        if let Some(path) = project_path {
-            correlate_with_cass(cass, &path, agent, session_started_at_ms, options).await
-        } else {
-            SessionCorrelation::unlinked(
-                vec!["missing_or_remote_cwd".to_string()],
-                0,
-                window_start_ms,
-                window_end_ms,
-            )
-        }
-    };
-
-    let mut session_record = select_session_record(storage, pane_id, agent, session_started_at_ms)
-        .await
-        .map_err(|e| e.to_string())?;
-    session_record.external_id = correlation.external_id.clone();
-    session_record.external_meta = Some(correlation.to_external_meta());
-
-    storage
-        .upsert_agent_session(session_record)
-        .await
-        .map_err(|e| e.to_string())?;
-
-    Ok(correlation)
+    let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+    correlate_and_persist_for_pane_with_cx(
+        &cx,
+        storage,
+        cass,
+        pane_id,
+        agent,
+        session_started_at_ms,
+        options,
+    )
+    .await
 }
 
 /// Cx-first [`correlate_and_persist_for_pane`] (ft-xbnl0.2.3).
@@ -507,59 +478,8 @@ pub async fn refresh_cass_summary_for_session(
     session_id: i64,
     options: &CassSummaryRefreshOptions,
 ) -> Result<CassSessionSummary, String> {
-    let mut record = storage
-        .get_agent_session(session_id)
-        .await
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| format!("agent session not found: {session_id}"))?;
-
-    let Some(external_id) = record.external_id.clone() else {
-        return Err("cass external_id missing on agent session".to_string());
-    };
-
-    let now = now_ms();
-    if !options.force {
-        if let Some(last_refresh) = record.external_meta.as_ref().and_then(extract_refresh_ms) {
-            let elapsed = now.saturating_sub(last_refresh);
-            if elapsed < options.min_refresh_interval_ms {
-                if let Some(summary) = record
-                    .external_meta
-                    .as_ref()
-                    .and_then(extract_summary_from_meta)
-                {
-                    return Ok(summary);
-                }
-            }
-        }
-    }
-
-    let session = cass
-        .query_session(&external_id)
-        .await
-        .map_err(|err| err.to_string())?;
-
-    let summary = CassSessionSummary::from_session(&session);
-    record.total_tokens = summary.total_tokens;
-    record.input_tokens = summary.input_tokens;
-    record.output_tokens = summary.output_tokens;
-
-    if record.ended_at.is_none() {
-        record.ended_at = summary.session_ended_at_ms;
-    }
-
-    record.external_meta = Some(merge_external_meta(
-        record.external_meta.take(),
-        &summary,
-        now,
-        &external_id,
-    ));
-
-    storage
-        .upsert_agent_session(record)
-        .await
-        .map_err(|e| e.to_string())?;
-
-    Ok(summary)
+    let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+    refresh_cass_summary_for_session_with_cx(&cx, storage, cass, session_id, options).await
 }
 
 /// Cx-first [`refresh_cass_summary_for_session`] (ft-xbnl0.2.3).
@@ -653,27 +573,7 @@ fn window_end(session_started_at_ms: i64, options: &CassCorrelationOptions) -> i
     session_started_at_ms.saturating_add(options.window_after_ms.max(0))
 }
 
-async fn select_session_record(
-    storage: &StorageHandle,
-    pane_id: u64,
-    agent: CassAgent,
-    session_started_at_ms: i64,
-) -> Result<AgentSessionRecord, crate::Error> {
-    let agent_type = agent.as_str();
-    let sessions = storage.get_sessions_for_pane(pane_id).await?;
-    if let Some(existing) = sessions
-        .iter()
-        .find(|record| record.agent_type == agent_type && record.ended_at.is_none())
-    {
-        return Ok(existing.clone());
-    }
-
-    let mut record = AgentSessionRecord::new_start(pane_id, agent_type);
-    record.started_at = session_started_at_ms;
-    Ok(record)
-}
-
-/// ft-xbnl0.2.3 Cx-first sibling of [`select_session_record`].
+/// Select an existing active session or construct a new record under `cx`.
 async fn select_session_record_with_cx(
     cx: &crate::cx::Cx,
     storage: &StorageHandle,

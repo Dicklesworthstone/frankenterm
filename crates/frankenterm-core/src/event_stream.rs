@@ -821,35 +821,8 @@ impl FilteredEventStream {
     /// Returns `None` when the channel is closed.
     /// Updates the cursor on each delivered event (if it has a storage ID).
     pub async fn next(&mut self) -> Option<Event> {
-        loop {
-            match self.subscriber.recv().await {
-                Ok(event) => {
-                    if self.filter.matches_event(&event) {
-                        self.delivered.fetch_add(1, Ordering::Relaxed);
-                        // Advance cursor if this is a persisted detection with an ID
-                        if let Event::PatternDetected {
-                            event_id: Some(id), ..
-                        } = &event
-                        {
-                            self.cursor.advance(*id);
-                        }
-                        return Some(event);
-                    }
-                    self.filtered_out.fetch_add(1, Ordering::Relaxed);
-                }
-                Err(crate::events::RecvError::Lagged { .. }) => {
-                    // Subscriber fell behind; events were lost but channel is
-                    // still open. Continue receiving from the new position.
-                }
-                Err(crate::events::RecvError::Cancelled) => {
-                    return None;
-                }
-                Err(crate::events::RecvError::Closed) => {
-                    // Channel closed — no more events will arrive.
-                    return None;
-                }
-            }
-        }
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.next_cx(&cx).await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`next`].

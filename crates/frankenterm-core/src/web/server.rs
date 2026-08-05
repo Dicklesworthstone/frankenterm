@@ -6,8 +6,6 @@ use super::{WebServerConfig, WebServerHandle, build_app};
 use crate::runtime_async::signal;
 use crate::web_framework::FrameworkWebRuntime;
 use crate::{Error, Result};
-use std::net::{SocketAddr, TcpStream};
-use std::time::Duration;
 use tracing::info;
 
 /// Start the web server and return a handle for shutdown.
@@ -15,22 +13,8 @@ use tracing::info;
 /// Refuses to bind on non-localhost addresses because the current web API has
 /// no authentication boundary.
 pub async fn start_web_server(config: WebServerConfig) -> Result<WebServerHandle> {
-    validate_bind_config(&config)?;
-    let bind_addr = config.bind_addr();
-    let runtime_limits = config.runtime_limits;
-    let app = build_app(config.storage, config.event_bus, runtime_limits);
-    let (local_addr, runtime) = FrameworkWebRuntime::start(bind_addr, app).await?;
-
-    info!(
-        target: "wa.web",
-        bound_addr = %local_addr,
-        "web server listening"
-    );
-
-    Ok(WebServerHandle {
-        bound_addr: local_addr,
-        runtime,
-    })
+    let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+    start_web_server_with_cx(&cx, config).await
 }
 
 /// ft-xbnl0.2.3 Cx-first sibling of [`start_web_server`].
@@ -47,22 +31,19 @@ pub async fn start_web_server_with_cx(
     cx: &crate::cx::Cx,
     config: WebServerConfig,
 ) -> Result<WebServerHandle> {
-    use tracing::info;
-
     cx.checkpoint()
         .map_err(|err| Error::runtime_cancelled("start_web_server", err.to_string()))?;
 
     validate_bind_config(&config)?;
     let bind_addr = config.bind_addr();
     let runtime_limits = config.runtime_limits;
-    let app = super::build_app(config.storage, config.event_bus, runtime_limits);
-    let (local_addr, runtime) =
-        crate::web_framework::FrameworkWebRuntime::start_with_cx(cx, bind_addr, app).await?;
+    let app = build_app(config.storage, config.event_bus, runtime_limits);
+    let (local_addr, runtime) = FrameworkWebRuntime::start_with_cx(cx, bind_addr, app).await?;
 
     info!(
         target: "wa.web",
         bound_addr = %local_addr,
-        "web server listening (cx-first)"
+        "web server listening"
     );
 
     Ok(WebServerHandle {
@@ -73,27 +54,8 @@ pub async fn start_web_server_with_cx(
 
 /// Run the web server until Ctrl+C, then shut down gracefully.
 pub async fn run_web_server(config: WebServerConfig) -> Result<()> {
-    let WebServerHandle {
-        bound_addr,
-        mut runtime,
-    } = start_web_server(config).await?;
-
-    println!("ft web listening on http://{bound_addr}");
-
-    crate::runtime_async::select! {
-        result = runtime.join_handle_mut() => {
-            runtime.finish(result).await?;
-        }
-        shutdown = wait_for_shutdown_signal() => {
-            shutdown?;
-            runtime.signal_shutdown();
-            poke_listener(bound_addr);
-            let result = runtime.join_handle_mut().await;
-            runtime.finish(result).await?;
-        }
-    }
-
-    Ok(())
+    let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+    run_web_server_with_cx(&cx, config).await
 }
 
 fn validate_bind_config(config: &WebServerConfig) -> Result<()> {
@@ -117,69 +79,76 @@ fn validate_bind_config(config: &WebServerConfig) -> Result<()> {
 
 /// ft-xbnl0.2.3 Cx-first sibling of [`run_web_server`].
 ///
-/// Orchestrator-level cx threading: routes the initial bind
-/// through `start_web_server_with_cx` so the bind phase honours
-/// caller cancellation, and passes the caller's cx into
-/// `wait_for_shutdown_signal_with_cx` so the signal wait can be
-/// interrupted by cx-cancel as well as by Ctrl+C/SIGTERM. A
-/// caller-initiated cx-cancel now triggers the same graceful-
-/// shutdown path (`signal_shutdown` + `poke_listener` + drain
-/// join handle) that a SIGTERM would.
+/// Routes the initial bind through [`start_web_server_with_cx`] so startup
+/// honors caller cancellation. After startup succeeds, every exit path owns
+/// the server until it has joined, drained, and run framework shutdown hooks.
+/// Caller cancellation triggers graceful shutdown, but is surfaced only after
+/// cleanup completes under an independent context. A server-join or cleanup
+/// failure takes precedence over the shutdown-wait or caller-cancellation error.
+/// Dropping the run future invokes the runtime's synchronous signal-and-wake
+/// fallback; full drain and async hooks require awaiting this function.
 pub async fn run_web_server_with_cx(cx: &crate::cx::Cx, config: WebServerConfig) -> Result<()> {
     let WebServerHandle {
         bound_addr,
         mut runtime,
     } = start_web_server_with_cx(cx, config).await?;
 
-    println!("ft web listening on http://{bound_addr} (cx-first)");
+    println!("ft web listening on http://{bound_addr}");
 
-    crate::runtime_async::select! {
+    let (join_result, shutdown_result) = crate::runtime_async::select! {
         result = runtime.join_handle_mut() => {
-            runtime.finish(result).await?;
+            (result, None)
         }
         shutdown = wait_for_shutdown_signal_with_cx(cx) => {
-            shutdown?;
             runtime.signal_shutdown();
-            poke_listener(bound_addr);
             let result = runtime.join_handle_mut().await;
-            runtime.finish(result).await?;
+            (result, Some(shutdown))
         }
+    };
+
+    // Once start succeeds, graceful cleanup is mandatory. In particular, a
+    // cancelled caller Cx must not suppress drain or framework shutdown hooks.
+    let cleanup_cx = crate::cx::for_request();
+    runtime.finish_with_cx(&cleanup_cx, join_result).await?;
+
+    if let Some(result) = shutdown_result {
+        result?;
     }
+
+    cx.checkpoint()
+        .map_err(|err| Error::runtime_cancelled("run_web_server", err.to_string()))?;
 
     Ok(())
 }
 
-async fn wait_for_shutdown_signal() -> Result<()> {
-    #[cfg(unix)]
-    {
-        use crate::runtime_async::signal::unix::SignalKind;
-
-        let mut term = signal::unix::signal(SignalKind::terminate())
-            .map_err(|e| Error::runtime_backend("web sigterm handler", e.to_string()))?;
-
-        crate::runtime_async::select! {
-            _ = signal::ctrl_c() => {}
-            _ = term.recv() => {}
+/// Poll until caller cancellation or budget exhaustion is observed.
+async fn wait_for_cx_cancellation(cx: &crate::cx::Cx) -> Result<()> {
+    loop {
+        cx.checkpoint()
+            .map_err(|err| Error::runtime_cancelled("web shutdown wait", err.to_string()))?;
+        if let Err(sleep_error) =
+            crate::runtime_async::sleep_with_cx(cx, std::time::Duration::from_millis(100)).await
+        {
+            if let Err(cancel_error) = cx.checkpoint() {
+                return Err(Error::runtime_cancelled(
+                    "web shutdown wait",
+                    cancel_error.to_string(),
+                ));
+            }
+            return Err(Error::runtime_backend(
+                "web shutdown wait sleep",
+                sleep_error,
+            ));
         }
-        Ok(())
-    }
-    #[cfg(not(unix))]
-    {
-        signal::ctrl_c()
-            .await
-            .map_err(|e| Error::runtime_backend("web ctrl_c handler", e.to_string()))?;
-        Ok(())
     }
 }
 
-/// ft-xbnl0.2.3 Cx-first sibling of [`wait_for_shutdown_signal`].
+/// Wait for an OS shutdown signal or caller cancellation under an explicit Cx.
 ///
-/// Races the OS signal futures against `cx` cancellation. On
-/// cx-cancel the function returns `Ok(())` — semantically
-/// "external shutdown request", indistinguishable from a SIGTERM
-/// for the caller's graceful-shutdown logic. That keeps
-/// `run_web_server_with_cx`'s shutdown branch simple: whichever
-/// of the three (SIGINT, SIGTERM, cx-cancel) fires first wins.
+/// Races the OS signal futures against `cx` cancellation. OS signals return
+/// `Ok(())`; caller cancellation returns a typed runtime-cancellation error.
+/// The caller retains that result while it completes mandatory cleanup, then
+/// surfaces it to its caller.
 #[cfg(unix)]
 async fn wait_for_shutdown_signal_with_cx(cx: &crate::cx::Cx) -> Result<()> {
     use crate::runtime_async::signal::unix::SignalKind;
@@ -192,15 +161,7 @@ async fn wait_for_shutdown_signal_with_cx(cx: &crate::cx::Cx) -> Result<()> {
     let mut term = signal::unix::signal(SignalKind::terminate())
         .map_err(|e| Error::runtime_backend("web sigterm handler", e.to_string()))?;
 
-    let cancel_fut = async {
-        loop {
-            if cx.is_cancel_requested() {
-                return;
-            }
-            let _ = crate::runtime_async::sleep_with_cx(cx, std::time::Duration::from_millis(100))
-                .await;
-        }
-    };
+    let cancel_fut = wait_for_cx_cancellation(cx);
     let ctrl_c = signal::ctrl_c();
     let term_recv = term.recv();
     pin_mut!(ctrl_c, term_recv, cancel_fut);
@@ -209,12 +170,20 @@ async fn wait_for_shutdown_signal_with_cx(cx: &crate::cx::Cx) -> Result<()> {
         Either::Left((Either::Left((result, _)), _)) => {
             result.map_err(|e| Error::runtime_backend("web ctrl_c handler", e.to_string()))?;
         }
-        Either::Left((Either::Right((_term, _)), _)) => {}
-        Either::Right(((), _)) => {}
+        Either::Left((Either::Right((term, _)), _)) => {
+            if term.is_none() {
+                return Err(Error::runtime_backend(
+                    "web sigterm handler",
+                    "signal stream closed without a termination signal",
+                ));
+            }
+        }
+        Either::Right((result, _)) => return result,
     }
     Ok(())
 }
 
+/// Non-Unix shutdown-signal race; see the Unix sibling for semantics.
 #[cfg(not(unix))]
 async fn wait_for_shutdown_signal_with_cx(cx: &crate::cx::Cx) -> Result<()> {
     use futures::future::{Either, select};
@@ -223,15 +192,7 @@ async fn wait_for_shutdown_signal_with_cx(cx: &crate::cx::Cx) -> Result<()> {
     cx.checkpoint()
         .map_err(|err| Error::runtime_cancelled("web shutdown wait", err.to_string()))?;
 
-    let cancel_fut = async {
-        loop {
-            if cx.is_cancel_requested() {
-                return;
-            }
-            let _ = crate::runtime_async::sleep_with_cx(cx, std::time::Duration::from_millis(100))
-                .await;
-        }
-    };
+    let cancel_fut = wait_for_cx_cancellation(cx);
     let ctrl_c = signal::ctrl_c();
     pin_mut!(ctrl_c, cancel_fut);
 
@@ -239,15 +200,9 @@ async fn wait_for_shutdown_signal_with_cx(cx: &crate::cx::Cx) -> Result<()> {
         Either::Left((result, _)) => {
             result.map_err(|e| Error::runtime_backend("web ctrl_c handler", e.to_string()))?;
         }
-        Either::Right(((), _)) => {}
+        Either::Right((result, _)) => return result,
     }
     Ok(())
-}
-
-pub(super) fn poke_listener(addr: SocketAddr) {
-    if let Ok(stream) = TcpStream::connect_timeout(&addr, Duration::from_millis(200)) {
-        let _ = stream.shutdown(std::net::Shutdown::Both);
-    }
 }
 
 #[cfg(test)]

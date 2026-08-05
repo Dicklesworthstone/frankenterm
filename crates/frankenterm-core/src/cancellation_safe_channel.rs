@@ -252,19 +252,8 @@ impl<T> TxProducer<T> {
     ///
     /// Returns `Err(Closed)` if the channel is closed while waiting.
     pub async fn reserve(&self) -> Result<Reservation, TxChannelError> {
-        loop {
-            match self.try_reserve() {
-                Ok(r) => return Ok(r),
-                Err(TxChannelError::Full) => {
-                    // Wait for capacity to be freed
-                    self.shared.rollback_state.capacity_freed.notified().await;
-                    if self.shared.closed.load(Ordering::Acquire) {
-                        return Err(TxChannelError::Closed);
-                    }
-                }
-                Err(e) => return Err(e),
-            }
-        }
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.reserve_with_cx(&cx).await
     }
 
     /// Cx-first [`Self::reserve`] (ft-xbnl0.2.3). Threads caller
@@ -277,6 +266,9 @@ impl<T> TxProducer<T> {
     /// return shape so existing callers that handle `Closed`
     /// don't need to special-case cancellation.
     pub async fn reserve_with_cx(&self, cx: &crate::cx::Cx) -> Result<Reservation, TxChannelError> {
+        use futures::future::{Either, select};
+        use std::time::Duration;
+
         loop {
             if cx.checkpoint().is_err() {
                 return Err(TxChannelError::Closed);
@@ -284,7 +276,23 @@ impl<T> TxProducer<T> {
             match self.try_reserve() {
                 Ok(r) => return Ok(r),
                 Err(TxChannelError::Full) => {
-                    self.shared.rollback_state.capacity_freed.notified().await;
+                    let notified =
+                        std::pin::pin!(self.shared.rollback_state.capacity_freed.notified());
+                    let cancel_watcher = std::pin::pin!(async {
+                        loop {
+                            if crate::runtime_async::sleep_with_cx(cx, Duration::from_millis(50))
+                                .await
+                                .is_err()
+                                || cx.is_cancel_requested()
+                            {
+                                return;
+                            }
+                        }
+                    });
+
+                    if let Either::Right(((), _)) = select(notified, cancel_watcher).await {
+                        return Err(TxChannelError::Closed);
+                    }
                     if self.shared.closed.load(Ordering::Acquire) {
                         return Err(TxChannelError::Closed);
                     }
@@ -457,15 +465,8 @@ impl<T> TxConsumer<T> {
     ///
     /// Returns `None` if the channel is closed and all values have been consumed.
     pub async fn recv(&self) -> Option<ReceivedValue<T>> {
-        loop {
-            if let Some(rv) = self.try_recv() {
-                return Some(rv);
-            }
-            if self.shared.closed.load(Ordering::Acquire) && self.shared.queue.is_empty() {
-                return None;
-            }
-            self.shared.not_empty.notified().await;
-        }
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.recv_with_cx(&cx).await
     }
 
     /// Cx-first [`Self::recv`] (ft-xbnl0.2.3). Threads caller

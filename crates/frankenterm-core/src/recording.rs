@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use crate::runtime_async::Mutex;
+use crate::runtime_async::{LockAcquireError, Mutex};
 use frankenterm_sigpipe::{catch_recoverable, RecoverablePanicSite};
 use serde::{Deserialize, Serialize};
 
@@ -694,6 +694,18 @@ fn recording_runtime_error(operation: &'static str, detail: impl Into<String>) -
     }
 }
 
+fn recording_lock_error(operation: &'static str, error: LockAcquireError) -> crate::Error {
+    match error {
+        LockAcquireError::Cancelled => crate::Error::RuntimeOperation {
+            operation,
+            source: RuntimeOperationSource::Cancelled(error.to_string()),
+        },
+        LockAcquireError::TimedOut { .. }
+        | LockAcquireError::Poisoned
+        | LockAcquireError::PolledAfterCompletion => recording_runtime_error(operation, error.to_string()),
+    }
+}
+
 impl RecordingManager {
     /// Create a new recording manager with the given options.
     #[must_use]
@@ -729,7 +741,11 @@ impl RecordingManager {
         path: &Path,
         started_at_ms: i64,
     ) -> Result<()> {
-        let mut guard = self.recorders.lock_with_cx(cx).await;
+        let mut guard = self
+            .recorders
+            .lock_with_cx(cx)
+            .await
+            .map_err(|error| recording_lock_error("recording.start", error))?;
         if guard.contains_key(&pane_id) {
             return Err(recording_runtime_error(
                 "recording.start",
@@ -765,7 +781,11 @@ impl RecordingManager {
         pane_id: u64,
         timeout: Duration,
     ) -> Result<Option<RecorderStats>> {
-        let mut guard = self.recorders.lock_with_cx(cx).await;
+        let mut guard = self
+            .recorders
+            .lock_with_cx(cx)
+            .await
+            .map_err(|error| recording_lock_error("recording.stop", error))?;
         if !guard.contains_key(&pane_id) {
             return Ok(None);
         }
@@ -810,7 +830,11 @@ impl RecordingManager {
         let content_len = segment.content.len() as u64;
         let is_gap = matches!(segment.kind, CapturedSegmentKind::Gap { .. });
 
-        let mut guard = self.recorders.lock_with_cx(cx).await;
+        let mut guard = self
+            .recorders
+            .lock_with_cx(cx)
+            .await
+            .map_err(|error| recording_lock_error("recording.segment", error))?;
         let Some(recorder) = guard.get_mut(&segment.pane_id) else {
             return Ok(());
         };
@@ -858,7 +882,11 @@ impl RecordingManager {
         };
         let detection_ref: &Detection = redacted_owned.as_ref().unwrap_or(detection);
 
-        let mut guard = self.recorders.lock_with_cx(cx).await;
+        let mut guard = self
+            .recorders
+            .lock_with_cx(cx)
+            .await
+            .map_err(|error| recording_lock_error("recording.event", error))?;
         let Some(recorder) = guard.get_mut(&pane_id) else {
             return Ok(());
         };
@@ -2338,7 +2366,11 @@ mod tests {
                 .expect("record segment");
 
             {
-                let mut guard = manager.recorders.lock_with_cx(&cx).await;
+                let mut guard = manager
+                    .recorders
+                    .lock_with_cx(&cx)
+                    .await
+                    .expect("live Cx must acquire recorder map");
                 let recorder = guard.get_mut(&11).expect("active recorder");
                 let first_timeout = recorder
                     .writer
@@ -2364,7 +2396,11 @@ mod tests {
             );
 
             {
-                let guard = manager.recorders.lock_with_cx(&cx).await;
+                let guard = manager
+                    .recorders
+                    .lock_with_cx(&cx)
+                    .await
+                    .expect("live Cx must acquire recorder map");
                 let recorder = guard
                     .get(&11)
                     .expect("recorder must remain registered after retryable stop timeout");
@@ -2381,7 +2417,11 @@ mod tests {
             assert_eq!(stats.state, RecorderState::Stopped);
             assert_eq!(stats.frames_written, 1);
 
-            let guard = manager.recorders.lock_with_cx(&cx).await;
+            let guard = manager
+                .recorders
+                .lock_with_cx(&cx)
+                .await
+                .expect("live Cx must acquire recorder map");
             assert!(
                 !guard.contains_key(&11),
                 "successful stop removes finalized recorder"

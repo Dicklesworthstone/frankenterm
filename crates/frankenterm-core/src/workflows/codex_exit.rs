@@ -76,22 +76,6 @@ pub async fn codex_exit_and_wait_for_summary_with_cx<S, F, Fut>(
     cx: &crate::cx::Cx,
     pane_id: u64,
     source: &S,
-    send_ctrl_c: F,
-    options: &CodexExitOptions,
-) -> Result<CodexExitOutcome, String>
-where
-    S: PaneTextSource + Sync + ?Sized,
-    F: FnMut() -> Fut,
-    Fut: Future<Output = Result<InjectionResult, String>> + Send,
-{
-    cx.checkpoint().map_err(|e| e.to_string())?;
-    codex_exit_and_wait_for_summary(pane_id, source, send_ctrl_c, options).await
-}
-
-#[allow(dead_code)]
-pub async fn codex_exit_and_wait_for_summary<S, F, Fut>(
-    pane_id: u64,
-    source: &S,
     mut send_ctrl_c: F,
     options: &CodexExitOptions,
 ) -> Result<CodexExitOutcome, String>
@@ -100,14 +84,16 @@ where
     F: FnMut() -> Fut,
     Fut: Future<Output = Result<InjectionResult, String>> + Send,
 {
+    cx.checkpoint().map_err(|e| e.to_string())?;
+
     let grace_timeout = Duration::from_millis(options.grace_timeout_ms);
     let summary_timeout = Duration::from_millis(options.summary_timeout_ms);
 
-    // First Ctrl-C attempt.
     let first = send_ctrl_c().await?;
     ctrl_c_injection_ok(first)?;
 
-    let first_wait = wait_for_codex_session_summary(
+    let first_wait = wait_for_codex_session_summary_with_cx(
+        cx,
         source,
         pane_id,
         grace_timeout,
@@ -123,11 +109,12 @@ where
         });
     }
 
-    // Second Ctrl-C attempt if summary not observed.
+    cx.checkpoint().map_err(|e| e.to_string())?;
     let second = send_ctrl_c().await?;
     ctrl_c_injection_ok(second)?;
 
-    let second_wait = wait_for_codex_session_summary(
+    let second_wait = wait_for_codex_session_summary_with_cx(
+        cx,
         source,
         pane_id,
         summary_timeout,
@@ -143,6 +130,9 @@ where
         });
     }
 
+    cx.checkpoint()
+        .map_err(|e| format!("Codex summary wait cancelled after Ctrl-C x2: {e}"))?;
+
     let last_hash = second_wait
         .last_tail_hash
         .map_or_else(|| "none".to_string(), |value| format!("{value:016x}"));
@@ -153,6 +143,22 @@ where
         second_wait.elapsed_ms,
         last_hash
     ))
+}
+
+#[allow(dead_code)]
+pub async fn codex_exit_and_wait_for_summary<S, F, Fut>(
+    pane_id: u64,
+    source: &S,
+    send_ctrl_c: F,
+    options: &CodexExitOptions,
+) -> Result<CodexExitOutcome, String>
+where
+    S: PaneTextSource + Sync + ?Sized,
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<InjectionResult, String>> + Send,
+{
+    let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+    codex_exit_and_wait_for_summary_with_cx(&cx, pane_id, source, send_ctrl_c, options).await
 }
 
 // ============================================================================
@@ -353,7 +359,11 @@ pub async fn persist_codex_session_summary_with_cx(
     summary: &CodexSessionSummary,
 ) -> Result<i64, String> {
     cx.checkpoint().map_err(|e| e.to_string())?;
-    persist_codex_session_summary(storage, pane_id, summary).await
+    let record = codex_session_record_from_summary(pane_id, summary);
+    storage
+        .upsert_agent_session_with_cx(cx, record)
+        .await
+        .map_err(|e| format!("Failed to persist Codex session summary: {e}"))
 }
 
 /// Persist parsed Codex summary data into agent_sessions.
@@ -363,11 +373,8 @@ pub async fn persist_codex_session_summary(
     pane_id: u64,
     summary: &CodexSessionSummary,
 ) -> Result<i64, String> {
-    let record = codex_session_record_from_summary(pane_id, summary);
-    storage
-        .upsert_agent_session(record)
-        .await
-        .map_err(|e| format!("Failed to persist Codex session summary: {e}"))
+    let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+    persist_codex_session_summary_with_cx(&cx, storage, pane_id, summary).await
 }
 
 #[cfg(test)]

@@ -7,8 +7,9 @@
 //!
 //! The pool manages a fixed set of connection slots. Each slot holds either
 //! an idle connection or is empty (available for a new connection). Callers
-//! acquire a `PoolGuard` which provides access to a connection and
-//! automatically returns it to the pool on drop.
+//! acquire a `PoolAcquireResult` that owns the concurrency permit and may
+//! contain an idle connection. Callers explicitly return reusable connections;
+//! dropping the result or its transferred guard always releases the slot.
 //!
 //! For CLI mode, pooling acts as a concurrency limiter — the underlying
 //! `WeztermClient` is stateless but spawning too many processes at once
@@ -19,7 +20,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::cx::{self, Cx};
-use crate::runtime_async::{Mutex, Semaphore, TryAcquireError};
+use crate::runtime_async::{LockAcquireError, Mutex, Semaphore, TryAcquireError};
 use serde::{Deserialize, Serialize};
 
 /// Configuration for the connection pool.
@@ -76,8 +77,11 @@ pub enum PoolError {
     AcquireTimeout,
     /// Pool has been shut down.
     Closed,
-    /// The caller's explicit capability context was cancelled.
+    /// The caller's explicit capability context was cancelled during a pool
+    /// operation.
     Cancelled,
+    /// The idle-queue lock failed for a non-cancellation reason.
+    LockAcquire(LockAcquireError),
 }
 
 impl std::fmt::Display for PoolError {
@@ -85,12 +89,31 @@ impl std::fmt::Display for PoolError {
         match self {
             Self::AcquireTimeout => write!(f, "connection pool acquire timeout"),
             Self::Closed => write!(f, "connection pool is closed"),
-            Self::Cancelled => write!(f, "connection pool acquire cancelled"),
+            Self::Cancelled => write!(f, "connection pool operation cancelled"),
+            Self::LockAcquire(error) => {
+                write!(f, "connection pool lock acquisition failed: {error}")
+            }
         }
     }
 }
 
-impl std::error::Error for PoolError {}
+impl std::error::Error for PoolError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::LockAcquire(error) => Some(error),
+            Self::AcquireTimeout | Self::Closed | Self::Cancelled => None,
+        }
+    }
+}
+
+impl From<LockAcquireError> for PoolError {
+    fn from(error: LockAcquireError) -> Self {
+        match error {
+            LockAcquireError::Cancelled => Self::Cancelled,
+            other => Self::LockAcquire(other),
+        }
+    }
+}
 
 /// A generic async connection pool.
 ///
@@ -133,27 +156,27 @@ impl<C: Send + 'static> Pool<C> {
     /// available, or `Err` if no slots are free. If `result.conn` is `None`,
     /// the caller should create a new connection.
     pub async fn try_acquire(&self) -> Result<PoolAcquireResult<C>, PoolError> {
-        {
-            let cx = Cx::current().unwrap_or_else(cx::for_request);
-            return self.try_acquire_with_cx(&cx).await;
-        }
+        let cx = Cx::current().unwrap_or_else(cx::for_request);
+        self.try_acquire_with_cx(&cx).await
     }
 
     /// Try to acquire a connection using an explicit capability context.
     ///
-    /// This is the migration-safe entry point for call paths that already
-    /// thread `Cx` explicitly. The internal idle-pool mutex acquire is
-    /// bound to the caller's `Cx` via `Mutex::lock_with_cx` so a
-    /// caller-cancelled wait propagates through the full acquire path
-    /// (ft-xbnl0.2.3). Without this, a cancelled caller could be
-    /// blocked on the ambient mutex acquire for the full `lock` budget
-    /// even though the caller had already abandoned the operation.
+    /// The internal idle-pool mutex acquire is
+    /// bound to the caller's `Cx` via
+    /// `Mutex::lock_with_cx`, so a caller-cancelled wait propagates
+    /// through the full acquire path as [`PoolError::Cancelled`] rather than a
+    /// panic (ft-xbnl0.2.3).
     pub async fn try_acquire_with_cx(&self, cx: &Cx) -> Result<PoolAcquireResult<C>, PoolError> {
         Self::checkpoint_explicit_cx(cx)?;
         match self.semaphore.clone().try_acquire_owned() {
             Ok(permit) => {
                 let conn = {
-                    let mut idle = self.idle.lock_with_cx(cx).await;
+                    let mut idle = self
+                        .idle
+                        .lock_with_cx(cx)
+                        .await
+                        .map_err(PoolError::from)?;
                     self.evict_expired(&mut idle);
                     idle.pop_front().map(|e| e.conn)
                 };
@@ -168,19 +191,13 @@ impl<C: Send + 'static> Pool<C> {
         }
     }
 
-    /// Inner implementation used by the non-asupersync (tokio) path. Under
-    /// `asupersync-runtime` the Cx-first `try_acquire_with_cx` inlines the
-    /// semaphore + idle-lock dance directly so the caller's Cx can be
-    /// threaded into the idle mutex acquire.
     /// Acquire a connection from the pool, waiting up to `acquire_timeout`.
     ///
     /// Returns an idle connection if available, or `None` as the connection
     /// value if the caller needs to create a fresh one (a permit is still held).
     pub async fn acquire(&self) -> Result<PoolAcquireResult<C>, PoolError> {
-        {
-            let cx = Cx::current().unwrap_or_else(cx::for_request);
-            return self.acquire_with_cx(&cx).await;
-        }
+        let cx = Cx::current().unwrap_or_else(cx::for_request);
+        self.acquire_with_cx(&cx).await
     }
 
     /// Acquire a connection using an explicit capability context.
@@ -230,10 +247,13 @@ impl<C: Send + 'static> Pool<C> {
         };
 
         let conn = {
-            // Use lock_with_cx for the idle-pool mutex so a caller-
-            // cancelled wait propagates through the full acquire path
-            // (ft-xbnl0.2.3). Matches the fix in try_acquire_with_cx.
-            let mut idle = self.idle.lock_with_cx(cx).await;
+            // Keep idle-queue cancellation typed. The permit is released
+            // automatically if lock acquisition returns early.
+            let mut idle = self
+                .idle
+                .lock_with_cx(cx)
+                .await
+                .map_err(PoolError::from)?;
             self.evict_expired(&mut idle);
             idle.pop_front().map(|e| e.conn)
         };
@@ -250,19 +270,28 @@ impl<C: Send + 'static> Pool<C> {
     /// If the pool's idle queue is already at capacity, the connection is
     /// dropped instead.
     pub async fn put(&self, conn: C) {
-        {
-            let cx = Cx::current().unwrap_or_else(cx::for_request);
-            return self.put_with_cx(&cx, conn).await;
-        }
+        let cleanup_cx = cx::for_request();
+        self.put_with_cx(&cleanup_cx, conn)
+            .await
+            .expect("infallible pool return failed under independent cleanup context");
     }
 
     /// Return a connection to the pool under an explicit `&Cx`
     /// (ft-xbnl0.2.3 Cx-first entry point). The internal idle-pool
-    /// mutex acquire is bound to the caller's `Cx` via
-    /// `Mutex::lock_with_cx` so a caller-cancelled wait propagates
-    /// cleanly through the return path.
-    pub async fn put_with_cx(&self, cx: &Cx, conn: C) {
-        let mut idle = self.idle.lock_with_cx(cx).await;
+    /// mutex acquire returns a typed error when the caller cancels. If that
+    /// happens, `conn` is dropped instead of being leaked or crossing a panic
+    /// boundary.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PoolError::Cancelled`] when `cx` is cancelled, or
+    /// [`PoolError::LockAcquire`] for another lock-acquisition failure.
+    pub async fn put_with_cx(&self, cx: &Cx, conn: C) -> Result<(), PoolError> {
+        let mut idle = self
+            .idle
+            .lock_with_cx(cx)
+            .await
+            .map_err(PoolError::from)?;
         self.evict_expired(&mut idle);
         if idle.len() < self.config.max_size {
             idle.push_back(PooledEntry {
@@ -272,38 +301,56 @@ impl<C: Send + 'static> Pool<C> {
             self.stats_returned.fetch_add(1, Ordering::Relaxed);
         }
         // If queue is at max_size, connection is dropped (not returned).
+        Ok(())
     }
 
     /// Evict idle connections that have exceeded the idle timeout.
     pub async fn evict_idle(&self) -> usize {
-        {
-            let cx = Cx::current().unwrap_or_else(cx::for_request);
-            return self.evict_idle_with_cx(&cx).await;
-        }
+        let cleanup_cx = cx::for_request();
+        self.evict_idle_with_cx(&cleanup_cx)
+            .await
+            .expect("infallible pool eviction failed under independent cleanup context")
     }
 
     /// Evict expired idle connections under an explicit `&Cx`
     /// (ft-xbnl0.2.3 Cx-first entry point).
-    pub async fn evict_idle_with_cx(&self, cx: &Cx) -> usize {
-        let mut idle = self.idle.lock_with_cx(cx).await;
-        self.evict_expired(&mut idle)
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed pool error if the idle queue cannot be locked.
+    pub async fn evict_idle_with_cx(&self, cx: &Cx) -> Result<usize, PoolError> {
+        let mut idle = self
+            .idle
+            .lock_with_cx(cx)
+            .await
+            .map_err(PoolError::from)?;
+        Ok(self.evict_expired(&mut idle))
     }
 
     /// Get current pool statistics.
     pub async fn stats(&self) -> PoolStats {
-        {
-            let cx = Cx::current().unwrap_or_else(cx::for_request);
-            return self.stats_with_cx(&cx).await;
-        }
+        let snapshot_cx = cx::for_request();
+        self.stats_with_cx(&snapshot_cx)
+            .await
+            .expect("infallible pool stats failed under independent snapshot context")
     }
 
     /// Get current pool statistics under an explicit `&Cx`
     /// (ft-xbnl0.2.3 Cx-first entry point).
-    pub async fn stats_with_cx(&self, cx: &Cx) -> PoolStats {
-        let idle_count = self.idle.lock_with_cx(cx).await.len();
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed pool error if the idle queue cannot be locked.
+    pub async fn stats_with_cx(&self, cx: &Cx) -> Result<PoolStats, PoolError> {
+        let idle_count = self
+            .idle
+            .lock_with_cx(cx)
+            .await
+            .map_err(PoolError::from)?
+            .len();
         let acquired = self.stats_acquired.load(Ordering::Relaxed);
         let returned = self.stats_returned.load(Ordering::Relaxed);
-        PoolStats {
+        Ok(PoolStats {
             max_size: self.config.max_size,
             idle_count,
             active_count: self.config.max_size - self.semaphore.available_permits(),
@@ -311,24 +358,33 @@ impl<C: Send + 'static> Pool<C> {
             total_returned: returned,
             total_evicted: self.stats_evicted.load(Ordering::Relaxed),
             total_timeouts: self.stats_timeouts.load(Ordering::Relaxed),
-        }
+        })
     }
 
     /// Drain all idle connections from the pool.
     pub async fn clear(&self) {
-        {
-            let cx = Cx::current().unwrap_or_else(cx::for_request);
-            return self.clear_with_cx(&cx).await;
-        }
+        let cleanup_cx = cx::for_request();
+        self.clear_with_cx(&cleanup_cx)
+            .await
+            .expect("infallible pool clear failed under independent cleanup context");
     }
 
     /// Drain all idle connections under an explicit `&Cx`
     /// (ft-xbnl0.2.3 Cx-first entry point).
-    pub async fn clear_with_cx(&self, cx: &Cx) {
-        let mut idle = self.idle.lock_with_cx(cx).await;
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed pool error if the idle queue cannot be locked.
+    pub async fn clear_with_cx(&self, cx: &Cx) -> Result<(), PoolError> {
+        let mut idle = self
+            .idle
+            .lock_with_cx(cx)
+            .await
+            .map_err(PoolError::from)?;
         let count = idle.len() as u64;
         idle.clear();
         self.stats_evicted.fetch_add(count, Ordering::Relaxed);
+        Ok(())
     }
 
     /// Internal: remove expired entries from the idle queue.
@@ -441,6 +497,22 @@ mod tests {
             idle_timeout: Duration::from_secs(60),
             acquire_timeout: Duration::from_millis(100),
         }
+    }
+
+    async fn wait_for_all_permits_to_be_consumed<C: Send + 'static>(pool: &Pool<C>) {
+        const MAX_SCHEDULER_STEPS: usize = 4_096;
+        for _ in 0..MAX_SCHEDULER_STEPS {
+            if pool.semaphore.available_permits() == 0 {
+                return;
+            }
+            crate::runtime_async::yield_now().await;
+        }
+        assert_eq!(
+            pool.semaphore.available_permits(),
+            0,
+            "waiter did not consume the pool permit after {MAX_SCHEDULER_STEPS} scheduler steps; configured_max_size={}",
+            pool.config.max_size,
+        );
     }
 
     #[test]
@@ -702,7 +774,11 @@ mod tests {
         assert_eq!(PoolError::Closed.to_string(), "connection pool is closed");
         assert_eq!(
             PoolError::Cancelled.to_string(),
-            "connection pool acquire cancelled"
+            "connection pool operation cancelled"
+        );
+        assert_eq!(
+            PoolError::LockAcquire(LockAcquireError::Poisoned).to_string(),
+            "connection pool lock acquisition failed: lock is poisoned"
         );
     }
 
@@ -1627,6 +1703,49 @@ mod tests {
     }
 
     #[test]
+    fn pool_try_acquire_cancellation_during_idle_lock_wait_is_typed() {
+        run_async_test(async {
+            let pool = Arc::new(Pool::<String>::new(test_config(1)));
+            let lock_cx = Cx::for_testing();
+            let idle_guard = pool
+                .idle
+                .lock_with_cx(&lock_cx)
+                .await
+                .expect("live lock context must acquire idle guard");
+
+            let operation_cx = Cx::for_testing();
+            let task_cx = operation_cx.clone();
+            let task_pool = Arc::clone(&pool);
+            let waiter = crate::runtime_async::task::spawn(async move {
+                task_pool.try_acquire_with_cx(&task_cx).await
+            });
+
+            wait_for_all_permits_to_be_consumed(&pool).await;
+            assert_eq!(
+                pool.semaphore.available_permits(),
+                0,
+                "waiter must hold the permit before cancellation exercises the idle lock"
+            );
+            operation_cx.cancel_with(
+                crate::outcome::CancelKind::User,
+                Some("cancel try_acquire during idle lock wait"),
+            );
+            drop(idle_guard);
+
+            let error = waiter
+                .await
+                .expect("try_acquire waiter task should join")
+                .expect_err("cancelled idle-lock wait must fail");
+            assert_eq!(error, PoolError::Cancelled);
+            assert_eq!(
+                pool.semaphore.available_permits(),
+                1,
+                "typed lock cancellation must release the acquired permit"
+            );
+        });
+    }
+
+    #[test]
     fn pool_acquire_with_precancelled_cx_returns_cancelled_without_timeout() {
         run_async_test(async {
             let pool: Pool<String> = Pool::new(test_config(1));
@@ -1651,6 +1770,49 @@ mod tests {
             );
             assert_eq!(stats.total_acquired, 0);
             assert_eq!(stats.active_count, 0);
+        });
+    }
+
+    #[test]
+    fn pool_acquire_cancellation_during_idle_lock_wait_is_typed() {
+        run_async_test(async {
+            let pool = Arc::new(Pool::<String>::new(test_config(1)));
+            let lock_cx = Cx::for_testing();
+            let idle_guard = pool
+                .idle
+                .lock_with_cx(&lock_cx)
+                .await
+                .expect("live lock context must acquire idle guard");
+
+            let operation_cx = Cx::for_testing();
+            let task_cx = operation_cx.clone();
+            let task_pool = Arc::clone(&pool);
+            let waiter = crate::runtime_async::task::spawn(async move {
+                task_pool.acquire_with_cx(&task_cx).await
+            });
+
+            wait_for_all_permits_to_be_consumed(&pool).await;
+            assert_eq!(
+                pool.semaphore.available_permits(),
+                0,
+                "waiter must hold the permit before cancellation exercises the idle lock"
+            );
+            operation_cx.cancel_with(
+                crate::outcome::CancelKind::User,
+                Some("cancel acquire during idle lock wait"),
+            );
+            drop(idle_guard);
+
+            let error = waiter
+                .await
+                .expect("acquire waiter task should join")
+                .expect_err("cancelled idle-lock wait must fail");
+            assert_eq!(error, PoolError::Cancelled);
+            assert_eq!(
+                pool.semaphore.available_permits(),
+                1,
+                "typed lock cancellation must release the acquired permit"
+            );
         });
     }
 
@@ -1765,22 +1927,35 @@ mod tests {
             let (_, guard) = result.into_parts();
 
             // Return a connection via put_with_cx.
-            pool.put_with_cx(&cx, "conn-a".to_string()).await;
+            pool.put_with_cx(&cx, "conn-a".to_string())
+                .await
+                .expect("put_with_cx should succeed");
             drop(guard);
 
             // stats_with_cx should reflect the put.
-            let stats = pool.stats_with_cx(&cx).await;
+            let stats = pool
+                .stats_with_cx(&cx)
+                .await
+                .expect("stats_with_cx should succeed");
             assert_eq!(stats.idle_count, 1, "put_with_cx should leave 1 idle");
             assert_eq!(stats.total_returned, 1);
 
             // evict_idle_with_cx with a fresh entry shouldn't evict (not
             // yet expired under the test config's idle_timeout).
-            let evicted = pool.evict_idle_with_cx(&cx).await;
+            let evicted = pool
+                .evict_idle_with_cx(&cx)
+                .await
+                .expect("evict_idle_with_cx should succeed");
             assert_eq!(evicted, 0, "fresh idle entry must not be evicted");
 
             // clear_with_cx drains the idle queue.
-            pool.clear_with_cx(&cx).await;
-            let stats_after_clear = pool.stats_with_cx(&cx).await;
+            pool.clear_with_cx(&cx)
+                .await
+                .expect("clear_with_cx should succeed");
+            let stats_after_clear = pool
+                .stats_with_cx(&cx)
+                .await
+                .expect("stats_with_cx after clear should succeed");
             assert_eq!(
                 stats_after_clear.idle_count, 0,
                 "clear_with_cx must drain all idle entries"
@@ -1789,6 +1964,60 @@ mod tests {
                 stats_after_clear.total_evicted >= 1,
                 "clear_with_cx must increment the evicted counter"
             );
+        });
+    }
+
+    #[test]
+    fn pool_non_acquire_methods_with_cancelled_cx_return_typed_errors() {
+        run_async_test(async {
+            struct DropProbe(Arc<AtomicU64>);
+
+            impl Drop for DropProbe {
+                fn drop(&mut self) {
+                    self.0.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+
+            let pool: Pool<DropProbe> = Pool::new(test_config(4));
+            let dropped = Arc::new(AtomicU64::new(0));
+            let cx = Cx::for_testing();
+            cx.cancel_with(
+                crate::outcome::CancelKind::User,
+                Some("cancel explicit pool maintenance"),
+            );
+
+            let put_error = pool
+                .put_with_cx(&cx, DropProbe(Arc::clone(&dropped)))
+                .await
+                .expect_err("cancelled put_with_cx must return a typed error");
+            assert_eq!(put_error, PoolError::Cancelled);
+            assert_eq!(
+                dropped.load(Ordering::Relaxed),
+                1,
+                "a connection that cannot be returned must be dropped exactly once"
+            );
+
+            let stats_error = pool
+                .stats_with_cx(&cx)
+                .await
+                .expect_err("cancelled stats_with_cx must return a typed error");
+            assert_eq!(stats_error, PoolError::Cancelled);
+
+            let evict_error = pool
+                .evict_idle_with_cx(&cx)
+                .await
+                .expect_err("cancelled evict_idle_with_cx must return a typed error");
+            assert_eq!(evict_error, PoolError::Cancelled);
+
+            let clear_error = pool
+                .clear_with_cx(&cx)
+                .await
+                .expect_err("cancelled clear_with_cx must return a typed error");
+            assert_eq!(clear_error, PoolError::Cancelled);
+
+            let ambient_stats = pool.stats().await;
+            assert_eq!(ambient_stats.idle_count, 0);
+            assert_eq!(ambient_stats.total_returned, 0);
         });
     }
 

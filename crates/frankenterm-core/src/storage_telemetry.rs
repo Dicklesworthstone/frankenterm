@@ -708,6 +708,26 @@ impl<S> InstrumentedStorage<S> {
     #[allow(clippy::unused_async_trait_impl)]
     pub async fn append_batch_instrumented(
         &self,
+        req: AppendRequest,
+        result: Result<AppendResponse, RecorderStorageError>,
+        start: Instant,
+        backend: RecorderBackendKind,
+    ) -> Result<AppendResponse, RecorderStorageError> {
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.append_batch_instrumented_with_cx(&cx, req, result, start, backend)
+            .await
+    }
+
+    /// ft-xbnl0.2.3 Cx-first sibling of [`append_batch_instrumented`].
+    ///
+    /// Records the supplied, already-completed append outcome synchronously,
+    /// even if the caller's context was cancelled after the append completed.
+    /// Cancellation belongs at the operation boundary; once an outcome exists,
+    /// dropping its telemetry would make the accounting observably false.
+    #[allow(clippy::future_not_send)]
+    pub async fn append_batch_instrumented_with_cx(
+        &self,
+        _cx: &crate::cx::Cx,
         _req: AppendRequest,
         result: Result<AppendResponse, RecorderStorageError>,
         start: Instant,
@@ -731,30 +751,6 @@ impl<S> InstrumentedStorage<S> {
             }
         }
         result
-    }
-
-    /// ft-xbnl0.2.3 Cx-first sibling of [`append_batch_instrumented`].
-    ///
-    /// Pre-flight checkpoint gates the telemetry recording so
-    /// cx-driven callers can propagate cancellation consistently
-    /// even though the recording itself is cheap in-memory work.
-    /// On cancellation, returns the original append result
-    /// unchanged (telemetry simply is not recorded for this call)
-    /// so the caller's error semantics are preserved.
-    #[allow(clippy::future_not_send)]
-    pub async fn append_batch_instrumented_with_cx(
-        &self,
-        cx: &crate::cx::Cx,
-        req: AppendRequest,
-        result: Result<AppendResponse, RecorderStorageError>,
-        start: Instant,
-        backend: RecorderBackendKind,
-    ) -> Result<AppendResponse, RecorderStorageError> {
-        if cx.checkpoint().is_err() {
-            return result;
-        }
-        self.append_batch_instrumented(req, result, start, backend)
-            .await
     }
 
     /// Time a flush call and record telemetry.
@@ -1591,6 +1587,115 @@ mod tests {
                 let backend_batches =
                     backend_metric_name(COUNTER_BATCHES_PROCESSED, RecorderBackendKind::AppendLog);
                 assert_eq!(telem.registry().counter_value(&backend_batches), 1);
+            });
+        }));
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(runtime)));
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::runtime_async::clear_runtime_handle();
+        }));
+        if let Err(payload) = result {
+            std::panic::resume_unwind(payload);
+        }
+    }
+
+    /// Once append work has produced an outcome, later caller cancellation
+    /// must not erase either successful-work or failure telemetry.
+    #[test]
+    fn append_batch_instrumented_with_cx_records_completed_outcomes_after_cancel() {
+        use crate::recorder_storage::{
+            AppendRequest, AppendResponse, DurabilityLevel, RecorderOffset,
+        };
+        use crate::runtime_async::{CompatRuntime, RuntimeBuilder};
+
+        let runtime = RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            runtime.block_on(async {
+                let telem = Arc::new(StorageTelemetry::with_defaults());
+                let instrumented = InstrumentedStorage::new((), telem.clone());
+                let cx = crate::cx::for_request();
+                cx.cancel_with(
+                    crate::outcome::CancelKind::User,
+                    Some("completed append telemetry regression test"),
+                );
+
+                let successful_request = AppendRequest {
+                    batch_id: "completed-success".to_string(),
+                    events: vec![],
+                    required_durability: DurabilityLevel::Enqueued,
+                    producer_ts_ms: 0,
+                };
+                let successful_response = AppendResponse {
+                    backend: RecorderBackendKind::AppendLog,
+                    accepted_count: 3,
+                    first_offset: RecorderOffset {
+                        segment_id: 0,
+                        byte_offset: 0,
+                        ordinal: 0,
+                    },
+                    last_offset: RecorderOffset {
+                        segment_id: 0,
+                        byte_offset: 128,
+                        ordinal: 2,
+                    },
+                    committed_durability: DurabilityLevel::Enqueued,
+                    committed_at_ms: 0,
+                };
+                let successful_result = instrumented
+                    .append_batch_instrumented_with_cx(
+                        &cx,
+                        successful_request,
+                        Ok(successful_response),
+                        Instant::now(),
+                        RecorderBackendKind::AppendLog,
+                    )
+                    .await
+                    .expect("completed success must remain successful");
+                assert_eq!(successful_result.accepted_count, 3);
+
+                let failed_request = AppendRequest {
+                    batch_id: "completed-failure".to_string(),
+                    events: vec![],
+                    required_durability: DurabilityLevel::Enqueued,
+                    producer_ts_ms: 0,
+                };
+                let failed_result = instrumented
+                    .append_batch_instrumented_with_cx(
+                        &cx,
+                        failed_request,
+                        Err(RecorderStorageError::QueueFull { capacity: 4 }),
+                        Instant::now(),
+                        RecorderBackendKind::AppendLog,
+                    )
+                    .await;
+                assert!(matches!(
+                    failed_result,
+                    Err(RecorderStorageError::QueueFull { capacity: 4 })
+                ));
+
+                assert_eq!(
+                    telem.registry().counter_value(COUNTER_BATCHES_PROCESSED),
+                    1,
+                    "the completed successful append must be counted"
+                );
+                assert_eq!(
+                    telem.registry().counter_value(COUNTER_EVENTS_APPENDED),
+                    3,
+                    "all accepted events must be counted"
+                );
+                assert_eq!(
+                    telem.registry().counter_value(COUNTER_ERROR_OVERLOAD),
+                    1,
+                    "the completed failed append must retain its error telemetry"
+                );
+                let backend_batches =
+                    backend_metric_name(COUNTER_BATCHES_PROCESSED, RecorderBackendKind::AppendLog);
+                assert_eq!(telem.registry().counter_value(&backend_batches), 1);
+                let backend_overload =
+                    backend_metric_name(COUNTER_ERROR_OVERLOAD, RecorderBackendKind::AppendLog);
+                assert_eq!(telem.registry().counter_value(&backend_overload), 1);
             });
         }));
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(runtime)));

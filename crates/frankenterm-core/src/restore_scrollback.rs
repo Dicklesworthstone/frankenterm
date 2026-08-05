@@ -24,7 +24,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::runtime_async::{Semaphore, sleep};
+use crate::runtime_async::Semaphore;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
@@ -237,61 +237,41 @@ impl ScrollbackInjector {
     ///
     /// `pane_id_map` maps old pane IDs to new (live) pane IDs.
     /// `scrollbacks` maps old pane IDs to their captured scrollback data.
+    ///
+    /// Cancellation is reported as a best-effort result with all unfinished
+    /// panes in [`InjectionReport::skipped`]. Call [`Self::inject_with_cx`]
+    /// when the caller needs the structured cancellation error.
     pub async fn inject(
         &self,
         pane_id_map: &HashMap<u64, u64>,
         scrollbacks: &HashMap<u64, ScrollbackData>,
     ) -> InjectionReport {
-        let mut report = InjectionReport::default();
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.inject_cx(&cx, pane_id_map, scrollbacks).await
+    }
 
-        // Collect target panes and create injection guard.
-        let target_new_ids: Vec<u64> = scrollbacks
-            .keys()
-            .filter_map(|old_id| pane_id_map.get(old_id).copied())
-            .collect();
-
-        let _guard = InjectionGuard::new(self.suppressed_panes.clone(), target_new_ids);
-
-        info!(
-            panes = scrollbacks.len(),
-            concurrent = self.config.concurrent_injections,
-            "starting scrollback injection"
-        );
-
-        let semaphore = Arc::new(Semaphore::new(self.config.concurrent_injections));
-
-        // Inject each pane. We process sequentially with semaphore to avoid
-        // Send bound issues with &self references.
-        for (old_id, scrollback) in scrollbacks {
-            let new_id = match pane_id_map.get(old_id) {
-                Some(&id) => id,
-                None => {
-                    debug!(old_pane = old_id, "pane not in id map, skipping");
-                    report.skipped.push(*old_id);
-                    continue;
+    /// Inject under an explicit Cx while preserving best-effort report semantics.
+    ///
+    /// This is the Cx-bearing counterpart of [`Self::inject`]. It deliberately
+    /// converts capability cancellation into a warning plus a deterministic
+    /// skipped-pane report; [`Self::inject_with_cx`] remains the fallible API.
+    pub async fn inject_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        pane_id_map: &HashMap<u64, u64>,
+        scrollbacks: &HashMap<u64, ScrollbackData>,
+    ) -> InjectionReport {
+        self.inject_with_cx(cx, pane_id_map, scrollbacks)
+            .await
+            .unwrap_or_else(|error| {
+                warn!(error = %error, "scrollback injection cancelled");
+                let mut skipped = scrollbacks.keys().copied().collect::<Vec<_>>();
+                skipped.sort_unstable();
+                InjectionReport {
+                    skipped,
+                    ..InjectionReport::default()
                 }
-            };
-
-            let _permit = semaphore.acquire().await.expect("semaphore closed");
-
-            match self.inject_pane(*old_id, new_id, scrollback).await {
-                Ok(stats) => report.successes.push(stats),
-                Err(e) => {
-                    warn!(old_pane = old_id, new_pane = new_id, error = %e, "injection failed");
-                    report.failures.push((*old_id, e.to_string()));
-                }
-            }
-        }
-
-        info!(
-            success = report.success_count(),
-            failed = report.failure_count(),
-            skipped = report.skipped.len(),
-            total_bytes = report.total_bytes(),
-            "scrollback injection complete"
-        );
-
-        report
+            })
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`inject`].
@@ -379,61 +359,7 @@ impl ScrollbackInjector {
         Ok(report)
     }
 
-    /// Inject scrollback into a single pane.
-    async fn inject_pane(
-        &self,
-        old_pane_id: u64,
-        new_pane_id: u64,
-        scrollback: &ScrollbackData,
-    ) -> crate::Result<PaneInjectionStats> {
-        let mut data = scrollback.clone();
-        data.truncate(self.config.max_lines);
-
-        if data.lines.is_empty() {
-            return Ok(PaneInjectionStats {
-                old_pane_id,
-                new_pane_id,
-                lines_injected: 0,
-                bytes_written: 0,
-                chunks_sent: 0,
-            });
-        }
-
-        debug!(
-            old_pane = old_pane_id,
-            new_pane = new_pane_id,
-            lines = data.lines.len(),
-            bytes = data.total_bytes,
-            "injecting scrollback"
-        );
-
-        // Build full content with ANSI reset prefix.
-        let content = build_injection_content(&data.lines);
-
-        // Split into chunks and write.
-        let chunks = chunk_content(&content, self.config.chunk_size);
-        let mut bytes_written = 0;
-
-        for (i, chunk) in chunks.iter().enumerate() {
-            self.wezterm.send_text(new_pane_id, chunk).await?;
-            bytes_written += chunk.len();
-
-            // Inter-chunk delay to prevent parser overload.
-            if i < chunks.len() - 1 && self.config.inter_chunk_delay_ms > 0 {
-                sleep(Duration::from_millis(self.config.inter_chunk_delay_ms)).await;
-            }
-        }
-
-        Ok(PaneInjectionStats {
-            old_pane_id,
-            new_pane_id,
-            lines_injected: data.lines.len(),
-            bytes_written,
-            chunks_sent: chunks.len(),
-        })
-    }
-
-    /// ft-xbnl0.2.3 tick 295: Cx-first sibling of [`Self::inject_pane`].
+    /// Inject scrollback into one pane under the caller's cx.
     ///
     /// Threads caller `&Cx` through the per-chunk send loop + inter-chunk
     /// delays so a cx-cancel during a large-scrollback injection cleanly

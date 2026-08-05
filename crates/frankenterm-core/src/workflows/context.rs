@@ -91,6 +91,10 @@ pub struct WorkflowVerifiedSubmit {
     pub verification_report: Option<crate::verified_submit::VerifiedSubmitReport>,
 }
 
+fn missing_injector_error(operation: &'static str) -> crate::Error {
+    crate::Error::runtime_backend(operation, "No injector configured")
+}
+
 impl WorkflowContext {
     /// Create a new workflow context
     #[must_use]
@@ -213,20 +217,9 @@ impl WorkflowContext {
     pub async fn send_text(
         &mut self,
         text: &str,
-    ) -> Result<crate::policy::InjectionResult, &'static str> {
-        let injector = self.injector.as_ref().ok_or("No injector configured")?;
+    ) -> crate::Result<crate::policy::InjectionResult> {
         let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-        let result = injector
-            .send_text(
-                &cx,
-                self.pane_id,
-                text,
-                crate::policy::ActorKind::Workflow,
-                &self.capabilities,
-                Some(&self.execution_id),
-            )
-            .await;
-        Ok(result)
+        self.send_text_with_cx(&cx, text).await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`send_text`] (tick 213).
@@ -239,9 +232,12 @@ impl WorkflowContext {
         &mut self,
         cx: &crate::cx::Cx,
         text: &str,
-    ) -> Result<crate::policy::InjectionResult, &'static str> {
-        let injector = self.injector.as_ref().ok_or("No injector configured")?;
-        let result = injector
+    ) -> crate::Result<crate::policy::InjectionResult> {
+        let injector = self
+            .injector
+            .as_ref()
+            .ok_or_else(|| missing_injector_error("workflow.context.send_text"))?;
+        injector
             .send_text(
                 cx,
                 self.pane_id,
@@ -250,14 +246,13 @@ impl WorkflowContext {
                 &self.capabilities,
                 Some(&self.execution_id),
             )
-            .await;
-        Ok(result)
+            .await
     }
 
     pub async fn send_verified(
         &mut self,
         text: &str,
-    ) -> Result<WorkflowVerifiedSubmit, &'static str> {
+    ) -> crate::Result<WorkflowVerifiedSubmit> {
         let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
         self.send_verified_with_cx(&cx, text).await
     }
@@ -266,11 +261,11 @@ impl WorkflowContext {
         &mut self,
         cx: &crate::cx::Cx,
         text: &str,
-    ) -> Result<WorkflowVerifiedSubmit, &'static str> {
+    ) -> crate::Result<WorkflowVerifiedSubmit> {
         let injector = self
             .injector
             .as_ref()
-            .ok_or("No injector configured")?
+            .ok_or_else(|| missing_injector_error("workflow.context.send_verified"))?
             .clone();
         let pane_id = self.pane_id;
         let capabilities = self.capabilities.clone();
@@ -301,7 +296,7 @@ impl WorkflowContext {
                 &capabilities,
                 Some(&execution_id),
             )
-            .await;
+            .await?;
 
         let verification_report =
             if matches!(&injection, crate::policy::InjectionResult::Allowed { .. }) {
@@ -351,28 +346,21 @@ impl WorkflowContext {
     /// Send Ctrl-C (interrupt) to the target pane via policy-gated injection.
     ///
     /// See [`send_text`](Self::send_text) for lock safety rationale.
-    pub async fn send_ctrl_c(&mut self) -> Result<crate::policy::InjectionResult, &'static str> {
-        let injector = self.injector.as_ref().ok_or("No injector configured")?;
+    pub async fn send_ctrl_c(&mut self) -> crate::Result<crate::policy::InjectionResult> {
         let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-        let result = injector
-            .send_ctrl_c(
-                &cx,
-                self.pane_id,
-                crate::policy::ActorKind::Workflow,
-                &self.capabilities,
-                Some(&self.execution_id),
-            )
-            .await;
-        Ok(result)
+        self.send_ctrl_c_with_cx(&cx).await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`send_ctrl_c`] (tick 213).
     pub async fn send_ctrl_c_with_cx(
         &mut self,
         cx: &crate::cx::Cx,
-    ) -> Result<crate::policy::InjectionResult, &'static str> {
-        let injector = self.injector.as_ref().ok_or("No injector configured")?;
-        let result = injector
+    ) -> crate::Result<crate::policy::InjectionResult> {
+        let injector = self
+            .injector
+            .as_ref()
+            .ok_or_else(|| missing_injector_error("workflow.context.send_ctrl_c"))?;
+        injector
             .send_ctrl_c(
                 cx,
                 self.pane_id,
@@ -380,35 +368,27 @@ impl WorkflowContext {
                 &self.capabilities,
                 Some(&self.execution_id),
             )
-            .await;
-        Ok(result)
+            .await
     }
 
     /// Send Ctrl-D (EOF) to the target pane via policy-gated injection.
     ///
     /// See [`send_text`](Self::send_text) for lock safety rationale.
-    pub async fn send_ctrl_d(&mut self) -> Result<crate::policy::InjectionResult, &'static str> {
-        let injector = self.injector.as_ref().ok_or("No injector configured")?;
+    pub async fn send_ctrl_d(&mut self) -> crate::Result<crate::policy::InjectionResult> {
         let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-        let result = injector
-            .send_ctrl_d(
-                &cx,
-                self.pane_id,
-                crate::policy::ActorKind::Workflow,
-                &self.capabilities,
-                Some(&self.execution_id),
-            )
-            .await;
-        Ok(result)
+        self.send_ctrl_d_with_cx(&cx).await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`send_ctrl_d`] (tick 213).
     pub async fn send_ctrl_d_with_cx(
         &mut self,
         cx: &crate::cx::Cx,
-    ) -> Result<crate::policy::InjectionResult, &'static str> {
-        let injector = self.injector.as_ref().ok_or("No injector configured")?;
-        let result = injector
+    ) -> crate::Result<crate::policy::InjectionResult> {
+        let injector = self
+            .injector
+            .as_ref()
+            .ok_or_else(|| missing_injector_error("workflow.context.send_ctrl_d"))?;
+        injector
             .send_ctrl_d(
                 cx,
                 self.pane_id,
@@ -416,35 +396,27 @@ impl WorkflowContext {
                 &self.capabilities,
                 Some(&self.execution_id),
             )
-            .await;
-        Ok(result)
+            .await
     }
 
     /// Send Ctrl-Z (suspend) to the target pane via policy-gated injection.
     ///
     /// See [`send_text`](Self::send_text) for lock safety rationale.
-    pub async fn send_ctrl_z(&mut self) -> Result<crate::policy::InjectionResult, &'static str> {
-        let injector = self.injector.as_ref().ok_or("No injector configured")?;
+    pub async fn send_ctrl_z(&mut self) -> crate::Result<crate::policy::InjectionResult> {
         let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-        let result = injector
-            .send_ctrl_z(
-                &cx,
-                self.pane_id,
-                crate::policy::ActorKind::Workflow,
-                &self.capabilities,
-                Some(&self.execution_id),
-            )
-            .await;
-        Ok(result)
+        self.send_ctrl_z_with_cx(&cx).await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`send_ctrl_z`] (tick 213).
     pub async fn send_ctrl_z_with_cx(
         &mut self,
         cx: &crate::cx::Cx,
-    ) -> Result<crate::policy::InjectionResult, &'static str> {
-        let injector = self.injector.as_ref().ok_or("No injector configured")?;
-        let result = injector
+    ) -> crate::Result<crate::policy::InjectionResult> {
+        let injector = self
+            .injector
+            .as_ref()
+            .ok_or_else(|| missing_injector_error("workflow.context.send_ctrl_z"))?;
+        injector
             .send_ctrl_z(
                 cx,
                 self.pane_id,
@@ -452,8 +424,7 @@ impl WorkflowContext {
                 &self.capabilities,
                 Some(&self.execution_id),
             )
-            .await;
-        Ok(result)
+            .await
     }
 
     // ========================================================================
@@ -608,6 +579,19 @@ mod tests {
     use crate::runtime_async::{CompatRuntime, RuntimeBuilder};
     #[allow(unused_imports)]
     use crate::storage::PaneRecord;
+
+    fn assert_injector_backend_error(error: crate::Error, operation: &'static str, detail: &str) {
+        match error {
+            crate::Error::RuntimeOperation {
+                operation: actual_operation,
+                source: crate::error::RuntimeOperationSource::Backend(actual_detail),
+            } => {
+                assert_eq!(actual_operation, operation);
+                assert!(actual_detail.contains(detail));
+            }
+            other => panic!("unexpected injector error: {other:?}"),
+        }
+    }
 
     // ========================================================================
     // PaneMetadata tests
@@ -972,8 +956,11 @@ mod tests {
             let mut ctx = WorkflowContext::new(storage, 1, PaneCapabilities::unknown(), "cx-err-1");
             let cx = crate::cx::for_testing();
             let result = ctx.send_text_with_cx(&cx, "hello").await;
-            assert!(result.is_err());
-            assert_eq!(result.unwrap_err(), "No injector configured");
+            assert_injector_backend_error(
+                result.expect_err("missing injector must fail"),
+                "workflow.context.send_text",
+                "No injector configured",
+            );
         });
     }
 
@@ -984,8 +971,11 @@ mod tests {
             let mut ctx = WorkflowContext::new(storage, 1, PaneCapabilities::unknown(), "cx-err-2");
             let cx = crate::cx::for_testing();
             let result = ctx.send_ctrl_c_with_cx(&cx).await;
-            assert!(result.is_err());
-            assert_eq!(result.unwrap_err(), "No injector configured");
+            assert_injector_backend_error(
+                result.expect_err("missing injector must fail"),
+                "workflow.context.send_ctrl_c",
+                "No injector configured",
+            );
         });
     }
 
@@ -996,8 +986,11 @@ mod tests {
             let mut ctx = WorkflowContext::new(storage, 1, PaneCapabilities::unknown(), "cx-err-3");
             let cx = crate::cx::for_testing();
             let result = ctx.send_ctrl_d_with_cx(&cx).await;
-            assert!(result.is_err());
-            assert_eq!(result.unwrap_err(), "No injector configured");
+            assert_injector_backend_error(
+                result.expect_err("missing injector must fail"),
+                "workflow.context.send_ctrl_d",
+                "No injector configured",
+            );
         });
     }
 
@@ -1008,8 +1001,11 @@ mod tests {
             let mut ctx = WorkflowContext::new(storage, 1, PaneCapabilities::unknown(), "cx-err-4");
             let cx = crate::cx::for_testing();
             let result = ctx.send_ctrl_z_with_cx(&cx).await;
-            assert!(result.is_err());
-            assert_eq!(result.unwrap_err(), "No injector configured");
+            assert_injector_backend_error(
+                result.expect_err("missing injector must fail"),
+                "workflow.context.send_ctrl_z",
+                "No injector configured",
+            );
         });
     }
 
@@ -1122,15 +1118,7 @@ mod tests {
     // ========================================================================
 
     #[test]
-    #[should_panic(expected = "runtime_async mutex lock failed")]
-    fn send_text_with_cx_pre_cancelled_cx_panics_on_lock() {
-        // A pre-cancelled cx might not panic on lock acquisition in 0.3.1
-        // if the lock is uncontended, but it should still fail the operation.
-        //
-        // Driven via the canonical runtime_async surface (not run_lab):
-        // the panic must propagate from the root future to the test thread
-        // for #[should_panic] to observe it, and the expected panic depends
-        // only on the pre-cancelled Cx, not on runtime scheduling.
+    fn send_text_with_cx_pre_cancelled_cx_returns_typed_error() {
         RuntimeBuilder::current_thread()
             .enable_all()
             .build()
@@ -1150,7 +1138,20 @@ mod tests {
                     Some("pre-cancel context test"),
                 );
 
-                let _res = ctx.send_text_with_cx(&cx, "should not run").await;
+                let error = ctx
+                    .send_text_with_cx(&cx, "should not run")
+                    .await
+                    .expect_err("pre-cancelled injector lock must fail");
+                assert!(
+                    matches!(
+                        error,
+                        crate::Error::RuntimeOperation {
+                            operation: "workflow.injector.send_text",
+                            source: crate::error::RuntimeOperationSource::Cancelled(_),
+                        }
+                    ),
+                    "pre-cancelled lock must remain a typed cancellation"
+                );
             });
     }
 }

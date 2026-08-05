@@ -472,84 +472,8 @@ pub async fn cleanup_preview(
     storage: &StorageHandle,
     config: &StorageConfig,
 ) -> crate::Result<CleanupPlan> {
-    let now = now_ms();
-    let global_cutoff_ms = retention_cutoff_ms(now, config.retention_days);
-
-    let mut plan = CleanupPlan {
-        dry_run: true,
-        ..Default::default()
-    };
-
-    // Events: tier-based retention
-    let retention_policy = compile_cleanup_retention_policy(config)?;
-    let events_summaries =
-        preview_events_by_tier(storage, config, retention_policy, now).await?;
-    for summary in events_summaries {
-        append_cleanup_summary(&mut plan, summary)?;
-    }
-
-    // Output segments: global retention
-    if config.retention_days > 0 {
-        let count = storage.count_segments_before(global_cutoff_ms).await?;
-        append_cleanup_summary(&mut plan, CleanupTableSummary {
-            table: "output_segments".to_string(),
-            eligible_rows: count,
-            deleted_rows: 0,
-            retention_days: config.retention_days,
-        })?;
-    }
-
-    // Audit actions: global retention
-    if config.retention_days > 0 {
-        let count = storage.count_audit_actions_before(global_cutoff_ms).await?;
-        append_cleanup_summary(&mut plan, CleanupTableSummary {
-            table: "audit_actions".to_string(),
-            eligible_rows: count,
-            deleted_rows: 0,
-            retention_days: config.retention_days,
-        })?;
-    }
-
-    // Usage metrics: global retention
-    if config.retention_days > 0 {
-        let count = storage.count_usage_metrics_before(global_cutoff_ms).await?;
-        append_cleanup_summary(&mut plan, CleanupTableSummary {
-            table: "usage_metrics".to_string(),
-            eligible_rows: count,
-            deleted_rows: 0,
-            retention_days: config.retention_days,
-        })?;
-    }
-
-    // Notification history: global retention
-    if config.retention_days > 0 {
-        let count = storage
-            .count_notification_history_before(global_cutoff_ms)
-            .await?;
-        append_cleanup_summary(&mut plan, CleanupTableSummary {
-            table: "notification_history".to_string(),
-            eligible_rows: count,
-            deleted_rows: 0,
-            retention_days: config.retention_days,
-        })?;
-    }
-
-    // High-frequency operational advisories use the global retention window.
-    // The storage predicate is an explicit allowlist: cleanup/retention
-    // receipts and future maintenance event classes remain fail-safe retained.
-    if config.retention_days > 0 {
-        let count = storage
-            .count_operational_maintenance_before(global_cutoff_ms)
-            .await?;
-        append_cleanup_summary(&mut plan, CleanupTableSummary {
-            table: "maintenance_log (operational)".to_string(),
-            eligible_rows: count,
-            deleted_rows: 0,
-            retention_days: config.retention_days,
-        })?;
-    }
-
-    Ok(plan)
+    let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+    cleanup_preview_with_cx(&cx, storage, config).await
 }
 
 /// Cx-first [`cleanup_preview`] (ft-xbnl0.2.3). Threads caller `&Cx`
@@ -1191,24 +1115,6 @@ fn fallback_event_cleanup_summary(
 }
 
 /// Preview events eligible for cleanup, grouped by retention tier.
-async fn preview_events_by_tier(
-    storage: &StorageHandle,
-    config: &StorageConfig,
-    retention_policy: std::sync::Arc<CompiledRetentionPolicy>,
-    now: i64,
-) -> crate::Result<Vec<CleanupTableSummary>> {
-    let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-    preview_events_by_tier_with_cx(
-        &cx,
-        storage,
-        config,
-        retention_policy,
-        now,
-    )
-    .await
-}
-
-/// ft-xbnl0.2.3 Cx-first sibling of [`preview_events_by_tier`].
 async fn preview_events_by_tier_with_cx(
     cx: &crate::cx::Cx,
     storage: &StorageHandle,

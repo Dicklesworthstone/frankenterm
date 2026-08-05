@@ -31,7 +31,6 @@ mod sse;
 mod websocket;
 
 pub use extractors::redact_depth_limit_hit_count;
-use server::poke_listener;
 pub use server::{run_web_server, start_web_server};
 pub use server::{run_web_server_with_cx, start_web_server_with_cx};
 pub use sse::{
@@ -277,39 +276,42 @@ impl WebServerHandle {
 
     /// Trigger graceful shutdown and wait for completion.
     pub async fn shutdown(self) -> Result<()> {
-        let WebServerHandle {
-            bound_addr,
-            mut runtime,
-        } = self;
-        runtime.signal_shutdown();
-        poke_listener(bound_addr);
-        let result = runtime.join_handle_mut().await;
-        runtime.finish(result).await
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.shutdown_with_cx(&cx).await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`shutdown`].
     ///
-    /// Signals shutdown + pokes the listener unconditionally so
-    /// the accept loop always wakes up, then routes through
-    /// `FrameworkWebRuntime::finish_with_cx` so the drain +
-    /// shutdown-hook phase is also cx-aware. A cancelled cx
-    /// allows the caller to return early after shutdown hooks
-    /// complete, instead of blocking further in the caller's
-    /// control flow.
+    /// Signals shutdown and, while the accept task is live, pokes the listener
+    /// so a blocked accept loop wakes up. Once shutdown has begun, joining the
+    /// server, draining connections, and running framework shutdown hooks use a
+    /// fresh cleanup context and cannot be skipped by cancellation of the
+    /// caller's context. Caller cancellation is surfaced only after cleanup
+    /// completes; a server-join or cleanup failure takes precedence over
+    /// cancellation.
+    /// If the shutdown future itself is dropped, the owned runtime's Drop
+    /// fallback still signals shutdown and wakes the listener, but Rust Drop
+    /// cannot await connection drain or async hooks.
     ///
-    /// Tick 101 upgraded this from a pre-flight-only delegate to
-    /// a two-seam path that threads cx through finish.
+    /// Tick 101 established the consuming shutdown seam; cleanup now
+    /// deliberately uses an independent Cx rather than the caller's Cx.
     pub async fn shutdown_with_cx(self, cx: &crate::cx::Cx) -> Result<()> {
         let WebServerHandle {
-            bound_addr,
             mut runtime,
+            ..
         } = self;
         runtime.signal_shutdown();
-        poke_listener(bound_addr);
+
+        // Graceful shutdown is a consuming cleanup boundary. The caller's Cx
+        // may already be cancelled, but that must never strand the framework
+        // runtime or bypass its drain and shutdown hooks.
+        let result = runtime.join_handle_mut().await;
+        let cleanup_cx = crate::cx::for_request();
+        runtime.finish_with_cx(&cleanup_cx, result).await?;
+
         cx.checkpoint()
             .map_err(|err| crate::Error::runtime_cancelled("web shutdown", err.to_string()))?;
-        let result = runtime.join_handle_mut().await;
-        runtime.finish_with_cx(cx, result).await
+        Ok(())
     }
 }
 

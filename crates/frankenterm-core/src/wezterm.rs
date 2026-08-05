@@ -21,7 +21,8 @@ use crate::circuit_breaker::{
     get_or_register_circuit,
 };
 use crate::error::WeztermError;
-use crate::runtime_async::{sleep, timeout};
+#[cfg(test)]
+use crate::runtime_async::sleep;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -1355,9 +1356,8 @@ impl WeztermClient {
     /// mux-pool call rebound via `MuxPool::list_panes_with_cx(cx)`
     /// (already Cx-first from prior ticks). Eligible transport failures retain
     /// the CLI fallback and time-windowed cache — the cache is a std Mutex
-    /// (sync, no Cx needed), and `run_cli_with_retry` internal retry sleeps
-    /// remain ambient since threading Cx through the retry helper is a larger
-    /// structural refactor that would affect every WeztermHandle async method.
+    /// (sync, no Cx needed), while `run_cli_with_retry_with_cx` keeps subprocess
+    /// attempts and retry sleeps on this same caller context.
     ///
     /// Most callers (snapshot engine, watchdog, native-events,
     /// discovery loop) go through the mux-pool fast path, so the
@@ -1408,7 +1408,7 @@ impl WeztermClient {
         }
 
         let output = self
-            .run_cli_with_retry(&["cli", "list", "--format", "json"])
+            .run_cli_with_retry_with_cx(cx, &["cli", "list", "--format", "json"])
             .await?;
         Self::guard_metadata_output_size("cli list", &output)?;
         let panes: Vec<PaneInfo> =
@@ -1431,7 +1431,7 @@ impl WeztermClient {
     /// legacy `list_panes` is invoked so existing callers behave
     /// identically.
     #[cfg(not(all(feature = "vendored", unix)))]
-    pub async fn list_panes_with_cx(&self, _cx: &crate::cx::Cx) -> Result<Vec<PaneInfo>> {
+    pub async fn list_panes_with_cx(&self, cx: &crate::cx::Cx) -> Result<Vec<PaneInfo>> {
         let cache_window = Duration::from_millis(LIST_PANES_CLI_CACHE_MS);
         {
             let cache = match self.list_panes_cache.lock() {
@@ -1447,7 +1447,7 @@ impl WeztermClient {
         }
 
         let output = self
-            .run_cli_with_retry(&["cli", "list", "--format", "json"])
+            .run_cli_with_retry_with_cx(cx, &["cli", "list", "--format", "json"])
             .await?;
         Self::guard_metadata_output_size("cli list", &output)?;
         let panes: Vec<PaneInfo> =
@@ -1468,11 +1468,8 @@ impl WeztermClient {
     ///
     /// Returns the pane info if found, or `WeztermError::PaneNotFound` if not.
     pub async fn get_pane(&self, pane_id: u64) -> Result<PaneInfo> {
-        let panes = self.list_panes().await?;
-        panes
-            .into_iter()
-            .find(|p| p.pane_id == pane_id)
-            .ok_or_else(|| WeztermError::PaneNotFound(pane_id).into())
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.get_pane_with_cx(&cx, pane_id).await
     }
 
     /// Get a specific pane by ID, bound to the caller's asupersync
@@ -1508,7 +1505,7 @@ impl WeztermClient {
     ///
     /// When `escapes == true` the mux path is not used (vendored mux
     /// does not support escape-sequence extraction) and the call
-    /// delegates to the legacy CLI path.
+    /// delegates to the explicit-Cx CLI path.
     #[cfg(all(feature = "vendored", unix))]
     pub async fn get_text_with_cx(
         &self,
@@ -1609,10 +1606,7 @@ impl WeztermClient {
                             Err(e) => {
                                 self.mux_circuit_record_failure(&e);
                                 if !self.mux_error_should_fallback_to_cli_for_client(&e) {
-                                    return Err(Self::mux_cancelled_error(
-                                        "get_text_with_cx",
-                                        e,
-                                    ));
+                                    return Err(Self::mux_cancelled_error("get_text_with_cx", e));
                                 }
                                 tracing::debug!(
                                     error = %e,
@@ -1635,21 +1629,22 @@ impl WeztermClient {
             }
         }
 
-        // CLI fallback delegates to the legacy cli execution path
+        // CLI fallback preserves the caller's Cx through retries and process IO.
         let pane_id_str = pane_id.to_string();
         let mut args = vec!["cli", "get-text", "--pane-id", &pane_id_str];
         if escapes {
             args.push("--escapes");
         }
-        self.run_cli_with_pane_check_retry(&args, pane_id).await
+        self.run_cli_with_pane_check_retry_with_cx(cx, &args, pane_id)
+            .await
     }
 
     /// Stub `get_text_with_cx` for configurations without
-    /// vendored+unix+asupersync — delegates to the legacy cli path.
+    /// vendored+unix+asupersync — delegates to the explicit-Cx CLI path.
     #[cfg(not(all(feature = "vendored", unix)))]
     pub async fn get_text_with_cx(
         &self,
-        _cx: &crate::cx::Cx,
+        cx: &crate::cx::Cx,
         pane_id: u64,
         escapes: bool,
     ) -> Result<String> {
@@ -1658,7 +1653,8 @@ impl WeztermClient {
         if escapes {
             args.push("--escapes");
         }
-        self.run_cli_with_pane_check_retry(&args, pane_id).await
+        self.run_cli_with_pane_check_retry_with_cx(cx, &args, pane_id)
+            .await
     }
 
     /// Get OSC 133 semantic zones from the live mux pane state.
@@ -1830,7 +1826,8 @@ impl WeztermClient {
     /// This uses WezTerm's paste mode which is efficient for sending multiple
     /// characters at once. For control characters, use `send_control` instead.
     pub async fn send_text(&self, pane_id: u64, text: &str) -> Result<()> {
-        self.send_text_impl(pane_id, text, false, false).await
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.send_text_with_cx(&cx, pane_id, text).await
     }
 
     /// Send text to a pane character by character (no paste mode)
@@ -1838,7 +1835,8 @@ impl WeztermClient {
     /// This is slower but necessary for some applications that don't handle
     /// paste mode well, or for simulating interactive typing.
     pub async fn send_text_no_paste(&self, pane_id: u64, text: &str) -> Result<()> {
-        self.send_text_impl(pane_id, text, true, false).await
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.send_text_no_paste_with_cx(&cx, pane_id, text).await
     }
 
     /// Send text with explicit options (paste/newline control).
@@ -1852,7 +1850,8 @@ impl WeztermClient {
         no_paste: bool,
         no_newline: bool,
     ) -> Result<()> {
-        self.send_text_impl(pane_id, text, no_paste, no_newline)
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.send_text_with_options_with_cx(&cx, pane_id, text, no_paste, no_newline)
             .await
     }
 
@@ -1872,22 +1871,24 @@ impl WeztermClient {
     /// # }
     /// ```
     pub async fn send_control(&self, pane_id: u64, control_char: &str) -> Result<()> {
-        // Control characters MUST use no-paste mode
-        self.send_text_impl(pane_id, control_char, true, true).await
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.send_control_with_cx(&cx, pane_id, control_char).await
     }
 
     /// Send Ctrl+C (interrupt) to a pane
     ///
     /// Convenience method for `send_control(pane_id, control::CTRL_C)`.
     pub async fn send_ctrl_c(&self, pane_id: u64) -> Result<()> {
-        self.send_control(pane_id, control::CTRL_C).await
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.send_ctrl_c_with_cx(&cx, pane_id).await
     }
 
     /// Send Ctrl+D (EOF) to a pane
     ///
     /// Convenience method for `send_control(pane_id, control::CTRL_D)`.
     pub async fn send_ctrl_d(&self, pane_id: u64) -> Result<()> {
-        self.send_control(pane_id, control::CTRL_D).await
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.send_ctrl_d_with_cx(&cx, pane_id).await
     }
 
     /// Cx-first send_text (ft-xbnl0.2.3). Defaults to paste mode + newline.
@@ -1966,8 +1967,8 @@ impl WeztermClient {
     /// # Returns
     /// The pane ID of the newly spawned pane
     pub async fn spawn(&self, cwd: Option<&str>, domain_name: Option<&str>) -> Result<u64> {
-        self.spawn_targeted(cwd, domain_name, SpawnTarget::default())
-            .await
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.spawn_with_cx(&cx, cwd, domain_name).await
     }
 
     /// Cx-first [`spawn`] (ft-xbnl0.2.3). Delegates to
@@ -1990,56 +1991,9 @@ impl WeztermClient {
         domain_name: Option<&str>,
         target: SpawnTarget,
     ) -> Result<u64> {
-        #[cfg(all(feature = "vendored", unix))]
-        if let Some(ref pool) = self.mux_pool {
-            if self.mux_circuit_guard() {
-                let spawn = Self::mux_spawn_request(cwd, domain_name, target)?;
-                match pool.spawn_v2(spawn).await {
-                    Ok(response) => {
-                        self.mux_circuit_record_success();
-                        return Ok(response.pane_id as u64);
-                    }
-                    Err(e) => {
-                        self.mux_circuit_record_failure(&e);
-                        if !self.mux_error_should_fallback_to_cli_for_client(&e) {
-                            return Err(Self::mux_cancelled_error("spawn_targeted", e));
-                        }
-                        tracing::debug!(
-                            error = %e,
-                            "mux pool spawn_targeted failed, falling back to CLI"
-                        );
-                    }
-                }
-            }
-        }
-
-        let mut args = vec!["cli", "spawn"];
-
-        let window_id_arg;
-        if target.new_window {
-            args.push("--new-window");
-        } else if let Some(window_id) = target.window_id {
-            window_id_arg = window_id.to_string();
-            args.push("--window-id");
-            args.push(&window_id_arg);
-        }
-
-        // Add domain if specified
-        let domain_arg;
-        if let Some(domain) = domain_name {
-            domain_arg = format!("--domain-name={domain}");
-            args.push(&domain_arg);
-        }
-
-        // Add cwd if specified
-        let cwd_arg;
-        if let Some(dir) = cwd {
-            cwd_arg = format!("--cwd={dir}");
-            args.push(&cwd_arg);
-        }
-
-        let output = self.run_cli(&args).await?;
-        Self::parse_pane_id(&output)
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.spawn_targeted_with_cx(&cx, cwd, domain_name, target)
+            .await
     }
 
     /// Cx-first [`spawn_targeted`] (ft-xbnl0.2.3). Threads caller
@@ -2122,61 +2076,9 @@ impl WeztermClient {
         cwd: Option<&str>,
         percent: Option<u8>,
     ) -> Result<u64> {
-        frankenterm_core_replay_types::simulation_guard::SimulationGuard::assert_not_simulating(
-            "wezterm::WeztermClient::split_pane",
-        );
-        #[cfg(all(feature = "vendored", unix))]
-        if let Some(ref pool) = self.mux_pool {
-            if self.mux_circuit_guard() {
-                let split = Self::mux_split_request(pane_id, direction, cwd, percent)?;
-                match pool.split_pane(split).await {
-                    Ok(response) => {
-                        self.mux_circuit_record_success();
-                        return Ok(response.pane_id as u64);
-                    }
-                    Err(e) => {
-                        self.mux_circuit_record_failure(&e);
-                        if !self.mux_error_should_fallback_to_cli_for_client(&e) {
-                            return Err(Self::mux_cancelled_error("split_pane", e));
-                        }
-                        tracing::debug!(
-                            error = %e,
-                            "mux pool split_pane failed, falling back to CLI"
-                        );
-                    }
-                }
-            }
-        }
-
-        let pane_id_str = pane_id.to_string();
-        let mut args = vec!["cli", "split-pane", "--pane-id", &pane_id_str];
-
-        // Add direction
-        let dir_flag = match direction {
-            SplitDirection::Left => "--left",
-            SplitDirection::Right => "--right",
-            SplitDirection::Top => "--top",
-            SplitDirection::Bottom => "--bottom",
-        };
-        args.push(dir_flag);
-
-        // Add cwd if specified
-        let cwd_arg;
-        if let Some(dir) = cwd {
-            cwd_arg = format!("--cwd={dir}");
-            args.push(&cwd_arg);
-        }
-
-        // Add percent if specified
-        let percent_arg;
-        if let Some(pct) = percent {
-            let clamped = pct.clamp(10, 90);
-            percent_arg = format!("--percent={clamped}");
-            args.push(&percent_arg);
-        }
-
-        let output = self.run_cli_with_pane_check(&args, pane_id).await?;
-        Self::parse_pane_id(&output)
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.split_pane_with_cx(&cx, pane_id, direction, cwd, percent)
+            .await
     }
 
     /// Cx-first [`split_pane`] (ft-xbnl0.2.3). Threads caller `&Cx`
@@ -2255,13 +2157,8 @@ impl WeztermClient {
     /// # Arguments
     /// * `pane_id` - The pane to activate
     pub async fn activate_pane(&self, pane_id: u64) -> Result<()> {
-        frankenterm_core_replay_types::simulation_guard::SimulationGuard::assert_not_simulating(
-            "wezterm::WeztermClient::activate_pane",
-        );
-        let pane_id_str = pane_id.to_string();
-        let args = ["cli", "activate-pane", "--pane-id", &pane_id_str];
-        self.run_cli_with_pane_check(&args, pane_id).await?;
-        Ok(())
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.activate_pane_with_cx(&cx, pane_id).await
     }
 
     /// Cx-first [`activate_pane`] (ft-xbnl0.2.3). Threads caller `&Cx`
@@ -2293,9 +2190,9 @@ impl WeztermClient {
         pane_id: u64,
         direction: MoveDirection,
     ) -> Result<Option<u64>> {
-        let source_pane = self.get_pane(pane_id).await?;
-        let all_panes = self.list_panes().await?;
-        Ok(find_neighbor_pane(&source_pane, &all_panes, direction))
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.get_pane_direction_with_cx(&cx, pane_id, direction)
+            .await
     }
 
     /// Get the pane ID in a specific direction under an explicit `&Cx`
@@ -2323,13 +2220,8 @@ impl WeztermClient {
     /// # Arguments
     /// * `pane_id` - The pane to kill
     pub async fn kill_pane(&self, pane_id: u64) -> Result<()> {
-        frankenterm_core_replay_types::simulation_guard::SimulationGuard::assert_not_simulating(
-            "wezterm::WeztermClient::kill_pane",
-        );
-        let pane_id_str = pane_id.to_string();
-        let args = ["cli", "kill-pane", "--pane-id", &pane_id_str];
-        self.run_cli_with_pane_check(&args, pane_id).await?;
-        Ok(())
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.kill_pane_with_cx(&cx, pane_id).await
     }
 
     /// Cx-first [`kill_pane`] (ft-xbnl0.2.3). Threads caller `&Cx`
@@ -2353,13 +2245,8 @@ impl WeztermClient {
     /// * `pane_id` - The pane to zoom/unzoom
     /// * `zoom` - Whether to zoom (true) or unzoom (false)
     pub async fn zoom_pane(&self, pane_id: u64, zoom: bool) -> Result<()> {
-        let pane_id_str = pane_id.to_string();
-        let mut args = vec!["cli", "zoom-pane", "--pane-id", &pane_id_str];
-        if !zoom {
-            args.push("--unzoom");
-        }
-        self.run_cli_with_pane_check(&args, pane_id).await?;
-        Ok(())
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.zoom_pane_with_cx(&cx, pane_id, zoom).await
     }
 
     /// Cx-first [`zoom_pane`] (ft-xbnl0.2.3). Threads caller `&Cx`
@@ -2392,30 +2279,12 @@ impl WeztermClient {
         })
     }
 
-    /// Internal implementation for send_text with paste mode option.
-    ///
-    /// When a mux pool is available, uses direct socket communication (paste
-    /// mode or raw write). CLI failover is limited to canonically replayable
-    /// pre-mutation transport failures.
-    async fn send_text_impl(
-        &self,
-        pane_id: u64,
-        text: &str,
-        no_paste: bool,
-        no_newline: bool,
-    ) -> Result<()> {
-        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-        self.send_text_impl_with_cx(&cx, pane_id, text, no_paste, no_newline)
-            .await
-    }
-
     /// Cx-first `send_text_impl` (ft-xbnl0.2.3). The mux-pool fast
     /// path uses `pool.write_to_pane_with_cx(cx)` /
     /// `pool.send_paste_with_cx(cx)`. For an eligible pre-mutation transport
-    /// failure, CLI failover uses the legacy `run_cli_with_pane_check` helper;
-    /// threading Cx through that helper plus `retry_with` requires a wider
-    /// refactor. Pool admission, cancellation, and indeterminate mutation
-    /// errors surface without CLI replay.
+    /// failure, CLI failover uses `run_cli_with_pane_check_with_cx`, preserving
+    /// the same cancellation context across both transports. Pool admission,
+    /// cancellation, and indeterminate mutation errors surface without replay.
     #[cfg(all(feature = "vendored", unix))]
     async fn send_text_impl_with_cx(
         &self,
@@ -2471,16 +2340,17 @@ impl WeztermClient {
         }
         args.push("--");
         args.push(text);
-        self.run_cli_with_pane_check(&args, pane_id).await?;
+        self.run_cli_with_pane_check_with_cx(cx, &args, pane_id)
+            .await?;
         Ok(())
     }
 
     /// Stub `send_text_impl_with_cx` for configurations without
-    /// vendored+unix+asupersync — delegates to the legacy cli path.
+    /// vendored+unix+asupersync — delegates to the explicit-Cx CLI path.
     #[cfg(not(all(feature = "vendored", unix)))]
     async fn send_text_impl_with_cx(
         &self,
-        _cx: &crate::cx::Cx,
+        cx: &crate::cx::Cx,
         pane_id: u64,
         text: &str,
         no_paste: bool,
@@ -2499,30 +2369,15 @@ impl WeztermClient {
         }
         args.push("--");
         args.push(text);
-        self.run_cli_with_pane_check(&args, pane_id).await?;
+        self.run_cli_with_pane_check_with_cx(cx, &args, pane_id)
+            .await?;
         Ok(())
     }
 
-    /// Run a CLI command with pane-specific error handling
-    async fn run_cli_with_pane_check(&self, args: &[&str], pane_id: u64) -> Result<String> {
-        match self.run_cli(args).await {
-            Ok(output) => Ok(output),
-            Err(crate::Error::Wezterm(WeztermError::CommandFailed(ref stderr)))
-                if stderr.contains("pane")
-                    && (stderr.contains("not found")
-                        || stderr.contains("does not exist")
-                        || stderr.contains("no such")) =>
-            {
-                Err(WeztermError::PaneNotFound(pane_id).into())
-            }
-            Err(e) => Err(e),
-        }
-    }
-
-    /// Cx-first variant of [`run_cli_with_pane_check`] (ft-xbnl0.2.3).
-    /// Threads `cx` through [`Self::run_cli_with_cx`] and applies the
+    /// Run a CLI command with pane-specific error handling under an explicit
+    /// capability context. Threads `cx` through [`Self::run_cli_with_cx`] and applies the
     /// same pane-level error mapping so `PaneNotFound` is surfaced
-    /// consistently between the legacy and Cx paths.
+    /// consistently across all callers.
     async fn run_cli_with_pane_check_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -2543,58 +2398,21 @@ impl WeztermClient {
         }
     }
 
-    /// Run a WezTerm CLI command with timeout
-    ///
-    /// Uses `kill_on_drop(true)` to ensure child processes are killed when the
-    /// future is dropped (e.g., on timeout), preventing orphan process accumulation.
-    async fn run_cli(&self, args: &[&str]) -> Result<String> {
-        use crate::runtime_async::process::Command;
-
-        if let Some(ref socket) = self.socket_path {
-            if !std::path::Path::new(socket).exists() {
-                return Err(WeztermError::SocketNotFound(socket.clone()).into());
-            }
-        }
-
-        let mut cmd = Command::new(wezterm_binary());
-        // `--no-auto-start` (when set) is a SUBCOMMAND-LEVEL flag on
-        // `wezterm cli`, NOT a top-level wezterm flag — `wezterm cli
-        // --no-auto-start <op>` is correct, `wezterm --no-auto-start
-        // cli <op>` errors with "unexpected argument". Insert the flag
-        // immediately after "cli" if present. See ft-dvgzi.1.1.
-        cmd.args(inject_no_auto_start(args, self.no_auto_start));
-        // Kill the child process when the future is dropped (e.g., on timeout).
-        // Without this, timed-out processes become orphans that accumulate.
-        cmd.kill_on_drop(true);
-
-        // Add socket path if specified
-        if let Some(ref socket) = self.socket_path {
-            cmd.env("WEZTERM_UNIX_SOCKET", socket);
-        }
-
-        // Execute with timeout
-        let timeout_duration = Duration::from_secs(self.timeout_secs);
-        let output = match timeout(timeout_duration, cmd.output()).await {
-            Ok(result) => result.map_err(|e| Self::categorize_io_error(&e))?,
-            Err(_) => return Err(WeztermError::Timeout(self.timeout_secs).into()),
-        };
-
-        Self::finalize_cli_output(output)
-    }
-
-    /// Cx-first [`run_cli`] variant (ft-xbnl0.2.3). Binds the subprocess
-    /// timeout to the provided `Cx` via
+    /// Run a WezTerm CLI command with an explicit capability context. Binds
+    /// the subprocess timeout to the provided `Cx` via
     /// [`crate::runtime_async::timeout_with_cx`] so caller cancellation,
     /// budget, and virtual time propagate into `wezterm cli` invocations.
     ///
     /// Mirrors the pattern in [`crate::cass::CassClient::run_with_cx`] and
     /// [`crate::caut::CautClient::run_with_cx`]. Pre-flight socket-path
-    /// check and post-execution error categorization are shared via
-    /// [`Self::finalize_cli_output`] so the legacy and Cx paths produce
-    /// bit-for-bit identical error surfaces for the same subprocess
-    /// output.
+    /// check and post-execution error categorization are centralized in
+    /// [`Self::finalize_cli_output`].
     async fn run_cli_with_cx(&self, cx: &crate::cx::Cx, args: &[&str]) -> Result<String> {
         use crate::runtime_async::process::Command;
+
+        cx.checkpoint().map_err(|err| {
+            crate::Error::Cancelled(format!("wezterm cli cancelled before spawn: {err}"))
+        })?;
 
         if let Some(ref socket) = self.socket_path {
             if !std::path::Path::new(socket).exists() {
@@ -2603,8 +2421,8 @@ impl WeztermClient {
         }
 
         let mut cmd = Command::new(wezterm_binary());
-        // See run_cli for the rationale on `--no-auto-start` ordering
-        // (ft-dvgzi.1.1): subcommand-level flag on `cli`, not top-level.
+        // `--no-auto-start` is a subcommand-level flag on `cli`, not a
+        // top-level flag; insert it immediately after `cli` (ft-dvgzi.1.1).
         cmd.args(inject_no_auto_start(args, self.no_auto_start));
         cmd.kill_on_drop(true);
 
@@ -2613,19 +2431,38 @@ impl WeztermClient {
         }
 
         let timeout_duration = Duration::from_secs(self.timeout_secs);
-        let output =
-            match crate::runtime_async::timeout_with_cx(cx, timeout_duration, cmd.output()).await {
-                Ok(result) => result.map_err(|e| Self::categorize_io_error(&e))?,
-                Err(_) => return Err(WeztermError::Timeout(self.timeout_secs).into()),
-            };
+        let output = match crate::runtime_async::timeout_with_cx(
+            cx,
+            timeout_duration,
+            cmd.output_with_cx(cx),
+        )
+        .await
+        {
+            Ok(Ok(output)) => output,
+            Ok(Err(error)) => {
+                if let Err(cancel) = cx.checkpoint() {
+                    return Err(crate::Error::Cancelled(format!(
+                        "wezterm cli cancelled while awaiting subprocess: {cancel}"
+                    )));
+                }
+                return Err(Self::categorize_io_error(&error));
+            }
+            Err(_) => {
+                if let Err(cancel) = cx.checkpoint() {
+                    return Err(crate::Error::Cancelled(format!(
+                        "wezterm cli budget exhausted or cancelled: {cancel}"
+                    )));
+                }
+                return Err(WeztermError::Timeout(self.timeout_secs).into());
+            }
+        };
 
         Self::finalize_cli_output(output)
     }
 
     /// Shared post-timeout validation: checks exit status, stderr
     /// (truncated safely on char boundaries), and maps common error
-    /// strings to structured variants. Extracted so `run_cli` and
-    /// `run_cli_with_cx` share the exact same error surface.
+    /// strings to structured variants.
     fn finalize_cli_output(output: std::process::Output) -> Result<String> {
         if !output.status.success() {
             const MAX_ERROR_CHARS: usize = 8 * 1024;
@@ -2876,22 +2713,9 @@ impl WeztermClient {
         }
     }
 
-    async fn run_cli_with_pane_check_retry(&self, args: &[&str], pane_id: u64) -> Result<String> {
-        self.circuit_guard()?;
-        let result = self
-            .retry_with(|| self.run_cli_with_pane_check(args, pane_id))
-            .await;
-        self.circuit_record_result(&result);
-        result
-    }
-
-    /// ft-xbnl0.2.3 Cx-first sibling of
-    /// [`WeztermClient::run_cli_with_pane_check_retry`].
-    ///
-    /// Routes the inner CLI invocation through
+    /// Routes a pane-specific CLI invocation through
     /// `run_cli_with_pane_check_with_cx` and calls
     /// `retry_with_with_cx` so each attempt honours cancellation.
-    #[allow(dead_code)]
     async fn run_cli_with_pane_check_retry_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -2908,18 +2732,8 @@ impl WeztermClient {
         result
     }
 
-    async fn run_cli_with_retry(&self, args: &[&str]) -> Result<String> {
-        self.circuit_guard()?;
-        let result = self.retry_with(|| self.run_cli(args)).await;
-        self.circuit_record_result(&result);
-        result
-    }
-
-    /// ft-xbnl0.2.3 Cx-first sibling of [`WeztermClient::run_cli_with_retry`].
-    ///
     /// Routes the inner CLI invocation through `run_cli_with_cx` and
     /// calls `retry_with_with_cx` so each attempt honours cancellation.
-    #[allow(dead_code)]
     async fn run_cli_with_retry_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -2933,6 +2747,7 @@ impl WeztermClient {
         result
     }
 
+    #[cfg(test)]
     async fn retry_with<F, Fut>(&self, mut runner: F) -> Result<String>
     where
         F: FnMut() -> Fut,
@@ -2955,15 +2770,12 @@ impl WeztermClient {
         }
     }
 
-    /// ft-xbnl0.2.3 Cx-first sibling of [`WeztermClient::retry_with`].
-    ///
     /// Pre-flight `cx.checkpoint()` on each iteration so a cancelled
     /// context interrupts the retry loop at the earliest boundary,
     /// before the next inner call and before the inter-attempt
     /// sleep. The inner `runner` closure is expected to route through
-    /// a cx-first path itself; this helper only owns cancellation of
-    /// the retry schedule, not of the underlying IO.
-    #[allow(dead_code)]
+    /// a cx-first path itself; this helper also re-checks cancellation
+    /// after a failed attempt and uses a cx-aware backoff sleep.
     async fn retry_with_with_cx<F, Fut>(&self, cx: &crate::cx::Cx, mut runner: F) -> Result<String>
     where
         F: FnMut() -> Fut,
@@ -2972,19 +2784,31 @@ impl WeztermClient {
         let mut attempt = 0;
         loop {
             cx.checkpoint().map_err(|err| {
-                crate::Error::Wezterm(WeztermError::CommandFailed(format!(
-                    "retry_with cancelled: {err}"
-                )))
+                crate::Error::Cancelled(format!("wezterm retry cancelled before attempt: {err}"))
             })?;
             attempt = next_retry_attempt(attempt);
             match runner().await {
                 Ok(output) => return Ok(output),
                 Err(err) => {
+                    cx.checkpoint().map_err(|cancel| {
+                        crate::Error::Cancelled(format!(
+                            "wezterm retry cancelled after failed attempt: {cancel}"
+                        ))
+                    })?;
                     if attempt >= self.retry_attempts as usize || !is_retryable_error(&err) {
                         return Err(err);
                     }
                     if self.retry_delay_ms > 0 {
-                        sleep(Duration::from_millis(self.retry_delay_ms)).await;
+                        crate::runtime_async::sleep_with_cx(
+                            cx,
+                            Duration::from_millis(self.retry_delay_ms),
+                        )
+                        .await
+                        .map_err(|cancel| {
+                            crate::Error::Cancelled(format!(
+                                "wezterm retry cancelled during backoff: {cancel}"
+                            ))
+                        })?;
                     }
                 }
             }
@@ -3711,6 +3535,13 @@ impl WeztermInterface for Arc<dyn WeztermInterface> {
             .split_pane_with_cx(cx, pane_id, direction, cwd, percent)
     }
 
+    fn watchdog_warnings_with_cx<'a>(
+        &'a self,
+        cx: &'a crate::cx::Cx,
+    ) -> WeztermFuture<'a, Vec<String>> {
+        self.as_ref().watchdog_warnings_with_cx(cx)
+    }
+
     fn pane_tiered_scrollback_summary_with_cx<'a>(
         &'a self,
         cx: &'a crate::cx::Cx,
@@ -3978,6 +3809,25 @@ fn wait_remaining(deadline: Option<Instant>, now: Instant, fallback: Duration) -
         .unwrap_or(fallback)
 }
 
+const WAIT_CX_CHECK_INTERVAL: Duration = Duration::from_millis(100);
+
+async fn wait_backoff_with_cx(cx: &crate::cx::Cx, duration: Duration) -> Result<()> {
+    let mut remaining = duration;
+    while !remaining.is_zero() {
+        cx.checkpoint().map_err(|error| {
+            crate::Error::runtime_cancelled("wezterm wait backoff", error.to_string())
+        })?;
+        let step = remaining.min(WAIT_CX_CHECK_INTERVAL);
+        crate::runtime_async::sleep_with_cx(cx, step)
+            .await
+            .map_err(|error| crate::Error::runtime_cancelled("wezterm wait backoff", error))?;
+        remaining = remaining.saturating_sub(step);
+    }
+    cx.checkpoint().map_err(|error| {
+        crate::Error::runtime_cancelled("wezterm wait backoff", error.to_string())
+    })
+}
+
 /// Shared waiter for polling pane text until a matcher succeeds.
 pub struct PaneWaiter<'a, S: PaneTextSource + Sync + ?Sized> {
     source: &'a S,
@@ -4008,66 +3858,8 @@ impl<'a, S: PaneTextSource + Sync + ?Sized> PaneWaiter<'a, S> {
         matcher: &WaitMatcher,
         timeout: Duration,
     ) -> Result<WaitResult> {
-        let matcher_desc = matcher.description();
-        let start = Instant::now();
-        let deadline = wait_deadline_after(start, timeout, "wait_for");
-        let mut polls = 0usize;
-        let mut interval = self.options.poll_initial;
-        tracing::info!(
-            pane_id,
-            timeout_ms = ms_u64(timeout),
-            matcher = %matcher_desc,
-            "wait_for start"
-        );
-
-        loop {
-            polls = next_poll_count(polls);
-            let text = self.source.get_text(pane_id, self.options.escapes).await?;
-            let tail = tail_text(&text, self.options.tail_lines);
-            let tail_hash = stable_hash(tail.as_bytes());
-
-            if matcher.matches(&tail)? {
-                let elapsed_ms = elapsed_ms(start);
-                tracing::info!(
-                    pane_id,
-                    elapsed_ms,
-                    polls,
-                    matcher = %matcher_desc,
-                    "wait_for matched"
-                );
-                return Ok(WaitResult::Matched { elapsed_ms, polls });
-            }
-
-            let now = Instant::now();
-            if wait_timed_out(deadline, now) || polls >= self.options.max_polls {
-                let elapsed_ms = elapsed_ms(start);
-                tracing::info!(
-                    pane_id,
-                    elapsed_ms,
-                    polls,
-                    matcher = %matcher_desc,
-                    "wait_for timeout"
-                );
-                return Ok(WaitResult::TimedOut {
-                    elapsed_ms,
-                    polls,
-                    last_tail_hash: Some(tail_hash),
-                });
-            }
-
-            let remaining = wait_remaining(deadline, now, interval);
-            let sleep_duration = if interval > remaining {
-                remaining
-            } else {
-                interval
-            };
-
-            sleep(sleep_duration).await;
-            interval = interval.saturating_mul(2);
-            if interval > self.options.poll_max {
-                interval = self.options.poll_max;
-            }
-        }
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.wait_for_with_cx(&cx, pane_id, matcher, timeout).await
     }
 
     /// Wait for a matcher to appear in the pane, bound to the caller's
@@ -4085,20 +3877,16 @@ impl<'a, S: PaneTextSource + Sync + ?Sized> PaneWaiter<'a, S> {
     ///     long-running wait exits promptly even before the sleep
     ///     fires.
     ///
-    ///   * `sleep_with_cx(cx, duration)` bounds the between-poll
-    ///     backoff sleep. If the Cx is cancelled mid-sleep, the
-    ///     sleep returns Err and the loop surfaces
-    ///     `WaitResult::Cancelled` rather than burning the remaining
-    ///     sleep budget.
+    ///   * The between-poll backoff is split into bounded
+    ///     [`WAIT_CX_CHECK_INTERVAL`] steps with a checkpoint before and after
+    ///     each sleep. Direct cancellation does not wake `sleep_with_cx`
+    ///     itself, but is observed no later than the end of the current step.
     ///
-    /// The `PaneTextSource::get_text` call still uses ambient Cx via
-    /// the source trait (get_text is not yet Cx-aware at the trait
-    /// level); the Cx-first wait here delivers meaningful cancellation
-    /// for the common case where the source responds quickly and the
-    /// loop spends most of its time in the backoff sleep.
-    ///
-    /// The legacy [`wait_for`](Self::wait_for) entry point is
-    /// preserved for non-migrated callers; this is strictly additive.
+    /// The loop invokes `PaneTextSource::get_text_with_cx`; source
+    /// implementations that override that method propagate the caller's Cx,
+    /// while the trait default retains its ambient read behavior. Loop
+    /// checkpoints and backoff always use the explicit Cx. The ambient
+    /// [`wait_for`](Self::wait_for) wrapper delegates here.
     pub async fn wait_for_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -4186,10 +3974,7 @@ impl<'a, S: PaneTextSource + Sync + ?Sized> PaneWaiter<'a, S> {
                 interval
             };
 
-            if crate::runtime_async::sleep_with_cx(cx, sleep_duration)
-                .await
-                .is_err()
-            {
+            if wait_backoff_with_cx(cx, sleep_duration).await.is_err() {
                 let elapsed_ms = elapsed_ms(start);
                 tracing::info!(
                     pane_id,
@@ -4225,67 +4010,8 @@ pub async fn wait_for_codex_session_summary<S: PaneTextSource + Sync + ?Sized>(
     timeout: Duration,
     options: WaitOptions,
 ) -> Result<CodexSummaryWaitResult> {
-    let start = Instant::now();
-    let deadline = wait_deadline_after(start, timeout, "codex_summary_wait");
-    let mut polls = 0usize;
-    let mut interval = options.poll_initial;
-
-    tracing::info!(
-        pane_id,
-        timeout_ms = ms_u64(timeout),
-        "codex_summary_wait start"
-    );
-
-    loop {
-        polls = next_poll_count(polls);
-        let text = source.get_text(pane_id, options.escapes).await?;
-        let tail = tail_text(&text, options.tail_lines);
-        let last_tail_hash = Some(stable_hash(tail.as_bytes()));
-
-        let last_markers = CodexSummaryMarkers {
-            token_usage: tail.contains("Token usage:"),
-            resume_hint: tail.contains("codex resume"),
-        };
-
-        if last_markers.complete() {
-            let elapsed_ms = elapsed_ms(start);
-            tracing::info!(pane_id, elapsed_ms, polls, "codex_summary_wait matched");
-            return Ok(CodexSummaryWaitResult {
-                matched: true,
-                elapsed_ms,
-                polls,
-                last_tail_hash,
-                last_markers,
-            });
-        }
-
-        let now = Instant::now();
-        if wait_timed_out(deadline, now) || polls >= options.max_polls {
-            let elapsed_ms = elapsed_ms(start);
-            tracing::info!(pane_id, elapsed_ms, polls, "codex_summary_wait timeout");
-            return Ok(CodexSummaryWaitResult {
-                matched: false,
-                elapsed_ms,
-                polls,
-                last_tail_hash,
-                last_markers,
-            });
-        }
-
-        let remaining = wait_remaining(deadline, now, interval);
-        let sleep_duration = if interval > remaining {
-            remaining
-        } else {
-            interval
-        };
-        if !sleep_duration.is_zero() {
-            sleep(sleep_duration).await;
-        }
-        interval = interval.saturating_mul(2);
-        if interval > options.poll_max {
-            interval = options.poll_max;
-        }
-    }
+    let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+    wait_for_codex_session_summary_with_cx(&cx, source, pane_id, timeout, options).await
 }
 
 /// Cx-first `wait_for_codex_session_summary` (ft-xbnl0.2.3).
@@ -4293,22 +4019,20 @@ pub async fn wait_for_codex_session_summary<S: PaneTextSource + Sync + ?Sized>(
 /// Mirrors the legacy function with three Cx-aware changes:
 ///
 ///   * Pre-flight `cx.checkpoint()` before the first poll. A
-///     caller-cancelled wait returns the pre-cancellation empty
-///     snapshot (`matched: false`, `polls: 0`, `elapsed_ms: 0`)
-///     without touching the source.
+///     caller-cancelled wait returns a typed runtime cancellation error without
+///     touching the source.
 ///
 ///   * Mid-loop `cx.checkpoint()` after each poll, before the
 ///     exponential-backoff sleep.
 ///
-///   * `sleep_with_cx(cx, duration)` bounds the between-poll
-///     backoff. Mid-sleep cancellation collapses to the
-///     timeout-shaped result (`matched: false`) for a stable
-///     surface — callers can distinguish cancelled from true
-///     timeout via the caller's own Cx state if needed.
+///   * The between-poll backoff is split into bounded
+///     [`WAIT_CX_CHECK_INTERVAL`] steps with explicit checkpoints. Direct
+///     cancellation is returned as a typed runtime error rather than a
+///     timeout-shaped `matched: false` result.
 ///
-/// The `PaneTextSource::get_text` call still uses ambient Cx
-/// (trait is not Cx-aware yet); the Cx-first wait here delivers
-/// meaningful cancellation for the between-poll sleep portion.
+/// The loop invokes `PaneTextSource::get_text_with_cx`; overriding sources
+/// propagate cancellation through reads, while the trait default preserves
+/// ambient read behavior. Loop checkpoints and backoff always use `cx`.
 pub async fn wait_for_codex_session_summary_with_cx<S: PaneTextSource + Sync + ?Sized>(
     cx: &crate::cx::Cx,
     source: &S,
@@ -4316,18 +4040,9 @@ pub async fn wait_for_codex_session_summary_with_cx<S: PaneTextSource + Sync + ?
     timeout: Duration,
     options: WaitOptions,
 ) -> Result<CodexSummaryWaitResult> {
-    if cx.checkpoint().is_err() {
-        return Ok(CodexSummaryWaitResult {
-            matched: false,
-            elapsed_ms: 0,
-            polls: 0,
-            last_tail_hash: None,
-            last_markers: CodexSummaryMarkers {
-                token_usage: false,
-                resume_hint: false,
-            },
-        });
-    }
+    cx.checkpoint().map_err(|error| {
+        crate::Error::runtime_cancelled("wezterm wait for Codex summary", error.to_string())
+    })?;
 
     let start = Instant::now();
     let deadline = wait_deadline_after(start, timeout, "codex_summary_wait_with_cx");
@@ -4389,22 +4104,9 @@ pub async fn wait_for_codex_session_summary_with_cx<S: PaneTextSource + Sync + ?
             });
         }
 
-        if cx.checkpoint().is_err() {
-            let elapsed_ms = elapsed_ms(start);
-            tracing::info!(
-                pane_id,
-                elapsed_ms,
-                polls,
-                "codex_summary_wait_with_cx cancelled mid-loop"
-            );
-            return Ok(CodexSummaryWaitResult {
-                matched: false,
-                elapsed_ms,
-                polls,
-                last_tail_hash,
-                last_markers,
-            });
-        }
+        cx.checkpoint().map_err(|error| {
+            crate::Error::runtime_cancelled("wezterm wait for Codex summary", error.to_string())
+        })?;
 
         let remaining = wait_remaining(deadline, now, interval);
         let sleep_duration = if interval > remaining {
@@ -4412,25 +4114,8 @@ pub async fn wait_for_codex_session_summary_with_cx<S: PaneTextSource + Sync + ?
         } else {
             interval
         };
-        if !sleep_duration.is_zero()
-            && crate::runtime_async::sleep_with_cx(cx, sleep_duration)
-                .await
-                .is_err()
-        {
-            let elapsed_ms = elapsed_ms(start);
-            tracing::info!(
-                pane_id,
-                elapsed_ms,
-                polls,
-                "codex_summary_wait_with_cx cancelled during sleep"
-            );
-            return Ok(CodexSummaryWaitResult {
-                matched: false,
-                elapsed_ms,
-                polls,
-                last_tail_hash,
-                last_markers,
-            });
+        if !sleep_duration.is_zero() {
+            wait_backoff_with_cx(cx, sleep_duration).await?;
         }
 
         interval = interval.saturating_mul(2);
@@ -5009,14 +4694,72 @@ mod tests {
                 "runner must NOT be invoked when cx is pre-cancelled"
             );
             match err {
-                crate::Error::Wezterm(WeztermError::CommandFailed(msg)) => {
+                crate::Error::Cancelled(msg) => {
                     assert!(
                         msg.contains("cancelled"),
                         "error should mention cancellation: {msg}"
                     );
                 }
-                other => panic!("expected Wezterm(CommandFailed) on pre-cancel, got {other:?}"),
+                other => panic!("expected Cancelled on pre-cancel, got {other:?}"),
             }
+        });
+    }
+
+    #[test]
+    fn run_cli_with_cx_short_circuits_before_process_spawn() {
+        run_async_test(async {
+            let client = WeztermClient::new();
+            let cx = crate::cx::for_testing();
+            cx.cancel_with(
+                crate::outcome::CancelKind::User,
+                Some("pre-cancel wezterm cli"),
+            );
+
+            let err = client
+                .run_cli_with_cx(&cx, &["cli", "list"])
+                .await
+                .expect_err("pre-cancelled cx must refuse subprocess spawn");
+            assert!(
+                matches!(&err, crate::Error::Cancelled(message) if message.contains("before spawn")),
+                "unexpected pre-cancel error: {err:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn retry_with_with_cx_does_not_retry_after_attempt_cancels_cx() {
+        run_async_test(async {
+            let client = WeztermClient::new();
+            let cx = crate::cx::for_testing();
+            let runner_cx = cx.clone();
+            let invocations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let runner_invocations = Arc::clone(&invocations);
+
+            let err = client
+                .retry_with_with_cx(&cx, move || {
+                    let runner_cx = runner_cx.clone();
+                    let runner_invocations = Arc::clone(&runner_invocations);
+                    async move {
+                        runner_invocations.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        runner_cx.cancel_with(
+                            crate::outcome::CancelKind::User,
+                            Some("cancel during failed cli attempt"),
+                        );
+                        Err::<String, crate::Error>(WeztermError::Timeout(1).into())
+                    }
+                })
+                .await
+                .expect_err("cancellation after a failed attempt must stop retries");
+
+            assert_eq!(
+                invocations.load(std::sync::atomic::Ordering::SeqCst),
+                1,
+                "cancelled retry must not invoke the runner again"
+            );
+            assert!(
+                matches!(&err, crate::Error::Cancelled(message) if message.contains("after failed attempt")),
+                "unexpected cancellation error: {err:?}"
+            );
         });
     }
 
@@ -5817,10 +5560,7 @@ mod tests {
     }
 
     #[cfg(all(feature = "vendored", unix))]
-    fn assert_mux_transport_failover(
-        err: &crate::vendored::MuxPoolError,
-        expected: bool,
-    ) {
+    fn assert_mux_transport_failover(err: &crate::vendored::MuxPoolError, expected: bool) {
         assert_eq!(
             WeztermClient::mux_error_requires_transport_failover(err),
             expected,
@@ -5965,9 +5705,7 @@ mod tests {
                 false,
             ),
             (
-                DirectMuxError::Io(std::io::Error::from(
-                    std::io::ErrorKind::PermissionDenied,
-                )),
+                DirectMuxError::Io(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
                 ProtocolErrorKind::Permanent,
                 false,
                 true,
@@ -6032,10 +5770,7 @@ mod tests {
             crate::pool::PoolError::Closed,
             crate::pool::PoolError::Cancelled,
         ] {
-            assert_mux_transport_failover(
-                &crate::vendored::MuxPoolError::Pool(pool_error),
-                false,
-            );
+            assert_mux_transport_failover(&crate::vendored::MuxPoolError::Pool(pool_error), false);
         }
     }
 
@@ -7698,6 +7433,13 @@ impl WeztermInterface for UnifiedClient {
             .split_pane_with_cx(cx, pane_id, direction, cwd, percent)
     }
 
+    fn watchdog_warnings_with_cx<'a>(
+        &'a self,
+        cx: &'a crate::cx::Cx,
+    ) -> WeztermFuture<'a, Vec<String>> {
+        self.inner.watchdog_warnings_with_cx(cx)
+    }
+
     fn pane_tiered_scrollback_summary_with_cx<'a>(
         &'a self,
         cx: &'a crate::cx::Cx,
@@ -7722,8 +7464,13 @@ pub struct MockWezterm {
     next_pane_id: std::sync::atomic::AtomicU64,
     next_window_id: std::sync::atomic::AtomicU64,
     next_tab_id: std::sync::atomic::AtomicU64,
-    watchdog_warnings: crate::runtime_async::RwLock<Vec<String>>,
-    watchdog_warning_error: crate::runtime_async::RwLock<Option<String>>,
+    watchdog_state: crate::runtime_async::RwLock<MockWatchdogState>,
+}
+
+#[derive(Debug, Default)]
+struct MockWatchdogState {
+    warnings: Vec<String>,
+    error: Option<String>,
 }
 
 /// State of a single mock pane.
@@ -7787,6 +7534,16 @@ fn mark_mock_id_seen(counter: &AtomicU64, id: u64) {
     let _ = counter.fetch_max(id.saturating_add(1), Ordering::SeqCst);
 }
 
+fn ensure_mock_id_available(counter: &AtomicU64, label: &str) -> crate::Result<()> {
+    let current = counter.load(Ordering::SeqCst);
+    if current == u64::MAX {
+        return Err(crate::Error::Wezterm(WeztermError::CommandFailed(format!(
+            "mock {label} id space exhausted at {current}"
+        ))));
+    }
+    Ok(())
+}
+
 fn allocate_mock_id(counter: &AtomicU64, label: &str) -> crate::Result<u64> {
     let mut current = counter.load(Ordering::SeqCst);
     loop {
@@ -7802,6 +7559,22 @@ fn allocate_mock_id(counter: &AtomicU64, label: &str) -> crate::Result<u64> {
     }
 }
 
+fn mock_lock_error(
+    operation: &'static str,
+    error: crate::runtime_async::LockAcquireError,
+) -> crate::Error {
+    match error {
+        crate::runtime_async::LockAcquireError::Cancelled => {
+            crate::Error::runtime_cancelled(operation, error.to_string())
+        }
+        crate::runtime_async::LockAcquireError::TimedOut { .. }
+        | crate::runtime_async::LockAcquireError::Poisoned
+        | crate::runtime_async::LockAcquireError::PolledAfterCompletion => {
+            crate::Error::runtime_backend(operation, error.to_string())
+        }
+    }
+}
+
 impl MockWezterm {
     /// Create a new MockWezterm with no panes.
     #[must_use]
@@ -7811,22 +7584,16 @@ impl MockWezterm {
             next_pane_id: std::sync::atomic::AtomicU64::new(0),
             next_window_id: std::sync::atomic::AtomicU64::new(0),
             next_tab_id: std::sync::atomic::AtomicU64::new(0),
-            watchdog_warnings: crate::runtime_async::RwLock::new(Vec::new()),
-            watchdog_warning_error: crate::runtime_async::RwLock::new(None),
+            watchdog_state: crate::runtime_async::RwLock::new(MockWatchdogState::default()),
         }
     }
 
     /// Add a pre-configured pane.
     pub async fn add_pane(&self, pane: MockPane) {
-        let mut panes = self.panes.write().await;
-        let id = pane.pane_id;
-        let window_id = pane.window_id;
-        let tab_id = pane.tab_id;
-        panes.insert(id, pane);
-        // Ensure next_pane_id stays above any manually inserted pane
-        mark_mock_id_seen(&self.next_pane_id, id);
-        mark_mock_id_seen(&self.next_window_id, window_id);
-        mark_mock_id_seen(&self.next_tab_id, tab_id);
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.add_pane_with_cx(&cx, pane)
+            .await
+            .expect("mock pane insertion failed");
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`MockWezterm::add_pane`]
@@ -7836,26 +7603,103 @@ impl MockWezterm {
     /// `write_with_cx(cx)` so a caller-cancelled cx interrupts the
     /// lock wait. Used by `Scenario::setup_with_cx` for the
     /// simulation-harness setup loop.
-    pub async fn add_pane_with_cx(&self, cx: &crate::cx::Cx, pane: MockPane) {
-        let mut panes = self.panes.write_with_cx(cx).await;
-        let id = pane.pane_id;
-        let window_id = pane.window_id;
-        let tab_id = pane.tab_id;
-        panes.insert(id, pane);
-        mark_mock_id_seen(&self.next_pane_id, id);
-        mark_mock_id_seen(&self.next_window_id, window_id);
-        mark_mock_id_seen(&self.next_tab_id, tab_id);
+    pub async fn add_pane_with_cx(&self, cx: &crate::cx::Cx, pane: MockPane) -> crate::Result<()> {
+        self.add_panes_with_cx(cx, vec![pane]).await
+    }
+
+    /// Atomically add a validated batch of panes under one write-lock acquire.
+    ///
+    /// Duplicate pane IDs, collisions with existing panes, and a combined
+    /// state containing more than one active pane are rejected before any
+    /// mutation. ID allocation counters advance only after every pane has been
+    /// inserted, so cancellation or validation failure leaves the mock
+    /// unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed cancellation/backend error if the write lock cannot be
+    /// acquired, or a validation error if committing the batch would violate a
+    /// mock-pane invariant.
+    pub async fn add_panes_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        new_panes: Vec<MockPane>,
+    ) -> crate::Result<()> {
+        cx.checkpoint().map_err(|error| {
+            crate::Error::runtime_cancelled("mock add panes", error.to_string())
+        })?;
+
+        let mut batch_ids = std::collections::HashSet::with_capacity(new_panes.len());
+        let mut batch_active_count = 0usize;
+        for pane in &new_panes {
+            if !batch_ids.insert(pane.pane_id) {
+                return Err(crate::Error::runtime_backend(
+                    "mock add panes",
+                    format!("duplicate pane id {} in batch", pane.pane_id),
+                ));
+            }
+            batch_active_count += usize::from(pane.is_active);
+        }
+        if batch_active_count > 1 {
+            return Err(crate::Error::runtime_backend(
+                "mock add panes",
+                format!("batch contains {batch_active_count} active panes; maximum is one"),
+            ));
+        }
+
+        let mut panes = self
+            .panes
+            .write_with_cx(cx)
+            .await
+            .map_err(|error| mock_lock_error("mock add panes", error))?;
+
+        if let Some(collision) = new_panes
+            .iter()
+            .find(|pane| panes.contains_key(&pane.pane_id))
+        {
+            return Err(crate::Error::runtime_backend(
+                "mock add panes",
+                format!("pane id {} already exists", collision.pane_id),
+            ));
+        }
+        let existing_active_count = panes.values().filter(|pane| pane.is_active).count();
+        let combined_active_count = existing_active_count.saturating_add(batch_active_count);
+        if combined_active_count > 1 {
+            return Err(crate::Error::runtime_backend(
+                "mock add panes",
+                format!(
+                    "combined mock state would contain {combined_active_count} active panes; maximum is one"
+                ),
+            ));
+        }
+
+        for pane in new_panes {
+            let id = pane.pane_id;
+            let window_id = pane.window_id;
+            let tab_id = pane.tab_id;
+            panes.insert(id, pane);
+            mark_mock_id_seen(&self.next_pane_id, id);
+            mark_mock_id_seen(&self.next_window_id, window_id);
+            mark_mock_id_seen(&self.next_tab_id, tab_id);
+        }
+        Ok(())
     }
 
     /// Create a simple mock pane with defaults.
     pub async fn add_default_pane(&self, pane_id: u64) -> MockPane {
         // ft-7xbaz: ergonomic wrapper around `add_default_pane_with_cx`.
         let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-        self.add_default_pane_with_cx(&cx, pane_id).await
+        self.add_default_pane_with_cx(&cx, pane_id)
+            .await
+            .expect("mock default pane insertion failed")
     }
 
     /// ft-7xbaz Cx-first sibling of [`Self::add_default_pane`].
-    pub async fn add_default_pane_with_cx(&self, cx: &crate::cx::Cx, pane_id: u64) -> MockPane {
+    pub async fn add_default_pane_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        pane_id: u64,
+    ) -> crate::Result<MockPane> {
         let pane = MockPane {
             pane_id,
             window_id: 0,
@@ -7869,13 +7713,35 @@ impl MockWezterm {
             rows: 24,
             content: String::new(),
         };
-        self.add_pane_with_cx(cx, pane.clone()).await;
-        pane
+        self.add_pane_with_cx(cx, pane.clone()).await?;
+        Ok(pane)
     }
 
     /// Inject an event into a specific pane.
     pub async fn inject(&self, pane_id: u64, event: MockEvent) -> crate::Result<()> {
-        let mut panes = self.panes.write().await;
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.inject_with_cx(&cx, pane_id, event).await
+    }
+
+    /// ft-xbnl0.2.3 Cx-first sibling of [`MockWezterm::inject`].
+    ///
+    /// Threads the caller's cx through the panes RwLock write-lock
+    /// acquire (`write_with_cx`) so a cancelled parent cx interrupts
+    /// the lock wait rather than blocking. Unlocks simulation harness
+    /// migrations (`TutorialSandbox::trigger_exercise_events_with_cx`
+    /// already uses this pattern via `execute_all_with_cx`; the resize
+    /// timeline helpers on Scenario can now follow suit).
+    pub async fn inject_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        pane_id: u64,
+        event: MockEvent,
+    ) -> crate::Result<()> {
+        let mut panes = self
+            .panes
+            .write_with_cx(cx)
+            .await
+            .map_err(|error| mock_lock_error("mock inject", error))?;
         let pane = panes.get_mut(&pane_id).ok_or(crate::Error::PaneOperation {
             pane_id,
             operation: "inject",
@@ -7893,42 +7759,10 @@ impl MockWezterm {
         Ok(())
     }
 
-    /// ft-xbnl0.2.3 Cx-first sibling of [`MockWezterm::inject`].
-    ///
-    /// Threads the caller's cx through the panes RwLock write-lock
-    /// acquire (`write_with_cx`) so a cancelled parent cx interrupts
-    /// the lock wait rather than blocking. Unlocks simulation harness
-    /// migrations (`TutorialSandbox::trigger_exercise_events_with_cx`
-    /// already uses this pattern via `execute_all_with_cx`; the resize
-    /// timeline helpers on Scenario can now follow suit).
-    pub async fn inject_with_cx(
-        &self,
-        cx: &crate::cx::Cx,
-        pane_id: u64,
-        event: MockEvent,
-    ) -> crate::Result<()> {
-        let mut panes = self.panes.write_with_cx(cx).await;
-        let pane = panes.get_mut(&pane_id).ok_or(crate::Error::PaneOperation {
-            pane_id,
-            operation: "inject_with_cx",
-            source: crate::error::PaneOperationSource::PaneNotFound,
-        })?;
-        match event {
-            MockEvent::AppendOutput(text) => pane.content.push_str(&text),
-            MockEvent::ClearScreen => pane.content.clear(),
-            MockEvent::Resize(cols, rows) => {
-                pane.cols = cols;
-                pane.rows = rows;
-            }
-            MockEvent::SetTitle(title) => pane.title = title,
-        }
-        Ok(())
-    }
-
     /// Inject output text into a pane (convenience wrapper).
     pub async fn inject_output(&self, pane_id: u64, text: &str) -> crate::Result<()> {
-        self.inject(pane_id, MockEvent::AppendOutput(text.to_string()))
-            .await
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.inject_output_with_cx(&cx, pane_id, text).await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`MockWezterm::inject_output`].
@@ -7949,54 +7783,90 @@ impl MockWezterm {
     pub async fn pane_state(&self, pane_id: u64) -> Option<MockPane> {
         // ft-7xbaz: ergonomic wrapper around `pane_state_with_cx`.
         let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-        self.pane_state_with_cx(&cx, pane_id).await
+        self.pane_state_with_cx(&cx, pane_id)
+            .await
+            .expect("mock pane-state read failed")
     }
 
     /// ft-7xbaz Cx-first sibling of [`Self::pane_state`].
-    pub async fn pane_state_with_cx(&self, _cx: &crate::cx::Cx, pane_id: u64) -> Option<MockPane> {
-        let panes = self.panes.read().await;
-        panes.get(&pane_id).cloned()
+    pub async fn pane_state_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        pane_id: u64,
+    ) -> crate::Result<Option<MockPane>> {
+        let panes = self
+            .panes
+            .read_with_cx(cx)
+            .await
+            .map_err(|error| mock_lock_error("mock pane state", error))?;
+        Ok(panes.get(&pane_id).cloned())
     }
 
     /// Get the number of panes.
     pub async fn pane_count(&self) -> usize {
         // ft-7xbaz: ergonomic wrapper around `pane_count_with_cx`.
         let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-        self.pane_count_with_cx(&cx).await
+        self.pane_count_with_cx(&cx)
+            .await
+            .expect("mock pane-count read failed")
     }
 
     /// ft-7xbaz Cx-first sibling of [`Self::pane_count`].
-    pub async fn pane_count_with_cx(&self, _cx: &crate::cx::Cx) -> usize {
-        self.panes.read().await.len()
+    pub async fn pane_count_with_cx(&self, cx: &crate::cx::Cx) -> crate::Result<usize> {
+        Ok(self
+            .panes
+            .read_with_cx(cx)
+            .await
+            .map_err(|error| mock_lock_error("mock pane count", error))?
+            .len())
     }
 
     /// Override watchdog warnings returned by this mock.
     pub async fn set_watchdog_warnings(&self, warnings: Vec<String>) {
         // ft-7xbaz: ergonomic wrapper around `set_watchdog_warnings_with_cx`.
         let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-        self.set_watchdog_warnings_with_cx(&cx, warnings).await;
+        self.set_watchdog_warnings_with_cx(&cx, warnings)
+            .await
+            .expect("mock watchdog-warning write failed");
     }
 
     /// ft-7xbaz Cx-first sibling of [`Self::set_watchdog_warnings`].
-    pub async fn set_watchdog_warnings_with_cx(&self, _cx: &crate::cx::Cx, warnings: Vec<String>) {
-        *self.watchdog_warnings.write().await = warnings;
-        *self.watchdog_warning_error.write().await = None;
+    pub async fn set_watchdog_warnings_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        warnings: Vec<String>,
+    ) -> crate::Result<()> {
+        let mut state = self
+            .watchdog_state
+            .write_with_cx(cx)
+            .await
+            .map_err(|error| mock_lock_error("mock watchdog warnings", error))?;
+        state.warnings = warnings;
+        state.error = None;
+        Ok(())
     }
 
     /// Configure watchdog warning probe failure behavior for this mock.
     pub async fn set_watchdog_warning_error(&self, error: Option<String>) {
         // ft-7xbaz: ergonomic wrapper around `set_watchdog_warning_error_with_cx`.
         let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-        self.set_watchdog_warning_error_with_cx(&cx, error).await;
+        self.set_watchdog_warning_error_with_cx(&cx, error)
+            .await
+            .expect("mock watchdog-error write failed");
     }
 
     /// ft-7xbaz Cx-first sibling of [`Self::set_watchdog_warning_error`].
     pub async fn set_watchdog_warning_error_with_cx(
         &self,
-        _cx: &crate::cx::Cx,
+        cx: &crate::cx::Cx,
         error: Option<String>,
-    ) {
-        *self.watchdog_warning_error.write().await = error;
+    ) -> crate::Result<()> {
+        self.watchdog_state
+            .write_with_cx(cx)
+            .await
+            .map_err(|lock_error| mock_lock_error("mock watchdog error", lock_error))?
+            .error = error;
+        Ok(())
     }
 }
 
@@ -8092,6 +7962,15 @@ impl WeztermInterface for MockWezterm {
         let cwd = cwd.unwrap_or("/home/user").to_string();
         let domain = domain_name.unwrap_or("local").to_string();
         Box::pin(async move {
+            let mut panes = self.panes.write().await;
+            // Validate the complete allocation before advancing any counter.
+            // All counter writers hold the panes write lock, so a later
+            // allocation cannot newly overflow after this preflight.
+            ensure_mock_id_available(&self.next_pane_id, "pane")?;
+            if target.new_window {
+                ensure_mock_id_available(&self.next_window_id, "window")?;
+            }
+            ensure_mock_id_available(&self.next_tab_id, "tab")?;
             let pane_id = allocate_mock_id(&self.next_pane_id, "pane")?;
             let window_id = if target.new_window {
                 allocate_mock_id(&self.next_window_id, "window")?
@@ -8114,7 +7993,7 @@ impl WeztermInterface for MockWezterm {
                 rows: 24,
                 content: String::new(),
             };
-            self.panes.write().await.insert(pane_id, pane);
+            panes.insert(pane_id, pane);
             Ok(pane_id)
         })
     }
@@ -8128,13 +8007,11 @@ impl WeztermInterface for MockWezterm {
     ) -> WeztermFuture<'_, u64> {
         let cwd = cwd.map(str::to_string);
         Box::pin(async move {
-            let parent = {
-                let panes = self.panes.read().await;
-                panes
-                    .get(&pane_id)
-                    .cloned()
-                    .ok_or(crate::Error::Wezterm(WeztermError::PaneNotFound(pane_id)))?
-            };
+            let mut panes = self.panes.write().await;
+            let parent = panes
+                .get(&pane_id)
+                .cloned()
+                .ok_or(crate::Error::Wezterm(WeztermError::PaneNotFound(pane_id)))?;
 
             let new_pane_id = allocate_mock_id(&self.next_pane_id, "pane")?;
             let pane = MockPane {
@@ -8150,7 +8027,7 @@ impl WeztermInterface for MockWezterm {
                 rows: parent.rows,
                 content: String::new(),
             };
-            self.panes.write().await.insert(new_pane_id, pane);
+            panes.insert(new_pane_id, pane);
             Ok(new_pane_id)
         })
     }
@@ -8158,14 +8035,12 @@ impl WeztermInterface for MockWezterm {
     fn activate_pane(&self, pane_id: u64) -> WeztermFuture<'_, ()> {
         Box::pin(async move {
             let mut panes = self.panes.write().await;
-            // Deactivate all, then activate target
-            for pane in panes.values_mut() {
-                pane.is_active = false;
+            if !panes.contains_key(&pane_id) {
+                return Err(crate::Error::Wezterm(WeztermError::PaneNotFound(pane_id)));
             }
-            let pane = panes
-                .get_mut(&pane_id)
-                .ok_or(crate::Error::Wezterm(WeztermError::PaneNotFound(pane_id)))?;
-            pane.is_active = true;
+            for pane in panes.values_mut() {
+                pane.is_active = pane.pane_id == pane_id;
+            }
             Ok(())
         })
     }
@@ -8209,19 +8084,367 @@ impl WeztermInterface for MockWezterm {
         })
     }
 
+    fn list_panes_with_cx<'a>(&'a self, cx: &'a crate::cx::Cx) -> WeztermFuture<'a, Vec<PaneInfo>> {
+        Box::pin(async move {
+            let panes = self
+                .panes
+                .read_with_cx(cx)
+                .await
+                .map_err(|error| mock_lock_error("mock list panes", error))?;
+            Ok(panes.values().map(MockPane::to_pane_info).collect())
+        })
+    }
+
+    fn get_pane_with_cx<'a>(
+        &'a self,
+        cx: &'a crate::cx::Cx,
+        pane_id: u64,
+    ) -> WeztermFuture<'a, PaneInfo> {
+        Box::pin(async move {
+            let panes = self
+                .panes
+                .read_with_cx(cx)
+                .await
+                .map_err(|error| mock_lock_error("mock get pane", error))?;
+            panes
+                .get(&pane_id)
+                .map(MockPane::to_pane_info)
+                .ok_or(crate::Error::Wezterm(WeztermError::PaneNotFound(pane_id)))
+        })
+    }
+
+    fn get_text_with_cx<'a>(
+        &'a self,
+        cx: &'a crate::cx::Cx,
+        pane_id: u64,
+        _escapes: bool,
+    ) -> WeztermFuture<'a, String> {
+        Box::pin(async move {
+            let panes = self
+                .panes
+                .read_with_cx(cx)
+                .await
+                .map_err(|error| mock_lock_error("mock get text", error))?;
+            panes
+                .get(&pane_id)
+                .map(|pane| pane.content.clone())
+                .ok_or(crate::Error::Wezterm(WeztermError::PaneNotFound(pane_id)))
+        })
+    }
+
+    fn get_semantic_zones_with_cx<'a>(
+        &'a self,
+        cx: &'a crate::cx::Cx,
+        pane_id: u64,
+    ) -> WeztermFuture<'a, MuxSemanticSnapshot> {
+        Box::pin(async move {
+            cx.checkpoint().map_err(|error| {
+                crate::Error::runtime_cancelled("mock semantic zones", error.to_string())
+            })?;
+            Err(WeztermError::CommandFailed(format!(
+                "semantic data unavailable for pane {pane_id}: mock backend does not expose SemanticZone data"
+            ))
+            .into())
+        })
+    }
+
+    fn send_text_with_cx<'a>(
+        &'a self,
+        cx: &'a crate::cx::Cx,
+        pane_id: u64,
+        text: &str,
+    ) -> WeztermFuture<'a, ()> {
+        let text = text.to_string();
+        Box::pin(async move {
+            let mut panes = self
+                .panes
+                .write_with_cx(cx)
+                .await
+                .map_err(|error| mock_lock_error("mock send text", error))?;
+            let pane = panes
+                .get_mut(&pane_id)
+                .ok_or(crate::Error::Wezterm(WeztermError::PaneNotFound(pane_id)))?;
+            pane.content.push_str(&text);
+            Ok(())
+        })
+    }
+
+    fn send_text_no_paste_with_cx<'a>(
+        &'a self,
+        cx: &'a crate::cx::Cx,
+        pane_id: u64,
+        text: &str,
+    ) -> WeztermFuture<'a, ()> {
+        self.send_text_with_cx(cx, pane_id, text)
+    }
+
+    fn send_text_with_options_with_cx<'a>(
+        &'a self,
+        cx: &'a crate::cx::Cx,
+        pane_id: u64,
+        text: &str,
+        _no_paste: bool,
+        _no_newline: bool,
+    ) -> WeztermFuture<'a, ()> {
+        self.send_text_with_cx(cx, pane_id, text)
+    }
+
+    fn send_control_with_cx<'a>(
+        &'a self,
+        cx: &'a crate::cx::Cx,
+        pane_id: u64,
+        _control_char: &str,
+    ) -> WeztermFuture<'a, ()> {
+        Box::pin(async move {
+            let panes = self
+                .panes
+                .read_with_cx(cx)
+                .await
+                .map_err(|error| mock_lock_error("mock send control", error))?;
+            if !panes.contains_key(&pane_id) {
+                return Err(crate::Error::Wezterm(WeztermError::PaneNotFound(pane_id)));
+            }
+            Ok(())
+        })
+    }
+
+    fn send_ctrl_c_with_cx<'a>(
+        &'a self,
+        cx: &'a crate::cx::Cx,
+        pane_id: u64,
+    ) -> WeztermFuture<'a, ()> {
+        self.send_control_with_cx(cx, pane_id, "\x03")
+    }
+
+    fn send_ctrl_d_with_cx<'a>(
+        &'a self,
+        cx: &'a crate::cx::Cx,
+        pane_id: u64,
+    ) -> WeztermFuture<'a, ()> {
+        self.send_control_with_cx(cx, pane_id, "\x04")
+    }
+
+    fn spawn_with_cx<'a>(
+        &'a self,
+        cx: &'a crate::cx::Cx,
+        cwd: Option<&'a str>,
+        domain_name: Option<&'a str>,
+    ) -> WeztermFuture<'a, u64> {
+        self.spawn_targeted_with_cx(cx, cwd, domain_name, SpawnTarget::default())
+    }
+
+    fn spawn_targeted_with_cx<'a>(
+        &'a self,
+        cx: &'a crate::cx::Cx,
+        cwd: Option<&'a str>,
+        domain_name: Option<&'a str>,
+        target: SpawnTarget,
+    ) -> WeztermFuture<'a, u64> {
+        let cwd = cwd.unwrap_or("/home/user").to_string();
+        let domain = domain_name.unwrap_or("local").to_string();
+        Box::pin(async move {
+            let mut panes = self
+                .panes
+                .write_with_cx(cx)
+                .await
+                .map_err(|error| mock_lock_error("mock spawn pane", error))?;
+            // Validate every fallible allocation before advancing any counter;
+            // this preserves all-or-nothing mock state on id exhaustion.
+            ensure_mock_id_available(&self.next_pane_id, "pane")?;
+            if target.new_window {
+                ensure_mock_id_available(&self.next_window_id, "window")?;
+            }
+            ensure_mock_id_available(&self.next_tab_id, "tab")?;
+            let pane_id = allocate_mock_id(&self.next_pane_id, "pane")?;
+            let window_id = if target.new_window {
+                allocate_mock_id(&self.next_window_id, "window")?
+            } else {
+                let existing_window_id = target.window_id.unwrap_or(0);
+                mark_mock_id_seen(&self.next_window_id, existing_window_id);
+                existing_window_id
+            };
+            let tab_id = allocate_mock_id(&self.next_tab_id, "tab")?;
+            panes.insert(
+                pane_id,
+                MockPane {
+                    pane_id,
+                    window_id,
+                    tab_id,
+                    title: format!("pane-{pane_id}"),
+                    domain,
+                    cwd,
+                    is_active: false,
+                    is_zoomed: false,
+                    cols: 80,
+                    rows: 24,
+                    content: String::new(),
+                },
+            );
+            Ok(pane_id)
+        })
+    }
+
+    fn split_pane_with_cx<'a>(
+        &'a self,
+        cx: &'a crate::cx::Cx,
+        pane_id: u64,
+        _direction: SplitDirection,
+        cwd: Option<&'a str>,
+        _percent: Option<u8>,
+    ) -> WeztermFuture<'a, u64> {
+        let cwd = cwd.map(str::to_string);
+        Box::pin(async move {
+            let mut panes = self
+                .panes
+                .write_with_cx(cx)
+                .await
+                .map_err(|error| mock_lock_error("mock split pane", error))?;
+            let parent = panes
+                .get(&pane_id)
+                .cloned()
+                .ok_or(crate::Error::Wezterm(WeztermError::PaneNotFound(pane_id)))?;
+            let new_pane_id = allocate_mock_id(&self.next_pane_id, "pane")?;
+            panes.insert(
+                new_pane_id,
+                MockPane {
+                    pane_id: new_pane_id,
+                    window_id: parent.window_id,
+                    tab_id: parent.tab_id,
+                    title: format!("pane-{new_pane_id}"),
+                    domain: parent.domain,
+                    cwd: cwd.unwrap_or(parent.cwd),
+                    is_active: false,
+                    is_zoomed: false,
+                    cols: parent.cols,
+                    rows: parent.rows,
+                    content: String::new(),
+                },
+            );
+            Ok(new_pane_id)
+        })
+    }
+
+    fn activate_pane_with_cx<'a>(
+        &'a self,
+        cx: &'a crate::cx::Cx,
+        pane_id: u64,
+    ) -> WeztermFuture<'a, ()> {
+        Box::pin(async move {
+            let mut panes = self
+                .panes
+                .write_with_cx(cx)
+                .await
+                .map_err(|error| mock_lock_error("mock activate pane", error))?;
+            if !panes.contains_key(&pane_id) {
+                return Err(crate::Error::Wezterm(WeztermError::PaneNotFound(pane_id)));
+            }
+            for pane in panes.values_mut() {
+                pane.is_active = pane.pane_id == pane_id;
+            }
+            Ok(())
+        })
+    }
+
+    fn get_pane_direction_with_cx<'a>(
+        &'a self,
+        cx: &'a crate::cx::Cx,
+        _pane_id: u64,
+        _direction: MoveDirection,
+    ) -> WeztermFuture<'a, Option<u64>> {
+        Box::pin(async move {
+            cx.checkpoint().map_err(|error| {
+                crate::Error::runtime_cancelled("mock pane direction", error.to_string())
+            })?;
+            Ok(None)
+        })
+    }
+
+    fn kill_pane_with_cx<'a>(
+        &'a self,
+        cx: &'a crate::cx::Cx,
+        pane_id: u64,
+    ) -> WeztermFuture<'a, ()> {
+        Box::pin(async move {
+            let mut panes = self
+                .panes
+                .write_with_cx(cx)
+                .await
+                .map_err(|error| mock_lock_error("mock kill pane", error))?;
+            panes.remove(&pane_id);
+            Ok(())
+        })
+    }
+
+    fn zoom_pane_with_cx<'a>(
+        &'a self,
+        cx: &'a crate::cx::Cx,
+        pane_id: u64,
+        zoom: bool,
+    ) -> WeztermFuture<'a, ()> {
+        Box::pin(async move {
+            let mut panes = self
+                .panes
+                .write_with_cx(cx)
+                .await
+                .map_err(|error| mock_lock_error("mock zoom pane", error))?;
+            let pane = panes
+                .get_mut(&pane_id)
+                .ok_or(crate::Error::Wezterm(WeztermError::PaneNotFound(pane_id)))?;
+            pane.is_zoomed = zoom;
+            Ok(())
+        })
+    }
+
+    fn pane_tiered_scrollback_summary_with_cx<'a>(
+        &'a self,
+        cx: &'a crate::cx::Cx,
+        pane_id: u64,
+    ) -> WeztermFuture<'a, PaneTieredScrollbackSummary> {
+        Box::pin(async move {
+            cx.checkpoint().map_err(|error| {
+                crate::Error::runtime_cancelled("mock tiered scrollback summary", error.to_string())
+            })?;
+            Err(WeztermError::CommandFailed(format!(
+                "tiered scrollback telemetry unavailable for pane {pane_id}: mock backend does not expose tiered scrollback status"
+            ))
+            .into())
+        })
+    }
+
     fn circuit_status(&self) -> CircuitBreakerStatus {
         CircuitBreakerStatus::default()
     }
 
     fn watchdog_warnings(&self) -> WeztermFuture<'_, Vec<String>> {
         Box::pin(async move {
-            if let Some(err) = self.watchdog_warning_error.read().await.clone() {
+            let state = self.watchdog_state.read().await;
+            if let Some(error) = &state.error {
                 return Err(crate::Error::WatchdogWarningRead {
                     backend: "mock_wezterm",
-                    source: crate::error::WatchdogWarningSource::Backend(err),
+                    source: crate::error::WatchdogWarningSource::Backend(error.clone()),
                 });
             }
-            Ok(self.watchdog_warnings.read().await.clone())
+            Ok(state.warnings.clone())
+        })
+    }
+
+    fn watchdog_warnings_with_cx<'a>(
+        &'a self,
+        cx: &'a crate::cx::Cx,
+    ) -> WeztermFuture<'a, Vec<String>> {
+        Box::pin(async move {
+            let state = self
+                .watchdog_state
+                .read_with_cx(cx)
+                .await
+                .map_err(|error| mock_lock_error("mock watchdog state read", error))?;
+            if let Some(error) = &state.error {
+                return Err(crate::Error::WatchdogWarningRead {
+                    backend: "mock_wezterm",
+                    source: crate::error::WatchdogWarningSource::Backend(error.clone()),
+                });
+            }
+            Ok(state.warnings.clone())
         })
     }
 }
@@ -8361,6 +8584,69 @@ mod mock_tests {
     }
 
     #[test]
+    fn mock_batch_add_rejects_multiple_active_panes_atomically() {
+        run_async_test(async {
+            let mock = MockWezterm::new();
+            let pane = |pane_id| MockPane {
+                pane_id,
+                window_id: 0,
+                tab_id: 0,
+                title: format!("pane-{pane_id}"),
+                domain: "local".to_string(),
+                cwd: "/tmp".to_string(),
+                is_active: true,
+                is_zoomed: false,
+                cols: 80,
+                rows: 24,
+                content: String::new(),
+            };
+            let cx = crate::cx::for_request();
+
+            let error = mock
+                .add_panes_with_cx(&cx, vec![pane(7), pane(9)])
+                .await
+                .expect_err("multiple active panes must reject the whole batch");
+
+            assert!(error.to_string().contains("2 active panes"));
+            assert_eq!(mock.pane_count().await, 0);
+            assert_eq!(mock.next_pane_id.load(Ordering::SeqCst), 0);
+        });
+    }
+
+    #[test]
+    fn mock_lock_errors_preserve_cancellation_vs_backend_classification() {
+        let cancelled = mock_lock_error(
+            "mock classification",
+            crate::runtime_async::LockAcquireError::Cancelled,
+        );
+        assert!(matches!(
+            cancelled,
+            crate::Error::RuntimeOperation {
+                operation: "mock classification",
+                source: crate::error::RuntimeOperationSource::Cancelled(_),
+            }
+        ));
+
+        for lock_error in [
+            crate::runtime_async::LockAcquireError::TimedOut { deadline_nanos: 7 },
+            crate::runtime_async::LockAcquireError::Poisoned,
+            crate::runtime_async::LockAcquireError::PolledAfterCompletion,
+        ] {
+            let mapped = mock_lock_error("mock classification", lock_error);
+            assert!(
+                matches!(
+                    mapped,
+                    crate::Error::RuntimeOperation {
+                        operation: "mock classification",
+                        source: crate::error::RuntimeOperationSource::Backend(_),
+                    }
+                ),
+                "non-cancellation lock failure must remain a backend error: {lock_error:?}"
+            );
+        }
+    }
+
+    #[test]
     fn mock_get_text_returns_content() {
         run_async_test(async {
             let mock = MockWezterm::new();
@@ -8432,6 +8718,8 @@ mod mock_tests {
     fn structured_error_mock_watchdog_warning_error_reports_backend_context() {
         run_async_test(async {
             let mock = MockWezterm::new();
+            mock.set_watchdog_warnings(vec!["stale warning".to_string()])
+                .await;
             mock.set_watchdog_warning_error(Some("socket closed".to_string()))
                 .await;
             let err = mock
@@ -8447,6 +8735,62 @@ mod mock_tests {
                     assert_eq!(source_err, "socket closed");
                 }
                 other => panic!("unexpected error: {other:?}"),
+            }
+
+            // Publishing a fresh warning snapshot is also the recovery
+            // transition. Warning data and probe-error state share one lock so
+            // callers can never observe a new snapshot paired with the stale
+            // error (or vice versa).
+            mock.set_watchdog_warnings(vec!["recovered".to_string()])
+                .await;
+            assert_eq!(
+                mock.watchdog_warnings()
+                    .await
+                    .expect("recovered warning read"),
+                vec!["recovered".to_string()]
+            );
+        });
+    }
+
+    #[test]
+    fn watchdog_warnings_with_cx_forwards_through_arc_and_unified() {
+        run_async_test(async {
+            let concrete = Arc::new(MockWezterm::new());
+            let handle: WeztermHandle = concrete;
+            let unified = UnifiedClient::from_handle(
+                Arc::clone(&handle),
+                BackendSelection {
+                    kind: BackendKind::Cli,
+                    reason: "watchdog cx forwarding regression guard".to_string(),
+                    compatibility: None,
+                },
+            );
+            let cx = crate::cx::for_testing();
+            cx.cancel_with(
+                crate::outcome::CancelKind::User,
+                Some("pre-cancel watchdog wrapper read"),
+            );
+
+            let arc_error = handle
+                .watchdog_warnings_with_cx(&cx)
+                .await
+                .expect_err("Arc wrapper must preserve caller cancellation");
+            let unified_error = unified
+                .watchdog_warnings_with_cx(&cx)
+                .await
+                .expect_err("UnifiedClient must preserve caller cancellation");
+
+            for error in [arc_error, unified_error] {
+                assert!(
+                    matches!(
+                        &error,
+                        crate::Error::RuntimeOperation {
+                            source: crate::error::RuntimeOperationSource::Cancelled(_),
+                            ..
+                        }
+                    ),
+                    "wrapper must forward cx to the concrete warning reader: {error:?}"
+                );
             }
         });
     }
@@ -8492,6 +8836,22 @@ mod mock_tests {
     }
 
     #[test]
+    fn mock_missing_activation_preserves_active_pane() {
+        run_async_test(async {
+            let mock = MockWezterm::new();
+            mock.add_default_pane(0).await;
+            mock.add_default_pane(1).await;
+
+            mock.activate_pane(99)
+                .await
+                .expect_err("missing activation target must fail");
+
+            assert!(mock.pane_state(0).await.expect("pane zero").is_active);
+            assert!(!mock.pane_state(1).await.expect("pane one").is_active);
+        });
+    }
+
+    #[test]
     fn mock_zoom_pane() {
         run_async_test(async {
             let mock = MockWezterm::new();
@@ -8527,6 +8887,151 @@ mod mock_tests {
             assert!(mock.get_text(99, false).await.is_err());
             assert!(mock.send_text(99, "x").await.is_err());
             assert!(mock.inject_output(99, "x").await.is_err());
+        });
+    }
+
+    #[test]
+    fn mock_explicit_cx_paths_return_cancellation_without_mutation() {
+        run_async_test(async {
+            let mock = MockWezterm::new();
+            mock.add_default_pane(0).await;
+            mock.add_default_pane(1).await;
+            mock.inject_output(0, "original").await.expect("seed pane");
+            let cx = crate::cx::for_testing();
+            cx.cancel_with(
+                crate::outcome::CancelKind::User,
+                Some("pre-cancel mock lock path test"),
+            );
+
+            let errors = vec![
+                mock.list_panes_with_cx(&cx)
+                    .await
+                    .expect_err("cancelled list must fail"),
+                mock.get_pane_with_cx(&cx, 0)
+                    .await
+                    .expect_err("cancelled pane read must fail"),
+                mock.get_text_with_cx(&cx, 0, false)
+                    .await
+                    .expect_err("cancelled text read must fail"),
+                mock.get_semantic_zones_with_cx(&cx, 0)
+                    .await
+                    .expect_err("cancelled semantic read must fail"),
+                mock.send_text_with_cx(&cx, 0, "mutated")
+                    .await
+                    .expect_err("cancelled send must fail"),
+                mock.send_text_no_paste_with_cx(&cx, 0, "mutated")
+                    .await
+                    .expect_err("cancelled no-paste send must fail"),
+                mock.send_text_with_options_with_cx(&cx, 0, "mutated", true, true)
+                    .await
+                    .expect_err("cancelled optioned send must fail"),
+                mock.send_control_with_cx(&cx, 0, "\x03")
+                    .await
+                    .expect_err("cancelled control send must fail"),
+                mock.send_ctrl_c_with_cx(&cx, 0)
+                    .await
+                    .expect_err("cancelled ctrl-c must fail"),
+                mock.send_ctrl_d_with_cx(&cx, 0)
+                    .await
+                    .expect_err("cancelled ctrl-d must fail"),
+                mock.spawn_with_cx(&cx, None, None)
+                    .await
+                    .expect_err("cancelled spawn must fail"),
+                mock.spawn_targeted_with_cx(&cx, None, None, SpawnTarget::default())
+                    .await
+                    .expect_err("cancelled targeted spawn must fail"),
+                mock.split_pane_with_cx(&cx, 0, SplitDirection::Right, None, None)
+                    .await
+                    .expect_err("cancelled split must fail"),
+                mock.activate_pane_with_cx(&cx, 1)
+                    .await
+                    .expect_err("cancelled activation must fail"),
+                mock.get_pane_direction_with_cx(&cx, 0, MoveDirection::Right)
+                    .await
+                    .expect_err("cancelled direction query must fail"),
+                mock.kill_pane_with_cx(&cx, 0)
+                    .await
+                    .expect_err("cancelled pane close must fail"),
+                mock.zoom_pane_with_cx(&cx, 0, true)
+                    .await
+                    .expect_err("cancelled zoom must fail"),
+                mock.pane_tiered_scrollback_summary_with_cx(&cx, 0)
+                    .await
+                    .expect_err("cancelled scrollback summary must fail"),
+                mock.watchdog_warnings_with_cx(&cx)
+                    .await
+                    .expect_err("cancelled warning read must fail"),
+                mock.inject_with_cx(&cx, 0, MockEvent::ClearScreen)
+                    .await
+                    .expect_err("cancelled injection must fail"),
+                mock.add_default_pane_with_cx(&cx, 2)
+                    .await
+                    .expect_err("cancelled pane insertion must fail"),
+                mock.pane_state_with_cx(&cx, 0)
+                    .await
+                    .expect_err("cancelled pane-state read must fail"),
+                mock.pane_count_with_cx(&cx)
+                    .await
+                    .expect_err("cancelled pane-count read must fail"),
+                mock.set_watchdog_warnings_with_cx(&cx, vec!["must not publish".to_string()])
+                    .await
+                    .expect_err("cancelled warning update must fail"),
+                mock.set_watchdog_warning_error_with_cx(&cx, Some("must not publish".to_string()))
+                    .await
+                    .expect_err("cancelled warning-error update must fail"),
+            ];
+
+            for error in errors {
+                assert!(
+                    matches!(
+                        &error,
+                        crate::Error::RuntimeOperation {
+                            source: crate::error::RuntimeOperationSource::Cancelled(_),
+                            ..
+                        }
+                    ),
+                    "lock cancellation must remain typed: {error:?}"
+                );
+            }
+
+            assert_eq!(
+                mock.pane_count().await,
+                2,
+                "cancelled writes must not add or remove panes"
+            );
+            assert_eq!(
+                mock.get_text(0, false)
+                    .await
+                    .expect("pane remains readable"),
+                "original",
+                "cancelled send/injection must not mutate pane content"
+            );
+            let pane_zero = mock.pane_state(0).await.expect("pane zero remains");
+            let pane_one = mock.pane_state(1).await.expect("pane one remains");
+            assert!(
+                pane_zero.is_active,
+                "cancelled activation must preserve active pane"
+            );
+            assert!(
+                !pane_zero.is_zoomed,
+                "cancelled zoom must preserve zoom state"
+            );
+            assert!(
+                !pane_one.is_active,
+                "cancelled activation must not select pane one"
+            );
+            assert_eq!(
+                mock.next_pane_id.load(Ordering::SeqCst),
+                2,
+                "cancelled spawn/split/add must not consume pane ids"
+            );
+            assert!(
+                mock.watchdog_warnings()
+                    .await
+                    .expect("warnings remain readable")
+                    .is_empty(),
+                "cancelled watchdog updates must not publish"
+            );
         });
     }
 
@@ -8616,6 +9121,72 @@ mod mock_tests {
                 err.contains("mock window id space exhausted"),
                 "unexpected error: {err}"
             );
+        });
+    }
+
+    #[test]
+    fn mock_spawn_id_exhaustion_is_atomic() {
+        run_async_test(async {
+            let new_window_mock = MockWezterm::new();
+            new_window_mock
+                .next_tab_id
+                .store(u64::MAX, Ordering::SeqCst);
+            let cx = crate::cx::for_request();
+
+            let error = new_window_mock
+                .spawn_targeted_with_cx(
+                    &cx,
+                    None,
+                    None,
+                    SpawnTarget {
+                        window_id: None,
+                        new_window: true,
+                    },
+                )
+                .await
+                .expect_err("tab exhaustion must reject the complete spawn");
+            assert!(
+                error.to_string().contains("mock tab id space exhausted"),
+                "unexpected error: {error}"
+            );
+            assert_eq!(
+                new_window_mock.next_pane_id.load(Ordering::SeqCst),
+                0,
+                "failed spawn must not consume a pane id"
+            );
+            assert_eq!(
+                new_window_mock.next_window_id.load(Ordering::SeqCst),
+                0,
+                "failed spawn must not consume a window id"
+            );
+            assert_eq!(new_window_mock.pane_count().await, 0);
+
+            let existing_window_mock = MockWezterm::new();
+            existing_window_mock
+                .next_tab_id
+                .store(u64::MAX, Ordering::SeqCst);
+            existing_window_mock
+                .spawn_targeted(
+                    None,
+                    None,
+                    SpawnTarget {
+                        window_id: Some(41),
+                        new_window: false,
+                    },
+                )
+                .await
+                .expect_err("tab exhaustion must reject an existing-window spawn");
+            assert_eq!(
+                existing_window_mock.next_window_id.load(Ordering::SeqCst),
+                0,
+                "failed spawn must not mark the requested window id as consumed"
+            );
+            assert_eq!(
+                existing_window_mock.next_pane_id.load(Ordering::SeqCst),
+                0,
+                "failed spawn must not consume a pane id"
+            );
+            assert_eq!(existing_window_mock.pane_count().await, 0);
         });
     }
 

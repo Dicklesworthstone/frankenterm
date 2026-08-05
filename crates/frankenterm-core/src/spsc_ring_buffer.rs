@@ -133,26 +133,9 @@ pub struct SpscProducer<T> {
 
 impl<T> SpscProducer<T> {
     /// Send a value, waiting asynchronously when the ring is full.
-    pub async fn send(&self, mut value: T) -> Result<(), T> {
-        loop {
-            if self.is_closed() {
-                return Err(value);
-            }
-
-            match self.shared.queue.push(value) {
-                Ok(()) => {
-                    self.shared.not_empty.notify_one();
-                    return Ok(());
-                }
-                Err(v) => {
-                    value = v;
-                    let notified = self.shared.not_full.notified();
-                    if self.shared.queue.is_full() && !self.is_closed() {
-                        notified.await;
-                    }
-                }
-            }
-        }
+    pub async fn send(&self, value: T) -> Result<(), T> {
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.send_with_cx(&cx, value).await
     }
 
     /// Cx-first [`Self::send`] (ft-xbnl0.2.3). Threads caller
@@ -249,20 +232,8 @@ impl<T> SpscConsumer<T> {
     ///
     /// Returns `None` once the channel is closed and fully drained.
     pub async fn recv(&self) -> Option<T> {
-        loop {
-            if let Some(value) = self.try_recv() {
-                return Some(value);
-            }
-
-            if self.is_closed() {
-                return None;
-            }
-
-            let notified = self.shared.not_empty.notified();
-            if self.shared.queue.is_empty() && !self.is_closed() {
-                notified.await;
-            }
-        }
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.recv_with_cx(&cx).await
     }
 
     /// Cx-first [`Self::recv`] (ft-xbnl0.2.3). Threads caller
@@ -342,22 +313,8 @@ pub struct SpmcProducer<T> {
 impl<T: Clone> SpmcProducer<T> {
     /// Send a value to all consumers, waiting asynchronously if any consumer queue is full.
     pub async fn send(&self, value: T) -> Result<(), T> {
-        loop {
-            if self.is_closed() {
-                return Err(value);
-            }
-
-            if let Some(full_idx) = self.first_full_queue() {
-                let notified = self.shared.not_full[full_idx].notified();
-                if self.shared.queues[full_idx].is_full() && !self.is_closed() {
-                    notified.await;
-                }
-                continue;
-            }
-
-            self.push_to_all(value);
-            return Ok(());
-        }
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.send_with_cx(&cx, value).await
     }
 
     /// Cx-first [`Self::send`] (ft-xbnl0.2.3). Threads caller
@@ -488,20 +445,8 @@ impl<T> SpmcConsumer<T> {
     ///
     /// Returns `None` once the channel is closed and this consumer queue is drained.
     pub async fn recv(&self) -> Option<T> {
-        loop {
-            if let Some(value) = self.try_recv() {
-                return Some(value);
-            }
-
-            if self.is_closed() {
-                return None;
-            }
-
-            let notified = self.shared.not_empty[self.consumer_idx].notified();
-            if self.shared.queues[self.consumer_idx].is_empty() && !self.is_closed() {
-                notified.await;
-            }
-        }
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.recv_with_cx(&cx).await
     }
 
     /// Cx-first [`Self::recv`] (ft-xbnl0.2.3). Threads caller

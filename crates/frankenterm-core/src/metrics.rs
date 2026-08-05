@@ -398,7 +398,8 @@ impl MetricsServerHandle {
     }
 
     pub async fn wait(self) {
-        let _ = self.join.await;
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.wait_with_cx(&cx).await;
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`wait`].
@@ -453,74 +454,8 @@ impl MetricsServer {
     }
 
     pub async fn start(self) -> Result<MetricsServerHandle> {
-        if !is_localhost_bind(&self.bind) && !self.allow_public_bind {
-            return Err(crate::Error::runtime_backend(
-                "metrics bind validation",
-                format!(
-                    "refusing to bind metrics on public address '{}' — use --dangerous-bind-any to override",
-                    self.bind
-                ),
-            ));
-        }
-        if !is_localhost_bind(&self.bind) {
-            warn!(
-                bind = %self.bind,
-                "binding metrics endpoint on non-localhost address — endpoint may be remotely reachable"
-            );
-        }
-
-        let bind_addr = self.bind.clone();
-        let listener = TcpListener::bind(bind_addr).await?;
-        let local_addr = listener.local_addr()?;
-        let prefix = sanitize_prefix(&self.prefix);
-        let collector = Arc::clone(&self.collector);
-        let shutdown_flag = Arc::clone(&self.shutdown_flag);
-        let join = {
-            let server_cx = crate::cx::for_request();
-            crate::runtime_async::task::spawn_with_cx(&server_cx, move |accept_cx| async move {
-                let accept_poll_interval = Duration::from_millis(250);
-                loop {
-                    if shutdown_flag.load(Ordering::SeqCst) {
-                        break;
-                    }
-
-                    match crate::runtime_async::timeout_with_cx(
-                        &accept_cx,
-                        accept_poll_interval,
-                        listener.accept(),
-                    )
-                    .await
-                    {
-                        Ok(Ok((socket, peer))) => {
-                            let collector = Arc::clone(&collector);
-                            let prefix = prefix.clone();
-                            crate::runtime_async::task::spawn_with_cx(
-                                &accept_cx,
-                                move |conn_cx| async move {
-                                    if let Err(err) = handle_connection_with_cx(
-                                        &conn_cx, socket, &prefix, collector,
-                                    )
-                                    .await
-                                    {
-                                        debug!(
-                                            error = %err,
-                                            peer = %peer,
-                                            "Metrics connection failed"
-                                        );
-                                    }
-                                },
-                            );
-                        }
-                        Ok(Err(err)) => {
-                            warn!(error = %err, "Metrics listener accept failed");
-                        }
-                        Err(_) => {}
-                    }
-                }
-            })
-        };
-
-        Ok(MetricsServerHandle { join, local_addr })
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.start_with_cx(&cx).await
     }
 
     /// Start the metrics server bound to the caller's asupersync capability

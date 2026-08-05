@@ -252,10 +252,8 @@ pub async fn cleanup_sessions_async(
     db_path: Arc<String>,
     config: SessionRetentionConfig,
 ) -> Result<CleanupResult, String> {
-    {
-        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-        cleanup_sessions_async_cx(&cx, db_path, config).await
-    }
+    let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+    cleanup_sessions_async_cx(&cx, db_path, config).await
 }
 
 /// Run cleanup asynchronously under an explicit `&Cx` (ft-xbnl0.2.2).

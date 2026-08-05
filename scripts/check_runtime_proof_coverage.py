@@ -2,21 +2,24 @@
 """ft-3kv6e — RuntimeProof coverage audit for frankenterm-core.
 
 Walks `crates/frankenterm-core/src/` and classifies every `pub async fn`
-site as **covered** or **uncovered**. A site is *covered* if its
-signature contains any of:
+site into a fail-closed census. A site is *covered* only when one direct
+call argument carries one of:
 
   * `&Cx` / `&mut Cx` parameter (Cx is sealed — see `runtime_proof.rs`)
   * `impl RuntimeProof`
   * `: RuntimeProof` (generic bound)
 
-A site is *exempt* (not counted) if it lives in one of the runtime-layer
+A site is *runtime-layer exempt* if it lives in one of the runtime-layer
 files listed in `EXEMPT_FILES` — those modules ARE the seal and cannot
 take a `RuntimeProof` bound on themselves.
 
+Narrow ambient-Cx wrappers and fresh-context cleanup adapters have separate,
+body-validated allowlists and separate census categories. Nested types such as
+`Option<&Cx>` and `impl FnOnce(&Cx)` are not proof arguments.
+
 The script ratchets a baseline at `tests/runtime_proof_coverage_baseline.json`.
-A run fails (exit 1) if the live uncovered count exceeds the baseline;
-each adoption commit is expected to lower the baseline. Update the
-baseline in the same commit that lowers the count.
+A run fails (exit 1) on uncovered growth or an aggregate/category/per-file
+census collapse. Update the baseline only alongside an audited source change.
 
 Usage:
   scripts/check_runtime_proof_coverage.py
@@ -32,6 +35,7 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter
+from dataclasses import dataclass
 import json
 import re
 import sys
@@ -55,8 +59,8 @@ EXEMPT_FILES: set[str] = {
 
 # Functions that are ergonomic wrappers around a `_with_cx` / `_cx` sibling.
 # Each entry is a (relative_file, fn_name) pair. The wrapper itself is
-# considered transitively covered because it constructs a default `Cx`
-# internally and immediately delegates to the covered sibling.
+# considered transitively covered only when its parsed body constructs an
+# ambient `Cx` and awaits the exact covered sibling once.
 #
 # Entries here MUST be paired with a real covered sibling — i.e. the same
 # file must contain `pub async fn <name>_with_cx(cx: &Cx, ...)` or
@@ -85,13 +89,8 @@ WRAPPER_EXEMPTIONS: set[tuple[str, str]] = {
     ("ipc.rs", "set_pane_priority"),
     ("ipc.rs", "clear_pane_priority"),
     ("ipc.rs", "call_rpc"),
-    # ft-dit9w: workflows cluster ergonomic wrappers. Each entry below is
-    # a non-Cx public method whose body either constructs a default `Cx`
-    # and delegates to its `_with_cx`/`_cx` sibling, or transitively
-    # delegates through another wrapper-exempt sibling that does.
-    # workflows/context.rs send_* methods construct a default Cx
-    # internally and pass it directly into the underlying CxPolicyInjector
-    # primitive call — no parallel non-Cx primitive path exists.
+    # ft-dit9w: workflows cluster ergonomic wrappers. Each entry below
+    # constructs an ambient Cx and awaits its exact `_with_cx`/`_cx` sibling.
     ("workflows/context.rs", "send_text"),
     ("workflows/context.rs", "send_ctrl_c"),
     ("workflows/context.rs", "send_ctrl_d"),
@@ -120,13 +119,8 @@ WRAPPER_EXEMPTIONS: set[tuple[str, str]] = {
     ("workflows/runner.rs", "abort_execution"),
     # workflows/plan_helpers.rs: delegates to `check_step_idempotency_with_cx`.
     ("workflows/plan_helpers.rs", "check_step_idempotency"),
-    # ft-7xbaz: wezterm.rs ergonomic wrappers. Every entry below either
-    # constructs a default Cx and calls a `_with_cx` sibling, OR
-    # delegates to a private helper (`send_text_impl`, `run_cli_*`,
-    # `query_panes`, etc.) whose body already constructs a default Cx
-    # and routes the primitive-use path through `pool.*_with_cx`.
-    # Either way the seal is preserved: every concrete async-await
-    # against a runtime primitive lives behind a Cx-bearing call.
+    # ft-7xbaz: wezterm.rs ergonomic wrappers. Every entry below constructs
+    # an ambient Cx and awaits its exact `_with_cx` sibling.
     ("wezterm.rs", "list_panes"),
     ("wezterm.rs", "get_pane"),
     ("wezterm.rs", "get_text"),
@@ -159,11 +153,8 @@ WRAPPER_EXEMPTIONS: set[tuple[str, str]] = {
     ("wezterm.rs", "set_watchdog_warnings"),
     ("wezterm.rs", "set_watchdog_warning_error"),
     # ft-7xbaz: vendored/mux_client.rs ergonomic wrappers. Each non-Cx
-    # public method either delegates to its `_with_cx` sibling or
-    # constructs a default Cx and calls the same primitive-using path.
-    # connect/list_panes/etc. construct a default cx; the floating-pane
-    # / layout / stack helpers each delegate via shared inner machinery
-    # whose `_with_cx` variant carries the seal.
+    # public method constructs an ambient Cx and awaits its exact
+    # `_with_cx` sibling.
     ("vendored/mux_client.rs", "connect"),
     ("vendored/mux_client.rs", "list_panes"),
     ("vendored/mux_client.rs", "spawn_v2"),
@@ -187,9 +178,8 @@ WRAPPER_EXEMPTIONS: set[tuple[str, str]] = {
     ("vendored/mux_client.rs", "batch"),
     ("vendored/mux_client.rs", "next"),
     ("vendored/mux_client.rs", "shutdown"),
-    # ft-7xbaz: vendored/mux_pool.rs ergonomic wrappers — pool-level
-    # methods that delegate through to the underlying mux_client's
-    # `_with_cx` chain.
+    # ft-7xbaz: vendored/mux_pool.rs ergonomic wrappers. Each pool-level
+    # method constructs an ambient Cx and awaits its exact `_with_cx` sibling.
     ("vendored/mux_pool.rs", "list_panes"),
     ("vendored/mux_pool.rs", "spawn_v2"),
     ("vendored/mux_pool.rs", "split_pane"),
@@ -200,9 +190,6 @@ WRAPPER_EXEMPTIONS: set[tuple[str, str]] = {
     ("vendored/mux_pool.rs", "write_to_pane"),
     ("vendored/mux_pool.rs", "send_paste"),
     ("vendored/mux_pool.rs", "health_check"),
-    ("vendored/mux_pool.rs", "evict_idle"),
-    ("vendored/mux_pool.rs", "clear"),
-    ("vendored/mux_pool.rs", "stats"),
     # ft-m2xpx: storage.rs cleanup-engine section (lines 3763–4679).
     # Bulk retention helpers (count_X_before, delete_X_before), DBA ops
     # (vacuum, checkpoint, sync_fts, database_page_stats), approval-token
@@ -447,8 +434,7 @@ WRAPPER_EXEMPTIONS: set[tuple[str, str]] = {
     ("wait.rs", "wait_for_quiescence_with_backoff"),
     ("wait.rs", "wait_for_condition"),
     ("wait.rs", "wait_for_condition_with_backoff"),
-    # retry.rs: with_retry chain delegates through `_outcome`
-    # variants whose `_cx` siblings carry the seal.
+    # retry.rs: each retry wrapper awaits its exact `_cx` sibling.
     ("retry.rs", "with_retry"),
     ("retry.rs", "with_retry_outcome"),
     ("retry.rs", "with_retry_and_circuit"),
@@ -458,27 +444,16 @@ WRAPPER_EXEMPTIONS: set[tuple[str, str]] = {
     # underlying acquire/release primitive ops.
     ("pool.rs", "try_acquire"),
     ("pool.rs", "acquire"),
-    ("pool.rs", "put"),
-    ("pool.rs", "evict_idle"),
-    ("pool.rs", "stats"),
-    ("pool.rs", "clear"),
     # cancellation_safe_channel.rs: the non-cx reserve/recv have
     # `_with_cx` siblings that gate the underlying mpsc primitive.
     ("cancellation_safe_channel.rs", "reserve"),
     ("cancellation_safe_channel.rs", "recv"),
-    # spsc_ring_buffer.rs: send/recv directly use sealed Notify +
-    # lock-free queue primitives. Their bodies are deliberate
-    # fast paths (no Cx checkpoint cost) that nevertheless preserve
-    # the structural seal — Notify is sealed in runtime_proof.rs, so
-    # tokio types could not substitute. The `_with_cx` siblings
-    # exist for callers who want responsive mid-flight cancel.
+    # spsc_ring_buffer.rs: send/recv construct an ambient Cx and await
+    # their exact `_with_cx` siblings, preserving one canonical queue path.
     ("spsc_ring_buffer.rs", "send"),
     ("spsc_ring_buffer.rs", "recv"),
-    # ft-tau16: policy/security cluster (24 sites). Each delegates to
-    # its `_with_cx` sibling (or to a chain that bottoms out at one).
-    # mcp_helpers.rs's 5 sites are deferred to ft-039ky misc_tail since
-    # they have no existing sibling and need siblings authored — outside
-    # this subset's scope.
+    # ft-tau16: policy/security cluster. Each ambient wrapper awaits its
+    # exact `_with_cx` sibling.
     # approval.rs: token-issuance + consume helpers.
     ("approval.rs", "issue"),
     ("approval.rs", "issue_for_plan"),
@@ -508,7 +483,6 @@ WRAPPER_EXEMPTIONS: set[tuple[str, str]] = {
     ("secrets.rs", "scan_storage_incremental"),
     # watchdog.rs: lifecycle methods on the supervised task.
     ("watchdog.rs", "join"),
-    ("watchdog.rs", "check"),
     # robot_sdk_contracts.rs: RPC dispatch entry points.
     ("robot_sdk_contracts.rs", "call"),
     ("robot_sdk_contracts.rs", "call_value"),
@@ -563,12 +537,8 @@ WRAPPER_EXEMPTIONS: set[tuple[str, str]] = {
     # session_retention.rs / search_explain.rs: single-fn files.
     ("session_retention.rs", "cleanup_sessions_async"),
     ("search_explain.rs", "build_explain_context"),
-    # ft-039ky: misc 1–3-site long tail (40 entries). Each delegates
-    # to its `_with_cx` sibling. The remaining 20-ish sites in the
-    # tail (runtime.rs, mcp_helpers.rs, tailer.rs, vendored.rs, plus
-    # the workflows/* stragglers tracked under ft-k42zv) need new
-    # `_with_cx` siblings authored — outside this subset's scope and
-    # filed as a follow-up bead.
+    # ft-039ky: misc 1–3-site long tail. Each ambient wrapper awaits its
+    # exact `_with_cx`/`_cx` sibling.
     ("alerts.rs", "check_alerts"),
     ("cleanup.rs", "cleanup_apply"),
     ("cleanup.rs", "cleanup_preview"),
@@ -613,11 +583,9 @@ WRAPPER_EXEMPTIONS: set[tuple[str, str]] = {
     ("web_framework.rs", "start"),
     ("webhook.rs", "dispatch"),
     ("webhook.rs", "dispatch_payload"),
-    # ft-tr5a0: missing-sibling tail — final 20 sites where a new
-    # `_with_cx` sibling was authored alongside the original. Each
-    # new sibling adds a pre-flight `cx.checkpoint()` and delegates
-    # to the legacy body, preserving existing semantics while
-    # giving callers a cancel-aware entry point.
+    # ft-tr5a0: former missing-sibling tail. Each ambient wrapper now
+    # constructs a Cx and awaits the exact Cx-bearing sibling; the sibling
+    # owns the implementation so delegation cannot recurse back.
     # vendored.rs (cfg(not(unix)) DirectMuxClient stub):
     ("vendored.rs", "connect"),
     # tailer.rs:
@@ -650,157 +618,1307 @@ WRAPPER_EXEMPTIONS: set[tuple[str, str]] = {
     ("workflows/wait_execution.rs", "execute"),
 }
 
-PUB_ASYNC_RE = re.compile(r"^\s*pub(?:\([^)]*\))? async fn\b")
-# Cx in the signature (ref or owned) / impl RuntimeProof / : RuntimeProof.
-# The `Cx` patterns admit:
-#   &Cx, &mut Cx, &crate::cx::Cx, &self::cx::Cx                — borrowed
-#   cx: Cx, : crate::cx::Cx                                    — owned
-# The optional `mut` and intermediate `[a-z_]+::` segments cover the common
-# fully-qualified forms threaded through frankenterm-core today. Matching
-# happens on the *raw* signature text so whitespace inside the param list
-# (line wraps, doc comments) is tolerated by the `\s*` runs.
-#
-# Owned `Cx` is just as sealed as `&Cx` (`impl RuntimeProof for Cx` lives
-# in runtime_proof.rs). Either form satisfies the bead's acceptance.
-COVERED_PATTERNS = [
-    re.compile(r"&\s*(?:mut\s+)?(?:[a-z_][a-z0-9_]*\s*::\s*)*Cx\b"),
-    re.compile(r":\s*(?:[a-z_][a-z0-9_]*\s*::\s*)*Cx\s*[,)<\s]"),
-    re.compile(r"\bimpl\s+RuntimeProof\b"),
-    re.compile(r":\s*RuntimeProof\b"),
+# Public cleanup/snapshot adapters whose contract intentionally uses a fresh,
+# independent request context instead of inheriting ambient caller
+# cancellation. These are NOT ordinary ergonomic wrappers: each entry must be
+# exactly `let cx = ...for_request(); sibling(&cx, ...).await.expect("...")`,
+# with the exact expected panic message recorded here. Keeping this category
+# separate makes independent cleanup semantics visible in the census and
+# prevents it from becoming a general post-await escape hatch.
+INDEPENDENT_CONTEXT_ADAPTERS: dict[tuple[str, str], str] = {
+    ("pool.rs", "put"): "infallible pool return failed under independent cleanup context",
+    ("pool.rs", "evict_idle"): (
+        "infallible pool eviction failed under independent cleanup context"
+    ),
+    ("pool.rs", "stats"): "infallible pool stats failed under independent snapshot context",
+    ("pool.rs", "clear"): "infallible pool clear failed under independent cleanup context",
+    ("vendored/mux_pool.rs", "evict_idle"): (
+        "infallible mux pool eviction failed under independent cleanup context"
+    ),
+    ("vendored/mux_pool.rs", "clear"): (
+        "infallible mux pool clear failed under independent cleanup context"
+    ),
+    ("vendored/mux_pool.rs", "stats"): (
+        "infallible mux pool stats failed under independent snapshot context"
+    ),
+    ("watchdog.rs", "check"): "fresh mux watchdog check context cannot be cancelled",
+}
+
+RAW_STRING_RE = re.compile(r"(?:br|cr|r)(?P<hashes>#{0,255})\"")
+IDENT_RE = re.compile(r"(?:r#)?[^\W\d]\w*", re.UNICODE)
+TOKEN_RE = re.compile(
+    r"r#[^\W\d]\w*|[^\W\d]\w*|::|->|=>|\.\.=|\.\.|"
+    r"==|!=|<=|>=|&&|\|\||\+=|-=|\*=|/=|%=|&=|\|=|\^=|[^\s]",
+    re.UNICODE,
+)
+
+# This checker deliberately recognizes a narrow source grammar. It does not
+# claim that a Python lexer is a Rust semantic frontend. In particular,
+# attribute/procedural macros can synthesize APIs that have no source-declared
+# `pub async fn` token sequence. Macro token bodies are excluded below, and an
+# obvious macro-contained public async declaration is a hard audit error.
+NEGATIVE_EVIDENCE = [
+    "source-declared APIs only; procedural/attribute macro expansions require compiler-side proof",
+    "type and module path resolution is lexical; shadowing/aliases require compiler-side proof",
+    "proof parameters must be direct values; nested callback/container Cx types are rejected",
+    "wrapper proof accepts only the canonical ambient-Cx binding plus tail sibling await grammar",
+    "independent cleanup proof accepts only fresh for_request plus an exact literal expect adapter",
 ]
-FN_NAME_RE = re.compile(r"pub(?:\([^)]*\))? async fn\s+([A-Za-z_][A-Za-z0-9_]*)")
 
 
-def signature_blocks(path: Path):
-    """Yield (start_line_num, fn_name, signature_text) for each pub async fn."""
-    text = path.read_text(encoding="utf-8", errors="replace")
-    lines = text.splitlines()
-    i = 0
-    while i < len(lines):
-        if PUB_ASYNC_RE.match(lines[i]):
-            start = i
-            buf = []
-            ended = False
-            while i < len(lines):
-                line = lines[i]
-                buf.append(line)
-                has_terminator = "{" in line or line.rstrip().endswith(";")
-                if has_terminator or re.search(r"\bwhere\b", line):
-                    if re.search(r"\bwhere\b", line) and not has_terminator:
-                        # Consume up to the next `{` or `;`
-                        j = i + 1
-                        while j < len(lines) and "{" not in lines[j] and ";" not in lines[j]:
-                            buf.append(lines[j])
-                            j += 1
-                        if j < len(lines):
-                            buf.append(lines[j])
-                            i = j
-                    ended = True
+@dataclass(frozen=True)
+class Token:
+    value: str
+    start: int
+    end: int
+
+
+@dataclass(frozen=True)
+class FunctionSite:
+    name: str
+    line: int
+    start: int
+    signature: str
+    param_text: str
+    body: str | None
+    raw_body: str | None
+    scope: tuple[int, ...]
+    cfg_key: tuple[tuple[str, ...], ...]
+
+
+@dataclass(frozen=True)
+class WrapperCall:
+    sibling_name: str
+    cx_arg_index: int
+
+
+def _normal_name(value: str) -> str:
+    return value[2:] if value.startswith("r#") else value
+
+
+def _blank(chars: list[str], start: int, end: int) -> None:
+    for index in range(start, min(end, len(chars))):
+        if chars[index] not in "\r\n":
+            chars[index] = " "
+
+
+def _char_literal_end(text: str, start: int) -> int | None:
+    """Return one-past a valid-looking Rust character literal, else None."""
+    cursor = start + 1
+    if cursor >= len(text) or text[cursor] in "\r\n":
+        return None
+    if text[cursor] == "\\":
+        cursor += 1
+        if cursor >= len(text):
+            return None
+        if text[cursor] == "x":
+            cursor += 3
+        elif text[cursor] == "u" and cursor + 1 < len(text) and text[cursor + 1] == "{":
+            closing = text.find("}", cursor + 2)
+            if closing < 0:
+                return None
+            cursor = closing + 1
+        else:
+            cursor += 1
+    else:
+        cursor += 1
+    return cursor + 1 if cursor < len(text) and text[cursor] == "'" else None
+
+
+def sanitize_rust(source: str) -> tuple[str, list[str]]:
+    """Blank comments/literals while preserving every offset and newline."""
+    chars = list(source)
+    errors: list[str] = []
+    cursor = 0
+    while cursor < len(source):
+        if source.startswith("//", cursor):
+            end = source.find("\n", cursor + 2)
+            end = len(source) if end < 0 else end
+            _blank(chars, cursor, end)
+            cursor = end
+            continue
+        if source.startswith("/*", cursor):
+            depth = 1
+            end = cursor + 2
+            while end < len(source) and depth:
+                if source.startswith("/*", end):
+                    depth += 1
+                    end += 2
+                elif source.startswith("*/", end):
+                    depth -= 1
+                    end += 2
+                else:
+                    end += 1
+            if depth:
+                errors.append(f"unterminated block comment at offset {cursor}")
+                end = len(source)
+            _blank(chars, cursor, end)
+            cursor = end
+            continue
+
+        raw = None
+        if source[cursor] in "bcr" and (
+            cursor == 0 or not (source[cursor - 1].isalnum() or source[cursor - 1] in "_#")
+        ):
+            raw = RAW_STRING_RE.match(source, cursor)
+        if raw:
+            terminator = '"' + raw.group("hashes")
+            closing = source.find(terminator, raw.end())
+            if closing < 0:
+                errors.append(f"unterminated raw string at offset {cursor}")
+                end = len(source)
+            else:
+                end = closing + len(terminator)
+            _blank(chars, cursor, end)
+            cursor = end
+            continue
+
+        string_prefix = 1 if source.startswith(("b\"", "c\""), cursor) else 0
+        if source[cursor + string_prefix : cursor + string_prefix + 1] == '"':
+            end = cursor + string_prefix + 1
+            closed = False
+            while end < len(source):
+                if source[end] == "\\":
+                    end += 2
+                elif source[end] == '"':
+                    end += 1
+                    closed = True
                     break
-                i += 1
-            if not ended:
-                return
-            sig = "\n".join(buf)
-            m = FN_NAME_RE.search(sig)
-            name = m.group(1) if m else "<unknown>"
-            yield start + 1, name, sig
-        i += 1
+                else:
+                    end += 1
+            if not closed:
+                errors.append(f"unterminated string literal at offset {cursor}")
+            _blank(chars, cursor, min(end, len(source)))
+            cursor = min(end, len(source))
+            continue
+
+        char_start = cursor + 1 if source.startswith("b'", cursor) else cursor
+        if source[char_start : char_start + 1] == "'":
+            char_end = _char_literal_end(source, char_start)
+            if char_end is not None:
+                _blank(chars, cursor, char_end)
+                cursor = char_end
+                continue
+        cursor += 1
+    return "".join(chars), errors
 
 
-def is_covered(sig: str) -> bool:
-    return any(pat.search(sig) for pat in COVERED_PATTERNS)
+def tokenize(code: str) -> list[Token]:
+    return [Token(match.group(0), match.start(), match.end()) for match in TOKEN_RE.finditer(code)]
+
+
+def delimiter_pairs(tokens: list[Token]) -> tuple[dict[int, int], list[str]]:
+    pairs: dict[int, int] = {}
+    errors: list[str] = []
+    stack: list[tuple[str, int]] = []
+    closing_for = {"(": ")", "[": "]", "{": "}"}
+    opening_for = {value: key for key, value in closing_for.items()}
+    for index, token in enumerate(tokens):
+        if token.value in closing_for:
+            stack.append((token.value, index))
+        elif token.value in opening_for:
+            expected = opening_for[token.value]
+            if not stack or stack[-1][0] != expected:
+                errors.append(f"unmatched {token.value!r} at offset {token.start}")
+                continue
+            _, opening = stack.pop()
+            pairs[opening] = index
+            pairs[index] = opening
+    for value, index in stack:
+        errors.append(f"unclosed {value!r} at offset {tokens[index].start}")
+    return pairs, errors
+
+
+def _macro_mentions_pub_async_fn(tokens: list[Token], start: int, end: int) -> bool:
+    values = [_normal_name(token.value) for token in tokens[start:end]]
+    for index, value in enumerate(values):
+        if value != "pub" and not (value == "$" and index + 1 < len(values) and values[index + 1] == "vis"):
+            continue
+        tail = values[index + 1 : index + 24]
+        if "async" in tail:
+            async_index = tail.index("async")
+            if "fn" in tail[async_index + 1 :]:
+                return True
+    return False
+
+
+def mask_macro_token_bodies(code: str) -> tuple[str, list[str]]:
+    """Exclude macro token bodies from the source-declared function census."""
+    tokens = tokenize(code)
+    pairs, errors = delimiter_pairs(tokens)
+    ranges: list[tuple[int, int]] = []
+    openings = {"(", "[", "{"}
+    for index, token in enumerate(tokens):
+        if token.value != "!" or index == 0:
+            continue
+        previous = _normal_name(tokens[index - 1].value)
+        if not IDENT_RE.fullmatch(tokens[index - 1].value):
+            continue
+        group_index = index + 1
+        if previous == "macro_rules":
+            group_index += 1  # Skip the macro name.
+        if group_index >= len(tokens) or tokens[group_index].value not in openings:
+            continue
+        closing = pairs.get(group_index)
+        if closing is None:
+            errors.append(f"unparseable macro token body at offset {tokens[group_index].start}")
+            continue
+        if _macro_mentions_pub_async_fn(tokens, group_index + 1, closing):
+            errors.append(
+                f"macro token body at offset {tokens[group_index].start} contains an ambiguous "
+                "public async function declaration"
+            )
+        ranges.append((tokens[group_index].start, tokens[closing].end))
+
+    # Declarative macro 2.0 has no `!`; mask its template body too.
+    for index, token in enumerate(tokens):
+        if _normal_name(token.value) != "macro" or index + 2 >= len(tokens):
+            continue
+        if not IDENT_RE.fullmatch(tokens[index + 1].value):
+            continue
+        group_index = index + 2
+        if tokens[group_index].value not in openings:
+            continue
+        first_close = pairs.get(group_index)
+        if first_close is None:
+            continue
+        body_index = first_close + 1
+        if body_index >= len(tokens) or tokens[body_index].value not in openings:
+            continue
+        body_close = pairs.get(body_index)
+        if body_close is None:
+            continue
+        if _macro_mentions_pub_async_fn(tokens, body_index + 1, body_close):
+            errors.append(
+                f"macro definition at offset {token.start} contains an ambiguous public async "
+                "function declaration"
+            )
+        ranges.append((tokens[body_index].start, tokens[body_close].end))
+
+    chars = list(code)
+    for start, end in ranges:
+        _blank(chars, start, end)
+    return "".join(chars), errors
+
+
+def _cfg_key(tokens: list[Token], pairs: dict[int, int], pub_index: int) -> tuple[tuple[str, ...], ...]:
+    attributes: list[tuple[str, ...]] = []
+    cursor = pub_index - 1
+    while cursor >= 0 and tokens[cursor].value == "]":
+        opening = pairs.get(cursor)
+        if opening is None or opening == 0 or tokens[opening - 1].value != "#":
+            break
+        content = tuple(_normal_name(token.value) for token in tokens[opening + 1 : cursor])
+        if content and content[0] in {"cfg", "cfg_attr"}:
+            attributes.append(content)
+        cursor = opening - 2
+    attributes.reverse()
+    return tuple(attributes)
+
+
+def discover_functions(source: str) -> tuple[list[FunctionSite], list[str]]:
+    """Discover source-declared public async functions without scanning macro bodies."""
+    clean, errors = sanitize_rust(source)
+    scan_code, macro_errors = mask_macro_token_bodies(clean)
+    errors.extend(macro_errors)
+    tokens = tokenize(scan_code)
+    pairs, pair_errors = delimiter_pairs(tokens)
+    errors.extend(pair_errors)
+
+    scopes: dict[int, tuple[int, ...]] = {}
+    brace_stack: list[int] = []
+    for index, token in enumerate(tokens):
+        if token.value == "}":
+            opening = pairs.get(index)
+            if brace_stack and brace_stack[-1] == opening:
+                brace_stack.pop()
+        if _normal_name(token.value) == "pub":
+            scopes[index] = tuple(tokens[opening].start for opening in brace_stack)
+        if token.value == "{":
+            brace_stack.append(index)
+
+    sites: list[FunctionSite] = []
+    qualifiers = {"default", "const", "async", "unsafe", "extern"}
+    openings = {"(", "["}
+    for pub_index, pub_token in enumerate(tokens):
+        if _normal_name(pub_token.value) != "pub":
+            continue
+        cursor = pub_index + 1
+        if cursor < len(tokens) and tokens[cursor].value == "(":
+            closing = pairs.get(cursor)
+            if closing is None:
+                errors.append(f"unparseable visibility at offset {pub_token.start}")
+                continue
+            cursor = closing + 1
+
+        saw_async = False
+        while cursor < len(tokens) and _normal_name(tokens[cursor].value) in qualifiers:
+            saw_async |= _normal_name(tokens[cursor].value) == "async"
+            cursor += 1
+        if cursor >= len(tokens) or _normal_name(tokens[cursor].value) != "fn":
+            if saw_async:
+                errors.append(f"ambiguous public async item at offset {pub_token.start}")
+            continue
+        if not saw_async:
+            continue
+        fn_index = cursor
+        cursor += 1
+        if cursor >= len(tokens) or not IDENT_RE.fullmatch(tokens[cursor].value):
+            errors.append(f"public async fn at offset {pub_token.start} has no parseable name")
+            continue
+        name = _normal_name(tokens[cursor].value)
+        cursor += 1
+
+        angle_depth = 0
+        param_open = None
+        while cursor < len(tokens):
+            value = tokens[cursor].value
+            if value == "<":
+                angle_depth += 1
+            elif value == ">" and angle_depth:
+                angle_depth -= 1
+            elif value == "(" and angle_depth == 0:
+                param_open = cursor
+                break
+            elif value in {"{", ";"} and angle_depth == 0:
+                break
+            cursor += 1
+        if param_open is None or param_open not in pairs:
+            errors.append(f"public async fn {name} at offset {pub_token.start} has no parameter list")
+            continue
+        param_close = pairs[param_open]
+
+        cursor = param_close + 1
+        angle_depth = 0
+        body_open = body_close = terminator = None
+        while cursor < len(tokens):
+            value = tokens[cursor].value
+            if value == "<":
+                angle_depth += 1
+                cursor += 1
+                continue
+            if value == ">" and angle_depth:
+                angle_depth -= 1
+                cursor += 1
+                continue
+            if value in openings:
+                closing = pairs.get(cursor)
+                if closing is None:
+                    break
+                cursor = closing + 1
+                continue
+            if value == "{" and angle_depth:
+                closing = pairs.get(cursor)
+                if closing is None:
+                    break
+                cursor = closing + 1
+                continue
+            if value == "{" and angle_depth == 0:
+                body_open = cursor
+                body_close = pairs.get(cursor)
+                break
+            if value == ";" and angle_depth == 0:
+                terminator = cursor
+                break
+            cursor += 1
+        if body_open is None and terminator is None:
+            errors.append(f"public async fn {name} at offset {pub_token.start} has no body terminator")
+            continue
+        if body_open is not None and body_close is None:
+            errors.append(f"public async fn {name} at offset {pub_token.start} has an unclosed body")
+            continue
+
+        signature_end = tokens[body_open if body_open is not None else terminator].start
+        body = None
+        raw_body = None
+        if body_open is not None and body_close is not None:
+            body = clean[tokens[body_open].end : tokens[body_close].start]
+            raw_body = source[tokens[body_open].end : tokens[body_close].start]
+        sites.append(
+            FunctionSite(
+                name=name,
+                line=source.count("\n", 0, pub_token.start) + 1,
+                start=pub_token.start,
+                signature=clean[pub_token.start:signature_end],
+                param_text=clean[tokens[param_open].end : tokens[param_close].start],
+                body=body,
+                raw_body=raw_body,
+                scope=scopes.get(pub_index, ()),
+                cfg_key=_cfg_key(tokens, pairs, pub_index),
+            )
+        )
+    return sites, errors
+
+
+def _split_top_level(tokens: list[Token], separator: str) -> list[list[Token]]:
+    chunks: list[list[Token]] = [[]]
+    stack: list[str] = []
+    closing = {")": "(", "]": "[", "}": "{"}
+    angle_depth = 0
+    for token in tokens:
+        value = token.value
+        if value in {"(", "[", "{"}:
+            stack.append(value)
+        elif value in closing and stack and stack[-1] == closing[value]:
+            stack.pop()
+        elif value == "<":
+            angle_depth += 1
+        elif value == ">" and angle_depth:
+            angle_depth -= 1
+        if value == separator and not stack and angle_depth == 0:
+            chunks.append([])
+        else:
+            chunks[-1].append(token)
+    return chunks
+
+
+def _matching_angle_close(tokens: list[Token], opening: int) -> int | None:
+    """Return the matching `>` for one generic `<`, conservatively."""
+    depth = 0
+    stack: list[str] = []
+    closing = {")": "(", "]": "[", "}": "{"}
+    for index in range(opening, len(tokens)):
+        value = tokens[index].value
+        if value in {"(", "[", "{"}:
+            stack.append(value)
+            continue
+        if value in closing:
+            if stack and stack[-1] == closing[value]:
+                stack.pop()
+            continue
+        if stack:
+            continue
+        if value == "<":
+            depth += 1
+        elif value == ">":
+            depth -= 1
+            if depth == 0:
+                return index
+    return None
+
+
+def _has_direct_runtime_proof_bound(tokens: list[Token]) -> bool:
+    """Recognize `RuntimeProof` as a top-level trait bound, not a nested type."""
+    for bound in _split_top_level(tokens, "+"):
+        segments = _path_segments([_normal_name(token.value) for token in bound])
+        if segments and segments[-1] == "RuntimeProof":
+            return True
+    return False
+
+
+def _bound_generic_name(tokens: list[Token]) -> str | None:
+    """Return `P` from one exact `P: ... + RuntimeProof` predicate."""
+    parts = _split_top_level(tokens, ":")
+    if len(parts) != 2 or len(parts[0]) != 1:
+        return None
+    name_token = parts[0][0]
+    if not IDENT_RE.fullmatch(name_token.value):
+        return None
+    bounds_and_default = _split_top_level(parts[1], "=")
+    if not bounds_and_default or not _has_direct_runtime_proof_bound(bounds_and_default[0]):
+        return None
+    return _normal_name(name_token.value)
+
+
+def _runtime_proof_generic_names(signature: str) -> set[str]:
+    """Collect directly RuntimeProof-bounded type parameters from a signature."""
+    tokens = tokenize(signature)
+    names: set[str] = set()
+    fn_index = next(
+        (
+            index
+            for index, token in enumerate(tokens)
+            if _normal_name(token.value) == "fn"
+        ),
+        None,
+    )
+    if fn_index is None or fn_index + 2 >= len(tokens):
+        return names
+
+    cursor = fn_index + 2
+    if tokens[cursor].value == "<":
+        generic_close = _matching_angle_close(tokens, cursor)
+        if generic_close is None:
+            return names
+        for parameter in _split_top_level(tokens[cursor + 1 : generic_close], ","):
+            name = _bound_generic_name(parameter)
+            if name is not None:
+                names.add(name)
+        cursor = generic_close + 1
+
+    pairs, _ = delimiter_pairs(tokens)
+    while cursor < len(tokens) and tokens[cursor].value != "(":
+        cursor += 1
+    if cursor >= len(tokens):
+        return names
+    param_close = pairs.get(cursor)
+    if param_close is None:
+        return names
+    where_index = next(
+        (
+            index
+            for index in range(param_close + 1, len(tokens))
+            if tokens[index].value == "where"
+        ),
+        None,
+    )
+    if where_index is None:
+        return names
+    for predicate in _split_top_level(tokens[where_index + 1 :], ","):
+        name = _bound_generic_name(predicate)
+        if name is not None:
+            names.add(name)
+    return names
+
+
+def _strip_reference_prefix(tokens: list[Token]) -> list[Token]:
+    """Strip one direct Rust reference prefix, including lifetime and `mut`."""
+    if not tokens or tokens[0].value != "&":
+        return tokens
+    cursor = 1
+    if (
+        cursor + 1 < len(tokens)
+        and tokens[cursor].value == "'"
+        and IDENT_RE.fullmatch(tokens[cursor + 1].value)
+    ):
+        cursor += 2
+    if cursor < len(tokens) and _normal_name(tokens[cursor].value) == "mut":
+        cursor += 1
+    return tokens[cursor:]
+
+
+def _is_direct_proof_type(tokens: list[Token], generic_names: set[str]) -> bool:
+    """Require the call argument itself to carry Cx/RuntimeProof evidence."""
+    direct = _strip_reference_prefix(tokens)
+    values = [_normal_name(token.value) for token in direct]
+    segments = _path_segments(values)
+    if segments and segments[-1] == "Cx":
+        return True
+    if len(values) == 1 and values[0] in generic_names:
+        return True
+    if values[:1] in (["impl"], ["dyn"]):
+        return _has_direct_runtime_proof_bound(direct[1:])
+    return False
+
+
+def _is_receiver_parameter(tokens: list[Token]) -> bool:
+    """Recognize Rust receiver syntax without treating `self::Type` as a receiver."""
+    declaration = _split_top_level(tokens, ":")
+    receiver = declaration[0] if len(declaration) == 2 else tokens
+    values = [_normal_name(token.value) for token in receiver]
+    if not values or values[-1] != "self":
+        return False
+    prefix = values[:-1]
+    if prefix in ([], ["mut"], ["&"], ["&", "mut"]):
+        return True
+    return (
+        len(prefix) in {3, 4}
+        and prefix[:1] == ["&"]
+        and prefix[1] == "'"
+        and IDENT_RE.fullmatch(prefix[2]) is not None
+        and (len(prefix) == 3 or prefix[3] == "mut")
+    )
+
+
+def proof_param_positions(site: FunctionSite) -> tuple[int, ...]:
+    """Return call-argument positions that carry a concrete proof value."""
+    param_tokens = tokenize(site.param_text)
+    chunks = _split_top_level(param_tokens, ",")
+    generic_bounds = _runtime_proof_generic_names(site.signature)
+    positions: list[int] = []
+    call_position = 0
+    for chunk in chunks:
+        if not chunk:
+            continue
+        if _is_receiver_parameter(chunk):
+            continue
+        declaration = _split_top_level(chunk, ":")
+        if len(declaration) == 2 and _is_direct_proof_type(declaration[1], generic_bounds):
+            positions.append(call_position)
+        call_position += 1
+    return tuple(positions)
+
+
+def is_covered(site: FunctionSite) -> bool:
+    return bool(proof_param_positions(site))
+
+
+def _cfg_predicate(key: tuple[tuple[str, ...], ...]) -> tuple[str, ...] | None:
+    if len(key) != 1:
+        return None
+    attribute = key[0]
+    if len(attribute) < 4 or attribute[0] != "cfg" or attribute[1] != "(" or attribute[-1] != ")":
+        return None
+    return attribute[2:-1]
+
+
+def _cfg_predicates_are_complements(
+    left: tuple[tuple[str, ...], ...], right: tuple[tuple[str, ...], ...]
+) -> bool:
+    left_predicate = _cfg_predicate(left)
+    right_predicate = _cfg_predicate(right)
+    if left_predicate is None or right_predicate is None:
+        return False
+
+    def is_not_of(candidate: tuple[str, ...], base: tuple[str, ...]) -> bool:
+        return (
+            len(candidate) == len(base) + 3
+            and candidate[:2] == ("not", "(")
+            and candidate[-1:] == (")",)
+            and candidate[2:-1] == base
+        )
+
+    return is_not_of(left_predicate, right_predicate) or is_not_of(
+        right_predicate, left_predicate
+    )
+
+
+def _select_cfg_siblings(
+    wrapper: FunctionSite, candidates: list[FunctionSite]
+) -> list[FunctionSite]:
+    """Select one sibling or an exact `cfg(P)`/`cfg(not(P))` partition."""
+    exact = [site for site in candidates if site.cfg_key == wrapper.cfg_key]
+    if len(exact) == 1:
+        return exact
+    if exact:
+        return []
+    unconditional = [site for site in candidates if not site.cfg_key]
+    if wrapper.cfg_key and len(unconditional) == 1:
+        return unconditional
+    if wrapper.cfg_key or unconditional or len(candidates) != 2:
+        return []
+    if _cfg_predicates_are_complements(candidates[0].cfg_key, candidates[1].cfg_key):
+        return candidates
+    return []
+
+
+def _path_segments(values: list[str]) -> list[str] | None:
+    if not values or len(values) % 2 == 0:
+        return None
+    segments: list[str] = []
+    for index, value in enumerate(values):
+        if index % 2:
+            if value != "::":
+                return None
+        else:
+            if not IDENT_RE.fullmatch(value):
+                return None
+            segments.append(_normal_name(value))
+    return segments
+
+
+def _is_for_request_path(values: list[str]) -> bool:
+    segments = _path_segments(values)
+    return tuple(segments or ()) in {
+        ("cx", "for_request"),
+        ("Cx", "for_request"),
+        ("crate", "cx", "for_request"),
+        ("crate", "cx", "Cx", "for_request"),
+    }
+
+
+def _is_current_path(values: list[str]) -> bool:
+    segments = _path_segments(values)
+    return tuple(segments or ()) in {
+        ("Cx", "current"),
+        ("cx", "Cx", "current"),
+        ("crate", "cx", "Cx", "current"),
+    }
+
+
+def _is_ambient_cx_expr(tokens: list[Token]) -> bool:
+    values = [token.value for token in tokens]
+    # Direct canonical constructor: Cx::for_request() or crate::cx::for_request().
+    if len(values) >= 3 and values[-2:] == ["(", ")"]:
+        if _is_for_request_path(values[:-2]):
+            return True
+
+    try:
+        first_open = values.index("(")
+    except ValueError:
+        return False
+    if not _is_current_path(values[:first_open]):
+        return False
+    if values[first_open : first_open + 4] != ["(", ")", ".", "unwrap_or_else"]:
+        return False
+    rest = values[first_open + 4 :]
+    if len(rest) < 3 or rest[0] != "(" or rest[-1] != ")":
+        return False
+    fallback = rest[1:-1]
+    if fallback[:1] == ["||"]:
+        fallback = fallback[1:]
+    elif fallback[:2] == ["|", "|"]:
+        fallback = fallback[2:]
+    if len(fallback) >= 2 and fallback[-2:] == ["(", ")"]:
+        fallback = fallback[:-2]
+    return _is_for_request_path(fallback)
+
+
+def _is_fresh_request_cx_expr(tokens: list[Token]) -> bool:
+    """Accept only a direct `for_request()` constructor, never ambient Cx."""
+    values = [token.value for token in tokens]
+    return (
+        len(values) >= 3
+        and values[-2:] == ["(", ")"]
+        and _is_for_request_path(values[:-2])
+    )
+
+
+def _matching_call_open(tokens: list[Token]) -> int | None:
+    if not tokens or tokens[-1].value != ")":
+        return None
+    depth = 0
+    for index in range(len(tokens) - 1, -1, -1):
+        if tokens[index].value == ")":
+            depth += 1
+        elif tokens[index].value == "(":
+            depth -= 1
+            if depth == 0:
+                return index
+    return None
+
+
+def _parse_wrapper(
+    site: FunctionSite, independent_expect: str | None
+) -> tuple[WrapperCall | None, str | None]:
+    """Parse one ordinary wrapper or one exact independent-context adapter."""
+    if site.body is None:
+        return None, "wrapper has no parseable body"
+    tokens = tokenize(site.body)
+    if not tokens:
+        return None, "wrapper body is empty"
+    forbidden_values = {
+        "!", "#", "?", "{", "}", "if", "else", "match", "for", "while", "loop",
+        "return", "break", "continue", "async", "fn", "impl", "trait", "mod", "struct",
+        "enum", "union", "const", "static", "use", "macro_rules",
+    }
+    present_forbidden = sorted({token.value for token in tokens if token.value in forbidden_values})
+    if present_forbidden:
+        return None, f"wrapper uses forbidden/ambiguous syntax: {', '.join(present_forbidden)}"
+    if sum(token.value == "await" for token in tokens) != 1:
+        return None, "wrapper must contain exactly one await token"
+
+    if tokens[-1].value == ";":
+        tokens = tokens[:-1]
+    statements = _split_top_level(tokens, ";")
+    if len(statements) != 2 or not all(statements):
+        return None, "wrapper must contain exactly one Cx binding and one tail call"
+    binding, tail = statements
+
+    values = [token.value for token in binding]
+    cursor = 0
+    if values[:1] != ["let"]:
+        return None, "first wrapper statement must be a let binding"
+    cursor += 1
+    mutable_binding = cursor < len(values) and values[cursor] == "mut"
+    if mutable_binding:
+        cursor += 1
+    if cursor >= len(values) or not IDENT_RE.fullmatch(values[cursor]):
+        return None, "ambient Cx binding must use one plain identifier"
+    binding_name = _normal_name(values[cursor])
+    if binding_name == "_":
+        return None, "Cx binding must be a usable identifier, not `_`"
+    if independent_expect is not None and mutable_binding:
+        return None, "independent adapter Cx binding may not be mutable"
+    cursor += 1
+    if cursor >= len(values) or values[cursor] != "=":
+        return None, "ambient Cx binding may not use a type annotation or pattern"
+    cx_expr = binding[cursor + 1 :]
+    if independent_expect is None:
+        if not _is_ambient_cx_expr(cx_expr):
+            return None, "first wrapper statement is not a canonical ambient Cx constructor"
+    elif not _is_fresh_request_cx_expr(cx_expr):
+        return None, "independent adapter must construct a fresh for_request Cx directly"
+
+    tail_values = [token.value for token in tail]
+    if independent_expect is not None:
+        if len(tail_values) < 8 or tail_values[-4:] != [".", "expect", "(", ")"]:
+            return None, "independent adapter must end in one literal .expect(...)"
+        if site.raw_body is None:
+            return None, "independent adapter has no raw body for literal validation"
+        raw_literal = site.raw_body[tail[-2].end : tail[-1].start].strip()
+        try:
+            decoded_literal = json.loads(raw_literal)
+        except (json.JSONDecodeError, TypeError) as error:
+            return None, f"independent adapter expect argument is not one JSON-style string: {error}"
+        if not isinstance(decoded_literal, str):
+            return None, "independent adapter expect argument must decode to a string"
+        if decoded_literal != independent_expect:
+            return None, "independent adapter expect message differs from its exact allowlist entry"
+        tail = tail[:-4]
+        tail_values = [token.value for token in tail]
+    if len(tail_values) < 4 or tail_values[-2:] != [".", "await"]:
+        return None, "second wrapper statement must be a tail-position direct await"
+    call_tokens = tail[:-2]
+    call_open = _matching_call_open(call_tokens)
+    if call_open is None:
+        return None, "tail await does not apply directly to one function call"
+    target = [token.value for token in call_tokens[:call_open]]
+    expected = {f"{site.name}_with_cx", f"{site.name}_cx"}
+    if len(target) == 1:
+        sibling_name = _normal_name(target[0])
+    elif len(target) == 3 and target[:2] == ["self", "."]:
+        sibling_name = _normal_name(target[2])
+    elif len(target) == 3 and target[:2] == ["Self", "::"]:
+        sibling_name = _normal_name(target[2])
+    else:
+        return None, "tail call target must be bare, self.<sibling>, or Self::<sibling>"
+    if sibling_name not in expected:
+        return None, f"tail call targets {sibling_name}, not the exact Cx sibling"
+
+    arguments = _split_top_level(call_tokens[call_open + 1 : -1], ",")
+    cx_argument_indexes: list[int] = []
+    binding_mentions = 0
+    for index, argument in enumerate(arguments):
+        arg_values = [_normal_name(token.value) for token in argument]
+        binding_mentions += arg_values.count(binding_name)
+        if independent_expect is not None:
+            is_cx_argument = arg_values == ["&", binding_name]
+        else:
+            is_cx_argument = arg_values in (
+                [binding_name],
+                ["&", binding_name],
+                ["&", "mut", binding_name],
+            )
+        if is_cx_argument:
+            cx_argument_indexes.append(index)
+    if binding_mentions != 1 or len(cx_argument_indexes) != 1:
+        return None, "the exact bound Cx identifier must be one complete sibling argument"
+    return WrapperCall(sibling_name, cx_argument_indexes[0]), None
+
+
+def parse_canonical_wrapper(site: FunctionSite) -> tuple[WrapperCall | None, str | None]:
+    """Accept only `let cx = ambient; exact_sibling(&cx, ...).await[;]`."""
+    return _parse_wrapper(site, None)
+
+
+def parse_independent_context_adapter(
+    site: FunctionSite, expected_message: str
+) -> tuple[WrapperCall | None, str | None]:
+    """Accept one fresh request Cx, one sibling await, and one exact expect."""
+    return _parse_wrapper(site, expected_message)
+
+
+def run_self_tests() -> list[str]:
+    """Small adversarial tests for the lexer and canonical wrapper grammar."""
+    failures: list[str] = []
+    source = """
+pub    async unsafe fn spaced(cx: &'static crate::cx::Cx) {}
+pub async fn commented() /* &Cx */ {}
+pub async fn first(cx: &Cx) {} pub async fn second(cx: &Cx) {}
+pub async fn const_generic(_: Foo<{ 1 }>, cx: &Cx) {}
+"""
+    sites, errors = discover_functions(source)
+    names = [site.name for site in sites]
+    if errors or names != ["spaced", "commented", "first", "second", "const_generic"]:
+        failures.append(f"function discovery regression: names={names!r}, errors={errors!r}")
+    by_name = {site.name: site for site in sites}
+    if "commented" in by_name and is_covered(by_name["commented"]):
+        failures.append("signature comments falsely satisfy RuntimeProof coverage")
+    if "const_generic" in by_name and by_name["const_generic"].body is None:
+        failures.append("const-generic braces were mistaken for the function body")
+
+    proof_shape_source = """
+pub async fn direct(cx: &crate::cx::Cx) {}
+pub async fn self_path(cx: &self::Cx) {}
+pub async fn owned(cx: crate::cx::Cx) {}
+pub async fn generic<P: crate::runtime_proof::RuntimeProof>(proof: &P) {}
+pub async fn where_bound<P>(proof: P) where P: RuntimeProof {}
+pub async fn optional(cx: Option<&crate::cx::Cx>) {}
+pub async fn callback(callback: impl FnOnce(&crate::cx::Cx)) {}
+pub async fn nested_bound<P: FnOnce(&dyn RuntimeProof)>(callback: P) {}
+"""
+    proof_sites, proof_errors = discover_functions(proof_shape_source)
+    proof_coverage = {site.name: is_covered(site) for site in proof_sites}
+    expected_proof_coverage = {
+        "direct": True,
+        "self_path": True,
+        "owned": True,
+        "generic": True,
+        "where_bound": True,
+        "optional": False,
+        "callback": False,
+        "nested_bound": False,
+    }
+    if proof_errors or proof_coverage != expected_proof_coverage:
+        failures.append(
+            "direct-proof parameter classification regression: "
+            f"coverage={proof_coverage!r}, errors={proof_errors!r}"
+        )
+
+    wrapper_source = """
+pub async fn run(&self) {
+    let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+    self.run_with_cx(&cx).await
+}
+pub async fn run_with_cx(&self, cx: &crate::cx::Cx) {}
+"""
+    wrapper_sites, wrapper_errors = discover_functions(wrapper_source)
+    if wrapper_errors or len(wrapper_sites) != 2:
+        failures.append(f"canonical wrapper fixture did not parse: {wrapper_errors!r}")
+    else:
+        call, error = parse_canonical_wrapper(wrapper_sites[0])
+        if error or call != WrapperCall("run_with_cx", 0):
+            failures.append(f"canonical wrapper was rejected: call={call!r}, error={error!r}")
+
+    independent_source = """
+pub async fn clear(&self) {
+    let cleanup_cx = crate::cx::for_request();
+    self.clear_with_cx(&cleanup_cx)
+        .await
+        .expect("independent cleanup failed");
+}
+pub async fn clear_with_cx(&self, cx: &crate::cx::Cx) {}
+"""
+    independent_sites, independent_errors = discover_functions(independent_source)
+    if independent_errors or len(independent_sites) != 2:
+        failures.append(
+            f"independent adapter fixture did not parse: {independent_errors!r}"
+        )
+    else:
+        call, error = parse_independent_context_adapter(
+            independent_sites[0], "independent cleanup failed"
+        )
+        if error or call != WrapperCall("clear_with_cx", 0):
+            failures.append(
+                f"independent adapter was rejected: call={call!r}, error={error!r}"
+            )
+        _, error = parse_independent_context_adapter(
+            independent_sites[0], "different message"
+        )
+        if error is None:
+            failures.append("independent adapter accepted the wrong expect message")
+
+        unqualified_sites, _ = discover_functions(
+            independent_source.replace("crate::cx::for_request()", "for_request()")
+        )
+        if unqualified_sites:
+            _, error = parse_independent_context_adapter(
+                unqualified_sites[0], "independent cleanup failed"
+            )
+            if error is None:
+                failures.append("independent adapter accepted an unqualified for_request symbol")
+
+        mutable_sites, _ = discover_functions(
+            independent_source
+            .replace("let cleanup_cx", "let mut cleanup_cx")
+            .replace("&cleanup_cx", "&mut cleanup_cx")
+        )
+        if mutable_sites:
+            _, error = parse_independent_context_adapter(
+                mutable_sites[0], "independent cleanup failed"
+            )
+            if error is None:
+                failures.append("independent adapter accepted a mutable fresh Cx contract")
+
+        unwrap_sites, _ = discover_functions(
+            independent_source.replace(
+                '.expect("independent cleanup failed")', ".unwrap()"
+            )
+        )
+        if unwrap_sites:
+            _, error = parse_independent_context_adapter(
+                unwrap_sites[0], "independent cleanup failed"
+            )
+            if error is None:
+                failures.append("independent adapter accepted unwrap instead of exact expect")
+
+    escaped_expect_source = """
+pub async fn clear(&self) {
+    /* offset-preserving noise: ") .expect(fake)" */
+    let cleanup_cx = crate::cx::for_request();
+    self.clear_with_cx(&cleanup_cx)
+        .await
+        .expect("independent cleanup\\nfailed");
+}
+"""
+    escaped_sites, escaped_errors = discover_functions(escaped_expect_source)
+    if escaped_errors or not escaped_sites:
+        failures.append(f"escaped expect fixture did not parse: {escaped_errors!r}")
+    else:
+        call, error = parse_independent_context_adapter(
+            escaped_sites[0], "independent cleanup\nfailed"
+        )
+        if error or call != WrapperCall("clear_with_cx", 0):
+            failures.append(
+                "raw/sanitized expect offsets diverged: "
+                f"call={call!r}, error={error!r}"
+            )
+
+    ambient_adapter_source = """
+pub async fn clear(&self) {
+    let cleanup_cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+    self.clear_with_cx(&cleanup_cx)
+        .await
+        .expect("independent cleanup failed");
+}
+"""
+    ambient_adapter_sites, _ = discover_functions(ambient_adapter_source)
+    if ambient_adapter_sites:
+        _, error = parse_independent_context_adapter(
+            ambient_adapter_sites[0], "independent cleanup failed"
+        )
+        if error is None:
+            failures.append("independent adapter accepted an ambient/current Cx")
+
+    stringify_source = """
+pub async fn run(&self) {
+    let _ = stringify!(Cx::current(); self.run_with_cx(&cx).await);
+}
+"""
+    stringify_sites, _ = discover_functions(stringify_source)
+    if stringify_sites:
+        _, error = parse_canonical_wrapper(stringify_sites[0])
+        if error is None:
+            failures.append("stringify macro token body defeated the wrapper grammar")
+
+    baseline_fixture = {
+        "schema_version": 2,
+        "total_sites": 1,
+        "covered_sites": 0,
+        "exempt_files_sites": 0,
+        "wrapper_exempt_sites": 1,
+        "independent_context_adapter_sites": 0,
+        "uncovered_sites": 0,
+        "by_file_counts": {
+            "fixture.rs": {
+                "total": 1,
+                "covered": 0,
+                "exempt": 0,
+                "wrapper_exempt": 1,
+                "independent_adapter": 0,
+                "uncovered": 0,
+            }
+        },
+    }
+    live_category_swap = {
+        "total_sites": 1,
+        "covered_sites": 0,
+        "exempt_files_sites": 0,
+        "wrapper_exempt_sites": 0,
+        "independent_context_adapter_sites": 1,
+        "uncovered_sites": 0,
+        "by_file": {
+            "fixture.rs": {
+                "total": 1,
+                "covered": 0,
+                "exempt": 0,
+                "wrapper_exempt": 0,
+                "independent_adapter": 1,
+                "uncovered": 0,
+            }
+        },
+    }
+    category_swap_errors = validate_baseline(live_category_swap, baseline_fixture)
+    if not any("ordinary-wrapper census collapsed" in error for error in category_swap_errors):
+        failures.append(
+            "baseline category ratchet allowed ordinary wrappers to become independent adapters"
+        )
+    return failures
 
 
 def audit() -> dict:
-    files = sorted(SRC_ROOT.rglob("*.rs"))
     results = {
         "total_sites": 0,
         "exempt_files_sites": 0,
         "wrapper_exempt_sites": 0,
+        "independent_context_adapter_sites": 0,
         "covered_sites": 0,
         "uncovered_sites": 0,
         "by_file": {},
-        "uncovered_examples": [],  # First N uncovered for debug
+        "uncovered_examples": [],
         "wrapper_audit_errors": [],
+        "negative_evidence": NEGATIVE_EVIDENCE,
     }
+    if not SRC_ROOT.is_dir():
+        results["wrapper_audit_errors"].append(f"source root does not exist: {SRC_ROOT}")
+        return results
+    files = sorted(SRC_ROOT.rglob("*.rs"))
+    if not files:
+        results["wrapper_audit_errors"].append(f"source root contains no Rust files: {SRC_ROOT}")
+        return results
+    relative_files = {path.relative_to(SRC_ROOT).as_posix() for path in files}
+    for exempt_file in sorted(EXEMPT_FILES):
+        if exempt_file not in relative_files:
+            results["wrapper_audit_errors"].append(
+                f"{exempt_file} runtime-layer exemption names a nonexistent file"
+            )
+    for exempt_file, exempt_name in sorted(WRAPPER_EXEMPTIONS):
+        if exempt_file not in relative_files:
+            results["wrapper_audit_errors"].append(
+                f"{exempt_file}::{exempt_name} allowlist entry names a nonexistent file"
+            )
+    for (adapter_file, adapter_name), adapter_message in sorted(
+        INDEPENDENT_CONTEXT_ADAPTERS.items()
+    ):
+        if adapter_file not in relative_files:
+            results["wrapper_audit_errors"].append(
+                f"{adapter_file}::{adapter_name} independent-adapter entry names a nonexistent file"
+            )
+        if (adapter_file, adapter_name) in WRAPPER_EXEMPTIONS:
+            results["wrapper_audit_errors"].append(
+                f"{adapter_file}::{adapter_name} appears in both wrapper categories"
+            )
+        if (
+            not isinstance(adapter_message, str)
+            or not adapter_message
+            or adapter_message.strip() != adapter_message
+        ):
+            results["wrapper_audit_errors"].append(
+                f"{adapter_file}::{adapter_name} independent-adapter expect message must be "
+                "a non-empty string without surrounding whitespace"
+            )
+
     file_data: dict[str, dict] = {}
     for path in files:
         rel = path.relative_to(SRC_ROOT).as_posix()
-        is_exempt_file = path.name in EXEMPT_FILES
-        # Index function names per file so we can sanity-check the
-        # WRAPPER_EXEMPTIONS allowlist.
-        fn_names: Counter[str] = Counter()
-        covered_fn_names: Counter[str] = Counter()
-        wrapper_fn_names: Counter[str] = Counter()
+        is_exempt_file = rel in EXEMPT_FILES
+        source = path.read_text(encoding="utf-8")
+        sites, parse_errors = discover_functions(source)
+        results["wrapper_audit_errors"].extend(f"{rel}: {error}" for error in parse_errors)
+
+        fn_names: Counter[str] = Counter(site.name for site in sites)
+        ordinary_wrapper_fn_names: Counter[str] = Counter()
+        independent_adapter_fn_names: Counter[str] = Counter()
+        covered_positions: dict[int, tuple[int, ...]] = {}
+        wrappers: list[tuple[FunctionSite, WrapperCall]] = []
         local_total = local_covered = local_uncovered = local_wrapper = 0
-        local_uncovered_lines = []
-        for line_no, name, sig in signature_blocks(path):
+        local_independent = local_exempt = 0
+        local_uncovered_lines: list[tuple[int, str]] = []
+        for site in sites:
             results["total_sites"] += 1
             local_total += 1
-            fn_names[name] += 1
             if is_exempt_file:
                 results["exempt_files_sites"] += 1
+                local_exempt += 1
                 continue
-            if is_covered(sig):
+            positions = proof_param_positions(site)
+            if positions:
                 results["covered_sites"] += 1
                 local_covered += 1
-                covered_fn_names[name] += 1
+                covered_positions[site.start] = positions
                 continue
-            if (rel, name) in WRAPPER_EXEMPTIONS:
+            if (rel, site.name) in WRAPPER_EXEMPTIONS:
                 results["wrapper_exempt_sites"] += 1
                 local_wrapper += 1
-                wrapper_fn_names[name] += 1
+                ordinary_wrapper_fn_names[site.name] += 1
+                call, error = parse_canonical_wrapper(site)
+                if error:
+                    results["wrapper_audit_errors"].append(
+                        f"{rel}:{site.line}::{site.name} {error}"
+                    )
+                elif call is not None:
+                    wrappers.append((site, call))
+                continue
+            adapter_key = (rel, site.name)
+            if adapter_key in INDEPENDENT_CONTEXT_ADAPTERS:
+                adapter_message = INDEPENDENT_CONTEXT_ADAPTERS[adapter_key]
+                results["independent_context_adapter_sites"] += 1
+                local_independent += 1
+                independent_adapter_fn_names[site.name] += 1
+                call, error = parse_independent_context_adapter(site, adapter_message)
+                if error:
+                    results["wrapper_audit_errors"].append(
+                        f"{rel}:{site.line}::{site.name} {error}"
+                    )
+                elif call is not None:
+                    wrappers.append((site, call))
                 continue
             results["uncovered_sites"] += 1
             local_uncovered += 1
-            local_uncovered_lines.append((line_no, name))
+            local_uncovered_lines.append((site.line, site.name))
             if len(results["uncovered_examples"]) < 25:
-                results["uncovered_examples"].append({
-                    "file": rel,
-                    "line": line_no,
-                    "fn": name,
-                })
-        # Cross-check wrapper allowlist: each (file, name) must point
-        # at a real fn in this file whose name has a covered sibling.
-        if not is_exempt_file:
-            for ef, ename in WRAPPER_EXEMPTIONS:
-                if ef != rel:
-                    continue
-                if ename not in fn_names:
+                results["uncovered_examples"].append(
+                    {"file": rel, "line": site.line, "fn": site.name}
+                )
+
+        for exempt_file, exempt_name in WRAPPER_EXEMPTIONS:
+            if exempt_file != rel:
+                continue
+            if fn_names[exempt_name] == 0:
+                results["wrapper_audit_errors"].append(
+                    f"{rel}::{exempt_name} listed in WRAPPER_EXEMPTIONS but no such pub async fn"
+                )
+            elif ordinary_wrapper_fn_names[exempt_name] == 0:
+                results["wrapper_audit_errors"].append(
+                    f"{rel}::{exempt_name} allowlist entry is unused; every occurrence is "
+                    "directly covered or exempt"
+                )
+        for adapter_file, adapter_name in INDEPENDENT_CONTEXT_ADAPTERS:
+            if adapter_file != rel:
+                continue
+            if fn_names[adapter_name] == 0:
+                results["wrapper_audit_errors"].append(
+                    f"{rel}::{adapter_name} independent-adapter entry has no pub async fn"
+                )
+            elif independent_adapter_fn_names[adapter_name] == 0:
+                results["wrapper_audit_errors"].append(
+                    f"{rel}::{adapter_name} independent-adapter entry is unused; every "
+                    "occurrence is directly covered or exempt"
+                )
+
+        used_siblings: set[int] = set()
+        for wrapper, call in wrappers:
+            candidates = [
+                site
+                for site in sites
+                if site.name == call.sibling_name
+                and site.scope == wrapper.scope
+                and call.cx_arg_index in covered_positions.get(site.start, ())
+            ]
+            selected_siblings = _select_cfg_siblings(wrapper, candidates)
+            if not selected_siblings:
+                results["wrapper_audit_errors"].append(
+                    f"{rel}:{wrapper.line}::{wrapper.name} tail call {call.sibling_name} has "
+                    f"no unique same-scope covered sibling or exact complementary cfg partition "
+                    f"among {len(candidates)} candidate occurrences"
+                )
+                continue
+            for sibling in selected_siblings:
+                if sibling.start in used_siblings:
                     results["wrapper_audit_errors"].append(
-                        f"{rel}::{ename} listed in WRAPPER_EXEMPTIONS but no such pub async fn"
+                        f"{rel}:{wrapper.line}::{wrapper.name} reuses covered sibling occurrence "
+                        f"{call.sibling_name} at line {sibling.line}"
                     )
-                    continue
-                expected_siblings = [f"{ename}_with_cx", f"{ename}_cx"]
-                present_siblings = [s for s in expected_siblings if fn_names[s] > 0]
-                if not present_siblings:
-                    results["wrapper_audit_errors"].append(
-                        f"{rel}::{ename} wrapper-exempt but no _with_cx/_cx sibling found"
-                    )
-                    continue
-                covered_sibling_count = sum(covered_fn_names[s] for s in present_siblings)
-                if covered_sibling_count == 0:
-                    siblings = ", ".join(present_siblings)
-                    results["wrapper_audit_errors"].append(
-                        f"{rel}::{ename} wrapper sibling is not Cx/RuntimeProof covered: "
-                        f"{siblings}"
-                    )
-                    continue
-                wrapper_count = wrapper_fn_names[ename]
-                if covered_sibling_count < wrapper_count:
-                    results["wrapper_audit_errors"].append(
-                        f"{rel}::{ename} has {wrapper_count} wrapper occurrences but only "
-                        f"{covered_sibling_count} covered sibling occurrences"
-                    )
+                used_siblings.add(sibling.start)
+
         file_data[rel] = {
             "exempt_file": is_exempt_file,
             "total": local_total,
+            "exempt": local_exempt,
             "covered": local_covered,
             "uncovered": local_uncovered,
             "wrapper_exempt": local_wrapper,
+            "independent_adapter": local_independent,
             "uncovered_lines": local_uncovered_lines,
         }
+        local_classified = (
+            local_exempt
+            + local_covered
+            + local_wrapper
+            + local_independent
+            + local_uncovered
+        )
+        if local_classified != local_total:
+            results["wrapper_audit_errors"].append(
+                f"{rel}: classification accounting mismatch: total={local_total} "
+                f"classified={local_classified}"
+            )
     results["by_file"] = file_data
+    if results["total_sites"] == 0:
+        results["wrapper_audit_errors"].append("function census returned zero sites")
+    classified = (
+        results["exempt_files_sites"]
+        + results["covered_sites"]
+        + results["wrapper_exempt_sites"]
+        + results["independent_context_adapter_sites"]
+        + results["uncovered_sites"]
+    )
+    if classified != results["total_sites"]:
+        results["wrapper_audit_errors"].append(
+            f"classification accounting mismatch: total={results['total_sites']} "
+            f"classified={classified}"
+        )
     return results
 
 
@@ -812,20 +1930,226 @@ def load_baseline() -> dict | None:
 
 def save_baseline(audit_data: dict) -> None:
     payload = {
-        "comment": "ft-3kv6e ratchet baseline. Lower with each adoption commit. "
-                   "Generated by scripts/check_runtime_proof_coverage.py.",
+        "schema_version": 2,
+        "comment": "ft-3kv6e fail-closed census ratchet. Update only with an audited source "
+                   "change. Generated by scripts/check_runtime_proof_coverage.py.",
         "uncovered_sites": audit_data["uncovered_sites"],
         "covered_sites": audit_data["covered_sites"],
         "exempt_files_sites": audit_data["exempt_files_sites"],
         "wrapper_exempt_sites": audit_data["wrapper_exempt_sites"],
+        "independent_context_adapter_sites": audit_data[
+            "independent_context_adapter_sites"
+        ],
         "total_sites": audit_data["total_sites"],
         "by_file_uncovered": {
             f: data["uncovered"]
             for f, data in sorted(audit_data["by_file"].items())
             if data["uncovered"] > 0
         },
+        "by_file_counts": {
+            f: {
+                "total": data["total"],
+                "exempt": data["exempt"],
+                "covered": data["covered"],
+                "wrapper_exempt": data["wrapper_exempt"],
+                "independent_adapter": data["independent_adapter"],
+                "uncovered": data["uncovered"],
+            }
+            for f, data in sorted(audit_data["by_file"].items())
+            if data["total"] > 0
+        },
     }
     BASELINE_PATH.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+
+
+def _is_non_negative_int(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def validate_baseline(data: dict, baseline: dict | None) -> list[str]:
+    """Reject uncovered growth and any aggregate/category/per-file census collapse."""
+    if baseline is None:
+        return [f"required baseline is missing: {BASELINE_PATH}"]
+    if not isinstance(baseline, dict):
+        return ["baseline root must be a JSON object"]
+    if baseline.get("schema_version") != 2:
+        return [
+            f"{BASELINE_PATH.name} does not use census schema 2; run --update-baseline "
+            "only after reviewing the live schema-v2 census"
+        ]
+    required = {
+        "total_sites", "covered_sites", "exempt_files_sites", "wrapper_exempt_sites",
+        "independent_context_adapter_sites", "uncovered_sites", "by_file_counts",
+    }
+    missing = sorted(required - baseline.keys())
+    if missing:
+        return [f"baseline is missing required fields: {', '.join(missing)}"]
+    errors: list[str] = []
+    numeric_fields = required - {"by_file_counts"}
+    for field in sorted(numeric_fields):
+        if not _is_non_negative_int(baseline.get(field)):
+            errors.append(f"baseline field {field} must be a non-negative integer")
+    if errors:
+        return errors
+    baseline_classified = (
+        baseline["covered_sites"]
+        + baseline["exempt_files_sites"]
+        + baseline["wrapper_exempt_sites"]
+        + baseline["independent_context_adapter_sites"]
+        + baseline["uncovered_sites"]
+    )
+    if baseline_classified != baseline["total_sites"]:
+        errors.append(
+            "baseline aggregate classification does not add up: "
+            f"total={baseline['total_sites']} classified={baseline_classified}"
+        )
+
+    if data["uncovered_sites"] > baseline["uncovered_sites"]:
+        errors.append(
+            f"uncovered count grew from {baseline['uncovered_sites']} to "
+            f"{data['uncovered_sites']}"
+        )
+    for field, label in (
+        ("total_sites", "total site census"),
+        ("covered_sites", "directly covered census"),
+        ("exempt_files_sites", "runtime-file exempt census"),
+        ("wrapper_exempt_sites", "ordinary-wrapper census"),
+        ("independent_context_adapter_sites", "independent-context adapter census"),
+    ):
+        if data[field] < baseline[field]:
+            errors.append(f"{label} collapsed from {baseline[field]} to {data[field]}")
+    live_accepted = (
+        data["covered_sites"]
+        + data["wrapper_exempt_sites"]
+        + data["independent_context_adapter_sites"]
+        + data["exempt_files_sites"]
+    )
+    baseline_accepted = (
+        baseline["covered_sites"]
+        + baseline["wrapper_exempt_sites"]
+        + baseline["independent_context_adapter_sites"]
+        + baseline["exempt_files_sites"]
+    )
+    if live_accepted < baseline_accepted:
+        errors.append(
+            f"accepted-site census collapsed from {baseline_accepted} to {live_accepted}"
+        )
+
+    by_file_counts = baseline["by_file_counts"]
+    if not isinstance(by_file_counts, dict) or not by_file_counts:
+        errors.append("baseline by_file_counts must be a non-empty object")
+        return errors
+    per_file_fields = {
+        "total",
+        "covered",
+        "exempt",
+        "wrapper_exempt",
+        "independent_adapter",
+        "uncovered",
+    }
+    baseline_file_sums = {field: 0 for field in per_file_fields}
+    all_file_counts_valid = True
+    for rel, expected in sorted(by_file_counts.items(), key=lambda item: repr(item[0])):
+        if not isinstance(rel, str) or not rel:
+            errors.append("baseline by_file_counts keys must be non-empty strings")
+            all_file_counts_valid = False
+            continue
+        if not isinstance(expected, dict):
+            errors.append(f"baseline by_file_counts[{rel!r}] must be an object")
+            all_file_counts_valid = False
+            continue
+        missing_fields = sorted(per_file_fields - expected.keys())
+        if missing_fields:
+            errors.append(
+                f"baseline {rel} is missing count fields: {', '.join(missing_fields)}"
+            )
+            all_file_counts_valid = False
+            continue
+        invalid_fields = sorted(
+            field
+            for field in per_file_fields
+            if not _is_non_negative_int(expected.get(field))
+        )
+        if invalid_fields:
+            errors.append(
+                f"baseline {rel} fields must be non-negative integers: "
+                f"{', '.join(invalid_fields)}"
+            )
+            all_file_counts_valid = False
+            continue
+        expected_classified = sum(
+            expected[field]
+            for field in (
+                "covered",
+                "exempt",
+                "wrapper_exempt",
+                "independent_adapter",
+                "uncovered",
+            )
+        )
+        if expected_classified != expected["total"]:
+            errors.append(
+                f"baseline {rel} classification does not add up: "
+                f"total={expected['total']} classified={expected_classified}"
+            )
+            all_file_counts_valid = False
+            continue
+        for field in per_file_fields:
+            baseline_file_sums[field] += expected[field]
+        live = data["by_file"].get(rel)
+        if live is None:
+            errors.append(f"per-file census disappeared entirely: {rel}")
+            continue
+        for field in (
+            "total",
+            "covered",
+            "exempt",
+            "wrapper_exempt",
+            "independent_adapter",
+        ):
+            floor = expected[field]
+            if live[field] < floor:
+                errors.append(f"per-file {rel}:{field} collapsed from {floor} to {live[field]}")
+        expected_accepted = sum(
+            expected[field]
+            for field in ("covered", "wrapper_exempt", "independent_adapter", "exempt")
+        )
+        live_accepted_for_file = sum(
+            live[field]
+            for field in ("covered", "wrapper_exempt", "independent_adapter", "exempt")
+        )
+        if live_accepted_for_file < expected_accepted:
+            errors.append(
+                f"per-file {rel}:accepted collapsed from {expected_accepted} "
+                f"to {live_accepted_for_file}"
+            )
+        expected_uncovered = expected["uncovered"]
+        if live["uncovered"] > expected_uncovered:
+            errors.append(
+                f"per-file {rel}:uncovered grew from {expected_uncovered} "
+                f"to {live['uncovered']}"
+            )
+    if all_file_counts_valid:
+        aggregate_by_file_fields = {
+            "total": "total_sites",
+            "covered": "covered_sites",
+            "exempt": "exempt_files_sites",
+            "wrapper_exempt": "wrapper_exempt_sites",
+            "independent_adapter": "independent_context_adapter_sites",
+            "uncovered": "uncovered_sites",
+        }
+        for file_field, aggregate_field in aggregate_by_file_fields.items():
+            if baseline_file_sums[file_field] != baseline[aggregate_field]:
+                errors.append(
+                    f"baseline per-file {file_field} sum {baseline_file_sums[file_field]} "
+                    f"does not match aggregate {aggregate_field}={baseline[aggregate_field]}"
+                )
+    for rel, live in sorted(data["by_file"].items()):
+        if rel not in by_file_counts and live["uncovered"]:
+            errors.append(
+                f"new census file {rel} introduces {live['uncovered']} uncovered sites"
+            )
+    return errors
 
 
 def main() -> int:
@@ -838,55 +2162,69 @@ def main() -> int:
                    help="Print only the headline numbers (no per-file detail).")
     args = p.parse_args()
 
+    self_test_errors = run_self_tests()
     data = audit()
-
-    if data["wrapper_audit_errors"]:
-        print("ft-3kv6e: WRAPPER_EXEMPTIONS allowlist is inconsistent:", file=sys.stderr)
-        for err in data["wrapper_audit_errors"]:
-            print(f"  - {err}", file=sys.stderr)
-        return 2
+    data["self_test_errors"] = self_test_errors
 
     if args.update_baseline:
+        if self_test_errors or data["wrapper_audit_errors"]:
+            print("ft-3kv6e: refusing to update a failed/ambiguous census:", file=sys.stderr)
+            for err in self_test_errors + data["wrapper_audit_errors"]:
+                print(f"  - {err}", file=sys.stderr)
+            return 2
         save_baseline(data)
         print(f"Baseline updated: uncovered={data['uncovered_sites']} "
-              f"covered={data['covered_sites']} exempt={data['exempt_files_sites']}")
+              f"covered={data['covered_sites']} "
+              f"independent={data['independent_context_adapter_sites']} "
+              f"exempt={data['exempt_files_sites']}")
         return 0
+
+    try:
+        baseline = load_baseline()
+        baseline_errors = validate_baseline(data, baseline)
+    except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError) as error:
+        baseline = None
+        baseline_errors = [f"baseline could not be read or validated: {error}"]
+    data["baseline_errors"] = baseline_errors
 
     if args.json:
         print(json.dumps(data, indent=2, sort_keys=True))
-        return 0
+        if self_test_errors or data["wrapper_audit_errors"]:
+            return 2
+        return 1 if baseline_errors else 0
+
+    if self_test_errors:
+        print("ft-3kv6e: INTERNAL SELF-TEST FAILURE:", file=sys.stderr)
+        for err in self_test_errors:
+            print(f"  - {err}", file=sys.stderr)
+        return 2
+    if data["wrapper_audit_errors"]:
+        print("ft-3kv6e: parser/wrapper audit is inconsistent:", file=sys.stderr)
+        for err in data["wrapper_audit_errors"]:
+            print(f"  - {err}", file=sys.stderr)
+        return 2
 
     print(f"ft-3kv6e RuntimeProof coverage audit")
     print(f"  total pub async fn      : {data['total_sites']}")
     print(f"  in exempt runtime files : {data['exempt_files_sites']}")
     print(f"  covered (Cx/RuntimeProof): {data['covered_sites']}")
     print(f"  wrapper-exempt          : {data['wrapper_exempt_sites']}")
+    print(f"  independent-context     : {data['independent_context_adapter_sites']}")
     print(f"  uncovered               : {data['uncovered_sites']}")
-
-    baseline = load_baseline()
-    if baseline is None:
-        print()
-        print("WARNING: no baseline file at", BASELINE_PATH)
-        print("Run with --update-baseline to seed it.")
-        return 0
-
-    baseline_uncovered = baseline.get("uncovered_sites", 0)
     print()
-    print(f"Baseline (from {BASELINE_PATH.name}): uncovered={baseline_uncovered}")
-    if data["uncovered_sites"] > baseline_uncovered:
-        delta = data["uncovered_sites"] - baseline_uncovered
-        print(f"FAIL: uncovered count grew by {delta} since baseline.", file=sys.stderr)
-        if not args.summary:
-            print("Newly-introduced sites likely include:", file=sys.stderr)
-            for ex in data["uncovered_examples"][:15]:
-                print(f"  {ex['file']}:{ex['line']} :: {ex['fn']}", file=sys.stderr)
+    if baseline_errors:
+        print("FAIL: census baseline validation failed:", file=sys.stderr)
+        for error in baseline_errors:
+            print(f"  - {error}", file=sys.stderr)
+        if not args.summary and data["uncovered_examples"]:
+            print("Live uncovered sites include:", file=sys.stderr)
+            for example in data["uncovered_examples"][:15]:
+                print(
+                    f"  {example['file']}:{example['line']} :: {example['fn']}",
+                    file=sys.stderr,
+                )
         return 1
-    if data["uncovered_sites"] < baseline_uncovered:
-        delta = baseline_uncovered - data["uncovered_sites"]
-        print(f"PROGRESS: uncovered count dropped by {delta}. "
-              f"Re-run with --update-baseline in this commit.")
-    else:
-        print("Uncovered count matches baseline (no regression).")
+    print(f"Baseline ({BASELINE_PATH.name}) passed schema-v2 aggregate/category/per-file ratchets.")
     return 0
 
 

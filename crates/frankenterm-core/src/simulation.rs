@@ -28,6 +28,27 @@ fn simulation_cancelled_error(operation: &'static str, detail: impl Into<String>
     }
 }
 
+fn contextualize_simulation_runtime_error(
+    error: Error,
+    operation: &'static str,
+    context: impl Into<String>,
+) -> Error {
+    let context = context.into();
+    match error {
+        Error::RuntimeOperation {
+            operation: child_operation,
+            source: RuntimeOperationSource::Cancelled(detail),
+        } => {
+            simulation_cancelled_error(operation, format!("{context}; {child_operation}: {detail}"))
+        }
+        Error::RuntimeOperation {
+            operation: child_operation,
+            source: RuntimeOperationSource::Backend(detail),
+        } => simulation_backend_error(operation, format!("{context}; {child_operation}: {detail}")),
+        other => other,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Scenario types
 // ---------------------------------------------------------------------------
@@ -634,61 +655,49 @@ impl Scenario {
 
     /// Apply scenario panes and initial content to a MockWezterm.
     pub async fn setup(&self, mock: &MockWezterm) -> Result<()> {
-        for pane_def in &self.panes {
-            let pane = MockPane {
-                pane_id: pane_def.id,
-                window_id: pane_def.window_id,
-                tab_id: pane_def.tab_id,
-                title: pane_def.title.clone(),
-                domain: pane_def.domain.clone(),
-                cwd: pane_def.cwd.clone(),
-                is_active: pane_def.id == 0,
-                is_zoomed: false,
-                cols: pane_def.cols,
-                rows: pane_def.rows,
-                content: pane_def.initial_content.clone(),
-            };
-            mock.add_pane(pane).await;
-        }
-        Ok(())
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.setup_with_cx(&cx, mock).await
     }
 
-    /// Cx-first [`Self::setup`] (ft-xbnl0.2.3). Threads caller
-    /// `&Cx` through the pane-add loop via `cx.checkpoint()`
-    /// before each `mock.add_pane` call. A pre-cancelled cx
-    /// returns `Err` before any panes are added. A mid-run cancel
-    /// returns with the pane index embedded in the error; panes
-    /// added before the cancellation remain on the mock (no
-    /// rollback — MockWezterm has no transactional bulk-add).
+    /// Cx-first [`Self::setup`] (ft-xbnl0.2.3). The scenario is validated and
+    /// all panes are prepared before one atomic mock batch write. Cancellation,
+    /// duplicate IDs, existing-ID collisions, or active-pane invariant failures
+    /// therefore leave the mock unchanged.
     pub async fn setup_with_cx(&self, cx: &crate::cx::Cx, mock: &MockWezterm) -> Result<()> {
+        self.validate()?;
         cx.checkpoint().map_err(|err| {
             simulation_cancelled_error("simulation.setup", format!("pre-start: {err}"))
         })?;
 
+        let mut panes = Vec::with_capacity(self.panes.len());
         for (index, pane_def) in self.panes.iter().enumerate() {
             cx.checkpoint().map_err(|err| {
                 simulation_cancelled_error("simulation.setup", format!("pane index {index}: {err}"))
             })?;
-            let pane = MockPane {
+            panes.push(MockPane {
                 pane_id: pane_def.id,
                 window_id: pane_def.window_id,
                 tab_id: pane_def.tab_id,
                 title: pane_def.title.clone(),
                 domain: pane_def.domain.clone(),
                 cwd: pane_def.cwd.clone(),
-                is_active: pane_def.id == 0,
+                is_active: index == 0,
                 is_zoomed: false,
                 cols: pane_def.cols,
                 rows: pane_def.rows,
                 content: pane_def.initial_content.clone(),
-            };
-            // Tick 203 (ft-xbnl0.2.3): route the mock pane insert
-            // through add_pane_with_cx(cx, ...) so the inner
-            // MockWezterm RwLock write-lock wait honors caller
-            // cancellation. Same rationale as tick 202.
-            mock.add_pane_with_cx(cx, pane).await;
+            });
         }
-        Ok(())
+
+        mock.add_panes_with_cx(cx, panes)
+            .await
+            .map_err(|error| {
+                contextualize_simulation_runtime_error(
+                    error,
+                    "simulation.setup",
+                    "atomic pane batch commit",
+                )
+            })
     }
 
     /// Convert a scenario event to a MockEvent for injection.
@@ -737,22 +746,14 @@ impl Scenario {
     ///
     /// Returns the number of events executed.
     pub async fn execute_until(&self, mock: &MockWezterm, elapsed: Duration) -> Result<usize> {
-        let mut count = 0;
-        for event in &self.events {
-            if event.at > elapsed {
-                break;
-            }
-            let mock_event = Self::to_mock_event(event)?;
-            mock.inject(event.pane, mock_event).await?;
-            count += 1;
-        }
-        Ok(count)
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.execute_until_with_cx(&cx, mock, elapsed).await
     }
 
     /// Cx-first [`Self::execute_until`] (ft-xbnl0.2.3). Threads
     /// caller `&Cx` through the event injection loop via
     /// `cx.checkpoint()` before each mock.inject call. A
-    /// pre-cancelled cx returns `Ok(0)` immediately; a
+    /// pre-cancelled cx returns a structured cancellation error immediately; a
     /// mid-iteration cancel returns a structured runtime-operation
     /// error with the event index embedded so the caller knows how
     /// far the scenario progressed before cancellation.
@@ -785,7 +786,15 @@ impl Scenario {
             // via `Cx::current()` thread-local fallback — orphan
             // hole whenever the simulation runs outside the caller's
             // thread-local scope.
-            mock.inject_with_cx(cx, event.pane, mock_event).await?;
+            mock.inject_with_cx(cx, event.pane, mock_event)
+                .await
+                .map_err(|error| {
+                    contextualize_simulation_runtime_error(
+                        error,
+                        "simulation.execute_until",
+                        format!("event index {index}"),
+                    )
+                })?;
             count += 1;
         }
         Ok(count)
@@ -793,7 +802,8 @@ impl Scenario {
 
     /// Execute all events in the scenario.
     pub async fn execute_all(&self, mock: &MockWezterm) -> Result<usize> {
-        self.execute_until(mock, self.duration).await
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.execute_all_with_cx(&cx, mock).await
     }
 
     /// Cx-first [`Self::execute_all`] (ft-xbnl0.2.3). Delegates
@@ -818,6 +828,17 @@ impl Scenario {
         mock: &MockWezterm,
         elapsed: Duration,
     ) -> Result<(usize, ResizeTimeline)> {
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.execute_until_with_resize_timeline_with_cx(&cx, mock, elapsed)
+            .await
+    }
+
+    async fn execute_until_with_resize_timeline_impl(
+        &self,
+        cx: &crate::cx::Cx,
+        mock: &MockWezterm,
+        elapsed: Duration,
+    ) -> Result<(usize, ResizeTimeline)> {
         let mut count = 0usize;
         let run_started = Instant::now();
         let reproducibility_key = self.reproducibility_key();
@@ -835,9 +856,24 @@ impl Scenario {
                 break;
             }
 
+            cx.checkpoint().map_err(|error| {
+                simulation_cancelled_error(
+                    "simulation.execute_until_with_resize_timeline",
+                    format!("event index {index}: {error}"),
+                )
+            })?;
+
             if !event.action.is_resize_timeline_action() {
                 let mock_event = Self::to_mock_event(event)?;
-                mock.inject(event.pane, mock_event).await?;
+                mock.inject_with_cx(cx, event.pane, mock_event)
+                    .await
+                    .map_err(|error| {
+                        contextualize_simulation_runtime_error(
+                            error,
+                            "simulation.execute_until_with_resize_timeline",
+                            format!("event index {index}"),
+                        )
+                    })?;
                 count += 1;
                 continue;
             }
@@ -917,7 +953,15 @@ impl Scenario {
 
             // Stage 5: presentation
             let stage_started = Instant::now();
-            mock.inject(event.pane, mock_event).await?;
+            mock.inject_with_cx(cx, event.pane, mock_event)
+                .await
+                .map_err(|error| {
+                    contextualize_simulation_runtime_error(
+                        error,
+                        "simulation.execute_until_with_resize_timeline",
+                        format!("event index {index}"),
+                    )
+                })?;
             let presentation_duration_ns = duration_ns_u64(stage_started.elapsed());
             stages.push(ResizeTimelineStageSample {
                 stage: ResizeTimelineStage::Presentation,
@@ -980,21 +1024,19 @@ impl Scenario {
         &self,
         mock: &MockWezterm,
     ) -> Result<(usize, ResizeTimeline)> {
-        self.execute_until_with_resize_timeline(mock, self.duration)
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.execute_all_with_resize_timeline_with_cx(&cx, mock)
             .await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of
     /// [`Scenario::execute_until_with_resize_timeline`].
     ///
-    /// Pre-flight `cx.checkpoint()` gates entry to the long
-    /// instrumentation loop (150+ LOC of stage-level probes). A
-    /// mid-execution cx cancel will not interrupt the current
-    /// iteration — the resize-timeline body is deliberately
-    /// deterministic for flamegraph reproducibility, so per-event
-    /// cx seams would drift the telemetry compared to the legacy
-    /// path. Callers that need per-event cancellation should use
-    /// the non-timeline variants (`execute_until_with_cx`).
+    /// Pre-flight and per-event checkpoints gate the instrumentation loop, and
+    /// the presentation mutation uses `MockWezterm::inject_with_cx`. A caller
+    /// cancellation therefore stops before the next event mutation or while
+    /// waiting for the mock write lock; completed earlier events remain
+    /// applied and no partial timeline is returned.
     ///
     /// The returned Err variant mirrors the shape of
     /// `execute_until_with_cx` cancellation errors so callers can
@@ -1011,7 +1053,8 @@ impl Scenario {
                 err.to_string(),
             )
         })?;
-        self.execute_until_with_resize_timeline(mock, elapsed).await
+        self.execute_until_with_resize_timeline_impl(cx, mock, elapsed)
+            .await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of
@@ -1061,20 +1104,14 @@ pub struct SandboxCommand {
 
 impl TutorialSandbox {
     /// Create a new sandbox with default mock panes for the tutorial.
-    pub async fn new() -> Self {
-        let mock = MockWezterm::new();
-        let scenario = Self::default_scenario();
-
-        if let Err(e) = scenario.setup(&mock).await {
-            tracing::warn!("Failed to set up tutorial sandbox scenario: {e}");
-        }
-
-        Self {
-            mock,
-            scenario: Some(scenario),
-            command_log: Vec::new(),
-            show_indicator: true,
-        }
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if default-scenario setup is cancelled or a mock pane
+    /// cannot be initialized.
+    pub async fn new() -> Result<Self> {
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        Self::new_with_cx(&cx).await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`TutorialSandbox::new`].
@@ -1083,26 +1120,16 @@ impl TutorialSandbox {
     /// (tick 65) so caller cancellation during a slow mock-setup
     /// (e.g. many pane injections) surfaces cleanly rather than
     /// swallowing cancel as a setup-failure tracing::warn.
-    pub async fn new_with_cx(cx: &crate::cx::Cx) -> Self {
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured cancellation error if `cx` is cancelled before or
+    /// during setup, or propagates another mock setup failure.
+    pub async fn new_with_cx(cx: &crate::cx::Cx) -> Result<Self> {
         let mock = MockWezterm::new();
         let scenario = Self::default_scenario();
 
-        if let Err(e) = scenario.setup_with_cx(cx, &mock).await {
-            tracing::warn!("Failed to set up tutorial sandbox scenario (cx path): {e}");
-        }
-
-        Self {
-            mock,
-            scenario: Some(scenario),
-            command_log: Vec::new(),
-            show_indicator: true,
-        }
-    }
-
-    /// Create a sandbox with a custom scenario.
-    pub async fn with_scenario(scenario: Scenario) -> Result<Self> {
-        let mock = MockWezterm::new();
-        scenario.setup(&mock).await?;
+        scenario.setup_with_cx(cx, &mock).await?;
 
         Ok(Self {
             mock,
@@ -1112,9 +1139,25 @@ impl TutorialSandbox {
         })
     }
 
+    /// Create a sandbox with a custom scenario.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the supplied scenario cannot initialize its mock
+    /// panes.
+    pub async fn with_scenario(scenario: Scenario) -> Result<Self> {
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        Self::with_scenario_with_cx(&cx, scenario).await
+    }
+
     /// ft-xbnl0.2.3 Cx-first sibling of [`TutorialSandbox::with_scenario`].
     ///
     /// Routes the scenario setup through `Scenario::setup_with_cx`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured cancellation error if `cx` is cancelled before or
+    /// during setup, or propagates another mock setup failure.
     pub async fn with_scenario_with_cx(cx: &crate::cx::Cx, scenario: Scenario) -> Result<Self> {
         let mock = MockWezterm::new();
         scenario.setup_with_cx(cx, &mock).await?;
@@ -1178,10 +1221,8 @@ impl TutorialSandbox {
     /// This fires all events in the scenario that haven't already been
     /// injected, simulating activity for the current exercise.
     pub async fn trigger_exercise_events(&self) -> Result<usize> {
-        match &self.scenario {
-            Some(s) => s.execute_all(&self.mock).await,
-            None => Ok(0),
-        }
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.trigger_exercise_events_with_cx(&cx).await
     }
 
     /// Cx-first [`Self::trigger_exercise_events`] (ft-xbnl0.2.3).
@@ -1199,98 +1240,84 @@ impl TutorialSandbox {
     }
 
     /// Check an expectation against the current sandbox state.
-    pub async fn check_expectation(&self, kind: &ExpectationKind) -> bool {
-        use crate::wezterm::WeztermInterface;
-
-        match kind {
-            ExpectationKind::Contains { pane, text } => {
-                // ft-xbnl0.2.3 tick 263: cx-first simulation expectation check.
-                let expect_cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-                if let Ok(content) = self.mock.get_text_with_cx(&expect_cx, *pane, false).await {
-                    content.contains(text)
-                } else {
-                    false
-                }
-            }
-            // Event/Workflow expectations need runtime integration
-            _ => false,
-        }
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed runtime error if reading the target pane is cancelled or
+    /// the mock backend fails.
+    pub async fn check_expectation(&self, kind: &ExpectationKind) -> Result<bool> {
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.check_expectation_with_cx(&cx, kind).await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`Self::check_expectation`].
     ///
-    /// Routes the mock `get_text` through `get_text_with_cx` so a
-    /// cancelled parent cx interrupts the read rather than silently
-    /// returning `false` on timeout/cancellation. Cancellation is
-    /// folded into the `false` return path to preserve the existing
-    /// "expectation failed or unknown → false" contract.
+    /// Routes the mock `get_text` through `get_text_with_cx` so the lock wait
+    /// observes caller cancellation without turning it into a failed
+    /// expectation.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed runtime error if reading the target pane is cancelled or
+    /// the mock backend fails.
     pub async fn check_expectation_with_cx(
         &self,
         cx: &crate::cx::Cx,
         kind: &ExpectationKind,
-    ) -> bool {
+    ) -> Result<bool> {
         use crate::wezterm::WeztermInterface;
 
         match kind {
             ExpectationKind::Contains { pane, text } => {
-                if let Ok(content) = self.mock.get_text_with_cx(cx, *pane, false).await {
-                    content.contains(text)
-                } else {
-                    false
-                }
+                let content = self
+                    .mock
+                    .get_text_with_cx(cx, *pane, false)
+                    .await
+                    .map_err(|error| {
+                        contextualize_simulation_runtime_error(
+                            error,
+                            "simulation.expectation.check",
+                            format!("pane {pane}"),
+                        )
+                    })?;
+                Ok(content.contains(text))
             }
-            _ => false,
+            ExpectationKind::Event { .. } | ExpectationKind::Workflow { .. } => Ok(false),
         }
     }
 
     /// Check all expectations from the loaded scenario.
     /// Returns (passed, failed, skipped) counts.
-    pub async fn check_all_expectations(&self) -> (usize, usize, usize) {
-        let expectations = match &self.scenario {
-            Some(s) => &s.expectations,
-            None => return (0, 0, 0),
-        };
-
-        let mut pass = 0;
-        let mut fail = 0;
-        let mut skip = 0;
-
-        for exp in expectations {
-            match &exp.kind {
-                ExpectationKind::Contains { .. } => {
-                    if self.check_expectation(&exp.kind).await {
-                        pass += 1;
-                    } else {
-                        fail += 1;
-                    }
-                }
-                _ => skip += 1,
-            }
-        }
-
-        (pass, fail, skip)
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed runtime error if expectation evaluation is cancelled or
+    /// a pane read fails.
+    pub async fn check_all_expectations(&self) -> Result<(usize, usize, usize)> {
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.check_all_expectations_with_cx(&cx).await
     }
 
     /// Cx-first [`Self::check_all_expectations`] (ft-xbnl0.2.3).
-    /// Threads caller `&Cx` through the expectation-check loop
-    /// via `cx.checkpoint()` at each iteration. A pre-cancelled
-    /// cx short-circuits to `(0, 0, 0)` without running any
-    /// expectation checks. A mid-run cancel returns the partial
-    /// counts accumulated so far (pass/fail/skip up to the
-    /// cancellation point). This matches the expected operator
-    /// UX: if a test run is aborted, the caller can still see
-    /// which expectations were evaluated before the abort.
+    /// Threads caller `&Cx` through the expectation-check loop via
+    /// `cx.checkpoint()` at each iteration. Cancellation returns a typed error;
+    /// it never fabricates empty or partially successful counts.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed runtime error if expectation evaluation is cancelled or
+    /// a pane read fails.
     pub async fn check_all_expectations_with_cx(
         &self,
         cx: &crate::cx::Cx,
-    ) -> (usize, usize, usize) {
-        if cx.checkpoint().is_err() {
-            return (0, 0, 0);
-        }
+    ) -> Result<(usize, usize, usize)> {
+        cx.checkpoint().map_err(|error| {
+            simulation_cancelled_error("simulation.expectations.check_all", error.to_string())
+        })?;
 
         let expectations = match &self.scenario {
             Some(s) => &s.expectations,
-            None => return (0, 0, 0),
+            None => return Ok((0, 0, 0)),
         };
 
         let mut pass = 0;
@@ -1298,9 +1325,12 @@ impl TutorialSandbox {
         let mut skip = 0;
 
         for exp in expectations {
-            if cx.checkpoint().is_err() {
-                break;
-            }
+            cx.checkpoint().map_err(|error| {
+                simulation_cancelled_error(
+                    "simulation.expectations.check_all",
+                    error.to_string(),
+                )
+            })?;
             match &exp.kind {
                 ExpectationKind::Contains { .. } => {
                     // Tick 210 (ft-xbnl0.2.3): route each expectation
@@ -1310,7 +1340,8 @@ impl TutorialSandbox {
                     // `check_expectation` which called `get_text()`
                     // picking up cx via Cx::current() thread-local
                     // fallback.
-                    if self.check_expectation_with_cx(cx, &exp.kind).await {
+                    let matched = self.check_expectation_with_cx(cx, &exp.kind).await?;
+                    if matched {
                         pass += 1;
                     } else {
                         fail += 1;
@@ -1320,7 +1351,7 @@ impl TutorialSandbox {
             }
         }
 
-        (pass, fail, skip)
+        Ok((pass, fail, skip))
     }
 
     /// Build the default tutorial sandbox scenario.
@@ -1776,6 +1807,45 @@ expectations:
       pane: 0
       text: "hello world"
 "#;
+
+    #[test]
+    fn simulation_runtime_error_context_preserves_typed_sources() {
+        let backend = contextualize_simulation_runtime_error(
+            Error::runtime_backend("mock inject", "lock is poisoned"),
+            "simulation.execute_until",
+            "event index 7",
+        );
+        match backend {
+            Error::RuntimeOperation {
+                operation,
+                source: RuntimeOperationSource::Backend(detail),
+            } => {
+                assert_eq!(operation, "simulation.execute_until");
+                assert!(detail.contains("event index 7"));
+                assert!(detail.contains("mock inject"));
+                assert!(detail.contains("lock is poisoned"));
+            }
+            other => panic!("unexpected contextualized backend error: {other:?}"),
+        }
+
+        let cancelled = contextualize_simulation_runtime_error(
+            Error::runtime_cancelled("mock add pane", "lock acquisition cancelled"),
+            "simulation.setup",
+            "pane index 2",
+        );
+        match cancelled {
+            Error::RuntimeOperation {
+                operation,
+                source: RuntimeOperationSource::Cancelled(detail),
+            } => {
+                assert_eq!(operation, "simulation.setup");
+                assert!(detail.contains("pane index 2"));
+                assert!(detail.contains("mock add pane"));
+                assert!(detail.contains("lock acquisition cancelled"));
+            }
+            other => panic!("unexpected contextualized cancellation error: {other:?}"),
+        }
+    }
 
     #[test]
     fn parse_basic_scenario() {
@@ -2785,7 +2855,7 @@ events: []
     #[test]
     fn sandbox_creates_default_panes() {
         run_async_test(async {
-            let sandbox = TutorialSandbox::new().await;
+            let sandbox = TutorialSandbox::new().await.expect("tutorial sandbox");
             assert_eq!(sandbox.mock().pane_count().await, 3);
 
             let p0 = sandbox.mock().pane_state(0).await.unwrap();
@@ -2798,9 +2868,102 @@ events: []
     }
 
     #[test]
+    fn sandbox_new_with_precancelled_cx_returns_error() {
+        run_async_test(async {
+            let cx = crate::cx::for_testing();
+            cx.cancel_with(
+                crate::outcome::CancelKind::User,
+                Some("pre-cancel tutorial sandbox construction"),
+            );
+
+            let result = TutorialSandbox::new_with_cx(&cx).await;
+
+            assert!(
+                matches!(
+                    result,
+                    Err(crate::Error::RuntimeOperation {
+                        source: crate::error::RuntimeOperationSource::Cancelled(_),
+                        ..
+                    })
+                ),
+                "cancelled setup must not return a partially initialized sandbox"
+            );
+        });
+    }
+
+    #[test]
+    fn scenario_setup_with_precancelled_cx_adds_no_panes() {
+        run_async_test(async {
+            let scenario = TutorialSandbox::default_scenario();
+            let mock = MockWezterm::new();
+            let cx = crate::cx::for_testing();
+            cx.cancel_with(
+                crate::outcome::CancelKind::User,
+                Some("pre-cancel scenario setup"),
+            );
+
+            let result = scenario.setup_with_cx(&cx, &mock).await;
+
+            assert!(result.is_err(), "pre-cancelled setup must fail");
+            assert_eq!(mock.pane_count().await, 0);
+        });
+    }
+
+    #[test]
+    fn scenario_setup_rejects_duplicate_ids_without_partial_mutation() {
+        run_async_test(async {
+            let mut scenario = TutorialSandbox::default_scenario();
+            scenario.panes.push(scenario.panes[0].clone());
+            let mock = MockWezterm::new();
+
+            let error = scenario
+                .setup(&mock)
+                .await
+                .expect_err("duplicate pane IDs must fail setup");
+
+            assert!(error.to_string().contains("Duplicate pane ID"));
+            assert_eq!(mock.pane_count().await, 0);
+        });
+    }
+
+    #[test]
+    fn scenario_setup_existing_id_collision_is_all_or_none() {
+        run_async_test(async {
+            let scenario = Scenario::from_yaml(
+                r#"
+name: collision
+duration: "1s"
+panes:
+  - id: 5
+    title: "new-before-collision"
+  - id: 99
+    title: "collision"
+events: []
+"#,
+            )
+            .unwrap();
+            let mock = MockWezterm::new();
+            mock.add_default_pane(99).await;
+
+            let error = scenario
+                .setup(&mock)
+                .await
+                .expect_err("existing pane ID collision must reject the batch");
+
+            assert!(error.to_string().contains("pane id 99 already exists"));
+            assert_eq!(mock.pane_count().await, 1);
+            assert!(mock.pane_state(5).await.is_none());
+            assert_eq!(
+                mock.pane_state(99).await.expect("original pane").title,
+                "pane-99"
+            );
+        });
+    }
+
+    #[test]
     fn sandbox_initial_content() {
         run_async_test(async {
-            let sandbox = TutorialSandbox::new().await;
+            let sandbox = TutorialSandbox::new().await.expect("tutorial sandbox");
 
             let t0 = sandbox.mock().get_text(0, false).await.unwrap();
             assert_eq!(t0, "$ ");
@@ -2812,7 +2975,7 @@ events: []
     #[test]
     fn sandbox_format_output_with_indicator() {
         run_async_test(async {
-            let sandbox = TutorialSandbox::new().await;
+            let sandbox = TutorialSandbox::new().await.expect("tutorial sandbox");
             assert_eq!(sandbox.format_output("hello"), "[SANDBOX] hello");
         });
     }
@@ -2820,7 +2983,7 @@ events: []
     #[test]
     fn sandbox_format_output_without_indicator() {
         run_async_test(async {
-            let mut sandbox = TutorialSandbox::new().await;
+            let mut sandbox = TutorialSandbox::new().await.expect("tutorial sandbox");
             sandbox.set_show_indicator(false);
             assert_eq!(sandbox.format_output("hello"), "hello");
         });
@@ -2829,7 +2992,7 @@ events: []
     #[test]
     fn sandbox_command_logging() {
         run_async_test(async {
-            let mut sandbox = TutorialSandbox::new().await;
+            let mut sandbox = TutorialSandbox::new().await.expect("tutorial sandbox");
             assert!(sandbox.command_log().is_empty());
 
             sandbox.log_command("ft status", Some("basics.1"));
@@ -2849,7 +3012,7 @@ events: []
     #[test]
     fn sandbox_trigger_events() {
         run_async_test(async {
-            let sandbox = TutorialSandbox::new().await;
+            let sandbox = TutorialSandbox::new().await.expect("tutorial sandbox");
             let count = sandbox.trigger_exercise_events().await.unwrap();
             assert_eq!(count, 2);
 
@@ -2863,10 +3026,13 @@ events: []
     #[test]
     fn sandbox_check_expectations_after_events() {
         run_async_test(async {
-            let sandbox = TutorialSandbox::new().await;
+            let sandbox = TutorialSandbox::new().await.expect("tutorial sandbox");
             sandbox.trigger_exercise_events().await.unwrap();
 
-            let (pass, fail, skip) = sandbox.check_all_expectations().await;
+            let (pass, fail, skip) = sandbox
+                .check_all_expectations()
+                .await
+                .expect("expectation checks");
             assert_eq!(pass, 2);
             assert_eq!(fail, 0);
             assert_eq!(skip, 0);
@@ -2878,26 +3044,32 @@ events: []
     /// `trigger_exercise_events_with_cx`, and
     /// `check_all_expectations_with_cx`. Uses the default
     /// tutorial sandbox (which `TutorialSandbox::new()` wires up
-    /// with 2 panes + 2 events + 2 contains expectations) as the
+    /// with 3 panes + 2 events + 2 contains expectations) as the
     /// fixture.
     #[test]
     fn sandbox_cx_first_trail_matches_legacy() {
         run_async_test(async {
             let cx = crate::cx::for_request();
 
-            // Both sandboxes: TutorialSandbox::new() calls the
-            // legacy `setup` internally. Tests the non-setup
-            // entry points (trigger/check) via their cx variants.
-            let sandbox_legacy = TutorialSandbox::new().await;
+            // The ambient constructor delegates to the Cx-aware setup path.
+            // This compares the ambient trigger/check wrappers with their
+            // explicit-Cx siblings.
+            let sandbox_legacy = TutorialSandbox::new().await.expect("legacy sandbox");
             let legacy_count = sandbox_legacy.trigger_exercise_events().await.unwrap();
-            let (lp, lf, ls) = sandbox_legacy.check_all_expectations().await;
+            let (lp, lf, ls) = sandbox_legacy
+                .check_all_expectations()
+                .await
+                .expect("legacy expectation checks");
 
-            let sandbox_cx = TutorialSandbox::new().await;
+            let sandbox_cx = TutorialSandbox::new().await.expect("cx sandbox");
             let cx_count = sandbox_cx
                 .trigger_exercise_events_with_cx(&cx)
                 .await
                 .unwrap();
-            let (cp, cf, cs) = sandbox_cx.check_all_expectations_with_cx(&cx).await;
+            let (cp, cf, cs) = sandbox_cx
+                .check_all_expectations_with_cx(&cx)
+                .await
+                .expect("Cx-first expectation checks");
 
             assert_eq!(legacy_count, cx_count, "trigger event counts must match");
             assert_eq!(
@@ -2911,10 +3083,8 @@ events: []
 
     /// ft-xbnl0.2.3 Cx-first: `Scenario::setup_with_cx` must
     /// match the legacy `setup` — same pane count, same pane
-    /// fields. Separate test from the sandbox trail because
-    /// setup is called from inside TutorialSandbox::new() which
-    /// uses the legacy setup. This test exercises setup_with_cx
-    /// directly on a bare MockWezterm.
+    /// fields. This test directly compares the ambient setup wrapper with
+    /// `setup_with_cx` on separate bare MockWezterm instances.
     #[test]
     fn scenario_setup_with_cx_matches_legacy() {
         run_async_test(async {
@@ -2961,9 +3131,12 @@ events: []
     #[test]
     fn sandbox_check_expectations_before_events() {
         run_async_test(async {
-            let sandbox = TutorialSandbox::new().await;
+            let sandbox = TutorialSandbox::new().await.expect("tutorial sandbox");
             // Don't trigger events — expectations should fail
-            let (pass, fail, skip) = sandbox.check_all_expectations().await;
+            let (pass, fail, skip) = sandbox
+                .check_all_expectations()
+                .await
+                .expect("expectation checks");
             assert_eq!(pass, 0);
             assert_eq!(fail, 2);
             assert_eq!(skip, 0);
@@ -3012,7 +3185,10 @@ events: []
     fn sandbox_empty_check_expectations() {
         run_async_test(async {
             let sandbox = TutorialSandbox::empty();
-            let (pass, fail, skip) = sandbox.check_all_expectations().await;
+            let (pass, fail, skip) = sandbox
+                .check_all_expectations()
+                .await
+                .expect("expectation checks");
             assert_eq!(pass, 0);
             assert_eq!(fail, 0);
             assert_eq!(skip, 0);
@@ -4304,6 +4480,28 @@ events: []
     }
 
     #[test]
+    fn setup_first_pane_is_active_even_when_ids_do_not_start_at_zero() {
+        run_async_test(async {
+            let scenario = Scenario::from_yaml(
+                r#"
+name: nonzero_active_test
+duration: "1s"
+panes:
+  - id: 5
+  - id: 9
+events: []
+"#,
+            )
+            .unwrap();
+            let mock = MockWezterm::new();
+            scenario.setup(&mock).await.unwrap();
+
+            assert!(mock.pane_state(5).await.expect("first pane").is_active);
+            assert!(!mock.pane_state(9).await.expect("second pane").is_active);
+        });
+    }
+
+    #[test]
     fn setup_panes_not_zoomed() {
         run_async_test(async {
             let yaml = r#"
@@ -4421,14 +4619,15 @@ events: []
     #[test]
     fn sandbox_check_event_expectation_returns_false() {
         run_async_test(async {
-            let sandbox = TutorialSandbox::new().await;
+            let sandbox = TutorialSandbox::new().await.expect("tutorial sandbox");
             // Event expectations always return false (need runtime)
             let result = sandbox
                 .check_expectation(&ExpectationKind::Event {
                     event: "test".to_string(),
                     detected_at: None,
                 })
-                .await;
+                .await
+                .expect("event expectation");
             assert!(!result);
         });
     }
@@ -4436,13 +4635,14 @@ events: []
     #[test]
     fn sandbox_check_workflow_expectation_returns_false() {
         run_async_test(async {
-            let sandbox = TutorialSandbox::new().await;
+            let sandbox = TutorialSandbox::new().await.expect("tutorial sandbox");
             let result = sandbox
                 .check_expectation(&ExpectationKind::Workflow {
                     workflow: "test".to_string(),
                     started_at: None,
                 })
-                .await;
+                .await
+                .expect("workflow expectation");
             assert!(!result);
         });
     }
@@ -4450,27 +4650,29 @@ events: []
     #[test]
     fn sandbox_check_contains_nonexistent_pane() {
         run_async_test(async {
-            let sandbox = TutorialSandbox::new().await;
-            let result = sandbox
+            let sandbox = TutorialSandbox::new().await.expect("tutorial sandbox");
+            let error = sandbox
                 .check_expectation(&ExpectationKind::Contains {
                     pane: 999,
                     text: "anything".to_string(),
                 })
-                .await;
-            assert!(!result);
+                .await
+                .expect_err("missing pane must remain a backend error");
+            assert!(error.to_string().contains("999"));
         });
     }
 
     #[test]
     fn sandbox_check_contains_missing_text() {
         run_async_test(async {
-            let sandbox = TutorialSandbox::new().await;
+            let sandbox = TutorialSandbox::new().await.expect("tutorial sandbox");
             let result = sandbox
                 .check_expectation(&ExpectationKind::Contains {
                     pane: 0,
                     text: "this text does not exist".to_string(),
                 })
-                .await;
+                .await
+                .expect("contains expectation");
             assert!(!result);
         });
     }
@@ -4478,14 +4680,15 @@ events: []
     #[test]
     fn sandbox_check_contains_present_text() {
         run_async_test(async {
-            let sandbox = TutorialSandbox::new().await;
+            let sandbox = TutorialSandbox::new().await.expect("tutorial sandbox");
             // Pane 0 has initial content "$ "
             let result = sandbox
                 .check_expectation(&ExpectationKind::Contains {
                     pane: 0,
                     text: "$ ".to_string(),
                 })
-                .await;
+                .await
+                .expect("contains expectation");
             assert!(result);
         });
     }
@@ -4493,7 +4696,7 @@ events: []
     #[test]
     fn sandbox_indicator_toggle() {
         run_async_test(async {
-            let mut sandbox = TutorialSandbox::new().await;
+            let mut sandbox = TutorialSandbox::new().await.expect("tutorial sandbox");
             assert_eq!(sandbox.format_output("x"), "[SANDBOX] x");
             sandbox.set_show_indicator(false);
             assert_eq!(sandbox.format_output("x"), "x");
@@ -4505,7 +4708,7 @@ events: []
     #[test]
     fn sandbox_command_log_timestamps_are_monotonic() {
         run_async_test(async {
-            let mut sandbox = TutorialSandbox::new().await;
+            let mut sandbox = TutorialSandbox::new().await.expect("tutorial sandbox");
             sandbox.log_command("cmd1", None);
             sandbox.log_command("cmd2", None);
             sandbox.log_command("cmd3", None);
@@ -4521,7 +4724,7 @@ events: []
     #[test]
     fn sandbox_format_output_empty_text() {
         run_async_test(async {
-            let sandbox = TutorialSandbox::new().await;
+            let sandbox = TutorialSandbox::new().await.expect("tutorial sandbox");
             assert_eq!(sandbox.format_output(""), "[SANDBOX] ");
         });
     }
@@ -4548,7 +4751,10 @@ expectations:
             let scenario = Scenario::from_yaml(yaml).unwrap();
             let sandbox = TutorialSandbox::with_scenario(scenario).await.unwrap();
 
-            let (pass, fail, skip) = sandbox.check_all_expectations().await;
+            let (pass, fail, skip) = sandbox
+                .check_all_expectations()
+                .await
+                .expect("expectation checks");
             assert_eq!(pass, 1); // contains passes
             assert_eq!(fail, 0);
             assert_eq!(skip, 2); // event and workflow are skipped

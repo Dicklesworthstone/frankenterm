@@ -119,6 +119,17 @@ fn runtime_backend_error(operation: &'static str, err: impl std::fmt::Display) -
     }
 }
 
+fn is_runtime_cancellation(error: &Error) -> bool {
+    matches!(
+        error,
+        Error::Cancelled(_)
+            | Error::RuntimeOperation {
+                source: RuntimeOperationSource::Cancelled(_),
+                ..
+            }
+    )
+}
+
 const BOCPD_CHANGE_POINT_RULE_ID: &str = "core.bocpd:change_point";
 const BOCPD_CHANGE_POINT_EVENT_TYPE: &str = "bocpd.change_point";
 
@@ -3283,11 +3294,16 @@ impl ObservationRuntime {
     pub async fn start_with_cx(&mut self, cx: &crate::cx::Cx) -> Result<RuntimeHandle> {
         cx.checkpoint()
             .map_err(|e| runtime_cancelled_error("runtime.start", e))?;
-        self.start().await
+        self.start_impl().await
     }
 
     #[instrument(skip(self))]
     pub async fn start(&mut self) -> Result<RuntimeHandle> {
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.start_with_cx(&cx).await
+    }
+
+    async fn start_impl(&mut self) -> Result<RuntimeHandle> {
         info!("Starting observation runtime");
 
         // Stage 1 ingress: multi-producer capture tasks write into bounded MPSC.
@@ -3397,7 +3413,7 @@ impl ObservationRuntime {
 
                     let loop_cx = runtime_loop_cx();
                     let handle = spawn_runtime_task(&loop_cx, move |_task_cx| async move {
-                        engine
+                        if let Err(error) = engine
                             .run_periodic(shutdown_rx, move || {
                                 let wez = wezterm.clone();
                                 async move {
@@ -3413,7 +3429,17 @@ impl ObservationRuntime {
                                     }
                                 }
                             })
-                            .await;
+                            .await
+                        {
+                            match error {
+                                crate::snapshot_engine::SnapshotError::Cancelled => {
+                                    info!("snapshot scheduler cancelled");
+                                }
+                                other => {
+                                    warn!(error = %other, "snapshot scheduler failed");
+                                }
+                            }
+                        }
                     });
                     info!("Snapshot engine started");
                     (Some(handle), Some(shutdown_tx), snapshot_triggers)
@@ -3477,6 +3503,9 @@ impl ObservationRuntime {
 
             loop {
                 if shutdown_flag.load(Ordering::SeqCst) {
+                    break;
+                }
+                if loop_cx.checkpoint().is_err() {
                     break;
                 }
 
@@ -3726,6 +3755,9 @@ impl ObservationRuntime {
                 heartbeats.record_maintenance();
 
                 if shutdown_flag.load(Ordering::SeqCst) {
+                    break;
+                }
+                if loop_cx.checkpoint().is_err() {
                     break;
                 }
 
@@ -4038,7 +4070,7 @@ impl ObservationRuntime {
                     Instant::now(),
                     Duration::from_secs(u64::from(checkpoint_secs)),
                 ) {
-                    match storage.checkpoint().await {
+                    match storage.checkpoint_with_cx(&loop_cx).await {
                         Ok(result) => {
                             debug!(
                                 wal_pages = result.wal_pages,
@@ -4046,6 +4078,7 @@ impl ObservationRuntime {
                                 "WAL checkpoint completed"
                             );
                         }
+                        Err(error) if is_runtime_cancellation(&error) => break,
                         Err(_error) => {
                             error!(
                                 error_class = "wal_checkpoint_failed",
@@ -4072,7 +4105,7 @@ impl ObservationRuntime {
                     let mut manual_vacuum_advised = false;
                     let mut page_stats_available = true;
 
-                    match storage.database_page_stats().await {
+                    match storage.database_page_stats_with_cx(&loop_cx).await {
                         Ok(stats) => {
                             page_count = stats.page_count;
                             free_pages = stats.free_pages;
@@ -4084,6 +4117,7 @@ impl ObservationRuntime {
                                 cache_gc_settings.vacuum_threshold,
                             );
                         }
+                        Err(error) if is_runtime_cancellation(&error) => break,
                         Err(_error) => {
                             page_stats_available = false;
                             error!(
@@ -4112,16 +4146,22 @@ impl ObservationRuntime {
                         "page_stats_available": page_stats_available,
                         "log_report": cache_gc_settings.log_report,
                     });
-                    if let Err(_error) = storage
-                        .record_maintenance(MaintenanceRecord {
-                            id: 0,
-                            event_type: "cache_gc".to_string(),
-                            message: Some("Periodic database cache GC cycle".to_string()),
-                            metadata: Some(metadata.to_string()),
-                            timestamp: epoch_ms(),
-                        })
+                    if let Err(error) = storage
+                        .record_maintenance_with_cx(
+                            &loop_cx,
+                            MaintenanceRecord {
+                                id: 0,
+                                event_type: "cache_gc".to_string(),
+                                message: Some("Periodic database cache GC cycle".to_string()),
+                                metadata: Some(metadata.to_string()),
+                                timestamp: epoch_ms(),
+                            },
+                        )
                         .await
                     {
+                        if is_runtime_cancellation(&error) {
+                            break;
+                        }
                         error!(
                             error_class = "cache_gc_maintenance_record_failed",
                             page_count,
@@ -4176,6 +4216,9 @@ impl ObservationRuntime {
                     let last_activity_by_pane = health_panes.last_activity_by_pane;
                     let last_seq_by_pane = health_panes.last_seq_by_pane;
                     let cursor_snapshot_bytes = health_panes.cursor_snapshot_bytes;
+                    if loop_cx.checkpoint().is_err() {
+                        break;
+                    }
                     metrics.record_cursor_snapshot_memory(cursor_snapshot_bytes);
 
                     let capture_cap = capture_queue_capacity;
@@ -4184,9 +4227,16 @@ impl ObservationRuntime {
                     let (write_depth, write_cap, db_writable) = {
                         let wd = storage.write_queue_depth();
                         let wc = storage.write_queue_capacity();
-                        let writable = storage.is_writable().await;
+                        let writable = match storage.is_writable_with_cx(&loop_cx).await {
+                            Ok(writable) => writable,
+                            Err(error) if is_runtime_cancellation(&error) => break,
+                            Err(_error) => false,
+                        };
                         (wd, wc, writable)
                     };
+                    if loop_cx.checkpoint().is_err() {
+                        break;
+                    }
 
                     let mut warnings = Vec::new();
 
@@ -4237,13 +4287,19 @@ impl ObservationRuntime {
                             bytes_to_mib(metrics.cursor_snapshot_bytes_max()),
                         ));
                     }
-                    match wezterm_handle.watchdog_warnings().await {
+                    match wezterm_handle.watchdog_warnings_with_cx(&loop_cx).await {
                         Ok(wezterm_warnings) => {
                             append_bounded_watchdog_warnings(&mut warnings, wezterm_warnings);
                         }
-                        Err(_error) => warnings.push(
-                            "Mux health warning probe failed: backend_unavailable".to_string(),
-                        ),
+                        Err(error) if is_runtime_cancellation(&error) => break,
+                        Err(_error) => {
+                            if loop_cx.checkpoint().is_err() {
+                                break;
+                            }
+                            warnings.push(
+                                "Mux health warning probe failed: backend_unavailable".to_string(),
+                            );
+                        }
                     }
                     let backpressure_tier = classify_backpressure_tier(
                         capture_depth,
@@ -4276,12 +4332,27 @@ impl ObservationRuntime {
                         reg.observed_pane_ids()
                     };
                     let observed_pane_count = observed_pane_ids.len();
-                    let tiered_scrollback_fetch = collect_pane_tiered_scrollback_summaries(
-                        &loop_cx,
-                        &wezterm_handle,
-                        &observed_pane_ids,
-                    )
-                    .await;
+                    let tiered_scrollback_fetch =
+                        match collect_pane_tiered_scrollback_summaries(
+                            &loop_cx,
+                            &wezterm_handle,
+                            &observed_pane_ids,
+                        )
+                        .await
+                        {
+                            Ok(fetch) => fetch,
+                            Err(error) if is_runtime_cancellation(&error) => break,
+                            Err(_error) => {
+                                warn!(
+                                    error_class = "pane_summary_collection_failed",
+                                    "Failed to collect mux-side tiered scrollback telemetry"
+                                );
+                                PaneTieredScrollbackFetch::default()
+                            }
+                        };
+                    if loop_cx.checkpoint().is_err() {
+                        break;
+                    }
                     let (fleet_pane_infos, fleet_pane_snapshots) = {
                         let reg = registry.read().await;
                         let cur = cursors.read().await;
@@ -4301,6 +4372,9 @@ impl ObservationRuntime {
                     let pane_scrollback_snapshot_count = fleet_pane_snapshots.len();
                     let mut pane_snapshots =
                         SnapshotPaneScrollbackAccess::new(fleet_pane_snapshots);
+                    if loop_cx.checkpoint().is_err() {
+                        break;
+                    }
                     let fleet_eval = fleet_coordinator.evaluate(
                         &fleet_signals,
                         &fleet_pane_infos,
@@ -4349,6 +4423,10 @@ impl ObservationRuntime {
                         };
                         let observed_state_changed =
                             last_fleet_coordinator_observed_state != Some(current_state);
+
+                        if loop_cx.checkpoint().is_err() {
+                            break;
+                        }
 
                         if observed_state_changed && telemetry_blind {
                             warn!(
@@ -4404,28 +4482,32 @@ impl ObservationRuntime {
                                 "cumulative_bytes_reclaimed": telem.bytes_reclaimed,
                             });
                             match storage
-                                .record_maintenance(MaintenanceRecord {
-                                    id: 0,
-                                    event_type: "fleet_scrollback_coordinator".to_string(),
-                                    message: Some(if telemetry_blind {
-                                        format!(
-                                            "Fleet coordinator {audit_reason}: tier={:?}, evicted={} pages; tiered scrollback telemetry blind",
-                                            fleet_eval.compound_tier, fleet_eval.pages_evicted,
-                                        )
-                                    } else {
-                                        format!(
-                                            "Fleet coordinator {audit_reason}: tier={:?}, evicted={} pages",
-                                            fleet_eval.compound_tier, fleet_eval.pages_evicted,
-                                        )
-                                    }),
-                                    metadata: Some(metadata.to_string()),
-                                    timestamp: epoch_ms(),
-                                })
+                                .record_maintenance_with_cx(
+                                    &loop_cx,
+                                    MaintenanceRecord {
+                                        id: 0,
+                                        event_type: "fleet_scrollback_coordinator".to_string(),
+                                        message: Some(if telemetry_blind {
+                                            format!(
+                                                "Fleet coordinator {audit_reason}: tier={:?}, evicted={} pages; tiered scrollback telemetry blind",
+                                                fleet_eval.compound_tier, fleet_eval.pages_evicted,
+                                            )
+                                        } else {
+                                            format!(
+                                                "Fleet coordinator {audit_reason}: tier={:?}, evicted={} pages",
+                                                fleet_eval.compound_tier, fleet_eval.pages_evicted,
+                                            )
+                                        }),
+                                        metadata: Some(metadata.to_string()),
+                                        timestamp: epoch_ms(),
+                                    },
+                                )
                                 .await
                             {
                                 Ok(_) => {
                                     last_fleet_coordinator_maintenance_state = Some(current_state);
                                 }
+                                Err(error) if is_runtime_cancellation(&error) => break,
                                 Err(_error) => {
                                     warn!(
                                         error_class = "maintenance_record_failed",
@@ -4438,6 +4520,9 @@ impl ObservationRuntime {
                     // ── end fleet coordinator tick ──────────────────────────
 
                     let snapshot_timestamp = epoch_ms_u64();
+                    if loop_cx.checkpoint().is_err() {
+                        break;
+                    }
                     let snapshot = HealthSnapshot {
                         timestamp: snapshot_timestamp,
                         observed_panes,
@@ -4488,6 +4573,9 @@ impl ObservationRuntime {
                         leak_risk_inventory,
                     };
 
+                    if loop_cx.checkpoint().is_err() {
+                        break;
+                    }
                     HealthSnapshot::update_global(snapshot);
                     RuntimeLockMemoryTelemetrySnapshot::update_global(
                         metrics.lock_memory_snapshot(),
@@ -8204,7 +8292,12 @@ async fn collect_pane_tiered_scrollback_summaries(
     runtime_cx: &RuntimeLoopCx,
     wezterm_handle: &WeztermHandle,
     pane_ids: &[u64],
-) -> PaneTieredScrollbackFetch {
+) -> Result<PaneTieredScrollbackFetch> {
+    runtime_cx.checkpoint().map_err(|error| {
+        crate::Error::Cancelled(format!(
+            "tiered scrollback collection cancelled before dispatch: {error}"
+        ))
+    })?;
     let mut fetch = PaneTieredScrollbackFetch::default();
     let mut remaining = pane_ids.iter().copied();
     let probe = |pane_id| {
@@ -8225,13 +8318,21 @@ async fn collect_pane_tiered_scrollback_summaries(
     }
 
     while let Some((pane_id, result)) = pending.next().await {
-        record_pane_tiered_scrollback_summary_result(&mut fetch, pane_id, result);
+        match result {
+            Err(error) if is_runtime_cancellation(&error) => return Err(error),
+            result => record_pane_tiered_scrollback_summary_result(&mut fetch, pane_id, result),
+        }
+        runtime_cx.checkpoint().map_err(|error| {
+            crate::Error::Cancelled(format!(
+                "tiered scrollback collection cancelled after pane {pane_id}: {error}"
+            ))
+        })?;
         if let Some(next_pane_id) = remaining.next() {
             pending.push(probe(next_pane_id));
         }
     }
 
-    fetch
+    Ok(fetch)
 }
 
 fn approximate_warm_page_count(summary: &PaneTieredScrollbackSummary) -> usize {
@@ -8444,7 +8545,8 @@ impl RuntimeHandle {
     #[allow(unknown_lints)]
     #[allow(clippy::unused_async_trait_impl)]
     pub async fn write_queue_depth(&self) -> usize {
-        self.storage.write_queue_depth()
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.write_queue_depth_with_cx(&cx).await
     }
 
     /// ft-tr5a0 Cx-first sibling of [`Self::write_queue_depth`].
@@ -8459,7 +8561,7 @@ impl RuntimeHandle {
     /// must run to completion to avoid leaking the spawned tasks.
     pub async fn join_with_cx(self, cx: &crate::cx::Cx) {
         let _ = cx.checkpoint();
-        self.join().await;
+        self.join_impl().await;
     }
 
     /// Wait for all tasks to complete.
@@ -8468,7 +8570,12 @@ impl RuntimeHandle {
     /// defensive [`Drop`] impl on [`RuntimeHandle`] sees `None`
     /// and skips the redundant `abort()` once the join has
     /// completed cleanly.
-    pub async fn join(mut self) {
+    pub async fn join(self) {
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.join_with_cx(&cx).await;
+    }
+
+    async fn join_impl(mut self) {
         if let Some(h) = self.discovery.take() {
             let _ = h.await;
         }
@@ -8503,8 +8610,8 @@ impl RuntimeHandle {
     /// so storage flushes and task joins always happen, regardless of
     /// caller cancellation.
     pub async fn shutdown_with_summary_with_cx(self, cx: &crate::cx::Cx) -> ShutdownSummary {
-        let _ = cx.checkpoint();
-        self.shutdown_with_summary().await
+        self.shutdown_with_timeout_with_cx(cx, DEFAULT_RUNTIME_SHUTDOWN_TIMEOUT)
+            .await
     }
 
     /// Request graceful shutdown and collect a summary.
@@ -8515,8 +8622,8 @@ impl RuntimeHandle {
     /// 3. Flushes storage
     /// 4. Collects and returns a shutdown summary
     pub async fn shutdown_with_summary(self) -> ShutdownSummary {
-        self.shutdown_with_timeout(DEFAULT_RUNTIME_SHUTDOWN_TIMEOUT)
-            .await
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.shutdown_with_summary_with_cx(&cx).await
     }
 
     /// ft-e87u6.13 Cx-first sibling of [`Self::shutdown_with_timeout`].
@@ -8528,7 +8635,7 @@ impl RuntimeHandle {
         shutdown_timeout: Duration,
     ) -> ShutdownSummary {
         let _ = cx.checkpoint();
-        self.shutdown_with_timeout(shutdown_timeout).await
+        self.shutdown_with_timeout_impl(shutdown_timeout).await
     }
 
     /// Request graceful shutdown with an explicit task-join timeout.
@@ -8542,7 +8649,16 @@ impl RuntimeHandle {
     /// join window — and is therefore still running concurrently with the
     /// flush — cannot wedge the flush either: each phase has its own
     /// independent timeout budget of `shutdown_timeout`.
-    pub async fn shutdown_with_timeout(mut self, shutdown_timeout: Duration) -> ShutdownSummary {
+    pub async fn shutdown_with_timeout(self, shutdown_timeout: Duration) -> ShutdownSummary {
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.shutdown_with_timeout_with_cx(&cx, shutdown_timeout)
+            .await
+    }
+
+    async fn shutdown_with_timeout_impl(
+        mut self,
+        shutdown_timeout: Duration,
+    ) -> ShutdownSummary {
         let elapsed_secs = self.start_time.elapsed().as_secs();
         let mut warnings = Vec::new();
         let mut clean = true;
@@ -8556,12 +8672,14 @@ impl RuntimeHandle {
         }
         info!("Shutdown signal sent");
 
-        // Wait for tasks with timeout. Each `.take()` empties the
-        // corresponding field so the defensive `Drop` impl on
-        // RuntimeHandle sees `None` for already-joined handles and
-        // skips the redundant `abort()`. Handles still in-place when
-        // the timeout fires (stubborn tasks) get aborted by `Drop`,
-        // not leaked.
+        // Wait for tasks with timeout. Each `.take()` moves a handle into the
+        // timed future. If the timeout wins, dropping that future also drops
+        // every remaining handle; the fields are already `None`, so
+        // `RuntimeHandle::drop` cannot abort them. More importantly, dropping
+        // the runtime_async join wrapper does not stop its underlying task, so
+        // a timed-out task may remain detached until its body cooperatively
+        // observes shutdown. Bead ft-interactive-systems-performance-4tenz.31
+        // owns the deeper cancellation redesign.
         let discovery = self.discovery.take();
         let capture = self.capture.take();
         let relay = self.relay.take();
@@ -8571,8 +8689,10 @@ impl RuntimeHandle {
         let connector_outbound = self.connector_outbound.take();
         let snapshot = self.snapshot.take();
         let snapshot_triggers = self.snapshot_triggers.take();
-        let shutdown_cx = runtime_loop_cx();
-        let join_result = runtime_timeout(&shutdown_cx, shutdown_timeout, async {
+        // Shutdown phases must never inherit an already-cancelled ambient Cx:
+        // each phase gets a fresh context and its own bounded timeout.
+        let join_cx = crate::cx::for_request();
+        let join_result = runtime_timeout(&join_cx, shutdown_timeout, async {
             if let Some(h) = discovery {
                 let _ = h.await;
             }
@@ -8604,7 +8724,10 @@ impl RuntimeHandle {
         .await;
 
         if join_result.is_err() {
-            warnings.push("Tasks did not complete within timeout".to_string());
+            warnings.push(
+                "Tasks did not complete within timeout; underlying tasks may remain detached"
+                    .to_string(),
+            );
             clean = false;
         }
 
@@ -8613,12 +8736,31 @@ impl RuntimeHandle {
         let events_recorded = self.metrics.events_recorded.get();
 
         // Get last seq per pane
-        let last_seq_by_pane: Vec<(u64, i64)> = {
-            let cursors = self.cursors.read().await;
-            cursors
-                .iter()
-                .map(|(pane_id, cursor)| (*pane_id, cursor.last_seq()))
-                .collect()
+        let cursor_cx = crate::cx::for_request();
+        let last_seq_by_pane = match runtime_timeout(&cursor_cx, shutdown_timeout, async {
+            self.cursors
+                .read_with_cx(&cursor_cx)
+                .await
+                .map(|cursors| {
+                    cursors
+                        .iter()
+                        .map(|(pane_id, cursor)| (*pane_id, cursor.last_seq()))
+                        .collect::<Vec<_>>()
+                })
+        })
+        .await
+        {
+            Ok(Ok(snapshot)) => snapshot,
+            Ok(Err(error)) => {
+                warnings.push(format!("Final cursor snapshot failed: {error}"));
+                clean = false;
+                Vec::new()
+            }
+            Err(_) => {
+                warnings.push("Final cursor snapshot did not complete within timeout".to_string());
+                clean = false;
+                Vec::new()
+            }
         };
 
         // Flush storage under the same bounded timeout. A storage backend
@@ -8627,14 +8769,13 @@ impl RuntimeHandle {
         // the flush after a join timeout) must not stall operator
         // shutdown indefinitely.
         //
-        // Cloning the StorageHandle (an `Arc`-backed clone, no real
-        // copy) instead of moving keeps `self.storage` in place so the
-        // defensive `Drop for RuntimeHandle` impl can run on a fully
-        // intact struct. The Drop only aborts task handles; it does
-        // not touch storage.
+        // Cloning the StorageHandle (an `Arc`-backed clone, no real copy) is
+        // required because a type implementing Drop cannot move out one of its
+        // fields. The defensive Drop does not flush storage.
         let storage = self.storage.clone();
-        let flush_result = runtime_timeout(&shutdown_cx, shutdown_timeout, async {
-            storage.shutdown().await
+        let flush_cx = crate::cx::for_request();
+        let flush_result = runtime_timeout(&flush_cx, shutdown_timeout, async {
+            storage.shutdown_with_cx(&flush_cx).await
         })
         .await;
         match flush_result {
@@ -8668,14 +8809,8 @@ impl RuntimeHandle {
     /// the caller needs to inspect warnings or distinguish clean from timed-out
     /// shutdown.
     pub async fn shutdown(self) {
-        let summary = self.shutdown_with_summary().await;
-        if !summary.clean || !summary.warnings.is_empty() {
-            warn!(
-                clean = summary.clean,
-                warnings = ?summary.warnings,
-                "runtime shutdown completed with warnings"
-            );
-        }
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.shutdown_with_cx(&cx).await;
     }
 
     /// ft-tr5a0 Cx-first sibling of [`Self::shutdown`]. Pre-flight
@@ -8683,8 +8818,14 @@ impl RuntimeHandle {
     /// completion regardless of caller cancellation (otherwise tasks
     /// leak).
     pub async fn shutdown_with_cx(self, cx: &crate::cx::Cx) {
-        let _ = cx.checkpoint();
-        self.shutdown().await;
+        let summary = self.shutdown_with_summary_with_cx(cx).await;
+        if !summary.clean || !summary.warnings.is_empty() {
+            warn!(
+                clean = summary.clean,
+                warnings = ?summary.warnings,
+                "runtime shutdown completed with warnings"
+            );
+        }
     }
 
     /// Signal shutdown without waiting.
@@ -8704,13 +8845,18 @@ impl RuntimeHandle {
         if cx.checkpoint().is_err() {
             return;
         }
-        self.update_health_snapshot().await;
+        self.update_health_snapshot_impl(cx).await;
     }
 
     /// Update the global health snapshot from current runtime state.
     ///
     /// Call this periodically (e.g., every 30s) to keep crash reports useful.
     pub async fn update_health_snapshot(&self) {
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.update_health_snapshot_with_cx(&cx).await;
+    }
+
+    async fn update_health_snapshot_impl(&self, cx: &crate::cx::Cx) {
         let (health_panes, leak_risk_inventory) = {
             let reg = self.registry.read().await;
             let cursors = self.cursors.read().await;
@@ -8727,6 +8873,9 @@ impl RuntimeHandle {
         let cursor_snapshot_bytes = health_panes.cursor_snapshot_bytes;
         self.metrics
             .record_cursor_snapshot_memory(cursor_snapshot_bytes);
+        if cx.checkpoint().is_err() {
+            return;
+        }
 
         // Measure queue depths for backpressure visibility
         let capture_depth = self.capture_queue_depth();
@@ -8735,10 +8884,17 @@ impl RuntimeHandle {
         let (write_depth, write_cap, db_writable) = {
             let wd = self.storage.write_queue_depth();
             let wc = self.storage.write_queue_capacity();
-            let writable = self.storage.is_writable().await;
+            let writable = match self.storage.is_writable_with_cx(cx).await {
+                Ok(writable) => writable,
+                Err(error) if is_runtime_cancellation(&error) => return,
+                Err(_) => false,
+            };
 
             (wd, wc, writable)
         };
+        if cx.checkpoint().is_err() {
+            return;
+        }
 
         // Generate backpressure warnings
         let mut warnings = Vec::new();
@@ -8790,11 +8946,15 @@ impl RuntimeHandle {
                 bytes_to_mib(self.metrics.cursor_snapshot_bytes_max()),
             ));
         }
-        match self.wezterm_handle.watchdog_warnings().await {
+        match self.wezterm_handle.watchdog_warnings_with_cx(cx).await {
             Ok(wezterm_warnings) => {
                 append_bounded_watchdog_warnings(&mut warnings, wezterm_warnings);
             }
+            Err(error) if is_runtime_cancellation(&error) => return,
             Err(_error) => {
+                if cx.checkpoint().is_err() {
+                    return;
+                }
                 warnings.push("Mux health warning probe failed: backend_unavailable".to_string());
             }
         }
@@ -8861,6 +9021,11 @@ impl RuntimeHandle {
             leak_risk_inventory,
         };
 
+        // Cancellation at any point in the sample invalidates the whole
+        // observation; never publish a partially degraded snapshot.
+        if cx.checkpoint().is_err() {
+            return;
+        }
         HealthSnapshot::update_global(snapshot);
         RuntimeLockMemoryTelemetrySnapshot::update_global(self.metrics.lock_memory_snapshot());
     }
@@ -8869,8 +9034,9 @@ impl RuntimeHandle {
     ///
     /// `RuntimeHandle` has a defensive `Drop` impl, so this method cannot move
     /// the field out directly. Consuming `self` still drops the runtime handle
-    /// and aborts any task handles left in place; the returned `StorageHandle`
-    /// is the caller's handle for any follow-up storage shutdown work.
+    /// and requests abort on any wrapper handles left in place. That abort does
+    /// not stop an already-detached underlying task; the returned
+    /// `StorageHandle` is the caller's handle for follow-up storage shutdown.
     #[must_use]
     pub fn take_storage(self) -> StorageHandle {
         self.storage.clone()
@@ -8913,12 +9079,10 @@ impl Drop for RuntimeHandle {
     ///     still polling it observes cancellation on its next tick.
     ///   - Send the snapshot-shutdown wake-up so the snapshot task
     ///     breaks out of any pending `watch` / `select` wait.
-    ///   - Call `JoinHandle::abort` on every task handle so the
-    ///     handle resource is freed immediately and any future
-    ///     poll observes `JoinError`. Abort is cooperative — the
-    ///     underlying asupersync task only exits when its body next
-    ///     observes the cancel signal — but at minimum the handle
-    ///     itself stops pinning the runtime.
+    ///   - Call `JoinHandle::abort` on every wrapper handle so a subsequent
+    ///     poll of that wrapper observes `JoinError`. The current wrapper cannot
+    ///     cancel the underlying asupersync task; dropping it may detach that
+    ///     task, which must observe the shared shutdown signal itself.
     ///
     /// A `tracing::warn` records the unclean exit so the leak shows
     /// up in operator logs instead of failing silently.
@@ -8929,7 +9093,7 @@ impl Drop for RuntimeHandle {
                 target: "ft.runtime",
                 event = "runtime_handle_dropped_without_shutdown",
                 "RuntimeHandle dropped without explicit shutdown — \
-                 background tasks aborted; storage may not be flushed; \
+                 background tasks may remain detached; storage may not be flushed; \
                  call shutdown_with_summary or shutdown_with_timeout for a \
                  clean exit"
             );
@@ -10750,6 +10914,17 @@ mod tests {
     }
 
     #[test]
+    fn runtime_cancellation_classifier_covers_structured_and_legacy_errors() {
+        let structured = runtime_cancelled_error("runtime.test", "structured cancel");
+        let legacy = Error::Cancelled("legacy cancel".to_string());
+        let backend = runtime_backend_error("runtime.test", "backend failure");
+
+        assert!(is_runtime_cancellation(&structured));
+        assert!(is_runtime_cancellation(&legacy));
+        assert!(!is_runtime_cancellation(&backend));
+    }
+
+    #[test]
     fn runtime_backend_error_uses_structured_runtime_operation() {
         let err = runtime_backend_error("runtime.test_update", "watch channel closed");
 
@@ -11776,6 +11951,49 @@ mod tests {
             assert!(
                 summary.warnings.is_empty(),
                 "shutdown should not emit warnings for mock lifecycle: {:?}",
+                summary.warnings
+            );
+        });
+    }
+
+    #[test]
+    fn runtime_shutdown_phases_do_not_inherit_cancelled_caller_context() {
+        run_async_test_isolated(|| async {
+            let (_dir, db_path) = temp_db_path();
+            let storage = StorageHandle::new(&db_path).await.unwrap();
+            let engine = PatternEngine::new();
+            let config = RuntimeConfig {
+                discovery_interval: Duration::from_millis(10),
+                capture_interval: Duration::from_millis(10),
+                min_capture_interval: Duration::from_millis(5),
+                channel_buffer: 64,
+                ..Default::default()
+            };
+            let mut runtime = ObservationRuntime::new(
+                config,
+                storage,
+                Arc::new(RwLock::new(engine)),
+            )
+            .with_wezterm_handle(Arc::new(crate::wezterm::MockWezterm::new()));
+            let handle = runtime.start().await.expect("runtime should start");
+
+            let caller_cx = crate::cx::for_testing();
+            caller_cx.cancel_with(
+                crate::outcome::CancelKind::User,
+                Some("cancel caller before mandatory runtime cleanup"),
+            );
+            let summary = handle
+                .shutdown_with_timeout_with_cx(&caller_cx, Duration::from_secs(2))
+                .await;
+
+            assert!(
+                summary.clean,
+                "fresh bounded cleanup contexts must complete despite caller cancellation: {:?}",
+                summary.warnings
+            );
+            assert!(
+                summary.warnings.is_empty(),
+                "caller cancellation must not poison independent cleanup phases: {:?}",
                 summary.warnings
             );
         });

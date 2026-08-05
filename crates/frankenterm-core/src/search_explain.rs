@@ -111,63 +111,8 @@ pub async fn build_explain_context(
     query: &str,
     pane_filter: Option<u64>,
 ) -> crate::Result<SearchExplainContext> {
-    let pane_records = storage.get_panes().await?;
-    let indexing_stats_raw = storage.get_pane_indexing_stats().await?;
-    let gaps_raw = storage.get_gaps().await?;
-    let retention_cleanup_count = storage.get_retention_cleanup_count().await?;
-    let (earliest_segment_at, latest_segment_at) = storage.get_segment_time_range().await?;
-
-    let panes = pane_records
-        .iter()
-        .map(|p| PaneExplainInfo {
-            pane_id: p.pane_id,
-            observed: p.observed,
-            ignore_reason: p.ignore_reason.clone(),
-            domain: p.domain.clone(),
-            last_seen_at: p.last_seen_at,
-        })
-        .collect();
-
-    let indexing_stats = indexing_stats_raw
-        .iter()
-        .map(|s| PaneIndexingInfo {
-            pane_id: s.pane_id,
-            segment_count: s.segment_count,
-            total_bytes: s.total_bytes,
-            last_segment_at: s.last_segment_at,
-            fts_row_count: s.fts_row_count,
-            fts_consistent: s.fts_consistent,
-        })
-        .collect();
-
-    let gaps = gaps_raw
-        .iter()
-        .map(|g| GapInfo {
-            pane_id: g.pane_id,
-            seq_before: g.seq_before,
-            seq_after: g.seq_after,
-            reason: g.reason.clone(),
-            detected_at: g.detected_at,
-        })
-        .collect();
-
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .ok()
-        .and_then(|d| i64::try_from(d.as_millis()).ok())
-        .unwrap_or(0);
-
-    Ok(SearchExplainContext {
-        query: query.to_string(),
-        pane_filter,
-        panes,
-        indexing_stats,
-        gaps,
-        retention_cleanup_count,
-        earliest_segment_at,
-        latest_segment_at,
-        now_ms,
-    })
+    let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+    build_explain_context_with_cx(&cx, storage, query, pane_filter).await
 }
 
 /// ft-xbnl0.2.3 Cx-first sibling of [`build_explain_context`].

@@ -109,38 +109,8 @@ impl LayoutRestorer {
     /// Creates windows, tabs, and pane splits to match the captured layout.
     /// Returns a mapping from old pane IDs to new pane IDs.
     pub async fn restore(&self, snapshot: &TopologySnapshot) -> crate::Result<RestoreResult> {
-        let mut result = RestoreResult::new();
-
-        info!(
-            windows = snapshot.windows.len(),
-            "starting layout restoration from snapshot"
-        );
-
-        for (win_idx, window) in snapshot.windows.iter().enumerate() {
-            match self.restore_window(window, win_idx, &mut result).await {
-                Ok(restored_any_tabs) => {
-                    if restored_any_tabs {
-                        result.windows_created += 1;
-                    }
-                }
-                Err(e) => {
-                    warn!(window_id = window.window_id, error = %e, "failed to restore window");
-                    if !self.config.continue_on_error {
-                        return Err(e);
-                    }
-                }
-            }
-        }
-
-        info!(
-            windows = result.windows_created,
-            tabs = result.tabs_created,
-            panes = result.panes_created,
-            failed = result.failed_panes.len(),
-            "layout restoration complete"
-        );
-
-        Ok(result)
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.restore_with_cx(&cx, snapshot).await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`restore`].

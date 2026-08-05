@@ -284,56 +284,9 @@ impl MigrationEngine {
         source_storage: &S,
         source_reader: &dyn RecorderEventReader,
     ) -> Result<MigrationManifest, MigrationError> {
-        // 1. Health check
-        let health: RecorderStorageHealth = source_storage.health().await;
-        if health.degraded {
-            return Err(MigrationError::SourceDegraded {
-                last_error: health.last_error,
-            });
-        }
-
-        // 2. Head offset
-        let head = source_reader.head_offset()?;
-
-        // 3. Scan all events for manifest counts
-        let mut cursor = source_reader.open_cursor_from_start()?;
-        let mut event_count: u64 = 0;
-        let mut first_ordinal: Option<u64> = None;
-        let mut last_ordinal: u64 = 0;
-        let mut per_pane_counts: HashMap<u64, u64> = HashMap::new();
-
-        loop {
-            let batch = cursor.next_batch(self.config.export_batch_size)?;
-            if batch.is_empty() {
-                break;
-            }
-            for record in &batch {
-                event_count += 1;
-                if first_ordinal.is_none() {
-                    first_ordinal = Some(record.offset.ordinal);
-                }
-                last_ordinal = record.offset.ordinal;
-                *per_pane_counts.entry(record.event.pane_id).or_insert(0) += 1;
-            }
-        }
-
-        let manifest = MigrationManifest {
-            event_count,
-            first_ordinal: first_ordinal.unwrap_or(0),
-            last_ordinal,
-            per_pane_counts,
-            last_offset: Some(head),
-            ..Default::default()
-        };
-
-        info!(
-            migration_stage = "M0",
-            event_count = event_count,
-            last_ordinal = %last_ordinal,
-            "preflight complete"
-        );
-
-        Ok(manifest)
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.m0_preflight_with_cx(&cx, source_storage, source_reader)
+            .await
     }
 
     /// Cx-first [`Self::m0_preflight`] (ft-xbnl0.2.3). Threads
@@ -480,77 +433,8 @@ impl MigrationEngine {
         records: &[CursorRecord],
         manifest: &mut MigrationManifest,
     ) -> Result<(), MigrationError> {
-        let mut import_digest = FNV1A_OFFSET_BASIS;
-        let mut import_count: u64 = 0;
-
-        // Write in batches
-        for chunk in records.chunks(self.config.import_batch_size) {
-            let first_ord = chunk.first().map(|r| r.offset.ordinal).unwrap_or(0);
-            let last_ord = chunk.last().map(|r| r.offset.ordinal).unwrap_or(0);
-            let batch_id = format!("{}-{first_ord}-{last_ord}", self.config.consumer_id);
-
-            let events: Vec<_> = chunk.iter().map(|r| r.event.clone()).collect();
-
-            let req = AppendRequest {
-                batch_id,
-                events,
-                required_durability: DurabilityLevel::Appended,
-                producer_ts_ms: 0,
-            };
-
-            target
-                .append_batch(req)
-                .await
-                .map_err(|e| MigrationError::TargetWriteError(e.to_string()))?;
-
-            // Compute digest over imported ordinals
-            for record in chunk {
-                import_digest = fnv1a_feed(import_digest, record.offset.ordinal);
-                import_count += 1;
-            }
-        }
-
-        // Verify counts
-        if import_count != manifest.export_count {
-            error!(
-                migration_abort = true,
-                stage = "M2",
-                expected_count = manifest.export_count,
-                actual_count = import_count,
-                "count mismatch"
-            );
-            return Err(MigrationError::CountMismatch {
-                expected: manifest.export_count,
-                actual: import_count,
-            });
-        }
-
-        // Verify digests
-        if import_digest != manifest.export_digest {
-            error!(
-                migration_abort = true,
-                stage = "M2",
-                expected_digest = %format!("{:#x}", manifest.export_digest),
-                actual_digest = %format!("{import_digest:#x}"),
-                "digest mismatch"
-            );
-            return Err(MigrationError::DigestMismatch {
-                expected: manifest.export_digest,
-                actual: import_digest,
-            });
-        }
-
-        manifest.import_digest = import_digest;
-        manifest.import_count = import_count;
-
-        info!(
-            migration_stage = "M2",
-            events_imported = import_count,
-            digest = %format!("{import_digest:#x}"),
-            "import complete"
-        );
-
-        Ok(())
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.m2_import_with_cx(&cx, target, records, manifest).await
     }
 
     /// Cx-first [`Self::m2_import`] (ft-xbnl0.2.3). Threads
@@ -680,108 +564,9 @@ impl MigrationEngine {
         target: &T,
         manifest: &MigrationManifest,
     ) -> Result<CheckpointSyncResult, MigrationError> {
-        // Discover consumers from source lag metrics
-        let lag = source
-            .lag_metrics()
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.m3_checkpoint_sync_with_cx(&cx, source, target, manifest)
             .await
-            .map_err(|e| MigrationError::StorageError(e.to_string()))?;
-
-        let consumer_ids: Vec<CheckpointConsumerId> =
-            lag.consumers.iter().map(|c| c.consumer.clone()).collect();
-
-        info!(
-            migration_stage = "M3",
-            consumers = consumer_ids.len(),
-            "checkpoint sync starting"
-        );
-
-        let mut result = CheckpointSyncResult {
-            consumers_found: consumer_ids.len(),
-            checkpoints_migrated: 0,
-            checkpoints_reset: 0,
-            reset_consumers: Vec::new(),
-        };
-
-        if consumer_ids.is_empty() {
-            return Ok(result);
-        }
-
-        for consumer_id in &consumer_ids {
-            let checkpoint_opt = source
-                .read_checkpoint(consumer_id)
-                .await
-                .map_err(|e| MigrationError::StorageError(e.to_string()))?;
-
-            let checkpoint = match checkpoint_opt {
-                Some(cp) => cp,
-                None => continue,
-            };
-
-            // Check if the checkpoint ordinal is within the migrated range
-            let ordinal = checkpoint.upto_offset.ordinal;
-            let in_range = ordinal >= manifest.first_ordinal && ordinal <= manifest.last_ordinal;
-
-            let target_checkpoint = if in_range {
-                debug!(
-                    checkpoint_migrated = true,
-                    consumer = %consumer_id.0,
-                    ordinal = ordinal,
-                    "migrating checkpoint as-is"
-                );
-                checkpoint
-            } else {
-                // Ordinal gap — reset to safe replay point
-                warn!(
-                    checkpoint_reset = true,
-                    consumer = %consumer_id.0,
-                    original_ordinal = ordinal,
-                    reset_ordinal = manifest.first_ordinal,
-                    reason = "ordinal_gap",
-                    "resetting checkpoint to safe replay point"
-                );
-                result.checkpoints_reset += 1;
-                result.reset_consumers.push(consumer_id.0.clone());
-
-                RecorderCheckpoint {
-                    consumer: consumer_id.clone(),
-                    upto_offset: RecorderOffset {
-                        segment_id: 0,
-                        byte_offset: 0,
-                        ordinal: manifest.first_ordinal,
-                    },
-                    schema_version: checkpoint.schema_version,
-                    committed_at_ms: checkpoint.committed_at_ms,
-                }
-            };
-
-            let outcome = target
-                .commit_checkpoint(target_checkpoint)
-                .await
-                .map_err(|e| MigrationError::StorageError(e.to_string()))?;
-
-            use crate::recorder_storage::CheckpointCommitOutcome;
-            match outcome {
-                CheckpointCommitOutcome::Advanced
-                | CheckpointCommitOutcome::NoopAlreadyAdvanced => {
-                    result.checkpoints_migrated += 1;
-                }
-                CheckpointCommitOutcome::RejectedOutOfOrder => {
-                    return Err(MigrationError::CheckpointCommitRejected {
-                        consumer: consumer_id.0.clone(),
-                        reason: "rejected out of order".to_string(),
-                    });
-                }
-            }
-        }
-
-        info!(
-            migration_stage = "M3",
-            migrated = result.checkpoints_migrated,
-            reset = result.checkpoints_reset,
-            "checkpoint sync complete"
-        );
-
-        Ok(result)
     }
 
     /// Cx-first [`Self::m3_checkpoint_sync`] (ft-xbnl0.2.3).
@@ -939,75 +724,9 @@ impl MigrationEngine {
         epoch_ms: u64,
         source_path: Option<String>,
     ) -> Result<CutoverResult, MigrationError> {
-        // Emit lifecycle marker
-        let marker_event = RecorderEvent {
-            schema_version: "ft.recorder.event.v1".to_string(),
-            event_id: format!("migration-cutover-{epoch_ms}"),
-            pane_id: 0,
-            session_id: None,
-            workflow_id: None,
-            correlation_id: None,
-            source: RecorderEventSource::RecoveryFlow,
-            occurred_at_ms: epoch_ms,
-            recorded_at_ms: epoch_ms,
-            sequence: manifest.last_ordinal + 1,
-            causality: RecorderEventCausality {
-                parent_event_id: None,
-                trigger_event_id: None,
-                root_event_id: None,
-            },
-            payload: RecorderEventPayload::LifecycleMarker {
-                lifecycle_phase: RecorderLifecyclePhase::CaptureStarted,
-                reason: Some("migration_complete".to_string()),
-                details: serde_json::json!({
-                    "migration_type": "append_log_to_frankensqlite",
-                    "event_count": manifest.event_count,
-                    "export_digest": format!("{:#x}", manifest.export_digest),
-                    "epoch_ms": epoch_ms,
-                }),
-            },
-        };
-
-        let req = AppendRequest {
-            batch_id: format!("{}-cutover-{epoch_ms}", self.config.consumer_id),
-            events: vec![marker_event],
-            required_durability: DurabilityLevel::Fsync,
-            producer_ts_ms: epoch_ms,
-        };
-
-        target
-            .append_batch(req)
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.m5_cutover_with_cx(&cx, target, manifest, epoch_ms, source_path)
             .await
-            .map_err(|e| MigrationError::TargetWriteError(e.to_string()))?;
-
-        // Verify target health post-activation
-        let health = target.health().await;
-
-        if source_path.is_some() {
-            info!(
-                source_retention = true,
-                path = %source_path.as_deref().unwrap_or(""),
-                "source files retained for rollback window"
-            );
-        }
-
-        let result = CutoverResult {
-            activated_backend: RecorderBackendKind::FrankenSqlite,
-            migration_epoch_ms: epoch_ms,
-            target_healthy: !health.degraded,
-            source_retained_path: source_path,
-        };
-
-        info!(
-            migration_stage = "M5",
-            activated = true,
-            backend = "frankensqlite",
-            epoch = %epoch_ms,
-            healthy = result.target_healthy,
-            "cutover complete"
-        );
-
-        Ok(result)
     }
 
     /// Cx-first [`Self::m5_cutover`] (ft-xbnl0.2.3). Threads
@@ -1132,16 +851,9 @@ impl MigrationEngine {
         source_reader: &dyn RecorderEventReader,
         target: &T,
     ) -> Result<MigrationManifest, MigrationError> {
-        // M0
-        let mut manifest = self.m0_preflight(source_storage, source_reader).await?;
-
-        // M1
-        let records = self.m1_export(source_reader, &mut manifest)?;
-
-        // M2
-        self.m2_import(target, &records, &mut manifest).await?;
-
-        Ok(manifest)
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.run_m0_m2_with_cx(&cx, source_storage, source_reader, target)
+            .await
     }
 
     /// Cx-first [`Self::run_m0_m2`] (ft-xbnl0.2.3). Composite

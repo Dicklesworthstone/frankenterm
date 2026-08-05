@@ -73,6 +73,24 @@ pub struct WorkflowStartInput {
     pub context: Option<serde_json::Value>,
 }
 
+impl WorkflowStartInput {
+    fn new(
+        execution_id: String,
+        workflow_name: String,
+        pane_id: u64,
+        trigger_event_id: Option<i64>,
+        context: Option<serde_json::Value>,
+    ) -> Self {
+        Self {
+            execution_id,
+            workflow_name,
+            pane_id,
+            trigger_event_id,
+            context,
+        }
+    }
+}
+
 pub struct WorkflowStatusUpdate<'a> {
     pub execution_id: &'a str,
     pub status: ExecutionStatus,
@@ -81,12 +99,48 @@ pub struct WorkflowStatusUpdate<'a> {
     pub error: Option<&'a str>,
 }
 
+impl<'a> WorkflowStatusUpdate<'a> {
+    fn new(
+        execution_id: &'a str,
+        status: ExecutionStatus,
+        current_step: usize,
+        wait_condition: Option<&'a WaitCondition>,
+        error: Option<&'a str>,
+    ) -> Self {
+        Self {
+            execution_id,
+            status,
+            current_step,
+            wait_condition,
+            error,
+        }
+    }
+}
+
 pub struct WorkflowStepLogInput<'a> {
     pub execution_id: &'a str,
     pub step_index: usize,
     pub step_name: &'a str,
     pub result: &'a StepResult,
     pub started_at: i64,
+}
+
+impl<'a> WorkflowStepLogInput<'a> {
+    fn new(
+        execution_id: &'a str,
+        step_index: usize,
+        step_name: &'a str,
+        result: &'a StepResult,
+        started_at: i64,
+    ) -> Self {
+        Self {
+            execution_id,
+            step_index,
+            step_name,
+            result,
+            started_at,
+        }
+    }
 }
 
 pub(super) struct WorkflowStepActionInput<'a> {
@@ -153,10 +207,10 @@ impl WorkflowEngine {
         trigger_event_id: Option<i64>,
         context: Option<serde_json::Value>,
     ) -> crate::Result<WorkflowExecution> {
-        let execution_id = generate_workflow_id(workflow_name);
-        self.start_with_id(
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.start_cx(
+            &cx,
             storage,
-            execution_id,
             workflow_name,
             pane_id,
             trigger_event_id,
@@ -215,13 +269,13 @@ impl WorkflowEngine {
         self.start_with_id_cx(
             &cx,
             storage,
-            WorkflowStartInput {
+            WorkflowStartInput::new(
                 execution_id,
-                workflow_name: workflow_name.to_string(),
+                workflow_name.to_string(),
                 pane_id,
                 trigger_event_id,
                 context,
-            },
+            ),
         )
         .await
     }
@@ -444,13 +498,13 @@ impl WorkflowEngine {
         self.update_status_cx(
             &cx,
             storage,
-            WorkflowStatusUpdate {
+            WorkflowStatusUpdate::new(
                 execution_id,
                 status,
                 current_step,
                 wait_condition,
                 error,
-            },
+            ),
         )
         .await
     }
@@ -479,12 +533,8 @@ impl WorkflowEngine {
             StepResult::SendText { .. } => "send_text",
             StepResult::JumpTo { .. } => "jump_to",
         };
-        let result_data = serde_json::to_string(input.result)
-            .inspect_err(
-                |e| tracing::warn!(error = %e, "workflow step result serialization failed"),
-            )
-            .ok();
-        let verification_refs = build_verification_refs(input.result, None);
+        let result_data = Some(serde_json::to_string(input.result)?);
+        let verification_refs = build_verification_refs(input.result, None)?;
         let error_code = step_error_code_from_result(input.result);
 
         let res = storage
@@ -525,13 +575,13 @@ impl WorkflowEngine {
         self.log_step_cx(
             &cx,
             storage,
-            WorkflowStepLogInput {
+            WorkflowStepLogInput::new(
                 execution_id,
                 step_index,
                 step_name,
                 result,
                 started_at,
-            },
+            ),
         )
         .await
     }
@@ -613,7 +663,7 @@ pub(super) fn now_ms() -> i64 {
 pub(super) fn build_verification_refs(
     step_result: &StepResult,
     step_plan: Option<&crate::plan::StepPlan>,
-) -> Option<String> {
+) -> crate::Result<Option<String>> {
     let mut refs: Vec<serde_json::Value> = Vec::new();
 
     if let Some(step_plan) = step_plan {
@@ -653,13 +703,9 @@ pub(super) fn build_verification_refs(
     }
 
     if refs.is_empty() {
-        None
+        Ok(None)
     } else {
-        serde_json::to_string(&refs)
-            .inspect_err(
-                |e| tracing::warn!(error = %e, "workflow verification_refs serialization failed"),
-            )
-            .ok()
+        Ok(Some(serde_json::to_string(&refs)?))
     }
 }
 
@@ -835,10 +881,10 @@ pub fn policy_summary_decision_is_allow(summary: &str) -> Option<bool> {
 
 pub(super) fn policy_summary_from_injection(
     result: &crate::policy::InjectionResult,
-) -> Option<String> {
-    serde_json::to_string(&WorkflowStepPolicySummary::from_injection(result))
-        .inspect_err(|e| tracing::warn!(error = %e, "workflow policy summary serialization failed"))
-        .ok()
+) -> crate::Result<String> {
+    Ok(serde_json::to_string(
+        &WorkflowStepPolicySummary::from_injection(result),
+    )?)
 }
 
 fn policy_error_code_from_decision(
@@ -872,27 +918,26 @@ pub(super) fn policy_error_code_from_injection(
 
 /// ft-xbnl0.2.3 Cx-aware workflow audit action recorder.
 ///
-/// Threads caller cx into `record_audit_action_redacted_with_cx`
-/// so the audit-row write honours cancellation. On cancel the
-/// return is `None` (same as any storage write failure) so callers
-/// in the startup path degrade gracefully — the workflow continues
-/// without a linked audit id rather than aborting.
+/// Threads caller cx into `record_audit_action_redacted_with_cx` and preserves
+/// cancellation/backend failures as typed errors.
 async fn record_workflow_action_with_cx(
     cx: &crate::cx::Cx,
     storage: &crate::storage::StorageHandle,
     input: WorkflowAuditActionInput<'_>,
-) -> Option<i64> {
+) -> crate::Result<i64> {
     let timestamp_ms = now_ms();
-    let decision_context = build_workflow_audit_decision_context(WorkflowAuditDecisionInput {
-        action_kind: input.action_kind,
-        execution_id: input.execution_id,
-        pane_id: input.pane_id,
-        workflow_name: input.workflow_name,
-        input_summary: input.input_summary.as_deref(),
-        result: input.result,
-        decision_reason: input.decision_reason.as_deref(),
-        timestamp_ms,
-    });
+    let decision_context = Some(build_workflow_audit_decision_context(
+        WorkflowAuditDecisionInput {
+            action_kind: input.action_kind,
+            execution_id: input.execution_id,
+            pane_id: input.pane_id,
+            workflow_name: input.workflow_name,
+            input_summary: input.input_summary.as_deref(),
+            result: input.result,
+            decision_reason: input.decision_reason.as_deref(),
+            timestamp_ms,
+        },
+    )?);
     let action = crate::storage::AuditActionRecord {
         id: 0,
         ts: timestamp_ms,
@@ -911,24 +956,14 @@ async fn record_workflow_action_with_cx(
         result: input.result.to_string(),
     };
 
-    match storage
+    storage
         .record_audit_action_redacted_with_cx(cx, action)
         .await
-    {
-        Ok(id) => Some(id),
-        Err(e) => {
-            tracing::warn!(
-                execution_id = input.execution_id,
-                action_kind = input.action_kind,
-                error = %e,
-                "Failed to record workflow audit action (cx path)"
-            );
-            None
-        }
-    }
 }
 
-fn build_workflow_audit_decision_context(input: WorkflowAuditDecisionInput<'_>) -> Option<String> {
+fn build_workflow_audit_decision_context(
+    input: WorkflowAuditDecisionInput<'_>,
+) -> crate::Result<String> {
     let mut context = crate::policy::DecisionContext::new_audit(
         input.timestamp_ms,
         crate::policy::ActionKind::WorkflowRun,
@@ -959,7 +994,7 @@ fn build_workflow_audit_decision_context(input: WorkflowAuditDecisionInput<'_>) 
     if let Some(decision_reason) = input.decision_reason {
         context.add_evidence("decision_reason", decision_reason);
     }
-    serde_json::to_string(&context).ok()
+    Ok(serde_json::to_string(&context)?)
 }
 
 pub(super) async fn record_workflow_start_action(
@@ -969,7 +1004,7 @@ pub(super) async fn record_workflow_start_action(
     pane_id: u64,
     step_count: usize,
     start_step: usize,
-) -> Option<i64> {
+) -> crate::Result<i64> {
     // ft-dit9w: ergonomic wrapper around `record_workflow_start_action_with_cx`.
     let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
     record_workflow_start_action_with_cx(
@@ -986,11 +1021,8 @@ pub(super) async fn record_workflow_start_action(
 
 /// ft-xbnl0.2.3 Cx-first sibling of [`record_workflow_start_action`].
 ///
-/// Routes both the audit-action write and the undo-metadata
-/// upsert through their cx-first storage siblings. On
-/// cancellation the return is `None` (legacy contract: a failed
-/// audit write returns None and the workflow continues without a
-/// linked action id) so the startup path degrades gracefully.
+/// Routes both the audit-action write and undo-metadata upsert through their
+/// Cx-first storage siblings without collapsing either failure.
 pub(super) async fn record_workflow_start_action_with_cx(
     cx: &crate::cx::Cx,
     storage: &crate::storage::StorageHandle,
@@ -999,16 +1031,14 @@ pub(super) async fn record_workflow_start_action_with_cx(
     pane_id: u64,
     step_count: usize,
     start_step: usize,
-) -> Option<i64> {
+) -> crate::Result<i64> {
     let summary = serde_json::json!({
         "workflow_name": workflow_name,
         "execution_id": execution_id,
         "step_count": step_count,
         "start_step": start_step,
     });
-    let summary = serde_json::to_string(&summary)
-        .inspect_err(|e| tracing::warn!(error = %e, "workflow start summary serialization failed"))
-        .ok();
+    let summary = Some(serde_json::to_string(&summary)?);
     let action_id = record_workflow_action_with_cx(
         cx,
         storage,
@@ -1033,29 +1063,21 @@ pub(super) async fn record_workflow_start_action_with_cx(
         undoable: true,
         undo_strategy: "workflow_abort".to_string(),
         undo_hint: Some(format!("ft robot workflow abort {execution_id}")),
-        undo_payload: serde_json::to_string(&undo_payload)
-            .inspect_err(
-                |e| tracing::warn!(error = %e, "workflow undo_payload serialization failed"),
-            )
-            .ok(),
+        undo_payload: Some(serde_json::to_string(&undo_payload)?),
         undone_at: None,
         undone_by: None,
     };
-    if let Err(e) = storage.upsert_action_undo_redacted_with_cx(cx, undo).await {
-        tracing::warn!(
-            execution_id,
-            error = %e,
-            "Failed to record workflow undo metadata (cx path)"
-        );
-    }
+    storage
+        .upsert_action_undo_redacted_with_cx(cx, undo)
+        .await?;
 
-    Some(action_id)
+    Ok(action_id)
 }
 
 pub(super) async fn fetch_workflow_start_action_id(
     storage: &crate::storage::StorageHandle,
     execution_id: &str,
-) -> Option<i64> {
+) -> crate::Result<Option<i64>> {
     // ft-dit9w: ergonomic wrapper around `fetch_workflow_start_action_id_with_cx`.
     let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
     fetch_workflow_start_action_id_with_cx(&cx, storage, execution_id).await
@@ -1063,32 +1085,29 @@ pub(super) async fn fetch_workflow_start_action_id(
 
 /// ft-xbnl0.2.3 Cx-first sibling of [`fetch_workflow_start_action_id`].
 ///
-/// Routes the audit-query through `get_audit_actions_with_cx`.
-/// Returns `None` on cancellation (matches legacy "storage error
-/// → None" contract) so workflow resume paths degrade gracefully
-/// without a new error variant.
+/// Routes the audit query through `get_audit_actions_with_cx`; `None` means no
+/// matching row, while cancellation/backend failure remains an error.
 pub(super) async fn fetch_workflow_start_action_id_with_cx(
     cx: &crate::cx::Cx,
     storage: &crate::storage::StorageHandle,
     execution_id: &str,
-) -> Option<i64> {
+) -> crate::Result<Option<i64>> {
     let query = crate::storage::AuditQuery {
         limit: Some(1),
         actor_id: Some(execution_id.to_string()),
         action_kind: Some("workflow_start".to_string()),
         ..Default::default()
     };
-    storage
+    let mut rows = storage
         .get_audit_actions_with_cx(cx, query)
-        .await
-        .ok()
-        .and_then(|mut rows| rows.pop().map(|row| row.id))
+        .await?;
+    Ok(rows.pop().map(|row| row.id))
 }
 
 pub(super) async fn record_workflow_step_action(
     storage: &crate::storage::StorageHandle,
     input: WorkflowStepActionInput<'_>,
-) -> Option<i64> {
+) -> crate::Result<i64> {
     // ft-dit9w: ergonomic wrapper around `record_workflow_step_action_with_cx`.
     let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
     record_workflow_step_action_with_cx(&cx, storage, input).await
@@ -1103,7 +1122,7 @@ pub(super) async fn record_workflow_step_action_with_cx(
     cx: &crate::cx::Cx,
     storage: &crate::storage::StorageHandle,
     input: WorkflowStepActionInput<'_>,
-) -> Option<i64> {
+) -> crate::Result<i64> {
     let summary = serde_json::json!({
         "workflow_name": input.workflow_name,
         "execution_id": input.execution_id,
@@ -1114,9 +1133,7 @@ pub(super) async fn record_workflow_step_action_with_cx(
         "result_type": input.result_type,
         "parent_action_id": input.parent_action_id,
     });
-    let summary = serde_json::to_string(&summary)
-        .inspect_err(|e| tracing::warn!(error = %e, "workflow step summary serialization failed"))
-        .ok();
+    let summary = Some(serde_json::to_string(&summary)?);
     record_workflow_action_with_cx(
         cx,
         storage,
@@ -1145,7 +1162,7 @@ pub(super) async fn record_workflow_terminal_action(
     step_index: Option<usize>,
     steps_executed: Option<usize>,
     start_action_id: Option<i64>,
-) {
+) -> crate::Result<()> {
     // ft-dit9w: ergonomic wrapper around `record_workflow_terminal_action_with_cx`.
     let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
     record_workflow_terminal_action_with_cx(
@@ -1161,16 +1178,16 @@ pub(super) async fn record_workflow_terminal_action(
         steps_executed,
         start_action_id,
     )
-    .await;
+    .await
 }
 
 /// ft-xbnl0.2.3 Cx-first sibling of [`record_workflow_terminal_action`].
 ///
-/// Tick 185: routes both inner writes through cx-aware paths:
+/// Routes both inner writes through Cx-aware paths:
 /// `record_workflow_action_with_cx` for the audit row and
 /// `storage.upsert_action_undo_redacted_with_cx` for undo metadata.
-/// Preserves the "fire-and-forget on error" contract — every
-/// audit/undo failure is warn-and-continue, not fail-fast.
+/// Cancellation/backend failures remain typed and cannot be mistaken for a
+/// successfully persisted terminal audit.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn record_workflow_terminal_action_with_cx(
     cx: &crate::cx::Cx,
@@ -1184,7 +1201,7 @@ pub(super) async fn record_workflow_terminal_action_with_cx(
     step_index: Option<usize>,
     steps_executed: Option<usize>,
     start_action_id: Option<i64>,
-) {
+) -> crate::Result<()> {
     let summary = serde_json::json!({
         "workflow_name": workflow_name,
         "execution_id": execution_id,
@@ -1193,12 +1210,8 @@ pub(super) async fn record_workflow_terminal_action_with_cx(
         "steps_executed": steps_executed,
         "parent_action_id": start_action_id,
     });
-    let summary = serde_json::to_string(&summary)
-        .inspect_err(
-            |e| tracing::warn!(error = %e, "workflow terminal summary serialization failed"),
-        )
-        .ok();
-    let _ = record_workflow_action_with_cx(
+    let summary = Some(serde_json::to_string(&summary)?);
+    record_workflow_action_with_cx(
         cx,
         storage,
         WorkflowAuditActionInput {
@@ -1211,7 +1224,7 @@ pub(super) async fn record_workflow_terminal_action_with_cx(
             decision_reason: reason.map(str::to_string),
         },
     )
-    .await;
+    .await?;
 
     if let Some(start_action_id) = start_action_id {
         let undo = crate::storage::ActionUndoRecord {
@@ -1223,63 +1236,11 @@ pub(super) async fn record_workflow_terminal_action_with_cx(
             undone_at: None,
             undone_by: None,
         };
-        if let Err(e) = storage.upsert_action_undo_redacted_with_cx(cx, undo).await {
-            tracing::warn!(
-                execution_id,
-                error = %e,
-                "Failed to update workflow undo metadata (cx path)"
-            );
-        }
+        storage
+            .upsert_action_undo_redacted_with_cx(cx, undo)
+            .await?;
     }
-}
-
-/// Tick 185: dispatcher for record_workflow_terminal_action call sites.
-/// Takes `Option<&Cx>` — when Some routes through the cx-first variant,
-/// otherwise falls through to the legacy helper.
-#[allow(clippy::too_many_arguments)]
-pub(super) async fn record_workflow_terminal_action_maybe_cx(
-    cx: Option<&crate::cx::Cx>,
-    storage: &crate::storage::StorageHandle,
-    workflow_name: &str,
-    execution_id: &str,
-    pane_id: u64,
-    action_kind: &str,
-    result: &str,
-    reason: Option<&str>,
-    step_index: Option<usize>,
-    steps_executed: Option<usize>,
-    start_action_id: Option<i64>,
-) {
-    if let Some(cx) = cx {
-        record_workflow_terminal_action_with_cx(
-            cx,
-            storage,
-            workflow_name,
-            execution_id,
-            pane_id,
-            action_kind,
-            result,
-            reason,
-            step_index,
-            steps_executed,
-            start_action_id,
-        )
-        .await;
-        return;
-    }
-    record_workflow_terminal_action(
-        storage,
-        workflow_name,
-        execution_id,
-        pane_id,
-        action_kind,
-        result,
-        reason,
-        step_index,
-        steps_executed,
-        start_action_id,
-    )
-    .await;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1578,7 +1539,8 @@ mod tests {
                     parent_action_id: Some(41),
                 },
             )
-            .await;
+            .await
+            .expect("workflow step audit should persist");
         });
 
         let audit = latest_audit_action(&db_path, "workflow_step");
@@ -2118,18 +2080,27 @@ mod tests {
 
     #[test]
     fn build_verification_refs_none_for_continue() {
-        assert!(build_verification_refs(&StepResult::Continue, None).is_none());
+        assert!(
+            build_verification_refs(&StepResult::Continue, None)
+                .expect("verification refs should serialize")
+                .is_none()
+        );
     }
 
     #[test]
     fn build_verification_refs_none_for_done() {
-        assert!(build_verification_refs(&StepResult::done_empty(), None).is_none());
+        assert!(
+            build_verification_refs(&StepResult::done_empty(), None)
+                .expect("verification refs should serialize")
+                .is_none()
+        );
     }
 
     #[test]
     fn build_verification_refs_includes_wait_for() {
         let result = StepResult::wait_for_with_timeout(WaitCondition::pattern("test.rule"), 5000);
-        let refs = build_verification_refs(&result, None);
+        let refs = build_verification_refs(&result, None)
+            .expect("verification refs should serialize");
         assert!(refs.is_some());
         let json: serde_json::Value = serde_json::from_str(&refs.unwrap()).unwrap();
         let arr = json.as_array().unwrap();
@@ -2144,7 +2115,8 @@ mod tests {
             WaitCondition::pane_idle(2000),
             10_000,
         );
-        let refs = build_verification_refs(&result, None);
+        let refs = build_verification_refs(&result, None)
+            .expect("verification refs should serialize");
         assert!(refs.is_some());
         let json: serde_json::Value = serde_json::from_str(&refs.unwrap()).unwrap();
         let arr = json.as_array().unwrap();
@@ -2155,7 +2127,11 @@ mod tests {
     #[test]
     fn build_verification_refs_send_text_without_wait_is_none() {
         let result = StepResult::send_text("hello".to_string());
-        assert!(build_verification_refs(&result, None).is_none());
+        assert!(
+            build_verification_refs(&result, None)
+                .expect("verification refs should serialize")
+                .is_none()
+        );
     }
 
     #[test]
@@ -2176,7 +2152,8 @@ mod tests {
             description: Some("verify idle".to_string()),
             timeout_ms: Some(5000),
         });
-        let refs = build_verification_refs(&StepResult::Continue, Some(&step_plan));
+        let refs = build_verification_refs(&StepResult::Continue, Some(&step_plan))
+            .expect("verification refs should serialize");
         assert!(refs.is_some());
         let json: serde_json::Value = serde_json::from_str(&refs.unwrap()).unwrap();
         let arr = json.as_array().unwrap();

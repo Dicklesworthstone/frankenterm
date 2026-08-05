@@ -24171,13 +24171,12 @@ fn classify_watch_outer_failure(
 /// Mint a tightly bounded capability for the completion/compensation phase of
 /// a delivery whose lease is already durable. It deliberately does not inherit
 /// caller cancellation: once output has returned, release/finalize must get an
-/// independent chance to settle durable ownership. The finite deadline and
-/// minimal poll quota prevent cleanup from becoming an unbounded escape path.
+/// independent chance to settle durable ownership. The caller wraps every use
+/// in a separate finite timeout; the fresh Cx itself deliberately carries no
+/// synthetic deadline because `Cx::for_request` does not inherit the active
+/// runtime's logical clock.
 fn watch_claim_completion_cx() -> frankenterm_core::cx::Cx {
-    frankenterm_core::runtime_async::fresh_request_cx_with_budget_timeout(
-        frankenterm_core::cx::Budget::MINIMAL,
-        WATCH_EVENTS_CLAIM_COMPLETION_TIMEOUT,
-    )
+    frankenterm_core::cx::for_request()
 }
 
 async fn release_watch_claim_bounded(
@@ -35274,7 +35273,7 @@ async fn run_watcher(
                             detection,
                             event_id,
                         }) => {
-                            let outcome = pipeline
+                            let outcome = match pipeline
                                 .handle_detection_with_cx(
                                     &cx,
                                     &detection,
@@ -35282,7 +35281,36 @@ async fn run_watcher(
                                     pane_uuid.as_deref(),
                                     event_id,
                                 )
-                                .await;
+                                .await
+                            {
+                                Ok(outcome) => outcome,
+                                Err(error) => {
+                                    let cancelled = matches!(
+                                        &error,
+                                        frankenterm_core::Error::Cancelled(_)
+                                            | frankenterm_core::Error::RuntimeOperation {
+                                                source: frankenterm_core::error::RuntimeOperationSource::Cancelled(_),
+                                                ..
+                                            }
+                                    );
+                                    if cancelled {
+                                        tracing::info!(
+                                            pane_id,
+                                            rule_id = %detection.rule_id,
+                                            error = %error,
+                                            "Notification pipeline cancelled during mute check"
+                                        );
+                                        break;
+                                    }
+                                    tracing::warn!(
+                                        pane_id,
+                                        rule_id = %detection.rule_id,
+                                        error = %error,
+                                        "Notification pipeline mute check failed"
+                                    );
+                                    continue;
+                                }
+                            };
                             match &outcome.decision {
                                 NotifyDecision::Send {
                                     suppressed_since_last,
@@ -35758,7 +35786,7 @@ async fn run_watcher(
                 }
             });
             frankenterm_core::runtime_async::task::spawn(async move {
-                engine_for_loop
+                if let Err(error) = engine_for_loop
                     .run_periodic(snap_shutdown_rx, move || async move {
                         let wez =
                             frankenterm_core::wezterm::wezterm_handle_with_timeout(loop_timeout);
@@ -35767,7 +35795,17 @@ async fn run_watcher(
                             .unwrap_or_else(frankenterm_core::cx::for_request);
                         wez.list_panes_with_cx(&probe_cx).await.ok()
                     })
-                    .await;
+                    .await
+                {
+                    match error {
+                        frankenterm_core::snapshot_engine::SnapshotError::Cancelled => {
+                            tracing::info!("snapshot scheduler cancelled");
+                        }
+                        other => {
+                            tracing::warn!(%other, "snapshot scheduler failed");
+                        }
+                    }
+                }
             });
             tracing::info!("Snapshot engine started");
             Some(engine)
@@ -68147,11 +68185,8 @@ fn session_mmap_replay_json(
     })
 }
 
-fn session_recovery_deadline_cx(timeout_seconds: u64) -> frankenterm_core::cx::Cx {
-    frankenterm_core::runtime_async::fresh_request_cx_with_budget_timeout(
-        frankenterm_core::cx::Budget::new(),
-        std::time::Duration::from_secs(timeout_seconds.max(1)),
-    )
+fn session_recovery_operation_cx() -> frankenterm_core::cx::Cx {
+    frankenterm_core::cx::for_request()
 }
 
 async fn session_recovery_create_pane(
@@ -68186,8 +68221,20 @@ async fn session_recovery_list_panes_on_runtime_task(
     timeout_seconds: u64,
 ) -> frankenterm_core::Result<Vec<frankenterm_core::wezterm::PaneInfo>> {
     let task = frankenterm_core::runtime_async::task::spawn(async move {
-        let cx = session_recovery_deadline_cx(timeout_seconds);
-        wezterm.list_panes_with_cx(&cx).await
+        let cx = session_recovery_operation_cx();
+        match frankenterm_core::runtime_async::timeout_with_cx(
+            &cx,
+            Duration::from_secs(timeout_seconds.max(1)),
+            wezterm.list_panes_with_cx(&cx),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(error) => Err(frankenterm_core::Error::RuntimeOperation {
+                operation: "session.recovery.list_panes.timeout",
+                source: frankenterm_core::error::RuntimeOperationSource::Backend(error),
+            }),
+        }
     });
     task.await
         .map_err(|err| frankenterm_core::Error::RuntimeOperation {
@@ -68202,16 +68249,26 @@ async fn session_recovery_split_pane_on_runtime_task(
     source_pane_id: u64,
 ) -> frankenterm_core::Result<u64> {
     let task = frankenterm_core::runtime_async::task::spawn(async move {
-        let cx = session_recovery_deadline_cx(timeout_seconds);
-        wezterm
-            .split_pane_with_cx(
+        let cx = session_recovery_operation_cx();
+        match frankenterm_core::runtime_async::timeout_with_cx(
+            &cx,
+            Duration::from_secs(timeout_seconds.max(1)),
+            wezterm.split_pane_with_cx(
                 &cx,
                 source_pane_id,
                 frankenterm_core::wezterm::SplitDirection::Right,
                 None,
                 Some(50),
-            )
-            .await
+            ),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(error) => Err(frankenterm_core::Error::RuntimeOperation {
+                operation: "session.recovery.split_pane.timeout",
+                source: frankenterm_core::error::RuntimeOperationSource::Backend(error),
+            }),
+        }
     });
     task.await
         .map_err(|err| frankenterm_core::Error::RuntimeOperation {
@@ -68227,10 +68284,20 @@ async fn session_recovery_send_text_on_runtime_task(
     text: String,
 ) -> frankenterm_core::Result<()> {
     let task = frankenterm_core::runtime_async::task::spawn(async move {
-        let cx = session_recovery_deadline_cx(timeout_seconds);
-        wezterm
-            .send_text_with_options_with_cx(&cx, pane_id, &text, true, true)
-            .await
+        let cx = session_recovery_operation_cx();
+        match frankenterm_core::runtime_async::timeout_with_cx(
+            &cx,
+            Duration::from_secs(timeout_seconds.max(1)),
+            wezterm.send_text_with_options_with_cx(&cx, pane_id, &text, true, true),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(error) => Err(frankenterm_core::Error::RuntimeOperation {
+                operation: "session.recovery.send_text.timeout",
+                source: frankenterm_core::error::RuntimeOperationSource::Backend(error),
+            }),
+        }
     });
     task.await
         .map_err(|err| frankenterm_core::Error::RuntimeOperation {

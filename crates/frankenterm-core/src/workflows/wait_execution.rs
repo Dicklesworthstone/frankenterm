@@ -318,7 +318,8 @@ impl<'a, S: PaneTextSource + Sync + ?Sized> WaitConditionExecutor<'a, S> {
         context_pane_id: u64,
         timeout: Duration,
     ) -> crate::Result<WaitConditionResult> {
-        self.execute_maybe_cx(None, condition, context_pane_id, timeout)
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.execute_with_cx(&cx, condition, context_pane_id, timeout)
             .await
     }
 

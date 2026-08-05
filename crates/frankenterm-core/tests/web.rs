@@ -2,6 +2,8 @@
 mod web_tests {
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::sync::Arc;
+    #[cfg(feature = "asupersync-runtime")]
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
 
     use frankenterm_core::events::{Event, EventBus};
@@ -16,6 +18,11 @@ mod web_tests {
     use frankenterm_core::web::{WebRuntimeLimits, WebServerConfig, start_web_server};
     #[cfg(feature = "asupersync-runtime")]
     use frankenterm_core::web::{run_web_server_with_cx, start_web_server_with_cx};
+    #[cfg(feature = "asupersync-runtime")]
+    use frankenterm_core::web_framework::{
+        FrameworkApp, FrameworkResponse, FrameworkResponseBody, FrameworkStartupHookError,
+        FrameworkWebRuntime,
+    };
 
     fn run_async_test<F>(future: F)
     where
@@ -254,6 +261,116 @@ mod web_tests {
         });
     }
 
+    /// Dropping an idle live handle cannot await graceful cleanup, but its
+    /// owned runtime guard must synchronously signal shutdown and wake the
+    /// listener so the accept task releases its socket.
+    #[test]
+    fn dropped_idle_web_server_handle_releases_listener() {
+        run_async_test(async {
+            let server = start_web_server(WebServerConfig::default().with_port(0))
+                .await
+                .expect("server should start");
+            let addr = server.bound_addr();
+            let response = fetch_health(addr)
+                .await
+                .expect("server should answer before handle drop");
+            assert!(response.contains("200"));
+
+            drop(server);
+
+            let mut listener_closed = false;
+            for _ in 0..50 {
+                match TcpStream::connect(addr).await {
+                    Ok(stream) => {
+                        drop(stream);
+                        sleep(Duration::from_millis(20)).await;
+                    }
+                    Err(_) => {
+                        listener_closed = true;
+                        break;
+                    }
+                }
+            }
+            assert!(
+                listener_closed,
+                "Drop fallback must stop the serve task and release {addr}"
+            );
+        });
+    }
+
+    /// A connection that stalls mid-request must not serialize the accept
+    /// loop. A later health request should complete while the first connection
+    /// is still waiting for the rest of its request bytes.
+    #[test]
+    fn web_server_serves_concurrent_connection_while_prior_read_is_stalled() {
+        run_async_test(async {
+            let server = start_web_server(WebServerConfig::default().with_port(0))
+                .await
+                .expect("server should start");
+            let addr = server.bound_addr();
+            let mut stalled = TcpStream::connect(addr)
+                .await
+                .expect("stalled connection should connect");
+            stalled
+                .write_all(b"G")
+                .await
+                .expect("partial request byte should write");
+
+            // Let the accept loop hand the partial request to a connection
+            // task before opening the independent health request.
+            sleep(Duration::from_millis(50)).await;
+            let health = timeout(Duration::from_millis(750), fetch_health(addr))
+                .await
+                .expect("health request must not wait for the stalled connection")
+                .expect("health request should succeed");
+            assert!(health.contains("200"));
+
+            drop(stalled);
+            server.shutdown().await.expect("server should shut down");
+        });
+    }
+
+    /// Graceful shutdown must be bounded even when a client leaves an HTTP
+    /// request incomplete. The configured idle-read timeout closes the stuck
+    /// connection inside the server's bounded drain window.
+    #[test]
+    fn web_shutdown_bounds_stalled_connection_read() {
+        run_async_test(async {
+            let server = start_web_server(WebServerConfig::default().with_port(0))
+                .await
+                .expect("server should start");
+            let addr = server.bound_addr();
+            let mut stalled = TcpStream::connect(addr)
+                .await
+                .expect("stalled connection should connect");
+            stalled
+                .write_all(b"G")
+                .await
+                .expect("partial request byte should write");
+            sleep(Duration::from_millis(50)).await;
+
+            let started = Instant::now();
+            let shutdown = timeout(Duration::from_secs(5), server.shutdown())
+                .await
+                .expect("bounded web shutdown must not hit the outer timeout");
+            let elapsed = started.elapsed();
+            shutdown.expect("stalled idle read should drain within the configured bound");
+            assert!(
+                elapsed < Duration::from_secs(3),
+                "stalled-read shutdown exceeded its drain bound: {elapsed:?}"
+            );
+
+            let mut byte = [0_u8; 1];
+            match timeout(Duration::from_secs(1), stalled.read(&mut byte)).await {
+                Ok(Ok(0)) | Ok(Err(_)) => {}
+                Ok(Ok(count)) => panic!(
+                    "stalled connection should close without response bytes, read {count} byte(s)"
+                ),
+                Err(error) => panic!("stalled connection remained open after shutdown: {error}"),
+            }
+        });
+    }
+
     /// ft-xbnl0.2.3 Cx-first: verify
     /// `start_web_server_with_cx` + `shutdown_with_cx` roundtrip
     /// on an ephemeral port, identically to the legacy pair. An
@@ -278,6 +395,325 @@ mod web_tests {
 
             assert!(response.contains("200"));
             assert!(response.contains("\"ok\":true"));
+        });
+    }
+
+    /// Cancellation requested by a completed startup hook is a post-startup
+    /// failure: shutdown hooks must run before the cancellation is returned.
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn web_startup_cancellation_rolls_back_shutdown_hooks() {
+        run_async_test(async {
+            let startup_count = Arc::new(AtomicUsize::new(0));
+            let shutdown_count = Arc::new(AtomicUsize::new(0));
+            let startup_count_for_hook = Arc::clone(&startup_count);
+            let shutdown_count_for_hook = Arc::clone(&shutdown_count);
+            let cx = frankenterm_core::cx::for_request();
+            let cx_for_hook = cx.clone();
+            let app = FrameworkApp::builder()
+                .on_startup(move || {
+                    startup_count_for_hook.fetch_add(1, Ordering::SeqCst);
+                    cx_for_hook.cancel_with(
+                        frankenterm_core::outcome::CancelKind::User,
+                        Some("cancel from web startup hook rollback test"),
+                    );
+                    Ok(())
+                })
+                .on_shutdown(move || {
+                    shutdown_count_for_hook.fetch_add(1, Ordering::SeqCst);
+                })
+                .build();
+
+            let result =
+                FrameworkWebRuntime::start_with_cx(&cx, "127.0.0.1:0".to_string(), app).await;
+
+            let error = result
+                .err()
+                .expect("post-hook cancellation must fail startup");
+            assert!(
+                error.to_string().contains("cancelled"),
+                "primary cancellation must survive startup rollback: {error}"
+            );
+            assert_eq!(startup_count.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                shutdown_count.load(Ordering::SeqCst),
+                1,
+                "post-startup cancellation must run shutdown hooks exactly once"
+            );
+        });
+    }
+
+    /// A fatal startup hook can abort after earlier hooks acquired resources;
+    /// shutdown hooks must roll those resources back before the fatal hook
+    /// error is returned.
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn web_startup_abort_rolls_back_shutdown_hooks() {
+        run_async_test(async {
+            let startup_count = Arc::new(AtomicUsize::new(0));
+            let shutdown_count = Arc::new(AtomicUsize::new(0));
+            let startup_count_for_hook = Arc::clone(&startup_count);
+            let shutdown_count_for_hook = Arc::clone(&shutdown_count);
+            let app = FrameworkApp::builder()
+                .on_startup(move || {
+                    startup_count_for_hook.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                })
+                .on_startup(|| Err(FrameworkStartupHookError::new("fatal-startup-sentinel")))
+                .on_shutdown(move || {
+                    shutdown_count_for_hook.fetch_add(1, Ordering::SeqCst);
+                })
+                .build();
+            let cx = frankenterm_core::cx::for_request();
+
+            let result =
+                FrameworkWebRuntime::start_with_cx(&cx, "127.0.0.1:0".to_string(), app).await;
+
+            let error = result.err().expect("fatal startup hook must abort startup");
+            assert!(
+                error.to_string().contains("fatal-startup-sentinel"),
+                "fatal startup hook error must remain primary: {error}"
+            );
+            assert_eq!(startup_count.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                shutdown_count.load(Ordering::SeqCst),
+                1,
+                "startup abort must run shutdown hooks exactly once"
+            );
+        });
+    }
+
+    /// A bind failure after successful startup hooks must also roll back the
+    /// hook lifecycle, while preserving the bind error as the primary result.
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn web_bind_failure_rolls_back_shutdown_hooks() {
+        run_async_test(async {
+            let occupied = TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("port reservation should bind");
+            let occupied_addr = occupied
+                .local_addr()
+                .expect("port reservation should expose its address");
+            let startup_count = Arc::new(AtomicUsize::new(0));
+            let shutdown_count = Arc::new(AtomicUsize::new(0));
+            let startup_count_for_hook = Arc::clone(&startup_count);
+            let shutdown_count_for_hook = Arc::clone(&shutdown_count);
+            let app = FrameworkApp::builder()
+                .on_startup(move || {
+                    startup_count_for_hook.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                })
+                .on_shutdown(move || {
+                    shutdown_count_for_hook.fetch_add(1, Ordering::SeqCst);
+                })
+                .build();
+            let cx = frankenterm_core::cx::for_request();
+
+            let result = FrameworkWebRuntime::start_with_cx(
+                &cx,
+                occupied_addr.to_string(),
+                app,
+            )
+            .await;
+
+            let error = result.err().expect("occupied address must fail startup");
+            let error_message = error.to_string();
+            assert!(
+                error_message.contains("I/O")
+                    || error_message.contains("address")
+                    || error_message.contains("Address"),
+                "primary bind failure must survive startup rollback: {error_message}"
+            );
+            assert_eq!(startup_count.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                shutdown_count.load(Ordering::SeqCst),
+                1,
+                "bind failure must run shutdown hooks exactly once"
+            );
+            drop(occupied);
+        });
+    }
+
+    /// A caller that is already cancelled when it consumes a server handle
+    /// must still release the listener and complete graceful cleanup before
+    /// receiving the cancellation error.
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn web_shutdown_with_precancelled_cx_cleans_before_error() {
+        run_async_test(async {
+            let start_cx = frankenterm_core::cx::for_request();
+            let server =
+                start_web_server_with_cx(&start_cx, WebServerConfig::default().with_port(0))
+                    .await
+                    .expect("server should start with a live Cx");
+            let addr = server.bound_addr();
+            let response = fetch_health(addr)
+                .await
+                .expect("server should answer before shutdown");
+            assert!(response.contains("200"));
+
+            let shutdown_cx = frankenterm_core::cx::for_request();
+            shutdown_cx.cancel_with(
+                frankenterm_core::outcome::CancelKind::User,
+                Some("pre-cancelled WebServerHandle shutdown test"),
+            );
+
+            let error = server
+                .shutdown_with_cx(&shutdown_cx)
+                .await
+                .expect_err("shutdown must surface cancellation after cleanup");
+            assert!(
+                error.to_string().contains("cancelled"),
+                "shutdown should return the caller cancellation: {error}"
+            );
+
+            let reconnect = timeout(Duration::from_secs(1), TcpStream::connect(addr)).await;
+            assert!(
+                matches!(reconnect, Ok(Err(_))),
+                "listener must be closed before shutdown returns: {reconnect:?}"
+            );
+        });
+    }
+
+    /// Framework cleanup must run registered shutdown hooks before it observes
+    /// cancellation of the context supplied to the finish phase.
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn web_finish_with_precancelled_cx_runs_shutdown_hooks() {
+        run_async_test(async {
+            let shutdown_count = Arc::new(AtomicUsize::new(0));
+            let shutdown_count_for_hook = Arc::clone(&shutdown_count);
+            let app = FrameworkApp::builder()
+                .get("/health", |_, _| async { FrameworkResponse::ok() })
+                .on_shutdown(move || {
+                    shutdown_count_for_hook.fetch_add(1, Ordering::SeqCst);
+                })
+                .build();
+            let start_cx = frankenterm_core::cx::for_request();
+            let (addr, mut runtime) = FrameworkWebRuntime::start_with_cx(
+                &start_cx,
+                "127.0.0.1:0".to_string(),
+                app,
+            )
+            .await
+            .expect("framework server should start");
+            let response = fetch_health(addr)
+                .await
+                .expect("framework server should answer before shutdown");
+            assert!(response.contains("200"));
+
+            runtime.signal_shutdown();
+            let join_result = runtime.join_handle_mut().await;
+            let finish_cx = frankenterm_core::cx::for_request();
+            finish_cx.cancel_with(
+                frankenterm_core::outcome::CancelKind::User,
+                Some("pre-cancelled framework finish test"),
+            );
+
+            let error = runtime
+                .finish_with_cx(&finish_cx, join_result)
+                .await
+                .expect_err("finish must surface cancellation after shutdown hooks");
+            assert!(
+                error.to_string().contains("cancelled"),
+                "finish should return the cleanup-context cancellation: {error}"
+            );
+            assert_eq!(
+                shutdown_count.load(Ordering::SeqCst),
+                1,
+                "finish must run shutdown hooks exactly once before returning cancellation"
+            );
+        });
+    }
+
+    /// A handler that outlives both bounded drain phases must produce a
+    /// truthful drain error rather than a false successful-shutdown result.
+    /// The test releases the synthetic handler afterward so no task is left
+    /// behind in the test runtime.
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn web_finish_reports_connection_that_survives_bounded_drain() {
+        run_async_test(async {
+            let handler_started = Arc::new(AtomicUsize::new(0));
+            let release_handler = Arc::new(AtomicUsize::new(0));
+            let started_for_handler = Arc::clone(&handler_started);
+            let release_for_handler = Arc::clone(&release_handler);
+            let app = FrameworkApp::builder()
+                .get("/stuck", move |_, _| {
+                    let started = Arc::clone(&started_for_handler);
+                    let release = Arc::clone(&release_for_handler);
+                    async move {
+                        started.store(1, Ordering::SeqCst);
+                        while release.load(Ordering::SeqCst) == 0 {
+                            sleep(Duration::from_millis(10)).await;
+                        }
+                        FrameworkResponse::ok()
+                            .body(FrameworkResponseBody::Bytes(b"released".to_vec()))
+                    }
+                })
+                .build();
+            let cx = frankenterm_core::cx::for_request();
+            let (addr, mut runtime) = FrameworkWebRuntime::start_with_cx(
+                &cx,
+                "127.0.0.1:0".to_string(),
+                app,
+            )
+            .await
+            .expect("framework server should start");
+            let mut client = TcpStream::connect(addr)
+                .await
+                .expect("stuck-handler client should connect");
+            client
+                .write_all(
+                    b"GET /stuck HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .expect("stuck-handler request should write");
+
+            let handler_start = timeout(Duration::from_secs(1), async {
+                while handler_started.load(Ordering::SeqCst) == 0 {
+                    sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await;
+            if let Err(error) = handler_start {
+                release_handler.store(1, Ordering::SeqCst);
+                panic!("stuck handler should start: {error}");
+            }
+
+            let started = Instant::now();
+            let finish_result = timeout(Duration::from_secs(6), async move {
+                runtime.signal_shutdown();
+                let join_result = runtime.join_handle_mut().await;
+                runtime.finish_with_cx(&cx, join_result).await
+            })
+            .await;
+            let elapsed = started.elapsed();
+            release_handler.store(1, Ordering::SeqCst);
+            let error = finish_result
+                .expect("two bounded drain phases must not hit the outer timeout")
+                .expect_err("a connection beyond both drain bounds must be reported");
+            let message = error.to_string();
+            assert!(
+                message.contains("active connection") && message.contains("drain"),
+                "bounded-drain failure must report the live connection: {message}"
+            );
+            assert!(
+                elapsed < Duration::from_secs(5),
+                "two bounded drain phases exceeded their combined limit: {elapsed:?}"
+            );
+
+            let mut response = Vec::new();
+            timeout(Duration::from_secs(1), client.read_to_end(&mut response))
+                .await
+                .expect("released synthetic connection should close")
+                .expect("released synthetic response should read");
+            assert!(
+                String::from_utf8_lossy(&response).contains("released"),
+                "released handler should complete its response"
+            );
+            task::yield_now().await;
         });
     }
 
@@ -324,45 +760,62 @@ mod web_tests {
     }
 
     /// ft-xbnl0.2.4 tick 417: `run_web_server_with_cx` orchestrator-level
-    /// mid-flight cx-cancel exits gracefully.
+    /// mid-flight cx-cancel completes graceful cleanup and then surfaces the
+    /// cancellation.
     ///
     /// Complements `web_server_with_cx_pre_cancelled_refuses_to_bind` (tick 323),
     /// which pins the pre-start timing. This test pins the mid-flight
     /// timing: cx is live when `run_web_server_with_cx` is called, the
     /// server binds and enters its `select! { join | shutdown_signal }`
-    /// orchestration, then a separate task cancels cx ~200 ms later.
+    /// orchestration, then the test confirms a health response before
+    /// cancelling the caller Cx.
     ///
-    /// `wait_for_shutdown_signal_with_cx` polls `cx.is_cancel_requested()`
-    /// every 100 ms via `sleep_with_cx`, so cx-cancel must wake the
-    /// shutdown branch, which then runs the graceful `signal_shutdown` +
-    /// `poke_listener` + drain path. The net observable effect: the
-    /// outer `run_web_server_with_cx` future resolves to `Ok(())` within
-    /// one or two poll cycles.
+    /// `wait_for_shutdown_signal_with_cx` checks the caller context every
+    /// 100 ms via `sleep_with_cx`, so cx-cancel must wake the shutdown branch,
+    /// which then runs `signal_shutdown` (including listener wake), followed by
+    /// drain and hooks under an independent cleanup context. Only after that
+    /// cleanup completes may the outer future return the cancellation error.
     ///
     /// This pins the orchestrator-level cx→shutdown wiring that was
     /// previously only covered by the pre-cancel pre-bind path.
     #[cfg(feature = "asupersync-runtime")]
     #[test]
-    fn web_server_with_cx_mid_flight_cancel_exits_cleanly() {
+    fn web_server_with_cx_mid_flight_cancel_surfaces_after_cleanup() {
         run_async_test(async {
             let cx = frankenterm_core::cx::for_request();
-            let cx_for_cancel = cx.clone();
+            let cx_for_server = cx.clone();
+
+            // Reserve a currently free port so the test can prove the server
+            // completed startup before cancellation. There is an unavoidable
+            // small release/rebind race, but readiness is verified below.
+            let port_probe = TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("ephemeral-port probe should bind");
+            let addr = port_probe
+                .local_addr()
+                .expect("ephemeral-port probe should expose its address");
+            drop(port_probe);
 
             let server_task = task::spawn(async move {
-                run_web_server_with_cx(&cx, WebServerConfig::default().with_port(0)).await
+                run_web_server_with_cx(
+                    &cx_for_server,
+                    WebServerConfig::default().with_port(addr.port()),
+                )
+                .await
             });
 
-            // Give the server time to bind + enter the select! loop.
-            task::spawn(async move {
-                sleep(Duration::from_millis(200)).await;
-                cx_for_cancel.cancel_with(
-                    frankenterm_core::outcome::CancelKind::User,
-                    Some("mid-flight cancel run_web_server_with_cx test"),
-                );
-            });
+            let response = fetch_health(addr)
+                .await
+                .expect("server must start successfully before mid-flight cancellation");
+            assert!(response.contains("200"));
 
-            // The orchestrator should exit within ~1s: 200ms pre-cancel
-            // delay + up to 100ms poll cycle + graceful shutdown drain.
+            cx.cancel_with(
+                frankenterm_core::outcome::CancelKind::User,
+                Some("mid-flight cancel run_web_server_with_cx test"),
+            );
+
+            // The orchestrator should exit within one or two 100ms poll cycles
+            // plus graceful shutdown drain time.
             let started = Instant::now();
             let outer = timeout(Duration::from_secs(10), server_task).await;
             let elapsed = started.elapsed();
@@ -373,7 +826,14 @@ mod web_tests {
             );
             let join = outer.expect("outer timeout should not fire");
             let inner = join.expect("run_web_server_with_cx task must not panic");
-            inner.expect("run_web_server_with_cx must return Ok on cx-cancel");
+            let error = inner.expect_err(
+                "run_web_server_with_cx must surface caller cancellation after cleanup",
+            );
+            let message = error.to_string();
+            assert!(
+                message.contains("cancelled") || message.contains("shutdown wait"),
+                "returned error must identify cancellation: {message}"
+            );
         });
     }
 

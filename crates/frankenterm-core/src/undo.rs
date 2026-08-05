@@ -23,6 +23,17 @@ fn undo_cancelled_error(operation: &'static str, detail: impl Into<String>) -> E
     }
 }
 
+fn is_undo_cancellation(error: &Error) -> bool {
+    matches!(
+        error,
+        Error::Cancelled(_)
+            | Error::RuntimeOperation {
+                source: RuntimeOperationSource::Cancelled(_),
+                ..
+            }
+    )
+}
+
 /// Outcome classification for undo execution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -171,100 +182,18 @@ impl UndoExecutor {
 
     /// Execute undo for a single recorded audit action.
     pub async fn execute(&self, request: UndoRequest) -> Result<UndoExecutionResult> {
-        let mut history = self
-            .storage
-            .get_action_history(ActionHistoryQuery {
-                audit_action_id: Some(request.action_id),
-                limit: Some(1),
-                ..Default::default()
-            })
-            .await?;
-
-        let Some(action) = history.pop() else {
-            return Ok(UndoExecutionResult::not_applicable(
-                request.action_id,
-                "none".to_string(),
-                format!("Action {} not found", request.action_id),
-                Some("Use `ft history` to list valid action IDs.".to_string()),
-                None,
-                None,
-            ));
-        };
-
-        let Some(undo) = self.storage.get_action_undo(request.action_id).await? else {
-            return Ok(UndoExecutionResult::not_applicable(
-                request.action_id,
-                "none".to_string(),
-                "No undo metadata recorded for this action".to_string(),
-                Some(
-                    "This action predates undo metadata, or was recorded as non-undoable."
-                        .to_string(),
-                ),
-                action.actor_id.clone(),
-                action.pane_id,
-            ));
-        };
-
-        if !undo.undoable {
-            return Ok(UndoExecutionResult::not_applicable(
-                request.action_id,
-                undo.undo_strategy,
-                "Action is not currently undoable".to_string(),
-                undo.undo_hint.or(action.undo_hint),
-                action.actor_id,
-                action.pane_id,
-            ));
-        }
-
-        if undo.undone_at.is_some() {
-            return Ok(UndoExecutionResult::not_applicable(
-                request.action_id,
-                undo.undo_strategy,
-                "Action has already been undone".to_string(),
-                undo.undo_hint.or(action.undo_hint),
-                action.actor_id,
-                action.pane_id,
-            ));
-        }
-
-        match undo.undo_strategy.as_str() {
-            "workflow_abort" => self.execute_workflow_abort(request, &action, &undo).await,
-            "pane_close" => self.execute_pane_close(request, &action, &undo).await,
-            "manual" | "none" | "custom" => Ok(UndoExecutionResult::not_applicable(
-                action.id,
-                undo.undo_strategy,
-                "Automatic undo is not supported for this strategy".to_string(),
-                undo.undo_hint.or(action.undo_hint),
-                action.actor_id,
-                action.pane_id,
-            )),
-            _ => Ok(UndoExecutionResult::failed(
-                action.id,
-                undo.undo_strategy,
-                "Unknown undo strategy".to_string(),
-                undo.undo_hint.or(action.undo_hint),
-                action.actor_id,
-                action.pane_id,
-            )),
-        }
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.execute_with_cx(&cx, request).await
     }
 
     /// Cx-first [`Self::execute`] (ft-xbnl0.2.3). Threads caller
-    /// `&Cx` through the three storage queries that precede the
-    /// strategy dispatch: `get_action_history`, `get_action_undo`,
-    /// and (inside the strategy handlers, unchanged) the wezterm
-    /// / storage calls that actually perform the undo. Checkpoints
-    /// at 3 seams give caller cancellation between each storage
+    /// `&Cx` through the storage queries that precede strategy dispatch and
+    /// through every blocking workflow, mux, and audit operation performed by
+    /// the selected strategy. Checkpoints at the dispatch seams give caller
+    /// cancellation between each storage
     /// read so a pre-cancelled cx returns an `Err` before touching
     /// storage at all, and a late-cancelled caller can abort
     /// before dispatch to the (potentially slow) strategy.
-    ///
-    /// The strategy handlers themselves remain on the ambient
-    /// path — they call `self.wezterm.*` and `self.mark_undone`
-    /// which don't yet have `_with_cx` surfaces. That is a
-    /// follow-on: once WeztermInterface pane-lifecycle methods
-    /// (all Cx-first since tick 46) are threaded through here,
-    /// the dispatched undo action will also honor caller cx.
     pub async fn execute_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -389,90 +318,12 @@ impl UndoExecutor {
         }
     }
 
-    async fn execute_workflow_abort(
-        &self,
-        request: UndoRequest,
-        action: &crate::storage::ActionHistoryRecord,
-        undo: &ActionUndoRecord,
-    ) -> Result<UndoExecutionResult> {
-        let execution_id = execution_id_from_undo(undo, action);
-        let Some(execution_id) = execution_id else {
-            return Ok(UndoExecutionResult::not_applicable(
-                action.id,
-                undo.undo_strategy.clone(),
-                "Undo payload did not contain a workflow execution ID".to_string(),
-                undo.undo_hint.clone().or_else(|| action.undo_hint.clone()),
-                None,
-                action.pane_id,
-            ));
-        };
-
-        let runner = self.build_workflow_runner();
-        match runner
-            .abort_execution(&execution_id, request.reason.as_deref(), false)
-            .await
-        {
-            Ok(result) if result.aborted => {
-                let undone_at = match self.mark_undone(action.id, &request.actor).await {
-                    Ok(at) => at,
-                    Err(err) => {
-                        return Ok(UndoExecutionResult::failed(
-                            action.id,
-                            undo.undo_strategy.clone(),
-                            format!(
-                                "Workflow {execution_id} aborted but audit update failed: {err}"
-                            ),
-                            undo.undo_hint.clone().or_else(|| action.undo_hint.clone()),
-                            Some(execution_id),
-                            action.pane_id,
-                        ));
-                    }
-                };
-                Ok(UndoExecutionResult::success(
-                    action.id,
-                    undo.undo_strategy.clone(),
-                    format!("Aborted workflow {}", result.execution_id),
-                    Some(result.execution_id),
-                    Some(result.pane_id),
-                    undone_at,
-                ))
-            }
-            Ok(result) => {
-                let reason = result
-                    .error_reason
-                    .unwrap_or_else(|| "not_applicable".to_string());
-                let message = format!(
-                    "Workflow {} is not undoable in current state ({reason})",
-                    result.execution_id
-                );
-                Ok(UndoExecutionResult::not_applicable(
-                    action.id,
-                    undo.undo_strategy.clone(),
-                    message,
-                    undo.undo_hint.clone().or_else(|| action.undo_hint.clone()),
-                    Some(result.execution_id),
-                    Some(result.pane_id),
-                ))
-            }
-            Err(err) => Ok(UndoExecutionResult::failed(
-                action.id,
-                undo.undo_strategy.clone(),
-                format!("Failed to abort workflow {execution_id}: {err}"),
-                undo.undo_hint.clone().or_else(|| action.undo_hint.clone()),
-                Some(execution_id),
-                action.pane_id,
-            )),
-        }
-    }
-
-    /// ft-xbnl0.2.3 Cx-first sibling of [`Self::execute_workflow_abort`].
-    ///
     /// Routes the runner abort through `abort_execution_with_cx`
     /// (tick 131) and the audit mark-undone through
-    /// `mark_undone_with_cx`, so undo of a workflow-abort action
-    /// honours caller cancellation at the two points where it can
-    /// actually block: the cross-WorkflowRunner abort flow and
-    /// the storage write.
+    /// `mark_undone_after_effect`, so undo of a workflow-abort action honours
+    /// caller cancellation until the abort commits. Once the workflow has
+    /// actually been aborted, the durable audit update is mandatory cleanup
+    /// and therefore runs under a fresh independent context.
     async fn execute_workflow_abort_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -480,16 +331,30 @@ impl UndoExecutor {
         action: &crate::storage::ActionHistoryRecord,
         undo: &ActionUndoRecord,
     ) -> Result<UndoExecutionResult> {
-        let execution_id = execution_id_from_undo(undo, action);
-        let Some(execution_id) = execution_id else {
-            return Ok(UndoExecutionResult::not_applicable(
-                action.id,
-                undo.undo_strategy.clone(),
-                "Undo payload did not contain a workflow execution ID".to_string(),
-                undo.undo_hint.clone().or_else(|| action.undo_hint.clone()),
-                None,
-                action.pane_id,
-            ));
+        let execution_id = match execution_id_from_undo(undo, action) {
+            Ok(Some(execution_id)) => execution_id,
+            Ok(None) => {
+                return Ok(UndoExecutionResult::not_applicable(
+                    action.id,
+                    undo.undo_strategy.clone(),
+                    "Legacy undo metadata did not identify a workflow execution".to_string(),
+                    undo.undo_hint.clone().or_else(|| action.undo_hint.clone()),
+                    None,
+                    action.pane_id,
+                ));
+            }
+            Err(detail) => {
+                return Ok(UndoExecutionResult::failed(
+                    action.id,
+                    undo.undo_strategy.clone(),
+                    format!(
+                        "Invalid workflow-abort undo target; refusing automatic undo: {detail}"
+                    ),
+                    undo.undo_hint.clone().or_else(|| action.undo_hint.clone()),
+                    None,
+                    action.pane_id,
+                ));
+            }
         };
 
         let runner = self.build_workflow_runner();
@@ -499,7 +364,7 @@ impl UndoExecutor {
         {
             Ok(result) if result.aborted => {
                 let undone_at = match self
-                    .mark_undone_with_cx(cx, action.id, &request.actor)
+                    .mark_undone_after_effect(action.id, &request.actor)
                     .await
                 {
                     Ok(at) => at,
@@ -542,6 +407,7 @@ impl UndoExecutor {
                     Some(result.pane_id),
                 ))
             }
+            Err(err) if is_undo_cancellation(&err) => Err(err),
             Err(err) => Ok(UndoExecutionResult::failed(
                 action.id,
                 undo.undo_strategy.clone(),
@@ -553,109 +419,20 @@ impl UndoExecutor {
         }
     }
 
-    async fn execute_pane_close(
-        &self,
-        request: UndoRequest,
-        action: &crate::storage::ActionHistoryRecord,
-        undo: &ActionUndoRecord,
-    ) -> Result<UndoExecutionResult> {
-        let pane_id = pane_id_from_undo(undo).or(action.pane_id);
-        let Some(pane_id) = pane_id else {
-            return Ok(UndoExecutionResult::not_applicable(
-                action.id,
-                undo.undo_strategy.clone(),
-                "Undo payload did not contain a pane ID".to_string(),
-                undo.undo_hint.clone().or_else(|| action.undo_hint.clone()),
-                action.actor_id.clone(),
-                None,
-            ));
-        };
-
-        match self.wezterm.get_pane(pane_id).await {
-            Ok(_) => {}
-            Err(Error::Wezterm(WeztermError::PaneNotFound(_))) => {
-                return Ok(UndoExecutionResult::not_applicable(
-                    action.id,
-                    undo.undo_strategy.clone(),
-                    format!("Pane {pane_id} no longer exists"),
-                    undo.undo_hint.clone().or_else(|| action.undo_hint.clone()),
-                    action.actor_id.clone(),
-                    Some(pane_id),
-                ));
-            }
-            Err(err) => {
-                return Ok(UndoExecutionResult::failed(
-                    action.id,
-                    undo.undo_strategy.clone(),
-                    format!("Failed to validate pane {pane_id}: {err}"),
-                    undo.undo_hint.clone().or_else(|| action.undo_hint.clone()),
-                    action.actor_id.clone(),
-                    Some(pane_id),
-                ));
-            }
-        }
-
-        match self.wezterm.kill_pane(pane_id).await {
-            Ok(()) => {
-                let undone_at = match self.mark_undone(action.id, &request.actor).await {
-                    Ok(at) => at,
-                    Err(err) => {
-                        return Ok(UndoExecutionResult::failed(
-                            action.id,
-                            undo.undo_strategy.clone(),
-                            format!("Pane {pane_id} closed but audit update failed: {err}"),
-                            undo.undo_hint.clone().or_else(|| action.undo_hint.clone()),
-                            action.actor_id.clone(),
-                            Some(pane_id),
-                        ));
-                    }
-                };
-                Ok(UndoExecutionResult::success(
-                    action.id,
-                    undo.undo_strategy.clone(),
-                    format!("Closed pane {pane_id}"),
-                    action.actor_id.clone(),
-                    Some(pane_id),
-                    undone_at,
-                ))
-            }
-            Err(Error::Wezterm(WeztermError::PaneNotFound(_))) => {
-                Ok(UndoExecutionResult::not_applicable(
-                    action.id,
-                    undo.undo_strategy.clone(),
-                    format!("Pane {pane_id} was already closed"),
-                    undo.undo_hint.clone().or_else(|| action.undo_hint.clone()),
-                    action.actor_id.clone(),
-                    Some(pane_id),
-                ))
-            }
-            Err(err) => Ok(UndoExecutionResult::failed(
-                action.id,
-                undo.undo_strategy.clone(),
-                format!("Failed to close pane {pane_id}: {err}"),
-                undo.undo_hint.clone().or_else(|| action.undo_hint.clone()),
-                action.actor_id.clone(),
-                Some(pane_id),
-            )),
-        }
-    }
-
-    /// Cx-first [`Self::execute_pane_close`] (ft-xbnl0.2.3).
+    /// Cx-first pane-close strategy (ft-xbnl0.2.3).
     /// Threads caller `&Cx` through the two wezterm calls
     /// (`get_pane_with_cx` + `kill_pane_with_cx` — both Cx-first
-    /// since ticks 44/45) and the `mark_undone` storage write
-    /// via checkpoint seams.
+    /// since ticks 44/45) and the post-effect durable audit write via
+    /// checkpoint seams.
     ///
     /// Cancellation-safety contract: the checkpoint BEFORE
     /// `kill_pane_with_cx` is the critical seam — a mid-run
     /// cancel here aborts BEFORE destroying the pane. A
-    /// cancel between `kill_pane_with_cx` and `mark_undone`
-    /// leaves the pane closed but the audit record not flagged
-    /// as undone. This is a narrow window; the alternative
-    /// (skipping the audit flag) would be worse because the pane
-    /// IS gone. The error includes the pane_id so the caller can
-    /// surface "pane closed but audit update failed" to
-    /// operators.
+    /// cancel after `kill_pane_with_cx` cannot suppress the audit update: once
+    /// the pane is gone, audit persistence is mandatory cleanup and runs with
+    /// a fresh independent context. A genuine storage failure is still
+    /// reported as "pane closed but audit update failed" so operators are not
+    /// told that the overall operation was atomic.
     async fn execute_pane_close_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -663,12 +440,30 @@ impl UndoExecutor {
         action: &crate::storage::ActionHistoryRecord,
         undo: &ActionUndoRecord,
     ) -> Result<UndoExecutionResult> {
-        let pane_id = pane_id_from_undo(undo).or(action.pane_id);
+        // A present payload is authoritative. Missing, mistyped, or malformed
+        // target data therefore fails closed; only a legacy row with no
+        // payload may use the action's pane metadata.
+        let pane_id = match pane_id_from_undo(undo) {
+            Ok(Some(pane_id)) => Some(pane_id),
+            Ok(None) => action.pane_id,
+            Err(detail) => {
+                return Ok(UndoExecutionResult::failed(
+                    action.id,
+                    undo.undo_strategy.clone(),
+                    format!(
+                        "Invalid pane-close undo target; refusing automatic undo: {detail}"
+                    ),
+                    undo.undo_hint.clone().or_else(|| action.undo_hint.clone()),
+                    action.actor_id.clone(),
+                    action.pane_id,
+                ));
+            }
+        };
         let Some(pane_id) = pane_id else {
             return Ok(UndoExecutionResult::not_applicable(
                 action.id,
                 undo.undo_strategy.clone(),
-                "Undo payload did not contain a pane ID".to_string(),
+                "Legacy undo metadata did not identify a pane".to_string(),
                 undo.undo_hint.clone().or_else(|| action.undo_hint.clone()),
                 action.actor_id.clone(),
                 None,
@@ -694,6 +489,7 @@ impl UndoExecutor {
                     Some(pane_id),
                 ));
             }
+            Err(err) if is_undo_cancellation(&err) => return Err(err),
             Err(err) => {
                 return Ok(UndoExecutionResult::failed(
                     action.id,
@@ -716,7 +512,7 @@ impl UndoExecutor {
         match self.wezterm.kill_pane_with_cx(cx, pane_id).await {
             Ok(()) => {
                 let undone_at = match self
-                    .mark_undone_with_cx(cx, action.id, &request.actor)
+                    .mark_undone_after_effect(action.id, &request.actor)
                     .await
                 {
                     Ok(at) => at,
@@ -753,7 +549,7 @@ impl UndoExecutor {
             Err(err) => Ok(UndoExecutionResult::failed(
                 action.id,
                 undo.undo_strategy.clone(),
-                format!("Failed to close pane {pane_id}: {err}"),
+                pane_close_failure_message(pane_id, &err),
                 undo.undo_hint.clone().or_else(|| action.undo_hint.clone()),
                 action.actor_id.clone(),
                 Some(pane_id),
@@ -779,20 +575,21 @@ impl UndoExecutor {
         )
     }
 
-    async fn mark_undone(&self, action_id: i64, actor: &str) -> Result<Option<i64>> {
-        let updated = self.storage.mark_action_undone(action_id, actor).await?;
-        if !updated {
-            return Ok(None);
-        }
-        Ok(self
-            .storage
-            .get_action_undo(action_id)
-            .await?
-            .and_then(|row| row.undone_at))
+    /// Persist the audit half of an undo whose external effect has already
+    /// committed. Caller cancellation is no longer a safe reason to abandon
+    /// this write: doing so would make a successful pane close or workflow
+    /// abort appear eligible for a duplicate undo attempt.
+    async fn mark_undone_after_effect(
+        &self,
+        action_id: i64,
+        actor: &str,
+    ) -> Result<Option<i64>> {
+        let cleanup_cx = crate::cx::for_request();
+        self.mark_undone_with_cx(&cleanup_cx, action_id, actor)
+            .await
     }
 
-    /// ft-xbnl0.2.3 Cx-first sibling of [`Self::mark_undone`].
-    /// Routes both storage calls through cx-first siblings.
+    /// Routes both storage calls through caller-Cx-aware operations.
     async fn mark_undone_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -803,14 +600,17 @@ impl UndoExecutor {
             .storage
             .mark_action_undone_with_cx(cx, action_id, actor)
             .await?;
-        if !updated {
-            return Ok(None);
-        }
-        Ok(self
+        let row = self
             .storage
             .get_action_undo_with_cx(cx, action_id)
-            .await?
-            .and_then(|row| row.undone_at))
+            .await?;
+
+        match row.and_then(|row| row.undone_at) {
+            Some(undone_at) => Ok(Some(undone_at)),
+            None => Err(Error::Storage(crate::StorageError::Database(format!(
+                "undo audit update did not produce a durable undone_at value for action {action_id} (updated={updated})"
+            )))),
+        }
     }
 }
 
@@ -848,10 +648,14 @@ pub fn reset_undo_payload_parse_drop_count_for_test() {
     UNDO_PAYLOAD_PARSE_DROP_COUNT.store(0, std::sync::atomic::Ordering::Relaxed);
 }
 
-fn parse_undo_payload(undo: &ActionUndoRecord) -> Option<serde_json::Value> {
-    let payload = undo.undo_payload.as_deref()?;
+fn parse_undo_payload_checked(
+    undo: &ActionUndoRecord,
+) -> std::result::Result<Option<serde_json::Value>, serde_json::Error> {
+    let Some(payload) = undo.undo_payload.as_deref() else {
+        return Ok(None);
+    };
     match serde_json::from_str::<serde_json::Value>(payload) {
-        Ok(value) => Some(value),
+        Ok(value) => Ok(Some(value)),
         Err(err) => {
             UNDO_PAYLOAD_PARSE_DROP_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             tracing::warn!(
@@ -859,37 +663,85 @@ fn parse_undo_payload(undo: &ActionUndoRecord) -> Option<serde_json::Value> {
                 event = "undo_payload_parse_drop",
                 audit_action_id = undo.audit_action_id,
                 error = %err,
-                "ActionUndoRecord.undo_payload could not be parsed as JSON; consumer will see None (br-ft-4ymqn)"
+                "ActionUndoRecord.undo_payload could not be parsed as JSON; automatic undo will fail closed (br-ft-4ymqn)"
             );
-            None
+            Err(err)
         }
     }
+}
+
+fn parse_undo_payload(undo: &ActionUndoRecord) -> Option<serde_json::Value> {
+    parse_undo_payload_checked(undo).ok().flatten()
 }
 
 fn execution_id_from_undo(
     undo: &ActionUndoRecord,
     action: &crate::storage::ActionHistoryRecord,
-) -> Option<String> {
-    if let Some(value) = parse_undo_payload(undo).and_then(|payload| {
-        payload
+) -> std::result::Result<Option<String>, String> {
+    if let Some(payload) = parse_undo_payload_checked(undo)
+        .map_err(|err| format!("payload is malformed JSON: {err}"))?
+    {
+        let execution_id = payload
+            .as_object()
+            .ok_or_else(|| "payload must be a JSON object".to_string())?
             .get("execution_id")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_string)
-    }) {
-        return Some(value);
+            .ok_or_else(|| "payload is missing `execution_id`".to_string())?
+            .as_str()
+            .ok_or_else(|| "payload `execution_id` must be a string".to_string())?;
+        if execution_id.trim().is_empty() {
+            return Err("payload `execution_id` must not be empty".to_string());
+        }
+        return Ok(Some(execution_id.to_string()));
     }
 
     if action.actor_kind == "workflow" {
-        return action.actor_id.clone();
+        return nonempty_legacy_execution_id(action.actor_id.as_deref(), "action actor_id");
     }
 
-    action.workflow_id.clone()
+    nonempty_legacy_execution_id(action.workflow_id.as_deref(), "action workflow_id")
 }
 
-fn pane_id_from_undo(undo: &ActionUndoRecord) -> Option<u64> {
-    let payload = parse_undo_payload(undo)?;
-    let raw = payload.get("pane_id")?.as_u64()?;
-    Some(raw)
+fn nonempty_legacy_execution_id(
+    value: Option<&str>,
+    source: &str,
+) -> std::result::Result<Option<String>, String> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    if value.trim().is_empty() {
+        return Err(format!("legacy {source} must not be empty"));
+    }
+    Ok(Some(value.to_string()))
+}
+
+fn pane_id_from_undo(
+    undo: &ActionUndoRecord,
+) -> std::result::Result<Option<u64>, String> {
+    let Some(payload) = parse_undo_payload_checked(undo)
+        .map_err(|err| format!("payload is malformed JSON: {err}"))?
+    else {
+        return Ok(None);
+    };
+    let pane_id = payload
+        .as_object()
+        .ok_or_else(|| "payload must be a JSON object".to_string())?
+        .get("pane_id")
+        .ok_or_else(|| "payload is missing `pane_id`".to_string())?
+        .as_u64()
+        .ok_or_else(|| "payload `pane_id` must be an unsigned integer".to_string())?;
+    Ok(Some(pane_id))
+}
+
+fn pane_close_failure_message(pane_id: u64, error: &Error) -> String {
+    if is_undo_cancellation(error) {
+        format!(
+            "Pane-close cancellation was observed after kill dispatch for pane {pane_id}; \
+             pane state is indeterminate and the undo audit was not marked complete. \
+             Verify whether the pane still exists before retrying: {error}"
+        )
+    } else {
+        format!("Failed to close pane {pane_id}: {error}")
+    }
 }
 
 #[cfg(test)]
@@ -938,6 +790,32 @@ mod tests {
             }
             other => panic!("expected structured runtime operation, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn undo_cancellation_classifier_accepts_both_supported_error_shapes() {
+        assert!(is_undo_cancellation(&Error::Cancelled(
+            "caller cancelled".to_string()
+        )));
+        assert!(is_undo_cancellation(&undo_cancelled_error(
+            "undo.test_checkpoint",
+            "caller cancelled"
+        )));
+        assert!(!is_undo_cancellation(&Error::runtime_backend(
+            "undo.test_checkpoint",
+            "backend failed"
+        )));
+    }
+
+    #[test]
+    fn pane_close_cancellation_message_marks_post_dispatch_state_indeterminate() {
+        let error = undo_cancelled_error("mock kill pane", "caller cancelled");
+        let message = pane_close_failure_message(41, &error);
+
+        assert!(message.contains("after kill dispatch"));
+        assert!(message.contains("state is indeterminate"));
+        assert!(message.contains("audit was not marked complete"));
+        assert!(message.contains("Verify whether the pane still exists"));
     }
 
     async fn seed_pane(storage: &StorageHandle, pane_id: u64) {
@@ -1449,7 +1327,9 @@ mod tests {
             make_action_history(1, "workflow", Some("wf-actor"), Some("wf-workflow"), None);
         // Payload takes priority
         assert_eq!(
-            execution_id_from_undo(&undo, &action).as_deref(),
+            execution_id_from_undo(&undo, &action)
+                .expect("valid payload target")
+                .as_deref(),
             Some("wf-payload")
         );
     }
@@ -1468,7 +1348,9 @@ mod tests {
         let action = make_action_history(1, "workflow", Some("wf-from-actor"), Some("wf-id"), None);
         // Falls back to actor_id when actor_kind is "workflow"
         assert_eq!(
-            execution_id_from_undo(&undo, &action).as_deref(),
+            execution_id_from_undo(&undo, &action)
+                .expect("valid legacy actor target")
+                .as_deref(),
             Some("wf-from-actor")
         );
     }
@@ -1486,7 +1368,9 @@ mod tests {
         };
         let action = make_action_history(1, "human", None, Some("wf-fallback"), None);
         assert_eq!(
-            execution_id_from_undo(&undo, &action).as_deref(),
+            execution_id_from_undo(&undo, &action)
+                .expect("valid legacy workflow target")
+                .as_deref(),
             Some("wf-fallback")
         );
     }
@@ -1503,7 +1387,11 @@ mod tests {
             undone_by: None,
         };
         let action = make_action_history(1, "human", None, None, None);
-        assert!(execution_id_from_undo(&undo, &action).is_none());
+        assert!(
+            execution_id_from_undo(&undo, &action)
+                .expect("absent legacy target is not malformed")
+                .is_none()
+        );
     }
 
     #[test]
@@ -1517,7 +1405,7 @@ mod tests {
             undone_at: None,
             undone_by: None,
         };
-        assert_eq!(pane_id_from_undo(&undo), Some(42));
+        assert_eq!(pane_id_from_undo(&undo), Ok(Some(42)));
     }
 
     #[test]
@@ -1531,7 +1419,7 @@ mod tests {
             undone_at: None,
             undone_by: None,
         };
-        assert!(pane_id_from_undo(&undo).is_none());
+        assert!(pane_id_from_undo(&undo).is_err());
     }
 
     #[test]
@@ -1545,7 +1433,7 @@ mod tests {
             undone_at: None,
             undone_by: None,
         };
-        assert!(pane_id_from_undo(&undo).is_none());
+        assert!(pane_id_from_undo(&undo).is_err());
     }
 
     #[test]
@@ -1559,7 +1447,7 @@ mod tests {
             undone_at: None,
             undone_by: None,
         };
-        assert!(pane_id_from_undo(&undo).is_none());
+        assert_eq!(pane_id_from_undo(&undo), Ok(None));
     }
 
     // ── DB-backed tests ──
@@ -1873,7 +1761,7 @@ mod tests {
     }
 
     #[test]
-    fn pane_close_no_pane_id_in_payload_returns_not_applicable() {
+    fn pane_close_no_pane_id_in_payload_fails_closed() {
         run_async_test(async {
             let temp = tempfile::TempDir::new().expect("tempdir");
             let db_path = temp.path().join("undo-pane-no-id.db");
@@ -1927,15 +1815,15 @@ mod tests {
                 .await
                 .expect("result");
 
-            assert_eq!(result.outcome, UndoOutcome::NotApplicable);
-            assert!(result.message.contains("pane ID"));
+            assert_eq!(result.outcome, UndoOutcome::Failed);
+            assert!(result.message.contains("missing `pane_id`"));
 
             storage.shutdown().await.expect("shutdown");
         });
     }
 
     #[test]
-    fn workflow_abort_no_execution_id_returns_not_applicable() {
+    fn workflow_abort_no_execution_id_fails_closed() {
         run_async_test(async {
             let temp = tempfile::TempDir::new().expect("tempdir");
             let db_path = temp.path().join("undo-wf-no-exec.db");
@@ -1989,8 +1877,8 @@ mod tests {
                 .await
                 .expect("result");
 
-            assert_eq!(result.outcome, UndoOutcome::NotApplicable);
-            assert!(result.message.contains("execution ID"));
+            assert_eq!(result.outcome, UndoOutcome::Failed);
+            assert!(result.message.contains("missing `execution_id`"));
 
             storage.shutdown().await.expect("shutdown");
         });
@@ -2062,7 +1950,7 @@ mod tests {
     ///   → execute_pane_close_with_cx (tick 64)
     ///   → wezterm.get_pane_with_cx (tick 44 trait extension)
     ///   → wezterm.kill_pane_with_cx (tick 45 trait extension)
-    ///   → mark_undone (ambient — no _with_cx surface yet)
+    ///   → mark_undone_after_effect (fresh cleanup Cx)
     ///
     /// If any link in the chain regressed to the ambient path,
     /// the MockWezterm (which has the trait-default _with_cx
@@ -2114,7 +2002,8 @@ mod tests {
                 Err(Error::Wezterm(WeztermError::PaneNotFound(id))) if id == pane_id
             ));
 
-            // Audit action was marked undone with the cx-first actor.
+            // Audit action was marked undone with the caller-provided actor;
+            // the post-effect write itself uses an independent cleanup Cx.
             let undo = storage
                 .get_action_undo(action_id)
                 .await
@@ -2122,6 +2011,300 @@ mod tests {
                 .expect("undo exists");
             assert!(undo.undone_at.is_some());
             assert_eq!(undo.undone_by.as_deref(), Some("cx-operator"));
+
+            storage.shutdown().await.expect("shutdown");
+        });
+    }
+
+    #[test]
+    fn post_effect_audit_accepts_a_concurrent_prior_mark() {
+        run_async_test(async {
+            let temp = tempfile::TempDir::new().expect("tempdir");
+            let db_path = temp.path().join("undo-post-effect-concurrent-mark.db");
+            let db_path = db_path.to_string_lossy().to_string();
+            let storage = Arc::new(StorageHandle::new(&db_path).await.expect("storage"));
+            let pane_id = 68_u64;
+            seed_pane(storage.as_ref(), pane_id).await;
+            let action_id =
+                seed_action(storage.as_ref(), pane_id, "human", Some("cli"), "spawn").await;
+            storage
+                .upsert_action_undo(ActionUndoRecord {
+                    audit_action_id: action_id,
+                    undoable: true,
+                    undo_strategy: "pane_close".to_string(),
+                    undo_hint: None,
+                    undo_payload: Some(serde_json::json!({ "pane_id": pane_id }).to_string()),
+                    undone_at: None,
+                    undone_by: None,
+                })
+                .await
+                .expect("undo metadata");
+            assert!(
+                storage
+                    .mark_action_undone(action_id, "concurrent-operator")
+                    .await
+                    .expect("concurrent mark")
+            );
+            let expected = storage
+                .get_action_undo(action_id)
+                .await
+                .expect("undo query")
+                .expect("undo exists")
+                .undone_at
+                .expect("concurrent mark timestamp");
+
+            let executor = UndoExecutor::new(Arc::clone(&storage), Arc::new(MockWezterm::new()));
+            let observed = executor
+                .mark_undone_after_effect(action_id, "late-operator")
+                .await
+                .expect("an existing durable mark is a successful post-effect audit");
+            assert_eq!(observed, Some(expected));
+            let row = storage
+                .get_action_undo(action_id)
+                .await
+                .expect("undo query")
+                .expect("undo exists");
+            assert_eq!(row.undone_by.as_deref(), Some("concurrent-operator"));
+
+            storage.shutdown().await.expect("shutdown");
+        });
+    }
+
+    #[test]
+    fn post_effect_audit_rejects_a_missing_durable_mark() {
+        run_async_test(async {
+            let temp = tempfile::TempDir::new().expect("tempdir");
+            let db_path = temp.path().join("undo-post-effect-missing-mark.db");
+            let db_path = db_path.to_string_lossy().to_string();
+            let storage = Arc::new(StorageHandle::new(&db_path).await.expect("storage"));
+            let executor = UndoExecutor::new(Arc::clone(&storage), Arc::new(MockWezterm::new()));
+
+            let error = executor
+                .mark_undone_after_effect(9_999_999, "operator")
+                .await
+                .expect_err("missing undo metadata cannot be reported as durable success");
+            assert!(matches!(error, Error::Storage(crate::StorageError::Database(_))));
+
+            storage.shutdown().await.expect("shutdown");
+        });
+    }
+
+    #[test]
+    fn execute_with_precancelled_cx_does_not_close_pane_or_mark_undo() {
+        run_async_test(async {
+            let temp = tempfile::TempDir::new().expect("tempdir");
+            let db_path = temp.path().join("undo-pane-close-pre-cancel.db");
+            let db_path = db_path.to_string_lossy().to_string();
+            let storage = Arc::new(StorageHandle::new(&db_path).await.expect("storage"));
+            let pane_id = 67_u64;
+            seed_pane(storage.as_ref(), pane_id).await;
+            let action_id =
+                seed_action(storage.as_ref(), pane_id, "human", Some("cli"), "spawn").await;
+            storage
+                .upsert_action_undo(ActionUndoRecord {
+                    audit_action_id: action_id,
+                    undoable: true,
+                    undo_strategy: "pane_close".to_string(),
+                    undo_hint: Some(format!("Close pane {pane_id}")),
+                    undo_payload: Some(serde_json::json!({ "pane_id": pane_id }).to_string()),
+                    undone_at: None,
+                    undone_by: None,
+                })
+                .await
+                .expect("undo metadata");
+
+            let mock = Arc::new(MockWezterm::new());
+            mock.add_default_pane(pane_id).await;
+            let executor = UndoExecutor::new(Arc::clone(&storage), mock.clone());
+            let cx = crate::cx::for_testing();
+            cx.cancel_with(
+                crate::outcome::CancelKind::User,
+                Some("cancel before undo dispatch"),
+            );
+
+            let error = executor
+                .execute_with_cx(&cx, UndoRequest::new(action_id))
+                .await
+                .expect_err("pre-cancelled undo must return structured cancellation");
+            assert!(is_undo_cancellation(&error));
+            assert_eq!(mock.get_pane(pane_id).await.expect("pane must remain").pane_id, pane_id);
+            let undo = storage
+                .get_action_undo(action_id)
+                .await
+                .expect("undo query")
+                .expect("undo exists");
+            assert_eq!(undo.undone_at, None);
+            assert_eq!(undo.undone_by, None);
+
+            storage.shutdown().await.expect("shutdown");
+        });
+    }
+
+    #[test]
+    fn malformed_explicit_payload_fails_closed_without_inferred_pane_mutation() {
+        run_async_test(async {
+            let temp = tempfile::TempDir::new().expect("tempdir");
+            let db_path = temp.path().join("undo-pane-close-malformed-payload.db");
+            let db_path = db_path.to_string_lossy().to_string();
+            let storage = Arc::new(StorageHandle::new(&db_path).await.expect("storage"));
+            let pane_id = 69_u64;
+            seed_pane(storage.as_ref(), pane_id).await;
+            let action_id =
+                seed_action(storage.as_ref(), pane_id, "human", Some("cli"), "spawn").await;
+            storage
+                .upsert_action_undo(ActionUndoRecord {
+                    audit_action_id: action_id,
+                    undoable: true,
+                    undo_strategy: "pane_close".to_string(),
+                    undo_hint: None,
+                    undo_payload: Some("{malformed-json".to_string()),
+                    undone_at: None,
+                    undone_by: None,
+                })
+                .await
+                .expect("undo metadata");
+
+            let mock = Arc::new(MockWezterm::new());
+            mock.add_default_pane(pane_id).await;
+            let executor = UndoExecutor::new(Arc::clone(&storage), mock.clone());
+
+            let result = executor
+                .execute(UndoRequest::new(action_id))
+                .await
+                .expect("malformed metadata is a typed undo outcome");
+
+            assert_eq!(result.outcome, UndoOutcome::Failed);
+            assert!(result.message.contains("malformed JSON"));
+            assert_eq!(
+                mock.get_pane(pane_id)
+                    .await
+                    .expect("action pane must not be used as a corrupt-payload fallback")
+                    .pane_id,
+                pane_id
+            );
+            let undo = storage
+                .get_action_undo(action_id)
+                .await
+                .expect("undo query")
+                .expect("undo exists");
+            assert_eq!(undo.undone_at, None);
+            assert_eq!(undo.undone_by, None);
+
+            storage.shutdown().await.expect("shutdown");
+        });
+    }
+
+    #[test]
+    fn explicit_payload_without_pane_id_does_not_fall_back_to_action_pane() {
+        run_async_test(async {
+            let temp = tempfile::TempDir::new().expect("tempdir");
+            let db_path = temp.path().join("undo-pane-close-missing-payload-target.db");
+            let db_path = db_path.to_string_lossy().to_string();
+            let storage = Arc::new(StorageHandle::new(&db_path).await.expect("storage"));
+            let pane_id = 70_u64;
+            seed_pane(storage.as_ref(), pane_id).await;
+            let action_id =
+                seed_action(storage.as_ref(), pane_id, "human", Some("cli"), "spawn").await;
+            storage
+                .upsert_action_undo(ActionUndoRecord {
+                    audit_action_id: action_id,
+                    undoable: true,
+                    undo_strategy: "pane_close".to_string(),
+                    undo_hint: None,
+                    undo_payload: Some(r#"{"unexpected":"field"}"#.to_string()),
+                    undone_at: None,
+                    undone_by: None,
+                })
+                .await
+                .expect("undo metadata");
+
+            let mock = Arc::new(MockWezterm::new());
+            mock.add_default_pane(pane_id).await;
+            let executor = UndoExecutor::new(Arc::clone(&storage), mock.clone());
+
+            let result = executor
+                .execute(UndoRequest::new(action_id))
+                .await
+                .expect("missing authoritative target is a typed undo outcome");
+
+            assert_eq!(result.outcome, UndoOutcome::Failed);
+            assert!(result.message.contains("missing `pane_id`"));
+            assert_eq!(
+                mock.get_pane(pane_id)
+                    .await
+                    .expect("action pane must not be used when a payload is present")
+                    .pane_id,
+                pane_id
+            );
+            let undo = storage
+                .get_action_undo(action_id)
+                .await
+                .expect("undo query")
+                .expect("undo exists");
+            assert_eq!(undo.undone_at, None);
+            assert_eq!(undo.undone_by, None);
+
+            storage.shutdown().await.expect("shutdown");
+        });
+    }
+
+    #[test]
+    fn explicit_pane_target_wins_when_action_metadata_names_another_pane() {
+        run_async_test(async {
+            let temp = tempfile::TempDir::new().expect("tempdir");
+            let db_path = temp.path().join("undo-pane-close-conflicting-target.db");
+            let db_path = db_path.to_string_lossy().to_string();
+            let storage = Arc::new(StorageHandle::new(&db_path).await.expect("storage"));
+            let payload_pane_id = 71_u64;
+            let action_pane_id = 72_u64;
+            seed_pane(storage.as_ref(), payload_pane_id).await;
+            seed_pane(storage.as_ref(), action_pane_id).await;
+            let action_id = seed_action(
+                storage.as_ref(),
+                action_pane_id,
+                "human",
+                Some("cli"),
+                "spawn",
+            )
+            .await;
+            storage
+                .upsert_action_undo(ActionUndoRecord {
+                    audit_action_id: action_id,
+                    undoable: true,
+                    undo_strategy: "pane_close".to_string(),
+                    undo_hint: None,
+                    undo_payload: Some(
+                        serde_json::json!({ "pane_id": payload_pane_id }).to_string(),
+                    ),
+                    undone_at: None,
+                    undone_by: None,
+                })
+                .await
+                .expect("undo metadata");
+
+            let mock = Arc::new(MockWezterm::new());
+            mock.add_default_pane(payload_pane_id).await;
+            mock.add_default_pane(action_pane_id).await;
+            let executor = UndoExecutor::new(Arc::clone(&storage), mock.clone());
+
+            let result = executor
+                .execute(UndoRequest::new(action_id))
+                .await
+                .expect("exact payload target should execute");
+
+            assert_eq!(result.outcome, UndoOutcome::Success);
+            assert_eq!(result.target_pane_id, Some(payload_pane_id));
+            assert!(matches!(
+                mock.get_pane(payload_pane_id).await,
+                Err(Error::Wezterm(WeztermError::PaneNotFound(id))) if id == payload_pane_id
+            ));
+            assert_eq!(
+                mock.get_pane(action_pane_id)
+                    .await
+                    .expect("conflicting action pane must remain")
+                    .pane_id,
+                action_pane_id
+            );
 
             storage.shutdown().await.expect("shutdown");
         });
@@ -2311,8 +2494,10 @@ mod tests {
             undone_by: None,
         };
         let action = make_action_history(1, "human", None, None, None);
-        // Numeric execution_id won't match as_str, falls through to None
-        assert!(execution_id_from_undo(&undo, &action).is_none());
+        assert!(
+            execution_id_from_undo(&undo, &action).is_err(),
+            "an explicitly present target with the wrong type must fail closed"
+        );
     }
 
     #[test]
@@ -2327,8 +2512,12 @@ mod tests {
             undone_by: None,
         };
         let action = make_action_history(1, "human", None, Some("wf-fallback"), None);
-        // Empty string is still a valid string, so it takes priority
-        assert_eq!(execution_id_from_undo(&undo, &action).as_deref(), Some(""));
+        // An explicitly recorded empty target must fail closed rather than
+        // falling back to a different workflow ID from action metadata.
+        assert!(
+            execution_id_from_undo(&undo, &action).is_err(),
+            "an empty explicit target must fail closed without metadata fallback"
+        );
     }
 
     #[test]
@@ -2342,7 +2531,7 @@ mod tests {
             undone_at: None,
             undone_by: None,
         };
-        assert_eq!(pane_id_from_undo(&undo), Some(0));
+        assert_eq!(pane_id_from_undo(&undo), Ok(Some(0)));
     }
 
     #[test]
@@ -2356,7 +2545,7 @@ mod tests {
             undone_at: None,
             undone_by: None,
         };
-        assert_eq!(pane_id_from_undo(&undo), Some(u64::MAX));
+        assert_eq!(pane_id_from_undo(&undo), Ok(Some(u64::MAX)));
     }
 
     #[test]
@@ -2370,8 +2559,10 @@ mod tests {
             undone_at: None,
             undone_by: None,
         };
-        // Negative numbers don't parse as u64
-        assert!(pane_id_from_undo(&undo).is_none());
+        assert!(
+            pane_id_from_undo(&undo).is_err(),
+            "negative explicit pane IDs must fail closed"
+        );
     }
 
     #[test]
@@ -2385,8 +2576,10 @@ mod tests {
             undone_at: None,
             undone_by: None,
         };
-        // Floats don't parse as u64
-        assert!(pane_id_from_undo(&undo).is_none());
+        assert!(
+            pane_id_from_undo(&undo).is_err(),
+            "fractional explicit pane IDs must fail closed"
+        );
     }
 
     #[test]

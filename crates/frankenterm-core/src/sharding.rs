@@ -916,20 +916,6 @@ fn health_circuit_status(backend: &ShardBackend) -> Result<CircuitBreakerStatus>
     .map_err(|_panic| backend_callback_panic_error())
 }
 
-async fn ambient_health_panes(backend: &ShardBackend) -> Result<Vec<PaneInfo>> {
-    let future = match catch_recoverable(
-        RecoverablePanicSite::ClientCallback,
-        std::panic::AssertUnwindSafe(|| backend.handle.list_panes()),
-    ) {
-        Ok(future) => future,
-        Err(_panic) => return Err(backend_callback_panic_error()),
-    };
-    match catch_recoverable_future(RecoverablePanicSite::ClientCallback, future).await {
-        Ok(result) => result,
-        Err(_panic) => Err(backend_callback_panic_error()),
-    }
-}
-
 async fn cx_health_panes(backend: &ShardBackend, cx: &crate::cx::Cx) -> Result<Vec<PaneInfo>> {
     let future = match catch_recoverable(
         RecoverablePanicSite::ClientCallback,
@@ -1508,24 +1494,9 @@ impl ShardedWeztermClient {
         domain_name: Option<&str>,
         agent_hint: Option<AgentType>,
     ) -> Result<u64> {
-        self.telemetry.spawns.fetch_add(1, Ordering::Relaxed);
-        let shard = self.choose_spawn_shard(domain_name, agent_hint);
-        let backend = self.backend_for_id(shard)?;
-        let local_id = backend
-            .handle
-            .spawn(cwd, domain_name)
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.spawn_with_hints_with_cx(&cx, cwd, domain_name, agent_hint)
             .await
-            .map_err(|err| self.backend_error(shard, "spawn", None, err))?;
-        let global_id =
-            Self::encode_created_pane_or_rollback(backend, shard, local_id, "spawn").await?;
-        self.insert_pane_route(
-            global_id,
-            PaneRoute {
-                shard_id: shard,
-                local_pane_id: local_id,
-            },
-        );
-        Ok(global_id)
     }
 
     /// Spawn a new pane honoring shard-assignment hints, bound to the
@@ -1572,54 +1543,17 @@ impl ShardedWeztermClient {
         Ok(global_id)
     }
 
-    async fn collect_panes(&self) -> Result<(Vec<PaneInfo>, HashMap<u64, PaneRoute>)> {
-        let mut all = Vec::new();
-        let mut routes = HashMap::new();
-
-        for backend in &self.backends {
-            let panes = backend
-                .handle
-                .list_panes()
-                .await
-                .map_err(|err| self.backend_error(backend.id, "list_panes", None, err))?;
-
-            for mut pane in panes {
-                let local_pane_id = pane.pane_id;
-                let global_pane_id = try_encode_sharded_pane_id(backend.id, local_pane_id)?;
-                pane.pane_id = global_pane_id;
-                pane.extra
-                    .insert("shard_id".to_string(), Value::from(backend.id.0 as u64));
-                pane.extra
-                    .insert("local_pane_id".to_string(), Value::from(local_pane_id));
-
-                routes.insert(
-                    global_pane_id,
-                    PaneRoute {
-                        shard_id: backend.id,
-                        local_pane_id,
-                    },
-                );
-                all.push(pane);
-            }
-        }
-
-        Ok((all, routes))
-    }
-
     /// Aggregate panes across all shards and refresh the route index.
     ///
     /// A snapshot that overlaps a newer spawn/kill/navigation route update is
     /// returned to the caller but not published into the cache; the point
     /// update is newer routing truth and must not be overwritten.
     pub async fn list_all_panes(&self) -> Result<Vec<PaneInfo>> {
-        self.telemetry.pane_listings.fetch_add(1, Ordering::Relaxed);
-        let route_generation = self.pane_route_generation();
-        let (panes, routes) = self.collect_panes().await?;
-        self.publish_pane_route_snapshot(route_generation, routes);
-        Ok(panes)
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.list_all_panes_with_cx(&cx).await
     }
 
-    /// Cx-first `collect_panes` (ft-xbnl0.2.3). Uses each backend's
+    /// Collect panes under the caller's cx. Uses each backend's
     /// `list_panes_with_cx(cx)` (added to `WeztermInterface` trait in
     /// tick 27 with a default impl that delegates to `list_panes` for
     /// backends without a Cx-aware path, and overridden by
@@ -1683,32 +1617,8 @@ impl ShardedWeztermClient {
 
     /// Build a shard-level health report for watchdog integration.
     pub async fn shard_health_report(&self) -> ShardHealthReport {
-        self.telemetry
-            .health_reports
-            .fetch_add(1, Ordering::Relaxed);
-        let mut shards = Vec::with_capacity(self.backends.len());
-
-        for backend in &self.backends {
-            let circuit = match health_circuit_status(backend) {
-                Ok(circuit) => circuit,
-                Err(error) => {
-                    shards.push(completed_shard_health_entry(
-                        backend,
-                        CircuitBreakerStatus::default(),
-                        Err(error),
-                    ));
-                    continue;
-                }
-            };
-            let panes = ambient_health_panes(backend).await;
-            shards.push(completed_shard_health_entry(backend, circuit, panes));
-        }
-
-        ShardHealthReport {
-            timestamp_ms: now_epoch_ms(),
-            overall: overall_shard_health(&shards),
-            shards,
-        }
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.shard_health_report_with_cx(&cx).await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`shard_health_report`].
@@ -1778,7 +1688,8 @@ impl ShardedWeztermClient {
 
     /// Produce watchdog warning lines from current shard health.
     pub async fn shard_watchdog_warnings(&self) -> Vec<String> {
-        self.shard_health_report().await.watchdog_warnings()
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.shard_watchdog_warnings_with_cx(&cx).await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`shard_watchdog_warnings`].

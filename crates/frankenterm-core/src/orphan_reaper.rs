@@ -76,10 +76,8 @@ struct ProcessEntry {
 /// Run the orphan reaper loop.  Returns when `shutdown_flag` is set or the
 /// reap interval is configured to zero (disabled).
 pub async fn run_orphan_reaper(config: CliConfig, shutdown_flag: Arc<AtomicBool>) {
-    {
-        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-        return run_orphan_reaper_with_cx(&cx, config, shutdown_flag).await;
-    }
+    let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+    run_orphan_reaper_with_cx(&cx, config, shutdown_flag).await;
 }
 
 /// Run the orphan reaper loop against the caller's asupersync capability
@@ -160,7 +158,8 @@ pub async fn run_orphan_reaper_with_cx(
 /// Scan for orphaned `wezterm cli` processes and kill those exceeding
 /// `max_age_seconds`, returning a serializable cycle report.
 pub async fn reap_orphans(max_age_seconds: u64) -> ReapReport {
-    scan_and_reap(max_age_seconds).await
+    let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+    reap_orphans_with_cx(&cx, max_age_seconds).await
 }
 
 /// ft-xbnl0.2.3 Cx-first sibling of [`reap_orphans`].
@@ -175,61 +174,6 @@ pub async fn reap_orphans(max_age_seconds: u64) -> ReapReport {
 ///   coherent snapshot of what did get reaped.
 pub async fn reap_orphans_with_cx(cx: &crate::cx::Cx, max_age_seconds: u64) -> ReapReport {
     scan_and_reap_with_cx(cx, max_age_seconds).await
-}
-
-/// Implementation for a single orphan-reaper cycle.
-async fn scan_and_reap(max_age_seconds: u64) -> ReapReport {
-    let mut report = ReapReport::default();
-    let entries = match list_wezterm_cli_processes_via_ps().await {
-        Ok(entries) => entries,
-        Err(error) => {
-            report.errors.push(error);
-            return report;
-        }
-    };
-    report.scanned = entries.len();
-
-    for entry in entries {
-        if entry.age_seconds >= max_age_seconds {
-            debug!(
-                pid = entry.pid,
-                age_s = entry.age_seconds,
-                cmd = %entry.command,
-                "killing orphaned wezterm cli process"
-            );
-            // Use runtime_async::spawn_blocking + std::process::Command to
-            // avoid requiring a Tokio reactor (panics under asupersync).
-            let pid = entry.pid;
-            let kill_result = crate::runtime_async::spawn_blocking(move || {
-                crate::runtime_async::process::send_unix_signal_to_pid(i64::from(pid), "KILL")
-            })
-            .await;
-
-            match kill_result {
-                Ok(Ok(status)) if status.success() => {
-                    report.killed += 1;
-                    report.killed_pids.push(pid);
-                }
-                Ok(Ok(status)) => {
-                    report
-                        .errors
-                        .push(format!("kill -s KILL {pid} exited with {status}"));
-                }
-                Ok(Err(error)) => {
-                    report
-                        .errors
-                        .push(format!("failed to run kill for pid {pid}: {error}"));
-                }
-                Err(error) => {
-                    report.errors.push(format!(
-                        "spawn_blocking failed while killing pid {pid}: {error}"
-                    ));
-                }
-            }
-        }
-    }
-
-    report
 }
 
 /// Cx-first implementation of a single orphan-reaper cycle.

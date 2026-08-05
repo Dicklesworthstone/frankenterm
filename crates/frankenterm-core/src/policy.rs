@@ -8046,31 +8046,7 @@ where
         &self.engine
     }
 
-    /// Inject a synthetic Trauma Guard feedback line into the pane when the
-    /// deny decision originated from the trauma loop interceptor.
-    async fn maybe_inject_trauma_feedback(&self, pane_id: u64, decision: &PolicyDecision) {
-        let Some(feedback) = trauma_feedback_comment(decision) else {
-            return;
-        };
-
-        if let Err(error) = self
-            .client
-            .send_text_with_options(pane_id, &feedback, true, false)
-            .await
-        {
-            tracing::warn!(
-                pane_id,
-                rule_id = ?decision.rule_id(),
-                error = %error,
-                "Failed to inject synthetic trauma guard feedback"
-            );
-        }
-    }
-
-    /// ft-xbnl0.2.3 Cx-first sibling of
-    /// [`Self::maybe_inject_trauma_feedback`].
-    ///
-    /// Routes the wezterm send through
+    /// Inject a synthetic Trauma Guard feedback line through
     /// `send_text_with_options_with_cx` so a cancelled parent (e.g.
     /// a shutting-down policy engine) bails before pumping the
     /// trauma-feedback text into the pane.
@@ -8101,12 +8077,8 @@ where
     /// Cx-first [`Self::send_text`] (ft-xbnl0.2.3). Routes the
     /// policy-gated send through [`Self::dispatch_wezterm_send_with_cx`]
     /// so the underlying wezterm subprocess honors caller
-    /// cancellation. Policy evaluation, audit emission, ingress
-    /// tap, and trauma-feedback hooks stay on the ambient path
-    /// (they're short and CPU-bound; threading cx there would be
-    /// noise). The single cx-aware await is the wezterm send,
-    /// which is where long-running subprocess latency actually
-    /// lives.
+    /// cancellation. Policy evaluation, audit emission, ingress tap, and
+    /// trauma-feedback delivery all share the same caller cx.
     ///
     /// Returns the same `InjectionResult` shape as the legacy
     /// `send_text` for easy drop-in replacement.
@@ -8131,14 +8103,9 @@ where
         .await
     }
 
-    /// Cx-first internal inject (ft-xbnl0.2.3). Mirrors
-    /// [`Self::inject`] but routes the wezterm send through
-    /// [`Self::dispatch_wezterm_send_with_cx`]. All other stages
-    /// (policy eval, decision capture, trauma feedback, ingress
-    /// tap, audit emission) are identical to the legacy
-    /// `inject` — no cx propagation there because they're either
-    /// synchronous (policy eval, decision capture) or already
-    /// bounded by their own timeouts (audit storage writes).
+    /// Cx-first internal injection flow (ft-xbnl0.2.3). Routes wezterm sends,
+    /// trauma feedback, workflow-audit lookup, and audit persistence through
+    /// their explicit-cx surfaces.
     // Policy injection keeps Cx, command, actor, and audit dependencies explicit.
     #[allow(clippy::too_many_arguments)]
     async fn inject_with_cx(
@@ -8352,15 +8319,9 @@ where
         capabilities: &PaneCapabilities,
         workflow_id: Option<&str>,
     ) -> InjectionResult {
-        self.inject(
-            pane_id,
-            text,
-            ActionKind::SendText,
-            actor,
-            capabilities,
-            workflow_id,
-        )
-        .await
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.send_text_with_cx(&cx, pane_id, text, actor, capabilities, workflow_id)
+            .await
     }
 
     /// Send Ctrl-C (interrupt) to a pane with policy gating
@@ -8371,15 +8332,9 @@ where
         capabilities: &PaneCapabilities,
         workflow_id: Option<&str>,
     ) -> InjectionResult {
-        self.inject(
-            pane_id,
-            crate::wezterm::control::CTRL_C,
-            ActionKind::SendCtrlC,
-            actor,
-            capabilities,
-            workflow_id,
-        )
-        .await
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.send_ctrl_c_with_cx(&cx, pane_id, actor, capabilities, workflow_id)
+            .await
     }
 
     /// Send Ctrl-D (EOF) to a pane with policy gating
@@ -8390,15 +8345,9 @@ where
         capabilities: &PaneCapabilities,
         workflow_id: Option<&str>,
     ) -> InjectionResult {
-        self.inject(
-            pane_id,
-            crate::wezterm::control::CTRL_D,
-            ActionKind::SendCtrlD,
-            actor,
-            capabilities,
-            workflow_id,
-        )
-        .await
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.send_ctrl_d_with_cx(&cx, pane_id, actor, capabilities, workflow_id)
+            .await
     }
 
     /// Send Ctrl-Z (suspend) to a pane with policy gating
@@ -8409,15 +8358,9 @@ where
         capabilities: &PaneCapabilities,
         workflow_id: Option<&str>,
     ) -> InjectionResult {
-        self.inject(
-            pane_id,
-            crate::wezterm::control::CTRL_Z,
-            ActionKind::SendCtrlZ,
-            actor,
-            capabilities,
-            workflow_id,
-        )
-        .await
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.send_ctrl_z_with_cx(&cx, pane_id, actor, capabilities, workflow_id)
+            .await
     }
 
     /// Send any control character to a pane with policy gating
@@ -8429,10 +8372,11 @@ where
         capabilities: &PaneCapabilities,
         workflow_id: Option<&str>,
     ) -> InjectionResult {
-        self.inject(
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.send_control_with_cx(
+            &cx,
             pane_id,
             control_char,
-            ActionKind::SendControl,
             actor,
             capabilities,
             workflow_id,
@@ -8735,36 +8679,7 @@ where
         .await
     }
 
-    /// Shared wezterm-send dispatch used by the policy-gated inject
-    /// flow. Extracted so the Cx-first dispatch path
-    /// ([`Self::dispatch_wezterm_send_with_cx`]) can use the same
-    /// ActionKind → WeztermInterface method mapping without
-    /// duplicating the match.
-    async fn dispatch_wezterm_send(
-        &self,
-        action: ActionKind,
-        pane_id: u64,
-        text: &str,
-    ) -> Result<(), crate::Error> {
-        let client = &self.client;
-        match action {
-            ActionKind::SendText => client.send_text(pane_id, text).await,
-            ActionKind::SendCtrlC => client.send_ctrl_c(pane_id).await,
-            ActionKind::SendCtrlD => client.send_ctrl_d(pane_id).await,
-            ActionKind::SendCtrlZ => {
-                client
-                    .send_control(pane_id, crate::wezterm::control::CTRL_Z)
-                    .await
-            }
-            ActionKind::SendControl => client.send_control(pane_id, text).await,
-            other => Err(crate::Error::Policy(format!(
-                "dispatch_wezterm_send called with non-injection action: {other:?}"
-            ))),
-        }
-    }
-
-    /// Cx-first parallel of [`Self::dispatch_wezterm_send`]
-    /// (ft-xbnl0.2.3). Routes each ActionKind to its `_with_cx`
+    /// Route each ActionKind to its `_with_cx`
     /// WeztermInterface method (tick 44/45 trait extensions), so
     /// caller cancellation, budget, and virtual time propagate
     /// into the underlying `wezterm cli` subprocess call. Future
@@ -8793,223 +8708,6 @@ where
                 "dispatch_wezterm_send_with_cx called with non-injection action: {other:?}"
             ))),
         }
-    }
-
-    /// Internal injection method with policy gating
-    ///
-    /// This method:
-    /// 1. Creates a redacted summary for audit
-    /// 2. Builds policy input with actor, capabilities, and command text
-    /// 3. Authorizes via PolicyEngine
-    /// 4. If allowed, executes the injection
-    /// 5. Emits an audit record (if storage is configured)
-    /// 6. Returns the structured result
-    async fn inject(
-        &mut self,
-        pane_id: u64,
-        text: &str,
-        action: ActionKind,
-        actor: ActorKind,
-        capabilities: &PaneCapabilities,
-        workflow_id: Option<&str>,
-    ) -> InjectionResult {
-        // Create redacted summary for audit
-        let summary = self.engine.redact_secrets(text);
-        let tap_summary = if self.ingress_tap.is_some() {
-            Some(summary.clone())
-        } else {
-            None
-        };
-
-        // Build policy input
-        let mut input = PolicyInput::new(action, actor)
-            .with_surface(PolicySurface::Mux)
-            .with_pane(pane_id)
-            .with_capabilities(capabilities.clone())
-            .with_text_summary(&summary);
-
-        // Add workflow context if present
-        if let Some(wf_id) = workflow_id {
-            input = input.with_workflow(wf_id);
-        }
-
-        // For SendText, add command text for safety gate
-        if action == ActionKind::SendText {
-            input = input.with_command_text(text);
-        }
-
-        // Authorize
-        let decision = self.engine.authorize(&input);
-
-        if let Some(adapter) = self.decision_capture.as_ref() {
-            let input_text = serde_json::to_string(&input).unwrap_or_else(|_| {
-                format!(
-                    "action={};pane_id={};actor={}",
-                    action.as_str(),
-                    pane_id,
-                    actor.as_str()
-                )
-            });
-            let output = serde_json::to_value(&decision).unwrap_or_else(|_| {
-                serde_json::json!({
-                    "decision": decision.as_str(),
-                    "rule_id": decision.rule_id(),
-                })
-            });
-            let decision_event = crate::replay_capture::DecisionEvent::new(
-                crate::replay_capture::DecisionType::PolicyEvaluation,
-                pane_id,
-                decision.rule_id().unwrap_or("policy.default_allow"),
-                &decision_definition_text(&decision),
-                &input_text,
-                output,
-                workflow_id.map(|id| format!("workflow_execution:{id}")),
-                None,
-                crate::recording::epoch_ms_now(),
-            );
-            if let Err(error) = adapter.capture_decision(
-                crate::recording::actor_to_source(actor),
-                workflow_id.map(String::from),
-                decision_event,
-            ) {
-                return InjectionResult::Error {
-                    decision,
-                    error: format!("replay capture rejected policy decision: {error}"),
-                    pane_id,
-                    action,
-                    audit_action_id: None,
-                };
-            }
-        }
-
-        // Build the injection result
-        let mut result = match &decision {
-            PolicyDecision::Allow { .. } => {
-                // SAFETY: This is the only place where actual injection happens
-                // after policy approval. The text reference lifetime is handled
-                // by copying to a String for the actual send.
-                let text_owned = text.to_string();
-
-                // Dispatch via the shared helper so the legacy and
-                // Cx-first inject paths route through the same
-                // ActionKind match (see [`Self::dispatch_wezterm_send_with_cx`]).
-                let send_result = self
-                    .dispatch_wezterm_send(action, pane_id, &text_owned)
-                    .await;
-
-                match send_result {
-                    Ok(()) => InjectionResult::Allowed {
-                        decision,
-                        summary,
-                        pane_id,
-                        action,
-                        audit_action_id: None,
-                    },
-                    Err(e) => InjectionResult::Error {
-                        decision,
-                        error: e.to_string(),
-                        pane_id,
-                        action,
-                        audit_action_id: None,
-                    },
-                }
-            }
-            PolicyDecision::Deny { .. } => {
-                self.maybe_inject_trauma_feedback(pane_id, &decision).await;
-                InjectionResult::Denied {
-                    decision,
-                    summary,
-                    pane_id,
-                    action,
-                    audit_action_id: None,
-                }
-            }
-            PolicyDecision::RequireApproval { .. } => InjectionResult::RequiresApproval {
-                decision,
-                summary,
-                pane_id,
-                action,
-                audit_action_id: None,
-            },
-        };
-
-        // Notify ingress tap (ft-oegrb.2.2)
-        if let Some(ref tap) = self.ingress_tap {
-            use crate::recording::{
-                IngressEvent, IngressOutcome, action_to_ingress_kind, actor_to_source, epoch_ms_now,
-            };
-            let outcome = match &result {
-                InjectionResult::Allowed { .. } => IngressOutcome::Allowed,
-                InjectionResult::Denied { decision, .. } => IngressOutcome::Denied {
-                    reason: format!("{decision:?}"),
-                },
-                InjectionResult::RequiresApproval { .. } => IngressOutcome::RequiresApproval,
-                InjectionResult::Error { error, .. } => IngressOutcome::Error {
-                    error: error.clone(),
-                },
-            };
-            if let Some(text) = tap_summary {
-                tap.on_ingress(IngressEvent {
-                    pane_id,
-                    text,
-                    source: actor_to_source(actor),
-                    ingress_kind: action_to_ingress_kind(action, actor),
-                    redaction: crate::recording::RecorderRedactionLevel::Partial,
-                    occurred_at_ms: epoch_ms_now(),
-                    outcome,
-                    workflow_id: workflow_id.map(String::from),
-                });
-            }
-        }
-
-        let storage_for_summary = self.storage.clone();
-        let mut audit_summary = None;
-        if action == ActionKind::SendText {
-            if let Some(storage) = storage_for_summary.as_ref() {
-                let parent_action_id = if actor == ActorKind::Workflow {
-                    if let Some(id) = workflow_id {
-                        find_workflow_start_action_id(storage, id).await
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                };
-                audit_summary = Some(build_send_text_audit_summary(
-                    text,
-                    workflow_id,
-                    parent_action_id,
-                ));
-            }
-        }
-
-        // Emit audit record if storage is configured (wa-4vx.8.7)
-        // Audit is emitted for ALL outcomes: allow, deny, require_approval, and error
-        // Capture the audit ID for workflow step correlation (wa-nu4.1.1.11)
-        if let Some(ref storage) = self.storage {
-            let mut audit_record = result.to_audit_record(
-                actor,
-                workflow_id.map(String::from),
-                None, // domain - could be derived from pane info if available
-            );
-            if let Some(summary) = audit_summary {
-                audit_record.input_summary = Some(summary);
-            }
-            match storage.record_audit_action_redacted(audit_record).await {
-                Ok(audit_id) => {
-                    result.set_audit_action_id(audit_id);
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        pane_id,
-                        action = action.as_str(),
-                        "Failed to emit audit record: {e}"
-                    );
-                }
-            }
-        }
-
-        result
     }
 
     /// Redact text using the policy engine's redactor
@@ -9044,25 +8742,6 @@ fn decision_definition_text(decision: &PolicyDecision) -> String {
     segments.join("|")
 }
 
-async fn find_workflow_start_action_id(
-    storage: &crate::storage::StorageHandle,
-    execution_id: &str,
-) -> Option<i64> {
-    let query = crate::storage::AuditQuery {
-        limit: Some(1),
-        actor_id: Some(execution_id.to_string()),
-        action_kind: Some("workflow_start".to_string()),
-        ..Default::default()
-    };
-    storage
-        .get_audit_actions(query)
-        .await
-        .ok()
-        .and_then(|mut rows| rows.pop().map(|row| row.id))
-}
-
-/// ft-xbnl0.2.3 Cx-first sibling of [`find_workflow_start_action_id`].
-///
 /// Routes through `get_audit_actions_with_cx` so the lookup
 /// honours cancellation. Returns `None` on cancellation (matching
 /// the legacy "swallow errors → None" contract), so callers in the
@@ -10718,7 +10397,10 @@ mod tests {
                 TRAUMA_LOOP_BLOCK_RULE_ID,
             );
 
-            injector.maybe_inject_trauma_feedback(1, &decision).await;
+            let cx = crate::cx::for_request();
+            injector
+                .maybe_inject_trauma_feedback_with_cx(&cx, 1, &decision)
+                .await;
 
             let pane = injector
                 .client
@@ -10743,7 +10425,10 @@ mod tests {
             let _pane = injector.client.add_default_pane(1).await;
             let decision = PolicyDecision::deny_with_rule("alt screen active", "policy.alt_screen");
 
-            injector.maybe_inject_trauma_feedback(1, &decision).await;
+            let cx = crate::cx::for_request();
+            injector
+                .maybe_inject_trauma_feedback_with_cx(&cx, 1, &decision)
+                .await;
 
             let pane = injector
                 .client

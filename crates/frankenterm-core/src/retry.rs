@@ -331,7 +331,8 @@ where
     F: FnMut() -> Fut,
     Fut: Future<Output = Result<T>>,
 {
-    with_retry_outcome(policy, operation).await.result
+    let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+    with_retry_cx(&cx, policy, operation).await
 }
 
 /// Execute an async operation with retry under an explicit `&Cx`.
@@ -355,10 +356,8 @@ where
     F: FnMut() -> Fut,
     Fut: Future<Output = Result<T>>,
 {
-    {
-        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-        with_retry_outcome_cx(&cx, policy, operation).await
-    }
+    let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+    with_retry_outcome_cx(&cx, policy, operation).await
 }
 
 /// Execute an async operation with retry under an explicit `&Cx`, returning
@@ -495,10 +494,8 @@ where
     F: FnMut() -> Fut,
     Fut: Future<Output = Result<T>>,
 {
-    {
-        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-        return with_retry_and_circuit_cx(&cx, policy, circuit, operation).await;
-    }
+    let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+    with_retry_and_circuit_cx(&cx, policy, circuit, operation).await
 }
 
 /// Circuit-aware retry under an explicit `&Cx` (ft-xbnl0.2.2).
@@ -632,10 +629,8 @@ where
     F: FnMut() -> Fut,
     Fut: Future<Output = Result<T>>,
 {
-    {
-        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-        with_smart_retry_cx(&cx, policy, operation).await
-    }
+    let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+    with_smart_retry_cx(&cx, policy, operation).await
 }
 
 /// Smart retry under an explicit `&Cx` (ft-xbnl0.2.2).

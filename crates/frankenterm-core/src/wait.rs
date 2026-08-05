@@ -151,10 +151,8 @@ pub async fn wait_for<P>(
 where
     P: WaitPredicate + Send,
 {
-    {
-        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-        wait_for_cx(&cx, predicate, timeout, backoff).await
-    }
+    let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+    wait_for_cx(&cx, predicate, timeout, backoff).await
 }
 
 /// Wait for a predicate under an explicit `&Cx` (ft-xbnl0.2.2 Cx-first
@@ -180,15 +178,10 @@ where
     let mut last_observed = None;
 
     loop {
-        // Tick 209 (ft-xbnl0.2.3): per-attempt cancel check. Cancel
-        // fired during the previous predicate.check() or backoff
-        // sleep lands BEFORE the next predicate call fires, rather
-        // than after. Returns a WaitError with last_observed set
-        // to "cancelled" so callers can distinguish cancel from a
-        // natural timeout (though the error type remains the same
-        // for API stability — elapsed < timeout also indicates
-        // premature return).
-        if cx.is_cancel_requested() {
+        // Gate every predicate attempt with the full capability checkpoint.
+        // This catches cancellation and exhausted/deadline budgets before a
+        // potentially side-effecting predicate is invoked.
+        if cx.checkpoint().is_err() {
             return Err(WaitError {
                 expected,
                 last_observed: Some("cancelled".to_string()),
@@ -278,7 +271,7 @@ where
 
 /// Wait for a query to return the expected value within a timeout.
 pub async fn wait_for_value<F, Fut, T>(
-    mut query: F,
+    query: F,
     expected: T,
     timeout: Duration,
 ) -> Result<T, WaitError>
@@ -287,22 +280,8 @@ where
     Fut: Future<Output = T> + Send + 'static,
     T: PartialEq + fmt::Debug + Clone + Send + 'static,
 {
-    let expected_desc = format!("value == {expected:?}");
-    let condition = WaitCondition::new(expected_desc, move || {
-        let fut = query();
-        let expected = expected.clone();
-        async move {
-            let observed = fut.await;
-            if observed == expected {
-                WaitFor::Ready(observed)
-            } else {
-                WaitFor::NotReady {
-                    last_observed: Some(format!("{observed:?}")),
-                }
-            }
-        }
-    });
-    wait_for(condition, timeout, Backoff::default()).await
+    let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+    wait_for_value_cx(&cx, query, expected, timeout).await
 }
 
 /// Signals used to determine quiescence.
@@ -363,7 +342,8 @@ pub async fn wait_for_quiescence<S>(signals: S, timeout: Duration) -> Result<(),
 where
     S: QuiescenceSignals + Clone + Send + 'static,
 {
-    wait_for_quiescence_with_backoff(signals, timeout, Backoff::default()).await
+    let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+    wait_for_quiescence_cx(&cx, signals, timeout).await
 }
 
 /// Wait for quiescence under an explicit `&Cx`.
@@ -413,20 +393,8 @@ pub async fn wait_for_quiescence_with_backoff<S>(
 where
     S: QuiescenceSignals + Clone + Send + 'static,
 {
-    let condition = WaitCondition::new("quiescence", move || {
-        let now = Instant::now();
-        let signals = signals.clone();
-        async move {
-            if signals.is_quiet(now) {
-                WaitFor::Ready(())
-            } else {
-                WaitFor::NotReady {
-                    last_observed: Some(signals.describe(now)),
-                }
-            }
-        }
-    });
-    wait_for(condition, timeout, backoff).await
+    let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+    wait_for_quiescence_with_backoff_cx(&cx, signals, timeout, backoff).await
 }
 
 // ---------------------------------------------------------------------------
@@ -765,31 +733,21 @@ where
 /// a bool predicate without structured `WaitFor` returns.
 pub async fn wait_for_condition<F, Fut>(
     description: impl Into<String>,
-    mut check: F,
+    check: F,
     timeout: Duration,
 ) -> Result<(), WaitError>
 where
     F: FnMut() -> Fut + Send,
     Fut: Future<Output = bool> + Send + 'static,
 {
-    let desc = description.into();
-    let condition = WaitCondition::new(desc, move || {
-        let fut = check();
-        async move {
-            if fut.await {
-                WaitFor::Ready(())
-            } else {
-                WaitFor::not_ready(None::<String>)
-            }
-        }
-    });
-    wait_for(condition, timeout, Backoff::default()).await
+    let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+    wait_for_condition_cx(&cx, description, check, timeout).await
 }
 
 /// Wait for a boolean condition with custom backoff.
 pub async fn wait_for_condition_with_backoff<F, Fut>(
     description: impl Into<String>,
-    mut check: F,
+    check: F,
     timeout: Duration,
     backoff: Backoff,
 ) -> Result<(), WaitError>
@@ -797,18 +755,8 @@ where
     F: FnMut() -> Fut + Send,
     Fut: Future<Output = bool> + Send + 'static,
 {
-    let desc = description.into();
-    let condition = WaitCondition::new(desc, move || {
-        let fut = check();
-        async move {
-            if fut.await {
-                WaitFor::Ready(())
-            } else {
-                WaitFor::not_ready(None::<String>)
-            }
-        }
-    });
-    wait_for(condition, timeout, backoff).await
+    let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+    wait_for_condition_with_backoff_cx(&cx, description, check, timeout, backoff).await
 }
 
 #[cfg(test)]

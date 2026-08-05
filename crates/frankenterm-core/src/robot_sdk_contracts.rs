@@ -554,22 +554,8 @@ impl RustSdkTransport {
         command: &str,
         payload: serde_json::Value,
     ) -> Result<T, RustSdkTransportError> {
-        let args = build_rust_sdk_ipc_args(command, &payload)?;
-        if let Some(cx) = crate::cx::Cx::current() {
-            let response = self
-                .ipc
-                .call_rpc_with_cx(&cx, args, None)
-                .await
-                .map_err(RustSdkTransportError::Transport)?;
-            return decode_rust_sdk_response(response);
-        }
-
-        let response = self
-            .ipc
-            .call_rpc(args, None)
-            .await
-            .map_err(RustSdkTransportError::Transport)?;
-        decode_rust_sdk_response(response)
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.call_with_cx(&cx, command, payload).await
     }
 
     /// Execute a contract command and return the untyped JSON payload.
@@ -581,7 +567,8 @@ impl RustSdkTransport {
         command: &str,
         payload: serde_json::Value,
     ) -> Result<serde_json::Value, RustSdkTransportError> {
-        self.call(command, payload).await
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.call_value_with_cx(&cx, command, payload).await
     }
 
     /// Cx-first [`Self::call`] (ft-xbnl0.2.3). Routes the IPC

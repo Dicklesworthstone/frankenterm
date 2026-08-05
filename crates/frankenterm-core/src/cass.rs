@@ -125,49 +125,8 @@ pub async fn export_sessions(
     storage: &StorageHandle,
     query: &CassExportQuery,
 ) -> crate::Result<Vec<CassExportSessionRecord>> {
-    let pane_workspaces: HashMap<u64, String> = storage
-        .get_panes()
-        .await?
-        .into_iter()
-        .filter_map(|pane| pane.cwd.map(|cwd| (pane.pane_id, cwd)))
-        .collect();
-
-    let mut sessions = storage
-        .export_sessions(ExportQuery {
-            pane_id: query.pane_id,
-            since: query.since,
-            until: query.until,
-            limit: None,
-        })
-        .await?;
-    sessions.sort_unstable_by_key(|session| session.id);
-
-    let mut exported = Vec::new();
-    for session in sessions
-        .into_iter()
-        .filter(|session| query.after_id.is_none_or(|after_id| session.id > after_id))
-        .take(query.effective_limit())
-    {
-        let content_tokens = match session_recorded_tokens(&session) {
-            Some(tokens) => tokens,
-            None => estimate_session_content_tokens(storage, &session).await?,
-        };
-        exported.push(CassExportSessionRecord {
-            session_row_id: session.id,
-            session_id: export_session_identifier(&session),
-            agent_type: session.agent_type.clone(),
-            workspace: pane_workspaces.get(&session.pane_id).cloned(),
-            pane_ids: vec![session.pane_id],
-            started_at_ms: session.started_at,
-            ended_at_ms: session.ended_at,
-            model_name: session.model_name.clone(),
-            content_tokens,
-            external_id: session.external_id.clone(),
-            external_meta: session.external_meta.clone(),
-        });
-    }
-
-    Ok(exported)
+    let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+    export_sessions_with_cx(&cx, storage, query).await
 }
 
 /// ft-xbnl0.2.3 Cx-first sibling of [`export_sessions`].
@@ -243,31 +202,8 @@ pub async fn export_content(
     session_id: &str,
     query: &CassContentExportQuery,
 ) -> crate::Result<Vec<CassExportContentChunk>> {
-    let session = resolve_export_session(storage, session_id).await?;
-    let exported_session_id = export_session_identifier(&session);
-    let segments = storage
-        .scan_segments(SegmentScanQuery {
-            after_id: query.after_id,
-            pane_id: Some(session.pane_id),
-            since: Some(session.started_at),
-            until: session.ended_at,
-            limit: query.effective_limit(),
-        })
-        .await?;
-
-    Ok(segments
-        .into_iter()
-        .map(|segment| CassExportContentChunk {
-            session_row_id: session.id,
-            session_id: exported_session_id.clone(),
-            segment_id: segment.id,
-            pane_id: segment.pane_id,
-            seq: segment.seq,
-            timestamp_ms: segment.captured_at,
-            content: segment.content,
-            content_type: "output".to_string(),
-        })
-        .collect())
+    let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+    export_content_with_cx(&cx, storage, session_id, query).await
 }
 
 /// ft-xbnl0.2.3 Cx-first sibling of [`export_content`].
@@ -881,24 +817,6 @@ fn session_recorded_tokens(session: &AgentSessionRecord) -> Option<u64> {
         .and_then(|value| u64::try_from(value).ok())
 }
 
-#[cfg(feature = "cass-export")]
-async fn estimate_session_content_tokens(
-    storage: &StorageHandle,
-    session: &AgentSessionRecord,
-) -> crate::Result<u64> {
-    let segments = storage
-        .export_segments(ExportQuery {
-            pane_id: Some(session.pane_id),
-            since: Some(session.started_at),
-            until: session.ended_at,
-            limit: None,
-        })
-        .await?;
-    Ok(segments.iter().map(estimate_segment_tokens).sum())
-}
-
-/// ft-xbnl0.2.3 Cx-first sibling of [`estimate_session_content_tokens`].
-///
 /// Routes through `export_segments_with_cx` so the session-token
 /// estimate honours cancellation of the parent export loop.
 #[cfg(feature = "cass-export")]
@@ -947,43 +865,6 @@ fn estimate_text_tokens(content: &str) -> u64 {
 #[cfg(feature = "cass-export")]
 const RESOLVE_SESSION_FALLBACK_LIMIT: usize = 10_000;
 
-#[cfg(feature = "cass-export")]
-async fn resolve_export_session(
-    storage: &StorageHandle,
-    session_id: &str,
-) -> crate::Result<AgentSessionRecord> {
-    let requested_id = session_id.trim();
-
-    if let Some(row_id) = parse_export_session_row_id(session_id) {
-        if let Some(session) = storage.get_agent_session(row_id).await? {
-            if export_session_identifier(&session) == requested_id {
-                return Ok(session);
-            }
-        }
-    }
-
-    // Bounded fallback: scan at most RESOLVE_SESSION_FALLBACK_LIMIT sessions
-    // to prevent OOM on large databases. If the session isn't in the most
-    // recent N sessions, it's effectively gone.
-    let sessions = storage
-        .export_sessions(ExportQuery {
-            limit: Some(RESOLVE_SESSION_FALLBACK_LIMIT),
-            ..ExportQuery::default()
-        })
-        .await?;
-
-    sessions
-        .into_iter()
-        .find(|candidate| export_session_identifier(candidate) == requested_id)
-        .ok_or_else(|| {
-            crate::Error::Storage(crate::StorageError::NotFound(format!(
-                "cass export session '{requested_id}'"
-            )))
-        })
-}
-
-/// ft-xbnl0.2.3 Cx-first sibling of [`resolve_export_session`].
-///
 /// Routes both the direct `get_agent_session_with_cx` probe and the
 /// bounded `export_sessions_with_cx` fallback through cx-first
 /// storage siblings so a cancelled parent interrupts the scan.

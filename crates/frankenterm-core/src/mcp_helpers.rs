@@ -221,15 +221,8 @@ pub(super) async fn derive_osc_state_from_storage_with_cx(
     pane_id: u64,
 ) -> std::result::Result<Option<Osc133State>, String> {
     cx.checkpoint().map_err(|e| e.to_string())?;
-    derive_osc_state_from_storage(storage, pane_id).await
-}
-
-pub(super) async fn derive_osc_state_from_storage(
-    storage: &StorageHandle,
-    pane_id: u64,
-) -> std::result::Result<Option<Osc133State>, String> {
     let segments = storage
-        .get_segments(pane_id, SEND_OSC_SEGMENT_LIMIT)
+        .get_segments_with_cx(cx, pane_id, SEND_OSC_SEGMENT_LIMIT)
         .await
         .map_err(|_| "Storage unavailable".to_string())?;
     if segments.is_empty() {
@@ -248,6 +241,14 @@ pub(super) async fn derive_osc_state_from_storage(
     Ok(Some(state))
 }
 
+pub(super) async fn derive_osc_state_from_storage(
+    storage: &StorageHandle,
+    pane_id: u64,
+) -> std::result::Result<Option<Osc133State>, String> {
+    let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+    derive_osc_state_from_storage_with_cx(&cx, storage, pane_id).await
+}
+
 /// ft-tr5a0 Cx-first sibling of [`fetch_pane_state_from_ipc`] (unix).
 #[cfg(unix)]
 pub(super) async fn fetch_pane_state_from_ipc_with_cx(
@@ -256,27 +257,8 @@ pub(super) async fn fetch_pane_state_from_ipc_with_cx(
     pane_id: u64,
 ) -> std::result::Result<Option<IpcPaneState>, String> {
     cx.checkpoint().map_err(|e| e.to_string())?;
-    fetch_pane_state_from_ipc(socket_path, pane_id).await
-}
-
-/// ft-tr5a0 Cx-first sibling of [`fetch_pane_state_from_ipc`] (non-unix).
-#[cfg(not(unix))]
-pub(super) async fn fetch_pane_state_from_ipc_with_cx(
-    _cx: &crate::cx::Cx,
-    _socket_path: &std::path::Path,
-    _pane_id: u64,
-) -> std::result::Result<Option<IpcPaneState>, String> {
-    Err("IPC not supported on this platform".to_string())
-}
-
-#[cfg(unix)]
-pub(super) async fn fetch_pane_state_from_ipc(
-    socket_path: &std::path::Path,
-    pane_id: u64,
-) -> std::result::Result<Option<IpcPaneState>, String> {
     let client = crate::ipc::IpcClient::new(socket_path);
-    let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-    match client.pane_state_with_cx(&cx, pane_id).await {
+    match client.pane_state_with_cx(cx, pane_id).await {
         Ok(response) => {
             if !response.ok {
                 let detail = response
@@ -296,12 +278,32 @@ pub(super) async fn fetch_pane_state_from_ipc(
     }
 }
 
+/// ft-tr5a0 Cx-first sibling of [`fetch_pane_state_from_ipc`] (non-unix).
 #[cfg(not(unix))]
-pub(super) async fn fetch_pane_state_from_ipc(
+pub(super) async fn fetch_pane_state_from_ipc_with_cx(
+    _cx: &crate::cx::Cx,
     _socket_path: &std::path::Path,
     _pane_id: u64,
 ) -> std::result::Result<Option<IpcPaneState>, String> {
     Err("IPC not supported on this platform".to_string())
+}
+
+#[cfg(unix)]
+pub(super) async fn fetch_pane_state_from_ipc(
+    socket_path: &std::path::Path,
+    pane_id: u64,
+) -> std::result::Result<Option<IpcPaneState>, String> {
+    let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+    fetch_pane_state_from_ipc_with_cx(&cx, socket_path, pane_id).await
+}
+
+#[cfg(not(unix))]
+pub(super) async fn fetch_pane_state_from_ipc(
+    socket_path: &std::path::Path,
+    pane_id: u64,
+) -> std::result::Result<Option<IpcPaneState>, String> {
+    let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+    fetch_pane_state_from_ipc_with_cx(&cx, socket_path, pane_id).await
 }
 
 pub(super) fn resolve_alt_screen_state(state: &IpcPaneState) -> Option<bool> {
@@ -325,19 +327,11 @@ pub(super) async fn resolve_pane_capabilities_with_cx(
     pane_id: u64,
 ) -> CapabilityResolution {
     let _ = cx.checkpoint();
-    resolve_pane_capabilities(config, storage, pane_id).await
-}
-
-pub(super) async fn resolve_pane_capabilities(
-    config: &Config,
-    storage: Option<&StorageHandle>,
-    pane_id: u64,
-) -> CapabilityResolution {
     let mut warnings = Vec::new();
     let mut osc_state = None;
 
     if let Some(storage) = storage {
-        match derive_osc_state_from_storage(storage, pane_id).await {
+        match derive_osc_state_from_storage_with_cx(cx, storage, pane_id).await {
             Ok(state) => osc_state = state,
             Err(err) => warnings.push(format!("OSC 133 state unavailable: {err}")),
         }
@@ -358,7 +352,7 @@ pub(super) async fn resolve_pane_capabilities(
     };
 
     if let Some(socket_path) = ipc_socket_path.as_deref() {
-        match fetch_pane_state_from_ipc(socket_path, pane_id).await {
+        match fetch_pane_state_from_ipc_with_cx(cx, socket_path, pane_id).await {
             Ok(Some(state)) => {
                 if state.pane_id != pane_id {
                     warnings.push(format!(
@@ -413,10 +407,8 @@ pub(super) async fn resolve_pane_capabilities(
         PaneCapabilities::from_ingest_state(osc_state.as_ref(), alt_screen, in_gap);
 
     if let Some(storage) = storage {
-        // ft-xbnl0.2.3 tick 258: cx-first reservation lookup.
-        let reservation_cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
         match storage
-            .get_active_reservation_with_cx(&reservation_cx, pane_id)
+            .get_active_reservation_with_cx(cx, pane_id)
             .await
         {
             Ok(Some(reservation)) => {
@@ -434,6 +426,15 @@ pub(super) async fn resolve_pane_capabilities(
         capabilities,
         _warnings: warnings,
     }
+}
+
+pub(super) async fn resolve_pane_capabilities(
+    config: &Config,
+    storage: Option<&StorageHandle>,
+    pane_id: u64,
+) -> CapabilityResolution {
+    let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+    resolve_pane_capabilities_with_cx(&cx, config, storage, pane_id).await
 }
 
 // ── Workflow helpers ───────────────────────────────────────────────
@@ -545,31 +546,9 @@ pub(super) async fn record_mcp_audit_with_cx(
     error_code: Option<&str>,
     elapsed_ms: u64,
 ) {
-    let _ = cx.checkpoint();
-    record_mcp_audit(
-        storage,
-        tool_name,
-        input_summary,
-        decision,
-        result,
-        error_code,
-        elapsed_ms,
-    )
-    .await;
-}
-
-/// Record an MCP tool call audit entry.
-///
-/// This is fire-and-forget: failures are logged but never propagated to the caller.
-pub(super) async fn record_mcp_audit(
-    storage: &StorageHandle,
-    tool_name: &str,
-    input_summary: String,
-    decision: &str,
-    result: &str,
-    error_code: Option<&str>,
-    elapsed_ms: u64,
-) {
+    if cx.checkpoint().is_err() {
+        return;
+    }
     let ts = i64::try_from(now_ms()).unwrap_or(0);
     let action_kind = format!("mcp.{tool_name}");
     let audit = crate::storage::AuditActionRecord {
@@ -596,14 +575,42 @@ pub(super) async fn record_mcp_audit(
         ),
         result: result.to_string(),
     };
-    // ft-xbnl0.2.3 tick 258: cx-first MCP audit write.
-    let audit_cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+    // Once admitted, finish the audit under a fresh request context so a
+    // cancellation racing the storage handoff cannot leave the tool call
+    // unaudited after the caller has already observed its result.
+    let audit_cx = crate::cx::for_request();
     if let Err(e) = storage
         .record_audit_action_redacted_with_cx(&audit_cx, audit)
         .await
     {
         tracing::warn!(tool = tool_name, error = %e, "Failed to record MCP audit entry");
     }
+}
+
+/// Record an MCP tool call audit entry.
+///
+/// This is fire-and-forget: failures are logged but never propagated to the caller.
+pub(super) async fn record_mcp_audit(
+    storage: &StorageHandle,
+    tool_name: &str,
+    input_summary: String,
+    decision: &str,
+    result: &str,
+    error_code: Option<&str>,
+    elapsed_ms: u64,
+) {
+    let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+    record_mcp_audit_with_cx(
+        &cx,
+        storage,
+        tool_name,
+        input_summary,
+        decision,
+        result,
+        error_code,
+        elapsed_ms,
+    )
+    .await;
 }
 
 /// Record an MCP audit entry for tools that have a db_path available.

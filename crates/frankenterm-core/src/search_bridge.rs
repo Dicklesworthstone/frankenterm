@@ -120,9 +120,10 @@ impl BridgeCancellationToken {
         self.state.cancelled.load(Ordering::Acquire)
     }
 
-    /// Await cancellation.
-    pub async fn cancelled(&self) {
-        self.cancelled_after_initial_check(|| {}).await;
+    /// Await cancellation and report whether the bridge or ambient Cx won.
+    pub async fn cancelled(&self) -> BridgeWaitOutcome {
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.cancelled_with_cx(&cx).await
     }
 
     /// Wait after one initial predicate observation while closing the
@@ -175,7 +176,7 @@ impl BridgeCancellationToken {
         // The cx-aware yield branch polls the cx at tick boundaries
         // so a cancelled cx wakes this future without depending on
         // the bridge's own notify path.
-        let bridge_cancelled = self.cancelled();
+        let bridge_cancelled = self.cancelled_after_initial_check(|| {});
         let cx_wait = async {
             loop {
                 if cx.checkpoint().is_err() {
@@ -349,12 +350,8 @@ impl SearchBridge {
         request: SearchBridgeRequest,
         on_phase: impl FnMut(SearchPhase) + Send + 'static,
     ) -> Result<SearchBridgeResult, SearchBridgeError> {
-        self.search_with_cx(
-            Cx::current().unwrap_or_else(Cx::for_request),
-            request,
-            on_phase,
-        )
-        .await
+        let cx = Cx::current().unwrap_or_else(Cx::for_request);
+        self.search_with_cx(cx, request, on_phase).await
     }
 
     /// Run a search with a caller-provided capability context.

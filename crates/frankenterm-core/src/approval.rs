@@ -309,47 +309,8 @@ impl<'a> ApprovalStore<'a> {
         input: &PolicyInput,
         summary: Option<String>,
     ) -> Result<ApprovalRequest> {
-        let now = now_ms();
-        let active = self
-            .storage
-            .count_active_approvals(&self.workspace_id, now)
-            .await?;
-        if active >= self.config.max_active_tokens {
-            return Err(Error::Policy(format!(
-                "Approval token limit reached ({active}/{})",
-                self.config.max_active_tokens
-            )));
-        }
-
-        let code = generate_allow_once_code(DEFAULT_CODE_LEN);
-        let code_hash = hash_allow_once_code(&code);
-        let fingerprint = fingerprint_for_input(input);
-        let expires_at = now.saturating_add(expiry_ms(self.config.token_expiry_secs));
-
-        let approval_record = ApprovalTokenRecord {
-            id: 0,
-            code_hash: code_hash.clone(),
-            created_at: now,
-            expires_at,
-            used_at: None,
-            workspace_id: self.workspace_id.clone(),
-            action_kind: input.action.as_str().to_string(),
-            pane_id: input.pane_id,
-            action_fingerprint: fingerprint,
-            plan_hash: None,
-            plan_version: None,
-            risk_summary: None,
-        };
-        self.storage.insert_approval_token(approval_record).await?;
-
-        let summary = summary.unwrap_or_else(|| summary_for_input(input));
-        Ok(ApprovalRequest {
-            allow_once_code: code.clone(),
-            allow_once_full_hash: code_hash,
-            expires_at,
-            summary,
-            command: format!("ft approve {code}"),
-        })
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.issue_with_cx(&cx, input, summary).await
     }
 
     /// Cx-first [`Self::issue`] (ft-xbnl0.2.3). Threads caller
@@ -437,50 +398,15 @@ impl<'a> ApprovalStore<'a> {
         plan_version: Option<i32>,
         risk_summary: Option<String>,
     ) -> Result<ApprovalRequest> {
-        let now = now_ms();
-        let active = self
-            .storage
-            .count_active_approvals(&self.workspace_id, now)
-            .await?;
-        if active >= self.config.max_active_tokens {
-            return Err(Error::Policy(format!(
-                "Approval token limit reached ({active}/{})",
-                self.config.max_active_tokens
-            )));
-        }
-
-        let code = generate_allow_once_code(DEFAULT_CODE_LEN);
-        let code_hash = hash_allow_once_code(&code);
-        let fingerprint = fingerprint_for_input(input);
-        let expires_at = now.saturating_add(expiry_ms(self.config.token_expiry_secs));
-
-        let summary_text = risk_summary
-            .clone()
-            .unwrap_or_else(|| summary_for_input(input));
-
-        let approval_record = ApprovalTokenRecord {
-            id: 0,
-            code_hash: code_hash.clone(),
-            created_at: now,
-            expires_at,
-            used_at: None,
-            workspace_id: self.workspace_id.clone(),
-            action_kind: input.action.as_str().to_string(),
-            pane_id: input.pane_id,
-            action_fingerprint: fingerprint,
-            plan_hash: Some(plan_hash.to_string()),
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.issue_for_plan_with_cx(
+            &cx,
+            input,
+            plan_hash,
             plan_version,
-            risk_summary: risk_summary.clone(),
-        };
-        self.storage.insert_approval_token(approval_record).await?;
-
-        Ok(ApprovalRequest {
-            allow_once_code: code.clone(),
-            allow_once_full_hash: code_hash,
-            expires_at,
-            summary: summary_text,
-            command: format!("ft approve {code}"),
-        })
+            risk_summary,
+        )
+        .await
     }
 
     /// Cx-first [`Self::issue_for_plan`] (ft-xbnl0.2.3). Parallel
@@ -567,7 +493,8 @@ impl<'a> ApprovalStore<'a> {
         input: &PolicyInput,
         plan_hash: &str,
     ) -> Result<Option<ApprovalTokenRecord>> {
-        self.consume_for_plan_with_context(allow_once_code, input, plan_hash, None)
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.consume_for_plan_with_cx(&cx, allow_once_code, input, plan_hash)
             .await
     }
 
@@ -593,34 +520,15 @@ impl<'a> ApprovalStore<'a> {
         plan_hash: &str,
         audit_context: Option<ApprovalAuditContext>,
     ) -> Result<Option<ApprovalTokenRecord>> {
-        let code_hash = hash_allow_once_code(allow_once_code);
-        let fingerprint = fingerprint_for_input(input);
-        let record = self
-            .storage
-            .consume_approval_token(
-                &code_hash,
-                &self.workspace_id,
-                input.action.as_str(),
-                input.pane_id,
-                &fingerprint,
-            )
-            .await?;
-
-        match record {
-            Some(token) => {
-                // ft-trdku: require plan-hash binding. None tokens
-                // (plain `issue`) and Some(stored) mismatches both
-                // reject; only an exact match passes through.
-                if token.plan_hash.as_deref() != Some(plan_hash) {
-                    return Ok(None);
-                }
-
-                self.audit_approval_grant(input, &code_hash, &fingerprint, audit_context.as_ref())
-                    .await?;
-                Ok(Some(token))
-            }
-            None => Ok(None),
-        }
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.consume_for_plan_with_context_with_cx(
+            &cx,
+            allow_once_code,
+            input,
+            plan_hash,
+            audit_context,
+        )
+        .await
     }
 
     /// Cx-first [`Self::consume_for_plan`] (ft-xbnl0.2.3). Pure
@@ -721,12 +629,9 @@ impl<'a> ApprovalStore<'a> {
         input: &PolicyInput,
         summary: Option<String>,
     ) -> Result<PolicyDecision> {
-        if decision.requires_approval() {
-            let approval = self.issue(input, summary).await?;
-            Ok(decision.with_approval(approval))
-        } else {
-            Ok(decision)
-        }
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.attach_to_decision_with_cx(&cx, decision, input, summary)
+            .await
     }
 
     /// Cx-first [`Self::attach_to_decision`] (ft-xbnl0.2.3).
@@ -757,8 +662,8 @@ impl<'a> ApprovalStore<'a> {
         allow_once_code: &str,
         input: &PolicyInput,
     ) -> Result<Option<ApprovalTokenRecord>> {
-        self.consume_with_context(allow_once_code, input, None)
-            .await
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.consume_with_cx(&cx, allow_once_code, input).await
     }
 
     /// Consume a previously issued allow-once approval with optional audit context
@@ -768,25 +673,9 @@ impl<'a> ApprovalStore<'a> {
         input: &PolicyInput,
         audit_context: Option<ApprovalAuditContext>,
     ) -> Result<Option<ApprovalTokenRecord>> {
-        let code_hash = hash_allow_once_code(allow_once_code);
-        let fingerprint = fingerprint_for_input(input);
-        let record = self
-            .storage
-            .consume_approval_token(
-                &code_hash,
-                &self.workspace_id,
-                input.action.as_str(),
-                input.pane_id,
-                &fingerprint,
-            )
-            .await?;
-
-        if record.is_some() {
-            self.audit_approval_grant(input, &code_hash, &fingerprint, audit_context.as_ref())
-                .await?;
-        }
-
-        Ok(record)
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.consume_with_context_with_cx(&cx, allow_once_code, input, audit_context)
+            .await
     }
 
     /// Cx-first [`Self::consume`] (ft-xbnl0.2.3). Pure delegate
@@ -931,46 +820,7 @@ impl<'a> ApprovalStore<'a> {
             .await
     }
 
-    async fn audit_approval_grant(
-        &self,
-        input: &PolicyInput,
-        code_hash: &str,
-        fingerprint: &str,
-        audit_context: Option<&ApprovalAuditContext>,
-    ) -> Result<()> {
-        let ts = now_ms();
-        let verification = format!(
-            "workspace={}, fingerprint={}, hash={}",
-            self.workspace_id, fingerprint, code_hash
-        );
-        let decision_context = audit_context
-            .and_then(|ctx| ctx.decision_context.clone())
-            .or_else(|| build_approval_grant_decision_context(&self.workspace_id, input, ts));
-
-        let audit = AuditActionRecord {
-            id: 0,
-            ts,
-            actor_kind: input.actor.as_str().to_string(),
-            actor_id: None,
-            correlation_id: audit_context.and_then(|ctx| ctx.correlation_id.clone()),
-            pane_id: input.pane_id,
-            domain: input.domain.clone(),
-            action_kind: "approve_allow_once".to_string(),
-            policy_decision: "allow".to_string(),
-            decision_reason: Some("allow_once approval granted".to_string()),
-            rule_id: None,
-            input_summary: Some(format!("allow_once approval for {}", input.action.as_str())),
-            verification_summary: Some(verification),
-            decision_context,
-            result: "success".to_string(),
-        };
-
-        self.storage.record_audit_action_redacted(audit).await?;
-        Ok(())
-    }
-
-    /// ft-xbnl0.2.3 Cx-first sibling of [`Self::audit_approval_grant`].
-    /// Routes the audit write through the cx-first storage sibling.
+    /// Record an approval grant through the cx-first storage surface.
     async fn audit_approval_grant_with_cx(
         &self,
         cx: &crate::cx::Cx,

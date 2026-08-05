@@ -316,10 +316,11 @@ pub trait WebhookTransport: Send + Sync {
     /// Send a JSON payload bound to the caller's asupersync capability
     /// context (ft-xbnl0.2.3 Cx-first trait extension).
     ///
-    /// Default implementation delegates to [`send`](Self::send) which
-    /// uses ambient Cx. Concrete implementations with a Cx-aware HTTP
-    /// client (e.g. asupersync::http) SHOULD override this method to
-    /// propagate caller Cx through to the underlying cancellable I/O.
+    /// The default implementation delegates to [`send`](Self::send). The
+    /// dispatcher checkpoints immediately before and after this fallback, so
+    /// cancellation prevents a new request and stops later fanout. A request
+    /// already in flight can only be interrupted when a concrete transport
+    /// overrides this method and propagates the Cx into its HTTP client.
     ///
     /// The `cx` parameter lifetime matches the returned future so
     /// overrides can thread cx into async operations held by the
@@ -352,6 +353,34 @@ pub struct WebhookDispatcher {
 /// Record of a single delivery attempt for observability.
 pub type DeliveryRecord = NotificationDeliveryRecord;
 
+const WEBHOOK_DISPATCH_TARGET: &str = "webhook_dispatch";
+const WEBHOOK_CANCELLATION_PREFIX: &str = "webhook dispatch cancelled";
+
+fn checkpoint_dispatch(
+    cx: &crate::cx::Cx,
+    target: impl Into<String>,
+) -> std::result::Result<(), DeliveryRecord> {
+    cx.checkpoint().map_err(|err| DeliveryRecord {
+        target: target.into(),
+        accepted: false,
+        status_code: 0,
+        error: Some(format!("{WEBHOOK_CANCELLATION_PREFIX}: {err}")),
+    })
+}
+
+fn notification_delivery_error(success: bool, records: &[DeliveryRecord]) -> Option<String> {
+    if success {
+        return None;
+    }
+
+    let error = records
+        .iter()
+        .filter_map(|record| record.error.as_deref())
+        .find(|error| error.starts_with(WEBHOOK_CANCELLATION_PREFIX))
+        .unwrap_or("one_or_more_deliveries_failed");
+    Some(error.to_owned())
+}
+
 impl WebhookDispatcher {
     /// Create a new dispatcher with the given endpoints and transport.
     #[must_use]
@@ -367,7 +396,9 @@ impl WebhookDispatcher {
 
     /// Dispatch a detection to all matching endpoints.
     ///
-    /// Returns a record for each endpoint that was attempted.
+    /// Returns a record for each endpoint that was attempted. If cancellation
+    /// prevents or stops fanout, the final failed record targets
+    /// `webhook_dispatch` and carries the cancellation error.
     pub async fn dispatch(
         &self,
         detection: &Detection,
@@ -375,18 +406,23 @@ impl WebhookDispatcher {
         rendered: &RenderedEvent,
         suppressed_since_last: u64,
     ) -> Vec<DeliveryRecord> {
-        let payload =
-            WebhookPayload::from_detection(detection, pane_id, rendered, suppressed_since_last);
-        self.dispatch_payload(&payload).await
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.dispatch_with_cx(
+            &cx,
+            detection,
+            pane_id,
+            rendered,
+            suppressed_since_last,
+        )
+        .await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`dispatch`].
     ///
-    /// Builds the payload synchronously (cheap) then routes
-    /// through [`dispatch_payload_with_cx`] so caller cx
-    /// propagates through each endpoint's `transport.send_with_cx`
-    /// call. Caller cancellation cuts mid-fanout once the
-    /// transport observes it.
+    /// Checkpoints before payload construction, then routes through
+    /// [`dispatch_payload_with_cx`] so caller Cx propagates through each
+    /// endpoint's `transport.send_with_cx` call. Caller cancellation cuts
+    /// fanout even when a transport uses the default Cx-unaware fallback.
     pub async fn dispatch_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -395,6 +431,10 @@ impl WebhookDispatcher {
         rendered: &RenderedEvent,
         suppressed_since_last: u64,
     ) -> Vec<DeliveryRecord> {
+        if let Err(record) = checkpoint_dispatch(cx, WEBHOOK_DISPATCH_TARGET) {
+            return vec![record];
+        }
+
         let payload =
             WebhookPayload::from_detection(detection, pane_id, rendered, suppressed_since_last);
         self.dispatch_payload_with_cx(cx, &payload).await
@@ -402,18 +442,52 @@ impl WebhookDispatcher {
 
     /// Dispatch a pre-built payload to all matching endpoints.
     pub async fn dispatch_payload(&self, payload: &NotificationPayload) -> Vec<DeliveryRecord> {
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.dispatch_payload_with_cx(&cx, payload).await
+    }
+
+    /// Cx-first `dispatch_payload` (ft-xbnl0.2.3). Checkpoints before any
+    /// rendering, logging, or transport side effect and between matching
+    /// endpoint attempts. Cx-aware transports may also interrupt the current
+    /// request; the default transport fallback is allowed to finish only the
+    /// request already in flight, after which cancellation stops all remaining
+    /// delivery. Cancellation observed after the final matching request has
+    /// completed does not retroactively turn completed delivery into failure.
+    pub async fn dispatch_payload_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        payload: &NotificationPayload,
+    ) -> Vec<DeliveryRecord> {
         let mut records = Vec::new();
 
-        for endpoint in &self.endpoints {
-            if !endpoint.enabled {
-                continue;
-            }
+        if let Err(record) = checkpoint_dispatch(cx, WEBHOOK_DISPATCH_TARGET) {
+            records.push(record);
+            return records;
+        }
 
-            if !endpoint.matches_event_type(&payload.event_type) {
-                continue;
+        let mut matching_endpoints = self
+            .endpoints
+            .iter()
+            .filter(|endpoint| {
+                endpoint.enabled && endpoint.matches_event_type(&payload.event_type)
+            })
+            .peekable();
+
+        while let Some(endpoint) = matching_endpoints.next() {
+            if let Err(record) = checkpoint_dispatch(cx, WEBHOOK_DISPATCH_TARGET) {
+                records.push(record);
+                return records;
             }
 
             let body = render_template(endpoint.template, payload);
+
+            // Rendering is pure but can be non-trivial. Re-check immediately
+            // before the first observable side effect so cancellation that
+            // arrived during rendering cannot leak into logging or delivery.
+            if let Err(record) = checkpoint_dispatch(cx, WEBHOOK_DISPATCH_TARGET) {
+                records.push(record);
+                return records;
+            }
 
             tracing::debug!(
                 endpoint = %endpoint.name,
@@ -423,66 +497,10 @@ impl WebhookDispatcher {
                 "dispatching webhook"
             );
 
-            let result = self
-                .transport
-                .send(&endpoint.url, &endpoint.headers, &body)
-                .await;
-
-            if result.accepted {
-                tracing::info!(
-                    endpoint = %endpoint.name,
-                    status = result.status_code,
-                    "webhook delivered"
-                );
-            } else {
-                tracing::warn!(
-                    endpoint = %endpoint.name,
-                    status = result.status_code,
-                    error = ?result.error,
-                    "webhook delivery failed"
-                );
+            if let Err(record) = checkpoint_dispatch(cx, WEBHOOK_DISPATCH_TARGET) {
+                records.push(record);
+                return records;
             }
-
-            records.push(DeliveryRecord {
-                target: endpoint.name.clone(),
-                accepted: result.accepted,
-                status_code: result.status_code,
-                error: result.error,
-            });
-        }
-
-        records
-    }
-
-    /// Cx-first `dispatch_payload` (ft-xbnl0.2.3). Threads caller cx
-    /// through each endpoint delivery via `transport.send_with_cx`.
-    /// When the transport is a Cx-aware HTTP client, caller
-    /// cancellation propagates through to the underlying request.
-    pub async fn dispatch_payload_with_cx(
-        &self,
-        cx: &crate::cx::Cx,
-        payload: &NotificationPayload,
-    ) -> Vec<DeliveryRecord> {
-        let mut records = Vec::new();
-
-        for endpoint in &self.endpoints {
-            if !endpoint.enabled {
-                continue;
-            }
-
-            if !endpoint.matches_event_type(&payload.event_type) {
-                continue;
-            }
-
-            let body = render_template(endpoint.template, payload);
-
-            tracing::debug!(
-                endpoint = %endpoint.name,
-                url = %endpoint.url,
-                template = %endpoint.template,
-                rule_id = %payload.event_type,
-                "dispatching webhook (cx-first)"
-            );
 
             let result = self
                 .transport
@@ -510,6 +528,18 @@ impl WebhookDispatcher {
                 status_code: result.status_code,
                 error: result.error,
             });
+
+            // The transport fallback may not observe Cx cancellation while a
+            // request is in flight. Check again only when another matching
+            // endpoint remains. Once the final intended side effect has
+            // completed, a concurrent late cancellation must not create a
+            // false failure that could invite duplicate delivery.
+            if matching_endpoints.peek().is_some() {
+                if let Err(record) = checkpoint_dispatch(cx, WEBHOOK_DISPATCH_TARGET) {
+                    records.push(record);
+                    return records;
+                }
+            }
         }
 
         records
@@ -541,15 +571,12 @@ impl NotificationSender for WebhookDispatcher {
         Box::pin(async move {
             let records = self.dispatch_payload_with_cx(cx, payload).await;
             let success = records.iter().all(|r| r.accepted);
+            let error = notification_delivery_error(success, &records);
             NotificationDelivery {
                 sender: self.name().to_string(),
                 success,
                 rate_limited: false,
-                error: if success {
-                    None
-                } else {
-                    Some("one_or_more_deliveries_failed".to_string())
-                },
+                error,
                 records,
             }
         })
@@ -559,15 +586,12 @@ impl NotificationSender for WebhookDispatcher {
         Box::pin(async move {
             let records = self.dispatch_payload(payload).await;
             let success = records.iter().all(|r| r.accepted);
+            let error = notification_delivery_error(success, &records);
             NotificationDelivery {
                 sender: self.name().to_string(),
                 success,
                 rate_limited: false,
-                error: if success {
-                    None
-                } else {
-                    Some("one_or_more_deliveries_failed".to_string())
-                },
+                error,
                 records,
             }
         })
@@ -697,6 +721,57 @@ mod tests {
             self.cx_requests.lock().unwrap().push(req);
             let resp = self.response.clone();
             Box::pin(async move { resp })
+        }
+    }
+
+    /// Transport that intentionally relies on the trait's default
+    /// `send_with_cx` implementation. This pins the dispatcher's cancellation
+    /// gates for transports that cannot interrupt an in-flight request.
+    #[derive(Clone)]
+    struct AmbientOnlyTransport {
+        requests: Arc<Mutex<Vec<MockRequest>>>,
+        cancel_on_send: Option<crate::cx::Cx>,
+    }
+
+    impl AmbientOnlyTransport {
+        fn success() -> Self {
+            Self {
+                requests: Arc::new(Mutex::new(Vec::new())),
+                cancel_on_send: None,
+            }
+        }
+
+        fn cancelling(cx: &crate::cx::Cx) -> Self {
+            Self {
+                requests: Arc::new(Mutex::new(Vec::new())),
+                cancel_on_send: Some(cx.clone()),
+            }
+        }
+
+        fn requests(&self) -> Vec<MockRequest> {
+            self.requests.lock().unwrap().clone()
+        }
+    }
+
+    impl WebhookTransport for AmbientOnlyTransport {
+        fn send<'a>(
+            &'a self,
+            url: &'a str,
+            headers: &'a HashMap<String, String>,
+            body: &'a serde_json::Value,
+        ) -> Pin<Box<dyn Future<Output = DeliveryResult> + Send + 'a>> {
+            self.requests.lock().unwrap().push(MockRequest {
+                url: url.to_string(),
+                headers: headers.clone(),
+                body: body.clone(),
+            });
+            if let Some(cx) = &self.cancel_on_send {
+                cx.cancel_with(
+                    crate::outcome::CancelKind::User,
+                    Some("default webhook transport mid-fanout test"),
+                );
+            }
+            Box::pin(async { DeliveryResult::ok(200) })
         }
     }
 
@@ -884,7 +959,7 @@ mod tests {
 
             assert_eq!(records.len(), 2);
             assert!(records.iter().all(|r| r.accepted));
-            assert_eq!(transport.requests().len(), 2);
+            assert_eq!(transport.cx_requests().len(), 2);
         });
     }
 
@@ -976,6 +1051,121 @@ mod tests {
     }
 
     #[test]
+    fn precancelled_cx_blocks_default_transport_and_surfaces_cancellation() {
+        run_async_test(async {
+            let transport = AmbientOnlyTransport::success();
+            let endpoints = vec![test_endpoint(
+                "blocked",
+                "https://example.invalid/blocked",
+                WebhookTemplate::Generic,
+            )];
+            let dispatcher = WebhookDispatcher::new(endpoints, Box::new(transport.clone()));
+            let payload =
+                NotificationPayload::from_detection(&test_detection(), 3, &test_rendered(), 0);
+            let cx = crate::cx::for_request();
+            cx.cancel_with(
+                crate::outcome::CancelKind::User,
+                Some("pre-cancelled webhook dispatch test"),
+            );
+
+            let delivery = dispatcher.send_with_cx(&cx, &payload).await;
+
+            assert!(!delivery.success);
+            assert_eq!(delivery.records.len(), 1);
+            assert_eq!(delivery.records[0].target, WEBHOOK_DISPATCH_TARGET);
+            assert!(!delivery.records[0].accepted);
+            assert!(
+                delivery.records[0]
+                    .error
+                    .as_deref()
+                    .is_some_and(|error| error.starts_with(WEBHOOK_CANCELLATION_PREFIX))
+            );
+            assert!(
+                delivery
+                    .error
+                    .as_deref()
+                    .is_some_and(|error| error.starts_with(WEBHOOK_CANCELLATION_PREFIX)),
+                "NotificationDelivery must surface cancellation, not a generic failure"
+            );
+            assert!(
+                transport.requests().is_empty(),
+                "pre-cancelled dispatch must not enter the default transport"
+            );
+        });
+    }
+
+    #[test]
+    fn cancellation_during_default_transport_stops_later_endpoints() {
+        run_async_test(async {
+            let cx = crate::cx::for_request();
+            let transport = AmbientOnlyTransport::cancelling(&cx);
+            let endpoints = vec![
+                test_endpoint(
+                    "first",
+                    "https://example.invalid/first",
+                    WebhookTemplate::Generic,
+                ),
+                test_endpoint(
+                    "must-not-run",
+                    "https://example.invalid/second",
+                    WebhookTemplate::Generic,
+                ),
+            ];
+            let dispatcher = WebhookDispatcher::new(endpoints, Box::new(transport.clone()));
+            let payload =
+                NotificationPayload::from_detection(&test_detection(), 3, &test_rendered(), 0);
+
+            let records = dispatcher.dispatch_payload_with_cx(&cx, &payload).await;
+
+            assert_eq!(
+                transport.requests().len(),
+                1,
+                "cancellation from the first default-transport request must stop later fanout"
+            );
+            assert_eq!(records.len(), 2);
+            assert_eq!(records[0].target, "first");
+            assert!(records[0].accepted, "the completed first attempt is retained");
+            assert_eq!(records[1].target, WEBHOOK_DISPATCH_TARGET);
+            assert!(!records[1].accepted);
+            assert!(
+                records[1]
+                    .error
+                    .as_deref()
+                    .is_some_and(|error| error.starts_with(WEBHOOK_CANCELLATION_PREFIX))
+            );
+            assert!(records.iter().all(|record| record.target != "must-not-run"));
+        });
+    }
+
+    #[test]
+    fn late_cancellation_does_not_falsify_completed_final_delivery() {
+        run_async_test(async {
+            let cx = crate::cx::for_request();
+            let transport = AmbientOnlyTransport::cancelling(&cx);
+            let endpoints = vec![test_endpoint(
+                "only",
+                "https://example.invalid/only",
+                WebhookTemplate::Generic,
+            )];
+            let dispatcher = WebhookDispatcher::new(endpoints, Box::new(transport.clone()));
+            let payload =
+                NotificationPayload::from_detection(&test_detection(), 3, &test_rendered(), 0);
+
+            let delivery = dispatcher.send_with_cx(&cx, &payload).await;
+
+            assert_eq!(transport.requests().len(), 1);
+            assert_eq!(delivery.records.len(), 1);
+            assert_eq!(delivery.records[0].target, "only");
+            assert!(delivery.records[0].accepted);
+            assert!(
+                delivery.success,
+                "a cancellation observed only after the final accepted side effect must not create a false failure"
+            );
+            assert_eq!(delivery.error, None);
+        });
+    }
+
+    #[test]
     fn dispatcher_skips_disabled_endpoints() {
         run_async_test(async {
             let transport = MockTransport::success();
@@ -988,7 +1178,7 @@ mod tests {
                 .await;
 
             assert!(records.is_empty());
-            assert!(transport.requests().is_empty());
+            assert!(transport.cx_requests().is_empty());
         });
     }
 
@@ -1005,7 +1195,7 @@ mod tests {
                 .await;
 
             assert!(records.is_empty());
-            assert!(transport.requests().is_empty());
+            assert!(transport.cx_requests().is_empty());
         });
     }
 
@@ -1045,7 +1235,7 @@ mod tests {
                 .dispatch(&test_detection(), 1, &test_rendered(), 0)
                 .await;
 
-            let reqs = transport.requests();
+            let reqs = transport.cx_requests();
             assert_eq!(reqs.len(), 2);
 
             // Generic has flat fields
@@ -1069,7 +1259,7 @@ mod tests {
                 .dispatch(&test_detection(), 1, &test_rendered(), 0)
                 .await;
 
-            let reqs = transport.requests();
+            let reqs = transport.cx_requests();
             assert_eq!(
                 reqs[0].headers.get("Authorization").unwrap(),
                 "Bearer tok123"
@@ -1195,6 +1385,7 @@ url = "http://localhost:8080/hook"
             }
             // Verify no requests were made
             assert!(transport.requests().is_empty());
+            assert!(transport.cx_requests().is_empty());
         });
     }
 
@@ -1239,7 +1430,7 @@ url = "http://localhost:8080/hook"
             assert_eq!(records.len(), 2);
             assert!(records.iter().all(|r| r.accepted));
 
-            let reqs = transport.requests();
+            let reqs = transport.cx_requests();
             assert_eq!(reqs.len(), 2);
             // First request: Slack (has blocks)
             assert!(reqs[0].body["blocks"].is_array());
@@ -1279,7 +1470,7 @@ url = "http://localhost:8080/hook"
                     .dispatch(&d, 3, &test_rendered(), suppressed_since_last)
                     .await;
             }
-            assert_eq!(transport.requests().len(), 1);
+            assert_eq!(transport.cx_requests().len(), 1);
 
             // Second identical event — should be deduplicated
             let d2 = gate.should_notify(&d, 3, None);
@@ -1346,7 +1537,7 @@ url = "http://localhost:8080/hook"
 
             assert_eq!(records.len(), 1);
             assert_eq!(records[0].target, "codex-hook");
-            assert_eq!(transport.requests().len(), 1);
+            assert_eq!(transport.cx_requests().len(), 1);
         });
     }
 

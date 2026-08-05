@@ -404,7 +404,66 @@ pub fn clear_runtime_handle() {
     ASUPERSYNC_HANDLE.with(|cell| cell.replace(None));
 }
 
-/// No-op for builds that do not install an asupersync runtime handle.
+/// Project-owned error surface for fallible mutex and rwlock acquisition.
+///
+/// Keeping this type in `runtime_async` prevents callers from depending on
+/// asupersync's crate-internal lock error types while retaining the failure
+/// distinctions needed for cancellation-safe control flow and diagnostics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LockAcquireError {
+    /// A panic occurred while a guard was held.
+    Poisoned,
+    /// The caller's capability context was cancelled.
+    Cancelled,
+    /// The capability-context deadline elapsed before acquisition.
+    TimedOut {
+        /// Logical deadline reported by asupersync, in nanoseconds.
+        deadline_nanos: u64,
+    },
+    /// The underlying acquisition future was polled after completion.
+    PolledAfterCompletion,
+}
+
+impl std::fmt::Display for LockAcquireError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Poisoned => write!(f, "lock is poisoned"),
+            Self::Cancelled => write!(f, "lock acquisition cancelled"),
+            Self::TimedOut { deadline_nanos } => {
+                write!(f, "lock acquisition timed out at {deadline_nanos}ns")
+            }
+            Self::PolledAfterCompletion => {
+                write!(f, "lock acquisition future polled after completion")
+            }
+        }
+    }
+}
+
+impl std::error::Error for LockAcquireError {}
+
+fn map_mutex_lock_error(error: asupersync::sync::LockError) -> LockAcquireError {
+    match error {
+        asupersync::sync::LockError::Poisoned => LockAcquireError::Poisoned,
+        asupersync::sync::LockError::Cancelled => LockAcquireError::Cancelled,
+        asupersync::sync::LockError::TimedOut(deadline) => LockAcquireError::TimedOut {
+            deadline_nanos: deadline.as_nanos(),
+        },
+        asupersync::sync::LockError::PolledAfterCompletion => {
+            LockAcquireError::PolledAfterCompletion
+        }
+    }
+}
+
+fn map_rwlock_error(error: asupersync::sync::RwLockError) -> LockAcquireError {
+    match error {
+        asupersync::sync::RwLockError::Poisoned => LockAcquireError::Poisoned,
+        asupersync::sync::RwLockError::Cancelled => LockAcquireError::Cancelled,
+        asupersync::sync::RwLockError::PolledAfterCompletion => {
+            LockAcquireError::PolledAfterCompletion
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct Mutex<T> {
     inner: asupersync::sync::Mutex<T>,
@@ -419,8 +478,10 @@ impl<T> Mutex<T> {
     }
 
     pub async fn lock(&self) -> MutexGuard<'_, T> {
-        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-        self.lock_with_cx(&cx).await
+        let cx = crate::cx::for_request();
+        self.lock_with_cx(&cx)
+            .await
+            .expect("runtime_async mutex lock failed")
     }
 
     /// Acquire the mutex bound to the caller's asupersync capability
@@ -432,35 +493,25 @@ impl<T> Mutex<T> {
     /// wait deterministically under `LabRuntime` virtual time instead
     /// of relying on `Cx::current()` thread-local lookup.
     ///
-    /// Panics with the same "runtime_async mutex lock failed" message
-    /// as [`lock`](Self::lock) if the underlying asupersync mutex
-    /// reports an acquire error. The panic surface is preserved
-    /// because changing it would break callers that rely on the legacy
-    /// `lock().await` infallible contract.
+    /// This method never turns cancellation, poisoning, or deadline expiry into
+    /// a panic. A cancellation requested while the future is suspended is
+    /// observed on its next poll; cancellation does not itself guarantee that a
+    /// contended lock waiter is woken, so callers requiring prompt cancellation
+    /// must race the acquire against a cancellation signal.
     ///
-    /// # Cancellation semantics
+    /// # Errors
     ///
-    /// Distinct contract from the channel / semaphore primitives
-    /// pinned by ft-xbnl0.2.4 ticks 418-439: instead of returning
-    /// an `Err` variant on cancel, `Mutex::lock_with_cx` **panics**
-    /// on any underlying acquire error (including cx-cancel). This is
-    /// an intentional infallible-contract preservation — callers
-    /// originally written against `Mutex::lock()` (no fallible return)
-    /// continue to work without Result-threading. If the caller needs
-    /// to observe cancel cleanly, use the recv/acquire primitives
-    /// instead (see `docs/ft-xbnl0-2-4-completion-evidence.md` §2.6.1
-    /// for the surface map). Mid-flight cancel observability while
-    /// holding the guard is equivalent to the broader asupersync
-    /// mid-flight gap documented in §2.6.1 — callers needing it
-    /// must apply the select-race pattern around the critical
-    /// section's awaits rather than around the lock acquire itself.
-    pub async fn lock_with_cx(&self, cx: &crate::cx::Cx) -> MutexGuard<'_, T> {
-        let guard = self
-            .inner
+    /// Returns [`LockAcquireError`] with the exact project-level failure class
+    /// reported by the underlying lock acquisition.
+    pub async fn lock_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+    ) -> Result<MutexGuard<'_, T>, LockAcquireError> {
+        self.inner
             .lock(cx)
             .await
-            .expect("runtime_async mutex lock failed");
-        MutexGuard { inner: guard }
+            .map(|inner| MutexGuard { inner })
+            .map_err(map_mutex_lock_error)
     }
 }
 
@@ -497,59 +548,70 @@ impl<T> RwLock<T> {
 
     #[allow(clippy::future_not_send)] // asupersync RwLock is !Sync by design
     pub async fn read(&self) -> RwLockReadGuard<'_, T> {
-        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-        self.read_with_cx(&cx).await
+        let cx = crate::cx::for_request();
+        self.read_with_cx(&cx)
+            .await
+            .expect("runtime_async rwlock read failed")
     }
 
     /// Acquire a read guard bound to the caller's asupersync capability
     /// context (ft-xbnl0.2.x Cx-first primitive).
     ///
-    /// Preferred over [`read`](Self::read) when the call site already
-    /// threads `&Cx` through its public API. Same panic surface as
-    /// [`read`](Self::read) — "runtime_async rwlock read failed" —
-    /// preserved for infallible-contract callers.
+    /// Preferred over [`read`](Self::read) when the call site already threads
+    /// `&Cx` through its public API.
     ///
-    /// # Cancellation semantics
+    /// Cancellation requested while a contended read is suspended is observed
+    /// on its next poll. Callers requiring cancellation itself to wake the
+    /// waiter must race the acquire against a cancellation signal.
     ///
-    /// Same panic-on-cancel contract as [`Mutex::lock_with_cx`]. See
-    /// that method's doc for the rationale and for the recv/acquire
-    /// alternatives that surface cancel as `Err` cleanly.
+    /// # Errors
+    ///
+    /// Returns [`LockAcquireError`] instead of panicking when acquisition is
+    /// cancelled, poisoned, or otherwise cannot complete.
     #[allow(clippy::future_not_send)] // asupersync RwLock is !Sync by design
-    pub async fn read_with_cx(&self, cx: &crate::cx::Cx) -> RwLockReadGuard<'_, T> {
-        let guard = self
-            .inner
+    pub async fn read_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+    ) -> Result<RwLockReadGuard<'_, T>, LockAcquireError> {
+        self.inner
             .read(cx)
             .await
-            .expect("runtime_async rwlock read failed");
-        RwLockReadGuard { inner: guard }
+            .map(|inner| RwLockReadGuard { inner })
+            .map_err(map_rwlock_error)
     }
 
     #[allow(clippy::future_not_send)] // asupersync RwLock is !Sync by design
     pub async fn write(&self) -> RwLockWriteGuard<'_, T> {
-        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-        self.write_with_cx(&cx).await
+        let cx = crate::cx::for_request();
+        self.write_with_cx(&cx)
+            .await
+            .expect("runtime_async rwlock write failed")
     }
 
     /// Acquire a write guard bound to the caller's asupersync capability
     /// context (ft-xbnl0.2.x Cx-first primitive).
     ///
     /// Preferred over [`write`](Self::write) when the call site already
-    /// threads `&Cx`. Same panic surface as [`write`](Self::write) —
-    /// "runtime_async rwlock write failed".
+    /// threads `&Cx`.
     ///
-    /// # Cancellation semantics
+    /// Cancellation requested while a contended write is suspended is observed
+    /// on its next poll. Callers requiring cancellation itself to wake the
+    /// waiter must race the acquire against a cancellation signal.
     ///
-    /// Same panic-on-cancel contract as [`Mutex::lock_with_cx`] and
-    /// [`RwLock::read_with_cx`]. See Mutex::lock_with_cx doc for the
-    /// rationale.
+    /// # Errors
+    ///
+    /// Returns [`LockAcquireError`] instead of panicking when acquisition is
+    /// cancelled, poisoned, or otherwise cannot complete.
     #[allow(clippy::future_not_send)] // asupersync RwLock is !Sync by design
-    pub async fn write_with_cx(&self, cx: &crate::cx::Cx) -> RwLockWriteGuard<'_, T> {
-        let guard = self
-            .inner
+    pub async fn write_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+    ) -> Result<RwLockWriteGuard<'_, T>, LockAcquireError> {
+        self.inner
             .write(cx)
             .await
-            .expect("runtime_async rwlock write failed");
-        RwLockWriteGuard { inner: guard }
+            .map(|inner| RwLockWriteGuard { inner })
+            .map_err(map_rwlock_error)
     }
 }
 
@@ -3614,10 +3676,11 @@ where
 /// follows this pattern (e.g. `MetricsServer::start_with_cx`,
 /// `start_web_server_with_cx`, `EventWaiter::wait_with_cx`).
 ///
-/// Mid-flight cancellation is observable only at await points inside
-/// the wrapped future whose primitives *themselves* honour cx cancel
-/// (e.g. `sleep_with_cx`, `broadcast_recv_with_cx`) — it is not
-/// otherwise observed by `timeout_with_cx`'s own polling.
+/// Mid-flight direct cancellation is observable only if the wrapped future is
+/// subsequently polled and checks the `Cx` itself. Neither this timeout nor
+/// `sleep_with_cx` registers a direct-cancellation wake, so a suspended caller
+/// that requires prompt cancellation must race against an explicit
+/// cancellation signal.
 pub async fn timeout_with_cx<F>(
     cx: &crate::cx::Cx,
     duration: Duration,
@@ -3634,24 +3697,6 @@ where
 fn cx_timer_now(cx: &crate::cx::Cx) -> asupersync::Time {
     cx.timer_driver()
         .map_or_else(asupersync::time::wall_now, |driver| driver.now())
-}
-
-/// Mint an independent request capability with both a caller-selected budget
-/// and a relative deadline.
-///
-/// Capability constructors outside this module should not reach through to
-/// asupersync's clock directly: doing so bypasses the runtime-owned timer
-/// driver under deterministic runtimes. The seed context supplies that clock;
-/// the returned context is fresh, so cancellation of an unrelated caller
-/// cannot suppress bounded cleanup or compensation work.
-#[must_use]
-pub fn fresh_request_cx_with_budget_timeout(
-    budget: crate::cx::Budget,
-    timeout: Duration,
-) -> crate::cx::Cx {
-    let seed = crate::cx::Cx::for_request();
-    let deadline = cx_timer_now(&seed) + timeout;
-    crate::cx::Cx::for_request_with_budget(budget.with_deadline(deadline))
 }
 
 /// Runs blocking work on the active runtime's blocking executor.
@@ -9689,8 +9734,73 @@ mod tests {
             run_lab(0x10C5_10C5_C410_4001, || async move {
                 let m = Mutex::new(42u32);
                 let cx = crate::cx::for_request();
-                let guard = m.lock_with_cx(&cx).await;
+                let guard = m
+                    .lock_with_cx(&cx)
+                    .await
+                    .expect("live explicit Cx must acquire mutex");
                 assert_eq!(*guard, 42);
+            });
+        }
+
+        /// The canonical mutex surface must report explicit-Cx cancellation.
+        #[test]
+        fn mutex_lock_with_cx_returns_cancelled() {
+            run_lab(0x10C5_10C5_C410_4011, || async move {
+                let m = Mutex::new(42u32);
+                let cx = crate::cx::for_testing();
+                cx.cancel_with(
+                    crate::outcome::CancelKind::User,
+                    Some("pre-cancel fallible mutex lock"),
+                );
+
+                let error = m
+                    .lock_with_cx(&cx)
+                    .await
+                    .err()
+                    .expect("pre-cancelled mutex acquire must be fallible");
+                assert_eq!(error, LockAcquireError::Cancelled);
+            });
+        }
+
+        /// A mutex waiter already queued behind an owner observes cancellation
+        /// when explicitly repolled, never acquires, and removes itself so a
+        /// later live waiter is not stranded behind stale queue state.
+        #[test]
+        fn mutex_contended_waiter_cancellation_cleans_queue() {
+            run_lab(0x10C5_10C5_C410_4021, || async move {
+                use std::future::Future as _;
+                use std::task::Poll;
+
+                let mutex = Mutex::new(41u32);
+                let owner_cx = crate::cx::for_request();
+                let owner = mutex
+                    .lock_with_cx(&owner_cx)
+                    .await
+                    .expect("owner must acquire mutex");
+                let waiter_cx = crate::cx::for_testing();
+                let mut waiter = Box::pin(mutex.lock_with_cx(&waiter_cx));
+                let waker = futures::task::noop_waker();
+                let mut task_cx = std::task::Context::from_waker(&waker);
+
+                assert!(matches!(waiter.as_mut().poll(&mut task_cx), Poll::Pending));
+                waiter_cx.cancel_with(
+                    crate::outcome::CancelKind::User,
+                    Some("cancel queued mutex waiter"),
+                );
+                assert!(matches!(
+                    waiter.as_mut().poll(&mut task_cx),
+                    Poll::Ready(Err(LockAcquireError::Cancelled))
+                ));
+                drop(waiter);
+                assert_eq!(*owner, 41, "cancelled waiter must not acquire or mutate");
+                drop(owner);
+
+                let probe_cx = crate::cx::for_request();
+                let probe = mutex
+                    .lock_with_cx(&probe_cx)
+                    .await
+                    .expect("cancelled waiter must leave no stale queue entry");
+                assert_eq!(*probe, 41);
             });
         }
 
@@ -9700,8 +9810,72 @@ mod tests {
             run_lab(0x10C5_10C5_C410_4002, || async move {
                 let r = RwLock::new(7u32);
                 let cx = crate::cx::for_request();
-                let guard = r.read_with_cx(&cx).await;
+                let guard = r
+                    .read_with_cx(&cx)
+                    .await
+                    .expect("live explicit Cx must acquire rwlock read guard");
                 assert_eq!(*guard, 7);
+            });
+        }
+
+        /// The canonical read surface reports explicit-Cx cancellation.
+        #[test]
+        fn rwlock_read_with_cx_returns_cancelled() {
+            run_lab(0x10C5_10C5_C410_4012, || async move {
+                let r = RwLock::new(7u32);
+                let cx = crate::cx::for_testing();
+                cx.cancel_with(
+                    crate::outcome::CancelKind::User,
+                    Some("pre-cancel fallible rwlock read"),
+                );
+
+                let error = r
+                    .read_with_cx(&cx)
+                    .await
+                    .err()
+                    .expect("pre-cancelled rwlock read must be fallible");
+                assert_eq!(error, LockAcquireError::Cancelled);
+            });
+        }
+
+        /// A queued read behind a writer observes cancellation on explicit
+        /// repoll and leaves the reader queue usable by a later live reader.
+        #[test]
+        fn rwlock_contended_reader_cancellation_cleans_queue() {
+            run_lab(0x10C5_10C5_C410_4022, || async move {
+                use std::future::Future as _;
+                use std::task::Poll;
+
+                let rwlock = RwLock::new(7u32);
+                let owner_cx = crate::cx::for_request();
+                let owner = rwlock
+                    .write_with_cx(&owner_cx)
+                    .await
+                    .expect("owner must acquire write guard");
+                let waiter_cx = crate::cx::for_testing();
+                let mut waiter = Box::pin(rwlock.read_with_cx(&waiter_cx));
+                let waker = futures::task::noop_waker();
+                let mut task_cx = std::task::Context::from_waker(&waker);
+
+                assert!(matches!(waiter.as_mut().poll(&mut task_cx), Poll::Pending));
+                waiter_cx.cancel_with(
+                    crate::outcome::CancelKind::User,
+                    Some("cancel queued rwlock reader"),
+                );
+                assert!(matches!(
+                    waiter.as_mut().poll(&mut task_cx),
+                    Poll::Ready(Err(LockAcquireError::Cancelled))
+                ));
+                drop(waiter);
+                assert_eq!(*owner, 7, "cancelled reader must not acquire");
+                drop(owner);
+
+                let probe_cx = crate::cx::for_request();
+                let probe = rwlock
+                    .read_with_cx(&probe_cx)
+                    .await
+                    .expect("cancelled reader must leave no stale queue entry");
+                assert_eq!(*probe, 7);
             });
         }
 
@@ -9713,18 +9887,109 @@ mod tests {
                 let r = RwLock::new(1u32);
                 let cx = crate::cx::for_request();
                 {
-                    let mut w = r.write_with_cx(&cx).await;
+                    let mut w = r
+                        .write_with_cx(&cx)
+                        .await
+                        .expect("live explicit Cx must acquire rwlock write guard");
                     *w = 100;
                 }
                 let read_cx = crate::cx::for_request();
-                let guard = r.read_with_cx(&read_cx).await;
+                let guard = r
+                    .read_with_cx(&read_cx)
+                    .await
+                    .expect("live explicit Cx must acquire follow-up read guard");
                 assert_eq!(*guard, 100, "write_with_cx mutation must be durable");
             });
         }
 
-        /// `lock_with_cx` delegates from `lock()`: the legacy entry point
-        /// still works. Pin the delegation contract so a future refactor
-        /// doesn't accidentally diverge the two paths.
+        /// The canonical write surface reports explicit-Cx cancellation.
+        #[test]
+        fn rwlock_write_with_cx_returns_cancelled() {
+            run_lab(0x10C5_10C5_C410_4013, || async move {
+                let r = RwLock::new(1u32);
+                let cx = crate::cx::for_testing();
+                cx.cancel_with(
+                    crate::outcome::CancelKind::User,
+                    Some("pre-cancel fallible rwlock write"),
+                );
+
+                let error = r
+                    .write_with_cx(&cx)
+                    .await
+                    .err()
+                    .expect("pre-cancelled rwlock write must be fallible");
+                assert_eq!(error, LockAcquireError::Cancelled);
+            });
+        }
+
+        /// A queued writer behind a reader observes cancellation on explicit
+        /// repoll and leaves the writer queue usable by a later live writer.
+        #[test]
+        fn rwlock_contended_writer_cancellation_cleans_queue() {
+            run_lab(0x10C5_10C5_C410_4023, || async move {
+                use std::future::Future as _;
+                use std::task::Poll;
+
+                let rwlock = RwLock::new(1u32);
+                let owner_cx = crate::cx::for_request();
+                let owner = rwlock
+                    .read_with_cx(&owner_cx)
+                    .await
+                    .expect("owner must acquire read guard");
+                let waiter_cx = crate::cx::for_testing();
+                let mut waiter = Box::pin(rwlock.write_with_cx(&waiter_cx));
+                let waker = futures::task::noop_waker();
+                let mut task_cx = std::task::Context::from_waker(&waker);
+
+                assert!(matches!(waiter.as_mut().poll(&mut task_cx), Poll::Pending));
+                waiter_cx.cancel_with(
+                    crate::outcome::CancelKind::User,
+                    Some("cancel queued rwlock writer"),
+                );
+                assert!(matches!(
+                    waiter.as_mut().poll(&mut task_cx),
+                    Poll::Ready(Err(LockAcquireError::Cancelled))
+                ));
+                drop(waiter);
+                assert_eq!(*owner, 1, "cancelled writer must not acquire or mutate");
+                drop(owner);
+
+                let probe_cx = crate::cx::for_request();
+                let mut probe = rwlock
+                    .write_with_cx(&probe_cx)
+                    .await
+                    .expect("cancelled writer must leave no stale queue entry");
+                *probe = 2;
+                drop(probe);
+                assert_eq!(*rwlock.read().await, 2);
+            });
+        }
+
+        /// Ambient lock helpers intentionally create an independent request Cx
+        /// instead of inheriting an installed caller context. Cancelling the
+        /// installed context therefore cannot turn their infallible contract
+        /// into a panic.
+        #[test]
+        fn ambient_locks_ignore_cancelled_installed_cx() {
+            run_lab(0x10C5_10C5_C410_4014, || async move {
+                let installed = crate::cx::Cx::current().expect("lab task installs a Cx");
+                installed.cancel_with(
+                    crate::outcome::CancelKind::User,
+                    Some("cancel installed context before ambient locks"),
+                );
+
+                let mutex = Mutex::new(11u32);
+                assert_eq!(*mutex.lock().await, 11);
+
+                let rwlock = RwLock::new(12u32);
+                assert_eq!(*rwlock.read().await, 12);
+                *rwlock.write().await = 13;
+                assert_eq!(*rwlock.read().await, 13);
+            });
+        }
+
+        /// The ambient mutex entry point retains its infallible guard contract
+        /// while delegating through the canonical typed explicit-Cx method.
         #[test]
         fn mutex_lock_still_works_after_cx_first_delegation() {
             run_lab(0x10C5_10C5_C410_4004, || async move {
@@ -9896,6 +10161,26 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "semaphore acquire future polled after completion"
+        );
+    }
+
+    #[test]
+    fn lock_acquire_error_display_preserves_failure_class() {
+        assert_eq!(LockAcquireError::Poisoned.to_string(), "lock is poisoned");
+        assert_eq!(
+            LockAcquireError::Cancelled.to_string(),
+            "lock acquisition cancelled"
+        );
+        assert_eq!(
+            LockAcquireError::TimedOut {
+                deadline_nanos: 42,
+            }
+            .to_string(),
+            "lock acquisition timed out at 42ns"
+        );
+        assert_eq!(
+            LockAcquireError::PolledAfterCompletion.to_string(),
+            "lock acquisition future polled after completion"
         );
     }
 

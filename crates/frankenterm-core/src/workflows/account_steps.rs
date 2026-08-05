@@ -76,25 +76,23 @@ pub async fn refresh_and_select_account_with_cx(
             message: e.to_string(),
         })
     })?;
-    refresh_and_select_account(caut_client, storage, config).await
-}
 
-#[allow(dead_code)]
-pub async fn refresh_and_select_account(
-    caut_client: &crate::caut::CautClient,
-    storage: &StorageHandle,
-    config: &crate::accounts::AccountSelectionConfig,
-) -> Result<AccountSelectionStepResult, AccountSelectionStepError> {
-    // Step 1: Refresh usage from caut
+    // Keep the subprocess-backed refresh and every storage operation on the
+    // caller's exact capability context.
     let refresh_result = caut_client
-        .refresh(crate::caut::CautService::OpenAI)
+        .refresh_cx(cx, crate::caut::CautService::OpenAI)
         .await
         .map_err(AccountSelectionStepError::Caut)?;
+    cx.checkpoint().map_err(|e| {
+        AccountSelectionStepError::Caut(crate::caut::CautError::Io {
+            message: e.to_string(),
+        })
+    })?;
 
-    // Step 2: Update accounts mirror in DB
     let accounts_refreshed = refresh_result.accounts.len();
     let now_ms = crate::accounts::now_ms();
-    persist_caut_refresh_accounts(
+    persist_caut_refresh_accounts_with_cx(
+        cx,
         storage,
         crate::caut::CautService::OpenAI,
         &refresh_result,
@@ -102,9 +100,8 @@ pub async fn refresh_and_select_account(
     )
     .await?;
 
-    // Step 3: Select best account
     let selection = storage
-        .select_account("openai", config)
+        .select_account_with_cx(cx, "openai", config)
         .await
         .map_err(|e| AccountSelectionStepError::Storage(e.to_string()))?;
     let quota_advisory = crate::accounts::build_quota_advisory(
@@ -120,6 +117,16 @@ pub async fn refresh_and_select_account(
     })
 }
 
+#[allow(dead_code)]
+pub async fn refresh_and_select_account(
+    caut_client: &crate::caut::CautClient,
+    storage: &StorageHandle,
+    config: &crate::accounts::AccountSelectionConfig,
+) -> Result<AccountSelectionStepResult, AccountSelectionStepError> {
+    let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+    refresh_and_select_account_with_cx(&cx, caut_client, storage, config).await
+}
+
 /// ft-tr5a0 Cx-first sibling of [`persist_caut_refresh_accounts`].
 pub async fn persist_caut_refresh_accounts_with_cx(
     cx: &crate::cx::Cx,
@@ -133,15 +140,6 @@ pub async fn persist_caut_refresh_accounts_with_cx(
             message: e.to_string(),
         })
     })?;
-    persist_caut_refresh_accounts(storage, service, refresh, now_ms).await
-}
-
-pub async fn persist_caut_refresh_accounts(
-    storage: &StorageHandle,
-    service: crate::caut::CautService,
-    refresh: &crate::caut::CautRefresh,
-    now_ms: i64,
-) -> Result<usize, AccountSelectionStepError> {
     fn extra_f64(
         extra: &std::collections::HashMap<String, serde_json::Value>,
         key: &str,
@@ -177,7 +175,7 @@ pub async fn persist_caut_refresh_accounts(
         let account_id = record.account_id.clone();
 
         storage
-            .upsert_account(record)
+            .upsert_account_with_cx(cx, record)
             .await
             .map_err(|e| AccountSelectionStepError::Storage(e.to_string()))?;
 
@@ -212,10 +210,8 @@ pub async fn persist_caut_refresh_accounts(
 
     // Best-effort: avoid breaking account selection due to metrics storage failure.
     if !metrics.is_empty() {
-        // ft-xbnl0.2.3 tick 260: cx-first batch usage-metric write.
-        let metrics_cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
         if let Err(err) = storage
-            .record_usage_metrics_batch_with_cx(&metrics_cx, metrics)
+            .record_usage_metrics_batch_with_cx(cx, metrics)
             .await
         {
             tracing::warn!(error = %err, "Failed to record caut refresh usage metrics");
@@ -223,6 +219,16 @@ pub async fn persist_caut_refresh_accounts(
     }
 
     Ok(refresh.accounts.len())
+}
+
+pub async fn persist_caut_refresh_accounts(
+    storage: &StorageHandle,
+    service: crate::caut::CautService,
+    refresh: &crate::caut::CautRefresh,
+    now_ms: i64,
+) -> Result<usize, AccountSelectionStepError> {
+    let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+    persist_caut_refresh_accounts_with_cx(&cx, storage, service, refresh, now_ms).await
 }
 
 /// Mark an account as used (update `last_used_at`) after successful failover.
@@ -237,18 +243,9 @@ pub async fn mark_account_used_with_cx(
     account_id: &str,
 ) -> Result<(), String> {
     cx.checkpoint().map_err(|e| e.to_string())?;
-    mark_account_used(storage, service, account_id).await
-}
-
-#[allow(dead_code)]
-pub async fn mark_account_used(
-    storage: &StorageHandle,
-    service: &str,
-    account_id: &str,
-) -> Result<(), String> {
     // Get current account record
     let account = storage
-        .get_account(service, account_id)
+        .get_account_with_cx(cx, service, account_id)
         .await
         .map_err(|e| format!("Failed to get account: {e}"))?
         .ok_or_else(|| format!("Account not found: {service}/{account_id}"))?;
@@ -262,11 +259,21 @@ pub async fn mark_account_used(
     };
 
     storage
-        .upsert_account(updated)
+        .upsert_account_with_cx(cx, updated)
         .await
         .map_err(|e| format!("Failed to update account: {e}"))?;
 
     Ok(())
+}
+
+#[allow(dead_code)]
+pub async fn mark_account_used(
+    storage: &StorageHandle,
+    service: &str,
+    account_id: &str,
+) -> Result<(), String> {
+    let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+    mark_account_used_with_cx(&cx, storage, service, account_id).await
 }
 
 // ============================================================================

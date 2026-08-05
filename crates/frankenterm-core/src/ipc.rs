@@ -10,7 +10,7 @@
 //! - Client sends: `{"type":"user_var","pane_id":1,"name":"FT_EVENT","value":"base64..."}\n`
 //! - Server responds: `{"ok":true}\n` or `{"ok":false,"error":"..."}\n`
 
-use crate::runtime_async::RwLock;
+use crate::runtime_async::{LockAcquireError, RwLock};
 use crate::runtime_async::mpsc;
 use frankenterm_alloc::{allocator_backend, jemalloc_enabled, read_allocator_stats};
 use serde::{Deserialize, Serialize};
@@ -1124,15 +1124,10 @@ impl IpcServer {
         auth: Option<IpcAuth>,
         shutdown_rx: mpsc::Receiver<()>,
     ) {
-        {
-            // ft-xbnl0.2.3: keep a single request-rooted Cx for the
-            // server lifetime, then immediately hand off to the
-            // explicit-Cx loop. This avoids manufacturing a fresh
-            // request Cx for every shutdown poll in the ambient path.
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            self.run_with_auth_with_cx(&cx, event_bus, auth, shutdown_rx)
-                .await;
-        }
+        // Keep one request-rooted Cx for the complete server lifetime.
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.run_with_auth_with_cx(&cx, event_bus, auth, shutdown_rx)
+            .await;
     }
 
     /// Run the IPC server with registry and optional auth configuration.
@@ -2255,6 +2250,23 @@ async fn handle_pane_state(pane_id: u64, ctx: &IpcHandlerContext) -> IpcResponse
     }))
 }
 
+fn registry_lock_error_response(error: LockAcquireError) -> IpcResponse {
+    match error {
+        LockAcquireError::Cancelled => IpcResponse::error_with_code(
+            "ipc.request_cancelled",
+            "pane registry access was cancelled",
+            None,
+        ),
+        LockAcquireError::TimedOut { .. }
+        | LockAcquireError::Poisoned
+        | LockAcquireError::PolledAfterCompletion => IpcResponse::error_with_code(
+            "ipc.registry_lock_failed",
+            format!("pane registry lock failed: {error}"),
+            Some("Retry the request; restart the watcher if the failure persists.".to_string()),
+        ),
+    }
+}
+
 /// ft-xbnl0.2.3 Cx-first sibling of [`handle_pane_state`].
 ///
 /// Threads caller cx through the registry RwLock `read_with_cx`
@@ -2274,7 +2286,10 @@ async fn handle_pane_state_with_cx(
     };
 
     let (entry, cursor) = {
-        let registry = registry_lock.read_with_cx(cx).await;
+        let registry = match registry_lock.read_with_cx(cx).await {
+            Ok(registry) => registry,
+            Err(error) => return registry_lock_error_response(error),
+        };
         let Some(entry) = registry.get_entry(pane_id) else {
             return IpcResponse::ok_with_data(serde_json::json!({
                 "pane_id": pane_id,
@@ -2356,7 +2371,10 @@ async fn handle_set_pane_priority_with_cx(
     };
 
     let installed = {
-        let mut registry = registry_lock.write_with_cx(cx).await;
+        let mut registry = match registry_lock.write_with_cx(cx).await {
+            Ok(registry) => registry,
+            Err(error) => return registry_lock_error_response(error),
+        };
         match registry.set_priority_override(pane_id, priority, ttl_ms) {
             Ok(ov) => ov,
             Err(e) => {
@@ -2428,7 +2446,10 @@ async fn handle_clear_pane_priority_with_cx(
     };
 
     {
-        let mut registry = registry_lock.write_with_cx(cx).await;
+        let mut registry = match registry_lock.write_with_cx(cx).await {
+            Ok(registry) => registry,
+            Err(error) => return registry_lock_error_response(error),
+        };
         if let Err(e) = registry.clear_priority_override(pane_id) {
             return IpcResponse::error_with_code(
                 "ipc.pane_not_found",
@@ -2974,31 +2995,52 @@ impl IpcClient {
 
     pub async fn send_user_var(
         &self,
-        _pane_id: u64,
-        _name: String,
-        _value: String,
+        pane_id: u64,
+        name: String,
+        value: String,
     ) -> Result<IpcResponse, UserVarError> {
-        Err(Self::unsupported())
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.send_user_var_with_cx(&cx, pane_id, name, value).await
     }
 
     pub async fn ping(&self) -> Result<IpcResponse, UserVarError> {
-        Err(Self::unsupported())
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.ping_with_cx(&cx).await
     }
 
     pub async fn status(&self) -> Result<IpcResponse, UserVarError> {
-        Err(Self::unsupported())
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.status_with_cx(&cx).await
     }
 
-    pub async fn pane_state(&self, _pane_id: u64) -> Result<IpcResponse, UserVarError> {
-        Err(Self::unsupported())
+    pub async fn pane_state(&self, pane_id: u64) -> Result<IpcResponse, UserVarError> {
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.pane_state_with_cx(&cx, pane_id).await
+    }
+
+    pub async fn set_pane_priority(
+        &self,
+        pane_id: u64,
+        priority: u32,
+        ttl_ms: Option<u64>,
+    ) -> Result<IpcResponse, UserVarError> {
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.set_pane_priority_with_cx(&cx, pane_id, priority, ttl_ms)
+            .await
+    }
+
+    pub async fn clear_pane_priority(&self, pane_id: u64) -> Result<IpcResponse, UserVarError> {
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.clear_pane_priority_with_cx(&cx, pane_id).await
     }
 
     pub async fn call_rpc(
         &self,
-        _args: Vec<String>,
-        _request_id: Option<String>,
+        args: Vec<String>,
+        request_id: Option<String>,
     ) -> Result<IpcResponse, UserVarError> {
-        Err(Self::unsupported())
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.call_rpc_with_cx(&cx, args, request_id).await
     }
 
     // ft-xbnl0.2.3 Cx-first: non-unix stubs so the Cx-first
@@ -4986,6 +5028,35 @@ mod tests {
         let ctx = IpcHandlerContext::with_registry(event_bus, registry);
         assert!(ctx.registry.is_some());
         assert!(ctx.auth.is_none());
+    }
+
+    #[test]
+    fn cx_registry_handlers_report_pre_cancelled_access_as_error() {
+        run_async_test(async {
+            let event_bus = Arc::new(EventBus::new(10));
+            let registry = Arc::new(RwLock::new(PaneRegistry::new()));
+            let ctx = IpcHandlerContext::with_registry(event_bus, registry);
+            let cx = crate::cx::for_testing();
+            cx.cancel_with(
+                crate::outcome::CancelKind::User,
+                Some("pre-cancel IPC pane-registry request"),
+            );
+
+            let responses = [
+                handle_pane_state_with_cx(&cx, 7, &ctx).await,
+                handle_set_pane_priority_with_cx(&cx, 7, 9, None, &ctx).await,
+                handle_clear_pane_priority_with_cx(&cx, 7, &ctx).await,
+            ];
+
+            for response in responses {
+                assert!(!response.ok, "cancelled registry access cannot succeed");
+                assert_eq!(
+                    response.error_code.as_deref(),
+                    Some("ipc.request_cancelled")
+                );
+                assert!(response.data.is_none());
+            }
+        });
     }
 
     #[test]

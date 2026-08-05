@@ -121,7 +121,8 @@ fn notif_pipeline_sends_when_gate_allows() {
 
         let outcome = pipeline
             .handle_detection(&test_detection(), 7, None, Some(42))
-            .await;
+            .await
+            .expect("notification pipeline");
 
         assert!(matches!(outcome.decision, NotifyDecision::Send { .. }));
         assert_eq!(outcome.deliveries.len(), 1);
@@ -145,7 +146,8 @@ fn notif_pipeline_filters_events() {
 
         let outcome = pipeline
             .handle_detection(&test_detection(), 7, None, None)
-            .await;
+            .await
+            .expect("notification pipeline");
 
         assert!(matches!(outcome.decision, NotifyDecision::Filtered));
         assert!(outcome.deliveries.is_empty());
@@ -169,10 +171,12 @@ fn notif_pipeline_deduplicates_repeated_events() {
 
         let _ = pipeline
             .handle_detection(&test_detection(), 7, None, None)
-            .await;
+            .await
+            .expect("notification pipeline");
         let outcome = pipeline
             .handle_detection(&test_detection(), 7, None, None)
-            .await;
+            .await
+            .expect("notification pipeline");
 
         assert!(matches!(
             outcome.decision,
@@ -276,7 +280,8 @@ fn notif_pipeline_fans_out_to_multiple_senders() {
 
         let outcome = pipeline
             .handle_detection(&test_detection(), 1, None, None)
-            .await;
+            .await
+            .expect("notification pipeline");
 
         assert!(matches!(outcome.decision, NotifyDecision::Send { .. }));
         assert_eq!(
@@ -300,7 +305,8 @@ fn notif_pipeline_empty_senders_still_returns_outcome() {
 
         let outcome = pipeline
             .handle_detection(&test_detection(), 1, None, None)
-            .await;
+            .await
+            .expect("notification pipeline");
 
         assert!(matches!(outcome.decision, NotifyDecision::Send { .. }));
         assert!(
@@ -354,7 +360,10 @@ fn notif_pipeline_with_mute_store_blocks_muted_events() {
         let mut pipeline =
             NotificationPipeline::with_mute_store(gate, vec![Box::new(sender)], storage_arc);
 
-        let outcome = pipeline.handle_detection(&detection, 7, None, None).await;
+        let outcome = pipeline
+            .handle_detection(&detection, 7, None, None)
+            .await
+            .expect("notification pipeline");
 
         assert!(
             matches!(outcome.decision, NotifyDecision::Filtered),
@@ -386,7 +395,8 @@ fn notif_pipeline_handles_sender_failure_gracefully() {
 
         let outcome = pipeline
             .handle_detection(&test_detection(), 1, None, None)
-            .await;
+            .await
+            .expect("notification pipeline");
 
         assert!(matches!(outcome.decision, NotifyDecision::Send { .. }));
         assert_eq!(outcome.deliveries.len(), 1);
@@ -412,7 +422,8 @@ fn notif_pipeline_partial_failure_still_delivers_to_healthy_senders() {
 
         let outcome = pipeline
             .handle_detection(&test_detection(), 1, None, None)
-            .await;
+            .await
+            .expect("notification pipeline");
 
         assert_eq!(outcome.deliveries.len(), 2);
         assert!(!outcome.deliveries[0].success);
@@ -432,7 +443,8 @@ fn notif_failed_delivery_error_does_not_contain_payload() {
 
         let outcome = pipeline
             .handle_detection(&test_detection(), 1, None, None)
-            .await;
+            .await
+            .expect("notification pipeline");
 
         let err = outcome.deliveries[0].error.as_deref().unwrap_or("");
         assert!(!err.contains("sk-abc"), "error should not leak secrets");

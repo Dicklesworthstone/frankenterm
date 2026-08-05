@@ -10,6 +10,7 @@
 use super::*;
 
 const MAX_WORKFLOW_TOTAL_DEADLINE_MS: u64 = 24 * 60 * 60 * 1000;
+const WORKFLOW_INDEPENDENT_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn spawn_runner_child_with_cx<F, Fut>(cx: &crate::cx::Cx, task: F)
 where
@@ -32,47 +33,49 @@ fn workflow_runner_cancelled(operation: &'static str, detail: impl Into<String>)
     }
 }
 
-async fn wait_duration_maybe_cx(
-    cx: Option<&crate::cx::Cx>,
+fn workflow_execution_error(
+    execution_id: &str,
+    error: impl std::fmt::Display,
+) -> WorkflowExecutionResult {
+    WorkflowExecutionResult::Error {
+        execution_id: Some(execution_id.to_string()),
+        error: error.to_string(),
+    }
+}
+
+async fn wait_duration_with_cx(
+    cx: &crate::cx::Cx,
     duration: Duration,
     label: &str,
 ) -> Result<(), crate::Error> {
-    if let Some(cx) = cx {
-        let deadline = std::time::Instant::now()
-            .checked_add(duration)
-            .ok_or_else(|| {
-                crate::Error::Workflow(crate::error::WorkflowError::Aborted(format!(
-                    "{label} duration is too large: {duration:?}"
-                )))
-            })?;
-        loop {
-            cx.checkpoint()
-                .map_err(|err| workflow_wait_aborted(label, err))?;
-
-            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-            if remaining.is_zero() {
-                return Ok(());
-            }
-
-            let chunk = remaining.min(Duration::from_millis(50));
-            crate::runtime_async::sleep_with_cx(cx, chunk)
-                .await
-                .map_err(|err| workflow_wait_aborted(label, err))?;
-        }
+    std::time::Instant::now()
+        .checked_add(duration)
+        .ok_or_else(|| {
+            crate::Error::Workflow(crate::error::WorkflowError::Aborted(format!(
+                "{label} duration is too large: {duration:?}"
+            )))
+        })?;
+    let mut remaining = duration;
+    while !remaining.is_zero() {
+        cx.checkpoint()
+            .map_err(|err| workflow_wait_aborted(label, err))?;
+        let chunk = remaining.min(Duration::from_millis(50));
+        crate::runtime_async::sleep_with_cx(cx, chunk)
+            .await
+            .map_err(|err| workflow_wait_aborted(label, err))?;
+        remaining = remaining.saturating_sub(chunk);
     }
-
-    sleep(duration).await;
     Ok(())
 }
 
-async fn wait_required_duration_maybe_cx(
-    cx: Option<&crate::cx::Cx>,
+async fn wait_required_duration_with_cx(
+    cx: &crate::cx::Cx,
     required: Duration,
     timeout: Duration,
     label: &str,
     condition: &str,
 ) -> Result<(), crate::Error> {
-    wait_duration_maybe_cx(cx, required.min(timeout), label).await?;
+    wait_duration_with_cx(cx, required.min(timeout), label).await?;
     if required > timeout {
         return Err(crate::Error::Workflow(
             crate::error::WorkflowError::Aborted(format!(
@@ -125,31 +128,29 @@ fn invalid_resume_step_reason(step: usize, step_count: usize) -> Option<String> 
     }
 }
 
-async fn wait_external_signal_maybe_cx(
-    cx: Option<&crate::cx::Cx>,
+async fn wait_external_signal_with_cx(
+    cx: &crate::cx::Cx,
     registry: &ExternalSignalRegistry,
     key: &str,
     timeout: Duration,
     label: &str,
 ) -> Result<(), crate::Error> {
-    let deadline = std::time::Instant::now()
+    std::time::Instant::now()
         .checked_add(timeout)
         .ok_or_else(|| {
             crate::Error::Workflow(crate::error::WorkflowError::Aborted(format!(
                 "{label} duration is too large: {timeout:?}"
             )))
         })?;
+    let mut remaining = timeout;
     let mut interval = Duration::from_millis(5);
     let max_interval = Duration::from_millis(50);
     loop {
-        if let Some(cx) = cx {
-            cx.checkpoint()
-                .map_err(|err| workflow_wait_aborted(label, err))?;
-        }
+        cx.checkpoint()
+            .map_err(|err| workflow_wait_aborted(label, err))?;
         if registry.is_signaled(key) {
             return Ok(());
         }
-        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
         if remaining.is_zero() {
             return Err(crate::Error::Workflow(
                 crate::error::WorkflowError::Aborted(format!(
@@ -159,19 +160,16 @@ async fn wait_external_signal_maybe_cx(
             ));
         }
         let chunk = interval.min(remaining);
-        if let Some(cx) = cx {
-            crate::runtime_async::sleep_with_cx(cx, chunk)
-                .await
-                .map_err(|err| workflow_wait_aborted(label, err))?;
-        } else {
-            sleep(chunk).await;
-        }
+        crate::runtime_async::sleep_with_cx(cx, chunk)
+            .await
+            .map_err(|err| workflow_wait_aborted(label, err))?;
+        remaining = remaining.saturating_sub(chunk);
         interval = interval.saturating_mul(2).min(max_interval);
     }
 }
 
-async fn wait_condition_pause_maybe_cx(
-    cx: Option<&crate::cx::Cx>,
+async fn wait_condition_pause_with_cx(
+    cx: &crate::cx::Cx,
     condition: &WaitCondition,
     timeout: Duration,
     external_signals: Option<&ExternalSignalRegistry>,
@@ -181,7 +179,7 @@ async fn wait_condition_pause_maybe_cx(
         WaitCondition::PaneIdle {
             idle_threshold_ms, ..
         } => {
-            wait_required_duration_maybe_cx(
+            wait_required_duration_with_cx(
                 cx,
                 Duration::from_millis(*idle_threshold_ms),
                 timeout,
@@ -219,10 +217,10 @@ async fn wait_condition_pause_maybe_cx(
                     )),
                 ));
             };
-            wait_external_signal_maybe_cx(cx, registry, key, timeout, label).await
+            wait_external_signal_with_cx(cx, registry, key, timeout, label).await
         }
         WaitCondition::StableTail { stable_for_ms, .. } => {
-            wait_required_duration_maybe_cx(
+            wait_required_duration_with_cx(
                 cx,
                 Duration::from_millis(*stable_for_ms),
                 timeout,
@@ -232,7 +230,7 @@ async fn wait_condition_pause_maybe_cx(
             .await
         }
         WaitCondition::Sleep { duration_ms } => {
-            wait_required_duration_maybe_cx(
+            wait_required_duration_with_cx(
                 cx,
                 Duration::from_millis(*duration_ms),
                 timeout,
@@ -974,22 +972,14 @@ impl WorkflowRunner {
             .await
     }
 
-    /// Tick 180: shared implementation for [`run_workflow`] and
-    /// [`run_workflow_with_cx`]. When `cx` is `Some`, the 4 startup
-    /// storage call sites (record_workflow_start_action,
-    /// fetch_workflow_start_action_id, get_workflow, get_pane) route
-    /// through their cx-first siblings so caller cancellation
-    /// propagates through the full workflow-start handshake. When
-    /// `cx` is `None` (legacy caller), the behavior is byte-for-byte
-    /// identical to the pre-tick-180 body.
-    ///
-    /// The step-loop portion (after ctx setup) does not yet thread
-    /// cx — future ticks (181+) will migrate per-step checkpoints
-    /// and per-step-branch storage calls progressively.
+    /// Shared Cx-first implementation for [`run_workflow`] and
+    /// [`run_workflow_with_cx`]. The ambient entry constructs a concrete Cx
+    /// before reaching this function, so optional proof would only hide gaps
+    /// in cancellation propagation.
     #[allow(clippy::too_many_arguments)]
     async fn run_workflow_inner(
         &self,
-        cx: Option<&crate::cx::Cx>,
+        cx: &crate::cx::Cx,
         pane_id: u64,
         workflow: Arc<dyn Workflow>,
         execution_id: &str,
@@ -1014,34 +1004,32 @@ impl WorkflowRunner {
         // Prevent infinite loops from backward JumpTo cycles.
         // A workflow with N steps should never need more than N*10 jumps.
         let max_total_jumps = step_count.saturating_mul(10).max(100);
-        let start_action_id = if start_step == 0 {
-            if let Some(cx) = cx {
-                record_workflow_start_action_with_cx(
-                    cx,
-                    &self.storage,
-                    &workflow_name,
-                    execution_id,
-                    pane_id,
-                    step_count,
-                    start_step,
-                )
-                .await
-            } else {
-                record_workflow_start_action(
-                    &self.storage,
-                    &workflow_name,
-                    execution_id,
-                    pane_id,
-                    step_count,
-                    start_step,
-                )
-                .await
-            }
+        let start_action_id_result = if start_step == 0 {
+            record_workflow_start_action_with_cx(
+                cx,
+                &self.storage,
+                &workflow_name,
+                execution_id,
+                pane_id,
+                step_count,
+                start_step,
+            )
+            .await
+            .map(Some)
         } else {
-            if let Some(cx) = cx {
-                fetch_workflow_start_action_id_with_cx(cx, &self.storage, execution_id).await
-            } else {
-                fetch_workflow_start_action_id(&self.storage, execution_id).await
+            fetch_workflow_start_action_id_with_cx(cx, &self.storage, execution_id).await
+        };
+        let start_action_id = match start_action_id_result {
+            Ok(action_id) => action_id,
+            Err(error) => {
+                let reason = format!("Workflow start-audit setup failed: {error}");
+                let error = self
+                    .persist_failure_with_fresh_cx(execution_id, &reason, "error")
+                    .await;
+                return WorkflowExecutionResult::Error {
+                    execution_id: Some(execution_id.to_string()),
+                    error,
+                };
             }
         };
 
@@ -1053,7 +1041,7 @@ impl WorkflowRunner {
                 "Workflow resume step is outside the executable step range"
             );
             if let Err(e) = self
-                .persist_aborted_execution_maybe_cx(cx, execution_id, &reason, "aborted")
+                .persist_aborted_execution_with_cx(cx, execution_id, &reason, "aborted")
                 .await
             {
                 tracing::error!(
@@ -1066,7 +1054,7 @@ impl WorkflowRunner {
                     error: e.to_string(),
                 };
             }
-            record_workflow_terminal_action_maybe_cx(
+            if let Err(error) = record_workflow_terminal_action_with_cx(
                 cx,
                 &self.storage,
                 &workflow_name,
@@ -1079,7 +1067,10 @@ impl WorkflowRunner {
                 None,
                 start_action_id,
             )
-            .await;
+            .await
+            {
+                return workflow_execution_error(execution_id, error);
+            }
 
             return WorkflowExecutionResult::Aborted {
                 execution_id: execution_id.to_string(),
@@ -1103,32 +1094,87 @@ impl WorkflowRunner {
         .with_injector(self.injector.clone());
 
         // Attach persisted trigger context (if any) so workflows can interpret extracted fields.
-        let maybe_wf = if let Some(cx) = cx {
-            self.storage.get_workflow_with_cx(cx, execution_id).await
-        } else {
-            self.storage.get_workflow(execution_id).await
+        let maybe_wf = match self.storage.get_workflow_with_cx(cx, execution_id).await {
+            Ok(record) => record,
+            Err(error) => {
+                let reason = format!("Workflow trigger-context lookup failed: {error}");
+                let error = self
+                    .persist_failure_with_fresh_cx(execution_id, &reason, "error")
+                    .await;
+                return WorkflowExecutionResult::Error {
+                    execution_id: Some(execution_id.to_string()),
+                    error,
+                };
+            }
         };
-        if let Ok(Some(record)) = maybe_wf {
+        if let Some(record) = maybe_wf {
             if let Some(trigger) = record.context {
                 ctx = ctx.with_trigger(trigger);
             }
         }
 
-        let maybe_pane = if let Some(cx) = cx {
-            self.storage.get_pane_with_cx(cx, pane_id).await
-        } else {
-            self.storage.get_pane(pane_id).await
+        let maybe_pane = match self.storage.get_pane_with_cx(cx, pane_id).await {
+            Ok(record) => record,
+            Err(error) => {
+                let reason = format!("Workflow pane-metadata lookup failed: {error}");
+                let error = self
+                    .persist_failure_with_fresh_cx(execution_id, &reason, "error")
+                    .await;
+                return WorkflowExecutionResult::Error {
+                    execution_id: Some(execution_id.to_string()),
+                    error,
+                };
+            }
         };
-        if let Ok(Some(record)) = maybe_pane {
+        if let Some(record) = maybe_pane {
             ctx.set_pane_meta(PaneMetadata::from_record(&record));
         }
 
         if let Some(adapter) = self.replay_capture.as_ref() {
-            let request_cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            let injector_cx = cx.unwrap_or(&request_cx);
-            self.injector
-                .set_decision_capture(injector_cx, adapter.clone())
-                .await;
+            if let Err(error) = self
+                .injector
+                .set_decision_capture(cx, adapter.clone())
+                .await
+            {
+                let reason = format!("Workflow decision-capture setup failed: {error}");
+                let cleanup_cx = crate::cx::for_request();
+                let mut reported_error = reason.clone();
+                if let Err(cleanup_error) = self
+                    .persist_aborted_execution_with_cx(
+                        &cleanup_cx,
+                        execution_id,
+                        &reason,
+                        "error",
+                    )
+                    .await
+                {
+                    reported_error.push_str(&format!(
+                        "; independent cleanup also failed: {cleanup_error}"
+                    ));
+                }
+                if let Err(audit_error) = record_workflow_terminal_action_with_cx(
+                    &cleanup_cx,
+                    &self.storage,
+                    &workflow_name,
+                    execution_id,
+                    pane_id,
+                    "workflow_error",
+                    "error",
+                    Some(&reason),
+                    Some(current_step),
+                    None,
+                    start_action_id,
+                )
+                .await
+                {
+                    reported_error
+                        .push_str(&format!("; terminal audit also failed: {audit_error}"));
+                }
+                return WorkflowExecutionResult::Error {
+                    execution_id: Some(execution_id.to_string()),
+                    error: reported_error,
+                };
+            }
         }
 
         // Plan-first execution: generate ActionPlan if workflow supports it (wa-upg.2.3)
@@ -1149,27 +1195,27 @@ impl WorkflowRunner {
                     "Action plan validation failed"
                 );
                 let reason = format!("Plan validation failed: {validation_error}");
-                if let Err(e) = self
-                    .fail_execution_maybe_cx(cx, execution_id, &reason)
+                if let Err(cleanup_error) = self
+                    .fail_execution_with_cx(cx, execution_id, &reason)
                     .await
                 {
-                    tracing::warn!(
+                    return workflow_execution_error(
                         execution_id,
-                        error = %e,
-                        "Failed to fail execution after plan validation error"
+                        format!(
+                            "{reason}; failure-state persistence also failed: {cleanup_error}"
+                        ),
                     );
                 }
-                if let Err(e) = self
-                    .mark_trigger_event_handled_maybe_cx(cx, execution_id, "error")
+                if let Err(cleanup_error) = self
+                    .mark_trigger_event_handled_with_cx(cx, execution_id, "error")
                     .await
                 {
-                    tracing::warn!(
+                    return workflow_execution_error(
                         execution_id,
-                        error = %e,
-                        "Failed to mark trigger event as handled after plan validation error"
+                        format!("{reason}; trigger-state persistence also failed: {cleanup_error}"),
                     );
                 }
-                record_workflow_terminal_action_maybe_cx(
+                if let Err(error) = record_workflow_terminal_action_with_cx(
                     cx,
                     &self.storage,
                     &workflow_name,
@@ -1182,27 +1228,29 @@ impl WorkflowRunner {
                     None,
                     start_action_id,
                 )
-                .await;
+                .await
+                {
+                    return workflow_execution_error(execution_id, error);
+                }
                 return WorkflowExecutionResult::Error {
                     execution_id: Some(execution_id.to_string()),
                     error: reason,
                 };
             }
 
-            // ft-xbnl0.2.3 tick 259: cx-first action-plan persist with maybe-cx fallback.
-            let persist_result = if let Some(cx) = cx {
-                self.storage
-                    .upsert_action_plan_with_cx(cx, execution_id, &plan)
-                    .await
-            } else {
-                self.storage.upsert_action_plan(execution_id, &plan).await
-            };
+            let persist_result = self
+                .storage
+                .upsert_action_plan_with_cx(cx, execution_id, &plan)
+                .await;
             if let Err(e) = persist_result {
-                tracing::warn!(
-                    execution_id,
-                    error = %e,
-                    "Failed to persist action plan"
-                );
+                let reason = format!("Workflow action-plan persistence failed: {e}");
+                let error = self
+                    .persist_failure_with_fresh_cx(execution_id, &reason, "error")
+                    .await;
+                return WorkflowExecutionResult::Error {
+                    execution_id: Some(execution_id.to_string()),
+                    error,
+                };
             }
 
             ctx.set_action_plan(plan);
@@ -1234,105 +1282,22 @@ impl WorkflowRunner {
                              elapsed {elapsed_ms}ms >= {deadline_ms}ms (workflow_total_deadline_ms)"
                         )
                     };
-                    if let Some(cx) = cx {
-                        if let Err(e) = self.fail_execution_with_cx(cx, execution_id, &reason).await
-                        {
-                            tracing::warn!(
-                                execution_id,
-                                error = %e,
-                                "ft-3p7re: failed to fail execution on overall deadline"
-                            );
-                        }
-                        if let Err(e) = self
-                            .mark_trigger_event_handled_with_cx(cx, execution_id, "error")
-                            .await
-                        {
-                            tracing::warn!(
-                                execution_id,
-                                error = %e,
-                                "ft-3p7re: failed to mark trigger event handled on overall deadline"
-                            );
-                        }
-                        record_workflow_terminal_action_with_cx(
-                            cx,
-                            &self.storage,
-                            &workflow_name,
-                            execution_id,
-                            pane_id,
-                            "workflow_error",
-                            "error",
-                            Some(&reason),
-                            Some(current_step),
-                            None,
-                            start_action_id,
-                        )
-                        .await;
-                    } else {
-                        if let Err(e) = self.fail_execution(execution_id, &reason).await {
-                            tracing::warn!(
-                                execution_id,
-                                error = %e,
-                                "ft-3p7re: failed to fail execution on overall deadline"
-                            );
-                        }
-                        if let Err(e) = self.mark_trigger_event_handled(execution_id, "error").await
-                        {
-                            tracing::warn!(
-                                execution_id,
-                                error = %e,
-                                "ft-3p7re: failed to mark trigger event handled on overall deadline"
-                            );
-                        }
-                        record_workflow_terminal_action(
-                            &self.storage,
-                            &workflow_name,
-                            execution_id,
-                            pane_id,
-                            "workflow_error",
-                            "error",
-                            Some(&reason),
-                            Some(current_step),
-                            None,
-                            start_action_id,
-                        )
-                        .await;
+                    let mut reported_error = reason.clone();
+                    if let Err(error) = self.fail_execution_with_cx(cx, execution_id, &reason).await {
+                        reported_error.push_str(&format!(
+                            "; failure-state persistence also failed: {error}"
+                        ));
                     }
-                    return WorkflowExecutionResult::Error {
-                        execution_id: Some(execution_id.to_string()),
-                        error: reason,
-                    };
-                }
-            }
-
-            // Tick 181: per-step cancellation seam. On cx-cancel
-            // we do the same cleanup sequence as a plan-validation
-            // error (fail_execution + mark_trigger_event_handled +
-            // lock release + terminal-action audit) so the pane
-            // lock and trigger state don't leak under a cancelled
-            // parent. No-op when cx is None (legacy caller) or
-            // healthy.
-            if let Some(cx) = cx {
-                if let Err(err) = cx.checkpoint() {
-                    let reason = format!("run_workflow cancelled at step {current_step}: {err}");
-                    // The caller's cx is already cancelled here. Use the
-                    // non-cx cleanup path so terminal state is still durable
-                    // instead of being rejected by cx-aware storage sends.
-                    if let Err(e) = self.fail_execution(execution_id, &reason).await {
-                        tracing::warn!(
-                            execution_id,
-                            error = %e,
-                            "Failed to fail execution on cx cancel"
-                        );
+                    if let Err(error) = self
+                        .mark_trigger_event_handled_with_cx(cx, execution_id, "error")
+                        .await
+                    {
+                        reported_error.push_str(&format!(
+                            "; trigger-state persistence also failed: {error}"
+                        ));
                     }
-                    if let Err(e) = self.mark_trigger_event_handled(execution_id, "error").await {
-                        tracing::warn!(
-                            execution_id,
-                            error = %e,
-                            "Failed to mark trigger event handled on cx cancel"
-                        );
-                    }
-                    record_workflow_terminal_action_maybe_cx(
-                        None,
+                    if let Err(error) = record_workflow_terminal_action_with_cx(
+                        cx,
                         &self.storage,
                         &workflow_name,
                         execution_id,
@@ -1344,12 +1309,68 @@ impl WorkflowRunner {
                         None,
                         start_action_id,
                     )
-                    .await;
+                    .await
+                    {
+                        reported_error
+                            .push_str(&format!("; terminal audit also failed: {error}"));
+                    }
                     return WorkflowExecutionResult::Error {
                         execution_id: Some(execution_id.to_string()),
-                        error: reason,
+                        error: reported_error,
                     };
                 }
+            }
+
+            // Tick 181: per-step cancellation seam. On cx-cancel
+            // we do the same cleanup sequence as a plan-validation
+            // error (fail_execution + mark_trigger_event_handled +
+            // lock release + terminal-action audit) so the pane
+            // lock and trigger state don't leak under a cancelled
+            // parent. Cleanup deliberately uses a new request-rooted Cx because
+            // the caller's Cx has already crossed its cancellation boundary.
+            if let Err(err) = cx.checkpoint() {
+                let reason = format!("run_workflow cancelled at step {current_step}: {err}");
+                let cleanup_cx = crate::cx::for_request();
+                let mut reported_error = reason.clone();
+                if let Err(error) = self
+                    .fail_execution_with_cx(&cleanup_cx, execution_id, &reason)
+                    .await
+                {
+                    reported_error.push_str(&format!(
+                        "; independent failure-state cleanup also failed: {error}"
+                    ));
+                }
+                if let Err(error) = self
+                    .mark_trigger_event_handled_with_cx(&cleanup_cx, execution_id, "error")
+                    .await
+                {
+                    reported_error.push_str(&format!(
+                        "; independent trigger-state cleanup also failed: {error}"
+                    ));
+                }
+                if let Err(error) = record_workflow_terminal_action_with_cx(
+                    &cleanup_cx,
+                    &self.storage,
+                    &workflow_name,
+                    execution_id,
+                    pane_id,
+                    "workflow_error",
+                    "error",
+                    Some(&reason),
+                    Some(current_step),
+                    None,
+                    start_action_id,
+                )
+                .await
+                {
+                    reported_error.push_str(&format!(
+                        "; independent terminal audit also failed: {error}"
+                    ));
+                }
+                return WorkflowExecutionResult::Error {
+                    execution_id: Some(execution_id.to_string()),
+                    error: reported_error,
+                };
             }
 
             let step_plan = ctx.get_step_plan(current_step).cloned();
@@ -1359,7 +1380,7 @@ impl WorkflowRunner {
 
             if let Some(step_plan) = step_plan.as_ref() {
                 if step_plan.idempotent {
-                    match check_step_idempotency_maybe_cx(
+                    match check_step_idempotency_with_cx(
                         cx,
                         &self.storage,
                         execution_id,
@@ -1418,17 +1439,7 @@ impl WorkflowRunner {
             } else if idempotency_skip.is_some() {
                 StepResult::Continue
             } else {
-                // Tick 187: route step execution through execute_step_cx
-                // when cx is Some so workflow implementors that override
-                // the cx-first trait method (ft-xbnl0.2.2) can observe
-                // caller cancellation mid-step. Implementors that use
-                // the default trait impl still receive ambient semantics
-                // — the default delegates to execute_step unchanged.
-                if let Some(cx) = cx {
-                    workflow.execute_step_cx(cx, &mut ctx, current_step).await
-                } else {
-                    workflow.execute_step(&mut ctx, current_step).await
-                }
+                workflow.execute_step_cx(cx, &mut ctx, current_step).await
             };
 
             // Log step result
@@ -1450,15 +1461,46 @@ impl WorkflowRunner {
             let step_plan_ref = step_plan.as_ref();
             let step_id = step_plan_ref.map(|step| step.step_id.0.clone());
             let step_kind = step_plan_ref.map(|step| step.action.action_type_name().to_string());
-            let verification_refs = build_verification_refs(&step_result, step_plan_ref);
+            let verification_refs = match build_verification_refs(&step_result, step_plan_ref) {
+                Ok(refs) => refs,
+                Err(error) => {
+                    let reason = format!(
+                        "Workflow verification metadata serialization failed at step \
+                         {current_step}: {error}"
+                    );
+                    let error = self
+                        .persist_failure_with_fresh_cx(execution_id, &reason, "error")
+                        .await;
+                    return workflow_execution_error(execution_id, error);
+                }
+            };
             let step_error_code = step_error_code_from_result(&step_result);
             let log_step_result = redacted_step_result_for_logging(&step_result);
 
             if let Some(adapter) = self.replay_capture.as_ref() {
-                let step_definition_text = steps
-                    .get(current_step)
-                    .and_then(|step| serde_json::to_string(step).ok())
-                    .unwrap_or_else(|| step_name.to_string());
+                let Some(step_definition) = steps.get(current_step) else {
+                    let reason = format!(
+                        "Workflow step definition missing at index {current_step} while step_count \
+                         reported {step_count}"
+                    );
+                    let error = self
+                        .persist_failure_with_fresh_cx(execution_id, &reason, "error")
+                        .await;
+                    return workflow_execution_error(execution_id, error);
+                };
+                let step_definition_text = match serde_json::to_string(step_definition) {
+                    Ok(text) => text,
+                    Err(error) => {
+                        let reason = format!(
+                            "Workflow replay step-definition serialization failed at step \
+                             {current_step}: {error}"
+                        );
+                        let error = self
+                            .persist_failure_with_fresh_cx(execution_id, &reason, "error")
+                            .await;
+                        return workflow_execution_error(execution_id, error);
+                    }
+                };
                 let step_input = serde_json::json!({
                     "workflow_name": workflow_name.as_str(),
                     "execution_id": execution_id,
@@ -1467,13 +1509,32 @@ impl WorkflowRunner {
                     "step_name": step_name,
                     "trigger": ctx.trigger().cloned().unwrap_or(serde_json::Value::Null),
                 });
-                let step_input_text = serde_json::to_string(&step_input)
-                    .unwrap_or_else(|_| format!("workflow={workflow_name};step={current_step}"));
-                let step_output = serde_json::to_value(&log_step_result).unwrap_or_else(|_| {
-                    serde_json::json!({
-                        "result_type": result_type,
-                    })
-                });
+                let step_input_text = match serde_json::to_string(&step_input) {
+                    Ok(text) => text,
+                    Err(error) => {
+                        let reason = format!(
+                            "Workflow replay input serialization failed at step {current_step}: \
+                             {error}"
+                        );
+                        let error = self
+                            .persist_failure_with_fresh_cx(execution_id, &reason, "error")
+                            .await;
+                        return workflow_execution_error(execution_id, error);
+                    }
+                };
+                let step_output = match serde_json::to_value(&log_step_result) {
+                    Ok(output) => output,
+                    Err(error) => {
+                        let reason = format!(
+                            "Workflow replay output serialization failed at step {current_step}: \
+                             {error}"
+                        );
+                        let error = self
+                            .persist_failure_with_fresh_cx(execution_id, &reason, "error")
+                            .await;
+                        return workflow_execution_error(execution_id, error);
+                    }
+                };
                 let decision_event = crate::replay_capture::DecisionEvent::new(
                     crate::replay_capture::DecisionType::WorkflowStep,
                     pane_id,
@@ -1524,18 +1585,27 @@ impl WorkflowRunner {
                     }
                 }
 
-                serde_json::to_string(&data)
-                    .inspect_err(
-                        |e| tracing::warn!(error = %e, "workflow step data serialization failed"),
-                    )
-                    .ok()
+                match serde_json::to_string(&data) {
+                    Ok(serialized) => Some(serialized),
+                    Err(error) => {
+                        let reason = format!(
+                            "Workflow step-data serialization failed at step {current_step}: \
+                             {error}"
+                        );
+                        let error = self
+                            .persist_failure_with_fresh_cx(execution_id, &reason, "error")
+                            .await;
+                        return workflow_execution_error(execution_id, error);
+                    }
+                }
             };
             let step_completed_at = now_ms();
 
             // Persist step log for non-SendText steps
             // SendText steps are logged after injection to capture the audit_action_id (wa-nu4.1.1.11)
             if !matches!(&step_result, StepResult::SendText { .. }) {
-                let step_audit_action_id = record_workflow_step_action(
+                let step_audit_action_id = match record_workflow_step_action_with_cx(
+                    cx,
                     &self.storage,
                     WorkflowStepActionInput {
                         workflow_name: &workflow_name,
@@ -1549,13 +1619,26 @@ impl WorkflowRunner {
                         parent_action_id: start_action_id,
                     },
                 )
-                .await;
+                .await
+                {
+                    Ok(action_id) => action_id,
+                    Err(error) => {
+                        let reason = format!(
+                            "Workflow step audit failed at step {current_step}: {error}"
+                        );
+                        let error = self
+                            .persist_failure_with_fresh_cx(execution_id, &reason, "error")
+                            .await;
+                        return workflow_execution_error(execution_id, error);
+                    }
+                };
 
-                if let Err(e) = self
+                if let Err(error) = self
                     .storage
-                    .insert_step_log(
+                    .insert_step_log_with_cx(
+                        cx,
                         execution_id,
-                        step_audit_action_id,
+                        Some(step_audit_action_id),
                         current_step,
                         step_name,
                         step_id.clone(),
@@ -1570,13 +1653,13 @@ impl WorkflowRunner {
                     )
                     .await
                 {
-                    tracing::warn!(
-                        workflow = %workflow_name,
-                        execution_id,
-                        step = current_step,
-                        error = %e,
-                        "Failed to log step"
+                    let reason = format!(
+                        "Workflow step-log persistence failed at step {current_step}: {error}"
                     );
+                    let error = self
+                        .persist_failure_with_fresh_cx(execution_id, &reason, "error")
+                        .await;
+                    return workflow_execution_error(execution_id, error);
                 }
             }
 
@@ -1588,7 +1671,7 @@ impl WorkflowRunner {
 
                     // Update execution state
                     if let Err(e) = self
-                        .update_execution_step_maybe_cx(cx, execution_id, current_step)
+                        .update_execution_step_with_cx(cx, execution_id, current_step)
                         .await
                     {
                         tracing::warn!(
@@ -1600,7 +1683,7 @@ impl WorkflowRunner {
                             crate::Error::Workflow(crate::error::WorkflowError::Aborted(
                                 reason,
                             )) => {
-                                record_workflow_terminal_action_maybe_cx(
+                                if let Err(error) = record_workflow_terminal_action_with_cx(
                                     cx,
                                     &self.storage,
                                     &workflow_name,
@@ -1613,7 +1696,13 @@ impl WorkflowRunner {
                                     None,
                                     start_action_id,
                                 )
-                                .await;
+                                .await
+                                {
+                                    return workflow_execution_error(
+                                        execution_id,
+                                        format!("{reason}; terminal audit failed: {error}"),
+                                    );
+                                }
                                 return WorkflowExecutionResult::Aborted {
                                     execution_id: execution_id.to_string(),
                                     reason,
@@ -1655,7 +1744,7 @@ impl WorkflowRunner {
                         );
 
                         if let Err(e) = self
-                            .persist_aborted_execution_maybe_cx(
+                            .persist_aborted_execution_with_cx(
                                 cx,
                                 execution_id,
                                 &reason,
@@ -1674,7 +1763,7 @@ impl WorkflowRunner {
                             };
                         }
                         workflow.cleanup(&mut ctx).await;
-                        record_workflow_terminal_action_maybe_cx(
+                        if let Err(error) = record_workflow_terminal_action_with_cx(
                             cx,
                             &self.storage,
                             &workflow_name,
@@ -1687,7 +1776,13 @@ impl WorkflowRunner {
                             Some(current_step + 1),
                             start_action_id,
                         )
-                        .await;
+                        .await
+                        {
+                            return workflow_execution_error(
+                                execution_id,
+                                format!("{reason}; terminal audit failed: {error}"),
+                            );
+                        }
 
                         return WorkflowExecutionResult::Aborted {
                             execution_id: execution_id.to_string(),
@@ -1701,7 +1796,7 @@ impl WorkflowRunner {
 
                     // Update execution state
                     if let Err(e) = self
-                        .update_execution_step_maybe_cx(cx, execution_id, current_step)
+                        .update_execution_step_with_cx(cx, execution_id, current_step)
                         .await
                     {
                         tracing::warn!(
@@ -1713,7 +1808,7 @@ impl WorkflowRunner {
                             crate::Error::Workflow(crate::error::WorkflowError::Aborted(
                                 reason,
                             )) => {
-                                record_workflow_terminal_action_maybe_cx(
+                                if let Err(error) = record_workflow_terminal_action_with_cx(
                                     cx,
                                     &self.storage,
                                     &workflow_name,
@@ -1726,7 +1821,13 @@ impl WorkflowRunner {
                                     None,
                                     start_action_id,
                                 )
-                                .await;
+                                .await
+                                {
+                                    return workflow_execution_error(
+                                        execution_id,
+                                        format!("{reason}; terminal audit failed: {error}"),
+                                    );
+                                }
                                 return WorkflowExecutionResult::Aborted {
                                     execution_id: execution_id.to_string(),
                                     reason,
@@ -1748,7 +1849,7 @@ impl WorkflowRunner {
                     let elapsed_ms = elapsed_ms(start_time);
 
                     if let Err(e) = self
-                        .persist_completed_execution_maybe_cx(
+                        .persist_completed_execution_with_cx(
                             cx,
                             execution_id,
                             Some(result.clone()),
@@ -1768,7 +1869,7 @@ impl WorkflowRunner {
 
                     // Release lock
 
-                    record_workflow_terminal_action_maybe_cx(
+                    if let Err(error) = record_workflow_terminal_action_with_cx(
                         cx,
                         &self.storage,
                         &workflow_name,
@@ -1781,7 +1882,13 @@ impl WorkflowRunner {
                         Some(current_step + 1),
                         start_action_id,
                     )
-                    .await;
+                    .await
+                    {
+                        return workflow_execution_error(
+                            execution_id,
+                            format!("Workflow completed but terminal audit failed: {error}"),
+                        );
+                    }
 
                     return WorkflowExecutionResult::Completed {
                         execution_id: execution_id.to_string(),
@@ -1801,7 +1908,7 @@ impl WorkflowRunner {
 
                         // Update execution to failed
                         if let Err(e) = self
-                            .fail_execution_maybe_cx(cx, execution_id, &reason)
+                            .fail_execution_with_cx(cx, execution_id, &reason)
                             .await
                         {
                             tracing::warn!(
@@ -1813,7 +1920,7 @@ impl WorkflowRunner {
 
                         // Mark trigger event as handled (with failed status)
                         if let Err(e) = self
-                            .mark_trigger_event_handled_maybe_cx(cx, execution_id, "failed")
+                            .mark_trigger_event_handled_with_cx(cx, execution_id, "failed")
                             .await
                         {
                             tracing::warn!(
@@ -1826,7 +1933,7 @@ impl WorkflowRunner {
                         // Cleanup and release lock
                         workflow.cleanup(&mut ctx).await;
 
-                        record_workflow_terminal_action_maybe_cx(
+                        if let Err(error) = record_workflow_terminal_action_with_cx(
                             cx,
                             &self.storage,
                             &workflow_name,
@@ -1839,7 +1946,13 @@ impl WorkflowRunner {
                             Some(current_step + 1),
                             start_action_id,
                         )
-                        .await;
+                        .await
+                        {
+                            return workflow_execution_error(
+                                execution_id,
+                                format!("{reason}; terminal audit failed: {error}"),
+                            );
+                        }
 
                         return WorkflowExecutionResult::Aborted {
                             execution_id: execution_id.to_string(),
@@ -1849,10 +1962,9 @@ impl WorkflowRunner {
                         };
                     }
 
-                    // Wait before retry. When the caller supplied a Cx,
-                    // cancellation during backoff must abort promptly instead
+                    // Cancellation during backoff must abort promptly instead
                     // of sleeping until the retry delay elapses.
-                    if let Err(e) = wait_duration_maybe_cx(
+                    if let Err(e) = wait_duration_with_cx(
                         cx,
                         cap_wait_by_workflow_deadline(
                             Duration::from_millis(delay_ms),
@@ -1872,8 +1984,8 @@ impl WorkflowRunner {
                             crate::Error::Workflow(crate::error::WorkflowError::Aborted(
                                 reason,
                             )) => {
-                                self.persist_cancelled_execution_maybe_cx(
-                                    cx,
+                                if let Err(cleanup_error) = self
+                                    .persist_cancelled_execution_with_fresh_cx(
                                     &workflow_name,
                                     execution_id,
                                     pane_id,
@@ -1881,7 +1993,16 @@ impl WorkflowRunner {
                                     current_step,
                                     start_action_id,
                                 )
-                                .await;
+                                .await
+                                {
+                                    return workflow_execution_error(
+                                        execution_id,
+                                        format!(
+                                            "{reason}; independent cancellation cleanup failed: \
+                                             {cleanup_error}"
+                                        ),
+                                    );
+                                }
                                 return WorkflowExecutionResult::Aborted {
                                     execution_id: execution_id.to_string(),
                                     reason,
@@ -1903,7 +2024,7 @@ impl WorkflowRunner {
 
                     // Update execution to failed
                     if let Err(e) = self
-                        .fail_execution_maybe_cx(cx, execution_id, &reason)
+                        .fail_execution_with_cx(cx, execution_id, &reason)
                         .await
                     {
                         tracing::warn!(
@@ -1915,7 +2036,7 @@ impl WorkflowRunner {
 
                     // Mark trigger event as handled (with aborted status)
                     if let Err(e) = self
-                        .mark_trigger_event_handled_maybe_cx(cx, execution_id, "aborted")
+                        .mark_trigger_event_handled_with_cx(cx, execution_id, "aborted")
                         .await
                     {
                         tracing::warn!(
@@ -1928,7 +2049,7 @@ impl WorkflowRunner {
                     // Cleanup and release lock
                     workflow.cleanup(&mut ctx).await;
 
-                    record_workflow_terminal_action_maybe_cx(
+                    if let Err(error) = record_workflow_terminal_action_with_cx(
                         cx,
                         &self.storage,
                         &workflow_name,
@@ -1941,7 +2062,13 @@ impl WorkflowRunner {
                         Some(current_step + 1),
                         start_action_id,
                     )
-                    .await;
+                    .await
+                    {
+                        return workflow_execution_error(
+                            execution_id,
+                            format!("{reason}; terminal audit failed: {error}"),
+                        );
+                    }
 
                     return WorkflowExecutionResult::Aborted {
                         execution_id: execution_id.to_string(),
@@ -1956,7 +2083,7 @@ impl WorkflowRunner {
                 } => {
                     // Update execution to waiting
                     if let Err(e) = self
-                        .set_execution_waiting_maybe_cx(cx, execution_id, current_step, &condition)
+                        .set_execution_waiting_with_cx(cx, execution_id, current_step, &condition)
                         .await
                     {
                         tracing::warn!(
@@ -1964,26 +2091,42 @@ impl WorkflowRunner {
                             error = %e,
                             "Failed to set waiting state"
                         );
-                        if let crate::Error::Workflow(crate::error::WorkflowError::Aborted(
-                            reason,
-                        )) = e
-                        {
-                            self.persist_cancelled_execution_maybe_cx(
-                                cx,
-                                &workflow_name,
-                                execution_id,
-                                pane_id,
-                                &reason,
-                                current_step,
-                                start_action_id,
-                            )
-                            .await;
-                            return WorkflowExecutionResult::Aborted {
-                                execution_id: execution_id.to_string(),
+                        match e {
+                            crate::Error::Workflow(crate::error::WorkflowError::Aborted(
                                 reason,
-                                step_index: current_step,
-                                elapsed_ms: elapsed_ms(start_time),
-                            };
+                            )) => {
+                                if let Err(cleanup_error) = self
+                                    .persist_cancelled_execution_with_fresh_cx(
+                                    &workflow_name,
+                                    execution_id,
+                                    pane_id,
+                                    &reason,
+                                    current_step,
+                                    start_action_id,
+                                )
+                                .await
+                                {
+                                    return workflow_execution_error(
+                                        execution_id,
+                                        format!(
+                                            "{reason}; independent cancellation cleanup failed: \
+                                             {cleanup_error}"
+                                        ),
+                                    );
+                                }
+                                return WorkflowExecutionResult::Aborted {
+                                    execution_id: execution_id.to_string(),
+                                    reason,
+                                    step_index: current_step,
+                                    elapsed_ms: elapsed_ms(start_time),
+                                };
+                            }
+                            other => {
+                                return WorkflowExecutionResult::Error {
+                                    execution_id: Some(execution_id.to_string()),
+                                    error: other.to_string(),
+                                };
+                            }
                         }
                     }
 
@@ -1998,7 +2141,7 @@ impl WorkflowRunner {
                         self.config.workflow_total_deadline_ms,
                     );
 
-                    if let Err(e) = wait_condition_pause_maybe_cx(
+                    if let Err(e) = wait_condition_pause_with_cx(
                         cx,
                         &condition,
                         timeout,
@@ -2016,8 +2159,8 @@ impl WorkflowRunner {
                             reason,
                         )) = e
                         {
-                            self.persist_cancelled_execution_maybe_cx(
-                                cx,
+                            if let Err(cleanup_error) = self
+                                .persist_cancelled_execution_with_fresh_cx(
                                 &workflow_name,
                                 execution_id,
                                 pane_id,
@@ -2025,7 +2168,16 @@ impl WorkflowRunner {
                                 current_step,
                                 start_action_id,
                             )
-                            .await;
+                            .await
+                            {
+                                return workflow_execution_error(
+                                    execution_id,
+                                    format!(
+                                        "{reason}; independent cancellation cleanup failed: \
+                                         {cleanup_error}"
+                                    ),
+                                );
+                            }
                             return WorkflowExecutionResult::Aborted {
                                 execution_id: execution_id.to_string(),
                                 reason,
@@ -2046,7 +2198,7 @@ impl WorkflowRunner {
 
                     // Update execution back to running
                     if let Err(e) = self
-                        .update_execution_step_maybe_cx(cx, execution_id, current_step)
+                        .update_execution_step_with_cx(cx, execution_id, current_step)
                         .await
                     {
                         tracing::warn!(
@@ -2058,7 +2210,7 @@ impl WorkflowRunner {
                             crate::Error::Workflow(crate::error::WorkflowError::Aborted(
                                 reason,
                             )) => {
-                                record_workflow_terminal_action_maybe_cx(
+                                if let Err(error) = record_workflow_terminal_action_with_cx(
                                     cx,
                                     &self.storage,
                                     &workflow_name,
@@ -2071,7 +2223,13 @@ impl WorkflowRunner {
                                     None,
                                     start_action_id,
                                 )
-                                .await;
+                                .await
+                                {
+                                    return workflow_execution_error(
+                                        execution_id,
+                                        format!("{reason}; terminal audit failed: {error}"),
+                                    );
+                                }
                                 return WorkflowExecutionResult::Aborted {
                                     execution_id: execution_id.to_string(),
                                     reason,
@@ -2101,28 +2259,79 @@ impl WorkflowRunner {
                         "Workflow requesting text injection"
                     );
 
-                    let request_cx =
-                        crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-                    let injector_cx = cx.unwrap_or(&request_cx);
-                    let send_result = self
+                    let send_result = match self
                         .injector
                         .send_text(
-                            injector_cx,
+                            cx,
                             pane_id,
                             &text,
                             crate::policy::ActorKind::Workflow,
                             ctx.capabilities(),
                             Some(execution_id),
                         )
-                        .await;
+                        .await
+                    {
+                        Ok(result) => result,
+                        Err(error) => {
+                            let reason = format!("Workflow text injection failed: {error}");
+                            let cleanup_cx = crate::cx::for_request();
+                            let mut reported_error = reason.clone();
+                            if let Err(cleanup_error) = self
+                                .persist_aborted_execution_with_cx(
+                                    &cleanup_cx,
+                                    execution_id,
+                                    &reason,
+                                    "error",
+                                )
+                                .await
+                            {
+                                reported_error.push_str(&format!(
+                                    "; independent failure cleanup also failed: {cleanup_error}"
+                                ));
+                            }
+                            if let Err(audit_error) = record_workflow_terminal_action_with_cx(
+                                &cleanup_cx,
+                                &self.storage,
+                                &workflow_name,
+                                execution_id,
+                                pane_id,
+                                "workflow_error",
+                                "error",
+                                Some(&reason),
+                                Some(current_step),
+                                None,
+                                start_action_id,
+                            )
+                            .await
+                            {
+                                reported_error.push_str(&format!(
+                                    "; independent terminal audit also failed: {audit_error}"
+                                ));
+                            }
+                            return workflow_execution_error(execution_id, reported_error);
+                        }
+                    };
 
                     // Log the SendText step with audit_action_id (wa-nu4.1.1.11)
                     let audit_action_id = send_result.audit_action_id();
-                    let policy_summary = policy_summary_from_injection(&send_result);
+                    let policy_summary = match policy_summary_from_injection(&send_result) {
+                        Ok(summary) => Some(summary),
+                        Err(error) => {
+                            let reason = format!(
+                                "Workflow policy-summary serialization failed at step \
+                                 {current_step}: {error}"
+                            );
+                            let error = self
+                                .persist_failure_with_fresh_cx(execution_id, &reason, "error")
+                                .await;
+                            return workflow_execution_error(execution_id, error);
+                        }
+                    };
                     let policy_error_code = policy_error_code_from_injection(&send_result);
-                    if let Err(e) = self
+                    if let Err(error) = self
                         .storage
-                        .insert_step_log(
+                        .insert_step_log_with_cx(
+                            cx,
                             execution_id,
                             audit_action_id,
                             current_step,
@@ -2139,14 +2348,14 @@ impl WorkflowRunner {
                         )
                         .await
                     {
-                        tracing::warn!(
-                            workflow = %workflow_name,
-                            execution_id,
-                            step = current_step,
-                            ?audit_action_id,
-                            error = %e,
-                            "Failed to log SendText step"
+                        let reason = format!(
+                            "Workflow SendText step-log persistence failed at step \
+                             {current_step}: {error}"
                         );
+                        let error = self
+                            .persist_failure_with_fresh_cx(execution_id, &reason, "error")
+                            .await;
+                        return workflow_execution_error(execution_id, error);
                     }
 
                     match send_result {
@@ -2165,7 +2374,7 @@ impl WorkflowRunner {
                                     self.config.workflow_total_deadline_ms,
                                 );
 
-                                if let Err(e) = wait_condition_pause_maybe_cx(
+                                if let Err(e) = wait_condition_pause_with_cx(
                                     cx,
                                     &condition,
                                     timeout,
@@ -2183,8 +2392,8 @@ impl WorkflowRunner {
                                         crate::error::WorkflowError::Aborted(reason),
                                     ) = e
                                     {
-                                        self.persist_cancelled_execution_maybe_cx(
-                                            cx,
+                                        if let Err(cleanup_error) = self
+                                            .persist_cancelled_execution_with_fresh_cx(
                                             &workflow_name,
                                             execution_id,
                                             pane_id,
@@ -2192,7 +2401,16 @@ impl WorkflowRunner {
                                             current_step,
                                             start_action_id,
                                         )
-                                        .await;
+                                        .await
+                                        {
+                                            return workflow_execution_error(
+                                                execution_id,
+                                                format!(
+                                                    "{reason}; independent cancellation cleanup \
+                                                     failed: {cleanup_error}"
+                                                ),
+                                            );
+                                        }
                                         return WorkflowExecutionResult::Aborted {
                                             execution_id: execution_id.to_string(),
                                             reason,
@@ -2213,7 +2431,7 @@ impl WorkflowRunner {
                             retries = 0;
 
                             if let Err(e) = self
-                                .update_execution_step_maybe_cx(cx, execution_id, current_step)
+                                .update_execution_step_with_cx(cx, execution_id, current_step)
                                 .await
                             {
                                 tracing::warn!(
@@ -2225,7 +2443,7 @@ impl WorkflowRunner {
                                     crate::Error::Workflow(
                                         crate::error::WorkflowError::Aborted(reason),
                                     ) => {
-                                        record_workflow_terminal_action_maybe_cx(
+                                        if let Err(error) = record_workflow_terminal_action_with_cx(
                                             cx,
                                             &self.storage,
                                             &workflow_name,
@@ -2238,7 +2456,15 @@ impl WorkflowRunner {
                                             None,
                                             start_action_id,
                                         )
-                                        .await;
+                                        .await
+                                        {
+                                            return workflow_execution_error(
+                                                execution_id,
+                                                format!(
+                                                    "{reason}; terminal audit failed: {error}"
+                                                ),
+                                            );
+                                        }
                                         return WorkflowExecutionResult::Aborted {
                                             execution_id: execution_id.to_string(),
                                             reason,
@@ -2274,7 +2500,7 @@ impl WorkflowRunner {
 
                             // Update execution to failed
                             if let Err(e) = self
-                                .fail_execution_maybe_cx(cx, execution_id, &abort_reason)
+                                .fail_execution_with_cx(cx, execution_id, &abort_reason)
                                 .await
                             {
                                 tracing::warn!(
@@ -2286,7 +2512,7 @@ impl WorkflowRunner {
 
                             // Mark trigger event as handled (with denied status)
                             if let Err(e) = self
-                                .mark_trigger_event_handled_maybe_cx(cx, execution_id, "denied")
+                                .mark_trigger_event_handled_with_cx(cx, execution_id, "denied")
                                 .await
                             {
                                 tracing::warn!(
@@ -2299,7 +2525,7 @@ impl WorkflowRunner {
                             // Cleanup and release lock
                             workflow.cleanup(&mut ctx).await;
 
-                            record_workflow_terminal_action_maybe_cx(
+                            if let Err(error) = record_workflow_terminal_action_with_cx(
                                 cx,
                                 &self.storage,
                                 &workflow_name,
@@ -2312,7 +2538,13 @@ impl WorkflowRunner {
                                 Some(current_step + 1),
                                 start_action_id,
                             )
-                            .await;
+                            .await
+                            {
+                                return workflow_execution_error(
+                                    execution_id,
+                                    format!("{abort_reason}; terminal audit failed: {error}"),
+                                );
+                            }
 
                             return WorkflowExecutionResult::Aborted {
                                 execution_id: execution_id.to_string(),
@@ -2350,7 +2582,7 @@ impl WorkflowRunner {
 
                             // Update execution to failed (approval not auto-granted for workflows)
                             if let Err(e) = self
-                                .fail_execution_maybe_cx(cx, execution_id, &abort_reason)
+                                .fail_execution_with_cx(cx, execution_id, &abort_reason)
                                 .await
                             {
                                 tracing::warn!(
@@ -2362,7 +2594,7 @@ impl WorkflowRunner {
 
                             // Mark trigger event as handled (with requires_approval status)
                             if let Err(e) = self
-                                .mark_trigger_event_handled_maybe_cx(
+                                .mark_trigger_event_handled_with_cx(
                                     cx,
                                     execution_id,
                                     "requires_approval",
@@ -2379,7 +2611,7 @@ impl WorkflowRunner {
                             // Cleanup and release lock
                             workflow.cleanup(&mut ctx).await;
 
-                            record_workflow_terminal_action_maybe_cx(
+                            if let Err(error) = record_workflow_terminal_action_with_cx(
                                 cx,
                                 &self.storage,
                                 &workflow_name,
@@ -2392,7 +2624,13 @@ impl WorkflowRunner {
                                 Some(current_step + 1),
                                 start_action_id,
                             )
-                            .await;
+                            .await
+                            {
+                                return workflow_execution_error(
+                                    execution_id,
+                                    format!("{abort_reason}; terminal audit failed: {error}"),
+                                );
+                            }
 
                             return WorkflowExecutionResult::Aborted {
                                 execution_id: execution_id.to_string(),
@@ -2415,7 +2653,7 @@ impl WorkflowRunner {
 
                             // Update execution to failed
                             if let Err(e) = self
-                                .fail_execution_maybe_cx(cx, execution_id, &abort_reason)
+                                .fail_execution_with_cx(cx, execution_id, &abort_reason)
                                 .await
                             {
                                 tracing::warn!(
@@ -2427,7 +2665,7 @@ impl WorkflowRunner {
 
                             // Mark trigger event as handled (with error status)
                             if let Err(e) = self
-                                .mark_trigger_event_handled_maybe_cx(cx, execution_id, "error")
+                                .mark_trigger_event_handled_with_cx(cx, execution_id, "error")
                                 .await
                             {
                                 tracing::warn!(
@@ -2440,7 +2678,7 @@ impl WorkflowRunner {
                             // Cleanup and release lock
                             workflow.cleanup(&mut ctx).await;
 
-                            record_workflow_terminal_action_maybe_cx(
+                            if let Err(error) = record_workflow_terminal_action_with_cx(
                                 cx,
                                 &self.storage,
                                 &workflow_name,
@@ -2453,7 +2691,13 @@ impl WorkflowRunner {
                                 Some(current_step + 1),
                                 start_action_id,
                             )
-                            .await;
+                            .await
+                            {
+                                return workflow_execution_error(
+                                    execution_id,
+                                    format!("{abort_reason}; terminal audit failed: {error}"),
+                                );
+                            }
 
                             return WorkflowExecutionResult::Aborted {
                                 execution_id: execution_id.to_string(),
@@ -2472,7 +2716,7 @@ impl WorkflowRunner {
         let result = serde_json::json!({ "status": "completed" });
 
         if let Err(e) = self
-            .persist_completed_execution_maybe_cx(cx, execution_id, Some(result.clone()))
+            .persist_completed_execution_with_cx(cx, execution_id, Some(result.clone()))
             .await
         {
             tracing::error!(
@@ -2486,7 +2730,7 @@ impl WorkflowRunner {
             };
         }
 
-        record_workflow_terminal_action_maybe_cx(
+        if let Err(error) = record_workflow_terminal_action_with_cx(
             cx,
             &self.storage,
             &workflow_name,
@@ -2499,7 +2743,13 @@ impl WorkflowRunner {
             Some(step_count),
             start_action_id,
         )
-        .await;
+        .await
+        {
+            return workflow_execution_error(
+                execution_id,
+                format!("Workflow completed but terminal audit failed: {error}"),
+            );
+        }
 
         WorkflowExecutionResult::Completed {
             execution_id: execution_id.to_string(),
@@ -2519,13 +2769,8 @@ impl WorkflowRunner {
     /// execution failed, mark the trigger handled) before surfacing
     /// `WorkflowExecutionResult::Error`.
     ///
-    /// Tick 180: upgraded to route through the shared
-    /// `run_workflow_inner(Some(cx), ...)` path so the 4 startup
-    /// storage call sites (record_workflow_start_action,
-    /// fetch_workflow_start_action_id, get_workflow, get_pane)
-    /// all thread the caller's cx. The step-loop portion after
-    /// ctx setup is still on the ambient path; future ticks
-    /// (181+) will migrate per-step cancellation.
+    /// Routes through the shared `run_workflow_inner(cx, ...)` path so the
+    /// complete internal workflow call graph carries one concrete Cx.
     ///
     /// Using the `Error` variant (not a new variant) keeps the
     /// match surface stable — every `run_workflow` caller already
@@ -2551,14 +2796,21 @@ impl WorkflowRunner {
                 .lock_manager
                 .held_lock_release_guard(pane_id, execution_id);
             let reason = format!("run_workflow cancelled pre-start: {err}");
-            if let Err(cleanup_err) = self.fail_execution(execution_id, &reason).await {
+            let cleanup_cx = crate::cx::for_request();
+            if let Err(cleanup_err) = self
+                .fail_execution_with_cx(&cleanup_cx, execution_id, &reason)
+                .await
+            {
                 tracing::warn!(
                     execution_id,
                     error = %cleanup_err,
                     "Failed to mark pre-start cancelled workflow as failed"
                 );
             }
-            if let Err(cleanup_err) = self.mark_trigger_event_handled(execution_id, "error").await {
+            if let Err(cleanup_err) = self
+                .mark_trigger_event_handled_with_cx(&cleanup_cx, execution_id, "error")
+                .await
+            {
                 tracing::warn!(
                     execution_id,
                     error = %cleanup_err,
@@ -2572,7 +2824,7 @@ impl WorkflowRunner {
             };
         }
         let result = self
-            .run_workflow_inner(Some(cx), pane_id, workflow, execution_id, start_step)
+            .run_workflow_inner(cx, pane_id, workflow, execution_id, start_step)
             .await;
         match &result {
             WorkflowExecutionResult::Completed { .. } => capacity_timer.finish_completion(),
@@ -3037,58 +3289,31 @@ impl WorkflowRunner {
 
     // --- Private helper methods ---
 
-    async fn update_execution_step(&self, execution_id: &str, step: usize) -> crate::Result<()> {
-        let mut record = self
-            .storage
-            .get_workflow(execution_id)
-            .await?
-            .ok_or_else(|| {
-                crate::Error::Workflow(crate::error::WorkflowError::NotFound(
-                    execution_id.to_string(),
-                ))
-            })?;
-
-        // Check if workflow was externally aborted/completed
-        if record.status == "aborted" || record.status == "failed" || record.status == "completed" {
-            return Err(crate::Error::Workflow(
-                crate::error::WorkflowError::Aborted(format!(
-                    "Workflow externally modified to status: {}",
-                    record.status
-                )),
-            ));
-        }
-
-        record.current_step = step;
-        record.status = "running".to_string();
-        record.wait_condition = None;
-        record.updated_at = now_ms();
-
-        self.storage.upsert_workflow(record).await
-    }
-
-    /// Tick 182: dispatcher used by `run_workflow_inner` step-loop
-    /// call sites. When `cx` is `Some`, routes through
-    /// `update_execution_step_with_cx`; otherwise falls through to
-    /// the legacy `update_execution_step`. Keeps the 4 call sites
-    /// inside the step loop to a single `.await` line rather than
-    /// a match-on-cx boilerplate at each site.
-    async fn update_execution_step_maybe_cx(
+    async fn persist_failure_with_fresh_cx(
         &self,
-        cx: Option<&crate::cx::Cx>,
         execution_id: &str,
-        step: usize,
-    ) -> crate::Result<()> {
-        if let Some(cx) = cx {
-            return self
-                .update_execution_step_with_cx(cx, execution_id, step)
-                .await;
+        reason: &str,
+        handled_status: &str,
+    ) -> String {
+        let cleanup_cx = crate::cx::for_request();
+        match self
+            .persist_aborted_execution_with_cx(
+                &cleanup_cx,
+                execution_id,
+                reason,
+                handled_status,
+            )
+            .await
+        {
+            Ok(()) => reason.to_string(),
+            Err(cleanup_error) => {
+                format!("{reason}; independent cleanup also failed: {cleanup_error}")
+            }
         }
-        self.update_execution_step(execution_id, step).await
     }
 
-    /// ft-xbnl0.2.3 Cx-first sibling of [`update_execution_step`].
-    ///
-    /// Tick 182: routes both the read (get_workflow_with_cx) and
+    /// Updates per-step progress using one explicit capability context.
+    /// Routes both the read (get_workflow_with_cx) and
     /// the write (upsert_workflow_with_cx) through storage cx-first
     /// siblings. The "externally modified" check stays inline —
     /// it's a pure status-enum match on the already-fetched record
@@ -3132,42 +3357,7 @@ impl WorkflowRunner {
         self.storage.upsert_workflow_with_cx(cx, record).await
     }
 
-    async fn set_execution_waiting(
-        &self,
-        execution_id: &str,
-        step: usize,
-        condition: &WaitCondition,
-    ) -> crate::Result<()> {
-        let mut record = self
-            .storage
-            .get_workflow(execution_id)
-            .await?
-            .ok_or_else(|| {
-                crate::Error::Workflow(crate::error::WorkflowError::NotFound(
-                    execution_id.to_string(),
-                ))
-            })?;
-
-        // Check if workflow was externally aborted/completed
-        if record.status == "aborted" || record.status == "failed" || record.status == "completed" {
-            return Err(crate::Error::Workflow(
-                crate::error::WorkflowError::Aborted(format!(
-                    "Workflow externally modified to status: {}",
-                    record.status
-                )),
-            ));
-        }
-
-        record.current_step = step;
-        record.status = "waiting".to_string();
-        record.wait_condition = Some(serde_json::to_value(condition)?);
-        record.updated_at = now_ms();
-
-        self.storage.upsert_workflow(record).await
-    }
-
-    /// ft-xbnl0.2.3 Cx-first sibling of [`set_execution_waiting`].
-    /// Tick 184: routes get_workflow + upsert_workflow through _with_cx.
+    /// Persists a waiting state under the workflow's explicit Cx.
     async fn set_execution_waiting_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -3202,81 +3392,9 @@ impl WorkflowRunner {
         self.storage.upsert_workflow_with_cx(cx, record).await
     }
 
-    /// Tick 184: dispatcher for set_execution_waiting call sites.
-    async fn set_execution_waiting_maybe_cx(
-        &self,
-        cx: Option<&crate::cx::Cx>,
-        execution_id: &str,
-        step: usize,
-        condition: &WaitCondition,
-    ) -> crate::Result<()> {
-        if let Some(cx) = cx {
-            return self
-                .set_execution_waiting_with_cx(cx, execution_id, step, condition)
-                .await;
-        }
-        self.set_execution_waiting(execution_id, step, condition)
-            .await
-    }
-
-    async fn complete_execution(
-        &self,
-        execution_id: &str,
-        result: Option<serde_json::Value>,
-    ) -> crate::Result<()> {
-        let mut record = self
-            .storage
-            .get_workflow(execution_id)
-            .await?
-            .ok_or_else(|| {
-                crate::Error::Workflow(crate::error::WorkflowError::NotFound(
-                    execution_id.to_string(),
-                ))
-            })?;
-
-        record.status = "completed".to_string();
-        record.result = result;
-        let now = now_ms();
-        record.updated_at = now;
-        record.completed_at = Some(now);
-
-        let duration_ms = now.saturating_sub(record.started_at);
-        let workflow_name = record.workflow_name.clone();
-        let pane_id = record.pane_id;
-        let metric = crate::storage::UsageMetricRecord {
-            id: 0,
-            timestamp: now,
-            metric_type: crate::storage::MetricType::WorkflowCost,
-            pane_id: Some(pane_id),
-            agent_type: None,
-            account_id: None,
-            workflow_id: Some(record.id.clone()),
-            count: Some(1),
-            amount: None,
-            tokens: None,
-            metadata: Some(
-                serde_json::json!({
-                    "source": "workflow.runner",
-                    "workflow_name": workflow_name,
-                    "status": "completed",
-                    "duration_ms": duration_ms,
-                })
-                .to_string(),
-            ),
-            created_at: now,
-        };
-
-        self.storage.upsert_workflow(record).await?;
-        if let Err(err) = self.storage.record_usage_metric(metric).await {
-            tracing::warn!(pane_id, error = %err, "Failed to record workflow completion metric");
-        }
-        Ok(())
-    }
-
-    /// ft-xbnl0.2.3 Cx-first sibling of [`complete_execution`].
-    /// Tick 184: routes get_workflow + upsert_workflow + record_usage_metric
-    /// through _with_cx. Metric-write failure stays warn-only (matches
-    /// tick 183's fail_execution_with_cx contract).
+    /// Persists completion and its usage metric with the workflow Cx.
+    /// Routes get_workflow + upsert_workflow + record_usage_metric
+    /// through Cx-first calls and preserves every persistence failure.
     async fn complete_execution_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -3326,109 +3444,37 @@ impl WorkflowRunner {
         };
 
         self.storage.upsert_workflow_with_cx(cx, record).await?;
-        if let Err(err) = self.storage.record_usage_metric_with_cx(cx, metric).await {
-            tracing::warn!(pane_id, error = %err, "Failed to record workflow completion metric (cx path)");
-        }
-        Ok(())
+        self.storage.record_usage_metric_with_cx(cx, metric).await
     }
 
-    /// Tick 184: dispatcher for complete_execution call sites.
-    async fn complete_execution_maybe_cx(
+    async fn persist_completed_execution_with_cx(
         &self,
-        cx: Option<&crate::cx::Cx>,
+        cx: &crate::cx::Cx,
         execution_id: &str,
         result: Option<serde_json::Value>,
     ) -> crate::Result<()> {
-        if let Some(cx) = cx {
-            return self
-                .complete_execution_with_cx(cx, execution_id, result)
-                .await;
-        }
-        self.complete_execution(execution_id, result).await
-    }
-
-    async fn persist_completed_execution_maybe_cx(
-        &self,
-        cx: Option<&crate::cx::Cx>,
-        execution_id: &str,
-        result: Option<serde_json::Value>,
-    ) -> crate::Result<()> {
-        self.complete_execution_maybe_cx(cx, execution_id, result)
+        self.complete_execution_with_cx(cx, execution_id, result)
             .await?;
-        self.mark_trigger_event_handled_maybe_cx(cx, execution_id, "completed")
+        self.mark_trigger_event_handled_with_cx(cx, execution_id, "completed")
             .await
     }
 
-    async fn persist_aborted_execution_maybe_cx(
+    async fn persist_aborted_execution_with_cx(
         &self,
-        cx: Option<&crate::cx::Cx>,
+        cx: &crate::cx::Cx,
         execution_id: &str,
         reason: &str,
         handled_status: &str,
     ) -> crate::Result<()> {
-        self.fail_execution_maybe_cx(cx, execution_id, reason)
+        self.fail_execution_with_cx(cx, execution_id, reason)
             .await?;
-        self.mark_trigger_event_handled_maybe_cx(cx, execution_id, handled_status)
+        self.mark_trigger_event_handled_with_cx(cx, execution_id, handled_status)
             .await
     }
 
-    async fn fail_execution(&self, execution_id: &str, error: &str) -> crate::Result<()> {
-        let mut record = self
-            .storage
-            .get_workflow(execution_id)
-            .await?
-            .ok_or_else(|| {
-                crate::Error::Workflow(crate::error::WorkflowError::NotFound(
-                    execution_id.to_string(),
-                ))
-            })?;
-
-        record.status = "failed".to_string();
-        record.error = Some(error.to_string());
-        let now = now_ms();
-        record.updated_at = now;
-        record.completed_at = Some(now);
-
-        let duration_ms = now.saturating_sub(record.started_at);
-        let workflow_name = record.workflow_name.clone();
-        let pane_id = record.pane_id;
-        let metric = crate::storage::UsageMetricRecord {
-            id: 0,
-            timestamp: now,
-            metric_type: crate::storage::MetricType::WorkflowCost,
-            pane_id: Some(pane_id),
-            agent_type: None,
-            account_id: None,
-            workflow_id: Some(record.id.clone()),
-            count: Some(1),
-            amount: None,
-            tokens: None,
-            metadata: Some(
-                serde_json::json!({
-                    "source": "workflow.runner",
-                    "workflow_name": workflow_name,
-                    "status": "failed",
-                    "duration_ms": duration_ms,
-                })
-                .to_string(),
-            ),
-            created_at: now,
-        };
-
-        self.storage.upsert_workflow(record).await?;
-        if let Err(err) = self.storage.record_usage_metric(metric).await {
-            tracing::warn!(pane_id, error = %err, "Failed to record workflow failure metric");
-        }
-        Ok(())
-    }
-
-    /// ft-xbnl0.2.3 Cx-first sibling of [`fail_execution`].
-    ///
-    /// Tick 183: all 3 storage calls (get_workflow + upsert_workflow
-    /// + record_usage_metric) route through their cx-first siblings.
-    ///   Keeps the "metric-write failure is warn-only" contract — the
-    ///   metric write uses `if let Err` on the cx-first path same as
-    ///   legacy, so a cx-cancelled metric write logs-and-continues.
+    /// Persists failure and its usage metric with an explicit Cx.
+    /// All storage calls route through Cx-first siblings, and metric failures
+    /// remain typed instead of being mistaken for a fully persisted outcome.
     async fn fail_execution_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -3478,23 +3524,7 @@ impl WorkflowRunner {
         };
 
         self.storage.upsert_workflow_with_cx(cx, record).await?;
-        if let Err(err) = self.storage.record_usage_metric_with_cx(cx, metric).await {
-            tracing::warn!(pane_id, error = %err, "Failed to record workflow failure metric (cx path)");
-        }
-        Ok(())
-    }
-
-    /// Tick 183: dispatcher for fail_execution call sites.
-    async fn fail_execution_maybe_cx(
-        &self,
-        cx: Option<&crate::cx::Cx>,
-        execution_id: &str,
-        error: &str,
-    ) -> crate::Result<()> {
-        if let Some(cx) = cx {
-            return self.fail_execution_with_cx(cx, execution_id, error).await;
-        }
-        self.fail_execution(execution_id, error).await
+        self.storage.record_usage_metric_with_cx(cx, metric).await
     }
 
     /// Mark the triggering event as handled after workflow completion.
@@ -3505,34 +3535,7 @@ impl WorkflowRunner {
     /// # Arguments
     /// * `execution_id` - The workflow execution ID
     /// * `status` - The handling status ("completed", "failed", "aborted", "denied")
-    async fn mark_trigger_event_handled(
-        &self,
-        execution_id: &str,
-        status: &str,
-    ) -> crate::Result<()> {
-        // Get the workflow record to find trigger_event_id
-        let record = self.storage.get_workflow(execution_id).await?;
-
-        if let Some(record) = record {
-            if let Some(event_id) = record.trigger_event_id {
-                self.storage
-                    .mark_event_handled(event_id, Some(execution_id.to_string()), status)
-                    .await?;
-
-                tracing::debug!(
-                    execution_id,
-                    event_id,
-                    status,
-                    "Marked trigger event as handled"
-                );
-            }
-        }
-
-        Ok(())
-    }
-
-    /// ft-xbnl0.2.3 Cx-first sibling of [`mark_trigger_event_handled`].
-    /// Tick 184: routes get_workflow + mark_event_handled through _with_cx.
+    /// Routes get_workflow + mark_event_handled through one explicit Cx.
     async fn mark_trigger_event_handled_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -3564,68 +3567,83 @@ impl WorkflowRunner {
         Ok(())
     }
 
-    /// Tick 184: dispatcher for mark_trigger_event_handled call sites.
-    async fn mark_trigger_event_handled_maybe_cx(
-        &self,
-        cx: Option<&crate::cx::Cx>,
-        execution_id: &str,
-        status: &str,
-    ) -> crate::Result<()> {
-        if let Some(cx) = cx {
-            return self
-                .mark_trigger_event_handled_with_cx(cx, execution_id, status)
-                .await;
-        }
-        self.mark_trigger_event_handled(execution_id, status).await
-    }
-
     #[allow(clippy::too_many_arguments)]
-    async fn persist_cancelled_execution_maybe_cx(
+    async fn persist_cancelled_execution_with_fresh_cx(
         &self,
-        cx: Option<&crate::cx::Cx>,
         workflow_name: &str,
         execution_id: &str,
         pane_id: u64,
         reason: &str,
         current_step: usize,
         start_action_id: Option<i64>,
-    ) {
-        // Cancellation cleanup must be durable even when the caller's cx is
-        // already cancelled; route terminal writes through the non-cx path.
-        let _ = cx;
-        if let Err(e) = self.fail_execution(execution_id, reason).await {
-            tracing::warn!(
-                execution_id,
-                error = %e,
-                "Failed to fail cancelled workflow execution"
-            );
-        }
+    ) -> crate::Result<()> {
+        // Cancellation cleanup must remain durable after the caller's Cx is
+        // cancelled, so every cleanup write shares a new request-rooted Cx.
+        // The outer timeout is driven by that same Cx and bounds the independent
+        // compensation lane without inheriting cancellation from the caller.
+        let cleanup_cx = crate::cx::for_request();
+        let cleanup = async {
+            let mut failures = Vec::new();
+            if let Err(error) = self
+                .fail_execution_with_cx(&cleanup_cx, execution_id, reason)
+                .await
+            {
+                failures.push(format!("failure-state persistence failed: {error}"));
+            }
 
-        if let Err(e) = self
-            .mark_trigger_event_handled(execution_id, "aborted")
+            if let Err(error) = self
+                .mark_trigger_event_handled_with_cx(&cleanup_cx, execution_id, "aborted")
+                .await
+            {
+                failures.push(format!("trigger settlement failed: {error}"));
+            }
+
+            if let Err(error) = record_workflow_terminal_action_with_cx(
+                &cleanup_cx,
+                &self.storage,
+                workflow_name,
+                execution_id,
+                pane_id,
+                "workflow_aborted",
+                "aborted",
+                Some(reason),
+                Some(current_step),
+                None,
+                start_action_id,
+            )
             .await
-        {
-            tracing::warn!(
-                execution_id,
-                error = %e,
-                "Failed to mark cancelled workflow trigger event as handled"
-            );
-        }
+            {
+                failures.push(format!("terminal audit failed: {error}"));
+            }
 
-        record_workflow_terminal_action_maybe_cx(
-            None,
-            &self.storage,
-            workflow_name,
-            execution_id,
-            pane_id,
-            "workflow_aborted",
-            "aborted",
-            Some(reason),
-            Some(current_step),
-            None,
-            start_action_id,
+            if failures.is_empty() {
+                Ok(())
+            } else {
+                Err(crate::Error::Workflow(
+                    crate::error::WorkflowError::Aborted(format!(
+                        "cancelled workflow cleanup incomplete: {}",
+                        failures.join("; ")
+                    )),
+                ))
+            }
+        };
+
+        match crate::runtime_async::timeout_with_cx(
+            &cleanup_cx,
+            WORKFLOW_INDEPENDENT_CLEANUP_TIMEOUT,
+            cleanup,
         )
-        .await;
+        .await
+        {
+            Ok(result) => result,
+            Err(error) => Err(workflow_runner_cancelled(
+                "workflow.cancelled_cleanup",
+                format!(
+                    "independent cleanup exceeded {:?}: {error}",
+                    WORKFLOW_INDEPENDENT_CLEANUP_TIMEOUT
+                ),
+            )),
+        }
     }
 
     /// Abort a running workflow execution.
@@ -5028,21 +5046,23 @@ mod tests {
             }
         }
 
-        /// wait_duration_maybe_cx with cx=None completes after sleep.
+        /// A Cx-aware duration wait completes normally while the Cx is live.
         #[test]
-        fn wait_duration_no_cx_completes() {
+        fn wait_duration_with_cx_completes() {
             run_async_test(async {
+                let cx = crate::cx::for_testing();
                 let result =
-                    wait_duration_maybe_cx(None, Duration::from_millis(1), "test-no-cx").await;
+                    wait_duration_with_cx(&cx, Duration::from_millis(1), "test-cx").await;
                 assert!(result.is_ok());
             });
         }
 
-        /// wait_duration_maybe_cx with zero duration returns immediately.
+        /// A Cx-aware zero duration wait returns immediately.
         #[test]
         fn wait_duration_zero_returns_immediately() {
             run_async_test(async {
-                let result = wait_duration_maybe_cx(None, Duration::ZERO, "test-zero").await;
+                let cx = crate::cx::for_testing();
+                let result = wait_duration_with_cx(&cx, Duration::ZERO, "test-zero").await;
                 assert!(result.is_ok());
             });
         }
@@ -5100,13 +5120,14 @@ mod tests {
             );
         }
 
-        /// wait_condition_pause_maybe_cx dispatches Sleep variant correctly.
+        /// wait_condition_pause_with_cx dispatches Sleep correctly.
         #[test]
-        fn wait_condition_sleep_no_cx() {
+        fn wait_condition_sleep_with_cx() {
             run_async_test(async {
+                let cx = crate::cx::for_testing();
                 let cond = WaitCondition::sleep(1);
-                let result = wait_condition_pause_maybe_cx(
-                    None,
+                let result = wait_condition_pause_with_cx(
+                    &cx,
                     &cond,
                     Duration::from_secs(1),
                     None,
@@ -5120,10 +5141,11 @@ mod tests {
         #[test]
         fn wait_condition_sleep_aborts_when_timeout_expires() {
             run_async_test(async {
+                let cx = crate::cx::for_testing();
                 let cond = WaitCondition::sleep(60);
                 let start = std::time::Instant::now();
-                let err = wait_condition_pause_maybe_cx(
-                    None,
+                let err = wait_condition_pause_with_cx(
+                    &cx,
                     &cond,
                     Duration::from_millis(5),
                     None,
@@ -5149,13 +5171,14 @@ mod tests {
             });
         }
 
-        /// wait_condition_pause_maybe_cx dispatches PaneIdle variant correctly.
+        /// wait_condition_pause_with_cx dispatches PaneIdle correctly.
         #[test]
-        fn wait_condition_pane_idle_no_cx() {
+        fn wait_condition_pane_idle_with_cx() {
             run_async_test(async {
+                let cx = crate::cx::for_testing();
                 let cond = WaitCondition::pane_idle(1);
-                let result = wait_condition_pause_maybe_cx(
-                    None,
+                let result = wait_condition_pause_with_cx(
+                    &cx,
                     &cond,
                     Duration::from_secs(1),
                     None,
@@ -5166,13 +5189,14 @@ mod tests {
             });
         }
 
-        /// wait_condition_pause_maybe_cx dispatches StableTail variant correctly.
+        /// wait_condition_pause_with_cx dispatches StableTail correctly.
         #[test]
-        fn wait_condition_stable_tail_no_cx() {
+        fn wait_condition_stable_tail_with_cx() {
             run_async_test(async {
+                let cx = crate::cx::for_testing();
                 let cond = WaitCondition::stable_tail(1);
-                let result = wait_condition_pause_maybe_cx(
-                    None,
+                let result = wait_condition_pause_with_cx(
+                    &cx,
                     &cond,
                     Duration::from_secs(1),
                     None,
@@ -5186,13 +5210,14 @@ mod tests {
         #[test]
         fn wait_condition_duration_variants_abort_when_timeout_expires() {
             run_async_test(async {
+                let cx = crate::cx::for_testing();
                 for (condition, expected_reason) in [
                     (WaitCondition::pane_idle(60), "pane idle wait timed out"),
                     (WaitCondition::stable_tail(60), "stable tail wait timed out"),
                 ] {
                     let start = std::time::Instant::now();
-                    let err = wait_condition_pause_maybe_cx(
-                        None,
+                    let err = wait_condition_pause_with_cx(
+                        &cx,
                         &condition,
                         Duration::from_millis(5),
                         None,
@@ -5222,6 +5247,7 @@ mod tests {
         #[test]
         fn pattern_and_text_match_waits_require_observable_pane_text() {
             run_async_test(async {
+                let cx = crate::cx::for_testing();
                 for (condition, expected_reason) in [
                     (
                         WaitCondition::pattern("prompt.ready"),
@@ -5232,8 +5258,8 @@ mod tests {
                         "text-match wait substring(len=4",
                     ),
                 ] {
-                    let err = wait_condition_pause_maybe_cx(
-                        None,
+                    let err = wait_condition_pause_with_cx(
+                        &cx,
                         &condition,
                         Duration::from_secs(60),
                         None,
@@ -5272,8 +5298,8 @@ mod tests {
                     Some("runner wait test pre-cancel"),
                 );
 
-                let err = wait_condition_pause_maybe_cx(
-                    Some(&cx),
+                let err = wait_condition_pause_with_cx(
+                    &cx,
                     &WaitCondition::sleep(250),
                     Duration::from_secs(1),
                     None,
@@ -5311,8 +5337,8 @@ mod tests {
                 });
 
                 let start = std::time::Instant::now();
-                let err = wait_duration_maybe_cx(
-                    Some(&cx),
+                let err = wait_duration_with_cx(
+                    &cx,
                     Duration::from_secs(60),
                     "workflow retry backoff",
                 )
@@ -5346,9 +5372,10 @@ mod tests {
         #[test]
         fn external_wait_without_registry_returns_explicit_error() {
             run_async_test(async {
+                let cx = crate::cx::for_testing();
                 let cond = WaitCondition::external("deploy-finished");
-                let err = wait_condition_pause_maybe_cx(
-                    None,
+                let err = wait_condition_pause_with_cx(
+                    &cx,
                     &cond,
                     Duration::from_secs(60),
                     None,
@@ -5375,10 +5402,11 @@ mod tests {
         #[test]
         fn external_wait_rejects_empty_signal_key() {
             run_async_test(async {
+                let cx = crate::cx::for_testing();
                 let registry = ExternalSignalRegistry::new();
                 let cond = WaitCondition::external(" \t ");
-                let err = wait_condition_pause_maybe_cx(
-                    None,
+                let err = wait_condition_pause_with_cx(
+                    &cx,
                     &cond,
                     Duration::from_secs(60),
                     Some(&registry),
@@ -5402,12 +5430,13 @@ mod tests {
         #[test]
         fn external_wait_observes_pre_fired_signal() {
             run_async_test(async {
+                let cx = crate::cx::for_testing();
                 let registry = ExternalSignalRegistry::new();
                 registry.signal("ready");
                 let cond = WaitCondition::external("ready");
                 let start = std::time::Instant::now();
-                wait_condition_pause_maybe_cx(
-                    None,
+                wait_condition_pause_with_cx(
+                    &cx,
                     &cond,
                     Duration::from_secs(60),
                     Some(&registry),
@@ -5428,6 +5457,7 @@ mod tests {
         #[test]
         fn external_wait_unblocks_when_signal_fires_during_wait() {
             run_async_test(async {
+                let cx = crate::cx::for_testing();
                 let registry = Arc::new(ExternalSignalRegistry::new());
                 let cond = WaitCondition::external("late");
                 let signaler = Arc::clone(&registry);
@@ -5437,8 +5467,8 @@ mod tests {
                 });
 
                 let start = std::time::Instant::now();
-                wait_condition_pause_maybe_cx(
-                    None,
+                wait_condition_pause_with_cx(
+                    &cx,
                     &cond,
                     Duration::from_secs(30),
                     Some(registry.as_ref()),
@@ -5464,11 +5494,12 @@ mod tests {
         #[test]
         fn external_wait_aborts_at_timeout_when_signal_never_fires() {
             run_async_test(async {
+                let cx = crate::cx::for_testing();
                 let registry = ExternalSignalRegistry::new();
                 let cond = WaitCondition::external("never");
                 let start = std::time::Instant::now();
-                let err = wait_condition_pause_maybe_cx(
-                    None,
+                let err = wait_condition_pause_with_cx(
+                    &cx,
                     &cond,
                     Duration::from_millis(120),
                     Some(&registry),
@@ -5507,8 +5538,8 @@ mod tests {
                     crate::outcome::CancelKind::User,
                     Some("external wait pre-cancel"),
                 );
-                let err = wait_condition_pause_maybe_cx(
-                    Some(&cx),
+                let err = wait_condition_pause_with_cx(
+                    &cx,
                     &WaitCondition::external("anything"),
                     Duration::from_secs(60),
                     Some(&registry),

@@ -67,12 +67,12 @@ pub use wait_execution::*;
 
 use crate::cass::{CassAgent, CassClient, CassSearchHit, SearchOptions};
 use crate::policy::{ActorKind, InjectionResult, PaneCapabilities, Redactor};
-use crate::runtime_async::sleep;
+use crate::runtime_async::{LockAcquireError, sleep};
 use crate::storage::StorageHandle;
 use crate::wezterm::{
     CodexSummaryWaitResult, PaneTextSource, PaneWaiter, WaitMatcher, WaitOptions, WaitResult,
     WeztermHandleSource, default_wezterm_handle, stable_hash, tail_text,
-    wait_for_codex_session_summary,
+    wait_for_codex_session_summary_with_cx,
 };
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -175,6 +175,17 @@ pub struct CxPolicyInjector {
     inner: Arc<crate::runtime_async::Mutex<PolicyInjector>>,
 }
 
+fn injector_lock_error(operation: &'static str, error: LockAcquireError) -> crate::Error {
+    match error {
+        LockAcquireError::Cancelled => crate::Error::runtime_cancelled(operation, error.to_string()),
+        LockAcquireError::TimedOut { .. }
+        | LockAcquireError::Poisoned
+        | LockAcquireError::PolledAfterCompletion => {
+            crate::Error::runtime_backend(operation, error.to_string())
+        }
+    }
+}
+
 impl CxPolicyInjector {
     /// Wrap a policy-gated injector in the Cx-aware workflow adapter used by
     /// cross-crate callers such as the ft CLI.
@@ -189,9 +200,14 @@ impl CxPolicyInjector {
         &self,
         cx: &crate::cx::Cx,
         adapter: crate::replay_capture::SharedCaptureAdapter,
-    ) {
-        let mut injector = self.inner.lock_with_cx(cx).await;
+    ) -> crate::Result<()> {
+        let mut injector = self
+            .inner
+            .lock_with_cx(cx)
+            .await
+            .map_err(|error| injector_lock_error("workflow.injector.set_capture", error))?;
         injector.set_decision_capture(adapter);
+        Ok(())
     }
 
     pub(crate) async fn send_text(
@@ -202,9 +218,13 @@ impl CxPolicyInjector {
         actor: ActorKind,
         capabilities: &PaneCapabilities,
         workflow_id: Option<&str>,
-    ) -> InjectionResult {
+    ) -> crate::Result<InjectionResult> {
         let fut = {
-            let mut injector = self.inner.lock_with_cx(cx).await;
+            let mut injector = self
+                .inner
+                .lock_with_cx(cx)
+                .await
+                .map_err(|error| injector_lock_error("workflow.injector.send_text", error))?;
             injector.inject_with_cx_detached(
                 cx,
                 pane_id,
@@ -215,7 +235,7 @@ impl CxPolicyInjector {
                 workflow_id,
             )
         };
-        fut.await
+        Ok(fut.await)
     }
 
     pub(crate) async fn send_ctrl_c(
@@ -225,9 +245,13 @@ impl CxPolicyInjector {
         actor: ActorKind,
         capabilities: &PaneCapabilities,
         workflow_id: Option<&str>,
-    ) -> InjectionResult {
+    ) -> crate::Result<InjectionResult> {
         let fut = {
-            let mut injector = self.inner.lock_with_cx(cx).await;
+            let mut injector = self
+                .inner
+                .lock_with_cx(cx)
+                .await
+                .map_err(|error| injector_lock_error("workflow.injector.send_ctrl_c", error))?;
             injector.inject_with_cx_detached(
                 cx,
                 pane_id,
@@ -238,7 +262,7 @@ impl CxPolicyInjector {
                 workflow_id,
             )
         };
-        fut.await
+        Ok(fut.await)
     }
 
     pub(crate) async fn send_ctrl_d(
@@ -248,9 +272,13 @@ impl CxPolicyInjector {
         actor: ActorKind,
         capabilities: &PaneCapabilities,
         workflow_id: Option<&str>,
-    ) -> InjectionResult {
+    ) -> crate::Result<InjectionResult> {
         let fut = {
-            let mut injector = self.inner.lock_with_cx(cx).await;
+            let mut injector = self
+                .inner
+                .lock_with_cx(cx)
+                .await
+                .map_err(|error| injector_lock_error("workflow.injector.send_ctrl_d", error))?;
             injector.inject_with_cx_detached(
                 cx,
                 pane_id,
@@ -261,7 +289,7 @@ impl CxPolicyInjector {
                 workflow_id,
             )
         };
-        fut.await
+        Ok(fut.await)
     }
 
     pub(crate) async fn send_ctrl_z(
@@ -271,9 +299,13 @@ impl CxPolicyInjector {
         actor: ActorKind,
         capabilities: &PaneCapabilities,
         workflow_id: Option<&str>,
-    ) -> InjectionResult {
+    ) -> crate::Result<InjectionResult> {
         let fut = {
-            let mut injector = self.inner.lock_with_cx(cx).await;
+            let mut injector = self
+                .inner
+                .lock_with_cx(cx)
+                .await
+                .map_err(|error| injector_lock_error("workflow.injector.send_ctrl_z", error))?;
             injector.inject_with_cx_detached(
                 cx,
                 pane_id,
@@ -284,7 +316,7 @@ impl CxPolicyInjector {
                 workflow_id,
             )
         };
-        fut.await
+        Ok(fut.await)
     }
 }
 
@@ -4723,6 +4755,8 @@ steps:
                 injector.send_text(&cx, 2, "b", ActorKind::Workflow, &caps, Some("wf-b")),
             )
             .await;
+            let a = a.expect("first injector lock acquisition");
+            let b = b.expect("second injector lock acquisition");
             assert!(
                 matches!(a, InjectionResult::Allowed { .. })
                     && matches!(b, InjectionResult::Allowed { .. })

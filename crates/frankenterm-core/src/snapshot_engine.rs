@@ -34,7 +34,7 @@ use serde_json::Value;
 use crate::agent_correlator::AgentCorrelator;
 use crate::config::{SnapshotConfig, SnapshotSchedulingMode};
 use crate::patterns::{AgentType, Detection, Severity};
-use crate::runtime_async::{Mutex, RwLock, mpsc, watch};
+use crate::runtime_async::{LockAcquireError, Mutex, RwLock, mpsc, watch};
 use crate::session_pane_state::{PaneStateSnapshot, ScrollbackRef};
 use crate::session_topology::TopologySnapshot;
 use crate::wezterm::PaneInfo;
@@ -274,6 +274,17 @@ pub enum SnapshotError {
     /// the capture race.
     #[error("snapshot capture cancelled via capability context")]
     Cancelled,
+    #[error("snapshot synchronization failed: {0}")]
+    LockAcquire(String),
+}
+
+fn snapshot_lock_error(error: LockAcquireError) -> SnapshotError {
+    match error {
+        LockAcquireError::Cancelled => SnapshotError::Cancelled,
+        LockAcquireError::TimedOut { .. }
+        | LockAcquireError::Poisoned
+        | LockAcquireError::PolledAfterCompletion => SnapshotError::LockAcquire(error.to_string()),
+    }
 }
 
 // =============================================================================
@@ -531,7 +542,11 @@ impl SnapshotEngine {
             trigger,
             SnapshotTrigger::Periodic | SnapshotTrigger::PeriodicFallback
         ) {
-            let last = self.last_state_hash.read_with_cx(cx).await;
+            let last = self
+                .last_state_hash
+                .read_with_cx(cx)
+                .await
+                .map_err(snapshot_lock_error)?;
             if last.as_deref() == Some(&state_hash) {
                 self.telemetry.dedup_skips.fetch_add(1, Ordering::Relaxed);
                 return Err(SnapshotError::NoChanges);
@@ -543,7 +558,18 @@ impl SnapshotEngine {
             .ensure_session_with_cx(cx, &topology_json, now_ms)
             .await?;
 
-        // 7. Persist checkpoint + pane states in a transaction
+        // 7. Acquire the final in-memory commit guard before the durable write.
+        // Once the SQLite transaction commits, cancellation is too late to
+        // report failure: doing so would lie about a checkpoint that now
+        // exists. Holding this guard across the write makes the durable and
+        // in-memory commit points one ordered operation.
+        let mut last_state_hash = self
+            .last_state_hash
+            .write_with_cx(cx)
+            .await
+            .map_err(snapshot_lock_error)?;
+
+        // 8. Persist checkpoint + pane states in a transaction.
         let checkpoint_type = trigger.as_db_str().to_string();
         let pane_count = pane_states.len();
 
@@ -568,10 +594,11 @@ impl SnapshotEngine {
         })
         .await?;
 
-        // 8. Update last hash — Cx-bound write
-        *self.last_state_hash.write_with_cx(cx).await = Some(state_hash);
+        // 9. Complete the in-memory half of the commit while the guard
+        // acquired before the durable effect is still held.
+        *last_state_hash = Some(state_hash);
 
-        // 9. Record success telemetry
+        // 10. Record success telemetry
         self.telemetry
             .captures_succeeded
             .fetch_add(1, Ordering::Relaxed);
@@ -600,17 +627,17 @@ impl SnapshotEngine {
     /// Run retention cleanup bound to the caller's asupersync capability
     /// context (ft-xbnl0.2.x Cx-first entry point).
     ///
-    /// Mirrors the `session_retention::cleanup_sessions_async_cx` pattern:
-    /// a `cx.checkpoint()` before the `spawn_blocking` handoff lets a
-    /// canceled caller skip the blocking DB work entirely, and a
-    /// `cx.checkpoint()` after the join lets the caller abort before
-    /// propagating a stale `removed` count into the wider call graph.
+    /// A `cx.checkpoint()` before the `spawn_blocking` handoff lets a
+    /// cancelled caller skip the blocking DB work entirely. Once the cleanup
+    /// transaction commits, its removal count is authoritative and is returned
+    /// even if cancellation arrives concurrently; reporting cancellation or
+    /// zero after that commit would misrepresent the durable effect.
     ///
     /// Pre-flight: if `cx` is already cancelled on entry, the
     /// `cleanup_runs` counter is still incremented (to preserve
     /// observability parity with `cleanup`), but the spawn_blocking is
-    /// skipped and the method returns `Ok(0)` without touching the
-    /// database.
+    /// skipped and the method returns [`SnapshotError::Cancelled`] without
+    /// touching the database.
     ///
     /// The legacy [`cleanup`](Self::cleanup) entry point is preserved
     /// for non-migrated callers; this is strictly additive.
@@ -624,7 +651,7 @@ impl SnapshotEngine {
             tracing::debug!(
                 "cleanup_with_cx: Cx cancelled before spawn_blocking; skipping cleanup"
             );
-            return Ok(0);
+            return Err(SnapshotError::Cancelled);
         }
 
         let db_path = Arc::clone(&self.db_path);
@@ -638,17 +665,6 @@ impl SnapshotEngine {
         self.telemetry
             .cleanup_removed
             .fetch_add(removed as u64, Ordering::Relaxed);
-
-        // Honor caller cancellation after the blocking work returns so a
-        // late-canceled caller does not propagate a stale result. The
-        // telemetry counter stays authoritative even if we short-circuit
-        // here because the removal already happened on the DB.
-        if cx.checkpoint().is_err() {
-            tracing::debug!(
-                "cleanup_with_cx: Cx cancelled after spawn_blocking returned; caller will see Ok(0)"
-            );
-            return Ok(0);
-        }
 
         Ok(removed)
     }
@@ -743,7 +759,7 @@ impl SnapshotEngine {
         cx: &crate::cx::Cx,
         pane_provider: &F,
         trigger: SnapshotTrigger,
-    ) -> bool
+    ) -> std::result::Result<bool, SnapshotError>
     where
         F: Fn() -> Fut + Send + Sync + 'static,
         Fut: std::future::Future<Output = Option<Vec<PaneInfo>>> + Send,
@@ -761,24 +777,24 @@ impl SnapshotEngine {
                     if let Err(e) = self.cleanup_with_cx(cx).await {
                         tracing::warn!(error = %e, "snapshot retention cleanup failed (cx path)");
                     }
-                    true
+                    Ok(true)
                 }
                 Err(SnapshotError::NoChanges) => {
                     tracing::debug!(trigger = ?trigger, "snapshot skipped: no changes");
-                    false
+                    Ok(false)
                 }
                 Err(SnapshotError::InProgress) => {
                     tracing::debug!(trigger = ?trigger, "snapshot skipped: capture in progress");
-                    false
+                    Ok(false)
                 }
                 Err(e) => {
                     tracing::warn!(trigger = ?trigger, error = %e, "snapshot capture failed");
-                    false
+                    Err(e)
                 }
             }
         } else {
             tracing::debug!(trigger = ?trigger, "snapshot skipped: no panes available");
-            false
+            Ok(false)
         }
     }
 
@@ -790,14 +806,23 @@ impl SnapshotEngine {
     ///
     /// `pane_provider` is called each time to fetch the current pane list.
     /// This decouples the engine from `WeztermClient` for testability.
-    pub async fn run_periodic<F, Fut>(&self, shutdown: watch::Receiver<bool>, pane_provider: F)
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed snapshot error when capture, synchronization, or caller
+    /// cancellation prevents the scheduler from completing normally.
+    pub async fn run_periodic<F, Fut>(
+        &self,
+        shutdown: watch::Receiver<bool>,
+        pane_provider: F,
+    ) -> std::result::Result<(), SnapshotError>
     where
         F: Fn() -> Fut + Send + Sync + 'static,
         Fut: std::future::Future<Output = Option<Vec<PaneInfo>>> + Send,
     {
         let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
         self.run_periodic_with_cx(&cx, shutdown, pane_provider)
-            .await;
+            .await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`run_periodic`].
@@ -814,20 +839,26 @@ impl SnapshotEngine {
     /// `scheduler_body(&cx, ...)` helper (via internal
     /// refactor); the legacy path passes `cx::for_request()` to
     /// preserve its prior semantics.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SnapshotError::Cancelled`] when `cx` is cancelled, or
+    /// propagates capture/synchronization failures from scheduler work.
     pub async fn run_periodic_with_cx<F, Fut>(
         &self,
         cx: &crate::cx::Cx,
         shutdown: watch::Receiver<bool>,
         pane_provider: F,
-    ) where
+    ) -> std::result::Result<(), SnapshotError>
+    where
         F: Fn() -> Fut + Send + Sync + 'static,
         Fut: std::future::Future<Output = Option<Vec<PaneInfo>>> + Send,
     {
         if cx.checkpoint().is_err() {
             tracing::info!("snapshot engine run_periodic cancelled at entry");
-            return;
+            return Err(SnapshotError::Cancelled);
         }
-        self.scheduler_body(cx, shutdown, pane_provider).await;
+        self.scheduler_body(cx, shutdown, pane_provider).await
     }
 
     /// Cx-aware scheduler body shared by `run_periodic` and
@@ -839,7 +870,8 @@ impl SnapshotEngine {
         cx: &crate::cx::Cx,
         mut shutdown: watch::Receiver<bool>,
         pane_provider: F,
-    ) where
+    ) -> std::result::Result<(), SnapshotError>
+    where
         F: Fn() -> Fut + Send + Sync + 'static,
         Fut: std::future::Future<Output = Option<Vec<PaneInfo>>> + Send,
     {
@@ -860,10 +892,12 @@ impl SnapshotEngine {
                         // shutdown.changed(cx) — both the outer interval-timeout
                         // AND the inner shutdown wait now honor cx-cancel.
                         let shutdown_fut = shutdown.changed(cx);
-                        if crate::runtime_async::timeout_with_cx(cx, interval, shutdown_fut)
-                            .await
-                            .is_ok()
-                        {
+                        let shutdown_wait =
+                            crate::runtime_async::timeout_with_cx(cx, interval, shutdown_fut).await;
+                        if cx.is_cancel_requested() {
+                            return Err(SnapshotError::Cancelled);
+                        }
+                        if shutdown_wait.is_ok() {
                             tracing::info!("snapshot engine shutting down");
                             break;
                         }
@@ -871,11 +905,12 @@ impl SnapshotEngine {
 
                     if cx.checkpoint().is_err() {
                         tracing::info!("snapshot engine run_periodic: cx cancelled, exiting");
-                        break;
+                        return Err(SnapshotError::Cancelled);
                     }
 
                     self.maybe_run_session_cleanup(cx, &mut last_session_cleanup)
                         .await;
+                    cx.checkpoint().map_err(|_| SnapshotError::Cancelled)?;
 
                     let trigger = if is_first {
                         is_first = false;
@@ -883,9 +918,9 @@ impl SnapshotEngine {
                     } else {
                         SnapshotTrigger::Periodic
                     };
-                    let _ = self
-                        .capture_from_provider_with_cx(cx, &pane_provider, trigger)
-                        .await;
+                    self.capture_from_provider_with_cx(cx, &pane_provider, trigger)
+                        .await?;
+                    cx.checkpoint().map_err(|_| SnapshotError::Cancelled)?;
                 }
             }
             SnapshotSchedulingMode::Intelligent => {
@@ -897,14 +932,18 @@ impl SnapshotEngine {
                             tracing::warn!(
                                 "snapshot intelligent scheduler: receiver already taken"
                             );
-                            return;
+                            return Ok(());
                         }
                     }
                 };
 
-                let _ = self
-                    .capture_from_provider_with_cx(cx, &pane_provider, SnapshotTrigger::Startup)
-                    .await;
+                self.capture_from_provider_with_cx(
+                    cx,
+                    &pane_provider,
+                    SnapshotTrigger::Startup,
+                )
+                .await?;
+                cx.checkpoint().map_err(|_| SnapshotError::Cancelled)?;
 
                 let fallback_secs = self
                     .config
@@ -939,11 +978,12 @@ impl SnapshotEngine {
                         tracing::info!(
                             "snapshot engine intelligent scheduler: cx cancelled, exiting"
                         );
-                        break;
+                        return Err(SnapshotError::Cancelled);
                     }
 
                     self.maybe_run_session_cleanup(cx, &mut last_session_cleanup)
                         .await;
+                    cx.checkpoint().map_err(|_| SnapshotError::Cancelled)?;
 
                     // ft-83kc7: read the shutdown FLAG, do not wait for a change
                     // event with a zero-duration timeout.
@@ -984,12 +1024,15 @@ impl SnapshotEngine {
                         let recv_fut = trigger_rx.recv(cx);
                         let recv_result =
                             crate::runtime_async::timeout_with_cx(cx, wait_step, recv_fut)
-                                .await
-                                .map(|result| result.ok());
+                                .await;
+
+                        if cx.is_cancel_requested() {
+                            return Err(SnapshotError::Cancelled);
+                        }
 
                         match recv_result {
-                            Ok(Some(trigger)) => TriggerPoll::Ready(trigger),
-                            Ok(None) => TriggerPoll::Closed,
+                            Ok(Ok(trigger)) => TriggerPoll::Ready(trigger),
+                            Ok(Err(_)) => TriggerPoll::Closed,
                             Err(_) => TriggerPoll::TimedOut,
                         }
                     };
@@ -1009,7 +1052,8 @@ impl SnapshotEngine {
                             if should_capture {
                                 let captured = self
                                     .capture_from_provider_with_cx(cx, &pane_provider, trigger)
-                                    .await;
+                                    .await?;
+                                cx.checkpoint().map_err(|_| SnapshotError::Cancelled)?;
                                 if captured || immediate || snapshot_threshold <= 0.0 {
                                     accumulated_value = 0.0;
                                 }
@@ -1034,7 +1078,8 @@ impl SnapshotEngine {
                                     &pane_provider,
                                     SnapshotTrigger::PeriodicFallback,
                                 )
-                                .await;
+                                .await?;
+                            cx.checkpoint().map_err(|_| SnapshotError::Cancelled)?;
                             if captured {
                                 accumulated_value = 0.0;
                             }
@@ -1044,6 +1089,7 @@ impl SnapshotEngine {
                 }
             }
         }
+        Ok(())
     }
 
     /// Run `[snapshots.session_retention]` cleanup on the configured cadence
@@ -1115,9 +1161,18 @@ impl SnapshotEngine {
         topology_json: &str,
         now_ms: u64,
     ) -> std::result::Result<String, SnapshotError> {
-        let existing_session_id = { self.session_id.read_with_cx(cx).await.clone() };
-        if let Some(id) = existing_session_id {
-            return Ok(id);
+        // Acquire the state commit guard before creating the durable session.
+        // The previous read-DB-write sequence had both a duplicate-session race
+        // and a post-effect cancellation hole: SQLite could contain a new
+        // session even though a cancelled final write-lock acquire returned an
+        // error and left `session_id` unset.
+        let mut session_id_guard = self
+            .session_id
+            .write_with_cx(cx)
+            .await
+            .map_err(snapshot_lock_error)?;
+        if let Some(id) = session_id_guard.as_ref() {
+            return Ok(id.clone());
         }
 
         if cx.checkpoint().is_err() {
@@ -1134,7 +1189,7 @@ impl SnapshotEngine {
         })
         .await?;
 
-        *self.session_id.write_with_cx(cx).await = Some(session_id.clone());
+        *session_id_guard = Some(session_id.clone());
         Ok(session_id)
     }
 
@@ -1160,10 +1215,11 @@ impl SnapshotEngine {
     /// deterministically under `LabRuntime` virtual time rather than only
     /// responding to the explicit `timeout` argument.
     ///
-    /// Pre-flight: if `cx` is already cancelled, skip the capture attempt
-    /// entirely, best-effort mark the session as cleanly shut down, and
-    /// return `Ok(None)`. An operator who has abandoned the shutdown race
-    /// should not trigger a full capture just to immediately time out.
+    /// Pre-flight: if `cx` is already cancelled, skip the capture attempt,
+    /// best-effort mark the session as cleanly shut down under an independent
+    /// cleanup capability, and return [`SnapshotError::Cancelled`]. This keeps
+    /// the clean-shutdown side effect without misreporting cancellation as an
+    /// empty successful checkpoint.
     ///
     /// The legacy [`shutdown_checkpoint`](Self::shutdown_checkpoint) entry
     /// point is preserved for non-migrated callers; this is strictly
@@ -1179,8 +1235,8 @@ impl SnapshotEngine {
                 "shutdown_checkpoint_with_cx: Cx pre-cancelled; skipping capture and marking \
                  shutdown"
             );
-            let _ = self.mark_shutdown().await;
-            return Ok(None);
+            self.best_effort_mark_shutdown_independently().await;
+            return Err(SnapshotError::Cancelled);
         }
 
         let result = crate::runtime_async::timeout_with_cx(cx, timeout, async {
@@ -1190,45 +1246,38 @@ impl SnapshotEngine {
             let capture_result = self
                 .capture_with_cx(cx, panes, SnapshotTrigger::Shutdown)
                 .await;
-            if let Err(e) = self.mark_shutdown().await {
-                tracing::warn!(error = %e, "Failed to mark session as clean shutdown");
-            }
+            self.best_effort_mark_shutdown_independently().await;
             capture_result
         })
         .await;
 
         match result {
             Ok(Ok(snap)) => Ok(Some(snap)),
-            Ok(Err(SnapshotError::NoChanges)) => {
-                let _ = self.mark_shutdown().await;
-                Ok(None)
-            }
-            Ok(Err(SnapshotError::Cancelled)) => {
-                // Caller Cx was cancelled mid-capture. Best-effort mark
-                // shutdown (mark_shutdown uses ambient Cx for its own
-                // DB write, which is acceptable since we're in a
-                // shutdown path and do not want a cancellation storm).
-                let _ = self.mark_shutdown().await;
-                Ok(None)
-            }
-            Ok(Err(e)) => {
-                let _ = self.mark_shutdown().await;
-                Err(e)
-            }
+            Ok(Err(SnapshotError::NoChanges)) => Ok(None),
+            Ok(Err(SnapshotError::Cancelled)) => Err(SnapshotError::Cancelled),
+            Ok(Err(e)) => Err(e),
             Err(_) => {
-                // `timeout_with_cx` returns Err on either the timeout
-                // elapsing OR the Cx being cancelled. Either way, best
-                // effort mark shutdown and surface None.
+                // `timeout_with_cx` returns the same outer error for timeout
+                // and budget exhaustion. The explicit cancellation flag lets
+                // us preserve caller cancellation as a typed error.
+                self.best_effort_mark_shutdown_independently().await;
                 if cx.is_cancel_requested() {
                     tracing::warn!(
                         "Shutdown checkpoint cancelled via Cx before completing within {timeout:?}"
                     );
+                    Err(SnapshotError::Cancelled)
                 } else {
                     tracing::warn!("Shutdown checkpoint timed out after {timeout:?}");
+                    Ok(None)
                 }
-                let _ = self.mark_shutdown().await;
-                Ok(None)
             }
+        }
+    }
+
+    async fn best_effort_mark_shutdown_independently(&self) {
+        let cleanup_cx = crate::cx::for_request();
+        if let Err(error) = self.mark_shutdown_with_cx(&cleanup_cx).await {
+            tracing::warn!(%error, "failed to mark session as clean shutdown");
         }
     }
 
@@ -1246,10 +1295,10 @@ impl SnapshotEngine {
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`mark_shutdown`].
     ///
-    /// Two checkpoint seams: (1) pre-flight before acquiring the
-    /// session-id read lock, (2) after the spawn_blocking DB
-    /// update returns (so a late-cancelled caller gets the
-    /// cancel surface without dropping the DB work in-flight).
+    /// Cancellation is accepted before the session-id lock/DB mutation. Once
+    /// the clean-shutdown update commits, the method returns success even if
+    /// cancellation arrives concurrently; the durable effect is then
+    /// authoritative and must not be reported as a failed operation.
     pub async fn mark_shutdown_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -1262,13 +1311,18 @@ impl SnapshotEngine {
         // `read().await` which picks up cx via Cx::current()
         // thread-local fallback. Matches the pattern already used
         // by ensure_session_with_cx (L1260) in this same file.
-        let session_id = { self.session_id.read_with_cx(cx).await.clone() };
+        let session_id = {
+            self.session_id
+                .read_with_cx(cx)
+                .await
+                .map_err(snapshot_lock_error)?
+                .clone()
+        };
         if let Some(id) = session_id {
             let db_path = Arc::clone(&self.db_path);
             Self::spawn_blocking_db(move || mark_shutdown_sync(&db_path, &id)).await?;
         }
 
-        cx.checkpoint().map_err(|_| SnapshotError::Cancelled)?;
         Ok(())
     }
 }
@@ -2377,7 +2431,7 @@ mod tests {
                     .run_periodic_with_cx(&task_cx, shutdown_rx, || async {
                         Some(vec![make_test_pane(1, 24, 80)])
                     })
-                    .await;
+                    .await
             });
 
             // Let the scheduler complete its startup capture and settle
@@ -2392,8 +2446,16 @@ mod tests {
                 Some("mid-flight cancel snapshot scheduler"),
             );
 
-            let _ = crate::runtime_async::timeout(Duration::from_secs(5), handle).await;
+            let task_result = crate::runtime_async::timeout(Duration::from_secs(5), handle)
+                .await
+                .expect("cancelled scheduler must exit before timeout")
+                .expect("snapshot scheduler task must not panic");
             let elapsed = started.elapsed();
+
+            assert!(
+                matches!(task_result, Err(SnapshotError::Cancelled)),
+                "mid-flight cancellation must remain a typed scheduler result"
+            );
 
             assert!(
                 elapsed < Duration::from_secs(5),
@@ -2600,7 +2662,9 @@ mod tests {
 
             let e2 = engine.clone();
             let handle = crate::runtime_async::task::spawn(async move {
-                e2.run_periodic(shutdown_rx, counting_pane_provider()).await;
+                e2.run_periodic(shutdown_rx, counting_pane_provider())
+                    .await
+                    .expect("snapshot scheduler");
             });
 
             // ft-83kc7: wait for the startup capture rather than guessing at it.
@@ -2634,7 +2698,9 @@ mod tests {
 
             let e2 = engine.clone();
             let handle = crate::runtime_async::task::spawn(async move {
-                e2.run_periodic(shutdown_rx, counting_pane_provider()).await;
+                e2.run_periodic(shutdown_rx, counting_pane_provider())
+                    .await
+                    .expect("snapshot scheduler");
             });
 
             sleep(Duration::from_millis(100)).await;
@@ -2667,7 +2733,9 @@ mod tests {
 
             let e2 = engine.clone();
             let handle = crate::runtime_async::task::spawn(async move {
-                e2.run_periodic(shutdown_rx, counting_pane_provider()).await;
+                e2.run_periodic(shutdown_rx, counting_pane_provider())
+                    .await
+                    .expect("snapshot scheduler");
             });
 
             sleep(Duration::from_millis(100)).await;
@@ -2695,7 +2763,9 @@ mod tests {
 
             let e2 = engine.clone();
             let handle = crate::runtime_async::task::spawn(async move {
-                e2.run_periodic(shutdown_rx, counting_pane_provider()).await;
+                e2.run_periodic(shutdown_rx, counting_pane_provider())
+                    .await
+                    .expect("snapshot scheduler");
             });
 
             sleep(Duration::from_millis(100)).await;
@@ -2723,7 +2793,9 @@ mod tests {
 
             let e2 = engine.clone();
             let handle = crate::runtime_async::task::spawn(async move {
-                e2.run_periodic(shutdown_rx, counting_pane_provider()).await;
+                e2.run_periodic(shutdown_rx, counting_pane_provider())
+                    .await
+                    .expect("snapshot scheduler");
             });
 
             sleep(Duration::from_millis(100)).await;
@@ -2777,7 +2849,9 @@ mod tests {
 
             let e2 = engine.clone();
             let handle = crate::runtime_async::task::spawn(async move {
-                e2.run_periodic(shutdown_rx, counting_pane_provider()).await;
+                e2.run_periodic(shutdown_rx, counting_pane_provider())
+                    .await
+                    .expect("snapshot scheduler");
             });
 
             sleep(Duration::from_millis(100)).await;
@@ -2800,7 +2874,9 @@ mod tests {
 
             let e2 = engine.clone();
             let handle = crate::runtime_async::task::spawn(async move {
-                e2.run_periodic(shutdown_rx, counting_pane_provider()).await;
+                e2.run_periodic(shutdown_rx, counting_pane_provider())
+                    .await
+                    .expect("snapshot scheduler");
             });
 
             // Wait for startup capture + scheduler loop to settle (250ms poll step)
@@ -2836,7 +2912,9 @@ mod tests {
 
             let e2 = engine.clone();
             let handle = crate::runtime_async::task::spawn(async move {
-                e2.run_periodic(shutdown_rx, counting_pane_provider()).await;
+                e2.run_periodic(shutdown_rx, counting_pane_provider())
+                    .await
+                    .expect("snapshot scheduler");
             });
 
             sleep(Duration::from_millis(100)).await;
@@ -2895,7 +2973,9 @@ mod tests {
 
             let e2 = engine.clone();
             let handle = crate::runtime_async::task::spawn(async move {
-                e2.run_periodic(shutdown_rx, counting_pane_provider()).await;
+                e2.run_periodic(shutdown_rx, counting_pane_provider())
+                    .await
+                    .expect("snapshot scheduler");
             });
 
             // ft-83kc7: wait for the startup capture rather than guessing at it.
@@ -2954,7 +3034,9 @@ mod tests {
 
             let e2 = engine.clone();
             let handle = crate::runtime_async::task::spawn(async move {
-                e2.run_periodic(shutdown_rx, counting_pane_provider()).await;
+                e2.run_periodic(shutdown_rx, counting_pane_provider())
+                    .await
+                    .expect("snapshot scheduler");
             });
 
             // ft-83kc7: wait for the startup capture rather than guessing at it.
@@ -3005,7 +3087,9 @@ mod tests {
 
             let e2 = engine.clone();
             let handle = crate::runtime_async::task::spawn(async move {
-                e2.run_periodic(shutdown_rx, counting_pane_provider()).await;
+                e2.run_periodic(shutdown_rx, counting_pane_provider())
+                    .await
+                    .expect("snapshot scheduler");
             });
 
             // Let the scheduler reach its loop (startup capture + first
@@ -3035,7 +3119,9 @@ mod tests {
 
             let e2 = engine.clone();
             let handle = crate::runtime_async::task::spawn(async move {
-                e2.run_periodic(shutdown_rx, counting_pane_provider()).await;
+                e2.run_periodic(shutdown_rx, counting_pane_provider())
+                    .await
+                    .expect("snapshot scheduler");
             });
 
             // ft-83kc7: wait for the startup capture rather than guessing at it.
@@ -3070,7 +3156,9 @@ mod tests {
 
             let e2 = engine.clone();
             let handle = crate::runtime_async::task::spawn(async move {
-                e2.run_periodic(shutdown_rx, counting_pane_provider()).await;
+                e2.run_periodic(shutdown_rx, counting_pane_provider())
+                    .await
+                    .expect("snapshot scheduler");
             });
 
             sleep(Duration::from_millis(100)).await;
@@ -3105,7 +3193,9 @@ mod tests {
 
             let e2 = engine.clone();
             let handle = crate::runtime_async::task::spawn(async move {
-                e2.run_periodic(shutdown_rx, counting_pane_provider()).await;
+                e2.run_periodic(shutdown_rx, counting_pane_provider())
+                    .await
+                    .expect("snapshot scheduler");
             });
 
             // ft-83kc7: wait for the startup capture rather than guessing at it.
@@ -3142,7 +3232,9 @@ mod tests {
             // First call takes the receiver
             let e2 = engine.clone();
             let handle = crate::runtime_async::task::spawn(async move {
-                e2.run_periodic(shutdown_rx, counting_pane_provider()).await;
+                e2.run_periodic(shutdown_rx, counting_pane_provider())
+                    .await
+                    .expect("snapshot scheduler");
             });
             sleep(Duration::from_millis(100)).await;
 
@@ -3151,7 +3243,8 @@ mod tests {
             let e3 = engine.clone();
             let result = timeout(Duration::from_secs(2), async move {
                 e3.run_periodic(shutdown_rx2, counting_pane_provider())
-                    .await;
+                    .await
+                    .expect("second snapshot scheduler call");
             })
             .await;
             assert!(result.is_ok(), "second run_periodic returns immediately");
@@ -3185,7 +3278,9 @@ mod tests {
 
             let e2 = engine.clone();
             let handle = crate::runtime_async::task::spawn(async move {
-                e2.run_periodic(shutdown_rx, counting_pane_provider()).await;
+                e2.run_periodic(shutdown_rx, counting_pane_provider())
+                    .await
+                    .expect("snapshot scheduler");
             });
 
             sleep(Duration::from_millis(100)).await;
@@ -3226,7 +3321,9 @@ mod tests {
 
             let e2 = engine.clone();
             let handle = crate::runtime_async::task::spawn(async move {
-                e2.run_periodic(shutdown_rx, counting_pane_provider()).await;
+                e2.run_periodic(shutdown_rx, counting_pane_provider())
+                    .await
+                    .expect("snapshot scheduler");
             });
 
             sleep(Duration::from_millis(100)).await;
@@ -3531,7 +3628,7 @@ mod tests {
     /// ft-xbnl0.2.x Cx-first: `shutdown_checkpoint_with_cx` must short-circuit
     /// when the caller's Cx is already cancelled on entry. The shutdown
     /// flag must still be recorded (best effort) and the result must be
-    /// `Ok(None)` — an operator who has abandoned the shutdown race
+    /// `SnapshotError::Cancelled` — an operator who has abandoned the shutdown race
     /// should not trigger a full capture just to immediately time out,
     /// but the session must still be marked as cleanly shut down so a
     /// subsequent restart does not offer an unclean-shutdown recovery
@@ -3561,15 +3658,15 @@ mod tests {
             );
 
             let wall_start = std::time::Instant::now();
-            let result = engine
+            let error = engine
                 .shutdown_checkpoint_with_cx(&cx, &panes2, Duration::from_secs(5))
                 .await
-                .expect("pre-cancelled shutdown returns Ok(None)");
+                .expect_err("pre-cancelled shutdown must report cancellation");
 
             // Must not have triggered a capture.
             assert!(
-                result.is_none(),
-                "pre-cancelled shutdown must skip capture and return None"
+                matches!(error, SnapshotError::Cancelled),
+                "pre-cancelled shutdown must preserve typed cancellation"
             );
             assert_eq!(
                 engine.telemetry().snapshot().captures_attempted,
@@ -3644,7 +3741,7 @@ mod tests {
     }
 
     /// ft-xbnl0.2.x Cx-first: `cleanup_with_cx` with a pre-cancelled Cx
-    /// must NOT delete any checkpoints and must return `Ok(0)`. The
+    /// must NOT delete any checkpoints and must return `SnapshotError::Cancelled`. The
     /// `cleanup_runs` counter MUST still increment so observability
     /// stays honest about how many cleanup *attempts* the engine saw.
     #[test]
@@ -3677,11 +3774,11 @@ mod tests {
                 Some("ft-xbnl0.2.x snapshot cleanup precancel"),
             );
 
-            let deleted = engine
+            let error = engine
                 .cleanup_with_cx(&cx)
                 .await
-                .expect("pre-cancelled cleanup returns Ok");
-            assert_eq!(deleted, 0, "pre-cancelled cleanup must return 0");
+                .expect_err("pre-cancelled cleanup must report cancellation");
+            assert!(matches!(error, SnapshotError::Cancelled));
 
             // 4 checkpoints must still be in the DB.
             let conn = Connection::open(db_path.as_str()).unwrap();

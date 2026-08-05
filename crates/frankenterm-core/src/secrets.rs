@@ -174,7 +174,8 @@ impl SecretScanEngine {
         storage: &StorageHandle,
         options: SecretScanOptions,
     ) -> Result<SecretScanReport> {
-        self.scan_storage_from(storage, options, None).await
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.scan_storage_with_cx(&cx, storage, options).await
     }
 
     /// Scan stored segments using the latest checkpoint (if available) and
@@ -184,28 +185,9 @@ impl SecretScanEngine {
         storage: &StorageHandle,
         options: SecretScanOptions,
     ) -> Result<SecretScanReport> {
-        let scope = SecretScanScope::from_options(&options);
-        let scope_json = serde_json::to_string(&scope)?;
-        let scope_hash = hash_bytes(scope_json.as_bytes());
-        let checkpoint = storage.latest_secret_scan_report(&scope_hash).await?;
-        let resume_after_id = checkpoint.and_then(|report| report.last_segment_id);
-
-        let report = self
-            .scan_storage_from(storage, options, resume_after_id)
-            .await?;
-
-        let record = SecretScanReportRecord {
-            id: 0,
-            scope_hash,
-            scope_json,
-            report_version: i64::from(report.report_version),
-            last_segment_id: report.last_segment_id,
-            report_json: serde_json::to_string(&report)?,
-            created_at: report.completed_at,
-        };
-        let _ = storage.record_secret_scan_report(record).await?;
-
-        Ok(report)
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.scan_storage_incremental_with_cx(&cx, storage, options)
+            .await
     }
 
     /// Cx-first [`scan_storage`] (ft-xbnl0.2.3). Threads caller `&Cx`
@@ -323,68 +305,6 @@ impl SecretScanEngine {
 
             // tick 133: cx-first segment scan.
             let batch = storage.scan_segments_with_cx(cx, query).await?;
-            if batch.is_empty() {
-                break;
-            }
-
-            for segment in &batch {
-                self.scan_segment(segment, &options, &mut report);
-                report.scanned_segments += 1;
-                report.scanned_bytes += segment.content_len as u64;
-
-                if let Some(max) = options.max_segments {
-                    if report.scanned_segments as usize >= max {
-                        break;
-                    }
-                }
-            }
-
-            after_id = batch.last().map(|seg| seg.id);
-            if batch.len() < limit {
-                break;
-            }
-        }
-
-        report.last_segment_id = after_id;
-        report.completed_at = now_ms();
-        Ok(report)
-    }
-
-    async fn scan_storage_from(
-        &self,
-        storage: &StorageHandle,
-        mut options: SecretScanOptions,
-        resume_after_id: Option<i64>,
-    ) -> Result<SecretScanReport> {
-        if options.batch_size == 0 {
-            options.batch_size = 1_000;
-        }
-
-        let scope = SecretScanScope::from_options(&options);
-        let mut report = SecretScanReport::new(scope, resume_after_id);
-        let mut after_id = resume_after_id;
-
-        loop {
-            let remaining = options
-                .max_segments
-                .map(|max| max.saturating_sub(report.scanned_segments as usize));
-            if matches!(remaining, Some(0)) {
-                break;
-            }
-
-            let limit = remaining
-                .map(|remain| remain.min(options.batch_size))
-                .unwrap_or(options.batch_size);
-
-            let query = SegmentScanQuery {
-                after_id,
-                pane_id: options.pane_id,
-                since: options.since,
-                until: options.until,
-                limit,
-            };
-
-            let batch = storage.scan_segments(query).await?;
             if batch.is_empty() {
                 break;
             }

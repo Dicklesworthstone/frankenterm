@@ -191,29 +191,6 @@ pub async fn check_step_idempotency_with_cx(
     IdempotencyCheckResult::NotExecuted
 }
 
-/// Tick 186: dispatcher for check_step_idempotency. When `cx` is
-/// `Some`, routes through `_with_cx`; otherwise falls through to
-/// the legacy helper.
-pub async fn check_step_idempotency_maybe_cx(
-    cx: Option<&crate::cx::Cx>,
-    storage: &StorageHandle,
-    execution_id: &str,
-    idempotency_key: &crate::plan::IdempotencyKey,
-    step_index: usize,
-) -> IdempotencyCheckResult {
-    if let Some(cx) = cx {
-        return check_step_idempotency_with_cx(
-            cx,
-            storage,
-            execution_id,
-            idempotency_key,
-            step_index,
-        )
-        .await;
-    }
-    check_step_idempotency(storage, execution_id, idempotency_key, step_index).await
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

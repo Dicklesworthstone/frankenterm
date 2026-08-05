@@ -132,12 +132,14 @@ covered instead via the `build_tls_server_name` invalid-host path.
 | Metrics server accept loop | Mid-flight cx-cancel terminates loop without shutdown flag | `metrics_server_start_with_cx_mid_flight_cancel_stops_accept_loop` (`src/metrics.rs`) | 322 |
 | Metrics server accept loop | Happy path serves request | `metrics_server_start_with_cx_happy_path_serves_request` (`src/metrics.rs`) | 320 |
 | Web server bind | Pre-cancelled cx refuses to bind | `web_server_with_cx_pre_cancelled_refuses_to_bind` (`tests/web.rs`) | 323 |
-| Web server orchestration | Mid-flight cx-cancel → graceful shutdown → Ok(()) | `web_server_with_cx_mid_flight_cancel_exits_cleanly` (`tests/web.rs`) | 417 |
+| Web server orchestration | Mid-flight cx-cancel completes graceful cleanup, then surfaces typed cancellation | `web_server_with_cx_mid_flight_cancel_surfaces_after_cleanup` (`tests/web.rs`) | 417 (contract corrected during fresh-eyes review) |
 
 Covers all three cx signal timings (pre-start, mid-flight, happy) on the
 two bead-scoped service boundaries. HTTP client side (§2.1) already has
-matching three-timing coverage — tick 417's web-server mid-flight test
-closes the orchestrator-level wiring gap.
+matching three-timing coverage. The web-server mid-flight test also pins the
+important distinction between completing cleanup and reporting success: caller
+cancellation is returned only after the listener and runtime resources have
+been drained.
 
 ### 2.4 Regression guards (`crates/frankenterm-core/tests/ft_xbnl0_2_4_no_direct_tokio_net_or_rustls.rs`)
 

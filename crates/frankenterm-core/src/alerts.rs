@@ -362,39 +362,8 @@ impl AlertMonitor {
         &self,
         storage: &StorageHandle,
     ) -> crate::error::Result<Vec<TriggeredAlert>> {
-        let now = now_ms();
-        let mut triggered = Vec::new();
-
-        for rule in &self.rules {
-            if !rule.enabled {
-                continue;
-            }
-
-            let current_value = self.get_current_value(storage, rule, now).await?;
-            if let Some(level) = rule.check(current_value) {
-                let percent = if rule.threshold > 0.0 {
-                    match rule.metric {
-                        AlertMetric::AccountBalance => 1.0 - (current_value / rule.threshold),
-                        _ => current_value / rule.threshold,
-                    }
-                } else {
-                    0.0
-                };
-
-                triggered.push(TriggeredAlert {
-                    rule_id: rule.id.clone(),
-                    metric: rule.metric.clone(),
-                    level,
-                    current_value,
-                    threshold: rule.threshold,
-                    percent_of_threshold: percent,
-                    period: rule.period,
-                    evaluated_at: now,
-                });
-            }
-        }
-
-        Ok(triggered)
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.check_alerts_with_cx(&cx, storage).await
     }
 
     /// Cx-first [`Self::check_alerts`] (ft-xbnl0.2.3). Threads
@@ -454,77 +423,12 @@ impl AlertMonitor {
         Ok(triggered)
     }
 
-    /// Query storage for the current value of a metric.
-    async fn get_current_value(
-        &self,
-        storage: &StorageHandle,
-        rule: &AlertRule,
-        now: i64,
-    ) -> crate::error::Result<f64> {
-        let since = now - rule.period.duration_ms();
-
-        match rule.metric {
-            AlertMetric::Cost => {
-                let query = crate::storage::MetricQuery {
-                    metric_type: Some(MetricType::ApiCost),
-                    agent_type: rule.agent_type.clone(),
-                    since: Some(since),
-                    ..Default::default()
-                };
-                let records = storage.query_usage_metrics(query).await?;
-                Ok(sum_amounts(&records))
-            }
-            AlertMetric::TokenUsage => {
-                let query = crate::storage::MetricQuery {
-                    metric_type: Some(MetricType::TokenUsage),
-                    agent_type: rule.agent_type.clone(),
-                    since: Some(since),
-                    ..Default::default()
-                };
-                let records = storage.query_usage_metrics(query).await?;
-                Ok(sum_tokens(&records) as f64)
-            }
-            AlertMetric::RateLimitFrequency => {
-                let query = crate::storage::MetricQuery {
-                    metric_type: Some(MetricType::RateLimitHit),
-                    agent_type: rule.agent_type.clone(),
-                    since: Some(since),
-                    ..Default::default()
-                };
-                let records = storage.query_usage_metrics(query).await?;
-                Ok(records.len() as f64)
-            }
-            AlertMetric::AccountBalance => {
-                // For account balance, query accounts by service
-                // Returns 100.0 (no alert) if no service configured or no accounts found
-                let service = match rule.service.as_deref() {
-                    Some(s) => s.to_string(),
-                    None => return Ok(100.0),
-                };
-                let accounts = storage.get_accounts_by_service(&service).await?;
-                if let Some(ref target_id) = rule.account_id {
-                    accounts
-                        .iter()
-                        .find(|a| a.account_id == *target_id)
-                        .map_or(Ok(100.0), |a| Ok(a.percent_remaining))
-                } else if accounts.is_empty() {
-                    Ok(100.0)
-                } else {
-                    let total: f64 = accounts.iter().map(|a| a.percent_remaining).sum();
-                    Ok(total / accounts.len() as f64)
-                }
-            }
-        }
-    }
-
-    /// ft-xbnl0.2.3 Cx-first sibling of [`Self::get_current_value`].
+    /// Cx-first storage query for the current value of a metric.
     ///
     /// Routes every storage call through its cx-first sibling
     /// (`query_usage_metrics_with_cx`, `get_accounts_by_service_with_cx`)
     /// so alert evaluation under a cancelled parent cx bails at the
     /// earliest boundary rather than completing a full metric scan.
-    /// Branch structure is preserved byte-for-byte with the legacy
-    /// path; only the inner storage calls change.
     async fn get_current_value_with_cx(
         &self,
         cx: &crate::cx::Cx,

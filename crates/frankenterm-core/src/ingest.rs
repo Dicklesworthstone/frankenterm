@@ -1865,7 +1865,8 @@ pub async fn persist_captured_segment(
     captured: &CapturedSegment,
     max_segment_bytes: usize,
 ) -> Result<PersistedCapture> {
-    persist_captured_segment_with_zone(storage, captured, max_segment_bytes, None).await
+    let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+    persist_captured_segment_with_cx(&cx, storage, captured, max_segment_bytes).await
 }
 
 /// Persist a captured segment with optional semantic zone metadata.

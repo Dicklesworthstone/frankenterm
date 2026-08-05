@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use crate::Result;
 use crate::error::RuntimeOperationSource;
 use crate::recording::{FrameHeader, FrameType, RecordingFrame, checked_frame_payload_len};
-use crate::runtime_async::{sleep, watch};
+use crate::runtime_async::watch;
 
 // ---------------------------------------------------------------------------
 // Frame parsing
@@ -582,42 +582,9 @@ impl Player {
         Ok(())
     }
 
-    /// Handle a control signal. Returns `true` if playback should stop.
-    async fn handle_control(
-        &mut self,
-        ctrl: PlayerControl,
-        control_rx: &mut watch::Receiver<PlayerControl>,
-    ) -> Result<bool> {
-        match ctrl {
-            PlayerControl::Stop => {
-                self.state = PlayerState::Stopped;
-                Ok(true)
-            }
-            PlayerControl::Pause => {
-                self.state = PlayerState::Paused;
-                let watch_cx = crate::cx::for_request();
-                loop {
-                    control_rx
-                        .changed(&watch_cx)
-                        .await
-                        .map_err(|_| replay_watch_channel_closed("replay.handle_control"))?;
-                }
-            }
-            PlayerControl::SetSpeed(s) => {
-                self.speed = s;
-                Ok(false)
-            }
-            PlayerControl::Play => Ok(false),
-        }
-    }
-
-    /// ft-xbnl0.2.3 Cx-first sibling of [`Self::handle_control`].
+    /// Handle a control signal under the caller's cx.
     ///
-    /// Fixes a latent cancellation hole in the legacy handler: the
-    /// Pause branch spins on `control_rx.changed(&watch_cx)` where
-    /// `watch_cx = crate::cx::for_request()` — an orphan cx that
-    /// doesn't inherit cancellation from the parent. The cx-first
-    /// variant threads the caller's cx into the wait, so a Pause
+    /// The Pause branch threads the caller's cx into the wait, so a Pause
     /// that lingers after `play_with_cx`'s parent was cancelled now
     /// exits within one cancel-signal tick instead of requiring an
     /// external Play/Stop control signal to wake it up.
@@ -680,57 +647,16 @@ impl Player {
     pub async fn play(
         &mut self,
         sink: &mut dyn OutputSink,
-        mut control_rx: watch::Receiver<PlayerControl>,
+        control_rx: watch::Receiver<PlayerControl>,
     ) -> Result<()> {
-        self.state = PlayerState::Playing;
-
-        while self.position.frame_index < self.recording.frames.len() {
-            // Check for control signals.
-            if let Some(ctrl) = check_control(&mut control_rx) {
-                if self.handle_control(ctrl, &mut control_rx).await? {
-                    return Ok(());
-                }
-            }
-
-            // Read frame timestamp and decode before any &mut self calls.
-            let frame_ts = self.recording.frames[self.position.frame_index]
-                .header
-                .timestamp_ms;
-
-            // Compute delay based on speed.
-            if frame_ts > self.position.timestamp_ms {
-                let raw_delay_ms = frame_ts - self.position.timestamp_ms;
-                let scaled_delay = (raw_delay_ms as f64) / (self.speed.as_f32() as f64);
-                if scaled_delay > 0.5 {
-                    sleep(Duration::from_micros((scaled_delay * 1000.0).round() as u64)).await;
-                }
-
-                // Re-check controls after sleep (signal may have arrived during delay).
-                if let Some(ctrl) = check_control(&mut control_rx) {
-                    if self.handle_control(ctrl, &mut control_rx).await? {
-                        return Ok(());
-                    }
-                }
-            }
-
-            // Decode and output (re-borrow after potential &mut self above).
-            let decoded = decode_frame(&self.recording.frames[self.position.frame_index])?;
-            output_decoded(sink, &decoded)?;
-
-            self.position = PlaybackPosition {
-                frame_index: self.position.frame_index + 1,
-                timestamp_ms: frame_ts,
-            };
-        }
-
-        self.state = PlayerState::Finished;
-        Ok(())
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.play_with_cx(&cx, sink, control_rx).await
     }
 
     /// Play the recording without external controls (convenience wrapper).
     pub async fn play_simple(&mut self, sink: &mut dyn OutputSink) -> Result<()> {
-        let (_tx, rx) = watch::channel(PlayerControl::Play);
-        self.play(sink, rx).await
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.play_simple_with_cx(&cx, sink).await
     }
 
     /// Cx-first [`Self::play`] (ft-xbnl0.2.3). Threads caller

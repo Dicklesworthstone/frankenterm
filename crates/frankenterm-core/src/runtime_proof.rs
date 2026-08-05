@@ -35,12 +35,13 @@
 //! of core's async surface):
 //! ```ignore
 //! use frankenterm_core::cx::Cx;
-//! use frankenterm_core::runtime_async::Mutex;
+//! use frankenterm_core::runtime_async::{LockAcquireError, Mutex};
 //!
-//! pub async fn lock_first<T>(cx: &Cx, m: &Mutex<T>) {
+//! pub async fn lock_first<T>(cx: &Cx, m: &Mutex<T>) -> Result<(), LockAcquireError> {
 //!     // Mutex implements RuntimeProof; passing a tokio::sync::Mutex here
 //!     // is a type error from the wrapper's monomorphization.
-//!     let _g = m.lock_with_cx(cx).await;
+//!     let _g = m.lock_with_cx(cx).await?;
+//!     Ok(())
 //! }
 //! ```
 //!
