@@ -1,0 +1,515 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://wezterm-automata.dev/schemas/wa-robot-event-stream-record.json",
+  "title": "WA Robot Event Stream Record",
+  "description": "One JSON record emitted by ft robot watch-events or ft robot await. These commands always emit newline-delimited JSON, independent of the global Robot output format.",
+  "type": "object",
+  "oneOf": [
+    { "$ref": "#/$defs/event" },
+    { "$ref": "#/$defs/cursor_checkpoint" },
+    { "$ref": "#/$defs/claim_deferred" },
+    { "$ref": "#/$defs/error" },
+    { "$ref": "#/$defs/cursor_discontinuity" },
+    { "$ref": "#/$defs/await_result" },
+    { "$ref": "#/$defs/heartbeat" },
+    { "$ref": "#/$defs/gap" }
+  ],
+  "$defs": {
+    "cursor": {
+      "type": ["integer", "null"],
+      "minimum": 0
+    },
+    "cursor_epoch": {
+      "type": ["string", "null"],
+      "pattern": "^[0-9a-f]{32}$"
+    },
+    "cursor_scope": {
+      "type": ["string", "null"],
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "cursor_state": {
+      "oneOf": [
+        {
+          "properties": {
+            "cursor": { "type": "integer" },
+            "cursor_epoch": { "type": "string" },
+            "cursor_scope": { "type": "string" }
+          }
+        },
+        {
+          "properties": {
+            "cursor": { "type": "null" },
+            "cursor_epoch": { "type": "null" },
+            "cursor_scope": { "type": "null" }
+          }
+        }
+      ]
+    },
+    "condition_status": {
+      "type": "object",
+      "required": ["condition", "met"],
+      "properties": {
+        "condition": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "met": { "type": "boolean" }
+      },
+      "additionalProperties": false
+    },
+    "event": {
+      "type": "object",
+      "required": [
+        "type",
+        "cursor",
+        "cursor_epoch",
+        "cursor_scope",
+        "id",
+        "pane_id",
+        "rule_id",
+        "agent_type",
+        "event_type",
+        "severity",
+        "confidence",
+        "detected_at",
+        "matched_text",
+        "extracted",
+        "handled",
+        "handled_status"
+      ],
+      "properties": {
+        "type": { "const": "event" },
+        "cursor": { "$ref": "#/$defs/cursor" },
+        "cursor_epoch": { "$ref": "#/$defs/cursor_epoch" },
+        "cursor_scope": { "$ref": "#/$defs/cursor_scope" },
+        "id": { "type": ["integer", "null"], "minimum": 1 },
+        "pane_id": { "type": "integer", "minimum": 0 },
+        "rule_id": { "type": ["string", "null"] },
+        "agent_type": { "type": ["string", "null"] },
+        "event_type": { "type": "string", "minLength": 1 },
+        "severity": { "type": ["string", "null"] },
+        "confidence": { "type": ["number", "null"], "minimum": 0, "maximum": 1 },
+        "detected_at": { "type": "integer", "minimum": 0 },
+        "matched_text": { "type": ["string", "null"] },
+        "extracted": {},
+        "handled": { "type": "boolean" },
+        "handled_status": { "type": ["string", "null"] },
+        "claim_delivery": { "const": "finalize_after_output_flush" },
+        "cursor_commit_state": { "const": "pending_finalize" },
+        "pending_finalize": { "const": true },
+        "candidate_cursor": { "type": "integer", "minimum": 1 }
+      },
+      "dependentRequired": {
+        "claim_delivery": ["cursor_commit_state", "pending_finalize", "candidate_cursor"],
+        "cursor_commit_state": ["claim_delivery", "pending_finalize", "candidate_cursor"],
+        "pending_finalize": ["claim_delivery", "cursor_commit_state", "candidate_cursor"],
+        "candidate_cursor": ["claim_delivery", "cursor_commit_state", "pending_finalize"]
+      },
+      "oneOf": [
+        {
+          "properties": {
+            "id": { "type": "integer" },
+            "rule_id": { "type": "string" },
+            "agent_type": { "type": "string" },
+            "event_type": { "type": "string", "minLength": 1 },
+            "severity": { "type": "string" },
+            "confidence": { "type": "number" }
+          }
+        },
+        {
+          "properties": {
+            "id": { "type": "null" },
+            "rule_id": { "type": "null" },
+            "agent_type": { "type": "null" },
+            "event_type": { "const": "pane_discovered" },
+            "severity": { "type": "null" },
+            "confidence": { "type": "null" },
+            "matched_text": { "type": "null" },
+            "extracted": {
+              "type": "object",
+              "required": ["domain", "title"],
+              "properties": {
+                "domain": { "type": "string" },
+                "title": { "type": "string" }
+              },
+              "additionalProperties": false
+            },
+            "handled": { "const": false },
+            "handled_status": { "type": "null" }
+          },
+          "not": { "required": ["claim_delivery"] }
+        },
+        {
+          "properties": {
+            "id": { "type": "null" },
+            "rule_id": { "type": "null" },
+            "agent_type": { "type": "null" },
+            "event_type": { "const": "pane_disappeared" },
+            "severity": { "type": "null" },
+            "confidence": { "type": "null" },
+            "matched_text": { "type": "null" },
+            "extracted": { "type": "object", "maxProperties": 0 },
+            "handled": { "const": false },
+            "handled_status": { "type": "null" }
+          },
+          "not": { "required": ["claim_delivery"] }
+        }
+      ],
+      "allOf": [
+        { "$ref": "#/$defs/cursor_state" },
+        {
+          "if": { "required": ["claim_delivery"] },
+          "then": {
+            "properties": {
+              "handled": { "const": false },
+              "handled_status": { "type": "null" }
+            }
+          }
+        }
+      ],
+      "additionalProperties": false
+    },
+    "cursor_checkpoint": {
+      "type": "object",
+      "required": [
+        "type",
+        "cursor",
+        "cursor_epoch",
+        "cursor_scope",
+        "cursor_commit_state",
+        "reason"
+      ],
+      "properties": {
+        "type": { "const": "cursor_checkpoint" },
+        "cursor": { "type": "integer", "minimum": 0 },
+        "cursor_epoch": { "type": "string", "pattern": "^[0-9a-f]{32}$" },
+        "cursor_scope": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "cursor_commit_state": { "const": "committed" },
+        "reason": {
+          "enum": [
+            "fresh_watch_tail_baseline",
+            "fresh_await_tail_baseline",
+            "examined_through_page",
+            "claim_delivery_committed"
+          ]
+        },
+        "claim_delivery": {
+          "enum": [
+            "finalized_after_output_flush",
+            "already_finalized",
+            "finalized_by_competitor"
+          ]
+        },
+        "event_id": { "type": "integer", "minimum": 1 }
+      },
+      "oneOf": [
+        {
+          "properties": {
+            "reason": {
+              "enum": [
+                "fresh_watch_tail_baseline",
+                "fresh_await_tail_baseline",
+                "examined_through_page"
+              ]
+            }
+          },
+          "not": {
+            "anyOf": [
+              { "required": ["claim_delivery"] },
+              { "required": ["event_id"] }
+            ]
+          }
+        },
+        {
+          "required": ["claim_delivery", "event_id"],
+          "properties": {
+            "reason": { "const": "claim_delivery_committed" }
+          }
+        }
+      ],
+      "additionalProperties": false
+    },
+    "claim_deferred": {
+      "type": "object",
+      "required": [
+        "type",
+        "terminal",
+        "retryable",
+        "reason",
+        "cursor",
+        "cursor_epoch",
+        "cursor_scope",
+        "candidate_cursor",
+        "retry_after_ms",
+        "message"
+      ],
+      "properties": {
+        "type": { "const": "claim_deferred" },
+        "terminal": { "const": true },
+        "retryable": { "const": true },
+        "reason": {
+          "enum": [
+            "delivery_lease_active",
+            "finalization_ownership_lost_after_output_flush"
+          ]
+        },
+        "cursor": { "$ref": "#/$defs/cursor" },
+        "cursor_epoch": { "type": "string", "pattern": "^[0-9a-f]{32}$" },
+        "cursor_scope": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "candidate_cursor": { "type": "integer", "minimum": 1 },
+        "retry_after_ms": { "type": ["integer", "null"], "minimum": 0 },
+        "message": { "type": "string", "minLength": 1 }
+      },
+      "additionalProperties": false
+    },
+    "error": {
+      "type": "object",
+      "required": [
+        "type",
+        "terminal",
+        "retryable",
+        "code",
+        "message",
+        "hint",
+        "cursor",
+        "cursor_epoch",
+        "cursor_scope"
+      ],
+      "properties": {
+        "type": { "const": "error" },
+        "terminal": { "const": true },
+        "retryable": { "type": "boolean" },
+        "code": { "type": "string", "pattern": "^robot\\.[a-z0-9_.-]+$" },
+        "message": { "type": "string", "minLength": 1 },
+        "hint": { "type": ["string", "null"] },
+        "cursor": { "$ref": "#/$defs/cursor" },
+        "cursor_epoch": { "$ref": "#/$defs/cursor_epoch" },
+        "cursor_scope": { "$ref": "#/$defs/cursor_scope" }
+      },
+      "additionalProperties": false
+    },
+    "cursor_discontinuity": {
+      "type": "object",
+      "required": [
+        "type",
+        "terminal",
+        "reason",
+        "requested_cursor",
+        "requested_cursor_epoch",
+        "requested_cursor_scope",
+        "message"
+      ],
+      "properties": {
+        "type": { "const": "cursor_discontinuity" },
+        "terminal": { "const": true },
+        "reason": {
+          "enum": [
+            "cursor_scope_mismatch",
+            "retention_pruned",
+            "legacy_history_unavailable",
+            "cursor_epoch_mismatch",
+            "cursor_ahead_of_high_water"
+          ]
+        },
+        "requested_cursor": { "type": "integer", "minimum": 0 },
+        "requested_cursor_epoch": { "type": "string", "pattern": "^[0-9a-f]{32}$" },
+        "requested_cursor_scope": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "expected_cursor_scope": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "checked_through": { "type": "integer", "minimum": 0 },
+        "current_cursor_epoch": { "type": "string", "pattern": "^[0-9a-f]{32}$" },
+        "current_cursor_scope": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "evidence_from_event_id": { "type": "integer", "minimum": 0 },
+        "max_event_id": { "type": "integer", "minimum": 0 },
+        "deleted_interval": {
+          "type": "object",
+          "required": ["start_id", "end_id", "first_generation", "last_generation"],
+          "properties": {
+            "start_id": { "type": "integer", "minimum": 0 },
+            "end_id": { "type": "integer", "minimum": 0 },
+            "first_generation": { "type": "integer", "minimum": 0 },
+            "last_generation": { "type": "integer", "minimum": 0 }
+          },
+          "additionalProperties": false
+        },
+        "candidate_cursor": { "type": "integer", "minimum": 0 },
+        "message": { "type": "string", "minLength": 1 }
+      },
+      "oneOf": [
+        { "required": ["expected_cursor_scope"] },
+        {
+          "required": [
+            "checked_through",
+            "current_cursor_epoch",
+            "current_cursor_scope",
+            "evidence_from_event_id",
+            "max_event_id"
+          ]
+        }
+      ],
+      "allOf": [
+        {
+          "if": { "properties": { "reason": { "const": "retention_pruned" } } },
+          "then": { "required": ["deleted_interval"] },
+          "else": { "not": { "required": ["deleted_interval"] } }
+        }
+      ],
+      "additionalProperties": false
+    },
+    "await_result": {
+      "type": "object",
+      "required": [
+        "type",
+        "satisfied",
+        "timed_out",
+        "elapsed_ms",
+        "final_cursor",
+        "final_cursor_epoch",
+        "final_cursor_scope",
+        "any",
+        "all"
+      ],
+      "properties": {
+        "type": { "const": "await_result" },
+        "satisfied": { "type": "boolean" },
+        "timed_out": { "type": "boolean" },
+        "elapsed_ms": { "type": "integer", "minimum": 0 },
+        "final_cursor": { "$ref": "#/$defs/cursor" },
+        "final_cursor_epoch": { "$ref": "#/$defs/cursor_epoch" },
+        "final_cursor_scope": { "$ref": "#/$defs/cursor_scope" },
+        "any": { "type": "array", "maxItems": 16, "items": { "$ref": "#/$defs/condition_status" } },
+        "all": { "type": "array", "maxItems": 16, "items": { "$ref": "#/$defs/condition_status" } }
+      },
+      "oneOf": [
+        {
+          "required": ["satisfied", "timed_out"],
+          "properties": {
+            "satisfied": { "const": true },
+            "timed_out": { "const": false },
+            "final_cursor": { "type": "integer" },
+            "final_cursor_epoch": { "type": "string" },
+            "final_cursor_scope": { "type": "string" }
+          }
+        },
+        {
+          "required": ["satisfied", "timed_out"],
+          "properties": {
+            "satisfied": { "const": false },
+            "timed_out": { "const": true },
+            "final_cursor": { "type": "integer" },
+            "final_cursor_epoch": { "type": "string" },
+            "final_cursor_scope": { "type": "string" }
+          }
+        }
+      ],
+      "additionalProperties": false
+    },
+    "heartbeat": {
+      "type": "object",
+      "required": ["type", "cursor", "cursor_epoch", "cursor_scope", "now"],
+      "properties": {
+        "type": { "const": "heartbeat" },
+        "cursor": { "$ref": "#/$defs/cursor" },
+        "cursor_epoch": { "$ref": "#/$defs/cursor_epoch" },
+        "cursor_scope": { "$ref": "#/$defs/cursor_scope" },
+        "now": { "type": "integer", "minimum": 0 }
+      },
+      "allOf": [{ "$ref": "#/$defs/cursor_state" }],
+      "additionalProperties": false
+    },
+    "gap": {
+      "type": "object",
+      "required": ["type", "reason", "cursor", "cursor_epoch", "cursor_scope", "message"],
+      "properties": {
+        "type": { "const": "gap" },
+        "reason": {
+          "enum": [
+            "broadcast_lag",
+            "ipc_protocol_fault",
+            "ipc_subscribe_unavailable",
+            "ipc_stream_eof",
+            "ipc_stream_read_failure"
+          ]
+        },
+        "cursor": { "$ref": "#/$defs/cursor" },
+        "cursor_epoch": { "$ref": "#/$defs/cursor_epoch" },
+        "cursor_scope": { "$ref": "#/$defs/cursor_scope" },
+        "message": { "type": "string", "minLength": 1 },
+        "now": { "type": "integer", "minimum": 0 },
+        "missed_count": { "type": "integer", "minimum": 1 },
+        "fault_kind": { "type": "string", "minLength": 1 },
+        "persisted_detection_recovery": { "const": "durable_cursor_backfill" },
+        "live_only_signal_recovery": { "const": "unavailable" },
+        "live_only_signals_at_risk": {
+          "type": "array",
+          "items": { "enum": ["pane_discovered", "pane_disappeared"] },
+          "minItems": 2,
+          "maxItems": 2,
+          "allOf": [
+            { "contains": { "const": "pane_discovered" } },
+            { "contains": { "const": "pane_disappeared" } }
+          ],
+          "uniqueItems": true
+        }
+      },
+      "oneOf": [
+        {
+          "required": ["missed_count"],
+          "properties": { "reason": { "const": "broadcast_lag" } },
+          "not": {
+            "anyOf": [
+              { "required": ["now"] },
+              { "required": ["fault_kind"] },
+              { "required": ["persisted_detection_recovery"] },
+              { "required": ["live_only_signal_recovery"] },
+              { "required": ["live_only_signals_at_risk"] }
+            ]
+          }
+        },
+        {
+          "required": ["now", "fault_kind"],
+          "properties": {
+            "reason": { "const": "ipc_protocol_fault" },
+            "fault_kind": {
+              "enum": [
+                "malformed_json",
+                "invalid_event_cursor",
+                "invalid_record_shape",
+                "unknown_record_type"
+              ]
+            }
+          },
+          "not": {
+            "anyOf": [
+              { "required": ["missed_count"] },
+              { "required": ["persisted_detection_recovery"] },
+              { "required": ["live_only_signal_recovery"] },
+              { "required": ["live_only_signals_at_risk"] }
+            ]
+          }
+        },
+        {
+          "required": [
+            "now",
+            "persisted_detection_recovery",
+            "live_only_signal_recovery",
+            "live_only_signals_at_risk"
+          ],
+          "properties": {
+            "reason": {
+              "enum": [
+                "ipc_subscribe_unavailable",
+                "ipc_stream_eof",
+                "ipc_stream_read_failure"
+              ]
+            }
+          },
+          "not": {
+            "anyOf": [
+              { "required": ["missed_count"] },
+              { "required": ["fault_kind"] }
+            ]
+          }
+        }
+      ],
+      "allOf": [{ "$ref": "#/$defs/cursor_state" }],
+      "additionalProperties": false
+    }
+  }
+}

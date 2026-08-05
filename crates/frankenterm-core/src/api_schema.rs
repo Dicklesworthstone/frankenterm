@@ -317,6 +317,17 @@ impl SchemaRegistry {
                     since: "0.1.0".into(),
                 },
                 EndpointMeta {
+                    id: "event_stream_record".into(),
+                    title: "Event Stream Record".into(),
+                    description:
+                        "One fixed-JSON NDJSON record from robot watch-events or await".into(),
+                    robot_command: Some("robot watch-events / robot await".into()),
+                    mcp_tool: None,
+                    schema_file: "wa-robot-event-stream-record.json".into(),
+                    stable: true,
+                    since: "0.13.0".into(),
+                },
+                EndpointMeta {
                     id: "events_annotate".into(),
                     title: "Annotate Event".into(),
                     description: "Set or clear notes on an event".into(),
@@ -1107,6 +1118,7 @@ mod tests {
             "wa-robot-search-index-stats.json",
             "wa-robot-search-index-reindex.json",
             "wa-robot-events.json",
+            "wa-robot-event-stream-record.json",
             "wa-robot-event-mutation.json",
             "wa-robot-agents-list.json",
             "wa-robot-agents-running.json",

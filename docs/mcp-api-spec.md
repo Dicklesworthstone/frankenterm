@@ -1,11 +1,12 @@
 # MCP API Spec (v1)
 
-This document defines the MCP surface for ft (FrankenTerm). The MCP API
-mirrors `ft robot` for parity, stability, and token-efficient responses.
+This document defines the MCP surface for ft (FrankenTerm). MCP and `ft robot`
+share the stable envelope and many payload schemas, but they are distinct
+transports with explicitly documented capability differences.
 
 ## Goals
 - Stable, versioned surface for agent integrations.
-- Token-efficient responses that match robot schemas.
+- Token-efficient responses with schema-validated shared or MCP-specific data.
 - Minimal, complete tool set required to operate ft (FrankenTerm).
 
 ## Running the MCP Server
@@ -42,7 +43,9 @@ By default (`format=json`), MCP tool calls return this JSON envelope:
 
 Notes:
 - When `ok=false`, `data` is omitted and `error` is populated.
-- `data` MUST match the corresponding robot JSON schema under `docs/json-schema/`.
+- When the tool table names a JSON schema, `data` MUST match that schema. <!-- MCP-V1-001 --> Tools
+  labeled `Inline` use the named Rust serde contract until a dedicated schema is
+  published.
 - `now` is epoch milliseconds.
 - Tools also accept optional `format: "json" | "toon"` in params:
   - `format=json` (default): response text is JSON envelope as shown above.
@@ -50,7 +53,8 @@ Notes:
 
 ## Tool List (v1)
 
-All tools mirror `ft robot` semantics and schemas.
+The table records schema correspondence; it does not imply identical transport,
+streaming, condition-source, or delivery-acknowledgment semantics.
 
 Note: Tool IDs currently still use the legacy `wa.*` prefix and resources use the
 legacy `wa://...` scheme for backward compatibility.
@@ -117,16 +121,20 @@ All tools accept an optional `format?: "json" | "toon"` parameter (default: `jso
   - Redaction/policy: response `query`/`snippet`/`content` fields are redacted; denied/approval-required outcomes return `FT-MCP-0006` (approval-required includes a hint command).
 
 - `wa.events`
-  - Params: `{ limit?: u64=20, pane?: u64, rule_id?: string, event_type?: string, triage_state?: string, label?: string, unhandled?: bool=false, since?: i64, would_handle?: bool=false, dry_run?: bool=false }`
+  - Params: `{ limit?: u64=20, pane?: u64, rule_id?: string, event_type?: string, triage_state?: string, label?: string, unhandled?: bool=false, since?: nonnegative_i64 }`
+  - This tool is a bounded newest-first snapshot, not a resumable cursor surface. Successful `data` always includes `cursor_capability="non_resumable_newest_first_snapshot"`. Use `wa.await_event` when a storage-authoritative cursor is required.
 
 - `wa.await_event`
-  - Params: `{ any?: string[], all?: string[], timeout_secs?: u64=30, poll_interval_ms?: u64=250, cursor?: i64, pane?: u64, unhandled?: bool=false, claim?: bool=false }`
-  - Each condition set is bounded to 16 entries; currently supported conditions are `rule:<glob>`. `timeout_secs` is bounded to `1..=300`.
-  - With `claim=true`, matched rows are atomically leased. The response truthfully shows their pre-finalization handled state, and `claim_delivery="finalize_after_delivery_ack"` means the server token-CAS finalizes them only after the requested-format response is successfully written/flushed at the transport's sender-side boundary. This acknowledgment does **not** prove that the client parsed, persisted, or acted on the response.
-  - A known serialization or delivery failure triggers an immediate **best-effort** token-CAS lease release. If completion-runtime construction, storage open, or the release operation itself fails, lease expiry remains the recovery authority; immediate release is not guaranteed on those failure paths.
+  - Params: `{ any?: string[], all?: string[], timeout_secs?: u64=30, poll_interval_ms?: u64=250, cursor?: i64, cursor_epoch?: 32-lowercase-hex, cursor_scope?: 64-lowercase-hex, pane?: u64, unhandled?: bool=false, claim?: bool=false, checkpoint_only?: bool=false }`
+  - Each condition set is bounded to 16 entries and each condition to 256 UTF-8 bytes. This MCP tool currently supports only `rule:<glob>` conditions; CLI-only quiescence and live pane-state conditions are not accepted. `timeout_secs` is bounded to `1..=300`.
+  - A durable resume token is the complete `cursor`/`cursor_epoch`/`cursor_scope` triple. The scope binds the canonical condition sets, pane filter, effective unhandled filter, claim mode, and the explicit DB-events-only quiescence capability marker. Partial, malformed, wrong-scope, stale-epoch, pruned, or ahead-of-authority tokens fail closed with `FT-MCP-0016`.
+  - With no cursor, the first atomic storage page establishes the current durable tail; history at or below that tail is not replayed. `checkpoint_only=true` returns immediately with `bootstrap_state="storage_tail_checkpoint"` and the fresh `final_cursor`/`final_cursor_epoch`/`final_cursor_scope` triple. Bootstrap requires `claim=false` and no input cursor.
+  - Normal responses return a `type="await_result"`, `final_cursor` triple, condition status arrays, matched events, `pending_finalize`, and optionally `candidate_cursor`, `claim_delivery`, and `bootstrap_state`. `candidate_cursor` is diagnostic pending state and is never a resumable token.
+  - With `claim=true`, matched rows are atomically leased. When a satisfied result retains at least one locally owned lease, the response truthfully shows pre-finalization handled state, sets `pending_finalize=true`, exposes the highest pending `candidate_cursor`, and sets `claim_delivery="pending_finalize_after_delivery_ack"`. The committed `final_cursor` never crosses the earliest pending or foreign lease. After the complete requested-format response is successfully written/flushed at the sender-side transport boundary, a bounded completion queue finalizes the local leases without blocking the transport loop. This acknowledgment does **not** prove that the client parsed, persisted, or acted on the response.
+  - A timeout/error after a partial composite match may also have local leases. Its public cursor returns to the safe pre-latch boundary, and the same bounded completion queue releases those leases asynchronously. Known serialization or delivery failure uses that queue as well. Queue saturation, disconnection, worker shutdown, storage-open failure, or token-CAS failure can make an immediate retry transiently observe the reservation; durable lease expiry remains the recovery authority. Such nonterminal results keep `pending_finalize=false` and omit `candidate_cursor` and `claim_delivery` because no advancement is being promised.
   - A foreign live lease retains the exposed cursor before that event independently of whether another event later satisfies the same condition, but does not prevent a monotonic scan from finding later claimable matches. Retried holes are refetched by exact event ID, and retried holes plus later matches are returned in ascending event-ID order.
   - Blocked-hole tracking retains at most 500 compact entries. If more concurrently leased matching rows are encountered, the request fails closed with `FT-MCP-0005` before advancing past the first untracked hole; retry from the same input cursor after competing claims complete.
-  - When `cursor` is omitted, the lower time boundary is captured at request entry, before storage open, so events detected while SQLite opening/initialization is delayed remain eligible. An explicit cursor disables that time boundary and remains the durable resume authority.
+  - Every explicit token is reconciled against the current retention epoch and exact deletion ledger before its cursor can be returned or advanced. A fresh request starts only at the successfully acquired atomic storage tail; process-entry time is not cursor authority.
 
 - `wa.events_annotate`
   - Params: `{ event_id: i64, note?: string, clear?: bool=false, by?: string }`
@@ -259,18 +267,19 @@ All MCP errors use stable codes prefixed with `FT-MCP-`:
 | `FT-MCP-0013` | CAAM/CAUT account backend error | `robot.caut_error` |
 | `FT-MCP-0014` | CASS integration error | `robot.cass_error` |
 | `FT-MCP-0015` | Remote pane text unavailable | `robot.remote_text_unavailable` |
+| `FT-MCP-0016` | Durable event cursor discontinuity (retention, epoch, scope, or authority mismatch) | `robot.cursor_discontinuity` |
 | `FT-MCP-9000` | Internal MCP/server error with redacted details | Internal runtime, IO, JSON, setup, cancellation, or other unclassified failures |
 
 ## Safety & Policy
 
-Any tool that causes side effects MUST pass the PolicyEngine, including:
+Any tool that causes side effects MUST pass the PolicyEngine, including: <!-- MCP-V1-003 -->
 - `wa.send`
 - `wa.workflow_run` / `wa.workflow_abort`
 - `wa.approve`
 - `wa.reserve` / `wa.release`
 - `wa.accounts_refresh` (if it triggers external calls)
 
-Resources are read-only and MUST not cause side effects.
+Resources are read-only and MUST not cause side effects. <!-- MCP-V1-004 -->
 
 Policy + redaction also apply to read/query tools:
 - `wa.get_text`
@@ -280,7 +289,11 @@ These surfaces may return `FT-MCP-0006` when policy denies access or requires ap
 
 ## Parity & Schema Contract
 
-The MCP surface is a thin wrapper over robot mode. For each tool:
-- Input parameters map 1:1 with the robot command.
-- Output `data` must validate against the matching robot JSON schema.
-- Errors must map to stable MCP error codes above.
+MCP and Robot Mode share envelope conventions, stable error semantics, and data
+schemas only where a tool explicitly claims that parity. Capability differences
+are part of the contract: for example, `wa.events` is a non-resumable snapshot
+while `ft robot events` also offers scoped cursor modes, and `wa.await_event`
+supports rule conditions plus optional claim leasing while the CLI additionally
+supports storage-derived quiescence. Every MCP error still maps to a stable code
+from the catalog above; callers must follow the per-tool parameter and response
+notes rather than assuming 1:1 command-line equivalence.

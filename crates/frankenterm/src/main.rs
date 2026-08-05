@@ -3707,7 +3707,10 @@ enum RobotCommands {
     },
 
     /// Get recent events
-    #[command(visible_aliases = ["event-log", "eventlog"])]
+    #[command(
+        visible_aliases = ["event-log", "eventlog"],
+        args_conflicts_with_subcommands = true
+    )]
     Events {
         /// Maximum number of events to return
         #[arg(long, default_value = "20")]
@@ -3890,13 +3893,23 @@ enum RobotCommands {
         #[arg(long, default_value = "500")]
         poll_interval_ms: u64,
 
+        /// Establish and emit a condition-scoped atomic tail checkpoint, then
+        /// exit without waiting. This bootstrap mode is cursorless by design.
+        #[arg(
+            long,
+            conflicts_with = "cursor",
+            conflicts_with = "cursor_epoch",
+            conflicts_with = "cursor_scope"
+        )]
+        checkpoint_only: bool,
+
         /// Resume cursor: consider events with id greater than this (default:
         /// only events that arrive after the await starts)
         #[arg(long)]
         cursor: Option<i64>,
 
-        /// Retention epoch paired with --cursor. Copy it from the prior
-        /// await_result or event-stream record.
+        /// Retention epoch paired with --cursor and --cursor-scope. Copy the
+        /// complete triple from a prior checkpoint/result for these conditions.
         #[arg(long, requires = "cursor")]
         cursor_epoch: Option<String>,
 
@@ -23746,6 +23759,7 @@ fn annotate_watch_event_claim_delivery(
         "cursor_commit_state".to_string(),
         serde_json::Value::String("pending_finalize".to_string()),
     );
+    object.insert("pending_finalize".to_string(), serde_json::Value::Bool(true));
     object.insert(
         "candidate_cursor".to_string(),
         serde_json::Value::from(event_id),
@@ -23986,31 +24000,46 @@ fn watch_event_ndjson(
     })
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WatchClaimCheckpointDisposition {
+    FinalizedAfterOutputFlush,
+    AlreadyFinalized,
+    FinalizedByCompetitor,
+}
+
+impl WatchClaimCheckpointDisposition {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::FinalizedAfterOutputFlush => "finalized_after_output_flush",
+            Self::AlreadyFinalized => "already_finalized",
+            Self::FinalizedByCompetitor => "finalized_by_competitor",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WatchCursorCheckpointReason {
+    FreshWatchTailBaseline,
+    FreshAwaitTailBaseline,
+    ExaminedThroughPage,
+}
+
+impl WatchCursorCheckpointReason {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::FreshWatchTailBaseline => "fresh_watch_tail_baseline",
+            Self::FreshAwaitTailBaseline => "fresh_await_tail_baseline",
+            Self::ExaminedThroughPage => "examined_through_page",
+        }
+    }
+}
+
 fn watch_claim_checkpoint_ndjson(
     cursor: i64,
     cursor_epoch: &str,
     cursor_scope: &str,
-    disposition: &str,
-    event_id: Option<i64>,
-) -> serde_json::Value {
-    let mut record = watch_cursor_checkpoint_ndjson(
-        cursor,
-        cursor_epoch,
-        cursor_scope,
-        "claim_delivery_committed",
-    );
-    record["claim_delivery"] = serde_json::Value::String(disposition.to_string());
-    if let Some(event_id) = event_id {
-        record["event_id"] = serde_json::Value::from(event_id);
-    }
-    record
-}
-
-fn watch_cursor_checkpoint_ndjson(
-    cursor: i64,
-    cursor_epoch: &str,
-    cursor_scope: &str,
-    reason: &str,
+    disposition: WatchClaimCheckpointDisposition,
+    event_id: i64,
 ) -> serde_json::Value {
     serde_json::json!({
         "type": "cursor_checkpoint",
@@ -24018,7 +24047,25 @@ fn watch_cursor_checkpoint_ndjson(
         "cursor_epoch": cursor_epoch,
         "cursor_scope": cursor_scope,
         "cursor_commit_state": "committed",
-        "reason": reason,
+        "reason": "claim_delivery_committed",
+        "claim_delivery": disposition.as_str(),
+        "event_id": event_id,
+    })
+}
+
+fn watch_cursor_checkpoint_ndjson(
+    cursor: i64,
+    cursor_epoch: &str,
+    cursor_scope: &str,
+    reason: WatchCursorCheckpointReason,
+) -> serde_json::Value {
+    serde_json::json!({
+        "type": "cursor_checkpoint",
+        "cursor": cursor,
+        "cursor_epoch": cursor_epoch,
+        "cursor_scope": cursor_scope,
+        "cursor_commit_state": "committed",
+        "reason": reason.as_str(),
     })
 }
 
@@ -24053,13 +24100,14 @@ fn watch_terminal_error_ndjson(
     cursor_scope: Option<&str>,
     retryable: bool,
 ) -> serde_json::Value {
+    let message = message.into();
     serde_json::json!({
         "type": "error",
         "terminal": true,
         "retryable": retryable,
         "code": code,
-        "message": message.into(),
-        "hint": hint,
+        "message": redact_for_output(&message),
+        "hint": hint.map(|hint| redact_for_output(&hint)),
         "cursor": cursor,
         "cursor_epoch": cursor_epoch,
         "cursor_scope": cursor_scope,
@@ -24120,6 +24168,9 @@ fn watch_max_hz_interval(max_hz: u32) -> Option<std::time::Duration> {
 }
 
 /// A single `ft robot await` condition (ft-7h5da.4.3).
+const AWAIT_CONDITION_SET_MAX: usize = 16;
+const AWAIT_CONDITION_MAX_BYTES: usize = 256;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum AwaitCondition {
     /// An event whose rule-id matches the glob has appeared since the await
@@ -24128,6 +24179,29 @@ enum AwaitCondition {
     /// Storage-derived pane quiescence: no captured output for at least the
     /// requested idle threshold.
     Quiescence { pane_id: u64, idle_ms: Option<u64> },
+}
+
+fn validate_await_condition_limits(any: &[String], all: &[String]) -> Result<(), String> {
+    for (set_name, conditions) in [("--any", any), ("--all", all)] {
+        if conditions.len() > AWAIT_CONDITION_SET_MAX {
+            return Err(format!(
+                "{set_name} accepts at most {AWAIT_CONDITION_SET_MAX} conditions (got {})",
+                conditions.len()
+            ));
+        }
+        if let Some((index, condition)) = conditions
+            .iter()
+            .enumerate()
+            .find(|(_, condition)| condition.len() > AWAIT_CONDITION_MAX_BYTES)
+        {
+            return Err(format!(
+                "{set_name} condition {} is {} bytes; each condition may contain at most {AWAIT_CONDITION_MAX_BYTES} bytes",
+                index + 1,
+                condition.len()
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Parse one `ft robot await` condition. Supported in DB-cursor mode:
@@ -24175,6 +24249,27 @@ fn await_condition_matches(
     }
 }
 
+/// Apply one stored event to the rule latches for a condition set.
+///
+/// Returns `true` only when this event changes at least one latch. Keeping
+/// that distinction lets the await cursor advance across irrelevant rows while
+/// holding immediately before the first rule occurrence whose process-local
+/// state would otherwise be lost on resume.
+fn apply_await_rule_event(
+    conditions: &[AwaitCondition],
+    met: &mut [bool],
+    event: &frankenterm_core::storage::StoredEvent,
+) -> bool {
+    let mut contributed = false;
+    for (condition, is_met) in conditions.iter().zip(met.iter_mut()) {
+        if !*is_met && await_condition_matches(condition, event) {
+            *is_met = true;
+            contributed = true;
+        }
+    }
+    contributed
+}
+
 /// Whether a storage-derived pane snapshot satisfies a quiescence condition.
 fn await_condition_matches_quiescence(
     cond: &AwaitCondition,
@@ -24185,7 +24280,13 @@ fn await_condition_matches_quiescence(
     match cond {
         AwaitCondition::Rule(_) => None,
         AwaitCondition::Quiescence { idle_ms, .. } => {
-            let last_output_ms = last_output_at.map(|ts| u64::try_from(ts).unwrap_or(0));
+            let last_output_ms = match last_output_at {
+                Some(timestamp) => match u64::try_from(timestamp) {
+                    Ok(timestamp) => Some(timestamp),
+                    Err(_) => return Some(false),
+                },
+                None => None,
+            };
             let threshold = idle_ms.unwrap_or(config.idle_silence_ms);
             Some(
                 frankenterm_core::agent_pane_state::pane_is_quiescent_from_last_output(
@@ -24214,31 +24315,83 @@ fn refresh_await_condition_state(
     }
 }
 
-async fn update_await_quiescence_conditions(
-    cx: &frankenterm_core::cx::Cx,
-    storage: &frankenterm_core::storage::StorageHandle,
+fn await_quiescence_pane_ids(
+    any_conditions: &[AwaitCondition],
+    all_conditions: &[AwaitCondition],
+) -> Vec<u64> {
+    any_conditions
+        .iter()
+        .chain(all_conditions)
+        .filter_map(|condition| match condition {
+            AwaitCondition::Rule(_) => None,
+            AwaitCondition::Quiescence { pane_id, .. } => Some(*pane_id),
+        })
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn update_await_quiescence_set_from_snapshot(
     config: &frankenterm_core::agent_pane_state::AgentDetectionConfig,
     conditions: &[AwaitCondition],
     met: &mut [bool],
-) -> frankenterm_core::Result<()> {
-    let now = now_ms();
+    pane_activity: &std::collections::HashMap<u64, Option<i64>>,
+    now: u64,
+) -> Result<(), u64> {
     for (condition, is_met) in conditions.iter().zip(met.iter_mut()) {
         let AwaitCondition::Quiescence { pane_id, .. } = condition else {
             continue;
         };
-        let last_output_at = storage.pane_last_output_at_with_cx(cx, *pane_id).await?;
+        let Some(last_output_at) = pane_activity.get(pane_id) else {
+            return Err(*pane_id);
+        };
         // Unlike a rule occurrence, quiescence is a level-triggered state, not
         // a historical latch. New output must be able to turn a previously
         // satisfied condition false before the composite is evaluated.
         *is_met = refresh_await_condition_state(
             condition,
             *is_met,
-            last_output_at,
+            *last_output_at,
             now,
             config,
         );
     }
     Ok(())
+}
+
+async fn update_await_quiescence_conditions(
+    cx: &frankenterm_core::cx::Cx,
+    storage: &frankenterm_core::storage::StorageHandle,
+    config: &frankenterm_core::agent_pane_state::AgentDetectionConfig,
+    any_conditions: &[AwaitCondition],
+    any_met: &mut [bool],
+    all_conditions: &[AwaitCondition],
+    all_met: &mut [bool],
+) -> frankenterm_core::Result<Option<u64>> {
+    let pane_ids = await_quiescence_pane_ids(any_conditions, all_conditions);
+    let pane_activity = storage
+        .pane_last_output_at_bulk_with_cx(cx, &pane_ids)
+        .await?;
+    let now = now_ms();
+    if let Err(pane_id) = update_await_quiescence_set_from_snapshot(
+        config,
+        any_conditions,
+        any_met,
+        &pane_activity,
+        now,
+    ) {
+        return Ok(Some(pane_id));
+    }
+    if let Err(pane_id) = update_await_quiescence_set_from_snapshot(
+        config,
+        all_conditions,
+        all_met,
+        &pane_activity,
+        now,
+    ) {
+        return Ok(Some(pane_id));
+    }
+    Ok(None)
 }
 
 /// Composite satisfaction for `ft robot await`: every `--all` condition is met
@@ -25988,8 +26141,8 @@ mod watch_events_tests {
             42,
             TEST_CURSOR_EPOCH,
             TEST_CURSOR_SCOPE,
-            "finalized_after_output_flush",
-            Some(42),
+            WatchClaimCheckpointDisposition::FinalizedAfterOutputFlush,
+            42,
         );
         assert_eq!(checkpoint["type"], "cursor_checkpoint");
         assert_eq!(checkpoint["cursor"], 42);
@@ -26003,7 +26156,7 @@ mod watch_events_tests {
             50,
             TEST_CURSOR_EPOCH,
             TEST_CURSOR_SCOPE,
-            "examined_through_page",
+            WatchCursorCheckpointReason::ExaminedThroughPage,
         );
         assert_eq!(page_checkpoint["cursor"], 50);
         assert!(page_checkpoint.get("event_id").is_none());
@@ -26043,6 +26196,21 @@ mod watch_events_tests {
         assert_eq!(error["cursor_epoch"], TEST_CURSOR_EPOCH);
         let encoded = serde_json::to_string(&error).expect("serialize terminal error");
         assert!(!encoded.contains('\n'));
+
+        let secret = watch_terminal_error_ndjson(
+            ROBOT_ERR_INVALID_ARGS,
+            "invalid condition AKIAIOSFODNN7EXAMPLE",
+            Some("retry AKIAIOSFODNN7EXAMPLE".to_string()),
+            None,
+            None,
+            None,
+            false,
+        );
+        let encoded = serde_json::to_string(&secret).expect("serialize redacted error");
+        assert!(
+            !encoded.contains("AKIAIOSFODNN7EXAMPLE"),
+            "stream error messages and hints must share the robot redaction boundary: {encoded}"
+        );
     }
 
     #[test]
@@ -26140,6 +26308,7 @@ mod watch_events_tests {
                 "finalize_after_output_flush"
             );
             assert_eq!(emitted["cursor_commit_state"], "pending_finalize");
+            assert_eq!(emitted["pending_finalize"], true);
             assert_eq!(emitted["cursor"], 0);
             assert_eq!(emitted["cursor_epoch"], TEST_CURSOR_EPOCH);
             assert_eq!(emitted["candidate_cursor"], success_id);
@@ -26530,6 +26699,18 @@ mod watch_events_tests {
     }
 
     #[test]
+    fn await_condition_sets_are_strictly_bounded() {
+        let at_limit = vec!["rule:ok".to_string(); AWAIT_CONDITION_SET_MAX];
+        assert!(validate_await_condition_limits(&at_limit, &[]).is_ok());
+
+        let over_limit = vec!["rule:ok".to_string(); AWAIT_CONDITION_SET_MAX + 1];
+        assert!(validate_await_condition_limits(&over_limit, &[]).is_err());
+
+        let oversized = vec!["x".repeat(AWAIT_CONDITION_MAX_BYTES + 1)];
+        assert!(validate_await_condition_limits(&[], &oversized).is_err());
+    }
+
+    #[test]
     fn await_is_satisfied_composition() {
         // only --all => every all-condition must be met.
         assert!(await_is_satisfied(&[], &[true, true]));
@@ -26557,6 +26738,85 @@ mod watch_events_tests {
     }
 
     #[test]
+    fn await_rule_latches_report_only_new_contributions() {
+        let conditions = vec![
+            AwaitCondition::Rule("build.a".to_string()),
+            AwaitCondition::Rule("build.b".to_string()),
+            AwaitCondition::Quiescence {
+                pane_id: 7,
+                idle_ms: None,
+            },
+        ];
+        let mut met = vec![false; conditions.len()];
+
+        assert!(apply_await_rule_event(
+            &conditions,
+            &mut met,
+            &ev(10, "build.a", "info", None)
+        ));
+        assert_eq!(met, [true, false, false]);
+        assert!(
+            !apply_await_rule_event(
+                &conditions,
+                &mut met,
+                &ev(11, "build.a", "info", None)
+            ),
+            "a duplicate occurrence must not create a second hidden latch"
+        );
+        assert!(apply_await_rule_event(
+            &conditions,
+            &mut met,
+            &ev(12, "build.b", "info", None)
+        ));
+        assert_eq!(met, [true, true, false]);
+    }
+
+    #[test]
+    fn await_quiescence_snapshot_dedupes_and_distinguishes_missing_panes() {
+        let any = vec![
+            AwaitCondition::Quiescence {
+                pane_id: 9,
+                idle_ms: Some(10),
+            },
+            AwaitCondition::Quiescence {
+                pane_id: 7,
+                idle_ms: Some(20),
+            },
+        ];
+        let all = vec![AwaitCondition::Quiescence {
+            pane_id: 9,
+            idle_ms: Some(30),
+        }];
+        assert_eq!(await_quiescence_pane_ids(&any, &all), [7, 9]);
+
+        let config = frankenterm_core::agent_pane_state::AgentDetectionConfig::default();
+        let mut met = vec![false; any.len()];
+        let activity = std::collections::HashMap::from([(9, None)]);
+        assert_eq!(
+            update_await_quiescence_set_from_snapshot(
+                &config,
+                &any,
+                &mut met,
+                &activity,
+                1_000,
+            ),
+            Err(7),
+            "a missing pane is not the same as an existing pane with no output"
+        );
+
+        let activity = std::collections::HashMap::from([(7, Some(990)), (9, None)]);
+        update_await_quiescence_set_from_snapshot(
+            &config,
+            &any,
+            &mut met,
+            &activity,
+            1_000,
+        )
+        .expect("all pane IDs exist");
+        assert_eq!(met, [true, false]);
+    }
+
+    #[test]
     fn await_condition_matches_storage_quiescence() {
         let config = frankenterm_core::agent_pane_state::AgentDetectionConfig::default();
         let cond = AwaitCondition::Quiescence {
@@ -26575,6 +26835,11 @@ mod watch_events_tests {
         assert_eq!(
             await_condition_matches_quiescence(&cond, None, 1_500, &config),
             Some(true)
+        );
+        assert_eq!(
+            await_condition_matches_quiescence(&cond, Some(-1), 1_500, &config),
+            Some(false),
+            "negative authority-bearing timestamps must fail closed"
         );
         assert_eq!(
             await_condition_matches_quiescence(
@@ -38904,6 +39169,126 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             dry_run,
                             command,
                         } => {
+                            // Query-only validation is deliberately completed
+                            // before workspace resolution or SQLite open. Bad
+                            // cursor/filter arguments must not pay migration
+                            // cost or mutate storage as a side effect. Clap's
+                            // args-vs-subcommand conflict keeps these query
+                            // options out of mutation invocations.
+                            if let Err(message) = validate_robot_events_cursor(cursor) {
+                                let response = RobotResponse::<RobotEventsData>::error_with_code(
+                                    ROBOT_ERR_INVALID_ARGS,
+                                    message.to_string(),
+                                    Some(
+                                        "Use the last `next_cursor` value from a prior response."
+                                            .to_string(),
+                                    ),
+                                    elapsed_ms(start),
+                                );
+                                print_robot_response(&response, format, stats)?;
+                                return Ok(());
+                            }
+                            if let Err(message) = validate_robot_events_since(since) {
+                                let response = RobotResponse::<RobotEventsData>::error_with_code(
+                                    ROBOT_ERR_INVALID_ARGS,
+                                    message.to_string(),
+                                    Some(
+                                        "Pass a Unix epoch timestamp in milliseconds, such as 1767225600000."
+                                            .to_string(),
+                                    ),
+                                    elapsed_ms(start),
+                                );
+                                print_robot_response(&response, format, stats)?;
+                                return Ok(());
+                            }
+                            let expected_cursor_scope = robot_events_cursor_scope(
+                                pane,
+                                rule_id.as_deref(),
+                                event_type.as_deref(),
+                                triage_state.as_deref(),
+                                label.as_deref(),
+                                unhandled,
+                                since,
+                            );
+                            if let Err(message) = validate_event_cursor_token_parts(
+                                cursor,
+                                cursor_epoch.as_deref(),
+                                cursor_scope.as_deref(),
+                            ) {
+                                let response = RobotResponse::<RobotEventsData>::error_with_code(
+                                    ROBOT_ERR_INVALID_ARGS,
+                                    message.to_string(),
+                                    Some(
+                                        "Copy next_cursor, next_cursor_epoch, and next_cursor_scope from the prior response."
+                                            .to_string(),
+                                    ),
+                                    elapsed_ms(start),
+                                );
+                                print_robot_response(&response, format, stats)?;
+                                return Ok(());
+                            }
+                            if let Err(message) = validate_event_cursor_scope_matches(
+                                cursor_scope.as_deref(),
+                                &expected_cursor_scope,
+                            ) {
+                                let discontinuity = event_cursor_scope_discontinuity_ndjson(
+                                    cursor.expect("validated scoped token has a cursor"),
+                                    cursor_epoch
+                                        .as_deref()
+                                        .expect("validated scoped token has an epoch"),
+                                    cursor_scope
+                                        .as_deref()
+                                        .expect("scope mismatch has a supplied scope"),
+                                    &expected_cursor_scope,
+                                );
+                                let response = RobotResponse::<RobotEventsData>::error_with_code_and_data(
+                                    ROBOT_ERR_CURSOR_DISCONTINUITY,
+                                    message.to_string(),
+                                    Some(
+                                        "Resume with exactly the same membership filters, or use --start-at-tail to establish a new scope."
+                                            .to_string(),
+                                    ),
+                                    discontinuity,
+                                    elapsed_ms(start),
+                                );
+                                print_robot_response(&response, format, stats)?;
+                                return Ok(());
+                            }
+                            if let Err(message) = validate_robot_events_limit(limit) {
+                                let response = RobotResponse::<RobotEventsData>::error_with_code(
+                                    ROBOT_ERR_INVALID_ARGS,
+                                    message.to_string(),
+                                    None,
+                                    elapsed_ms(start),
+                                );
+                                print_robot_response(&response, format, stats)?;
+                                return Ok(());
+                            }
+                            if let Err(message) = validate_robot_events_replay_limit(replay_limit) {
+                                let response = RobotResponse::<RobotEventsData>::error_with_code(
+                                    ROBOT_ERR_INVALID_ARGS,
+                                    message.to_string(),
+                                    None,
+                                    elapsed_ms(start),
+                                );
+                                print_robot_response(&response, format, stats)?;
+                                return Ok(());
+                            }
+                            if replay_limit.is_some() && cursor.is_none() {
+                                let response = RobotResponse::<RobotEventsData>::error_with_code(
+                                    ROBOT_ERR_INVALID_ARGS,
+                                    "--replay-limit requires --cursor, --cursor-epoch, and --cursor-scope"
+                                        .to_string(),
+                                    Some(
+                                        "Use --limit for ordinary newest-first listing, or establish a cursor with --start-at-tail."
+                                            .to_string(),
+                                    ),
+                                    elapsed_ms(start),
+                                );
+                                print_robot_response(&response, format, stats)?;
+                                return Ok(());
+                            }
+
                             // Get workspace layout for DB path
                             let layout = match config.workspace_layout(Some(&workspace_root)) {
                                 Ok(l) => l,
@@ -39480,121 +39865,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                 return Ok(());
                             }
 
-                            // Build event query
-                            if let Err(message) = validate_robot_events_cursor(cursor) {
-                                let response = RobotResponse::<RobotEventsData>::error_with_code(
-                                    ROBOT_ERR_INVALID_ARGS,
-                                    message.to_string(),
-                                    Some(
-                                        "Use the last `next_cursor` value from a prior response."
-                                            .to_string(),
-                                    ),
-                                    elapsed_ms(start),
-                                );
-                                print_robot_response(&response, format, stats)?;
-                                return Ok(());
-                            }
-                            if let Err(message) = validate_robot_events_since(since) {
-                                let response = RobotResponse::<RobotEventsData>::error_with_code(
-                                    ROBOT_ERR_INVALID_ARGS,
-                                    message.to_string(),
-                                    Some(
-                                        "Pass a Unix epoch timestamp in milliseconds, such as 1767225600000."
-                                            .to_string(),
-                                    ),
-                                    elapsed_ms(start),
-                                );
-                                print_robot_response(&response, format, stats)?;
-                                return Ok(());
-                            }
-                            let expected_cursor_scope = robot_events_cursor_scope(
-                                pane,
-                                rule_id.as_deref(),
-                                event_type.as_deref(),
-                                triage_state.as_deref(),
-                                label.as_deref(),
-                                unhandled,
-                                since,
-                            );
-                            if let Err(message) = validate_event_cursor_token_parts(
-                                cursor,
-                                cursor_epoch.as_deref(),
-                                cursor_scope.as_deref(),
-                            )
-                            {
-                                let response = RobotResponse::<RobotEventsData>::error_with_code(
-                                    ROBOT_ERR_INVALID_ARGS,
-                                    message.to_string(),
-                                    Some(
-                                        "Copy next_cursor, next_cursor_epoch, and next_cursor_scope from the prior response."
-                                            .to_string(),
-                                    ),
-                                    elapsed_ms(start),
-                                );
-                                print_robot_response(&response, format, stats)?;
-                                return Ok(());
-                            }
-                            if let Err(message) = validate_event_cursor_scope_matches(
-                                cursor_scope.as_deref(),
-                                &expected_cursor_scope,
-                            ) {
-                                let discontinuity = event_cursor_scope_discontinuity_ndjson(
-                                    cursor.expect("validated scoped token has a cursor"),
-                                    cursor_epoch
-                                        .as_deref()
-                                        .expect("validated scoped token has an epoch"),
-                                    cursor_scope
-                                        .as_deref()
-                                        .expect("scope mismatch has a supplied scope"),
-                                    &expected_cursor_scope,
-                                );
-                                let response = RobotResponse::<RobotEventsData>::error_with_code_and_data(
-                                    ROBOT_ERR_CURSOR_DISCONTINUITY,
-                                    message.to_string(),
-                                    Some(
-                                        "Resume with exactly the same membership filters, or use --start-at-tail to establish a new scope."
-                                            .to_string(),
-                                    ),
-                                    discontinuity,
-                                    elapsed_ms(start),
-                                );
-                                print_robot_response(&response, format, stats)?;
-                                return Ok(());
-                            }
-                            if let Err(message) = validate_robot_events_limit(limit) {
-                                let response = RobotResponse::<RobotEventsData>::error_with_code(
-                                    ROBOT_ERR_INVALID_ARGS,
-                                    message.to_string(),
-                                    None,
-                                    elapsed_ms(start),
-                                );
-                                print_robot_response(&response, format, stats)?;
-                                return Ok(());
-                            }
-                            if let Err(message) = validate_robot_events_replay_limit(replay_limit) {
-                                let response = RobotResponse::<RobotEventsData>::error_with_code(
-                                    ROBOT_ERR_INVALID_ARGS,
-                                    message.to_string(),
-                                    None,
-                                    elapsed_ms(start),
-                                );
-                                print_robot_response(&response, format, stats)?;
-                                return Ok(());
-                            }
-                            if replay_limit.is_some() && cursor.is_none() {
-                                let response = RobotResponse::<RobotEventsData>::error_with_code(
-                                    ROBOT_ERR_INVALID_ARGS,
-                                    "--replay-limit requires --cursor, --cursor-epoch, and --cursor-scope"
-                                        .to_string(),
-                                    Some(
-                                        "Use --limit for ordinary newest-first listing, or establish a cursor with --start-at-tail."
-                                            .to_string(),
-                                    ),
-                                    elapsed_ms(start),
-                                );
-                                print_robot_response(&response, format, stats)?;
-                                return Ok(());
-                            }
+                            // Build the already validated event query.
                             let effective_limit = replay_limit.unwrap_or(limit);
                             let cursor_mode = cursor.is_some() || start_at_tail;
                             let order = if cursor_mode {
@@ -39767,6 +40038,40 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             };
                             match events_result {
                                 Ok(events) => {
+                                    let event_ids = events
+                                        .iter()
+                                        .map(|event| event.id)
+                                        .collect::<Vec<_>>();
+                                    let annotations_cx = frankenterm_core::cx::Cx::current()
+                                        .unwrap_or_else(frankenterm_core::cx::for_request);
+                                    let mut annotations_by_event = match storage
+                                        .get_event_annotations_bulk_with_cx(
+                                            &annotations_cx,
+                                            &event_ids,
+                                        )
+                                        .await
+                                    {
+                                        Ok(annotations) => annotations,
+                                        Err(error)
+                                            if watch_core_failure_source(&error)
+                                                == WatchFailureSource::Cancellation =>
+                                        {
+                                            return Err(error.into());
+                                        }
+                                        Err(error) => {
+                                            let response = RobotResponse::<RobotEventsData>::error_with_code(
+                                                ROBOT_ERR_STORAGE,
+                                                format!("Failed to query event annotations: {error}"),
+                                                Some(
+                                                    "Retry after storage recovers; FrankenTerm did not return partially annotated event data."
+                                                        .to_string(),
+                                                ),
+                                                elapsed_ms(start),
+                                            );
+                                            print_robot_response(&response, format, stats)?;
+                                            return Ok(());
+                                        }
+                                    };
                                     let include_preview = would_handle || dry_run;
                                     let rule_index = if include_preview {
                                         let patterns_root = resolved_config_path
@@ -39804,17 +40109,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                     let mut items: Vec<RobotEventItem> =
                                         Vec::with_capacity(events.len());
                                     for e in events {
-                                        let annotations = match storage
-                                            .get_event_annotations(e.id)
-                                            .await
-                                        {
-                                            Ok(Some(a)) => Some(a),
-                                            Ok(None) => None,
-                                            Err(err) => {
-                                                tracing::warn!(error = %err, event_id = e.id, "Failed to load event annotations");
-                                                None
-                                            }
-                                        };
+                                        let annotations = annotations_by_event.remove(&e.id);
                                         // Derive pack_id from rule_id (e.g., "codex.usage.reached" -> "builtin:codex")
                                         let pack_id = e.rule_id.split('.').next().map_or_else(
                                             || "builtin:unknown".to_string(),
@@ -39904,9 +40199,9 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                     ROBOT_ERR_INVALID_ARGS,
                                     "Invalid --cursor: must be non-negative",
                                     None,
-                                    cursor,
-                                    cursor_epoch.as_deref(),
-                                    cursor_scope.as_deref(),
+                                    None,
+                                    None,
+                                    None,
                                     false,
                                 )?;
                                 return Ok(());
@@ -39924,9 +40219,9 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                         "Copy cursor, cursor_epoch, and cursor_scope from the prior stream record."
                                             .to_string(),
                                     ),
-                                    cursor,
-                                    cursor_epoch.as_deref(),
-                                    cursor_scope.as_deref(),
+                                    None,
+                                    None,
+                                    None,
                                     false,
                                 )?;
                                 return Ok(());
@@ -39970,6 +40265,8 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                 unhandled,
                                 claim,
                             );
+                            let cx = frankenterm_core::cx::Cx::current()
+                                .unwrap_or_else(frankenterm_core::cx::for_request);
                             if validate_event_cursor_scope_matches(
                                 cursor_scope.as_deref(),
                                 &expected_cursor_scope,
@@ -39986,6 +40283,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                         .expect("scope mismatch has a supplied scope"),
                                     &expected_cursor_scope,
                                 );
+                                watch_checkpoint(&cx, "watch scope-discontinuity output")?;
                                 let mut lock = std::io::stdout().lock();
                                 let _ = write_ndjson_line(&mut lock, &discontinuity)?;
                                 return Ok(());
@@ -39993,6 +40291,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             let layout = match config.workspace_layout(Some(&workspace_root)) {
                                 Ok(l) => l,
                                 Err(e) => {
+                                    watch_checkpoint(&cx, "watch workspace-layout error output")?;
                                     let _ = write_terminal_stream_error_ndjson(
                                         ROBOT_ERR_CONFIG,
                                         format!("Failed to get workspace layout: {e}"),
@@ -40006,13 +40305,22 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                 }
                             };
                             let db_path = layout.db_path.to_string_lossy();
-                            let storage = match frankenterm_core::storage::StorageHandle::new(
+                            let storage = match frankenterm_core::storage::StorageHandle::new_with_cx(
+                                &cx,
                                 &db_path,
-                            )
-                            .await
-                            {
+                            ).await {
                                 Ok(s) => s,
                                 Err(e) => {
+                                    match classify_watch_outer_failure(
+                                        &cx,
+                                        "storage open",
+                                        watch_core_failure_source(&e),
+                                    ) {
+                                        WatchOuterFailure::Cancelled(error) => {
+                                            return Err(error.into());
+                                        }
+                                        WatchOuterFailure::Degraded => {}
+                                    }
                                     let _ = write_terminal_stream_error_ndjson(
                                         ROBOT_ERR_STORAGE,
                                         format!("Failed to open storage: {e}"),
@@ -40025,6 +40333,10 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                     return Ok(());
                                 }
                             };
+                            if let Err(error) = watch_checkpoint(&cx, "post-storage-open") {
+                                storage.shutdown().await.ok();
+                                return Err(error.into());
+                            }
 
                             let severity_filter = severity.as_deref();
                             let rule_glob = rule_id.as_deref();
@@ -40046,8 +40358,6 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             let mut last_emit = std::time::Instant::now();
                             let mut last_event_emit: Option<std::time::Instant> = None;
                             let stdout = std::io::stdout();
-                            let cx = frankenterm_core::cx::Cx::current()
-                                .unwrap_or_else(frankenterm_core::cx::for_request);
                             let mut retention_coverage: Option<EventRetentionCoverage> = None;
 
                             // ft-7h5da.4.1: live IPC transport state. Persisted
@@ -40141,7 +40451,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                             .as_deref()
                                             .expect("fresh baseline epoch was assigned"),
                                         &expected_cursor_scope,
-                                        "fresh_tail_baseline",
+                                        WatchCursorCheckpointReason::FreshWatchTailBaseline,
                                     );
                                     if !emit_watch_stream_record(
                                         &stdout,
@@ -40342,8 +40652,8 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                                     redacted.id,
                                                     &page_epoch,
                                                     &expected_cursor_scope,
-                                                    "finalized_after_output_flush",
-                                                    Some(redacted.id),
+                                                    WatchClaimCheckpointDisposition::FinalizedAfterOutputFlush,
+                                                    redacted.id,
                                                 );
                                                 watch_checkpoint(
                                                     &cx,
@@ -40410,8 +40720,8 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                                                 redacted.id,
                                                                 &page_epoch,
                                                                 &expected_cursor_scope,
-                                                                "already_finalized",
-                                                                Some(redacted.id),
+                                                                WatchClaimCheckpointDisposition::AlreadyFinalized,
+                                                                redacted.id,
                                                             );
                                                         if !emit_watch_stream_record(
                                                             &stdout,
@@ -40546,8 +40856,8 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                                                 redacted.id,
                                                                 &page_epoch,
                                                                 &expected_cursor_scope,
-                                                                "finalized_by_competitor",
-                                                                Some(redacted.id),
+                                                                WatchClaimCheckpointDisposition::FinalizedByCompetitor,
+                                                                redacted.id,
                                                             );
                                                         if !emit_watch_stream_record(
                                                             &stdout,
@@ -40656,7 +40966,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                             page_checked_through,
                                             epoch,
                                             &expected_cursor_scope,
-                                            "examined_through_page",
+                                            WatchCursorCheckpointReason::ExaminedThroughPage,
                                         );
                                         if !emit_watch_stream_record(
                                             &stdout,
@@ -41117,6 +41427,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             all,
                             timeout_secs,
                             poll_interval_ms,
+                            checkpoint_only,
                             cursor,
                             cursor_epoch,
                             cursor_scope,
@@ -41126,9 +41437,9 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                     ROBOT_ERR_INVALID_ARGS,
                                     message,
                                     None,
-                                    cursor,
-                                    cursor_epoch.as_deref(),
-                                    cursor_scope.as_deref(),
+                                    None,
+                                    None,
+                                    None,
                                     false,
                                 )?;
                                 return Ok(());
@@ -41146,6 +41457,18 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                         "Copy final_cursor, final_cursor_epoch, and final_cursor_scope from the prior await result."
                                             .to_string(),
                                     ),
+                                    None,
+                                    None,
+                                    None,
+                                    false,
+                                )?;
+                                return Ok(());
+                            }
+                            if let Err(message) = validate_await_condition_limits(&any, &all) {
+                                let _ = write_terminal_stream_error_ndjson(
+                                    ROBOT_ERR_INVALID_ARGS,
+                                    message,
+                                    None,
                                     cursor,
                                     cursor_epoch.as_deref(),
                                     cursor_scope.as_deref(),
@@ -41199,6 +41522,8 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                 &all_conds,
                                 &config.agent_detection,
                             );
+                            let cx = frankenterm_core::cx::Cx::current()
+                                .unwrap_or_else(frankenterm_core::cx::for_request);
                             if validate_event_cursor_scope_matches(
                                 cursor_scope.as_deref(),
                                 &expected_cursor_scope,
@@ -41215,6 +41540,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                         .expect("scope mismatch has a supplied scope"),
                                     &expected_cursor_scope,
                                 );
+                                watch_checkpoint(&cx, "await scope-discontinuity output")?;
                                 let mut lock = std::io::stdout().lock();
                                 let _ = write_ndjson_line(&mut lock, &discontinuity)?;
                                 return Ok(());
@@ -41223,6 +41549,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             let layout = match config.workspace_layout(Some(&workspace_root)) {
                                 Ok(l) => l,
                                 Err(e) => {
+                                    watch_checkpoint(&cx, "await workspace-layout error output")?;
                                     let _ = write_terminal_stream_error_ndjson(
                                         ROBOT_ERR_CONFIG,
                                         format!("Failed to get workspace layout: {e}"),
@@ -41236,13 +41563,22 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                 }
                             };
                             let db_path = layout.db_path.to_string_lossy();
-                            let storage = match frankenterm_core::storage::StorageHandle::new(
+                            let storage = match frankenterm_core::storage::StorageHandle::new_with_cx(
+                                &cx,
                                 &db_path,
-                            )
-                            .await
-                            {
+                            ).await {
                                 Ok(s) => s,
                                 Err(e) => {
+                                    match classify_watch_outer_failure(
+                                        &cx,
+                                        "await storage open",
+                                        watch_core_failure_source(&e),
+                                    ) {
+                                        WatchOuterFailure::Cancelled(error) => {
+                                            return Err(error.into());
+                                        }
+                                        WatchOuterFailure::Degraded => {}
+                                    }
                                     let _ = write_terminal_stream_error_ndjson(
                                         ROBOT_ERR_STORAGE,
                                         format!("Failed to open storage: {e}"),
@@ -41255,19 +41591,32 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                     return Ok(());
                                 }
                             };
+                            if let Err(error) = watch_checkpoint(&cx, "await post-storage-open") {
+                                storage.shutdown().await.ok();
+                                return Err(error.into());
+                            }
 
                             let poll = std::time::Duration::from_millis(poll_interval_ms.max(10));
                             let started = std::time::Instant::now();
+                            // `after_id` is an internal scan candidate. The
+                            // committed token advances across irrelevant rows,
+                            // then holds immediately before the first partial
+                            // rule contribution until the composite condition
+                            // is satisfied. Rule matches are process-local
+                            // latches, so publishing past that hold on a
+                            // timeout/error would make a resumed ALL wait
+                            // permanently forget earlier matches.
+                            let mut committed_cursor = cursor;
+                            let mut committed_cursor_epoch = cursor_epoch.clone();
                             let mut after_id = cursor;
                             let mut current_cursor_epoch = cursor_epoch;
                             let mut retention_coverage: Option<EventRetentionCoverage> = None;
                             let mut any_met = vec![false; any_conds.len()];
                             let mut all_met = vec![false; all_conds.len()];
+                            let mut cursor_held_for_rule_latch = false;
                             let stdout = std::io::stdout();
-                            let cx = frankenterm_core::cx::Cx::current()
-                                .unwrap_or_else(frankenterm_core::cx::for_request);
 
-                            let (satisfied, timed_out) = loop {
+                            let (satisfied, timed_out, final_cursor) = 'await_poll: loop {
                                 let query = frankenterm_core::storage::EventStreamQuery {
                                     after_id,
                                     limit: Some(500),
@@ -41291,17 +41640,22 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                 {
                                     Ok(page) => page,
                                     Err(e) => {
-                                        if watch_core_failure_source(&e)
-                                            == WatchFailureSource::Cancellation
-                                        {
-                                            return Err(e.into());
+                                        match classify_watch_outer_failure(
+                                            &cx,
+                                            "await event query",
+                                            watch_core_failure_source(&e),
+                                        ) {
+                                            WatchOuterFailure::Cancelled(error) => {
+                                                return Err(error.into());
+                                            }
+                                            WatchOuterFailure::Degraded => {}
                                         }
                                         let _ = write_terminal_stream_error_ndjson(
                                             ROBOT_ERR_STORAGE,
                                             format!("Failed to query events: {e}"),
                                             None,
-                                            after_id,
-                                            current_cursor_epoch.as_deref(),
+                                            committed_cursor,
+                                            committed_cursor_epoch.as_deref(),
                                             Some(&expected_cursor_scope),
                                             true,
                                         )?;
@@ -41314,13 +41668,15 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                         Some(page.retention.cursor_epoch.clone());
                                     after_id =
                                         Some(fresh_event_cursor_baseline(&page.retention));
+                                    committed_cursor = after_id;
+                                    committed_cursor_epoch = current_cursor_epoch.clone();
                                     let checkpoint = watch_cursor_checkpoint_ndjson(
                                         after_id.expect("fresh await baseline was assigned"),
                                         current_cursor_epoch
                                             .as_deref()
                                             .expect("fresh await epoch was assigned"),
                                         &expected_cursor_scope,
-                                        "fresh_await_tail_baseline",
+                                        WatchCursorCheckpointReason::FreshAwaitTailBaseline,
                                     );
                                     watch_checkpoint(&cx, "await baseline output")?;
                                     let continue_writing = {
@@ -41328,6 +41684,10 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                         write_ndjson_line(&mut lock, &checkpoint)?
                                     };
                                     if !continue_writing {
+                                        storage.shutdown().await.ok();
+                                        return Ok(());
+                                    }
+                                    if checkpoint_only {
                                         storage.shutdown().await.ok();
                                         return Ok(());
                                     }
@@ -41342,10 +41702,12 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                     let epoch = current_cursor_epoch
                                         .as_deref()
                                         .expect("an await cursor always has an epoch");
+                                    let reconciliation_cursor =
+                                        committed_cursor.unwrap_or(requested);
                                     let check = match reconcile_event_stream_cursor_page(
                                         &cx,
                                         &storage,
-                                        requested,
+                                        reconciliation_cursor,
                                         epoch,
                                         &page,
                                         500,
@@ -41355,10 +41717,15 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                     {
                                         Ok(check) => check,
                                         Err(error) => {
-                                            if watch_core_failure_source(&error)
-                                                == WatchFailureSource::Cancellation
-                                            {
-                                                return Err(error.into());
+                                            match classify_watch_outer_failure(
+                                                &cx,
+                                                "await retention reconciliation",
+                                                watch_core_failure_source(&error),
+                                            ) {
+                                                WatchOuterFailure::Cancelled(cancel_error) => {
+                                                    return Err(cancel_error.into());
+                                                }
+                                                WatchOuterFailure::Degraded => {}
                                             }
                                             let _ = write_terminal_stream_error_ndjson(
                                                 ROBOT_ERR_STORAGE,
@@ -41369,8 +41736,8 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                                     "Retry after storage recovers; the await refused to guess whether retention pruned the cursor."
                                                         .to_string(),
                                                 ),
-                                                after_id,
-                                                current_cursor_epoch.as_deref(),
+                                                committed_cursor,
+                                                committed_cursor_epoch.as_deref(),
                                                 Some(&expected_cursor_scope),
                                                 true,
                                             )?;
@@ -41378,13 +41745,21 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                             return Ok(());
                                         }
                                     };
-                                    if let Some(record) = check.as_ref().and_then(|check| {
+                                    if let Some(mut record) = check.as_ref().and_then(|check| {
                                         event_cursor_discontinuity_ndjson(
                                             check,
                                             epoch,
                                             &expected_cursor_scope,
                                         )
                                     }) {
+                                        if reconciliation_cursor != requested {
+                                            record["candidate_cursor"] =
+                                                serde_json::Value::from(requested);
+                                        }
+                                        watch_checkpoint(
+                                            &cx,
+                                            "await cursor-discontinuity output",
+                                        )?;
                                         let mut lock = stdout.lock();
                                         let _ = write_ndjson_line(&mut lock, &record)?;
                                         drop(lock);
@@ -41396,78 +41771,108 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                 let checked_through =
                                     event_stream_page_checked_through(&page, 500);
                                 let batch_len = page.events.len();
-                                for ev in &page.events {
-                                    for (i, c) in any_conds.iter().enumerate() {
-                                        if !any_met[i] && await_condition_matches(c, ev) {
-                                            any_met[i] = true;
-                                        }
-                                    }
-                                    for (i, c) in all_conds.iter().enumerate() {
-                                        if !all_met[i] && await_condition_matches(c, ev) {
-                                            all_met[i] = true;
-                                        }
-                                    }
-                                }
-                                after_id = Some(checked_through);
-                                if let Err(e) = update_await_quiescence_conditions(
+                                match update_await_quiescence_conditions(
                                     &cx,
                                     &storage,
                                     &config.agent_detection,
                                     &any_conds,
                                     &mut any_met,
-                                )
-                                .await
-                                {
-                                    if watch_core_failure_source(&e)
-                                        == WatchFailureSource::Cancellation
-                                    {
-                                        return Err(e.into());
-                                    }
-                                    let _ = write_terminal_stream_error_ndjson(
-                                        ROBOT_ERR_STORAGE,
-                                        format!("Failed to query pane output timestamps: {e}"),
-                                        None,
-                                        after_id,
-                                        current_cursor_epoch.as_deref(),
-                                        Some(&expected_cursor_scope),
-                                        true,
-                                    )?;
-                                    storage.shutdown().await.ok();
-                                    return Ok(());
-                                }
-                                if let Err(e) = update_await_quiescence_conditions(
-                                    &cx,
-                                    &storage,
-                                    &config.agent_detection,
                                     &all_conds,
                                     &mut all_met,
                                 )
                                 .await
                                 {
-                                    if watch_core_failure_source(&e)
-                                        == WatchFailureSource::Cancellation
-                                    {
-                                        return Err(e.into());
+                                    Ok(None) => {}
+                                    Ok(Some(pane_id)) => {
+                                        let _ = write_terminal_stream_error_ndjson(
+                                            ROBOT_ERR_PANE_NOT_FOUND,
+                                            format!("Pane {pane_id} does not exist"),
+                                            Some(
+                                                "Use 'ft robot state' to list available panes."
+                                                    .to_string(),
+                                            ),
+                                            committed_cursor,
+                                            committed_cursor_epoch.as_deref(),
+                                            Some(&expected_cursor_scope),
+                                            false,
+                                        )?;
+                                        storage.shutdown().await.ok();
+                                        return Ok(());
                                     }
-                                    let _ = write_terminal_stream_error_ndjson(
-                                        ROBOT_ERR_STORAGE,
-                                        format!("Failed to query pane output timestamps: {e}"),
-                                        None,
-                                        after_id,
-                                        current_cursor_epoch.as_deref(),
-                                        Some(&expected_cursor_scope),
-                                        true,
-                                    )?;
-                                    storage.shutdown().await.ok();
-                                    return Ok(());
+                                    Err(e) => {
+                                        match classify_watch_outer_failure(
+                                            &cx,
+                                            "await quiescence snapshot query",
+                                            watch_core_failure_source(&e),
+                                        ) {
+                                            WatchOuterFailure::Cancelled(error) => {
+                                                return Err(error.into());
+                                            }
+                                            WatchOuterFailure::Degraded => {}
+                                        }
+                                        let _ = write_terminal_stream_error_ndjson(
+                                            ROBOT_ERR_STORAGE,
+                                            format!("Failed to query pane output timestamps: {e}"),
+                                            None,
+                                            committed_cursor,
+                                            committed_cursor_epoch.as_deref(),
+                                            Some(&expected_cursor_scope),
+                                            true,
+                                        )?;
+                                        storage.shutdown().await.ok();
+                                        return Ok(());
+                                    }
                                 }
+                                // A level-triggered condition can complete at
+                                // the page's input boundary. Do not consume
+                                // rows beyond that exact completion point: a
+                                // caller may reuse this condition-scoped token
+                                // to await its next occurrence.
                                 if await_is_satisfied(&any_met, &all_met) {
-                                    break (true, false);
+                                    break 'await_poll (true, false, after_id);
+                                }
+
+                                for event in &page.events {
+                                    let any_contributed = apply_await_rule_event(
+                                        &any_conds,
+                                        &mut any_met,
+                                        event,
+                                    );
+                                    let all_contributed = apply_await_rule_event(
+                                        &all_conds,
+                                        &mut all_met,
+                                        event,
+                                    );
+                                    let contributed = any_contributed || all_contributed;
+
+                                    if await_is_satisfied(&any_met, &all_met) {
+                                        // The exact event that completed the
+                                        // composite is the only safe terminal
+                                        // boundary. Rows later in this page
+                                        // remain available to a resumed wait.
+                                        after_id = Some(event.id);
+                                        break 'await_poll (true, false, after_id);
+                                    }
+
+                                    if contributed && !cursor_held_for_rule_latch {
+                                        committed_cursor = Some(event.id.saturating_sub(1));
+                                        cursor_held_for_rule_latch = true;
+                                    } else if !cursor_held_for_rule_latch {
+                                        committed_cursor = Some(event.id);
+                                    }
+                                }
+
+                                after_id = Some(checked_through);
+                                if !cursor_held_for_rule_latch {
+                                    // A short page's authoritative high-water
+                                    // mark can skip allocator gaps and rows
+                                    // irrelevant to this condition scope.
+                                    committed_cursor = after_id;
                                 }
                                 let timeout = (timeout_secs > 0)
                                     .then(|| std::time::Duration::from_secs(timeout_secs));
                                 if timeout.is_some_and(|timeout| started.elapsed() >= timeout) {
-                                    break (false, true);
+                                    break 'await_poll (false, true, committed_cursor);
                                 }
                                 // Drain a full backlog batch before idling, but
                                 // never let backlog volume bypass the timeout.
@@ -41488,8 +41893,12 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                 satisfied,
                                 timed_out,
                                 elapsed_ms(start),
-                                after_id,
-                                current_cursor_epoch.as_deref(),
+                                final_cursor,
+                                if satisfied {
+                                    current_cursor_epoch.as_deref()
+                                } else {
+                                    committed_cursor_epoch.as_deref()
+                                },
                                 Some(&expected_cursor_scope),
                                 &any_status,
                                 &all_status,
@@ -91397,6 +91806,72 @@ A  docs/new-proof.md\n";
             ])
             .is_err(),
             "fresh bootstrap and resume cursor are mutually exclusive"
+        );
+    }
+
+    #[test]
+    fn cli_robot_events_mutations_reject_query_options() {
+        Cli::try_parse_from([
+            "ft", "robot", "events", "annotate", "7", "--clear",
+        ])
+        .expect("event mutation without query options should parse");
+
+        assert!(
+            Cli::try_parse_from([
+                "ft", "robot", "events", "--limit", "5", "annotate", "7", "--clear",
+            ])
+            .is_err(),
+            "query options must not be silently ignored by mutation subcommands"
+        );
+    }
+
+    #[test]
+    fn cli_robot_await_checkpoint_only_is_cursorless() {
+        let cli = Cli::try_parse_from([
+            "ft",
+            "robot",
+            "await",
+            "--all",
+            "rule:build.done",
+            "--checkpoint-only",
+        ])
+        .expect("cursorless await checkpoint bootstrap should parse");
+        match cli.command.map(|command| *command) {
+            Some(Commands::Robot { command, .. }) => match command {
+                Some(RobotCommands::Await {
+                    checkpoint_only,
+                    cursor,
+                    cursor_epoch,
+                    cursor_scope,
+                    ..
+                }) => {
+                    assert!(checkpoint_only);
+                    assert_eq!(cursor, None);
+                    assert_eq!(cursor_epoch, None);
+                    assert_eq!(cursor_scope, None);
+                }
+                _ => panic!("expected RobotCommands::Await"),
+            },
+            _ => panic!("expected Robot command"),
+        }
+
+        assert!(
+            Cli::try_parse_from([
+                "ft",
+                "robot",
+                "await",
+                "--all",
+                "rule:build.done",
+                "--checkpoint-only",
+                "--cursor",
+                "7",
+                "--cursor-epoch",
+                "0123456789abcdef0123456789abcdef",
+                "--cursor-scope",
+                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            ])
+            .is_err(),
+            "checkpoint-only bootstrap must not accept an existing cursor token"
         );
     }
 

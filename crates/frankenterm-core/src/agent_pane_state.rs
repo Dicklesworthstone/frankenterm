@@ -196,10 +196,10 @@ impl AwaitPaneCondition {
 /// (ft-7h5da.4.3): a pane is quiescent when no output has been observed for at
 /// least `quiescent_after_ms`. Derivable from the latest captured segment's
 /// timestamp, so it needs no in-process watcher gauge. `now_ms < last_output_ms`
-/// (clock skew) saturates to "not quiescent".
+/// (clock skew) is explicitly not quiescent, including at a zero threshold.
 #[must_use]
 pub fn pane_is_quiescent(last_output_ms: u64, now_ms: u64, quiescent_after_ms: u64) -> bool {
-    now_ms.saturating_sub(last_output_ms) >= quiescent_after_ms
+    now_ms >= last_output_ms && now_ms - last_output_ms >= quiescent_after_ms
 }
 
 /// Storage-derived quiescence for `ft robot await quiescence:<pane>` (ft-r0977).
@@ -397,6 +397,10 @@ mod tests {
         assert!(!pane_is_quiescent(0, 59_999, 60_000));
         // Clock skew (now < last_output) saturates to not-quiescent.
         assert!(!pane_is_quiescent(100_000, 50_000, 10_000));
+        assert!(
+            !pane_is_quiescent(100_000, 50_000, 0),
+            "clock skew must remain fail-closed at a zero threshold"
+        );
     }
 
     #[test]

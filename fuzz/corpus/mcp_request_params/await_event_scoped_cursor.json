@@ -1,0 +1,1 @@
+{"name":"wa.await_event","arguments":{"all":["rule:build.done"],"timeout_secs":1,"poll_interval_ms":10,"cursor":7,"cursor_epoch":"0123456789abcdef0123456789abcdef","cursor_scope":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","pane":1,"unhandled":true,"claim":false,"checkpoint_only":false}}

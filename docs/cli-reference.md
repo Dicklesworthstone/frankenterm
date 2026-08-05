@@ -254,7 +254,9 @@ ft sync         # requires --features sync
 
 ## Robot mode (stable JSON/TOON)
 
-Robot mode uses a stable envelope and mirrors MCP schemas.
+Robot mode uses stable machine contracts. MCP shares the common envelope and
+documented data schemas where the two surfaces expose the same capability;
+surface-specific differences are explicit rather than implied parity.
 
 ```bash
 ft robot help
@@ -280,7 +282,7 @@ ft robot events label <event_id> --add <label> [--by <actor>]
 ft robot events label <event_id> --remove <label>
 ft robot events label <event_id> --list
 ft robot watch-events [--follow] [--severity <critical|error|warning|info>] [--rule-id <glob>] [--pane <id>] [--unhandled] [--claim] [--cursor <id> --cursor-epoch <32-lowercase-hex> --cursor-scope <64-lowercase-hex>] [--limit <n>] [--heartbeat-interval-ms <ms>] [--poll-interval-ms <ms>] [--max-hz <n>]
-ft robot await [--any 'rule:<glob>'|'quiescence:<pane>[:<idle_ms>]'] [--all 'rule:<glob>'|'quiescence:<pane>[:<idle_ms>]'] [--timeout-secs <n>] [--poll-interval-ms <ms>] [--cursor <id> --cursor-epoch <32-lowercase-hex> --cursor-scope <64-lowercase-hex>]
+ft robot await [--any 'rule:<glob>'|'quiescence:<pane>[:<idle_ms>]'] [--all 'rule:<glob>'|'quiescence:<pane>[:<idle_ms>]'] [--timeout-secs <n>] [--poll-interval-ms <ms>] [--checkpoint-only] [--cursor <id> --cursor-epoch <32-lowercase-hex> --cursor-scope <64-lowercase-hex>]
 
 ft robot workflow list
 ft robot workflow run <name> <pane_id> [--force] [--dry-run]
@@ -321,17 +323,34 @@ SHA-256 fingerprint of every membership filter, including `--since`, so a
 token cannot be reused after changing filters. `--since` is a nonnegative Unix
 epoch timestamp in milliseconds.
 
-`ft robot watch-events` and `ft robot await` are fixed compact-NDJSON streams;
+`ft robot watch-events` and `ft robot await` are fixed compact-NDJSON streams
+whose closed record union is `docs/json-schema/wa-robot-event-stream-record.json`;
 their success, control, and error records do not switch encoding when the
-global `--format` setting is JSON-pretty or TOON. Omitting the cursor triple
-does not replay existing rows. The command first acquires the current durable
-tail atomically and emits a committed `cursor_checkpoint`; only events created
-after that successful acquisition are eligible. A fresh await therefore emits
-at least two records: the baseline checkpoint and one terminal `await_result`.
-Resume by copying the complete cursor/epoch/scope triple. Await conditions may
-combine rule globs with storage-derived pane quiescence; an omitted quiescence
-idle threshold is canonicalized to the configured default and is part of the
-scope fingerprint.
+global `--format` setting is JSON-pretty or TOON. In particular,
+`--format toon` does not apply to these two streaming commands. Omitting the
+cursor triple does not replay existing rows. The command first acquires the
+current durable tail atomically and emits a committed `cursor_checkpoint`; only
+events created after that successful acquisition are eligible. Except in
+`--checkpoint-only` mode, a fresh await therefore emits at least two records:
+the baseline checkpoint and one terminal `await_result`. Resume by copying the
+complete cursor/epoch/scope triple. Await
+conditions may combine rule globs with storage-derived pane quiescence; an
+omitted quiescence idle threshold is canonicalized to the configured default
+and is part of the scope fingerprint. A missing pane produces a terminal
+`robot.pane_not_found` record rather than being mistaken for a pane with no
+captured output. `await --checkpoint-only` emits that exact condition-scoped
+tail checkpoint and exits, which lets a caller bootstrap a token without a
+timeout, a matching event, or terminating a long-lived child process. Each of
+`--any` and `--all` accepts at most 16 conditions, and each condition is bounded
+to 256 UTF-8 bytes.
+
+Rule matches inside a composite await are request-local latches. The published
+resume cursor advances across irrelevant rows, then holds immediately before
+the first rule occurrence needed by a still-incomplete composite. A timeout or
+recoverable error returns that held token so a later request replays the hidden
+partial match. A successful await commits only through the exact event that
+completed the composite, leaving later occurrences in the same storage page
+available to the next wait.
 
 `ft robot watch-events --claim` is flush-before-handle and at-least-once. It
 atomically leases each persisted event, emits and flushes a pending record whose
@@ -342,12 +361,13 @@ field is true. It then token-CAS marks the row handled and emits a committed
 token-CAS lease release. If release cannot reach storage, lease expiry remains
 the recovery path; a crash also leaves the event eligible for redelivery after
 expiry. The durable cursor advances only after successful finalization or
-exact evidence that another path already handled the row. Ambiguous
-finalization emits `claim_deferred` with the unchanged committed triple, and a
-missing row advances no cursor without authoritative retention evidence.
-Finalization races can therefore duplicate but cannot silently skip an event.
-Live-only `pane_discovered` and `pane_disappeared` notifications have no
-durable row and are not claimable.
+exact evidence that another path already handled the row. In one-shot mode,
+ambiguous finalization emits `claim_deferred` with the unchanged committed
+triple; follow mode retains that cursor and retries. A missing row advances no
+cursor without authoritative retention evidence. Finalization races can
+therefore duplicate but cannot silently skip an event. Live-only
+`pane_discovered` and `pane_disappeared` notifications have no durable row and
+are not claimable.
 
 Every durable event cursor is a three-part token: a nonnegative event ID, a
 128-bit lowercase-hex retention epoch, and a 256-bit lowercase-hex scope
@@ -362,8 +382,9 @@ In follow mode, a persisted detection received from the live IPC EventBus is a
 low-latency wakeup, not an ordering or payload authority. FrankenTerm re-enters
 the SQLite cursor drain and emits the exact stored rows in increasing event-ID
 order; this prevents out-of-order EventBus publication or dedupe conflicts from
-advancing the resumable cursor past an unseen row. Cursorless pane-lifecycle
-notifications remain direct, best-effort live records. The private IPC
+advancing the resumable cursor past an unseen row. Live-only pane-lifecycle
+notifications remain direct, best-effort records with `id: null`; the public
+relay attaches the follower's current committed cursor triple. The private IPC
 subscription requests a heartbeat no slower than the configured durable DB
 poll cadence, and each private heartbeat returns the follower to the SQLite
 drain. `--heartbeat-interval-ms 0` disables user-visible heartbeat records,
