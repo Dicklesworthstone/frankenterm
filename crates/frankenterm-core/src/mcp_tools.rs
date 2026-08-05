@@ -23330,10 +23330,23 @@ exit 17",
             &secret[split_at..],
             "x".repeat(2_000)
         );
+        let mut decision_context = super::DecisionContext::empty();
+        decision_context.domain = Some(hostile.clone());
+        decision_context.text_summary = Some(hostile.clone());
+        decision_context.workflow_id = Some(hostile.clone());
+        decision_context.capabilities.reserved_by = Some(hostile.clone());
+        decision_context.record_rule(
+            hostile.clone(),
+            true,
+            Some("allow"),
+            Some(hostile.clone()),
+        );
+        decision_context.add_evidence(hostile.clone(), hostile.clone());
         let mut data = super::McpSendData {
             pane_id: 17,
             injection: super::InjectionResult::Allowed {
-                decision: super::PolicyDecision::allow_with_rule("test.wa_send_output"),
+                decision: super::PolicyDecision::allow_with_rule("test.wa_send_output")
+                    .with_context(decision_context),
                 summary: hostile.clone(),
                 pane_id: 17,
                 action: ActionKind::SendText,
@@ -23361,6 +23374,14 @@ exit 17",
             serde_json::from_str(&json).expect("parse bounded wa.send response");
         for field in [
             value["injection"]["summary"].as_str(),
+            value["injection"]["decision"]["context"]["domain"].as_str(),
+            value["injection"]["decision"]["context"]["text_summary"].as_str(),
+            value["injection"]["decision"]["context"]["workflow_id"].as_str(),
+            value["injection"]["decision"]["context"]["capabilities"]["reserved_by"].as_str(),
+            value["injection"]["decision"]["context"]["rules_evaluated"][0]["rule_id"].as_str(),
+            value["injection"]["decision"]["context"]["rules_evaluated"][0]["reason"].as_str(),
+            value["injection"]["decision"]["context"]["evidence"][0]["key"].as_str(),
+            value["injection"]["decision"]["context"]["evidence"][0]["value"].as_str(),
             value["wait_for"]["pattern"].as_str(),
             value["verification_error"].as_str(),
         ] {
