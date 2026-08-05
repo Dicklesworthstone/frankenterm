@@ -236,6 +236,38 @@ fn scalar_sync_converges_after_short_fetch_byte_prefix() {
 }
 
 #[test]
+fn fts_batch_byte_budget_uses_authoritative_content_not_cached_length() {
+    let mut conn = Connection::open_in_memory().unwrap();
+    initialize_schema(&conn).unwrap();
+    apply_defer_fts_triggers(&conn);
+    insert_test_pane(&conn, 1);
+    insert_test_segment(&conn, 1, 0, &"x".repeat(64));
+    insert_test_segment(&conn, 1, 1, &"y".repeat(64));
+    conn.execute("UPDATE output_segments SET content_len = 0", [])
+        .unwrap();
+
+    with_fts_backend(&mut conn, |backend| {
+        let scalar = get_unindexed_segments_backend(backend, 1, 0, 2, true)?;
+        assert_eq!(
+            scalar
+                .iter()
+                .map(|segment| segment.content_len)
+                .collect::<Vec<_>>(),
+            vec![64, 64],
+            "the scalar path must derive the resource charge from content"
+        );
+
+        let set_based = insert_fts_entries_select_batch_backend(backend, 1, 0, 2, true, 80)?
+            .expect("set-based batch selects its first row");
+        assert_eq!(set_based.fetched_count, 2);
+        assert_eq!(set_based.indexed_count, 1);
+        assert_eq!(set_based.max_seq, 0);
+        Ok(())
+    })
+    .unwrap();
+}
+
+#[test]
 fn missing_fts_state_forces_authoritative_rebuild() {
     let mut conn = Connection::open_in_memory().unwrap();
     initialize_schema(&conn).unwrap();

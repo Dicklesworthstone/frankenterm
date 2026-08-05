@@ -1937,6 +1937,18 @@ fn canonical_retention_tier(
                 "storage.retention_tiers[{tier_index}].severities[{filter_index}] must not be empty"
             ));
         }
+        // SQLite's built-in NOCASE collation treats U+0000 as a string
+        // terminator. Accepting a NUL-bearing filter would therefore make SQL
+        // classification disagree with Rust's `eq_ignore_ascii_case` for
+        // bytes after the NUL. Stored severities may still contain arbitrary
+        // UTF-8; the compiled predicate below includes an exact byte-length
+        // guard so a normal filter cannot alias a longer stored value whose
+        // prefix ends at NUL.
+        if severity.contains('\0') {
+            return Err(format!(
+                "storage.retention_tiers[{tier_index}].severities[{filter_index}] must not contain NUL"
+            ));
+        }
         let canonical_key = severity.to_ascii_lowercase();
         if seen_severities.insert(canonical_key) {
             // Preserve the first operator-supplied spelling for diagnostics;
@@ -1980,7 +1992,14 @@ fn append_compiled_retention_tier_predicate(
             if index > 0 {
                 sql.push_str(" OR ");
             }
-            sql.push_str("severity = ? COLLATE NOCASE");
+            // NOCASE alone stops comparing at embedded NUL. The accepted
+            // filter cannot contain NUL (validated above), and this byte-length
+            // equality prevents a stored `"warning\0suffix"` from aliasing
+            // the ordinary `"warning"` filter while retaining exact Rust
+            // `eq_ignore_ascii_case` semantics for all accepted filters.
+            sql.push_str("(length(CAST(severity AS BLOB)) = ");
+            sql.push_str(&severity.len().to_string());
+            sql.push_str(" AND severity = ? COLLATE NOCASE)");
             bind_values.push(severity.clone());
         }
         sql.push(')');
@@ -8674,6 +8693,25 @@ recorder_backend = "franken_sqlite"
             config.resolve_retention_days("CRITICAL", "error", false),
             90
         );
+    }
+
+    #[test]
+    fn retention_tier_rejects_nul_bearing_severity_filters() {
+        let config = StorageConfig {
+            retention_tiers: vec![RetentionTier {
+                name: "invalid-nul-severity".to_string(),
+                retention_days: 7,
+                severities: vec!["warning\0suffix".to_string()],
+                event_types: Vec::new(),
+                handled: None,
+            }],
+            ..StorageConfig::default()
+        };
+
+        let error = config
+            .compile_retention_policy()
+            .expect_err("SQLite NOCASE cannot represent NUL-bearing severity filters exactly");
+        assert!(error.contains("severities[0] must not contain NUL"));
     }
 
     #[test]

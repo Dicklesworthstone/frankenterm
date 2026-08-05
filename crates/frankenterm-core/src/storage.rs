@@ -10043,6 +10043,11 @@ impl StorageIoWriterGate {
     fn finish_batch(&mut self) {
         if self.scheduler.aggregate_items() == 0 {
             self.next_ordering_sequence_by_stream.clear();
+            // Work IDs only need to be unique while commands are resident in
+            // this gate. Reset at the empty-batch boundary so a process that
+            // runs indefinitely can never saturate `u64` and overwrite a live
+            // command in `pending_io` with a duplicate ID.
+            self.next_work_id = 1;
         }
     }
 
@@ -10169,10 +10174,11 @@ fn dispatch_write_command_batch(
 
     while let Some(cmd) = batch.pop_front() {
         if *should_break {
-            fail_undispatched_write_commands(
-                batch,
-                "storage writer shut down before dispatch".to_string(),
-            );
+            let message = "storage writer shut down before dispatch".to_string();
+            *should_break |= fail_undispatched_write_command(cmd, message.clone());
+            if fail_undispatched_write_commands(batch, message) {
+                *should_break = true;
+            }
             io_gate.finish_batch();
             return;
         }
@@ -10215,6 +10221,7 @@ fn dispatch_write_command_batch(
             io_gate,
             group_commit_events,
         ) {
+            *should_break |= fail_undispatched_write_command(cmd, message.clone());
             if fail_undispatched_write_commands(batch, message) {
                 *should_break = true;
             }
@@ -10237,10 +10244,11 @@ fn dispatch_write_command_batch(
                 return;
             }
         } else {
-            fail_undispatched_write_commands(
-                batch,
-                "storage writer shut down before dispatch".to_string(),
-            );
+            let message = "storage writer shut down before dispatch".to_string();
+            *should_break |= fail_undispatched_write_command(cmd, message.clone());
+            if fail_undispatched_write_commands(batch, message) {
+                *should_break = true;
+            }
             io_gate.finish_batch();
             return;
         }
@@ -10330,9 +10338,11 @@ fn flush_storage_io_pending_commands(
                 mmap_mirror,
                 segment_redactors,
             ) {
-                // The flushed appends were already failed inside the flush; drop
-                // the still-undispatched `cmd` (closing its oneshot, matching the
-                // legacy fail path) and fail the rest.
+                // The flushed appends were already failed inside the flush.
+                // Return the same typed failure to the command that forced the
+                // flush before failing the remaining scheduler tail; merely
+                // dropping its oneshot would erase the recovered-panic cause.
+                *should_break |= fail_undispatched_write_command(cmd, message.clone());
                 fail_pending_event_gap(std::mem::take(&mut pending_event_gap), message.clone());
                 fail_pending_storage_io_commands(std::mem::take(pending_io), message.clone());
                 io_gate.reset_after_panic();
@@ -10346,6 +10356,7 @@ fn flush_storage_io_pending_commands(
                 mmap_mirror,
                 segment_redactors,
             ) {
+                *should_break |= fail_undispatched_write_command(cmd, message.clone());
                 fail_pending_append_segments(
                     std::mem::take(&mut pending_append_segments),
                     message.clone(),
@@ -11234,8 +11245,36 @@ fn storage_io_option_str_bytes(value: Option<&str>) -> u64 {
     value.map_or(0, storage_io_str_bytes)
 }
 
+#[derive(Default)]
+struct StorageIoJsonByteCounter {
+    bytes: u64,
+}
+
+impl std::io::Write for StorageIoJsonByteCounter {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        self.bytes = self
+            .bytes
+            .saturating_add(u64::try_from(buffer.len()).unwrap_or(u64::MAX));
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 fn storage_io_json_bytes(value: Option<&serde_json::Value>) -> u64 {
-    value.map_or(0, |json| storage_io_str_bytes(&json.to_string()))
+    value.map_or(0, |json| {
+        // Preserve exact serialized-size accounting without materializing a
+        // temporary JSON String for every event admitted to the writer. A
+        // serde_json::Value cannot fail to serialize through this infallible
+        // sink; retain a conservative maximum if that invariant ever changes.
+        let mut counter = StorageIoJsonByteCounter::default();
+        match serde_json::to_writer(&mut counter, json) {
+            Ok(()) => counter.bytes.max(1),
+            Err(_) => u64::MAX,
+        }
+    })
 }
 
 fn storage_io_stored_event_bytes(event: &StoredEvent) -> u64 {
@@ -11591,6 +11630,22 @@ mod writer_io_scheduler_tests {
     }
 
     #[test]
+    fn writer_json_cost_counts_serialized_bytes_without_semantic_shortcuts() {
+        let value = serde_json::json!({
+            "escaped": "quote=\" newline=\n emoji=😀",
+            "nested": [null, true, -17, {"key": "value"}],
+        });
+        let expected = serde_json::to_vec(&value)
+            .expect("serialize scheduler JSON fixture")
+            .len();
+        assert_eq!(
+            storage_io_json_bytes(Some(&value)),
+            u64::try_from(expected).expect("fixture length fits u64")
+        );
+        assert_eq!(storage_io_json_bytes(None), 0);
+    }
+
+    #[test]
     fn writer_io_gate_preserves_segment_gap_order_inside_batch() {
         let mut gate = tiny_writer_gate();
         let segment = segment_command(7, "first durable segment");
@@ -11753,9 +11808,11 @@ mod writer_io_scheduler_tests {
         assert!(gate.next_ordering_sequence_by_stream.is_empty());
 
         let next_segment = segment_command(11, "new batch segment");
-        let (_, next_decision) = gate.admit_command(&next_segment).unwrap();
+        let (next_id, next_decision) = gate.admit_command(&next_segment).unwrap();
         assert!(next_decision.outcome.accepted());
         let dispatched = gate.pop_next().unwrap();
+        assert_eq!(next_id, 1, "empty batches reset the bounded work-ID epoch");
+        assert_eq!(dispatched.item.id, next_id);
         let ordering = dispatched.item.ordering.unwrap();
         assert_eq!(ordering.stream, "pane:11");
         assert_eq!(ordering.sequence, 0);
@@ -11800,7 +11857,6 @@ mod writer_io_scheduler_tests {
                 capture_hold: None,
                 respond: second_tx,
             });
-
             dispatch_write_command_batch(
                 &backend,
                 batch,
@@ -12015,6 +12071,8 @@ mod writer_io_scheduler_tests {
             let mut segment_redactors = HashMap::<u64, SegmentPersistRedactor>::new();
             let (first_tx, first_rx) = oneshot::channel();
             let (second_tx, second_rx) = oneshot::channel();
+            let (routed_tail_tx, routed_tail_rx) = oneshot::channel();
+            let (barrier_tail_tx, barrier_tail_rx) = oneshot::channel();
             let mut batch = VecDeque::new();
             batch.push_back(WriteCommand::AppendSegment {
                 pane_id: 77,
@@ -12031,6 +12089,33 @@ mod writer_io_scheduler_tests {
                 zone_type: None,
                 capture_hold: None,
                 respond: second_tx,
+            });
+            batch.push_back(WriteCommand::RecordEvent {
+                event: StoredEvent {
+                    id: 0,
+                    pane_id: 77,
+                    rule_id: "panic-tail-event".to_string(),
+                    agent_type: "test".to_string(),
+                    event_type: "panic.tail".to_string(),
+                    severity: "info".to_string(),
+                    confidence: 1.0,
+                    extracted: None,
+                    matched_text: None,
+                    segment_id: None,
+                    detected_at: 1,
+                    dedupe_key: None,
+                    handled_at: None,
+                    handled_by_workflow_id: None,
+                    handled_status: None,
+                },
+                capture_hold: None,
+                respond: routed_tail_tx,
+            });
+            batch.push_back(WriteCommand::MarkEventHandled {
+                event_id: 42,
+                workflow_id: None,
+                status: "panic-tail-barrier".to_string(),
+                respond: barrier_tail_tx,
             });
 
             dispatch_write_command_batch(
@@ -12073,6 +12158,30 @@ mod writer_io_scheduler_tests {
                 "{second_error}"
             );
             assert!(!second_error.to_string().contains("SECRET-APPEND-SENTINEL"));
+
+            let routed_tail_result = crate::runtime_async::oneshot_recv(routed_tail_rx)
+                .await
+                .expect("routed command that forced the append flush should receive an error");
+            let routed_tail_error =
+                routed_tail_result.expect_err("routed flush tail must fail closed");
+            assert!(
+                routed_tail_error
+                    .to_string()
+                    .contains("storage writer recovered from append group commit panic"),
+                "{routed_tail_error}"
+            );
+
+            let barrier_tail_result = crate::runtime_async::oneshot_recv(barrier_tail_rx)
+                .await
+                .expect("barrier command after the failed routed flush should receive an error");
+            let barrier_tail_error =
+                barrier_tail_result.expect_err("barrier flush tail must fail closed");
+            assert!(
+                barrier_tail_error
+                    .to_string()
+                    .contains("storage writer recovered from append group commit panic"),
+                "{barrier_tail_error}"
+            );
         });
     }
 
@@ -12192,9 +12301,16 @@ mod writer_io_scheduler_tests {
             );
 
             let (shutdown_tx, shutdown_rx) = oneshot::channel();
+            let (post_shutdown_tx, post_shutdown_rx) = oneshot::channel();
             let mut shutdown_batch = VecDeque::new();
             shutdown_batch.push_back(WriteCommand::Shutdown {
                 respond: shutdown_tx,
+            });
+            shutdown_batch.push_back(WriteCommand::MarkEventHandled {
+                event_id: 43,
+                workflow_id: None,
+                status: "must-not-run-after-shutdown".to_string(),
+                respond: post_shutdown_tx,
             });
             dispatch_write_command_batch(
                 &backend,
@@ -12209,6 +12325,17 @@ mod writer_io_scheduler_tests {
                 .await
                 .expect("writer should still process a later shutdown");
             assert!(should_break);
+            let post_shutdown_result = crate::runtime_async::oneshot_recv(post_shutdown_rx)
+                .await
+                .expect("the first command after shutdown must receive a typed result");
+            let post_shutdown_error = post_shutdown_result
+                .expect_err("commands after shutdown must fail without being dispatched");
+            assert!(
+                post_shutdown_error
+                    .to_string()
+                    .contains("storage writer shut down before dispatch"),
+                "{post_shutdown_error}"
+            );
         });
     }
 
@@ -18782,7 +18909,7 @@ const SIZE_EVICTION_DOMINANCE_CONTENT_MULTIPLIER: u64 = 4;
 /// than deleting every segment when unrelated tables alone exceed the cap.
 const SIZE_EVICTION_DOMINANCE_ALLOWANCE_BYTES: u64 = 64 * 1024;
 const OLDEST_SEGMENT_EVICTION_SAMPLE_SQL: &str =
-    "SELECT content_len FROM output_segments
+    "SELECT length(CAST(content AS BLOB)) FROM output_segments
      ORDER BY captured_at ASC, id ASC LIMIT ?1";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -18816,10 +18943,10 @@ fn oldest_segment_eviction_sample_backend(
     for row in rows.iter().take(SIZE_EVICTION_BATCH) {
         let content_len = RowReader::new(row)
             .i64(0)
-            .map_err(|error| storage_backend_error("Size-eviction sample content length", error))?;
+            .map_err(|error| storage_backend_error("Size-eviction sample content bytes", error))?;
         let content_len = u64::try_from(content_len).map_err(|_| {
             StorageError::Database(format!(
-                "size-eviction sample contained negative content_len {content_len}"
+                "size-eviction sample contained negative content byte length {content_len}"
             ))
         })?;
         sampled_rows = sampled_rows.checked_add(1).ok_or_else(|| {
@@ -20706,7 +20833,10 @@ fn retention_tier_match_predicate(
             .iter()
             .map(|severity| {
                 params.push(ToSqlValue::OwnedText(severity.clone()));
-                "severity = ? COLLATE NOCASE".to_string()
+                format!(
+                    "(length(CAST(severity AS BLOB)) = {} AND severity = ? COLLATE NOCASE)",
+                    severity.len()
+                )
             })
             .collect::<Vec<_>>();
         clauses.push(format!("({})", conditions.join(" OR ")));
@@ -22832,6 +22962,41 @@ fn segment_from_backend_cells(row: &[SqlCell]) -> Result<Segment> {
     })
 }
 
+/// Decode the narrower FTS-catch-up row shape while charging the authoritative
+/// UTF-8 bytes that will actually be inserted into FTS. `content_len` is a
+/// cached statistics column and can be stale in legacy or externally repaired
+/// databases, so it is deliberately absent from this resource-boundary query.
+fn fts_segment_from_backend_cells(row: &[SqlCell]) -> Result<Segment> {
+    let reader = CellRowReader::new(row);
+    let pane_id = reader
+        .i64(1)
+        .and_then(|value| backend_i64_to_u64(value, "output_segments.pane_id"))
+        .map_err(|err| storage_backend_error("FTS segment pane_id", err))?;
+    let seq = reader
+        .i64(2)
+        .and_then(|value| backend_i64_to_u64(value, "output_segments.seq"))
+        .map_err(|err| storage_backend_error("FTS segment seq", err))?;
+    let content = reader
+        .string(3)
+        .map_err(|err| storage_backend_error("FTS segment content", err))?;
+    let content_len = content.len();
+    Ok(Segment {
+        id: reader
+            .i64(0)
+            .map_err(|err| storage_backend_error("FTS segment id", err))?,
+        pane_id,
+        seq,
+        content,
+        content_len,
+        content_hash: reader
+            .optional_string(4)
+            .map_err(|err| storage_backend_error("FTS segment content_hash", err))?,
+        captured_at: reader
+            .i64(5)
+            .map_err(|err| storage_backend_error("FTS segment captured_at", err))?,
+    })
+}
+
 fn check_fts_integrity_backend(backend: &dyn StorageBackend) -> Result<bool> {
     match backend.execute_batch(
         "INSERT INTO output_segments_fts(output_segments_fts) VALUES('integrity-check')",
@@ -22958,13 +23123,13 @@ fn get_unindexed_segments_backend(
     include_from_zero: bool,
 ) -> Result<Vec<Segment>> {
     let sql = if include_from_zero {
-        "SELECT id, pane_id, seq, content, content_len, content_hash, captured_at
+        "SELECT id, pane_id, seq, content, content_hash, captured_at
              FROM output_segments
              WHERE pane_id = ?1
              ORDER BY seq
              LIMIT ?3"
     } else {
-        "SELECT id, pane_id, seq, content, content_len, content_hash, captured_at
+        "SELECT id, pane_id, seq, content, content_hash, captured_at
              FROM output_segments
              WHERE pane_id = ?1 AND seq > ?2
              ORDER BY seq
@@ -22984,7 +23149,7 @@ fn get_unindexed_segments_backend(
         )
         .map_err(|err| storage_backend_error("Failed to query unindexed segments", err))?;
     rows.iter()
-        .map(|row| segment_from_backend_cells(row))
+        .map(|row| fts_segment_from_backend_cells(row))
         .collect()
 }
 
@@ -23041,9 +23206,9 @@ pub fn set_fts_insert_select_batch_override_for_bench(enabled: Option<bool>) {
 fn fts_insert_select_batch_summary_sql(include_from_zero: bool) -> &'static str {
     if include_from_zero {
         "WITH limited AS (
-             SELECT id, seq, content, content_len,
+             SELECT seq, length(CAST(content AS BLOB)) AS content_bytes,
                     ROW_NUMBER() OVER (ORDER BY seq) AS batch_ordinal,
-                    SUM(content_len) OVER (
+                    SUM(length(CAST(content AS BLOB))) OVER (
                         ORDER BY seq ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
                     ) AS running_bytes
              FROM output_segments
@@ -23052,7 +23217,7 @@ fn fts_insert_select_batch_summary_sql(include_from_zero: bool) -> &'static str 
              LIMIT ?3
          ),
          selected AS (
-             SELECT id, seq, content
+             SELECT seq
              FROM limited
              WHERE batch_ordinal = 1 OR running_bytes <= ?4
          )
@@ -23060,12 +23225,12 @@ fn fts_insert_select_batch_summary_sql(include_from_zero: bool) -> &'static str 
              (SELECT COUNT(*) FROM limited) AS fetched_count,
              (SELECT COUNT(*) FROM selected) AS indexed_count,
              (SELECT MAX(seq) FROM selected) AS max_seq,
-             (SELECT MIN(content_len) FROM limited) AS min_content_len"
+             (SELECT MIN(content_bytes) FROM limited) AS min_content_bytes"
     } else {
         "WITH limited AS (
-             SELECT id, seq, content, content_len,
+             SELECT seq, length(CAST(content AS BLOB)) AS content_bytes,
                     ROW_NUMBER() OVER (ORDER BY seq) AS batch_ordinal,
-                    SUM(content_len) OVER (
+                    SUM(length(CAST(content AS BLOB))) OVER (
                         ORDER BY seq ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
                     ) AS running_bytes
              FROM output_segments
@@ -23074,7 +23239,7 @@ fn fts_insert_select_batch_summary_sql(include_from_zero: bool) -> &'static str 
              LIMIT ?3
          ),
          selected AS (
-             SELECT id, seq, content
+             SELECT seq
              FROM limited
              WHERE batch_ordinal = 1 OR running_bytes <= ?4
          )
@@ -23082,16 +23247,16 @@ fn fts_insert_select_batch_summary_sql(include_from_zero: bool) -> &'static str 
              (SELECT COUNT(*) FROM limited) AS fetched_count,
              (SELECT COUNT(*) FROM selected) AS indexed_count,
              (SELECT MAX(seq) FROM selected) AS max_seq,
-             (SELECT MIN(content_len) FROM limited) AS min_content_len"
+             (SELECT MIN(content_bytes) FROM limited) AS min_content_bytes"
     }
 }
 
 fn fts_insert_select_batch_sql(include_from_zero: bool) -> &'static str {
     if include_from_zero {
         "WITH limited AS (
-             SELECT id, seq, content, content_len,
+             SELECT id, seq, content,
                     ROW_NUMBER() OVER (ORDER BY seq) AS batch_ordinal,
-                    SUM(content_len) OVER (
+                    SUM(length(CAST(content AS BLOB))) OVER (
                         ORDER BY seq ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
                     ) AS running_bytes
              FROM output_segments
@@ -23106,9 +23271,9 @@ fn fts_insert_select_batch_sql(include_from_zero: bool) -> &'static str {
          ORDER BY seq"
     } else {
         "WITH limited AS (
-             SELECT id, seq, content, content_len,
+             SELECT id, seq, content,
                     ROW_NUMBER() OVER (ORDER BY seq) AS batch_ordinal,
-                    SUM(content_len) OVER (
+                    SUM(length(CAST(content AS BLOB))) OVER (
                         ORDER BY seq ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
                     ) AS running_bytes
              FROM output_segments
@@ -23184,20 +23349,22 @@ fn insert_fts_entries_select_batch_backend(
         ))
         .into());
     }
-    let min_content_len = reader
+    let min_content_bytes = reader
         .optional_i64(3)
-        .map_err(|err| storage_backend_error("Failed to parse set-based FTS min_content_len", err))?;
-    if fetched_count > 0 && min_content_len.is_none() {
+        .map_err(|err| {
+            storage_backend_error("Failed to parse set-based FTS min_content_bytes", err)
+        })?;
+    if fetched_count > 0 && min_content_bytes.is_none() {
         return Err(StorageError::Database(
-            "set-based FTS batch fetched rows without a minimum content length".to_string(),
+            "set-based FTS batch fetched rows without a minimum content byte length".to_string(),
         )
         .into());
     }
-    if let Some(min_content_len) = min_content_len
-        && min_content_len < 0
+    if let Some(min_content_bytes) = min_content_bytes
+        && min_content_bytes < 0
     {
         return Err(StorageError::Database(format!(
-            "set-based FTS batch encountered negative content_len {min_content_len}",
+            "set-based FTS batch encountered negative content byte length {min_content_bytes}",
         ))
         .into());
     }
@@ -27550,6 +27717,54 @@ fn retention_policy_sql_prefix_matches_rust_for_multibyte_and_embedded_nul() {
 }
 
 #[test]
+fn retention_policy_sql_severity_does_not_alias_a_nul_terminated_prefix() {
+    let backend = memory_backend();
+    seed_pane_backend(&backend, 1, 1);
+    seed_retention_event_backend(&backend, 1, "WARNING", "ordinary", 10, None);
+    seed_retention_event_backend(
+        &backend,
+        1,
+        "WARNING\0private-suffix",
+        "nul-bearing",
+        10,
+        None,
+    );
+
+    let tier = RetentionTier {
+        name: "warning-only".to_string(),
+        retention_days: 1,
+        severities: vec!["warning".to_string()],
+        event_types: Vec::new(),
+        handled: None,
+    };
+    assert!("warning".eq_ignore_ascii_case("WARNING"));
+    assert!(!"warning".eq_ignore_ascii_case("WARNING\0private-suffix"));
+    let compiled = compile_retention_policy_tiers(std::slice::from_ref(&tier)).unwrap();
+
+    assert_eq!(
+        count_events_by_retention_rule_backend(&backend, 100, Some(&tier), &[]).unwrap(),
+        1,
+        "legacy SQL classification must match Rust beyond SQLite NOCASE's NUL terminator"
+    );
+    assert_eq!(
+        count_events_by_compiled_retention_branch_backend(&backend, 100, &compiled, 0).unwrap(),
+        1,
+        "compiled SQL classification must reject the longer NUL-bearing severity"
+    );
+    assert_eq!(
+        count_events_by_compiled_retention_branch_backend(
+            &backend,
+            100,
+            &compiled,
+            compiled.fallback_branch_index(),
+        )
+        .unwrap(),
+        1,
+        "the NUL-bearing severity must remain in the fallback partition"
+    );
+}
+
+#[test]
 fn compiled_retention_policy_counts_and_drains_all_branches_in_one_scan() {
     let backend = memory_backend();
     seed_pane_backend(&backend, 1, 1);
@@ -29727,6 +29942,27 @@ fn size_eviction_estimator_samples_bounded_oldest_rows_via_index() {
         !plan.contains("USE TEMP B-TREE FOR ORDER BY"),
         "bounded oldest-segment sample must not sort full history:\n{plan}"
     );
+}
+
+#[test]
+fn size_eviction_estimator_uses_authoritative_content_bytes() {
+    let backend = memory_backend();
+    seed_pane_backend(&backend, 1, 1);
+    execute_typed(
+        &backend,
+        "INSERT INTO output_segments (pane_id, seq, content, content_len, captured_at)
+         VALUES (1, 0, 'tiny', 999999, 1),
+                (1, 1, '猫', -1, 2)",
+        &[],
+    )
+    .expect("seed stale cached segment lengths");
+
+    let sample = oldest_segment_eviction_sample_backend(&backend)
+        .expect("derive size-eviction charge from stored content");
+    assert_eq!(sample.sampled_rows, 2);
+    assert_eq!(sample.sampled_content_bytes, 7);
+    assert_eq!(sample.largest_content_bytes, 4);
+    assert!(sample.contains_every_segment);
 }
 
 #[test]
