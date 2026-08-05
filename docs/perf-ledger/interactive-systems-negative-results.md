@@ -2570,6 +2570,94 @@ experiment. It is not converted into a flattering keep or a durable rejection.
 - **Primary retry condition:**
   > Promote encoded-frame authority only after every production constructor is classified, raw construction is test-only, final write admission proves the actual encoded family and serial, and cross-wired metadata/byte fixtures fail before queue or network effects.
 
+### IS-N080 — EventBus arrival order is not a durable resume-cursor authority
+
+- **Classification:** out-of-order delivery and false-authority rejection;
+  persisted watch records reduced to wakeups
+- **Beads:** `ft-7h5da.4.8`, `ft-ubuw2`, and `ft-1vca6`
+- **Rejected candidate:** emit each persisted `EventBus` record directly and
+  advance the consumer resume cursor to the record's database ID.
+- **Negative evidence:** durable rows can commit and publish from independent
+  producers in a different order. Receiving ID 11 before ID 10 and exposing
+  cursor 11 makes a disconnect or later `id > cursor` scan omit ID 10. A
+  bounded-broadcast lag marker detects dropped channel records, but it cannot
+  turn channel arrival order or payload identity into SQLite ordering
+  authority. Dedupe conflicts can also associate a current attempted payload
+  with an older stored ID.
+- **Decision:** the robot watch follower now treats cursor-bearing IPC records
+  only as wakeups and fetches exact payloads in ascending SQLite-ID order.
+  Cursorless lifecycle signals stay distinctly best-effort. The shared
+  `FilteredEventStream` remains unqualified until `ft-7h5da.4.8` gives it the
+  same storage-owned scan/acknowledgment state machine.
+- **Primary retry condition:**
+  > Permit a persisted bus record to advance a resume cursor only after deterministic out-of-order, subscribe-before-drain, lag, reconnect, filtered-row, claim-contention, output-failure, and retention-expiry proofs show that every durable row is scanned in storage order and no unacknowledged row can be skipped.
+
+### IS-N081 — Insert-then-publish adjacency is not an atomic delivery boundary
+
+- **Classification:** crash-window and false-completion rejection; durable
+  outbox follow-on required
+- **Bead:** `ft-7h5da.4.9`
+- **Rejected inference:** a successful event insert followed immediately by an
+  in-memory `EventBus::publish` is effectively atomic because both operations
+  occur in one producer function.
+- **Negative evidence:** process death, cancellation, panic, or runtime failure
+  can occur after SQLite commit and before publication. The event then exists
+  durably but workflow and connector consumers may never receive a wakeup.
+  Publishing first is also invalid because consumers could act on a row whose
+  transaction later fails. The new `EventRecordOutcome` correctly suppresses
+  duplicate live publication, but it cannot close this two-commit crash seam.
+- **Decision:** keep insert outcome as dedupe authority and do not fake atomic
+  publication. `ft-7h5da.4.9` requires an outbox intent committed in the event
+  transaction, bounded token-CAS replay, a frozen per-event delivery plan, and
+  idempotent per-consumer receipts.
+- **Primary retry condition:**
+  > Treat durable insert as complete downstream delivery only after crash injection at every post-commit boundary proves startup and periodic replay conserve every required sink effect, duplicate attempts converge through stable receipts, and ambiguous external effects fail closed rather than being silently retried or dropped.
+
+### IS-N082 — A single unkeyed response-delivery slot cannot survive concurrent MCP
+
+- **Classification:** concurrency and cross-request authority rejection;
+  sequential containment retained
+- **Beads:** `ft-7h5da.4.7` and `ft-7h5da.4.10`
+- **Rejected candidate:** remove FastMCP's per-connection request serialization
+  while retaining one prepared/armed delivery-action slot that finalizes after
+  the next response flush.
+- **Negative evidence:** two requests completing out of order can arm, replace,
+  finalize, or release the wrong event leases. The current sequential transport
+  makes the single-flight coordinator safe, but a long `wa.await_event` also
+  prevents the reader from receiving later work and the very
+  `notifications/cancelled` frame intended to stop that request.
+- **Decision:** retain truthful sequential delivery acknowledgment now and
+  document the head-of-line/cancellation limitation. Concurrent dispatch is
+  blocked on `ft-7h5da.4.10`: dedicated reader, bounded structured request
+  tasks, one frame writer, and delivery actions keyed by JSON-RPC ID plus an
+  unforgeable request generation.
+- **Primary retry condition:**
+  > Enable concurrent per-connection tool execution only after out-of-order response, duplicate-ID, ID-reuse, cancellation/completion race, partial-write, flush-failure, connection-close, and saturation models prove at most one response per request generation and no lease action can cross request boundaries.
+
+### IS-N083 — Structural correctness work is not M4/M5/Threadripper performance proof
+
+- **Classification:** wrong-evidence-pipeline rejection; improvements retained
+  without native latency claims
+- **Beads:** `ft-interactive-systems-performance-4tenz`,
+  `ft-interactive-swarm-product-convergence-7xqz4.8.10`, and
+  `ft-interactive-systems-performance-4tenz.13`
+- **Rejected inference:** sharded route maps, bounded lease scans, batched parser
+  policy, ordered durable drains, and reduced hot-loop allocation necessarily
+  establish improved keypress, resize, zoom, or long-session responsiveness on
+  recent Apple silicon and the 128-core Threadripper host.
+- **Negative evidence:** these changes have static and focused remote
+  correctness evidence only. The ordered-window path remains capability-fenced,
+  durable tab-order restoration remains incomplete, and the retained
+  target-class resource-cockpit artifact is still `skipped_not_proven`. No
+  current-source native key-to-photon, continuous-resize, visual-equivalence,
+  long-soak, thermal, energy, or NUMA result exists for M4, M5, or `trj`.
+- **Decision:** retain the structural changes because they close concrete
+  correctness and boundedness defects, but make no target-performance claim.
+  Qualification must use isolated fixtures and named target artifacts without
+  launching, attaching to, or perturbing a user's live FrankenTerm session.
+- **Primary retry condition:**
+  > Promote any Apple-silicon or Threadripper performance claim only after exact-source baseline/candidate A/B runs retain target identity, workload and font/config hashes, p50/p95/p99/p999 with uncertainty, visual/state equivalence, RSS and allocation slopes, thermal/energy context, and rollback evidence for quiet plus q20/q50/q200 long-session workloads.
+
 ## Open hypothesis register
 
 These are not negative results. Each remains open until a retained same-window
