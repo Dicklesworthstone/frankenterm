@@ -1105,12 +1105,33 @@ fn fatal_toast_notification(title: &str, message: &str) {
 }
 
 fn notify_on_panic() {
-    let default_hook = std::panic::take_hook();
+    let previous_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        if let Some(s) = info.payload().downcast_ref::<&str>() {
-            fatal_toast_notification("FrankenTerm panic", s);
+        // Audited catches mark the unwind before the hook runs. Suppress every
+        // fatal surface here; catch_recoverable emits bounded telemetry only
+        // after control safely reaches the recovery branch. This must precede
+        // payload classification: plugin-controlled panic text can imitate an
+        // EPIPE message but cannot override the audited marker.
+        if frankenterm_sigpipe::is_recoverable_panic() {
+            return;
         }
-        default_hook(info);
+        // Unmarked EPIPE retains its deterministic quiet exit through the
+        // inner shared hook. Never raise a toast for a closed pipeline.
+        if frankenterm_sigpipe::panic_is_broken_pipe(info) {
+            previous_hook(info);
+            return;
+        }
+
+        let report_claim = frankenterm_sigpipe::FatalReportClaim::enter();
+        if report_claim.is_owner() {
+            fatal_toast_notification(
+                "FrankenTerm fatal error",
+                "FrankenTerm encountered an internal error and must exit.",
+            );
+        }
+        // The claim stays live through delegation, so the shared sanitized
+        // terminal hook cannot emit a duplicate report.
+        previous_hook(info);
     }));
 }
 
@@ -1140,14 +1161,12 @@ fn main() {
     // identity without executing the GUI or creating a window.
     std::hint::black_box(FT_ATOMIC_COMPONENT_MARKER);
 
+    // Install the privacy-bounded terminal hook first. The GUI notifier wraps
+    // this chain below; reversing the order would discard the notifier.
+    frankenterm_sigpipe::exit_quietly_on_broken_pipe();
     config::designate_this_as_the_main_thread();
     config::assign_error_callback(mux::connui::show_configuration_error_message);
     notify_on_panic();
-    // GH#75: installed after notify_on_panic so broken-pipe write panics
-    // (e.g. `frankenterm-gui show-keys | head -5`) exit 141 quietly instead
-    // of raising a panic toast and SIGABRT under panic = "abort". Non-EPIPE
-    // panics still reach the notify hook unchanged.
-    frankenterm_sigpipe::exit_quietly_on_broken_pipe();
     log_renderer_rollout_env_overrides();
     if let Err(e) = run() {
         terminate_with_error(e);

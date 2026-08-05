@@ -57,7 +57,7 @@ _Counts are auto-stamped by `scripts/stamp-readme-counts.sh` and drift fast. See
 <h3>Quick Install</h3>
 
 ```bash
-cargo install --git https://github.com/Dicklesworthstone/frankenterm.git --bin ft frankenterm
+cargo install --profile release-interactive --git https://github.com/Dicklesworthstone/frankenterm.git --bin ft frankenterm
 ```
 
 `ft --version` works immediately after install. `ft doctor` / `ft doctor --json` run immediately. Pane/session operations that talk to the live mux require WezTerm CLI in `PATH` and a reachable mux/GUI for `wezterm cli list`.
@@ -70,7 +70,7 @@ cargo install --git https://github.com/Dicklesworthstone/frankenterm.git --bin f
 
 **The Problem.** Running large AI coding swarms across ad-hoc terminal panes is chaos. When you're driving 50–200 Claude Code / Codex / Gemini agents at once, a single undetected rate limit wastes hours of compute. A stuck agent silently burns tokens. An auth failure goes unnoticed for thirty minutes. You have no search across agent output, no audit trail, no way for one AI to safely control another, and no way to know whether your swarm is operating inside or outside its safe envelope.
 
-**The Solution.** `ft` is a **full terminal platform for agent swarms** with deep observability, deterministic eventing, policy-gated automation, machine-native control surfaces (Robot Mode + MCP), and a fail-closed operating-envelope contract. It captures every byte of terminal output across every pane, detects state transitions via multi-pattern matching plus Bayesian change-point detection, triggers transactional workflows in response, and exposes all of it through a JSON API built for AI-to-AI orchestration. The closest analogy is Kubernetes for terminal-based AI agents: observe, detect, react, audit, and refuse to drive the swarm outside its proven safe envelope.
+**The Solution.** `ft` is a **full terminal platform for agent swarms** with deep observability, deterministic eventing, policy-gated automation, machine-native control surfaces (Robot Mode + MCP), and a fail-closed operating-envelope contract. It captures bounded terminal-output deltas across observed panes and records explicit gaps whenever continuity cannot be established, detects state transitions via multi-pattern matching plus Bayesian change-point detection, triggers transactional workflows in response, and exposes those surfaces through a JSON API built for AI-to-AI orchestration. The closest analogy is Kubernetes for terminal-based AI agents: observe, detect, react, audit, and refuse to drive the swarm outside its proven safe envelope.
 
 **Runtime model.** Fully `Cx`-aware, structured, cancel-correct async on **asupersync**. Direct `tokio` usage is **banned at the dependency level** via `cargo-deny` and at the type level via the `RuntimeProof` sealed trait. The `runtime_async` module is the canonical asupersync wrapper that every first-party crate imports. The dual-runtime era is over.
 
@@ -754,33 +754,33 @@ Post-install expectations:
 ```bash
 git clone https://github.com/Dicklesworthstone/frankenterm.git
 cd frankenterm
-cargo build --release
-cp target/release/ft ~/.local/bin/
+cargo build --profile release-interactive
+cp target/release-interactive/ft ~/.local/bin/
 ```
 
 ### With optional features
 
 ```bash
 # MCP server support
-cargo build -p frankenterm --release --features mcp
+cargo build -p frankenterm --profile release-interactive --features mcp
 
 # Web API with SSE event/delta streaming
-cargo build -p frankenterm --release --features web
+cargo build -p frankenterm --profile release-interactive --features web
 
 # Distributed mode (agent streaming)
-cargo build -p frankenterm --release --features distributed
+cargo build -p frankenterm --profile release-interactive --features distributed
 
 # Semantic search (ML embeddings)
-cargo build -p frankenterm --release --features semantic-search
+cargo build -p frankenterm --profile release-interactive --features semantic-search
 
 # TUI dashboard (FrankenTUI backend)
-cargo build -p frankenterm --release --features ftui
+cargo build -p frankenterm --profile release-interactive --features ftui
 
 # Legacy ratatui parity oracle for development/regression checks
 cargo build -p frankenterm --features tui-oracle
 
 # Everything
-cargo build -p frankenterm --release --all-features
+cargo build -p frankenterm --profile release-interactive --all-features
 ```
 
 ### Requirements
@@ -1257,7 +1257,7 @@ Error codes include `robot.pane_not_found`, `robot.timeout`, `robot.wezterm_not_
 ### MCP (Model Context Protocol)
 
 ```bash
-cargo build --release --features mcp
+cargo build --profile release-interactive --features mcp
 ft mcp serve                                # MCP server over stdio
 ```
 
@@ -1439,7 +1439,7 @@ frankenterm/                              # 77 workspace members (auto-stamped)
 │   │   │   ├── ingest.rs                 # Pane discovery + delta extraction
 │   │   │   ├── patterns.rs               # Pattern detection engine
 │   │   │   ├── events.rs                 # Event bus and detection fanout
-│   │   │   ├── storage/                  # SQLite + FTS5 (currently schema v33)
+│   │   │   ├── storage/                  # SQLite + FTS5 (currently schema v35)
 │   │   │   ├── policy.rs                 # Safety / access control
 │   │   │   ├── redactor.rs               # Secret redaction (T1/T2/T3 tiers)
 │   │   │   ├── plan.rs                   # Mission + Tx types
@@ -2136,12 +2136,12 @@ Block-compressed (zstd) older lines. Compression block size is tuned so a single
 
 ### Cold tier
 
-When a line is evicted from warm (under Critical/Emergency pressure or aged past the warm threshold), it is dropped from RAM. The line remains queryable via the `output_segments` table (which is the canonical source of truth) and via FTS5 search.
+When a line is evicted from warm (under Critical/Emergency pressure or aged past the warm threshold), it is dropped from RAM. Within the configured durable-retention window, the line remains queryable via the `output_segments` table (which is the canonical source of truth) and via FTS5 search; age, count, or storage-size retention may later prune it.
 
 ### Why this layout
 
 - **Renderer hot path stays fast.** The renderer only reads from the hot tier.
-- **Search remains complete.** Lines that age out are still searchable via SQLite.
+- **Tier eviction does not create an immediate search gap.** Lines that leave RAM remain searchable in SQLite until the configured durable-retention policy prunes them.
 - **Memory scales sublinearly with scrollback depth.** Adding 10× more scrollback doesn't add 10× RAM.
 
 ---
@@ -2385,7 +2385,7 @@ Retractions are append-only and visible to anyone who verifies the bundle; this 
 
 ### Current schema version
 
-The current version is **v33**. The authoritative source is
+The current version is **v35**. The authoritative source is
 [`storage/schema_ddl.rs::SCHEMA_VERSION`](crates/frankenterm-core/src/storage/schema_ddl.rs);
 documentation must follow that constant rather than becoming an independent
 version authority.
@@ -2846,11 +2846,11 @@ The current reality-check round (ft-tf6g3) is wiring the formal-methods substrat
 
 ### `--all-features` build
 
-`cargo build -p frankenterm --release --all-features` builds the entire surface. This is what release CI does for end-to-end verification; operators typically build a subset.
+`cargo build -p frankenterm --profile release-interactive --all-features` builds the entire surface with the shipped unwind contract; operators typically build a subset.
 
 ### Trimming for embedded / minimal builds
 
-`cargo build -p frankenterm --release --no-default-features` produces the smallest binary. Agent-inventory robot calls become unavailable; everything else stays. Robust for headless / scripted use.
+`cargo build -p frankenterm --profile release-interactive --no-default-features` produces the smallest shipped-profile binary. Agent-inventory robot calls become unavailable; everything else stays. Robust for headless / scripted use.
 
 ---
 
@@ -3356,7 +3356,7 @@ Shape per `pub struct MissionTxContract` in `plan.rs`. The tx steps live **insid
         "action": {
           "type": "send_text",
           "pane_id": 1,
-          "text": "cargo build --release"
+          "text": "cargo build --profile release-interactive"
         }
       },
       {
@@ -3702,7 +3702,7 @@ This section catalogues the non-obvious design decisions the project has made, t
 - **SQLite is bundled** (no system dep), runs in-process (no IPC overhead), and supports FTS5 + WAL out of the box.
 - **Single-writer integrity** is a deliberate constraint: only one watcher writes, and multiple readers are fine.
 - **Backup is the SQLite online backup API**: consistent snapshots without stop-the-world.
-- **Future-proof**: schema migrations are versioned (`SCHEMA_VERSION = 33` at HEAD; the live authority is [`storage/schema_ddl.rs::SCHEMA_VERSION`](crates/frankenterm-core/src/storage/schema_ddl.rs)); rollbacks are tracked in `forensic_migration` + `rollback_execution`.
+- **Future-proof**: schema migrations are versioned (`SCHEMA_VERSION = 35` at HEAD; the live authority is [`storage/schema_ddl.rs::SCHEMA_VERSION`](crates/frankenterm-core/src/storage/schema_ddl.rs)); rollbacks are tracked in `forensic_migration` + `rollback_execution`.
 - **Trade-off accepted**: at fleet-of-thousands scale, write throughput would become a bottleneck. We're not there.
 
 ### Why asupersync, not tokio?
@@ -3717,7 +3717,7 @@ This section catalogues the non-obvious design decisions the project has made, t
 - **Memory safety should be a guarantee, not a goal.** Forbidding unsafe at the workspace level means we can't accidentally introduce it during a refactor.
 - **Native-API workarounds use `std::process::Command`** (sysctl, ps, pgrep on macOS) rather than FFI.
 - **Vendored WezTerm crates with unsafe** are audited separately and tracked in `docs/vendored-wezterm-design.md`.
-- **Trade-off accepted**: some optimizations require unsafe and we don't take them. The platform isn't the bottleneck for any production workload we've measured.
+- **Trade-off accepted**: some optimizations require unsafe and we don't take them. Performance work remains measurement-driven within safe Rust; current target-class input latency, resize/zoom responsiveness, and long-session scalability are not certified and must not be inferred from this safety policy.
 
 ### Why TOON in addition to JSON?
 
@@ -3828,7 +3828,7 @@ For continuous monitoring, prefer Prometheus + SSE. For incident response, prefe
 Secure distributed mode is available as an optional feature-gated build and is off by default.
 
 ```bash
-cargo build -p frankenterm --release --features distributed
+cargo build -p frankenterm --profile release-interactive --features distributed
 ```
 
 The distributed wire protocol provides:

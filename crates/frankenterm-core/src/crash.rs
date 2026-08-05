@@ -141,6 +141,15 @@ fn read_optional_json_bundle_file<T: serde::de::DeserializeOwned>(
 /// Maximum backtrace string length included in crash bundles (64 KiB).
 const MAX_BACKTRACE_LEN: usize = 64 * 1024;
 
+/// Maximum panic-message bytes retained in a redacted crash bundle.
+const MAX_CRASH_MESSAGE_LEN: usize = 8 * 1024;
+
+/// Maximum source-location bytes retained in a redacted crash bundle.
+const MAX_CRASH_LOCATION_LEN: usize = 1024;
+
+/// Maximum thread-name bytes retained in a redacted crash bundle.
+const MAX_CRASH_THREAD_NAME_LEN: usize = 256;
+
 /// Maximum crash bundle size in bytes (1 MiB) — a privacy/size budget.
 const MAX_BUNDLE_SIZE: usize = 1024 * 1024;
 
@@ -1325,18 +1334,36 @@ pub struct CrashManifest {
 
 /// Install the panic hook for crash reporting.
 ///
-/// Replaces the default panic hook with one that writes a crash bundle
-/// containing the panic message, backtrace, and last known health snapshot.
-/// The bundle is written atomically (temp dir + rename) and all text
-/// content is passed through the [`Redactor`] before being persisted.
+/// Wraps the current project panic hook with one that writes a privacy-bounded
+/// crash bundle containing a generic message, bounded backtrace, and last known
+/// health snapshot. The bundle is written atomically (temp dir + rename) and
+/// all text content is passed through the [`Redactor`] before persistence.
 ///
-/// If `crash_dir` is `None` the hook still prints the panic to stderr but
-/// does not write any files.
+/// This layer never treats artifact persistence as user-visible reporting. It
+/// always delegates fatal panics so the next GUI/base hook emits exactly one
+/// generic notification; recoverable panics and EPIPE retain their shared
+/// process-policy semantics.
 pub fn install_panic_hook(config: &CrashConfig) {
     let include_backtrace = config.include_backtrace;
     let crash_dir = config.crash_dir.clone();
+    let previous_hook = std::panic::take_hook();
 
     std::panic::set_hook(Box::new(move |info| {
+        // A hook runs before catch_unwind returns. The project-owned marker is
+        // the only authority that this panic belongs to an audited recovery
+        // boundary; never create fatal artifacts for that path. This check
+        // must precede payload classification because payload text is
+        // caller-controlled and can spoof an EPIPE-looking message.
+        if frankenterm_sigpipe::is_recoverable_panic() {
+            return;
+        }
+        // Unmarked EPIPE must retain the shared hook's deterministic quiet
+        // exit(141), including after watch mode installs bundle reporting.
+        if frankenterm_sigpipe::panic_is_broken_pipe(info) {
+            previous_hook(info);
+            return;
+        }
+
         // Capture backtrace early (before allocations that might fail)
         let bt = if include_backtrace {
             Some(Backtrace::force_capture())
@@ -1344,73 +1371,45 @@ pub fn install_panic_hook(config: &CrashConfig) {
             None
         };
 
-        // Extract panic message
-        let message = if let Some(s) = info.payload().downcast_ref::<&str>() {
-            (*s).to_string()
-        } else if let Some(s) = info.payload().downcast_ref::<String>() {
-            s.clone()
-        } else {
-            "unknown panic payload".to_string()
-        };
-
-        // Extract location
+        // Never retain caller- or plugin-controlled panic payload text. The
+        // backtrace and privacy-bounded line/column retain diagnostic value.
+        let message = frankenterm_sigpipe::GENERIC_FATAL_REPORT.to_string();
         let location = info
             .location()
-            .map(|loc| format!("{}:{}:{}", loc.file(), loc.line(), loc.column()));
+            .map(|loc| format!("line:{}:column:{}", loc.line(), loc.column()));
 
-        // Print to stderr only when the TUI rendering pipeline is not active.
-        // When the TUI owns the terminal, stray eprintln! corrupts the UI.
-        // The crash bundle (written to disk below) preserves the information
-        // regardless of whether stderr output is suppressed.
-        #[cfg(any(feature = "tui", feature = "ftui"))]
-        let stderr_ok = !crate::tui::output_gate::is_output_suppressed();
-        #[cfg(not(any(feature = "tui", feature = "ftui")))]
-        let stderr_ok = true;
-
-        if stderr_ok {
-            if let Some(ref loc) = location {
-                eprintln!("FrankenTerm: panic at {loc}: {message}");
-            } else {
-                eprintln!("FrankenTerm: panic: {message}");
-            }
-        }
-
-        // Write crash bundle if crash_dir is configured
+        // Write a silent, privacy-bounded crash bundle if configured. Artifact
+        // persistence is not an operator-visible report: regardless of write
+        // success, delegation below lets the next GUI/base hook surface
+        // exactly one generic notification.
         if let Some(ref dir) = crash_dir {
             let report = CrashReport {
                 message,
                 location,
                 backtrace: bt.map(|b| {
-                    let s = b.to_string();
-                    if s.len() > MAX_BACKTRACE_LEN {
-                        let mut truncated = s[..MAX_BACKTRACE_LEN].to_string();
-                        truncated.push_str("\n... [truncated]");
-                        truncated
-                    } else {
-                        s
-                    }
+                    truncate_utf8_with_marker(
+                        &b.to_string(),
+                        MAX_BACKTRACE_LEN,
+                        "\n... [truncated]",
+                    )
                 }),
                 timestamp: epoch_secs(),
                 pid: std::process::id(),
-                thread_name: std::thread::current().name().map(String::from),
+                // Thread names are application-controlled and may carry pane,
+                // account, or plugin text. The backtrace already identifies the
+                // failing execution context without reflecting that content.
+                thread_name: None,
             };
 
             let health = HealthSnapshot::get_global();
             let resize_ctx = crate::resize_crash_forensics::ResizeCrashContext::get_global();
-
-            match write_crash_bundle(dir, &report, health.as_ref(), resize_ctx.as_ref()) {
-                Ok(path) => {
-                    if stderr_ok {
-                        eprintln!("FrankenTerm: crash bundle written to {}", path.display());
-                    }
-                }
-                Err(e) => {
-                    if stderr_ok {
-                        eprintln!("FrankenTerm: failed to write crash bundle: {e}");
-                    }
-                }
-            }
+            let _ = write_crash_bundle(dir, &report, health.as_ref(), resize_ctx.as_ref());
         }
+
+        // Never claim operator-visible reporting here. In GUI binaries the
+        // next hook owns a generic toast and suppresses the base stderr line;
+        // in headless binaries the base hook owns one generic stderr line.
+        previous_hook(info);
     }));
 }
 
@@ -1464,12 +1463,34 @@ pub fn write_crash_bundle(
     // 1. Write crash_report.json (redacted)
     {
         let redacted_report = CrashReport {
-            message: redactor.redact(&report.message),
-            location: report.location.clone(),
-            backtrace: report.backtrace.as_ref().map(|bt| redactor.redact(bt)),
+            message: truncate_utf8_with_marker(
+                &redactor.redact(&report.message),
+                MAX_CRASH_MESSAGE_LEN,
+                "... [truncated]",
+            ),
+            location: report.location.as_ref().map(|location| {
+                truncate_utf8_with_marker(
+                    &redactor.redact(location),
+                    MAX_CRASH_LOCATION_LEN,
+                    "... [truncated]",
+                )
+            }),
+            backtrace: report.backtrace.as_ref().map(|backtrace| {
+                truncate_utf8_with_marker(
+                    &redactor.redact(backtrace),
+                    MAX_BACKTRACE_LEN,
+                    "\n... [truncated]",
+                )
+            }),
             timestamp: report.timestamp,
             pid: report.pid,
-            thread_name: report.thread_name.clone(),
+            thread_name: report.thread_name.as_ref().map(|thread_name| {
+                truncate_utf8_with_marker(
+                    &redactor.redact(thread_name),
+                    MAX_CRASH_THREAD_NAME_LEN,
+                    "... [truncated]",
+                )
+            }),
         };
         let json = serde_json::to_string_pretty(&redacted_report).map_err(std::io::Error::other)?;
         let bytes = json.as_bytes();
@@ -8167,11 +8188,11 @@ mod tests {
         .concat();
         let report = CrashReport {
             message: format!("failed with key {api_key}"),
-            location: None,
+            location: Some(format!("plugin/{api_key}:17")),
             backtrace: Some("token=my_secret_token_1234567890 in frame".to_string()),
             timestamp: 1_700_000_000,
             pid: 1,
-            thread_name: None,
+            thread_name: Some(format!("worker-{api_key}")),
         };
 
         let bundle_path = write_crash_bundle(&crash_dir, &report, None, None).unwrap();
@@ -8190,6 +8211,10 @@ mod tests {
             parsed.message.contains("[REDACTED]"),
             "Should contain REDACTED marker: {}",
             parsed.message
+        );
+        assert!(
+            !report_json.contains(&prefix),
+            "location/thread fields must be redacted with the same policy"
         );
     }
 
@@ -8392,21 +8417,21 @@ mod tests {
     }
 
     #[test]
-    fn write_crash_bundle_size_budget_skips_oversized_files() {
+    fn write_crash_bundle_bounds_oversized_report_fields_before_budgeting() {
         let tmp = tempfile::tempdir().unwrap();
         let crash_dir = tmp.path().join("crash");
 
-        // Create a report with a backtrace that exceeds MAX_BUNDLE_SIZE.
-        // The bundle writer should skip writing crash_report.json when the
-        // serialized content exceeds the privacy budget.
+        // Caller-controlled report fields are bounded before serialization, so
+        // an oversized backtrace cannot crowd the useful crash report out of
+        // the bundle-wide privacy budget.
         let huge_bt = "x".repeat(MAX_BUNDLE_SIZE + 1000);
         let report = CrashReport {
-            message: "big backtrace".to_string(),
-            location: None,
+            message: "m".repeat(MAX_CRASH_MESSAGE_LEN + 1000),
+            location: Some("l".repeat(MAX_CRASH_LOCATION_LEN + 1000)),
             backtrace: Some(huge_bt),
             timestamp: 1_700_000_000,
             pid: 1,
-            thread_name: None,
+            thread_name: Some("t".repeat(MAX_CRASH_THREAD_NAME_LEN + 1000)),
         };
 
         let bundle_path = write_crash_bundle(&crash_dir, &report, None, None).unwrap();
@@ -8414,16 +8439,26 @@ mod tests {
         // Manifest should always exist regardless of budget
         assert!(bundle_path.join("manifest.json").exists());
 
-        // The oversized crash_report.json should be skipped
         let manifest_json = fs::read_to_string(bundle_path.join("manifest.json")).unwrap();
         let manifest: CrashManifest = serde_json::from_str(&manifest_json).unwrap();
-
-        // Since the report exceeds budget, it should not be in the file list
         assert!(
-            !manifest.files.contains(&"crash_report.json".to_string()),
-            "oversized report should be skipped, files: {:?}",
+            manifest.files.contains(&"crash_report.json".to_string()),
+            "bounded report should remain useful, files: {:?}",
             manifest.files
         );
+        let report_json = fs::read_to_string(bundle_path.join("crash_report.json")).unwrap();
+        let bounded: CrashReport = serde_json::from_str(&report_json).unwrap();
+        assert!(bounded.message.len() <= MAX_CRASH_MESSAGE_LEN);
+        assert!(bounded.message.ends_with("... [truncated]"));
+        let location = bounded.location.expect("bounded location retained");
+        assert!(location.len() <= MAX_CRASH_LOCATION_LEN);
+        assert!(location.ends_with("... [truncated]"));
+        let backtrace = bounded.backtrace.expect("bounded backtrace retained");
+        assert!(backtrace.len() <= MAX_BACKTRACE_LEN);
+        assert!(backtrace.ends_with("\n... [truncated]"));
+        let thread_name = bounded.thread_name.expect("bounded thread name retained");
+        assert!(thread_name.len() <= MAX_CRASH_THREAD_NAME_LEN);
+        assert!(thread_name.ends_with("... [truncated]"));
     }
 
     #[test]

@@ -1240,8 +1240,8 @@ jobs:
       - name: Install jq
         run: sudo apt-get update -qq && sudo apt-get install -qq -y jq
 
-      - name: Build ft (release)
-        run: cargo build --release -p frankenterm
+      - name: Build ft (shipped interactive profile)
+        run: cargo build --profile release-interactive -p frankenterm
 
       - name: E2E harness self-check
         run: scripts/e2e_test.sh --self-check --skip-self-check 2>&1 || true
@@ -1350,7 +1350,7 @@ jobs:
 
       - name: Build ft for Docker E2E
         if: matrix.mode == 'linux-real-docker'
-        run: cargo build --release -p frankenterm
+        run: cargo build --profile release-interactive -p frankenterm
 
       - name: Run real Docker setup-remote E2E (Linux)
         if: matrix.mode == 'linux-real-docker'
@@ -1459,14 +1459,14 @@ jobs:
           echo "Provisioned OpenSSL at $OPENSSL_ROOT"
           ls -la "$OPENSSL_ROOT/lib"
 
-      - name: Build release binary
-        run: cargo build --release --target ${{ matrix.target }}
+      - name: Build shipped binary
+        run: cargo build --profile release-interactive --target ${{ matrix.target }}
       - uses: actions/upload-artifact@v7.0.1
         with:
           name: ft-${{ matrix.target }}
           path: |
-            target/${{ matrix.target }}/release/ft
-            target/${{ matrix.target }}/release/ft.exe
+            target/${{ matrix.target }}/release-interactive/ft
+            target/${{ matrix.target }}/release-interactive/ft.exe
           if-no-files-found: ignore
 
   # Assert that the shipped release binary's `ft --version` and
@@ -1501,7 +1501,7 @@ jobs:
         run: |
           set -euo pipefail
           # upload-artifact@v4 preserves path structure, so the binary may land at
-          # dl/ft or dl/target/<triple>/release/ft depending on how the producer
+          # dl/ft or dl/target/<triple>/release-interactive/ft depending on how the producer
           # configured the path. Find it either way.
           binary="$(find dl -type f -name ft | head -n 1)"
           if [[ -z "$binary" ]]; then

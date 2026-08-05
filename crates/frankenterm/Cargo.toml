@@ -25,7 +25,7 @@ workspace = true
 [dependencies]
 frankenterm-core = { workspace = true, default-features = false }
 # GH#75: broken-pipe (EPIPE) panic-to-exit(141) handling; `ft list | head`
-# must not SIGABRT under the release profile's panic = "abort".
+# must not unwind through or crash the shipped process.
 frankenterm-sigpipe = { workspace = true }
 # ft-y0loj.4 / ft-j1qjt.2: 24 replay_* modules moved out of frankenterm-core
 # to this sub-crate. `ft` consumes a handful of them directly (replay diff /

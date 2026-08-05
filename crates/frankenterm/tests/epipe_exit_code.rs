@@ -2,9 +2,9 @@
 //!
 //! Rust's runtime sets `SIGPIPE` to `SIG_IGN`, so an early-closing
 //! downstream reader surfaces as an `EPIPE` write error, `println!` panics
-//! on it, and the release profile's `panic = "abort"` turned that panic
-//! into a `SIGABRT` process abort (exit 134 plus a macOS crash-report
-//! dialog). The fix (`frankenterm_sigpipe::exit_quietly_on_broken_pipe`,
+//! on it, and an unhandled write panic can turn an ordinary pipeline close
+//! into an operator-visible crash. The fix
+//! (`frankenterm_sigpipe::exit_quietly_on_broken_pipe`,
 //! installed at the top of every binary's `main`) recognizes broken-pipe
 //! write panics in a panic hook — which still runs before the abort — and
 //! exits with the conventional `128 + SIGPIPE = 141` instead.

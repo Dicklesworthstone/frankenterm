@@ -594,12 +594,28 @@ frankenterm-core-replay = { path = "crates/frankenterm-core-replay", default-fea
 frankenterm-alloc = { path = "crates/frankenterm-alloc" }
 
 [profile.release]
-opt-level = "z"     # Optimize for size
+opt-level = "z"     # Conventional safe release default; explicit shipped profile inherits this
 lto = true          # Link-time optimization
 codegen-units = 1   # Single codegen unit for better optimization
-panic = "abort"     # Smaller binary, no unwinding overhead
-strip = true        # Remove debug symbols (size-optimized CLI release; deadlock guards landed in 9fba0d14b/f17d35c72)
+panic = "unwind"    # Fail-safe default: audited catches remain executable
+strip = true        # Size-oriented release artifact
 debug = false       # No debuginfo in release artifacts
+
+[profile.release-interactive]
+# Every shipped process (`ft`, GUI, mux-server) uses this profile. In-process
+# callback/task containment is a correctness contract, so these artifacts MUST
+# unwind. Keep all other release knobs inherited until
+# ft-interactive-systems-performance-4tenz.13 records a target-class
+# latency/size A/B; this P0 changes panic semantics, not a perf arm.
+inherits = "release"
+panic = "unwind"
+
+[profile.release-abort-probe]
+# Negative-control artifact used only by the panic-contract subprocess gate.
+# Keeping abort behind an explicit name means an operator's conventional
+# `cargo build --release` cannot silently disable audited recovery boundaries.
+inherits = "release"
+panic = "abort"
 
 [profile.release-perf]
 # Round-4 gauntlet A/B profile. NEVER bench on `--release` (opt-level="z", size-optimized):
@@ -607,11 +623,17 @@ debug = false       # No debuginfo in release artifacts
 # Use thin LTO (not the shipped fat `lto=true`) so each A/B arm rebuilds fast on RCH workers;
 # relative before/after deltas stay valid because both arms use the identical profile.
 # Frame pointers (set via RUSTFLAGS="-C force-frame-pointers=yes" in the bench-AB driver) keep
-# flamegraphs attributable. opt-level=3 + codegen-units=1 (inherited) for representative codegen.
+# flamegraphs attributable. Inherit directly from Cargo's built-in `release`
+# profile, then repeat the panic contract explicitly; this keeps the benchmark
+# identity portable without depending on custom-profile inheritance chaining.
 inherits = "release"
 opt-level = 3
 lto = "thin"
 debug = "line-tables-only"
+panic = "unwind"
+# The inherited shipping profile strips symbols. That would discard the line
+# tables this measurement profile explicitly requests and make sampled stacks
+# needlessly opaque, so preserve them for attribution-quality A/B evidence.
 strip = "none"
 
 [profile.release.package.frankenterm-fuzz]

@@ -90,7 +90,16 @@ catch common omissions.
    For capture-lag or capture-fairness claims, cite the retained `ft-n447z.5`
    200-pane reduced RCH artifact and keep target-class wording blocked unless
    the same run also retains a passing high-core hardware predicate.
-10. **Tag and push.** `git tag vX.Y.0 && git push origin vX.Y.0`.
+10. **Verify artifact-specific panic profiles.** Every standalone CLI archive
+    and every `FrankenTerm.app` executable must come from
+    `target/<triple>/release-interactive/`, carry the same profile-specific
+    atomic identity for that target, and declare `panic.*=unwind`. The ordinary
+    `release` profile is also unwind-safe but is not the release identity. Never
+    package the explicitly aborting `release-abort-probe`; run that negative
+    control and the shipped-profile arm through the panic-contract subprocess
+    proof with strict remote RCH. Unit-profile catch tests do not prove shipped
+    recovery.
+11. **Tag and push.** `git tag vX.Y.0 && git push origin vX.Y.0`.
    The release workflow at `.github/workflows/release.yml`
    handles the rest (binaries, checksums, GitHub release notes,
    sigstore-signed attestation bundle).

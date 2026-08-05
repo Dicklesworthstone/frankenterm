@@ -22762,11 +22762,7 @@ fn step_plan_metadata(step: &frankenterm_core::plan::StepPlan) -> serde_json::Va
                 serde_json::Value::Number(text.len().into()),
             );
             // Show truncated preview (redacted at report level)
-            let preview = if text.len() > 60 {
-                format!("{}...", &text[..60])
-            } else {
-                text.clone()
-            };
+            let preview = frankenterm_core::output::truncate(text, 60);
             meta.insert(
                 "text_preview".to_string(),
                 serde_json::Value::String(preview),
@@ -23378,7 +23374,8 @@ fn watch_checkpoint(cx: &frankenterm_core::cx::Cx, operation: &str) -> std::io::
         let reason = cx
             .cancel_reason()
             .and_then(|reason| reason.message)
-            .filter(|message| !message.is_empty());
+            .filter(|message| !message.is_empty())
+            .map(|message| redact_for_output(&message));
         let detail = reason.map_or_else(
             || error.to_string(),
             |message| format!("{error}; reason: {message}"),
@@ -24101,6 +24098,19 @@ fn watch_terminal_error_ndjson(
     retryable: bool,
 ) -> serde_json::Value {
     let message = message.into();
+    // Error paths must never turn a partial or malformed caller-controlled
+    // token into apparent resume authority. Preserve the token only when the
+    // complete triple is canonical; otherwise fail closed to three nulls.
+    let (cursor, cursor_epoch, cursor_scope) = match (cursor, cursor_epoch, cursor_scope) {
+        (Some(cursor), Some(epoch), Some(scope))
+            if cursor >= 0
+                && event_cursor_epoch_is_canonical(epoch)
+                && event_cursor_scope_is_canonical(scope) =>
+        {
+            (Some(cursor), Some(epoch), Some(scope))
+        }
+        _ => (None, None, None),
+    };
     serde_json::json!({
         "type": "error",
         "terminal": true,
@@ -25974,6 +25984,24 @@ mod watch_events_tests {
         assert_eq!(error.kind(), std::io::ErrorKind::Interrupted);
         assert!(error.to_string().contains("outer-loop cancellation"));
 
+        let secret_cancelled = frankenterm_core::cx::for_testing();
+        let secret = "sk-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        secret_cancelled.cancel_with(
+            frankenterm_core::outcome::CancelKind::User,
+            Some(&format!("operator request carried {secret}")),
+        );
+        let secret_error = watch_checkpoint(&secret_cancelled, "secret-bearing cancellation")
+            .expect_err("cancelled checkpoint must fail");
+        let rendered = secret_error.to_string();
+        assert!(
+            rendered.contains("[REDACTED]"),
+            "the cancellation reason must retain an explicit redaction marker: {rendered}"
+        );
+        assert!(
+            !rendered.contains(secret),
+            "the raw cancellation reason must not cross the watch output boundary: {rendered}"
+        );
+
         assert_eq!(
             watch_core_failure_source(&frankenterm_core::Error::Cancelled(
                 "storage cancelled".to_string()
@@ -26211,6 +26239,41 @@ mod watch_events_tests {
             !encoded.contains("AKIAIOSFODNN7EXAMPLE"),
             "stream error messages and hints must share the robot redaction boundary: {encoded}"
         );
+
+        for partial_or_malformed in [
+            watch_terminal_error_ndjson(
+                ROBOT_ERR_CONFIG,
+                "scope without authority",
+                None,
+                None,
+                None,
+                Some(TEST_CURSOR_SCOPE),
+                false,
+            ),
+            watch_terminal_error_ndjson(
+                ROBOT_ERR_INVALID_ARGS,
+                "malformed authority",
+                None,
+                Some(41),
+                Some("AKIAIOSFODNN7EXAMPLE"),
+                Some(TEST_CURSOR_SCOPE),
+                false,
+            ),
+        ] {
+            assert_eq!(partial_or_malformed["cursor"], serde_json::Value::Null);
+            assert_eq!(
+                partial_or_malformed["cursor_epoch"],
+                serde_json::Value::Null
+            );
+            assert_eq!(
+                partial_or_malformed["cursor_scope"],
+                serde_json::Value::Null
+            );
+            assert!(
+                !partial_or_malformed.to_string().contains("AKIAIOSFODNN7EXAMPLE"),
+                "malformed cursor authority must not be reflected"
+            );
+        }
     }
 
     #[test]
@@ -33926,8 +33989,12 @@ async fn run_distributed_agent(
         patterns: config.patterns.clone(),
         patterns_root,
         channel_buffer: 1024,
-        max_concurrent_captures: config.ingest.max_concurrent_captures as usize,
+        max_concurrent_captures: config.ingest.max_concurrent_captures,
         retention_days: config.storage.retention_days,
+        retention_policy: config
+            .storage
+            .compile_retention_policy()
+            .map_err(|error| anyhow::anyhow!("invalid startup retention policy: {error}"))?,
         retention_max_mb: config.storage.retention_max_mb,
         checkpoint_interval_secs: config.storage.checkpoint_interval_secs,
         gc: config.gc,
@@ -34623,8 +34690,12 @@ async fn run_watcher(
         patterns: config.patterns.clone(),
         patterns_root: patterns_root.clone(),
         channel_buffer: 1024,
-        max_concurrent_captures: config.ingest.max_concurrent_captures as usize,
+        max_concurrent_captures: config.ingest.max_concurrent_captures,
         retention_days: config.storage.retention_days,
+        retention_policy: config
+            .storage
+            .compile_retention_policy()
+            .map_err(|error| anyhow::anyhow!("invalid startup retention policy: {error}"))?,
         retention_max_mb: config.storage.retention_max_mb,
         checkpoint_interval_secs: config.storage.checkpoint_interval_secs,
         gc: config.gc,
@@ -34970,12 +35041,26 @@ async fn run_watcher(
                                         }
 
                                         // Create hot-reloadable config and apply to runtime
-                                        let hot_config = HotReloadableConfig::from_config(&new_config);
-                                        if let Err(e) = handle.apply_config_update(hot_config) {
-                                            tracing::error!(error = %e, "Failed to apply config update");
-                                        } else {
-                                            current_config = new_config;
-                                            tracing::info!("Config reload complete");
+                                        match HotReloadableConfig::from_config(&new_config) {
+                                            Ok(hot_config) => {
+                                                if let Err(e) =
+                                                    handle.apply_config_update(hot_config)
+                                                {
+                                                    tracing::error!(
+                                                        error = %e,
+                                                        "Failed to apply config update"
+                                                    );
+                                                } else {
+                                                    current_config = new_config;
+                                                    tracing::info!("Config reload complete");
+                                                }
+                                            }
+                                            Err(e) => {
+                                                tracing::error!(
+                                                    error = %e,
+                                                    "Rejected invalid hot-reload retention policy"
+                                                );
+                                            }
                                         }
                                     }
                                 }
@@ -35107,6 +35192,28 @@ fn maybe_trigger_e2e_watcher_panic_once(layout: &frankenterm_core::config::Works
     panic!("ft-e2e: intentional watcher panic (one-shot)");
 }
 
+fn bounded_utf8_string(mut value: String, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value;
+    }
+
+    let mut boundary = max_bytes;
+    while boundary > 0 && !value.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    value.truncate(boundary);
+    value
+}
+
+#[cfg(test)]
+#[test]
+fn bounded_utf8_string_never_splits_a_codepoint() {
+    assert_eq!(bounded_utf8_string("héllo".to_string(), 3), "hé");
+    assert_eq!(bounded_utf8_string("😀abc".to_string(), 3), "");
+    assert_eq!(bounded_utf8_string("😀abc".to_string(), 4), "😀");
+    assert_eq!(bounded_utf8_string("text".to_string(), 0), "");
+}
+
 async fn run_saved_search_scheduler(
     storage: frankenterm_core::storage::StorageHandle,
     event_bus: Arc<frankenterm_core::events::EventBus>,
@@ -35177,13 +35284,6 @@ async fn run_saved_search_scheduler(
             return None;
         }
         usize::try_from(value).ok()
-    }
-
-    fn bounded_string(mut value: String, max_len: usize) -> String {
-        if value.len() > max_len {
-            value.truncate(max_len);
-        }
-        value
     }
 
     let redactor = Redactor::new();
@@ -35286,7 +35386,7 @@ async fn run_saved_search_scheduler(
                     next_allowed_run_at_by_id.insert(search_id.clone(), next_allowed);
                     next_wake_at = next_wake_at.min(next_allowed);
 
-                    let message = bounded_string(err.to_string(), 600);
+                    let message = bounded_utf8_string(err.to_string(), 600);
                     if let Err(update_err) = storage
                         .update_saved_search_run(&search_id, now, None, Some(message.clone()))
                         .await
@@ -35346,7 +35446,7 @@ async fn run_saved_search_scheduler(
             let snippet = results
                 .first()
                 .and_then(|r| r.snippet.as_deref())
-                .map(|s| bounded_string(redactor.redact(s), 280))
+                .map(|s| bounded_utf8_string(redactor.redact(s), 280))
                 .filter(|s| !s.trim().is_empty());
 
             let extracted = {
@@ -35357,7 +35457,10 @@ async fn run_saved_search_scheduler(
                 );
                 map.insert(
                     "query".to_string(),
-                    serde_json::Value::String(bounded_string(redactor.redact(&search_query), 400)),
+                    serde_json::Value::String(bounded_utf8_string(
+                        redactor.redact(&search_query),
+                        400,
+                    )),
                 );
                 map.insert("scope".to_string(), serde_json::Value::String(scope));
                 map.insert(
@@ -35767,8 +35870,7 @@ fn main() {
 
     // GH#75: `ft` output is machine-readable and destined for pipelines;
     // a downstream `| head` closing stdout early must exit 141 quietly, not
-    // panic-abort with SIGABRT (and a macOS crash report) under the release
-    // profile's panic = "abort".
+    // unwind through the shipped process or produce a macOS crash report.
     frankenterm_sigpipe::exit_quietly_on_broken_pipe();
 
     // Keep the exact compile-time package identity discoverable by the static
@@ -54066,12 +54168,11 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                 frankenterm_core::crash::latest_crash_bundle(&layout.crash_dir)
             {
                 let detail = if let Some(ref report) = bundle.report {
-                    let msg = if report.message.len() > 80 {
-                        format!("{}...", &report.message[..77])
-                    } else {
-                        report.message.clone()
-                    };
-                    let loc = report.location.as_deref().unwrap_or("unknown location");
+                    let msg = frankenterm_core::output::truncate(&report.message, 80);
+                    let loc = frankenterm_core::output::truncate(
+                        report.location.as_deref().unwrap_or("unknown location"),
+                        120,
+                    );
                     format!("{msg} (at {loc})")
                 } else if let Some(ref manifest) = bundle.manifest {
                     format!("crash at {}", manifest.created_at)
@@ -57027,15 +57128,12 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     frankenterm_core::crash::latest_crash_bundle(&layout.crash_dir)
                 {
                     let detail = if let Some(ref report) = bundle.report {
-                        let msg = if report.message.len() > 100 {
-                            format!("{}...", &report.message[..97])
-                        } else {
-                            report.message.clone()
-                        };
-                        format!(
-                            "{msg} (at {})",
-                            report.location.as_deref().unwrap_or("unknown")
-                        )
+                        let msg = frankenterm_core::output::truncate(&report.message, 100);
+                        let location = frankenterm_core::output::truncate(
+                            report.location.as_deref().unwrap_or("unknown"),
+                            120,
+                        );
+                        format!("{msg} (at {location})")
                     } else if let Some(ref manifest) = bundle.manifest {
                         format!("crash at {}", manifest.created_at)
                     } else {
@@ -66335,11 +66433,7 @@ async fn handle_snapshot_command(
                 );
                 println!("{}", "-".repeat(70));
                 for (id, session_id, _at, cp_type, panes, bytes, _hash) in &snapshots {
-                    let short_session = if session_id.len() > 34 {
-                        &session_id[..34]
-                    } else {
-                        session_id
-                    };
+                    let short_session = truncate_id(session_id, 34);
                     println!(
                         "{:<6} {:<36} {:<10} {:<6} {:<10}",
                         id, short_session, cp_type, panes, bytes
@@ -67516,11 +67610,22 @@ fn session_mmap_replay_skip_reason_json(
 
 /// Truncate a session ID for display.
 fn truncate_id(id: &str, max: usize) -> String {
-    if id.len() <= max {
-        id.to_string()
-    } else {
-        format!("{}…", &id[..max - 1])
-    }
+    // IDs originate in persisted/session state and are rendered directly in
+    // fixed-width terminal summaries. Share the hardened terminal-cell path so
+    // ANSI, multiline/bidi controls, wide graphemes, and UTF-8 boundaries all
+    // obey the same display contract as other CLI fields.
+    frankenterm_core::output::truncate(id, max)
+}
+
+#[cfg(test)]
+#[test]
+fn truncate_id_is_bounded_and_preserves_utf8_boundaries() {
+    assert_eq!(truncate_id("short", 8), "short");
+    assert_eq!(truncate_id("héllo-world", 6), "hél...");
+    assert_eq!(truncate_id("😀abc", 2), "😀");
+    assert_eq!(truncate_id("nonempty", 1), "n");
+    assert_eq!(truncate_id("nonempty", 0), "");
+    assert_eq!(truncate_id("\x1b]0;title\x07safe\u{202e}id", 20), "safe id");
 }
 
 /// Format epoch ms for display.

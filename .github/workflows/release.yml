@@ -143,14 +143,14 @@ jobs:
             --source-revision "$SOURCE_REVISION" \
             --version "$VERSION" \
             --target "${{ matrix.target }}" \
-            --profile release \
+            --profile release-interactive \
             --feature-contract "$FEATURE_CONTRACT")"
           {
             echo "FT_ATOMIC_BUILD_IDENTITY=$BUILD_ID"
             echo "FT_ATOMIC_SOURCE_REVISION=$SOURCE_REVISION"
             echo "FT_ATOMIC_BUILD_VERSION=$VERSION"
             echo "FT_ATOMIC_BUILD_TARGET=${{ matrix.target }}"
-            echo "FT_ATOMIC_BUILD_PROFILE=release"
+            echo "FT_ATOMIC_BUILD_PROFILE=release-interactive"
             echo "FT_ATOMIC_FEATURE_CONTRACT=$FEATURE_CONTRACT"
           } >> "$GITHUB_ENV"
 
@@ -169,19 +169,57 @@ jobs:
           #      tikv-jemalloc-sys's autoconf build script can't produce
           #      executables under MSVC. System allocator instead.
           if [[ "${{ matrix.target }}" == *windows* ]]; then
-            cargo build --release --target ${{ matrix.target }} \
+            cargo build --profile release-interactive --target ${{ matrix.target }} \
               -p frankenterm --bin ft \
               --no-default-features \
               --features browser,distributed,vendored,mcp,metrics,native-wezterm,semantic-search,subprocess-bridge,sync,ftui,tui-dashboard,tui-widgets,web,redis-session,asupersync-runtime
           else
-            cargo build --release --target ${{ matrix.target }}
+            # `ft watch` and core task/storage paths contain audited recovery
+            # boundaries, so every shipped CLI must share the unwind contract.
+            cargo build --profile release-interactive --target ${{ matrix.target }} \
+              -p frankenterm --bin ft
+          fi
+
+          if [[ "${{ matrix.target }}" == "aarch64-apple-darwin" ]]; then
+            # The app bundle is a separate interactive process family. Build
+            # all three components together under the already-frozen shipped
+            # identity. The standalone archive and bundled copy of `ft` are the
+            # same profile/identity, so a second build cannot silently mint
+            # incompatible CLI bytes.
+            cargo build --profile "$FT_ATOMIC_BUILD_PROFILE" \
+              --target ${{ matrix.target }} \
+              --bin frankenterm-gui \
+              --bin frankenterm-mux-server \
+              --bin ft
           fi
         shell: bash
+
+      - name: Verify release panic contracts as built subprocesses
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: |
+          set -euo pipefail
+          cargo build --locked --target "${{ matrix.target }}" \
+            --profile release-interactive \
+            -p frankenterm-core --example panic_contract_probe \
+            --no-default-features
+          cargo build --locked --target "${{ matrix.target }}" \
+            --profile release-abort-probe \
+            -p frankenterm-core --example panic_contract_probe \
+            --no-default-features
+          panic_contract_args=(
+            "target/${{ matrix.target }}/release-interactive/examples/panic_contract_probe"
+            "target/${{ matrix.target }}/release-abort-probe/examples/panic_contract_probe"
+          )
+          [[ ${#panic_contract_args[@]} -eq 2 ]] || {
+            echo "panic-contract checker requires exactly two profile artifacts" >&2
+            exit 2
+          }
+          scripts/check-release-panic-contract.sh "${panic_contract_args[@]}"
 
       - name: Smoke test binary (Unix)
         if: runner.os != 'Windows'
         run: |
-          BINARY="target/${{ matrix.target }}/release/${{ matrix.artifact }}"
+          BINARY="target/${{ matrix.target }}/release-interactive/${{ matrix.artifact }}"
           echo "=== ft --version ==="
           "$BINARY" --version
           echo "=== ft version --full ==="
@@ -221,18 +259,14 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $PSNativeCommandUseErrorActionPreference = $true
 
-          $binary = "target/${{ matrix.target }}/release/${{ matrix.artifact }}"
+          $binary = "target/${{ matrix.target }}/release-interactive/${{ matrix.artifact }}"
           Write-Host "=== ft --version ==="
           & $binary --version
           Write-Host "=== ft version --full ==="
           & $binary version --full
           Write-Host "=== ft --help ==="
           & $binary --help
-          # `ft doctor --json` is informational on Windows CI: non-zero exit
-          # is expected when the runner has no FrankenTerm/WezTerm install or
-          # agent-mail. We only assert that the binary emits parseable JSON,
-          # which catches launch panics / arg-parse regressions but doesn't
-          # gate on environmental gaps the doctor correctly reports.
+          # Same informational JSON-only doctor contract as the Unix smoke.
           Write-Host "=== ft doctor --json (informational) ==="
           # Capture stdout only — stderr (tracing logs) would mix into the
           # captured stream and break the json.loads validation below.
@@ -252,7 +286,7 @@ jobs:
           mkdir -p dist target/atomic-release-staging
           STAGING="target/atomic-release-staging/${{ matrix.asset }}"
           mkdir "$STAGING"
-          cp "target/${{ matrix.target }}/release/${{ matrix.artifact }}" "$STAGING/ft"
+          cp "target/${{ matrix.target }}/release-interactive/${{ matrix.artifact }}" "$STAGING/ft"
           cp scripts/atomic-component-manifest.sh "$STAGING/verify-components.sh"
           chmod 0755 "$STAGING/ft" "$STAGING/verify-components.sh"
 
@@ -298,7 +332,8 @@ jobs:
             --contract codec.min-supported="$CODEC_MIN_SUPPORTED" \
             --contract render-application.version="$RENDER_PROTOCOL_VERSION" \
             --contract core-wire.version="$CORE_WIRE_PROTOCOL_VERSION" \
-            --contract storage.schema="$STORAGE_SCHEMA_VERSION"
+            --contract storage.schema="$STORAGE_SCHEMA_VERSION" \
+            --contract panic.cli=unwind
           bash "$STAGING/verify-components.sh" verify \
             --root "$STAGING" \
             --manifest "$MANIFEST"
@@ -311,9 +346,10 @@ jobs:
       - name: Bundle + checksum macOS .app
         if: runner.os == 'macOS'
         run: |
-          # The darwin build above produced the full default-members set
-          # (frankenterm-gui + frankenterm-mux-server + ft) under
-          # target/<triple>/release. Package them into FrankenTerm.app (icon,
+          # The darwin build above produced the complete app process family
+          # (frankenterm-gui + frankenterm-mux-server + bundled ft) under
+          # target/<triple>/release-interactive with panic=unwind. Package it
+          # into FrankenTerm.app (icon,
           # Info.plist, bundled Pragmasevka font, ad-hoc signature) and publish
           # the bundle as a SECOND darwin asset so the curl|bash installer can
           # place the GUI app on macOS hosts — not just the ft CLI.
@@ -322,8 +358,7 @@ jobs:
           # separate, credential-bearing lift; until then the installer relies
           # on the no-quarantine local-install path (a terminal/curl-placed app
           # is not Gatekeeper-quarantined). create-macos-bundle.sh locates the
-          # binaries at $CARGO_TARGET_DIR/release/*, so point it at the
-          # per-target dir the --target build wrote to.
+          # binaries at $CARGO_TARGET_DIR/<target>/release-interactive/*.
           set -euo pipefail
           # create-macos-bundle.sh hard-fails without zstd (it unpacks the
           # bundled Pragmasevka font payload); ensure it's present so a missing
@@ -331,6 +366,7 @@ jobs:
           command -v zstd >/dev/null 2>&1 || HOMEBREW_NO_AUTO_UPDATE=1 brew install zstd
           mkdir -p dist
           CARGO_TARGET_DIR=target SOURCE_DATE_EPOCH=0 \
+            FT_ATOMIC_BUILD_IDENTITY="$FT_ATOMIC_BUILD_IDENTITY" \
             scripts/create-macos-bundle.sh \
               --skip-build \
               --target "${{ matrix.target }}" \
@@ -349,7 +385,7 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path dist
-          Compress-Archive -Path "target/${{ matrix.target }}/release/${{ matrix.artifact }}" -DestinationPath "dist/${{ matrix.asset }}.zip"
+          Compress-Archive -Path "target/${{ matrix.target }}/release-interactive/${{ matrix.artifact }}" -DestinationPath "dist/${{ matrix.asset }}.zip"
           cd dist
           $hash = (Get-FileHash -Algorithm SHA256 "${{ matrix.asset }}.zip").Hash.ToLower()
           "$hash  ${{ matrix.asset }}.zip" | Out-File -Encoding ASCII "${{ matrix.asset }}.zip.sha256"
@@ -530,7 +566,7 @@ jobs:
             --source-revision "$SOURCE_REVISION" \
             --version "$RELEASE_VERSION" \
             --target multi-platform-release \
-            --profile release \
+            --profile release-interactive \
             --feature-contract "$FEATURE_CONTRACT")"
           cp scripts/atomic-component-manifest.sh dist/verify-release-components.sh
           chmod 0755 dist/verify-release-components.sh
@@ -562,7 +598,7 @@ jobs:
             --source-revision "$SOURCE_REVISION" \
             --version "$RELEASE_VERSION" \
             --target multi-platform-release \
-            --profile release \
+            --profile release-interactive \
             --feature-contract "$FEATURE_CONTRACT" \
             "${manifest_args[@]}" \
             --source-match verify-release-components.sh=scripts/atomic-component-manifest.sh \

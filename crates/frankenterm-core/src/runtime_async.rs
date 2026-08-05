@@ -2445,27 +2445,12 @@ where
     T: Send + 'static,
     F: FnOnce() -> T + Send + 'static,
 {
-    use futures::FutureExt;
-
-    std::panic::AssertUnwindSafe(asupersync::runtime::spawn_blocking(work))
-        .catch_unwind()
+    frankenterm_sigpipe::catch_recoverable_future(
+        frankenterm_sigpipe::RecoverablePanicSite::CoreAsyncTaskJoin,
+        asupersync::runtime::spawn_blocking(work),
+    )
         .await
-        .map_err(|payload| {
-            format!(
-                "blocking task panicked: {}",
-                blocking_panic_payload_detail(payload.as_ref())
-            )
-        })
-}
-
-fn blocking_panic_payload_detail(payload: &(dyn std::any::Any + Send)) -> String {
-    if let Some(message) = payload.downcast_ref::<&'static str>() {
-        (*message).to_string()
-    } else if let Some(message) = payload.downcast_ref::<String>() {
-        message.clone()
-    } else {
-        "non-string panic payload".to_string()
-    }
+        .map_err(|_| "blocking task panicked (error_code=WA-RUNTIME-BLOCKING-PANIC)".to_string())
 }
 
 /// Typed failure from [`spawn_blocking_with_cx`].
@@ -4919,9 +4904,14 @@ mod tests {
 
             match error {
                 SpawnBlockingWithCxError::RuntimeFailure { detail } => {
+                    assert_eq!(
+                        detail,
+                        "blocking task panicked (error_code=WA-RUNTIME-BLOCKING-PANIC)",
+                        "runtime failure must be stable and content-free"
+                    );
                     assert!(
-                        detail.contains("injected blocking closure panic"),
-                        "runtime failure must preserve the panic detail; got: {detail}"
+                        !detail.contains("injected blocking closure panic"),
+                        "runtime failure must not reflect panic payload text"
                     );
                 }
                 other => {

@@ -1,6 +1,6 @@
 [package]
 name = "frankenterm-sigpipe"
-description = "Broken-pipe (EPIPE) exit handling shared by every FrankenTerm binary"
+description = "Process panic policy and broken-pipe handling shared by every FrankenTerm binary"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -13,5 +13,3 @@ categories = ["command-line-interface"]
 
 [lints]
 workspace = true
-
-[dependencies]

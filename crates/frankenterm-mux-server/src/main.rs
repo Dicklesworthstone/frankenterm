@@ -182,7 +182,8 @@ impl From<DispatchIoBackendArg> for frankenterm_mux_server_impl::dispatch::Dispa
 
 fn main() {
     // GH#75: a downstream reader closing our piped stdout early must exit
-    // 141 quietly, not panic-abort with SIGABRT under panic = "abort".
+    // 141 quietly without a fatal report. The hook remains required under the
+    // shipped unwind profile because std's stdout macros still panic on EPIPE.
     frankenterm_sigpipe::exit_quietly_on_broken_pipe();
 
     // Retain the static build fence through LTO/strip.  Package verification

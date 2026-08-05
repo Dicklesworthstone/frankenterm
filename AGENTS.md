@@ -274,18 +274,50 @@ classification and release-bundle evidence live at
 | `ftui` | FrankenTUI terminal UI (optional, migration target) |
 | `ratatui` + `crossterm` | TUI rendering (optional) |
 
-### Release Profile
+### Release Profiles and Panic Contracts
 
-The release build optimizes for size (this is a CLI binary):
+Every shipped process — standalone `ft`, GUI, mux server, and the `ft` copy
+inside `FrankenTerm.app` — uses `release-interactive`. That profile has
+`panic = "unwind"` so audited `frankenterm_sigpipe::catch_recoverable`
+boundaries are executable. The conventional `release` profile also fails safe
+with unwind semantics, so an operator who omits the project-specific profile
+cannot silently disable recovery. Release packaging still uses the explicit
+`release-interactive` identity. Only `release-abort-probe` disables unwinding,
+and that profile is reserved for the subprocess negative control.
 
 ```toml
-[profile.release]
-opt-level = "z"     # Optimize for size
-lto = true          # Link-time optimization
-codegen-units = 1   # Single codegen unit for better optimization
-panic = "abort"     # Smaller binary, no unwinding overhead
-strip = true        # Remove debug symbols
+[profile.release] # fail-safe conventional default
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "unwind"
+strip = true
+
+[profile.release-interactive]
+inherits = "release"
+panic = "unwind"
+
+[profile.release-abort-probe] # never package
+inherits = "release"
+panic = "abort"
+
+[profile.release-perf]
+inherits = "release"
+opt-level = 3
+lto = "thin"
+debug = "line-tables-only"
+panic = "unwind"
+strip = "none"
 ```
+
+Every project-installed panic hook must consult
+`frankenterm_sigpipe::is_recoverable_panic`. A production recovery contract
+must use the canonical helper so the original panic payload is disposed under
+the process-wide quarantine/poison contract and only a finite, content-free
+site label reaches telemetry. Direct
+`catch_unwind` is reserved for tests that rethrow/inspect the panic or for an
+explicitly documented non-recovery boundary. Release panic-policy proof must
+run the built artifact as a subprocess; ordinary unit tests are insufficient.
 
 ---
 
@@ -1245,7 +1277,7 @@ RCH offloads `cargo build`, `cargo test`, `cargo clippy`, and other compilation 
 To manually offload a build:
 ```bash
 RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- \
-  env CARGO_TARGET_DIR=/tmp/ft-<bead>-build cargo build --release
+  env CARGO_TARGET_DIR=/tmp/ft-<bead>-build cargo build --profile release-interactive
 RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- \
   env CARGO_TARGET_DIR=/tmp/ft-<bead>-test cargo test
 RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- \
