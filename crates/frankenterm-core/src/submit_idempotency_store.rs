@@ -1,56 +1,48 @@
-//! Durable claim state machine for verified-submit idempotency.
+//! Durable, fail-closed claim state machine for verified-submit idempotency.
 //!
-//! A claim is committed as `in_doubt` *before* policy-gated injection can have
-//! any side effect. A concurrent caller for the same fully bound request cannot
-//! claim the unique SQLite row, and an interrupted owner is never
-//! automatically retried. This provides at-most-once automatic effect under
-//! ambiguity; it deliberately does not claim exactly-once delivery.
+//! The caller nonce selects one stable row. A separately stored semantic
+//! request digest makes nonce reuse with changed text or verification semantics
+//! a typed conflict rather than a second effect. The owner state is split from
+//! `effect_applied_receipt_pending` and `in_doubt`, so replay never treats a
+//! successful injector call as an unperformed write merely because later wait,
+//! audit, or receipt work was interrupted. This is an at-most-once automatic
+//! effect contract; reconciliation remains an explicit future operation.
 
-use crate::robot_types::SubmitReceiptState;
-use crate::verified_submit::{SubmitIdempotencyBinding, VerifiedSubmitReport};
+use crate::robot_types::{SubmitGuaranteeLevel, SubmitReceipt, SubmitReceiptState};
+use crate::verified_submit::SubmitIdempotencyBinding;
+use rand::{TryRng, rngs::SysRng};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
+use std::fmt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const STORE_FILENAME: &str = "submit_idempotency.sqlite3";
-const STORE_SCHEMA_VERSION: i64 = 1;
-const STATE_IN_DOUBT: i64 = 1;
-const STATE_COMPLETED: i64 = 2;
-const STATE_RETRYABLE: i64 = 3;
+const LEGACY_STORE_NAME: &str = "submit_idempotency";
+const STORE_APPLICATION_ID: i64 = 0x4654_4944;
+const STORE_SCHEMA_VERSION: i64 = 2;
+const RECEIPT_SCHEMA_VERSION: u16 = 1;
+const STATE_ACTIVE_OWNER: i64 = 1;
+const STATE_EFFECT_APPLIED_RECEIPT_PENDING: i64 = 2;
+const STATE_IN_DOUBT: i64 = 3;
+const STATE_COMPLETED: i64 = 4;
+const STATE_RETRYABLE: i64 = 5;
 const RETRYABLE_POLICY_DENIED: i64 = 1;
 const RETRYABLE_APPROVAL_REQUIRED: i64 = 2;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+const OWNER_NONCE_BYTES: usize = 32;
+const OWNER_LEASE_DURATION_MS: i64 = 60_000;
 const MAX_RECEIPT_JSON_BYTES: usize = 64 * 1024;
-const MAX_REPORT_EVIDENCE_ITEMS: usize = 64;
-const MAX_REPORT_FIELD_BYTES: usize = 1024;
-const MAX_REPORT_CURSOR_BYTES: usize = 512;
+const MAX_RECEIPT_EVIDENCE_ITEMS: usize = 64;
+const MAX_RECEIPT_FIELD_BYTES: usize = 1024;
+const MAX_RECEIPT_CURSOR_BYTES: usize = 512;
+const MAX_CALLER_KEY_BYTES: usize = 256;
+const MAX_STORE_RECORDS: i64 = 16_384;
+const MAX_STORE_LOGICAL_BYTES: i64 = 128 * 1024 * 1024;
+const LOGICAL_RECORD_OVERHEAD_BYTES: i64 = 128;
 
-const CREATE_SCHEMA_SQL: &str = r#"
-CREATE TABLE IF NOT EXISTS verified_submit_idempotency (
-    idempotency_key TEXT PRIMARY KEY NOT NULL,
-    schema_version INTEGER NOT NULL,
-    pane_id TEXT NOT NULL,
-    request_sha256 TEXT NOT NULL,
-    state INTEGER NOT NULL CHECK (state IN (1, 2, 3)),
-    retryable_reason INTEGER,
-    receipt_json TEXT,
-    generation INTEGER NOT NULL DEFAULT 1 CHECK (generation >= 1),
-    created_unix_ms INTEGER NOT NULL,
-    updated_unix_ms INTEGER NOT NULL,
-    CHECK (length(idempotency_key) BETWEEN 71 AND 90),
-    CHECK (length(pane_id) BETWEEN 1 AND 20),
-    CHECK (length(request_sha256) = 64),
-    CHECK (receipt_json IS NULL OR length(CAST(receipt_json AS BLOB)) <= 65536),
-    CHECK (
-        (state = 1 AND retryable_reason IS NULL AND receipt_json IS NULL) OR
-        (state = 2 AND retryable_reason IS NULL AND receipt_json IS NOT NULL) OR
-        (state = 3 AND retryable_reason IN (1, 2) AND receipt_json IS NULL)
-    )
-) STRICT, WITHOUT ROWID;
-CREATE UNIQUE INDEX IF NOT EXISTS verified_submit_idempotency_request_unique
-    ON verified_submit_idempotency (pane_id, request_sha256);
-"#;
+const CREATE_TABLE_SQL: &str = "CREATE TABLE verified_submit_idempotency (idempotency_key TEXT COLLATE BINARY PRIMARY KEY NOT NULL, schema_version INTEGER NOT NULL, pane_id TEXT COLLATE BINARY NOT NULL, request_sha256 TEXT COLLATE BINARY NOT NULL, effect_sha256 TEXT COLLATE BINARY NOT NULL, state INTEGER NOT NULL CHECK (state IN (1, 2, 3, 4, 5)), retryable_reason INTEGER, receipt_json TEXT COLLATE BINARY, generation INTEGER NOT NULL CHECK (generation >= 1), owner_nonce BLOB NOT NULL CHECK (typeof(owner_nonce) = 'blob' AND length(owner_nonce) = 32), lease_expires_unix_ms INTEGER CHECK (lease_expires_unix_ms IS NULL OR lease_expires_unix_ms >= 0), created_unix_ms INTEGER NOT NULL, updated_unix_ms INTEGER NOT NULL, CHECK (length(CAST(idempotency_key AS BLOB)) BETWEEN 71 AND 90), CHECK (length(CAST(pane_id AS BLOB)) BETWEEN 1 AND 20), CHECK (length(CAST(request_sha256 AS BLOB)) = 64 AND request_sha256 NOT GLOB '*[^0-9a-f]*'), CHECK (length(CAST(effect_sha256 AS BLOB)) = 64 AND effect_sha256 NOT GLOB '*[^0-9a-f]*'), CHECK (receipt_json IS NULL OR length(CAST(receipt_json AS BLOB)) <= 65536), CHECK ((state = 1 AND retryable_reason IS NULL AND receipt_json IS NULL AND lease_expires_unix_ms IS NOT NULL) OR (state IN (2, 3) AND retryable_reason IS NULL AND receipt_json IS NULL AND lease_expires_unix_ms IS NULL) OR (state = 4 AND retryable_reason IS NULL AND receipt_json IS NOT NULL AND lease_expires_unix_ms IS NULL) OR (state = 5 AND retryable_reason IN (1, 2) AND receipt_json IS NULL AND lease_expires_unix_ms IS NULL))) STRICT, WITHOUT ROWID";
+const CREATE_INDEX_SQL: &str = "CREATE INDEX verified_submit_idempotency_request_lookup ON verified_submit_idempotency (pane_id COLLATE BINARY, request_sha256 COLLATE BINARY)";
 
 /// Finite failure taxonomy. No variant retains a filesystem path, SQL string,
 /// serialized receipt, or backend error message.
@@ -58,16 +50,28 @@ CREATE UNIQUE INDEX IF NOT EXISTS verified_submit_idempotency_request_unique
 pub enum SubmitIdempotencyError {
     #[error("submit idempotency binding is invalid")]
     InvalidBinding,
+    #[error("submit idempotency caller key is empty")]
+    EmptyCallerKey,
     #[error("submit idempotency database path is a symbolic link")]
     SymlinkRejected,
+    #[error("legacy submit idempotency storage is present")]
+    LegacyStorePresent,
     #[error("submit idempotency database directory is unavailable")]
     DirectoryUnavailable,
     #[error("submit idempotency database open failed")]
     OpenFailed,
+    #[error("submit idempotency database is busy")]
+    Busy,
     #[error("submit idempotency database configuration failed")]
     ConfigurationFailed,
     #[error("submit idempotency schema is unsupported")]
     SchemaMismatch,
+    #[error("submit idempotency request conflicts with the caller key")]
+    RequestConflict,
+    #[error("submit idempotency store capacity is exhausted")]
+    CapacityExceeded,
+    #[error("submit idempotency owner entropy is unavailable")]
+    EntropyUnavailable,
     #[error("submit idempotency claim failed")]
     ClaimFailed,
     #[error("submit idempotency transition failed")]
@@ -90,11 +94,17 @@ impl SubmitIdempotencyError {
     pub const fn error_class(self) -> &'static str {
         match self {
             Self::InvalidBinding => "invalid_binding",
+            Self::EmptyCallerKey => "empty_caller_key",
             Self::SymlinkRejected => "symlink_rejected",
+            Self::LegacyStorePresent => "legacy_store_present",
             Self::DirectoryUnavailable => "directory_unavailable",
             Self::OpenFailed => "open_failed",
+            Self::Busy => "busy",
             Self::ConfigurationFailed => "configuration_failed",
             Self::SchemaMismatch => "schema_mismatch",
+            Self::RequestConflict => "request_conflict",
+            Self::CapacityExceeded => "capacity_exceeded",
+            Self::EntropyUnavailable => "entropy_unavailable",
             Self::ClaimFailed => "claim_failed",
             Self::TransitionFailed => "transition_failed",
             Self::MissingClaim => "missing_claim",
@@ -104,6 +114,12 @@ impl SubmitIdempotencyError {
             Self::ReceiptInvalid => "receipt_invalid",
         }
     }
+
+    /// Only a real open failure or SQLite lock/busy result is retryable.
+    #[must_use]
+    pub const fn is_retryable(self) -> bool {
+        matches!(self, Self::OpenFailed | Self::Busy)
+    }
 }
 
 /// A successful unique claim, a completed replay, or a conservative refusal to
@@ -112,16 +128,29 @@ impl SubmitIdempotencyError {
 #[must_use]
 pub enum ClaimOutcome {
     Claimed(ClaimToken),
-    Completed(VerifiedSubmitReport),
+    Completed(SubmitReceipt),
+    InFlight,
+    EffectAppliedReceiptPending,
     InDoubt,
 }
 
 /// Opaque ownership generation returned by [`claim`]. Every terminal
 /// transition must present the token so a stale owner cannot complete or reopen
 /// a later claimant's generation (the retryable-state ABA guard).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct ClaimToken {
     generation: i64,
+    owner_nonce: [u8; OWNER_NONCE_BYTES],
+}
+
+impl fmt::Debug for ClaimToken {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ClaimToken")
+            .field("generation", &self.generation)
+            .field("owner_nonce", &"[REDACTED]")
+            .finish()
+    }
 }
 
 /// Pre-effect terminal outcomes that are proven safe to retry.
@@ -151,19 +180,22 @@ impl RetryableReason {
 /// Read-only state used by diagnostics and tests.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StoredSubmitState {
+    ActiveOwner,
+    EffectAppliedReceiptPending,
     InDoubt,
-    Completed(VerifiedSubmitReport),
+    Completed(SubmitReceipt),
     Retryable(RetryableReason),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct StoredReceiptEnvelope {
-    schema_version: i64,
-    idempotency_key: String,
+struct StoredReceiptEnvelopeV1 {
+    schema_version: u16,
+    internal_claim_key: String,
     pane_id: u64,
     request_sha256: String,
-    report: StoredVerifiedSubmitReport,
+    effect_sha256: String,
+    receipt: StoredSubmitReceiptV1,
 }
 
 /// Storage-local mirror so unknown/missing receipt fields cannot be silently
@@ -171,46 +203,132 @@ struct StoredReceiptEnvelope {
 /// change to this shape requires a store-schema migration/version bump.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct StoredVerifiedSubmitReport {
-    state: SubmitReceiptState,
+struct StoredSubmitReceiptV1 {
+    state: StoredSubmitReceiptStateV1,
+    guarantee_level: StoredSubmitGuaranteeLevelV1,
+    guarantee_met: bool,
     agent_type: Option<String>,
     profile_id: Option<String>,
     profile_version: Option<String>,
     attempts: u32,
     evidence_rule_ids: Vec<String>,
+    elapsed_ms: u64,
     polls: usize,
     cursor_before: Option<String>,
     cursor_after: Option<String>,
+    idempotency_key: String,
 }
 
-impl From<&VerifiedSubmitReport> for StoredVerifiedSubmitReport {
-    fn from(report: &VerifiedSubmitReport) -> Self {
-        Self {
-            state: report.state,
-            agent_type: report.agent_type.clone(),
-            profile_id: report.profile_id.clone(),
-            profile_version: report.profile_version.clone(),
-            attempts: report.attempts,
-            evidence_rule_ids: report.evidence_rule_ids.clone(),
-            polls: report.polls,
-            cursor_before: report.cursor_before.clone(),
-            cursor_after: report.cursor_after.clone(),
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum StoredSubmitReceiptStateV1 {
+    Submitted,
+    QueuedBehindOperation,
+    StuckInComposer,
+    PaneCrashedToShell,
+    VerificationUnavailable,
+    PolicyDenied,
+    RequiresApproval,
+    SendFailed,
+}
+
+impl From<SubmitReceiptState> for StoredSubmitReceiptStateV1 {
+    fn from(state: SubmitReceiptState) -> Self {
+        match state {
+            SubmitReceiptState::Submitted => Self::Submitted,
+            SubmitReceiptState::QueuedBehindOperation => Self::QueuedBehindOperation,
+            SubmitReceiptState::StuckInComposer => Self::StuckInComposer,
+            SubmitReceiptState::PaneCrashedToShell => Self::PaneCrashedToShell,
+            SubmitReceiptState::VerificationUnavailable => Self::VerificationUnavailable,
+            SubmitReceiptState::PolicyDenied => Self::PolicyDenied,
+            SubmitReceiptState::RequiresApproval => Self::RequiresApproval,
+            SubmitReceiptState::SendFailed => Self::SendFailed,
         }
     }
 }
 
-impl From<StoredVerifiedSubmitReport> for VerifiedSubmitReport {
-    fn from(report: StoredVerifiedSubmitReport) -> Self {
+impl From<StoredSubmitReceiptStateV1> for SubmitReceiptState {
+    fn from(state: StoredSubmitReceiptStateV1) -> Self {
+        match state {
+            StoredSubmitReceiptStateV1::Submitted => Self::Submitted,
+            StoredSubmitReceiptStateV1::QueuedBehindOperation => Self::QueuedBehindOperation,
+            StoredSubmitReceiptStateV1::StuckInComposer => Self::StuckInComposer,
+            StoredSubmitReceiptStateV1::PaneCrashedToShell => Self::PaneCrashedToShell,
+            StoredSubmitReceiptStateV1::VerificationUnavailable => Self::VerificationUnavailable,
+            StoredSubmitReceiptStateV1::PolicyDenied => Self::PolicyDenied,
+            StoredSubmitReceiptStateV1::RequiresApproval => Self::RequiresApproval,
+            StoredSubmitReceiptStateV1::SendFailed => Self::SendFailed,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum StoredSubmitGuaranteeLevelV1 {
+    Write,
+    Composer,
+    Submitted,
+    Working,
+}
+
+impl From<SubmitGuaranteeLevel> for StoredSubmitGuaranteeLevelV1 {
+    fn from(level: SubmitGuaranteeLevel) -> Self {
+        match level {
+            SubmitGuaranteeLevel::Write => Self::Write,
+            SubmitGuaranteeLevel::Composer => Self::Composer,
+            SubmitGuaranteeLevel::Submitted => Self::Submitted,
+            SubmitGuaranteeLevel::Working => Self::Working,
+        }
+    }
+}
+
+impl From<StoredSubmitGuaranteeLevelV1> for SubmitGuaranteeLevel {
+    fn from(level: StoredSubmitGuaranteeLevelV1) -> Self {
+        match level {
+            StoredSubmitGuaranteeLevelV1::Write => Self::Write,
+            StoredSubmitGuaranteeLevelV1::Composer => Self::Composer,
+            StoredSubmitGuaranteeLevelV1::Submitted => Self::Submitted,
+            StoredSubmitGuaranteeLevelV1::Working => Self::Working,
+        }
+    }
+}
+
+impl From<&SubmitReceipt> for StoredSubmitReceiptV1 {
+    fn from(receipt: &SubmitReceipt) -> Self {
         Self {
-            state: report.state,
-            agent_type: report.agent_type,
-            profile_id: report.profile_id,
-            profile_version: report.profile_version,
-            attempts: report.attempts,
-            evidence_rule_ids: report.evidence_rule_ids,
-            polls: report.polls,
-            cursor_before: report.cursor_before,
-            cursor_after: report.cursor_after,
+            state: receipt.state.into(),
+            guarantee_level: receipt.guarantee_level.into(),
+            guarantee_met: receipt.guarantee_met,
+            agent_type: receipt.agent_type.clone(),
+            profile_id: receipt.profile_id.clone(),
+            profile_version: receipt.profile_version.clone(),
+            attempts: receipt.attempts,
+            evidence_rule_ids: receipt.evidence_rule_ids.clone(),
+            elapsed_ms: receipt.elapsed_ms,
+            polls: receipt.polls,
+            cursor_before: receipt.cursor_before.clone(),
+            cursor_after: receipt.cursor_after.clone(),
+            idempotency_key: receipt.idempotency_key.clone(),
+        }
+    }
+}
+
+impl From<StoredSubmitReceiptV1> for SubmitReceipt {
+    fn from(receipt: StoredSubmitReceiptV1) -> Self {
+        Self {
+            state: receipt.state.into(),
+            guarantee_level: receipt.guarantee_level.into(),
+            guarantee_met: receipt.guarantee_met,
+            agent_type: receipt.agent_type,
+            profile_id: receipt.profile_id,
+            profile_version: receipt.profile_version,
+            attempts: receipt.attempts,
+            evidence_rule_ids: receipt.evidence_rule_ids,
+            elapsed_ms: receipt.elapsed_ms,
+            polls: receipt.polls,
+            cursor_before: receipt.cursor_before,
+            cursor_after: receipt.cursor_after,
+            idempotency_key: receipt.idempotency_key,
         }
     }
 }
@@ -220,6 +338,27 @@ struct StoredHeader {
     state: i64,
     retryable_reason: Option<i64>,
     generation: i64,
+    owner_nonce: [u8; OWNER_NONCE_BYTES],
+    lease_expires_unix_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct StoreLimits {
+    max_records: i64,
+    max_logical_bytes: i64,
+    receipt_reserve_bytes: i64,
+}
+
+const PRODUCTION_LIMITS: StoreLimits = StoreLimits {
+    max_records: MAX_STORE_RECORDS,
+    max_logical_bytes: MAX_STORE_LOGICAL_BYTES,
+    receipt_reserve_bytes: MAX_RECEIPT_JSON_BYTES as i64,
+};
+
+#[derive(Debug, Clone, Copy)]
+enum StoreOpenMode {
+    Create,
+    Existing,
 }
 
 /// Location of the dedicated SQLite store.
@@ -251,15 +390,19 @@ pub fn is_valid_submit_key(key: &str) -> bool {
 }
 
 fn validate_binding(binding: &SubmitIdempotencyBinding) -> Result<(), SubmitIdempotencyError> {
-    if binding.is_canonical()
-        && is_valid_submit_key(binding.key())
-        && binding
-            .key()
-            .strip_prefix("idem:")
-            .and_then(|rest| rest.split_once(':'))
-            .and_then(|(pane, _)| pane.parse::<u64>().ok())
-            == Some(binding.pane_id())
-    {
+    if binding.caller_key().is_empty() {
+        return Err(SubmitIdempotencyError::EmptyCallerKey);
+    }
+    if binding.caller_key().len() > MAX_CALLER_KEY_BYTES || !binding.is_canonical() {
+        return Err(SubmitIdempotencyError::InvalidBinding);
+    }
+    let pane_matches = binding
+        .key()
+        .strip_prefix("idem:")
+        .and_then(|rest| rest.split_once(':'))
+        .and_then(|(pane, _)| pane.parse::<u64>().ok())
+        == Some(binding.pane_id());
+    if is_valid_submit_key(binding.key()) && pane_matches {
         Ok(())
     } else {
         Err(SubmitIdempotencyError::InvalidBinding)
@@ -274,50 +417,125 @@ fn now_unix_ms() -> i64 {
     i64::try_from(millis).unwrap_or(i64::MAX)
 }
 
-fn validate_initialized_schema(conn: &Connection) -> Result<(), SubmitIdempotencyError> {
-    let (without_rowid, strict) = conn
+fn map_sqlite_error(
+    error: &rusqlite::Error,
+    fallback: SubmitIdempotencyError,
+) -> SubmitIdempotencyError {
+    match error.sqlite_error_code() {
+        Some(rusqlite::ffi::ErrorCode::DatabaseBusy | rusqlite::ffi::ErrorCode::DatabaseLocked) => {
+            SubmitIdempotencyError::Busy
+        }
+        _ => fallback,
+    }
+}
+
+fn map_sqlite<T>(
+    result: rusqlite::Result<T>,
+    fallback: SubmitIdempotencyError,
+) -> Result<T, SubmitIdempotencyError> {
+    result.map_err(|error| map_sqlite_error(&error, fallback))
+}
+
+fn schema_header(conn: &Connection) -> Result<(i64, i64), SubmitIdempotencyError> {
+    let application_id = map_sqlite(
+        conn.query_row("PRAGMA application_id", [], |row| row.get::<_, i64>(0)),
+        SubmitIdempotencyError::SchemaMismatch,
+    )?;
+    let user_version = map_sqlite(
+        conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0)),
+        SubmitIdempotencyError::SchemaMismatch,
+    )?;
+    Ok((application_id, user_version))
+}
+
+fn validate_initialized_schema_locked(
+    conn: &Connection,
+) -> Result<(), SubmitIdempotencyError> {
+    if schema_header(conn)? != (STORE_APPLICATION_ID, STORE_SCHEMA_VERSION) {
+        return Err(SubmitIdempotencyError::SchemaMismatch);
+    }
+
+    let (table_sql, index_sql, user_objects) = map_sqlite(
+        conn.query_row(
+            "SELECT (SELECT sql FROM main.sqlite_schema WHERE type = 'table' AND name = 'verified_submit_idempotency' COLLATE BINARY), (SELECT sql FROM main.sqlite_schema WHERE type = 'index' AND name = 'verified_submit_idempotency_request_lookup' COLLATE BINARY), (SELECT COUNT(*) FROM main.sqlite_schema WHERE name NOT LIKE 'sqlite_%')",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            },
+        ),
+        SubmitIdempotencyError::SchemaMismatch,
+    )?;
+    if table_sql.as_deref() != Some(CREATE_TABLE_SQL)
+        || index_sql.as_deref() != Some(CREATE_INDEX_SQL)
+        || user_objects != 2
+    {
+        return Err(SubmitIdempotencyError::SchemaMismatch);
+    }
+
+    let (without_rowid, strict) = map_sqlite(
+        conn
         .query_row(
             "SELECT wr, strict FROM pragma_table_list \
              WHERE schema = 'main' AND name = 'verified_submit_idempotency'",
             [],
             |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
-        )
-        .map_err(|_| SubmitIdempotencyError::SchemaMismatch)?;
-    let (columns, matching_columns) = conn
+        ),
+        SubmitIdempotencyError::SchemaMismatch,
+    )?;
+    let (columns, matching_columns) = map_sqlite(
+        conn
         .query_row(
             "SELECT COUNT(*), COALESCE(SUM(CASE \
                  WHEN cid = 0 AND name = 'idempotency_key' AND type = 'TEXT' AND \"notnull\" = 1 AND pk = 1 AND hidden = 0 THEN 1 \
                  WHEN cid = 1 AND name = 'schema_version' AND type = 'INTEGER' AND \"notnull\" = 1 AND pk = 0 AND hidden = 0 THEN 1 \
                  WHEN cid = 2 AND name = 'pane_id' AND type = 'TEXT' AND \"notnull\" = 1 AND pk = 0 AND hidden = 0 THEN 1 \
                  WHEN cid = 3 AND name = 'request_sha256' AND type = 'TEXT' AND \"notnull\" = 1 AND pk = 0 AND hidden = 0 THEN 1 \
-                 WHEN cid = 4 AND name = 'state' AND type = 'INTEGER' AND \"notnull\" = 1 AND pk = 0 AND hidden = 0 THEN 1 \
-                 WHEN cid = 5 AND name = 'retryable_reason' AND type = 'INTEGER' AND \"notnull\" = 0 AND pk = 0 AND hidden = 0 THEN 1 \
-                 WHEN cid = 6 AND name = 'receipt_json' AND type = 'TEXT' AND \"notnull\" = 0 AND pk = 0 AND hidden = 0 THEN 1 \
-                 WHEN cid = 7 AND name = 'generation' AND type = 'INTEGER' AND \"notnull\" = 1 AND pk = 0 AND hidden = 0 THEN 1 \
-                 WHEN cid = 8 AND name = 'created_unix_ms' AND type = 'INTEGER' AND \"notnull\" = 1 AND pk = 0 AND hidden = 0 THEN 1 \
-                 WHEN cid = 9 AND name = 'updated_unix_ms' AND type = 'INTEGER' AND \"notnull\" = 1 AND pk = 0 AND hidden = 0 THEN 1 \
+                 WHEN cid = 4 AND name = 'effect_sha256' AND type = 'TEXT' AND \"notnull\" = 1 AND pk = 0 AND hidden = 0 THEN 1 \
+                 WHEN cid = 5 AND name = 'state' AND type = 'INTEGER' AND \"notnull\" = 1 AND pk = 0 AND hidden = 0 THEN 1 \
+                 WHEN cid = 6 AND name = 'retryable_reason' AND type = 'INTEGER' AND \"notnull\" = 0 AND pk = 0 AND hidden = 0 THEN 1 \
+                 WHEN cid = 7 AND name = 'receipt_json' AND type = 'TEXT' AND \"notnull\" = 0 AND pk = 0 AND hidden = 0 THEN 1 \
+                 WHEN cid = 8 AND name = 'generation' AND type = 'INTEGER' AND \"notnull\" = 1 AND pk = 0 AND hidden = 0 THEN 1 \
+                 WHEN cid = 9 AND name = 'owner_nonce' AND type = 'BLOB' AND \"notnull\" = 1 AND pk = 0 AND hidden = 0 THEN 1 \
+                 WHEN cid = 10 AND name = 'lease_expires_unix_ms' AND type = 'INTEGER' AND \"notnull\" = 0 AND pk = 0 AND hidden = 0 THEN 1 \
+                 WHEN cid = 11 AND name = 'created_unix_ms' AND type = 'INTEGER' AND \"notnull\" = 1 AND pk = 0 AND hidden = 0 THEN 1 \
+                 WHEN cid = 12 AND name = 'updated_unix_ms' AND type = 'INTEGER' AND \"notnull\" = 1 AND pk = 0 AND hidden = 0 THEN 1 \
                  ELSE 0 END), 0) \
              FROM pragma_table_xinfo('verified_submit_idempotency')",
             [],
             |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
-        )
-        .map_err(|_| SubmitIdempotencyError::SchemaMismatch)?;
-    let (triggers, foreign_keys) = conn
+        ),
+        SubmitIdempotencyError::SchemaMismatch,
+    )?;
+    let (triggers, foreign_keys, indexes) = map_sqlite(
+        conn
         .query_row(
             "SELECT \
                  (SELECT COUNT(*) FROM main.sqlite_schema \
                   WHERE type = 'trigger' AND tbl_name = 'verified_submit_idempotency'), \
                  (SELECT COUNT(*) \
-                  FROM pragma_foreign_key_list('verified_submit_idempotency'))",
+                  FROM pragma_foreign_key_list('verified_submit_idempotency')), \
+                 (SELECT COUNT(*) FROM pragma_index_list('verified_submit_idempotency'))",
             [],
-            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
-        )
-        .map_err(|_| SubmitIdempotencyError::SchemaMismatch)?;
-    let (index_unique, index_origin, index_partial) = conn
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            },
+        ),
+        SubmitIdempotencyError::SchemaMismatch,
+    )?;
+    let (index_unique, index_origin, index_partial) = map_sqlite(
+        conn
         .query_row(
             "SELECT \"unique\", origin, partial \
              FROM pragma_index_list('verified_submit_idempotency') \
-             WHERE name = 'verified_submit_idempotency_request_unique'",
+             WHERE name = 'verified_submit_idempotency_request_lookup'",
             [],
             |row| {
                 Ok((
@@ -326,30 +544,60 @@ fn validate_initialized_schema(conn: &Connection) -> Result<(), SubmitIdempotenc
                     row.get::<_, i64>(2)?,
                 ))
             },
-        )
-        .map_err(|_| SubmitIdempotencyError::SchemaMismatch)?;
-    let (index_columns, matching_index_columns) = conn
+        ),
+        SubmitIdempotencyError::SchemaMismatch,
+    )?;
+    let (index_columns, matching_index_columns) = map_sqlite(
+        conn
         .query_row(
             "SELECT COUNT(*), COALESCE(SUM(CASE \
-                 WHEN seqno = 0 AND cid = 2 AND name = 'pane_id' THEN 1 \
-                 WHEN seqno = 1 AND cid = 3 AND name = 'request_sha256' THEN 1 \
+                 WHEN seqno = 0 AND cid = 2 AND name = 'pane_id' AND \"desc\" = 0 AND coll = 'BINARY' THEN 1 \
+                 WHEN seqno = 1 AND cid = 3 AND name = 'request_sha256' AND \"desc\" = 0 AND coll = 'BINARY' THEN 1 \
                  ELSE 0 END), 0) \
-             FROM pragma_index_info('verified_submit_idempotency_request_unique')",
+             FROM pragma_index_xinfo('verified_submit_idempotency_request_lookup') WHERE key = 1",
             [],
             |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
-        )
-        .map_err(|_| SubmitIdempotencyError::SchemaMismatch)?;
+        ),
+        SubmitIdempotencyError::SchemaMismatch,
+    )?;
+    let (pk_name, pk_unique, pk_partial) = map_sqlite(
+        conn.query_row(
+            "SELECT name, \"unique\", partial FROM pragma_index_list('verified_submit_idempotency') WHERE origin = 'pk'",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            },
+        ),
+        SubmitIdempotencyError::SchemaMismatch,
+    )?;
+    let (pk_columns, matching_pk_columns) = map_sqlite(
+        conn.query_row(
+            "SELECT COUNT(*), COALESCE(SUM(CASE WHEN seqno = 0 AND cid = 0 AND name = 'idempotency_key' AND \"desc\" = 0 AND coll = 'BINARY' THEN 1 ELSE 0 END), 0) FROM pragma_index_xinfo(?1) WHERE key = 1",
+            [pk_name],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+        ),
+        SubmitIdempotencyError::SchemaMismatch,
+    )?;
     if without_rowid == 1
         && strict == 1
-        && columns == 10
-        && matching_columns == 10
-        && index_unique == 1
+        && columns == 13
+        && matching_columns == 13
+        && index_unique == 0
         && index_origin == "c"
         && index_partial == 0
         && index_columns == 2
         && matching_index_columns == 2
+        && pk_unique == 1
+        && pk_partial == 0
+        && pk_columns == 1
+        && matching_pk_columns == 1
         && triggers == 0
         && foreign_keys == 0
+        && indexes == 2
     {
         Ok(())
     } else {
@@ -357,126 +605,211 @@ fn validate_initialized_schema(conn: &Connection) -> Result<(), SubmitIdempotenc
     }
 }
 
-fn open_store(ft_dir: &Path) -> Result<Connection, SubmitIdempotencyError> {
-    std::fs::create_dir_all(ft_dir)
-        .map_err(|_| SubmitIdempotencyError::DirectoryUnavailable)?;
+fn initialize_or_validate_schema_locked(
+    conn: &Connection,
+    allow_initialize: bool,
+) -> Result<(), SubmitIdempotencyError> {
+    let header = schema_header(conn)?;
+    if header == (STORE_APPLICATION_ID, STORE_SCHEMA_VERSION) {
+        return validate_initialized_schema_locked(conn);
+    }
+    if header != (0, 0) || !allow_initialize {
+        return Err(SubmitIdempotencyError::SchemaMismatch);
+    }
+    let objects = map_sqlite(
+        conn.query_row(
+            "SELECT COUNT(*) FROM main.sqlite_schema WHERE name NOT LIKE 'sqlite_%'",
+            [],
+            |row| row.get::<_, i64>(0),
+        ),
+        SubmitIdempotencyError::SchemaMismatch,
+    )?;
+    if objects != 0 {
+        return Err(SubmitIdempotencyError::SchemaMismatch);
+    }
+    map_sqlite(
+        conn.execute_batch(CREATE_TABLE_SQL),
+        SubmitIdempotencyError::ConfigurationFailed,
+    )?;
+    map_sqlite(
+        conn.execute_batch(CREATE_INDEX_SQL),
+        SubmitIdempotencyError::ConfigurationFailed,
+    )?;
+    map_sqlite(
+        conn.pragma_update(None, "application_id", STORE_APPLICATION_ID),
+        SubmitIdempotencyError::ConfigurationFailed,
+    )?;
+    map_sqlite(
+        conn.pragma_update(None, "user_version", STORE_SCHEMA_VERSION),
+        SubmitIdempotencyError::ConfigurationFailed,
+    )?;
+    validate_initialized_schema_locked(conn)
+}
+
+fn prepare_store_path(
+    ft_dir: &Path,
+    mode: StoreOpenMode,
+) -> Result<Option<PathBuf>, SubmitIdempotencyError> {
+    match std::fs::symlink_metadata(ft_dir) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(SubmitIdempotencyError::SymlinkRejected);
+        }
+        Ok(metadata) if !metadata.is_dir() => {
+            return Err(SubmitIdempotencyError::DirectoryUnavailable);
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => match mode {
+            StoreOpenMode::Existing => return Ok(None),
+            StoreOpenMode::Create => {
+                std::fs::create_dir_all(ft_dir)
+                    .map_err(|_| SubmitIdempotencyError::DirectoryUnavailable)?;
+                let metadata = std::fs::symlink_metadata(ft_dir)
+                    .map_err(|_| SubmitIdempotencyError::DirectoryUnavailable)?;
+                if metadata.file_type().is_symlink() {
+                    return Err(SubmitIdempotencyError::SymlinkRejected);
+                }
+                if !metadata.is_dir() {
+                    return Err(SubmitIdempotencyError::DirectoryUnavailable);
+                }
+            }
+        },
+        Err(_) => return Err(SubmitIdempotencyError::DirectoryUnavailable),
+    }
+
+    match std::fs::symlink_metadata(ft_dir.join(LEGACY_STORE_NAME)) {
+        Ok(_) => return Err(SubmitIdempotencyError::LegacyStorePresent),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return Err(SubmitIdempotencyError::DirectoryUnavailable),
+    }
+
     let path = database_path(ft_dir);
     match std::fs::symlink_metadata(&path) {
         Ok(metadata) if metadata.file_type().is_symlink() => {
             return Err(SubmitIdempotencyError::SymlinkRejected);
         }
-        Ok(_) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Ok(metadata) if !metadata.is_file() => return Err(SubmitIdempotencyError::OpenFailed),
+        Ok(_) => return Ok(Some(path)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => match mode {
+            StoreOpenMode::Create => return Ok(Some(path)),
+            StoreOpenMode::Existing => return Ok(None),
+        },
         Err(_) => return Err(SubmitIdempotencyError::OpenFailed),
     }
+}
 
-    let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
-        | OpenFlags::SQLITE_OPEN_CREATE
+fn open_store(
+    ft_dir: &Path,
+    mode: StoreOpenMode,
+) -> Result<Option<Connection>, SubmitIdempotencyError> {
+    let Some(path) = prepare_store_path(ft_dir, mode)? else {
+        return Ok(None);
+    };
+    let mut flags = OpenFlags::SQLITE_OPEN_READ_WRITE
         | OpenFlags::SQLITE_OPEN_FULL_MUTEX
         | OpenFlags::SQLITE_OPEN_NOFOLLOW;
-    let mut conn = Connection::open_with_flags(path, flags)
+    if matches!(mode, StoreOpenMode::Create) {
+        flags |= OpenFlags::SQLITE_OPEN_CREATE;
+    }
+    let conn = Connection::open_with_flags(path, flags)
         .map_err(|_| SubmitIdempotencyError::OpenFailed)?;
-    conn.busy_timeout(BUSY_TIMEOUT)
-        .map_err(|_| SubmitIdempotencyError::ConfigurationFailed)?;
-    conn.pragma_update(None, "journal_mode", "WAL")
-        .map_err(|_| SubmitIdempotencyError::ConfigurationFailed)?;
-    conn.pragma_update(None, "synchronous", "FULL")
-        .map_err(|_| SubmitIdempotencyError::ConfigurationFailed)?;
-    conn.pragma_update(None, "fullfsync", true)
-        .map_err(|_| SubmitIdempotencyError::ConfigurationFailed)?;
-    conn.pragma_update(None, "checkpoint_fullfsync", true)
-        .map_err(|_| SubmitIdempotencyError::ConfigurationFailed)?;
-    conn.pragma_update(None, "trusted_schema", false)
-        .map_err(|_| SubmitIdempotencyError::ConfigurationFailed)?;
-
-    let version = conn
-        .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
-        .map_err(|_| SubmitIdempotencyError::ConfigurationFailed)?;
-    if !matches!(version, 0 | STORE_SCHEMA_VERSION) {
-        return Err(SubmitIdempotencyError::SchemaMismatch);
+    map_sqlite(
+        conn.busy_timeout(BUSY_TIMEOUT),
+        SubmitIdempotencyError::ConfigurationFailed,
+    )?;
+    for (pragma, value) in [
+        ("journal_mode", "WAL"),
+        ("synchronous", "FULL"),
+        ("fullfsync", "ON"),
+        ("checkpoint_fullfsync", "ON"),
+        ("trusted_schema", "OFF"),
+        ("foreign_keys", "ON"),
+    ] {
+        map_sqlite(
+            conn.pragma_update(None, pragma, value),
+            SubmitIdempotencyError::ConfigurationFailed,
+        )?;
     }
-    if version == 0 {
-        let tx = conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(|_| SubmitIdempotencyError::ConfigurationFailed)?;
-        tx.execute_batch(CREATE_SCHEMA_SQL)
-            .map_err(|_| SubmitIdempotencyError::ConfigurationFailed)?;
-        validate_initialized_schema(&tx)?;
-        tx.pragma_update(None, "user_version", STORE_SCHEMA_VERSION)
-            .map_err(|_| SubmitIdempotencyError::ConfigurationFailed)?;
-        tx.commit()
-            .map_err(|_| SubmitIdempotencyError::ConfigurationFailed)?;
-    }
-    validate_initialized_schema(&conn)?;
-    Ok(conn)
+    Ok(Some(conn))
 }
 
 fn read_header(
     conn: &Connection,
     binding: &SubmitIdempotencyBinding,
+    fallback: SubmitIdempotencyError,
 ) -> Result<Option<StoredHeader>, SubmitIdempotencyError> {
-    let pane = binding.pane_id().to_string();
-    let row = conn
+    let row = map_sqlite(
+        conn
         .query_row(
-            "SELECT schema_version, pane_id = ?2, request_sha256 = ?3, \
-                    length(pane_id), length(request_sha256), state, \
-                    retryable_reason, length(CAST(receipt_json AS BLOB)), generation \
-             FROM verified_submit_idempotency WHERE idempotency_key = ?1",
-            params![binding.key(), pane, binding.request_sha256()],
+            "SELECT schema_version, length(CAST(idempotency_key AS BLOB)), substr(CAST(idempotency_key AS BLOB), 1, 90), length(CAST(pane_id AS BLOB)), substr(CAST(pane_id AS BLOB), 1, 21), length(CAST(request_sha256 AS BLOB)), substr(CAST(request_sha256 AS BLOB), 1, 65), length(CAST(effect_sha256 AS BLOB)), substr(CAST(effect_sha256 AS BLOB), 1, 65), state, retryable_reason, length(CAST(receipt_json AS BLOB)), generation, length(owner_nonce), substr(owner_nonce, 1, 33) FROM verified_submit_idempotency WHERE idempotency_key COLLATE BINARY = ?1 COLLATE BINARY",
+            [binding.key()],
             |row| {
                 Ok((
                     row.get::<_, i64>(0)?,
                     row.get::<_, i64>(1)?,
-                    row.get::<_, i64>(2)?,
+                    row.get::<_, Vec<u8>>(2)?,
                     row.get::<_, i64>(3)?,
-                    row.get::<_, i64>(4)?,
+                    row.get::<_, Vec<u8>>(4)?,
                     row.get::<_, i64>(5)?,
-                    row.get::<_, Option<i64>>(6)?,
-                    row.get::<_, Option<i64>>(7)?,
-                    row.get::<_, i64>(8)?,
+                    row.get::<_, Vec<u8>>(6)?,
+                    row.get::<_, i64>(7)?,
+                    row.get::<_, Vec<u8>>(8)?,
+                    row.get::<_, i64>(9)?,
+                    row.get::<_, Option<i64>>(10)?,
+                    row.get::<_, Option<i64>>(11)?,
+                    row.get::<_, i64>(12)?,
+                    row.get::<_, i64>(13)?,
+                    row.get::<_, Vec<u8>>(14)?,
                 ))
             },
         )
-        .optional()
-        .map_err(|_| SubmitIdempotencyError::ClaimFailed)?;
+        .optional(),
+        fallback,
+    )?;
     let Some((
         schema,
-        pane_matches,
-        request_matches,
+        key_len,
+        key,
         pane_len,
+        pane,
         digest_len,
+        request_digest,
+        effect_len,
+        effect_digest,
         state,
         reason,
         bytes,
         generation,
+        nonce_len,
+        nonce,
     )) = row
     else {
-        let request_row_exists = conn
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM verified_submit_idempotency \
-                 WHERE pane_id = ?1 AND request_sha256 = ?2)",
-                params![pane, binding.request_sha256()],
-                |row| row.get::<_, i64>(0),
-            )
-            .map_err(|_| SubmitIdempotencyError::ClaimFailed)?;
-        return if request_row_exists == 0 {
-            Ok(None)
-        } else {
-            Err(SubmitIdempotencyError::RecordCorrupt)
-        };
+        return Ok(None);
     };
-    let expected_pane_len = i64::try_from(binding.pane_id().to_string().len()).unwrap_or(i64::MAX);
+    let expected_pane = binding.pane_id().to_string();
     if schema != STORE_SCHEMA_VERSION
-        || pane_matches != 1
-        || request_matches != 1
-        || pane_len != expected_pane_len
+        || key_len != i64::try_from(binding.key().len()).unwrap_or(i64::MAX)
+        || key != binding.key().as_bytes()
+        || pane_len != i64::try_from(expected_pane.len()).unwrap_or(i64::MAX)
+        || pane != expected_pane.as_bytes()
         || digest_len != 64
+        || request_digest.len() != 64
+        || effect_len != 64
+        || effect_digest.len() != 64
         || generation < 1
+        || nonce_len != OWNER_NONCE_BYTES as i64
+        || nonce.len() != OWNER_NONCE_BYTES
     {
         return Err(SubmitIdempotencyError::RecordCorrupt);
     }
+    if request_digest != binding.request_sha256().as_bytes()
+        || effect_digest != binding.effect_sha256().as_bytes()
+    {
+        return Err(SubmitIdempotencyError::RequestConflict);
+    }
     let shape_ok = match state {
-        STATE_IN_DOUBT => reason.is_none() && bytes.is_none(),
+        STATE_ACTIVE_OWNER | STATE_EFFECT_APPLIED_RECEIPT_PENDING | STATE_IN_DOUBT => {
+            reason.is_none() && bytes.is_none()
+        }
         STATE_COMPLETED => {
             reason.is_none()
                 && bytes.is_some_and(|value| {
@@ -500,10 +833,14 @@ fn read_header(
             Err(SubmitIdempotencyError::RecordCorrupt)
         };
     }
+    let owner_nonce: [u8; OWNER_NONCE_BYTES] = nonce
+        .try_into()
+        .map_err(|_| SubmitIdempotencyError::RecordCorrupt)?;
     Ok(Some(StoredHeader {
         state,
         retryable_reason: reason,
         generation,
+        owner_nonce,
     }))
 }
 
@@ -518,34 +855,53 @@ fn validate_optional_field(
     }
 }
 
-fn validate_report(report: &VerifiedSubmitReport) -> Result<(), SubmitIdempotencyError> {
-    validate_optional_field(report.agent_type.as_deref(), MAX_REPORT_FIELD_BYTES)?;
-    validate_optional_field(report.profile_id.as_deref(), MAX_REPORT_FIELD_BYTES)?;
-    validate_optional_field(report.profile_version.as_deref(), MAX_REPORT_FIELD_BYTES)?;
-    validate_optional_field(report.cursor_before.as_deref(), MAX_REPORT_CURSOR_BYTES)?;
-    validate_optional_field(report.cursor_after.as_deref(), MAX_REPORT_CURSOR_BYTES)?;
-    if report.evidence_rule_ids.len() > MAX_REPORT_EVIDENCE_ITEMS
-        || report
+fn validate_receipt(
+    binding: &SubmitIdempotencyBinding,
+    receipt: &SubmitReceipt,
+) -> Result<(), SubmitIdempotencyError> {
+    validate_optional_field(receipt.agent_type.as_deref(), MAX_RECEIPT_FIELD_BYTES)?;
+    validate_optional_field(receipt.profile_id.as_deref(), MAX_RECEIPT_FIELD_BYTES)?;
+    validate_optional_field(receipt.profile_version.as_deref(), MAX_RECEIPT_FIELD_BYTES)?;
+    validate_optional_field(receipt.cursor_before.as_deref(), MAX_RECEIPT_CURSOR_BYTES)?;
+    validate_optional_field(receipt.cursor_after.as_deref(), MAX_RECEIPT_CURSOR_BYTES)?;
+    if receipt.idempotency_key.len() > MAX_CALLER_KEY_BYTES
+        || receipt.evidence_rule_ids.len() > MAX_RECEIPT_EVIDENCE_ITEMS
+        || receipt
             .evidence_rule_ids
             .iter()
-            .any(|item| item.len() > MAX_REPORT_FIELD_BYTES)
+            .any(|item| item.len() > MAX_RECEIPT_FIELD_BYTES)
     {
         return Err(SubmitIdempotencyError::ReceiptOversize);
+    }
+    if receipt.idempotency_key.as_bytes() != binding.caller_key().as_bytes()
+        || receipt.guarantee_met
+            != receipt
+                .guarantee_level
+                .is_met_by(receipt.state, &receipt.evidence_rule_ids)
+        || matches!(
+            receipt.state,
+            SubmitReceiptState::PolicyDenied
+                | SubmitReceiptState::RequiresApproval
+                | SubmitReceiptState::SendFailed
+        )
+    {
+        return Err(SubmitIdempotencyError::ReceiptInvalid);
     }
     Ok(())
 }
 
 fn serialize_receipt(
     binding: &SubmitIdempotencyBinding,
-    report: &VerifiedSubmitReport,
+    receipt: &SubmitReceipt,
 ) -> Result<String, SubmitIdempotencyError> {
-    validate_report(report)?;
-    let envelope = StoredReceiptEnvelope {
-        schema_version: STORE_SCHEMA_VERSION,
-        idempotency_key: binding.key().to_string(),
+    validate_receipt(binding, receipt)?;
+    let envelope = StoredReceiptEnvelopeV1 {
+        schema_version: RECEIPT_SCHEMA_VERSION,
+        internal_claim_key: binding.key().to_string(),
         pane_id: binding.pane_id(),
         request_sha256: binding.request_sha256().to_string(),
-        report: report.into(),
+        effect_sha256: binding.effect_sha256().to_string(),
+        receipt: receipt.into(),
     };
     let json = serde_json::to_string(&envelope)
         .map_err(|_| SubmitIdempotencyError::ReceiptInvalid)?;
@@ -558,35 +914,118 @@ fn serialize_receipt(
 fn load_receipt(
     conn: &Connection,
     binding: &SubmitIdempotencyBinding,
-) -> Result<VerifiedSubmitReport, SubmitIdempotencyError> {
-    let json = conn
+) -> Result<SubmitReceipt, SubmitIdempotencyError> {
+    let (length, bytes) = map_sqlite(
+        conn
         .query_row(
-            "SELECT receipt_json FROM verified_submit_idempotency WHERE idempotency_key = ?1",
+            "SELECT length(CAST(receipt_json AS BLOB)), substr(CAST(receipt_json AS BLOB), 1, 65537) FROM verified_submit_idempotency WHERE idempotency_key COLLATE BINARY = ?1 COLLATE BINARY",
             [binding.key()],
-            |row| row.get::<_, String>(0),
-        )
-        .map_err(|_| SubmitIdempotencyError::RecordCorrupt)?;
-    if json.len() > MAX_RECEIPT_JSON_BYTES {
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?)),
+        ),
+        SubmitIdempotencyError::RecordCorrupt,
+    )?;
+    if length < 0 || usize::try_from(length).map_or(true, |size| size > MAX_RECEIPT_JSON_BYTES) {
         return Err(SubmitIdempotencyError::ReceiptOversize);
     }
-    let envelope: StoredReceiptEnvelope =
-        serde_json::from_str(&json).map_err(|_| SubmitIdempotencyError::ReceiptInvalid)?;
-    if envelope.schema_version != STORE_SCHEMA_VERSION
-        || envelope.idempotency_key != binding.key()
+    if bytes.len() != usize::try_from(length).map_err(|_| SubmitIdempotencyError::RecordCorrupt)? {
+        return Err(SubmitIdempotencyError::RecordCorrupt);
+    }
+    let json = std::str::from_utf8(&bytes).map_err(|_| SubmitIdempotencyError::ReceiptInvalid)?;
+    let envelope: StoredReceiptEnvelopeV1 =
+        serde_json::from_str(json).map_err(|_| SubmitIdempotencyError::ReceiptInvalid)?;
+    if envelope.schema_version != RECEIPT_SCHEMA_VERSION
+        || envelope.internal_claim_key.as_bytes() != binding.key().as_bytes()
         || envelope.pane_id != binding.pane_id()
-        || envelope.request_sha256 != binding.request_sha256()
+        || envelope.request_sha256.as_bytes() != binding.request_sha256().as_bytes()
+        || envelope.effect_sha256.as_bytes() != binding.effect_sha256().as_bytes()
     {
         return Err(SubmitIdempotencyError::RecordCorrupt);
     }
-    let report = VerifiedSubmitReport::from(envelope.report);
-    validate_report(&report)?;
-    if matches!(
-        report.state,
-        SubmitReceiptState::PolicyDenied | SubmitReceiptState::RequiresApproval
-    ) {
-        return Err(SubmitIdempotencyError::RecordCorrupt);
+    let receipt = SubmitReceipt::from(envelope.receipt);
+    validate_receipt(binding, &receipt).map_err(|error| match error {
+        SubmitIdempotencyError::ReceiptOversize => error,
+        _ => SubmitIdempotencyError::ReceiptInvalid,
+    })?;
+    Ok(receipt)
+}
+
+fn fresh_owner_nonce() -> Result<[u8; OWNER_NONCE_BYTES], SubmitIdempotencyError> {
+    let mut nonce = [0_u8; OWNER_NONCE_BYTES];
+    let mut rng = SysRng;
+    rng.try_fill_bytes(&mut nonce)
+        .map_err(|_| SubmitIdempotencyError::EntropyUnavailable)?;
+    Ok(nonce)
+}
+
+fn store_usage(
+    conn: &Connection,
+    limits: StoreLimits,
+) -> Result<(i64, i64), SubmitIdempotencyError> {
+    map_sqlite(
+        conn.query_row(
+            "SELECT COUNT(*), COALESCE(SUM(?1 + length(CAST(idempotency_key AS BLOB)) + length(CAST(pane_id AS BLOB)) + length(CAST(request_sha256 AS BLOB)) + length(CAST(effect_sha256 AS BLOB)) + length(owner_nonce) + CASE WHEN state = ?2 THEN length(CAST(receipt_json AS BLOB)) WHEN state = ?3 THEN 0 ELSE ?4 END), 0) FROM verified_submit_idempotency",
+            params![
+                LOGICAL_RECORD_OVERHEAD_BYTES,
+                STATE_COMPLETED,
+                STATE_RETRYABLE,
+                limits.receipt_reserve_bytes,
+            ],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+        ),
+        SubmitIdempotencyError::ClaimFailed,
+    )
+}
+
+fn new_record_logical_bytes(
+    binding: &SubmitIdempotencyBinding,
+    limits: StoreLimits,
+) -> Result<i64, SubmitIdempotencyError> {
+    let variable = binding
+        .key()
+        .len()
+        .checked_add(binding.pane_id().to_string().len())
+        .and_then(|value| value.checked_add(binding.request_sha256().len()))
+        .and_then(|value| value.checked_add(binding.effect_sha256().len()))
+        .and_then(|value| value.checked_add(OWNER_NONCE_BYTES))
+        .and_then(|value| i64::try_from(value).ok())
+        .ok_or(SubmitIdempotencyError::CapacityExceeded)?;
+    LOGICAL_RECORD_OVERHEAD_BYTES
+        .checked_add(variable)
+        .and_then(|value| value.checked_add(limits.receipt_reserve_bytes))
+        .ok_or(SubmitIdempotencyError::CapacityExceeded)
+}
+
+fn ensure_new_record_capacity(
+    conn: &Connection,
+    binding: &SubmitIdempotencyBinding,
+    limits: StoreLimits,
+) -> Result<(), SubmitIdempotencyError> {
+    let (records, bytes) = store_usage(conn, limits)?;
+    let new_bytes = new_record_logical_bytes(binding, limits)?;
+    if records >= limits.max_records
+        || bytes
+            .checked_add(new_bytes)
+            .is_none_or(|total| total > limits.max_logical_bytes)
+    {
+        Err(SubmitIdempotencyError::CapacityExceeded)
+    } else {
+        Ok(())
     }
-    Ok(report)
+}
+
+fn ensure_reclaim_capacity(
+    conn: &Connection,
+    limits: StoreLimits,
+) -> Result<(), SubmitIdempotencyError> {
+    let (_, bytes) = store_usage(conn, limits)?;
+    if bytes
+        .checked_add(limits.receipt_reserve_bytes)
+        .is_none_or(|total| total > limits.max_logical_bytes)
+    {
+        Err(SubmitIdempotencyError::CapacityExceeded)
+    } else {
+        Ok(())
+    }
 }
 
 /// Atomically claim a request before any possible injection side effect.
@@ -602,79 +1041,120 @@ pub fn claim(
     ft_dir: &Path,
     binding: &SubmitIdempotencyBinding,
 ) -> Result<ClaimOutcome, SubmitIdempotencyError> {
+    claim_with_nonce_and_limits(ft_dir, binding, fresh_owner_nonce()?, PRODUCTION_LIMITS)
+}
+
+fn claim_with_nonce_and_limits(
+    ft_dir: &Path,
+    binding: &SubmitIdempotencyBinding,
+    owner_nonce: [u8; OWNER_NONCE_BYTES],
+    limits: StoreLimits,
+) -> Result<ClaimOutcome, SubmitIdempotencyError> {
     validate_binding(binding)?;
-    let mut conn = open_store(ft_dir)?;
-    let tx = conn
-        .transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(|_| SubmitIdempotencyError::ClaimFailed)?;
-    match read_header(&tx, binding)? {
+    if limits.max_records < 1
+        || limits.max_logical_bytes < 1
+        || limits.receipt_reserve_bytes < 1
+        || limits.receipt_reserve_bytes > MAX_RECEIPT_JSON_BYTES as i64
+    {
+        return Err(SubmitIdempotencyError::CapacityExceeded);
+    }
+    let mut conn = open_store(ft_dir, StoreOpenMode::Create)?
+        .ok_or(SubmitIdempotencyError::OpenFailed)?;
+    let tx = map_sqlite(
+        conn.transaction_with_behavior(TransactionBehavior::Immediate),
+        SubmitIdempotencyError::ClaimFailed,
+    )?;
+    initialize_or_validate_schema_locked(&tx, true)?;
+    match read_header(&tx, binding, SubmitIdempotencyError::ClaimFailed)? {
         None => {
+            ensure_new_record_capacity(&tx, binding, limits)?;
             let now = now_unix_ms();
-            tx.execute(
+            let changed = map_sqlite(
+                tx.execute(
                 "INSERT INTO verified_submit_idempotency \
-                 (idempotency_key, schema_version, pane_id, request_sha256, state, \
-                  retryable_reason, receipt_json, generation, created_unix_ms, updated_unix_ms) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, NULL, NULL, 1, ?6, ?6)",
+                 (idempotency_key, schema_version, pane_id, request_sha256, effect_sha256, state, \
+                  retryable_reason, receipt_json, generation, owner_nonce, created_unix_ms, updated_unix_ms) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, NULL, 1, ?7, ?8, ?8)",
                 params![
                     binding.key(),
                     STORE_SCHEMA_VERSION,
                     binding.pane_id().to_string(),
                     binding.request_sha256(),
-                    STATE_IN_DOUBT,
+                    binding.effect_sha256(),
+                    STATE_ACTIVE_OWNER,
+                    &owner_nonce[..],
                     now,
                 ],
-            )
-            .map_err(|_| SubmitIdempotencyError::ClaimFailed)?;
-            tx.commit()
-                .map_err(|_| SubmitIdempotencyError::ClaimFailed)?;
-            Ok(ClaimOutcome::Claimed(ClaimToken { generation: 1 }))
+                ),
+                SubmitIdempotencyError::ClaimFailed,
+            )?;
+            if changed != 1 {
+                return Err(SubmitIdempotencyError::ClaimFailed);
+            }
+            map_sqlite(tx.commit(), SubmitIdempotencyError::ClaimFailed)?;
+            Ok(ClaimOutcome::Claimed(ClaimToken {
+                generation: 1,
+                owner_nonce,
+            }))
+        }
+        Some(header) if header.state == STATE_ACTIVE_OWNER => {
+            map_sqlite(tx.commit(), SubmitIdempotencyError::ClaimFailed)?;
+            Ok(ClaimOutcome::InFlight)
+        }
+        Some(header) if header.state == STATE_EFFECT_APPLIED_RECEIPT_PENDING => {
+            map_sqlite(tx.commit(), SubmitIdempotencyError::ClaimFailed)?;
+            Ok(ClaimOutcome::EffectAppliedReceiptPending)
         }
         Some(header) if header.state == STATE_IN_DOUBT => {
-            tx.commit()
-                .map_err(|_| SubmitIdempotencyError::ClaimFailed)?;
+            map_sqlite(tx.commit(), SubmitIdempotencyError::ClaimFailed)?;
             Ok(ClaimOutcome::InDoubt)
         }
         Some(header) if header.state == STATE_COMPLETED => {
-            let report = load_receipt(&tx, binding)?;
-            tx.commit()
-                .map_err(|_| SubmitIdempotencyError::ClaimFailed)?;
-            Ok(ClaimOutcome::Completed(report))
+            let receipt = load_receipt(&tx, binding)?;
+            map_sqlite(tx.commit(), SubmitIdempotencyError::ClaimFailed)?;
+            Ok(ClaimOutcome::Completed(receipt))
         }
         Some(header) if header.state == STATE_RETRYABLE => {
+            ensure_reclaim_capacity(&tx, limits)?;
             let next_generation = header
                 .generation
                 .checked_add(1)
                 .ok_or(SubmitIdempotencyError::RecordCorrupt)?;
-            let changed = tx
-                .execute(
+            let changed = map_sqlite(
+                tx.execute(
                     "UPDATE verified_submit_idempotency \
                      SET state = ?2, retryable_reason = NULL, receipt_json = NULL, \
-                         generation = ?3, updated_unix_ms = ?4 \
-                     WHERE idempotency_key = ?1 AND state = ?5 AND generation = ?6",
+                         generation = ?3, owner_nonce = ?4, updated_unix_ms = ?5 \
+                     WHERE idempotency_key COLLATE BINARY = ?1 COLLATE BINARY AND state = ?6 \
+                       AND generation = ?7 AND owner_nonce = ?8",
                     params![
                         binding.key(),
-                        STATE_IN_DOUBT,
+                        STATE_ACTIVE_OWNER,
                         next_generation,
+                        &owner_nonce[..],
                         now_unix_ms(),
                         STATE_RETRYABLE,
                         header.generation,
+                        &header.owner_nonce[..],
                     ],
-                )
-                .map_err(|_| SubmitIdempotencyError::ClaimFailed)?;
+                ),
+                SubmitIdempotencyError::ClaimFailed,
+            )?;
             if changed != 1 {
                 return Err(SubmitIdempotencyError::ClaimFailed);
             }
-            tx.commit()
-                .map_err(|_| SubmitIdempotencyError::ClaimFailed)?;
+            map_sqlite(tx.commit(), SubmitIdempotencyError::ClaimFailed)?;
             Ok(ClaimOutcome::Claimed(ClaimToken {
                 generation: next_generation,
+                owner_nonce,
             }))
         }
         Some(_) => Err(SubmitIdempotencyError::RecordCorrupt),
     }
 }
 
-/// Durably attach a bounded, fully bound receipt to an owned `in_doubt` claim.
+/// Durably attach a bounded, fully bound receipt to an owned
+/// `effect_applied_receipt_pending` claim.
 /// Repeating the identical completion is idempotent; conflicting or retryable
 /// transitions fail closed.
 ///
@@ -685,58 +1165,139 @@ pub fn complete(
     ft_dir: &Path,
     binding: &SubmitIdempotencyBinding,
     token: ClaimToken,
-    report: &VerifiedSubmitReport,
+    receipt: &SubmitReceipt,
 ) -> Result<(), SubmitIdempotencyError> {
     validate_binding(binding)?;
-    if matches!(
-        report.state,
-        SubmitReceiptState::PolicyDenied | SubmitReceiptState::RequiresApproval
-    ) {
-        return Err(SubmitIdempotencyError::InvalidTransition);
-    }
-    let receipt_json = serialize_receipt(binding, report)?;
-    let mut conn = open_store(ft_dir)?;
-    let tx = conn
-        .transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(|_| SubmitIdempotencyError::TransitionFailed)?;
-    let Some(header) = read_header(&tx, binding)? else {
+    let receipt_json = serialize_receipt(binding, receipt)?;
+    let mut conn = open_store(ft_dir, StoreOpenMode::Existing)?
+        .ok_or(SubmitIdempotencyError::MissingClaim)?;
+    let tx = map_sqlite(
+        conn.transaction_with_behavior(TransactionBehavior::Immediate),
+        SubmitIdempotencyError::TransitionFailed,
+    )?;
+    initialize_or_validate_schema_locked(&tx, false)?;
+    let Some(header) = read_header(&tx, binding, SubmitIdempotencyError::TransitionFailed)? else {
         return Err(SubmitIdempotencyError::MissingClaim);
     };
-    if header.generation != token.generation {
+    if header.generation != token.generation || header.owner_nonce != token.owner_nonce {
         return Err(SubmitIdempotencyError::InvalidTransition);
     }
     if header.state == STATE_COMPLETED {
         let stored = load_receipt(&tx, binding)?;
-        if stored != *report {
+        if stored != *receipt {
             return Err(SubmitIdempotencyError::InvalidTransition);
         }
-        tx.commit()
-            .map_err(|_| SubmitIdempotencyError::TransitionFailed)?;
+        map_sqlite(tx.commit(), SubmitIdempotencyError::TransitionFailed)?;
         return Ok(());
     }
-    if header.state != STATE_IN_DOUBT {
+    if header.state != STATE_EFFECT_APPLIED_RECEIPT_PENDING {
         return Err(SubmitIdempotencyError::InvalidTransition);
     }
-    let changed = tx
-        .execute(
+    let changed = map_sqlite(
+        tx.execute(
             "UPDATE verified_submit_idempotency \
              SET state = ?2, retryable_reason = NULL, receipt_json = ?3, updated_unix_ms = ?4 \
-             WHERE idempotency_key = ?1 AND state = ?5 AND generation = ?6",
+             WHERE idempotency_key COLLATE BINARY = ?1 COLLATE BINARY AND state = ?5 \
+               AND generation = ?6 AND owner_nonce = ?7",
             params![
                 binding.key(),
                 STATE_COMPLETED,
                 receipt_json,
                 now_unix_ms(),
-                STATE_IN_DOUBT,
+                STATE_EFFECT_APPLIED_RECEIPT_PENDING,
                 token.generation,
+                &token.owner_nonce[..],
             ],
-        )
-        .map_err(|_| SubmitIdempotencyError::TransitionFailed)?;
+        ),
+        SubmitIdempotencyError::TransitionFailed,
+    )?;
     if changed != 1 {
         return Err(SubmitIdempotencyError::TransitionFailed);
     }
-    tx.commit()
-        .map_err(|_| SubmitIdempotencyError::TransitionFailed)
+    map_sqlite(tx.commit(), SubmitIdempotencyError::TransitionFailed)
+}
+
+fn transition_from_active_owner(
+    ft_dir: &Path,
+    binding: &SubmitIdempotencyBinding,
+    token: ClaimToken,
+    target_state: i64,
+    retryable_reason: Option<RetryableReason>,
+) -> Result<(), SubmitIdempotencyError> {
+    validate_binding(binding)?;
+    let mut conn = open_store(ft_dir, StoreOpenMode::Existing)?
+        .ok_or(SubmitIdempotencyError::MissingClaim)?;
+    let tx = map_sqlite(
+        conn.transaction_with_behavior(TransactionBehavior::Immediate),
+        SubmitIdempotencyError::TransitionFailed,
+    )?;
+    initialize_or_validate_schema_locked(&tx, false)?;
+    let Some(header) = read_header(&tx, binding, SubmitIdempotencyError::TransitionFailed)? else {
+        return Err(SubmitIdempotencyError::MissingClaim);
+    };
+    if header.generation != token.generation || header.owner_nonce != token.owner_nonce {
+        return Err(SubmitIdempotencyError::InvalidTransition);
+    }
+    let expected_reason = retryable_reason.map(RetryableReason::as_db);
+    if header.state == target_state && header.retryable_reason == expected_reason {
+        map_sqlite(tx.commit(), SubmitIdempotencyError::TransitionFailed)?;
+        return Ok(());
+    }
+    if header.state != STATE_ACTIVE_OWNER {
+        return Err(SubmitIdempotencyError::InvalidTransition);
+    }
+    let changed = map_sqlite(
+        tx.execute(
+            "UPDATE verified_submit_idempotency SET state = ?2, retryable_reason = ?3, receipt_json = NULL, updated_unix_ms = ?4 WHERE idempotency_key COLLATE BINARY = ?1 COLLATE BINARY AND state = ?5 AND generation = ?6 AND owner_nonce = ?7",
+            params![
+                binding.key(),
+                target_state,
+                expected_reason,
+                now_unix_ms(),
+                STATE_ACTIVE_OWNER,
+                token.generation,
+                &token.owner_nonce[..],
+            ],
+        ),
+        SubmitIdempotencyError::TransitionFailed,
+    )?;
+    if changed != 1 {
+        return Err(SubmitIdempotencyError::TransitionFailed);
+    }
+    map_sqlite(tx.commit(), SubmitIdempotencyError::TransitionFailed)
+}
+
+/// Record that the injector returned `Allowed` before any later observation,
+/// audit enrichment, or receipt serialization is attempted.
+///
+/// # Errors
+/// Returns a finite error when the token is stale or the durable transition
+/// cannot be committed.
+pub fn mark_effect_applied_receipt_pending(
+    ft_dir: &Path,
+    binding: &SubmitIdempotencyBinding,
+    token: ClaimToken,
+) -> Result<(), SubmitIdempotencyError> {
+    transition_from_active_owner(
+        ft_dir,
+        binding,
+        token,
+        STATE_EFFECT_APPLIED_RECEIPT_PENDING,
+        None,
+    )
+}
+
+/// Record an injector/backend error whose pane-write outcome is ambiguous.
+///
+/// # Errors
+/// Returns a finite error when the token is stale or the durable transition
+/// cannot be committed.
+pub fn mark_in_doubt(
+    ft_dir: &Path,
+    binding: &SubmitIdempotencyBinding,
+    token: ClaimToken,
+) -> Result<(), SubmitIdempotencyError> {
+    transition_from_active_owner(ft_dir, binding, token, STATE_IN_DOUBT, None)
 }
 
 /// Mark a proven pre-effect denial as retryable. This transition must never be
@@ -751,45 +1312,7 @@ pub fn mark_retryable(
     token: ClaimToken,
     reason: RetryableReason,
 ) -> Result<(), SubmitIdempotencyError> {
-    validate_binding(binding)?;
-    let mut conn = open_store(ft_dir)?;
-    let tx = conn
-        .transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(|_| SubmitIdempotencyError::TransitionFailed)?;
-    let Some(header) = read_header(&tx, binding)? else {
-        return Err(SubmitIdempotencyError::MissingClaim);
-    };
-    if header.generation != token.generation {
-        return Err(SubmitIdempotencyError::InvalidTransition);
-    }
-    if header.state == STATE_RETRYABLE && header.retryable_reason == Some(reason.as_db()) {
-        tx.commit()
-            .map_err(|_| SubmitIdempotencyError::TransitionFailed)?;
-        return Ok(());
-    }
-    if header.state != STATE_IN_DOUBT {
-        return Err(SubmitIdempotencyError::InvalidTransition);
-    }
-    let changed = tx
-        .execute(
-            "UPDATE verified_submit_idempotency \
-             SET state = ?2, retryable_reason = ?3, receipt_json = NULL, updated_unix_ms = ?4 \
-             WHERE idempotency_key = ?1 AND state = ?5 AND generation = ?6",
-            params![
-                binding.key(),
-                STATE_RETRYABLE,
-                reason.as_db(),
-                now_unix_ms(),
-                STATE_IN_DOUBT,
-                token.generation,
-            ],
-        )
-        .map_err(|_| SubmitIdempotencyError::TransitionFailed)?;
-    if changed != 1 {
-        return Err(SubmitIdempotencyError::TransitionFailed);
-    }
-    tx.commit()
-        .map_err(|_| SubmitIdempotencyError::TransitionFailed)
+    transition_from_active_owner(ft_dir, binding, token, STATE_RETRYABLE, Some(reason))
 }
 
 /// Inspect a bound claim without changing its state.
@@ -802,17 +1325,20 @@ pub fn lookup(
     binding: &SubmitIdempotencyBinding,
 ) -> Result<Option<StoredSubmitState>, SubmitIdempotencyError> {
     validate_binding(binding)?;
-    match std::fs::symlink_metadata(database_path(ft_dir)) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Ok(_) => {}
-        Err(_) => return Err(SubmitIdempotencyError::OpenFailed),
-    }
-    let mut conn = open_store(ft_dir)?;
-    let tx = conn
-        .transaction_with_behavior(TransactionBehavior::Deferred)
-        .map_err(|_| SubmitIdempotencyError::ClaimFailed)?;
-    let state = match read_header(&tx, binding)? {
+    let Some(mut conn) = open_store(ft_dir, StoreOpenMode::Existing)? else {
+        return Ok(None);
+    };
+    let tx = map_sqlite(
+        conn.transaction_with_behavior(TransactionBehavior::Immediate),
+        SubmitIdempotencyError::ClaimFailed,
+    )?;
+    initialize_or_validate_schema_locked(&tx, false)?;
+    let state = match read_header(&tx, binding, SubmitIdempotencyError::ClaimFailed)? {
         None => None,
+        Some(header) if header.state == STATE_ACTIVE_OWNER => Some(StoredSubmitState::ActiveOwner),
+        Some(header) if header.state == STATE_EFFECT_APPLIED_RECEIPT_PENDING => {
+            Some(StoredSubmitState::EffectAppliedReceiptPending)
+        }
         Some(header) if header.state == STATE_IN_DOUBT => Some(StoredSubmitState::InDoubt),
         Some(header) if header.state == STATE_COMPLETED => {
             Some(StoredSubmitState::Completed(load_receipt(&tx, binding)?))
@@ -826,8 +1352,7 @@ pub fn lookup(
         }
         Some(_) => return Err(SubmitIdempotencyError::RecordCorrupt),
     };
-    tx.commit()
-        .map_err(|_| SubmitIdempotencyError::ClaimFailed)?;
+    map_sqlite(tx.commit(), SubmitIdempotencyError::ClaimFailed)?;
     Ok(state)
 }
 
