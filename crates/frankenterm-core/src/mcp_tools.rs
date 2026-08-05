@@ -123,7 +123,7 @@ async fn record_event_mutation_audit_or_log(
     audit: crate::storage::AuditActionRecord,
     tool_name: &'static str,
 ) {
-    if let Err(err) = storage
+    if let Err(_error) = storage
         .record_audit_action_redacted_with_cx(audit_cx, audit)
         .await
     {
@@ -131,7 +131,7 @@ async fn record_event_mutation_audit_or_log(
         tracing::warn!(
             target: "ft.security.audit",
             tool = tool_name,
-            error = %err,
+            error_class = "mcp_event_mutation_audit_write_failed",
             "br-ft-pgjat: silent record_audit_action_redacted_with_cx failure; audit row \
              missing for this MCP event-mutation call (client still got success per the \
              ft-luav8 fire-and-forget contract). MCP_AUDIT_FAILURE_COUNT bumped."
@@ -360,13 +360,13 @@ fn record_mcp_workflow_plan_serde_drop() {
 pub fn parse_workflow_plan_json(plan_json: &str, plan_id: &str) -> Option<crate::plan::ActionPlan> {
     match serde_json::from_str::<crate::plan::ActionPlan>(plan_json) {
         Ok(plan) => Some(plan),
-        Err(err) => {
+        Err(_error) => {
             record_mcp_workflow_plan_serde_drop();
             tracing::warn!(
                 target: "frankenterm::mcp_tools",
                 event = "br-ft-ncijf",
-                error = %err,
-                plan_id = %plan_id,
+                error_class = "workflow_plan_json_deserialization_failed",
+                plan_id_hash = %intent_hash_hex(plan_id),
                 plan_json_len = plan_json.len(),
                 "workflow plan_json failed to deserialize as ActionPlan; \
                  status response will report plan_step_name=None and total_steps=None"
@@ -1050,10 +1050,9 @@ fn mcp_authorize_mcp_mutation(
         tracing::warn!(
             target: "ft::security::policy",
             tool = %summary,
-            command = %command_text,
+            intent_hash = %intent_hash_hex(command_text),
             decision = "denied",
-            rule_id = ?decision.rule_id(),
-            reason = %reason,
+            rule_id_present = decision.rule_id().is_some(),
             "MCP mutation denied by policy"
         );
         persist_mcp_policy_denial(
@@ -1090,10 +1089,9 @@ fn mcp_authorize_mcp_mutation(
         tracing::warn!(
             target: "ft::security::policy",
             tool = %summary,
-            command = %command_text,
+            intent_hash = %intent_hash_hex(command_text),
             decision = "require_approval_unsupported",
-            rule_id = ?decision.rule_id(),
-            reason = %reason,
+            rule_id_present = decision.rule_id().is_some(),
             "MCP mutation policy returned RequireApproval but tool surface does not \
              support approval flow; fail-closed (br-ft-6h1rv)"
         );
@@ -1138,11 +1136,11 @@ fn persist_mcp_policy_denial(
 ) {
     let layout = match config.workspace_layout(None) {
         Ok(layout) => layout,
-        Err(err) => {
+        Err(_error) => {
             tracing::warn!(
                 target: "ft::security::policy",
                 tool = %tool_name,
-                error = %err,
+                error_class = "policy_denial_workspace_layout_unavailable",
                 "workspace_layout unavailable; skipping policy_denied_audit write"
             );
             return;
@@ -1159,13 +1157,13 @@ fn persist_mcp_policy_denial(
         rule_id: rule_id.map(String::from),
         decision: decision.to_string(),
     };
-    if let Err(err) =
+    if let Err(_error) =
         crate::storage::record_policy_denial_audit_blocking(layout.db_path.as_path(), &record)
     {
         tracing::warn!(
             target: "ft::security::policy",
             tool = %tool_name,
-            error = %err,
+            error_class = "policy_denial_audit_write_failed",
             "policy_denied_audit write failed; tracing emission remains the primary signal"
         );
     }
@@ -1199,11 +1197,11 @@ async fn persist_mcp_policy_denial_async(
         rule_id: rule_id.map(String::from),
         decision: decision.to_string(),
     };
-    if let Err(err) = storage.record_policy_denial_audit(record).await {
+    if let Err(_error) = storage.record_policy_denial_audit(record).await {
         tracing::warn!(
             target: "ft::security::policy",
             tool = %tool_name,
-            error = %err,
+            error_class = "policy_denial_audit_write_failed",
             "policy_denied_audit write failed; tracing emission remains the primary signal"
         );
     }
@@ -1230,10 +1228,9 @@ async fn audit_mcp_policy_denial_async(
     tracing::warn!(
         target: "ft::security::policy",
         tool = %tool_name,
-        command = %command_text,
+        intent_hash = %intent_hash_hex(command_text),
         decision = %decision,
-        rule_id = ?rule_id,
-        reason = %reason,
+        rule_id_present = rule_id.is_some(),
         reason_code = %reason_code,
         storage_attached = storage.is_some(),
         "MCP action denied by policy"
@@ -1287,8 +1284,11 @@ async fn load_distributed_remote_panes(
     let mcp_panes_cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
     let storage = StorageHandle::new_with_cx(&mcp_panes_cx, &db_path.to_string_lossy()).await?;
     let panes = storage.get_panes_with_cx(&mcp_panes_cx).await?;
-    if let Err(err) = storage.shutdown().await {
-        tracing::warn!(error = %err, "Failed to shutdown storage cleanly after MCP pane query");
+    if let Err(_error) = storage.shutdown().await {
+        tracing::warn!(
+            error_class = "mcp_pane_query_storage_shutdown_failed",
+            "Failed to shutdown storage cleanly after MCP pane query"
+        );
     }
 
     Ok(panes
@@ -1349,14 +1349,17 @@ fn serialize_mcp_audit_decision_context(
     context: &crate::policy::DecisionContext,
 ) -> Option<String> {
     serde_json::to_string(context)
-        .inspect_err(|e| {
+        .inspect_err(|_error| {
             // br-ft-yygus: route through the cross-module counter
             // so MCP-built audit rows that lose decision_context
             // are visible alongside the policy.rs sites in the
             // same metric. Don't replace the tracing::warn; bump
             // is additive observability.
             crate::policy::record_policy_decision_context_serde_drop();
-            tracing::warn!(error = %e, "mcp audit decision_context serialization failed");
+            tracing::warn!(
+                error_class = "mcp_audit_decision_context_serialization_failed",
+                "mcp audit decision_context serialization failed"
+            );
         })
         .ok()
 }
@@ -2802,10 +2805,9 @@ impl ToolHandler for WaStateTool {
                     Ok(remote_records) => {
                         merge_distributed_remote_mcp_states(&mut states, remote_records, &params);
                     }
-                    Err(err) => {
+                    Err(_error) => {
                         tracing::warn!(
-                            error = %err,
-                            path = %db_path.display(),
+                            error_class = "wa_state_distributed_panes_unavailable",
                             "Failed to load distributed panes for wa.state"
                         );
                     }
@@ -5716,9 +5718,9 @@ fn run_mcp_await_event_delivery_completion_worker(
         .build()
     {
         Ok(runtime) => runtime,
-        Err(error) => {
+        Err(_error) => {
             tracing::error!(
-                error = %error,
+                error_class = "mcp_await_event_runtime_initialization_failed",
                 "Unable to build the long-lived shared MCP await-event runtime"
             );
             return;
@@ -5924,14 +5926,14 @@ fn run_mcp_await_event_delivery_completion_worker(
             let synthetic_failure = false;
 
             let initialization = if synthetic_failure {
-                Err("synthetic test storage initialization failure".to_string())
+                Err("synthetic_storage_initialization_failure")
             } else {
                 let cx = crate::cx::for_request();
                 let _active_cx =
                     McpAwaitEventActiveCxGuard::install(&active_completion_cx, &cx);
                 runtime
                     .block_on(StorageHandle::new_with_cx(&cx, &db_path_text))
-                    .map_err(|error| error.to_string())
+                    .map_err(|_error| "storage_open_failed")
             };
 
             #[cfg(test)]
@@ -5975,7 +5977,6 @@ fn run_mcp_await_event_delivery_completion_worker(
                     drop(lifecycle_guard);
                     tracing::info!(
                         storage_epoch,
-                        db_path = %db_path_text,
                         "Initialized one shared MCP await-event storage epoch"
                     );
                 }
@@ -5985,10 +5986,9 @@ fn run_mcp_await_event_delivery_completion_worker(
                         .storage_initialization_failures
                         .fetch_add(1, Ordering::Relaxed);
                     tracing::error!(
-                        error,
+                        error_class = error,
                         reconnect_backoff_ms = u64::try_from(reconnect_backoff.as_millis())
                             .unwrap_or(u64::MAX),
-                        db_path = %db_path_text,
                         "Unable to initialize shared MCP await-event storage; all await admission remains fail-closed"
                     );
                     stats.record_reconnect_backoff(reconnect_backoff);
@@ -6482,12 +6482,12 @@ async fn complete_mcp_await_event_deliveries_with_storage(
                 'remaining_batches: for lease_batch in
                     canonical_leases.chunks(EVENT_DELIVERY_LEASE_BULK_MAX)
                 {
-                    if let Err(err) = mcp_request_checkpoint(
+                    if let Err(_error) = mcp_request_checkpoint(
                         &operation_cx,
                         "wa.await_event delivery completion batch",
                     ) {
                         tracing::error!(
-                            error = %err,
+                            error_class = "event_delivery_batch_cancelled",
                             remaining_delivery_count = lease_batch.len(),
                             ?outcome,
                             "MCP event-delivery completion was cancelled before the next batch; lease expiry remains the recovery authority"
@@ -6551,7 +6551,7 @@ async fn complete_mcp_await_event_deliveries_with_storage(
                             ) =>
                         {
                             tracing::error!(
-                                error = %batch_error,
+                                error_class = "event_delivery_storage_epoch_invalidated",
                                 delivery_count = lease_batch.len(),
                                 ?outcome,
                                 "MCP event-delivery bulk completion invalidated the shared storage epoch; remaining leases recover by expiry"
@@ -6561,7 +6561,7 @@ async fn complete_mcp_await_event_deliveries_with_storage(
                         }
                         Err(batch_error) => {
                             tracing::warn!(
-                                error = %batch_error,
+                                error_class = "event_delivery_bulk_mutation_failed",
                                 delivery_count = lease_batch.len(),
                                 ?outcome,
                                 "MCP event-delivery bulk completion failed; retrying exact leases individually"
@@ -6585,12 +6585,12 @@ async fn complete_mcp_await_event_deliveries_with_storage(
                         let mut fallback_observed_writer_response = false;
                         let mut fallback_invalidated_storage = false;
                         for lease in lease_batch {
-                            if let Err(err) = mcp_request_checkpoint(
+                            if let Err(_error) = mcp_request_checkpoint(
                                 &operation_cx,
                                 "wa.await_event delivery completion fallback",
                             ) {
                                 tracing::error!(
-                                    error = %err,
+                                    error_class = "event_delivery_fallback_cancelled",
                                     event_id = lease.event_id(),
                                     ?outcome,
                                     "MCP event-delivery fallback was cancelled; remaining leases will recover by expiry"
@@ -6632,13 +6632,16 @@ async fn complete_mcp_await_event_deliveries_with_storage(
                                     );
                                 }
                                 Err(err) => {
+                                    let epoch_invalidating =
+                                        mcp_await_event_error_invalidates_storage_epoch(&err);
                                     tracing::error!(
-                                        error = %err,
+                                        error_class = "event_delivery_single_mutation_failed",
+                                        epoch_invalidating,
                                         event_id = lease.event_id(),
                                         ?outcome,
                                         "MCP event-delivery completion failed; lease expiry remains the recovery authority"
                                     );
-                                    if mcp_await_event_error_invalidates_storage_epoch(&err) {
+                                    if epoch_invalidating {
                                         fallback_invalidated_storage = true;
                                         break;
                                     }
@@ -6673,9 +6676,9 @@ async fn complete_mcp_await_event_deliveries_with_storage(
 
     match completion {
         Ok(storage_reusable) => storage_reusable,
-        Err(err) => {
+        Err(_elapsed) => {
             tracing::error!(
-                error = %err,
+                error_class = "event_delivery_completion_deadline_elapsed",
                 delivery_count,
                 finalize_grace_secs = MCP_AWAIT_EVENT_DELIVERY_FINALIZE_GRACE_SECS,
                 ?outcome,
@@ -6701,9 +6704,9 @@ fn complete_mcp_await_event_deliveries(
         .build()
     {
         Ok(runtime) => runtime,
-        Err(error) => {
+        Err(_error) => {
             tracing::error!(
-                error = %error,
+                error_class = "test_event_delivery_runtime_initialization_failed",
                 delivery_count = leases.len(),
                 ?outcome,
                 "Unable to build test runtime for MCP event-delivery completion; leases will recover by expiry"
@@ -6718,9 +6721,9 @@ fn complete_mcp_await_event_deliveries(
         &db_path.to_string_lossy(),
     )) {
         Ok(storage) => storage,
-        Err(error) => {
+        Err(_error) => {
             tracing::error!(
-                error = %error,
+                error_class = "test_event_delivery_storage_open_failed",
                 delivery_count = leases.len(),
                 ?outcome,
                 "Unable to open test storage for MCP event-delivery completion; leases will recover by expiry"
@@ -6734,9 +6737,9 @@ fn complete_mcp_await_event_deliveries(
         leases,
         outcome,
     ));
-    if let Err(error) = runtime.block_on(storage.shutdown_with_cx(&cx)) {
+    if let Err(_error) = runtime.block_on(storage.shutdown_with_cx(&cx)) {
         tracing::warn!(
-            error = %error,
+            error_class = "test_event_delivery_storage_shutdown_failed",
             ?outcome,
             "Test MCP event-delivery completion storage shutdown failed"
         );
@@ -7530,9 +7533,9 @@ impl ToolHandler for WaEventsTool {
                 StorageHandle::new_with_cx(&request_cx, &db_path.to_string_lossy()).await;
             if let Err(cancellation) = mcp_request_checkpoint(&request_cx, "wa.events") {
                 if let Ok(storage) = storage_result {
-                    if let Err(shutdown_error) = storage.shutdown().await {
+                    if let Err(_shutdown_error) = storage.shutdown().await {
                         tracing::warn!(
-                            error = %shutdown_error,
+                            error_class = "wa_events_cancelled_storage_shutdown_failed",
                             "wa.events cancelled after storage open; shutdown failed"
                         );
                     }
@@ -7657,9 +7660,9 @@ impl WaAwaitEventTool {
         let await_service =
             match McpAwaitEventDeliveryCompletionExecutor::new(Arc::clone(&db_path)) {
                 Ok(executor) => Some(Arc::new(executor)),
-                Err(error) => {
+                Err(_error) => {
                     tracing::error!(
-                        error = %error,
+                        error_class = "mcp_await_event_service_start_failed",
                         "Unable to start the shared MCP await-event service; all await requests will fail closed"
                     );
                     None
@@ -8732,9 +8735,9 @@ impl ToolHandler for WaAwaitEventTool {
                         )) {
                             Ok(storage) => {
                                 let output = runtime.block_on(request_operation(storage.clone()));
-                                if let Err(error) = runtime.block_on(storage.shutdown_with_cx(&open_cx)) {
+                                if let Err(_error) = runtime.block_on(storage.shutdown_with_cx(&open_cx)) {
                                     tracing::warn!(
-                                        error = %error,
+                                        error_class = "test_await_event_storage_shutdown_failed",
                                         "Test-only direct wa.await_event storage shutdown failed"
                                     );
                                 }
@@ -8958,10 +8961,10 @@ fn mcp_load_submit_profile(
 
     match PatternEngine::from_config(&config.patterns) {
         Ok(engine) => engine.submit_profile_for_agent(agent_type).cloned(),
-        Err(error) => {
+        Err(_error) => {
             tracing::warn!(
-                %error,
-                %agent_type,
+                error_class = "wa_send_submit_profile_unavailable",
+                agent_type_hash = %intent_hash_hex(agent_type),
                 "Failed to load submit profile pattern engine for wa.send; verified-submit will fail open"
             );
             None
@@ -8976,10 +8979,10 @@ async fn mcp_capture_submit_text(
 ) -> Option<String> {
     match wezterm.get_text_with_cx(cx, pane_id, false).await {
         Ok(text) => Some(text),
-        Err(error) => {
+        Err(_error) => {
             tracing::debug!(
                 pane_id,
-                %error,
+                error_class = "wa_send_submit_text_capture_unavailable",
                 "wa.send verified-submit text capture unavailable"
             );
             None
@@ -8994,10 +8997,10 @@ async fn mcp_capture_submit_semantic_snapshot(
 ) -> Option<crate::wezterm::MuxSemanticSnapshot> {
     match wezterm.get_semantic_zones_with_cx(cx, pane_id).await {
         Ok(snapshot) => Some(snapshot),
-        Err(error) => {
+        Err(_error) => {
             tracing::debug!(
                 pane_id,
-                %error,
+                error_class = "wa_send_submit_semantic_capture_unavailable",
                 "wa.send verified-submit semantic capture unavailable"
             );
             None
@@ -9048,7 +9051,6 @@ async fn attach_mcp_submit_receipt_to_audit(
 ) {
     let Some(audit_action_id) = injection.audit_action_id() else {
         tracing::debug!(
-            idempotency_key = %receipt.idempotency_key,
             "wa.send submit receipt has no audit action id to attach"
         );
         return;
@@ -9081,10 +9083,10 @@ async fn attach_mcp_submit_receipt_to_audit(
                 "wa.send audit row not found for submit receipt attach"
             );
         }
-        Err(error) => {
+        Err(_error) => {
             tracing::warn!(
                 audit_action_id,
-                %error,
+                error_class = "wa_send_submit_receipt_attach_failed",
                 "Failed to attach wa.send submit receipt to audit"
             );
         }
@@ -13892,7 +13894,7 @@ mod tests {
         WaWorkflowRunTool, WaWorkflowStatusTool, accounts_refresh_policy_input,
         audit_mcp_policy_denial_async, authorize_mcp_policy_call, build_mcp_shared_rate_limiter,
         build_policy_engine_with_shared_rate_limiter, catch_recoverable,
-        mcp_event_mutation_decision_context,
+        intent_hash_hex, mcp_event_mutation_decision_context,
         mcp_get_text_policy_input, mcp_load_mission_tx_contract_from_path, mcp_now_ms_i64,
         mcp_release_pane_policy_input, mcp_reserve_pane_policy_input,
         mcp_search_output_policy_input, mcp_send_text_policy_input, mcp_workflow_run_policy_input,
@@ -23729,15 +23731,19 @@ exit 17",
             .with_ansi(false)
             .with_max_level(tracing::Level::TRACE)
             .finish();
+        let secret_command = format!("get-text pane_id=7 {}", redaction_test_prefix());
+        let secret_reason = format!("reads blocked because {}", redaction_test_prefix());
+        let secret_rule_id = format!("policy.{}", redaction_test_prefix());
+        let expected_intent_hash = intent_hash_hex(&secret_command);
 
         let runtime = CompatRuntimeBuilder::current_thread().build().unwrap();
         tracing::subscriber::with_default(subscriber, || {
             runtime.block_on(audit_mcp_policy_denial_async(
                 None, // degraded mode: no StorageHandle / db_path
                 "wa.get_text",
-                "get-text pane_id=7",
-                "reads are blocked",
-                Some("policy.read_block"),
+                &secret_command,
+                &secret_reason,
+                Some(&secret_rule_id),
                 crate::storage::PolicyDeniedAuditRecord::DECISION_DENIED,
                 crate::storage::PolicyDeniedAuditRecord::REASON_CODE_DENIED,
             ));
@@ -23756,6 +23762,20 @@ exit 17",
             captured.contains("storage_attached=false"),
             "tracing must flag the degraded (no-storage) state; got: {captured:?}"
         );
+        assert!(
+            captured.contains(&expected_intent_hash),
+            "tracing must retain a finite command correlation hash; got: {captured:?}"
+        );
+        for secret in [
+            secret_command.as_str(),
+            secret_reason.as_str(),
+            secret_rule_id.as_str(),
+        ] {
+            assert!(
+                !captured.contains(secret),
+                "degraded-mode tracing must not reflect policy input or decision text; got: {captured:?}"
+            );
+        }
     }
 
     #[test]
