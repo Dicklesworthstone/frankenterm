@@ -3814,7 +3814,8 @@ enum RobotCommands {
         #[arg(long, default_value = "100")]
         limit: usize,
 
-        /// Idle heartbeat interval in ms (0 disables heartbeats)
+        /// User-visible idle heartbeat interval in ms (0 disables heartbeat
+        /// records, but not the private durable-poll wakeup in follow mode)
         #[arg(long, default_value = "5000")]
         heartbeat_interval_ms: u64,
 
