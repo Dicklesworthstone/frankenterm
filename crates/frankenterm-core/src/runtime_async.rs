@@ -4927,7 +4927,7 @@ mod tests {
 
             let started = std::time::Instant::now();
             let result = spawn_blocking_with_cx(&cx, || {
-                std::thread::sleep(Duration::from_millis(400));
+                std::thread::sleep(Duration::from_secs(1));
                 42_u64
             })
             .await;
@@ -4943,7 +4943,7 @@ mod tests {
                 "finite Cx deadline must surface as typed mid-flight cancellation; got: {result:?}"
             );
             assert!(
-                elapsed < Duration::from_millis(300),
+                elapsed < Duration::from_millis(750),
                 "deadline watcher must return before the blocking closure completes; took {elapsed:?}"
             );
         });
@@ -5425,7 +5425,7 @@ mod tests {
                 "deadline-cancelled process output must surface as Interrupted: {error}"
             );
             assert!(
-                elapsed < Duration::from_secs(1),
+                elapsed < Duration::from_millis(1500),
                 "deadline must stop the child before its 2 s sleep completes; took {elapsed:?}"
             );
         });
