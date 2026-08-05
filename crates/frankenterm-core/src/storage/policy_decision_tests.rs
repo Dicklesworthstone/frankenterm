@@ -284,8 +284,8 @@ fn migration_plan_empty_when_at_target() {
 fn downgrade_below_forward_only_floor_fails_closed() {
     // v34 is deliberately forward-only because downgrading it would discard
     // authoritative deletion evidence. build_migration_plan hard-errors when
-    // any undone migration lacks down_sql, so current head cannot be rolled
-    // back to any older target.
+    // any undone migration lacks down_sql, so current head can roll back the
+    // reversible v35 tail to v34 but cannot cross that floor.
     let forward_only_floor = MIGRATIONS
         .iter()
         .filter(|migration| migration.down_sql.is_none())
@@ -293,6 +293,12 @@ fn downgrade_below_forward_only_floor_fails_closed() {
         .max()
         .expect("the v1 baseline is forward-only");
     assert_eq!(forward_only_floor, 34, "v34 is the current rollback floor");
+
+    let reversible_tail = build_migration_plan(SCHEMA_VERSION, 34)
+        .expect("the v35 index-only tail must roll back to the v34 floor");
+    assert_eq!(reversible_tail.steps.len(), 1);
+    assert_eq!(reversible_tail.steps[0].migration_version, 35);
+    assert_eq!(reversible_tail.steps[0].resulting_version, 34);
 
     for target in [1, 3, 17, 32, 33] {
         let err = build_migration_plan(SCHEMA_VERSION, target)
@@ -2295,7 +2301,12 @@ fn purge_audit_actions_removes_old_entries() {
     // purge_audit_actions_backend at c64527d9c. Wrap the test
     // conn into a RusqliteBackend for the backend-trait call.
     let backend = RusqliteBackend::new(conn);
-    let deleted = purge_audit_actions_backend(&backend, 1_500).unwrap();
+    let deleted = purge_audit_actions_backend(
+        &backend,
+        1_500,
+        AUXILIARY_RETENTION_DELETE_BATCH_MAX,
+    )
+    .unwrap();
     assert_eq!(deleted, 1);
 
     let rows = query_audit_actions_backend(&backend, &AuditQuery::default()).unwrap();
@@ -2619,7 +2630,8 @@ fn retention_prunes_old_segments_and_fts() {
         .unwrap();
 
     let backend = RusqliteBackend::new(conn);
-    let deleted = prune_segments_backend(&backend, now_ms).unwrap();
+    let deleted =
+        prune_segments_backend(&backend, now_ms, SEGMENT_RETENTION_DELETE_BATCH_MAX).unwrap();
     assert_eq!(deleted, 1);
     let conn = backend.into_connection();
 
@@ -2688,7 +2700,8 @@ fn prune_segments_rewinds_stranded_fts_progress_ft_znu6v() {
     assert_eq!(progress_before.last_indexed_seq, 5);
 
     let backend = RusqliteBackend::new(conn);
-    let deleted = prune_segments_backend(&backend, old_ts).unwrap();
+    let deleted =
+        prune_segments_backend(&backend, old_ts, SEGMENT_RETENTION_DELETE_BATCH_MAX).unwrap();
     assert_eq!(deleted, 6, "full pre-prune chain must be removed");
     let mut conn = backend.into_connection();
 
@@ -2780,7 +2793,8 @@ fn prune_segments_rewinds_when_partial_prune_truncates_tail_ft_znu6v() {
     .unwrap();
 
     let backend = RusqliteBackend::new(conn);
-    let deleted = prune_segments_backend(&backend, boundary_ts).unwrap();
+    let deleted =
+        prune_segments_backend(&backend, boundary_ts, SEGMENT_RETENTION_DELETE_BATCH_MAX).unwrap();
     assert_eq!(deleted, 3, "only pre-boundary rows must be pruned");
     let mut conn = backend.into_connection();
 

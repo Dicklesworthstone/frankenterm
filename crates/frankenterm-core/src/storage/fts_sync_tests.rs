@@ -194,6 +194,114 @@ fn sync_fts_on_startup_initializes_state() {
     assert_eq!(state.index_version, FTS_INDEX_VERSION);
 }
 
+fn assert_short_fetch_byte_prefix_converges(insert_select_batch: bool) {
+    let mut conn = Connection::open_in_memory().unwrap();
+    initialize_schema(&conn).unwrap();
+    apply_defer_fts_triggers(&conn);
+    insert_test_pane(&conn, 1);
+    for seq in 0..7u64 {
+        insert_test_segment(
+            &conn,
+            1,
+            seq,
+            &format!("shortfetchbytetoken-{seq}-{}", "x".repeat(96)),
+        );
+    }
+
+    let config = FtsSyncConfig {
+        // Fetch is short on the first query, while the byte limit admits only
+        // one row. The loop must continue from max_seq instead of mistaking
+        // `fetched < batch_size` for complete processing.
+        batch_size: 50,
+        max_batch_bytes: 64,
+        commit_progress: true,
+    };
+    let (indexed, max_seq) = with_fts_backend(&mut conn, |backend| {
+        sync_fts_for_pane_backend_with_mode(backend, 1, &config, insert_select_batch)
+    })
+    .unwrap();
+    assert_eq!(indexed, 7);
+    assert_eq!(max_seq, 6);
+    assert_eq!(fts_match_count(&conn, "shortfetchbytetoken"), 7);
+}
+
+#[test]
+fn set_based_sync_converges_after_short_fetch_byte_prefix() {
+    assert_short_fetch_byte_prefix_converges(true);
+}
+
+#[test]
+fn scalar_sync_converges_after_short_fetch_byte_prefix() {
+    assert_short_fetch_byte_prefix_converges(false);
+}
+
+#[test]
+fn missing_fts_state_forces_authoritative_rebuild() {
+    let mut conn = Connection::open_in_memory().unwrap();
+    initialize_schema(&conn).unwrap();
+    apply_defer_fts_triggers(&conn);
+    insert_test_pane(&conn, 1);
+    insert_test_segment(&conn, 1, 0, "missingstaterebuildtoken");
+    conn.execute("DELETE FROM fts_index_state", []).unwrap();
+
+    let result = sync_fts_on_startup_test(&mut conn, &FtsSyncConfig::default()).unwrap();
+    assert!(result.full_rebuild);
+    assert_eq!(result.segments_indexed, 1);
+    assert_eq!(fts_match_count(&conn, "missingstaterebuildtoken"), 1);
+    assert_eq!(
+        get_fts_index_state_test(&mut conn)
+            .unwrap()
+            .unwrap()
+            .index_version,
+        FTS_INDEX_VERSION
+    );
+}
+
+#[test]
+fn invalid_fts_batch_bounds_fail_before_rebuild_mutation() {
+    for config in [
+        FtsSyncConfig {
+            batch_size: 0,
+            ..FtsSyncConfig::default()
+        },
+        FtsSyncConfig {
+            batch_size: FTS_SYNC_MAX_BATCH_SEGMENTS + 1,
+            ..FtsSyncConfig::default()
+        },
+        FtsSyncConfig {
+            max_batch_bytes: 0,
+            ..FtsSyncConfig::default()
+        },
+        FtsSyncConfig {
+            max_batch_bytes: FTS_SYNC_MAX_BATCH_BYTES + 1,
+            ..FtsSyncConfig::default()
+        },
+    ] {
+        let mut conn = Connection::open_in_memory().unwrap();
+        initialize_schema(&conn).unwrap();
+        insert_test_pane(&conn, 1);
+        insert_test_segment(&conn, 1, 0, "invalidconfigsentineltoken");
+        let state_before = get_fts_index_state_test(&mut conn).unwrap().unwrap();
+        let hits_before = fts_match_count(&conn, "invalidconfigsentineltoken");
+
+        let error = full_fts_rebuild_test(&mut conn, &config)
+            .expect_err("invalid FTS bounds must fail before delete-all");
+        assert!(error.to_string().contains("FTS sync"));
+        assert_eq!(
+            get_fts_index_state_test(&mut conn)
+                .unwrap()
+                .unwrap()
+                .index_version,
+            state_before.index_version
+        );
+        assert_eq!(
+            fts_match_count(&conn, "invalidconfigsentineltoken"),
+            hits_before,
+            "invalid config must not mutate searchable postings"
+        );
+    }
+}
+
 // ── [ft-wk5fo] Deferred FTS trigger mode ──────────────────────────
 
 /// Helper: count FTS hits for a MATCH token.
@@ -260,7 +368,9 @@ fn sync_all_panes_for_test(
         for pane_id in panes_needing_fts_sync_backend(backend)? {
             let (indexed, _) =
                 sync_fts_for_pane_backend_with_mode(backend, pane_id, config, insert_select_batch)?;
-            total_indexed = total_indexed.saturating_add(indexed);
+            total_indexed = total_indexed.checked_add(indexed).ok_or_else(|| {
+                StorageError::Database("test FTS indexed-row count overflow".to_string())
+            })?;
         }
         Ok(total_indexed)
     })
@@ -590,6 +700,114 @@ fn insert_select_batch_resumes_after_crash_progress_restart() {
         actual, expected,
         "crash-progress restart must finish with the same searchable corpus as the per-row oracle"
     );
+}
+
+#[test]
+fn fts_sync_rejects_negative_cached_lengths_before_index_mutation() {
+    for insert_select_batch in [false, true] {
+        let mut conn = Connection::open_in_memory().unwrap();
+        initialize_schema(&conn).unwrap();
+        apply_defer_fts_triggers(&conn);
+        insert_test_pane(&conn, 1);
+        insert_test_segment(&conn, 1, 0, "negative-length-corruption");
+        conn.execute(
+            "UPDATE output_segments SET content_len = -1 WHERE pane_id = 1 AND seq = 0",
+            [],
+        )
+        .unwrap();
+
+        let error = with_fts_backend(&mut conn, |backend| {
+            sync_fts_for_pane_backend_with_mode(
+                backend,
+                1,
+                &FtsSyncConfig::default(),
+                insert_select_batch,
+            )
+        })
+        .expect_err("negative cached content length must fail closed");
+        let message = error.to_string();
+        assert!(
+            message.contains("content_len") || message.contains("content length"),
+            "both FTS engines must identify the corrupt cached length: {message}"
+        );
+        let indexed: i64 = conn
+            .query_row("SELECT COUNT(*) FROM output_segments_fts", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            indexed, 0,
+            "a corrupt cached length must be detected before either engine mutates FTS"
+        );
+        assert!(
+            get_fts_pane_progress_test(&mut conn, 1).unwrap().is_none(),
+            "a rejected batch must not advance its resume cursor"
+        );
+    }
+}
+
+#[test]
+fn fts_sync_rolls_back_postings_when_progress_checkpoint_fails() {
+    for insert_select_batch in [false, true] {
+        for commit_progress in [false, true] {
+            let mut conn = Connection::open_in_memory().unwrap();
+            initialize_schema(&conn).unwrap();
+            apply_defer_fts_triggers(&conn);
+            insert_test_pane(&conn, 1);
+            insert_test_segment(&conn, 1, 0, "atomic-progress-checkpoint-zero");
+            insert_test_segment(&conn, 1, 1, "atomic-progress-checkpoint-one");
+            conn.execute_batch(
+                "CREATE TRIGGER reject_fts_progress
+                 BEFORE INSERT ON fts_pane_progress
+                 BEGIN
+                     SELECT RAISE(ABORT, 'injected progress failure');
+                 END;",
+            )
+            .unwrap();
+            let config = FtsSyncConfig {
+                batch_size: 1,
+                max_batch_bytes: 1_048_576,
+                commit_progress,
+            };
+
+            with_fts_backend(&mut conn, |backend| {
+                sync_fts_for_pane_backend_with_mode(
+                    backend,
+                    1,
+                    &config,
+                    insert_select_batch,
+                )
+            })
+            .expect_err("injected progress failure must abort the atomic FTS unit");
+            let indexed: i64 = conn
+                .query_row("SELECT COUNT(*) FROM output_segments_fts", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(
+                indexed, 0,
+                "postings must roll back when their resume checkpoint does not commit"
+            );
+            assert!(
+                get_fts_pane_progress_test(&mut conn, 1).unwrap().is_none(),
+                "failed progress checkpoint must leave no cursor"
+            );
+
+            conn.execute_batch("DROP TRIGGER reject_fts_progress")
+                .unwrap();
+            let (indexed, max_seq) = with_fts_backend(&mut conn, |backend| {
+                sync_fts_for_pane_backend_with_mode(
+                    backend,
+                    1,
+                    &config,
+                    insert_select_batch,
+                )
+            })
+            .expect("retry after the injected failure must recover cleanly");
+            assert_eq!((indexed, max_seq), (2, 1));
+            assert_eq!(fts_match_count(&conn, "atomic"), 2);
+        }
+    }
 }
 
 /// [ft-7do6c] The seq=0 off-by-one: a fresh pane's FIRST segment
@@ -1219,7 +1437,7 @@ fn fts_rebuild_pending_version_triggers_full_rebuild() {
 }
 
 #[test]
-fn fts_hard_rebuild_failure_marks_index_pending_and_clears_progress() {
+fn fts_hard_rebuild_failure_leaves_pending_marker_and_rolls_back_progress_clear() {
     let mut conn = Connection::open_in_memory().unwrap();
     initialize_schema(&conn).unwrap();
 
@@ -1253,12 +1471,82 @@ fn fts_hard_rebuild_failure_marks_index_pending_and_clears_progress() {
 
     let err = full_fts_rebuild_test(&mut conn, &FtsSyncConfig::default()).unwrap_err();
     let err_msg = err.to_string();
-    assert!(err_msg.contains("FTS rebuild incomplete"));
+    assert!(err_msg.contains("FTS rebuild could not clear the prior index"));
 
     let state = get_fts_index_state_test(&mut conn).unwrap().unwrap();
     assert_eq!(state.index_version, FTS_INDEX_REBUILD_PENDING_VERSION);
     assert_eq!(state.last_full_rebuild_at, None);
-    assert!(get_fts_pane_progress_test(&mut conn, 1).unwrap().is_none());
+    assert_eq!(
+        get_fts_pane_progress_test(&mut conn, 1)
+            .unwrap()
+            .unwrap()
+            .last_indexed_seq,
+        1,
+        "the destructive rebuild transaction must roll back its progress clear"
+    );
+}
+
+#[test]
+fn startup_repairs_an_interrupted_pending_rebuild_before_publishing_current() {
+    let mut conn = Connection::open_in_memory().unwrap();
+    initialize_schema(&conn).unwrap();
+    insert_test_pane(&conn, 1);
+    insert_test_segment(&conn, 1, 1, "interruptedrebuildtoken");
+    assert_eq!(fts_match_count(&conn, "interruptedrebuildtoken"), 1);
+
+    // Model a database left by a pre-atomic or interrupted rebuild: the
+    // durable pending marker was published, but destructive index/progress
+    // mutations became visible before the process stopped.
+    with_fts_backend(&mut conn, |backend| {
+        mark_fts_rebuild_pending_backend(backend, now_ms())?;
+        backend
+            .execute_batch(
+                "INSERT INTO output_segments_fts(output_segments_fts) VALUES('delete-all')",
+            )
+            .map_err(|error| storage_backend_error("Simulate interrupted FTS rebuild", error))?;
+        clear_fts_pane_progress_backend(backend)
+    })
+    .unwrap();
+    assert_eq!(fts_match_count(&conn, "interruptedrebuildtoken"), 0);
+
+    let result = sync_fts_on_startup_test(&mut conn, &FtsSyncConfig::default()).unwrap();
+    assert!(result.full_rebuild);
+    assert_eq!(result.segments_indexed, 1);
+    assert_eq!(fts_match_count(&conn, "interruptedrebuildtoken"), 1);
+    let state = get_fts_index_state_test(&mut conn).unwrap().unwrap();
+    assert_eq!(state.index_version, FTS_INDEX_VERSION);
+    assert!(state.last_full_rebuild_at.is_some());
+}
+
+#[test]
+fn search_fails_closed_while_fts_rebuild_is_pending() {
+    let mut conn = Connection::open_in_memory().unwrap();
+    initialize_schema(&conn).unwrap();
+    insert_test_pane(&conn, 1);
+    insert_test_segment(&conn, 1, 1, "pendingsearchgatetoken");
+    assert_eq!(
+        fts_search_projection(&mut conn, "pendingsearchgatetoken", &SearchOptions::default())
+            .unwrap()
+            .len(),
+        1
+    );
+
+    with_fts_backend(&mut conn, |backend| {
+        mark_fts_rebuild_pending_backend(backend, now_ms())
+    })
+    .unwrap();
+    let error =
+        fts_search_projection(&mut conn, "pendingsearchgatetoken", &SearchOptions::default())
+            .expect_err("search must not expose a potentially partial pending index");
+    assert!(error.to_string().contains("rebuilding or requires repair"));
+
+    full_fts_rebuild_test(&mut conn, &FtsSyncConfig::default()).unwrap();
+    assert_eq!(
+        fts_search_projection(&mut conn, "pendingsearchgatetoken", &SearchOptions::default())
+            .unwrap()
+            .len(),
+        1
+    );
 }
 
 #[test]

@@ -1698,6 +1698,153 @@ pub struct RetentionTier {
     pub handled: Option<bool>,
 }
 
+/// Maximum number of ordered event-retention tiers accepted from configuration.
+///
+/// Cleanup evaluates every branch, so this bounds both first-match classifier
+/// size and the number of count/delete operations in one maintenance pass.
+pub const RETENTION_POLICY_MAX_TIERS: usize = 64;
+
+/// Maximum combined severity and event-type filters in one retention tier.
+pub const RETENTION_POLICY_MAX_FILTERS_PER_TIER: usize = 128;
+
+/// Maximum aggregate SQLite variable cost of all retention filters.
+///
+/// Severity filters cost one bind; event-type prefix filters cost two binds to
+/// preserve byte-exact `starts_with` semantics. The widest compiled statement
+/// adds one cutoff per tier plus the fallback cutoff, one newest-active-cutoff
+/// prefilter, and a batch limit, leaving headroom under SQLite's portable
+/// 999-variable floor.
+pub const RETENTION_POLICY_MAX_SQL_BIND_COST: usize = 896;
+
+/// Maximum aggregate UTF-8 bytes across retention tier names and filters.
+pub const RETENTION_POLICY_MAX_UTF8_BYTES: usize = 64 * 1024;
+
+const RETENTION_POLICY_MAX_FIXED_BINDS: usize = RETENTION_POLICY_MAX_TIERS + 3;
+const SQLITE_PORTABLE_VARIABLE_LIMIT: usize = 999;
+const _: () = assert!(
+    RETENTION_POLICY_MAX_SQL_BIND_COST + RETENTION_POLICY_MAX_FIXED_BINDS
+        < SQLITE_PORTABLE_VARIABLE_LIMIT
+);
+
+/// Deterministic work counters emitted by one retention-policy compilation.
+/// These are deliberately input-proportional so tests can pin the linear
+/// bound without wall-clock timing assertions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetentionPolicyCompileStats {
+    /// Number of ordered tiers visited.
+    pub tiers_visited: usize,
+    /// Number of raw severity and event-type filters visited.
+    pub filters_visited: usize,
+    /// Number of filters retained after semantics-preserving deduplication.
+    pub canonical_filters: usize,
+    /// SQLite bind cost of the raw input policy.
+    pub input_sql_bind_cost: usize,
+    /// SQLite bind cost of the compiled canonical classifier.
+    pub compiled_sql_bind_cost: usize,
+    /// Aggregate UTF-8 bytes across tier names and filters.
+    pub input_utf8_bytes: usize,
+}
+
+/// Canonical, first-match-preserving retention classifier shared by every
+/// count and bounded delete batch in one cleanup pass.
+///
+/// Tier order, names, retention durations, and handled predicates remain
+/// unchanged. Severity duplicates are compared with the same ASCII-insensitive
+/// semantics as production matching; event-type duplicates remain byte-exact.
+/// The generated classifier and its bind values are built once, while the
+/// execution counter records cheap reuse by storage operations.
+pub struct CompiledRetentionPolicy {
+    tiers: Vec<RetentionTier>,
+    count_sql: String,
+    candidate_sql: String,
+    all_branch_count_sql: String,
+    all_branch_candidate_sql: String,
+    bind_values: Vec<String>,
+    stats: RetentionPolicyCompileStats,
+    sql_execution_count: std::sync::atomic::AtomicU64,
+}
+
+impl std::fmt::Debug for CompiledRetentionPolicy {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CompiledRetentionPolicy")
+            .field("tiers", &self.tiers.len())
+            .field("canonical_filters", &self.stats.canonical_filters)
+            .field("sql_bind_cost", &self.stats.compiled_sql_bind_cost)
+            .field("utf8_bytes", &self.stats.input_utf8_bytes)
+            .field(
+                "sql_execution_count",
+                &self
+                    .sql_execution_count
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            )
+            .finish()
+    }
+}
+
+impl PartialEq for CompiledRetentionPolicy {
+    fn eq(&self, other: &Self) -> bool {
+        self.tiers == other.tiers
+    }
+}
+
+impl CompiledRetentionPolicy {
+    pub(crate) fn tiers(&self) -> &[RetentionTier] {
+        &self.tiers
+    }
+
+    pub(crate) fn fallback_branch_index(&self) -> usize {
+        self.tiers.len()
+    }
+
+    pub(crate) fn validate_branch_index(&self, branch_index: usize) -> Result<(), String> {
+        if branch_index > self.fallback_branch_index() {
+            return Err(format!(
+                "retention policy branch index {branch_index} exceeds fallback branch {}",
+                self.fallback_branch_index()
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn count_sql(&self) -> &str {
+        &self.count_sql
+    }
+
+    pub(crate) fn candidate_sql(&self) -> &str {
+        &self.candidate_sql
+    }
+
+    pub(crate) fn all_branch_count_sql(&self) -> &str {
+        &self.all_branch_count_sql
+    }
+
+    pub(crate) fn all_branch_candidate_sql(&self) -> &str {
+        &self.all_branch_candidate_sql
+    }
+
+    pub(crate) fn bind_values(&self) -> &[String] {
+        &self.bind_values
+    }
+
+    /// Return deterministic, input-proportional compilation work counters.
+    #[must_use]
+    pub fn stats(&self) -> RetentionPolicyCompileStats {
+        self.stats
+    }
+
+    pub(crate) fn note_sql_execution(&self) {
+        self.sql_execution_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn sql_execution_count(&self) -> u64 {
+        self.sql_execution_count
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
 /// Default retention tiers: critical kept longest, info shortest.
 ///
 /// `pub(crate)` so the runtime maintenance loop can seed its initial
@@ -1726,6 +1873,290 @@ pub(crate) fn default_retention_tiers() -> Vec<RetentionTier> {
             handled: None,
         },
     ]
+}
+
+fn retention_policy_checked_add(
+    total: &mut usize,
+    amount: usize,
+    description: &str,
+) -> Result<(), String> {
+    *total = total.checked_add(amount).ok_or_else(|| {
+        format!("storage.retention_tiers {description} overflowed the platform size limit")
+    })?;
+    Ok(())
+}
+
+fn retention_policy_change_summary(tiers: &[RetentionTier]) -> String {
+    let mut filters = 0usize;
+    let mut bind_cost = 0usize;
+    let mut utf8_bytes = 0usize;
+    for tier in tiers {
+        filters = filters.saturating_add(tier.severities.len());
+        filters = filters.saturating_add(tier.event_types.len());
+        bind_cost = bind_cost.saturating_add(tier.severities.len());
+        bind_cost = bind_cost.saturating_add(tier.event_types.len().saturating_mul(2));
+        utf8_bytes = utf8_bytes.saturating_add(tier.name.len());
+        for value in tier.severities.iter().chain(&tier.event_types) {
+            utf8_bytes = utf8_bytes.saturating_add(value.len());
+        }
+    }
+    format!(
+        "tiers={}, filters={filters}, bind_cost={bind_cost}, utf8_bytes={utf8_bytes}",
+        tiers.len()
+    )
+}
+
+fn canonical_retention_tier(
+    tier: &RetentionTier,
+    tier_index: usize,
+) -> Result<RetentionTier, String> {
+    if tier.name.trim().is_empty() {
+        return Err(format!(
+            "storage.retention_tiers[{tier_index}].name must not be empty"
+        ));
+    }
+
+    let filter_count = tier
+        .severities
+        .len()
+        .checked_add(tier.event_types.len())
+        .ok_or_else(|| {
+            format!("storage.retention_tiers[{tier_index}] filter count overflowed")
+        })?;
+    if filter_count > RETENTION_POLICY_MAX_FILTERS_PER_TIER {
+        return Err(format!(
+            "storage.retention_tiers[{tier_index}] has {filter_count} filters; maximum is {RETENTION_POLICY_MAX_FILTERS_PER_TIER}"
+        ));
+    }
+
+    let mut seen_severities = HashSet::with_capacity(tier.severities.len());
+    let mut severities = Vec::with_capacity(tier.severities.len());
+    for (filter_index, severity) in tier.severities.iter().enumerate() {
+        if severity.is_empty() {
+            return Err(format!(
+                "storage.retention_tiers[{tier_index}].severities[{filter_index}] must not be empty"
+            ));
+        }
+        let canonical_key = severity.to_ascii_lowercase();
+        if seen_severities.insert(canonical_key) {
+            // Preserve the first operator-supplied spelling for diagnostics;
+            // SQLite NOCASE and Rust eq_ignore_ascii_case retain identical
+            // matching behavior.
+            severities.push(severity.clone());
+        }
+    }
+
+    let mut seen_event_types = HashSet::with_capacity(tier.event_types.len());
+    let mut event_types = Vec::with_capacity(tier.event_types.len());
+    for (filter_index, event_type) in tier.event_types.iter().enumerate() {
+        if event_type.is_empty() {
+            return Err(format!(
+                "storage.retention_tiers[{tier_index}].event_types[{filter_index}] must not be empty; use an empty filter list for a wildcard tier"
+            ));
+        }
+        if seen_event_types.insert(event_type.clone()) {
+            event_types.push(event_type.clone());
+        }
+    }
+
+    Ok(RetentionTier {
+        name: tier.name.clone(),
+        retention_days: tier.retention_days,
+        severities,
+        event_types,
+        handled: tier.handled,
+    })
+}
+
+fn append_compiled_retention_tier_predicate(
+    sql: &mut String,
+    bind_values: &mut Vec<String>,
+    tier: &RetentionTier,
+) {
+    let mut needs_and = false;
+    if !tier.severities.is_empty() {
+        sql.push('(');
+        for (index, severity) in tier.severities.iter().enumerate() {
+            if index > 0 {
+                sql.push_str(" OR ");
+            }
+            sql.push_str("severity = ? COLLATE NOCASE");
+            bind_values.push(severity.clone());
+        }
+        sql.push(')');
+        needs_and = true;
+    }
+    if !tier.event_types.is_empty() {
+        if needs_and {
+            sql.push_str(" AND ");
+        }
+        sql.push('(');
+        for (index, event_type) in tier.event_types.iter().enumerate() {
+            if index > 0 {
+                sql.push_str(" OR ");
+            }
+            // Compare BLOB prefixes so SQLite measures the UTF-8 byte length
+            // and does not truncate at an embedded NUL.  This is byte-exact,
+            // treats %, _, and backslash as literals, and therefore matches
+            // Rust's `str::starts_with` semantics for every valid UTF-8 string.
+            sql.push_str(
+                "substr(CAST(event_type AS BLOB), 1, length(CAST(? AS BLOB))) = \
+                 CAST(? AS BLOB)",
+            );
+            bind_values.push(event_type.clone());
+            bind_values.push(event_type.clone());
+        }
+        sql.push(')');
+        needs_and = true;
+    }
+    if let Some(want_handled) = tier.handled {
+        if needs_and {
+            sql.push_str(" AND ");
+        }
+        sql.push_str(if want_handled {
+            "handled_at IS NOT NULL"
+        } else {
+            "handled_at IS NULL"
+        });
+        needs_and = true;
+    }
+    if !needs_and {
+        sql.push_str("1=1");
+    }
+}
+
+pub(crate) fn compile_retention_policy_tiers(
+    tiers: &[RetentionTier],
+) -> Result<std::sync::Arc<CompiledRetentionPolicy>, String> {
+    if tiers.len() > RETENTION_POLICY_MAX_TIERS {
+        return Err(format!(
+            "storage.retention_tiers has {} tiers; maximum is {RETENTION_POLICY_MAX_TIERS}",
+            tiers.len()
+        ));
+    }
+
+    let mut filters_visited = 0usize;
+    let mut input_sql_bind_cost = 0usize;
+    let mut input_utf8_bytes = 0usize;
+    let mut canonical_tiers = Vec::with_capacity(tiers.len());
+    for (tier_index, tier) in tiers.iter().enumerate() {
+        let filter_count = tier
+            .severities
+            .len()
+            .checked_add(tier.event_types.len())
+            .ok_or_else(|| {
+                format!("storage.retention_tiers[{tier_index}] filter count overflowed")
+            })?;
+        retention_policy_checked_add(&mut filters_visited, filter_count, "filter count")?;
+        retention_policy_checked_add(
+            &mut input_sql_bind_cost,
+            tier.severities.len(),
+            "SQL bind cost",
+        )?;
+        retention_policy_checked_add(
+            &mut input_sql_bind_cost,
+            tier.event_types.len().checked_mul(2).ok_or_else(|| {
+                format!("storage.retention_tiers[{tier_index}] event bind cost overflowed")
+            })?,
+            "SQL bind cost",
+        )?;
+        retention_policy_checked_add(
+            &mut input_utf8_bytes,
+            tier.name.len(),
+            "UTF-8 byte count",
+        )?;
+        for value in tier.severities.iter().chain(&tier.event_types) {
+            retention_policy_checked_add(
+                &mut input_utf8_bytes,
+                value.len(),
+                "UTF-8 byte count",
+            )?;
+        }
+
+        canonical_tiers.push(canonical_retention_tier(tier, tier_index)?);
+    }
+
+    if input_sql_bind_cost > RETENTION_POLICY_MAX_SQL_BIND_COST {
+        return Err(format!(
+            "storage.retention_tiers requires {input_sql_bind_cost} filter SQL binds; maximum is {RETENTION_POLICY_MAX_SQL_BIND_COST}"
+        ));
+    }
+    if input_utf8_bytes > RETENTION_POLICY_MAX_UTF8_BYTES {
+        return Err(format!(
+            "storage.retention_tiers contains {input_utf8_bytes} UTF-8 bytes; maximum is {RETENTION_POLICY_MAX_UTF8_BYTES}"
+        ));
+    }
+
+    let canonical_filters = canonical_tiers
+        .iter()
+        .map(|tier| tier.severities.len() + tier.event_types.len())
+        .sum();
+    let mut classification_sql = String::from("CASE");
+    let mut bind_values = Vec::with_capacity(input_sql_bind_cost);
+    for (branch_index, tier) in canonical_tiers.iter().enumerate() {
+        classification_sql.push_str(" WHEN (");
+        append_compiled_retention_tier_predicate(
+            &mut classification_sql,
+            &mut bind_values,
+            tier,
+        );
+        classification_sql.push_str(") THEN ");
+        classification_sql.push_str(&branch_index.to_string());
+    }
+    classification_sql.push_str(" ELSE ");
+    classification_sql.push_str(&canonical_tiers.len().to_string());
+    classification_sql.push_str(" END");
+
+    let count_sql = format!(
+        "SELECT COUNT(*) FROM events \
+         WHERE detected_at < ? AND delivery_lease_token IS NULL \
+         AND ({classification_sql}) = ?"
+    );
+    let candidate_sql = format!(
+        "SELECT id FROM events WHERE detected_at < ? \
+         AND ({classification_sql}) = ?"
+    );
+    let classified_sql = format!(
+        "SELECT id, detected_at, ({classification_sql}) AS retention_branch \
+         FROM events WHERE delivery_lease_token IS NULL AND detected_at < ?"
+    );
+    let mut cutoff_case_sql = String::from("CASE retention_branch");
+    for branch_index in 0..=canonical_tiers.len() {
+        cutoff_case_sql.push_str(" WHEN ");
+        cutoff_case_sql.push_str(&branch_index.to_string());
+        cutoff_case_sql.push_str(" THEN ?");
+    }
+    cutoff_case_sql.push_str(" END");
+    let all_branch_count_sql = format!(
+        "SELECT retention_branch, COUNT(*) FROM ({classified_sql}) \
+         WHERE detected_at < ({cutoff_case_sql}) \
+         GROUP BY retention_branch ORDER BY retention_branch ASC"
+    );
+    let all_branch_candidate_sql = format!(
+        "SELECT id, retention_branch FROM ({classified_sql}) \
+         WHERE detected_at < ({cutoff_case_sql}) \
+         ORDER BY id ASC LIMIT ?"
+    );
+    let compiled_sql_bind_cost = bind_values.len();
+    debug_assert!(compiled_sql_bind_cost <= input_sql_bind_cost);
+
+    Ok(std::sync::Arc::new(CompiledRetentionPolicy {
+        tiers: canonical_tiers,
+        count_sql,
+        candidate_sql,
+        all_branch_count_sql,
+        all_branch_candidate_sql,
+        bind_values,
+        stats: RetentionPolicyCompileStats {
+            tiers_visited: tiers.len(),
+            filters_visited,
+            canonical_filters,
+            input_sql_bind_cost,
+            compiled_sql_bind_cost,
+            input_utf8_bytes,
+        },
+        sql_execution_count: std::sync::atomic::AtomicU64::new(0),
+    }))
 }
 
 impl StorageConfig {
@@ -1763,7 +2194,25 @@ impl StorageConfig {
         let allow_outside = db_path_outside_workspace_allowed();
         check_db_path_workspace_safety(&self.db_path, allow_outside)?;
 
+        // Compile as part of validation so every accepted configuration is
+        // guaranteed to fit the portable SQLite statement envelope. Cleanup
+        // compiles once more when it creates the reusable execution plan.
+        self.compile_retention_policy()?;
+
         Ok(())
+    }
+
+    /// Validate and compile the ordered event-retention tiers into a reusable
+    /// first-match SQL classifier.
+    ///
+    /// # Errors
+    ///
+    /// Returns a validation error when a configured tier is malformed or the
+    /// policy exceeds a documented tier, filter, bind, or byte bound.
+    pub fn compile_retention_policy(
+        &self,
+    ) -> Result<std::sync::Arc<CompiledRetentionPolicy>, String> {
+        compile_retention_policy_tiers(&self.retention_tiers)
     }
 }
 
@@ -4415,12 +4864,11 @@ pub struct HotReloadableConfig {
     pub retention_max_mb: u32,
     /// Checkpoint interval in seconds
     pub checkpoint_interval_secs: u32,
-    /// Tiered retention rules (ft-tkke8). Carried through the hot-reload
-    /// channel so the maintenance loop can apply per-tier event retention via
-    /// `cleanup::cleanup_apply_with_cx` instead of a flat `retention_days`
-    /// cutoff. Empty = flat retention only.
-    pub retention_tiers: Vec<RetentionTier>,
-    /// Periodic cache GC and vacuum policy.
+    /// Validated and compiled tiered retention policy. The exact shared plan is
+    /// carried through the hot-reload channel so maintenance never recompiles
+    /// or treats a second raw vector as policy authority.
+    pub retention_policy: std::sync::Arc<CompiledRetentionPolicy>,
+    /// Periodic cache GC and explicit-VACUUM advisory policy.
     pub gc: crate::gc::CacheGcSettings,
 
     // Patterns
@@ -4440,9 +4888,18 @@ pub struct HotReloadableConfig {
 
 impl HotReloadableConfig {
     /// Extract hot-reloadable settings from a full Config.
-    #[must_use]
-    pub fn from_config(config: &Config) -> Self {
-        Self {
+    ///
+    /// # Errors
+    ///
+    /// Returns a validation error if the configured retention policy cannot be
+    /// compiled within its documented resource bounds.
+    pub fn from_config(config: &Config) -> crate::Result<Self> {
+        let retention_policy = config.storage.compile_retention_policy().map_err(|error| {
+            crate::error::ConfigError::ValidationError(format!(
+                "hot-reload retention policy is invalid: {error}"
+            ))
+        })?;
+        Ok(Self {
             log_level: config.general.log_level.clone(),
             poll_interval_ms: config.ingest.poll_interval_ms,
             min_poll_interval_ms: config.ingest.min_poll_interval_ms,
@@ -4452,13 +4909,13 @@ impl HotReloadableConfig {
             retention_days: config.storage.retention_days,
             retention_max_mb: config.storage.retention_max_mb,
             checkpoint_interval_secs: config.storage.checkpoint_interval_secs,
-            retention_tiers: config.storage.retention_tiers.clone(),
+            retention_policy,
             gc: config.gc,
             patterns: config.patterns.clone(),
             workflows_enabled: config.workflows.enabled.clone(),
             auto_run_allowlist: config.workflows.auto_run_allowlist.clone(),
             trauma_guard: config.safety.trauma_guard.clone(),
-        }
+        })
     }
 }
 
@@ -4665,8 +5122,11 @@ impl Config {
         if self.storage.retention_tiers != new_config.storage.retention_tiers {
             changes.push(HotReloadChange {
                 name: "storage.retention_tiers".to_string(),
-                old_value: format!("{:?}", self.storage.retention_tiers),
-                new_value: format!("{:?}", new_config.storage.retention_tiers),
+                // Operator-supplied names and filters may contain sensitive or
+                // simply enormous text. Hot-reload logs need bounded work
+                // shape, not the policy payload itself.
+                old_value: retention_policy_change_summary(&self.storage.retention_tiers),
+                new_value: retention_policy_change_summary(&new_config.storage.retention_tiers),
             });
         }
 
@@ -4818,8 +5278,11 @@ impl Config {
     }
 
     /// Get the hot-reloadable subset of this config.
-    #[must_use]
-    pub fn hot_reloadable(&self) -> HotReloadableConfig {
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the retention policy is invalid.
+    pub fn hot_reloadable(&self) -> crate::Result<HotReloadableConfig> {
         HotReloadableConfig::from_config(self)
     }
 }
@@ -7613,13 +8076,15 @@ max_bytes_per_sec = 1048576
             handled: None,
         }];
 
-        let hot = config.hot_reloadable();
+        let hot = config
+            .hot_reloadable()
+            .expect("compile hot-reload retention policy");
 
         assert_eq!(hot.log_level, "debug");
         assert_eq!(hot.poll_interval_ms, 500);
-        assert_eq!(hot.retention_tiers.len(), 1);
-        assert_eq!(hot.retention_tiers[0].name, "audit-keep");
-        assert_eq!(hot.retention_tiers[0].retention_days, 365);
+        assert_eq!(hot.retention_policy.tiers().len(), 1);
+        assert_eq!(hot.retention_policy.tiers()[0].name, "audit-keep");
+        assert_eq!(hot.retention_policy.tiers()[0].retention_days, 365);
         assert_eq!(hot.pane_priorities.default_priority, 42);
         assert_eq!(hot.capture_budgets.max_captures_per_sec, 25);
         assert_eq!(hot.retention_days, 45);
@@ -8248,6 +8713,41 @@ recorder_backend = "franken_sqlite"
     }
 
     #[test]
+    fn retention_tier_hot_reload_summary_is_bounded_and_never_reflects_content() {
+        let secret_name = "operator-secret-tier-name";
+        let secret_filter = "operator-secret-filter-prefix";
+        let mut config_a = Config::default();
+        config_a.storage.retention_tiers = Vec::new();
+        let mut config_b = Config::default();
+        config_b.storage.retention_tiers = vec![RetentionTier {
+            name: secret_name.to_string(),
+            retention_days: 7,
+            severities: vec!["warning".to_string()],
+            event_types: vec![secret_filter.to_string()],
+            handled: Some(false),
+        }];
+
+        let result = config_a.diff_for_hot_reload(&config_b);
+        let change = result
+            .changes
+            .iter()
+            .find(|change| change.name == "storage.retention_tiers")
+            .expect("retention tier change summary");
+        assert_eq!(
+            change.new_value,
+            format!(
+                "tiers=1, filters=2, bind_cost=3, utf8_bytes={}",
+                secret_name.len() + "warning".len() + secret_filter.len()
+            )
+        );
+        for summary in [&change.old_value, &change.new_value] {
+            assert!(summary.len() <= 96, "summary must stay log-bounded: {summary}");
+            assert!(!summary.contains(secret_name));
+            assert!(!summary.contains(secret_filter));
+        }
+    }
+
+    #[test]
     fn retention_tiers_hot_reload_no_change() {
         let config = Config::default();
         let result = config.diff_for_hot_reload(&config);
@@ -8273,6 +8773,179 @@ retention_tiers = []
                 .storage
                 .resolve_retention_days("critical", "error", false),
             45
+        );
+    }
+
+    #[test]
+    fn retention_policy_validation_accepts_exact_caps_and_rejects_cap_plus_one() {
+        let tier = |name: String, severities: Vec<String>, event_types: Vec<String>| {
+            RetentionTier {
+                name,
+                retention_days: 7,
+                severities,
+                event_types,
+                handled: None,
+            }
+        };
+
+        let mut exact_tiers = StorageConfig::default();
+        exact_tiers.retention_tiers = (0..RETENTION_POLICY_MAX_TIERS)
+            .map(|index| tier(format!("tier-{index}"), Vec::new(), Vec::new()))
+            .collect();
+        exact_tiers.validate().expect("exact tier cap is valid");
+        exact_tiers.retention_tiers.push(tier(
+            "tier-overflow".to_string(),
+            Vec::new(),
+            Vec::new(),
+        ));
+        let tier_error = exact_tiers.validate().expect_err("tier cap + 1 must fail");
+        assert!(tier_error.contains(&format!("{} tiers", RETENTION_POLICY_MAX_TIERS + 1)));
+        assert!(tier_error.contains(&format!("maximum is {RETENTION_POLICY_MAX_TIERS}")));
+
+        let exact_filters = (0..RETENTION_POLICY_MAX_FILTERS_PER_TIER)
+            .map(|index| format!("severity-{index}"))
+            .collect::<Vec<_>>();
+        let mut filter_config = StorageConfig {
+            retention_tiers: vec![tier(
+                "filter-cap".to_string(),
+                exact_filters,
+                Vec::new(),
+            )],
+            ..StorageConfig::default()
+        };
+        filter_config.validate().expect("exact per-tier filter cap is valid");
+        filter_config.retention_tiers[0]
+            .severities
+            .push("severity-overflow".to_string());
+        let filter_error = filter_config
+            .validate()
+            .expect_err("filter cap + 1 must fail");
+        assert!(filter_error.contains(&format!(
+            "{} filters",
+            RETENTION_POLICY_MAX_FILTERS_PER_TIER + 1
+        )));
+
+        let mut bind_tiers = Vec::new();
+        let mut remaining = RETENTION_POLICY_MAX_SQL_BIND_COST;
+        let mut tier_index = 0usize;
+        while remaining > 0 {
+            let filter_count = remaining.min(RETENTION_POLICY_MAX_FILTERS_PER_TIER);
+            bind_tiers.push(tier(
+                format!("bind-tier-{tier_index}"),
+                (0..filter_count)
+                    .map(|filter_index| format!("bind-{tier_index}-{filter_index}"))
+                    .collect(),
+                Vec::new(),
+            ));
+            remaining -= filter_count;
+            tier_index += 1;
+        }
+        let mut bind_config = StorageConfig {
+            retention_tiers: bind_tiers,
+            ..StorageConfig::default()
+        };
+        let exact_bind_plan = bind_config
+            .compile_retention_policy()
+            .expect("exact aggregate bind cap is valid");
+        assert_eq!(
+            exact_bind_plan.stats().input_sql_bind_cost,
+            RETENTION_POLICY_MAX_SQL_BIND_COST
+        );
+        bind_config.retention_tiers.push(tier(
+            "bind-overflow".to_string(),
+            vec!["one-more-bind".to_string()],
+            Vec::new(),
+        ));
+        let bind_error = bind_config
+            .validate()
+            .expect_err("aggregate bind cap + 1 must fail");
+        assert!(bind_error.contains(&format!(
+            "{} filter SQL binds",
+            RETENTION_POLICY_MAX_SQL_BIND_COST + 1
+        )));
+
+        let exact_byte_filter = "x".repeat(RETENTION_POLICY_MAX_UTF8_BYTES - 1);
+        let mut byte_config = StorageConfig {
+            retention_tiers: vec![tier(
+                "b".to_string(),
+                vec![exact_byte_filter],
+                Vec::new(),
+            )],
+            ..StorageConfig::default()
+        };
+        let exact_byte_plan = byte_config
+            .compile_retention_policy()
+            .expect("exact aggregate byte cap is valid");
+        assert_eq!(
+            exact_byte_plan.stats().input_utf8_bytes,
+            RETENTION_POLICY_MAX_UTF8_BYTES
+        );
+        byte_config.retention_tiers[0].severities[0].push('x');
+        let byte_error = byte_config
+            .validate()
+            .expect_err("aggregate byte cap + 1 must fail");
+        assert!(byte_error.contains(&format!(
+            "{} UTF-8 bytes",
+            RETENTION_POLICY_MAX_UTF8_BYTES + 1
+        )));
+    }
+
+    #[test]
+    fn retention_policy_compilation_is_linear_canonical_and_reusable() {
+        let config = StorageConfig {
+            retention_tiers: vec![RetentionTier {
+                name: "first operator display name".to_string(),
+                retention_days: 42,
+                severities: vec![
+                    "Warning".to_string(),
+                    "warning".to_string(),
+                    "INFO".to_string(),
+                    "info".to_string(),
+                ],
+                event_types: vec!["rate.".to_string(), "rate.".to_string()],
+                handled: Some(false),
+            }],
+            ..StorageConfig::default()
+        };
+        let expected_input_bytes = config
+            .retention_tiers
+            .iter()
+            .map(|tier| {
+                tier.name.len()
+                    + tier.severities.iter().map(String::len).sum::<usize>()
+                    + tier.event_types.iter().map(String::len).sum::<usize>()
+            })
+            .sum();
+        let plan = config
+            .compile_retention_policy()
+            .expect("compile canonical retention plan");
+        assert_eq!(plan.tiers()[0].name, "first operator display name");
+        assert_eq!(plan.tiers()[0].retention_days, 42);
+        assert_eq!(plan.tiers()[0].severities, vec!["Warning", "INFO"]);
+        assert_eq!(plan.tiers()[0].event_types, vec!["rate."]);
+        assert_eq!(
+            plan.stats(),
+            RetentionPolicyCompileStats {
+                tiers_visited: 1,
+                filters_visited: 6,
+                canonical_filters: 3,
+                input_sql_bind_cost: 8,
+                compiled_sql_bind_cost: 4,
+                input_utf8_bytes: expected_input_bytes,
+            }
+        );
+        assert!(
+            plan.stats().compiled_sql_bind_cost + RETENTION_POLICY_MAX_FIXED_BINDS
+                < SQLITE_PORTABLE_VARIABLE_LIMIT
+        );
+
+        assert_eq!(plan.sql_execution_count(), 0);
+        plan.note_sql_execution();
+        plan.note_sql_execution();
+        assert_eq!(
+            plan.sql_execution_count(),
+            2,
+            "one immutable compilation must be reusable across repeated cleanup SQL executions"
         );
     }
 

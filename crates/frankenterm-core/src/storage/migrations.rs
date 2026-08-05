@@ -1874,6 +1874,45 @@ pub(crate) static MIGRATIONS: &[Migration] = &[
         // skip, so v34 deliberately establishes a new forward-only floor.
         down_sql: None,
     },
+    Migration {
+        version: 35,
+        description: "Add unhandled-event hot-path and per-pane output activity indexes",
+        // Drop same-name objects first so the migration repairs a malformed
+        // pre-existing index instead of letting IF NOT EXISTS preserve it.
+        // The v34 constant-key partial index is replaced by indexes matching
+        // the incompatible hot-path access patterns: newest-first refreshes,
+        // ascending durable-cursor delivery, and exact pane counts. Keeping
+        // only the detected-at order would force cursor reads and pane counts
+        // to scan or sort the full unhandled set.
+        up_sql: r"
+        DROP INDEX IF EXISTS idx_events_unhandled;
+        DROP INDEX IF EXISTS idx_events_unhandled_detected;
+        DROP INDEX IF EXISTS idx_events_unhandled_id;
+        DROP INDEX IF EXISTS idx_events_unhandled_pane;
+        CREATE INDEX idx_events_unhandled_detected
+            ON events(detected_at DESC, id DESC) WHERE handled_at IS NULL;
+        CREATE INDEX idx_events_unhandled_id
+            ON events(id ASC) WHERE handled_at IS NULL;
+        CREATE INDEX idx_events_unhandled_pane
+            ON events(pane_id ASC) WHERE handled_at IS NULL;
+
+        DROP INDEX IF EXISTS idx_segments_pane_captured;
+        CREATE INDEX idx_segments_pane_captured
+            ON output_segments(pane_id, captured_at DESC);
+        ",
+        down_sql: Some(
+            r"
+            DROP INDEX IF EXISTS idx_events_unhandled_detected;
+            DROP INDEX IF EXISTS idx_events_unhandled_id;
+            DROP INDEX IF EXISTS idx_events_unhandled_pane;
+            DROP INDEX IF EXISTS idx_events_unhandled;
+            CREATE INDEX idx_events_unhandled
+                ON events(handled_at) WHERE handled_at IS NULL;
+
+            DROP INDEX IF EXISTS idx_segments_pane_captured;
+            ",
+        ),
+    },
 ];
 
 // =============================================================================
@@ -1969,7 +2008,21 @@ pub fn initialize_schema(conn: &Connection) -> Result<()> {
     // BEGIN IMMEDIATE / COMMIT (ft-k542h, c06b230a follow-up) so a
     // crash mid-init never leaves half-applied state.
     if current == 0 {
-        return run_v0_init_in_transaction(conn);
+        run_v0_init_in_transaction(conn)?;
+        if needs_init {
+            // A genuinely fresh database has no historical postings to
+            // repair, so stamp the live FTS index version directly. Existing
+            // unversioned v0 databases deliberately retain migration 10's
+            // legacy marker and are rebuilt by the storage-open repair gate.
+            conn.execute(
+                "UPDATE fts_index_state
+                 SET index_version = ?1, updated_at = strftime('%s', 'now') * 1000
+                 WHERE id = 1",
+                params![i64::from(super::FTS_INDEX_VERSION)],
+            )
+            .map_err(|error| StorageError::Database(error.to_string()))?;
+        }
+        return Ok(());
     }
     // `needs_init` is intentionally consulted only via the path above;
     // a future caller that wants to discriminate "really fresh" vs
@@ -2892,8 +2945,8 @@ pub(crate) fn build_migration_plan(from_version: i32, to_version: i32) -> Result
     // Downgrade contract (ft-ftwck): v1, v30, v32, and v34 are deliberately
     // forward-only (down_sql: None), so the lowest reachable downgrade target
     // is the HIGHEST forward-only version.  v34 protects durable retention-loss
-    // evidence from being discarded by a rollback; there is currently no
-    // reversible tail above that floor.
+    // evidence from being discarded by a rollback; reversible migrations above
+    // that floor (currently v35) may still roll back to exactly v34.
     let mut steps = Vec::new();
     for migration in MIGRATIONS.iter().rev() {
         if migration.version <= to_version || migration.version > from_version {
@@ -4122,7 +4175,7 @@ mod tests {
         assert!(build_migration_plan(34, 33).is_err());
 
         let conn = Connection::open_in_memory().expect("open fresh sqlite");
-        initialize_schema(&conn).expect("initialize v34 schema");
+        initialize_schema(&conn).expect("initialize current schema");
         let state = conn
             .query_row(
                 "SELECT length(cursor_epoch), legacy_history_complete,
@@ -4300,6 +4353,135 @@ mod tests {
             events_table_info(&upgraded),
             fresh_descriptor,
             "fresh and v32-upgraded events tables must have identical PRAGMA descriptors and order"
+        );
+    }
+
+    #[test]
+    fn hot_path_index_v35_fresh_upgrade_and_downgrade_are_exact() {
+        fn normalized_index_sql(conn: &Connection, name: &str) -> Option<String> {
+            let sql = conn
+                .query_row(
+                    "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?1",
+                    [name],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .expect("inspect sqlite index definition")?;
+            Some(
+                sql.split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ")
+                    .to_ascii_lowercase()
+                    .replace("if not exists ", ""),
+            )
+        }
+
+        let migration = MIGRATIONS
+            .iter()
+            .find(|migration| migration.version == 35)
+            .expect("v35 migration");
+        assert!(migration.down_sql.is_some(), "v35 must remain reversible");
+
+        let fresh = Connection::open_in_memory().expect("open fresh sqlite");
+        initialize_schema(&fresh).expect("initialize fresh current schema");
+        let fresh_unhandled = normalized_index_sql(&fresh, "idx_events_unhandled_detected")
+            .expect("fresh schema newest-first unhandled index");
+        let fresh_unhandled_cursor = normalized_index_sql(&fresh, "idx_events_unhandled_id")
+            .expect("fresh schema ascending unhandled-cursor index");
+        let fresh_unhandled_pane = normalized_index_sql(&fresh, "idx_events_unhandled_pane")
+            .expect("fresh schema pane-grouped unhandled index");
+        let fresh_pane_activity = normalized_index_sql(&fresh, "idx_segments_pane_captured")
+            .expect("fresh schema pane-activity index");
+        assert_eq!(
+            normalized_index_sql(&fresh, "idx_events_unhandled"),
+            None,
+            "fresh v35 schema must not retain the constant-key v34 index"
+        );
+
+        let upgraded = Connection::open_in_memory().expect("open upgrade sqlite");
+        initialize_schema(&upgraded).expect("initialize current upgrade fixture");
+        let down = build_migration_plan(35, 34).expect("build reversible v35 down plan");
+        apply_migration_plan(&upgraded, &down).expect("apply v35 down migration");
+        assert_eq!(get_user_version(&upgraded).expect("v34 user_version"), 34);
+        assert!(normalized_index_sql(&upgraded, "idx_events_unhandled").is_some());
+        assert_eq!(
+            normalized_index_sql(&upgraded, "idx_events_unhandled_detected"),
+            None
+        );
+        assert_eq!(
+            normalized_index_sql(&upgraded, "idx_events_unhandled_id"),
+            None
+        );
+        assert_eq!(
+            normalized_index_sql(&upgraded, "idx_events_unhandled_pane"),
+            None
+        );
+        assert_eq!(
+            normalized_index_sql(&upgraded, "idx_segments_pane_captured"),
+            None
+        );
+
+        // Same-name malformed indexes can be left by an interrupted manual
+        // repair or a pre-release build. v35 deliberately replaces, rather
+        // than preserves, those definitions.
+        upgraded
+            .execute_batch(
+                "CREATE INDEX idx_events_unhandled_detected ON events(id);
+                 CREATE INDEX idx_events_unhandled_id ON events(detected_at);
+                 CREATE INDEX idx_events_unhandled_pane ON events(detected_at);
+                 CREATE INDEX idx_segments_pane_captured ON output_segments(captured_at);",
+            )
+            .expect("seed malformed same-name v35 indexes");
+        let up = build_migration_plan(34, 35).expect("build v34 to v35 plan");
+        apply_migration_plan(&upgraded, &up).expect("apply v35 upgrade");
+        assert_eq!(get_user_version(&upgraded).expect("v35 user_version"), 35);
+        assert_eq!(
+            normalized_index_sql(&upgraded, "idx_events_unhandled_detected"),
+            Some(fresh_unhandled),
+            "upgraded and fresh unhandled indexes must be identical"
+        );
+        assert_eq!(
+            normalized_index_sql(&upgraded, "idx_events_unhandled_id"),
+            Some(fresh_unhandled_cursor),
+            "upgraded and fresh unhandled cursor indexes must be identical"
+        );
+        assert_eq!(
+            normalized_index_sql(&upgraded, "idx_events_unhandled_pane"),
+            Some(fresh_unhandled_pane),
+            "upgraded and fresh pane-grouped unhandled indexes must be identical"
+        );
+        assert_eq!(
+            normalized_index_sql(&upgraded, "idx_segments_pane_captured"),
+            Some(fresh_pane_activity),
+            "upgraded and fresh pane-activity indexes must be identical"
+        );
+        assert_eq!(normalized_index_sql(&upgraded, "idx_events_unhandled"), None);
+
+        let down_again = build_migration_plan(35, 34).expect("rebuild v35 down plan");
+        apply_migration_plan(&upgraded, &down_again).expect("reapply v35 down migration");
+        assert_eq!(get_user_version(&upgraded).expect("restored v34 user_version"), 34);
+        assert_eq!(
+            normalized_index_sql(&upgraded, "idx_events_unhandled"),
+            Some(
+                "create index idx_events_unhandled on events(handled_at) where handled_at is null"
+                    .to_string()
+            )
+        );
+        assert_eq!(
+            normalized_index_sql(&upgraded, "idx_events_unhandled_detected"),
+            None
+        );
+        assert_eq!(
+            normalized_index_sql(&upgraded, "idx_events_unhandled_id"),
+            None
+        );
+        assert_eq!(
+            normalized_index_sql(&upgraded, "idx_events_unhandled_pane"),
+            None
+        );
+        assert_eq!(
+            normalized_index_sql(&upgraded, "idx_segments_pane_captured"),
+            None
         );
     }
 

@@ -50,6 +50,7 @@ use frankenterm_core::runtime_telemetry::{
 use frankenterm_core::storage::io_scheduler::{
     StorageIoClass, StorageIoDominantClassSummary, StorageIoOperatorSummary, StorageIoPressureTier,
 };
+use frankenterm_core::storage::SCHEMA_VERSION;
 use frankenterm_core::swarm_scheduler::{
     AdmissionAction, AdmissionDecisionCounters, AdmissionReasonCode,
     ResourceAdmissionDecisionSummary,
@@ -75,6 +76,26 @@ fn schema_dir() -> PathBuf {
 /// Path to docs/json-schema/PROVENANCE.md.
 fn schema_provenance_path() -> PathBuf {
     schema_dir().join("PROVENANCE.md")
+}
+
+#[test]
+fn readme_tracks_executable_storage_schema_version() {
+    let readme_path = workspace_root().join("README.md");
+    let readme = fs::read_to_string(&readme_path)
+        .unwrap_or_else(|err| panic!("failed to read {}: {err}", readme_path.display()));
+    let expected_markers = [
+        format!("currently schema v{SCHEMA_VERSION}"),
+        format!("current version is **v{SCHEMA_VERSION}**"),
+        format!("`SCHEMA_VERSION = {SCHEMA_VERSION}` at HEAD"),
+    ];
+
+    for marker in expected_markers {
+        assert_eq!(
+            readme.matches(&marker).count(),
+            1,
+            "README storage-schema marker must appear exactly once: {marker}"
+        );
+    }
 }
 
 /// Load all .json files from docs/json-schema/.
@@ -1619,6 +1640,31 @@ fn event_stream_schema_covers_every_closed_record_family() {
         "error records must reject non-authoritative negative cursors"
     );
 
+    let mut split_error_token = records
+        .iter()
+        .find(|record| record["type"].as_str() == Some("error"))
+        .expect("terminal error fixture")
+        .clone();
+    split_error_token["cursor_scope"] = json!(scope);
+    assert!(
+        !validator.is_valid(&split_error_token),
+        "error records must preserve either a complete cursor triple or three nulls"
+    );
+
+    let mut canonical_error_token = records
+        .iter()
+        .find(|record| record["type"].as_str() == Some("error"))
+        .expect("terminal error fixture")
+        .clone();
+    canonical_error_token["cursor"] = json!(7);
+    canonical_error_token["cursor_epoch"] = json!(epoch);
+    canonical_error_token["cursor_scope"] = json!(scope);
+    assert_schema_accepts(
+        "terminal error with complete cursor authority",
+        &validator,
+        &canonical_error_token,
+    );
+
     let mut impossible_await = records
         .iter()
         .find(|record| {
@@ -1645,6 +1691,46 @@ fn event_stream_schema_covers_every_closed_record_family() {
     assert!(
         !validator.is_valid(&invented_reason),
         "the closed discontinuity vocabulary must reject approximate aliases"
+    );
+
+    let mut retention_reason_with_scope_shape = records
+        .iter()
+        .find(|record| {
+            record["type"].as_str() == Some("cursor_discontinuity")
+                && record["reason"].as_str() == Some("cursor_scope_mismatch")
+        })
+        .expect("scope discontinuity fixture")
+        .clone();
+    retention_reason_with_scope_shape["reason"] = json!("cursor_epoch_mismatch");
+    assert!(
+        !validator.is_valid(&retention_reason_with_scope_shape),
+        "retention reasons must carry retention evidence rather than scope-mismatch fields"
+    );
+
+    let mut scope_reason_with_retention_shape = records
+        .iter()
+        .find(|record| {
+            record["type"].as_str() == Some("cursor_discontinuity")
+                && record["reason"].as_str() == Some("cursor_epoch_mismatch")
+        })
+        .expect("epoch discontinuity fixture")
+        .clone();
+    scope_reason_with_retention_shape["reason"] = json!("cursor_scope_mismatch");
+    assert!(
+        !validator.is_valid(&scope_reason_with_retention_shape),
+        "scope mismatch must carry the expected scope rather than retention evidence"
+    );
+
+    let mut conditionless_await = records
+        .iter()
+        .find(|record| record["type"].as_str() == Some("await_result"))
+        .expect("await-result fixture")
+        .clone();
+    conditionless_await["any"] = json!([]);
+    conditionless_await["all"] = json!([]);
+    assert!(
+        !validator.is_valid(&conditionless_await),
+        "await results must retain at least one declared condition"
     );
 
     let mut impossible_checkpoint = records
@@ -1888,6 +1974,7 @@ fn robot_envelope_schema_tracks_current_core_error_codes() {
         "robot.wezterm_command_failed",
         "robot.wezterm_parse_error",
         "robot.circuit_open",
+        "robot.cursor_discontinuity",
         "robot.storage_error",
         "robot.fts_query_error",
         "robot.policy_denied",

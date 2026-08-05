@@ -43,11 +43,14 @@ use std::{
 
 use crate::runtime_async::{SpawnBlockingWithCxError, oneshot};
 use frankenterm_core_audit_types::storage_audit::AuditFieldRedactor;
+use frankenterm_sigpipe::{RecoverablePanicSite, catch_recoverable};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Result, StorageError};
 use crate::capture_authority::CapturePersistenceHold;
-use crate::config::RetentionTier;
+use crate::config::{
+    CompiledRetentionPolicy, RetentionTier, compile_retention_policy_tiers,
+};
 use crate::events::event_identity_key;
 use crate::lru_cache::LruCache;
 use crate::policy::Redactor;
@@ -79,6 +82,12 @@ pub mod io_scheduler;
 pub mod mmap_store;
 
 const TIMELINE_PANE_ID_INLINE_LIMIT: usize = 96;
+const WRITER_EVENT_GAP_PANIC_ERROR: &str =
+    "storage writer recovered from event/gap group commit panic (WA-STORAGE-WRITER-PANIC)";
+const WRITER_APPEND_PANIC_ERROR: &str =
+    "storage writer recovered from append group commit panic (WA-STORAGE-WRITER-PANIC)";
+const WRITER_DISPATCH_PANIC_ERROR: &str =
+    "storage writer recovered from dispatch panic (WA-STORAGE-WRITER-PANIC)";
 
 /// Maximum number of identifiers accepted by one storage bulk-read call.
 ///
@@ -89,6 +98,113 @@ pub const STORAGE_BULK_ID_INPUT_MAX: usize = 4_096;
 
 /// Maximum number of downstream-delivery leases changed by one atomic batch.
 pub const EVENT_DELIVERY_LEASE_BULK_MAX: usize = 64;
+
+// Keep hot-path SQL in one place so execution and EXPLAIN-plan regression
+// tests cannot silently drift apart.
+const QUERY_UNHANDLED_EVENTS_NEWEST_SQL: &str =
+    r"SELECT id, pane_id, rule_id, agent_type, event_type, severity, confidence,
+     extracted, matched_text, segment_id, detected_at, dedupe_key, handled_at,
+     handled_by_workflow_id, handled_status
+     FROM events
+     WHERE handled_at IS NULL
+     ORDER BY detected_at DESC, id DESC
+     LIMIT ?1";
+
+const QUERY_UNHANDLED_EVENT_COUNTS_SQL: &str =
+    r"SELECT pane_id, COUNT(*) AS cnt
+      FROM events
+      WHERE handled_at IS NULL
+      GROUP BY pane_id";
+
+const QUERY_UNHANDLED_EVENT_COUNTS_BULK_SQL: &str =
+    r"WITH requested(pane_id) AS (
+         SELECT CAST(requested_json.value AS INTEGER)
+         FROM json_each(?1) AS requested_json
+         WHERE requested_json.type = 'integer'
+     )
+     SELECT requested.pane_id,
+            (
+                SELECT COUNT(*)
+                FROM events
+                WHERE events.handled_at IS NULL
+                  AND events.pane_id = requested.pane_id
+            )
+     FROM requested";
+
+const QUERY_PANE_LAST_OUTPUT_AT_SQL: &str =
+    r"SELECT captured_at
+      FROM output_segments
+      WHERE pane_id = ?1
+      ORDER BY captured_at DESC
+      LIMIT 1";
+
+const QUERY_PANE_LAST_OUTPUT_AT_BULK_SQL: &str =
+    r"WITH requested(pane_id) AS (
+         SELECT CAST(requested_json.value AS INTEGER)
+         FROM json_each(?1) AS requested_json
+         WHERE requested_json.type = 'integer'
+     )
+     SELECT panes.pane_id,
+            (
+                SELECT output_segments.captured_at
+                FROM output_segments
+                WHERE output_segments.pane_id = panes.pane_id
+                ORDER BY output_segments.captured_at DESC
+                LIMIT 1
+     )
+     FROM requested
+     JOIN panes ON panes.pane_id = requested.pane_id";
+
+const QUERY_LAST_ACTIVITY_BY_PANE_SQL: &str =
+    r"SELECT panes.pane_id,
+              (
+                  SELECT output_segments.captured_at
+                  FROM output_segments
+                  WHERE output_segments.pane_id = panes.pane_id
+                  ORDER BY output_segments.captured_at DESC
+                  LIMIT 1
+              )
+       FROM panes
+       ORDER BY panes.pane_id ASC";
+
+const FINALIZE_EVENT_DELIVERY_LEASES_BULK_SQL: &str =
+    r"WITH requested(event_id, token) AS (
+         SELECT CAST(json_extract(lease_json.value, '$[0]') AS INTEGER),
+                json_extract(lease_json.value, '$[1]')
+         FROM json_each(?1) AS lease_json
+         WHERE json_type(lease_json.value, '$[0]') = 'integer'
+           AND json_type(lease_json.value, '$[1]') = 'text'
+     )
+     UPDATE events
+     SET handled_at = ?2,
+         handled_by_workflow_id = ?3,
+         handled_status = ?4,
+         delivery_lease_token = NULL,
+         delivery_lease_acquired_at = NULL,
+         delivery_lease_expires_at = NULL
+     WHERE handled_at IS NULL
+       AND (id, delivery_lease_token) IN (
+           SELECT requested.event_id, requested.token FROM requested
+       )
+     RETURNING id";
+
+const RELEASE_EVENT_DELIVERY_LEASES_BULK_SQL: &str =
+    r"WITH requested(event_id, token) AS (
+         SELECT CAST(json_extract(lease_json.value, '$[0]') AS INTEGER),
+                json_extract(lease_json.value, '$[1]')
+         FROM json_each(?1) AS lease_json
+         WHERE json_type(lease_json.value, '$[0]') = 'integer'
+           AND json_type(lease_json.value, '$[1]') = 'text'
+     )
+     UPDATE events
+     SET delivery_lease_token = NULL,
+         delivery_lease_acquired_at = NULL,
+         delivery_lease_expires_at = NULL
+     WHERE handled_at IS NULL
+       AND (id, delivery_lease_token) IN (
+           SELECT requested.event_id, requested.token FROM requested
+       )
+     RETURNING id";
 
 pub use frankenterm_core_audit_types::storage_audit::{
     ActionHistoryQuery, ActionHistoryRecord, ActionUndoRecord, AuditActionRecord, AuditQuery,
@@ -224,9 +340,76 @@ pub struct SizeEvictionOutcome {
     /// Estimated live (non-free) database size after eviction, in bytes.
     pub used_bytes_after: u64,
     /// True if the database was still over the cap when the pass stopped — i.e.
-    /// non-segment data alone exceeds the limit, or the per-pass deletion budget
-    /// was exhausted (eviction continues on the next maintenance tick).
+    /// non-segment data alone exceeds the limit. A cancellable call may return
+    /// early as an error between already-committed bounded writer turns.
     pub over_limit_after: bool,
+}
+
+/// Truthful result of a bounded, multi-turn durable mutation.
+///
+/// A caller cancellation or storage failure can arrive after one or more
+/// writer turns have committed.  Returning a bare `Err` at that point loses
+/// the only exact count of durable work.  Cleanup orchestration uses this
+/// contract to retain the committed prefix, stop before issuing another
+/// delete, and emit an auditable partial-completion receipt.
+#[derive(Debug)]
+pub(crate) enum DurableMutationProgress<T> {
+    Complete(T),
+    Interrupted {
+        /// Exact aggregate of writer turns known to have committed. `None`
+        /// means the operation failed before its first durable mutation.
+        durable: Option<T>,
+        error: crate::Error,
+    },
+}
+
+/// Per-branch result of one bounded all-policy event-retention writer turn.
+/// The vector always contains one slot per configured tier plus the fallback
+/// branch, in classifier order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CompiledRetentionDeleteBatch {
+    deleted_by_branch: Vec<usize>,
+}
+
+impl CompiledRetentionDeleteBatch {
+    fn total_deleted(&self) -> Result<usize> {
+        self.deleted_by_branch.iter().try_fold(0usize, |total, deleted| {
+            total.checked_add(*deleted).ok_or_else(|| {
+                StorageError::Database(
+                    "compiled retention batch deleted-row count overflow".to_string(),
+                )
+                .into()
+            })
+        })
+    }
+}
+
+impl<T> DurableMutationProgress<T> {
+    fn into_legacy_result(self) -> Result<T> {
+        match self {
+            Self::Complete(value) => Ok(value),
+            Self::Interrupted { error, .. } => Err(error),
+        }
+    }
+}
+
+const AUXILIARY_RETENTION_DELETE_BATCH_MAX: usize = 1_024;
+
+#[derive(Clone, Copy)]
+enum AuxiliaryRetentionTable {
+    AuditActions,
+    UsageMetrics,
+    NotificationHistory,
+}
+
+impl AuxiliaryRetentionTable {
+    const fn operation(self) -> &'static str {
+        match self {
+            Self::AuditActions => "purge_audit_actions_before",
+            Self::UsageMetrics => "purge_usage_metrics",
+            Self::NotificationHistory => "purge_notification_history",
+        }
+    }
 }
 
 // br-ft-8bvg0 slice 2: 10 search/index result types lifted to
@@ -835,6 +1018,7 @@ enum WriteCommand {
     /// Purge audit actions older than a cutoff timestamp
     PurgeAuditActions {
         before_ts: i64,
+        batch_size: usize,
         respond: oneshot::Sender<Result<usize>>,
     },
     /// Insert an approval token
@@ -911,6 +1095,7 @@ enum WriteCommand {
     /// Prune output segments older than a cutoff
     PruneSegments {
         before_ts: i64,
+        batch_size: usize,
         respond: oneshot::Sender<Result<usize>>,
     },
     /// Enforce a size-based retention cap (`storage.retention_max_mb`) by
@@ -985,6 +1170,7 @@ enum WriteCommand {
     /// Purge usage metrics older than a cutoff timestamp
     PurgeUsageMetrics {
         before_ts: i64,
+        batch_size: usize,
         respond: oneshot::Sender<Result<usize>>,
     },
     /// Record a notification in the history log
@@ -1014,6 +1200,7 @@ enum WriteCommand {
     /// Purge notification history older than a cutoff timestamp
     PurgeNotificationHistory {
         before_ts: i64,
+        batch_size: usize,
         respond: oneshot::Sender<Result<usize>>,
     },
     /// Delete events older than a cutoff (flat, no tier filters)
@@ -1022,24 +1209,22 @@ enum WriteCommand {
         batch_size: usize,
         respond: oneshot::Sender<Result<usize>>,
     },
-    /// Delete events matching tier criteria older than a cutoff
-    DeleteEventsByTier {
+    /// Delete one disjoint branch of a compiled first-match retention policy.
+    /// The immutable classifier is shared across every bounded writer turn.
+    DeleteEventsByRetentionRule {
         before_ts: i64,
-        severities: Vec<String>,
-        event_types: Vec<String>,
-        handled: Option<bool>,
+        policy: Arc<CompiledRetentionPolicy>,
+        branch_index: usize,
         batch_size: usize,
         respond: oneshot::Sender<Result<usize>>,
     },
-    /// Delete one disjoint first-match retention-policy branch.  `tier=None`
-    /// is the global fallback; `excluded_tiers` are all earlier ordered rules,
-    /// including keep-forever rules.
-    DeleteEventsByRetentionRule {
-        before_ts: i64,
-        tier: Option<RetentionTier>,
-        excluded_tiers: Vec<RetentionTier>,
+    /// Delete one bounded batch across every branch of a compiled retention
+    /// policy after classifying each candidate row once.
+    DeleteEventsByRetentionPolicy {
+        policy: Arc<CompiledRetentionPolicy>,
+        cutoffs: Arc<[Option<i64>]>,
         batch_size: usize,
-        respond: oneshot::Sender<Result<usize>>,
+        respond: oneshot::Sender<Result<CompiledRetentionDeleteBatch>>,
     },
     /// Insert a pane bookmark
     InsertPaneBookmark {
@@ -1127,6 +1312,7 @@ enum WriteCommand {
     /// Test-only command that panics inside the writer dispatch path.
     #[cfg(test)]
     PanicForTest {
+        message: &'static str,
         respond: oneshot::Sender<Result<()>>,
     },
     /// Shutdown the writer thread (flush pending writes)
@@ -1196,8 +1382,8 @@ impl std::fmt::Debug for WriteCommand {
             Self::IncrementNotificationRetry { .. } => "IncrementNotificationRetry",
             Self::PurgeNotificationHistory { .. } => "PurgeNotificationHistory",
             Self::DeleteEventsBefore { .. } => "DeleteEventsBefore",
-            Self::DeleteEventsByTier { .. } => "DeleteEventsByTier",
             Self::DeleteEventsByRetentionRule { .. } => "DeleteEventsByRetentionRule",
+            Self::DeleteEventsByRetentionPolicy { .. } => "DeleteEventsByRetentionPolicy",
             Self::InsertPaneBookmark { .. } => "InsertPaneBookmark",
             Self::DeletePaneBookmark { .. } => "DeletePaneBookmark",
             Self::InsertAgentProfile { .. } => "InsertAgentProfile",
@@ -1993,6 +2179,28 @@ impl StorageBackendProvider for RusqliteStorageBackendProvider {
             StorageHandle::checkpoint_storage_open(cx, "after FTS trigger setup")?;
         }
 
+        // FTS index version 2 is a one-time repair boundary for historical
+        // deferred-retention builds that could leave stale postings across
+        // output_segments rowid reuse. A version mismatch forces an
+        // authoritative full rebuild before this handle can serve searches;
+        // deferred mode additionally performs its normal incremental catch-up
+        // on every open. Trigger-maintained version-2 databases skip the
+        // incremental path because their postings are already current.
+        let fts_state = get_fts_index_state_backend(&backend)?;
+        let requires_version_repair = fts_state
+            .as_ref()
+            .is_none_or(|state| state.index_version != FTS_INDEX_VERSION);
+        if requires_version_repair || request.defer_fts_triggers {
+            let result = sync_fts_on_startup_backend(&backend, &FtsSyncConfig::default())?;
+            for warning in result.warnings {
+                tracing::warn!(warning, "FTS startup synchronization warning");
+            }
+        }
+
+        if let Some(cx) = request.cx.as_ref() {
+            StorageHandle::checkpoint_storage_open(cx, "after FTS startup repair")?;
+        }
+
         #[cfg(unix)]
         {
             ensure_db_permissions(Path::new(&request.db_path), !request.db_existed)?;
@@ -2119,9 +2327,57 @@ pub struct StorageHandle {
     writer_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
     /// Semantic budget state for hybrid search guardrails/telemetry.
     semantic_budget_state: Arc<Mutex<SemanticBudgetState>>,
+    /// Deterministic unit-test cancellation at the exact boundary after one
+    /// durable writer batch and before continuation is enqueued.
+    #[cfg(test)]
+    test_cancel_after_batch: Arc<Mutex<Option<&'static str>>>,
 }
 
 impl StorageHandle {
+    #[cfg(test)]
+    pub(crate) fn cancel_after_next_committed_batch_for_test(
+        &self,
+        operation: &'static str,
+    ) {
+        *self
+            .test_cancel_after_batch
+            .lock()
+            .expect("test batch-cancellation hook lock") = Some(operation);
+    }
+
+    #[cfg(test)]
+    fn maybe_cancel_after_committed_batch_for_test(
+        &self,
+        cx: &crate::cx::Cx,
+        operation: &'static str,
+        committed_rows: usize,
+    ) {
+        if committed_rows == 0 {
+            return;
+        }
+        let mut hook = self
+            .test_cancel_after_batch
+            .lock()
+            .expect("test batch-cancellation hook lock");
+        if *hook == Some(operation) {
+            *hook = None;
+            cx.cancel_with(
+                crate::outcome::CancelKind::User,
+                Some("deterministic test cancellation after committed storage batch"),
+            );
+        }
+    }
+
+    #[cfg(not(test))]
+    #[inline(always)]
+    fn maybe_cancel_after_committed_batch_for_test(
+        &self,
+        _cx: &crate::cx::Cx,
+        _operation: &'static str,
+        _committed_rows: usize,
+    ) {
+    }
+
     /// Create a new storage handle
     ///
     /// Opens/creates the database at `db_path`, initializes the schema,
@@ -2253,8 +2509,11 @@ impl StorageHandle {
     {
         match crate::runtime_async::spawn_blocking_with_cx(cx, work).await {
             Ok(result) => result,
-            Err(error @ SpawnBlockingWithCxError::CancelledBeforeSpawn { .. })
-            | Err(error @ SpawnBlockingWithCxError::CancelledMidFlight { .. }) => {
+            Err(
+                error
+                @ (SpawnBlockingWithCxError::CancelledBeforeSpawn { .. }
+                | SpawnBlockingWithCxError::CancelledMidFlight { .. }),
+            ) => {
                 Err(crate::Error::Cancelled(format!(
                     "{join_error_prefix}: {error}"
                 )))
@@ -2454,6 +2713,8 @@ impl StorageHandle {
             semantic_budget_state: Arc::new(Mutex::new(SemanticBudgetState::new(
                 SemanticBudgetConfig::default(),
             ))),
+            #[cfg(test)]
+            test_cancel_after_batch: Arc::new(Mutex::new(None)),
         };
         register_storage_backend_provider(handle.db_path.as_str(), &handle.backend_provider);
         Ok(handle)
@@ -2964,18 +3225,12 @@ impl StorageHandle {
             .map_err(|error| {
                 Self::writer_send_error("finalize_event_delivery_leases_bulk", error)
             })?;
-        let result = Self::recv_writer_response(rx).await;
-        let completion_checkpoint = Self::checkpoint_storage_operation(
-            cx,
-            "finalize_event_delivery_leases_bulk completion",
-        );
-        match result {
-            Ok(finalized) => {
-                completion_checkpoint?;
-                Ok(finalized)
-            }
-            Err(error) => Err(error),
-        }
+        // Sending the command is the cancellation commit point. Once the
+        // serialized writer may have changed durable state, return its exact
+        // result even if cancellation arrives while the transaction runs;
+        // reporting cancellation after a successful commit would conceal the
+        // finalized leases from the caller.
+        Self::recv_writer_response(rx).await
     }
 
     /// Atomically release a bounded set of delivery leases after a known
@@ -3021,18 +3276,8 @@ impl StorageHandle {
             .map_err(|error| {
                 Self::writer_send_error("release_event_delivery_leases_bulk", error)
             })?;
-        let result = Self::recv_writer_response(rx).await;
-        let completion_checkpoint = Self::checkpoint_storage_operation(
-            cx,
-            "release_event_delivery_leases_bulk completion",
-        );
-        match result {
-            Ok(released) => {
-                completion_checkpoint?;
-                Ok(released)
-            }
-            Err(error) => Err(error),
-        }
+        // As above, do not turn a committed release into a cancellation error.
+        Self::recv_writer_response(rx).await
     }
 
     /// Set or clear an event's triage state.
@@ -3523,20 +3768,25 @@ impl StorageHandle {
         cx: &crate::cx::Cx,
         before_ts: i64,
     ) -> Result<usize> {
-        Self::checkpoint_storage_operation(cx, "purge_audit_actions_before")?;
-        let (tx, rx) = oneshot::channel();
-        self.write_tx
-            .send_with_cx(
-                cx,
-                WriteCommand::PurgeAuditActions {
-                    before_ts,
-                    respond: tx,
-                },
-            )
-            .await
-            .map_err(|error| Self::writer_send_error("purge_audit_actions_before", error))?;
+        self.purge_auxiliary_history_with_cx(
+            cx,
+            before_ts,
+            AuxiliaryRetentionTable::AuditActions,
+        )
+        .await
+    }
 
-        Self::recv_writer_response(rx).await
+    pub(crate) async fn purge_audit_actions_before_progress_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        before_ts: i64,
+    ) -> DurableMutationProgress<usize> {
+        self.purge_auxiliary_history_progress_with_cx(
+            cx,
+            before_ts,
+            AuxiliaryRetentionTable::AuditActions,
+        )
+        .await
     }
 
     /// Record a maintenance event
@@ -4098,20 +4348,80 @@ impl StorageHandle {
         cx: &crate::cx::Cx,
         before_ts: i64,
     ) -> Result<usize> {
-        Self::checkpoint_storage_operation(cx, "prune_segments_before")?;
-        let (tx, rx) = oneshot::channel();
-        self.write_tx
-            .send_with_cx(
-                cx,
-                WriteCommand::PruneSegments {
-                    before_ts,
-                    respond: tx,
-                },
-            )
+        self.prune_segments_before_progress_with_cx(cx, before_ts)
             .await
-            .map_err(|error| Self::writer_send_error("prune_segments_before", error))?;
+            .into_legacy_result()
+    }
 
-        Self::recv_writer_response(rx).await
+    /// Partial-progress-preserving sibling used by cleanup orchestration.
+    pub(crate) async fn prune_segments_before_progress_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        before_ts: i64,
+    ) -> DurableMutationProgress<usize> {
+        let mut total_deleted = 0usize;
+        loop {
+            if let Err(error) = Self::checkpoint_storage_operation(cx, "prune_segments_before") {
+                return DurableMutationProgress::Interrupted {
+                    durable: (total_deleted > 0).then_some(total_deleted),
+                    error,
+                };
+            }
+            let (tx, rx) = oneshot::channel();
+            if let Err(error) = self
+                .write_tx
+                .send_with_cx(
+                    cx,
+                    WriteCommand::PruneSegments {
+                        before_ts,
+                        batch_size: SEGMENT_RETENTION_DELETE_BATCH_MAX,
+                        respond: tx,
+                    },
+                )
+                .await
+                .map_err(|error| Self::writer_send_error("prune_segments_before", error))
+            {
+                return DurableMutationProgress::Interrupted {
+                    durable: (total_deleted > 0).then_some(total_deleted),
+                    error,
+                };
+            }
+
+            let deleted = match Self::recv_writer_response(rx).await {
+                Ok(deleted) => deleted,
+                Err(error) => {
+                    return DurableMutationProgress::Interrupted {
+                        durable: (total_deleted > 0).then_some(total_deleted),
+                        error,
+                    };
+                }
+            };
+            let (next_total, complete) = match accumulate_bounded_writer_batch(
+                total_deleted,
+                deleted,
+                SEGMENT_RETENTION_DELETE_BATCH_MAX,
+                "prune_segments_before",
+            ) {
+                Ok(progress) => progress,
+                Err(error) => {
+                    return DurableMutationProgress::Interrupted {
+                        durable: total_deleted.checked_add(deleted),
+                        error,
+                    };
+                }
+            };
+            total_deleted = next_total;
+            self.maybe_cancel_after_committed_batch_for_test(
+                cx,
+                "prune_segments_before",
+                deleted,
+            );
+            if complete {
+                return DurableMutationProgress::Complete(total_deleted);
+            }
+            // A full batch re-enters through the channel tail so interactive
+            // writes can run before the next retention transaction.
+        }
     }
 
     /// Prune output segments older than a cutoff timestamp
@@ -4188,19 +4498,91 @@ impl StorageHandle {
         cx: &crate::cx::Cx,
         max_mb: u32,
     ) -> Result<SizeEvictionOutcome> {
-        Self::checkpoint_storage_operation(cx, "enforce_size_limit")?;
-        let (tx, rx) = oneshot::channel();
-        self.write_tx
-            .send_with_cx(
-                cx,
-                WriteCommand::EnforceSizeLimit {
-                    max_mb,
-                    respond: tx,
-                },
-            )
+        self.enforce_size_limit_progress_with_cx(cx, max_mb)
             .await
-            .map_err(|error| Self::writer_send_error("enforce_size_limit", error))?;
-        Self::recv_writer_response(rx).await
+            .into_legacy_result()
+    }
+
+    pub(crate) async fn enforce_size_limit_progress_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        max_mb: u32,
+    ) -> DurableMutationProgress<SizeEvictionOutcome> {
+        let mut aggregate: Option<SizeEvictionOutcome> = None;
+        loop {
+            if let Err(error) = Self::checkpoint_storage_operation(cx, "enforce_size_limit") {
+                return DurableMutationProgress::Interrupted {
+                    durable: aggregate,
+                    error,
+                };
+            }
+            let (tx, rx) = oneshot::channel();
+            if let Err(error) = self
+                .write_tx
+                .send_with_cx(
+                    cx,
+                    WriteCommand::EnforceSizeLimit {
+                        max_mb,
+                        respond: tx,
+                    },
+                )
+                .await
+                .map_err(|error| Self::writer_send_error("enforce_size_limit", error))
+            {
+                return DurableMutationProgress::Interrupted {
+                    durable: aggregate,
+                    error,
+                };
+            }
+            let turn = match Self::recv_writer_response(rx).await {
+                Ok(turn) => turn,
+                Err(error) => {
+                    return DurableMutationProgress::Interrupted {
+                        durable: aggregate,
+                        error,
+                    };
+                }
+            };
+            let prior_deleted = aggregate.as_ref().map_or(0, |value| value.deleted_segments);
+            let Some(deleted_segments) = prior_deleted.checked_add(turn.deleted_segments) else {
+                return DurableMutationProgress::Interrupted {
+                    durable: aggregate,
+                    error: StorageError::Database(
+                        "size-eviction deleted-segment count overflow".to_string(),
+                    )
+                    .into(),
+                };
+            };
+            let current = aggregate.get_or_insert(SizeEvictionOutcome {
+                deleted_segments: 0,
+                used_bytes_before: turn.used_bytes_before,
+                used_bytes_after: turn.used_bytes_before,
+                over_limit_after: turn.over_limit_after,
+            });
+            current.deleted_segments = deleted_segments;
+            current.used_bytes_after = turn.used_bytes_after;
+            current.over_limit_after = turn.over_limit_after;
+            self.maybe_cancel_after_committed_batch_for_test(
+                cx,
+                "enforce_size_limit",
+                turn.deleted_segments,
+            );
+
+            if !turn.over_limit_after
+                || turn.deleted_segments == 0
+                || turn.used_bytes_after >= turn.used_bytes_before
+            {
+                // A committed batch that releases no live pages cannot make
+                // progress toward this page-based cap. Stop rather than
+                // destroying more history in a tight loop; later SQLite page
+                // reuse or a subsequent maintenance pass may change the
+                // physical-page economics.
+                return DurableMutationProgress::Complete(*current);
+            }
+            // Re-enter through the FIFO tail. The checkpoint at the next
+            // iteration makes cancellation observable between committed
+            // batches and lets latency-sensitive writes run first.
+        }
     }
 
     /// Record a usage metric for analytics tracking.
@@ -4276,20 +4658,25 @@ impl StorageHandle {
         cx: &crate::cx::Cx,
         before_ts: i64,
     ) -> Result<usize> {
-        Self::checkpoint_storage_operation(cx, "purge_usage_metrics")?;
-        let (tx, rx) = oneshot::channel();
-        self.write_tx
-            .send_with_cx(
-                cx,
-                WriteCommand::PurgeUsageMetrics {
-                    before_ts,
-                    respond: tx,
-                },
-            )
-            .await
-            .map_err(|error| Self::writer_send_error("purge_usage_metrics", error))?;
+        self.purge_auxiliary_history_with_cx(
+            cx,
+            before_ts,
+            AuxiliaryRetentionTable::UsageMetrics,
+        )
+        .await
+    }
 
-        Self::recv_writer_response(rx).await
+    pub(crate) async fn purge_usage_metrics_progress_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        before_ts: i64,
+    ) -> DurableMutationProgress<usize> {
+        self.purge_auxiliary_history_progress_with_cx(
+            cx,
+            before_ts,
+            AuxiliaryRetentionTable::UsageMetrics,
+        )
+        .await
     }
 
     /// Query usage metrics with filters (read-only, uses read connection).
@@ -4514,20 +4901,115 @@ impl StorageHandle {
         cx: &crate::cx::Cx,
         before_ts: i64,
     ) -> Result<usize> {
-        Self::checkpoint_storage_operation(cx, "purge_notification_history")?;
-        let (tx, rx) = oneshot::channel();
-        self.write_tx
-            .send_with_cx(
-                cx,
-                WriteCommand::PurgeNotificationHistory {
+        self.purge_auxiliary_history_with_cx(
+            cx,
+            before_ts,
+            AuxiliaryRetentionTable::NotificationHistory,
+        )
+        .await
+    }
+
+    pub(crate) async fn purge_notification_history_progress_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        before_ts: i64,
+    ) -> DurableMutationProgress<usize> {
+        self.purge_auxiliary_history_progress_with_cx(
+            cx,
+            before_ts,
+            AuxiliaryRetentionTable::NotificationHistory,
+        )
+        .await
+    }
+
+    async fn purge_auxiliary_history_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        before_ts: i64,
+        table: AuxiliaryRetentionTable,
+    ) -> Result<usize> {
+        self.purge_auxiliary_history_progress_with_cx(cx, before_ts, table)
+            .await
+            .into_legacy_result()
+    }
+
+    async fn purge_auxiliary_history_progress_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        before_ts: i64,
+        table: AuxiliaryRetentionTable,
+    ) -> DurableMutationProgress<usize> {
+        let operation = table.operation();
+        let mut total_deleted = 0usize;
+        loop {
+            if let Err(error) = Self::checkpoint_storage_operation(cx, operation) {
+                return DurableMutationProgress::Interrupted {
+                    durable: (total_deleted > 0).then_some(total_deleted),
+                    error,
+                };
+            }
+            let (tx, rx) = oneshot::channel();
+            let command = match table {
+                AuxiliaryRetentionTable::AuditActions => WriteCommand::PurgeAuditActions {
                     before_ts,
+                    batch_size: AUXILIARY_RETENTION_DELETE_BATCH_MAX,
                     respond: tx,
                 },
-            )
-            .await
-            .map_err(|error| Self::writer_send_error("purge_notification_history", error))?;
-
-        Self::recv_writer_response(rx).await
+                AuxiliaryRetentionTable::UsageMetrics => WriteCommand::PurgeUsageMetrics {
+                    before_ts,
+                    batch_size: AUXILIARY_RETENTION_DELETE_BATCH_MAX,
+                    respond: tx,
+                },
+                AuxiliaryRetentionTable::NotificationHistory => {
+                    WriteCommand::PurgeNotificationHistory {
+                        before_ts,
+                        batch_size: AUXILIARY_RETENTION_DELETE_BATCH_MAX,
+                        respond: tx,
+                    }
+                }
+            };
+            if let Err(error) = self
+                .write_tx
+                .send_with_cx(cx, command)
+                .await
+                .map_err(|error| Self::writer_send_error(operation, error))
+            {
+                return DurableMutationProgress::Interrupted {
+                    durable: (total_deleted > 0).then_some(total_deleted),
+                    error,
+                };
+            }
+            let deleted = match Self::recv_writer_response(rx).await {
+                Ok(deleted) => deleted,
+                Err(error) => {
+                    return DurableMutationProgress::Interrupted {
+                        durable: (total_deleted > 0).then_some(total_deleted),
+                        error,
+                    };
+                }
+            };
+            let (accumulated, converged) = match accumulate_bounded_writer_batch(
+                total_deleted,
+                deleted,
+                AUXILIARY_RETENTION_DELETE_BATCH_MAX,
+                operation,
+            ) {
+                Ok(progress) => progress,
+                Err(error) => {
+                    return DurableMutationProgress::Interrupted {
+                        durable: total_deleted.checked_add(deleted),
+                        error,
+                    };
+                }
+            };
+            total_deleted = accumulated;
+            self.maybe_cancel_after_committed_batch_for_test(cx, operation, deleted);
+            if converged {
+                return DurableMutationProgress::Complete(total_deleted);
+            }
+            // A full batch may have more eligible rows. Re-enter through the
+            // FIFO tail after the next cancellation checkpoint.
+        }
     }
 
     // =========================================================================
@@ -4626,26 +5108,16 @@ impl StorageHandle {
         event_types: &[String],
         handled: Option<bool>,
     ) -> Result<usize> {
-        Self::checkpoint_storage_operation(cx, "count_events_by_tier")?;
-        let db_path = Arc::clone(&self.db_path);
-        let severities = severities.to_vec();
-        let event_types = event_types.to_vec();
-        Self::spawn_blocking_storage_with_cx_with_join_error(
-            cx,
-            "Spawn blocking failed",
-            move || {
-                pooled_backend(db_path.as_str(), |backend| {
-                    count_events_by_tier_backend(
-                        backend,
-                        before_ts,
-                        &severities,
-                        &event_types,
-                        handled,
-                    )
-                })
-            },
-        )
-        .await
+        let policy = compile_retention_policy_tiers(&[RetentionTier {
+            name: "ad-hoc".to_string(),
+            retention_days: 0,
+            severities: severities.to_vec(),
+            event_types: event_types.to_vec(),
+            handled,
+        }])
+        .map_err(retention_policy_compile_error)?;
+        self.count_events_by_compiled_retention_branch_with_cx(cx, before_ts, policy, 0)
+            .await
     }
 
     /// Count one disjoint ordered retention-policy branch.  `tier=None`
@@ -4675,20 +5147,70 @@ impl StorageHandle {
         tier: Option<&RetentionTier>,
         excluded_tiers: &[RetentionTier],
     ) -> Result<usize> {
+        let (policy, branch_index) =
+            compile_ordered_retention_policy_branch(tier, excluded_tiers)?;
+        self.count_events_by_compiled_retention_branch_with_cx(
+            cx,
+            before_ts,
+            policy,
+            branch_index,
+        )
+        .await
+    }
+
+    /// Count one branch of a precompiled first-match classifier with explicit
+    /// caller cancellation.
+    pub(crate) async fn count_events_by_compiled_retention_branch_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        before_ts: i64,
+        policy: Arc<CompiledRetentionPolicy>,
+        branch_index: usize,
+    ) -> Result<usize> {
         Self::checkpoint_storage_operation(cx, "count_events_by_retention_rule")?;
+        policy
+            .validate_branch_index(branch_index)
+            .map_err(retention_policy_compile_error)?;
         let db_path = Arc::clone(&self.db_path);
-        let tier = tier.cloned();
-        let excluded_tiers = excluded_tiers.to_vec();
         Self::spawn_blocking_storage_with_cx_with_join_error(
             cx,
             "Spawn blocking failed",
             move || {
                 pooled_backend(db_path.as_str(), |backend| {
-                    count_events_by_retention_rule_backend(
+                    count_events_by_compiled_retention_branch_backend(
                         backend,
                         before_ts,
-                        tier.as_ref(),
-                        &excluded_tiers,
+                        &policy,
+                        branch_index,
+                    )
+                })
+            },
+        )
+        .await
+    }
+
+    /// Count every eligible branch of one compiled retention policy in a
+    /// single events-table scan. `cutoffs` contains one optional epoch-ms
+    /// cutoff per configured tier plus the fallback branch; `None` means that
+    /// branch is retained forever.
+    pub(crate) async fn count_events_by_compiled_retention_policy_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        policy: Arc<CompiledRetentionPolicy>,
+        cutoffs: Arc<[Option<i64>]>,
+    ) -> Result<Vec<usize>> {
+        Self::checkpoint_storage_operation(cx, "count_events_by_retention_policy")?;
+        validate_compiled_retention_cutoffs(&policy, &cutoffs)?;
+        let db_path = Arc::clone(&self.db_path);
+        Self::spawn_blocking_storage_with_cx_with_join_error(
+            cx,
+            "Spawn blocking failed",
+            move || {
+                pooled_backend(db_path.as_str(), |backend| {
+                    count_events_by_compiled_retention_policy_backend(
+                        backend,
+                        &policy,
+                        &cutoffs,
                     )
                 })
             },
@@ -4791,21 +5313,86 @@ impl StorageHandle {
         before_ts: i64,
         batch_size: usize,
     ) -> Result<usize> {
-        Self::checkpoint_storage_operation(cx, "delete_events_before")?;
-        let (tx, rx) = oneshot::channel();
-        self.write_tx
-            .send_with_cx(
-                cx,
-                WriteCommand::DeleteEventsBefore {
-                    before_ts,
-                    batch_size,
-                    respond: tx,
-                },
-            )
+        self.delete_events_before_progress_with_cx(cx, before_ts, batch_size)
             .await
-            .map_err(|error| Self::writer_send_error("delete_events_before", error))?;
+            .into_legacy_result()
+    }
 
-        Self::recv_writer_response(rx).await
+    pub(crate) async fn delete_events_before_progress_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        before_ts: i64,
+        batch_size: usize,
+    ) -> DurableMutationProgress<usize> {
+        let batch_size = bounded_event_retention_batch_size(batch_size);
+        let mut total_deleted = 0usize;
+        loop {
+            if let Err(error) = Self::checkpoint_storage_operation(cx, "delete_events_before") {
+                return DurableMutationProgress::Interrupted {
+                    durable: (total_deleted > 0).then_some(total_deleted),
+                    error,
+                };
+            }
+            if batch_size == 0 {
+                return DurableMutationProgress::Complete(0);
+            }
+            let (tx, rx) = oneshot::channel();
+            if let Err(error) = self
+                .write_tx
+                .send_with_cx(
+                    cx,
+                    WriteCommand::DeleteEventsBefore {
+                        before_ts,
+                        batch_size,
+                        respond: tx,
+                    },
+                )
+                .await
+                .map_err(|error| Self::writer_send_error("delete_events_before", error))
+            {
+                return DurableMutationProgress::Interrupted {
+                    durable: (total_deleted > 0).then_some(total_deleted),
+                    error,
+                };
+            }
+
+            let deleted = match Self::recv_writer_response(rx).await {
+                Ok(deleted) => deleted,
+                Err(error) => {
+                    return DurableMutationProgress::Interrupted {
+                        durable: (total_deleted > 0).then_some(total_deleted),
+                        error,
+                    };
+                }
+            };
+            let (next_total, complete) = match accumulate_bounded_writer_batch(
+                total_deleted,
+                deleted,
+                batch_size,
+                "delete_events_before",
+            ) {
+                Ok(progress) => progress,
+                Err(error) => {
+                    return DurableMutationProgress::Interrupted {
+                        durable: total_deleted.checked_add(deleted),
+                        error,
+                    };
+                }
+            };
+            total_deleted = next_total;
+            self.maybe_cancel_after_committed_batch_for_test(
+                cx,
+                "delete_events_before",
+                deleted,
+            );
+            if complete {
+                return DurableMutationProgress::Complete(total_deleted);
+            }
+            // Re-enqueue at the writer tail instead of monopolizing the single
+            // writer across the full retained history. The checkpoint at the
+            // top of the next iteration is the cancellation boundary between
+            // committed batches.
+        }
     }
 
     /// Delete events matching tier criteria older than a cutoff (write-path).
@@ -4839,24 +5426,22 @@ impl StorageHandle {
         handled: Option<bool>,
         batch_size: usize,
     ) -> Result<usize> {
-        Self::checkpoint_storage_operation(cx, "delete_events_by_tier")?;
-        let (tx, rx) = oneshot::channel();
-        self.write_tx
-            .send_with_cx(
-                cx,
-                WriteCommand::DeleteEventsByTier {
-                    before_ts,
-                    severities: severities.to_vec(),
-                    event_types: event_types.to_vec(),
-                    handled,
-                    batch_size,
-                    respond: tx,
-                },
-            )
-            .await
-            .map_err(|error| Self::writer_send_error("delete_events_by_tier", error))?;
-
-        Self::recv_writer_response(rx).await
+        let policy = compile_retention_policy_tiers(&[RetentionTier {
+            name: "ad-hoc".to_string(),
+            retention_days: 0,
+            severities: severities.to_vec(),
+            event_types: event_types.to_vec(),
+            handled,
+        }])
+        .map_err(retention_policy_compile_error)?;
+        self.delete_events_by_compiled_retention_branch_with_cx(
+            cx,
+            before_ts,
+            policy,
+            0,
+            batch_size,
+        )
+        .await
     }
 
     /// Delete one disjoint ordered retention-policy branch.
@@ -4887,24 +5472,248 @@ impl StorageHandle {
         excluded_tiers: &[RetentionTier],
         batch_size: usize,
     ) -> Result<usize> {
-        Self::checkpoint_storage_operation(cx, "delete_events_by_retention_rule")?;
-        let (tx, rx) = oneshot::channel();
-        self.write_tx
-            .send_with_cx(
+        let (policy, branch_index) =
+            compile_ordered_retention_policy_branch(tier, excluded_tiers)?;
+        self.delete_events_by_compiled_retention_branch_with_cx(
+            cx,
+            before_ts,
+            policy,
+            branch_index,
+            batch_size,
+        )
+        .await
+    }
+
+    /// Delete one branch of a precompiled first-match classifier with explicit
+    /// caller cancellation.
+    pub(crate) async fn delete_events_by_compiled_retention_branch_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        before_ts: i64,
+        policy: Arc<CompiledRetentionPolicy>,
+        branch_index: usize,
+        batch_size: usize,
+    ) -> Result<usize> {
+        self.delete_events_by_compiled_retention_branch_progress_with_cx(
+            cx,
+            before_ts,
+            policy,
+            branch_index,
+            batch_size,
+        )
+        .await
+        .into_legacy_result()
+    }
+
+    pub(crate) async fn delete_events_by_compiled_retention_branch_progress_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        before_ts: i64,
+        policy: Arc<CompiledRetentionPolicy>,
+        branch_index: usize,
+        batch_size: usize,
+    ) -> DurableMutationProgress<usize> {
+        let batch_size = bounded_event_retention_batch_size(batch_size);
+        if let Err(error) = policy
+            .validate_branch_index(branch_index)
+            .map_err(retention_policy_compile_error)
+        {
+            return DurableMutationProgress::Interrupted {
+                durable: None,
+                error,
+            };
+        }
+        let mut total_deleted = 0usize;
+        loop {
+            if let Err(error) =
+                Self::checkpoint_storage_operation(cx, "delete_events_by_retention_rule")
+            {
+                return DurableMutationProgress::Interrupted {
+                    durable: (total_deleted > 0).then_some(total_deleted),
+                    error,
+                };
+            }
+            if batch_size == 0 {
+                return DurableMutationProgress::Complete(0);
+            }
+            let (tx, rx) = oneshot::channel();
+            if let Err(error) = self
+                .write_tx
+                .send_with_cx(
+                    cx,
+                    WriteCommand::DeleteEventsByRetentionRule {
+                        before_ts,
+                        policy: Arc::clone(&policy),
+                        branch_index,
+                        batch_size,
+                        respond: tx,
+                    },
+                )
+                .await
+                .map_err(|error| {
+                    Self::writer_send_error("delete_events_by_retention_rule", error)
+                })
+            {
+                return DurableMutationProgress::Interrupted {
+                    durable: (total_deleted > 0).then_some(total_deleted),
+                    error,
+                };
+            }
+
+            let deleted = match Self::recv_writer_response(rx).await {
+                Ok(deleted) => deleted,
+                Err(error) => {
+                    return DurableMutationProgress::Interrupted {
+                        durable: (total_deleted > 0).then_some(total_deleted),
+                        error,
+                    };
+                }
+            };
+            let (next_total, complete) = match accumulate_bounded_writer_batch(
+                total_deleted,
+                deleted,
+                batch_size,
+                "delete_events_by_retention_rule",
+            ) {
+                Ok(progress) => progress,
+                Err(error) => {
+                    return DurableMutationProgress::Interrupted {
+                        durable: total_deleted.checked_add(deleted),
+                        error,
+                    };
+                }
+            };
+            total_deleted = next_total;
+            self.maybe_cancel_after_committed_batch_for_test(
                 cx,
-                WriteCommand::DeleteEventsByRetentionRule {
-                    before_ts,
-                    tier: tier.cloned(),
-                    excluded_tiers: excluded_tiers.to_vec(),
-                    batch_size,
-                    respond: tx,
-                },
-            )
-            .await
-            .map_err(|error| {
-                Self::writer_send_error("delete_events_by_retention_rule", error)
-            })?;
-        Self::recv_writer_response(rx).await
+                "delete_events_by_retention_rule",
+                deleted,
+            );
+            if complete {
+                return DurableMutationProgress::Complete(total_deleted);
+            }
+        }
+    }
+
+    /// Delete every eligible policy branch through one classified bounded
+    /// candidate scan per writer turn, preserving exact per-branch durable
+    /// totals if cancellation or storage failure interrupts continuation.
+    pub(crate) async fn delete_events_by_compiled_retention_policy_progress_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        policy: Arc<CompiledRetentionPolicy>,
+        cutoffs: Arc<[Option<i64>]>,
+        batch_size: usize,
+    ) -> DurableMutationProgress<Vec<usize>> {
+        if let Err(error) = validate_compiled_retention_cutoffs(&policy, &cutoffs) {
+            return DurableMutationProgress::Interrupted {
+                durable: None,
+                error,
+            };
+        }
+        let batch_size = bounded_event_retention_batch_size(batch_size);
+        let branch_count = cutoffs.len();
+        let mut aggregate = vec![0usize; branch_count];
+        loop {
+            if let Err(error) = Self::checkpoint_storage_operation(
+                cx,
+                "delete_events_by_retention_policy",
+            ) {
+                return DurableMutationProgress::Interrupted {
+                    durable: aggregate.iter().any(|count| *count > 0).then_some(aggregate),
+                    error,
+                };
+            }
+            if batch_size == 0 {
+                return DurableMutationProgress::Complete(aggregate);
+            }
+            let (tx, rx) = oneshot::channel();
+            if let Err(error) = self
+                .write_tx
+                .send_with_cx(
+                    cx,
+                    WriteCommand::DeleteEventsByRetentionPolicy {
+                        policy: Arc::clone(&policy),
+                        cutoffs: Arc::clone(&cutoffs),
+                        batch_size,
+                        respond: tx,
+                    },
+                )
+                .await
+                .map_err(|error| {
+                    Self::writer_send_error("delete_events_by_retention_policy", error)
+                })
+            {
+                return DurableMutationProgress::Interrupted {
+                    durable: aggregate.iter().any(|count| *count > 0).then_some(aggregate),
+                    error,
+                };
+            }
+            let turn = match Self::recv_writer_response(rx).await {
+                Ok(turn) => turn,
+                Err(error) => {
+                    return DurableMutationProgress::Interrupted {
+                        durable: aggregate.iter().any(|count| *count > 0).then_some(aggregate),
+                        error,
+                    };
+                }
+            };
+            if turn.deleted_by_branch.len() != branch_count {
+                return DurableMutationProgress::Interrupted {
+                    durable: aggregate.iter().any(|count| *count > 0).then_some(aggregate),
+                    error: StorageError::Database(format!(
+                        "compiled retention writer returned {} branches; expected {branch_count}",
+                        turn.deleted_by_branch.len()
+                    ))
+                    .into(),
+                };
+            }
+            let turn_total = match turn.total_deleted() {
+                Ok(total) => total,
+                Err(error) => {
+                    return DurableMutationProgress::Interrupted {
+                        durable: aggregate.iter().any(|count| *count > 0).then_some(aggregate),
+                        error,
+                    };
+                }
+            };
+            let mut next = aggregate.clone();
+            for (branch_index, deleted) in turn.deleted_by_branch.iter().copied().enumerate() {
+                let Some(total) = next[branch_index].checked_add(deleted) else {
+                    return DurableMutationProgress::Interrupted {
+                        durable: Some(aggregate),
+                        error: StorageError::Database(format!(
+                            "compiled retention branch {branch_index} deleted-row count overflow"
+                        ))
+                        .into(),
+                    };
+                };
+                next[branch_index] = total;
+            }
+            if turn_total > batch_size {
+                // The writer transaction has already committed, so retain its
+                // exact per-branch prefix even while rejecting the violated
+                // bounded-turn protocol.
+                return DurableMutationProgress::Interrupted {
+                    durable: Some(next),
+                    error: StorageError::Database(format!(
+                        "compiled retention writer returned {turn_total} rows for a batch bounded at {batch_size}"
+                    ))
+                    .into(),
+                };
+            }
+            aggregate = next;
+            self.maybe_cancel_after_committed_batch_for_test(
+                cx,
+                "delete_events_by_retention_policy",
+                turn_total,
+            );
+            if turn_total < batch_size {
+                return DurableMutationProgress::Complete(aggregate);
+            }
+            // A full batch may have more candidates. Re-enqueue at the FIFO
+            // tail and observe cancellation before the next durable turn.
+        }
     }
 
     /// Query notification history with filters.
@@ -6623,6 +7432,43 @@ impl StorageHandle {
         .await
     }
 
+    /// Count unhandled events for a bounded set of pane IDs in one read
+    /// snapshot.
+    ///
+    /// Every requested ID is present in the result, including missing panes
+    /// and panes with no unhandled events, which both map to zero. Duplicate
+    /// IDs are harmless and input is capped at [`STORAGE_BULK_ID_INPUT_MAX`].
+    pub async fn count_unhandled_events_by_pane_bulk(
+        &self,
+        pane_ids: &[u64],
+    ) -> Result<HashMap<u64, u32>> {
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.count_unhandled_events_by_pane_bulk_with_cx(&cx, pane_ids)
+            .await
+    }
+
+    /// Cancellation-aware sibling of
+    /// [`Self::count_unhandled_events_by_pane_bulk`].
+    pub async fn count_unhandled_events_by_pane_bulk_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        pane_ids: &[u64],
+    ) -> Result<HashMap<u64, u32>> {
+        Self::checkpoint_storage_operation(cx, "count_unhandled_events_by_pane_bulk")?;
+        let pane_ids = canonical_pane_ids(pane_ids, "pane unhandled counts")?;
+        if pane_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let db_path = Arc::clone(&self.db_path);
+
+        Self::spawn_blocking_storage_with_cx(cx, move || {
+            pooled_backend(db_path.as_str(), |backend| {
+                query_unhandled_event_counts_bulk_canonical_backend(backend, &pane_ids)
+            })
+        })
+        .await
+    }
+
     /// Get the most recent activity timestamp for each pane
     ///
     /// Returns a map from pane_id to the most recent segment captured_at timestamp.
@@ -6926,7 +7772,7 @@ impl StorageHandle {
         pane_ids: &[u64],
     ) -> Result<HashMap<u64, Option<i64>>> {
         Self::checkpoint_storage_operation(cx, "pane_last_output_at_bulk")?;
-        let pane_ids = canonical_pane_activity_ids(pane_ids)?;
+        let pane_ids = canonical_pane_ids(pane_ids, "pane activity")?;
         if pane_ids.is_empty() {
             return Ok(HashMap::new());
         }
@@ -9718,23 +10564,23 @@ fn flush_event_gap_group_recovering(
         );
     }
 
-    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        event_gap_group_commit_backend(backend, &group, mmap_mirror, segment_redactors)
-    }));
+    let outcome = catch_recoverable(
+        RecoverablePanicSite::StorageWriter,
+        std::panic::AssertUnwindSafe(|| {
+            event_gap_group_commit_backend(backend, &group, mmap_mirror, segment_redactors)
+        }),
+    );
     match outcome {
         Ok(result) => {
             dispatch_event_gap_group_commit_result(result, group);
             None
         }
-        Err(payload) => {
+        Err(_) => {
             STORAGE_WRITER_PANICS_TOTAL.fetch_add(1, AtomicOrdering::Relaxed);
-            let message = format!(
-                "storage writer recovered from event/gap group commit panic: {}",
-                panic_payload_summary(payload.as_ref())
-            );
+            let message = WRITER_EVENT_GAP_PANIC_ERROR.to_string();
             tracing::error!(
                 writer_panics_total = storage_writer_panics_total(),
-                error = %message,
+                error_code = "WA-STORAGE-WRITER-PANIC",
                 "storage writer event/gap group commit panic recovered; failing grouped callers"
             );
             rollback_event_gap_group_best_effort(backend, "event/gap group panic");
@@ -10003,23 +10849,23 @@ fn flush_append_segment_group_recovering(
         );
     }
 
-    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        append_segment_group_commit_backend(backend, &group, segment_redactors)
-    }));
+    let outcome = catch_recoverable(
+        RecoverablePanicSite::StorageWriter,
+        std::panic::AssertUnwindSafe(|| {
+            append_segment_group_commit_backend(backend, &group, segment_redactors)
+        }),
+    );
     match outcome {
         Ok(result) => {
             dispatch_append_segment_group_commit_result(result, group, mmap_mirror);
             None
         }
-        Err(payload) => {
+        Err(_) => {
             STORAGE_WRITER_PANICS_TOTAL.fetch_add(1, AtomicOrdering::Relaxed);
-            let message = format!(
-                "storage writer recovered from append group commit panic: {}",
-                panic_payload_summary(payload.as_ref())
-            );
+            let message = WRITER_APPEND_PANIC_ERROR.to_string();
             tracing::error!(
                 writer_panics_total = storage_writer_panics_total(),
-                error = %message,
+                error_code = "WA-STORAGE-WRITER-PANIC",
                 "storage writer append group commit panic recovered; failing undispatched batch commands"
             );
             rollback_append_segment_group_best_effort(backend, "append group panic");
@@ -10204,9 +11050,11 @@ fn fail_undispatched_write_command(cmd: WriteCommand, message: String) -> bool {
         | WriteCommand::PurgeUsageMetrics { respond, .. }
         | WriteCommand::PurgeNotificationHistory { respond, .. }
         | WriteCommand::DeleteEventsBefore { respond, .. }
-        | WriteCommand::DeleteEventsByTier { respond, .. }
         | WriteCommand::DeleteEventsByRetentionRule { respond, .. }
         | WriteCommand::PruneSessionCheckpoints { respond, .. } => {
+            respond_oneshot_best_effort(respond, writer_panic_error(&message));
+        }
+        WriteCommand::DeleteEventsByRetentionPolicy { respond, .. } => {
             respond_oneshot_best_effort(respond, writer_panic_error(&message));
         }
         WriteCommand::ConsumeApprovalToken { respond, .. }
@@ -10242,7 +11090,7 @@ fn fail_undispatched_write_command(cmd: WriteCommand, message: String) -> bool {
             respond_oneshot_best_effort(respond, writer_panic_error(&message));
         }
         #[cfg(test)]
-        WriteCommand::PanicForTest { respond } => {
+        WriteCommand::PanicForTest { respond, .. } => {
             respond_oneshot_best_effort(respond, writer_panic_error(&message));
         }
         WriteCommand::Shutdown { respond } => {
@@ -10265,20 +11113,20 @@ fn dispatch_write_command_raw_recovering(
     segment_redactors: &mut HashMap<u64, SegmentPersistRedactor>,
 ) -> Option<String> {
     let command_was_shutdown = matches!(cmd, WriteCommand::Shutdown { .. });
-    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        dispatch_write_command_raw(backend, cmd, should_break, mmap_mirror, segment_redactors);
-    }));
+    let outcome = catch_recoverable(
+        RecoverablePanicSite::StorageWriter,
+        std::panic::AssertUnwindSafe(|| {
+            dispatch_write_command_raw(backend, cmd, should_break, mmap_mirror, segment_redactors);
+        }),
+    );
     match outcome {
         Ok(()) => None,
-        Err(payload) => {
+        Err(_) => {
             STORAGE_WRITER_PANICS_TOTAL.fetch_add(1, AtomicOrdering::Relaxed);
-            let message = format!(
-                "storage writer recovered from dispatch panic: {}",
-                panic_payload_summary(payload.as_ref())
-            );
+            let message = WRITER_DISPATCH_PANIC_ERROR.to_string();
             tracing::error!(
                 writer_panics_total = storage_writer_panics_total(),
-                error = %message,
+                error_code = "WA-STORAGE-WRITER-PANIC",
                 "storage writer dispatch panic recovered; failing undispatched batch commands"
             );
             flush_segment_redactors(backend, mmap_mirror, segment_redactors);
@@ -10287,16 +11135,6 @@ fn dispatch_write_command_raw_recovering(
             }
             Some(message)
         }
-    }
-}
-
-fn panic_payload_summary(payload: &(dyn std::any::Any + Send)) -> String {
-    if let Some(message) = payload.downcast_ref::<&'static str>() {
-        (*message).to_string()
-    } else if let Some(message) = payload.downcast_ref::<String>() {
-        message.clone()
-    } else {
-        "non-string panic payload".to_string()
     }
 }
 
@@ -11144,7 +11982,7 @@ mod writer_io_scheduler_tests {
             _sql: &str,
             _params: &[&str],
         ) -> std::result::Result<Option<Vec<String>>, BackendError> {
-            std::panic::panic_any("append group panic after begin")
+            std::panic::panic_any("PANIC-PAYLOAD-SECRET-APPEND-SENTINEL")
         }
 
         fn query_map_strings(
@@ -11223,6 +12061,7 @@ mod writer_io_scheduler_tests {
                     .contains("storage writer recovered from append group commit panic"),
                 "{first_error}"
             );
+            assert!(!first_error.to_string().contains("SECRET-APPEND-SENTINEL"));
             let second_result = crate::runtime_async::oneshot_recv(second_rx)
                 .await
                 .expect("second grouped append should receive a recovered panic error");
@@ -11233,6 +12072,7 @@ mod writer_io_scheduler_tests {
                     .contains("storage writer recovered from append group commit panic"),
                 "{second_error}"
             );
+            assert!(!second_error.to_string().contains("SECRET-APPEND-SENTINEL"));
         });
     }
 
@@ -11253,7 +12093,10 @@ mod writer_io_scheduler_tests {
             let (finalize_tx, finalize_rx) = oneshot::channel();
             let (release_tx, release_rx) = oneshot::channel();
             let mut batch = VecDeque::new();
-            batch.push_back(WriteCommand::PanicForTest { respond: panic_tx });
+            batch.push_back(WriteCommand::PanicForTest {
+                message: "PANIC-PAYLOAD-SECRET-DISPATCH-SENTINEL",
+                respond: panic_tx,
+            });
             batch.push_back(WriteCommand::MarkEventHandled {
                 event_id: 42,
                 workflow_id: None,
@@ -11303,6 +12146,7 @@ mod writer_io_scheduler_tests {
                     .contains("storage writer recovered from dispatch panic"),
                 "{panic_error}"
             );
+            assert!(!panic_error.to_string().contains("SECRET-DISPATCH-SENTINEL"));
             let tail_result = crate::runtime_async::oneshot_recv(tail_rx)
                 .await
                 .expect("undispatched tail command should receive a panic error");
@@ -12530,7 +13374,7 @@ impl<T> Drop for WriterResultResponder<T> {
         if let Some(respond) = self.respond.take() {
             respond_oneshot_best_effort(
                 respond,
-                writer_panic_error("storage writer recovered from dispatch panic"),
+                writer_panic_error(WRITER_DISPATCH_PANIC_ERROR),
             );
         }
     }
@@ -12941,12 +13785,16 @@ fn dispatch_write_command_raw(
                 mark_action_undone_backend(backend, audit_action_id, undone_at, &undone_by);
             respond_oneshot_best_effort(respond, result);
         }
-        WriteCommand::PurgeAuditActions { before_ts, respond } => {
+        WriteCommand::PurgeAuditActions {
+            before_ts,
+            batch_size,
+            respond,
+        } => {
             let respond = WriterResultResponder::new(respond);
             // br-ft-l1jgo: routes through the writer backend trait surface.
             // Replaces the legacy
             // purge_audit_actions direct-rusqlite path.
-            let result = purge_audit_actions_backend(backend, before_ts);
+            let result = purge_audit_actions_backend(backend, before_ts, batch_size);
             respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::InsertApprovalToken { token, respond } => {
@@ -13049,9 +13897,13 @@ fn dispatch_write_command_raw(
             let result = full_fts_rebuild_backend(backend, &config);
             respond_oneshot_best_effort(respond, result);
         }
-        WriteCommand::PruneSegments { before_ts, respond } => {
+        WriteCommand::PruneSegments {
+            before_ts,
+            batch_size,
+            respond,
+        } => {
             let respond = WriterResultResponder::new(respond);
-            let result = prune_segments_backend(backend, before_ts);
+            let result = prune_segments_backend(backend, before_ts, batch_size);
             respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::EnforceSizeLimit { max_mb, respond } => {
@@ -13146,9 +13998,13 @@ fn dispatch_write_command_raw(
             let result = record_usage_metrics_batch_backend(backend, &records);
             respond_oneshot_best_effort(respond, result);
         }
-        WriteCommand::PurgeUsageMetrics { before_ts, respond } => {
+        WriteCommand::PurgeUsageMetrics {
+            before_ts,
+            batch_size,
+            respond,
+        } => {
             let respond = WriterResultResponder::new(respond);
-            let result = purge_usage_metrics_backend(backend, before_ts);
+            let result = purge_usage_metrics_backend(backend, before_ts, batch_size);
             respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::RecordNotification { record, respond } => {
@@ -13187,9 +14043,13 @@ fn dispatch_write_command_raw(
             let result = increment_notification_retry_backend(backend, id);
             respond_oneshot_best_effort(respond, result);
         }
-        WriteCommand::PurgeNotificationHistory { before_ts, respond } => {
+        WriteCommand::PurgeNotificationHistory {
+            before_ts,
+            batch_size,
+            respond,
+        } => {
             let respond = WriterResultResponder::new(respond);
-            let result = purge_notification_history_backend(backend, before_ts);
+            let result = purge_notification_history_backend(backend, before_ts, batch_size);
             respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::DeleteEventsBefore {
@@ -13201,38 +14061,34 @@ fn dispatch_write_command_raw(
             let result = delete_events_before_backend(backend, before_ts, batch_size);
             respond_oneshot_best_effort(respond, result);
         }
-        WriteCommand::DeleteEventsByTier {
+        WriteCommand::DeleteEventsByRetentionRule {
             before_ts,
-            severities,
-            event_types,
-            handled,
+            policy,
+            branch_index,
             batch_size,
             respond,
         } => {
             let respond = WriterResultResponder::new(respond);
-            let result = delete_events_by_tier_backend(
+            let result = delete_events_by_compiled_retention_branch_backend(
                 backend,
                 before_ts,
-                &severities,
-                &event_types,
-                handled,
+                &policy,
+                branch_index,
                 batch_size,
             );
             respond_oneshot_best_effort(respond, result);
         }
-        WriteCommand::DeleteEventsByRetentionRule {
-            before_ts,
-            tier,
-            excluded_tiers,
+        WriteCommand::DeleteEventsByRetentionPolicy {
+            policy,
+            cutoffs,
             batch_size,
             respond,
         } => {
             let respond = WriterResultResponder::new(respond);
-            let result = delete_events_by_retention_rule_backend(
+            let result = delete_events_by_compiled_retention_policy_backend(
                 backend,
-                before_ts,
-                tier.as_ref(),
-                &excluded_tiers,
+                &policy,
+                &cutoffs,
                 batch_size,
             );
             respond_oneshot_best_effort(respond, result);
@@ -13354,9 +14210,9 @@ fn dispatch_write_command_raw(
             respond_oneshot_best_effort(respond, result);
         }
         #[cfg(test)]
-        WriteCommand::PanicForTest { respond } => {
+        WriteCommand::PanicForTest { message, respond } => {
             let _respond = WriterResultResponder::new(respond);
-            std::panic::panic_any("storage writer panic injection for test");
+            std::panic::panic_any(message);
         }
         WriteCommand::Shutdown { respond } => {
             let respond = WriterShutdownResponder::new(respond);
@@ -15025,27 +15881,7 @@ fn finalize_event_delivery_leases_bulk_backend(
         |backend| {
             backend
                 .query_map_cells(
-                    "WITH requested(event_id, token) AS (
-                         SELECT CAST(json_extract(lease_json.value, '$[0]') AS INTEGER),
-                                json_extract(lease_json.value, '$[1]')
-                         FROM json_each(?1) AS lease_json
-                         WHERE json_type(lease_json.value, '$[0]') = 'integer'
-                           AND json_type(lease_json.value, '$[1]') = 'text'
-                     )
-                     UPDATE events
-                     SET handled_at = ?2,
-                         handled_by_workflow_id = ?3,
-                         handled_status = ?4,
-                         delivery_lease_token = NULL,
-                         delivery_lease_acquired_at = NULL,
-                         delivery_lease_expires_at = NULL
-                     WHERE handled_at IS NULL
-                       AND EXISTS (
-                           SELECT 1 FROM requested
-                           WHERE requested.event_id = events.id
-                             AND requested.token = events.delivery_lease_token
-                       )
-                     RETURNING id",
+                    FINALIZE_EVENT_DELIVERY_LEASES_BULK_SQL,
                     &[
                         ToSqlValue::Text(&leases_json),
                         ToSqlValue::Integer(handled_at_ms),
@@ -15076,24 +15912,7 @@ fn release_event_delivery_leases_bulk_backend(
         |backend| {
             backend
                 .query_map_cells(
-                    "WITH requested(event_id, token) AS (
-                         SELECT CAST(json_extract(lease_json.value, '$[0]') AS INTEGER),
-                                json_extract(lease_json.value, '$[1]')
-                         FROM json_each(?1) AS lease_json
-                         WHERE json_type(lease_json.value, '$[0]') = 'integer'
-                           AND json_type(lease_json.value, '$[1]') = 'text'
-                     )
-                     UPDATE events
-                     SET delivery_lease_token = NULL,
-                         delivery_lease_acquired_at = NULL,
-                         delivery_lease_expires_at = NULL
-                     WHERE handled_at IS NULL
-                       AND EXISTS (
-                           SELECT 1 FROM requested
-                           WHERE requested.event_id = events.id
-                             AND requested.token = events.delivery_lease_token
-                       )
-                     RETURNING id",
+                    RELEASE_EVENT_DELIVERY_LEASES_BULK_SQL,
                     &[ToSqlValue::Text(&leases_json)],
                 )
                 .map_err(|err| {
@@ -15302,12 +16121,18 @@ fn query_event_annotations_bulk_canonical_backend(
                     event_notes.note,
                     event_notes.updated_at,
                     event_notes.updated_by,
-                    event_labels.label
+                    COALESCE(
+                        (
+                            SELECT json_group_array(event_labels.label)
+                            FROM event_labels
+                            WHERE event_labels.event_id = events.id
+                        ),
+                        '[]'
+                    ) AS labels_json
              FROM requested
              JOIN events ON events.id = requested.event_id
              LEFT JOIN event_notes ON event_notes.event_id = events.id
-             LEFT JOIN event_labels ON event_labels.event_id = events.id
-             ORDER BY events.id ASC, event_labels.label ASC",
+             ORDER BY events.id ASC",
             &[ToSqlValue::Text(&event_ids_json)],
         )
         .map_err(|err| storage_backend_error("Bulk event annotations query failed", err))?;
@@ -15333,6 +16158,21 @@ fn query_event_annotations_bulk_canonical_backend(
             .into());
         }
 
+        let labels_json = reader
+            .string(7)
+            .map_err(|err| storage_backend_error("Decode bulk event labels", err))?;
+        let mut labels = serde_json::from_str::<Vec<String>>(&labels_json).map_err(|error| {
+            StorageError::Database(format!(
+                "bulk annotation labels were not a string array for event {event_id}: {error}"
+            ))
+        })?;
+        labels.sort_unstable();
+        if labels.windows(2).any(|pair| pair[0] == pair[1]) {
+            return Err(StorageError::Database(format!(
+                "bulk annotation labels contain a duplicate for event {event_id}"
+            ))
+            .into());
+        }
         let row_annotations = EventAnnotations {
             triage_state: reader
                 .optional_string(1)
@@ -15352,7 +16192,7 @@ fn query_event_annotations_bulk_canonical_backend(
             note_updated_by: reader
                 .optional_string(6)
                 .map_err(|err| storage_backend_error("Decode bulk note updater", err))?,
-            labels: Vec::new(),
+            labels,
         };
         for (label, timestamp) in [
             ("triage_updated_at", row_annotations.triage_updated_at),
@@ -15365,47 +16205,11 @@ fn query_event_annotations_bulk_canonical_backend(
                 .into());
             }
         }
-        let label = reader
-            .optional_string(7)
-            .map_err(|err| storage_backend_error("Decode bulk event label", err))?;
-
-        use std::collections::hash_map::Entry;
-        match annotations.entry(event_id) {
-            Entry::Vacant(entry) => {
-                let mut row_annotations = row_annotations;
-                if let Some(label) = label {
-                    row_annotations.labels.push(label);
-                }
-                entry.insert(row_annotations);
-            }
-            Entry::Occupied(mut entry) => {
-                let existing = entry.get_mut();
-                let same_base = existing.triage_state == row_annotations.triage_state
-                    && existing.triage_updated_at == row_annotations.triage_updated_at
-                    && existing.triage_updated_by == row_annotations.triage_updated_by
-                    && existing.note == row_annotations.note
-                    && existing.note_updated_at == row_annotations.note_updated_at
-                    && existing.note_updated_by == row_annotations.note_updated_by;
-                if !same_base {
-                    return Err(StorageError::Database(format!(
-                        "bulk annotation rows disagree for event {event_id}"
-                    ))
-                    .into());
-                }
-                let Some(label) = label else {
-                    return Err(StorageError::Database(format!(
-                        "bulk annotation query returned duplicate unlabeled row for event {event_id}"
-                    ))
-                    .into());
-                };
-                if existing.labels.last().is_some_and(|previous| previous >= &label) {
-                    return Err(StorageError::Database(format!(
-                        "bulk annotation labels are duplicate or out of order for event {event_id}"
-                    ))
-                    .into());
-                }
-                existing.labels.push(label);
-            }
+        if annotations.insert(event_id, row_annotations).is_some() {
+            return Err(StorageError::Database(format!(
+                "bulk annotation query returned duplicate event {event_id}"
+            ))
+            .into());
         }
     }
 
@@ -16881,11 +17685,29 @@ fn mark_action_undone_backend(
 ///
 /// Returns the number of audit_actions rows deleted (rows whose
 /// `ts < before_ts`).
-fn purge_audit_actions_backend(backend: &dyn StorageBackend, before_ts: i64) -> Result<usize> {
+fn purge_audit_actions_backend(
+    backend: &dyn StorageBackend,
+    before_ts: i64,
+    requested_batch_size: usize,
+) -> Result<usize> {
+    let batch_size = requested_batch_size.min(AUXILIARY_RETENTION_DELETE_BATCH_MAX);
+    if batch_size == 0 {
+        return Ok(0);
+    }
     let returned = backend
         .query_map_typed(
-            "DELETE FROM audit_actions WHERE ts < ?1 RETURNING id",
-            &[ToSqlValue::Integer(before_ts)],
+            "DELETE FROM audit_actions
+             WHERE id IN (
+                 SELECT id FROM audit_actions
+                 WHERE ts < ?1
+                 ORDER BY ts ASC, id ASC
+                 LIMIT ?2
+             )
+             RETURNING id",
+            &[
+                ToSqlValue::Integer(before_ts),
+                ToSqlValue::Integer(usize_to_i64(batch_size, "audit purge batch size")?),
+            ],
         )
         .map_err(|err| storage_backend_error("Failed to purge audit actions", err))?;
     Ok(returned.len())
@@ -17728,27 +18550,168 @@ fn list_pane_bookmarks_by_tag_backend(
         .collect()
 }
 
-fn prune_segments_backend(backend: &dyn StorageBackend, before_ts: i64) -> Result<usize> {
+/// Maximum output segments removed by one time-retention writer command.
+///
+/// Segment deletion may also run FTS triggers and detach event provenance, so
+/// this is deliberately smaller than the event-ledger batch. Full cleanup
+/// converges through FIFO re-enqueueing in `prune_segments_before_with_cx`.
+const SEGMENT_RETENTION_DELETE_BATCH_MAX: usize = 1_024;
+
+fn bounded_segment_retention_batch_size(requested: usize) -> usize {
+    requested.min(SEGMENT_RETENTION_DELETE_BATCH_MAX)
+}
+
+const REWIND_AFFECTED_FTS_PROGRESS_SQL: &str =
+    "DELETE FROM fts_pane_progress
+     WHERE pane_id IN (SELECT pane_id FROM segment_retention_affected_panes)
+       AND last_indexed_seq > COALESCE(
+           (SELECT MAX(seq) FROM output_segments
+            WHERE output_segments.pane_id = fts_pane_progress.pane_id),
+           -1
+       )
+     RETURNING pane_id";
+
+fn prepare_segment_delete_batch_tables_backend(backend: &dyn StorageBackend) -> Result<()> {
+    backend
+        .execute_batch(
+            "CREATE TEMP TABLE IF NOT EXISTS segment_retention_delete_batch (
+                 id INTEGER PRIMARY KEY,
+                 pane_id INTEGER NOT NULL,
+                 seq INTEGER NOT NULL,
+                 content TEXT NOT NULL
+             );
+             CREATE TEMP TABLE IF NOT EXISTS segment_retention_affected_panes (
+                 pane_id INTEGER PRIMARY KEY
+             );
+             DELETE FROM segment_retention_delete_batch;
+             DELETE FROM segment_retention_affected_panes;",
+        )
+        .map_err(|err| storage_backend_error("Prepare segment retention batch tables", err))?;
+    Ok(())
+}
+
+fn capture_segment_delete_affected_panes_backend(backend: &dyn StorageBackend) -> Result<()> {
+    execute_typed(
+        backend,
+        "INSERT INTO segment_retention_affected_panes (pane_id)
+         SELECT DISTINCT pane_id FROM segment_retention_delete_batch",
+        &[],
+    )
+    .map_err(|err| storage_backend_error("Capture affected segment-retention panes", err))?;
+    Ok(())
+}
+
+fn segment_delete_fts_trigger_present_backend(backend: &dyn StorageBackend) -> Result<bool> {
+    row_exists_where(
+        backend,
+        "sqlite_master",
+        "type = 'trigger' AND name = 'output_segments_ad'",
+        &[],
+    )
+    .map_err(|err| storage_backend_error("Detect output-segment FTS delete trigger", err).into())
+}
+
+/// Remove postings for the exact bounded delete batch when deferred indexing
+/// has dropped the normal `output_segments_ad` trigger.
+///
+/// FTS5's external-content delete command must not be sent for a row that was
+/// never indexed: doing so subtracts nonexistent tokens and corrupts the
+/// inverted index. The FTS-owned `_docsize` shadow table is an exact,
+/// primary-key-indexed ledger of indexed rowids for this schema
+/// (`columnsize=1`, the FTS5 default), so the join is O(batch) and safely skips
+/// not-yet-indexed deferred rows. Captured content is retained in the temp
+/// table because the delete command requires the original token stream and
+/// must execute before the base row disappears.
+fn delete_deferred_fts_entries_for_segment_batch_backend(
+    backend: &dyn StorageBackend,
+) -> Result<()> {
+    if segment_delete_fts_trigger_present_backend(backend)? {
+        return Ok(());
+    }
+    execute_typed(
+        backend,
+        "INSERT INTO output_segments_fts(output_segments_fts, rowid, content)
+         SELECT 'delete', batch.id, batch.content
+         FROM segment_retention_delete_batch AS batch
+         JOIN output_segments_fts_docsize AS indexed ON indexed.id = batch.id
+         ORDER BY batch.id",
+        &[],
+    )
+    .map_err(|err| storage_backend_error("Delete deferred FTS segment postings", err))?;
+    Ok(())
+}
+
+fn clear_segment_delete_batch_tables_backend(backend: &dyn StorageBackend) -> Result<()> {
+    backend
+        .execute_batch(
+            "DELETE FROM segment_retention_delete_batch;
+             DELETE FROM segment_retention_affected_panes;",
+        )
+        .map_err(|err| storage_backend_error("Clear segment retention batch tables", err))?;
+    Ok(())
+}
+
+fn prune_segments_backend(
+    backend: &dyn StorageBackend,
+    before_ts: i64,
+    requested_batch_size: usize,
+) -> Result<usize> {
+    let batch_size = bounded_segment_retention_batch_size(requested_batch_size);
+    if batch_size == 0 {
+        return Ok(0);
+    }
+    let batch_size = usize_to_i64(batch_size, "segment retention batch size")?;
     backend
         .execute("BEGIN IMMEDIATE")
         .map_err(|err| storage_backend_error("Begin segment retention transaction", err))?;
     let tx_result = (|| -> Result<usize> {
+        prepare_segment_delete_batch_tables_backend(backend)?;
+        execute_typed(
+            backend,
+            "INSERT INTO segment_retention_delete_batch (id, pane_id, seq, content)
+             SELECT id, pane_id, seq, content FROM output_segments
+             WHERE captured_at < ?1
+             ORDER BY captured_at ASC, id ASC
+             LIMIT ?2",
+            &[
+                ToSqlValue::Integer(before_ts),
+                ToSqlValue::Integer(batch_size),
+            ],
+        )
+        .map_err(|err| storage_backend_error("Select segment retention batch", err))?;
+        capture_segment_delete_affected_panes_backend(backend)?;
+        let selected = count_table_where(
+            backend,
+            "segment_retention_delete_batch",
+            "1=1",
+            &[],
+        )
+        .map_err(|err| storage_backend_error("Count segment retention batch", err))?;
+        let selected = count_i64_to_usize(selected, "Segment retention batch count")?;
+
         execute_typed(
             backend,
             "UPDATE events SET segment_id = NULL
-             WHERE segment_id IN (
-                 SELECT id FROM output_segments WHERE captured_at < ?1
-             )",
-            &[ToSqlValue::Integer(before_ts)],
+             WHERE segment_id IN (SELECT id FROM segment_retention_delete_batch)",
+            &[],
         )
         .map_err(|err| storage_backend_error("Detach retained event segments", err))?;
+        delete_deferred_fts_entries_for_segment_batch_backend(backend)?;
         let deleted_rows = backend
             .query_map_typed(
-                "DELETE FROM output_segments WHERE captured_at < ?1 RETURNING id",
-                &[ToSqlValue::Integer(before_ts)],
+                "DELETE FROM output_segments
+                 WHERE id IN (SELECT id FROM segment_retention_delete_batch)
+                 RETURNING id",
+                &[],
             )
             .map_err(|err| storage_backend_error("Failed to prune segments", err))?;
         let deleted = deleted_rows.len();
+        if deleted != selected {
+            return Err(StorageError::Database(format!(
+                "segment retention candidate/delete mismatch: selected {selected} ids but deleted {deleted}"
+            ))
+            .into());
+        }
 
         // [ft-znu6v] Rewind stranded FTS progress after pruning.
         //
@@ -17769,8 +18732,9 @@ fn prune_segments_backend(backend: &dyn StorageBackend, before_ts: i64) -> Resul
         // `sync_fts_for_pane_backend` sees `had_prior_progress = false` and
         // takes the inclusive `WHERE pane_id = ?1` branch, picking up seq=0.
         if deleted > 0 {
-            rewind_stranded_fts_progress_backend(backend)?;
+            rewind_stranded_fts_progress_for_affected_panes_backend(backend)?;
         }
+        clear_segment_delete_batch_tables_backend(backend)?;
         Ok(deleted)
     })();
 
@@ -17789,43 +18753,94 @@ fn prune_segments_backend(backend: &dyn StorageBackend, before_ts: i64) -> Resul
     }
 }
 
-/// Drop any `fts_pane_progress` row whose `last_indexed_seq` no longer maps to a
-/// surviving segment for that pane, so a subsequent `sync_fts_for_pane_backend`
-/// re-picks-up the reset-chain rows. Shared by every path that deletes
-/// `output_segments` rows ([`prune_segments_backend`] time-cutoff prune and
-/// [`enforce_size_limit_backend`] size-cap eviction); see the detailed rationale
-/// in `prune_segments_backend` ([ft-znu6v]).
-fn rewind_stranded_fts_progress_backend(backend: &dyn StorageBackend) -> Result<()> {
+/// Rewind only progress rows for panes represented in the current exact delete
+/// batch. The affected-pane temp table is captured before segment deletion, so
+/// this avoids an all-pane correlated MAX scan after every retention batch
+/// while retaining reset-chain correctness for every pane actually changed.
+fn rewind_stranded_fts_progress_for_affected_panes_backend(
+    backend: &dyn StorageBackend,
+) -> Result<()> {
     backend
-        .query_map_typed(
-            "DELETE FROM fts_pane_progress
-             WHERE last_indexed_seq > COALESCE(
-                 (SELECT MAX(seq) FROM output_segments
-                  WHERE output_segments.pane_id = fts_pane_progress.pane_id),
-                 -1
-             )
-             RETURNING pane_id",
-            &[],
-        )
-        .map_err(|err| storage_backend_error("Failed to rewind stranded FTS progress", err))?;
+        .query_map_typed(REWIND_AFFECTED_FTS_PROGRESS_SQL, &[])
+        .map_err(|err| {
+            storage_backend_error("Failed to rewind affected-pane FTS progress", err)
+        })?;
     Ok(())
 }
 
-/// Maximum output segments evicted per [`enforce_size_limit_backend`]
-/// invocation. A badly-over-cap database converges over several maintenance
-/// ticks instead of stalling the single writer thread with one unbounded
-/// delete.
-const SIZE_EVICTION_MAX_DELETE_PER_PASS: usize = 200_000;
+/// Oldest-segment sample and maximum delete batch per size-eviction writer
+/// turn. The extra probe row distinguishes an exact `SIZE_EVICTION_BATCH`-row
+/// table from a larger table without a full count.
+const SIZE_EVICTION_BATCH: usize = 256;
+const SIZE_EVICTION_SAMPLE_PROBE_ROWS: usize = SIZE_EVICTION_BATCH + 1;
+const SIZE_EVICTION_ESTIMATED_ROW_OVERHEAD_BYTES: u64 = 4 * 1024;
+const SIZE_EVICTION_DOMINANCE_CONTENT_MULTIPLIER: u64 = 4;
 
-/// Oldest-segment delete batch per inner iteration of size eviction.
-const SIZE_EVICTION_BATCH: usize = 4_096;
+/// Conservative per-row allowance used only by the obvious non-segment-data
+/// dominance guard. This is intentionally much larger than the row and index
+/// metadata of a normal segment; refusing a destructive eviction is safer
+/// than deleting every segment when unrelated tables alone exceed the cap.
+const SIZE_EVICTION_DOMINANCE_ALLOWANCE_BYTES: u64 = 64 * 1024;
+const OLDEST_SEGMENT_EVICTION_SAMPLE_SQL: &str =
+    "SELECT content_len FROM output_segments
+     ORDER BY captured_at ASC, id ASC LIMIT ?1";
 
-/// Hard cap on size-eviction loop iterations per invocation. Proportional
-/// batch estimation (see [`enforce_size_limit_backend`]) can shrink batches to
-/// a handful of segments near the cap; this bounds the per-invocation PRAGMA
-/// remeasure cost for pathological overhead-dominated databases. An
-/// over-limit exit is retried by the next maintenance tick.
-const SIZE_EVICTION_MAX_PASSES: usize = 4_096;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SegmentEvictionSample {
+    sampled_rows: usize,
+    sampled_content_bytes: u64,
+    largest_content_bytes: u64,
+    contains_every_segment: bool,
+}
+
+/// Read at most `SIZE_EVICTION_BATCH + 1` oldest rows through the retention
+/// ordering index. This replaces the former `COUNT(*)` over the entire segment
+/// table and keeps estimator work independent of long-session history size.
+fn oldest_segment_eviction_sample_backend(
+    backend: &dyn StorageBackend,
+) -> Result<SegmentEvictionSample> {
+    let probe_limit = usize_to_i64(
+        SIZE_EVICTION_SAMPLE_PROBE_ROWS,
+        "size-eviction sample probe rows",
+    )?;
+    let rows = backend
+        .query_map_typed(
+            OLDEST_SEGMENT_EVICTION_SAMPLE_SQL,
+            &[ToSqlValue::Integer(probe_limit)],
+        )
+        .map_err(|error| storage_backend_error("Sample oldest segments for size eviction", error))?;
+    let contains_every_segment = rows.len() <= SIZE_EVICTION_BATCH;
+    let mut sampled_rows = 0usize;
+    let mut sampled_content_bytes = 0u64;
+    let mut largest_content_bytes = 0u64;
+    for row in rows.iter().take(SIZE_EVICTION_BATCH) {
+        let content_len = RowReader::new(row)
+            .i64(0)
+            .map_err(|error| storage_backend_error("Size-eviction sample content length", error))?;
+        let content_len = u64::try_from(content_len).map_err(|_| {
+            StorageError::Database(format!(
+                "size-eviction sample contained negative content_len {content_len}"
+            ))
+        })?;
+        sampled_rows = sampled_rows.checked_add(1).ok_or_else(|| {
+            StorageError::Database("size-eviction sample row count overflow".to_string())
+        })?;
+        sampled_content_bytes = sampled_content_bytes
+            .checked_add(content_len)
+            .ok_or_else(|| {
+                StorageError::Database(
+                    "size-eviction sample content-byte count overflow".to_string(),
+                )
+            })?;
+        largest_content_bytes = largest_content_bytes.max(content_len);
+    }
+    Ok(SegmentEvictionSample {
+        sampled_rows,
+        sampled_content_bytes,
+        largest_content_bytes,
+        contains_every_segment,
+    })
+}
 
 /// Estimated live (non-free) database size in bytes:
 /// `(page_count - freelist_count) * page_size`. This is the quantity a
@@ -17840,10 +18855,26 @@ fn database_used_bytes_backend(backend: &dyn StorageBackend) -> Result<u64> {
         .ok_or_else(|| StorageError::Database("PRAGMA page_size returned no row".to_string()))?
         .parse::<i64>()
         .map_err(|e| StorageError::Database(format!("PRAGMA page_size parse: {e}")))?;
-    let live_pages = stats.page_count.saturating_sub(stats.free_pages).max(0);
-    let live_pages = u64::try_from(live_pages).unwrap_or(0);
-    let page_size = u64::try_from(page_size).unwrap_or(0);
-    Ok(live_pages.saturating_mul(page_size))
+    if stats.page_count < 0
+        || stats.free_pages < 0
+        || stats.free_pages > stats.page_count
+        || page_size <= 0
+    {
+        return Err(StorageError::Database(format!(
+            "invalid SQLite page statistics: page_count={}, free_pages={}, page_size={page_size}",
+            stats.page_count, stats.free_pages
+        ))
+        .into());
+    }
+    let live_pages = u64::try_from(stats.page_count - stats.free_pages).map_err(|_| {
+        StorageError::Database("SQLite live-page count exceeds u64 range".to_string())
+    })?;
+    let page_size = u64::try_from(page_size).map_err(|_| {
+        StorageError::Database("SQLite page size exceeds u64 range".to_string())
+    })?;
+    live_pages.checked_mul(page_size).ok_or_else(|| {
+        StorageError::Database("SQLite live-byte count overflow".to_string()).into()
+    })
 }
 
 /// Delete the `limit` oldest output segments (by `captured_at`, ties broken by
@@ -17858,24 +18889,24 @@ fn delete_oldest_segments_backend(backend: &dyn StorageBackend, limit: usize) ->
         .execute("BEGIN IMMEDIATE")
         .map_err(|err| storage_backend_error("Begin segment size-eviction transaction", err))?;
     let tx_result = (|| -> Result<usize> {
-        backend
-            .execute(
-                "CREATE TEMP TABLE IF NOT EXISTS segment_retention_delete_batch (
-                     id INTEGER PRIMARY KEY
-                 )",
-            )
-            .map_err(|err| storage_backend_error("Create segment delete batch", err))?;
-        backend
-            .execute("DELETE FROM segment_retention_delete_batch")
-            .map_err(|err| storage_backend_error("Clear segment delete batch", err))?;
+        prepare_segment_delete_batch_tables_backend(backend)?;
         execute_typed(
             backend,
-            "INSERT INTO segment_retention_delete_batch (id)
-             SELECT id FROM output_segments
+            "INSERT INTO segment_retention_delete_batch (id, pane_id, seq, content)
+             SELECT id, pane_id, seq, content FROM output_segments
              ORDER BY captured_at ASC, id ASC LIMIT ?1",
             &[ToSqlValue::Integer(limit)],
         )
         .map_err(|err| storage_backend_error("Select oldest segment delete batch", err))?;
+        capture_segment_delete_affected_panes_backend(backend)?;
+        let selected = count_table_where(
+            backend,
+            "segment_retention_delete_batch",
+            "1=1",
+            &[],
+        )
+        .map_err(|err| storage_backend_error("Count size-eviction segment batch", err))?;
+        let selected = count_i64_to_usize(selected, "Size-eviction segment batch count")?;
         execute_typed(
             backend,
             "UPDATE events SET segment_id = NULL
@@ -17883,6 +18914,7 @@ fn delete_oldest_segments_backend(backend: &dyn StorageBackend, limit: usize) ->
             &[],
         )
         .map_err(|err| storage_backend_error("Detach size-evicted event segments", err))?;
+        delete_deferred_fts_entries_for_segment_batch_backend(backend)?;
         let deleted_rows = backend
             .query_map_typed(
                 "DELETE FROM output_segments
@@ -17892,12 +18924,16 @@ fn delete_oldest_segments_backend(backend: &dyn StorageBackend, limit: usize) ->
             )
             .map_err(|err| storage_backend_error("Failed to evict oldest segments", err))?;
         let deleted = deleted_rows.len();
-        if deleted > 0 {
-            rewind_stranded_fts_progress_backend(backend)?;
+        if deleted != selected {
+            return Err(StorageError::Database(format!(
+                "segment size-eviction candidate/delete mismatch: selected {selected} ids but deleted {deleted}"
+            ))
+            .into());
         }
-        backend
-            .execute("DELETE FROM segment_retention_delete_batch")
-            .map_err(|err| storage_backend_error("Clear committed segment delete batch", err))?;
+        if deleted > 0 {
+            rewind_stranded_fts_progress_for_affected_panes_backend(backend)?;
+        }
+        clear_segment_delete_batch_tables_backend(backend)?;
         Ok(deleted)
     })();
     match tx_result {
@@ -17916,9 +18952,12 @@ fn delete_oldest_segments_backend(backend: &dyn StorageBackend, limit: usize) ->
     }
 }
 
-/// Enforce a size-based retention cap by evicting the oldest output segments
-/// until the live database size is under `max_mb` (or no more segments remain,
-/// or the per-pass deletion budget is exhausted). `max_mb == 0` is a no-op.
+/// Execute exactly one bounded size-eviction writer turn.
+///
+/// The async handle re-enqueues another turn at the FIFO tail when this result
+/// remains over limit and deleted at least one segment. Keeping measurement,
+/// candidate selection, deletion, and affected-pane FTS rewind to one bounded
+/// turn prevents size enforcement from monopolizing the serialized writer.
 fn enforce_size_limit_backend(
     backend: &dyn StorageBackend,
     max_mb: u32,
@@ -17936,45 +18975,68 @@ fn enforce_size_limit_backend(
         });
     }
 
-    let mut deleted_total = 0usize;
-    let mut used_now = used_before;
-    let mut passes = 0usize;
-    while used_now > cap_bytes
-        && deleted_total < SIZE_EVICTION_MAX_DELETE_PER_PASS
-        && passes < SIZE_EVICTION_MAX_PASSES
-    {
-        passes += 1;
-        let budget = SIZE_EVICTION_MAX_DELETE_PER_PASS - deleted_total;
-        // Proportional batch sizing: estimate how many oldest segments must go
-        // to reach the cap (attributing the whole live size to the current
-        // segment population) instead of always deleting a full
-        // SIZE_EVICTION_BATCH. A fixed 4096-batch wiped EVERY segment in any
-        // over-cap database holding fewer than 4096 of them — a small DB one
-        // megabyte over its cap lost all scrollback instead of its oldest
-        // slice. The estimate over-attributes fixed overhead to segments, so
-        // it under-deletes and the loop converges from above in a few passes.
-        let seg_count = count_segments_before_backend(backend, i64::MAX)?;
-        if seg_count == 0 {
-            break;
+    // Proportional batch sizing is based solely on a bounded sample of the
+    // rows that the next delete turn can actually reclaim. The former
+    // `used_before / COUNT(all segments)` estimate both scanned the entire
+    // history and incorrectly attributed unrelated table bytes to segments.
+    let sample = oldest_segment_eviction_sample_backend(backend)?;
+    if sample.sampled_rows == 0 {
+        return Ok(SizeEvictionOutcome {
+            deleted_segments: 0,
+            used_bytes_before: used_before,
+            used_bytes_after: used_before,
+            over_limit_after: true,
+        });
+    }
+    let over_bytes = used_before - cap_bytes;
+
+    // If the bounded probe saw the complete table, conservatively detect the
+    // obvious case where even an extremely generous per-row physical-storage
+    // allowance is dwarfed by the overage. Preserve all segment history and
+    // report `over_limit_after` instead of deleting data that cannot plausibly
+    // make the configured cap attainable.
+    if sample.contains_every_segment {
+        let sampled_rows = u64::try_from(sample.sampled_rows).unwrap_or(u64::MAX);
+        let generous_per_row = sample
+            .largest_content_bytes
+            // Allow multiple physical representations (table payload, FTS,
+            // indexes, and transient page slack) before concluding that the
+            // overage cannot plausibly belong to this complete segment set.
+            .saturating_mul(SIZE_EVICTION_DOMINANCE_CONTENT_MULTIPLIER)
+            .saturating_add(SIZE_EVICTION_DOMINANCE_ALLOWANCE_BYTES);
+        let generous_total_reclaim = generous_per_row.saturating_mul(sampled_rows);
+        if over_bytes > generous_total_reclaim {
+            return Ok(SizeEvictionOutcome {
+                deleted_segments: 0,
+                used_bytes_before: used_before,
+                used_bytes_after: used_before,
+                over_limit_after: true,
+            });
         }
-        let avg_bytes = (used_now / seg_count as u64).max(1);
-        let over_bytes = used_now - cap_bytes;
-        let needed = usize::try_from(over_bytes.div_ceil(avg_bytes)).unwrap_or(usize::MAX);
-        let batch = SIZE_EVICTION_BATCH.min(budget).min(needed.max(1));
-        let deleted = delete_oldest_segments_backend(backend, batch)?;
-        deleted_total += deleted;
-        if deleted == 0 {
-            // No more segments to evict; non-segment data alone exceeds the cap.
-            break;
-        }
-        used_now = database_used_bytes_backend(backend)?;
     }
 
+    let sampled_rows = u64::try_from(sample.sampled_rows).unwrap_or(u64::MAX);
+    let average_content_bytes = sample
+        .sampled_content_bytes
+        .div_ceil(sampled_rows)
+        .max(1);
+    let estimated_reclaim_per_segment = average_content_bytes
+        .saturating_add(SIZE_EVICTION_ESTIMATED_ROW_OVERHEAD_BYTES);
+    let needed = usize::try_from(over_bytes.div_ceil(estimated_reclaim_per_segment))
+        .unwrap_or(usize::MAX);
+    let batch_size = SIZE_EVICTION_BATCH.min(needed.max(1));
+    let deleted_segments = delete_oldest_segments_backend(backend, batch_size)?;
+    let used_after = if deleted_segments == 0 {
+        used_before
+    } else {
+        database_used_bytes_backend(backend)?
+    };
+
     Ok(SizeEvictionOutcome {
-        deleted_segments: deleted_total,
+        deleted_segments,
         used_bytes_before: used_before,
-        used_bytes_after: used_now,
-        over_limit_after: used_now > cap_bytes,
+        used_bytes_after: used_after,
+        over_limit_after: used_after > cap_bytes,
     })
 }
 
@@ -18170,13 +19232,29 @@ fn record_usage_metrics_batch_backend(
     Ok(inserted)
 }
 
-fn purge_usage_metrics_backend(backend: &dyn StorageBackend, before_ts: i64) -> Result<usize> {
+fn purge_usage_metrics_backend(
+    backend: &dyn StorageBackend,
+    before_ts: i64,
+    requested_batch_size: usize,
+) -> Result<usize> {
+    let batch_size = requested_batch_size.min(AUXILIARY_RETENTION_DELETE_BATCH_MAX);
+    if batch_size == 0 {
+        return Ok(0);
+    }
     let deleted = backend
         .query_map_typed(
             "DELETE FROM usage_metrics
-             WHERE timestamp < ?1
-             RETURNING 1",
-            &[ToSqlValue::Integer(before_ts)],
+             WHERE id IN (
+                 SELECT id FROM usage_metrics
+                 WHERE timestamp < ?1
+                 ORDER BY timestamp ASC, id ASC
+                 LIMIT ?2
+             )
+             RETURNING id",
+            &[
+                ToSqlValue::Integer(before_ts),
+                ToSqlValue::Integer(usize_to_i64(batch_size, "usage purge batch size")?),
+            ],
         )
         .map_err(|err| storage_backend_error("Failed to purge usage metrics", err))?;
     Ok(deleted.len())
@@ -18496,13 +19574,29 @@ fn increment_notification_retry_backend(backend: &dyn StorageBackend, id: i64) -
 fn purge_notification_history_backend(
     backend: &dyn StorageBackend,
     before_ts: i64,
+    requested_batch_size: usize,
 ) -> Result<usize> {
+    let batch_size = requested_batch_size.min(AUXILIARY_RETENTION_DELETE_BATCH_MAX);
+    if batch_size == 0 {
+        return Ok(0);
+    }
     let deleted = backend
         .query_map_typed(
             "DELETE FROM notification_history
-             WHERE timestamp < ?1
-             RETURNING 1",
-            &[ToSqlValue::Integer(before_ts)],
+             WHERE id IN (
+                 SELECT id FROM notification_history
+                 WHERE timestamp < ?1
+                 ORDER BY timestamp ASC, id ASC
+                 LIMIT ?2
+             )
+             RETURNING id",
+            &[
+                ToSqlValue::Integer(before_ts),
+                ToSqlValue::Integer(usize_to_i64(
+                    batch_size,
+                    "notification purge batch size",
+                )?),
+            ],
         )
         .map_err(|err| storage_backend_error("Failed to purge notification history", err))?;
     Ok(deleted.len())
@@ -18553,6 +19647,7 @@ fn count_events_before_backend(backend: &dyn StorageBackend, before_ts: i64) -> 
     count_i64_to_usize(count, "Failed to count events row")
 }
 
+#[cfg(test)]
 fn count_events_by_tier_backend(
     backend: &dyn StorageBackend,
     before_ts: i64,
@@ -18578,6 +19673,7 @@ fn count_events_by_tier_backend(
     count_query_row_to_usize(&row, "Failed to count events by tier row")
 }
 
+#[cfg(test)]
 fn count_events_by_retention_rule_backend(
     backend: &dyn StorageBackend,
     before_ts: i64,
@@ -18599,6 +19695,139 @@ fn count_events_by_retention_rule_backend(
             )
         })?;
     count_query_row_to_usize(&row, "Ordered event retention count row")
+}
+
+fn compiled_retention_query_params<'a>(
+    before_ts: i64,
+    policy: &'a CompiledRetentionPolicy,
+    branch_index: usize,
+) -> Result<Vec<ToSqlValue<'a>>> {
+    policy
+        .validate_branch_index(branch_index)
+        .map_err(retention_policy_compile_error)?;
+    let mut params = Vec::with_capacity(policy.bind_values().len() + 2);
+    params.push(ToSqlValue::Integer(before_ts));
+    params.extend(policy.bind_values().iter().map(|value| ToSqlValue::Text(value)));
+    params.push(ToSqlValue::Integer(usize_to_i64(
+        branch_index,
+        "retention policy branch index",
+    )?));
+    Ok(params)
+}
+
+fn validate_compiled_retention_cutoffs(
+    policy: &CompiledRetentionPolicy,
+    cutoffs: &[Option<i64>],
+) -> Result<()> {
+    let expected = policy
+        .fallback_branch_index()
+        .checked_add(1)
+        .ok_or_else(|| {
+            StorageError::Database("compiled retention branch count overflow".to_string())
+        })?;
+    if cutoffs.len() != expected {
+        return Err(StorageError::Database(format!(
+            "compiled retention policy received {} cutoffs; expected {expected}",
+            cutoffs.len()
+        ))
+        .into());
+    }
+    Ok(())
+}
+
+fn compiled_retention_all_branch_params<'a>(
+    policy: &'a CompiledRetentionPolicy,
+    cutoffs: &[Option<i64>],
+) -> Result<Vec<ToSqlValue<'a>>> {
+    validate_compiled_retention_cutoffs(policy, cutoffs)?;
+    let capacity = policy
+        .bind_values()
+        .len()
+        .checked_add(cutoffs.len())
+        .and_then(|capacity| capacity.checked_add(1))
+        .ok_or_else(|| {
+            StorageError::Database("compiled retention bind count overflow".to_string())
+        })?;
+    let mut params = Vec::with_capacity(capacity);
+    params.extend(
+        policy
+            .bind_values()
+            .iter()
+            .map(|value| ToSqlValue::Text(value)),
+    );
+    // The classifier subquery can use the ordinary detected-at index to avoid
+    // visiting rows newer than every active branch cutoff.  `NULL` deliberately
+    // produces an empty candidate set when all branches are keep-forever.
+    params.push(match cutoffs.iter().flatten().max().copied() {
+        Some(newest_cutoff) => ToSqlValue::Integer(newest_cutoff),
+        None => ToSqlValue::Null,
+    });
+    params.extend(cutoffs.iter().map(|cutoff| match cutoff {
+        Some(cutoff) => ToSqlValue::Integer(*cutoff),
+        None => ToSqlValue::Null,
+    }));
+    Ok(params)
+}
+
+fn count_events_by_compiled_retention_branch_backend(
+    backend: &dyn StorageBackend,
+    before_ts: i64,
+    policy: &CompiledRetentionPolicy,
+    branch_index: usize,
+) -> Result<usize> {
+    let params = compiled_retention_query_params(before_ts, policy, branch_index)?;
+    policy.note_sql_execution();
+    let row = backend
+        .query_row_typed(policy.count_sql(), &params)
+        .map_err(|err| storage_backend_error("Count compiled event retention branch", err))?
+        .ok_or_else(|| {
+            StorageError::Database(
+                "compiled event retention count returned no row".to_string(),
+            )
+        })?;
+    count_query_row_to_usize(&row, "Compiled event retention count row")
+}
+
+fn count_events_by_compiled_retention_policy_backend(
+    backend: &dyn StorageBackend,
+    policy: &CompiledRetentionPolicy,
+    cutoffs: &[Option<i64>],
+) -> Result<Vec<usize>> {
+    let params = compiled_retention_all_branch_params(policy, cutoffs)?;
+    policy.note_sql_execution();
+    let rows = backend
+        .query_map_typed(policy.all_branch_count_sql(), &params)
+        .map_err(|error| {
+            storage_backend_error("Count compiled event retention policy", error)
+        })?;
+    let mut counts = vec![0usize; cutoffs.len()];
+    let mut seen = vec![false; cutoffs.len()];
+    for row in &rows {
+        let reader = RowReader::new(row);
+        let branch = reader
+            .i64(0)
+            .map_err(|error| storage_backend_error("Compiled retention count branch", error))?;
+        let branch = usize::try_from(branch).map_err(|_| {
+            StorageError::Database(format!(
+                "compiled retention count returned invalid branch {branch}"
+            ))
+        })?;
+        if branch >= counts.len() || std::mem::replace(&mut seen[branch], true) {
+            return Err(StorageError::Database(format!(
+                "compiled retention count returned out-of-range or duplicate branch {branch}"
+            ))
+            .into());
+        }
+        counts[branch] = count_query_row_to_usize(
+            row.get(1..).ok_or_else(|| {
+                StorageError::Database(
+                    "compiled retention count row omitted its count".to_string(),
+                )
+            })?,
+            "Compiled retention policy count row",
+        )?;
+    }
+    Ok(counts)
 }
 
 fn count_audit_actions_before_backend(
@@ -18669,6 +19898,56 @@ fn bounded_event_retention_batch_size(requested: usize) -> usize {
     requested.min(EVENT_RETENTION_DELETE_BATCH_MAX)
 }
 
+fn retention_policy_compile_error(error: String) -> crate::Error {
+    StorageError::Database(format!("Invalid event retention policy: {error}")).into()
+}
+
+fn compile_ordered_retention_policy_branch(
+    tier: Option<&RetentionTier>,
+    excluded_tiers: &[RetentionTier],
+) -> Result<(Arc<CompiledRetentionPolicy>, usize)> {
+    let branch_index = excluded_tiers.len();
+    let mut tiers = Vec::with_capacity(branch_index + usize::from(tier.is_some()));
+    tiers.extend_from_slice(excluded_tiers);
+    if let Some(tier) = tier {
+        tiers.push(tier.clone());
+    }
+    let policy =
+        compile_retention_policy_tiers(&tiers).map_err(retention_policy_compile_error)?;
+    let branch_index = if tier.is_some() {
+        branch_index
+    } else {
+        policy.fallback_branch_index()
+    };
+    Ok((policy, branch_index))
+}
+
+/// Validate and accumulate one writer-reported bounded delete batch.
+///
+/// A full batch means that more matching rows may remain, so the async caller
+/// must yield by re-enqueuing another writer command. A short batch proves
+/// convergence for the command's immutable predicate. Keeping this accounting
+/// outside the writer preserves each public total-count contract without
+/// letting one command monopolize the serialized writer. Shared by event and
+/// output-segment retention.
+fn accumulate_bounded_writer_batch(
+    total_deleted: usize,
+    deleted: usize,
+    batch_size: usize,
+    operation: &str,
+) -> Result<(usize, bool)> {
+    if deleted > batch_size {
+        return Err(StorageError::Database(format!(
+            "{operation} writer returned {deleted} rows for a batch bounded at {batch_size}"
+        ))
+        .into());
+    }
+    let total_deleted = total_deleted.checked_add(deleted).ok_or_else(|| {
+        StorageError::Database(format!("{operation} deleted-row count overflow"))
+    })?;
+    Ok((total_deleted, deleted < batch_size))
+}
+
 fn delete_events_before_backend(
     backend: &dyn StorageBackend,
     before_ts: i64,
@@ -18683,6 +19962,7 @@ fn delete_events_before_backend(
     )
 }
 
+#[cfg(test)]
 fn delete_events_by_tier_backend(
     backend: &dyn StorageBackend,
     before_ts: i64,
@@ -18707,6 +19987,7 @@ fn delete_events_by_tier_backend(
     )
 }
 
+#[cfg(test)]
 fn delete_events_by_retention_rule_backend(
     backend: &dyn StorageBackend,
     before_ts: i64,
@@ -18729,6 +20010,66 @@ fn delete_events_by_retention_rule_backend(
     )
 }
 
+fn delete_events_by_compiled_retention_branch_backend(
+    backend: &dyn StorageBackend,
+    before_ts: i64,
+    policy: &CompiledRetentionPolicy,
+    branch_index: usize,
+    batch_size: usize,
+) -> Result<usize> {
+    let params = compiled_retention_query_params(before_ts, policy, branch_index)?;
+    policy.note_sql_execution();
+    delete_events_with_retention_ledger_backend(
+        backend,
+        policy.candidate_sql(),
+        &params,
+        batch_size,
+        "compiled ordered event retention rule",
+    )
+}
+
+fn delete_events_by_compiled_retention_policy_backend(
+    backend: &dyn StorageBackend,
+    policy: &CompiledRetentionPolicy,
+    cutoffs: &[Option<i64>],
+    requested_batch_size: usize,
+) -> Result<CompiledRetentionDeleteBatch> {
+    let batch_size = bounded_event_retention_batch_size(requested_batch_size);
+    validate_compiled_retention_cutoffs(policy, cutoffs)?;
+    if batch_size == 0 {
+        return Ok(CompiledRetentionDeleteBatch {
+            deleted_by_branch: vec![0usize; cutoffs.len()],
+        });
+    }
+    let mut params = compiled_retention_all_branch_params(policy, cutoffs)?;
+    params.push(ToSqlValue::Integer(usize_to_i64(
+        batch_size,
+        "compiled retention policy batch size",
+    )?));
+    policy.note_sql_execution();
+    let result = delete_event_retention_batch_from_query_backend(
+        backend,
+        policy.all_branch_candidate_sql(),
+        &params,
+        "compiled all-branch event retention policy",
+        EVENT_RETENTION_INTERVAL_ROW_MAX,
+        Some(cutoffs.len()),
+    )?;
+    Ok(CompiledRetentionDeleteBatch {
+        deleted_by_branch: result.deleted_by_branch.ok_or_else(|| {
+            StorageError::Database(
+                "compiled retention delete omitted per-branch accounting".to_string(),
+            )
+        })?,
+    })
+}
+
+#[derive(Debug)]
+struct EventRetentionDeleteBatchResult {
+    deleted: usize,
+    deleted_by_branch: Option<Vec<usize>>,
+}
+
 fn delete_events_with_retention_ledger_backend(
     backend: &dyn StorageBackend,
     candidate_query: &str,
@@ -18742,25 +20083,28 @@ fn delete_events_with_retention_ledger_backend(
     }
     let batch_size_i64 = usize_to_i64(batch_size, "event retention batch size")?;
 
-    let mut total_deleted = 0usize;
-    loop {
-        let deleted = delete_event_retention_batch_backend(
-            backend,
-            candidate_query,
-            candidate_params,
-            batch_size_i64,
-            operation,
-            EVENT_RETENTION_INTERVAL_ROW_MAX,
-        )?;
-        total_deleted = total_deleted.checked_add(deleted).ok_or_else(|| {
-            StorageError::Database(format!("{operation} deleted-row count overflow"))
-        })?;
-        if deleted < batch_size {
-            return Ok(total_deleted);
-        }
-    }
+    // Exactly one durable transaction per writer command. The Cx-facing
+    // handle accumulates totals and re-enqueues full batches at the channel
+    // tail, allowing unrelated interactive writes to run between batches.
+    let candidate_sql = format!(
+        "{candidate_query}
+         AND delivery_lease_token IS NULL
+         ORDER BY id ASC LIMIT ?"
+    );
+    let mut params = candidate_params.to_vec();
+    params.push(ToSqlValue::Integer(batch_size_i64));
+    delete_event_retention_batch_from_query_backend(
+        backend,
+        &candidate_sql,
+        &params,
+        operation,
+        EVENT_RETENTION_INTERVAL_ROW_MAX,
+        None,
+    )
+    .map(|result| result.deleted)
 }
 
+#[cfg(test)]
 fn delete_event_retention_batch_backend(
     backend: &dyn StorageBackend,
     candidate_query: &str,
@@ -18769,11 +20113,37 @@ fn delete_event_retention_batch_backend(
     operation: &str,
     interval_row_limit: usize,
 ) -> Result<usize> {
+    let candidate_sql = format!(
+        "{candidate_query}
+         AND delivery_lease_token IS NULL
+         ORDER BY id ASC LIMIT ?"
+    );
+    let mut params = candidate_params.to_vec();
+    params.push(ToSqlValue::Integer(batch_size));
+    delete_event_retention_batch_from_query_backend(
+        backend,
+        &candidate_sql,
+        &params,
+        operation,
+        interval_row_limit,
+        None,
+    )
+    .map(|result| result.deleted)
+}
+
+fn delete_event_retention_batch_from_query_backend(
+    backend: &dyn StorageBackend,
+    candidate_query: &str,
+    candidate_params: &[ToSqlValue<'_>],
+    operation: &str,
+    interval_row_limit: usize,
+    branch_count: Option<usize>,
+) -> Result<EventRetentionDeleteBatchResult> {
     backend
         .execute("BEGIN IMMEDIATE")
         .map_err(|err| storage_backend_error("Begin event retention transaction", err))?;
 
-    let tx_result = (|| -> Result<usize> {
+    let tx_result = (|| -> Result<EventRetentionDeleteBatchResult> {
         let now = now_ms();
         let stale_authorizations = count_table_where(
             backend,
@@ -18788,19 +20158,14 @@ fn delete_event_retention_batch_backend(
             ))
             .into());
         }
-        let mut params = candidate_params.to_vec();
-        params.push(ToSqlValue::Integer(batch_size));
-        let candidate_sql = format!(
-            "{candidate_query}
-             AND delivery_lease_token IS NULL
-             ORDER BY id ASC LIMIT ?"
-        );
         let candidate_rows = backend
-            .query_map_typed(&candidate_sql, &params)
+            .query_map_typed(candidate_query, candidate_params)
             .map_err(|err| storage_backend_error("Select event retention candidates", err))?;
         let mut candidate_ids = Vec::with_capacity(candidate_rows.len());
+        let mut deleted_by_branch = branch_count.map(|count| vec![0usize; count]);
         for row in &candidate_rows {
-            let id = RowReader::new(row)
+            let reader = RowReader::new(row);
+            let id = reader
                 .i64(0)
                 .map_err(|err| storage_backend_error("Event retention candidate id", err))?;
             if id <= 0 || candidate_ids.last().is_some_and(|previous| *previous >= id) {
@@ -18810,9 +20175,33 @@ fn delete_event_retention_batch_backend(
                 .into());
             }
             candidate_ids.push(id);
+            if let Some(counts) = deleted_by_branch.as_mut() {
+                let branch = reader.i64(1).map_err(|err| {
+                    storage_backend_error("Event retention candidate branch", err)
+                })?;
+                let branch = usize::try_from(branch).map_err(|_| {
+                    StorageError::Database(format!(
+                        "{operation} returned invalid retention branch {branch}"
+                    ))
+                })?;
+                let Some(count) = counts.get_mut(branch) else {
+                    return Err(StorageError::Database(format!(
+                        "{operation} returned out-of-range retention branch {branch}"
+                    ))
+                    .into());
+                };
+                *count = count.checked_add(1).ok_or_else(|| {
+                    StorageError::Database(format!(
+                        "{operation} branch {branch} candidate count overflow"
+                    ))
+                })?;
+            }
         }
         if candidate_ids.is_empty() {
-            return Ok(0);
+            return Ok(EventRetentionDeleteBatchResult {
+                deleted: 0,
+                deleted_by_branch,
+            });
         }
 
         let id_rows = candidate_ids
@@ -18921,7 +20310,10 @@ fn delete_event_retention_batch_backend(
         backend
             .execute("DELETE FROM event_retention_delete_authorizations")
             .map_err(|err| storage_backend_error("Clear committed event delete batch", err))?;
-        Ok(candidate_ids.len())
+        Ok(EventRetentionDeleteBatchResult {
+            deleted: candidate_ids.len(),
+            deleted_by_branch,
+        })
     })();
 
     match tx_result {
@@ -19259,6 +20651,7 @@ fn record_event_retention_intervals_backend(
 }
 
 /// Build a tier-filtered query clause with positional parameters.
+#[cfg(test)]
 fn build_tier_query(
     select_prefix: &str,
     before_ts: i64,
@@ -19276,6 +20669,7 @@ fn build_tier_query(
     build_retention_rule_query(select_prefix, before_ts, Some(&tier), &[])
 }
 
+#[cfg(test)]
 fn build_retention_rule_query(
     select_prefix: &str,
     before_ts: i64,
@@ -19300,6 +20694,7 @@ fn build_retention_rule_query(
     (sql, params)
 }
 
+#[cfg(test)]
 fn retention_tier_match_predicate(
     tier: &RetentionTier,
     params: &mut Vec<ToSqlValue<'static>>,
@@ -19323,9 +20718,11 @@ fn retention_tier_match_predicate(
             .map(|event_type| {
                 params.push(ToSqlValue::OwnedText(event_type.clone()));
                 params.push(ToSqlValue::OwnedText(event_type.clone()));
-                // Equality remains BINARY/case-sensitive and treats %, _, and
-                // backslash literally, matching Rust's `str::starts_with`.
-                "substr(event_type, 1, length(?)) = ? COLLATE BINARY".to_string()
+                // Compare UTF-8 bytes so SQLite does not truncate either the
+                // prefix length or the event type at an embedded NUL.
+                "substr(CAST(event_type AS BLOB), 1, length(CAST(? AS BLOB))) = \
+                 CAST(? AS BLOB)"
+                    .to_string()
             })
             .collect::<Vec<_>>();
         clauses.push(format!("({})", conditions.join(" OR ")));
@@ -20396,6 +21793,21 @@ fn consume_approval_token_by_id_backend(
 /// check — but we can stop the probe after the first match.
 type FtsHydratedRows = std::collections::HashMap<i64, (Segment, Option<String>, Option<String>)>;
 
+fn ensure_fts_search_ready_backend(backend: &dyn StorageBackend) -> Result<()> {
+    let state = get_fts_index_state_backend(backend)?;
+    if state
+        .as_ref()
+        .is_some_and(|state| state.index_version == FTS_INDEX_VERSION)
+    {
+        return Ok(());
+    }
+    Err(StorageError::FtsQueryError(
+        "FTS index is rebuilding or requires repair; retry after synchronization completes"
+            .to_string(),
+    )
+    .into())
+}
+
 fn validate_fts_query_backend(backend: &dyn StorageBackend, query: &str) -> Result<()> {
     let result = backend.query_row_cells(
         "SELECT 1 FROM output_segments_fts WHERE output_segments_fts MATCH ?1 LIMIT 1",
@@ -20433,6 +21845,7 @@ fn search_fts_with_snippets_backend(
     query: &str,
     options: &SearchOptions,
 ) -> Result<Vec<SearchResult>> {
+    ensure_fts_search_ready_backend(backend)?;
     validate_fts_query_backend(backend, query)?;
 
     let limit = options.limit.unwrap_or(100);
@@ -21294,20 +22707,42 @@ fn build_indexing_health_report(
 // Incremental FTS Sync (wa-3g9.4)
 // =============================================================================
 
-/// Current FTS index version. Increment when FTS schema changes require rebuild.
-const FTS_INDEX_VERSION: u32 = 1;
+/// Current FTS index version. Version 2 forces a one-time authoritative rebuild
+/// to repair stale postings that historical deferred-retention builds could
+/// leave behind when `output_segments` rowids were reused.
+const FTS_INDEX_VERSION: u32 = 2;
 /// Sentinel version used when a rebuild was started but did not finish.
 ///
 /// `sync_fts_on_startup_backend()` treats any non-current version as a
 /// forced full rebuild. This leaves an explicit "must rebuild" marker instead
 /// of silently trusting a partially rebuilt index.
 const FTS_INDEX_REBUILD_PENDING_VERSION: u32 = 0;
+const FTS_SYNC_MAX_BATCH_SEGMENTS: usize = 4_096;
+const FTS_SYNC_MAX_BATCH_BYTES: usize = 16 * 1024 * 1024;
 const FT_MOONSHOT_FTS_INSERT_SELECT_BATCH_ENV: &str = "FT_MOONSHOT_FTS_INSERT_SELECT_BATCH";
 const FTS_INSERT_SELECT_BATCH_OVERRIDE_INHERIT: u8 = 0;
 const FTS_INSERT_SELECT_BATCH_OVERRIDE_DISABLED: u8 = 1;
 const FTS_INSERT_SELECT_BATCH_OVERRIDE_ENABLED: u8 = 2;
 static FTS_INSERT_SELECT_BATCH_OVERRIDE_FOR_BENCH: AtomicU8 =
     AtomicU8::new(FTS_INSERT_SELECT_BATCH_OVERRIDE_INHERIT);
+
+fn validate_fts_sync_config(config: &FtsSyncConfig) -> Result<()> {
+    if config.batch_size == 0 || config.batch_size > FTS_SYNC_MAX_BATCH_SEGMENTS {
+        return Err(StorageError::Database(format!(
+            "FTS sync batch_size must be in 1..={FTS_SYNC_MAX_BATCH_SEGMENTS}, got {}",
+            config.batch_size
+        ))
+        .into());
+    }
+    if config.max_batch_bytes == 0 || config.max_batch_bytes > FTS_SYNC_MAX_BATCH_BYTES {
+        return Err(StorageError::Database(format!(
+            "FTS sync max_batch_bytes must be in 1..={FTS_SYNC_MAX_BATCH_BYTES}, got {}",
+            config.max_batch_bytes
+        ))
+        .into());
+    }
+    Ok(())
+}
 
 #[derive(Debug, Clone, Copy)]
 struct FtsInsertSelectBatchOutcome {
@@ -21624,7 +23059,8 @@ fn fts_insert_select_batch_summary_sql(include_from_zero: bool) -> &'static str 
          SELECT
              (SELECT COUNT(*) FROM limited) AS fetched_count,
              (SELECT COUNT(*) FROM selected) AS indexed_count,
-             (SELECT MAX(seq) FROM selected) AS max_seq"
+             (SELECT MAX(seq) FROM selected) AS max_seq,
+             (SELECT MIN(content_len) FROM limited) AS min_content_len"
     } else {
         "WITH limited AS (
              SELECT id, seq, content, content_len,
@@ -21645,7 +23081,8 @@ fn fts_insert_select_batch_summary_sql(include_from_zero: bool) -> &'static str 
          SELECT
              (SELECT COUNT(*) FROM limited) AS fetched_count,
              (SELECT COUNT(*) FROM selected) AS indexed_count,
-             (SELECT MAX(seq) FROM selected) AS max_seq"
+             (SELECT MAX(seq) FROM selected) AS max_seq,
+             (SELECT MIN(content_len) FROM limited) AS min_content_len"
     }
 }
 
@@ -21697,12 +23134,12 @@ fn insert_fts_entries_select_batch_backend(
 ) -> Result<Option<FtsInsertSelectBatchOutcome>> {
     let pane_id = u64_to_i64(pane_id, "output_segments.pane_id")?;
     let last_indexed_seq = u64_to_i64(last_indexed_seq, "output_segments.seq")?;
-    let limit = usize_to_i64(limit, "FTS sync batch_size")?;
+    let limit_i64 = usize_to_i64(limit, "FTS sync batch_size")?;
     let max_batch_bytes = usize_to_i64(max_batch_bytes, "FTS sync max_batch_bytes")?;
     let params = [
         ToSqlValue::Integer(pane_id),
         ToSqlValue::Integer(last_indexed_seq),
-        ToSqlValue::Integer(limit),
+        ToSqlValue::Integer(limit_i64),
         ToSqlValue::Integer(max_batch_bytes),
     ];
 
@@ -21716,6 +23153,13 @@ fn insert_fts_entries_select_batch_backend(
             StorageError::Database("set-based FTS batch summary returned no row".to_string())
         })?;
     let reader = CellRowReader::new(&summary_row);
+    if reader.column_count() != 4 {
+        return Err(StorageError::Database(format!(
+            "set-based FTS batch summary returned {} columns; expected 4",
+            reader.column_count()
+        ))
+        .into());
+    }
     let fetched_count_u64 = reader
         .i64(0)
         .and_then(|value| backend_i64_to_u64(value, "set-based FTS fetched_count"))
@@ -21729,6 +23173,40 @@ fn insert_fts_entries_select_batch_backend(
         .i64(1)
         .and_then(|value| backend_i64_to_u64(value, "set-based FTS indexed_count"))
         .map_err(|err| storage_backend_error("Failed to parse set-based FTS indexed_count", err))?;
+    let limit_u64 = u64::try_from(limit_i64).map_err(|_| {
+        StorageError::Database(format!(
+            "set-based FTS limit {limit_i64} exceeds u64 range"
+        ))
+    })?;
+    if fetched_count_u64 > limit_u64 || indexed_count > fetched_count_u64 {
+        return Err(StorageError::Database(format!(
+            "set-based FTS batch violated its bounds: fetched={fetched_count_u64}, indexed={indexed_count}, limit={limit_u64}"
+        ))
+        .into());
+    }
+    let min_content_len = reader
+        .optional_i64(3)
+        .map_err(|err| storage_backend_error("Failed to parse set-based FTS min_content_len", err))?;
+    if fetched_count > 0 && min_content_len.is_none() {
+        return Err(StorageError::Database(
+            "set-based FTS batch fetched rows without a minimum content length".to_string(),
+        )
+        .into());
+    }
+    if let Some(min_content_len) = min_content_len
+        && min_content_len < 0
+    {
+        return Err(StorageError::Database(format!(
+            "set-based FTS batch encountered negative content_len {min_content_len}",
+        ))
+        .into());
+    }
+    if indexed_count == 0 && fetched_count != 0 {
+        return Err(StorageError::Database(format!(
+            "set-based FTS batch fetched {fetched_count} rows but selected none"
+        ))
+        .into());
+    }
     if indexed_count == 0 {
         return Ok(None);
     }
@@ -21771,6 +23249,80 @@ fn sync_fts_for_pane_backend_with_mode(
     config: &FtsSyncConfig,
     insert_select_batch: bool,
 ) -> Result<(u64, u64)> {
+    validate_fts_sync_config(config)?;
+    if config.commit_progress {
+        return sync_fts_for_pane_backend_impl(backend, pane_id, config, insert_select_batch, true);
+    }
+
+    // `commit_progress = false` deliberately checkpoints only after the whole
+    // pane. Keep every posting and that final checkpoint in one savepoint so a
+    // crash or progress-write error can never leave durable postings behind a
+    // stale resume cursor. SAVEPOINT composes with the outer transaction used
+    // by a full rebuild and starts an atomic transaction when called alone.
+    with_fts_sync_savepoint(backend, || {
+        sync_fts_for_pane_backend_impl(backend, pane_id, config, insert_select_batch, false)
+    })
+}
+
+fn with_fts_sync_savepoint<T>(
+    backend: &dyn StorageBackend,
+    operation: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    const SAVEPOINT: &str = "frankenterm_fts_sync_unit";
+    backend
+        .execute("SAVEPOINT frankenterm_fts_sync_unit")
+        .map_err(|error| storage_backend_error("Begin atomic FTS sync unit", error))?;
+
+    match operation() {
+        Ok(value) => match backend.execute("RELEASE SAVEPOINT frankenterm_fts_sync_unit") {
+            Ok(_) => Ok(value),
+            Err(error) => {
+                let rollback = backend.execute("ROLLBACK TO SAVEPOINT frankenterm_fts_sync_unit");
+                let release = backend.execute("RELEASE SAVEPOINT frankenterm_fts_sync_unit");
+                if rollback.is_err() || release.is_err() {
+                    tracing::error!(
+                        savepoint = SAVEPOINT,
+                        rollback_error = ?rollback.err(),
+                        release_error = ?release.err(),
+                        "failed to restore the FTS transaction after sync-unit commit failed"
+                    );
+                    return Err(StorageError::Database(
+                        "FTS sync commit failed and its transaction could not be restored"
+                            .to_string(),
+                    )
+                    .into());
+                }
+                Err(storage_backend_error("Commit atomic FTS sync unit", error).into())
+            }
+        },
+        Err(error) => {
+            let rollback = backend.execute("ROLLBACK TO SAVEPOINT frankenterm_fts_sync_unit");
+            let release = backend.execute("RELEASE SAVEPOINT frankenterm_fts_sync_unit");
+            let transaction_not_restored = rollback.is_err() || release.is_err();
+            if transaction_not_restored {
+                tracing::error!(
+                    savepoint = SAVEPOINT,
+                    rollback_error = ?rollback.err(),
+                    release_error = ?release.err(),
+                    "failed to restore the FTS transaction after an atomic sync-unit error"
+                );
+                return Err(StorageError::Database(
+                    "FTS sync failed and its transaction could not be restored".to_string(),
+                )
+                .into());
+            }
+            Err(error)
+        }
+    }
+}
+
+fn sync_fts_for_pane_backend_impl(
+    backend: &dyn StorageBackend,
+    pane_id: u64,
+    config: &FtsSyncConfig,
+    insert_select_batch: bool,
+    commit_each_batch: bool,
+) -> Result<(u64, u64)> {
     let now = now_ms();
     let progress = get_fts_pane_progress_backend(backend, pane_id)?;
     let last_seq = progress.as_ref().map_or(0, |p| p.last_indexed_seq);
@@ -21783,33 +23335,60 @@ fn sync_fts_for_pane_backend_with_mode(
     loop {
         let include_from_zero = !had_prior_progress && total_indexed == 0;
         if insert_select_batch {
-            let Some(outcome) = insert_fts_entries_select_batch_backend(
-                backend,
-                pane_id,
-                max_seq,
-                config.batch_size,
-                include_from_zero,
-                config.max_batch_bytes,
-            )?
+            let batch = || {
+                let Some(outcome) = insert_fts_entries_select_batch_backend(
+                    backend,
+                    pane_id,
+                    max_seq,
+                    config.batch_size,
+                    include_from_zero,
+                    config.max_batch_bytes,
+                )?
+                else {
+                    return Ok(None);
+                };
+                let next_total_indexed = total_indexed
+                    .checked_add(outcome.indexed_count)
+                    .ok_or_else(|| {
+                        StorageError::Database(
+                            "FTS sync total-indexed count overflow".to_string(),
+                        )
+                    })?;
+                let next_indexed_count = indexed_count
+                    .checked_add(outcome.indexed_count)
+                    .ok_or_else(|| {
+                        StorageError::Database("FTS pane indexed-count overflow".to_string())
+                    })?;
+                if config.commit_progress {
+                    upsert_fts_pane_progress_backend(
+                        backend,
+                        &FtsPaneProgress {
+                            pane_id,
+                            last_indexed_seq: outcome.max_seq,
+                            indexed_count: next_indexed_count,
+                            last_indexed_at: now,
+                        },
+                    )?;
+                }
+                Ok(Some((outcome, next_total_indexed, next_indexed_count)))
+            };
+            let batch = if commit_each_batch {
+                with_fts_sync_savepoint(backend, batch)?
+            } else {
+                batch()?
+            };
+            let Some((outcome, next_total_indexed, next_indexed_count)) = batch
             else {
                 break;
             };
-
-            total_indexed = total_indexed.saturating_add(outcome.indexed_count);
-            indexed_count = indexed_count.saturating_add(outcome.indexed_count);
+            total_indexed = next_total_indexed;
+            indexed_count = next_indexed_count;
             max_seq = outcome.max_seq;
 
-            if config.commit_progress {
-                let new_progress = FtsPaneProgress {
-                    pane_id,
-                    last_indexed_seq: max_seq,
-                    indexed_count,
-                    last_indexed_at: now,
-                };
-                upsert_fts_pane_progress_backend(backend, &new_progress)?;
-            }
-
-            if outcome.fetched_count < config.batch_size {
+            let fetched_count = u64::try_from(outcome.fetched_count).unwrap_or(u64::MAX);
+            if outcome.fetched_count < config.batch_size
+                && outcome.indexed_count == fetched_count
+            {
                 break;
             }
             continue;
@@ -21826,30 +23405,63 @@ fn sync_fts_for_pane_backend_with_mode(
             break;
         }
 
-        let mut batch_bytes = 0usize;
-        for segment in &segments {
-            if batch_bytes > 0 && batch_bytes + segment.content_len > config.max_batch_bytes {
-                break;
+        let scalar_batch = || {
+            let mut next_total_indexed = total_indexed;
+            let mut next_indexed_count = indexed_count;
+            let mut next_max_seq = max_seq;
+            let mut batch_bytes = 0usize;
+            let mut indexed_this_batch = 0usize;
+            for segment in &segments {
+                let next_batch_bytes = batch_bytes
+                    .checked_add(segment.content_len)
+                    .unwrap_or(usize::MAX);
+                if batch_bytes > 0 && next_batch_bytes > config.max_batch_bytes {
+                    break;
+                }
+
+                insert_fts_entry_backend(backend, segment)?;
+                next_total_indexed = next_total_indexed.checked_add(1).ok_or_else(|| {
+                    StorageError::Database("FTS sync total-indexed count overflow".to_string())
+                })?;
+                next_indexed_count = next_indexed_count.checked_add(1).ok_or_else(|| {
+                    StorageError::Database("FTS pane indexed-count overflow".to_string())
+                })?;
+                next_max_seq = segment.seq;
+                batch_bytes = next_batch_bytes;
+                indexed_this_batch = indexed_this_batch.checked_add(1).ok_or_else(|| {
+                    StorageError::Database("FTS scalar batch row-count overflow".to_string())
+                })?;
             }
 
-            insert_fts_entry_backend(backend, segment)?;
-            total_indexed = total_indexed.saturating_add(1);
-            indexed_count = indexed_count.saturating_add(1);
-            max_seq = segment.seq;
-            batch_bytes = batch_bytes.saturating_add(segment.content_len);
-        }
-
-        if config.commit_progress && total_indexed > 0 {
-            let new_progress = FtsPaneProgress {
-                pane_id,
-                last_indexed_seq: max_seq,
-                indexed_count,
-                last_indexed_at: now,
+            if config.commit_progress {
+                upsert_fts_pane_progress_backend(
+                    backend,
+                    &FtsPaneProgress {
+                        pane_id,
+                        last_indexed_seq: next_max_seq,
+                        indexed_count: next_indexed_count,
+                        last_indexed_at: now,
+                    },
+                )?;
+            }
+            Ok((
+                next_total_indexed,
+                next_indexed_count,
+                next_max_seq,
+                indexed_this_batch,
+            ))
+        };
+        let (next_total_indexed, next_indexed_count, next_max_seq, indexed_this_batch) =
+            if commit_each_batch {
+                with_fts_sync_savepoint(backend, scalar_batch)?
+            } else {
+                scalar_batch()?
             };
-            upsert_fts_pane_progress_backend(backend, &new_progress)?;
-        }
+        total_indexed = next_total_indexed;
+        indexed_count = next_indexed_count;
+        max_seq = next_max_seq;
 
-        if segments.len() < config.batch_size {
+        if segments.len() < config.batch_size && indexed_this_batch == segments.len() {
             break;
         }
     }
@@ -21897,108 +23509,94 @@ fn full_fts_rebuild_backend(
     config: &FtsSyncConfig,
 ) -> Result<FtsSyncResult> {
     use std::time::Instant;
+    validate_fts_sync_config(config)?;
     let start = Instant::now();
     let now = now_ms();
-    let mut warnings = Vec::new();
+    let created_at = get_fts_index_state_backend(backend)?
+        .map_or(now, |state| state.created_at);
 
-    if let Err(err) = backend
-        .execute_batch("INSERT INTO output_segments_fts(output_segments_fts) VALUES('delete-all')")
-    {
-        warnings.push(format!("FTS delete-all failed (may be empty): {err}"));
-    }
-
-    clear_fts_pane_progress_backend(backend)?;
-
-    let pane_ids = backend
-        .query_map_cells(
-            "SELECT DISTINCT pane_id FROM output_segments ORDER BY pane_id",
-            &[],
-        )
-        .map_err(|err| storage_backend_error("Failed to query panes", err))?
-        .iter()
-        .map(|row| {
-            CellRowReader::new(row)
-                .i64(0)
-                .and_then(|value| backend_i64_to_u64(value, "output_segments.pane_id"))
-                .map_err(|err| storage_backend_error("Failed to list panes", err).into())
-        })
-        .collect::<Result<Vec<_>>>()?;
-
-    let mut total_indexed = 0u64;
-    let panes_processed = pane_ids.len() as u64;
-    let mut hard_failure_panes: Vec<(u64, String)> = Vec::new();
-
-    for pane_id in &pane_ids {
-        match sync_fts_for_pane_backend(backend, *pane_id, config) {
-            Ok((indexed, _)) => total_indexed = total_indexed.saturating_add(indexed),
-            Err(err) => {
-                let err_msg = format!("{err}");
-                let is_hard = matches!(
-                    &err,
-                    crate::Error::Storage(StorageError::Database(_)) | crate::Error::Io(_)
-                );
-                if is_hard {
-                    tracing::error!(
-                        pane_id = pane_id,
-                        error = %err,
-                        "FTS rebuild: pane completely failed to re-index (hard I/O error)"
-                    );
-                    hard_failure_panes.push((*pane_id, err_msg.clone()));
-                } else {
-                    tracing::warn!(
-                        pane_id = pane_id,
-                        error = %err,
-                        "FTS rebuild: pane sync produced non-fatal error"
-                    );
-                }
-                warnings.push(format!("Pane {pane_id} sync failed: {err_msg}"));
-            }
-        }
-    }
-
-    if !hard_failure_panes.is_empty() {
-        tracing::error!(
-            failed_count = hard_failure_panes.len(),
-            total_panes = pane_ids.len(),
-            "FTS rebuild had hard failures; marking index as rebuild-pending"
-        );
-        if let Err(cleanup_err) = backend.execute_batch(
-            "INSERT INTO output_segments_fts(output_segments_fts) VALUES('delete-all')",
-        ) {
-            tracing::error!(
-                error = %cleanup_err,
-                "Failed to clear partially rebuilt FTS contents after hard rebuild failure"
-            );
-        }
+    // Persist the fail-closed marker before any destructive index mutation.
+    // The rebuild itself is one transaction: readers see the old complete
+    // snapshot until commit, a crash rolls every partial posting back, and the
+    // separately committed pending marker forces recovery on the next open.
+    mark_fts_rebuild_pending_backend(backend, now)?;
+    backend
+        .execute("BEGIN IMMEDIATE")
+        .map_err(|err| storage_backend_error("Begin atomic FTS rebuild", err))?;
+    let rebuild_result = (|| -> Result<(u64, u64)> {
+        backend
+            .execute_batch(
+                "INSERT INTO output_segments_fts(output_segments_fts) VALUES('delete-all')",
+            )
+            .map_err(|err| {
+                storage_backend_error("FTS rebuild could not clear the prior index", err)
+            })?;
         clear_fts_pane_progress_backend(backend)?;
-        mark_fts_rebuild_pending_backend(backend, now)?;
 
-        let failed_panes = hard_failure_panes
+        let pane_ids = backend
+            .query_map_cells(
+                "SELECT DISTINCT pane_id FROM output_segments ORDER BY pane_id",
+                &[],
+            )
+            .map_err(|err| storage_backend_error("Failed to query panes", err))?
             .iter()
-            .map(|(pane_id, _)| pane_id.to_string())
-            .collect::<Vec<_>>()
-            .join(", ");
-        return Err(StorageError::Database(format!(
-            "FTS rebuild incomplete after hard failures in panes [{failed_panes}]; index marked for full rebuild"
+            .map(|row| {
+                CellRowReader::new(row)
+                    .i64(0)
+                    .and_then(|value| backend_i64_to_u64(value, "output_segments.pane_id"))
+                    .map_err(|err| storage_backend_error("Failed to list panes", err).into())
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let mut total_indexed = 0u64;
+        for pane_id in &pane_ids {
+            let (indexed, _) = sync_fts_for_pane_backend(backend, *pane_id, config).map_err(
+                |error| {
+                    StorageError::Database(format!(
+                        "FTS rebuild failed while indexing pane {pane_id}: {error}"
+                    ))
+                },
+            )?;
+            total_indexed = total_indexed.checked_add(indexed).ok_or_else(|| {
+                StorageError::Database("FTS rebuild indexed-row count overflow".to_string())
+            })?;
+        }
+
+        upsert_fts_index_state_backend(
+            backend,
+            &FtsIndexState {
+                index_version: FTS_INDEX_VERSION,
+                last_full_rebuild_at: Some(now),
+                created_at,
+                updated_at: now,
+            },
+        )?;
+        Ok((
+            total_indexed,
+            u64::try_from(pane_ids.len()).unwrap_or(u64::MAX),
         ))
-        .into());
-    }
+    })();
 
-    let state = FtsIndexState {
-        index_version: FTS_INDEX_VERSION,
-        last_full_rebuild_at: Some(now),
-        created_at: now,
-        updated_at: now,
+    let (segments_indexed, panes_processed) = match rebuild_result {
+        Ok(outcome) => match backend.execute("COMMIT") {
+            Ok(_) => outcome,
+            Err(error) => {
+                let _ = backend.execute("ROLLBACK");
+                return Err(storage_backend_error("Commit atomic FTS rebuild", error).into());
+            }
+        },
+        Err(error) => {
+            let _ = backend.execute("ROLLBACK");
+            return Err(error);
+        }
     };
-    upsert_fts_index_state_backend(backend, &state)?;
 
-    let duration = start.elapsed();
     Ok(FtsSyncResult {
-        segments_indexed: total_indexed,
+        segments_indexed,
         panes_processed,
         full_rebuild: true,
-        duration_ms: duration.as_millis() as u64,
-        warnings,
+        duration_ms: u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX),
+        warnings: Vec::new(),
     })
 }
 
@@ -22007,6 +23605,7 @@ fn sync_fts_on_startup_backend(
     config: &FtsSyncConfig,
 ) -> Result<FtsSyncResult> {
     use std::time::Instant;
+    validate_fts_sync_config(config)?;
     let start = Instant::now();
     let mut warnings = Vec::new();
 
@@ -22027,23 +23626,26 @@ fn sync_fts_on_startup_backend(
             return full_fts_rebuild_backend(backend, config);
         }
     } else {
-        let now = now_ms();
-        let new_state = FtsIndexState {
-            index_version: FTS_INDEX_VERSION,
-            last_full_rebuild_at: None,
-            created_at: now,
-            updated_at: now,
-        };
-        upsert_fts_index_state_backend(backend, &new_state)?;
+        tracing::info!(
+            new_version = FTS_INDEX_VERSION,
+            "FTS index state is missing; performing authoritative full rebuild"
+        );
+        return full_fts_rebuild_backend(backend, config);
     }
 
     let pane_ids = panes_needing_fts_sync_backend(backend)?;
     let mut total_indexed = 0u64;
-    let panes_processed = pane_ids.len() as u64;
+    let panes_processed = u64::try_from(pane_ids.len()).unwrap_or(u64::MAX);
 
     for pane_id in pane_ids {
         match sync_fts_for_pane_backend(backend, pane_id, config) {
-            Ok((indexed, _)) => total_indexed = total_indexed.saturating_add(indexed),
+            Ok((indexed, _)) => {
+                total_indexed = total_indexed.checked_add(indexed).ok_or_else(|| {
+                    StorageError::Database(
+                        "incremental FTS sync indexed-row count overflow".to_string(),
+                    )
+                })?;
+            }
             Err(err) => warnings.push(format!("Pane {pane_id} incremental sync failed: {err}")),
         }
     }
@@ -22053,7 +23655,7 @@ fn sync_fts_on_startup_backend(
         segments_indexed: total_indexed,
         panes_processed,
         full_rebuild: false,
-        duration_ms: duration.as_millis() as u64,
+        duration_ms: u64::try_from(duration.as_millis()).unwrap_or(u64::MAX),
         warnings,
     })
 }
@@ -22265,13 +23867,7 @@ fn query_unhandled_events_backend(
     let limit_i64 = usize_to_i64(limit, "limit")?;
     let rows = backend
         .query_map_cells(
-            "SELECT id, pane_id, rule_id, agent_type, event_type, severity, confidence,
-             extracted, matched_text, segment_id, detected_at, dedupe_key, handled_at,
-             handled_by_workflow_id, handled_status
-             FROM events
-             WHERE handled_at IS NULL
-             ORDER BY detected_at DESC, id DESC
-             LIMIT ?1",
+            QUERY_UNHANDLED_EVENTS_NEWEST_SQL,
             &[ToSqlValue::Integer(limit_i64)],
         )
         .map_err(|err| storage_backend_error("Query unhandled events", err))?;
@@ -22286,27 +23882,36 @@ fn query_unhandled_event_counts(
     backend: &dyn StorageBackend,
 ) -> Result<std::collections::HashMap<u64, u32>> {
     let rows = backend
-        .query_map_typed(
-            "SELECT pane_id, COUNT(*) as cnt
-             FROM events
-             WHERE handled_at IS NULL
-             GROUP BY pane_id",
-            &[],
-        )
+        .query_map_typed(QUERY_UNHANDLED_EVENT_COUNTS_SQL, &[])
         .map_err(|err| storage_backend_error("Query unhandled event counts", err))?;
 
-    let mut result = std::collections::HashMap::new();
+    decode_unhandled_event_count_rows(&rows, None)
+}
+
+fn decode_unhandled_event_count_rows(
+    rows: &[Vec<String>],
+    requested_pane_ids: Option<&[i64]>,
+) -> Result<HashMap<u64, u32>> {
+    let mut result = HashMap::with_capacity(rows.len());
     for row in rows {
-        let reader = RowReader::new(&row);
-        let pane_id = reader
+        let reader = RowReader::new(row);
+        let pane_id_i64 = reader
             .i64(0)
             .map_err(|err| storage_backend_error("Unhandled event count pane_id", err))?;
+        if requested_pane_ids
+            .is_some_and(|pane_ids| pane_ids.binary_search(&pane_id_i64).is_err())
+        {
+            return Err(StorageError::Database(format!(
+                "unhandled event count query returned unrequested pane {pane_id_i64}"
+            ))
+            .into());
+        }
         let count = reader
             .i64(1)
             .map_err(|err| storage_backend_error("Unhandled event count", err))?;
-        let pane_id = u64::try_from(pane_id).map_err(|_| {
+        let pane_id = u64::try_from(pane_id_i64).map_err(|_| {
             StorageError::Database(format!(
-                "unhandled event count pane_id {pane_id} is out of u64 range"
+                "unhandled event count pane_id {pane_id_i64} is out of u64 range"
             ))
         })?;
         let count = u32::try_from(count).map_err(|_| {
@@ -22325,28 +23930,68 @@ fn query_unhandled_event_counts(
     Ok(result)
 }
 
+#[cfg(test)]
+fn query_unhandled_event_counts_bulk_backend(
+    backend: &dyn StorageBackend,
+    pane_ids: &[u64],
+) -> Result<HashMap<u64, u32>> {
+    let pane_ids = canonical_pane_ids(pane_ids, "pane unhandled counts")?;
+    query_unhandled_event_counts_bulk_canonical_backend(backend, &pane_ids)
+}
+
+fn query_unhandled_event_counts_bulk_canonical_backend(
+    backend: &dyn StorageBackend,
+    pane_ids: &[i64],
+) -> Result<HashMap<u64, u32>> {
+    if pane_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let pane_ids_json = canonical_i64_id_json(pane_ids, "pane unhandled counts")?;
+    let rows = backend
+        .query_map_typed(
+            QUERY_UNHANDLED_EVENT_COUNTS_BULK_SQL,
+            &[ToSqlValue::Text(&pane_ids_json)],
+        )
+        .map_err(|err| storage_backend_error("Query bulk unhandled event counts", err))?;
+    let counts = decode_unhandled_event_count_rows(&rows, Some(pane_ids))?;
+    if counts.len() != pane_ids.len() {
+        return Err(StorageError::Database(format!(
+            "bulk unhandled event count query returned {} panes; expected {}",
+            counts.len(),
+            pane_ids.len()
+        ))
+        .into());
+    }
+    Ok(counts)
+}
+
 fn query_last_activity_by_pane_backend(
     backend: &dyn StorageBackend,
 ) -> Result<std::collections::HashMap<u64, i64>> {
     let rows = backend
-        .query_map_cells(
-            "SELECT pane_id, MAX(captured_at) as last_activity
-             FROM output_segments
-             GROUP BY pane_id",
-            &[],
-        )
+        .query_map_cells(QUERY_LAST_ACTIVITY_BY_PANE_SQL, &[])
         .map_err(|err| storage_backend_error("Query last activity by pane", err))?;
 
     let mut result = std::collections::HashMap::new();
     for row in &rows {
         let reader = CellRowReader::new(row);
+        if reader.column_count() != 2 {
+            return Err(StorageError::Database(format!(
+                "last activity row has {} columns; expected 2",
+                reader.column_count()
+            ))
+            .into());
+        }
         let pane_id = reader
             .i64(0)
             .and_then(|value| backend_i64_to_u64(value, "output_segments.pane_id"))
             .map_err(|err| storage_backend_error("Last activity row pane_id", err))?;
         let last_activity = reader
-            .i64(1)
+            .optional_i64(1)
             .map_err(|err| storage_backend_error("Last activity row timestamp", err))?;
+        let Some(last_activity) = last_activity else {
+            continue;
+        };
         if last_activity < 0 {
             return Err(StorageError::Database(format!(
                 "pane {pane_id} has a negative last activity timestamp"
@@ -22455,9 +24100,9 @@ const EVENT_STREAM_COLUMNS: &str =
      extracted, matched_text, segment_id, detected_at, dedupe_key, handled_at, \
      handled_by_workflow_id, handled_status";
 
-fn build_event_stream_suffix<'a>(
-    query: &'a EventStreamQuery,
-) -> Result<(String, Vec<ToSqlValue<'a>>)> {
+fn build_event_stream_suffix(
+    query: &EventStreamQuery,
+) -> Result<(String, Vec<ToSqlValue<'_>>)> {
     let mut sql = String::from(" WHERE 1=1");
     let mut params = Vec::new();
 
@@ -23762,26 +25407,25 @@ fn query_max_seq_backend(backend: &dyn StorageBackend, pane_id: u64) -> Result<O
 }
 
 /// ft-r0977: latest captured-segment timestamp (epoch ms) for a pane, or `None`
-/// when the pane has no captured output. `MAX(captured_at)` over an empty/absent
-/// pane yields SQL NULL → `None`.
+/// when the pane has no captured output.
 fn query_pane_last_output_at_backend(
     backend: &dyn StorageBackend,
     pane_id: u64,
 ) -> Result<Option<i64>> {
     let pane_id_i64 = u64_to_i64(pane_id, "pane_id")?;
-    let row = backend
+    let Some(row) = backend
         .query_row_cells(
-            "SELECT MAX(captured_at) FROM output_segments WHERE pane_id = ?1",
+            QUERY_PANE_LAST_OUTPUT_AT_SQL,
             &[ToSqlValue::Integer(pane_id_i64)],
         )
-        .map_err(|err| storage_backend_error("Query pane last output at", err))?;
-    let row = row.ok_or_else(|| {
-        StorageError::Database("MAX(captured_at) query returned no aggregate row".to_string())
-    })?;
+        .map_err(|err| storage_backend_error("Query pane last output at", err))?
+    else {
+        return Ok(None);
+    };
     let reader = CellRowReader::new(&row);
     if reader.column_count() != 1 {
         return Err(StorageError::Database(format!(
-            "MAX(captured_at) query returned {} columns; expected 1",
+            "pane last-output query returned {} columns; expected 1",
             reader.column_count()
         ))
         .into());
@@ -23798,8 +25442,8 @@ fn query_pane_last_output_at_backend(
     Ok(captured_at)
 }
 
-fn canonical_pane_activity_ids(pane_ids: &[u64]) -> Result<Vec<i64>> {
-    validate_bulk_id_input_len("pane activity", pane_ids.len())?;
+fn canonical_pane_ids(pane_ids: &[u64], operation: &str) -> Result<Vec<i64>> {
+    validate_bulk_id_input_len(operation, pane_ids.len())?;
     let mut canonical = Vec::with_capacity(pane_ids.len());
     for pane_id in pane_ids {
         canonical.push(u64_to_i64(*pane_id, "pane_id")?);
@@ -23814,7 +25458,7 @@ fn query_pane_last_output_at_bulk_backend(
     backend: &dyn StorageBackend,
     pane_ids: &[u64],
 ) -> Result<HashMap<u64, Option<i64>>> {
-    let pane_ids = canonical_pane_activity_ids(pane_ids)?;
+    let pane_ids = canonical_pane_ids(pane_ids, "pane activity")?;
     query_pane_last_output_at_bulk_canonical_backend(backend, &pane_ids)
 }
 
@@ -23831,22 +25475,7 @@ fn query_pane_last_output_at_bulk_canonical_backend(
     let pane_ids_json = canonical_i64_id_json(pane_ids, "pane activity")?;
     let rows = backend
         .query_map_cells(
-            "WITH requested(pane_id) AS (
-                 SELECT CAST(requested_json.value AS INTEGER)
-                 FROM json_each(?1) AS requested_json
-                 WHERE requested_json.type = 'integer'
-             )
-             SELECT panes.pane_id,
-                    (
-                        SELECT output_segments.captured_at
-                        FROM output_segments
-                        WHERE output_segments.pane_id = panes.pane_id
-                        ORDER BY output_segments.captured_at DESC
-                        LIMIT 1
-                    )
-             FROM requested
-             JOIN panes ON panes.pane_id = requested.pane_id
-             ORDER BY panes.pane_id ASC",
+            QUERY_PANE_LAST_OUTPUT_AT_BULK_SQL,
             &[ToSqlValue::Text(&pane_ids_json)],
         )
         .map_err(|err| storage_backend_error("Bulk pane activity query failed", err))?;
@@ -24569,6 +26198,42 @@ fn seed_retention_event_backend(
     .event_id()
 }
 
+fn explain_query_plan_backend(
+    backend: &dyn StorageBackend,
+    sql: &str,
+    params: &[ToSqlValue<'_>],
+) -> String {
+    let explain_sql = format!("EXPLAIN QUERY PLAN {sql}");
+    backend
+        .query_map_typed(&explain_sql, params)
+        .unwrap()
+        .iter()
+        .map(|row| RowReader::new(row).string(3).unwrap())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn explain_query_opcode_rows_backend(
+    backend: &dyn StorageBackend,
+    sql: &str,
+    params: &[ToSqlValue<'_>],
+) -> Vec<(String, i64, String)> {
+    let explain_sql = format!("EXPLAIN {sql}");
+    backend
+        .query_map_typed(&explain_sql, params)
+        .unwrap()
+        .iter()
+        .map(|row| {
+            let reader = RowReader::new(row);
+            (
+                reader.string(1).unwrap(),
+                reader.i64(2).unwrap(),
+                reader.string(5).unwrap(),
+            )
+        })
+        .collect()
+}
+
 #[test]
 fn event_annotations_bulk_supports_bounded_json_each_snapshot() {
     let backend = memory_backend();
@@ -24638,6 +26303,9 @@ fn pane_last_output_bulk_distinguishes_missing_empty_active_and_corrupt() {
     assert_eq!(activity.get(&1), Some(&None));
     assert_eq!(activity.get(&2), Some(&Some(200)));
     assert!(!activity.contains_key(&9_999), "missing panes must be omitted");
+    assert_eq!(query_pane_last_output_at_backend(&backend, 0).unwrap(), None);
+    assert_eq!(query_pane_last_output_at_backend(&backend, 2).unwrap(), Some(200));
+    assert_eq!(query_pane_last_output_at_backend(&backend, 9_999).unwrap(), None);
 
     let max_ids = (0..u64::try_from(STORAGE_BULK_ID_INPUT_MAX).unwrap()).collect::<Vec<_>>();
     let max_result = query_pane_last_output_at_bulk_backend(&backend, &max_ids).unwrap();
@@ -24880,6 +26548,261 @@ fn event_delivery_lease_batches_are_exact_atomic_and_bounded() {
     )
     .is_err());
     assert!(finalize_event_delivery_leases_bulk_backend(&backend, &[], 1, None, "").is_err());
+
+    let plan_leases_json = event_delivery_lease_pairs_json(&[
+        (third, "token-3".to_string()),
+        (fourth, "token-4".to_string()),
+    ])
+    .unwrap();
+    let finalize_plan = explain_query_plan_backend(
+        &backend,
+        FINALIZE_EVENT_DELIVERY_LEASES_BULK_SQL,
+        &[
+            ToSqlValue::Text(&plan_leases_json),
+            ToSqlValue::Integer(700),
+            ToSqlValue::Null,
+            ToSqlValue::Text("delivered"),
+        ],
+    );
+    assert!(
+        finalize_plan.contains("USING INTEGER PRIMARY KEY"),
+        "bulk finalize must seek requested event IDs, not scan all unhandled events:\n{finalize_plan}"
+    );
+    assert!(
+        !finalize_plan.contains("SCAN events"),
+        "bulk finalize must remain bounded by the lease batch:\n{finalize_plan}"
+    );
+    let release_plan = explain_query_plan_backend(
+        &backend,
+        RELEASE_EVENT_DELIVERY_LEASES_BULK_SQL,
+        &[ToSqlValue::Text(&plan_leases_json)],
+    );
+    assert!(
+        release_plan.contains("USING INTEGER PRIMARY KEY"),
+        "bulk release must seek requested event IDs, not scan all unhandled events:\n{release_plan}"
+    );
+    assert!(
+        !release_plan.contains("SCAN events"),
+        "bulk release must remain bounded by the lease batch:\n{release_plan}"
+    );
+}
+
+#[test]
+fn storage_v35_hot_path_indexes_drive_exact_production_query_plans() {
+    let backend = memory_backend();
+    seed_pane_backend(&backend, 1, 1);
+    seed_pane_backend(&backend, 2, 1);
+    seed_pane_backend(&backend, 3, 1);
+
+    // A large handled history must not be scanned or sorted when only the
+    // newest unhandled events are requested.
+    backend
+        .execute(
+            "WITH RECURSIVE sequence(event_id) AS (
+                 VALUES(1)
+                 UNION ALL
+                 SELECT event_id + 1 FROM sequence WHERE event_id < 16384
+             )
+             INSERT INTO events (
+                 id, pane_id, rule_id, agent_type, event_type, severity,
+                 confidence, detected_at, handled_at, handled_status
+             )
+             SELECT event_id, 1, 'handled-' || event_id, 'test', 'handled',
+                    'info', 1.0, event_id, event_id, 'delivered'
+             FROM sequence
+             ORDER BY event_id ASC",
+        )
+        .unwrap();
+    let first = seed_retention_event_backend(&backend, 1, "info", "unhandled-first", 20_000, None);
+    let second = seed_retention_event_backend(&backend, 1, "info", "unhandled-second", 20_000, None);
+    let third = seed_retention_event_backend(&backend, 1, "info", "unhandled-third", 20_000, None);
+    backend.execute("ANALYZE").unwrap();
+
+    let newest = query_unhandled_events_backend(&backend, 3)
+        .unwrap()
+        .into_iter()
+        .map(|event| event.id)
+        .collect::<Vec<_>>();
+    assert_eq!(newest, vec![third, second, first]);
+    let event_plan = explain_query_plan_backend(
+        &backend,
+        QUERY_UNHANDLED_EVENTS_NEWEST_SQL,
+        &[ToSqlValue::Integer(3)],
+    );
+    assert!(
+        event_plan.contains("idx_events_unhandled_detected"),
+        "newest unhandled query must use the v35 partial ordering index:\n{event_plan}"
+    );
+    assert!(
+        !event_plan.contains("USE TEMP B-TREE FOR ORDER BY"),
+        "newest unhandled query must not sort its candidate set:\n{event_plan}"
+    );
+
+    // Cursor delivery has the opposite ordering requirement. It must seek
+    // directly into the unhandled ID stream rather than scanning the
+    // detected-time index and sorting every surviving row.
+    let cursor_query = EventStreamQuery {
+        after_id: Some(first - 1),
+        unhandled_only: true,
+        limit: Some(2),
+        ..EventStreamQuery::default()
+    };
+    let cursor_ids = query_events_stream_backend(&backend, &cursor_query)
+        .unwrap()
+        .into_iter()
+        .map(|event| event.id)
+        .collect::<Vec<_>>();
+    assert_eq!(cursor_ids, vec![first, second]);
+    let (cursor_suffix, cursor_params) = build_event_stream_suffix(&cursor_query).unwrap();
+    let cursor_sql = format!("SELECT {EVENT_STREAM_COLUMNS} FROM events{cursor_suffix}");
+    let cursor_plan = explain_query_plan_backend(&backend, &cursor_sql, &cursor_params);
+    assert!(
+        cursor_plan.contains("idx_events_unhandled_id"),
+        "ascending unhandled cursor must use the v35 partial ID index:\n{cursor_plan}"
+    );
+    assert!(
+        !cursor_plan.contains("USE TEMP B-TREE FOR ORDER BY"),
+        "ascending unhandled cursor must not sort its candidate set:\n{cursor_plan}"
+    );
+
+    let event_counts = query_unhandled_event_counts(&backend).unwrap();
+    assert_eq!(event_counts.get(&1), Some(&3));
+    let requested_counts =
+        query_unhandled_event_counts_bulk_backend(&backend, &[2, 9_999, 1, 1]).unwrap();
+    assert_eq!(requested_counts.len(), 3);
+    assert_eq!(requested_counts.get(&1), Some(&3));
+    assert_eq!(requested_counts.get(&2), Some(&0));
+    assert_eq!(requested_counts.get(&9_999), Some(&0));
+    let count_plan = explain_query_plan_backend(
+        &backend,
+        QUERY_UNHANDLED_EVENT_COUNTS_SQL,
+        &[],
+    );
+    assert!(
+        count_plan.contains("idx_events_unhandled_pane"),
+        "global unhandled counts must use the pane-ordered partial v35 index:\n{count_plan}"
+    );
+    assert!(
+        !count_plan.contains("USE TEMP B-TREE FOR GROUP BY"),
+        "pane-ordered global counts must aggregate without a temp sort:\n{count_plan}"
+    );
+    let count_opcodes =
+        explain_query_opcode_rows_backend(&backend, QUERY_UNHANDLED_EVENT_COUNTS_SQL, &[]);
+    let events_table_cursor = count_opcodes
+        .iter()
+        .find_map(|(opcode, cursor, p4)| {
+            (opcode == "OpenRead" && !p4.starts_with("k(")).then_some(*cursor)
+        });
+    if let Some(events_table_cursor) = events_table_cursor {
+        assert!(
+            !count_opcodes.iter().any(|(opcode, cursor, _)|
+                opcode == "Column" && *cursor == events_table_cursor),
+            "the covering v35 index must supply pane_id without row-table reads:\n{count_opcodes:?}"
+        );
+    }
+    let requested_pane_ids_json = "[1,2,9999]";
+    let bulk_count_plan = explain_query_plan_backend(
+        &backend,
+        QUERY_UNHANDLED_EVENT_COUNTS_BULK_SQL,
+        &[ToSqlValue::Text(requested_pane_ids_json)],
+    );
+    assert!(
+        bulk_count_plan.contains("CORRELATED SCALAR SUBQUERY"),
+        "bulk unhandled counts must issue one bounded lookup per live pane:\n{bulk_count_plan}"
+    );
+    assert!(
+        bulk_count_plan.contains("idx_events_unhandled_pane"),
+        "bulk unhandled counts must seek the pane-ordered partial index:\n{bulk_count_plan}"
+    );
+    assert!(
+        !bulk_count_plan.contains("SCAN events")
+            && !bulk_count_plan.contains("USE TEMP B-TREE"),
+        "bulk unhandled counts must neither scan all events nor sort:\n{bulk_count_plan}"
+    );
+
+    let max_count_ids =
+        (0..u64::try_from(STORAGE_BULK_ID_INPUT_MAX).unwrap()).collect::<Vec<_>>();
+    assert_eq!(
+        query_unhandled_event_counts_bulk_backend(&backend, &max_count_ids)
+            .unwrap()
+            .len(),
+        STORAGE_BULK_ID_INPUT_MAX
+    );
+    let over_count_limit =
+        (0..=u64::try_from(STORAGE_BULK_ID_INPUT_MAX).unwrap()).collect::<Vec<_>>();
+    assert!(query_unhandled_event_counts_bulk_backend(&backend, &over_count_limit).is_err());
+    let duplicate_count_over_limit = vec![1; STORAGE_BULK_ID_INPUT_MAX + 1];
+    assert!(
+        query_unhandled_event_counts_bulk_backend(&backend, &duplicate_count_over_limit).is_err()
+    );
+    assert!(query_unhandled_event_counts_bulk_backend(&backend, &[u64::MAX]).is_err());
+
+    // The correlated newest-output lookup should seek once per requested pane,
+    // regardless of the pane's retained segment history.
+    backend
+        .execute(
+            "WITH RECURSIVE sequence(seq) AS (
+                 VALUES(0)
+                 UNION ALL
+                 SELECT seq + 1 FROM sequence WHERE seq < 8191
+             )
+             INSERT INTO output_segments (
+                 pane_id, seq, content, content_len, captured_at
+             )
+             SELECT 3, seq, 'captured output', 15, 100 + seq
+             FROM sequence
+             ORDER BY seq ASC",
+        )
+        .unwrap();
+    backend.execute("ANALYZE").unwrap();
+
+    let activity = query_pane_last_output_at_bulk_backend(&backend, &[3, 2, 9_999]).unwrap();
+    assert_eq!(activity.get(&2), Some(&None));
+    assert_eq!(activity.get(&3), Some(&Some(8_291)));
+    assert!(!activity.contains_key(&9_999));
+    let all_activity = query_last_activity_by_pane_backend(&backend).unwrap();
+    assert_eq!(all_activity.len(), 1, "panes without output remain omitted");
+    assert_eq!(all_activity.get(&3), Some(&8_291));
+    let pane_ids_json = "[2,3,9999]";
+    let pane_plan = explain_query_plan_backend(
+        &backend,
+        QUERY_PANE_LAST_OUTPUT_AT_BULK_SQL,
+        &[ToSqlValue::Text(pane_ids_json)],
+    );
+    assert!(
+        pane_plan.contains("CORRELATED SCALAR SUBQUERY"),
+        "bulk pane activity must retain one correlated top-row lookup per pane:\n{pane_plan}"
+    );
+    assert!(
+        pane_plan.contains("idx_segments_pane_captured"),
+        "bulk pane activity must use the v35 pane/captured index:\n{pane_plan}"
+    );
+    assert!(
+        !pane_plan.contains("USE TEMP B-TREE"),
+        "bulk pane activity must not sort unordered map results:\n{pane_plan}"
+    );
+    let all_panes_plan = explain_query_plan_backend(
+        &backend,
+        QUERY_LAST_ACTIVITY_BY_PANE_SQL,
+        &[],
+    );
+    assert!(
+        all_panes_plan.contains("CORRELATED SCALAR SUBQUERY"),
+        "all-pane activity must issue one top-row lookup per pane:\n{all_panes_plan}"
+    );
+    assert!(
+        all_panes_plan.contains("idx_segments_pane_captured"),
+        "all-pane activity must use the v35 pane/captured index:\n{all_panes_plan}"
+    );
+    let single_pane_plan = explain_query_plan_backend(
+        &backend,
+        QUERY_PANE_LAST_OUTPUT_AT_SQL,
+        &[ToSqlValue::Integer(3)],
+    );
+    assert!(
+        single_pane_plan.contains("idx_segments_pane_captured"),
+        "single-pane activity polling must use the v35 pane/captured index:\n{single_pane_plan}"
+    );
 }
 
 #[test]
@@ -24890,7 +26813,17 @@ fn event_retention_flat_delete_records_exact_intervals_and_prevents_id_reuse() {
     assert_eq!(seed_retention_event_backend(&backend, 1, "info", "two", 20, None), 2);
     assert_eq!(seed_retention_event_backend(&backend, 1, "info", "three", 100, None), 3);
 
-    assert_eq!(delete_events_before_backend(&backend, 50, 1).unwrap(), 2);
+    assert_eq!(
+        delete_events_before_backend(&backend, 50, 1).unwrap(),
+        1,
+        "one writer command must execute exactly one bounded batch"
+    );
+    assert_eq!(delete_events_before_backend(&backend, 50, 1).unwrap(), 1);
+    assert_eq!(
+        delete_events_before_backend(&backend, 50, 1).unwrap(),
+        0,
+        "a short batch is the convergence signal for the async caller"
+    );
     let snapshot = event_retention_snapshot_backend(&backend).unwrap();
     assert!(snapshot.legacy_history_complete);
     assert_eq!(snapshot.generation, 2, "one generation per bounded batch");
@@ -25522,6 +27455,11 @@ fn retention_policy_sql_matches_ordered_rust_semantics_and_literal_prefixes() {
         event_types: vec!["rate%".to_string()],
         handled: None,
     };
+    let compiled = compile_retention_policy_tiers(&[
+        keep_warning.clone(),
+        literal_prefix.clone(),
+    ])
+    .unwrap();
     assert_eq!(
         count_events_by_retention_rule_backend(
             &backend,
@@ -25534,6 +27472,11 @@ fn retention_policy_sql_matches_ordered_rust_semantics_and_literal_prefixes() {
         "earlier case-insensitive severity rule protects the literal-prefix match"
     );
     assert_eq!(
+        count_events_by_compiled_retention_branch_backend(&backend, 100, &compiled, 1).unwrap(),
+        0,
+        "compiled branch classification must preserve first-match exclusion"
+    );
+    assert_eq!(
         count_events_by_retention_rule_backend(
             &backend,
             100,
@@ -25543,6 +27486,162 @@ fn retention_policy_sql_matches_ordered_rust_semantics_and_literal_prefixes() {
         .unwrap(),
         2,
         "wildcard-looking prefix is literal and unmatched rows reach fallback"
+    );
+    assert_eq!(
+        count_events_by_compiled_retention_branch_backend(
+            &backend,
+            100,
+            &compiled,
+            compiled.fallback_branch_index(),
+        )
+        .unwrap(),
+        2,
+        "compiled fallback must preserve byte-exact prefix semantics"
+    );
+    assert_eq!(
+        compiled.sql_execution_count(),
+        2,
+        "both SQL executions must reuse one compiled classifier"
+    );
+}
+
+#[test]
+fn retention_policy_sql_prefix_matches_rust_for_multibyte_and_embedded_nul() {
+    let backend = memory_backend();
+    seed_pane_backend(&backend, 1, 1);
+    let prefix = "π\0fatal.";
+    let matching_event_type = "π\0fatal.crash";
+    let nonmatching_event_type = "π\0warning.crash";
+    assert!(matching_event_type.starts_with(prefix));
+    assert!(!nonmatching_event_type.starts_with(prefix));
+
+    seed_retention_event_backend(&backend, 1, "info", matching_event_type, 10, None);
+    seed_retention_event_backend(&backend, 1, "info", nonmatching_event_type, 10, None);
+    let tier = RetentionTier {
+        name: "nul-safe-prefix".to_string(),
+        retention_days: 1,
+        severities: vec![],
+        event_types: vec![prefix.to_string()],
+        handled: None,
+    };
+    let compiled = compile_retention_policy_tiers(std::slice::from_ref(&tier)).unwrap();
+
+    assert_eq!(
+        count_events_by_retention_rule_backend(&backend, 100, Some(&tier), &[]).unwrap(),
+        1,
+        "legacy SQL predicate must match Rust's multibyte embedded-NUL prefix semantics"
+    );
+    assert_eq!(
+        count_events_by_compiled_retention_branch_backend(&backend, 100, &compiled, 0).unwrap(),
+        1,
+        "compiled SQL predicate must match Rust's multibyte embedded-NUL prefix semantics"
+    );
+    assert_eq!(
+        count_events_by_compiled_retention_branch_backend(
+            &backend,
+            100,
+            &compiled,
+            compiled.fallback_branch_index(),
+        )
+        .unwrap(),
+        1,
+        "the nonmatching embedded-NUL event must reach the fallback partition"
+    );
+}
+
+#[test]
+fn compiled_retention_policy_counts_and_drains_all_branches_in_one_scan() {
+    let backend = memory_backend();
+    seed_pane_backend(&backend, 1, 1);
+    let policy = compile_retention_policy_tiers(&[
+        RetentionTier {
+            name: "keep-critical".to_string(),
+            retention_days: 0,
+            severities: vec!["critical".to_string()],
+            event_types: Vec::new(),
+            handled: None,
+        },
+        RetentionTier {
+            name: "expire-info".to_string(),
+            retention_days: 1,
+            severities: vec!["info".to_string()],
+            event_types: Vec::new(),
+            handled: None,
+        },
+    ])
+    .expect("compile all-branch retention policy");
+    let cutoffs = [None, Some(500), Some(100)];
+
+    seed_retention_event_backend(&backend, 1, "critical", "critical-old", 10, None);
+    seed_retention_event_backend(&backend, 1, "info", "info-old", 10, None);
+    seed_retention_event_backend(&backend, 1, "info", "info-new", 600, None);
+    seed_retention_event_backend(&backend, 1, "warning", "fallback-old", 50, None);
+    seed_retention_event_backend(&backend, 1, "warning", "fallback-new", 200, None);
+    let leased = seed_retention_event_backend(&backend, 1, "info", "leased-old", 10, None);
+    execute_typed(
+        &backend,
+        "UPDATE events SET delivery_lease_token = 'active-lease' WHERE id = ?1",
+        &[ToSqlValue::Integer(leased)],
+    )
+    .expect("lease one otherwise-eligible event");
+
+    let counts = count_events_by_compiled_retention_policy_backend(
+        &backend,
+        &policy,
+        &cutoffs,
+    )
+    .expect("count all eligible retention branches");
+    assert_eq!(counts, vec![0, 1, 1]);
+
+    let count_params = compiled_retention_all_branch_params(&policy, &cutoffs)
+        .expect("build all-branch count parameters");
+    let count_plan = explain_query_plan_backend(
+        &backend,
+        policy.all_branch_count_sql(),
+        &count_params,
+    );
+    assert!(
+        count_plan.contains("idx_events_detected"),
+        "classified retention count must prefilter at the newest active cutoff through the detected-at index:\n{count_plan}"
+    );
+
+    let mut candidate_params = compiled_retention_all_branch_params(&policy, &cutoffs)
+        .expect("build all-branch query parameters");
+    candidate_params.push(ToSqlValue::Integer(10));
+    let plan = explain_query_plan_backend(
+        &backend,
+        policy.all_branch_candidate_sql(),
+        &candidate_params,
+    );
+    let event_accesses = plan
+        .lines()
+        .filter(|line| line.contains("events"))
+        .count();
+    assert_eq!(
+        event_accesses,
+        1,
+        "all-branch candidate selection must scan the event stream once, not once per tier:\n{plan}"
+    );
+
+    let deleted = delete_events_by_compiled_retention_policy_backend(
+        &backend,
+        &policy,
+        &cutoffs,
+        10,
+    )
+    .expect("delete one converged all-branch batch");
+    assert_eq!(deleted.deleted_by_branch, vec![0, 1, 1]);
+    assert_eq!(deleted.total_deleted().unwrap(), 2);
+    assert_eq!(
+        count_events_by_compiled_retention_policy_backend(&backend, &policy, &cutoffs)
+            .expect("recount after all-branch delete"),
+        vec![0, 0, 0]
+    );
+    assert_eq!(count_events_backend(&backend).unwrap(), 4);
+    assert_eq!(
+        policy.sql_execution_count(),
+        3,
+        "one count, one bounded drain, and one verification count must each reuse the compiled classifier exactly once"
     );
 }
 
@@ -25607,7 +27706,7 @@ fn segment_retention_atomically_nulls_surviving_event_source_link() {
         20,
         Some(segment.id),
     );
-    assert_eq!(prune_segments_backend(&backend, 11).unwrap(), 1);
+    assert_eq!(prune_segments_backend(&backend, 11, 10).unwrap(), 1);
     assert_eq!(
         backend
             .query_scalar(&format!("SELECT segment_id FROM events WHERE id = {event_id}"))
@@ -25659,6 +27758,33 @@ fn event_retention_batch_bound_handles_extreme_requested_size() {
         0,
         "an empty bounded batch must not manufacture a retention generation"
     );
+}
+
+#[test]
+fn bounded_writer_batch_accounting_rejects_protocol_and_counter_overflow() {
+    assert_eq!(bounded_segment_retention_batch_size(0), 0);
+    assert_eq!(
+        bounded_segment_retention_batch_size(usize::MAX),
+        SEGMENT_RETENTION_DELETE_BATCH_MAX
+    );
+    assert_eq!(prune_segments_backend(&memory_backend(), i64::MAX, 0).unwrap(), 0);
+    assert_eq!(
+        accumulate_bounded_writer_batch(7, 2, 3, "test retention batch").unwrap(),
+        (9, true),
+        "a short batch is the convergence signal"
+    );
+    assert_eq!(
+        accumulate_bounded_writer_batch(7, 3, 3, "test retention batch").unwrap(),
+        (10, false),
+        "a full batch must be re-enqueued"
+    );
+    let over_report =
+        accumulate_bounded_writer_batch(0, 4, 3, "test retention batch").unwrap_err();
+    assert!(over_report.to_string().contains("returned 4 rows"));
+    assert!(over_report.to_string().contains("bounded at 3"));
+    let overflow =
+        accumulate_bounded_writer_batch(usize::MAX, 1, 3, "test retention batch").unwrap_err();
+    assert!(overflow.to_string().contains("deleted-row count overflow"));
 }
 
 /// Exactness guard for the segment-write hot path: `append_segment_backend`
@@ -26812,6 +28938,640 @@ where
     }
 }
 
+#[test]
+fn v35_performance_campaign_event_retention_writer_yields_and_public_calls_converge() {
+    run_storage_async_test(async {
+        async fn record_fixture_event(
+            storage: &StorageHandle,
+            severity: &str,
+            event_type: &str,
+            detected_at: i64,
+        ) -> i64 {
+            storage
+                .record_event(StoredEvent {
+                    id: 0,
+                    pane_id: 1,
+                    rule_id: format!("retention.{event_type}"),
+                    agent_type: "test".to_string(),
+                    event_type: event_type.to_string(),
+                    severity: severity.to_string(),
+                    confidence: 1.0,
+                    extracted: None,
+                    matched_text: Some(format!("{event_type}-{detected_at}")),
+                    segment_id: None,
+                    detected_at,
+                    dedupe_key: None,
+                    handled_at: None,
+                    handled_by_workflow_id: None,
+                    handled_status: None,
+                })
+                .await
+                .expect("record retention fixture event")
+        }
+
+        let temp_dir = tempfile::tempdir().expect("retention temp directory");
+        let db_path = temp_dir.path().join("bounded-event-retention.db");
+        let db_path_string = db_path.to_string_lossy().to_string();
+        let storage = StorageHandle::new(&db_path_string)
+            .await
+            .expect("open retention storage");
+        storage
+            .upsert_pane(PaneRecord {
+                pane_id: 1,
+                pane_uuid: None,
+                domain: "local".to_string(),
+                window_id: None,
+                tab_id: None,
+                title: Some("retention source".to_string()),
+                cwd: None,
+                tty_name: None,
+                first_seen_at: 1,
+                last_seen_at: 1,
+                observed: true,
+                ignore_reason: None,
+                last_decision_at: None,
+            })
+            .await
+            .expect("seed source pane");
+
+        for detected_at in 10..13 {
+            record_fixture_event(&storage, "warning", "tier.delete", detected_at).await;
+        }
+        assert_eq!(
+            storage
+                .delete_events_by_tier(
+                    100,
+                    &["warning".to_string()],
+                    &[],
+                    None,
+                    1,
+                )
+                .await
+                .expect("converge tier deletion"),
+            3,
+            "the public tier API must accumulate all bounded batches"
+        );
+
+        for detected_at in 20..23 {
+            record_fixture_event(&storage, "info", "ordered.delete", detected_at).await;
+        }
+        let ordered_tier = RetentionTier {
+            name: "ordered-delete".to_string(),
+            retention_days: 1,
+            severities: Vec::new(),
+            event_types: vec!["ordered.".to_string()],
+            handled: None,
+        };
+        assert_eq!(
+            storage
+                .delete_events_by_retention_rule(100, Some(&ordered_tier), &[], 1)
+                .await
+                .expect("converge ordered-rule deletion"),
+            3,
+            "the public first-match API must accumulate all bounded batches"
+        );
+        record_fixture_event(&storage, "info", "keep", 500).await;
+
+        for detected_at in 30..33 {
+            record_fixture_event(&storage, "info", "flat.delete", detected_at).await;
+        }
+        let baseline = storage
+            .get_event_retention_snapshot()
+            .await
+            .expect("read pre-interleave retention generation");
+        assert_eq!(baseline.generation, 6);
+
+        // Hold SQLite's writer lock while two commands enter the channel in a
+        // known FIFO order. The pane trigger succeeds only if the first event
+        // command commits exactly one row/generation before the unrelated
+        // latency-sensitive write runs. A writer-side loop would instead
+        // consume all three rows and make this upsert fail closed.
+        let connection = rusqlite::Connection::open(&db_path).expect("open lock connection");
+        connection
+            .execute_batch(&format!(
+                "CREATE TRIGGER assert_retention_writer_yield
+                 BEFORE INSERT ON panes
+                 WHEN NEW.pane_id = 2
+                  AND (SELECT generation FROM event_retention_state WHERE singleton = 1) != {}
+                 BEGIN
+                     SELECT RAISE(ABORT, 'retention writer monopolized FIFO');
+                 END;",
+                baseline.generation + 1
+            ))
+            .expect("install FIFO assertion trigger");
+        connection
+            .execute_batch("BEGIN IMMEDIATE")
+            .expect("hold writer lock");
+
+        let cx = crate::cx::for_testing();
+        let (delete_tx, delete_rx) = oneshot::channel();
+        storage
+            .write_tx
+            .send_with_cx(
+                &cx,
+                WriteCommand::DeleteEventsBefore {
+                    before_ts: 100,
+                    batch_size: 1,
+                    respond: delete_tx,
+                },
+            )
+            .await
+            .expect("enqueue one retention batch");
+        let (pane_tx, pane_rx) = oneshot::channel();
+        storage
+            .write_tx
+            .send_with_cx(
+                &cx,
+                WriteCommand::UpsertPane {
+                    pane: PaneRecord {
+                        pane_id: 2,
+                        pane_uuid: None,
+                        domain: "local".to_string(),
+                        window_id: None,
+                        tab_id: None,
+                        title: Some("latency-sensitive follower".to_string()),
+                        cwd: None,
+                        tty_name: None,
+                        first_seen_at: 2,
+                        last_seen_at: 2,
+                        observed: true,
+                        ignore_reason: None,
+                        last_decision_at: None,
+                    },
+                    respond: pane_tx,
+                },
+            )
+            .await
+            .expect("enqueue unrelated writer command");
+        connection
+            .execute_batch("COMMIT")
+            .expect("release writer lock");
+
+        assert_eq!(
+            StorageHandle::recv_writer_response(delete_rx)
+                .await
+                .expect("receive bounded retention result"),
+            1
+        );
+        StorageHandle::recv_writer_response(pane_rx)
+            .await
+            .expect("unrelated write must run after one batch");
+        assert!(storage.get_pane(2).await.expect("read follower pane").is_some());
+        assert_eq!(
+            storage
+                .delete_events_before(100, 1)
+                .await
+                .expect("converge remaining flat batches"),
+            2
+        );
+
+        record_fixture_event(&storage, "info", "cancelled.delete", 40).await;
+        let count_before_cancel = storage.count_events().await.expect("pre-cancel event count");
+        let cancelled_cx = crate::cx::for_testing();
+        cancelled_cx.cancel_with(
+            crate::outcome::CancelKind::User,
+            Some("pre-cancel bounded event retention"),
+        );
+        let cancelled = storage
+            .delete_events_before_with_cx(&cancelled_cx, 100, 1)
+            .await
+            .expect_err("pre-cancelled retention must not enqueue");
+        assert!(matches!(cancelled, crate::Error::Cancelled(_)));
+        assert_eq!(
+            storage.count_events().await.expect("post-cancel event count"),
+            count_before_cancel,
+            "a pre-cancelled call must not delete its first batch"
+        );
+        assert_eq!(
+            storage
+                .delete_events_before(100, 0)
+                .await
+                .expect("zero-sized retention is a no-op"),
+            0
+        );
+        assert_eq!(
+            storage
+                .delete_events_before(100, 1)
+                .await
+                .expect("delete post-cancel fixture"),
+            1
+        );
+        assert_eq!(storage.count_events().await.expect("final event count"), 1);
+
+        storage.shutdown().await.expect("shutdown retention storage");
+    });
+}
+
+#[test]
+fn v35_performance_campaign_segment_retention_writer_yields_and_preserves_fts() {
+    run_storage_async_test(async {
+        let temp_dir = tempfile::tempdir().expect("segment retention temp directory");
+        let db_path = temp_dir.path().join("bounded-segment-retention.db");
+        let db_path_string = db_path.to_string_lossy().to_string();
+        let storage = StorageHandle::with_config(
+            &db_path_string,
+            StorageConfig {
+                defer_fts_triggers: true,
+                ..StorageConfig::default()
+            },
+        )
+        .await
+        .expect("open deferred-FTS storage");
+        storage
+            .upsert_pane(PaneRecord {
+                pane_id: 1,
+                pane_uuid: None,
+                domain: "local".to_string(),
+                window_id: None,
+                tab_id: None,
+                title: Some("segment retention source".to_string()),
+                cwd: None,
+                tty_name: None,
+                first_seen_at: 1,
+                last_seen_at: 1,
+                observed: true,
+                ignore_reason: None,
+                last_decision_at: None,
+            })
+            .await
+            .expect("seed segment source pane");
+        storage
+            .upsert_pane(PaneRecord {
+                pane_id: 3,
+                pane_uuid: None,
+                domain: "local".to_string(),
+                window_id: None,
+                tab_id: None,
+                title: Some("unrelated FTS progress sentinel".to_string()),
+                cwd: None,
+                tty_name: None,
+                first_seen_at: 3,
+                last_seen_at: 3,
+                observed: true,
+                ignore_reason: None,
+                last_decision_at: None,
+            })
+            .await
+            .expect("seed unrelated progress pane");
+
+        let segment_count = SEGMENT_RETENTION_DELETE_BATCH_MAX * 2 + 1;
+        let last_seq = i64::try_from(segment_count - 1).expect("segment sequence fits i64");
+        let connection = rusqlite::Connection::open(&db_path).expect("open segment seed database");
+        connection
+            .execute_batch("PRAGMA foreign_keys = ON")
+            .expect("enable seed foreign keys");
+        connection
+            .execute(
+                "WITH RECURSIVE segment_seqs(seq) AS (
+                     VALUES(0)
+                     UNION ALL
+                     SELECT seq + 1 FROM segment_seqs WHERE seq < ?1
+                 )
+                 INSERT INTO output_segments (
+                     pane_id, seq, content, content_len, captured_at
+                 )
+                 SELECT 1, seq, 'retentionstaletoken bounded-old-' || seq,
+                        length('retentionstaletoken bounded-old-' || seq), 100 + seq
+                 FROM segment_seqs
+                 ORDER BY seq ASC",
+                [last_seq],
+            )
+            .expect("seed more than two segment-retention batches");
+        connection
+            .execute(
+                "INSERT INTO fts_pane_progress (
+                     pane_id, last_indexed_seq, indexed_count, last_indexed_at
+                 ) VALUES (3, 99, 100, 5000)",
+                [],
+            )
+            .expect("seed unrelated stranded FTS progress sentinel");
+        connection
+            .execute_batch(&format!(
+                "INSERT INTO events (
+                     id, pane_id, rule_id, agent_type, event_type, severity,
+                     confidence, segment_id, detected_at
+                 ) VALUES
+                     (1, 1, 'segment.first', 'test', 'segment', 'info', 1.0, 1, 6000),
+                     (2, 1, 'segment.middle', 'test', 'segment', 'info', 1.0, {}, 6001),
+                     (3, 1, 'segment.last', 'test', 'segment', 'info', 1.0, {}, 6002);",
+                SEGMENT_RETENTION_DELETE_BATCH_MAX + 1,
+                segment_count
+            ))
+            .expect("seed exact event provenance links");
+        storage
+            .sync_fts(FtsSyncConfig::default())
+            .await
+            .expect("index the pre-prune deferred segment chain");
+        assert!(
+            !storage
+                .search("retentionstaletoken")
+                .await
+                .expect("search pre-prune unique term")
+                .is_empty(),
+            "the regression must begin with searchable pre-prune postings"
+        );
+        let indexed_rows: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM output_segments_fts_docsize",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count exact pre-prune FTS row ledger");
+        assert_eq!(
+            usize::try_from(indexed_rows).expect("nonnegative FTS ledger row count"),
+            segment_count
+        );
+
+        let count_before_cancel = storage
+            .count_segments_before(i64::MAX)
+            .await
+            .expect("pre-cancel segment count");
+        let cancelled_cx = crate::cx::for_testing();
+        cancelled_cx.cancel_with(
+            crate::outcome::CancelKind::User,
+            Some("pre-cancel bounded segment retention"),
+        );
+        let cancelled = storage
+            .prune_segments_before_with_cx(&cancelled_cx, i64::MAX)
+            .await
+            .expect_err("pre-cancelled segment retention must not enqueue");
+        assert!(matches!(cancelled, crate::Error::Cancelled(_)));
+        assert_eq!(
+            storage
+                .count_segments_before(i64::MAX)
+                .await
+                .expect("post-cancel segment count"),
+            count_before_cancel
+        );
+
+        // The trigger validates both FIFO fairness and the exact candidate-set
+        // provenance update. Only segment 1 may be gone when the unrelated
+        // pane write runs; links to every surviving segment must remain.
+        connection
+            .execute_batch(&format!(
+                "CREATE TRIGGER assert_segment_retention_yield
+                 BEFORE INSERT ON panes
+                 WHEN NEW.pane_id = 2
+                  AND (
+                       (SELECT COUNT(*) FROM output_segments) != {}
+                       OR (SELECT segment_id FROM events WHERE id = 1) IS NOT NULL
+                       OR (SELECT segment_id FROM events WHERE id = 2) IS NOT {}
+                       OR (SELECT segment_id FROM events WHERE id = 3) IS NOT {}
+                       OR NOT EXISTS (
+                           SELECT 1 FROM fts_pane_progress
+                           WHERE pane_id = 1 AND last_indexed_seq = {}
+                       )
+                  )
+                 BEGIN
+                     SELECT RAISE(ABORT, 'segment retention monopolized FIFO or detached survivors');
+                 END;",
+                segment_count - 1,
+                SEGMENT_RETENTION_DELETE_BATCH_MAX + 1,
+                segment_count,
+                last_seq
+            ))
+            .expect("install segment FIFO assertion trigger");
+        connection
+            .execute_batch("BEGIN IMMEDIATE")
+            .expect("hold segment writer lock");
+
+        let cx = crate::cx::for_testing();
+        let (prune_tx, prune_rx) = oneshot::channel();
+        storage
+            .write_tx
+            .send_with_cx(
+                &cx,
+                WriteCommand::PruneSegments {
+                    before_ts: i64::MAX,
+                    batch_size: 1,
+                    respond: prune_tx,
+                },
+            )
+            .await
+            .expect("enqueue one segment batch");
+        let (pane_tx, pane_rx) = oneshot::channel();
+        storage
+            .write_tx
+            .send_with_cx(
+                &cx,
+                WriteCommand::UpsertPane {
+                    pane: PaneRecord {
+                        pane_id: 2,
+                        pane_uuid: None,
+                        domain: "local".to_string(),
+                        window_id: None,
+                        tab_id: None,
+                        title: Some("segment latency follower".to_string()),
+                        cwd: None,
+                        tty_name: None,
+                        first_seen_at: 2,
+                        last_seen_at: 2,
+                        observed: true,
+                        ignore_reason: None,
+                        last_decision_at: None,
+                    },
+                    respond: pane_tx,
+                },
+            )
+            .await
+            .expect("enqueue segment follower write");
+        connection
+            .execute_batch("COMMIT")
+            .expect("release segment writer lock");
+
+        assert_eq!(
+            StorageHandle::recv_writer_response(prune_rx)
+                .await
+                .expect("receive one-segment batch"),
+            1
+        );
+        StorageHandle::recv_writer_response(pane_rx)
+            .await
+            .expect("follower write runs after one segment batch");
+        assert_eq!(
+            storage
+                .prune_segments_before(i64::MAX)
+                .await
+                .expect("converge two remaining full segment batches"),
+            segment_count - 1
+        );
+
+        let remaining_segments: i64 = connection
+            .query_row("SELECT COUNT(*) FROM output_segments", [], |row| row.get(0))
+            .expect("count remaining segments");
+        assert_eq!(remaining_segments, 0);
+        let attached_events: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE segment_id IS NOT NULL",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count surviving event links");
+        assert_eq!(attached_events, 0);
+        let progress_rows: i64 = connection
+            .query_row("SELECT COUNT(*) FROM fts_pane_progress", [], |row| row.get(0))
+            .expect("count stranded progress rows");
+        assert_eq!(
+            progress_rows, 1,
+            "retention must rewind only affected panes, not scan/delete unrelated progress"
+        );
+        let unrelated_progress: i64 = connection
+            .query_row(
+                "SELECT last_indexed_seq FROM fts_pane_progress WHERE pane_id = 3",
+                [],
+                |row| row.get(0),
+            )
+            .expect("unrelated progress sentinel must survive");
+        assert_eq!(unrelated_progress, 99);
+
+        let reset_segment = storage
+            .append_segment(1, "bounded postreset freshindextoken searchable", None)
+            .await
+            .expect("append reset-chain segment");
+        assert_eq!(
+            reset_segment.id, 1,
+            "a fully pruned INTEGER PRIMARY KEY table reuses rowid 1; stale FTS postings must already be gone"
+        );
+        assert_eq!(reset_segment.seq, 0);
+        storage
+            .sync_fts(FtsSyncConfig::default())
+            .await
+            .expect("incrementally sync reset chain");
+        let hits = storage
+            .search("postreset")
+            .await
+            .expect("search reset-chain segment");
+        assert!(
+            hits.iter().any(|segment| segment.id == reset_segment.id),
+            "rewound progress must allow the reset seq=0 row into FTS"
+        );
+        assert!(
+            storage
+                .search("retentionstaletoken")
+                .await
+                .expect("search deleted unique term")
+                .is_empty(),
+            "exact deferred-FTS delete commands must prevent stale terms after rowid reuse"
+        );
+        let fresh_hits = storage
+            .search("freshindextoken")
+            .await
+            .expect("search replacement row term");
+        assert_eq!(fresh_hits.len(), 1);
+        assert_eq!(fresh_hits[0].id, reset_segment.id);
+        connection
+            .execute_batch(
+                "INSERT INTO output_segments_fts(output_segments_fts) VALUES('integrity-check')",
+            )
+            .expect("exact deferred deletes must preserve FTS5 integrity");
+
+        storage.shutdown().await.expect("shutdown segment storage");
+    });
+}
+
+#[test]
+fn v35_fts_version_upgrade_repairs_historical_stale_rowid_postings() {
+    run_storage_async_test(async {
+        let temp_dir = tempfile::tempdir().expect("historical FTS repair tempdir");
+        let db_path = temp_dir.path().join("historical-stale-rowid.db");
+        let db_path_string = db_path.to_string_lossy().to_string();
+        let deferred_config = StorageConfig {
+            defer_fts_triggers: true,
+            ..StorageConfig::default()
+        };
+
+        let storage = StorageHandle::with_config(&db_path_string, deferred_config.clone())
+            .await
+            .expect("open historical fixture storage");
+        storage
+            .upsert_pane(PaneRecord {
+                pane_id: 91,
+                pane_uuid: None,
+                domain: "local".to_string(),
+                window_id: None,
+                tab_id: None,
+                title: Some("historical FTS repair".to_string()),
+                cwd: None,
+                tty_name: None,
+                first_seen_at: 91,
+                last_seen_at: 91,
+                observed: true,
+                ignore_reason: None,
+                last_decision_at: None,
+            })
+            .await
+            .expect("seed historical repair pane");
+        let old_segment = storage
+            .append_segment(91, "historicalstalepostingtoken", None)
+            .await
+            .expect("append historical old row");
+        storage
+            .sync_fts(FtsSyncConfig::default())
+            .await
+            .expect("index historical old row");
+        storage.shutdown().await.expect("close historical fixture");
+
+        // Reproduce the state an affected old build could persist: the base
+        // row is removed without an FTS delete, INTEGER PRIMARY KEY rowid is
+        // reused for different content, and the legacy index-version marker
+        // still claims the stale posting set is authoritative.
+        let connection = rusqlite::Connection::open(&db_path).expect("open historical corrupter");
+        connection
+            .execute("DELETE FROM output_segments WHERE id = ?1", [old_segment.id])
+            .expect("simulate historical base-row-only prune");
+        connection
+            .execute(
+                "INSERT INTO output_segments (
+                     id, pane_id, seq, content, content_len, captured_at
+                 ) VALUES (?1, 91, 0, 'historicalfreshpostingtoken',
+                           length('historicalfreshpostingtoken'), 999)",
+                [old_segment.id],
+            )
+            .expect("reuse historical rowid with different content");
+        connection
+            .execute(
+                "UPDATE fts_index_state SET index_version = ?1 WHERE id = 1",
+                [i64::from(FTS_INDEX_VERSION - 1)],
+            )
+            .expect("restore legacy FTS index version marker");
+        let stale_hits: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM output_segments_fts
+                 WHERE output_segments_fts MATCH 'historicalstalepostingtoken'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("confirm historical stale posting exists");
+        assert_eq!(stale_hits, 1);
+        drop(connection);
+
+        let repaired = StorageHandle::with_config(&db_path_string, deferred_config)
+            .await
+            .expect("version mismatch must rebuild before opening storage");
+        assert!(
+            repaired
+                .search("historicalstalepostingtoken")
+                .await
+                .expect("search repaired stale token")
+                .is_empty(),
+            "one-time version repair must remove historical stale terms"
+        );
+        let fresh_hits = repaired
+            .search("historicalfreshpostingtoken")
+            .await
+            .expect("search rebuilt current term");
+        assert_eq!(fresh_hits.len(), 1);
+        assert_eq!(fresh_hits[0].id, old_segment.id);
+        let state = repaired
+            .get_fts_index_state()
+            .await
+            .expect("read repaired FTS state")
+            .expect("repaired FTS state row");
+        assert_eq!(state.index_version, FTS_INDEX_VERSION);
+        repaired.shutdown().await.expect("shutdown repaired storage");
+    });
+}
+
 /// [ft-iq339 / ft-3tvvt] Multi-thread sibling of
 /// [`run_storage_async_test`] for proptest cases that need the
 /// multi-thread runtime (writer + reader concurrency under
@@ -26934,6 +29694,75 @@ fn storage_writer_queue_size_reaches_handle() {
 /// enforce it, and assert the oldest segments are evicted and the live size
 /// shrinks — while `max_mb == 0` and an over-cap value stay no-ops.
 #[test]
+fn size_eviction_estimator_samples_bounded_oldest_rows_via_index() {
+    let backend = memory_backend();
+    seed_pane_backend(&backend, 1, 1);
+    backend
+        .execute(
+            "WITH RECURSIVE sequence(seq) AS (
+                 VALUES(0) UNION ALL SELECT seq + 1 FROM sequence WHERE seq < 299
+             )
+             INSERT INTO output_segments (pane_id, seq, content, content_len, captured_at)
+             SELECT 1, seq, 'sample-' || seq, length('sample-' || seq), seq
+             FROM sequence ORDER BY seq ASC",
+        )
+        .expect("seed more rows than the bounded estimator sample");
+
+    let sample = oldest_segment_eviction_sample_backend(&backend)
+        .expect("sample oldest size-eviction rows");
+    assert_eq!(sample.sampled_rows, SIZE_EVICTION_BATCH);
+    assert!(!sample.contains_every_segment);
+    let plan = explain_query_plan_backend(
+        &backend,
+        OLDEST_SEGMENT_EVICTION_SAMPLE_SQL,
+        &[ToSqlValue::Integer(
+            i64::try_from(SIZE_EVICTION_SAMPLE_PROBE_ROWS).unwrap(),
+        )],
+    );
+    assert!(
+        plan.contains("idx_segments_captured"),
+        "bounded oldest-segment sample must use the captured-at index:\n{plan}"
+    );
+    assert!(
+        !plan.contains("USE TEMP B-TREE FOR ORDER BY"),
+        "bounded oldest-segment sample must not sort full history:\n{plan}"
+    );
+}
+
+#[test]
+fn size_eviction_preserves_segments_when_unrelated_data_obviously_dominates_cap() {
+    let backend = memory_backend();
+    seed_pane_backend(&backend, 1, 1);
+    backend
+        .execute(
+            "WITH RECURSIVE sequence(seq) AS (
+                 VALUES(0) UNION ALL SELECT seq + 1 FROM sequence WHERE seq < 9
+             )
+             INSERT INTO output_segments (pane_id, seq, content, content_len, captured_at)
+             SELECT 1, seq, 'tiny', 4, seq FROM sequence ORDER BY seq ASC",
+        )
+        .expect("seed tiny segment history");
+    backend
+        .execute(
+            "INSERT INTO maintenance_log (event_type, message, metadata, timestamp)
+             VALUES ('large-unrelated-fixture', NULL, hex(zeroblob(4194304)), 1)",
+        )
+        .expect("seed large unrelated storage payload");
+
+    let before = count_segments_before_backend(&backend, i64::MAX)
+        .expect("count tiny segments before size enforcement");
+    let outcome = enforce_size_limit_backend(&backend, 1)
+        .expect("evaluate non-segment-dominated size cap");
+    let after = count_segments_before_backend(&backend, i64::MAX)
+        .expect("count tiny segments after size enforcement");
+    assert_eq!(before, 10);
+    assert_eq!(after, before, "unattainable cap must preserve segment history");
+    assert_eq!(outcome.deleted_segments, 0);
+    assert!(outcome.over_limit_after);
+    assert_eq!(outcome.used_bytes_after, outcome.used_bytes_before);
+}
+
+#[test]
 fn enforce_size_limit_evicts_oldest_segments_under_cap() {
     run_storage_async_test(async {
         let temp_dir = tempfile::tempdir().expect("tempdir");
@@ -26941,10 +29770,16 @@ fn enforce_size_limit_evicts_oldest_segments_under_cap() {
         let db_path_str = db_path.to_string_lossy().to_string();
 
         let cx = crate::cx::for_testing();
-        let storage =
-            StorageHandle::with_config_with_cx(&cx, &db_path_str, StorageConfig::default())
-                .await
-                .unwrap();
+        let storage = StorageHandle::with_config_with_cx(
+            &cx,
+            &db_path_str,
+            StorageConfig {
+                defer_fts_triggers: true,
+                ..StorageConfig::default()
+            },
+        )
+        .await
+        .unwrap();
 
         // Segments carry a foreign key to their pane row; register the pane
         // before appending (matches the live capture path).
@@ -26972,11 +29807,26 @@ fn enforce_size_limit_evicts_oldest_segments_under_cap() {
         // the byte accounting deterministic. 256 x 16 KiB ~= 4 MiB of content.
         let big = "x".repeat(16 * 1024);
         for i in 0..256u64 {
+            let marker = if i == 0 {
+                "sizecapoldesttoken"
+            } else if i == 255 {
+                "sizecapnewesttoken"
+            } else {
+                "sizecapmiddletoken"
+            };
             storage
-                .append_segment(7, &format!("seg-{i}-{big}"), None)
+                .append_segment(7, &format!("{marker} seg-{i}-{big}"), None)
                 .await
                 .unwrap();
         }
+        storage
+            .sync_fts(FtsSyncConfig::default())
+            .await
+            .expect("index deferred size-cap fixture");
+        assert!(
+            !storage.search("sizecapoldesttoken").await.unwrap().is_empty(),
+            "oldest posting must exist before size eviction"
+        );
         // Move the WAL into the main file so PRAGMA page_count is stable.
         storage.checkpoint().await.unwrap();
 
@@ -27002,6 +29852,10 @@ fn enforce_size_limit_evicts_oldest_segments_under_cap() {
             outcome.used_bytes_after < outcome.used_bytes_before,
             "live database size must shrink after eviction: {outcome:?}"
         );
+        assert!(
+            !outcome.over_limit_after,
+            "segment-dominated fixture must converge below its live-page cap: {outcome:?}"
+        );
 
         // Eviction is partial (some newest segments survive) and oldest-first.
         let remaining = storage.count_segments_before(i64::MAX).await.unwrap();
@@ -27014,6 +29868,20 @@ fn enforce_size_limit_evicts_oldest_segments_under_cap() {
             !recent.is_empty(),
             "the newest segment must survive size eviction"
         );
+        assert!(
+            storage.search("sizecapoldesttoken").await.unwrap().is_empty(),
+            "deferred size eviction must remove the exact oldest FTS posting"
+        );
+        let newest_hits = storage.search("sizecapnewesttoken").await.unwrap();
+        assert_eq!(newest_hits.len(), 1, "newest FTS posting must survive");
+        assert_eq!(newest_hits[0].id, recent[0].id);
+        let integrity_connection =
+            rusqlite::Connection::open(&db_path).expect("open size-cap integrity connection");
+        integrity_connection
+            .execute_batch(
+                "INSERT INTO output_segments_fts(output_segments_fts) VALUES('integrity-check')",
+            )
+            .expect("deferred size eviction must preserve FTS5 integrity");
 
         // A pass with a cap above the current size is a no-op.
         let noop = storage.enforce_size_limit(4096).await.unwrap();
@@ -27024,6 +29892,617 @@ fn enforce_size_limit_evicts_oldest_segments_under_cap() {
 
         storage.shutdown().await.unwrap();
     });
+}
+
+#[test]
+fn durable_mutation_progress_reports_exact_prefix_for_each_retention_family() {
+    run_storage_async_test(async {
+        async fn open_fixture(
+            file_name: &str,
+        ) -> (tempfile::TempDir, std::path::PathBuf, StorageHandle) {
+            let temp_dir = tempfile::tempdir().expect("partial-progress tempdir");
+            let db_path = temp_dir.path().join(file_name);
+            let storage = StorageHandle::new(&db_path.to_string_lossy())
+                .await
+                .expect("open partial-progress storage");
+            storage
+                .upsert_pane(PaneRecord {
+                    pane_id: 1,
+                    pane_uuid: None,
+                    domain: "local".to_string(),
+                    window_id: None,
+                    tab_id: None,
+                    title: Some("partial-progress".to_string()),
+                    cwd: None,
+                    tty_name: None,
+                    first_seen_at: 1,
+                    last_seen_at: 1,
+                    observed: true,
+                    ignore_reason: None,
+                    last_decision_at: None,
+                })
+                .await
+                .expect("seed partial-progress pane");
+            (temp_dir, db_path, storage)
+        }
+
+        let (_event_dir, event_path, event_storage) = open_fixture("events.db").await;
+        let event_connection = rusqlite::Connection::open(&event_path)
+            .expect("open event partial-progress seeder");
+        event_connection
+            .execute(
+                "WITH RECURSIVE ids(id) AS (
+                     VALUES(1) UNION ALL SELECT id + 1 FROM ids WHERE id < 3
+                 )
+                 INSERT INTO events (
+                     id, pane_id, rule_id, agent_type, event_type, severity,
+                     confidence, detected_at
+                 )
+                 SELECT id, 1, 'partial-' || id, 'test', 'partial', 'info', 1.0, id
+                 FROM ids ORDER BY id ASC",
+                [],
+            )
+            .expect("seed multi-batch event retention fixture");
+        let event_cx = crate::cx::for_testing();
+        event_storage.cancel_after_next_committed_batch_for_test("delete_events_before");
+        let event_progress = event_storage
+            .delete_events_before_progress_with_cx(&event_cx, 100, 2)
+            .await;
+        match event_progress {
+            DurableMutationProgress::Interrupted { durable, error } => {
+                assert_eq!(durable, Some(2));
+                assert!(matches!(error, crate::Error::Cancelled(_)));
+            }
+            DurableMutationProgress::Complete(value) => {
+                panic!("event retention unexpectedly completed with {value} deletions")
+            }
+        }
+        assert_eq!(event_storage.count_events().await.unwrap(), 1);
+        event_storage.shutdown().await.unwrap();
+
+        let (_segment_dir, segment_path, segment_storage) = open_fixture("segments.db").await;
+        let segment_connection = rusqlite::Connection::open(&segment_path)
+            .expect("open segment partial-progress seeder");
+        let last_segment = i64::try_from(SEGMENT_RETENTION_DELETE_BATCH_MAX)
+            .expect("segment fixture bound fits i64");
+        segment_connection
+            .execute(
+                "WITH RECURSIVE seqs(seq) AS (
+                     VALUES(0) UNION ALL SELECT seq + 1 FROM seqs WHERE seq < ?1
+                 )
+                 INSERT INTO output_segments (pane_id, seq, content, content_len, captured_at)
+                 SELECT 1, seq, 'partial-segment', 15, seq FROM seqs ORDER BY seq ASC",
+                [last_segment],
+            )
+            .expect("seed multi-batch segment retention fixture");
+        let segment_cx = crate::cx::for_testing();
+        segment_storage.cancel_after_next_committed_batch_for_test("prune_segments_before");
+        let segment_progress = segment_storage
+            .prune_segments_before_progress_with_cx(&segment_cx, i64::MAX)
+            .await;
+        match segment_progress {
+            DurableMutationProgress::Interrupted { durable, error } => {
+                assert_eq!(durable, Some(SEGMENT_RETENTION_DELETE_BATCH_MAX));
+                assert!(matches!(error, crate::Error::Cancelled(_)));
+            }
+            DurableMutationProgress::Complete(value) => {
+                panic!("segment retention unexpectedly completed with {value} deletions")
+            }
+        }
+        assert_eq!(
+            segment_storage
+                .count_segments_before(i64::MAX)
+                .await
+                .unwrap(),
+            1
+        );
+        segment_storage.shutdown().await.unwrap();
+
+        let (_audit_dir, audit_path, audit_storage) = open_fixture("audit.db").await;
+        let audit_connection = rusqlite::Connection::open(&audit_path)
+            .expect("open audit partial-progress seeder");
+        let last_audit = i64::try_from(AUXILIARY_RETENTION_DELETE_BATCH_MAX + 1)
+            .expect("audit fixture bound fits i64");
+        audit_connection
+            .execute(
+                "WITH RECURSIVE ids(id) AS (
+                     VALUES(1) UNION ALL SELECT id + 1 FROM ids WHERE id < ?1
+                 )
+                 INSERT INTO audit_actions (
+                     id, ts, actor_kind, action_kind, policy_decision, result
+                 )
+                 SELECT id, id, 'test', 'test', 'allow', 'success' FROM ids",
+                [last_audit],
+            )
+            .expect("seed multi-batch auxiliary retention fixture");
+        let audit_cx = crate::cx::for_testing();
+        audit_storage
+            .cancel_after_next_committed_batch_for_test("purge_audit_actions_before");
+        let audit_progress = audit_storage
+            .purge_audit_actions_before_progress_with_cx(&audit_cx, i64::MAX)
+            .await;
+        match audit_progress {
+            DurableMutationProgress::Interrupted { durable, error } => {
+                assert_eq!(durable, Some(AUXILIARY_RETENTION_DELETE_BATCH_MAX));
+                assert!(matches!(error, crate::Error::Cancelled(_)));
+            }
+            DurableMutationProgress::Complete(value) => {
+                panic!("auxiliary retention unexpectedly completed with {value} deletions")
+            }
+        }
+        assert_eq!(
+            audit_storage
+                .count_audit_actions_before(i64::MAX)
+                .await
+                .unwrap(),
+            1
+        );
+        audit_storage.shutdown().await.unwrap();
+
+        let (_size_dir, size_path, size_storage) = open_fixture("size.db").await;
+        let size_connection = rusqlite::Connection::open(&size_path)
+            .expect("open size partial-progress seeder");
+        size_connection
+            .execute(
+                "WITH RECURSIVE seqs(seq) AS (
+                     VALUES(0) UNION ALL SELECT seq + 1 FROM seqs WHERE seq < 1023
+                 )
+                 INSERT INTO output_segments (pane_id, seq, content, content_len, captured_at)
+                 SELECT 1, seq, hex(zeroblob(4096)), 8192, seq FROM seqs ORDER BY seq ASC",
+                [],
+            )
+            .expect("seed multi-turn size retention fixture");
+        size_storage.checkpoint().await.unwrap();
+        let size_before = size_storage
+            .count_segments_before(i64::MAX)
+            .await
+            .unwrap();
+        let size_cx = crate::cx::for_testing();
+        size_storage.cancel_after_next_committed_batch_for_test("enforce_size_limit");
+        let size_progress = size_storage
+            .enforce_size_limit_progress_with_cx(&size_cx, 1)
+            .await;
+        let durable_size = match size_progress {
+            DurableMutationProgress::Interrupted { durable, error } => {
+                assert!(matches!(error, crate::Error::Cancelled(_)));
+                durable.expect("size eviction must report its first committed turn")
+            }
+            DurableMutationProgress::Complete(value) => {
+                panic!("size retention unexpectedly completed: {value:?}")
+            }
+        };
+        assert!((1..=SIZE_EVICTION_BATCH).contains(&durable_size.deleted_segments));
+        assert!(durable_size.over_limit_after);
+        let size_after = size_storage
+            .count_segments_before(i64::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            size_before - size_after,
+            durable_size.deleted_segments,
+            "size progress must exactly match the durable segment-row delta"
+        );
+        size_storage.shutdown().await.unwrap();
+    });
+}
+
+#[test]
+fn v35_performance_campaign_size_eviction_yields_between_bounded_writer_turns() {
+    run_storage_async_test(async {
+        let temp_dir = tempfile::tempdir().expect("size FIFO tempdir");
+        let db_path = temp_dir.path().join("bounded-size-eviction.db");
+        let db_path_string = db_path.to_string_lossy().to_string();
+        let storage = StorageHandle::with_config(
+            &db_path_string,
+            StorageConfig {
+                defer_fts_triggers: true,
+                ..StorageConfig::default()
+            },
+        )
+        .await
+        .expect("open bounded size-eviction storage");
+        storage
+            .upsert_pane(PaneRecord {
+                pane_id: 70,
+                pane_uuid: None,
+                domain: "local".to_string(),
+                window_id: None,
+                tab_id: None,
+                title: Some("size FIFO source".to_string()),
+                cwd: None,
+                tty_name: None,
+                first_seen_at: 70,
+                last_seen_at: 70,
+                observed: true,
+                ignore_reason: None,
+                last_decision_at: None,
+            })
+            .await
+            .expect("seed size FIFO pane");
+
+        let initial_segments = SIZE_EVICTION_BATCH + 904;
+        let last_seq = i64::try_from(initial_segments - 1).expect("fixture sequence fits i64");
+        let connection = rusqlite::Connection::open(&db_path).expect("open size FIFO seeder");
+        connection
+            .execute(
+                "WITH RECURSIVE segment_seqs(seq) AS (
+                     VALUES(0)
+                     UNION ALL
+                     SELECT seq + 1 FROM segment_seqs WHERE seq < ?1
+                 )
+                 INSERT INTO output_segments (
+                     pane_id, seq, content, content_len, captured_at
+                 )
+                 SELECT 70, seq,
+                        'bounded-size-' || seq || '-' || hex(zeroblob(256)),
+                        length('bounded-size-' || seq || '-' || hex(zeroblob(256))),
+                        100 + seq
+                 FROM segment_seqs
+                 ORDER BY seq ASC",
+                [last_seq],
+            )
+            .expect("bulk seed more than one size-eviction writer batch");
+        storage.checkpoint().await.expect("stabilize size fixture pages");
+        assert_eq!(
+            storage
+                .count_segments_before(i64::MAX)
+                .await
+                .expect("count size fixture"),
+            initial_segments
+        );
+
+        let cancelled_cx = crate::cx::for_testing();
+        cancelled_cx.cancel_with(
+            crate::outcome::CancelKind::User,
+            Some("pre-cancel bounded size eviction"),
+        );
+        let cancelled = storage
+            .enforce_size_limit_with_cx(&cancelled_cx, 1)
+            .await
+            .expect_err("pre-cancelled size eviction must not enqueue");
+        assert!(matches!(cancelled, crate::Error::Cancelled(_)));
+
+        // Hold the writer lock while the bounded eviction and a latency
+        // follower enter the FIFO in known order. The follower trigger permits
+        // one non-empty batch of at most SIZE_EVICTION_BATCH rows; an old
+        // writer-side convergence loop would delete more before yielding.
+        connection
+            .execute_batch(&format!(
+                "CREATE TRIGGER assert_size_eviction_yield
+                 BEFORE INSERT ON panes
+                 WHEN NEW.pane_id = 71
+                  AND (
+                       (SELECT COUNT(*) FROM output_segments) >= {initial_segments}
+                       OR (SELECT COUNT(*) FROM output_segments) < {}
+                  )
+                 BEGIN
+                     SELECT RAISE(ABORT, 'size eviction monopolized writer FIFO');
+                 END;",
+                initial_segments - SIZE_EVICTION_BATCH
+            ))
+            .expect("install bounded size FIFO assertion");
+        connection
+            .execute_batch("BEGIN IMMEDIATE")
+            .expect("hold size FIFO writer lock");
+        let cx = crate::cx::for_testing();
+        let (evict_tx, evict_rx) = oneshot::channel();
+        storage
+            .write_tx
+            .send_with_cx(
+                &cx,
+                WriteCommand::EnforceSizeLimit {
+                    max_mb: 1,
+                    respond: evict_tx,
+                },
+            )
+            .await
+            .expect("enqueue one bounded size-eviction turn");
+        let (pane_tx, pane_rx) = oneshot::channel();
+        storage
+            .write_tx
+            .send_with_cx(
+                &cx,
+                WriteCommand::UpsertPane {
+                    pane: PaneRecord {
+                        pane_id: 71,
+                        pane_uuid: None,
+                        domain: "local".to_string(),
+                        window_id: None,
+                        tab_id: None,
+                        title: Some("size FIFO follower".to_string()),
+                        cwd: None,
+                        tty_name: None,
+                        first_seen_at: 71,
+                        last_seen_at: 71,
+                        observed: true,
+                        ignore_reason: None,
+                        last_decision_at: None,
+                    },
+                    respond: pane_tx,
+                },
+            )
+            .await
+            .expect("enqueue size FIFO follower");
+        connection
+            .execute_batch("COMMIT")
+            .expect("release size FIFO writer lock");
+
+        let first_turn = StorageHandle::recv_writer_response(evict_rx)
+            .await
+            .expect("receive first bounded size turn");
+        assert!(
+            (1..=SIZE_EVICTION_BATCH).contains(&first_turn.deleted_segments),
+            "one writer turn must delete a non-empty bounded batch: {first_turn:?}"
+        );
+        StorageHandle::recv_writer_response(pane_rx)
+            .await
+            .expect("latency follower must run after one bounded size turn");
+
+        let continuation = storage
+            .enforce_size_limit(1)
+            .await
+            .expect("public size API must converge through FIFO re-enqueueing");
+        let remaining = storage
+            .count_segments_before(i64::MAX)
+            .await
+            .expect("count post-convergence segments");
+        assert_eq!(
+            first_turn.deleted_segments + continuation.deleted_segments,
+            initial_segments - remaining,
+            "bounded turn accounting must equal the durable row delta"
+        );
+        assert!(
+            !continuation.over_limit_after || remaining == 0,
+            "convergence may remain over cap only when no segment data remains: {continuation:?}"
+        );
+
+        storage.shutdown().await.expect("shutdown size FIFO storage");
+    });
+}
+
+async fn exercise_bounded_auxiliary_retention(table: AuxiliaryRetentionTable) {
+    let temp_dir = tempfile::tempdir().expect("auxiliary retention tempdir");
+    let db_path = temp_dir.path().join(format!("{}.db", table.operation()));
+    let db_path_string = db_path.to_string_lossy().to_string();
+    let storage = StorageHandle::new(&db_path_string)
+        .await
+        .expect("open auxiliary retention storage");
+    let mut connection = rusqlite::Connection::open(&db_path).expect("open auxiliary seeder");
+    let eligible = AUXILIARY_RETENTION_DELETE_BATCH_MAX + 2;
+    let last_id = i64::try_from(eligible).expect("fixture count fits i64");
+    let cutoff = 10_000i64;
+    let (table_name, timestamp_column, seed_sql) = match table {
+        AuxiliaryRetentionTable::AuditActions => (
+            "audit_actions",
+            "ts",
+            "WITH RECURSIVE ids(id) AS (
+                 VALUES(1) UNION ALL SELECT id + 1 FROM ids WHERE id < ?1
+             )
+             INSERT INTO audit_actions (
+                 id, ts, actor_kind, action_kind, policy_decision, result
+             )
+             SELECT id, 100 + id, 'test', 'test', 'allow', 'success' FROM ids",
+        ),
+        AuxiliaryRetentionTable::UsageMetrics => (
+            "usage_metrics",
+            "timestamp",
+            "WITH RECURSIVE ids(id) AS (
+                 VALUES(1) UNION ALL SELECT id + 1 FROM ids WHERE id < ?1
+             )
+             INSERT INTO usage_metrics (
+                 id, timestamp, metric_type, count, created_at
+             )
+             SELECT id, 100 + id, 'test', 1, 100 + id FROM ids",
+        ),
+        AuxiliaryRetentionTable::NotificationHistory => (
+            "notification_history",
+            "timestamp",
+            "WITH RECURSIVE ids(id) AS (
+                 VALUES(1) UNION ALL SELECT id + 1 FROM ids WHERE id < ?1
+             )
+             INSERT INTO notification_history (
+                 id, timestamp, channel, title, body, severity, status, created_at
+             )
+             SELECT id, 100 + id, 'test', 'title', 'body', 'info', 'sent', 100 + id
+             FROM ids",
+        ),
+    };
+    connection
+        .execute(seed_sql, [last_id])
+        .expect("seed more than one auxiliary purge batch");
+    connection
+        .execute(
+            &format!(
+                "INSERT INTO {table_name} (id, {timestamp_column}{}) VALUES (?1, ?2{})",
+                match table {
+                    AuxiliaryRetentionTable::AuditActions => {
+                        ", actor_kind, action_kind, policy_decision, result"
+                    }
+                    AuxiliaryRetentionTable::UsageMetrics => ", metric_type, count, created_at",
+                    AuxiliaryRetentionTable::NotificationHistory => {
+                        ", channel, title, body, severity, status, created_at"
+                    }
+                },
+                match table {
+                    AuxiliaryRetentionTable::AuditActions => ", 'test', 'test', 'allow', 'success'",
+                    AuxiliaryRetentionTable::UsageMetrics => ", 'test', 1, ?2",
+                    AuxiliaryRetentionTable::NotificationHistory => {
+                        ", 'test', 'title', 'body', 'info', 'sent', ?2"
+                    }
+                }
+            ),
+            rusqlite::params![last_id + 1, cutoff],
+        )
+        .expect("seed exact-cutoff boundary row");
+
+    // Zero-sized backend requests are no-ops and cannot accidentally become
+    // an unbounded SQLite LIMIT.
+    let zero_deleted = with_test_storage_backend(&mut connection, |backend| match table {
+        AuxiliaryRetentionTable::AuditActions => {
+            purge_audit_actions_backend(backend, cutoff, 0)
+        }
+        AuxiliaryRetentionTable::UsageMetrics => {
+            purge_usage_metrics_backend(backend, cutoff, 0)
+        }
+        AuxiliaryRetentionTable::NotificationHistory => {
+            purge_notification_history_backend(backend, cutoff, 0)
+        }
+    })
+    .expect("zero auxiliary batch");
+    assert_eq!(zero_deleted, 0);
+
+    connection
+        .execute_batch(&format!(
+            "CREATE TRIGGER assert_auxiliary_retention_yield
+             BEFORE INSERT ON panes
+             WHEN NEW.pane_id = 777
+              AND (SELECT COUNT(*) FROM {table_name}) != 3
+             BEGIN
+                 SELECT RAISE(ABORT, 'auxiliary purge monopolized writer FIFO');
+             END;"
+        ))
+        .expect("install auxiliary FIFO assertion");
+    connection
+        .execute_batch("BEGIN IMMEDIATE")
+        .expect("hold auxiliary writer lock");
+    let cx = crate::cx::for_testing();
+    let (purge_tx, purge_rx) = oneshot::channel();
+    let purge_command = match table {
+        AuxiliaryRetentionTable::AuditActions => WriteCommand::PurgeAuditActions {
+            before_ts: cutoff,
+            batch_size: AUXILIARY_RETENTION_DELETE_BATCH_MAX,
+            respond: purge_tx,
+        },
+        AuxiliaryRetentionTable::UsageMetrics => WriteCommand::PurgeUsageMetrics {
+            before_ts: cutoff,
+            batch_size: AUXILIARY_RETENTION_DELETE_BATCH_MAX,
+            respond: purge_tx,
+        },
+        AuxiliaryRetentionTable::NotificationHistory => {
+            WriteCommand::PurgeNotificationHistory {
+                before_ts: cutoff,
+                batch_size: AUXILIARY_RETENTION_DELETE_BATCH_MAX,
+                respond: purge_tx,
+            }
+        }
+    };
+    storage
+        .write_tx
+        .send_with_cx(&cx, purge_command)
+        .await
+        .expect("enqueue one auxiliary purge batch");
+    let (pane_tx, pane_rx) = oneshot::channel();
+    storage
+        .write_tx
+        .send_with_cx(
+            &cx,
+            WriteCommand::UpsertPane {
+                pane: PaneRecord {
+                    pane_id: 777,
+                    pane_uuid: None,
+                    domain: "local".to_string(),
+                    window_id: None,
+                    tab_id: None,
+                    title: Some("auxiliary FIFO follower".to_string()),
+                    cwd: None,
+                    tty_name: None,
+                    first_seen_at: 777,
+                    last_seen_at: 777,
+                    observed: true,
+                    ignore_reason: None,
+                    last_decision_at: None,
+                },
+                respond: pane_tx,
+            },
+        )
+        .await
+        .expect("enqueue auxiliary FIFO follower");
+    connection
+        .execute_batch("COMMIT")
+        .expect("release auxiliary writer lock");
+    assert_eq!(
+        StorageHandle::recv_writer_response(purge_rx)
+            .await
+            .expect("receive one auxiliary batch"),
+        AUXILIARY_RETENTION_DELETE_BATCH_MAX
+    );
+    StorageHandle::recv_writer_response(pane_rx)
+        .await
+        .expect("auxiliary follower runs between purge batches");
+
+    // Cancellation after a durable full batch must admit no continuation and
+    // leave the short remainder resumable.
+    let cancelled_cx = crate::cx::for_testing();
+    cancelled_cx.cancel_with(
+        crate::outcome::CancelKind::User,
+        Some("cancel auxiliary continuation"),
+    );
+    let cancelled = storage
+        .purge_auxiliary_history_with_cx(&cancelled_cx, cutoff, table)
+        .await
+        .expect_err("cancelled continuation must not enqueue");
+    assert!(matches!(cancelled, crate::Error::Cancelled(_)));
+
+    // A concurrently arriving eligible row is included by the resumed stable
+    // cutoff predicate; the exact-cutoff boundary remains untouched.
+    connection
+        .execute(
+            &format!(
+                "INSERT INTO {table_name} (id, {timestamp_column}{}) VALUES (?1, 50{})",
+                match table {
+                    AuxiliaryRetentionTable::AuditActions => {
+                        ", actor_kind, action_kind, policy_decision, result"
+                    }
+                    AuxiliaryRetentionTable::UsageMetrics => ", metric_type, count, created_at",
+                    AuxiliaryRetentionTable::NotificationHistory => {
+                        ", channel, title, body, severity, status, created_at"
+                    }
+                },
+                match table {
+                    AuxiliaryRetentionTable::AuditActions => ", 'test', 'test', 'allow', 'success'",
+                    AuxiliaryRetentionTable::UsageMetrics => ", 'test', 1, 50",
+                    AuxiliaryRetentionTable::NotificationHistory => {
+                        ", 'test', 'title', 'body', 'info', 'sent', 50"
+                    }
+                }
+            ),
+            [last_id + 2],
+        )
+        .expect("insert concurrently eligible auxiliary row");
+    let resumed = storage
+        .purge_auxiliary_history_with_cx(&crate::cx::for_testing(), cutoff, table)
+        .await
+        .expect("resume auxiliary purge");
+    assert_eq!(resumed, 3);
+    let remaining: i64 = connection
+        .query_row(&format!("SELECT COUNT(*) FROM {table_name}"), [], |row| {
+            row.get(0)
+        })
+        .expect("count auxiliary survivors");
+    assert_eq!(remaining, 1, "only the exact-cutoff boundary survives");
+
+    storage.shutdown().await.expect("shutdown auxiliary storage");
+}
+
+#[test]
+fn v35_audit_action_retention_is_bounded_and_fifo_fair() {
+    run_storage_async_test(exercise_bounded_auxiliary_retention(
+        AuxiliaryRetentionTable::AuditActions,
+    ));
+}
+
+#[test]
+fn v35_usage_metric_retention_is_bounded_and_fifo_fair() {
+    run_storage_async_test(exercise_bounded_auxiliary_retention(
+        AuxiliaryRetentionTable::UsageMetrics,
+    ));
+}
+
+#[test]
+fn v35_notification_retention_is_bounded_and_fifo_fair() {
+    run_storage_async_test(exercise_bounded_auxiliary_retention(
+        AuxiliaryRetentionTable::NotificationHistory,
+    ));
 }
 
 /// ft-y76wt: a custom `[storage] read_pool_size` must actually reach the

@@ -61,7 +61,12 @@
 /// cursor epoch and high-water mark identify the history whose deletions can be
 /// proven, while canonical inclusive intervals record every committed deletion
 /// inside the current epoch's authoritative evidence range.
-pub const SCHEMA_VERSION: i32 = 34;
+/// Bumped 34 → 35 to replace the constant-key unhandled-event index with
+/// order- and identity-specific partial indexes and add a per-pane
+/// newest-output index. These indexes bound the storage work behind large
+/// event streams and pane-activity snapshots without changing persisted
+/// records.
+pub const SCHEMA_VERSION: i32 = 35;
 
 /// [ft-ih4tm] Idempotent re-creation of the three `output_segments` FTS
 /// triggers. Called when a database is opened with
@@ -155,6 +160,8 @@ CREATE TABLE IF NOT EXISTS output_segments (
 
 CREATE INDEX IF NOT EXISTS idx_segments_pane_seq ON output_segments(pane_id, seq);
 CREATE INDEX IF NOT EXISTS idx_segments_captured ON output_segments(captured_at);
+CREATE INDEX IF NOT EXISTS idx_segments_pane_captured
+    ON output_segments(pane_id, captured_at DESC);
 CREATE INDEX IF NOT EXISTS idx_segments_zone_type ON output_segments(zone_type);
 
 -- Segment embeddings for semantic search
@@ -250,7 +257,12 @@ CREATE TABLE IF NOT EXISTS events (
 
 CREATE INDEX IF NOT EXISTS idx_events_pane ON events(pane_id);
 CREATE INDEX IF NOT EXISTS idx_events_rule ON events(rule_id);
-CREATE INDEX IF NOT EXISTS idx_events_unhandled ON events(handled_at) WHERE handled_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_events_unhandled_detected
+    ON events(detected_at DESC, id DESC) WHERE handled_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_events_unhandled_id
+    ON events(id ASC) WHERE handled_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_events_unhandled_pane
+    ON events(pane_id ASC) WHERE handled_at IS NULL;
 CREATE INDEX IF NOT EXISTS idx_events_detected ON events(detected_at);
 CREATE INDEX IF NOT EXISTS idx_events_severity ON events(severity, detected_at);
 CREATE INDEX IF NOT EXISTS idx_events_triage_state
