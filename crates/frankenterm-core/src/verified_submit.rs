@@ -1296,6 +1296,7 @@ mod tests {
                 ..base
             },
             SubmitIdempotencyRequest {
+                guarantee_level: SubmitGuaranteeLevel::Submitted,
                 append_verification_canary: true,
                 ..base
             },
@@ -1320,6 +1321,16 @@ mod tests {
                 idempotency_binding(variant).request_sha256()
             );
         }
+
+        let ineffective_write_canary = idempotency_binding(SubmitIdempotencyRequest {
+            append_verification_canary: true,
+            ..base
+        });
+        assert_eq!(
+            base_binding.request_sha256(),
+            ineffective_write_canary.request_sha256(),
+            "the canary flag must canonicalize away when the Write guarantee cannot append one"
+        );
 
         let irrelevant_wait_knobs = idempotency_binding(SubmitIdempotencyRequest {
             wait_for_regex: true,

@@ -12719,7 +12719,7 @@ fn writer_loop(
                     // Publishing before dispatch allowed a concurrent sender
                     // to observe a false clean cause when shutdown itself
                     // panicked and the epoch was subsequently poisoned. The
-                    // terminal admission mutex prevents any post-publication
+                    // terminal admission fence prevents any post-publication
                     // sender from registering after the drain's final zero.
                     terminal_state.store(WRITER_TERMINAL_CLOSED_CLEANLY, AtomicOrdering::Release);
                     close_writer_terminal_admissions(
