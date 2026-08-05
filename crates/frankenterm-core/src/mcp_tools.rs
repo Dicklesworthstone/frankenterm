@@ -3943,6 +3943,7 @@ pub(crate) const MCP_AWAIT_EVENT_TIMEOUT_SECS_MAX: u64 = 300;
 const MCP_AWAIT_EVENT_POLL_INTERVAL_MS_MIN: u64 = 10;
 const MCP_AWAIT_EVENT_POLL_INTERVAL_MS_MAX: u64 = 30_000;
 const MCP_AWAIT_EVENT_CONDITION_SET_MAX: usize = 16;
+const MCP_AWAIT_EVENT_CONDITION_MAX_BYTES: usize = 256;
 const MCP_AWAIT_EVENT_BATCH_LIMIT: usize = 500;
 const MCP_AWAIT_EVENT_BLOCKED_EVENT_MAX: usize = MCP_AWAIT_EVENT_BATCH_LIMIT;
 pub(crate) const MCP_AWAIT_EVENT_DELIVERY_FINALIZE_GRACE_SECS: u64 = 30;
@@ -4120,6 +4121,25 @@ fn parse_mcp_await_event_condition(
             "unrecognized condition `{spec}`; expected `rule:<glob>`"
         ))
     }
+}
+
+fn validate_mcp_await_event_condition_lengths(
+    any: &[String],
+    all: &[String],
+) -> std::result::Result<(), String> {
+    for (set_name, conditions) in [("any", any), ("all", all)] {
+        if let Some((index, condition)) = conditions
+            .iter()
+            .enumerate()
+            .find(|(_, condition)| condition.len() > MCP_AWAIT_EVENT_CONDITION_MAX_BYTES)
+        {
+            return Err(format!(
+                "{set_name}[{index}] is {} bytes; each condition may contain at most {MCP_AWAIT_EVENT_CONDITION_MAX_BYTES} bytes",
+                condition.len()
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn mcp_await_event_condition_matches(
@@ -4485,14 +4505,14 @@ impl ToolHandler for WaAwaitEventTool {
                 "properties": {
                     "any": {
                         "type": "array",
-                        "items": { "type": "string", "minLength": 1, "maxLength": 256 },
+                        "items": { "type": "string", "minLength": 1, "maxLength": MCP_AWAIT_EVENT_CONDITION_MAX_BYTES },
                         "default": [],
                         "maxItems": MCP_AWAIT_EVENT_CONDITION_SET_MAX,
                         "description": "At least one condition in this set must match; supported condition: rule:<glob>"
                     },
                     "all": {
                         "type": "array",
-                        "items": { "type": "string", "minLength": 1, "maxLength": 256 },
+                        "items": { "type": "string", "minLength": 1, "maxLength": MCP_AWAIT_EVENT_CONDITION_MAX_BYTES },
                         "default": [],
                         "maxItems": MCP_AWAIT_EVENT_CONDITION_SET_MAX,
                         "description": "Every condition in this set must match; supported condition: rule:<glob>"
@@ -4586,6 +4606,19 @@ impl ToolHandler for WaAwaitEventTool {
                 Some(
                     "Split larger condition sets across multiple wa.await_event requests."
                         .to_string(),
+                ),
+                elapsed_ms(start),
+            );
+            return envelope_to_content(envelope);
+        }
+        if let Err(message) =
+            validate_mcp_await_event_condition_lengths(&params.any, &params.all)
+        {
+            let envelope = McpEnvelope::<()>::error(
+                MCP_ERR_INVALID_ARGS,
+                message,
+                Some(
+                    "Shorten each rule condition before retrying wa.await_event.".to_string(),
                 ),
                 elapsed_ms(start),
             );
@@ -10856,6 +10889,36 @@ mod tests {
                 .as_str()
                 .is_some_and(|message| message.contains("at most 16")),
             "server-side bound must remain explicit: {envelope}"
+        );
+    }
+
+    #[test]
+    fn await_event_enforces_condition_byte_bounds_without_relying_on_client_schema_validation() {
+        let (_dir, db_path) = temp_db_path();
+        let tool = WaAwaitEventTool::new(Arc::clone(&db_path));
+        let oversized_condition = format!(
+            "rule:{}",
+            "x".repeat(super::MCP_AWAIT_EVENT_CONDITION_MAX_BYTES)
+        );
+
+        let envelope = parse_json_content(
+            tool.call(
+                &test_mcp_context(),
+                serde_json::json!({
+                    "all": [oversized_condition],
+                    "timeout_secs": 1,
+                    "poll_interval_ms": 10
+                }),
+            )
+            .expect("oversized condition should return an invalid-args envelope"),
+        );
+        assert_eq!(envelope["ok"], false);
+        assert_eq!(envelope["error_code"], MCP_ERR_INVALID_ARGS);
+        assert!(
+            envelope["error"]
+                .as_str()
+                .is_some_and(|message| message.contains("at most 256 bytes")),
+            "server-side byte bound must remain explicit: {envelope}"
         );
     }
 
