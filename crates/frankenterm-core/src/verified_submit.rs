@@ -13,28 +13,33 @@ const VERIFIED_SUBMIT_CANARY_DIGEST_CHARS: usize = 16;
 const SUBMIT_IDEMPOTENCY_REQUEST_DOMAIN: &[u8] =
     b"frankenterm:verified-submit:semantic-request:v2\0";
 const SUBMIT_IDEMPOTENCY_EFFECT_DOMAIN: &[u8] =
-    b"frankenterm:verified-submit:effect:v1\0";
+    b"frankenterm:verified-submit:exact-outbound-effect:v2\0";
 const SUBMIT_IDEMPOTENCY_KEY_DOMAIN: &[u8] =
     b"frankenterm:verified-submit:caller-claim-key:v1\0";
 const SUBMIT_IDEMPOTENCY_CANARY_DOMAIN: &[u8] =
-    b"frankenterm:verified-submit:semantic-canary:v1\0";
+    b"frankenterm:verified-submit:effect-canary:v2\0";
 
 /// Wire-stable semantic contract included in every durable submit binding.
-pub const SUBMIT_IDEMPOTENCY_SEMANTICS_VERSION: u16 = 1;
+pub const SUBMIT_IDEMPOTENCY_SEMANTICS_VERSION: u16 = 2;
 
 /// Complete semantic request used to derive a durable submit binding.
 ///
 /// Every caller-controlled field that can change injection, verified-submit
 /// classification, or requested wait behavior is bound. Regex mode and timeout
-/// are intentionally canonicalized away when `wait_for` is absent. Runtime
-/// profile discovery is intentionally excluded so environmental drift cannot
-/// transform a retry into a different claim identity.
+/// are intentionally canonicalized away when `wait_for` is absent. Profile
+/// identity/version metadata is excluded, but the resolved canary-presence
+/// decision is bound because it changes the exact pane effect; availability
+/// drift therefore conflicts safely on the caller's stable claim row.
 #[derive(Debug, Clone, Copy)]
 pub struct SubmitIdempotencyRequest<'a> {
     pub pane_id: u64,
     pub text: &'a str,
     pub caller_key: &'a str,
     pub guarantee_level: SubmitGuaranteeLevel,
+    /// Whether live pane/profile resolution selected a supported semantic
+    /// canary for the exact effect. This is an effect-bearing decision and is
+    /// therefore part of the durable request identity.
+    pub append_verification_canary: bool,
     pub wait_for: Option<&'a str>,
     pub wait_for_regex: bool,
     pub timeout_secs: u64,
@@ -54,7 +59,9 @@ pub struct SubmitIdempotencyBinding {
     request_sha256: String,
     effect_sha256: String,
     caller_key: String,
+    guarantee_level: SubmitGuaranteeLevel,
     verification_canary: Option<String>,
+    outbound_text: String,
 }
 
 impl std::fmt::Debug for SubmitIdempotencyBinding {
@@ -66,7 +73,9 @@ impl std::fmt::Debug for SubmitIdempotencyBinding {
             .field("request_sha256", &self.request_sha256)
             .field("effect_sha256", &self.effect_sha256)
             .field("caller_key", &"[REDACTED]")
+            .field("guarantee_level", &self.guarantee_level)
             .field("verification_canary", &self.verification_canary)
+            .field("outbound_text", &"[REDACTED]")
             .finish()
     }
 }
@@ -101,6 +110,12 @@ impl SubmitIdempotencyBinding {
         &self.caller_key
     }
 
+    /// Resolved caller-selected guarantee bound into the semantic request.
+    #[must_use]
+    pub const fn guarantee_level(&self) -> SubmitGuaranteeLevel {
+        self.guarantee_level
+    }
+
     /// Semantic canary to append to the exact original text, when the bound
     /// verified-submit mode selected one.
     #[must_use]
@@ -108,16 +123,13 @@ impl SubmitIdempotencyBinding {
         self.verification_canary.as_deref()
     }
 
-    /// Produce the exact outbound text for this binding.
+    /// Exact outbound bytes whose digest is fenced by this binding.
+    ///
+    /// The binding owns these bytes so callers cannot accidentally pair a
+    /// durable effect digest with a different arbitrary input string.
     #[must_use]
-    pub fn outbound_text(&self, original_text: &str) -> String {
-        let Some(canary) = self.verification_canary() else {
-            return original_text.to_string();
-        };
-        let mut outbound = String::with_capacity(original_text.len() + canary.len());
-        outbound.push_str(original_text);
-        outbound.push_str(canary);
-        outbound
+    pub fn outbound_text(&self) -> &str {
+        &self.outbound_text
     }
 
     /// Recompute the internal key from the exact caller nonce and validate all
@@ -130,8 +142,13 @@ impl SubmitIdempotencyBinding {
             && !self.caller_key.is_empty()
             && self.key == submit_key_from_caller_key(self.pane_id, &self.caller_key)
             && self.verification_canary.as_deref().is_none_or(|canary| {
-                canary == semantic_canary_from_effect_digest(&self.effect_sha256)
+                is_semantic_canary(canary)
+                    && self.outbound_text.strip_suffix(canary).is_some_and(|original| {
+                        semantic_canary_from_effect_inputs(self.pane_id, original, true) == canary
+                    })
             })
+            && self.effect_sha256
+                == hex::encode(submit_effect_digest(self.pane_id, &self.outbound_text))
     }
 }
 
@@ -539,8 +556,8 @@ fn submit_request_digest(request: SubmitIdempotencyRequest<'_>) -> [u8; 32] {
     hasher.update(SUBMIT_IDEMPOTENCY_SEMANTICS_VERSION.to_be_bytes());
     hasher.update(request.pane_id.to_be_bytes());
     hash_len_prefixed(&mut hasher, request.text);
-    hash_len_prefixed(&mut hasher, request.caller_key);
     hasher.update([guarantee_level_tag(request.guarantee_level)]);
+    hasher.update([u8::from(should_append_semantic_canary(request))]);
     match request.wait_for {
         Some(pattern) => {
             hasher.update([1]);
@@ -553,15 +570,12 @@ fn submit_request_digest(request: SubmitIdempotencyRequest<'_>) -> [u8; 32] {
     hasher.finalize().into()
 }
 
-fn submit_effect_digest(request: SubmitIdempotencyRequest<'_>) -> [u8; 32] {
+fn submit_effect_digest(pane_id: u64, outbound_text: &str) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(SUBMIT_IDEMPOTENCY_EFFECT_DOMAIN);
     hasher.update(SUBMIT_IDEMPOTENCY_SEMANTICS_VERSION.to_be_bytes());
-    hasher.update(request.pane_id.to_be_bytes());
-    hash_len_prefixed(&mut hasher, request.text);
-    hash_len_prefixed(&mut hasher, request.caller_key);
-    hasher.update([guarantee_level_tag(request.guarantee_level)]);
-    hasher.update([u8::from(should_append_semantic_canary(request))]);
+    hasher.update(pane_id.to_be_bytes());
+    hash_len_prefixed(&mut hasher, outbound_text);
     hasher.finalize().into()
 }
 
@@ -573,10 +587,17 @@ fn submit_key_from_caller_key(pane_id: u64, caller_key: &str) -> String {
     format!("idem:{pane_id}:{}", hex::encode(hasher.finalize()))
 }
 
-fn semantic_canary_from_effect_digest(effect_sha256: &str) -> String {
+fn semantic_canary_from_effect_inputs(
+    pane_id: u64,
+    original_text: &str,
+    append_verification_canary: bool,
+) -> String {
     let mut hasher = Sha256::new();
     hasher.update(SUBMIT_IDEMPOTENCY_CANARY_DOMAIN);
-    hasher.update(effect_sha256.as_bytes());
+    hasher.update(SUBMIT_IDEMPOTENCY_SEMANTICS_VERSION.to_be_bytes());
+    hasher.update(pane_id.to_be_bytes());
+    hash_len_prefixed(&mut hasher, original_text);
+    hasher.update([u8::from(append_verification_canary)]);
     let digest = hex::encode(hasher.finalize());
     format!(
         "{VERIFIED_SUBMIT_CANARY_PREFIX}{}",
@@ -585,7 +606,20 @@ fn semantic_canary_from_effect_digest(effect_sha256: &str) -> String {
 }
 
 fn should_append_semantic_canary(request: SubmitIdempotencyRequest<'_>) -> bool {
-    request.guarantee_level.requires_submit_profile() && !request.text.trim().is_empty()
+    request.append_verification_canary
+        && request.guarantee_level.requires_submit_profile()
+        && !request.text.trim().is_empty()
+}
+
+fn is_semantic_canary(value: &str) -> bool {
+    value
+        .strip_prefix(VERIFIED_SUBMIT_CANARY_PREFIX)
+        .is_some_and(|digest| {
+            digest.len() == VERIFIED_SUBMIT_CANARY_DIGEST_CHARS
+                && digest
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
 }
 
 fn is_lower_hex_sha256(value: &str) -> bool {
@@ -601,17 +635,29 @@ fn is_lower_hex_sha256(value: &str) -> bool {
 #[must_use]
 pub fn idempotency_binding(request: SubmitIdempotencyRequest<'_>) -> SubmitIdempotencyBinding {
     let request_sha256 = hex::encode(submit_request_digest(request));
-    let effect_sha256 = hex::encode(submit_effect_digest(request));
     let key = submit_key_from_caller_key(request.pane_id, request.caller_key);
     let verification_canary = should_append_semantic_canary(request)
-        .then(|| semantic_canary_from_effect_digest(&effect_sha256));
+        .then(|| semantic_canary_from_effect_inputs(request.pane_id, request.text, true));
+    let mut outbound_text = String::with_capacity(
+        request.text.len()
+            + verification_canary
+                .as_ref()
+                .map_or(0, std::string::String::len),
+    );
+    outbound_text.push_str(request.text);
+    if let Some(canary) = verification_canary.as_deref() {
+        outbound_text.push_str(canary);
+    }
+    let effect_sha256 = hex::encode(submit_effect_digest(request.pane_id, &outbound_text));
     SubmitIdempotencyBinding {
         key,
         pane_id: request.pane_id,
         request_sha256,
         effect_sha256,
         caller_key: request.caller_key.to_string(),
+        guarantee_level: request.guarantee_level,
         verification_canary,
+        outbound_text,
     }
 }
 
@@ -1172,6 +1218,7 @@ mod tests {
             text,
             caller_key,
             guarantee_level: SubmitGuaranteeLevel::Write,
+            append_verification_canary: false,
             wait_for: None,
             wait_for_regex: false,
             timeout_secs: 30,
@@ -1245,11 +1292,11 @@ mod tests {
                 ..base
             },
             SubmitIdempotencyRequest {
-                caller_key: "attempt-2",
+                guarantee_level: SubmitGuaranteeLevel::Submitted,
                 ..base
             },
             SubmitIdempotencyRequest {
-                guarantee_level: SubmitGuaranteeLevel::Submitted,
+                append_verification_canary: true,
                 ..base
             },
             SubmitIdempotencyRequest {
@@ -1284,19 +1331,27 @@ mod tests {
             irrelevant_wait_knobs.request_sha256(),
             "regex mode and timeout are irrelevant without a wait pattern"
         );
+
+        let different_nonce = idempotency_binding(SubmitIdempotencyRequest {
+            caller_key: "attempt-2",
+            ..base
+        });
+        assert_eq!(base_binding.request_sha256(), different_nonce.request_sha256());
+        assert_ne!(base_binding.key(), different_nonce.key());
     }
 
     #[test]
     fn bound_verification_canary_is_stable_for_the_exact_effect() {
         let request = SubmitIdempotencyRequest {
             guarantee_level: SubmitGuaranteeLevel::Submitted,
+            append_verification_canary: true,
             ..idempotency_request(7, "deploy now", "attempt-1")
         };
         let binding = idempotency_binding(request);
         let same = idempotency_binding(request);
         assert_eq!(binding.verification_canary(), same.verification_canary());
-        assert_eq!(binding.outbound_text(request.text), same.outbound_text(request.text));
-        assert!(binding.outbound_text(request.text).starts_with(request.text));
+        assert_eq!(binding.outbound_text(), same.outbound_text());
+        assert!(binding.outbound_text().starts_with(request.text));
 
         let changed_wait = idempotency_binding(SubmitIdempotencyRequest {
             wait_for: Some("ready"),
@@ -1307,11 +1362,61 @@ mod tests {
         assert_eq!(binding.effect_sha256(), changed_wait.effect_sha256());
         assert_eq!(binding.verification_canary(), changed_wait.verification_canary());
 
+        let changed_nonce = idempotency_binding(SubmitIdempotencyRequest {
+            caller_key: "attempt-2",
+            ..request
+        });
+        assert_eq!(binding.effect_sha256(), changed_nonce.effect_sha256());
+        assert_eq!(binding.outbound_text(), changed_nonce.outbound_text());
+
+        let working = idempotency_binding(SubmitIdempotencyRequest {
+            guarantee_level: SubmitGuaranteeLevel::Working,
+            ..request
+        });
+        assert_ne!(binding.request_sha256(), working.request_sha256());
+        assert_eq!(binding.effect_sha256(), working.effect_sha256());
+        assert_eq!(binding.outbound_text(), working.outbound_text());
+
+        let write = idempotency_binding(SubmitIdempotencyRequest {
+            guarantee_level: SubmitGuaranteeLevel::Write,
+            append_verification_canary: true,
+            ..request
+        });
+        assert_eq!(write.verification_canary(), None);
+        assert_eq!(write.outbound_text(), request.text);
+        assert_ne!(binding.effect_sha256(), write.effect_sha256());
+        assert_ne!(binding.outbound_text(), write.outbound_text());
+
         let blank = idempotency_binding(SubmitIdempotencyRequest {
             guarantee_level: SubmitGuaranteeLevel::Submitted,
+            append_verification_canary: true,
             ..idempotency_request(7, "   ", "attempt-blank")
         });
         assert_eq!(blank.verification_canary(), None);
+        assert_eq!(blank.outbound_text(), "   ");
+    }
+
+    #[test]
+    fn supported_profile_decision_is_bound_and_unsupported_effect_is_unmodified() {
+        let unsupported = idempotency_binding(SubmitIdempotencyRequest {
+            guarantee_level: SubmitGuaranteeLevel::Submitted,
+            append_verification_canary: false,
+            ..idempotency_request(7, "deploy now", "profile-drift")
+        });
+        assert_eq!(unsupported.verification_canary(), None);
+        assert_eq!(unsupported.outbound_text(), "deploy now");
+
+        let supported = idempotency_binding(SubmitIdempotencyRequest {
+            guarantee_level: SubmitGuaranteeLevel::Submitted,
+            append_verification_canary: true,
+            ..idempotency_request(7, "deploy now", "profile-drift")
+        });
+        assert_eq!(supported.key(), unsupported.key());
+        assert_ne!(supported.request_sha256(), unsupported.request_sha256());
+        assert_ne!(supported.effect_sha256(), unsupported.effect_sha256());
+        assert!(supported.verification_canary().is_some());
+        assert!(supported.outbound_text().starts_with("deploy now"));
+        assert_ne!(supported.outbound_text(), unsupported.outbound_text());
     }
 
     #[test]
