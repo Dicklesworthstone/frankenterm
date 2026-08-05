@@ -28,8 +28,19 @@ inductive RustType where
   | mutex
   | rwLock
   | semaphore
+  | mpscSender
+  | mpscWeakSender
+  | mpscReceiver
+  | mpscReserve
+  | mpscSendPermit
+  | mpscRecv
+  | mpscRecvMany
+  | watchSender
+  | watchReceiver
+  | watchChangedFuture
   | broadcastSender
   | broadcastReceiver
+  | broadcastRecv
   | oneshotSender
   | oneshotReceiver
   | joinHandle
@@ -44,8 +55,19 @@ def rustRuntimeProofImplNames : List String := [
   "runtime_async::Mutex<T>",
   "runtime_async::RwLock<T>",
   "runtime_async::Semaphore",
+  "runtime_async::mpsc::Sender<T>",
+  "runtime_async::mpsc::WeakSender<T>",
+  "runtime_async::mpsc::Receiver<T>",
+  "runtime_async::mpsc::Reserve<'_,T>",
+  "runtime_async::mpsc::SendPermit<'_,T>",
+  "runtime_async::mpsc::Recv<'_,T,Caps>",
+  "runtime_async::mpsc::RecvMany<'_,T,Caps>",
+  "runtime_async::watch::Sender<T>",
+  "runtime_async::watch::Receiver<T>",
+  "runtime_async::watch::ChangedFuture<'_,'_,T,Caps>",
   "runtime_async::broadcast::Sender<T>",
   "runtime_async::broadcast::Receiver<T>",
+  "runtime_async::broadcast::Recv<'_,T>",
   "runtime_async::oneshot::Sender<T>",
   "runtime_async::oneshot::Receiver<T>",
   "runtime_async::task::JoinHandle<T>",
@@ -58,8 +80,19 @@ def declaredRuntimeProofImpl : RustType -> Prop
   | RustType.mutex => True
   | RustType.rwLock => True
   | RustType.semaphore => True
+  | RustType.mpscSender => True
+  | RustType.mpscWeakSender => True
+  | RustType.mpscReceiver => True
+  | RustType.mpscReserve => True
+  | RustType.mpscSendPermit => True
+  | RustType.mpscRecv => True
+  | RustType.mpscRecvMany => True
+  | RustType.watchSender => True
+  | RustType.watchReceiver => True
+  | RustType.watchChangedFuture => True
   | RustType.broadcastSender => True
   | RustType.broadcastReceiver => True
+  | RustType.broadcastRecv => True
   | RustType.oneshotSender => True
   | RustType.oneshotReceiver => True
   | RustType.joinHandle => True

@@ -301,8 +301,9 @@ close-after-drain.
 
 ### Cross-references
 
-- `runtime_async::broadcast` re-exports the asupersync broadcast
-  primitives (Sender, Receiver, RecvError, etc.).
+- `runtime_async::broadcast` publishes project-owned sender, receiver,
+  receive-future, and error wrappers over the asupersync broadcast primitive.
+  Pending receives retain only a stable trusted waker proxy.
 - `tests/loom_broadcast.rs` — the proofs themselves.
 - Lagging-receiver / bounded-ring overwrite semantics are filed as a
   follow-on under the umbrella docs bead ft-jnaa0.
@@ -390,8 +391,10 @@ version greater than the count of completed sends.
 
 ### Cross-references
 
-- `runtime_async::watch` re-exports the asupersync watch primitives
-  (`Sender`, `Receiver`, `RecvError`, `SendError`, `channel`).
+- `runtime_async::watch` publishes project-owned `Sender`, `Receiver`, and
+  `ChangedFuture` wrappers over the asupersync watch primitive. Non-waiting
+  error, telemetry, and borrowed-value types remain direct re-exports; the
+  wrapper ensures an inner waiter retains only a stable trusted waker proxy.
 - `tests/loom_watch.rs` — the proofs themselves.
 - The asupersync Sender-drop contract makes "send-after-close"
   structurally impossible at the type level (the Sender is consumed
@@ -504,8 +507,10 @@ producer.
 
 ### Cross-references
 
-- `runtime_async::mpsc` re-exports the asupersync mpsc primitives
-  (`Sender`, `Receiver`, `channel`, `RecvError`, `SendError`).
+- `runtime_async::mpsc` publishes project-owned sender, receiver, permit, and
+  receive-future wrappers over the asupersync MPSC primitive. Non-waiting
+  error and telemetry types remain direct re-exports; the wrapper ensures an
+  inner waiter retains only a stable trusted waker proxy.
 - `tests/loom_mpsc.rs` — the proofs themselves.
 
 ---
@@ -686,8 +691,8 @@ schedules where:
 
 ### Cross-references
 
-- `runtime_async::Semaphore` re-exports the asupersync semaphore
-  primitive.
+- `runtime_async::Semaphore` is a project-owned wrapper over the asupersync
+  semaphore primitive.
 - `tests/loom_sync.rs` (Semaphore section) — the proofs themselves.
 
 ---

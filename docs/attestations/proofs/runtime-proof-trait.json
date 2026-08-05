@@ -5,6 +5,8 @@
   "release_version": "0.0.0-substrate",
   "generated_at": "2026-05-09T21:52:45Z",
   "produced_by_bead": "ft-e87u6.13",
+  "updated_at": "2026-08-05T21:05:00Z",
+  "updated_by_bead": "ft-iaxog.1",
   "foundation_bead": "ft-i2eni.1",
   "adoption_bead": "ft-3kv6e",
   "status": "pass",
@@ -18,8 +20,19 @@
       "runtime_async::Mutex<T>",
       "runtime_async::RwLock<T>",
       "runtime_async::Semaphore",
+      "runtime_async::mpsc::Sender<T>",
+      "runtime_async::mpsc::WeakSender<T>",
+      "runtime_async::mpsc::Receiver<T>",
+      "runtime_async::mpsc::Reserve<'_, T>",
+      "runtime_async::mpsc::SendPermit<'_, T>",
+      "runtime_async::mpsc::Recv<'_, T, Caps>",
+      "runtime_async::mpsc::RecvMany<'_, T, Caps>",
+      "runtime_async::watch::Sender<T>",
+      "runtime_async::watch::Receiver<T>",
+      "runtime_async::watch::ChangedFuture<'_, '_, T, Caps>",
       "runtime_async::broadcast::Sender<T>",
       "runtime_async::broadcast::Receiver<T>",
+      "runtime_async::broadcast::Recv<'_, T>",
       "runtime_async::oneshot::Sender<T>",
       "runtime_async::oneshot::Receiver<T>",
       "runtime_async::task::JoinHandle<T>",
@@ -28,8 +41,6 @@
       "cx::Cx"
     ],
     "known_transitive_only_surfaces": [
-      "runtime_async::mpsc::*",
-      "runtime_async::watch::*",
       "runtime_async::notify::Notify"
     ],
     "policy": "Foreign runtime primitives cannot implement RuntimeProof because the Sealed supertrait is private to runtime_proof.rs."

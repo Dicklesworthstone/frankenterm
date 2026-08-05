@@ -6,13 +6,13 @@
 //!
 //! # Why
 //!
-//! `AGENTS.md` states: "direct `tokio` usage is forbidden." Today that rule
-//! is enforced by grep guards and `cargo deny`. Both are *runtime* checks —
-//! a clever import path or a vendored re-export can sneak past them. The
-//! `RuntimeProof` trait closes the gap at the *type* level: any function
-//! that bounds a generic on `T: RuntimeProof` cannot accept a tokio type,
-//! because the supertrait `sealed::Sealed` lives in a private module that
-//! external crates cannot name.
+//! `AGENTS.md` states: "direct `tokio` usage is forbidden." Source guards and
+//! `cargo deny` enforce that rule externally, but neither makes a forbidden
+//! type unrepresentable in Rust's type system. The `RuntimeProof` trait adds a
+//! type-level gate: a function that bounds a generic on `T: RuntimeProof`
+//! cannot accept a raw tokio primitive as that proof witness, because the
+//! supertrait `sealed::Sealed` lives in a private module that external crates
+//! cannot name.
 //!
 //! Adding new tokio re-exports to runtime_async would require also adding
 //! them to the sealed-impl list here. Forgetting to do that is loud (the
@@ -46,8 +46,9 @@
 //!
 //! The function below is the canary the bridge plan asks for: it accepts
 //! anything that implements `RuntimeProof`, and is impossible to call with
-//! a tokio type. The `compile_fail` doctest at the bottom of this file
-//! proves the negative case mechanically.
+//! a raw tokio primitive. The `compile_fail` doctest at the bottom of this
+//! file mechanically pins rejection of that example; as with every rustdoc
+//! `compile_fail` test, it does not assert a particular compiler diagnostic.
 
 mod sealed {
     /// Sealed supertrait. Lives in a private module so that no downstream
@@ -57,16 +58,17 @@ mod sealed {
     pub trait Sealed {}
 }
 
-/// Witness that a value comes from `runtime_async`'s asupersync-backed
-/// surface. Cannot be implemented outside this module — `sealed::Sealed`
-/// is private.
+/// Witness that a value's outer type belongs to `runtime_async`'s explicitly
+/// enumerated asupersync-backed surface. This nominal seal is intentionally
+/// non-recursive: it does not inspect a wrapper's generic payload types.
+/// Cannot be implemented outside this module — `sealed::Sealed` is private.
 pub trait RuntimeProof: sealed::Sealed {}
 
 /// Compile-time canary. Accepts only types that satisfy [`RuntimeProof`].
 ///
 /// The seal is operational: any attempt to pass a tokio (or other foreign)
 /// async primitive here is a type error. Used in tests and as the anchor
-/// for the wider per-API adoption sweep tracked by ft-i2eni.1's follow-on.
+/// for the completed per-API adoption ratchet tracked by `ft-3kv6e`.
 ///
 /// # Examples
 ///
@@ -98,8 +100,8 @@ pub fn assert_runtime_proof<T: RuntimeProof + ?Sized>(_value: &T) {}
 //
 // Each impl below is paired with the corresponding wrapper type in
 // runtime_async.rs. Adding a new wrapper REQUIRES adding it here — that's
-// the whole point. The compile_fail doctest at the bottom of the file plus
-// the unit tests below ensure the invariant survives refactors.
+// the whole point. The compile-fail canary, positive unit tests, and synced
+// soundness-model inventory make acceptance-set drift visible.
 // ─────────────────────────────────────────────────────────────────────────
 
 use crate::cx::Cx;
@@ -116,11 +118,44 @@ impl<T> RuntimeProof for runtime_async::RwLock<T> {}
 impl sealed::Sealed for runtime_async::Semaphore {}
 impl RuntimeProof for runtime_async::Semaphore {}
 
+impl<T> sealed::Sealed for runtime_async::mpsc::Sender<T> {}
+impl<T> RuntimeProof for runtime_async::mpsc::Sender<T> {}
+
+impl<T> sealed::Sealed for runtime_async::mpsc::WeakSender<T> {}
+impl<T> RuntimeProof for runtime_async::mpsc::WeakSender<T> {}
+
+impl<T> sealed::Sealed for runtime_async::mpsc::Receiver<T> {}
+impl<T> RuntimeProof for runtime_async::mpsc::Receiver<T> {}
+
+impl<T> sealed::Sealed for runtime_async::mpsc::Reserve<'_, T> {}
+impl<T> RuntimeProof for runtime_async::mpsc::Reserve<'_, T> {}
+
+impl<T> sealed::Sealed for runtime_async::mpsc::SendPermit<'_, T> {}
+impl<T> RuntimeProof for runtime_async::mpsc::SendPermit<'_, T> {}
+
+impl<T, Caps> sealed::Sealed for runtime_async::mpsc::Recv<'_, T, Caps> {}
+impl<T, Caps> RuntimeProof for runtime_async::mpsc::Recv<'_, T, Caps> {}
+
+impl<T, Caps> sealed::Sealed for runtime_async::mpsc::RecvMany<'_, T, Caps> {}
+impl<T, Caps> RuntimeProof for runtime_async::mpsc::RecvMany<'_, T, Caps> {}
+
+impl<T> sealed::Sealed for runtime_async::watch::Sender<T> {}
+impl<T> RuntimeProof for runtime_async::watch::Sender<T> {}
+
+impl<T> sealed::Sealed for runtime_async::watch::Receiver<T> {}
+impl<T> RuntimeProof for runtime_async::watch::Receiver<T> {}
+
+impl<T, Caps> sealed::Sealed for runtime_async::watch::ChangedFuture<'_, '_, T, Caps> {}
+impl<T, Caps> RuntimeProof for runtime_async::watch::ChangedFuture<'_, '_, T, Caps> {}
+
 impl<T: Clone> sealed::Sealed for runtime_async::broadcast::Sender<T> {}
 impl<T: Clone> RuntimeProof for runtime_async::broadcast::Sender<T> {}
 
 impl<T: Clone> sealed::Sealed for runtime_async::broadcast::Receiver<T> {}
 impl<T: Clone> RuntimeProof for runtime_async::broadcast::Receiver<T> {}
+
+impl<T> sealed::Sealed for runtime_async::broadcast::Recv<'_, T> {}
+impl<T> RuntimeProof for runtime_async::broadcast::Recv<'_, T> {}
 
 impl<T> sealed::Sealed for runtime_async::oneshot::Sender<T> {}
 impl<T> RuntimeProof for runtime_async::oneshot::Sender<T> {}
@@ -150,10 +185,11 @@ impl RuntimeProof for runtime_async::Runtime {}
 impl sealed::Sealed for Cx {}
 impl RuntimeProof for Cx {}
 
-// mpsc / watch / notify aliases re-export asupersync types directly from the
-// foreign crate; orphan rules forbid sealing them here. They are still
-// gated transitively when callers thread `&Cx`. A follow-on bead can wrap
-// them in local newtypes if direct seal coverage is needed.
+// `notify::Notify` remains a direct asupersync re-export, so the orphan rules
+// prevent sealing it here. MPSC, watch, broadcast, and oneshot publish local
+// wrappers and therefore receive direct seal coverage above. Non-waiting
+// foreign error, telemetry, and borrowed-value types do not retain task
+// wakers and are intentionally outside this async-primitive proof inventory.
 
 #[cfg(test)]
 mod tests {
@@ -220,13 +256,28 @@ mod tests {
 
     #[test]
     fn task_and_runtime_handles_impl_runtime_proof() {
-        // JoinHandle / JoinSet / Runtime are sealed above (lines 131-138) but
-        // were previously untested — only Mutex/RwLock/Semaphore/broadcast/
-        // oneshot/Cx had assertions. Pin their RuntimeProof membership at the
-        // type level so dropping any of these impls fails the build loudly.
+        // JoinHandle / JoinSet / Runtime were previously untested — only
+        // Mutex/RwLock/Semaphore/broadcast/oneshot/Cx had assertions. Pin
+        // their RuntimeProof membership at the type level so dropping any of
+        // these impls fails the build loudly.
         assert_type_impls_proof::<runtime_async::task::JoinHandle<()>>();
         assert_type_impls_proof::<runtime_async::task::JoinSet<()>>();
         assert_type_impls_proof::<runtime_async::Runtime>();
+    }
+
+    #[test]
+    fn channel_operation_wrappers_impl_runtime_proof() {
+        assert_type_impls_proof::<runtime_async::mpsc::Sender<u8>>();
+        assert_type_impls_proof::<runtime_async::mpsc::WeakSender<u8>>();
+        assert_type_impls_proof::<runtime_async::mpsc::Receiver<u8>>();
+        assert_type_impls_proof::<runtime_async::mpsc::Reserve<'static, u8>>();
+        assert_type_impls_proof::<runtime_async::mpsc::SendPermit<'static, u8>>();
+        assert_type_impls_proof::<runtime_async::mpsc::Recv<'static, u8>>();
+        assert_type_impls_proof::<runtime_async::mpsc::RecvMany<'static, u8>>();
+        assert_type_impls_proof::<runtime_async::watch::Sender<u8>>();
+        assert_type_impls_proof::<runtime_async::watch::Receiver<u8>>();
+        assert_type_impls_proof::<runtime_async::watch::ChangedFuture<'static, 'static, u8>>();
+        assert_type_impls_proof::<runtime_async::broadcast::Recv<'static, u8>>();
     }
 
     // The compile-fail doctest demonstrating that tokio::sync::Mutex is

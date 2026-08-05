@@ -22,8 +22,8 @@ pub const RAW_TOKIO_RUNTIME_BUILDER_QUARANTINE_V1: &[&str] = &[];
 
 /// Negative-evidence ledger for raw channel values that can retain caller
 /// wakers. An empty inventory means every such value published by this module
-/// is a project-owned wrapper; only payload-free error and telemetry types are
-/// re-exported from asupersync.
+/// is a project-owned wrapper; only non-waiter error, telemetry, and borrowed
+/// watch-value types are re-exported from asupersync.
 pub const RAW_ASUPERSYNC_RETAINED_CHANNEL_WAKER_EXPOSURES_V1: &[&str] = &[];
 
 use std::ops::{Deref, DerefMut};
@@ -272,6 +272,78 @@ impl ContainedWakerBoundary {
     fn proxy(&self) -> &std::task::Waker {
         &self.proxy
     }
+}
+
+/// Poll a channel primitive through a stable trusted proxy. This is the
+/// general-purpose path for primitives whose wake can be edge-triggered rather
+/// than coupled to durable readiness: the caller registration must exist
+/// before the inner primitive receives any waker.
+#[inline]
+fn poll_with_contained_channel_waker<R>(
+    boundary_slot: &mut Option<ContainedWakerBoundary>,
+    caller_cx: &std::task::Context<'_>,
+    mut poll_inner: impl FnMut(&mut std::task::Context<'_>) -> std::task::Poll<R>,
+    new_boundary: impl FnOnce() -> ContainedWakerBoundary,
+    registration_failure: impl FnOnce() -> R,
+) -> std::task::Poll<R> {
+    let boundary = boundary_slot.get_or_insert_with(new_boundary);
+    // Publish the current caller before the one inner poll. A wake that races
+    // with the compare/clone phase may still consume the preceding valid
+    // registration; this poll then observes the resulting state. Any wake
+    // after the slot update sees this caller or a later one.
+    if boundary.register(caller_cx.waker()).is_err() {
+        return std::task::Poll::Ready(registration_failure());
+    }
+    let mut proxy_cx = std::task::Context::from_waker(boundary.proxy());
+    let result = poll_inner(&mut proxy_cx);
+    if result.is_ready() {
+        boundary.clear();
+    }
+    result
+}
+
+/// Poll a channel primitive without cloning or allocating a caller-waker proxy
+/// on an immediately-ready path. This optimization is sound only when every
+/// wake is coupled to state that remains observable by the immediate proxy
+/// repoll. A pending first probe installs only a trusted no-op waker; the
+/// second poll publishes the stable proxy after the caller waker has been
+/// quarantined behind it. Re-polls reuse the existing proxy.
+#[inline]
+fn poll_with_durable_probe_contained_channel_waker<R>(
+    boundary_slot: &mut Option<ContainedWakerBoundary>,
+    caller_cx: &std::task::Context<'_>,
+    mut poll_inner: impl FnMut(&mut std::task::Context<'_>) -> std::task::Poll<R>,
+    new_boundary: impl FnOnce() -> ContainedWakerBoundary,
+    registration_failure: impl FnOnce() -> R,
+) -> std::task::Poll<R> {
+    if boundary_slot.is_some() {
+        return poll_with_contained_channel_waker(
+            boundary_slot,
+            caller_cx,
+            poll_inner,
+            new_boundary,
+            registration_failure,
+        );
+    }
+
+    let mut noop_cx = std::task::Context::from_waker(std::task::Waker::noop());
+    let first_poll = poll_inner(&mut noop_cx);
+    if first_poll.is_ready() {
+        return first_poll;
+    }
+
+    // A wake racing with the no-op registration requests a poll that this
+    // invocation is already about to perform. The immediate proxy repoll both
+    // observes any durable ready state and replaces the temporary no-op before
+    // returning Pending, closing the publication window without exposing the
+    // caller's waker to the inner channel.
+    poll_with_contained_channel_waker(
+        boundary_slot,
+        caller_cx,
+        poll_inner,
+        new_boundary,
+        registration_failure,
+    )
 }
 
 /// Clears a forwarding slot before the wrapped pending future is dropped.
@@ -712,7 +784,7 @@ impl OwnedSemaphorePermit {
     }
 }
 
-/// MPSC channel aliases for the active runtime.
+/// Project-owned MPSC wrappers for the active runtime.
 ///
 /// Under asupersync the receiver's `recv(cx)` method observes
 /// **pre-cancel** on cx via the per-poll `cx.checkpoint()`
@@ -749,12 +821,6 @@ pub mod mpsc {
     #[must_use]
     pub fn retained_waker_callback_panic_count() -> u64 {
         RETAINED_WAKER_CALLBACK_PANIC_COUNT.load(std::sync::atomic::Ordering::Relaxed)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn reset_retained_waker_counters_for_test() {
-        RETAINED_WAKER_LOCK_POISONED_COUNT.store(0, std::sync::atomic::Ordering::Relaxed);
-        RETAINED_WAKER_CALLBACK_PANIC_COUNT.store(0, std::sync::atomic::Ordering::Relaxed);
     }
 
     fn new_waker_boundary() -> super::ContainedWakerBoundary {
@@ -800,7 +866,7 @@ pub mod mpsc {
 
     impl<T> Sender<T> {
         /// Reserves one channel slot. A stable trusted waker proxy is allocated
-        /// only if this future is actually polled.
+        /// only if the first inner readiness probe returns `Pending`.
         #[must_use]
         pub fn reserve<'a>(&'a self, cx: &'a crate::cx::Cx) -> Reserve<'a, T> {
             Reserve {
@@ -909,28 +975,31 @@ pub mod mpsc {
         retained_waker: Option<super::ContainedWakerBoundary>,
     }
 
+    #[cfg(test)]
+    impl<T> Reserve<'_, T> {
+        pub(super) fn retained_waker_allocated_for_test(&self) -> bool {
+            self.retained_waker.is_some()
+        }
+    }
+
     impl<'a, T> Future for Reserve<'a, T> {
         type Output = Result<SendPermit<'a, T>, SendError<()>>;
 
+        #[inline]
         fn poll(self: Pin<&mut Self>, caller_cx: &mut Context<'_>) -> Poll<Self::Output> {
             let this = self.get_mut();
-            let boundary = this.retained_waker.get_or_insert_with(new_waker_boundary);
-            if boundary.register(caller_cx.waker()).is_err() {
-                return Poll::Ready(Err(SendError::Cancelled(())));
-            }
-
-            let mut proxy_cx = Context::from_waker(boundary.proxy());
-            match Pin::new(&mut this.inner).poll(&mut proxy_cx) {
-                Poll::Ready(Ok(inner)) => {
-                    boundary.clear();
-                    Poll::Ready(Ok(SendPermit { inner }))
-                }
-                Poll::Ready(Err(error)) => {
-                    boundary.clear();
-                    Poll::Ready(Err(error))
-                }
-                Poll::Pending => Poll::Pending,
-            }
+            let Self {
+                inner,
+                retained_waker,
+            } = this;
+            let result = super::poll_with_durable_probe_contained_channel_waker(
+                retained_waker,
+                caller_cx,
+                |proxy_cx| Pin::new(&mut *inner).poll(proxy_cx),
+                new_waker_boundary,
+                || Err(SendError::Cancelled(())),
+            );
+            result.map(|result| result.map(|inner| SendPermit { inner }))
         }
     }
 
@@ -976,6 +1045,11 @@ pub mod mpsc {
     }
 
     /// Project-owned receiving side of a bounded MPSC channel.
+    ///
+    /// Receive polls install the stable proxy before their first inner poll.
+    /// They intentionally do not use the no-op fast probe because
+    /// [`Sender::wake_receiver`] is an edge-triggered wake with no durable
+    /// message or close transition for a follow-up probe to observe.
     pub struct Receiver<T> {
         inner: inner::Receiver<T>,
         retained_waker: Option<super::ContainedWakerBoundary>,
@@ -990,6 +1064,11 @@ pub mod mpsc {
     }
 
     impl<T> Receiver<T> {
+        #[cfg(test)]
+        pub(super) fn retained_waker_allocated_for_test(&self) -> bool {
+            self.retained_waker.is_some()
+        }
+
         pub fn close(&mut self) {
             if let Some(boundary) = &self.retained_waker {
                 boundary.clear();
@@ -1006,10 +1085,9 @@ pub mod mpsc {
                 inner,
                 retained_waker,
             } = self;
-            let boundary = retained_waker.get_or_insert_with(new_waker_boundary);
             Recv {
                 inner: inner.recv(cx),
-                boundary,
+                retained_waker,
             }
         }
 
@@ -1024,10 +1102,9 @@ pub mod mpsc {
                 inner,
                 retained_waker,
             } = self;
-            let boundary = retained_waker.get_or_insert_with(new_waker_boundary);
             RecvMany {
                 inner: inner.recv_many(cx, buffer, limit),
-                boundary,
+                retained_waker,
             }
         }
 
@@ -1040,16 +1117,13 @@ pub mod mpsc {
                 inner,
                 retained_waker,
             } = self;
-            let boundary = retained_waker.get_or_insert_with(new_waker_boundary);
-            if boundary.register(caller_cx.waker()).is_err() {
-                return Poll::Ready(Err(RecvError::Cancelled));
-            }
-            let mut proxy_cx = Context::from_waker(boundary.proxy());
-            let result = inner.poll_recv(cx, &mut proxy_cx);
-            if result.is_ready() {
-                boundary.clear();
-            }
-            result
+            super::poll_with_contained_channel_waker(
+                retained_waker,
+                caller_cx,
+                |proxy_cx| inner.poll_recv(cx, proxy_cx),
+                new_waker_boundary,
+                || Err(RecvError::Cancelled),
+            )
         }
 
         pub fn poll_recv_many<Caps>(
@@ -1063,20 +1137,21 @@ pub mod mpsc {
                 inner,
                 retained_waker,
             } = self;
-            let boundary = retained_waker.get_or_insert_with(new_waker_boundary);
-            if boundary.register(caller_cx.waker()).is_err() {
-                return Poll::Ready(Err(RecvError::Cancelled));
-            }
-            let mut proxy_cx = Context::from_waker(boundary.proxy());
-            let result = inner.poll_recv_many(cx, buffer, limit, &mut proxy_cx);
-            if result.is_ready() {
-                boundary.clear();
-            }
-            result
+            super::poll_with_contained_channel_waker(
+                retained_waker,
+                caller_cx,
+                |proxy_cx| inner.poll_recv_many(cx, buffer, limit, proxy_cx),
+                new_waker_boundary,
+                || Err(RecvError::Cancelled),
+            )
         }
 
         pub fn try_recv(&mut self) -> Result<T, RecvError> {
             let result = self.inner.try_recv();
+            // `Empty` leaves the inner proxy registered for an earlier direct
+            // receive poll, so its matching caller registration must survive.
+            // Every other result consumes a value or terminal state and the
+            // inner receiver removes that proxy; retire the caller in lockstep.
             if !matches!(&result, Err(RecvError::Empty)) {
                 if let Some(boundary) = &self.retained_waker {
                     boundary.clear();
@@ -1125,60 +1200,78 @@ pub mod mpsc {
     }
 
     /// Future returned by [`Receiver::recv`].
+    ///
+    /// The mutable forwarding-slot borrow keeps receiver-side operations from
+    /// racing this wait. `Drop` clears the caller before the inner receive
+    /// future releases its trusted proxy.
     pub struct Recv<'a, T, Caps = asupersync::cx::cap::All> {
         inner: inner::Recv<'a, T, Caps>,
-        boundary: &'a super::ContainedWakerBoundary,
+        retained_waker: &'a mut Option<super::ContainedWakerBoundary>,
     }
 
     impl<T, Caps> Future for Recv<'_, T, Caps> {
         type Output = Result<T, RecvError>;
 
+        #[inline]
         fn poll(self: Pin<&mut Self>, caller_cx: &mut Context<'_>) -> Poll<Self::Output> {
             let this = self.get_mut();
-            if this.boundary.register(caller_cx.waker()).is_err() {
-                return Poll::Ready(Err(RecvError::Cancelled));
-            }
-            let mut proxy_cx = Context::from_waker(this.boundary.proxy());
-            let result = Pin::new(&mut this.inner).poll(&mut proxy_cx);
-            if result.is_ready() {
-                this.boundary.clear();
-            }
-            result
+            let Self {
+                inner,
+                retained_waker,
+            } = this;
+            super::poll_with_contained_channel_waker(
+                &mut **retained_waker,
+                caller_cx,
+                |proxy_cx| Pin::new(&mut *inner).poll(proxy_cx),
+                new_waker_boundary,
+                || Err(RecvError::Cancelled),
+            )
         }
     }
 
     impl<T, Caps> Drop for Recv<'_, T, Caps> {
         fn drop(&mut self) {
-            self.boundary.clear();
+            if let Some(boundary) = self.retained_waker.as_ref() {
+                boundary.clear();
+            }
         }
     }
 
     /// Future returned by [`Receiver::recv_many`].
+    ///
+    /// The mutable forwarding-slot borrow keeps receiver-side operations from
+    /// racing this wait. `Drop` clears the caller before the inner batch
+    /// receive future releases its trusted proxy.
     pub struct RecvMany<'a, T, Caps = asupersync::cx::cap::All> {
         inner: inner::RecvMany<'a, T, Caps>,
-        boundary: &'a super::ContainedWakerBoundary,
+        retained_waker: &'a mut Option<super::ContainedWakerBoundary>,
     }
 
     impl<T, Caps> Future for RecvMany<'_, T, Caps> {
         type Output = Result<usize, RecvError>;
 
+        #[inline]
         fn poll(self: Pin<&mut Self>, caller_cx: &mut Context<'_>) -> Poll<Self::Output> {
             let this = self.get_mut();
-            if this.boundary.register(caller_cx.waker()).is_err() {
-                return Poll::Ready(Err(RecvError::Cancelled));
-            }
-            let mut proxy_cx = Context::from_waker(this.boundary.proxy());
-            let result = Pin::new(&mut this.inner).poll(&mut proxy_cx);
-            if result.is_ready() {
-                this.boundary.clear();
-            }
-            result
+            let Self {
+                inner,
+                retained_waker,
+            } = this;
+            super::poll_with_contained_channel_waker(
+                &mut **retained_waker,
+                caller_cx,
+                |proxy_cx| Pin::new(&mut *inner).poll(proxy_cx),
+                new_waker_boundary,
+                || Err(RecvError::Cancelled),
+            )
         }
     }
 
     impl<T, Caps> Drop for RecvMany<'_, T, Caps> {
         fn drop(&mut self) {
-            self.boundary.clear();
+            if let Some(boundary) = self.retained_waker.as_ref() {
+                boundary.clear();
+            }
         }
     }
 
@@ -1206,7 +1299,7 @@ pub mod mpsc {
     }
 }
 
-/// Watch channel aliases for the active runtime.
+/// Project-owned watch wrappers for the active runtime.
 ///
 /// Under asupersync the receiver's `changed(cx)` method observes
 /// **pre-cancel** on cx via the per-poll `cx.checkpoint()`
@@ -1247,12 +1340,6 @@ pub mod watch {
     #[must_use]
     pub fn retained_waker_callback_panic_count() -> u64 {
         RETAINED_WAKER_CALLBACK_PANIC_COUNT.load(std::sync::atomic::Ordering::Relaxed)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn reset_retained_waker_counters_for_test() {
-        RETAINED_WAKER_LOCK_POISONED_COUNT.store(0, std::sync::atomic::Ordering::Relaxed);
-        RETAINED_WAKER_CALLBACK_PANIC_COUNT.store(0, std::sync::atomic::Ordering::Relaxed);
     }
 
     fn new_waker_boundary() -> super::ContainedWakerBoundary {
@@ -1330,8 +1417,9 @@ pub mod watch {
         }
     }
 
-    /// Project-owned watch receiver. Its stable proxy is allocated on the
-    /// first `changed` operation and then reused by that receiver.
+    /// Project-owned watch receiver. Its stable proxy is allocated only after
+    /// the first inner `changed` probe returns `Pending`, then reused by that
+    /// receiver.
     pub struct Receiver<T> {
         inner: inner::Receiver<T>,
         retained_waker: Option<super::ContainedWakerBoundary>,
@@ -1355,6 +1443,11 @@ pub mod watch {
     }
 
     impl<T> Receiver<T> {
+        #[cfg(test)]
+        pub(super) fn retained_waker_allocated_for_test(&self) -> bool {
+            self.retained_waker.is_some()
+        }
+
         #[must_use]
         pub fn changed<'a, 'b, Caps>(
             &'a mut self,
@@ -1364,10 +1457,9 @@ pub mod watch {
                 inner,
                 retained_waker,
             } = self;
-            let boundary = retained_waker.get_or_insert_with(new_waker_boundary);
             ChangedFuture {
                 inner: inner.changed(cx),
-                boundary,
+                retained_waker,
             }
         }
 
@@ -1431,36 +1523,46 @@ pub mod watch {
     }
 
     /// Future returned by [`Receiver::changed`].
+    ///
+    /// This future mutably borrows both the inner receiver and its forwarding
+    /// slot. Receiver state-consuming methods therefore cannot run until this
+    /// future is dropped, whose `Drop` clears the caller before the inner
+    /// future releases its proxy registration.
     pub struct ChangedFuture<'a, 'b, T, Caps = asupersync::cx::cap::All> {
         inner: inner::ChangedFuture<'a, 'b, T, Caps>,
-        boundary: &'a super::ContainedWakerBoundary,
+        retained_waker: &'a mut Option<super::ContainedWakerBoundary>,
     }
 
     impl<T, Caps> Future for ChangedFuture<'_, '_, T, Caps> {
         type Output = Result<(), RecvError>;
 
+        #[inline]
         fn poll(self: Pin<&mut Self>, caller_cx: &mut Context<'_>) -> Poll<Self::Output> {
             let this = self.get_mut();
-            if this.boundary.register(caller_cx.waker()).is_err() {
-                return Poll::Ready(Err(RecvError::Cancelled));
-            }
-            let mut proxy_cx = Context::from_waker(this.boundary.proxy());
-            let result = Pin::new(&mut this.inner).poll(&mut proxy_cx);
-            if result.is_ready() {
-                this.boundary.clear();
-            }
-            result
+            let Self {
+                inner,
+                retained_waker,
+            } = this;
+            super::poll_with_durable_probe_contained_channel_waker(
+                &mut **retained_waker,
+                caller_cx,
+                |proxy_cx| Pin::new(&mut *inner).poll(proxy_cx),
+                new_waker_boundary,
+                || Err(RecvError::Cancelled),
+            )
         }
     }
 
     impl<T, Caps> Drop for ChangedFuture<'_, '_, T, Caps> {
         fn drop(&mut self) {
-            self.boundary.clear();
+            if let Some(boundary) = self.retained_waker.as_ref() {
+                boundary.clear();
+            }
         }
     }
 }
 
-/// Broadcast channel aliases for the active runtime.
+/// Project-owned broadcast wrappers for the active runtime.
 ///
 /// Provides wrapper types around `asupersync::channel::broadcast` that acquire
 /// a `Cx` internally while retaining the established call-site signatures.
@@ -1484,12 +1586,6 @@ pub mod broadcast {
     #[must_use]
     pub fn retained_waker_callback_panic_count() -> u64 {
         RETAINED_WAKER_CALLBACK_PANIC_COUNT.load(std::sync::atomic::Ordering::Relaxed)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn reset_retained_waker_counters_for_test() {
-        RETAINED_WAKER_LOCK_POISONED_COUNT.store(0, std::sync::atomic::Ordering::Relaxed);
-        RETAINED_WAKER_CALLBACK_PANIC_COUNT.store(0, std::sync::atomic::Ordering::Relaxed);
     }
 
     fn new_waker_boundary() -> super::ContainedWakerBoundary {
@@ -1656,6 +1752,11 @@ pub mod broadcast {
     }
 
     impl<T: Clone> Receiver<T> {
+        #[cfg(test)]
+        pub(super) fn retained_waker_allocated_for_test(&self) -> bool {
+            self.retained_waker.is_some()
+        }
+
         /// Receives the next message.
         ///
         /// Acquires a `Cx` internally for the asupersync async recv.
@@ -1668,38 +1769,16 @@ pub mod broadcast {
         /// Cx-first API). Cancellation, budget, and virtual time all flow
         /// through the provided capability context instead of being pulled
         /// from thread-local state.
-        pub async fn recv_with_cx(&mut self, cx: &crate::cx::Cx) -> Result<T, RecvError> {
+        #[must_use]
+        pub fn recv_with_cx<'a>(&'a mut self, cx: &'a crate::cx::Cx) -> Recv<'a, T> {
             let Self {
                 inner,
                 retained_waker,
             } = self;
-            let boundary = retained_waker.get_or_insert_with(new_waker_boundary);
-            let mut receive = std::pin::pin!(inner.recv(cx));
-            // Declared after `receive` so cancellation clears the caller slot
-            // before the underlying future removes and drops its trusted proxy.
-            let clear_on_drop = super::ClearContainedWakerOnDrop::new(std::sync::Arc::clone(
-                &boundary.forwarding,
-            ));
-            let received = std::future::poll_fn(|caller_cx| {
-                if clear_on_drop.register(caller_cx.waker()).is_err() {
-                    return std::task::Poll::Ready(Err(RecvError::Cancelled));
-                }
-                let mut proxy_cx = std::task::Context::from_waker(boundary.proxy());
-                match receive.as_mut().poll(&mut proxy_cx) {
-                    std::task::Poll::Ready(result) => {
-                        clear_on_drop.clear();
-                        std::task::Poll::Ready(Ok(result))
-                    }
-                    std::task::Poll::Pending => std::task::Poll::Pending,
-                }
-            })
-            .await?;
-            received.map_err(|e| match e {
-                inner::RecvError::Lagged(n) => RecvError::Lagged(n),
-                inner::RecvError::Closed => RecvError::Closed,
-                inner::RecvError::Cancelled => RecvError::Cancelled,
-                inner::RecvError::PolledAfterCompletion => RecvError::Closed,
-            })
+            Recv {
+                inner: inner.recv(cx),
+                retained_waker,
+            }
         }
 
         /// Attempts to receive the next message without blocking.
@@ -1709,6 +1788,56 @@ pub mod broadcast {
                 inner::TryRecvError::Closed => TryRecvError::Closed,
                 inner::TryRecvError::Lagged(n) => TryRecvError::Lagged(n),
             })
+        }
+    }
+
+    /// Future returned by [`Receiver::recv_with_cx`].
+    ///
+    /// This future mutably borrows both the inner receiver and its forwarding
+    /// slot. `try_recv` therefore cannot run until this future is dropped,
+    /// whose `Drop` clears the caller before the inner future releases its
+    /// proxy registration.
+    pub struct Recv<'a, T> {
+        inner: inner::Recv<'a, T>,
+        retained_waker: &'a mut Option<super::ContainedWakerBoundary>,
+    }
+
+    impl<T: Clone> Future for Recv<'_, T> {
+        type Output = Result<T, RecvError>;
+
+        #[inline]
+        fn poll(
+            self: std::pin::Pin<&mut Self>,
+            caller_cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Self::Output> {
+            let this = self.get_mut();
+            let Self {
+                inner,
+                retained_waker,
+            } = this;
+            super::poll_with_durable_probe_contained_channel_waker(
+                &mut **retained_waker,
+                caller_cx,
+                |proxy_cx| std::pin::Pin::new(&mut *inner).poll(proxy_cx),
+                new_waker_boundary,
+                || Err(inner::RecvError::Cancelled),
+            )
+            .map(|result| {
+                result.map_err(|error| match error {
+                    inner::RecvError::Lagged(missed) => RecvError::Lagged(missed),
+                    inner::RecvError::Closed => RecvError::Closed,
+                    inner::RecvError::Cancelled => RecvError::Cancelled,
+                    inner::RecvError::PolledAfterCompletion => RecvError::Closed,
+                })
+            })
+        }
+    }
+
+    impl<T> Drop for Recv<'_, T> {
+        fn drop(&mut self) {
+            if let Some(boundary) = self.retained_waker.as_ref() {
+                boundary.clear();
+            }
         }
     }
 
@@ -4960,6 +5089,214 @@ mod tests {
             assert_eq!(broadcast_recv(&mut rx1).await.expect("r1"), 7);
             assert_eq!(broadcast_recv(&mut rx2).await.expect("r2"), 7);
         });
+    }
+
+    #[test]
+    fn immediately_ready_durable_channel_polls_do_not_allocate_forwarding_boundaries() {
+        let cx = asupersync::Cx::for_testing();
+        let caller_waker = futures::task::noop_waker();
+        let mut caller_cx = std::task::Context::from_waker(&caller_waker);
+
+        let (reserve_tx, _reserve_rx) = mpsc::channel::<u8>(1);
+        let mut reserve = Box::pin(reserve_tx.reserve(&cx));
+        let permit = match reserve.as_mut().poll(&mut caller_cx) {
+            std::task::Poll::Ready(Ok(permit)) => permit,
+            other => panic!("uncontended reserve was not ready: {other:?}"),
+        };
+        assert!(!reserve
+            .as_ref()
+            .get_ref()
+            .retained_waker_allocated_for_test());
+        permit.abort();
+
+        let (watch_tx, mut watch_rx) = watch::channel(0u8);
+        watch_tx.send(2).expect("publish immediate watch value");
+        let mut changed = Box::pin(watch_rx.changed(&cx));
+        assert!(matches!(
+            changed.as_mut().poll(&mut caller_cx),
+            std::task::Poll::Ready(Ok(()))
+        ));
+        drop(changed);
+        assert!(!watch_rx.retained_waker_allocated_for_test());
+
+        let (broadcast_tx, mut broadcast_rx) = broadcast::channel(1);
+        broadcast_tx
+            .send_with_cx(&cx, 3)
+            .expect("publish immediate broadcast value");
+        let mut broadcast_receive = Box::pin(broadcast_rx.recv_with_cx(&cx));
+        assert!(matches!(
+            broadcast_receive.as_mut().poll(&mut caller_cx),
+            std::task::Poll::Ready(Ok(3))
+        ));
+        drop(broadcast_receive);
+        assert!(!broadcast_rx.retained_waker_allocated_for_test());
+    }
+
+    #[test]
+    fn contained_proxy_forwards_a_nondurable_first_poll_wake() {
+        static LOCK_POISONED_COUNT: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(0);
+        static CALLBACK_PANIC_COUNT: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(0);
+
+        let mut retained_waker = None;
+        let (caller_probe, caller_waker) = probe_waker(false);
+        let caller_cx = std::task::Context::from_waker(&caller_waker);
+        let mut inner_poll_count = 0usize;
+        let result = poll_with_contained_channel_waker(
+            &mut retained_waker,
+            &caller_cx,
+            |inner_cx| {
+                inner_poll_count += 1;
+                // Model `mpsc::Sender::wake_receiver()`: this wake carries no
+                // durable message or closed-state transition for a later
+                // probe to observe.
+                inner_cx.waker().wake_by_ref();
+                std::task::Poll::<()>::Pending
+            },
+            || ContainedWakerBoundary::new(&LOCK_POISONED_COUNT, &CALLBACK_PANIC_COUNT),
+            || (),
+        );
+
+        assert!(result.is_pending());
+        assert_eq!(inner_poll_count, 1);
+        assert_eq!(
+            caller_probe.count(),
+            1,
+            "an edge-triggered first-poll wake must reach the caller"
+        );
+        assert!(retained_waker.is_some());
+    }
+
+    #[test]
+    fn immediately_ready_mpsc_receive_uses_the_edge_safe_boundary() {
+        let cx = asupersync::Cx::for_testing();
+        let caller_waker = futures::task::noop_waker();
+        let mut caller_cx = std::task::Context::from_waker(&caller_waker);
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.try_send(1).expect("queue immediate MPSC value");
+
+        let mut receive = Box::pin(rx.recv(&cx));
+        assert!(matches!(
+            receive.as_mut().poll(&mut caller_cx),
+            std::task::Poll::Ready(Ok(1))
+        ));
+        drop(receive);
+        assert!(
+            rx.retained_waker_allocated_for_test(),
+            "MPSC's out-of-band wake_receiver contract requires containment before first poll"
+        );
+    }
+
+    #[cfg(panic = "unwind")]
+    #[test]
+    fn contained_channel_waker_pending_repoll_polls_inner_once() {
+        static LOCK_POISONED_COUNT: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(0);
+        static CALLBACK_PANIC_COUNT: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(0);
+
+        let mut retained_waker = None;
+        let (drop_count, drop_panicking) = drop_panicking_waker();
+        let mut initial_poll_count = 0usize;
+        {
+            let hostile_cx = std::task::Context::from_waker(&drop_panicking);
+            let initial = poll_with_durable_probe_contained_channel_waker(
+                &mut retained_waker,
+                &hostile_cx,
+                |_| {
+                    initial_poll_count += 1;
+                    std::task::Poll::<()>::Pending
+                },
+                || ContainedWakerBoundary::new(&LOCK_POISONED_COUNT, &CALLBACK_PANIC_COUNT),
+                || (),
+            );
+            assert!(initial.is_pending());
+        }
+        assert_eq!(
+            initial_poll_count, 2,
+            "the boundary-free probe must repoll once to publish its proxy"
+        );
+        assert!(retained_waker.is_some());
+
+        drop(drop_panicking);
+        let (_, replacement_waker) = probe_waker(false);
+        let replacement_cx = std::task::Context::from_waker(&replacement_waker);
+        let mut repoll_count = 0usize;
+        let repoll = poll_with_durable_probe_contained_channel_waker(
+            &mut retained_waker,
+            &replacement_cx,
+            |_| {
+                repoll_count += 1;
+                std::task::Poll::<()>::Pending
+            },
+            || ContainedWakerBoundary::new(&LOCK_POISONED_COUNT, &CALLBACK_PANIC_COUNT),
+            || (),
+        );
+        assert!(repoll.is_pending());
+        assert_eq!(
+            repoll_count, 1,
+            "an existing proxy must not double-poll a sustained pending operation"
+        );
+        assert_eq!(
+            drop_count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "repoll replacement must quarantine the hostile caller-waker destructor"
+        );
+        assert_eq!(
+            CALLBACK_PANIC_COUNT.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+
+        retained_waker
+            .as_ref()
+            .expect("pending repoll must retain its stable proxy")
+            .clear();
+    }
+
+    #[test]
+    fn contained_channel_waker_second_poll_closes_noop_probe_race() {
+        static LOCK_POISONED_COUNT: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(0);
+        static CALLBACK_PANIC_COUNT: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(0);
+
+        let mut retained_waker = None;
+        let (caller_probe, caller_waker) = probe_waker(false);
+        let caller_cx = std::task::Context::from_waker(&caller_waker);
+        let mut inner_poll_count = 0usize;
+        let result = poll_with_durable_probe_contained_channel_waker(
+            &mut retained_waker,
+            &caller_cx,
+            |inner_cx| {
+                inner_poll_count += 1;
+                if inner_poll_count == 1 {
+                    inner_cx.waker().wake_by_ref();
+                    std::task::Poll::Pending
+                } else {
+                    std::task::Poll::Ready(41u8)
+                }
+            },
+            || ContainedWakerBoundary::new(&LOCK_POISONED_COUNT, &CALLBACK_PANIC_COUNT),
+            || 0,
+        );
+        assert_eq!(result, std::task::Poll::Ready(41));
+        assert_eq!(inner_poll_count, 2);
+        assert_eq!(
+            caller_probe.count(),
+            0,
+            "the wrapper itself consumes a first-probe wake by immediately repolling"
+        );
+
+        let boundary = retained_waker
+            .as_ref()
+            .expect("a pending first probe must allocate its stable proxy");
+        boundary.proxy().wake_by_ref();
+        assert_eq!(
+            caller_probe.count(),
+            0,
+            "a race-closing Ready result must clear the caller registration"
+        );
     }
 
     #[cfg(panic = "unwind")]
@@ -8317,9 +8654,10 @@ mod tests {
     /// 3. Wrap `rx.changed(&cx)` in a 2 s outer safety-net timeout.
     /// 4. Assert elapsed < 1 s AND `Err(RecvError::Cancelled)`.
     ///
-    /// Like mpsc, watch is re-exported directly (no runtime_async wrapper).
-    /// Watch channels underpin config-change notification and
-    /// snapshot-version signalling — pinning cx-cancel guards those sites.
+    /// The project-owned watch wrapper delegates this checkpoint to
+    /// asupersync while retaining only its stable trusted waker proxy. Watch
+    /// channels underpin config-change notification and snapshot-version
+    /// signalling — pinning cx-cancel guards those sites.
     #[test]
     fn watch_changed_with_cx_observes_pre_cancel() {
         let rt = RuntimeBuilder::current_thread()
@@ -8823,11 +9161,10 @@ mod tests {
     /// `rx.recv(&cx).await` must return `Err(RecvError::Cancelled)`
     /// promptly.
     ///
-    /// Unlike oneshot / broadcast which have runtime_async wrappers,
-    /// mpsc is re-exported directly (`pub use asupersync::channel::mpsc`)
-    /// so the test exercises the asupersync primitive through the
-    /// runtime_async module's public re-export. The cancel semantics
-    /// are surfaced by asupersync's `poll_recv` short-circuit:
+    /// The project-owned runtime_async MPSC wrapper delegates cancellation
+    /// checks to asupersync while ensuring that the inner primitive retains
+    /// only a stable trusted waker proxy. The cancel semantics are surfaced
+    /// by asupersync's `poll_recv` short-circuit:
     /// `if cx.checkpoint().is_err() { Poll::Ready(Err(Cancelled)) }`.
     ///
     /// Setup:
