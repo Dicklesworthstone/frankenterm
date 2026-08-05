@@ -1092,9 +1092,9 @@ impl ProductionQueryClient {
 
         match result {
             Ok(fields) => fields,
-            Err(err) => {
+            Err(_error) => {
                 tracing::warn!(
-                    error = %err,
+                    error_class = "tui_storage_health_unavailable",
                     "Failed to load TUI storage health counters",
                 );
                 (0, None)
