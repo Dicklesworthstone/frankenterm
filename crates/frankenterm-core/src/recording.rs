@@ -315,6 +315,9 @@ impl FrameWriter {
         let spawn_result = std::thread::Builder::new()
             .name("ft-recording-finalize".to_string())
             .spawn(move || {
+                if let Some(delay) = worker_delay {
+                    std::thread::sleep(delay);
+                }
                 let parts = worker_parts
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
