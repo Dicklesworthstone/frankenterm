@@ -716,7 +716,7 @@ impl ShardedWeztermClient {
 
         if let Some(runtime_handle) = crate::runtime_async::current_runtime_handle() {
             let cleanup_handle = backend.handle.clone();
-            match crate::cx::try_spawn_with_cx(
+            return match crate::cx::try_spawn_with_cx(
                 &runtime_handle,
                 &cleanup_cx,
                 move |cleanup_cx| async move {
@@ -733,19 +733,19 @@ impl ShardedWeztermClient {
                     // compensator. If the creator future itself is dropped,
                     // dropping asupersync's JoinHandle detaches rather than
                     // aborts, so the independently bounded rollback survives.
-                    return match std::panic::AssertUnwindSafe(join).catch_unwind().await {
+                    match std::panic::AssertUnwindSafe(join).catch_unwind().await {
                         Ok(result) => result,
                         Err(payload) => Err(Self::pane_creation_rollback_panic_error(
                             "join",
                             payload,
                         )),
-                    };
+                    }
                 }
                 Err(admission_error) => {
                     // Runtime shutdown or admission pressure can prevent task
                     // creation. Inline cleanup remains the strongest available
                     // fallback; retain both errors if that attempt also fails.
-                    return Self::run_pane_creation_rollback_catching_panic(
+                    Self::run_pane_creation_rollback_catching_panic(
                         &cleanup_cx,
                         &backend.handle,
                         local_pane_id,
@@ -755,9 +755,9 @@ impl ShardedWeztermClient {
                         crate::Error::Wezterm(WeztermError::CommandFailed(format!(
                             "bounded rollback task admission failed: {admission_error}; inline bounded rollback also failed: {cleanup_error}"
                         )))
-                    });
+                    })
                 }
-            }
+            };
         }
 
         // Compatibility fallback for callers polling this future outside the
