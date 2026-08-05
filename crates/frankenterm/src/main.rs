@@ -23020,6 +23020,8 @@ fn watch_event_passes_filters(
 const WATCH_EVENTS_CLAIM_WORKFLOW_ID: &str = "robot.watch_events";
 const WATCH_EVENTS_CLAIM_STATUS: &str = "claimed";
 const WATCH_EVENTS_CLAIM_LEASE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+const WATCH_EVENTS_CLAIM_COMPLETION_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(5);
 const WATCH_EVENTS_BATCH_LIMIT_MAX: usize = 1_000;
 const WATCH_EVENTS_BATCH_LIMIT_ERROR: &str = "Invalid --limit: must be in 1..=1000";
 const WATCH_EVENTS_POLL_INTERVAL_MS_MIN: u64 = 10;
@@ -23077,12 +23079,124 @@ fn watch_checkpoint(cx: &frankenterm_core::cx::Cx, operation: &str) -> std::io::
     })
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WatchFailureSource {
+    Cancellation,
+    Degradation,
+}
+
+#[derive(Debug)]
+enum WatchOuterFailure {
+    Cancelled(std::io::Error),
+    Degraded,
+}
+
+fn watch_core_failure_source(error: &frankenterm_core::Error) -> WatchFailureSource {
+    match error {
+        frankenterm_core::Error::Cancelled(_)
+        | frankenterm_core::Error::RuntimeOperation {
+            source: frankenterm_core::error::RuntimeOperationSource::Cancelled(_),
+            ..
+        } => WatchFailureSource::Cancellation,
+        _ => WatchFailureSource::Degradation,
+    }
+}
+
+/// Classify an outer-loop operation failure before it can produce a storage
+/// error response or transport-gap record. Caller cancellation is control
+/// flow, not degradation, even when a compatibility transport flattened the
+/// original cancellation into its ordinary error type.
+fn classify_watch_outer_failure(
+    cx: &frankenterm_core::cx::Cx,
+    operation: &str,
+    source: WatchFailureSource,
+) -> WatchOuterFailure {
+    if let Err(error) = watch_checkpoint(cx, operation) {
+        return WatchOuterFailure::Cancelled(error);
+    }
+    match source {
+        WatchFailureSource::Cancellation => WatchOuterFailure::Cancelled(std::io::Error::new(
+            std::io::ErrorKind::Interrupted,
+            format!("watch-events {operation} cancelled"),
+        )),
+        WatchFailureSource::Degradation => WatchOuterFailure::Degraded,
+    }
+}
+
+/// Mint a tightly bounded capability for the completion/compensation phase of
+/// a delivery whose lease is already durable. It deliberately does not inherit
+/// caller cancellation: once output has returned, release/finalize must get an
+/// independent chance to settle durable ownership. The finite deadline and
+/// minimal poll quota prevent cleanup from becoming an unbounded escape path.
+fn watch_claim_completion_cx() -> frankenterm_core::cx::Cx {
+    let seed = frankenterm_core::cx::Cx::for_request();
+    let now = seed
+        .timer_driver()
+        .map_or_else(asupersync::time::wall_now, |driver| driver.now());
+    frankenterm_core::cx::Cx::for_request_with_budget(
+        frankenterm_core::cx::Budget::MINIMAL
+            .with_deadline(now + WATCH_EVENTS_CLAIM_COMPLETION_TIMEOUT),
+    )
+}
+
+async fn release_watch_claim_bounded(
+    storage: &frankenterm_core::storage::StorageHandle,
+    lease: &frankenterm_core::storage::EventDeliveryLease,
+) -> Result<bool, String> {
+    let completion_cx = watch_claim_completion_cx();
+    match frankenterm_core::runtime_async::timeout_with_cx(
+        &completion_cx,
+        WATCH_EVENTS_CLAIM_COMPLETION_TIMEOUT,
+        storage.release_event_delivery_with_cx(&completion_cx, lease),
+    )
+    .await
+    {
+        Ok(result) => result.map_err(|error| error.to_string()),
+        Err(error) => Err(format!(
+            "delivery-lease release exceeded the bounded completion window: {error}"
+        )),
+    }
+}
+
+async fn finalize_watch_claim_bounded(
+    storage: &frankenterm_core::storage::StorageHandle,
+    lease: &frankenterm_core::storage::EventDeliveryLease,
+) -> Result<bool, String> {
+    let completion_cx = watch_claim_completion_cx();
+    match frankenterm_core::runtime_async::timeout_with_cx(
+        &completion_cx,
+        WATCH_EVENTS_CLAIM_COMPLETION_TIMEOUT,
+        storage.finalize_event_delivery_with_cx(
+            &completion_cx,
+            lease,
+            Some(WATCH_EVENTS_CLAIM_WORKFLOW_ID.to_string()),
+            WATCH_EVENTS_CLAIM_STATUS,
+        ),
+    )
+    .await
+    {
+        Ok(result) => result.map_err(|error| error.to_string()),
+        Err(error) => Err(format!(
+            "delivery finalization exceeded the bounded completion window: {error}"
+        )),
+    }
+}
+
+#[cfg(unix)]
+fn watch_durable_poll_remaining_at(
+    started_at: std::time::Instant,
+    interval: std::time::Duration,
+    now: std::time::Instant,
+) -> std::time::Duration {
+    interval.saturating_sub(now.saturating_duration_since(started_at))
+}
+
 #[cfg(unix)]
 fn watch_durable_poll_remaining(
     started_at: std::time::Instant,
     interval: std::time::Duration,
 ) -> std::time::Duration {
-    interval.saturating_sub(std::time::Instant::now().saturating_duration_since(started_at))
+    watch_durable_poll_remaining_at(started_at, interval, std::time::Instant::now())
 }
 
 #[cfg(unix)]
@@ -23134,7 +23248,14 @@ where
     )
     .await
     {
-        Ok(line) => line.map(WatchIpcStreamRead::Line),
+        Ok(line) => {
+            // The read future can complete in the same poll that requests
+            // cancellation. Re-check before exposing a ready line/EOF to the
+            // relay, otherwise it could emit output or a false transport gap
+            // after the caller has already stopped the operation.
+            watch_checkpoint(cx, "IPC read completion")?;
+            line.map(WatchIpcStreamRead::Line)
+        }
         Err(_deadline) => {
             watch_checkpoint(cx, "IPC read")?;
             Ok(watch_ipc_timeout_outcome(
@@ -23220,27 +23341,69 @@ async fn pace_watch_event(
     }
 }
 
+fn watch_delay_remaining_at(
+    started_at: std::time::Instant,
+    delay: std::time::Duration,
+    now: std::time::Instant,
+) -> std::time::Duration {
+    delay.saturating_sub(now.saturating_duration_since(started_at))
+}
+
+/// Implementation seam for deterministic cancellation tests. Production uses
+/// `std::thread::sleep`; tests may inject a blocking sleeper that cancels its Cx
+/// after the worker has actually started.
+async fn sleep_watch_delay_with_cx_using<F>(
+    cx: &frankenterm_core::cx::Cx,
+    delay: std::time::Duration,
+    operation: &str,
+    blocking_sleep: F,
+) -> std::io::Result<()>
+where
+    F: Fn(std::time::Duration) + Clone + Send + 'static,
+{
+    let started_at = std::time::Instant::now();
+    loop {
+        watch_checkpoint(cx, operation)?;
+        let remaining = watch_delay_remaining_at(
+            started_at,
+            delay,
+            std::time::Instant::now(),
+        );
+        if remaining.is_zero() {
+            break;
+        }
+        let slice = remaining.min(WATCH_EVENTS_CANCELLATION_CHECK_INTERVAL);
+        let blocking_sleep = blocking_sleep.clone();
+        frankenterm_core::runtime_async::spawn_blocking_with_cx(cx, move || {
+            blocking_sleep(slice);
+        })
+        .await
+        .map_err(|error| {
+            if error.is_cancelled() {
+                std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    format!("watch-events {operation} cancelled: {error}"),
+                )
+            } else {
+                std::io::Error::other(format!(
+                    "watch-events {operation} blocking delay failed: {error}"
+                ))
+            }
+        })?;
+    }
+    watch_checkpoint(cx, operation)
+}
+
 /// Sleep without relying on a timer-capable runtime, while still bounding how
-/// long structured cancellation can remain unobserved. Slicing also prevents a
-/// pathological `u64::MAX` poll interval from stranding a blocking-pool worker
-/// for the lifetime of the process after cancellation.
+/// long structured cancellation can remain unobserved. Each slice uses the
+/// Cx-aware blocking race, and the next slice is computed from total elapsed
+/// time so executor/scheduling overhead cannot accumulate into oversleep.
 async fn sleep_watch_delay_with_cx(
     cx: &frankenterm_core::cx::Cx,
     delay: std::time::Duration,
     operation: &str,
 ) -> std::io::Result<()> {
-    let mut remaining = delay;
-    while !remaining.is_zero() {
-        watch_checkpoint(cx, operation)?;
-        let slice = remaining.min(WATCH_EVENTS_CANCELLATION_CHECK_INTERVAL);
-        frankenterm_core::runtime_async::spawn_blocking(move || std::thread::sleep(slice))
-            .await
-            .map_err(|error| {
-                std::io::Error::other(format!("watch-events {operation} failed: {error}"))
-            })?;
-        remaining = remaining.saturating_sub(slice);
-    }
-    watch_checkpoint(cx, operation)
+    sleep_watch_delay_with_cx_using(cx, delay, operation, std::thread::sleep).await
 }
 
 fn watch_claim_retry_delay(
@@ -23284,10 +23447,15 @@ fn annotate_watch_event_claim_delivery(record: &mut serde_json::Value) -> std::i
 /// Reserve one event, write and flush its truthful pre-finalization record,
 /// then atomically mark it handled. A process crash leaves an expiring lease;
 /// a known output failure attempts to release it immediately and falls back to
-/// expiry if storage cannot perform the release. Cursor ownership remains with
-/// the caller and must advance only for
+/// expiry if storage cannot perform the release. Once ownership is acquired,
+/// release/finalize run under a fresh bounded completion Cx so cancellation of
+/// the caller cannot suppress compensation after output returns. Cursor
+/// ownership remains with the caller and must advance only for
 /// [`WatchEventClaimDelivery::Delivered`] or
 /// [`WatchEventClaimDelivery::AlreadyHandledOrMissing`].
+///
+/// The supplied writer is synchronous. This function can bound settlement
+/// after it returns, but cannot preempt a blocking OS write from this layer.
 async fn deliver_claimed_watch_event<F>(
     cx: &frankenterm_core::cx::Cx,
     storage: &frankenterm_core::storage::StorageHandle,
@@ -23307,9 +23475,15 @@ where
         .reserve_event_delivery_with_cx(cx, event_id, WATCH_EVENTS_CLAIM_LEASE_TTL)
         .await
         .map_err(|error| {
-            std::io::Error::other(format!(
-                "failed to reserve watch event {event_id} for delivery: {error}"
-            ))
+            let kind = if watch_core_failure_source(&error) == WatchFailureSource::Cancellation {
+                std::io::ErrorKind::Interrupted
+            } else {
+                std::io::ErrorKind::Other
+            };
+            std::io::Error::new(
+                kind,
+                format!("failed to reserve watch event {event_id} for delivery: {error}"),
+            )
         })?;
     let lease = match reservation {
         EventDeliveryReservation::Acquired(lease) => lease,
@@ -23321,10 +23495,25 @@ where
         }
     };
 
+    // Reservation may have completed in the same poll that cancelled the
+    // caller. Do not start a synchronous output write after cancellation; use
+    // an independent bounded compensation Cx to release the acquired lease.
+    if let Err(cancel_error) = watch_checkpoint(cx, "claimed output pre-write") {
+        return match release_watch_claim_bounded(storage, &lease).await {
+            Ok(_) => Err(cancel_error),
+            Err(release_error) => Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                format!(
+                    "{cancel_error}; event {event_id} lease release after cancellation failed: {release_error}"
+                ),
+            )),
+        };
+    }
+
     let flushed_at = match write_and_flush(&record) {
         Ok(true) => std::time::Instant::now(),
         Ok(false) => {
-            match storage.release_event_delivery_with_cx(cx, &lease).await {
+            match release_watch_claim_bounded(storage, &lease).await {
                 Ok(true) => {}
                 Ok(false) => tracing::warn!(
                     event_id,
@@ -23344,7 +23533,7 @@ where
         Err(write_error) => {
             let error_kind = write_error.kind();
             let error_message = write_error.to_string();
-            match storage.release_event_delivery_with_cx(cx, &lease).await {
+            match release_watch_claim_bounded(storage, &lease).await {
                 Ok(true) => return Err(write_error),
                 Ok(false) => {
                     tracing::warn!(
@@ -23365,13 +23554,7 @@ where
         }
     };
 
-    let finalized = storage
-        .finalize_event_delivery_with_cx(
-            cx,
-            &lease,
-            Some(WATCH_EVENTS_CLAIM_WORKFLOW_ID.to_string()),
-            WATCH_EVENTS_CLAIM_STATUS,
-        )
+    let finalized = finalize_watch_claim_bounded(storage, &lease)
         .await
         .map_err(|error| {
             std::io::Error::other(format!(
@@ -23663,7 +23846,7 @@ fn validate_watch_oldest_retained_event_id(oldest: Option<i64>) -> Result<Option
 async fn watch_oldest_retained_event_id(
     cx: &frankenterm_core::cx::Cx,
     storage: &frankenterm_core::storage::StorageHandle,
-) -> Result<Option<i64>, String> {
+) -> frankenterm_core::Result<Option<i64>> {
     let query = frankenterm_core::storage::EventStreamQuery {
         after_id: None,
         limit: Some(1),
@@ -23676,13 +23859,12 @@ async fn watch_oldest_retained_event_id(
         since: None,
         until: None,
     };
-    let oldest = storage
-        .get_events_stream_with_cx(cx, query)
-        .await
-        .map_err(|error| error.to_string())?
-        .first()
-        .map(|event| event.id);
+    let events = storage.get_events_stream_with_cx(cx, query).await?;
+    cx.checkpoint()
+        .map_err(|error| frankenterm_core::Error::Cancelled(error.to_string()))?;
+    let oldest = events.first().map(|event| event.id);
     validate_watch_oldest_retained_event_id(oldest)
+        .map_err(|error| frankenterm_core::StorageError::Database(error).into())
 }
 
 /// Typed `cursor_expired` NDJSON record: the requested resume cursor fell behind
@@ -24403,6 +24585,7 @@ async fn relay_ipc_event_line(
     heartbeat: std::time::Duration,
     last_emit: &mut std::time::Instant,
 ) -> std::io::Result<IpcRelayAction> {
+    watch_checkpoint(cx, "IPC relay")?;
     let value = match decode_ipc_relay_record(line) {
         Ok(value) => value,
         Err(fault) => return Ok(IpcRelayAction::ProtocolFault(fault)),
@@ -24446,6 +24629,7 @@ async fn relay_ipc_event_line(
 
             // Cursorless pane lifecycle records cannot participate in durable
             // claims; they remain best-effort live notifications.
+            watch_checkpoint(cx, "IPC lifecycle output")?;
             let mut lock = stdout.lock();
             let continue_writing = write_ndjson_line(&mut lock, &value)?;
             drop(lock);
@@ -24466,6 +24650,7 @@ async fn relay_ipc_event_line(
             // disabled, and emit a user-visible heartbeat only when its own
             // deadline is due. The server sends a null cursor because it does
             // not track the follower's durable position.
+            watch_checkpoint(cx, "IPC heartbeat output")?;
             if !emit_watch_heartbeat_if_due(
                 stdout,
                 *current_cursor,
@@ -24486,6 +24671,7 @@ async fn relay_ipc_event_line(
             // (but persisted) events are backfilled at-least-once
             // (ft-7h5da.4.2, no-silent-gaps).
             let output = ipc_gap_with_follower_cursor(value, *current_cursor);
+            watch_checkpoint(cx, "IPC lag-gap output")?;
             let mut lock = stdout.lock();
             let cont = write_ndjson_line(&mut lock, &output)?;
             drop(lock);
@@ -24780,16 +24966,24 @@ mod watch_events_tests {
     fn stalled_ipc_read_reaches_independent_durable_poll_deadline() {
         run_watch_claim_async(async move {
             let cx = frankenterm_core::cx::for_testing();
+            let read_was_polled = std::cell::Cell::new(false);
             let outcome = read_watch_ipc_line_until_durable_poll(
                 &cx,
                 std::time::Instant::now(),
-                std::time::Duration::from_millis(5),
-                std::future::pending::<std::io::Result<Option<String>>>(),
+                std::time::Duration::ZERO,
+                async {
+                    read_was_polled.set(true);
+                    std::future::pending::<std::io::Result<Option<String>>>().await
+                },
             )
             .await
             .expect("deadline is a normal durable-poll wakeup");
 
             assert_eq!(outcome, WatchIpcStreamRead::DurablePollDeadline);
+            assert!(
+                !read_was_polled.get(),
+                "an already-elapsed window must not depend on a real-time 5 ms timer"
+            );
 
             let ready = read_watch_ipc_line_until_durable_poll(
                 &cx,
@@ -24805,42 +24999,58 @@ mod watch_events_tests {
 
     #[cfg(unix)]
     #[test]
-    fn ready_ipc_lines_cannot_extend_the_durable_poll_window() {
+    fn durable_poll_window_math_is_fixed_and_saturating() {
+        let started_at = std::time::Instant::now();
+        let interval = std::time::Duration::from_millis(5);
+        assert_eq!(
+            watch_durable_poll_remaining_at(started_at, interval, started_at),
+            interval
+        );
+        assert_eq!(
+            watch_durable_poll_remaining_at(started_at, interval, started_at + interval),
+            std::time::Duration::ZERO,
+            "ready lines cannot reset the caller-owned start time"
+        );
+        assert_eq!(
+            watch_durable_poll_remaining_at(
+                started_at,
+                interval,
+                started_at + std::time::Duration::from_secs(1),
+            ),
+            std::time::Duration::ZERO,
+            "late observations must saturate instead of underflowing"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn completed_ipc_line_is_rejected_if_its_read_cancelled_the_caller() {
         run_watch_claim_async(async move {
             let cx = frankenterm_core::cx::for_testing();
-            let started_at = std::time::Instant::now();
-            let interval = std::time::Duration::from_millis(5);
-            let first = read_watch_ipc_line_until_durable_poll(
+            let cancel_cx = cx.clone();
+            let relay_effect_ran = std::cell::Cell::new(false);
+            let result = read_watch_ipc_line_until_durable_poll(
                 &cx,
-                started_at,
-                interval,
-                std::future::ready(Ok(Some("first".to_string()))),
-            )
-            .await
-            .expect("first ready line");
-            assert_eq!(
-                first,
-                WatchIpcStreamRead::Line(Some("first".to_string()))
-            );
-
-            std::thread::sleep(std::time::Duration::from_millis(10));
-            let second_read_was_polled = std::cell::Cell::new(false);
-            let second = read_watch_ipc_line_until_durable_poll(
-                &cx,
-                started_at,
-                interval,
-                async {
-                    second_read_was_polled.set(true);
-                    Ok(Some("second".to_string()))
+                std::time::Instant::now(),
+                std::time::Duration::from_secs(1),
+                async move {
+                    cancel_cx.cancel_with(
+                        frankenterm_core::outcome::CancelKind::User,
+                        Some("cancelled in ready IPC read"),
+                    );
+                    Ok(Some("must-not-be-relayed".to_string()))
                 },
             )
-            .await
-            .expect("expired durable-poll window is a normal storage wakeup");
+            .await;
+            if result.is_ok() {
+                relay_effect_ran.set(true);
+            }
 
-            assert_eq!(second, WatchIpcStreamRead::DurablePollDeadline);
+            let error = result.expect_err("post-read checkpoint must win over the ready line");
+            assert_eq!(error.kind(), std::io::ErrorKind::Interrupted);
             assert!(
-                !second_read_was_polled.get(),
-                "an already-expired relay stint must return to storage before polling another ready line"
+                !relay_effect_ran.get(),
+                "a line returned concurrently with cancellation must have no relay/output effects"
             );
         });
     }
@@ -24894,6 +25104,152 @@ mod watch_events_tests {
                 .await
                 .expect_err("pre-cancelled delay must not spawn a huge blocking sleep");
             assert_eq!(sleep_error.kind(), std::io::ErrorKind::Interrupted);
+        });
+    }
+
+    #[test]
+    fn outer_failure_classifier_never_reports_cancellation_as_degradation() {
+        let healthy = frankenterm_core::cx::for_testing();
+        assert!(matches!(
+            classify_watch_outer_failure(
+                &healthy,
+                "healthy transport failure",
+                WatchFailureSource::Degradation,
+            ),
+            WatchOuterFailure::Degraded
+        ));
+
+        let typed = classify_watch_outer_failure(
+            &healthy,
+            "typed storage cancellation",
+            WatchFailureSource::Cancellation,
+        );
+        let WatchOuterFailure::Cancelled(error) = typed else {
+            panic!("typed cancellation was misclassified as degradation");
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::Interrupted);
+
+        let cancelled = frankenterm_core::cx::for_testing();
+        cancelled.cancel_with(
+            frankenterm_core::outcome::CancelKind::User,
+            Some("outer-loop cancellation"),
+        );
+        let flattened = classify_watch_outer_failure(
+            &cancelled,
+            "flattened IPC failure",
+            WatchFailureSource::Degradation,
+        );
+        let WatchOuterFailure::Cancelled(error) = flattened else {
+            panic!("cancelled Cx was misclassified as transport degradation");
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::Interrupted);
+        assert!(error.to_string().contains("outer-loop cancellation"));
+
+        assert_eq!(
+            watch_core_failure_source(&frankenterm_core::Error::Cancelled(
+                "storage cancelled".to_string()
+            )),
+            WatchFailureSource::Cancellation
+        );
+        assert_eq!(
+            watch_core_failure_source(&frankenterm_core::Error::runtime_cancelled(
+                "watch-test",
+                "runtime cancelled",
+            )),
+            WatchFailureSource::Cancellation
+        );
+        assert_eq!(
+            watch_core_failure_source(&frankenterm_core::Error::Io(
+                std::io::Error::other("transport failed")
+            )),
+            WatchFailureSource::Degradation
+        );
+    }
+
+    #[test]
+    fn elapsed_delay_recomputation_does_not_accumulate_executor_oversleep() {
+        let started_at = std::time::Instant::now();
+        let delay = std::time::Duration::from_millis(1_500);
+        assert_eq!(
+            watch_delay_remaining_at(
+                started_at,
+                delay,
+                started_at + std::time::Duration::from_millis(700),
+            ),
+            std::time::Duration::from_millis(800),
+            "a 500 ms slice plus 200 ms executor delay must consume the full 700 ms"
+        );
+        assert_eq!(
+            watch_delay_remaining_at(
+                started_at,
+                delay,
+                started_at + std::time::Duration::from_millis(1_700),
+            ),
+            std::time::Duration::ZERO,
+            "elapsed time beyond the target must saturate without an extra slice"
+        );
+    }
+
+    #[test]
+    fn blocking_delay_observes_cancellation_after_the_worker_starts() {
+        run_watch_claim_async(async move {
+            let cx = frankenterm_core::cx::for_testing();
+            let cancel_cx = cx.clone();
+            // (release worker, worker finished)
+            let gate = std::sync::Arc::new((
+                std::sync::Mutex::new((false, false)),
+                std::sync::Condvar::new(),
+            ));
+            let worker_gate = std::sync::Arc::clone(&gate);
+            let sleeper = std::sync::Arc::new(move |_slice: std::time::Duration| {
+                cancel_cx.cancel_with(
+                    frankenterm_core::outcome::CancelKind::User,
+                    Some("blocking delay cancelled from worker"),
+                );
+                let (lock, wake) = &*worker_gate;
+                let state = lock.lock().expect("lock blocking-delay test gate");
+                let (mut state, timeout) = wake
+                    .wait_timeout_while(
+                        state,
+                        std::time::Duration::from_secs(2),
+                        |state| !state.0,
+                    )
+                    .expect("wait for blocking-delay test release");
+                // The timeout is a test-failure escape hatch, not a success
+                // path: the assertion below requires the await to return while
+                // this worker is still blocked.
+                if timeout.timed_out() && !state.0 {
+                    state.1 = true;
+                    wake.notify_all();
+                    return;
+                }
+                state.1 = true;
+                wake.notify_all();
+            });
+
+            let error = sleep_watch_delay_with_cx_using(
+                &cx,
+                std::time::Duration::from_secs(60),
+                "mid-flight cancellation test",
+                sleeper,
+            )
+            .await
+            .expect_err("Cx-aware blocking race must return before its worker finishes");
+            assert_eq!(error.kind(), std::io::ErrorKind::Interrupted);
+
+            let (lock, wake) = &*gate;
+            let mut state = lock.lock().expect("lock blocking-delay release gate");
+            assert!(
+                !state.1,
+                "helper waited for the blocking worker instead of observing cancellation"
+            );
+            state.0 = true;
+            wake.notify_all();
+            while !state.1 {
+                state = wake
+                    .wait(state)
+                    .expect("wait for abandoned blocking slice to finish");
+            }
         });
     }
 
@@ -25003,7 +25359,7 @@ mod watch_events_tests {
 
     #[test]
     fn claimed_delivery_is_flush_before_handle_and_releases_known_failures() {
-        let (_directory, database_path, event_ids) = watch_claim_fixture(6);
+        let (_directory, database_path, event_ids) = watch_claim_fixture(9);
         run_watch_claim_async(async move {
             let cx = frankenterm_core::cx::for_testing();
             let storage = frankenterm_core::storage::StorageHandle::new(&database_path)
@@ -25218,6 +25574,129 @@ mod watch_events_tests {
             assert!(
                 stored.handled_at.is_none(),
                 "lost finalization ownership must not mark the event handled"
+            );
+
+            // Once the writer runs, caller cancellation must not suppress the
+            // durable completion/compensation phase. Exercise all three writer
+            // outcomes with cancellation triggered deterministically inside
+            // the synchronous writer itself.
+            let cancelled_success_id = event_ids[6];
+            let cancelled_success_cx = frankenterm_core::cx::for_testing();
+            let cancel_in_success = cancelled_success_cx.clone();
+            let cancelled_success = deliver_claimed_watch_event(
+                &cancelled_success_cx,
+                &storage,
+                cancelled_success_id,
+                ipc_persisted_event(cancelled_success_id),
+                move |_record| {
+                    cancel_in_success.cancel_with(
+                        frankenterm_core::outcome::CancelKind::User,
+                        Some("writer cancelled before successful completion"),
+                    );
+                    Ok(true)
+                },
+            )
+            .await
+            .expect("fresh completion Cx must finalize after writer cancellation");
+            assert!(cancelled_success_cx.is_cancel_requested());
+            assert!(matches!(
+                cancelled_success,
+                WatchEventClaimDelivery::Delivered { .. }
+            ));
+            let stored = storage
+                .get_events_stream(watch_claim_query(cancelled_success_id - 1))
+                .await
+                .expect("load cancellation-finalized event")
+                .into_iter()
+                .next()
+                .expect("cancellation-finalized event remains queryable");
+            assert_eq!(stored.id, cancelled_success_id);
+            assert!(stored.handled_at.is_some());
+
+            let cancelled_pipe_id = event_ids[7];
+            let cancelled_pipe_cx = frankenterm_core::cx::for_testing();
+            let cancel_in_pipe = cancelled_pipe_cx.clone();
+            let cancelled_pipe = deliver_claimed_watch_event(
+                &cancelled_pipe_cx,
+                &storage,
+                cancelled_pipe_id,
+                ipc_persisted_event(cancelled_pipe_id),
+                move |_record| {
+                    cancel_in_pipe.cancel_with(
+                        frankenterm_core::outcome::CancelKind::User,
+                        Some("writer cancelled before closed-pipe result"),
+                    );
+                    Ok(false)
+                },
+            )
+            .await
+            .expect("fresh compensation Cx must release after closed-pipe cancellation");
+            assert!(cancelled_pipe_cx.is_cancel_requested());
+            assert_eq!(cancelled_pipe, WatchEventClaimDelivery::PipeClosed);
+            let verification_cx = frankenterm_core::cx::for_testing();
+            let reacquired = storage
+                .reserve_event_delivery_with_cx(
+                    &verification_cx,
+                    cancelled_pipe_id,
+                    WATCH_EVENTS_CLAIM_LEASE_TTL,
+                )
+                .await
+                .expect("cancelled closed-pipe writer must release immediately");
+            let reacquired = match reacquired {
+                frankenterm_core::storage::EventDeliveryReservation::Acquired(lease) => lease,
+                other => panic!(
+                    "cancelled closed-pipe event was not immediately reacquired: {other:?}"
+                ),
+            };
+            assert!(
+                storage
+                    .release_event_delivery_with_cx(&verification_cx, &reacquired)
+                    .await
+                    .expect("release cancellation closed-pipe verification lease")
+            );
+
+            let cancelled_error_id = event_ids[8];
+            let cancelled_error_cx = frankenterm_core::cx::for_testing();
+            let cancel_in_error = cancelled_error_cx.clone();
+            let cancelled_error = deliver_claimed_watch_event(
+                &cancelled_error_cx,
+                &storage,
+                cancelled_error_id,
+                ipc_persisted_event(cancelled_error_id),
+                move |_record| {
+                    cancel_in_error.cancel_with(
+                        frankenterm_core::outcome::CancelKind::User,
+                        Some("writer cancelled before error result"),
+                    );
+                    Err(std::io::Error::other(
+                        "injected error after writer cancellation",
+                    ))
+                },
+            )
+            .await
+            .expect_err("writer error must survive successful fresh-Cx compensation");
+            assert!(cancelled_error_cx.is_cancel_requested());
+            assert_eq!(cancelled_error.kind(), std::io::ErrorKind::Other);
+            let verification_cx = frankenterm_core::cx::for_testing();
+            let reacquired = storage
+                .reserve_event_delivery_with_cx(
+                    &verification_cx,
+                    cancelled_error_id,
+                    WATCH_EVENTS_CLAIM_LEASE_TTL,
+                )
+                .await
+                .expect("cancelled error writer must release immediately");
+            let reacquired = match reacquired {
+                frankenterm_core::storage::EventDeliveryReservation::Acquired(lease) => lease,
+                other => panic!(
+                    "cancelled error event was not immediately reacquired: {other:?}"
+                ),
+            };
+            assert!(
+                storage
+                    .release_event_delivery_with_cx(&verification_cx, &reacquired)
+                    .await
+                    .expect("release cancellation error verification lease")
             );
 
             storage.shutdown().await.expect("shutdown watch claim storage");
@@ -38309,6 +38788,16 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                 {
                                     Ok(e) => e,
                                     Err(e) => {
+                                        match classify_watch_outer_failure(
+                                            &cx,
+                                            "durable event query",
+                                            watch_core_failure_source(&e),
+                                        ) {
+                                            WatchOuterFailure::Cancelled(error) => {
+                                                return Err(error.into());
+                                            }
+                                            WatchOuterFailure::Degraded => {}
+                                        }
                                         let response =
                                             RobotResponse::<serde_json::Value>::error_with_code(
                                                 ROBOT_ERR_STORAGE,
@@ -38316,10 +38805,12 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                                 None,
                                                 elapsed_ms(start),
                                             );
+                                        watch_checkpoint(&cx, "storage error response")?;
                                         print_robot_response(&response, format, stats)?;
                                         break 'follow;
                                     }
                                 };
+                                watch_checkpoint(&cx, "durable event query completion")?;
                                 let reconciliation_now = std::time::Instant::now();
                                 if watch_retention_reconciliation_is_due(
                                     current_cursor,
@@ -38332,6 +38823,16 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                     {
                                         Ok(oldest) => oldest,
                                         Err(error) => {
+                                            match classify_watch_outer_failure(
+                                                &cx,
+                                                "retention reconciliation",
+                                                watch_core_failure_source(&error),
+                                            ) {
+                                                WatchOuterFailure::Cancelled(error) => {
+                                                    return Err(error.into());
+                                                }
+                                                WatchOuterFailure::Degraded => {}
+                                            }
                                             let response =
                                                 RobotResponse::<serde_json::Value>::error_with_code(
                                                     ROBOT_ERR_STORAGE,
@@ -38344,6 +38845,10 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                                     ),
                                                     elapsed_ms(start),
                                                 );
+                                            watch_checkpoint(
+                                                &cx,
+                                                "retention error response",
+                                            )?;
                                             print_robot_response(&response, format, stats)?;
                                             break 'follow;
                                         }
@@ -38356,6 +38861,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                             .expect("expiry requires a durable cursor");
                                         let record =
                                             watch_cursor_expired_ndjson(requested, oldest);
+                                        watch_checkpoint(&cx, "cursor-expired output")?;
                                         let continue_writing = {
                                             let mut lock = stdout.lock();
                                             write_ndjson_line(&mut lock, &record)?
@@ -38633,6 +39139,18 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                                             continue 'follow;
                                                         }
                                                         IpcRelayAction::ProtocolFault(fault) => {
+                                                            match classify_watch_outer_failure(
+                                                                &cx,
+                                                                "IPC protocol-fault output",
+                                                                WatchFailureSource::Degradation,
+                                                            ) {
+                                                                WatchOuterFailure::Cancelled(
+                                                                    error,
+                                                                ) => {
+                                                                    return Err(error.into());
+                                                                }
+                                                                WatchOuterFailure::Degraded => {}
+                                                            }
                                                             observe_ipc_fallback(
                                                                 &mut ipc_diagnostics,
                                                                 IpcFallbackObservation::ProtocolFault,
@@ -38640,6 +39158,10 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                                             );
                                                             let gap_was_open =
                                                                 ipc_transport_gap_open;
+                                                            watch_checkpoint(
+                                                                &cx,
+                                                                "IPC protocol-fault gap output",
+                                                            )?;
                                                             let continue_writing = {
                                                                 let mut lock = stdout.lock();
                                                                 write_ipc_protocol_fault_once(
@@ -38689,6 +39211,16 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                                     }
                                                 }
                                                 Ok(WatchIpcStreamRead::Line(None)) => {
+                                                    match classify_watch_outer_failure(
+                                                        &cx,
+                                                        "IPC stream EOF",
+                                                        WatchFailureSource::Degradation,
+                                                    ) {
+                                                        WatchOuterFailure::Cancelled(error) => {
+                                                            return Err(error.into());
+                                                        }
+                                                        WatchOuterFailure::Degraded => {}
+                                                    }
                                                     observe_ipc_fallback(
                                                         &mut ipc_diagnostics,
                                                         IpcFallbackObservation::StreamEof,
@@ -38696,6 +39228,10 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                                     );
                                                     let gap_was_open =
                                                         ipc_transport_gap_open;
+                                                    watch_checkpoint(
+                                                        &cx,
+                                                        "IPC EOF gap output",
+                                                    )?;
                                                     let continue_writing = {
                                                         let mut lock = stdout.lock();
                                                         write_ipc_transport_gap_once(
@@ -38717,6 +39253,18 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                                     break;
                                                 }
                                                 Err(error) => {
+                                                    match classify_watch_outer_failure(
+                                                        &cx,
+                                                        "IPC stream read",
+                                                        WatchFailureSource::Degradation,
+                                                    ) {
+                                                        WatchOuterFailure::Cancelled(
+                                                            cancel_error,
+                                                        ) => {
+                                                            return Err(cancel_error.into());
+                                                        }
+                                                        WatchOuterFailure::Degraded => {}
+                                                    }
                                                     observe_ipc_fallback(
                                                         &mut ipc_diagnostics,
                                                         IpcFallbackObservation::StreamReadFailed,
@@ -38724,6 +39272,10 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                                     );
                                                     let gap_was_open =
                                                         ipc_transport_gap_open;
+                                                    watch_checkpoint(
+                                                        &cx,
+                                                        "IPC read-failure gap output",
+                                                    )?;
                                                     let continue_writing = {
                                                         let mut lock = stdout.lock();
                                                         write_ipc_transport_gap_once(
@@ -38779,6 +39331,18 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                                 continue 'follow;
                                             }
                                             Err(error) => {
+                                                match classify_watch_outer_failure(
+                                                    &cx,
+                                                    "IPC subscription",
+                                                    WatchFailureSource::Degradation,
+                                                ) {
+                                                    WatchOuterFailure::Cancelled(
+                                                        cancel_error,
+                                                    ) => {
+                                                        return Err(cancel_error.into());
+                                                    }
+                                                    WatchOuterFailure::Degraded => {}
+                                                }
                                                 observe_ipc_fallback(
                                                     &mut ipc_diagnostics,
                                                     IpcFallbackObservation::SubscribeFailed,
@@ -38786,6 +39350,10 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                                 );
                                                 let gap_was_open =
                                                     ipc_transport_gap_open;
+                                                watch_checkpoint(
+                                                    &cx,
+                                                    "IPC subscribe-failure gap output",
+                                                )?;
                                                 let continue_writing = {
                                                     let mut lock = stdout.lock();
                                                     write_ipc_transport_gap_once(
