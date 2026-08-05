@@ -1116,6 +1116,176 @@ fn mcp_conformance_retried_hole_across_large_backlog_preserves_order_and_cursor(
 }
 
 #[test]
+fn mcp_conformance_foreign_hole_outlives_met_mask_until_exact_refetch() {
+    let mut harness = new_harness();
+    seed_many_events(
+        &harness,
+        vec![
+            make_event_with(1, "rule.a", FIXTURE_TS),
+            make_event_with(2, "rule.a", FIXTURE_TS + 1),
+        ],
+    );
+    let competing_lease = reserve_fixture_event_id(
+        &harness.db_path,
+        1,
+        std::time::Duration::from_secs(10),
+    );
+
+    let db_path = harness.db_path.clone();
+    let mut await_client = spawn_client(Some(db_path.clone()));
+    let waiter = std::thread::spawn(move || {
+        let envelope = parse_tool_envelope(
+            &await_client
+                .call_tool(
+                    "wa.await_event",
+                    json!({
+                        "all": ["rule:rule.a", "rule:rule.b"],
+                        "cursor": 0,
+                        "pane": FIXTURE_PANE_ID,
+                        "timeout_secs": 5,
+                        "poll_interval_ms": 10,
+                        "claim": true
+                    }),
+                )
+                .expect("call delayed-B A/A/B await"),
+        );
+        await_client
+            .call_tool("wa.events", json!({"limit": 1}))
+            .expect("delayed-B delivery barrier");
+        envelope
+    });
+
+    // Synchronize on id=2 being leased by the waiter. At that point the A
+    // condition is met while id=1 remains a foreign-owned cursor hole.
+    wait_for_event_delivery_lease(&db_path, 2, std::time::Duration::from_secs(5));
+    release_fixture_event(&db_path, &competing_lease);
+    seed_many_events_at(
+        &db_path,
+        vec![make_event_with(3, "rule.b", FIXTURE_TS + 2)],
+    );
+
+    let acquired = waiter.join().expect("join delayed-B A/A/B waiter");
+    assert_success_envelope_shape(&acquired);
+    assert_eq!(acquired["data"]["satisfied"], Value::Bool(true));
+    assert_eq!(acquired["data"]["timed_out"], Value::Bool(false));
+    assert_eq!(acquired["data"]["final_cursor"], Value::from(3));
+    assert_eq!(
+        acquired["data"]["events"]
+            .as_array()
+            .expect("delayed-B matched events")
+            .iter()
+            .map(|event| event["id"].as_i64().expect("event id"))
+            .collect::<Vec<_>>(),
+        vec![1, 2, 3],
+        "the id=1 hole must survive after id=2 satisfies the same A mask"
+    );
+
+    let events = load_fixture_events(&db_path);
+    assert_eq!(events.len(), 3);
+    assert!(
+        events.iter().all(|event| event.handled_at.is_some()),
+        "every emitted A/A/B event must finalize after the delivery barrier"
+    );
+}
+
+#[test]
+fn mcp_conformance_blocked_hole_cap_fails_closed_across_pages() {
+    const BLOCKED_CAP: i64 = 500;
+    let mut harness = new_harness();
+    seed_many_events(
+        &harness,
+        (1..=BLOCKED_CAP + 1)
+            .map(|id| {
+                make_event_with(
+                    u64::try_from(id).expect("positive fixture id fits u64"),
+                    "rule.a",
+                    FIXTURE_TS + id,
+                )
+            })
+            .collect(),
+    );
+    let competing_leases = reserve_fixture_event_ids(
+        &harness.db_path,
+        1..=BLOCKED_CAP + 1,
+        std::time::Duration::from_secs(60),
+    );
+
+    let saturated = call_await_event(
+        &mut harness,
+        json!({
+            "any": ["rule:rule.a"],
+            "cursor": 0,
+            "pane": FIXTURE_PANE_ID,
+            "timeout_secs": 5,
+            "poll_interval_ms": 10,
+            "claim": true
+        }),
+    );
+    assert_common_envelope_fields(&saturated, false);
+    assert_eq!(saturated["error_code"], "FT-MCP-0005");
+    assert_eq!(
+        saturated["error"],
+        "wa.await_event cannot safely track more than 500 concurrently leased matching events"
+    );
+
+    // Saturation occurred on page two before id=501 could become an untracked
+    // cursor advance. Reusing the original cursor after releasing only id=1
+    // must still discover and claim the earliest event.
+    release_fixture_event(&harness.db_path, &competing_leases[0]);
+    let retried = call_await_event(
+        &mut harness,
+        json!({
+            "any": ["rule:rule.a"],
+            "cursor": 0,
+            "pane": FIXTURE_PANE_ID,
+            "timeout_secs": 2,
+            "poll_interval_ms": 10,
+            "claim": true
+        }),
+    );
+    assert_success_envelope_shape(&retried);
+    assert_eq!(retried["data"]["events"][0]["id"], Value::from(1));
+    assert_eq!(retried["data"]["final_cursor"], Value::from(1));
+    let _delivery_barrier = call_events(&mut harness, json!({"limit": 1}));
+    release_fixture_events(&harness.db_path, &competing_leases[1..]);
+}
+
+#[test]
+fn mcp_conformance_storage_paths_are_redacted_from_event_tool_errors() {
+    let workspace = tempfile::tempdir().expect("create redaction workspace");
+    let secret_marker = "operator-secret-mcp-database";
+    let invalid_db_path = workspace.path().join(secret_marker);
+    std::fs::create_dir(&invalid_db_path).expect("create directory at invalid database path");
+    let mut client = spawn_client(Some(invalid_db_path.clone()));
+
+    for (tool, arguments) in [
+        ("wa.events", json!({"limit": 1})),
+        (
+            "wa.await_event",
+            json!({
+                "any": ["rule:rule.a"],
+                "cursor": 0,
+                "timeout_secs": 1,
+                "poll_interval_ms": 10
+            }),
+        ),
+    ] {
+        let envelope = parse_tool_envelope(
+            &client
+                .call_tool(tool, arguments)
+                .unwrap_or_else(|error| panic!("call {tool} redaction case: {error}")),
+        );
+        assert_common_envelope_fields(&envelope, false);
+        assert_eq!(envelope["error_code"], "FT-MCP-0005");
+        assert_eq!(envelope["error"], "Storage unavailable");
+        let serialized = envelope.to_string();
+        let invalid_db_path_text = invalid_db_path.to_string_lossy();
+        assert!(!serialized.contains(secret_marker));
+        assert!(!serialized.contains(invalid_db_path_text.as_ref()));
+    }
+}
+
+#[test]
 fn mcp_conformance_live_lease_does_not_block_a_later_matching_event() {
     let mut harness = new_harness();
     seed_many_events(
