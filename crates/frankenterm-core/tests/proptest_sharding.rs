@@ -8,10 +8,11 @@ use frankenterm_core::circuit_breaker::CircuitBreakerStatus;
 use frankenterm_core::config::{Config, VendoredShardingConfig};
 use frankenterm_core::patterns::AgentType;
 use frankenterm_core::sharding::{
-    AssignmentStrategy, LOCAL_PANE_ID_BITS, LOCAL_PANE_ID_MASK, MAX_GLOBAL_PANE_ID, MAX_SHARD_ID,
-    ShardHealthEntry, ShardHealthReport, ShardId, assign_pane_with_strategy,
-    decode_sharded_pane_id, encode_sharded_pane_id, is_sharded_pane_id,
-    try_decode_sharded_pane_id, try_encode_sharded_pane_id,
+    AssignmentStrategy, LOCAL_PANE_ID_BITS, LOCAL_PANE_ID_MASK, MAX_CONFIGURED_SHARDS,
+    MAX_GLOBAL_PANE_ID, MAX_SHARD_ID, ShardBackendErrorClass, ShardHealthEntry,
+    ShardHealthProbeOutcome, ShardHealthReport, ShardHealthReportOutcome, ShardId,
+    assign_pane_with_strategy, decode_sharded_pane_id, encode_sharded_pane_id,
+    is_sharded_pane_id, try_decode_sharded_pane_id, try_encode_sharded_pane_id,
 };
 use frankenterm_core::watchdog::HealthStatus;
 
@@ -133,16 +134,54 @@ fn arb_shard_health_entry() -> impl Strategy<Value = ShardHealthEntry> {
         arb_health_status(),
         proptest::option::of(0usize..1000), // pane_count
         arb_circuit_breaker_status(),
-        proptest::option::of("[a-z ]{3,30}"), // error
+        prop_oneof![
+            Just(None),
+            Just(Some("scan_cancelled".to_owned())),
+            Just(Some("not_started".to_owned())),
+            Just(Some("command_failed".to_owned())),
+            Just(Some("timed_out".to_owned())),
+            Just(Some("backend_panicked".to_owned())),
+            proptest::option::of("[a-z ]{3,30}"),
+        ],
     )
         .prop_map(
-            |(shard_id, label, status, pane_count, circuit, error)| ShardHealthEntry {
-                shard_id: ShardId(shard_id),
-                label,
-                status,
-                pane_count,
-                circuit,
-                error,
+            |(shard_id, label, mut status, mut pane_count, circuit, error)| {
+                let probe_outcome = match error.as_deref() {
+                    None => ShardHealthProbeOutcome::Complete,
+                    Some("scan_cancelled") => ShardHealthProbeOutcome::Cancelled,
+                    Some("not_started") => ShardHealthProbeOutcome::NotStarted,
+                    Some("command_failed") => ShardHealthProbeOutcome::Failed(
+                        ShardBackendErrorClass::CommandFailed,
+                    ),
+                    Some("timed_out") => {
+                        ShardHealthProbeOutcome::Failed(ShardBackendErrorClass::TimedOut)
+                    }
+                    Some("backend_panicked") => ShardHealthProbeOutcome::Failed(
+                        ShardBackendErrorClass::Panicked,
+                    ),
+                    Some(_) => {
+                        ShardHealthProbeOutcome::Failed(ShardBackendErrorClass::Other)
+                    }
+                };
+                if probe_outcome != ShardHealthProbeOutcome::Complete
+                    && status == HealthStatus::Healthy
+                {
+                    status = HealthStatus::Degraded;
+                }
+                if matches!(
+                    probe_outcome,
+                    ShardHealthProbeOutcome::Failed(_) | ShardHealthProbeOutcome::NotStarted
+                ) {
+                    pane_count = None;
+                }
+                ShardHealthEntry {
+                    shard_id: ShardId(shard_id),
+                    label,
+                    status,
+                    pane_count,
+                    circuit,
+                    error,
+                }
             },
         )
 }
@@ -150,13 +189,22 @@ fn arb_shard_health_entry() -> impl Strategy<Value = ShardHealthEntry> {
 fn arb_shard_health_report() -> impl Strategy<Value = ShardHealthReport> {
     (
         0u64..2_000_000_000,
-        arb_health_status(),
-        prop::collection::vec(arb_shard_health_entry(), 0..8),
+        prop::collection::vec(arb_shard_health_entry(), 0..80),
     )
-        .prop_map(|(timestamp_ms, overall, shards)| ShardHealthReport {
-            timestamp_ms,
-            overall,
-            shards,
+        .prop_map(|(timestamp_ms, mut shards)| {
+            for (index, entry) in shards.iter_mut().enumerate() {
+                entry.shard_id = ShardId(index);
+            }
+            let overall = shards
+                .iter()
+                .fold(HealthStatus::Healthy, |worst, entry| {
+                    worst.max(entry.status)
+                });
+            ShardHealthReport {
+                timestamp_ms,
+                overall,
+                shards,
+            }
         })
 }
 
@@ -217,6 +265,58 @@ proptest! {
         let enc2 = encode_sharded_pane_id(ShardId(shard2), local2);
         prop_assert_ne!(enc1, enc2, "distinct shard+local should produce distinct encoded IDs");
     }
+}
+
+#[test]
+fn health_probe_wire_uses_typed_finite_outcomes_only() {
+    let cases = [
+        (None, ShardHealthProbeOutcome::Complete),
+        (
+            Some("command_failed".to_owned()),
+            ShardHealthProbeOutcome::Failed(ShardBackendErrorClass::CommandFailed),
+        ),
+        (
+            Some("backend-secret-that-is-not-a-class".to_owned()),
+            ShardHealthProbeOutcome::Failed(ShardBackendErrorClass::Other),
+        ),
+        (
+            Some("scan_cancelled".to_owned()),
+            ShardHealthProbeOutcome::Cancelled,
+        ),
+        (
+            Some("not_started".to_owned()),
+            ShardHealthProbeOutcome::NotStarted,
+        ),
+    ];
+
+    for (index, (error, expected)) in cases.into_iter().enumerate() {
+        let entry = ShardHealthEntry {
+            shard_id: ShardId(index),
+            label: "label-secret-that-must-not-be-projected".to_owned(),
+            status: match expected {
+                ShardHealthProbeOutcome::Complete => HealthStatus::Healthy,
+                ShardHealthProbeOutcome::Failed(_) => HealthStatus::Hung,
+                ShardHealthProbeOutcome::Cancelled | ShardHealthProbeOutcome::NotStarted => {
+                    HealthStatus::Degraded
+                }
+            },
+            pane_count: None,
+            circuit: CircuitBreakerStatus::default(),
+            error,
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        assert!(!json.contains("label-secret"));
+        assert!(!json.contains("backend-secret"));
+        assert!(!json.contains("\"label\""));
+        assert!(!json.contains("\"error\""));
+        let back: ShardHealthEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.probe_outcome(), expected);
+    }
+}
+
+#[test]
+fn configured_shard_capacity_matches_the_encoded_id_domain() {
+    assert_eq!(MAX_CONFIGURED_SHARDS, MAX_SHARD_ID + 1);
 }
 
 // =========================================================================
@@ -461,16 +561,13 @@ proptest! {
             virtual_nodes: vnodes,
         };
 
-        // Note: Manual variant with non-empty pane_to_shard (HashMap<u64, _>)
-        // cannot round-trip through JSON strings due to a known serde_json
-        // limitation: externally-tagged enums buffer content as Value, and
-        // Value::Object stores keys as String which u64's Visitor rejects.
-        // Test Manual separately only when pane_to_shard is empty.
-        let strategies: Vec<AssignmentStrategy> = if manual_pairs.is_empty() {
-            vec![by_domain, by_agent, manual, consistent, AssignmentStrategy::RoundRobin]
-        } else {
-            vec![by_domain, by_agent, consistent, AssignmentStrategy::RoundRobin]
-        };
+        let strategies = vec![
+            by_domain,
+            by_agent,
+            manual,
+            consistent,
+            AssignmentStrategy::RoundRobin,
+        ];
         for strategy in strategies {
             let encoded = serde_json::to_string(&strategy).unwrap();
             let decoded: AssignmentStrategy = serde_json::from_str(&encoded).unwrap();
@@ -486,31 +583,48 @@ proptest! {
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(60))]
 
-    /// ShardHealthEntry serde roundtrip preserves all fields.
+    /// ShardHealthEntry serde emits only typed, finite authority and restores
+    /// compatibility fields from that typed outcome.
     #[test]
     fn prop_health_entry_serde_roundtrip(entry in arb_shard_health_entry()) {
+        let expected_outcome = entry.probe_outcome();
         let json = serde_json::to_string(&entry).unwrap();
+        let projection: serde_json::Value = serde_json::from_str(&json).unwrap();
         let back: ShardHealthEntry = serde_json::from_str(&json).unwrap();
         prop_assert_eq!(back.shard_id, entry.shard_id);
-        prop_assert_eq!(&back.label, &entry.label);
+        prop_assert!(back.label.is_empty());
         prop_assert_eq!(back.status, entry.status);
         prop_assert_eq!(back.pane_count, entry.pane_count);
         prop_assert_eq!(back.circuit.state, entry.circuit.state);
-        prop_assert_eq!(&back.error, &entry.error);
+        prop_assert_eq!(back.probe_outcome(), expected_outcome);
+        prop_assert!(projection.get("label").is_none());
+        prop_assert!(projection.get("error").is_none());
+        prop_assert!(projection.get("probe_outcome").is_some());
     }
 
-    /// ShardHealthReport serde roundtrip preserves structure.
+    /// ShardHealthReport serde roundtrip preserves its validated typed outcome
+    /// and deterministic shard ordering.
     #[test]
     fn prop_health_report_serde_roundtrip(report in arb_shard_health_report()) {
+        let expected_outcome = report.outcome();
         let json = serde_json::to_string(&report).unwrap();
+        let projection: serde_json::Value = serde_json::from_str(&json).unwrap();
         let back: ShardHealthReport = serde_json::from_str(&json).unwrap();
         prop_assert_eq!(back.timestamp_ms, report.timestamp_ms);
         prop_assert_eq!(back.overall, report.overall);
+        prop_assert_eq!(back.outcome(), expected_outcome);
         prop_assert_eq!(back.shards.len(), report.shards.len());
         for (b, r) in back.shards.iter().zip(report.shards.iter()) {
             prop_assert_eq!(b.shard_id, r.shard_id);
             prop_assert_eq!(b.status, r.status);
+            prop_assert_eq!(b.probe_outcome(), r.probe_outcome());
+            prop_assert!(b.label.is_empty());
         }
+        let expected_outcome_name = match expected_outcome {
+            ShardHealthReportOutcome::Complete => "complete",
+            ShardHealthReportOutcome::Cancelled => "cancelled",
+        };
+        prop_assert_eq!(projection["outcome"].as_str(), Some(expected_outcome_name));
     }
 
     /// unhealthy_shards returns only non-Healthy entries.
@@ -526,13 +640,27 @@ proptest! {
         prop_assert_eq!(unhealthy.len(), expected);
     }
 
-    /// watchdog_warnings count matches unhealthy_shards count.
+    /// watchdog_warnings admits at most 64 entries plus one exact omission
+    /// summary for larger unhealthy sets.
     #[test]
     fn prop_watchdog_warnings_count(report in arb_shard_health_report()) {
+        const WARNING_LIMIT: usize = 64;
         let warnings = report.watchdog_warnings();
         let unhealthy = report.unhealthy_shards();
-        prop_assert_eq!(warnings.len(), unhealthy.len(),
-            "watchdog_warnings count should match unhealthy_shards count");
+        let expected = unhealthy.len().min(WARNING_LIMIT)
+            + usize::from(unhealthy.len() > WARNING_LIMIT);
+        prop_assert_eq!(warnings.len(), expected);
+        prop_assert!(warnings.iter().all(|warning| warning.len() < 256));
+        if unhealthy.len() > WARNING_LIMIT {
+            let omitted = unhealthy.len() - WARNING_LIMIT;
+            let expected_suffix = format!(
+                "omitted {omitted} additional unhealthy shard(s) after bounded limit \
+                 {WARNING_LIMIT}"
+            );
+            prop_assert!(warnings
+                .last()
+                .is_some_and(|warning| warning.contains(&expected_suffix)));
+        }
     }
 }
 
@@ -714,11 +842,16 @@ proptest! {
         prop_assert_eq!(cloned.shards.len(), report.shards.len());
     }
 
-    /// Health report Debug is non-empty.
+    /// Health report Debug is non-empty and cardinality-bounded.
     #[test]
     fn prop_health_report_debug(report in arb_shard_health_report()) {
         let debug = format!("{:?}", report);
         prop_assert!(!debug.is_empty());
+        prop_assert!(debug.len() < 16 * 1_024);
+        if report.shards.len() > 16 {
+            let omitted = report.shards.len() - 16;
+            prop_assert!(debug.contains(&format!("omitted_shards: {omitted}")));
+        }
     }
 
     /// Empty shards report has zero unhealthy and zero warnings.

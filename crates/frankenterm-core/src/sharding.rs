@@ -12,7 +12,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use frankenterm_sigpipe::{RecoverablePanicSite, catch_recoverable_future};
+use frankenterm_sigpipe::{RecoverablePanicSite, catch_recoverable, catch_recoverable_future};
 
 use crate::Result;
 use crate::circuit_breaker::{CircuitBreakerStatus, CircuitStateKind};
@@ -81,6 +81,12 @@ pub const LOCAL_PANE_ID_MASK: u64 = (1u64 << LOCAL_PANE_ID_BITS) - 1;
 /// Maximum shard id representable in encoded pane ids.
 pub const MAX_SHARD_ID: usize = ((1u64 << SHARD_ID_BITS) - 1) as usize;
 
+/// Maximum number of uniquely identified shards accepted by one client.
+///
+/// This also bounds the cardinality of a full health report, including a
+/// cancelled report that retains explicit not-started entries.
+pub const MAX_CONFIGURED_SHARDS: usize = MAX_SHARD_ID + 1;
+
 /// Largest global pane id that every signed-64 persistence boundary accepts.
 pub const MAX_GLOBAL_PANE_ID: u64 = (1u64 << 63) - 1;
 
@@ -99,6 +105,18 @@ const PANE_CREATION_ROLLBACK_OPERATION_PANIC: &str =
     "WA-SHARDING-ROLLBACK-PANIC: pane-creation rollback operation panicked";
 const PANE_CREATION_ROLLBACK_JOIN_PANIC: &str =
     "WA-SHARDING-ROLLBACK-PANIC: pane-creation rollback join panicked";
+
+/// Content-free result classes for rollback paths that cannot preserve the
+/// original backend diagnostic safely. Backend and scheduler errors can carry
+/// pane text, paths, credentials, or arbitrarily large caller-controlled
+/// strings, so public errors retain only these finite classes.
+const PANE_CREATION_ROLLBACK_TIMEOUT_CLASS: &str =
+    "WA-SHARDING-ROLLBACK-TIMEOUT: pane-creation rollback timed out";
+const PANE_CREATION_ROLLBACK_ADMISSION_CLASS: &str =
+    "WA-SHARDING-ROLLBACK-ADMISSION: rollback admission and inline cleanup failed";
+
+const SHARD_BACKEND_CALLBACK_PANIC_DETAIL: &str =
+    "WA-SHARDING-BACKEND-PANIC: backend health callback panicked";
 
 /// Identifier for a mux shard.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -220,7 +238,7 @@ where
 }
 
 /// How panes should be assigned to shards.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case", tag = "strategy")]
 pub enum AssignmentStrategy {
     /// Select shards round-robin for new panes. Existing panes are routed by
@@ -248,6 +266,42 @@ pub enum AssignmentStrategy {
     },
     /// Route by consistent hashing on pane id.
     ConsistentHash { virtual_nodes: u32 },
+}
+
+impl std::fmt::Debug for AssignmentStrategy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::RoundRobin => f.write_str("RoundRobin"),
+            Self::ByDomain {
+                domain_to_shard,
+                default_shard,
+            } => f
+                .debug_struct("ByDomain")
+                .field("mapping_count", &domain_to_shard.len())
+                .field("default_shard", default_shard)
+                .finish(),
+            Self::ByAgentType {
+                agent_to_shard,
+                default_shard,
+            } => f
+                .debug_struct("ByAgentType")
+                .field("mapping_count", &agent_to_shard.len())
+                .field("default_shard", default_shard)
+                .finish(),
+            Self::Manual {
+                pane_to_shard,
+                default_shard,
+            } => f
+                .debug_struct("Manual")
+                .field("mapping_count", &pane_to_shard.len())
+                .field("default_shard", default_shard)
+                .finish(),
+            Self::ConsistentHash { virtual_nodes } => f
+                .debug_struct("ConsistentHash")
+                .field("virtual_nodes", virtual_nodes)
+                .finish(),
+        }
+    }
 }
 
 impl AssignmentStrategy {
@@ -423,27 +477,288 @@ pub fn infer_agent_type(pane: &PaneInfo) -> AgentType {
 #[derive(Clone)]
 pub struct ShardBackend {
     pub id: ShardId,
-    pub label: String,
     pub handle: WeztermHandle,
 }
 
+/// Finite classification of a backend failure observed by sharded routing.
+///
+/// This is deliberately less detailed than [`crate::Error`]. The latter can
+/// contain untrusted backend text, while this enum is safe to project into
+/// operator errors, telemetry, health reports, and debug output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShardBackendErrorClass {
+    /// Backend executable, process, or transport endpoint unavailable.
+    Unavailable,
+    /// Requested pane was absent.
+    PaneNotFound,
+    /// Backend rejected or failed a command without a stronger class.
+    CommandFailed,
+    /// Backend response could not be parsed or validated.
+    InvalidResponse,
+    /// Backend response exceeded an enforced size limit.
+    OutputTooLarge,
+    /// Operation exceeded its time budget.
+    TimedOut,
+    /// Circuit breaker rejected the operation.
+    CircuitOpen,
+    /// Backend operation reported cancellation.
+    #[serde(rename = "backend_cancelled")]
+    Cancelled,
+    /// Backend operation crossed a contained panic boundary.
+    #[serde(rename = "backend_panicked")]
+    Panicked,
+    /// Local I/O failed.
+    Io,
+    /// Failure did not match a more specific safe class.
+    Other,
+}
+
+impl ShardBackendErrorClass {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unavailable => "unavailable",
+            Self::PaneNotFound => "pane_not_found",
+            Self::CommandFailed => "command_failed",
+            Self::InvalidResponse => "invalid_response",
+            Self::OutputTooLarge => "output_too_large",
+            Self::TimedOut => "timed_out",
+            Self::CircuitOpen => "circuit_open",
+            Self::Cancelled => "backend_cancelled",
+            Self::Panicked => "backend_panicked",
+            Self::Io => "io",
+            Self::Other => "other",
+        }
+    }
+
+}
+
+impl std::fmt::Display for ShardBackendErrorClass {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Finite outcome for one shard probe in a health scan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "state", content = "error_class")]
+pub enum ShardHealthProbeOutcome {
+    /// Probe finished successfully.
+    Complete,
+    /// Probe finished with a finite backend error class.
+    Failed(ShardBackendErrorClass),
+    /// Probe was interrupted by scan cancellation.
+    Cancelled,
+    /// Scan cancellation was observed before this probe began.
+    NotStarted,
+}
+
+impl ShardHealthProbeOutcome {
+    const fn warning_token(self) -> &'static str {
+        match self {
+            Self::Complete => "complete",
+            Self::Failed(class) => class.as_str(),
+            Self::Cancelled => "scan_cancelled",
+            Self::NotStarted => "not_started",
+        }
+    }
+}
+
+/// Completion state for an entire shard health scan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShardHealthReportOutcome {
+    /// Every configured shard was inspected.
+    Complete,
+    /// The scan was interrupted; per-shard outcomes identify the boundary.
+    Cancelled,
+}
+
 /// Health for a single shard backend.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone)]
 pub struct ShardHealthEntry {
     pub shard_id: ShardId,
-    pub label: String,
     pub status: HealthStatus,
     pub pane_count: Option<usize>,
     pub circuit: CircuitBreakerStatus,
-    pub error: Option<String>,
+    /// Finite probe result. Raw backend diagnostics never enter health-report
+    /// state or its operator-facing projections.
+    pub probe_outcome: ShardHealthProbeOutcome,
+}
+
+impl Serialize for ShardHealthEntry {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+
+        validate_shard_health_entry(self).map_err(serde::ser::Error::custom)?;
+        let mut state = serializer.serialize_struct("ShardHealthEntry", 5)?;
+        state.serialize_field("shard_id", &self.shard_id)?;
+        state.serialize_field("status", &self.status)?;
+        state.serialize_field("pane_count", &self.pane_count)?;
+        state.serialize_field("circuit", &self.circuit)?;
+        state.serialize_field("probe_outcome", &self.probe_outcome)?;
+        state.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for ShardHealthEntry {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct WireEntry {
+            shard_id: ShardId,
+            status: HealthStatus,
+            pane_count: Option<usize>,
+            circuit: CircuitBreakerStatus,
+            probe_outcome: ShardHealthProbeOutcome,
+        }
+
+        let wire = WireEntry::deserialize(deserializer)?;
+        let entry = Self {
+            shard_id: wire.shard_id,
+            status: wire.status,
+            pane_count: wire.pane_count,
+            circuit: wire.circuit,
+            probe_outcome: wire.probe_outcome,
+        };
+        validate_shard_health_entry(&entry).map_err(serde::de::Error::custom)?;
+        Ok(entry)
+    }
+}
+
+impl std::fmt::Debug for ShardHealthEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ShardHealthEntry")
+            .field("shard_id", &self.shard_id)
+            .field("status", &self.status)
+            .field("pane_count", &self.pane_count)
+            .field("circuit", &self.circuit)
+            .field("probe_outcome", &self.probe_outcome)
+            .finish()
+    }
 }
 
 /// Point-in-time health report across all configured shards.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone)]
 pub struct ShardHealthReport {
     pub timestamp_ms: u64,
     pub overall: HealthStatus,
     pub shards: Vec<ShardHealthEntry>,
+}
+
+impl std::fmt::Debug for ShardHealthReport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        const DEBUG_ENTRY_LIMIT: usize = 16;
+
+        let admitted = self.shards.len().min(DEBUG_ENTRY_LIMIT);
+        f.debug_struct("ShardHealthReport")
+            .field("timestamp_ms", &self.timestamp_ms)
+            .field("overall", &self.overall)
+            .field("outcome", &self.outcome())
+            .field("shard_count", &self.shards.len())
+            .field("shards", &&self.shards[..admitted])
+            .field("omitted_shards", &self.shards.len().saturating_sub(admitted))
+            .finish()
+    }
+}
+
+fn deserialize_bounded_shard_health_entries<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Vec<ShardHealthEntry>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct BoundedShardEntriesVisitor;
+
+    impl<'de> serde::de::Visitor<'de> for BoundedShardEntriesVisitor {
+        type Value = Vec<ShardHealthEntry>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(
+                formatter,
+                "at most {MAX_CONFIGURED_SHARDS} shard health entries"
+            )
+        }
+
+        fn visit_seq<A>(self, mut sequence: A) -> std::result::Result<Self::Value, A::Error>
+        where
+            A: serde::de::SeqAccess<'de>,
+        {
+            let size_hint = sequence.size_hint();
+            if let Some(length) = size_hint.filter(|length| *length > MAX_CONFIGURED_SHARDS) {
+                return Err(serde::de::Error::invalid_length(
+                    length,
+                    &self,
+                ));
+            }
+
+            let capacity = size_hint.unwrap_or_default().min(MAX_CONFIGURED_SHARDS);
+            let mut entries = Vec::with_capacity(capacity);
+            while let Some(entry) = sequence.next_element()? {
+                if entries.len() == MAX_CONFIGURED_SHARDS {
+                    return Err(serde::de::Error::invalid_length(
+                        MAX_CONFIGURED_SHARDS + 1,
+                        &self,
+                    ));
+                }
+                entries.push(entry);
+            }
+            Ok(entries)
+        }
+    }
+
+    deserializer.deserialize_seq(BoundedShardEntriesVisitor)
+}
+
+impl Serialize for ShardHealthReport {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+
+        let outcome = self.outcome();
+        validate_shard_health_report(self, outcome).map_err(serde::ser::Error::custom)?;
+        let mut state = serializer.serialize_struct("ShardHealthReport", 4)?;
+        state.serialize_field("timestamp_ms", &self.timestamp_ms)?;
+        state.serialize_field("overall", &self.overall)?;
+        state.serialize_field("outcome", &outcome)?;
+        state.serialize_field("shards", &self.shards)?;
+        state.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for ShardHealthReport {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct WireReport {
+            timestamp_ms: u64,
+            overall: HealthStatus,
+            outcome: ShardHealthReportOutcome,
+            #[serde(deserialize_with = "deserialize_bounded_shard_health_entries")]
+            shards: Vec<ShardHealthEntry>,
+        }
+
+        let wire = WireReport::deserialize(deserializer)?;
+        let report = Self {
+            timestamp_ms: wire.timestamp_ms,
+            overall: wire.overall,
+            shards: wire.shards,
+        };
+        validate_shard_health_report(&report, wire.outcome)
+            .map_err(serde::de::Error::custom)?;
+        Ok(report)
+    }
 }
 
 impl ShardHealthReport {
@@ -452,7 +767,28 @@ impl ShardHealthReport {
     /// unhealthy shards were omitted.
     const WATCHDOG_WARNING_LIMIT: usize = 64;
 
-    /// Return shard entries that are not healthy.
+    /// Report whether all configured shards were inspected.
+    ///
+    /// A cancelled scan always retains one stable entry per configured shard;
+    /// entries that were interrupted or never started carry explicit typed
+    /// outcomes instead of silently disappearing from an apparently healthy
+    /// report.
+    #[must_use]
+    pub fn outcome(&self) -> ShardHealthReportOutcome {
+        if self.shards.iter().any(|entry| {
+            matches!(
+                entry.probe_outcome,
+                ShardHealthProbeOutcome::Cancelled | ShardHealthProbeOutcome::NotStarted
+            )
+        }) {
+            ShardHealthReportOutcome::Cancelled
+        } else {
+            ShardHealthReportOutcome::Complete
+        }
+    }
+
+    /// Return shard entries that are unhealthy or whose health was not
+    /// observed because the scan was interrupted.
     #[must_use]
     pub fn unhealthy_shards(&self) -> Vec<&ShardHealthEntry> {
         self.shards
@@ -487,17 +823,25 @@ impl ShardHealthReport {
                 omitted = omitted.saturating_add(1);
                 continue;
             }
+            let probe_outcome = entry.probe_outcome;
             warnings.push(format!(
-                "Shard {} unhealthy (status={}, circuit={:?}, pane_count={:?}, backend_error={})",
+                "Shard {} {} (status={}, circuit={}, probe={})",
                 entry.shard_id.0,
-                entry.status,
-                entry.circuit.state,
-                entry.pane_count,
-                if entry.error.is_some() {
-                    "present"
+                if matches!(
+                    probe_outcome,
+                    ShardHealthProbeOutcome::Cancelled | ShardHealthProbeOutcome::NotStarted
+                ) {
+                    "health unknown"
                 } else {
-                    "absent"
-                }
+                    "unhealthy"
+                },
+                entry.status,
+                if probe_outcome == ShardHealthProbeOutcome::NotStarted {
+                    "not_observed"
+                } else {
+                    circuit_state_token(entry.circuit.state)
+                },
+                probe_outcome.warning_token(),
             ));
         }
         if omitted > 0 {
@@ -514,20 +858,206 @@ impl std::fmt::Debug for ShardBackend {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ShardBackend")
             .field("id", &self.id)
-            .field("label", &self.label)
             .finish_non_exhaustive()
     }
 }
 
 impl ShardBackend {
     #[must_use]
-    pub fn new(id: ShardId, label: impl Into<String>, handle: WeztermHandle) -> Self {
-        Self {
-            id,
-            label: label.into(),
-            handle,
+    pub fn new(id: ShardId, handle: WeztermHandle) -> Self {
+        Self { id, handle }
+    }
+}
+
+const fn circuit_state_token(state: CircuitStateKind) -> &'static str {
+    match state {
+        CircuitStateKind::Closed => "closed",
+        CircuitStateKind::Open => "open",
+        CircuitStateKind::HalfOpen => "half_open",
+    }
+}
+
+fn classify_backend_error(error: &crate::Error) -> ShardBackendErrorClass {
+    match error {
+        crate::Error::Wezterm(error) => match error {
+            WeztermError::CliNotFound
+            | WeztermError::NotRunning
+            | WeztermError::SocketNotFound(_) => ShardBackendErrorClass::Unavailable,
+            WeztermError::PaneNotFound(_) => ShardBackendErrorClass::PaneNotFound,
+            WeztermError::CommandFailed(_) => ShardBackendErrorClass::CommandFailed,
+            WeztermError::ParseError(_) => ShardBackendErrorClass::InvalidResponse,
+            WeztermError::OutputTooLarge { .. } => ShardBackendErrorClass::OutputTooLarge,
+            WeztermError::Timeout(_) => ShardBackendErrorClass::TimedOut,
+            WeztermError::CircuitOpen { .. } => ShardBackendErrorClass::CircuitOpen,
+        },
+        crate::Error::RuntimeOperation {
+            source: crate::error::RuntimeOperationSource::Cancelled(_),
+            ..
+        }
+        | crate::Error::Cancelled(_) => ShardBackendErrorClass::Cancelled,
+        crate::Error::Panicked(_) => ShardBackendErrorClass::Panicked,
+        crate::Error::PaneOperation {
+            source: crate::error::PaneOperationSource::PaneNotFound,
+            ..
+        } => ShardBackendErrorClass::PaneNotFound,
+        crate::Error::Io(_) => ShardBackendErrorClass::Io,
+        _ => ShardBackendErrorClass::Other,
+    }
+}
+
+fn backend_callback_panic_error() -> crate::Error {
+    crate::Error::Panicked(SHARD_BACKEND_CALLBACK_PANIC_DETAIL.to_owned())
+}
+
+fn health_circuit_status(backend: &ShardBackend) -> Result<CircuitBreakerStatus> {
+    catch_recoverable(
+        RecoverablePanicSite::ClientCallback,
+        std::panic::AssertUnwindSafe(|| backend.handle.circuit_status()),
+    )
+    .map_err(|_panic| backend_callback_panic_error())
+}
+
+async fn ambient_health_panes(backend: &ShardBackend) -> Result<Vec<PaneInfo>> {
+    let future = match catch_recoverable(
+        RecoverablePanicSite::ClientCallback,
+        std::panic::AssertUnwindSafe(|| backend.handle.list_panes()),
+    ) {
+        Ok(future) => future,
+        Err(_panic) => return Err(backend_callback_panic_error()),
+    };
+    match catch_recoverable_future(RecoverablePanicSite::ClientCallback, future).await {
+        Ok(result) => result,
+        Err(_panic) => Err(backend_callback_panic_error()),
+    }
+}
+
+async fn cx_health_panes(backend: &ShardBackend, cx: &crate::cx::Cx) -> Result<Vec<PaneInfo>> {
+    let future = match catch_recoverable(
+        RecoverablePanicSite::ClientCallback,
+        std::panic::AssertUnwindSafe(|| backend.handle.list_panes_with_cx(cx)),
+    ) {
+        Ok(future) => future,
+        Err(_panic) => return Err(backend_callback_panic_error()),
+    };
+    match catch_recoverable_future(RecoverablePanicSite::ClientCallback, future).await {
+        Ok(result) => result,
+        Err(_panic) => Err(backend_callback_panic_error()),
+    }
+}
+
+fn pending_shard_health_entry(backend: &ShardBackend) -> ShardHealthEntry {
+    // A pending entry must be constructible without invoking any backend. In
+    // particular, a pre-cancelled scan must not call even synchronous backend
+    // callbacks while creating its stable topology projection.
+    let circuit = CircuitBreakerStatus::default();
+    ShardHealthEntry {
+        shard_id: backend.id,
+        status: health_from_circuit_state(circuit.state).max(HealthStatus::Degraded),
+        pane_count: None,
+        circuit,
+        probe_outcome: ShardHealthProbeOutcome::NotStarted,
+    }
+}
+
+fn completed_shard_health_entry(
+    backend: &ShardBackend,
+    circuit: CircuitBreakerStatus,
+    panes: std::result::Result<Vec<PaneInfo>, crate::Error>,
+) -> ShardHealthEntry {
+    let circuit_health = health_from_circuit_state(circuit.state);
+    match panes {
+        Ok(panes) => ShardHealthEntry {
+            shard_id: backend.id,
+            status: circuit_health,
+            pane_count: Some(panes.len()),
+            circuit,
+            probe_outcome: ShardHealthProbeOutcome::Complete,
+        },
+        Err(error) => ShardHealthEntry {
+            shard_id: backend.id,
+            status: circuit_health.max(HealthStatus::Hung),
+            pane_count: None,
+            circuit,
+            probe_outcome: ShardHealthProbeOutcome::Failed(classify_backend_error(&error)),
+        },
+    }
+}
+
+fn cancelled_shard_health_entry(
+    backend: &ShardBackend,
+    circuit: CircuitBreakerStatus,
+) -> ShardHealthEntry {
+    ShardHealthEntry {
+        shard_id: backend.id,
+        status: health_from_circuit_state(circuit.state).max(HealthStatus::Degraded),
+        pane_count: None,
+        circuit,
+        probe_outcome: ShardHealthProbeOutcome::Cancelled,
+    }
+}
+
+fn overall_shard_health(shards: &[ShardHealthEntry]) -> HealthStatus {
+    shards
+        .iter()
+        .fold(HealthStatus::Healthy, |overall, entry| {
+            overall.max(entry.status)
+        })
+}
+
+fn validate_shard_health_entry(entry: &ShardHealthEntry) -> std::result::Result<(), &'static str> {
+    if entry.shard_id.0 > MAX_SHARD_ID {
+        return Err("shard health entry contains an out-of-range shard id");
+    }
+    if entry.probe_outcome != ShardHealthProbeOutcome::Complete
+        && entry.status == HealthStatus::Healthy
+    {
+        return Err("an incomplete or failed shard health probe cannot be healthy");
+    }
+    if matches!(
+        entry.probe_outcome,
+        ShardHealthProbeOutcome::Failed(_) | ShardHealthProbeOutcome::NotStarted
+    ) && entry.pane_count.is_some()
+    {
+        return Err("an unobserved or failed shard health probe cannot report a pane count");
+    }
+    Ok(())
+}
+
+fn validate_shard_health_report(
+    report: &ShardHealthReport,
+    declared_outcome: ShardHealthReportOutcome,
+) -> std::result::Result<(), &'static str> {
+    if report.shards.len() > MAX_CONFIGURED_SHARDS {
+        return Err("shard health report exceeds bounded shard capacity");
+    }
+
+    let mut previous_shard_id = None;
+    let mut computed_outcome = ShardHealthReportOutcome::Complete;
+    let mut computed_overall = HealthStatus::Healthy;
+    for entry in &report.shards {
+        if entry.shard_id.0 > MAX_SHARD_ID {
+            return Err("shard health report contains an out-of-range shard id");
+        }
+        if previous_shard_id.is_some_and(|previous| previous >= entry.shard_id) {
+            return Err("shard health report entries are not strictly ordered and unique");
+        }
+        validate_shard_health_entry(entry)?;
+        previous_shard_id = Some(entry.shard_id);
+        computed_overall = computed_overall.max(entry.status);
+        if matches!(
+            entry.probe_outcome,
+            ShardHealthProbeOutcome::Cancelled | ShardHealthProbeOutcome::NotStarted
+        ) {
+            computed_outcome = ShardHealthReportOutcome::Cancelled;
         }
     }
+    if computed_outcome != declared_outcome {
+        return Err("shard health report outcome disagrees with its entries");
+    }
+    if computed_overall != report.overall {
+        return Err("shard health report overall status disagrees with its entries");
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -537,7 +1067,6 @@ struct PaneRoute {
 }
 
 /// Shard-aware wrapper implementing the WezTerm interface.
-#[derive(Debug)]
 pub struct ShardedWeztermClient {
     backends: Vec<ShardBackend>,
     backend_index: HashMap<ShardId, usize>,
@@ -550,6 +1079,21 @@ pub struct ShardedWeztermClient {
     telemetry: ShardingTelemetry,
 }
 
+impl std::fmt::Debug for ShardedWeztermClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ShardedWeztermClient")
+            .field("backend_count", &self.backends.len())
+            .field("strategy", &self.strategy)
+            .field(
+                "pane_route_generation",
+                &self.pane_route_generation.load(Ordering::Relaxed),
+            )
+            .field("hash_ring_present", &self.hash_ring.is_some())
+            .field("telemetry", &self.telemetry.snapshot())
+            .finish_non_exhaustive()
+    }
+}
+
 impl ShardedWeztermClient {
     /// Create a new sharded client.
     pub fn new(mut backends: Vec<ShardBackend>, strategy: AssignmentStrategy) -> Result<Self> {
@@ -557,6 +1101,12 @@ impl ShardedWeztermClient {
             return Err(crate::Error::Wezterm(WeztermError::CommandFailed(
                 "sharded client requires at least one backend".to_string(),
             )));
+        }
+        if backends.len() > MAX_CONFIGURED_SHARDS {
+            return Err(crate::Error::Wezterm(WeztermError::CommandFailed(format!(
+                "sharded client backend count {} exceeds bounded capacity {MAX_CONFIGURED_SHARDS}",
+                backends.len()
+            ))));
         }
 
         backends.sort_by_key(|backend| backend.id);
@@ -604,10 +1154,16 @@ impl ShardedWeztermClient {
 
     /// Convenience constructor assigning shard ids sequentially from handles.
     pub fn from_handles(strategy: AssignmentStrategy, handles: Vec<WeztermHandle>) -> Result<Self> {
+        if handles.len() > MAX_CONFIGURED_SHARDS {
+            return Err(crate::Error::Wezterm(WeztermError::CommandFailed(format!(
+                "sharded client backend count {} exceeds bounded capacity {MAX_CONFIGURED_SHARDS}",
+                handles.len()
+            ))));
+        }
         let backends = handles
             .into_iter()
             .enumerate()
-            .map(|(idx, handle)| ShardBackend::new(ShardId(idx), format!("shard-{idx}"), handle))
+            .map(|(idx, handle)| ShardBackend::new(ShardId(idx), handle))
             .collect::<Vec<_>>();
         Self::new(backends, strategy)
     }
@@ -704,39 +1260,33 @@ impl ShardedWeztermClient {
     fn backend_error(
         &self,
         shard_id: ShardId,
-        op: &str,
+        op: &'static str,
         pane_id: Option<u64>,
         err: crate::Error,
     ) -> crate::Error {
-        let label = self
-            .backend_for_id(shard_id)
-            .map(|backend| backend.label.as_str().to_string())
-            .unwrap_or_else(|_| format!("shard-{shard_id}"));
+        let error_class = classify_backend_error(&err);
         let pane_hint = pane_id.map_or_else(String::new, |id| format!(", pane={id}"));
         crate::Error::Wezterm(WeztermError::CommandFailed(format!(
-            "{op} failed on {label} ({shard_id}{pane_hint}): {err}"
+            "{op} failed on shard {shard_id}{pane_hint} (class={error_class})"
         )))
     }
 
     fn codec_error_with_cleanup_failure(
-        primary: crate::Error,
         creation_op: &'static str,
         cleanup_op: &'static str,
         backend: &ShardBackend,
         local_pane_id: u64,
         cleanup_error: &crate::Error,
     ) -> crate::Error {
-        // `try_encode_sharded_pane_id` currently returns this exact typed
-        // shape. Keep the codec failure first and in the same error variant so
+        // Keep the codec failure first and in the same error variant so
         // rollback trouble adds evidence without replacing the root cause.
         // A backend label or ordinary cleanup error is just as untrusted as a
         // panic payload: either can contain credentials, pane text, paths, or
         // an arbitrarily large string. Retain only static operation classes
         // and numeric routing identity in the compensator suffix.
-        let primary_detail = match primary {
-            crate::Error::Wezterm(WeztermError::CommandFailed(detail)) => detail,
-            other => other.to_string(),
-        };
+        let primary_detail = format!(
+            "local pane id {local_pane_id} exceeds {LOCAL_PANE_ID_BITS}-bit encoded capacity (max={LOCAL_PANE_ID_MASK})"
+        );
         let cleanup_class = match cleanup_error {
             crate::Error::Wezterm(WeztermError::CommandFailed(detail))
                 if detail == PANE_CREATION_ROLLBACK_OPERATION_PANIC =>
@@ -747,6 +1297,16 @@ impl ShardedWeztermClient {
                 if detail == PANE_CREATION_ROLLBACK_JOIN_PANIC =>
             {
                 PANE_CREATION_ROLLBACK_JOIN_PANIC
+            }
+            crate::Error::Wezterm(WeztermError::CommandFailed(detail))
+                if detail == PANE_CREATION_ROLLBACK_TIMEOUT_CLASS =>
+            {
+                PANE_CREATION_ROLLBACK_TIMEOUT_CLASS
+            }
+            crate::Error::Wezterm(WeztermError::CommandFailed(detail))
+                if detail == PANE_CREATION_ROLLBACK_ADMISSION_CLASS =>
+            {
+                PANE_CREATION_ROLLBACK_ADMISSION_CLASS
             }
             _ => "cleanup_failed",
         };
@@ -769,14 +1329,15 @@ impl ShardedWeztermClient {
 
         match Self::rollback_unencodable_pane_with_fresh_cx(backend, local_pane_id).await {
             Ok(()) => Err(primary),
-            Err(cleanup_error) => Err(Self::codec_error_with_cleanup_failure(
-                primary,
-                creation_op,
-                "kill_pane_with_fresh_cleanup_cx",
-                backend,
-                local_pane_id,
-                &cleanup_error,
-            )),
+            Err(cleanup_error) => {
+                Err(Self::codec_error_with_cleanup_failure(
+                    creation_op,
+                    "kill_pane_with_fresh_cleanup_cx",
+                    backend,
+                    local_pane_id,
+                    &cleanup_error,
+                ))
+            }
         }
     }
 
@@ -793,11 +1354,8 @@ impl ShardedWeztermClient {
         .await
         {
             Ok(result) => result,
-            Err(timeout_error) => Err(crate::Error::Wezterm(WeztermError::CommandFailed(
-                format!(
-                    "pane-creation rollback exceeded its {}s hard limit: {timeout_error}",
-                    PANE_CREATION_ROLLBACK_TIMEOUT.as_secs()
-                ),
+            Err(_timeout_error) => Err(crate::Error::Wezterm(WeztermError::CommandFailed(
+                PANE_CREATION_ROLLBACK_TIMEOUT_CLASS.to_owned(),
             ))),
         }
     }
@@ -865,20 +1423,21 @@ impl ShardedWeztermClient {
                         )),
                     }
                 }
-                Err(admission_error) => {
+                Err(_admission_error) => {
                     // Runtime shutdown or admission pressure can prevent task
                     // creation. Inline cleanup remains the strongest available
-                    // fallback; retain both errors if that attempt also fails.
+                    // fallback. If both paths fail, expose only a finite class;
+                    // either underlying error may contain untrusted text.
                     Self::run_pane_creation_rollback_catching_panic(
                         &cleanup_cx,
                         &backend.handle,
                         local_pane_id,
                     )
                     .await
-                    .map_err(|cleanup_error| {
-                        crate::Error::Wezterm(WeztermError::CommandFailed(format!(
-                            "bounded rollback task admission failed: {admission_error}; inline bounded rollback also failed: {cleanup_error}"
-                        )))
+                    .map_err(|_cleanup_error| {
+                        crate::Error::Wezterm(WeztermError::CommandFailed(
+                            PANE_CREATION_ROLLBACK_ADMISSION_CLASS.to_owned(),
+                        ))
                     })
                 }
             };
@@ -1125,39 +1684,27 @@ impl ShardedWeztermClient {
         self.telemetry
             .health_reports
             .fetch_add(1, Ordering::Relaxed);
-        let mut overall = HealthStatus::Healthy;
         let mut shards = Vec::with_capacity(self.backends.len());
 
         for backend in &self.backends {
-            let circuit = backend.handle.circuit_status();
-            let mut status = health_from_circuit_state(circuit.state);
-            let mut pane_count = None;
-            let mut error = None;
-
-            match backend.handle.list_panes().await {
-                Ok(panes) => {
-                    pane_count = Some(panes.len());
+            let circuit = match health_circuit_status(backend) {
+                Ok(circuit) => circuit,
+                Err(error) => {
+                    shards.push(completed_shard_health_entry(
+                        backend,
+                        CircuitBreakerStatus::default(),
+                        Err(error),
+                    ));
+                    continue;
                 }
-                Err(err) => {
-                    status = status.max(HealthStatus::Hung);
-                    error = Some(err.to_string());
-                }
-            }
-
-            overall = overall.max(status);
-            shards.push(ShardHealthEntry {
-                shard_id: backend.id,
-                label: backend.label.clone(),
-                status,
-                pane_count,
-                circuit,
-                error,
-            });
+            };
+            let panes = ambient_health_panes(backend).await;
+            shards.push(completed_shard_health_entry(backend, circuit, panes));
         }
 
         ShardHealthReport {
             timestamp_ms: now_epoch_ms(),
-            overall,
+            overall: overall_shard_health(&shards),
             shards,
         }
     }
@@ -1169,48 +1716,60 @@ impl ShardedWeztermClient {
     /// gets responsive shutdown across multi-shard topologies.
     /// Per-shard checkpoint between iterations lets a caller
     /// abort partway through a large fleet health scan and
-    /// return a partial report marked as potentially incomplete.
+    /// return a stable full-topology report whose typed outcomes identify the
+    /// interrupted and not-started shards.
     pub async fn shard_health_report_with_cx(&self, cx: &crate::cx::Cx) -> ShardHealthReport {
         self.telemetry
             .health_reports
             .fetch_add(1, Ordering::Relaxed);
-        let mut overall = HealthStatus::Healthy;
-        let mut shards = Vec::with_capacity(self.backends.len());
+        // Materialize the complete, deterministically ordered topology before
+        // any checkpoint. Cancellation must never erase shards from the report
+        // or let an incomplete scan masquerade as healthy.
+        let mut shards = self
+            .backends
+            .iter()
+            .map(pending_shard_health_entry)
+            .collect::<Vec<_>>();
 
-        for backend in &self.backends {
+        for (index, backend) in self.backends.iter().enumerate() {
             if cx.checkpoint().is_err() {
                 break;
             }
 
-            let circuit = backend.handle.circuit_status();
-            let mut status = health_from_circuit_state(circuit.state);
-            let mut pane_count = None;
-            let mut error = None;
+            let circuit = match health_circuit_status(backend) {
+                Ok(circuit) => circuit,
+                Err(error) => {
+                    shards[index] = completed_shard_health_entry(
+                        backend,
+                        CircuitBreakerStatus::default(),
+                        Err(error),
+                    );
+                    continue;
+                }
+            };
+            let panes = cx_health_panes(backend, cx).await;
+            let cancelled = cx.is_cancel_requested();
 
-            match backend.handle.list_panes_with_cx(cx).await {
-                Ok(panes) => {
-                    pane_count = Some(panes.len());
+            if cancelled {
+                if panes.is_ok() {
+                    let mut entry = completed_shard_health_entry(backend, circuit, panes);
+                    // Keep the successfully observed pane count, but make the
+                    // interrupted report state explicit and non-healthy.
+                    entry.status = entry.status.max(HealthStatus::Degraded);
+                    entry.probe_outcome = ShardHealthProbeOutcome::Cancelled;
+                    shards[index] = entry;
+                } else {
+                    shards[index] = cancelled_shard_health_entry(backend, circuit);
                 }
-                Err(err) => {
-                    status = status.max(HealthStatus::Hung);
-                    error = Some(err.to_string());
-                }
+                break;
             }
 
-            overall = overall.max(status);
-            shards.push(ShardHealthEntry {
-                shard_id: backend.id,
-                label: backend.label.clone(),
-                status,
-                pane_count,
-                circuit,
-                error,
-            });
+            shards[index] = completed_shard_health_entry(backend, circuit, panes);
         }
 
         ShardHealthReport {
             timestamp_ms: now_epoch_ms(),
-            overall,
+            overall: overall_shard_health(&shards),
             shards,
         }
     }
@@ -2067,6 +2626,10 @@ mod tests {
         cx_kills_with_cancelled_context: AtomicUsize,
         created_local_pane_id: u64,
         cancel_after_cx_creation: bool,
+        cancel_during_health_probe: bool,
+        fail_health_probe_with_hostile_error: bool,
+        panic_health_probe: bool,
+        panic_circuit_status: bool,
         fail_cleanup: bool,
         cleanup_panics_remaining: AtomicUsize,
     }
@@ -2091,6 +2654,10 @@ mod tests {
                 cx_kills_with_cancelled_context: AtomicUsize::new(0),
                 created_local_pane_id,
                 cancel_after_cx_creation,
+                cancel_during_health_probe: false,
+                fail_health_probe_with_hostile_error: false,
+                panic_health_probe: false,
+                panic_circuit_status: false,
                 fail_cleanup,
                 cleanup_panics_remaining: AtomicUsize::new(0),
             }
@@ -2106,6 +2673,30 @@ mod tests {
 
         const fn cancel_after_oversized_creation() -> Self {
             Self::new(Self::OVERSIZED_LOCAL_PANE_ID, true, false)
+        }
+
+        const fn cancel_during_health_probe() -> Self {
+            let mut backend = Self::new(Self::VALID_LOCAL_PANE_ID, false, false);
+            backend.cancel_during_health_probe = true;
+            backend
+        }
+
+        const fn hostile_health_failure() -> Self {
+            let mut backend = Self::new(Self::VALID_LOCAL_PANE_ID, false, false);
+            backend.fail_health_probe_with_hostile_error = true;
+            backend
+        }
+
+        const fn panicking_health_probe() -> Self {
+            let mut backend = Self::new(Self::VALID_LOCAL_PANE_ID, false, false);
+            backend.panic_health_probe = true;
+            backend
+        }
+
+        const fn panicking_circuit_status() -> Self {
+            let mut backend = Self::new(Self::VALID_LOCAL_PANE_ID, false, false);
+            backend.panic_circuit_status = true;
+            backend
         }
 
         fn oversized_with_one_cleanup_panic() -> Self {
@@ -2143,13 +2734,44 @@ mod tests {
                 Ok(())
             }
         }
+
+        fn health_probe_result(&self) -> Result<Vec<PaneInfo>> {
+            self.list_calls.fetch_add(1, Ordering::Relaxed);
+            if self.panic_health_probe {
+                std::panic::panic_any(String::from(
+                    "health-panic-secret-sentinel-that-must-not-be-reflected",
+                ));
+            }
+            if self.fail_health_probe_with_hostile_error {
+                Err(crate::Error::Wezterm(WeztermError::CommandFailed(
+                    format!(
+                        "health-error-secret-sentinel-{}",
+                        "z".repeat(64 * 1_024)
+                    ),
+                )))
+            } else {
+                Ok(Vec::new())
+            }
+        }
     }
 
     impl WeztermInterface for CreationBoundaryBackend {
         fn list_panes(&self) -> WeztermFuture<'_, Vec<PaneInfo>> {
-            Box::pin(async {
-                self.list_calls.fetch_add(1, Ordering::Relaxed);
-                Ok(Vec::new())
+            Box::pin(async { self.health_probe_result() })
+        }
+
+        fn list_panes_with_cx<'a>(
+            &'a self,
+            cx: &'a crate::cx::Cx,
+        ) -> WeztermFuture<'a, Vec<PaneInfo>> {
+            Box::pin(async move {
+                if self.cancel_during_health_probe {
+                    cx.cancel_with(
+                        crate::outcome::CancelKind::User,
+                        Some("injected cancellation during shard health probe"),
+                    );
+                }
+                self.health_probe_result()
             })
         }
 
@@ -2305,6 +2927,11 @@ mod tests {
         }
 
         fn circuit_status(&self) -> CircuitBreakerStatus {
+            if self.panic_circuit_status {
+                std::panic::panic_any(String::from(
+                    "circuit-panic-secret-sentinel-that-must-not-be-reflected",
+                ));
+            }
             CircuitBreakerStatus::default()
         }
     }
@@ -2314,13 +2941,8 @@ mod tests {
     ) -> (ShardedWeztermClient, Arc<CreationBoundaryBackend>) {
         let backend = Arc::new(CreationBoundaryBackend::oversized(fail_cleanup));
         let handle: WeztermHandle = backend.clone();
-        let label = if fail_cleanup {
-            format!("backend-secret-sentinel-{}", "y".repeat(64 * 1_024))
-        } else {
-            "oversized".to_string()
-        };
         let client = ShardedWeztermClient::new(
-            vec![ShardBackend::new(ShardId(0), label, handle)],
+            vec![ShardBackend::new(ShardId(0), handle)],
             AssignmentStrategy::RoundRobin,
         )
         .unwrap();
@@ -2331,7 +2953,7 @@ mod tests {
         let backend = Arc::new(CreationBoundaryBackend::cancel_after_valid_creation());
         let handle: WeztermHandle = backend.clone();
         let client = ShardedWeztermClient::new(
-            vec![ShardBackend::new(ShardId(0), "cancelling", handle)],
+            vec![ShardBackend::new(ShardId(0), handle)],
             AssignmentStrategy::RoundRobin,
         )
         .unwrap();
@@ -2347,7 +2969,6 @@ mod tests {
         let client = ShardedWeztermClient::new(
             vec![ShardBackend::new(
                 ShardId(0),
-                "cancelling-oversized",
                 handle,
             )],
             AssignmentStrategy::RoundRobin,
@@ -2548,8 +3169,8 @@ mod tests {
 
             let client = ShardedWeztermClient::new(
                 vec![
-                    ShardBackend::new(ShardId(0), "zero", handle0),
-                    ShardBackend::new(ShardId(1), "one", handle1),
+                    ShardBackend::new(ShardId(0), handle0),
+                    ShardBackend::new(ShardId(1), handle1),
                 ],
                 AssignmentStrategy::RoundRobin,
             )
@@ -2599,8 +3220,8 @@ mod tests {
             let shard1_handle: WeztermHandle = shard1.clone();
             let client = ShardedWeztermClient::new(
                 vec![
-                    ShardBackend::new(ShardId(0), "zero", shard0_handle),
-                    ShardBackend::new(ShardId(1), "one", shard1_handle),
+                    ShardBackend::new(ShardId(0), shard0_handle),
+                    ShardBackend::new(ShardId(1), shard1_handle),
                 ],
                 AssignmentStrategy::RoundRobin,
             )
@@ -2623,8 +3244,8 @@ mod tests {
             let cx_shard1_handle: WeztermHandle = cx_shard1.clone();
             let cx_client = ShardedWeztermClient::new(
                 vec![
-                    ShardBackend::new(ShardId(0), "zero", cx_shard0_handle),
-                    ShardBackend::new(ShardId(1), "one", cx_shard1_handle),
+                    ShardBackend::new(ShardId(0), cx_shard0_handle),
+                    ShardBackend::new(ShardId(1), cx_shard1_handle),
                 ],
                 AssignmentStrategy::RoundRobin,
             )
@@ -2647,7 +3268,7 @@ mod tests {
     fn stale_route_snapshots_cannot_overwrite_concurrent_point_mutations() {
         let backend: WeztermHandle = Arc::new(CreationBoundaryBackend::new(11, false, false));
         let client = ShardedWeztermClient::new(
-            vec![ShardBackend::new(ShardId(0), "only", backend)],
+            vec![ShardBackend::new(ShardId(0), backend)],
             AssignmentStrategy::RoundRobin,
         )
         .unwrap();
@@ -2727,7 +3348,6 @@ mod tests {
             let client = ShardedWeztermClient::new(
                 vec![ShardBackend::new(
                     ShardId(0),
-                    "only",
                     shard as WeztermHandle,
                 )],
                 AssignmentStrategy::RoundRobin,
@@ -2761,7 +3381,6 @@ mod tests {
             let client = ShardedWeztermClient::new(
                 vec![ShardBackend::new(
                     ShardId(0),
-                    "oversized-local",
                     shard as WeztermHandle,
                 )],
                 AssignmentStrategy::RoundRobin,
@@ -2787,8 +3406,8 @@ mod tests {
 
             let client = ShardedWeztermClient::new(
                 vec![
-                    ShardBackend::new(ShardId(0), "zero", handle0),
-                    ShardBackend::new(ShardId(1), "one", handle1),
+                    ShardBackend::new(ShardId(0), handle0),
+                    ShardBackend::new(ShardId(1), handle1),
                 ],
                 AssignmentStrategy::RoundRobin,
             )
@@ -2814,8 +3433,8 @@ mod tests {
 
             let client = ShardedWeztermClient::new(
                 vec![
-                    ShardBackend::new(ShardId(0), "zero", handle0),
-                    ShardBackend::new(ShardId(1), "one", handle1),
+                    ShardBackend::new(ShardId(0), handle0),
+                    ShardBackend::new(ShardId(1), handle1),
                 ],
                 AssignmentStrategy::ByAgentType {
                     agent_to_shard: HashMap::from([
@@ -2856,8 +3475,8 @@ mod tests {
 
             let client = ShardedWeztermClient::new(
                 vec![
-                    ShardBackend::new(ShardId(0), "zero", handle0),
-                    ShardBackend::new(ShardId(1), "one", handle1),
+                    ShardBackend::new(ShardId(0), handle0),
+                    ShardBackend::new(ShardId(1), handle1),
                 ],
                 AssignmentStrategy::ByAgentType {
                     agent_to_shard: HashMap::from([
@@ -2916,8 +3535,8 @@ mod tests {
                 .await;
             let client = ShardedWeztermClient::new(
                 vec![
-                    ShardBackend::new(ShardId(0), "zero", shard0.clone() as WeztermHandle),
-                    ShardBackend::new(ShardId(1), "one", shard1.clone() as WeztermHandle),
+                    ShardBackend::new(ShardId(0), shard0.clone() as WeztermHandle),
+                    ShardBackend::new(ShardId(1), shard1.clone() as WeztermHandle),
                 ],
                 AssignmentStrategy::RoundRobin,
             )
@@ -2973,8 +3592,8 @@ mod tests {
                 .await;
             let client = ShardedWeztermClient::new(
                 vec![
-                    ShardBackend::new(ShardId(0), "zero", shard0.clone() as WeztermHandle),
-                    ShardBackend::new(ShardId(1), "one", shard1.clone() as WeztermHandle),
+                    ShardBackend::new(ShardId(0), shard0.clone() as WeztermHandle),
+                    ShardBackend::new(ShardId(1), shard1.clone() as WeztermHandle),
                 ],
                 AssignmentStrategy::RoundRobin,
             )
@@ -3035,8 +3654,8 @@ mod tests {
 
             let client = ShardedWeztermClient::new(
                 vec![
-                    ShardBackend::new(ShardId(0), "zero", shard0 as WeztermHandle),
-                    ShardBackend::new(ShardId(1), "one", shard1 as WeztermHandle),
+                    ShardBackend::new(ShardId(0), shard0 as WeztermHandle),
+                    ShardBackend::new(ShardId(1), shard1 as WeztermHandle),
                 ],
                 AssignmentStrategy::RoundRobin,
             )
@@ -3384,6 +4003,46 @@ mod tests {
         });
     }
 
+    #[test]
+    fn rollback_admission_diagnostics_use_only_finite_classes() {
+        let backend = ShardBackend::new(
+            ShardId(0),
+            Arc::new(MockWezterm::new()) as WeztermHandle,
+        );
+        let hostile_cleanup = crate::Error::Wezterm(WeztermError::CommandFailed(format!(
+            "admission-secret-sentinel:{}:cleanup-secret-sentinel:{}",
+            "a".repeat(64 * 1_024),
+            "b".repeat(64 * 1_024)
+        )));
+        let error = ShardedWeztermClient::codec_error_with_cleanup_failure(
+            "spawn",
+            "kill_pane_with_fresh_cleanup_cx",
+            &backend,
+            CreationBoundaryBackend::OVERSIZED_LOCAL_PANE_ID,
+            &hostile_cleanup,
+        );
+        let rendered = error.to_string();
+
+        assert!(rendered.contains("cleanup_failed"));
+        assert!(!rendered.contains("admission-secret-sentinel"));
+        assert!(!rendered.contains("cleanup-secret-sentinel"));
+        assert!(rendered.len() < 512);
+
+        let classified_admission = crate::Error::Wezterm(WeztermError::CommandFailed(
+            PANE_CREATION_ROLLBACK_ADMISSION_CLASS.to_owned(),
+        ));
+        let classified = ShardedWeztermClient::codec_error_with_cleanup_failure(
+            "spawn",
+            "kill_pane_with_fresh_cleanup_cx",
+            &backend,
+            CreationBoundaryBackend::OVERSIZED_LOCAL_PANE_ID,
+            &classified_admission,
+        )
+        .to_string();
+        assert!(classified.contains(PANE_CREATION_ROLLBACK_ADMISSION_CLASS));
+        assert!(classified.len() < 512);
+    }
+
     #[cfg(panic = "unwind")]
     #[test]
     fn rollback_panic_is_bounded_nonreflecting_and_later_cleanup_recovers() {
@@ -3391,7 +4050,7 @@ mod tests {
             let backend = Arc::new(CreationBoundaryBackend::oversized_with_one_cleanup_panic());
             let handle: WeztermHandle = backend.clone();
             let client = ShardedWeztermClient::new(
-                vec![ShardBackend::new(ShardId(0), "panic-boundary", handle)],
+                vec![ShardBackend::new(ShardId(0), handle)],
                 AssignmentStrategy::RoundRobin,
             )
             .expect("construct panic-boundary sharded client");
@@ -3551,11 +4210,10 @@ mod tests {
             overall: HealthStatus::Healthy,
             shards: vec![ShardHealthEntry {
                 shard_id: ShardId(0),
-                label: "s0".to_string(),
                 status: HealthStatus::Healthy,
                 pane_count: Some(3),
                 circuit: CircuitBreakerStatus::default(),
-                error: None,
+                probe_outcome: ShardHealthProbeOutcome::Complete,
             }],
         };
         assert!(report.unhealthy_shards().is_empty());
@@ -3570,19 +4228,19 @@ mod tests {
             shards: vec![
                 ShardHealthEntry {
                     shard_id: ShardId(0),
-                    label: "s0".to_string(),
                     status: HealthStatus::Healthy,
                     pane_count: Some(3),
                     circuit: CircuitBreakerStatus::default(),
-                    error: None,
+                    probe_outcome: ShardHealthProbeOutcome::Complete,
                 },
                 ShardHealthEntry {
                     shard_id: ShardId(1),
-                    label: "s1".to_string(),
                     status: HealthStatus::Degraded,
                     pane_count: None,
                     circuit: CircuitBreakerStatus::default(),
-                    error: Some("timeout".to_string()),
+                    probe_outcome: ShardHealthProbeOutcome::Failed(
+                        ShardBackendErrorClass::Other,
+                    ),
                 },
             ],
         };
@@ -3593,9 +4251,7 @@ mod tests {
         let warnings = report.watchdog_warnings();
         assert_eq!(warnings.len(), 1);
         assert!(warnings[0].contains("Shard 1 unhealthy"));
-        assert!(warnings[0].contains("backend_error=present"));
-        assert!(!warnings[0].contains("s1"));
-        assert!(!warnings[0].contains("timeout"));
+        assert!(warnings[0].contains("probe=other"));
     }
 
     #[test]
@@ -3609,6 +4265,8 @@ mod tests {
         let back: ShardHealthReport = serde_json::from_str(&json).unwrap();
         assert_eq!(back.timestamp_ms, 1234);
         assert_eq!(back.overall, HealthStatus::Healthy);
+        assert_eq!(back.outcome(), ShardHealthReportOutcome::Complete);
+        assert!(json.contains("\"outcome\":\"complete\""));
     }
 
     // -----------------------------------------------------------------------
@@ -3684,8 +4342,8 @@ mod tests {
 
             let client = ShardedWeztermClient::new(
                 vec![
-                    ShardBackend::new(ShardId(0), "healthy", healthy_handle),
-                    ShardBackend::new(ShardId(1), "failing", failing_handle),
+                    ShardBackend::new(ShardId(0), healthy_handle),
+                    ShardBackend::new(ShardId(1), failing_handle),
                 ],
                 AssignmentStrategy::RoundRobin,
             )
@@ -3702,7 +4360,7 @@ mod tests {
                 .unwrap();
             assert_eq!(healthy_entry.status, HealthStatus::Healthy);
             assert_eq!(healthy_entry.pane_count, Some(1));
-            assert!(healthy_entry.error.is_none());
+            assert_eq!(healthy_entry.probe_outcome, ShardHealthProbeOutcome::Complete);
 
             let failing_entry = report
                 .shards
@@ -3711,17 +4369,18 @@ mod tests {
                 .unwrap();
             assert_eq!(failing_entry.status, HealthStatus::Hung);
             assert_eq!(failing_entry.pane_count, None);
-            assert!(failing_entry.error.is_some());
+            assert_eq!(
+                failing_entry.probe_outcome,
+                ShardHealthProbeOutcome::Failed(ShardBackendErrorClass::CommandFailed)
+            );
 
             let warnings = report.watchdog_warnings();
             assert_eq!(warnings.len(), 1);
             assert!(warnings[0].contains("Shard 1 unhealthy"));
-            assert!(!warnings[0].contains("failing"));
 
             let trait_warnings = client.watchdog_warnings().await.unwrap();
             assert_eq!(trait_warnings.len(), 1);
             assert!(trait_warnings[0].contains("Shard 1 unhealthy"));
-            assert!(!trait_warnings[0].contains("failing"));
         });
     }
 
@@ -3740,8 +4399,8 @@ mod tests {
 
             let client = ShardedWeztermClient::new(
                 vec![
-                    ShardBackend::new(ShardId(0), "healthy", healthy_handle),
-                    ShardBackend::new(ShardId(1), "failing", failing_handle),
+                    ShardBackend::new(ShardId(0), healthy_handle),
+                    ShardBackend::new(ShardId(1), failing_handle),
                 ],
                 AssignmentStrategy::RoundRobin,
             )
@@ -3764,23 +4423,23 @@ mod tests {
             let warnings = client.shard_watchdog_warnings_with_cx(&cx).await;
             assert_eq!(warnings.len(), 1);
             assert!(warnings[0].contains("Shard 1 unhealthy"));
-            assert!(
-                !warnings[0].contains("failing"),
-                "Cx-first watchdog warnings must not reflect backend labels"
-            );
         });
     }
 
     /// ft-xbnl0.2.3 Cx-first: `shard_health_report_with_cx` must
-    /// bail early on a pre-cancelled cx, returning a report
-    /// with 0 shards (never touched any backend).
+    /// bail early on a pre-cancelled cx without touching a backend while still
+    /// returning one explicit not-started entry per configured shard.
     #[test]
     fn shard_health_report_with_cx_bails_on_precancelled_cx() {
         run_async_test(async {
-            let healthy = Arc::new(MockWezterm::new());
+            let healthy = Arc::new(CreationBoundaryBackend::new(
+                CreationBoundaryBackend::VALID_LOCAL_PANE_ID,
+                false,
+                false,
+            ));
             let healthy_handle: WeztermHandle = healthy.clone();
             let client = ShardedWeztermClient::new(
-                vec![ShardBackend::new(ShardId(0), "healthy", healthy_handle)],
+                vec![ShardBackend::new(ShardId(0), healthy_handle)],
                 AssignmentStrategy::RoundRobin,
             )
             .unwrap();
@@ -3792,11 +4451,202 @@ mod tests {
             );
 
             let report = client.shard_health_report_with_cx(&cx).await;
+            assert_eq!(report.shards.len(), 1);
+            assert_eq!(report.outcome(), ShardHealthReportOutcome::Cancelled);
+            assert_eq!(report.overall, HealthStatus::Degraded);
             assert_eq!(
-                report.shards.len(),
-                0,
-                "pre-cancelled cx should skip all shards"
+                report.shards[0].probe_outcome,
+                ShardHealthProbeOutcome::NotStarted
             );
+            assert_eq!(healthy.list_calls.load(Ordering::Relaxed), 0);
+            let warnings = report.watchdog_warnings();
+            assert_eq!(warnings.len(), 1);
+            assert!(warnings[0].contains("health unknown"));
+            assert!(warnings[0].contains("circuit=not_observed"));
+            assert!(warnings[0].contains("probe=not_started"));
+        });
+    }
+
+    #[test]
+    fn shard_health_report_with_cx_preserves_mid_cancel_topology() {
+        run_async_test(async {
+            let first = Arc::new(CreationBoundaryBackend::new(
+                CreationBoundaryBackend::VALID_LOCAL_PANE_ID,
+                false,
+                false,
+            ));
+            let cancelling = Arc::new(CreationBoundaryBackend::cancel_during_health_probe());
+            let not_started = Arc::new(CreationBoundaryBackend::new(
+                CreationBoundaryBackend::VALID_LOCAL_PANE_ID,
+                false,
+                false,
+            ));
+
+            let client = ShardedWeztermClient::new(
+                vec![
+                    ShardBackend::new(ShardId(0), first.clone() as WeztermHandle),
+                    ShardBackend::new(
+                        ShardId(1),
+                        cancelling.clone() as WeztermHandle,
+                    ),
+                    ShardBackend::new(
+                        ShardId(2),
+                        not_started.clone() as WeztermHandle,
+                    ),
+                ],
+                AssignmentStrategy::RoundRobin,
+            )
+            .unwrap();
+
+            let cx = crate::cx::for_testing();
+            let report = client.shard_health_report_with_cx(&cx).await;
+
+            assert_eq!(report.shards.len(), 3);
+            assert_eq!(report.outcome(), ShardHealthReportOutcome::Cancelled);
+            assert_eq!(report.overall, HealthStatus::Degraded);
+            assert_eq!(
+                report.shards[0].probe_outcome,
+                ShardHealthProbeOutcome::Complete
+            );
+            assert_eq!(
+                report.shards[1].probe_outcome,
+                ShardHealthProbeOutcome::Cancelled
+            );
+            assert_eq!(report.shards[1].pane_count, Some(0));
+            assert_eq!(
+                report.shards[2].probe_outcome,
+                ShardHealthProbeOutcome::NotStarted
+            );
+            assert_eq!(first.list_calls.load(Ordering::Relaxed), 1);
+            assert_eq!(cancelling.list_calls.load(Ordering::Relaxed), 1);
+            assert_eq!(not_started.list_calls.load(Ordering::Relaxed), 0);
+
+            let json = serde_json::to_string(&report).unwrap();
+            assert!(json.contains("\"outcome\":\"cancelled\""));
+            assert!(!json.contains("injected cancellation"));
+        });
+    }
+
+    #[test]
+    fn hostile_health_errors_are_classified_and_bounded() {
+        run_async_test(async {
+            let backend = Arc::new(CreationBoundaryBackend::hostile_health_failure());
+            let handle: WeztermHandle = backend.clone();
+            let debug_backend = ShardBackend::new(ShardId(0), handle.clone());
+            let debug = format!("{debug_backend:?}");
+            assert!(debug.len() < 128);
+
+            let shard_count = ShardHealthReport::WATCHDOG_WARNING_LIMIT + 2;
+            let backends = (0..shard_count)
+                .map(|index| ShardBackend::new(ShardId(index), handle.clone()))
+                .collect();
+            let client =
+                ShardedWeztermClient::new(backends, AssignmentStrategy::RoundRobin).unwrap();
+            let client_debug = format!("{client:?}");
+            assert!(!client_debug.contains("health-label-secret-sentinel"));
+            assert!(client_debug.len() < 512);
+
+            let routed_error = client
+                .list_all_panes()
+                .await
+                .expect_err("hostile backend must fail pane listing");
+            let routed_rendered = routed_error.to_string();
+            assert!(routed_rendered.contains("class=command_failed"));
+            assert!(!routed_rendered.contains("health-error-secret-sentinel"));
+            assert!(routed_rendered.len() < 256);
+
+            let report = client.shard_health_report().await;
+            assert_eq!(report.shards.len(), shard_count);
+            assert_eq!(report.outcome(), ShardHealthReportOutcome::Complete);
+            assert_eq!(report.overall, HealthStatus::Hung);
+            assert!(report.shards.iter().all(|entry| {
+                entry.probe_outcome
+                    == ShardHealthProbeOutcome::Failed(ShardBackendErrorClass::CommandFailed)
+            }));
+
+            let json = serde_json::to_string(&report).unwrap();
+            assert!(!json.contains("health-error-secret-sentinel"));
+            assert!(json.len() < 128 * 1_024);
+            let report_debug = format!("{report:?}");
+            assert!(!report_debug.contains("health-error-secret-sentinel"));
+            assert!(report_debug.contains("omitted_shards: 50"));
+            assert!(report_debug.len() < 16 * 1_024);
+
+            let warnings = report.watchdog_warnings();
+            assert_eq!(warnings.len(), ShardHealthReport::WATCHDOG_WARNING_LIMIT + 1);
+            assert!(warnings.iter().all(|warning| warning.len() < 256));
+            assert!(warnings.iter().all(|warning| {
+                !warning.contains("health-error-secret-sentinel")
+            }));
+            assert_eq!(
+                warnings.last().map(String::as_str),
+                Some(
+                    "Shard watchdog omitted 2 additional unhealthy shard(s) after bounded limit 64"
+                )
+            );
+        });
+    }
+
+    #[cfg(panic = "unwind")]
+    #[test]
+    fn health_callback_panics_are_contained_classified_and_nonreflecting() {
+        run_async_test(async {
+            let probe_panic = Arc::new(CreationBoundaryBackend::panicking_health_probe());
+            let circuit_panic = Arc::new(CreationBoundaryBackend::panicking_circuit_status());
+            let healthy = Arc::new(CreationBoundaryBackend::new(
+                CreationBoundaryBackend::VALID_LOCAL_PANE_ID,
+                false,
+                false,
+            ));
+            let client = ShardedWeztermClient::new(
+                vec![
+                    ShardBackend::new(
+                        ShardId(0),
+                        probe_panic.clone() as WeztermHandle,
+                    ),
+                    ShardBackend::new(
+                        ShardId(1),
+                        circuit_panic.clone() as WeztermHandle,
+                    ),
+                    ShardBackend::new(
+                        ShardId(2),
+                        healthy.clone() as WeztermHandle,
+                    ),
+                ],
+                AssignmentStrategy::RoundRobin,
+            )
+            .unwrap();
+
+            let report = client.shard_health_report().await;
+            assert_eq!(report.shards.len(), 3);
+            assert_eq!(report.outcome(), ShardHealthReportOutcome::Complete);
+            assert_eq!(report.overall, HealthStatus::Hung);
+            assert_eq!(
+                report.shards[0].probe_outcome,
+                ShardHealthProbeOutcome::Failed(ShardBackendErrorClass::Panicked)
+            );
+            assert_eq!(
+                report.shards[1].probe_outcome,
+                ShardHealthProbeOutcome::Failed(ShardBackendErrorClass::Panicked)
+            );
+            assert_eq!(
+                report.shards[2].probe_outcome,
+                ShardHealthProbeOutcome::Complete
+            );
+            assert_eq!(probe_panic.list_calls.load(Ordering::Relaxed), 1);
+            assert_eq!(circuit_panic.list_calls.load(Ordering::Relaxed), 0);
+            assert_eq!(healthy.list_calls.load(Ordering::Relaxed), 1);
+
+            let json = serde_json::to_string(&report).unwrap();
+            let debug = format!("{report:?}");
+            let warnings = report.watchdog_warnings();
+            for projection in std::iter::once(json.as_str())
+                .chain(std::iter::once(debug.as_str()))
+                .chain(warnings.iter().map(String::as_str))
+            {
+                assert!(!projection.contains("health-panic-secret-sentinel"));
+                assert!(!projection.contains("circuit-panic-secret-sentinel"));
+            }
         });
     }
 
@@ -3828,16 +4678,15 @@ mod tests {
 
     #[test]
     fn assignment_strategy_manual_serde() {
-        // HashMap<u64, _> serializes keys as strings in JSON; use empty map
-        // to avoid the string-key-to-u64 deserialization limitation, then
-        // verify the default_shard field survives.
         let s = AssignmentStrategy::Manual {
-            pane_to_shard: HashMap::new(),
+            pane_to_shard: HashMap::from([(7, ShardId(1)), (u64::MAX, ShardId(2))]),
             default_shard: Some(ShardId(0)),
         };
         let json = serde_json::to_string(&s).unwrap();
         let back: AssignmentStrategy = serde_json::from_str(&json).unwrap();
         assert_eq!(back, s);
+        assert!(json.contains("\"7\""));
+        assert!(json.contains(&format!("\"{}\"", u64::MAX)));
     }
 
     // -----------------------------------------------------------------------
@@ -3980,10 +4829,9 @@ mod tests {
     #[test]
     fn shard_backend_debug_omits_handle() {
         let mock = Arc::new(MockWezterm::new()) as WeztermHandle;
-        let backend = ShardBackend::new(ShardId(3), "test-shard", mock);
+        let backend = ShardBackend::new(ShardId(3), mock);
         let debug = format!("{:?}", backend);
         assert!(debug.contains("id: ShardId(3)"));
-        assert!(debug.contains("test-shard"));
         // handle should be omitted via finish_non_exhaustive
         assert!(debug.contains(".."));
     }
@@ -4010,8 +4858,8 @@ mod tests {
         let mock2 = Arc::new(MockWezterm::new()) as WeztermHandle;
         let result = ShardedWeztermClient::new(
             vec![
-                ShardBackend::new(ShardId(0), "a", mock1),
-                ShardBackend::new(ShardId(0), "b", mock2),
+                ShardBackend::new(ShardId(0), mock1),
+                ShardBackend::new(ShardId(0), mock2),
             ],
             AssignmentStrategy::RoundRobin,
         );
@@ -4030,7 +4878,6 @@ mod tests {
         let result = ShardedWeztermClient::new(
             vec![ShardBackend::new(
                 ShardId(MAX_SHARD_ID + 1),
-                "overflow",
                 mock,
             )],
             AssignmentStrategy::RoundRobin,
@@ -4048,7 +4895,7 @@ mod tests {
     fn one_backend_uncached_route_rejects_non_persistable_global_id() {
         let mock = Arc::new(MockWezterm::new()) as WeztermHandle;
         let client = ShardedWeztermClient::new(
-            vec![ShardBackend::new(ShardId(0), "only", mock)],
+            vec![ShardBackend::new(ShardId(0), mock)],
             AssignmentStrategy::RoundRobin,
         )
         .unwrap();
@@ -4085,8 +4932,8 @@ mod tests {
         // Provide out-of-order backends
         let client = ShardedWeztermClient::new(
             vec![
-                ShardBackend::new(ShardId(5), "five", mock0),
-                ShardBackend::new(ShardId(2), "two", mock1),
+                ShardBackend::new(ShardId(5), mock0),
+                ShardBackend::new(ShardId(2), mock1),
             ],
             AssignmentStrategy::RoundRobin,
         )
@@ -4195,17 +5042,33 @@ mod tests {
             shard_id: ShardId(2),
             label: "test".to_string(),
             status: HealthStatus::Degraded,
-            pane_count: Some(5),
+            pane_count: None,
             circuit: CircuitBreakerStatus::default(),
             error: Some("timeout".to_string()),
         };
         let json = serde_json::to_string(&entry).unwrap();
         let back: ShardHealthEntry = serde_json::from_str(&json).unwrap();
         assert_eq!(back.shard_id, ShardId(2));
-        assert_eq!(back.label, "test");
+        assert!(back.label.is_empty());
         assert_eq!(back.status, HealthStatus::Degraded);
-        assert_eq!(back.pane_count, Some(5));
-        assert_eq!(back.error.as_deref(), Some("timeout"));
+        assert_eq!(back.pane_count, None);
+        assert_eq!(back.error.as_deref(), Some("other"));
+        assert!(!json.contains("test"));
+        assert!(!json.contains("timeout"));
+        let projection: Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(projection["probe_outcome"]["state"], "failed");
+        assert_eq!(projection["probe_outcome"]["error_class"], "other");
+    }
+
+    #[test]
+    fn shard_health_entry_decoder_rejects_oversized_sequence_from_size_hint() {
+        let sequence = std::iter::repeat(0_u8).take(MAX_CONFIGURED_SHARDS + 1);
+        let deserializer = serde::de::value::SeqDeserializer::<
+            _,
+            serde::de::value::Error,
+        >::new(sequence);
+        let error = deserialize_bounded_shard_health_entries(deserializer).unwrap_err();
+        assert!(error.to_string().contains("at most 32768 shard health entries"));
     }
 
     // -----------------------------------------------------------------------
@@ -4432,7 +5295,9 @@ mod tests {
                 .await
                 .expect_err("failing backend kill must propagate its error");
             assert!(
-                error.to_string().contains("kill_pane failed on failing"),
+                error
+                    .to_string()
+                    .contains("kill_pane failed on shard 0, pane=7 (class=command_failed)"),
                 "unexpected backend error: {error}"
             );
             assert!(
@@ -4587,7 +5452,7 @@ mod tests {
         };
         let warnings = report.watchdog_warnings();
         assert_eq!(warnings.len(), 1);
-        assert!(warnings[0].contains("backend_error=absent"));
+        assert!(warnings[0].contains("probe=complete"));
         assert!(!warnings[0].contains("s0"));
     }
 
@@ -4620,6 +5485,18 @@ mod tests {
             .all(|warning| warning.len() < 256));
         assert!(warnings.iter().all(|warning| !warning.contains("private-label")));
         assert!(warnings.iter().all(|warning| !warning.contains("secret-error")));
+        assert!(warnings[..ShardHealthReport::WATCHDOG_WARNING_LIMIT]
+            .iter()
+            .all(|warning| warning.contains("probe=other")));
+        let json = serde_json::to_string(&report).unwrap();
+        assert!(!json.contains("private-label"));
+        assert!(!json.contains("secret-error"));
+        assert!(json.len() < 128 * 1_024);
+        let roundtrip: ShardHealthReport = serde_json::from_str(&json).unwrap();
+        assert!(roundtrip
+            .shards
+            .iter()
+            .all(|entry| entry.label.is_empty() && entry.error.as_deref() == Some("other")));
         assert_eq!(
             warnings.last().map(String::as_str),
             Some(
@@ -4638,6 +5515,7 @@ mod tests {
         assert_eq!(LOCAL_PANE_ID_BITS, 48);
         assert_eq!(SHARD_ID_BITS + LOCAL_PANE_ID_BITS, 63);
         assert_eq!(LOCAL_PANE_ID_MASK, (1u64 << LOCAL_PANE_ID_BITS) - 1);
+        assert_eq!(MAX_CONFIGURED_SHARDS, MAX_SHARD_ID + 1);
     }
 
     // -- Batch: DarkBadger wa-1u90p.7.1 ----------------------------------------
@@ -4750,6 +5628,20 @@ mod tests {
         assert_eq!(s, cloned);
         let dbg = format!("{:?}", s);
         assert!(dbg.contains("RoundRobin"));
+    }
+
+    #[test]
+    fn assignment_strategy_debug_reports_cardinality_without_raw_keys() {
+        let secret = format!("strategy-secret-sentinel-{}", "q".repeat(64 * 1_024));
+        let strategy = AssignmentStrategy::ByDomain {
+            domain_to_shard: HashMap::from([(secret.clone(), ShardId(0))]),
+            default_shard: Some(ShardId(0)),
+        };
+
+        let debug = format!("{strategy:?}");
+        assert!(debug.contains("mapping_count: 1"));
+        assert!(!debug.contains("strategy-secret-sentinel"));
+        assert!(debug.len() < 128);
     }
 
     #[test]
