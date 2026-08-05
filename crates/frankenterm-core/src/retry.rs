@@ -566,6 +566,8 @@ pub fn is_retryable(error: &Error) -> bool {
         // Storage errors - only generic database errors are retryable (lock conflicts)
         Error::Storage(e) => match e {
             StorageError::Database(_) => true, // Might be transient lock conflict
+            StorageError::WriterBackendEpochPoisoned => false, // Must reopen the storage handle
+            StorageError::MigrationEpochPoisoned => false, // Must reopen the migration connection
             StorageError::InvalidEventDeliveryLeaseBatch(_) => false, // Caller must rebuild input
             StorageError::ReservationConflict { .. } => false, // Another owner must release first
             StorageError::LeaseTokenConflict { .. } => false, // Input authority is contradictory
@@ -1767,6 +1769,22 @@ mod tests {
         assert!(is_retryable(&Error::Storage(StorageError::Database(
             "SQLITE_BUSY".into()
         ))));
+    }
+
+    #[test]
+    fn writer_backend_epoch_poison_requires_reopen_instead_of_retry() {
+        use crate::error::StorageError;
+        assert!(!is_retryable(&Error::Storage(
+            StorageError::WriterBackendEpochPoisoned,
+        )));
+    }
+
+    #[test]
+    fn migration_epoch_poison_requires_reopen_instead_of_retry() {
+        use crate::error::StorageError;
+        assert!(!is_retryable(&Error::Storage(
+            StorageError::MigrationEpochPoisoned,
+        )));
     }
 
     #[test]

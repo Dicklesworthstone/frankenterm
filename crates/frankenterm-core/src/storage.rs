@@ -1938,6 +1938,7 @@ fn ensure_db_permissions(_path: &Path, _is_new: bool) -> Result<()> {
 struct WriteCommandSender {
     inner: mpsc::Sender<WriteCommand>,
     queued_depth: Arc<AtomicUsize>,
+    terminal_state: Arc<AtomicU8>,
     max_capacity: usize,
     /// [round-4 Q2] Present only when `writer_blocking_recv` is enabled; signals
     /// the condvar-parked writer after each successful enqueue. `None` keeps the
@@ -1945,13 +1946,101 @@ struct WriteCommandSender {
     wakeup: Option<Arc<WriterWakeup>>,
 }
 
-type WriteCommandSendError = Box<mpsc::SendError<WriteCommand>>;
+const WRITER_TERMINAL_HEALTHY: u8 = 0;
+const WRITER_TERMINAL_BACKEND_EPOCH_POISONED: u8 = 1;
+
+#[derive(Debug)]
+enum WriteCommandSendError {
+    Channel(Box<mpsc::SendError<WriteCommand>>),
+    WriterBackendEpochPoisoned,
+}
+
+/// Storage-local stable waker used by writer-queue reservations.
+///
+/// asupersync's bounded mpsc retains the caller waker while a sender waits for
+/// capacity and invokes those retained wakers synchronously from
+/// `Receiver::close`.  A caller-supplied waker is arbitrary code: allowing it
+/// to unwind would stop the close loop at the first hostile waiter and strand
+/// every waiter after it.  Polling the reserve future only with this proxy
+/// keeps the channel's retained waker trusted; the downstream wake and waker
+/// destruction both run inside the canonical recovery boundary.
+#[derive(Default)]
+struct StorageWriterForwardingWaker {
+    downstream: Mutex<Option<std::task::Waker>>,
+}
+
+impl StorageWriterForwardingWaker {
+    fn replace(&self, downstream: &std::task::Waker) {
+        let next = downstream.clone();
+        let mut slot = self
+            .downstream
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let previous = slot.replace(next);
+        drop(slot);
+        drop(previous);
+    }
+
+    fn forward(&self) {
+        let downstream = self
+            .downstream
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(downstream) = downstream {
+            // Keep wake and destruction in separate recovery boundaries. A
+            // hostile RawWaker may panic from either callback; catching the
+            // wake before dropping the still-owned Waker prevents a second
+            // panic during unwinding from aborting the process.
+            storage_writer_waker_action_recovering("downstream_wake", || {
+                downstream.wake_by_ref();
+            });
+            storage_writer_waker_action_recovering("downstream_drop", || drop(downstream));
+        }
+    }
+
+    fn clear(&self) {
+        let downstream = self
+            .downstream
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        drop(downstream);
+    }
+}
+
+impl std::task::Wake for StorageWriterForwardingWaker {
+    fn wake(self: Arc<Self>) {
+        storage_writer_waker_action_recovering("wake", || self.forward());
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        storage_writer_waker_action_recovering("wake_by_ref", || self.forward());
+    }
+}
+
+impl Drop for StorageWriterForwardingWaker {
+    fn drop(&mut self) {
+        // A caller may cancel and drop `send_with_cx` while its reservation is
+        // still pending, so the explicit post-await `clear` is not guaranteed
+        // to run. Contain destruction of the retained caller waker here too.
+        let downstream = self
+            .downstream
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(downstream) = downstream {
+            storage_writer_waker_action_recovering("proxy_drop", || drop(downstream));
+        }
+    }
+}
 
 impl WriteCommandSender {
     fn new(inner: mpsc::Sender<WriteCommand>, max_capacity: usize) -> Self {
         Self {
             inner,
             queued_depth: Arc::new(AtomicUsize::new(0)),
+            terminal_state: Arc::new(AtomicU8::new(WRITER_TERMINAL_HEALTHY)),
             max_capacity,
             wakeup: None,
         }
@@ -1997,18 +2086,122 @@ impl WriteCommandSender {
         cx: &crate::cx::Cx,
         command: WriteCommand,
     ) -> std::result::Result<(), WriteCommandSendError> {
-        let permit = match self.inner.reserve(cx).await {
+        if self.terminal_state.load(AtomicOrdering::Acquire)
+            == WRITER_TERMINAL_BACKEND_EPOCH_POISONED
+        {
+            drop(command);
+            return Err(WriteCommandSendError::WriterBackendEpochPoisoned);
+        }
+
+        // Preserve the cancellation checkpoint that `reserve(cx)` performs,
+        // then take the channel's FIFO-aware synchronous fast path. Most
+        // storage sends never wait, so they need neither an Arc allocation nor
+        // a Mutex-backed forwarding waker. Only a genuinely full/FIFO-blocked
+        // queue can retain a caller waker and therefore needs the proxy.
+        let immediate_reserve = if cx.checkpoint().is_err() {
+            Err(mpsc::SendError::Cancelled(()))
+        } else {
+            self.inner.try_reserve()
+        };
+
+        let permit = match immediate_reserve {
             Ok(permit) => permit,
             Err(mpsc::SendError::Disconnected(())) => {
-                return Err(Box::new(mpsc::SendError::Disconnected(command)));
-            }
-            Err(mpsc::SendError::Full(())) => {
-                return Err(Box::new(mpsc::SendError::Full(command)));
+                if self.terminal_state.load(AtomicOrdering::Acquire)
+                    == WRITER_TERMINAL_BACKEND_EPOCH_POISONED
+                {
+                    drop(command);
+                    return Err(WriteCommandSendError::WriterBackendEpochPoisoned);
+                }
+                return Err(WriteCommandSendError::Channel(Box::new(
+                    mpsc::SendError::Disconnected(command),
+                )));
             }
             Err(mpsc::SendError::Cancelled(())) => {
-                return Err(Box::new(mpsc::SendError::Cancelled(command)));
+                return Err(WriteCommandSendError::Channel(Box::new(
+                    mpsc::SendError::Cancelled(command),
+                )));
+            }
+            Err(mpsc::SendError::Full(())) => {
+                if self.terminal_state.load(AtomicOrdering::Acquire)
+                    == WRITER_TERMINAL_BACKEND_EPOCH_POISONED
+                {
+                    drop(command);
+                    return Err(WriteCommandSendError::WriterBackendEpochPoisoned);
+                }
+
+                let forwarding = Arc::new(StorageWriterForwardingWaker::default());
+                let reserve = self.inner.reserve(cx);
+                let mut reserve = std::pin::pin!(reserve);
+                let reserve_result = std::future::poll_fn(|caller_cx| {
+                    let forwarding_for_poll = Arc::clone(&forwarding);
+                    let poll = catch_recoverable(
+                        RecoverablePanicSite::StorageWriter,
+                        std::panic::AssertUnwindSafe(|| {
+                            forwarding_for_poll.replace(caller_cx.waker());
+                            let stable_waker = std::task::Waker::from(forwarding_for_poll);
+                            let mut stable_cx = std::task::Context::from_waker(&stable_waker);
+                            std::future::Future::poll(reserve.as_mut(), &mut stable_cx)
+                        }),
+                    );
+                    match poll {
+                        Ok(poll) => poll,
+                        Err(_) => {
+                            STORAGE_WRITER_WAKER_PANICS_TOTAL
+                                .fetch_add(1, AtomicOrdering::Relaxed);
+                            tracing::error!(
+                                action = "reserve_poll",
+                                writer_waker_panics_total = storage_writer_waker_panics_total(),
+                                error_code = "WA-STORAGE-WRITER-WAKER-PANIC",
+                                "storage writer queue contained a panic from a caller waker"
+                            );
+                            std::task::Poll::Ready(Err(mpsc::SendError::Disconnected(())))
+                        }
+                    }
+                })
+                .await;
+                storage_writer_waker_action_recovering("clear", || forwarding.clear());
+
+                match reserve_result {
+                    Ok(permit) => permit,
+                    Err(mpsc::SendError::Disconnected(())) => {
+                        if self.terminal_state.load(AtomicOrdering::Acquire)
+                            == WRITER_TERMINAL_BACKEND_EPOCH_POISONED
+                        {
+                            drop(command);
+                            return Err(WriteCommandSendError::WriterBackendEpochPoisoned);
+                        }
+                        return Err(WriteCommandSendError::Channel(Box::new(
+                            mpsc::SendError::Disconnected(command),
+                        )));
+                    }
+                    Err(mpsc::SendError::Full(())) => {
+                        if self.terminal_state.load(AtomicOrdering::Acquire)
+                            == WRITER_TERMINAL_BACKEND_EPOCH_POISONED
+                        {
+                            drop(command);
+                            return Err(WriteCommandSendError::WriterBackendEpochPoisoned);
+                        }
+                        return Err(WriteCommandSendError::Channel(Box::new(
+                            mpsc::SendError::Full(command),
+                        )));
+                    }
+                    Err(mpsc::SendError::Cancelled(())) => {
+                        return Err(WriteCommandSendError::Channel(Box::new(
+                            mpsc::SendError::Cancelled(command),
+                        )));
+                    }
+                }
             }
         };
+
+        if self.terminal_state.load(AtomicOrdering::Acquire)
+            == WRITER_TERMINAL_BACKEND_EPOCH_POISONED
+        {
+            drop(permit);
+            drop(command);
+            return Err(WriteCommandSendError::WriterBackendEpochPoisoned);
+        }
 
         self.queued_depth.fetch_add(1, AtomicOrdering::AcqRel);
         match permit.try_send(command) {
@@ -2023,7 +2216,14 @@ impl WriteCommandSender {
             }
             Err(err) => {
                 Self::mark_command_dequeued(&self.queued_depth);
-                Err(Box::new(err))
+                if matches!(&err, mpsc::SendError::Disconnected(_))
+                    && self.terminal_state.load(AtomicOrdering::Acquire)
+                        == WRITER_TERMINAL_BACKEND_EPOCH_POISONED
+                {
+                    drop(err);
+                    return Err(WriteCommandSendError::WriterBackendEpochPoisoned);
+                }
+                Err(WriteCommandSendError::Channel(Box::new(err)))
             }
         }
     }
@@ -2465,18 +2665,23 @@ impl StorageHandle {
     /// Classify the Cx-aware writer enqueue failure without turning a
     /// caller-requested cancellation into a false writer outage.
     fn writer_send_error(operation: &str, error: WriteCommandSendError) -> crate::Error {
-        match error.as_ref() {
-            mpsc::SendError::Cancelled(_) => crate::Error::Cancelled(format!(
-                "{operation} cancelled while waiting for storage writer capacity"
-            )),
-            mpsc::SendError::Disconnected(_) => StorageError::Database(format!(
-                "{operation}: storage writer thread is not available"
-            ))
-            .into(),
-            mpsc::SendError::Full(_) => StorageError::Database(format!(
-                "{operation}: storage writer queue was unexpectedly full after reservation"
-            ))
-            .into(),
+        match error {
+            WriteCommandSendError::WriterBackendEpochPoisoned => {
+                StorageError::WriterBackendEpochPoisoned.into()
+            }
+            WriteCommandSendError::Channel(error) => match error.as_ref() {
+                mpsc::SendError::Cancelled(_) => crate::Error::Cancelled(format!(
+                    "{operation} cancelled while waiting for storage writer capacity"
+                )),
+                mpsc::SendError::Disconnected(_) => StorageError::Database(format!(
+                    "{operation}: storage writer thread is not available"
+                ))
+                .into(),
+                mpsc::SendError::Full(_) => StorageError::Database(format!(
+                    "{operation}: storage writer queue was unexpectedly full after reservation"
+                ))
+                .into(),
+            },
         }
     }
 
@@ -2706,6 +2911,7 @@ impl StorageHandle {
         let mut write_tx = WriteCommandSender::new(write_tx_raw, config.write_queue_size);
         write_tx.wakeup.clone_from(&writer_wakeup);
         let queued_depth_for_writer = Arc::clone(&write_tx.queued_depth);
+        let terminal_state_for_writer = Arc::clone(&write_tx.terminal_state);
         let mmap_runtime_for_writer = mmap_runtime.clone();
         let writer_wakeup_for_writer = writer_wakeup;
 
@@ -2720,6 +2926,7 @@ impl StorageHandle {
                     &mut write_rx,
                     &mut mmap_mirror,
                     &queued_depth_for_writer,
+                    &terminal_state_for_writer,
                     group_commit_events,
                     writer_wakeup_for_writer.as_deref(),
                     group_commit_adaptive,
@@ -10015,6 +10222,20 @@ impl Default for SegmentScanQuery {
 const WRITER_BATCH_CAP: usize = 128;
 
 static STORAGE_WRITER_PANICS_TOTAL: AtomicU64 = AtomicU64::new(0);
+static STORAGE_WRITER_EPOCH_POISONS_TOTAL: AtomicU64 = AtomicU64::new(0);
+static STORAGE_WRITER_RESPONSE_PANICS_TOTAL: AtomicU64 = AtomicU64::new(0);
+static STORAGE_WRITER_WAKER_PANICS_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+std::thread_local! {
+    /// Dispatch-local poison signal. Transaction helpers sit below the raw
+    /// command dispatcher and return their typed error through heterogeneous
+    /// oneshot result types; this bit lets the outer dispatcher terminate the
+    /// backend epoch after it has delivered that typed result to the command
+    /// that discovered the poison.
+    static STORAGE_WRITER_EPOCH_POISONED_IN_DISPATCH: std::cell::Cell<bool> = const {
+        std::cell::Cell::new(false)
+    };
+}
 
 /// Cumulative count of storage writer dispatch panics recovered in-process.
 #[must_use]
@@ -10022,9 +10243,394 @@ pub fn storage_writer_panics_total() -> u64 {
     STORAGE_WRITER_PANICS_TOTAL.load(AtomicOrdering::Relaxed)
 }
 
+/// Cumulative count of writer backend epochs terminated after an
+/// indeterminate transaction-control outcome.
+#[must_use]
+pub fn storage_writer_epoch_poisons_total() -> u64 {
+    STORAGE_WRITER_EPOCH_POISONS_TOTAL.load(AtomicOrdering::Relaxed)
+}
+
+/// Cumulative count of panics contained while delivering writer responses.
+#[must_use]
+pub fn storage_writer_response_panics_total() -> u64 {
+    STORAGE_WRITER_RESPONSE_PANICS_TOTAL.load(AtomicOrdering::Relaxed)
+}
+
+/// Cumulative count of panics contained at the storage writer queue's stable
+/// waker boundary.
+#[must_use]
+pub fn storage_writer_waker_panics_total() -> u64 {
+    STORAGE_WRITER_WAKER_PANICS_TOTAL.load(AtomicOrdering::Relaxed)
+}
+
 #[cfg(test)]
 fn reset_storage_writer_panics_total_for_test() {
     STORAGE_WRITER_PANICS_TOTAL.store(0, AtomicOrdering::Relaxed);
+}
+
+#[cfg(test)]
+fn reset_storage_writer_recovery_counters_for_test() {
+    STORAGE_WRITER_EPOCH_POISONS_TOTAL.store(0, AtomicOrdering::Relaxed);
+    STORAGE_WRITER_RESPONSE_PANICS_TOTAL.store(0, AtomicOrdering::Relaxed);
+    STORAGE_WRITER_WAKER_PANICS_TOTAL.store(0, AtomicOrdering::Relaxed);
+    let _ = take_writer_backend_epoch_poisoned_signal();
+}
+
+fn storage_writer_waker_action_recovering(action: &'static str, operation: impl FnOnce()) {
+    if catch_recoverable(
+        RecoverablePanicSite::StorageWriter,
+        std::panic::AssertUnwindSafe(operation),
+    )
+    .is_err()
+    {
+        STORAGE_WRITER_WAKER_PANICS_TOTAL.fetch_add(1, AtomicOrdering::Relaxed);
+        tracing::error!(
+            action,
+            writer_waker_panics_total = storage_writer_waker_panics_total(),
+            error_code = "WA-STORAGE-WRITER-WAKER-PANIC",
+            "storage writer contained a panic from a caller waker"
+        );
+    }
+}
+
+fn mark_writer_backend_epoch_poisoned(operation: &'static str, phase: &'static str) {
+    let newly_poisoned = STORAGE_WRITER_EPOCH_POISONED_IN_DISPATCH.with(|poisoned| {
+        let was_poisoned = poisoned.replace(true);
+        !was_poisoned
+    });
+    if newly_poisoned {
+        STORAGE_WRITER_EPOCH_POISONS_TOTAL.fetch_add(1, AtomicOrdering::Relaxed);
+    }
+    tracing::error!(
+        operation,
+        phase,
+        writer_epoch_poisons_total = storage_writer_epoch_poisons_total(),
+        error_code = "WA-STORAGE-WRITER-EPOCH-POISONED",
+        "storage writer backend epoch is no longer reusable"
+    );
+}
+
+fn take_writer_backend_epoch_poisoned_signal() -> bool {
+    STORAGE_WRITER_EPOCH_POISONED_IN_DISPATCH.with(|poisoned| poisoned.replace(false))
+}
+
+fn writer_backend_epoch_poisoned_signal_is_set() -> bool {
+    STORAGE_WRITER_EPOCH_POISONED_IN_DISPATCH.with(std::cell::Cell::get)
+}
+
+fn writer_backend_epoch_poisoned_error<T>() -> Result<T> {
+    Err(StorageError::WriterBackendEpochPoisoned.into())
+}
+
+fn is_writer_backend_epoch_poisoned(error: &crate::Error) -> bool {
+    matches!(
+        error,
+        crate::Error::Storage(StorageError::WriterBackendEpochPoisoned)
+    )
+}
+
+#[derive(Debug, Clone)]
+enum WriterFailure {
+    Database(String),
+    BackendEpochPoisoned,
+}
+
+impl WriterFailure {
+    fn result<T>(&self) -> Result<T> {
+        match self {
+            Self::Database(message) => Err(StorageError::Database(message.clone()).into()),
+            Self::BackendEpochPoisoned => writer_backend_epoch_poisoned_error(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct WriterDispatchInterruption {
+    failure: WriterFailure,
+    terminate_epoch: bool,
+}
+
+impl WriterDispatchInterruption {
+    fn recovered(message: impl Into<String>) -> Self {
+        Self {
+            failure: WriterFailure::Database(message.into()),
+            terminate_epoch: false,
+        }
+    }
+
+    fn backend_epoch_poisoned() -> Self {
+        Self {
+            failure: WriterFailure::BackendEpochPoisoned,
+            terminate_epoch: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WriterTransactionBeginMode {
+    Deferred,
+    Immediate,
+}
+
+impl WriterTransactionBeginMode {
+    const fn sql(self) -> &'static str {
+        match self {
+            Self::Deferred => "BEGIN",
+            Self::Immediate => "BEGIN IMMEDIATE",
+        }
+    }
+}
+
+enum WriterTransactionControlOutcome {
+    Succeeded,
+    Failed(BackendError),
+    Panicked,
+}
+
+fn writer_transaction_control(
+    backend: &dyn StorageBackend,
+    sql: &'static str,
+    operation: &'static str,
+    phase: &'static str,
+) -> WriterTransactionControlOutcome {
+    match catch_recoverable(
+        RecoverablePanicSite::StorageWriter,
+        std::panic::AssertUnwindSafe(|| backend.execute(sql)),
+    ) {
+        Ok(Ok(_)) => WriterTransactionControlOutcome::Succeeded,
+        Ok(Err(error)) => WriterTransactionControlOutcome::Failed(error),
+        Err(_) => {
+            STORAGE_WRITER_PANICS_TOTAL.fetch_add(1, AtomicOrdering::Relaxed);
+            tracing::error!(
+                operation,
+                phase,
+                writer_panics_total = storage_writer_panics_total(),
+                error_code = "WA-STORAGE-WRITER-PANIC",
+                "storage writer contained a transaction-control panic"
+            );
+            WriterTransactionControlOutcome::Panicked
+        }
+    }
+}
+
+fn rollback_writer_transaction(
+    backend: &dyn StorageBackend,
+    operation: &'static str,
+) -> bool {
+    match writer_transaction_control(backend, "ROLLBACK", operation, "rollback") {
+        WriterTransactionControlOutcome::Succeeded => true,
+        WriterTransactionControlOutcome::Failed(BackendError::TxPoisoned) => {
+            mark_writer_backend_epoch_poisoned(operation, "rollback");
+            false
+        }
+        WriterTransactionControlOutcome::Failed(_) | WriterTransactionControlOutcome::Panicked => {
+            false
+        }
+    }
+}
+
+/// Execute one complete transaction on the long-lived writer connection.
+///
+/// An ordinary mutation error is returned unchanged only after rollback is
+/// proven. A panic after BEGIN, a COMMIT failure/ambiguity, or any failed
+/// rollback poisons the whole writer epoch even if a best-effort rollback later
+/// appears to succeed; no later command may reuse that connection.
+fn run_writer_transaction<T, F>(
+    backend: &dyn StorageBackend,
+    begin_mode: WriterTransactionBeginMode,
+    operation: &'static str,
+    mutation: F,
+) -> Result<T>
+where
+    F: FnOnce() -> Result<T>,
+{
+    match writer_transaction_control(backend, begin_mode.sql(), operation, "begin") {
+        WriterTransactionControlOutcome::Succeeded => {}
+        WriterTransactionControlOutcome::Failed(BackendError::TxPoisoned) => {
+            mark_writer_backend_epoch_poisoned(operation, "begin");
+            return writer_backend_epoch_poisoned_error();
+        }
+        WriterTransactionControlOutcome::Failed(error) => {
+            return Err(storage_backend_error("Begin writer transaction", error).into());
+        }
+        WriterTransactionControlOutcome::Panicked => {
+            let _ = rollback_writer_transaction(backend, operation);
+            mark_writer_backend_epoch_poisoned(operation, "begin");
+            return writer_backend_epoch_poisoned_error();
+        }
+    }
+
+    let mutation_outcome = catch_recoverable(
+        RecoverablePanicSite::StorageWriter,
+        std::panic::AssertUnwindSafe(mutation),
+    );
+    match mutation_outcome {
+        Ok(Ok(value)) => {
+            match writer_transaction_control(backend, "COMMIT", operation, "commit") {
+                WriterTransactionControlOutcome::Succeeded => Ok(value),
+                WriterTransactionControlOutcome::Failed(BackendError::TxPoisoned) => {
+                    mark_writer_backend_epoch_poisoned(operation, "commit");
+                    writer_backend_epoch_poisoned_error()
+                }
+                WriterTransactionControlOutcome::Failed(_)
+                | WriterTransactionControlOutcome::Panicked => {
+                    let _ = rollback_writer_transaction(backend, operation);
+                    mark_writer_backend_epoch_poisoned(operation, "commit");
+                    writer_backend_epoch_poisoned_error()
+                }
+            }
+        }
+        Ok(Err(error)) => {
+            let nested_poison = is_writer_backend_epoch_poisoned(&error);
+            if nested_poison {
+                mark_writer_backend_epoch_poisoned(operation, "mutation");
+                writer_backend_epoch_poisoned_error()
+            } else if rollback_writer_transaction(backend, operation) {
+                Err(error)
+            } else {
+                mark_writer_backend_epoch_poisoned(operation, "rollback");
+                writer_backend_epoch_poisoned_error()
+            }
+        }
+        Err(_) => {
+            STORAGE_WRITER_PANICS_TOTAL.fetch_add(1, AtomicOrdering::Relaxed);
+            tracing::error!(
+                operation,
+                writer_panics_total = storage_writer_panics_total(),
+                error_code = "WA-STORAGE-WRITER-PANIC",
+                "storage writer contained a transaction mutation panic"
+            );
+            let _ = rollback_writer_transaction(backend, operation);
+            mark_writer_backend_epoch_poisoned(operation, "mutation");
+            writer_backend_epoch_poisoned_error()
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct WriterSavepoint {
+    begin_sql: &'static str,
+    rollback_sql: &'static str,
+    release_sql: &'static str,
+}
+
+fn restore_writer_savepoint(
+    backend: &dyn StorageBackend,
+    savepoint: WriterSavepoint,
+    operation: &'static str,
+) -> bool {
+    let rolled_back = match writer_transaction_control(
+        backend,
+        savepoint.rollback_sql,
+        operation,
+        "rollback",
+    ) {
+        WriterTransactionControlOutcome::Succeeded => true,
+        WriterTransactionControlOutcome::Failed(BackendError::TxPoisoned) => {
+            mark_writer_backend_epoch_poisoned(operation, "rollback");
+            return false;
+        }
+        WriterTransactionControlOutcome::Failed(_) | WriterTransactionControlOutcome::Panicked => {
+            false
+        }
+    };
+    let released = match writer_transaction_control(
+        backend,
+        savepoint.release_sql,
+        operation,
+        "release",
+    ) {
+        WriterTransactionControlOutcome::Succeeded => true,
+        WriterTransactionControlOutcome::Failed(BackendError::TxPoisoned) => {
+            mark_writer_backend_epoch_poisoned(operation, "release");
+            false
+        }
+        WriterTransactionControlOutcome::Failed(_) | WriterTransactionControlOutcome::Panicked => {
+            false
+        }
+    };
+    rolled_back && released
+}
+
+/// Panic-safe savepoint sibling of [`run_writer_transaction`].
+///
+/// Both ROLLBACK TO and RELEASE must succeed before an ordinary mutation error
+/// may be returned. RELEASE failure is commit ambiguity and therefore poisons
+/// the writer epoch even when the subsequent restore sequence succeeds.
+fn run_writer_savepoint<T, F>(
+    backend: &dyn StorageBackend,
+    savepoint: WriterSavepoint,
+    operation: &'static str,
+    mutation: F,
+) -> Result<T>
+where
+    F: FnOnce() -> Result<T>,
+{
+    match writer_transaction_control(backend, savepoint.begin_sql, operation, "begin") {
+        WriterTransactionControlOutcome::Succeeded => {}
+        WriterTransactionControlOutcome::Failed(BackendError::TxPoisoned) => {
+            mark_writer_backend_epoch_poisoned(operation, "begin");
+            return writer_backend_epoch_poisoned_error();
+        }
+        WriterTransactionControlOutcome::Failed(error) => {
+            return Err(storage_backend_error("Begin writer savepoint", error).into());
+        }
+        WriterTransactionControlOutcome::Panicked => {
+            let _ = restore_writer_savepoint(backend, savepoint, operation);
+            mark_writer_backend_epoch_poisoned(operation, "begin");
+            return writer_backend_epoch_poisoned_error();
+        }
+    }
+
+    match catch_recoverable(
+        RecoverablePanicSite::StorageWriter,
+        std::panic::AssertUnwindSafe(mutation),
+    ) {
+        Ok(Ok(value)) => {
+            match writer_transaction_control(
+                backend,
+                savepoint.release_sql,
+                operation,
+                "release",
+            ) {
+                WriterTransactionControlOutcome::Succeeded => Ok(value),
+                WriterTransactionControlOutcome::Failed(BackendError::TxPoisoned) => {
+                    mark_writer_backend_epoch_poisoned(operation, "release");
+                    writer_backend_epoch_poisoned_error()
+                }
+                WriterTransactionControlOutcome::Failed(_)
+                | WriterTransactionControlOutcome::Panicked => {
+                    let _ = restore_writer_savepoint(backend, savepoint, operation);
+                    mark_writer_backend_epoch_poisoned(operation, "release");
+                    writer_backend_epoch_poisoned_error()
+                }
+            }
+        }
+        Ok(Err(error)) => {
+            let nested_poison = is_writer_backend_epoch_poisoned(&error);
+            if nested_poison {
+                mark_writer_backend_epoch_poisoned(operation, "mutation");
+                writer_backend_epoch_poisoned_error()
+            } else if restore_writer_savepoint(backend, savepoint, operation) {
+                Err(error)
+            } else {
+                mark_writer_backend_epoch_poisoned(operation, "rollback");
+                writer_backend_epoch_poisoned_error()
+            }
+        }
+        Err(_) => {
+            STORAGE_WRITER_PANICS_TOTAL.fetch_add(1, AtomicOrdering::Relaxed);
+            tracing::error!(
+                operation,
+                writer_panics_total = storage_writer_panics_total(),
+                error_code = "WA-STORAGE-WRITER-PANIC",
+                "storage writer contained a savepoint mutation panic"
+            );
+            let _ = restore_writer_savepoint(backend, savepoint, operation);
+            mark_writer_backend_epoch_poisoned(operation, "mutation");
+            writer_backend_epoch_poisoned_error()
+        }
+    }
 }
 
 /// ft-0eby0: test lock for `STORAGE_WRITER_PANICS_TOTAL`. The counter is
@@ -10298,18 +10904,20 @@ fn dispatch_write_command_batch(
     segment_redactors: &mut HashMap<u64, SegmentPersistRedactor>,
     io_gate: &mut StorageIoWriterGate,
     group_commit_events: bool,
-) {
+) -> Option<WriterDispatchInterruption> {
     let mut pending_io = HashMap::<u64, WriteCommand>::new();
 
     while let Some(cmd) = batch.pop_front() {
         if *should_break {
-            let message = "storage writer shut down before dispatch".to_string();
-            *should_break |= fail_undispatched_write_command(cmd, message.clone());
-            if fail_undispatched_write_commands(batch, message) {
+            let failure = WriterFailure::Database(
+                "storage writer shut down before dispatch".to_string(),
+            );
+            *should_break |= fail_undispatched_write_command(cmd, &failure);
+            if fail_undispatched_write_commands(batch, &failure) {
                 *should_break = true;
             }
             io_gate.finish_batch();
-            return;
+            return None;
         }
 
         if let Some((work_id, decision)) = io_gate.admit_command(&cmd) {
@@ -10341,7 +10949,7 @@ fn dispatch_write_command_batch(
             continue;
         }
 
-        if let Some(message) = flush_storage_io_pending_commands(
+        if let Some(interruption) = flush_storage_io_pending_commands(
             backend,
             &mut pending_io,
             should_break,
@@ -10350,40 +10958,47 @@ fn dispatch_write_command_batch(
             io_gate,
             group_commit_events,
         ) {
-            *should_break |= fail_undispatched_write_command(cmd, message.clone());
-            if fail_undispatched_write_commands(batch, message) {
+            *should_break |= interruption.terminate_epoch;
+            *should_break |= fail_undispatched_write_command(cmd, &interruption.failure);
+            if fail_undispatched_write_commands(batch, &interruption.failure) {
                 *should_break = true;
             }
             io_gate.finish_batch();
-            return;
+            return Some(interruption);
         }
         if !*should_break {
-            if let Some(message) = dispatch_write_command_raw_recovering(
+            if let Some(interruption) = dispatch_write_command_raw_recovering(
                 backend,
                 cmd,
                 should_break,
                 mmap_mirror,
                 segment_redactors,
             ) {
-                fail_pending_storage_io_commands(std::mem::take(&mut pending_io), message.clone());
-                if fail_undispatched_write_commands(batch, message) {
+                *should_break |= interruption.terminate_epoch;
+                fail_pending_storage_io_commands(
+                    std::mem::take(&mut pending_io),
+                    &interruption.failure,
+                );
+                if fail_undispatched_write_commands(batch, &interruption.failure) {
                     *should_break = true;
                 }
                 io_gate.reset_after_panic();
-                return;
+                return Some(interruption);
             }
         } else {
-            let message = "storage writer shut down before dispatch".to_string();
-            *should_break |= fail_undispatched_write_command(cmd, message.clone());
-            if fail_undispatched_write_commands(batch, message) {
+            let failure = WriterFailure::Database(
+                "storage writer shut down before dispatch".to_string(),
+            );
+            *should_break |= fail_undispatched_write_command(cmd, &failure);
+            if fail_undispatched_write_commands(batch, &failure) {
                 *should_break = true;
             }
             io_gate.finish_batch();
-            return;
+            return None;
         }
     }
 
-    if let Some(message) = flush_storage_io_pending_commands(
+    if let Some(interruption) = flush_storage_io_pending_commands(
         backend,
         &mut pending_io,
         should_break,
@@ -10392,13 +11007,15 @@ fn dispatch_write_command_batch(
         io_gate,
         group_commit_events,
     ) {
-        if fail_undispatched_write_commands(batch, message) {
+        *should_break |= interruption.terminate_epoch;
+        if fail_undispatched_write_commands(batch, &interruption.failure) {
             *should_break = true;
         }
         io_gate.finish_batch();
-        return;
+        return Some(interruption);
     }
     io_gate.finish_batch();
+    None
 }
 
 fn flush_storage_io_pending_commands(
@@ -10409,28 +11026,33 @@ fn flush_storage_io_pending_commands(
     segment_redactors: &mut HashMap<u64, SegmentPersistRedactor>,
     io_gate: &mut StorageIoWriterGate,
     group_commit_events: bool,
-) -> Option<String> {
+) -> Option<WriterDispatchInterruption> {
     let mut pending_append_segments = Vec::new();
     let mut pending_event_gap: Vec<PendingEventOrGap> = Vec::new();
 
     while !pending_io.is_empty() && !*should_break {
         let Some(dispatched) = io_gate.pop_next() else {
-            let message =
-                "storage IO scheduler lost queued writer commands before dispatch".to_string();
+            let interruption = WriterDispatchInterruption::recovered(
+                "storage IO scheduler lost queued writer commands before dispatch",
+            );
             tracing::error!(
                 pending = pending_io.len(),
                 "storage IO scheduler returned no dispatchable work for queued commands"
             );
             fail_pending_append_segments(
                 std::mem::take(&mut pending_append_segments),
-                message.clone(),
+                &interruption.failure,
             );
-            fail_pending_event_gap(std::mem::take(&mut pending_event_gap), message.clone());
-            fail_pending_storage_io_commands(std::mem::take(pending_io), message);
+            fail_pending_event_gap(
+                std::mem::take(&mut pending_event_gap),
+                &interruption.failure,
+            );
+            fail_pending_storage_io_commands(
+                std::mem::take(pending_io),
+                &interruption.failure,
+            );
             io_gate.reset_after_scheduler_loss();
-            return Some(
-                "storage IO scheduler lost queued writer commands before dispatch".to_string(),
-            );
+            return Some(interruption);
         };
 
         let work_id = dispatched.item.id;
@@ -10461,7 +11083,7 @@ fn flush_storage_io_pending_commands(
         let kind = writer_coalesce_kind(&cmd, group_commit_events);
 
         if !matches!(kind, WriterCoalesceKind::Append) {
-            if let Some(message) = flush_append_segment_group_recovering(
+            if let Some(interruption) = flush_append_segment_group_recovering(
                 backend,
                 &mut pending_append_segments,
                 mmap_mirror,
@@ -10471,28 +11093,39 @@ fn flush_storage_io_pending_commands(
                 // Return the same typed failure to the command that forced the
                 // flush before failing the remaining scheduler tail; merely
                 // dropping its oneshot would erase the recovered-panic cause.
-                *should_break |= fail_undispatched_write_command(cmd, message.clone());
-                fail_pending_event_gap(std::mem::take(&mut pending_event_gap), message.clone());
-                fail_pending_storage_io_commands(std::mem::take(pending_io), message.clone());
+                *should_break |= interruption.terminate_epoch;
+                *should_break |= fail_undispatched_write_command(cmd, &interruption.failure);
+                fail_pending_event_gap(
+                    std::mem::take(&mut pending_event_gap),
+                    &interruption.failure,
+                );
+                fail_pending_storage_io_commands(
+                    std::mem::take(pending_io),
+                    &interruption.failure,
+                );
                 io_gate.reset_after_panic();
-                return Some(message);
+                return Some(interruption);
             }
         }
         if !matches!(kind, WriterCoalesceKind::EventGap) {
-            if let Some(message) = flush_event_gap_group_recovering(
+            if let Some(interruption) = flush_event_gap_group_recovering(
                 backend,
                 &mut pending_event_gap,
                 mmap_mirror,
                 segment_redactors,
             ) {
-                *should_break |= fail_undispatched_write_command(cmd, message.clone());
+                *should_break |= interruption.terminate_epoch;
+                *should_break |= fail_undispatched_write_command(cmd, &interruption.failure);
                 fail_pending_append_segments(
                     std::mem::take(&mut pending_append_segments),
-                    message.clone(),
+                    &interruption.failure,
                 );
-                fail_pending_storage_io_commands(std::mem::take(pending_io), message.clone());
+                fail_pending_storage_io_commands(
+                    std::mem::take(pending_io),
+                    &interruption.failure,
+                );
                 io_gate.reset_after_panic();
-                return Some(message);
+                return Some(interruption);
             }
         }
 
@@ -10502,75 +11135,86 @@ fn flush_storage_io_pending_commands(
                 // `kind` already proved this is an append; the Err arm is
                 // unreachable, but dispatch defensively rather than panic.
                 Err(unexpected) => {
-                    if let Some(message) = dispatch_write_command_raw_recovering(
+                    if let Some(interruption) = dispatch_write_command_raw_recovering(
                         backend,
                         *unexpected,
                         should_break,
                         mmap_mirror,
                         segment_redactors,
                     ) {
+                        *should_break |= interruption.terminate_epoch;
                         fail_pending_storage_io_commands(
                             std::mem::take(pending_io),
-                            message.clone(),
+                            &interruption.failure,
                         );
                         io_gate.reset_after_panic();
-                        return Some(message);
+                        return Some(interruption);
                     }
                 }
             },
             WriterCoalesceKind::EventGap => match pending_event_or_gap_from_command(cmd) {
                 Ok(pending_eg) => pending_event_gap.push(pending_eg),
                 Err(unexpected) => {
-                    if let Some(message) = dispatch_write_command_raw_recovering(
+                    if let Some(interruption) = dispatch_write_command_raw_recovering(
                         backend,
                         *unexpected,
                         should_break,
                         mmap_mirror,
                         segment_redactors,
                     ) {
+                        *should_break |= interruption.terminate_epoch;
                         fail_pending_storage_io_commands(
                             std::mem::take(pending_io),
-                            message.clone(),
+                            &interruption.failure,
                         );
                         io_gate.reset_after_panic();
-                        return Some(message);
+                        return Some(interruption);
                     }
                 }
             },
             WriterCoalesceKind::Other => {
-                if let Some(message) = dispatch_write_command_raw_recovering(
+                if let Some(interruption) = dispatch_write_command_raw_recovering(
                     backend,
                     cmd,
                     should_break,
                     mmap_mirror,
                     segment_redactors,
                 ) {
-                    fail_pending_storage_io_commands(std::mem::take(pending_io), message.clone());
+                    *should_break |= interruption.terminate_epoch;
+                    fail_pending_storage_io_commands(
+                        std::mem::take(pending_io),
+                        &interruption.failure,
+                    );
                     io_gate.reset_after_panic();
-                    return Some(message);
+                    return Some(interruption);
                 }
             }
         }
     }
 
-    if let Some(message) = flush_append_segment_group_recovering(
+    if let Some(interruption) = flush_append_segment_group_recovering(
         backend,
         &mut pending_append_segments,
         mmap_mirror,
         segment_redactors,
     ) {
-        fail_pending_event_gap(std::mem::take(&mut pending_event_gap), message.clone());
+        *should_break |= interruption.terminate_epoch;
+        fail_pending_event_gap(
+            std::mem::take(&mut pending_event_gap),
+            &interruption.failure,
+        );
         io_gate.reset_after_panic();
-        return Some(message);
+        return Some(interruption);
     }
-    if let Some(message) = flush_event_gap_group_recovering(
+    if let Some(interruption) = flush_event_gap_group_recovering(
         backend,
         &mut pending_event_gap,
         mmap_mirror,
         segment_redactors,
     ) {
+        *should_break |= interruption.terminate_epoch;
         io_gate.reset_after_panic();
-        return Some(message);
+        return Some(interruption);
     }
     None
 }
@@ -10684,7 +11328,7 @@ fn flush_event_gap_group_recovering(
     pending_event_gap: &mut Vec<PendingEventOrGap>,
     mmap_mirror: &mut Option<mmap_store::MmapScrollbackStore>,
     segment_redactors: &mut HashMap<u64, SegmentPersistRedactor>,
-) -> Option<String> {
+) -> Option<WriterDispatchInterruption> {
     if pending_event_gap.is_empty() {
         return None;
     }
@@ -10704,6 +11348,7 @@ fn flush_event_gap_group_recovering(
         );
     }
 
+    let _ = take_writer_backend_epoch_poisoned_signal();
     let outcome = catch_recoverable(
         RecoverablePanicSite::StorageWriter,
         std::panic::AssertUnwindSafe(|| {
@@ -10712,20 +11357,34 @@ fn flush_event_gap_group_recovering(
     );
     match outcome {
         Ok(result) => {
+            let signalled = take_writer_backend_epoch_poisoned_signal();
+            let result = if signalled {
+                writer_backend_epoch_poisoned_error()
+            } else {
+                result
+            };
+            let terminal = result
+                .as_ref()
+                .err()
+                .is_some_and(is_writer_backend_epoch_poisoned);
             dispatch_event_gap_group_commit_result(result, group);
-            None
+            terminal.then(WriterDispatchInterruption::backend_epoch_poisoned)
         }
         Err(_) => {
             STORAGE_WRITER_PANICS_TOTAL.fetch_add(1, AtomicOrdering::Relaxed);
-            let message = WRITER_EVENT_GAP_PANIC_ERROR.to_string();
+            let backend_epoch_poisoned = take_writer_backend_epoch_poisoned_signal();
+            let interruption = if backend_epoch_poisoned {
+                WriterDispatchInterruption::backend_epoch_poisoned()
+            } else {
+                WriterDispatchInterruption::recovered(WRITER_EVENT_GAP_PANIC_ERROR)
+            };
             tracing::error!(
                 writer_panics_total = storage_writer_panics_total(),
                 error_code = "WA-STORAGE-WRITER-PANIC",
                 "storage writer event/gap group commit panic recovered; failing grouped callers"
             );
-            rollback_event_gap_group_best_effort(backend, "event/gap group panic");
-            fail_pending_event_gap(group, message.clone());
-            Some(message)
+            fail_pending_event_gap(group, &interruption.failure);
+            Some(interruption)
         }
     }
 }
@@ -10749,24 +11408,12 @@ fn event_gap_group_commit_backend(
         return Ok(Vec::new());
     }
 
-    backend
-        .execute("BEGIN")
-        .map_err(|err| storage_backend_error("Begin event/gap group commit", err))?;
-
-    let result = event_gap_group_commit_inner(backend, group, mmap_mirror, segment_redactors);
-    match result {
-        Ok(results) => {
-            if let Err(err) = backend.execute("COMMIT") {
-                rollback_event_gap_group_best_effort(backend, "commit failure");
-                return Err(storage_backend_error("Commit event/gap group", err).into());
-            }
-            Ok(results)
-        }
-        Err(error) => {
-            rollback_event_gap_group_best_effort(backend, "event/gap failure");
-            Err(error)
-        }
-    }
+    run_writer_transaction(
+        backend,
+        WriterTransactionBeginMode::Deferred,
+        "event/gap group commit",
+        || event_gap_group_commit_inner(backend, group, mmap_mirror, segment_redactors),
+    )
 }
 
 fn event_gap_group_commit_inner(
@@ -10814,7 +11461,7 @@ fn dispatch_event_gap_group_commit_result(
                     pending_count,
                     "storage writer event/gap group commit returned mismatched results; failing grouped callers"
                 );
-                fail_pending_event_gap(group, message);
+                fail_pending_event_gap(group, &WriterFailure::Database(message));
                 return;
             }
 
@@ -10876,18 +11523,24 @@ fn dispatch_event_gap_group_commit_result(
             }
         }
         Err(error) => {
-            let message = format!("storage event/gap group commit failed: {error}");
+            let failure = if is_writer_backend_epoch_poisoned(&error) {
+                WriterFailure::BackendEpochPoisoned
+            } else {
+                WriterFailure::Database(format!(
+                    "storage event/gap group commit failed: {error}"
+                ))
+            };
             tracing::warn!(
                 commands = group.len(),
                 error = %error,
                 "storage writer event/gap group commit failed; failing grouped callers"
             );
-            fail_pending_event_gap(group, message);
+            fail_pending_event_gap(group, &failure);
         }
     }
 }
 
-fn fail_pending_event_gap(group: Vec<PendingEventOrGap>, message: String) {
+fn fail_pending_event_gap(group: Vec<PendingEventOrGap>, failure: &WriterFailure) {
     for pending in group {
         match pending {
             PendingEventOrGap::Event {
@@ -10895,7 +11548,7 @@ fn fail_pending_event_gap(group: Vec<PendingEventOrGap>, message: String) {
                 respond,
                 ..
             } => {
-                respond.respond_best_effort(Err(StorageError::Database(message.clone()).into()));
+                respond.respond_best_effort(failure.result());
                 drop(capture_hold);
             }
             PendingEventOrGap::Gap {
@@ -10903,20 +11556,10 @@ fn fail_pending_event_gap(group: Vec<PendingEventOrGap>, message: String) {
                 respond,
                 ..
             } => {
-                respond.respond_best_effort(Err(StorageError::Database(message.clone()).into()));
+                respond.respond_best_effort(failure.result());
                 drop(capture_hold);
             }
         }
-    }
-}
-
-fn rollback_event_gap_group_best_effort(backend: &dyn StorageBackend, cause: &str) {
-    if let Err(err) = backend.execute("ROLLBACK") {
-        tracing::error!(
-            cause,
-            error = %err,
-            "failed to roll back event/gap group transaction"
-        );
     }
 }
 
@@ -10971,7 +11614,7 @@ fn flush_append_segment_group_recovering(
     pending_append_segments: &mut Vec<PendingAppendSegmentWrite>,
     mmap_mirror: &mut Option<mmap_store::MmapScrollbackStore>,
     segment_redactors: &mut HashMap<u64, SegmentPersistRedactor>,
-) -> Option<String> {
+) -> Option<WriterDispatchInterruption> {
     if pending_append_segments.is_empty() {
         return None;
     }
@@ -10989,6 +11632,7 @@ fn flush_append_segment_group_recovering(
         );
     }
 
+    let _ = take_writer_backend_epoch_poisoned_signal();
     let outcome = catch_recoverable(
         RecoverablePanicSite::StorageWriter,
         std::panic::AssertUnwindSafe(|| {
@@ -10997,21 +11641,37 @@ fn flush_append_segment_group_recovering(
     );
     match outcome {
         Ok(result) => {
+            let signalled = take_writer_backend_epoch_poisoned_signal();
+            let result = if signalled {
+                writer_backend_epoch_poisoned_error()
+            } else {
+                result
+            };
+            let terminal = result
+                .as_ref()
+                .err()
+                .is_some_and(is_writer_backend_epoch_poisoned);
             dispatch_append_segment_group_commit_result(result, group, mmap_mirror);
-            None
+            terminal.then(WriterDispatchInterruption::backend_epoch_poisoned)
         }
         Err(_) => {
             STORAGE_WRITER_PANICS_TOTAL.fetch_add(1, AtomicOrdering::Relaxed);
-            let message = WRITER_APPEND_PANIC_ERROR.to_string();
+            let backend_epoch_poisoned = take_writer_backend_epoch_poisoned_signal();
+            let interruption = if backend_epoch_poisoned {
+                WriterDispatchInterruption::backend_epoch_poisoned()
+            } else {
+                WriterDispatchInterruption::recovered(WRITER_APPEND_PANIC_ERROR)
+            };
             tracing::error!(
                 writer_panics_total = storage_writer_panics_total(),
                 error_code = "WA-STORAGE-WRITER-PANIC",
                 "storage writer append group commit panic recovered; failing undispatched batch commands"
             );
-            rollback_append_segment_group_best_effort(backend, "append group panic");
-            flush_segment_redactors(backend, mmap_mirror, segment_redactors);
-            fail_pending_append_segments(group, message.clone());
-            Some(message)
+            if !backend_epoch_poisoned {
+                flush_segment_redactors(backend, mmap_mirror, segment_redactors);
+            }
+            fail_pending_append_segments(group, &interruption.failure);
+            Some(interruption)
         }
     }
 }
@@ -11035,7 +11695,7 @@ fn dispatch_append_segment_group_commit_result(
                     pending_count,
                     "storage writer append group commit returned mismatched results; failing grouped append callers"
                 );
-                fail_pending_append_segments(group, message);
+                fail_pending_append_segments(group, &WriterFailure::Database(message));
                 return;
             }
 
@@ -11055,52 +11715,63 @@ fn dispatch_append_segment_group_commit_result(
             }
         }
         Err(error) => {
-            let message = format!("storage append segment group commit failed: {error}");
+            let failure = if is_writer_backend_epoch_poisoned(&error) {
+                WriterFailure::BackendEpochPoisoned
+            } else {
+                WriterFailure::Database(format!(
+                    "storage append segment group commit failed: {error}"
+                ))
+            };
             tracing::warn!(
                 segments = group.len(),
                 error = %error,
                 "storage writer append group commit failed; failing grouped append callers"
             );
-            fail_pending_append_segments(group, message);
+            fail_pending_append_segments(group, &failure);
         }
     }
 }
 
-fn fail_pending_append_segments(commands: Vec<PendingAppendSegmentWrite>, message: String) {
+fn fail_pending_append_segments(commands: Vec<PendingAppendSegmentWrite>, failure: &WriterFailure) {
     for cmd in commands {
         let PendingAppendSegmentWrite {
             capture_hold,
             respond,
             ..
         } = cmd;
-        respond
-            .respond_best_effort(Err(StorageError::Database(message.clone()).into()));
+        respond.respond_best_effort(failure.result());
         drop(capture_hold);
     }
 }
 
-fn fail_pending_storage_io_commands(commands: HashMap<u64, WriteCommand>, message: String) {
+fn fail_pending_storage_io_commands(
+    commands: HashMap<u64, WriteCommand>,
+    failure: &WriterFailure,
+) {
     for (_, cmd) in commands {
-        fail_undispatched_write_command(cmd, message.clone());
+        fail_undispatched_write_command(cmd, failure);
     }
 }
 
-fn fail_undispatched_write_commands(commands: VecDeque<WriteCommand>, message: String) -> bool {
+fn fail_undispatched_write_commands(
+    commands: VecDeque<WriteCommand>,
+    failure: &WriterFailure,
+) -> bool {
     let mut should_break = false;
     for cmd in commands {
-        should_break |= fail_undispatched_write_command(cmd, message.clone());
+        should_break |= fail_undispatched_write_command(cmd, failure);
     }
     should_break
 }
 
-fn fail_undispatched_write_command(cmd: WriteCommand, message: String) -> bool {
+fn fail_undispatched_write_command(cmd: WriteCommand, failure: &WriterFailure) -> bool {
     match cmd {
         WriteCommand::AppendSegment {
             capture_hold,
             respond,
             ..
         } => {
-            respond_oneshot_best_effort(respond, writer_panic_error(&message));
+            respond_oneshot_best_effort(respond, failure.result());
             drop(capture_hold);
         }
         WriteCommand::RecordGap {
@@ -11108,7 +11779,7 @@ fn fail_undispatched_write_command(cmd: WriteCommand, message: String) -> bool {
             respond,
             ..
         } => {
-            respond_oneshot_best_effort(respond, writer_panic_error(&message));
+            respond_oneshot_best_effort(respond, failure.result());
             drop(capture_hold);
         }
         WriteCommand::RecordEvent {
@@ -11116,11 +11787,11 @@ fn fail_undispatched_write_command(cmd: WriteCommand, message: String) -> bool {
             respond,
             ..
         } => {
-            respond_oneshot_best_effort(respond, writer_panic_error(&message));
+            respond_oneshot_best_effort(respond, failure.result());
             drop(capture_hold);
         }
         WriteCommand::ReserveEventDelivery { respond, .. } => {
-            respond_oneshot_best_effort(respond, writer_panic_error(&message));
+            respond_oneshot_best_effort(respond, failure.result());
         }
         WriteCommand::MarkEventHandled { respond, .. }
         | WriteCommand::SetEventNote { respond, .. }
@@ -11141,7 +11812,7 @@ fn fail_undispatched_write_command(cmd: WriteCommand, message: String) -> bool {
         | WriteCommand::IncrementNotificationRetry { respond, .. }
         | WriteCommand::InsertMuxSession { respond, .. }
         | WriteCommand::MarkSessionShutdownClean { respond, .. } => {
-            respond_oneshot_best_effort(respond, writer_panic_error(&message));
+            respond_oneshot_best_effort(respond, failure.result());
         }
         WriteCommand::FinalizeEventDelivery { respond, .. }
         | WriteCommand::ReleaseEventDelivery { respond, .. }
@@ -11155,14 +11826,14 @@ fn fail_undispatched_write_command(cmd: WriteCommand, message: String) -> bool {
         | WriteCommand::UpdateAuditActionSubmitReceipt { respond, .. }
         | WriteCommand::DeletePaneBookmark { respond, .. }
         | WriteCommand::DeleteAgentProfile { respond, .. } => {
-            respond_oneshot_best_effort(respond, writer_panic_error(&message));
+            respond_oneshot_best_effort(respond, failure.result());
         }
         WriteCommand::FinalizeEventDeliveriesBulk { respond, .. }
         | WriteCommand::ReleaseEventDeliveriesBulk { respond, .. } => {
-            respond_oneshot_best_effort(respond, writer_panic_error(&message));
+            respond_oneshot_best_effort(respond, failure.result());
         }
         WriteCommand::ConsumePreparedPlan { respond, .. } => {
-            respond_oneshot_best_effort(respond, writer_panic_error(&message));
+            respond_oneshot_best_effort(respond, failure.result());
         }
         WriteCommand::UpsertSession { respond, .. }
         | WriteCommand::RecordAuditAction { respond, .. }
@@ -11174,13 +11845,13 @@ fn fail_undispatched_write_command(cmd: WriteCommand, message: String) -> bool {
         | WriteCommand::RecordNotification { respond, .. }
         | WriteCommand::InsertPaneBookmark { respond, .. }
         | WriteCommand::InsertSessionCheckpoint { respond, .. } => {
-            respond_oneshot_best_effort(respond, writer_panic_error(&message));
+            respond_oneshot_best_effort(respond, failure.result());
         }
         WriteCommand::UpsertLimitWindow { respond, .. } => {
-            respond_oneshot_best_effort(respond, writer_panic_error(&message));
+            respond_oneshot_best_effort(respond, failure.result());
         }
         WriteCommand::EnforceSizeLimit { respond, .. } => {
-            respond_oneshot_best_effort(respond, writer_panic_error(&message));
+            respond_oneshot_best_effort(respond, failure.result());
         }
         WriteCommand::PurgeAuditActions { respond, .. }
         | WriteCommand::PurgeOperationalMaintenance { respond, .. }
@@ -11193,46 +11864,46 @@ fn fail_undispatched_write_command(cmd: WriteCommand, message: String) -> bool {
         | WriteCommand::DeleteEventsBefore { respond, .. }
         | WriteCommand::DeleteEventsByRetentionRule { respond, .. }
         | WriteCommand::PruneSessionCheckpoints { respond, .. } => {
-            respond_oneshot_best_effort(respond, writer_panic_error(&message));
+            respond_oneshot_best_effort(respond, failure.result());
         }
         WriteCommand::DeleteEventsByRetentionPolicy { respond, .. } => {
-            respond_oneshot_best_effort(respond, writer_panic_error(&message));
+            respond_oneshot_best_effort(respond, failure.result());
         }
         WriteCommand::ConsumeApprovalToken { respond, .. }
         | WriteCommand::ConsumeApprovalTokenByCode { respond, .. }
         | WriteCommand::ConsumeApprovalTokenById { respond, .. } => {
-            respond_oneshot_best_effort(respond, writer_panic_error(&message));
+            respond_oneshot_best_effort(respond, failure.result());
         }
         WriteCommand::SyncFts { respond, .. } | WriteCommand::RebuildFts { respond, .. } => {
-            respond_oneshot_best_effort(respond, writer_panic_error(&message));
+            respond_oneshot_best_effort(respond, failure.result());
         }
         WriteCommand::Checkpoint { respond } => {
-            respond_oneshot_best_effort(respond, writer_panic_error(&message));
+            respond_oneshot_best_effort(respond, failure.result());
         }
         WriteCommand::UpsertAccount { respond, .. } => {
-            respond_oneshot_best_effort(respond, writer_panic_error(&message));
+            respond_oneshot_best_effort(respond, failure.result());
         }
         WriteCommand::CreateReservation { respond, .. } => {
-            respond_oneshot_best_effort(respond, writer_panic_error(&message));
+            respond_oneshot_best_effort(respond, failure.result());
         }
         WriteCommand::InsertAgentProfile { respond, .. } => {
-            respond_oneshot_best_effort(respond, writer_panic_error(&message));
+            respond_oneshot_best_effort(respond, failure.result());
         }
         WriteCommand::GetAgentProfile { respond, .. } => {
-            respond_oneshot_best_effort(respond, writer_panic_error(&message));
+            respond_oneshot_best_effort(respond, failure.result());
         }
         WriteCommand::ListAgentProfiles { respond, .. } => {
-            respond_oneshot_best_effort(respond, writer_panic_error(&message));
+            respond_oneshot_best_effort(respond, failure.result());
         }
         WriteCommand::GetConfigValue { respond, .. } => {
-            respond_oneshot_best_effort(respond, writer_panic_error(&message));
+            respond_oneshot_best_effort(respond, failure.result());
         }
         WriteCommand::SetConfigValue { respond, .. } => {
-            respond_oneshot_best_effort(respond, writer_panic_error(&message));
+            respond_oneshot_best_effort(respond, failure.result());
         }
         #[cfg(test)]
         WriteCommand::PanicForTest { respond, .. } => {
-            respond_oneshot_best_effort(respond, writer_panic_error(&message));
+            respond_oneshot_best_effort(respond, failure.result());
         }
         WriteCommand::Shutdown { respond } => {
             respond_oneshot_best_effort(respond, ());
@@ -11242,17 +11913,14 @@ fn fail_undispatched_write_command(cmd: WriteCommand, message: String) -> bool {
     false
 }
 
-fn writer_panic_error<T>(message: &str) -> Result<T> {
-    Err(StorageError::Database(message.to_string()).into())
-}
-
 fn dispatch_write_command_raw_recovering(
     backend: &dyn StorageBackend,
     cmd: WriteCommand,
     should_break: &mut bool,
     mmap_mirror: &mut Option<mmap_store::MmapScrollbackStore>,
     segment_redactors: &mut HashMap<u64, SegmentPersistRedactor>,
-) -> Option<String> {
+) -> Option<WriterDispatchInterruption> {
+    let _ = take_writer_backend_epoch_poisoned_signal();
     let command_was_shutdown = matches!(cmd, WriteCommand::Shutdown { .. });
     let outcome = catch_recoverable(
         RecoverablePanicSite::StorageWriter,
@@ -11261,20 +11929,27 @@ fn dispatch_write_command_raw_recovering(
         }),
     );
     match outcome {
-        Ok(()) => None,
+        Ok(()) => take_writer_backend_epoch_poisoned_signal()
+            .then(WriterDispatchInterruption::backend_epoch_poisoned),
         Err(_) => {
             STORAGE_WRITER_PANICS_TOTAL.fetch_add(1, AtomicOrdering::Relaxed);
-            let message = WRITER_DISPATCH_PANIC_ERROR.to_string();
+            let backend_epoch_poisoned = take_writer_backend_epoch_poisoned_signal();
             tracing::error!(
                 writer_panics_total = storage_writer_panics_total(),
                 error_code = "WA-STORAGE-WRITER-PANIC",
                 "storage writer dispatch panic recovered; failing undispatched batch commands"
             );
-            flush_segment_redactors(backend, mmap_mirror, segment_redactors);
+            if !backend_epoch_poisoned {
+                flush_segment_redactors(backend, mmap_mirror, segment_redactors);
+            }
             if command_was_shutdown {
                 *should_break = true;
             }
-            Some(message)
+            Some(if backend_epoch_poisoned {
+                WriterDispatchInterruption::backend_epoch_poisoned()
+            } else {
+                WriterDispatchInterruption::recovered(WRITER_DISPATCH_PANIC_ERROR)
+            })
         }
     }
 }
@@ -11470,6 +12145,48 @@ fn storage_io_fts_rebuild_bytes(config: &FtsSyncConfig) -> u64 {
     storage_io_fts_sync_bytes(config).saturating_mul(4).max(1)
 }
 
+/// Close the bounded writer channel and settle every command that was already
+/// visible before the terminal backend-epoch transition.
+///
+/// `WriteCommandSender` checks the shared terminal state both before and after
+/// capacity reservation. A sender racing this drain either landed in the
+/// channel and is drained here, or loses `try_send` against the closed receiver
+/// and decrements its own reserved-depth slot. Every command removed here
+/// decrements exactly once before its response is delivered.
+fn close_and_drain_poisoned_writer_queue(
+    rx: &mut mpsc::Receiver<WriteCommand>,
+    queued_depth: &AtomicUsize,
+    failure: &WriterFailure,
+) {
+    if catch_recoverable(
+        RecoverablePanicSite::StorageWriter,
+        std::panic::AssertUnwindSafe(|| rx.close()),
+    )
+    .is_err()
+    {
+        STORAGE_WRITER_PANICS_TOTAL.fetch_add(1, AtomicOrdering::Relaxed);
+        tracing::error!(
+            writer_panics_total = storage_writer_panics_total(),
+            error_code = "WA-STORAGE-WRITER-PANIC",
+            "storage writer contained a panic while closing its poisoned queue"
+        );
+    }
+
+    loop {
+        match rx.try_recv() {
+            Ok(command) => {
+                WriteCommandSender::mark_command_dequeued(queued_depth);
+                let _ = fail_undispatched_write_command(command, failure);
+            }
+            Err(
+                mpsc::RecvError::Empty
+                | mpsc::RecvError::Disconnected
+                | mpsc::RecvError::Cancelled,
+            ) => break,
+        }
+    }
+}
+
 /// Main loop for the writer thread.
 ///
 /// Opportunistically processes burst traffic while preserving caller-visible
@@ -11488,6 +12205,7 @@ fn writer_loop(
     rx: &mut mpsc::Receiver<WriteCommand>,
     mmap_mirror: &mut Option<mmap_store::MmapScrollbackStore>,
     queued_depth: &AtomicUsize,
+    terminal_state: &AtomicU8,
     group_commit_events: bool,
     writer_wakeup: Option<&WriterWakeup>,
     group_commit_adaptive: bool,
@@ -11590,7 +12308,7 @@ fn writer_loop(
                 let batch_len = batch.len();
                 let dispatch_start = adaptive.as_ref().map(|_| std::time::Instant::now());
 
-                dispatch_write_command_batch(
+                let interruption = dispatch_write_command_batch(
                     backend,
                     batch,
                     &mut should_break,
@@ -11599,6 +12317,24 @@ fn writer_loop(
                     &mut io_gate,
                     group_commit_events,
                 );
+
+                let terminal_failure = interruption
+                    .as_ref()
+                    .filter(|interruption| interruption.terminate_epoch)
+                    .map(|interruption| interruption.failure.clone());
+                if let Some(failure) = terminal_failure {
+                    terminal_state.store(
+                        WRITER_TERMINAL_BACKEND_EPOCH_POISONED,
+                        AtomicOrdering::Release,
+                    );
+                    // Transaction state is indeterminate: disable projections
+                    // and clear in-memory redaction state without issuing even
+                    // one more backend call on this connection.
+                    *mmap_mirror = None;
+                    segment_redactors.clear();
+                    close_and_drain_poisoned_writer_queue(rx, queued_depth, &failure);
+                    break 'main;
+                }
 
                 if let (Some(ctl), Some(start), Some(cstart)) =
                     (adaptive.as_mut(), dispatch_start, cycle_start)
@@ -11628,7 +12364,962 @@ fn writer_loop(
         }
     }
 
-    flush_segment_redactors(backend, mmap_mirror, &mut segment_redactors);
+    if terminal_state.load(AtomicOrdering::Acquire)
+        != WRITER_TERMINAL_BACKEND_EPOCH_POISONED
+    {
+        flush_segment_redactors(backend, mmap_mirror, &mut segment_redactors);
+    }
+}
+
+#[cfg(test)]
+mod writer_epoch_transaction_tests {
+    use super::*;
+
+    #[derive(Clone, Copy)]
+    enum FaultMode {
+        Error,
+        Poison,
+        Panic,
+    }
+
+    struct FaultBackend {
+        inner: crate::storage_backend_trait::MockBackend,
+        target_sql: &'static str,
+        mode: FaultMode,
+        target_occurrence: usize,
+        matching_calls: AtomicUsize,
+        calls: Mutex<Vec<String>>,
+        post_poison_calls: AtomicUsize,
+    }
+
+    impl FaultBackend {
+        fn new(target_sql: &'static str, mode: FaultMode) -> Self {
+            Self {
+                inner: crate::storage_backend_trait::MockBackend::new(),
+                target_sql,
+                mode,
+                target_occurrence: 0,
+                matching_calls: AtomicUsize::new(0),
+                calls: Mutex::new(Vec::new()),
+                post_poison_calls: AtomicUsize::new(0),
+            }
+        }
+
+        fn with_target_occurrence(mut self, target_occurrence: usize) -> Self {
+            self.target_occurrence = target_occurrence;
+            self
+        }
+
+        fn observe(&self, sql: &str) {
+            if writer_backend_epoch_poisoned_signal_is_set() {
+                self.post_poison_calls
+                    .fetch_add(1, AtomicOrdering::Relaxed);
+            }
+            self.calls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(sql.to_string());
+        }
+
+        fn inject_if_selected(&self, sql: &str) -> Option<BackendError> {
+            if !sql.trim().eq_ignore_ascii_case(self.target_sql) {
+                return None;
+            }
+            let occurrence = self.matching_calls.fetch_add(1, AtomicOrdering::Relaxed);
+            if occurrence != self.target_occurrence {
+                return None;
+            }
+            match self.mode {
+                FaultMode::Error => Some(BackendError::Query(
+                    "injected finite transaction-control failure".to_string(),
+                )),
+                FaultMode::Poison => Some(BackendError::TxPoisoned),
+                FaultMode::Panic => {
+                    std::panic::panic_any("INJECTED-TRANSACTION-CONTROL-PANIC")
+                }
+            }
+        }
+
+        fn calls(&self) -> Vec<String> {
+            self.calls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        }
+    }
+
+    impl StorageBackend for FaultBackend {
+        fn execute(&self, sql: &str) -> std::result::Result<usize, BackendError> {
+            self.observe(sql);
+            if let Some(error) = self.inject_if_selected(sql) {
+                return Err(error);
+            }
+            self.inner.execute(sql)
+        }
+
+        fn execute_batch(&self, sql: &str) -> std::result::Result<(), BackendError> {
+            self.observe(sql);
+            if let Some(error) = self.inject_if_selected(sql) {
+                return Err(error);
+            }
+            self.inner.execute_batch(sql)
+        }
+
+        fn set_busy_timeout(
+            &self,
+            timeout: std::time::Duration,
+        ) -> std::result::Result<(), BackendError> {
+            self.inner.set_busy_timeout(timeout)
+        }
+
+        fn query_scalar(
+            &self,
+            sql: &str,
+        ) -> std::result::Result<Option<String>, BackendError> {
+            self.observe(sql);
+            self.inner.query_scalar(sql)
+        }
+
+        fn query_row_strings(
+            &self,
+            sql: &str,
+            params: &[&str],
+        ) -> std::result::Result<Option<Vec<String>>, BackendError> {
+            self.observe(sql);
+            if let Some(error) = self.inject_if_selected(sql) {
+                return Err(error);
+            }
+            self.inner.query_row_strings(sql, params)
+        }
+
+        fn begin_transaction(
+            &self,
+        ) -> std::result::Result<
+            crate::storage_backend_trait::TransactionGuard<'_>,
+            BackendError,
+        > {
+            self.inner.begin_transaction()
+        }
+
+        fn user_version(&self) -> std::result::Result<u32, BackendError> {
+            self.inner.user_version()
+        }
+
+        fn set_user_version(&self, version: u32) -> std::result::Result<(), BackendError> {
+            self.inner.set_user_version(version)
+        }
+
+        fn backend_name(&self) -> &'static str {
+            "writer_fault"
+        }
+    }
+
+    fn assert_epoch_poisoned<T>(result: &Result<T>) {
+        assert!(matches!(
+            result,
+            Err(crate::Error::Storage(
+                StorageError::WriterBackendEpochPoisoned
+            ))
+        ));
+    }
+
+    #[test]
+    fn writer_transaction_helper_classifies_every_control_and_mutation_outcome() {
+        let _guard = writer_panic_counter_test_lock();
+        reset_storage_writer_recovery_counters_for_test();
+
+        for mode in [FaultMode::Error, FaultMode::Panic] {
+            let backend = FaultBackend::new("BEGIN IMMEDIATE", mode);
+            let result: Result<()> = run_writer_transaction(
+                &backend,
+                WriterTransactionBeginMode::Immediate,
+                "begin ambiguity test",
+                || Ok(()),
+            );
+            match mode {
+                FaultMode::Error => {
+                    assert!(matches!(
+                        result,
+                        Err(crate::Error::Storage(StorageError::Database(_)))
+                    ));
+                    assert_eq!(backend.calls(), vec!["BEGIN IMMEDIATE"]);
+                    assert!(!take_writer_backend_epoch_poisoned_signal());
+                }
+                FaultMode::Panic => {
+                    assert_epoch_poisoned(&result);
+                    assert_eq!(backend.calls(), vec!["BEGIN IMMEDIATE", "ROLLBACK"]);
+                    assert!(take_writer_backend_epoch_poisoned_signal());
+                }
+                FaultMode::Poison => unreachable!("poison mode is covered separately"),
+            }
+        }
+
+        let backend = FaultBackend::new("BEGIN IMMEDIATE", FaultMode::Poison);
+        let begin_poison: Result<()> = run_writer_transaction(
+            &backend,
+            WriterTransactionBeginMode::Immediate,
+            "begin backend poison test",
+            || Ok(()),
+        );
+        assert_epoch_poisoned(&begin_poison);
+        assert_eq!(backend.calls(), vec!["BEGIN IMMEDIATE"]);
+        assert_eq!(backend.post_poison_calls.load(AtomicOrdering::Relaxed), 0);
+        assert!(take_writer_backend_epoch_poisoned_signal());
+
+        let backend = FaultBackend::new("NEVER", FaultMode::Error);
+        let ordinary_error: Result<()> = run_writer_transaction(
+            &backend,
+            WriterTransactionBeginMode::Immediate,
+            "ordinary mutation error test",
+            || Err(StorageError::Database("ordinary mutation error".to_string()).into()),
+        );
+        assert!(ordinary_error
+            .expect_err("ordinary mutation must fail")
+            .to_string()
+            .contains("ordinary mutation error"));
+        assert_eq!(backend.calls(), vec!["BEGIN IMMEDIATE", "ROLLBACK"]);
+        assert!(!take_writer_backend_epoch_poisoned_signal());
+
+        let backend = FaultBackend::new("NEVER", FaultMode::Error);
+        let mutation_panic: Result<()> = run_writer_transaction(
+            &backend,
+            WriterTransactionBeginMode::Immediate,
+            "mutation panic test",
+            || std::panic::panic_any("INJECTED-MUTATION-PANIC"),
+        );
+        assert_epoch_poisoned(&mutation_panic);
+        assert_eq!(backend.calls(), vec!["BEGIN IMMEDIATE", "ROLLBACK"]);
+        assert!(take_writer_backend_epoch_poisoned_signal());
+
+        let backend = FaultBackend::new("MUTATE", FaultMode::Poison);
+        let mutation_poison: Result<()> = run_writer_transaction(
+            &backend,
+            WriterTransactionBeginMode::Deferred,
+            "mutation backend poison test",
+            || {
+                backend.execute("MUTATE").map(|_| ()).map_err(|error| {
+                    storage_backend_error("Injected poisoned mutation", error).into()
+                })
+            },
+        );
+        assert_epoch_poisoned(&mutation_poison);
+        assert_eq!(backend.calls(), vec!["BEGIN", "MUTATE"]);
+        assert_eq!(backend.post_poison_calls.load(AtomicOrdering::Relaxed), 0);
+        assert!(take_writer_backend_epoch_poisoned_signal());
+
+        let backend = FaultBackend::new(SEGMENT_EMBEDDING_INSERT_SQL, FaultMode::Error);
+        let ordinary_embedding_error: Result<()> = run_writer_transaction(
+            &backend,
+            WriterTransactionBeginMode::Deferred,
+            "best-effort embedding ordinary error test",
+            || {
+                index_segment_embedding_backend(
+                    &backend,
+                    &crate::search::HashEmbedder::default(),
+                    "test-embedder",
+                    1,
+                    "content",
+                    1,
+                )
+            },
+        );
+        ordinary_embedding_error.expect("ordinary embedding errors remain best-effort");
+        assert_eq!(
+            backend.calls(),
+            vec!["BEGIN", SEGMENT_EMBEDDING_INSERT_SQL, "COMMIT"]
+        );
+        assert!(!take_writer_backend_epoch_poisoned_signal());
+
+        let backend = FaultBackend::new(SEGMENT_EMBEDDING_INSERT_SQL, FaultMode::Poison);
+        let embedding_poison: Result<()> = run_writer_transaction(
+            &backend,
+            WriterTransactionBeginMode::Deferred,
+            "best-effort embedding backend poison test",
+            || {
+                index_segment_embedding_backend(
+                    &backend,
+                    &crate::search::HashEmbedder::default(),
+                    "test-embedder",
+                    1,
+                    "content",
+                    1,
+                )
+            },
+        );
+        assert_epoch_poisoned(&embedding_poison);
+        assert_eq!(
+            backend.calls(),
+            vec!["BEGIN", SEGMENT_EMBEDDING_INSERT_SQL]
+        );
+        assert_eq!(backend.post_poison_calls.load(AtomicOrdering::Relaxed), 0);
+        assert!(take_writer_backend_epoch_poisoned_signal());
+
+        let backend = FaultBackend::new(FTS_INTEGRITY_CHECK_SQL, FaultMode::Poison);
+        let integrity_poison = check_fts_integrity_backend(&backend);
+        assert_epoch_poisoned(&integrity_poison);
+        assert_eq!(backend.calls(), vec![FTS_INTEGRITY_CHECK_SQL]);
+        assert_eq!(backend.post_poison_calls.load(AtomicOrdering::Relaxed), 0);
+        assert!(take_writer_backend_epoch_poisoned_signal());
+
+        for mode in [FaultMode::Error, FaultMode::Panic] {
+            let backend = FaultBackend::new("COMMIT", mode);
+            let result: Result<u64> = run_writer_transaction(
+                &backend,
+                WriterTransactionBeginMode::Deferred,
+                "commit ambiguity test",
+                || Ok(7),
+            );
+            assert_epoch_poisoned(&result);
+            assert_eq!(backend.calls(), vec!["BEGIN", "COMMIT", "ROLLBACK"]);
+            assert!(take_writer_backend_epoch_poisoned_signal());
+        }
+
+        let backend = FaultBackend::new("COMMIT", FaultMode::Poison);
+        let commit_poison: Result<u64> = run_writer_transaction(
+            &backend,
+            WriterTransactionBeginMode::Deferred,
+            "commit backend poison test",
+            || Ok(7),
+        );
+        assert_epoch_poisoned(&commit_poison);
+        assert_eq!(backend.calls(), vec!["BEGIN", "COMMIT"]);
+        assert_eq!(backend.post_poison_calls.load(AtomicOrdering::Relaxed), 0);
+        assert!(take_writer_backend_epoch_poisoned_signal());
+
+        for mode in [FaultMode::Error, FaultMode::Panic] {
+            let backend = FaultBackend::new("ROLLBACK", mode);
+            let result: Result<()> = run_writer_transaction(
+                &backend,
+                WriterTransactionBeginMode::Immediate,
+                "rollback failure test",
+                || Err(StorageError::Database("force rollback".to_string()).into()),
+            );
+            assert_epoch_poisoned(&result);
+            assert_eq!(backend.calls(), vec!["BEGIN IMMEDIATE", "ROLLBACK"]);
+            assert!(take_writer_backend_epoch_poisoned_signal());
+        }
+
+        let backend = FaultBackend::new("ROLLBACK", FaultMode::Poison);
+        let rollback_poison: Result<()> = run_writer_transaction(
+            &backend,
+            WriterTransactionBeginMode::Immediate,
+            "rollback backend poison test",
+            || Err(StorageError::Database("force rollback".to_string()).into()),
+        );
+        assert_epoch_poisoned(&rollback_poison);
+        assert_eq!(backend.calls(), vec!["BEGIN IMMEDIATE", "ROLLBACK"]);
+        assert_eq!(backend.post_poison_calls.load(AtomicOrdering::Relaxed), 0);
+        assert!(take_writer_backend_epoch_poisoned_signal());
+
+        let backend = FaultBackend::new("NEVER", FaultMode::Error);
+        let committed: Result<u64> = run_writer_transaction(
+            &backend,
+            WriterTransactionBeginMode::Deferred,
+            "successful transaction test",
+            || Ok(11),
+        );
+        assert_eq!(committed.expect("transaction should commit"), 11);
+        assert_eq!(backend.calls(), vec!["BEGIN", "COMMIT"]);
+        assert!(!take_writer_backend_epoch_poisoned_signal());
+    }
+
+    fn fts_test_savepoint() -> WriterSavepoint {
+        WriterSavepoint {
+            begin_sql: "SAVEPOINT test_unit",
+            rollback_sql: "ROLLBACK TO SAVEPOINT test_unit",
+            release_sql: "RELEASE SAVEPOINT test_unit",
+        }
+    }
+
+    #[test]
+    fn writer_savepoint_helper_verifies_rollback_and_release_before_reuse() {
+        let _guard = writer_panic_counter_test_lock();
+        reset_storage_writer_recovery_counters_for_test();
+
+        for mode in [FaultMode::Error, FaultMode::Panic] {
+            let backend = FaultBackend::new("SAVEPOINT test_unit", mode);
+            let result: Result<()> = run_writer_savepoint(
+                &backend,
+                fts_test_savepoint(),
+                "savepoint begin ambiguity test",
+                || Ok(()),
+            );
+            match mode {
+                FaultMode::Error => {
+                    assert!(matches!(
+                        result,
+                        Err(crate::Error::Storage(StorageError::Database(_)))
+                    ));
+                    assert_eq!(backend.calls(), vec!["SAVEPOINT test_unit"]);
+                    assert!(!take_writer_backend_epoch_poisoned_signal());
+                }
+                FaultMode::Panic => {
+                    assert_epoch_poisoned(&result);
+                    assert_eq!(
+                        backend.calls(),
+                        vec![
+                            "SAVEPOINT test_unit",
+                            "ROLLBACK TO SAVEPOINT test_unit",
+                            "RELEASE SAVEPOINT test_unit",
+                        ]
+                    );
+                    assert!(take_writer_backend_epoch_poisoned_signal());
+                }
+                FaultMode::Poison => unreachable!("poison mode is covered separately"),
+            }
+        }
+
+        let backend = FaultBackend::new("SAVEPOINT test_unit", FaultMode::Poison);
+        let begin_poison: Result<()> = run_writer_savepoint(
+            &backend,
+            fts_test_savepoint(),
+            "savepoint begin backend poison test",
+            || Ok(()),
+        );
+        assert_epoch_poisoned(&begin_poison);
+        assert_eq!(backend.calls(), vec!["SAVEPOINT test_unit"]);
+        assert_eq!(backend.post_poison_calls.load(AtomicOrdering::Relaxed), 0);
+        assert!(take_writer_backend_epoch_poisoned_signal());
+
+        let backend = FaultBackend::new("NEVER", FaultMode::Error);
+        let ordinary_error: Result<()> = run_writer_savepoint(
+            &backend,
+            fts_test_savepoint(),
+            "ordinary savepoint error test",
+            || Err(StorageError::Database("ordinary savepoint error".to_string()).into()),
+        );
+        assert!(ordinary_error.is_err());
+        assert_eq!(
+            backend.calls(),
+            vec![
+                "SAVEPOINT test_unit",
+                "ROLLBACK TO SAVEPOINT test_unit",
+                "RELEASE SAVEPOINT test_unit",
+            ]
+        );
+        assert!(!take_writer_backend_epoch_poisoned_signal());
+
+        let backend = FaultBackend::new("NEVER", FaultMode::Error);
+        let mutation_panic: Result<()> = run_writer_savepoint(
+            &backend,
+            fts_test_savepoint(),
+            "savepoint mutation panic test",
+            || std::panic::panic_any("INJECTED-SAVEPOINT-MUTATION-PANIC"),
+        );
+        assert_epoch_poisoned(&mutation_panic);
+        assert_eq!(
+            backend.calls(),
+            vec![
+                "SAVEPOINT test_unit",
+                "ROLLBACK TO SAVEPOINT test_unit",
+                "RELEASE SAVEPOINT test_unit",
+            ]
+        );
+        assert!(take_writer_backend_epoch_poisoned_signal());
+
+        let backend = FaultBackend::new("MUTATE", FaultMode::Poison);
+        let mutation_poison: Result<()> = run_writer_savepoint(
+            &backend,
+            fts_test_savepoint(),
+            "savepoint mutation backend poison test",
+            || {
+                backend.execute("MUTATE").map(|_| ()).map_err(|error| {
+                    storage_backend_error("Injected poisoned savepoint mutation", error).into()
+                })
+            },
+        );
+        assert_epoch_poisoned(&mutation_poison);
+        assert_eq!(backend.calls(), vec!["SAVEPOINT test_unit", "MUTATE"]);
+        assert_eq!(backend.post_poison_calls.load(AtomicOrdering::Relaxed), 0);
+        assert!(take_writer_backend_epoch_poisoned_signal());
+
+        for mode in [FaultMode::Error, FaultMode::Panic] {
+            let backend = FaultBackend::new("RELEASE SAVEPOINT test_unit", mode);
+            let result: Result<()> = run_writer_savepoint(
+                &backend,
+                fts_test_savepoint(),
+                "savepoint release ambiguity test",
+                || Ok(()),
+            );
+            assert_epoch_poisoned(&result);
+            assert_eq!(
+                backend.calls(),
+                vec![
+                    "SAVEPOINT test_unit",
+                    "RELEASE SAVEPOINT test_unit",
+                    "ROLLBACK TO SAVEPOINT test_unit",
+                    "RELEASE SAVEPOINT test_unit",
+                ]
+            );
+            assert!(take_writer_backend_epoch_poisoned_signal());
+        }
+
+        let backend = FaultBackend::new("RELEASE SAVEPOINT test_unit", FaultMode::Poison);
+        let release_poison: Result<()> = run_writer_savepoint(
+            &backend,
+            fts_test_savepoint(),
+            "savepoint release backend poison test",
+            || Ok(()),
+        );
+        assert_epoch_poisoned(&release_poison);
+        assert_eq!(
+            backend.calls(),
+            vec!["SAVEPOINT test_unit", "RELEASE SAVEPOINT test_unit"]
+        );
+        assert_eq!(backend.post_poison_calls.load(AtomicOrdering::Relaxed), 0);
+        assert!(take_writer_backend_epoch_poisoned_signal());
+
+        for mode in [FaultMode::Error, FaultMode::Panic] {
+            let backend = FaultBackend::new("ROLLBACK TO SAVEPOINT test_unit", mode);
+            let result: Result<()> = run_writer_savepoint(
+                &backend,
+                fts_test_savepoint(),
+                "savepoint rollback failure test",
+                || Err(StorageError::Database("force savepoint rollback".to_string()).into()),
+            );
+            assert_epoch_poisoned(&result);
+            assert_eq!(
+                backend.calls(),
+                vec![
+                    "SAVEPOINT test_unit",
+                    "ROLLBACK TO SAVEPOINT test_unit",
+                    "RELEASE SAVEPOINT test_unit",
+                ]
+            );
+            assert!(take_writer_backend_epoch_poisoned_signal());
+        }
+
+        let backend = FaultBackend::new("ROLLBACK TO SAVEPOINT test_unit", FaultMode::Poison);
+        let rollback_poison: Result<()> = run_writer_savepoint(
+            &backend,
+            fts_test_savepoint(),
+            "savepoint rollback backend poison test",
+            || Err(StorageError::Database("force savepoint rollback".to_string()).into()),
+        );
+        assert_epoch_poisoned(&rollback_poison);
+        assert_eq!(
+            backend.calls(),
+            vec![
+                "SAVEPOINT test_unit",
+                "ROLLBACK TO SAVEPOINT test_unit",
+            ]
+        );
+        assert_eq!(backend.post_poison_calls.load(AtomicOrdering::Relaxed), 0);
+        assert!(take_writer_backend_epoch_poisoned_signal());
+
+        for mode in [FaultMode::Error, FaultMode::Panic] {
+            let backend = FaultBackend::new("RELEASE SAVEPOINT test_unit", mode)
+                .with_target_occurrence(0);
+            let result: Result<()> = run_writer_savepoint(
+                &backend,
+                fts_test_savepoint(),
+                "savepoint rollback release failure test",
+                || Err(StorageError::Database("force savepoint rollback".to_string()).into()),
+            );
+            assert_epoch_poisoned(&result);
+            assert_eq!(
+                backend.calls(),
+                vec![
+                    "SAVEPOINT test_unit",
+                    "ROLLBACK TO SAVEPOINT test_unit",
+                    "RELEASE SAVEPOINT test_unit",
+                ]
+            );
+            assert!(take_writer_backend_epoch_poisoned_signal());
+        }
+
+        let backend = FaultBackend::new("NEVER", FaultMode::Error);
+        let committed: Result<u64> = run_writer_savepoint(
+            &backend,
+            fts_test_savepoint(),
+            "successful savepoint test",
+            || Ok(13),
+        );
+        assert_eq!(committed.expect("savepoint should release"), 13);
+        assert_eq!(
+            backend.calls(),
+            vec!["SAVEPOINT test_unit", "RELEASE SAVEPOINT test_unit"]
+        );
+        assert!(!take_writer_backend_epoch_poisoned_signal());
+    }
+
+    #[test]
+    fn poisoned_writer_drains_more_than_one_batch_with_one_typed_cause() {
+        let _guard = writer_panic_counter_test_lock();
+        run_storage_async_test(async {
+            let backend = FaultBackend::new("BEGIN IMMEDIATE", FaultMode::Panic);
+            let (raw_tx, mut rx) = mpsc::channel::<WriteCommand>(WRITER_BATCH_CAP + 32);
+            let sender = WriteCommandSender::new(raw_tx, WRITER_BATCH_CAP + 32);
+            let terminal_state = Arc::clone(&sender.terminal_state);
+            let queued_depth = Arc::clone(&sender.queued_depth);
+
+            let (first_tx, first_rx) = oneshot::channel();
+            sender
+                .send(WriteCommand::FinalizeEventDeliveriesBulk {
+                    leases: vec![(17, "lease-token-17".to_string())],
+                    handled_at_ms: 1,
+                    workflow_id: None,
+                    status: "delivered".to_string(),
+                    respond: first_tx,
+                })
+                .await
+                .expect("queue poison-triggering transaction");
+
+            let mut tail_receivers = Vec::new();
+            for _ in 0..(WRITER_BATCH_CAP + 8) {
+                let (respond, receive) = oneshot::channel();
+                sender
+                    .send(WriteCommand::Vacuum { respond })
+                    .await
+                    .expect("queue writer tail");
+                tail_receivers.push(receive);
+            }
+            let (shutdown_tx, shutdown_rx) = oneshot::channel();
+            sender
+                .send(WriteCommand::Shutdown {
+                    respond: shutdown_tx,
+                })
+                .await
+                .expect("queue shutdown tail");
+
+            let mut mmap_mirror = None;
+            writer_loop(
+                &backend,
+                &mut rx,
+                &mut mmap_mirror,
+                queued_depth.as_ref(),
+                terminal_state.as_ref(),
+                false,
+                None,
+                true,
+            );
+
+            let first = crate::runtime_async::oneshot_recv(first_rx)
+                .await
+                .expect("first response");
+            assert_epoch_poisoned(&first);
+            for receive in tail_receivers {
+                let result = crate::runtime_async::oneshot_recv(receive)
+                    .await
+                    .expect("tail response");
+                assert_epoch_poisoned(&result);
+            }
+            crate::runtime_async::oneshot_recv(shutdown_rx)
+                .await
+                .expect("shutdown command must still be acknowledged");
+
+            assert_eq!(queued_depth.load(AtomicOrdering::Acquire), 0);
+            assert_eq!(
+                terminal_state.load(AtomicOrdering::Acquire),
+                WRITER_TERMINAL_BACKEND_EPOCH_POISONED
+            );
+            assert_eq!(backend.calls(), vec!["BEGIN IMMEDIATE", "ROLLBACK"]);
+            assert_eq!(
+                backend.post_poison_calls.load(AtomicOrdering::Relaxed),
+                0,
+                "writer must not touch its backend after epoch poison"
+            );
+
+            let poisoned_send = sender
+                .send(WriteCommand::Shutdown {
+                    respond: oneshot::channel().0,
+                })
+                .await;
+            assert!(matches!(
+                poisoned_send,
+                Err(WriteCommandSendError::WriterBackendEpochPoisoned)
+            ));
+        });
+    }
+
+    struct PanickingWake;
+
+    impl std::task::Wake for PanickingWake {
+        fn wake(self: Arc<Self>) {
+            std::panic::panic_any("INJECTED-HOSTILE-WAKER-WAKE")
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            std::panic::panic_any("INJECTED-HOSTILE-WAKER-WAKE-BY-REF")
+        }
+    }
+
+    #[derive(Default)]
+    struct CountingWake {
+        wakes: AtomicUsize,
+    }
+
+    impl std::task::Wake for CountingWake {
+        fn wake(self: Arc<Self>) {
+            self.wakes.fetch_add(1, AtomicOrdering::Relaxed);
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.wakes.fetch_add(1, AtomicOrdering::Relaxed);
+        }
+    }
+
+    struct NoopWake;
+
+    impl std::task::Wake for NoopWake {
+        fn wake(self: Arc<Self>) {}
+    }
+
+    struct PanickingDropWake;
+
+    impl std::task::Wake for PanickingDropWake {
+        fn wake(self: Arc<Self>) {}
+    }
+
+    impl Drop for PanickingDropWake {
+        fn drop(&mut self) {
+            std::panic::panic_any("INJECTED-HOSTILE-WAKER-DROP")
+        }
+    }
+
+    fn poll_writer_send<F>(
+        future: &mut std::pin::Pin<Box<F>>,
+        waker: &std::task::Waker,
+    ) -> std::task::Poll<std::result::Result<(), WriteCommandSendError>>
+    where
+        F: std::future::Future<Output = std::result::Result<(), WriteCommandSendError>>,
+    {
+        let mut cx = std::task::Context::from_waker(waker);
+        std::future::Future::poll(future.as_mut(), &mut cx)
+    }
+
+    #[test]
+    fn writer_queue_close_contains_hostile_waiter_and_wakes_later_waiters() {
+        run_storage_async_test(async {
+            let start = storage_writer_waker_panics_total();
+            let (raw_tx, mut rx) = mpsc::channel::<WriteCommand>(1);
+            let sender = WriteCommandSender::new(raw_tx, 1);
+            let (queued_tx, _queued_rx) = oneshot::channel();
+            sender
+                .send(WriteCommand::Shutdown { respond: queued_tx })
+                .await
+                .expect("fill writer queue");
+
+            let cx = crate::cx::for_request();
+            let (hostile_tx, _hostile_rx) = oneshot::channel();
+            let (later_tx, _later_rx) = oneshot::channel();
+            let (drop_tx, _drop_rx) = oneshot::channel();
+            let (cancel_drop_tx, _cancel_drop_rx) = oneshot::channel();
+            let mut hostile_send = Box::pin(sender.send_with_cx(
+                &cx,
+                WriteCommand::Shutdown {
+                    respond: hostile_tx,
+                },
+            ));
+            let mut later_send = Box::pin(sender.send_with_cx(
+                &cx,
+                WriteCommand::Shutdown { respond: later_tx },
+            ));
+            let mut drop_send = Box::pin(sender.send_with_cx(
+                &cx,
+                WriteCommand::Shutdown { respond: drop_tx },
+            ));
+            let mut cancel_drop_send = Box::pin(sender.send_with_cx(
+                &cx,
+                WriteCommand::Shutdown {
+                    respond: cancel_drop_tx,
+                },
+            ));
+
+            let hostile_waker = std::task::Waker::from(Arc::new(PanickingWake));
+            let counting = Arc::new(CountingWake::default());
+            let counting_waker = std::task::Waker::from(Arc::clone(&counting));
+            let drop_waker = std::task::Waker::from(Arc::new(PanickingDropWake));
+            let cancel_drop_waker = std::task::Waker::from(Arc::new(PanickingDropWake));
+            assert!(poll_writer_send(&mut hostile_send, &hostile_waker).is_pending());
+            assert!(poll_writer_send(&mut later_send, &counting_waker).is_pending());
+            assert!(poll_writer_send(&mut drop_send, &drop_waker).is_pending());
+            assert!(
+                poll_writer_send(&mut cancel_drop_send, &cancel_drop_waker).is_pending()
+            );
+            drop(cancel_drop_waker);
+            let cancelled_waiter_drop = catch_recoverable(
+                RecoverablePanicSite::StorageWriter,
+                std::panic::AssertUnwindSafe(|| drop(cancel_drop_send)),
+            );
+            assert!(
+                cancelled_waiter_drop.is_ok(),
+                "dropping a pending reservation must contain caller-waker destruction"
+            );
+            // The proxy now owns the final RawWaker reference. Its disposal
+            // panic must be contained while the receiver closes all waiters.
+            drop(drop_waker);
+
+            let closed = catch_recoverable(
+                RecoverablePanicSite::StorageWriter,
+                std::panic::AssertUnwindSafe(|| rx.close()),
+            );
+            assert!(closed.is_ok(), "stable waiter proxies must contain wake panics");
+            assert!(
+                counting.wakes.load(AtomicOrdering::Relaxed) > 0,
+                "a hostile first waiter must not strand later waiters"
+            );
+            assert!(storage_writer_waker_panics_total() > start);
+
+            let noop_waker = std::task::Waker::from(Arc::new(NoopWake));
+            for result in [
+                poll_writer_send(&mut hostile_send, &noop_waker),
+                poll_writer_send(&mut later_send, &noop_waker),
+                poll_writer_send(&mut drop_send, &noop_waker),
+            ] {
+                assert!(matches!(
+                    result,
+                    std::task::Poll::Ready(Err(WriteCommandSendError::Channel(error)))
+                        if matches!(error.as_ref(), mpsc::SendError::Disconnected(_))
+                ));
+            }
+
+            let queued = rx.try_recv().expect("drain command visible before close");
+            WriteCommandSender::mark_command_dequeued(&sender.queued_depth);
+            drop(queued);
+            assert_eq!(sender.queued_depth.load(AtomicOrdering::Acquire), 0);
+        });
+    }
+
+    #[test]
+    fn writer_waiter_racing_poisoned_close_receives_the_typed_terminal_cause() {
+        run_storage_async_test(async {
+            let (raw_tx, mut rx) = mpsc::channel::<WriteCommand>(1);
+            let sender = WriteCommandSender::new(raw_tx, 1);
+            let (queued_tx, _queued_rx) = oneshot::channel();
+            sender
+                .send(WriteCommand::Shutdown { respond: queued_tx })
+                .await
+                .expect("fill writer queue");
+
+            let cx = crate::cx::for_request();
+            let (waiting_tx, _waiting_rx) = oneshot::channel();
+            let mut waiting_send = Box::pin(sender.send_with_cx(
+                &cx,
+                WriteCommand::Shutdown {
+                    respond: waiting_tx,
+                },
+            ));
+            let noop_waker = std::task::Waker::from(Arc::new(NoopWake));
+            assert!(poll_writer_send(&mut waiting_send, &noop_waker).is_pending());
+
+            sender.terminal_state.store(
+                WRITER_TERMINAL_BACKEND_EPOCH_POISONED,
+                AtomicOrdering::Release,
+            );
+            rx.close();
+            assert!(matches!(
+                poll_writer_send(&mut waiting_send, &noop_waker),
+                std::task::Poll::Ready(Err(
+                    WriteCommandSendError::WriterBackendEpochPoisoned
+                ))
+            ));
+
+            let queued = rx.try_recv().expect("drain command visible before close");
+            WriteCommandSender::mark_command_dequeued(&sender.queued_depth);
+            drop(queued);
+            assert_eq!(sender.queued_depth.load(AtomicOrdering::Acquire), 0);
+        });
+    }
+
+    struct PanicOnDrop;
+
+    impl Drop for PanicOnDrop {
+        fn drop(&mut self) {
+            std::panic::panic_any("INJECTED-RESPONSE-VALUE-DROP-PANIC");
+        }
+    }
+
+    struct WakerResponder<T> {
+        waker: std::task::Waker,
+        marker: std::marker::PhantomData<fn(T)>,
+    }
+
+    impl<T> BestEffortRespond<T> for WakerResponder<T> {
+        fn respond_best_effort(self, _value: T) {
+            self.waker.wake();
+        }
+    }
+
+    struct NestedRawResponse {
+        responder: Option<WakerResponder<Result<()>>>,
+    }
+
+    impl Drop for NestedRawResponse {
+        fn drop(&mut self) {
+            if let Some(responder) = self.responder.take() {
+                respond_oneshot_best_effort(responder, Ok(()));
+            }
+        }
+    }
+
+    #[test]
+    fn writer_response_boundary_contains_hostile_wake_drop_and_nested_unwind() {
+        let start = storage_writer_response_panics_total();
+        let hostile_waker = std::task::Waker::from(Arc::new(PanickingWake));
+
+        let delivered = catch_recoverable(
+            RecoverablePanicSite::StorageWriter,
+            std::panic::AssertUnwindSafe(|| {
+                respond_oneshot_best_effort(
+                    WakerResponder {
+                        waker: hostile_waker.clone(),
+                        marker: std::marker::PhantomData,
+                    },
+                    Ok(()),
+                );
+            }),
+        );
+        assert!(delivered.is_ok(), "response helper must contain hostile wake");
+
+        let (drop_tx, drop_rx) = oneshot::channel::<PanicOnDrop>();
+        drop(drop_rx);
+        let dropped = catch_recoverable(
+            RecoverablePanicSite::StorageWriter,
+            std::panic::AssertUnwindSafe(|| {
+                respond_oneshot_best_effort(drop_tx, PanicOnDrop);
+            }),
+        );
+        assert!(dropped.is_ok(), "response helper must contain returned-value Drop");
+
+        let outer = catch_recoverable(
+            RecoverablePanicSite::StorageWriter,
+            std::panic::AssertUnwindSafe(|| {
+                let _responder = NestedRawResponse {
+                    responder: Some(WakerResponder {
+                        waker: hostile_waker.clone(),
+                        marker: std::marker::PhantomData,
+                    }),
+                };
+                std::panic::panic_any("INJECTED-OUTER-BACKEND-PANIC");
+            }),
+        );
+        assert!(outer.is_err(), "outer panic remains visible to its recovery boundary");
+        assert!(
+            storage_writer_response_panics_total() >= start.saturating_add(3),
+            "all three response panic surfaces must be counted"
+        );
+    }
+
+    #[test]
+    fn hostile_response_does_not_abort_later_tail_responses() {
+        run_storage_async_test(async {
+            let hostile_waker = std::task::Waker::from(Arc::new(PanickingWake));
+            let (second_tx, second_rx) = oneshot::channel::<Result<()>>();
+            respond_oneshot_best_effort(
+                WakerResponder {
+                    waker: hostile_waker,
+                    marker: std::marker::PhantomData,
+                },
+                Ok(()),
+            );
+            respond_oneshot_best_effort(second_tx, Ok(()));
+            crate::runtime_async::oneshot_recv(second_rx)
+                .await
+                .expect("later tail response channel")
+                .expect("later tail response value");
+        });
+    }
 }
 
 #[cfg(test)]
@@ -11999,7 +13690,7 @@ mod writer_io_scheduler_tests {
                 capture_hold: None,
                 respond: second_tx,
             });
-            dispatch_write_command_batch(
+            let interruption = dispatch_write_command_batch(
                 &backend,
                 batch,
                 &mut should_break,
@@ -12009,6 +13700,7 @@ mod writer_io_scheduler_tests {
                 false,
             );
 
+            assert!(interruption.is_none());
             assert!(!should_break);
             let first = crate::runtime_async::oneshot_recv(first_rx)
                 .await
@@ -12260,7 +13952,7 @@ mod writer_io_scheduler_tests {
                 respond: barrier_tail_tx,
             });
 
-            dispatch_write_command_batch(
+            let interruption = dispatch_write_command_batch(
                 &backend,
                 batch,
                 &mut should_break,
@@ -12270,7 +13962,12 @@ mod writer_io_scheduler_tests {
                 false,
             );
 
-            assert!(!should_break);
+            assert!(
+                interruption
+                    .as_ref()
+                    .is_some_and(|interruption| interruption.terminate_epoch)
+            );
+            assert!(should_break);
             assert_eq!(storage_writer_panics_total(), 1);
             assert_eq!(
                 backend.executed(),
@@ -12282,23 +13979,19 @@ mod writer_io_scheduler_tests {
                 .await
                 .expect("first grouped append should receive a recovered panic error");
             let first_error = first_result.expect_err("first grouped append should fail closed");
-            assert!(
-                first_error
-                    .to_string()
-                    .contains("storage writer recovered from append group commit panic"),
-                "{first_error}"
-            );
+            assert!(matches!(
+                &first_error,
+                crate::Error::Storage(StorageError::WriterBackendEpochPoisoned)
+            ));
             assert!(!first_error.to_string().contains("SECRET-APPEND-SENTINEL"));
             let second_result = crate::runtime_async::oneshot_recv(second_rx)
                 .await
                 .expect("second grouped append should receive a recovered panic error");
             let second_error = second_result.expect_err("second grouped append should fail closed");
-            assert!(
-                second_error
-                    .to_string()
-                    .contains("storage writer recovered from append group commit panic"),
-                "{second_error}"
-            );
+            assert!(matches!(
+                &second_error,
+                crate::Error::Storage(StorageError::WriterBackendEpochPoisoned)
+            ));
             assert!(!second_error.to_string().contains("SECRET-APPEND-SENTINEL"));
 
             let routed_tail_result = crate::runtime_async::oneshot_recv(routed_tail_rx)
@@ -12306,24 +13999,20 @@ mod writer_io_scheduler_tests {
                 .expect("routed command that forced the append flush should receive an error");
             let routed_tail_error =
                 routed_tail_result.expect_err("routed flush tail must fail closed");
-            assert!(
-                routed_tail_error
-                    .to_string()
-                    .contains("storage writer recovered from append group commit panic"),
-                "{routed_tail_error}"
-            );
+            assert!(matches!(
+                routed_tail_error,
+                crate::Error::Storage(StorageError::WriterBackendEpochPoisoned)
+            ));
 
             let barrier_tail_result = crate::runtime_async::oneshot_recv(barrier_tail_rx)
                 .await
                 .expect("barrier command after the failed routed flush should receive an error");
             let barrier_tail_error =
                 barrier_tail_result.expect_err("barrier flush tail must fail closed");
-            assert!(
-                barrier_tail_error
-                    .to_string()
-                    .contains("storage writer recovered from append group commit panic"),
-                "{barrier_tail_error}"
-            );
+            assert!(matches!(
+                barrier_tail_error,
+                crate::Error::Storage(StorageError::WriterBackendEpochPoisoned)
+            ));
         });
     }
 
@@ -12373,7 +14062,7 @@ mod writer_io_scheduler_tests {
                 respond: release_tx,
             });
 
-            dispatch_write_command_batch(
+            let interruption = dispatch_write_command_batch(
                 &backend,
                 batch,
                 &mut should_break,
@@ -12383,6 +14072,11 @@ mod writer_io_scheduler_tests {
                 false,
             );
 
+            assert!(
+                interruption
+                    .as_ref()
+                    .is_some_and(|interruption| !interruption.terminate_epoch)
+            );
             assert!(!should_break);
             assert_eq!(storage_writer_panics_total(), 1);
             assert_eq!(gate.scheduler.aggregate_items(), 0);
@@ -12454,7 +14148,7 @@ mod writer_io_scheduler_tests {
                 status: "must-not-run-after-shutdown".to_string(),
                 respond: post_shutdown_tx,
             });
-            dispatch_write_command_batch(
+            let interruption = dispatch_write_command_batch(
                 &backend,
                 shutdown_batch,
                 &mut should_break,
@@ -12463,6 +14157,7 @@ mod writer_io_scheduler_tests {
                 &mut gate,
                 false,
             );
+            assert!(interruption.is_none());
             crate::runtime_async::oneshot_recv(shutdown_rx)
                 .await
                 .expect("writer should still process a later shutdown");
@@ -12913,6 +14608,7 @@ mod writer_io_scheduler_tests {
                 vec!["BEGIN".to_string(), "ROLLBACK".to_string()],
                 "a failed COMMIT must be followed by ROLLBACK, never a silent partial commit"
             );
+            assert!(take_writer_backend_epoch_poisoned_signal());
             dispatch_event_gap_group_commit_result(result, group);
 
             assert!(
@@ -12998,7 +14694,7 @@ mod writer_io_scheduler_tests {
                 respond: tx3,
             });
 
-            dispatch_write_command_batch(
+            let interruption = dispatch_write_command_batch(
                 &backend,
                 batch,
                 &mut should_break,
@@ -13008,6 +14704,7 @@ mod writer_io_scheduler_tests {
                 true,
             );
 
+            assert!(interruption.is_none());
             assert!(!should_break);
             let mut ids = vec![
                 crate::runtime_async::oneshot_recv(rx1)
@@ -13641,10 +15338,12 @@ impl<T> Drop for WriterResultResponder<T> {
         }
 
         if let Some(respond) = self.respond.take() {
-            respond_oneshot_best_effort(
-                respond,
-                writer_panic_error(WRITER_DISPATCH_PANIC_ERROR),
-            );
+            let failure = if writer_backend_epoch_poisoned_signal_is_set() {
+                WriterFailure::BackendEpochPoisoned
+            } else {
+                WriterFailure::Database(WRITER_DISPATCH_PANIC_ERROR.to_string())
+            };
+            respond_oneshot_best_effort(respond, failure.result());
         }
     }
 }
@@ -13702,7 +15401,19 @@ fn respond_oneshot_best_effort<T, R>(tx: R, value: T)
 where
     R: BestEffortRespond<T>,
 {
-    tx.respond_best_effort(value);
+    if catch_recoverable(
+        RecoverablePanicSite::StorageWriter,
+        std::panic::AssertUnwindSafe(|| tx.respond_best_effort(value)),
+    )
+    .is_err()
+    {
+        STORAGE_WRITER_RESPONSE_PANICS_TOTAL.fetch_add(1, AtomicOrdering::Relaxed);
+        tracing::error!(
+            writer_response_panics_total = storage_writer_response_panics_total(),
+            error_code = "WA-STORAGE-WRITER-RESPONSE-PANIC",
+            "storage writer contained a panic while delivering a response"
+        );
+    }
 }
 
 /// Dispatch a single already-admitted write command to the appropriate sync handler.
@@ -15314,7 +17025,7 @@ fn append_segment_backend(
         segment.id,
         content,
         now,
-    );
+    )?;
     Ok(segment)
 }
 
@@ -15332,24 +17043,12 @@ fn append_segment_group_commit_backend(
         return Ok(Vec::new());
     }
 
-    backend
-        .execute("BEGIN")
-        .map_err(|err| storage_backend_error("Begin append segment group commit", err))?;
-
-    let result = append_segment_group_commit_inner(backend, writes, segment_redactors);
-    match result {
-        Ok(committed_segments) => {
-            if let Err(err) = backend.execute("COMMIT") {
-                rollback_append_segment_group_best_effort(backend, "commit failure");
-                return Err(storage_backend_error("Commit append segment group", err).into());
-            }
-            Ok(committed_segments)
-        }
-        Err(error) => {
-            rollback_append_segment_group_best_effort(backend, "append failure");
-            Err(error)
-        }
-    }
+    run_writer_transaction(
+        backend,
+        WriterTransactionBeginMode::Deferred,
+        "append segment group commit",
+        || append_segment_group_commit_inner(backend, writes, segment_redactors),
+    )
 }
 
 fn append_segment_group_commit_inner(
@@ -15407,7 +17106,7 @@ fn append_segment_group_commit_inner(
             segment.id,
             &content,
             now,
-        );
+        )?;
         committed_segments.push(CommittedAppendSegment {
             segment,
             retained_tail_moved,
@@ -15416,6 +17115,10 @@ fn append_segment_group_commit_inner(
 
     Ok(committed_segments)
 }
+
+const SEGMENT_EMBEDDING_INSERT_SQL: &str =
+    "INSERT OR REPLACE INTO segment_embeddings (segment_id, embedder_id, dimension, vector, embedded_at)
+     VALUES (?1, ?2, ?3, ?4, ?5)";
 
 /// ft-xx5cl: best-effort — compute and persist the semantic embedding for a
 /// freshly-appended segment on the SAME writer transaction. Before this,
@@ -15429,11 +17132,12 @@ fn append_segment_group_commit_inner(
 /// computed over the already-REDACTED `content` (the persisted form) so we never
 /// embed secrets, consistent with the lexical FTS path.
 ///
-/// Failures are logged and swallowed: a semantic-index hiccup must never block
-/// segment durability, and the `segment_embeddings` FK (`ON DELETE CASCADE`)
-/// keeps the table consistent under retention/size eviction. A failed statement
-/// does not abort the surrounding SQLite transaction, so the segment still
-/// commits.
+/// Ordinary failures are logged and swallowed: a semantic-index hiccup must
+/// never block segment durability, and the `segment_embeddings` FK (`ON DELETE
+/// CASCADE`) keeps the table consistent under retention/size eviction. The
+/// terminal [`BackendError::TxPoisoned`] classification is the sole exception:
+/// it is propagated immediately because no later operation may reuse that
+/// backend epoch.
 fn index_segment_embedding_backend(
     backend: &dyn StorageBackend,
     embedder: &crate::search::HashEmbedder,
@@ -15441,11 +17145,11 @@ fn index_segment_embedding_backend(
     segment_id: i64,
     content: &str,
     embedded_at_ms: i64,
-) {
+) -> Result<()> {
     use crate::search::Embedder;
 
     if content.is_empty() {
-        return;
+        return Ok(());
     }
     let vector = match embedder.embed(content) {
         Ok(vector) => vector,
@@ -15455,7 +17159,7 @@ fn index_segment_embedding_backend(
                 error = %err,
                 "ft-xx5cl: segment embedding skipped (embed failed)"
             );
-            return;
+            return Ok(());
         }
     };
     let dimension = match i32::try_from(vector.len()) {
@@ -15466,7 +17170,7 @@ fn index_segment_embedding_backend(
                 dim = vector.len(),
                 "ft-xx5cl: segment embedding skipped (dimension exceeds i32)"
             );
-            return;
+            return Ok(());
         }
     };
     let blob = match encode_f32_embedding_blob(&vector) {
@@ -15477,13 +17181,12 @@ fn index_segment_embedding_backend(
                 error = %err,
                 "ft-xx5cl: segment embedding skipped (encode failed)"
             );
-            return;
+            return Ok(());
         }
     };
     if let Err(err) = execute_typed(
         backend,
-        "INSERT OR REPLACE INTO segment_embeddings (segment_id, embedder_id, dimension, vector, embedded_at)
-         VALUES (?1, ?2, ?3, ?4, ?5)",
+        SEGMENT_EMBEDDING_INSERT_SQL,
         &[
             ToSqlValue::Integer(segment_id),
             ToSqlValue::Text(embedder_id),
@@ -15492,22 +17195,16 @@ fn index_segment_embedding_backend(
             ToSqlValue::Integer(embedded_at_ms),
         ],
     ) {
+        if matches!(&err, BackendError::TxPoisoned) {
+            return Err(storage_backend_error("Insert segment embedding", err).into());
+        }
         tracing::warn!(
             segment_id,
             error = %err,
             "ft-xx5cl: segment embedding insert failed (best-effort)"
         );
     }
-}
-
-fn rollback_append_segment_group_best_effort(backend: &dyn StorageBackend, cause: &str) {
-    if let Err(err) = backend.execute("ROLLBACK") {
-        tracing::error!(
-            cause,
-            error = %err,
-            "failed to roll back append segment group transaction"
-        );
-    }
+    Ok(())
 }
 
 fn next_output_segment_seq_for_group(
@@ -16156,95 +17853,25 @@ fn validate_event_delivery_bulk_returned_ids(
     Ok(())
 }
 
-const fn event_delivery_backend_error_class(error: &BackendError) -> &'static str {
-    match error {
-        BackendError::Connect(_) => "connect",
-        BackendError::Query(_) => "query",
-        BackendError::TxPoisoned => "transaction_poisoned",
-        BackendError::Schema(_) => "schema",
-        BackendError::Other(_) => "other",
-    }
-}
-
 fn execute_event_delivery_bulk_transaction<F>(
     backend: &dyn StorageBackend,
     leases: &[(i64, String)],
-    operation: &str,
+    operation: &'static str,
     mutation: F,
 ) -> Result<usize>
 where
     F: FnOnce(&dyn StorageBackend) -> Result<Vec<Vec<SqlCell>>>,
 {
-    backend.execute("BEGIN IMMEDIATE").map_err(|err| {
-        storage_backend_error(&format!("Begin {operation} transaction"), err)
-    })?;
-    // The outer writer-dispatch boundary contains panics, but it cannot repair
-    // a transaction whose BEGIN already succeeded. Catch the complete
-    // mutation/validation/COMMIT region here so every recovered unwind first
-    // drives the same explicit rollback path as an ordinary error. Otherwise
-    // the long-lived writer connection remains inside an open transaction and
-    // every later bulk command fails or accidentally joins stale work.
-    let transaction_result = catch_recoverable(
-        RecoverablePanicSite::StorageWriter,
-        std::panic::AssertUnwindSafe(|| {
-            mutation(backend)
-                .and_then(|rows| {
-                    validate_event_delivery_bulk_returned_ids(&rows, leases, operation)?;
-                    Ok(leases.len())
-                })
-                .and_then(|updated| {
-                    backend
-                        .execute("COMMIT")
-                        .map(|_| updated)
-                        .map_err(|error| {
-                            storage_backend_error(
-                                &format!("Commit {operation} transaction"),
-                                error,
-                            )
-                            .into()
-                        })
-                })
-        }),
-    );
-
-    let transaction_error = match transaction_result {
-        Ok(Ok(updated)) => return Ok(updated),
-        Ok(Err(error)) => error,
-        Err(_) => {
-            STORAGE_WRITER_PANICS_TOTAL.fetch_add(1, AtomicOrdering::Relaxed);
-            tracing::error!(
-                operation,
-                writer_panics_total = storage_writer_panics_total(),
-                error_code = "WA-STORAGE-WRITER-PANIC",
-                "storage writer recovered from an event-delivery bulk transaction panic"
-            );
-            StorageError::Database(
-                "storage writer recovered from event-delivery bulk transaction panic \
-                 (WA-STORAGE-WRITER-PANIC)"
-                    .to_string(),
-            )
-            .into()
-        }
-    };
-
-    if let Err(rollback_error) = backend.execute("ROLLBACK") {
-        tracing::error!(
-            operation,
-            error_class = event_delivery_backend_error_class(&rollback_error),
-            "event delivery bulk rollback failed"
-        );
-        // A logical ownership conflict is safe for exact per-lease fallback
-        // only after the all-or-rollback invariant has been re-established.
-        // If rollback itself fails, return a writer error so callers invalidate
-        // this storage epoch instead of issuing more mutations into an
-        // indeterminate transaction.
-        return Err(storage_backend_error(
-            &format!("Rollback {operation} transaction after mutation failure"),
-            rollback_error,
-        )
-        .into());
-    }
-    Err(transaction_error)
+    run_writer_transaction(
+        backend,
+        WriterTransactionBeginMode::Immediate,
+        operation,
+        || {
+            let rows = mutation(backend)?;
+            validate_event_delivery_bulk_returned_ids(&rows, leases, operation)?;
+            Ok(leases.len())
+        },
+    )
 }
 
 fn finalize_event_delivery_leases_bulk_backend(
@@ -17106,7 +18733,12 @@ fn open_read_storage_backend(db_path: &str) -> Result<RusqliteBackend> {
 }
 
 fn storage_backend_error(context: &str, err: BackendError) -> StorageError {
-    StorageError::Database(format!("{context}: {err}"))
+    if matches!(&err, BackendError::TxPoisoned) {
+        mark_writer_backend_epoch_poisoned("storage backend operation", "backend");
+        StorageError::WriterBackendEpochPoisoned
+    } else {
+        StorageError::Database(format!("{context}: {err}"))
+    }
 }
 
 /// br-ft-3twzm: pooled-backend helper that re-fixes ft-bhyxz.
@@ -18206,31 +19838,16 @@ where
     let Some(cleanup_receipt_id) = cleanup_receipt_id else {
         return mutation();
     };
-    backend.execute("BEGIN IMMEDIATE").map_err(|err| {
-        storage_backend_error("Begin auxiliary cleanup receipt transaction", err)
-    })?;
-    let tx_result = (|| -> Result<usize> {
-        let deleted = mutation()?;
-        advance_tiered_cleanup_receipt_backend(backend, cleanup_receipt_id, deleted)?;
-        Ok(deleted)
-    })();
-    match tx_result {
-        Ok(deleted) => match backend.execute("COMMIT") {
-            Ok(_) => Ok(deleted),
-            Err(error) => {
-                let _ = backend.execute("ROLLBACK");
-                Err(storage_backend_error(
-                    "Commit auxiliary cleanup receipt transaction",
-                    error,
-                )
-                .into())
-            }
+    run_writer_transaction(
+        backend,
+        WriterTransactionBeginMode::Immediate,
+        "auxiliary cleanup receipt transaction",
+        || {
+            let deleted = mutation()?;
+            advance_tiered_cleanup_receipt_backend(backend, cleanup_receipt_id, deleted)?;
+            Ok(deleted)
         },
-        Err(error) => {
-            let _ = backend.execute("ROLLBACK");
-            Err(error)
-        }
-    }
+    )
 }
 
 /// Purge audit actions before a cutoff timestamp (synchronous)
@@ -18378,24 +19995,12 @@ fn finalize_tiered_cleanup_receipt_transaction_backend(
     record: &MaintenanceRecord,
     timestamp: i64,
 ) -> Result<i64> {
-    backend.execute("BEGIN IMMEDIATE").map_err(|err| {
-        storage_backend_error("Begin tiered cleanup receipt finalization", err)
-    })?;
-    let result = update_tiered_cleanup_receipt_backend(backend, record, timestamp);
-    match result {
-        Ok(maintenance_id) => match backend.execute("COMMIT") {
-            Ok(_) => Ok(maintenance_id),
-            Err(error) => {
-                let _ = backend.execute("ROLLBACK");
-                Err(storage_backend_error("Commit tiered cleanup receipt finalization", error)
-                    .into())
-            }
-        },
-        Err(error) => {
-            let _ = backend.execute("ROLLBACK");
-            Err(error)
-        }
-    }
+    run_writer_transaction(
+        backend,
+        WriterTransactionBeginMode::Immediate,
+        "tiered cleanup receipt finalization",
+        || update_tiered_cleanup_receipt_backend(backend, record, timestamp),
+    )
 }
 
 fn record_maintenance_backend(
@@ -19015,82 +20620,69 @@ fn insert_session_checkpoint_backend(
         })
         .collect::<Result<Vec<_>>>()?;
 
-    backend
-        .execute("BEGIN IMMEDIATE")
-        .map_err(|err| storage_backend_error("Failed to begin checkpoint txn", err))?;
-
-    let tx_result = (|| -> Result<i64> {
-        let row = backend
-            .query_row_typed(
-                "INSERT INTO session_checkpoints
+    run_writer_transaction(
+        backend,
+        WriterTransactionBeginMode::Immediate,
+        "insert session checkpoint",
+        || -> Result<i64> {
+            let row = backend
+                .query_row_typed(
+                    "INSERT INTO session_checkpoints
          (session_id, checkpoint_at, checkpoint_type, state_hash, pane_count, total_bytes, metadata_json)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
          RETURNING id",
-                &[
-                    ToSqlValue::Text(session_id),
-                    ToSqlValue::Integer(now),
-                    ToSqlValue::Text(checkpoint_type),
-                    ToSqlValue::Text(state_hash),
-                    ToSqlValue::Integer(pane_count_i64),
-                    ToSqlValue::Integer(total_bytes_i64),
-                    ToSqlValue::optional_text(metadata_json),
-                ],
-            )
-            .map_err(|err| storage_backend_error("Failed to insert session checkpoint", err))?
-            .ok_or_else(|| {
-                StorageError::Database(
-                    "Failed to insert session checkpoint: no id returned".to_string(),
+                    &[
+                        ToSqlValue::Text(session_id),
+                        ToSqlValue::Integer(now),
+                        ToSqlValue::Text(checkpoint_type),
+                        ToSqlValue::Text(state_hash),
+                        ToSqlValue::Integer(pane_count_i64),
+                        ToSqlValue::Integer(total_bytes_i64),
+                        ToSqlValue::optional_text(metadata_json),
+                    ],
                 )
+                .map_err(|err| storage_backend_error("Failed to insert session checkpoint", err))?
+                .ok_or_else(|| {
+                    StorageError::Database(
+                        "Failed to insert session checkpoint: no id returned".to_string(),
+                    )
+                })?;
+            let checkpoint_id = RowReader::new(&row).i64(0).map_err(|err| {
+                storage_backend_error("Failed to parse session checkpoint id", err)
             })?;
-        let checkpoint_id = RowReader::new(&row)
-            .i64(0)
-            .map_err(|err| storage_backend_error("Failed to parse session checkpoint id", err))?;
 
-        let pane_state_param_rows: Vec<Vec<ToSqlValue<'_>>> = pane_state_rows
-            .iter()
-            .map(|row| {
-                let mut params = Vec::with_capacity(9);
-                params.push(ToSqlValue::Integer(checkpoint_id));
-                params.extend(row.iter().cloned());
-                params
-            })
-            .collect();
+            let pane_state_param_rows: Vec<Vec<ToSqlValue<'_>>> = pane_state_rows
+                .iter()
+                .map(|row| {
+                    let mut params = Vec::with_capacity(9);
+                    params.push(ToSqlValue::Integer(checkpoint_id));
+                    params.extend(row.iter().cloned());
+                    params
+                })
+                .collect();
 
-        backend
-            .execute_many(
-                "INSERT INTO mux_pane_state
+            backend
+                .execute_many(
+                    "INSERT INTO mux_pane_state
                  (checkpoint_id, pane_id, cwd, command, env_json, terminal_state_json,
                   agent_metadata_json, scrollback_checkpoint_seq, last_output_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-                &pane_state_param_rows,
+                    &pane_state_param_rows,
+                )
+                .map_err(|err| storage_backend_error("Failed to insert pane state", err))?;
+
+            execute_typed(
+                backend,
+                "UPDATE mux_sessions SET last_checkpoint_at = ?1 WHERE session_id = ?2",
+                &[ToSqlValue::Integer(now), ToSqlValue::Text(session_id)],
             )
-            .map_err(|err| storage_backend_error("Failed to insert pane state", err))?;
+            .map_err(|err| {
+                storage_backend_error("Failed to update session checkpoint timestamp", err)
+            })?;
 
-        execute_typed(
-            backend,
-            "UPDATE mux_sessions SET last_checkpoint_at = ?1 WHERE session_id = ?2",
-            &[ToSqlValue::Integer(now), ToSqlValue::Text(session_id)],
-        )
-        .map_err(|err| {
-            storage_backend_error("Failed to update session checkpoint timestamp", err)
-        })?;
-
-        Ok(checkpoint_id)
-    })();
-
-    match tx_result {
-        Ok(checkpoint_id) => match backend.execute("COMMIT") {
-            Ok(_) => Ok(checkpoint_id),
-            Err(commit_err) => {
-                let _ = backend.execute("ROLLBACK");
-                Err(storage_backend_error("Failed to commit checkpoint", commit_err).into())
-            }
+            Ok(checkpoint_id)
         },
-        Err(err) => {
-            let _ = backend.execute("ROLLBACK");
-            Err(err)
-        }
-    }
+    )
 }
 
 /// Prune session_checkpoints down to the most-recent `retention`
@@ -19112,14 +20704,14 @@ fn prune_session_checkpoints_backend(
 ) -> Result<usize> {
     let keep_count = i64::try_from(retention).unwrap_or(i64::MAX);
 
-    backend
-        .execute("BEGIN IMMEDIATE")
-        .map_err(|err| storage_backend_error("Failed to begin checkpoint prune txn", err))?;
-
-    let tx_result = (|| -> Result<usize> {
-        let returned = backend
-            .query_map_typed(
-                "DELETE FROM session_checkpoints
+    run_writer_transaction(
+        backend,
+        WriterTransactionBeginMode::Immediate,
+        "prune session checkpoints",
+        || -> Result<usize> {
+            let returned = backend
+                .query_map_typed(
+                    "DELETE FROM session_checkpoints
                  WHERE session_id = ?1
                  AND id NOT IN (
                      SELECT id FROM session_checkpoints
@@ -19128,42 +20720,31 @@ fn prune_session_checkpoints_backend(
                      LIMIT ?2
                  )
                  RETURNING id",
-                &[
-                    ToSqlValue::Text(session_id),
-                    ToSqlValue::Integer(keep_count),
-                ],
-            )
-            .map_err(|err| storage_backend_error("Failed to prune session checkpoints", err))?;
+                    &[
+                        ToSqlValue::Text(session_id),
+                        ToSqlValue::Integer(keep_count),
+                    ],
+                )
+                .map_err(|err| {
+                    storage_backend_error("Failed to prune session checkpoints", err)
+                })?;
 
-        execute_typed(
-            backend,
-            "DELETE FROM mux_sessions
+            execute_typed(
+                backend,
+                "DELETE FROM mux_sessions
              WHERE session_id = ?1
              AND last_checkpoint_at IS NOT NULL
              AND NOT EXISTS (
                  SELECT 1 FROM session_checkpoints
                  WHERE session_id = ?1
              )",
-            &[ToSqlValue::Text(session_id)],
-        )
-        .map_err(|err| storage_backend_error("Failed to prune empty mux session", err))?;
+                &[ToSqlValue::Text(session_id)],
+            )
+            .map_err(|err| storage_backend_error("Failed to prune empty mux session", err))?;
 
-        Ok(returned.len())
-    })();
-
-    match tx_result {
-        Ok(pruned) => match backend.execute("COMMIT") {
-            Ok(_) => Ok(pruned),
-            Err(commit_err) => {
-                let _ = backend.execute("ROLLBACK");
-                Err(storage_backend_error("Failed to commit checkpoint prune", commit_err).into())
-            }
+            Ok(returned.len())
         },
-        Err(err) => {
-            let _ = backend.execute("ROLLBACK");
-            Err(err)
-        }
-    }
+    )
 }
 
 /// br-ft-l1jgo writer-thread migration: replaces the legacy
@@ -19438,99 +21019,87 @@ fn prune_segments_with_cleanup_receipt_backend(
         return Ok(0);
     }
     let batch_size = usize_to_i64(batch_size, "segment retention batch size")?;
-    backend
-        .execute("BEGIN IMMEDIATE")
-        .map_err(|err| storage_backend_error("Begin segment retention transaction", err))?;
-    let tx_result = (|| -> Result<usize> {
-        prepare_segment_delete_batch_tables_backend(backend)?;
-        execute_typed(
-            backend,
-            "INSERT INTO segment_retention_delete_batch (id, pane_id, seq, content)
+    run_writer_transaction(
+        backend,
+        WriterTransactionBeginMode::Immediate,
+        "segment retention transaction",
+        || -> Result<usize> {
+            prepare_segment_delete_batch_tables_backend(backend)?;
+            execute_typed(
+                backend,
+                "INSERT INTO segment_retention_delete_batch (id, pane_id, seq, content)
              SELECT id, pane_id, seq, content FROM output_segments
              WHERE captured_at < ?1
              ORDER BY captured_at ASC, id ASC
              LIMIT ?2",
-            &[
-                ToSqlValue::Integer(before_ts),
-                ToSqlValue::Integer(batch_size),
-            ],
-        )
-        .map_err(|err| storage_backend_error("Select segment retention batch", err))?;
-        capture_segment_delete_affected_panes_backend(backend)?;
-        let selected = count_table_where(
-            backend,
-            "segment_retention_delete_batch",
-            "1=1",
-            &[],
-        )
-        .map_err(|err| storage_backend_error("Count segment retention batch", err))?;
-        let selected = count_i64_to_usize(selected, "Segment retention batch count")?;
-
-        execute_typed(
-            backend,
-            "UPDATE events SET segment_id = NULL
-             WHERE segment_id IN (SELECT id FROM segment_retention_delete_batch)",
-            &[],
-        )
-        .map_err(|err| storage_backend_error("Detach retained event segments", err))?;
-        delete_deferred_fts_entries_for_segment_batch_backend(backend)?;
-        let deleted_rows = backend
-            .query_map_typed(
-                "DELETE FROM output_segments
-                 WHERE id IN (SELECT id FROM segment_retention_delete_batch)
-                 RETURNING id",
+                &[
+                    ToSqlValue::Integer(before_ts),
+                    ToSqlValue::Integer(batch_size),
+                ],
+            )
+            .map_err(|err| storage_backend_error("Select segment retention batch", err))?;
+            capture_segment_delete_affected_panes_backend(backend)?;
+            let selected = count_table_where(
+                backend,
+                "segment_retention_delete_batch",
+                "1=1",
                 &[],
             )
-            .map_err(|err| storage_backend_error("Failed to prune segments", err))?;
-        let deleted = deleted_rows.len();
-        if deleted != selected {
-            return Err(StorageError::Database(format!(
-                "segment retention candidate/delete mismatch: selected {selected} ids but deleted {deleted}"
-            ))
-            .into());
-        }
+            .map_err(|err| storage_backend_error("Count segment retention batch", err))?;
+            let selected = count_i64_to_usize(selected, "Segment retention batch count")?;
 
-        // [ft-znu6v] Rewind stranded FTS progress after pruning.
-        //
-        // `append_segment_backend` assigns `seq = COALESCE(MAX(seq) + 1, 0)`,
-        // so after a full prune a live pane's next append restarts at seq=0.
-        // If a progress row still carries the pre-prune high-water mark, the
-        // strict `seq > last_indexed_seq` branch in
-        // `get_unindexed_segments_backend` would never surface the reset-chain
-        // rows. This is especially damaging under deferred FTS
-        // (`defer_fts_triggers=true`), where the output_segments_fts delete
-        // triggers have been dropped and the normal cascade does not clean
-        // stale FTS state either.
-        //
-        // Drop any progress row whose `last_indexed_seq` no longer maps to a
-        // surviving row for that pane. The COALESCE(..., -1) treats the "no
-        // remaining rows for pane" case as `max_seq = -1`, so any recorded
-        // `last_indexed_seq >= 0` triggers the delete. A subsequent
-        // `sync_fts_for_pane_backend` sees `had_prior_progress = false` and
-        // takes the inclusive `WHERE pane_id = ?1` branch, picking up seq=0.
-        if deleted > 0 {
-            rewind_stranded_fts_progress_for_affected_panes_backend(backend)?;
-        }
-        clear_segment_delete_batch_tables_backend(backend)?;
-        if let Some(cleanup_receipt_id) = cleanup_receipt_id {
-            advance_tiered_cleanup_receipt_backend(backend, cleanup_receipt_id, deleted)?;
-        }
-        Ok(deleted)
-    })();
-
-    match tx_result {
-        Ok(deleted) => match backend.execute("COMMIT") {
-            Ok(_) => Ok(deleted),
-            Err(error) => {
-                let _ = backend.execute("ROLLBACK");
-                Err(storage_backend_error("Commit segment retention transaction", error).into())
+            execute_typed(
+                backend,
+                "UPDATE events SET segment_id = NULL
+             WHERE segment_id IN (SELECT id FROM segment_retention_delete_batch)",
+                &[],
+            )
+            .map_err(|err| storage_backend_error("Detach retained event segments", err))?;
+            delete_deferred_fts_entries_for_segment_batch_backend(backend)?;
+            let deleted_rows = backend
+                .query_map_typed(
+                    "DELETE FROM output_segments
+                 WHERE id IN (SELECT id FROM segment_retention_delete_batch)
+                 RETURNING id",
+                    &[],
+                )
+                .map_err(|err| storage_backend_error("Failed to prune segments", err))?;
+            let deleted = deleted_rows.len();
+            if deleted != selected {
+                return Err(StorageError::Database(format!(
+                    "segment retention candidate/delete mismatch: selected {selected} ids but deleted {deleted}"
+                ))
+                .into());
             }
+
+            // [ft-znu6v] Rewind stranded FTS progress after pruning.
+            //
+            // `append_segment_backend` assigns `seq = COALESCE(MAX(seq) + 1, 0)`,
+            // so after a full prune a live pane's next append restarts at seq=0.
+            // If a progress row still carries the pre-prune high-water mark, the
+            // strict `seq > last_indexed_seq` branch in
+            // `get_unindexed_segments_backend` would never surface the reset-chain
+            // rows. This is especially damaging under deferred FTS
+            // (`defer_fts_triggers=true`), where the output_segments_fts delete
+            // triggers have been dropped and the normal cascade does not clean
+            // stale FTS state either.
+            //
+            // Drop any progress row whose `last_indexed_seq` no longer maps to a
+            // surviving row for that pane. The COALESCE(..., -1) treats the "no
+            // remaining rows for pane" case as `max_seq = -1`, so any recorded
+            // `last_indexed_seq >= 0` triggers the delete. A subsequent
+            // `sync_fts_for_pane_backend` sees `had_prior_progress = false` and
+            // takes the inclusive `WHERE pane_id = ?1` branch, picking up seq=0.
+            if deleted > 0 {
+                rewind_stranded_fts_progress_for_affected_panes_backend(backend)?;
+            }
+            clear_segment_delete_batch_tables_backend(backend)?;
+            if let Some(cleanup_receipt_id) = cleanup_receipt_id {
+                advance_tiered_cleanup_receipt_backend(backend, cleanup_receipt_id, deleted)?;
+            }
+            Ok(deleted)
         },
-        Err(error) => {
-            let _ = backend.execute("ROLLBACK");
-            Err(error)
-        }
-    }
+    )
 }
 
 /// Rewind only progress rows for panes represented in the current exact delete
@@ -19665,71 +21234,59 @@ fn delete_oldest_segments_backend(backend: &dyn StorageBackend, limit: usize) ->
         return Ok(0);
     }
     let limit = usize_to_i64(limit, "segment size-eviction batch size")?;
-    backend
-        .execute("BEGIN IMMEDIATE")
-        .map_err(|err| storage_backend_error("Begin segment size-eviction transaction", err))?;
-    let tx_result = (|| -> Result<usize> {
-        prepare_segment_delete_batch_tables_backend(backend)?;
-        execute_typed(
-            backend,
-            "INSERT INTO segment_retention_delete_batch (id, pane_id, seq, content)
+    run_writer_transaction(
+        backend,
+        WriterTransactionBeginMode::Immediate,
+        "segment size-eviction transaction",
+        || -> Result<usize> {
+            prepare_segment_delete_batch_tables_backend(backend)?;
+            execute_typed(
+                backend,
+                "INSERT INTO segment_retention_delete_batch (id, pane_id, seq, content)
              SELECT id, pane_id, seq, content FROM output_segments
              ORDER BY captured_at ASC, id ASC LIMIT ?1",
-            &[ToSqlValue::Integer(limit)],
-        )
-        .map_err(|err| storage_backend_error("Select oldest segment delete batch", err))?;
-        capture_segment_delete_affected_panes_backend(backend)?;
-        let selected = count_table_where(
-            backend,
-            "segment_retention_delete_batch",
-            "1=1",
-            &[],
-        )
-        .map_err(|err| storage_backend_error("Count size-eviction segment batch", err))?;
-        let selected = count_i64_to_usize(selected, "Size-eviction segment batch count")?;
-        execute_typed(
-            backend,
-            "UPDATE events SET segment_id = NULL
-             WHERE segment_id IN (SELECT id FROM segment_retention_delete_batch)",
-            &[],
-        )
-        .map_err(|err| storage_backend_error("Detach size-evicted event segments", err))?;
-        delete_deferred_fts_entries_for_segment_batch_backend(backend)?;
-        let deleted_rows = backend
-            .query_map_typed(
-                "DELETE FROM output_segments
-                 WHERE id IN (SELECT id FROM segment_retention_delete_batch)
-                 RETURNING id",
+                &[ToSqlValue::Integer(limit)],
+            )
+            .map_err(|err| storage_backend_error("Select oldest segment delete batch", err))?;
+            capture_segment_delete_affected_panes_backend(backend)?;
+            let selected = count_table_where(
+                backend,
+                "segment_retention_delete_batch",
+                "1=1",
                 &[],
             )
-            .map_err(|err| storage_backend_error("Failed to evict oldest segments", err))?;
-        let deleted = deleted_rows.len();
-        if deleted != selected {
-            return Err(StorageError::Database(format!(
-                "segment size-eviction candidate/delete mismatch: selected {selected} ids but deleted {deleted}"
-            ))
-            .into());
-        }
-        if deleted > 0 {
-            rewind_stranded_fts_progress_for_affected_panes_backend(backend)?;
-        }
-        clear_segment_delete_batch_tables_backend(backend)?;
-        Ok(deleted)
-    })();
-    match tx_result {
-        Ok(deleted) => match backend.execute("COMMIT") {
-            Ok(_) => Ok(deleted),
-            Err(error) => {
-                let _ = backend.execute("ROLLBACK");
-                Err(storage_backend_error("Commit segment size-eviction transaction", error)
-                    .into())
+            .map_err(|err| storage_backend_error("Count size-eviction segment batch", err))?;
+            let selected = count_i64_to_usize(selected, "Size-eviction segment batch count")?;
+            execute_typed(
+                backend,
+                "UPDATE events SET segment_id = NULL
+             WHERE segment_id IN (SELECT id FROM segment_retention_delete_batch)",
+                &[],
+            )
+            .map_err(|err| storage_backend_error("Detach size-evicted event segments", err))?;
+            delete_deferred_fts_entries_for_segment_batch_backend(backend)?;
+            let deleted_rows = backend
+                .query_map_typed(
+                    "DELETE FROM output_segments
+                 WHERE id IN (SELECT id FROM segment_retention_delete_batch)
+                 RETURNING id",
+                    &[],
+                )
+                .map_err(|err| storage_backend_error("Failed to evict oldest segments", err))?;
+            let deleted = deleted_rows.len();
+            if deleted != selected {
+                return Err(StorageError::Database(format!(
+                    "segment size-eviction candidate/delete mismatch: selected {selected} ids but deleted {deleted}"
+                ))
+                .into());
             }
+            if deleted > 0 {
+                rewind_stranded_fts_progress_for_affected_panes_backend(backend)?;
+            }
+            clear_segment_delete_batch_tables_backend(backend)?;
+            Ok(deleted)
         },
-        Err(error) => {
-            let _ = backend.execute("ROLLBACK");
-            Err(error)
-        }
-    }
+    )
 }
 
 /// Execute exactly one bounded size-eviction writer turn.
@@ -19982,34 +21539,21 @@ fn record_usage_metrics_batch_backend(
         })
         .collect();
 
-    // Wrap in BEGIN/COMMIT for atomic-batch + per-batch fsync. See the
-    // execute_many recipe in docs/storage/backend-migration-guide.md
-    // for the error-handling rationale.
-    backend
-        .execute("BEGIN IMMEDIATE")
-        .map_err(|err| storage_backend_error("Start metrics batch tx", err))?;
-    let inserted = match backend.execute_many(
-        "INSERT INTO usage_metrics (timestamp, metric_type, pane_id, agent_type, \
-         account_id, workflow_id, count, amount, tokens, metadata, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-        &owned_rows,
-    ) {
-        Ok(count) => match backend.execute("COMMIT") {
-            Ok(_) => Ok(count),
-            Err(commit_err) => {
-                let _ = backend.execute("ROLLBACK");
-                Err(storage_backend_error("Commit metrics batch tx", commit_err))
-            }
+    run_writer_transaction(
+        backend,
+        WriterTransactionBeginMode::Immediate,
+        "usage metric batch",
+        || {
+            backend
+                .execute_many(
+                    "INSERT INTO usage_metrics (timestamp, metric_type, pane_id, agent_type, \
+                     account_id, workflow_id, count, amount, tokens, metadata, created_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                    &owned_rows,
+                )
+                .map_err(|error| storage_backend_error("Insert usage metric batch", error).into())
         },
-        Err(batch_err) => {
-            let _ = backend.execute("ROLLBACK");
-            Err(storage_backend_error(
-                "Insert usage metric batch",
-                batch_err,
-            ))
-        }
-    }?;
-    Ok(inserted)
+    )
 }
 
 fn purge_usage_metrics_backend(
@@ -20956,125 +22500,130 @@ fn delete_event_retention_batch_from_query_backend(
     branch_count: Option<usize>,
     cleanup_receipt_id: Option<i64>,
 ) -> Result<EventRetentionDeleteBatchResult> {
-    backend
-        .execute("BEGIN IMMEDIATE")
-        .map_err(|err| storage_backend_error("Begin event retention transaction", err))?;
-
-    let tx_result = (|| -> Result<EventRetentionDeleteBatchResult> {
-        let now = now_ms();
-        let stale_authorizations = count_table_where(
-            backend,
-            "event_retention_delete_authorizations",
-            "1=1",
-            &[],
-        )
-        .map_err(|err| storage_backend_error("Check event retention delete batch", err))?;
-        if stale_authorizations != 0 {
-            return Err(StorageError::Database(format!(
-                "event retention delete authorization table was non-empty outside a batch: {stale_authorizations} rows"
-            ))
-            .into());
-        }
-        let candidate_rows = backend
-            .query_map_typed(candidate_query, candidate_params)
-            .map_err(|err| storage_backend_error("Select event retention candidates", err))?;
-        let mut candidate_ids = Vec::with_capacity(candidate_rows.len());
-        let mut deleted_by_branch = branch_count.map(|count| vec![0usize; count]);
-        for row in &candidate_rows {
-            let reader = RowReader::new(row);
-            let id = reader
-                .i64(0)
-                .map_err(|err| storage_backend_error("Event retention candidate id", err))?;
-            if id <= 0 || candidate_ids.last().is_some_and(|previous| *previous >= id) {
+    run_writer_transaction(
+        backend,
+        WriterTransactionBeginMode::Immediate,
+        "event retention transaction",
+        || -> Result<EventRetentionDeleteBatchResult> {
+            let now = now_ms();
+            let stale_authorizations = count_table_where(
+                backend,
+                "event_retention_delete_authorizations",
+                "1=1",
+                &[],
+            )
+            .map_err(|err| storage_backend_error("Check event retention delete batch", err))?;
+            if stale_authorizations != 0 {
                 return Err(StorageError::Database(format!(
-                    "{operation} returned a non-positive or non-increasing event id: {id}"
+                    "event retention delete authorization table was non-empty outside a batch: {stale_authorizations} rows"
                 ))
                 .into());
             }
-            candidate_ids.push(id);
-            if let Some(counts) = deleted_by_branch.as_mut() {
-                let branch = reader.i64(1).map_err(|err| {
-                    storage_backend_error("Event retention candidate branch", err)
-                })?;
-                let branch = usize::try_from(branch).map_err(|_| {
-                    StorageError::Database(format!(
-                        "{operation} returned invalid retention branch {branch}"
-                    ))
-                })?;
-                let Some(count) = counts.get_mut(branch) else {
+            let candidate_rows = backend
+                .query_map_typed(candidate_query, candidate_params)
+                .map_err(|err| storage_backend_error("Select event retention candidates", err))?;
+            let mut candidate_ids = Vec::with_capacity(candidate_rows.len());
+            let mut deleted_by_branch = branch_count.map(|count| vec![0usize; count]);
+            for row in &candidate_rows {
+                let reader = RowReader::new(row);
+                let id = reader
+                    .i64(0)
+                    .map_err(|err| storage_backend_error("Event retention candidate id", err))?;
+                if id <= 0 || candidate_ids.last().is_some_and(|previous| *previous >= id) {
                     return Err(StorageError::Database(format!(
-                        "{operation} returned out-of-range retention branch {branch}"
+                        "{operation} returned a non-positive or non-increasing event id: {id}"
                     ))
                     .into());
-                };
-                *count = count.checked_add(1).ok_or_else(|| {
-                    StorageError::Database(format!(
-                        "{operation} branch {branch} candidate count overflow"
-                    ))
-                })?;
+                }
+                candidate_ids.push(id);
+                if let Some(counts) = deleted_by_branch.as_mut() {
+                    let branch = reader.i64(1).map_err(|err| {
+                        storage_backend_error("Event retention candidate branch", err)
+                    })?;
+                    let branch = usize::try_from(branch).map_err(|_| {
+                        StorageError::Database(format!(
+                            "{operation} returned invalid retention branch {branch}"
+                        ))
+                    })?;
+                    let Some(count) = counts.get_mut(branch) else {
+                        return Err(StorageError::Database(format!(
+                            "{operation} returned out-of-range retention branch {branch}"
+                        ))
+                        .into());
+                    };
+                    *count = count.checked_add(1).ok_or_else(|| {
+                        StorageError::Database(format!(
+                            "{operation} branch {branch} candidate count overflow"
+                        ))
+                    })?;
+                }
             }
-        }
-        if candidate_ids.is_empty() {
-            return Ok(EventRetentionDeleteBatchResult {
-                deleted: 0,
-                deleted_by_branch,
-            });
-        }
+            if candidate_ids.is_empty() {
+                return Ok(EventRetentionDeleteBatchResult {
+                    deleted: 0,
+                    deleted_by_branch,
+                });
+            }
 
-        let id_rows = candidate_ids
-            .iter()
-            .map(|id| vec![ToSqlValue::Integer(*id)])
-            .collect::<Vec<_>>();
-        backend
-            .execute_many(
-                "INSERT INTO event_retention_delete_authorizations (event_id) VALUES (?1)",
-                &id_rows,
-            )
-            .map_err(|err| storage_backend_error("Populate event retention delete batch", err))?;
+            let id_rows = candidate_ids
+                .iter()
+                .map(|id| vec![ToSqlValue::Integer(*id)])
+                .collect::<Vec<_>>();
+            backend
+                .execute_many(
+                    "INSERT INTO event_retention_delete_authorizations (event_id) VALUES (?1)",
+                    &id_rows,
+                )
+                .map_err(|err| {
+                    storage_backend_error("Populate event retention delete batch", err)
+                })?;
 
-        // Preserve workflow history while removing the restrictive FK edge.
-        // This is the transactional equivalent of ON DELETE SET NULL for the
-        // legacy schema and prevents one referenced event from aborting an
-        // otherwise-valid retention batch.
-        backend
-            .execute(
-                "UPDATE workflow_executions SET trigger_event_id = NULL
+            // Preserve workflow history while removing the restrictive FK edge.
+            // This is the transactional equivalent of ON DELETE SET NULL for the
+            // legacy schema and prevents one referenced event from aborting an
+            // otherwise-valid retention batch.
+            backend
+                .execute(
+                    "UPDATE workflow_executions SET trigger_event_id = NULL
                  WHERE trigger_event_id IN (
                      SELECT event_id FROM event_retention_delete_authorizations
                  )",
-            )
-            .map_err(|err| storage_backend_error("Detach retained workflow trigger events", err))?;
+                )
+                .map_err(|err| {
+                    storage_backend_error("Detach retained workflow trigger events", err)
+                })?;
 
-        let deleted_rows = backend
-            .query_map_typed(
-                "DELETE FROM events
+            let deleted_rows = backend
+                .query_map_typed(
+                    "DELETE FROM events
                  WHERE id IN (SELECT event_id FROM event_retention_delete_authorizations)
                  RETURNING id",
-                &[],
-            )
-            .map_err(|err| storage_backend_error("Delete retained events", err))?;
-        let mut deleted_ids = Vec::with_capacity(deleted_rows.len());
-        for row in &deleted_rows {
-            deleted_ids.push(
-                RowReader::new(row)
-                    .i64(0)
-                    .map_err(|err| storage_backend_error("Deleted event id", err))?,
-            );
-        }
-        deleted_ids.sort_unstable();
-        if deleted_ids != candidate_ids {
-            return Err(StorageError::Database(format!(
-                "{operation} candidate/delete mismatch: selected {} ids but deleted {}",
-                candidate_ids.len(),
-                deleted_ids.len()
-            ))
-            .into());
-        }
+                    &[],
+                )
+                .map_err(|err| storage_backend_error("Delete retained events", err))?;
+            let mut deleted_ids = Vec::with_capacity(deleted_rows.len());
+            for row in &deleted_rows {
+                deleted_ids.push(
+                    RowReader::new(row)
+                        .i64(0)
+                        .map_err(|err| storage_backend_error("Deleted event id", err))?,
+                );
+            }
+            deleted_ids.sort_unstable();
+            if deleted_ids != candidate_ids {
+                return Err(StorageError::Database(format!(
+                    "{operation} candidate/delete mismatch: selected {} ids but deleted {}",
+                    candidate_ids.len(),
+                    deleted_ids.len()
+                ))
+                .into());
+            }
 
-        let deleted_count = usize_to_i64(candidate_ids.len(), "event retention deleted count")?;
-        let generation_row = backend
-            .query_row_typed(
-                "UPDATE event_retention_state
+            let deleted_count =
+                usize_to_i64(candidate_ids.len(), "event retention deleted count")?;
+            let generation_row = backend
+                .query_row_typed(
+                    "UPDATE event_retention_state
                  SET generation = generation + 1,
                      deleted_event_count = deleted_event_count + ?1,
                      last_deleted_at = CASE
@@ -21085,75 +22634,63 @@ fn delete_event_retention_batch_from_query_backend(
                    AND generation < 9223372036854775807
                    AND deleted_event_count <= 9223372036854775807 - ?1
                  RETURNING generation, evidence_from_event_id",
-                &[
-                    ToSqlValue::Integer(deleted_count),
-                    ToSqlValue::Integer(now),
-                ],
-            )
-            .map_err(|err| storage_backend_error("Advance event retention generation", err))?
-            .ok_or_else(|| {
-                StorageError::Database(
-                    "event retention state is missing or its counters are exhausted".to_string(),
+                    &[
+                        ToSqlValue::Integer(deleted_count),
+                        ToSqlValue::Integer(now),
+                    ],
                 )
-            })?;
-        let generation = RowReader::new(&generation_row)
-            .i64(0)
-            .map_err(|err| storage_backend_error("Event retention generation", err))?;
-        let evidence_from_event_id = RowReader::new(&generation_row)
-            .i64(1)
-            .map_err(|err| storage_backend_error("Event retention evidence boundary", err))?;
-        if evidence_from_event_id <= 0 {
-            return Err(StorageError::Database(format!(
-                "event retention evidence boundary is invalid: {evidence_from_event_id}"
-            ))
-            .into());
-        }
-        // After a bounded-ledger epoch rotation, IDs below the new evidence
-        // boundary are deliberately unknowable. A long-running cleanup may
-        // still delete such legacy rows in later batches. Do not re-materialize
-        // those old holes in the new epoch: they cannot make a current-epoch
-        // cursor less complete, and retaining them would cause needless
-        // repeated rotations under sparse tier rules.
-        let authoritative_start = candidate_ids
-            .partition_point(|event_id| *event_id < evidence_from_event_id);
-        record_event_retention_intervals_backend(
-            backend,
-            &candidate_ids[authoritative_start..],
-            generation,
-            now,
-        )?;
-        enforce_event_retention_interval_bound_backend(backend, interval_row_limit)?;
-
-        backend
-            .execute("DELETE FROM event_retention_delete_authorizations")
-            .map_err(|err| storage_backend_error("Clear committed event delete batch", err))?;
-        if let Some(cleanup_receipt_id) = cleanup_receipt_id {
-            advance_tiered_cleanup_receipt_backend(
-                backend,
-                cleanup_receipt_id,
-                candidate_ids.len(),
-            )?;
-        }
-        Ok(EventRetentionDeleteBatchResult {
-            deleted: candidate_ids.len(),
-            deleted_by_branch,
-        })
-    })();
-
-    match tx_result {
-        Ok(deleted) => match backend.execute("COMMIT") {
-            Ok(_) => Ok(deleted),
-            Err(commit_error) => {
-                let _ = backend.execute("ROLLBACK");
-                Err(storage_backend_error("Commit event retention transaction", commit_error)
-                    .into())
+                .map_err(|err| storage_backend_error("Advance event retention generation", err))?
+                .ok_or_else(|| {
+                    StorageError::Database(
+                        "event retention state is missing or its counters are exhausted".to_string(),
+                    )
+                })?;
+            let generation = RowReader::new(&generation_row)
+                .i64(0)
+                .map_err(|err| storage_backend_error("Event retention generation", err))?;
+            let evidence_from_event_id = RowReader::new(&generation_row)
+                .i64(1)
+                .map_err(|err| storage_backend_error("Event retention evidence boundary", err))?;
+            if evidence_from_event_id <= 0 {
+                return Err(StorageError::Database(format!(
+                    "event retention evidence boundary is invalid: {evidence_from_event_id}"
+                ))
+                .into());
             }
+            // After a bounded-ledger epoch rotation, IDs below the new evidence
+            // boundary are deliberately unknowable. A long-running cleanup may
+            // still delete such legacy rows in later batches. Do not re-materialize
+            // those old holes in the new epoch: they cannot make a current-epoch
+            // cursor less complete, and retaining them would cause needless
+            // repeated rotations under sparse tier rules.
+            let authoritative_start = candidate_ids
+                .partition_point(|event_id| *event_id < evidence_from_event_id);
+            record_event_retention_intervals_backend(
+                backend,
+                &candidate_ids[authoritative_start..],
+                generation,
+                now,
+            )?;
+            enforce_event_retention_interval_bound_backend(backend, interval_row_limit)?;
+
+            backend
+                .execute("DELETE FROM event_retention_delete_authorizations")
+                .map_err(|err| {
+                    storage_backend_error("Clear committed event delete batch", err)
+                })?;
+            if let Some(cleanup_receipt_id) = cleanup_receipt_id {
+                advance_tiered_cleanup_receipt_backend(
+                    backend,
+                    cleanup_receipt_id,
+                    candidate_ids.len(),
+                )?;
+            }
+            Ok(EventRetentionDeleteBatchResult {
+                deleted: candidate_ids.len(),
+                deleted_by_branch,
+            })
         },
-        Err(error) => {
-            let _ = backend.execute("ROLLBACK");
-            Err(error)
-        }
-    }
+    )
 }
 
 /// Enforce the per-epoch exact-interval ceiling after a complete deletion
@@ -23694,11 +25231,17 @@ fn fts_segment_from_backend_cells(row: &[SqlCell]) -> Result<Segment> {
     })
 }
 
+const FTS_INTEGRITY_CHECK_SQL: &str =
+    "INSERT INTO output_segments_fts(output_segments_fts) VALUES('integrity-check')";
+
 fn check_fts_integrity_backend(backend: &dyn StorageBackend) -> Result<bool> {
-    match backend.execute_batch(
-        "INSERT INTO output_segments_fts(output_segments_fts) VALUES('integrity-check')",
-    ) {
+    match backend.execute_batch(FTS_INTEGRITY_CHECK_SQL) {
         Ok(()) => Ok(true),
+        Err(BackendError::TxPoisoned) => Err(storage_backend_error(
+            "FTS integrity check",
+            BackendError::TxPoisoned,
+        )
+        .into()),
         Err(err) => {
             let msg = err.to_string();
             if msg.contains("database disk image is malformed") || msg.contains("fts5: ") {
@@ -24132,52 +25675,16 @@ fn with_fts_sync_savepoint<T>(
     backend: &dyn StorageBackend,
     operation: impl FnOnce() -> Result<T>,
 ) -> Result<T> {
-    const SAVEPOINT: &str = "frankenterm_fts_sync_unit";
-    backend
-        .execute("SAVEPOINT frankenterm_fts_sync_unit")
-        .map_err(|error| storage_backend_error("Begin atomic FTS sync unit", error))?;
-
-    match operation() {
-        Ok(value) => match backend.execute("RELEASE SAVEPOINT frankenterm_fts_sync_unit") {
-            Ok(_) => Ok(value),
-            Err(error) => {
-                let rollback = backend.execute("ROLLBACK TO SAVEPOINT frankenterm_fts_sync_unit");
-                let release = backend.execute("RELEASE SAVEPOINT frankenterm_fts_sync_unit");
-                if rollback.is_err() || release.is_err() {
-                    tracing::error!(
-                        savepoint = SAVEPOINT,
-                        rollback_error = ?rollback.err(),
-                        release_error = ?release.err(),
-                        "failed to restore the FTS transaction after sync-unit commit failed"
-                    );
-                    return Err(StorageError::Database(
-                        "FTS sync commit failed and its transaction could not be restored"
-                            .to_string(),
-                    )
-                    .into());
-                }
-                Err(storage_backend_error("Commit atomic FTS sync unit", error).into())
-            }
+    run_writer_savepoint(
+        backend,
+        WriterSavepoint {
+            begin_sql: "SAVEPOINT frankenterm_fts_sync_unit",
+            rollback_sql: "ROLLBACK TO SAVEPOINT frankenterm_fts_sync_unit",
+            release_sql: "RELEASE SAVEPOINT frankenterm_fts_sync_unit",
         },
-        Err(error) => {
-            let rollback = backend.execute("ROLLBACK TO SAVEPOINT frankenterm_fts_sync_unit");
-            let release = backend.execute("RELEASE SAVEPOINT frankenterm_fts_sync_unit");
-            let transaction_not_restored = rollback.is_err() || release.is_err();
-            if transaction_not_restored {
-                tracing::error!(
-                    savepoint = SAVEPOINT,
-                    rollback_error = ?rollback.err(),
-                    release_error = ?release.err(),
-                    "failed to restore the FTS transaction after an atomic sync-unit error"
-                );
-                return Err(StorageError::Database(
-                    "FTS sync failed and its transaction could not be restored".to_string(),
-                )
-                .into());
-            }
-            Err(error)
-        }
-    }
+        "atomic FTS sync unit",
+        operation,
+    )
 }
 
 fn sync_fts_for_pane_backend_impl(
@@ -24384,76 +25891,68 @@ fn full_fts_rebuild_backend(
     // snapshot until commit, a crash rolls every partial posting back, and the
     // separately committed pending marker forces recovery on the next open.
     mark_fts_rebuild_pending_backend(backend, now)?;
-    backend
-        .execute("BEGIN IMMEDIATE")
-        .map_err(|err| storage_backend_error("Begin atomic FTS rebuild", err))?;
-    let rebuild_result = (|| -> Result<(u64, u64)> {
-        backend
-            .execute_batch(
-                "INSERT INTO output_segments_fts(output_segments_fts) VALUES('delete-all')",
-            )
-            .map_err(|err| {
-                storage_backend_error("FTS rebuild could not clear the prior index", err)
-            })?;
-        clear_fts_pane_progress_backend(backend)?;
+    let (segments_indexed, panes_processed) = run_writer_transaction(
+        backend,
+        WriterTransactionBeginMode::Immediate,
+        "atomic FTS rebuild",
+        || -> Result<(u64, u64)> {
+            backend
+                .execute_batch(
+                    "INSERT INTO output_segments_fts(output_segments_fts) VALUES('delete-all')",
+                )
+                .map_err(|err| {
+                    storage_backend_error("FTS rebuild could not clear the prior index", err)
+                })?;
+            clear_fts_pane_progress_backend(backend)?;
 
-        let pane_ids = backend
-            .query_map_cells(
-                "SELECT DISTINCT pane_id FROM output_segments ORDER BY pane_id",
-                &[],
-            )
-            .map_err(|err| storage_backend_error("Failed to query panes", err))?
-            .iter()
-            .map(|row| {
-                CellRowReader::new(row)
-                    .i64(0)
-                    .and_then(|value| backend_i64_to_u64(value, "output_segments.pane_id"))
-                    .map_err(|err| storage_backend_error("Failed to list panes", err).into())
-            })
-            .collect::<Result<Vec<_>>>()?;
+            let pane_ids = backend
+                .query_map_cells(
+                    "SELECT DISTINCT pane_id FROM output_segments ORDER BY pane_id",
+                    &[],
+                )
+                .map_err(|err| storage_backend_error("Failed to query panes", err))?
+                .iter()
+                .map(|row| {
+                    CellRowReader::new(row)
+                        .i64(0)
+                        .and_then(|value| backend_i64_to_u64(value, "output_segments.pane_id"))
+                        .map_err(|err| storage_backend_error("Failed to list panes", err).into())
+                })
+                .collect::<Result<Vec<_>>>()?;
 
-        let mut total_indexed = 0u64;
-        for pane_id in &pane_ids {
-            let (indexed, _) = sync_fts_for_pane_backend(backend, *pane_id, config).map_err(
-                |error| {
-                    StorageError::Database(format!(
-                        "FTS rebuild failed while indexing pane {pane_id}: {error}"
-                    ))
+            let mut total_indexed = 0u64;
+            for pane_id in &pane_ids {
+                let (indexed, _) =
+                    sync_fts_for_pane_backend(backend, *pane_id, config).map_err(|error| {
+                        if is_writer_backend_epoch_poisoned(&error) {
+                            error
+                        } else {
+                            StorageError::Database(format!(
+                                "FTS rebuild failed while indexing pane {pane_id}: {error}"
+                            ))
+                            .into()
+                        }
+                    })?;
+                total_indexed = total_indexed.checked_add(indexed).ok_or_else(|| {
+                    StorageError::Database("FTS rebuild indexed-row count overflow".to_string())
+                })?;
+            }
+
+            upsert_fts_index_state_backend(
+                backend,
+                &FtsIndexState {
+                    index_version: FTS_INDEX_VERSION,
+                    last_full_rebuild_at: Some(now),
+                    created_at,
+                    updated_at: now,
                 },
             )?;
-            total_indexed = total_indexed.checked_add(indexed).ok_or_else(|| {
-                StorageError::Database("FTS rebuild indexed-row count overflow".to_string())
-            })?;
-        }
-
-        upsert_fts_index_state_backend(
-            backend,
-            &FtsIndexState {
-                index_version: FTS_INDEX_VERSION,
-                last_full_rebuild_at: Some(now),
-                created_at,
-                updated_at: now,
-            },
-        )?;
-        Ok((
-            total_indexed,
-            u64::try_from(pane_ids.len()).unwrap_or(u64::MAX),
-        ))
-    })();
-
-    let (segments_indexed, panes_processed) = match rebuild_result {
-        Ok(outcome) => match backend.execute("COMMIT") {
-            Ok(_) => outcome,
-            Err(error) => {
-                let _ = backend.execute("ROLLBACK");
-                return Err(storage_backend_error("Commit atomic FTS rebuild", error).into());
-            }
+            Ok((
+                total_indexed,
+                u64::try_from(pane_ids.len()).unwrap_or(u64::MAX),
+            ))
         },
-        Err(error) => {
-            let _ = backend.execute("ROLLBACK");
-            return Err(error);
-        }
-    };
+    )?;
 
     Ok(FtsSyncResult {
         segments_indexed,
@@ -24510,6 +26009,7 @@ fn sync_fts_on_startup_backend(
                     )
                 })?;
             }
+            Err(err) if is_writer_backend_epoch_poisoned(&err) => return Err(err),
             Err(err) => warnings.push(format!("Pane {pane_id} incremental sync failed: {err}")),
         }
     }
@@ -27554,6 +29054,7 @@ fn event_delivery_lease_batches_are_exact_atomic_and_bounded() {
 
 #[test]
 fn event_delivery_bulk_transaction_panic_rolls_back_before_returning() {
+    let _guard = writer_panic_counter_test_lock();
     let backend = crate::storage_backend_trait::MockBackend::new();
     let leases = vec![(17, "token-17".to_string())];
     let result = execute_event_delivery_bulk_transaction(
@@ -27566,12 +29067,10 @@ fn event_delivery_bulk_transaction_panic_rolls_back_before_returning() {
     );
 
     let error = result.expect_err("contained transaction panic must fail the command");
-    assert!(
-        error
-            .to_string()
-            .contains("WA-STORAGE-WRITER-PANIC"),
-        "contained panic must retain the finite storage-writer code: {error}"
-    );
+    assert!(matches!(
+        &error,
+        crate::Error::Storage(StorageError::WriterBackendEpochPoisoned)
+    ));
     assert!(
         !error
             .to_string()
@@ -27583,6 +29082,7 @@ fn event_delivery_bulk_transaction_panic_rolls_back_before_returning() {
         vec!["BEGIN IMMEDIATE".to_string(), "ROLLBACK".to_string()],
         "a recovered unwind after BEGIN must roll its transaction back"
     );
+    assert!(take_writer_backend_epoch_poisoned_signal());
 }
 
 #[test]
@@ -36044,7 +37544,9 @@ mod write_command_sender_tests {
     fn writer_send_error_distinguishes_cancellation_from_writer_failure() {
         let cancelled = StorageHandle::writer_send_error(
             "test_write",
-            Box::new(mpsc::SendError::Cancelled(shutdown_command())),
+            super::WriteCommandSendError::Channel(Box::new(mpsc::SendError::Cancelled(
+                shutdown_command(),
+            ))),
         );
         assert!(
             matches!(
@@ -36056,7 +37558,9 @@ mod write_command_sender_tests {
 
         let disconnected = StorageHandle::writer_send_error(
             "test_write",
-            Box::new(mpsc::SendError::Disconnected(shutdown_command())),
+            super::WriteCommandSendError::Channel(Box::new(mpsc::SendError::Disconnected(
+                shutdown_command(),
+            ))),
         );
         assert!(
             matches!(
@@ -36069,7 +37573,9 @@ mod write_command_sender_tests {
 
         let full = StorageHandle::writer_send_error(
             "test_write",
-            Box::new(mpsc::SendError::Full(shutdown_command())),
+            super::WriteCommandSendError::Channel(Box::new(mpsc::SendError::Full(
+                shutdown_command(),
+            ))),
         );
         assert!(
             matches!(
@@ -36079,6 +37585,15 @@ mod write_command_sender_tests {
             ),
             "a violated post-reservation capacity invariant must remain a storage failure"
         );
+
+        let poisoned = StorageHandle::writer_send_error(
+            "test_write",
+            super::WriteCommandSendError::WriterBackendEpochPoisoned,
+        );
+        assert!(matches!(
+            poisoned,
+            crate::Error::Storage(StorageError::WriterBackendEpochPoisoned)
+        ));
     }
 
     #[test]

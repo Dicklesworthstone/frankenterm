@@ -431,6 +431,46 @@ pub static FT_2004: ErrorCodeDef = ErrorCodeDef {
     doc_link: None,
 };
 
+/// WA-2005: Long-lived storage writer backend epoch poisoned
+pub static FT_2005: ErrorCodeDef = ErrorCodeDef {
+    code: "FT-2005",
+    category: ErrorCategory::Storage,
+    title: "Storage writer must be reopened",
+    description: "The dedicated storage writer encountered an indeterminate transaction outcome. \
+                  Its current backend connection has been stopped and must not be reused.",
+    causes: &[
+        "A storage backend panicked while a transaction was open",
+        "Commit or rollback failed with an indeterminate outcome",
+        "The backend explicitly reported transaction poison",
+    ],
+    recovery_steps: &[
+        RecoveryStep::text("Reopen FrankenTerm storage before retrying the operation"),
+        RecoveryStep::with_command("Run diagnostics", "ft doctor"),
+        RecoveryStep::text("Inspect storage-writer telemetry if the error recurs"),
+    ],
+    doc_link: None,
+};
+
+/// WA-2006: Schema-migration connection epoch poisoned
+pub static FT_2006: ErrorCodeDef = ErrorCodeDef {
+    code: "FT-2006",
+    category: ErrorCategory::Storage,
+    title: "Storage migration must be reopened",
+    description: "A schema migration could not prove that its failed transaction rolled back. \
+                  The migration connection has been stopped and must not be reused.",
+    causes: &[
+        "Rollback failed after a migration step returned an error",
+        "A migration transaction panicked and cleanup could not be verified",
+        "The migration backend explicitly reported transaction poison",
+    ],
+    recovery_steps: &[
+        RecoveryStep::text("Reopen FrankenTerm storage before retrying migration"),
+        RecoveryStep::with_command("Run diagnostics", "ft doctor"),
+        RecoveryStep::text("Restore a known-good backup if migration poison recurs"),
+    ],
+    doc_link: None,
+};
+
 /// WA-2010: Sequence discontinuity
 pub static FT_2010: ErrorCodeDef = ErrorCodeDef {
     code: "FT-2010",
@@ -1125,6 +1165,8 @@ pub static ERROR_CATALOG: LazyLock<HashMap<&'static str, &'static ErrorCodeDef>>
         m.insert("FT-2002", &FT_2002);
         m.insert("FT-2003", &FT_2003);
         m.insert("FT-2004", &FT_2004);
+        m.insert("FT-2005", &FT_2005);
+        m.insert("FT-2006", &FT_2006);
         m.insert("FT-2010", &FT_2010);
         m.insert("FT-2020", &FT_2020);
         m.insert("FT-2030", &FT_2030);
@@ -1907,6 +1949,30 @@ mod tests {
             def.causes
                 .iter()
                 .any(|c| c.contains("permission") || c.contains("disk"))
+        );
+    }
+
+    #[test]
+    fn ft_2005_requires_a_fresh_writer_epoch() {
+        let def = get_error_code("FT-2005").expect("writer poison code");
+        assert_eq!(def.category, ErrorCategory::Storage);
+        assert!(def.title.contains("reopened"));
+        assert!(
+            def.recovery_steps
+                .iter()
+                .any(|step| step.description.contains("Reopen"))
+        );
+    }
+
+    #[test]
+    fn ft_2006_requires_a_fresh_migration_epoch() {
+        let def = get_error_code("FT-2006").expect("migration poison code");
+        assert_eq!(def.category, ErrorCategory::Storage);
+        assert!(def.title.contains("reopened"));
+        assert!(
+            def.recovery_steps
+                .iter()
+                .any(|step| step.description.contains("Reopen"))
         );
     }
 

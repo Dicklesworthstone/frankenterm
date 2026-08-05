@@ -602,6 +602,18 @@ pub enum StorageError {
     #[error("Database error: {0}")]
     Database(String),
 
+    /// The dedicated writer recovered from a transaction-control failure whose
+    /// commit/rollback state cannot be proven.  The connection must never be
+    /// reused after this error; callers may retry only after opening a fresh
+    /// storage handle and therefore a fresh backend epoch.
+    #[error("Storage writer backend epoch is poisoned; reopen storage before retrying")]
+    WriterBackendEpochPoisoned,
+
+    /// A schema-migration transaction could not prove rollback after failure.
+    /// The migration connection is terminal and must not be reused.
+    #[error("Storage migration connection epoch is poisoned; reopen storage before retrying")]
+    MigrationEpochPoisoned,
+
     #[error("Pane {pane_id} already has active reservation (id={existing_id})")]
     ReservationConflict { pane_id: u64, existing_id: i64 },
 
@@ -654,6 +666,20 @@ impl StorageError {
             )
             .command("Diagnostics", "ft doctor")
             .alternative("Ensure the workspace directory is writable."),
+            Self::WriterBackendEpochPoisoned => Remediation::new(
+                "The storage writer stopped after an indeterminate transaction outcome.",
+            )
+            .command("Diagnostics", "ft doctor")
+            .alternative(
+                "Reopen FrankenTerm storage before retrying; the stopped writer connection is not reusable.",
+            ),
+            Self::MigrationEpochPoisoned => Remediation::new(
+                "Storage migration stopped after an indeterminate transaction outcome.",
+            )
+            .command("Diagnostics", "ft doctor")
+            .alternative(
+                "Reopen FrankenTerm storage before retrying; the stopped migration connection is not reusable.",
+            ),
             Self::ReservationConflict {
                 pane_id,
                 existing_id,
@@ -896,6 +922,8 @@ mod tests {
                 retry_after_ms: 500,
             }),
             Error::Storage(StorageError::Database("db error".to_string())),
+            Error::Storage(StorageError::WriterBackendEpochPoisoned),
+            Error::Storage(StorageError::MigrationEpochPoisoned),
             Error::Storage(StorageError::ReservationConflict {
                 pane_id: 7,
                 existing_id: 11,

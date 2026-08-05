@@ -50,6 +50,8 @@ impl ErrorRenderer {
             },
             Error::Storage(e) => match e {
                 StorageError::Database(_) => "FT-2001",
+                StorageError::WriterBackendEpochPoisoned => "FT-2005",
+                StorageError::MigrationEpochPoisoned => "FT-2006",
                 StorageError::InvalidEventDeliveryLeaseBatch(_) => "FT-2051",
                 StorageError::ReservationConflict { .. } => "FT-2050",
                 StorageError::LeaseTokenConflict { .. } => "FT-2052",
@@ -565,6 +567,18 @@ mod tests {
         assert_eq!(
             ErrorRenderer::error_code(&Error::Storage(StorageError::Database("x".into()))),
             "FT-2001"
+        );
+        assert_eq!(
+            ErrorRenderer::error_code(&Error::Storage(
+                StorageError::WriterBackendEpochPoisoned,
+            )),
+            "FT-2005"
+        );
+        assert_eq!(
+            ErrorRenderer::error_code(&Error::Storage(
+                StorageError::MigrationEpochPoisoned,
+            )),
+            "FT-2006"
         );
         assert_eq!(
             ErrorRenderer::error_code(&Error::Storage(

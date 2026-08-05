@@ -8,7 +8,9 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use chrono::Utc;
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{
+    Connection, DropBehavior, OptionalExtension, Transaction, TransactionBehavior, params,
+};
 use serde::{Deserialize, Serialize};
 
 use super::{
@@ -1957,7 +1959,8 @@ fn record_migration(conn: &Connection, version: i32, description: &str) -> Resul
 ///
 /// - Fresh database (user_version = 0): Creates all tables via SCHEMA_SQL
 /// - Existing database (user_version < SCHEMA_VERSION): Applies pending migrations
-/// - Up-to-date database (user_version = SCHEMA_VERSION): No-op
+/// - Up-to-date database (user_version = SCHEMA_VERSION): Atomically validates
+///   and repairs the FrankenTerm metadata row when necessary
 ///
 /// # Errors
 ///
@@ -1981,9 +1984,11 @@ pub fn initialize_schema(conn: &Connection) -> Result<()> {
     }
 
     if current == SCHEMA_VERSION {
-        // Already up to date
-        ensure_ft_meta(conn, SCHEMA_VERSION)?;
-        return Ok(());
+        // Already up to date. Metadata repair can still write, so retain the
+        // same panic/rollback/epoch contract as a schema migration.
+        return run_owned_migration_transaction(conn, "schema metadata", |transaction| {
+            ensure_ft_meta(transaction, SCHEMA_VERSION)
+        });
     }
 
     // Both the fresh-DB case (current == 0 && needs_init: no `panes` table
@@ -2008,20 +2013,7 @@ pub fn initialize_schema(conn: &Connection) -> Result<()> {
     // BEGIN IMMEDIATE / COMMIT (ft-k542h, c06b230a follow-up) so a
     // crash mid-init never leaves half-applied state.
     if current == 0 {
-        run_v0_init_in_transaction(conn)?;
-        if needs_init {
-            // A genuinely fresh database has no historical postings to
-            // repair, so stamp the live FTS index version directly. Existing
-            // unversioned v0 databases deliberately retain migration 10's
-            // legacy marker and are rebuilt by the storage-open repair gate.
-            conn.execute(
-                "UPDATE fts_index_state
-                 SET index_version = ?1, updated_at = strftime('%s', 'now') * 1000
-                 WHERE id = 1",
-                params![i64::from(super::FTS_INDEX_VERSION)],
-            )
-            .map_err(|error| StorageError::Database(error.to_string()))?;
-        }
+        run_v0_init_in_transaction(conn, needs_init)?;
         return Ok(());
     }
     // `needs_init` is intentionally consulted only via the path above;
@@ -2032,9 +2024,9 @@ pub fn initialize_schema(conn: &Connection) -> Result<()> {
     // Apply pending migrations for existing databases (version > 0)
     run_migrations(conn, current)?;
 
-    ensure_ft_meta(conn, SCHEMA_VERSION)?;
-
-    Ok(())
+    run_owned_migration_transaction(conn, "schema metadata", |transaction| {
+        ensure_ft_meta(transaction, SCHEMA_VERSION)
+    })
 }
 
 pub(crate) fn table_has_column(conn: &Connection, table: &str, column: &str) -> Result<bool> {
@@ -2795,6 +2787,251 @@ pub(crate) fn split_schema_sql_pragmas() -> (String, String) {
     (preamble, body)
 }
 
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MigrationTransactionFault {
+    Begin,
+    MutationPanic,
+    Commit,
+    Rollback,
+    ClosureVerification,
+}
+
+#[cfg(test)]
+thread_local! {
+    static MIGRATION_TRANSACTION_FAULT: std::cell::Cell<i8> = const { std::cell::Cell::new(-1) };
+}
+
+#[cfg(test)]
+fn set_migration_transaction_fault_for_test(fault: Option<MigrationTransactionFault>) {
+    let value = match fault {
+        None => -1,
+        Some(MigrationTransactionFault::Begin) => 0,
+        Some(MigrationTransactionFault::MutationPanic) => 1,
+        Some(MigrationTransactionFault::Commit) => 2,
+        Some(MigrationTransactionFault::Rollback) => 3,
+        Some(MigrationTransactionFault::ClosureVerification) => 4,
+    };
+    MIGRATION_TRANSACTION_FAULT.with(|cell| cell.set(value));
+}
+
+#[cfg(test)]
+fn take_migration_transaction_fault(fault: MigrationTransactionFault) -> bool {
+    let expected = match fault {
+        MigrationTransactionFault::Begin => 0,
+        MigrationTransactionFault::MutationPanic => 1,
+        MigrationTransactionFault::Commit => 2,
+        MigrationTransactionFault::Rollback => 3,
+        MigrationTransactionFault::ClosureVerification => 4,
+    };
+    MIGRATION_TRANSACTION_FAULT.with(|cell| {
+        if cell.get() == expected {
+            cell.set(-1);
+            true
+        } else {
+            false
+        }
+    })
+}
+
+#[cfg(not(test))]
+const fn take_migration_begin_fault() -> bool {
+    false
+}
+
+#[cfg(test)]
+fn take_migration_begin_fault() -> bool {
+    take_migration_transaction_fault(MigrationTransactionFault::Begin)
+}
+
+#[cfg(not(test))]
+const fn take_migration_mutation_panic_fault() -> bool {
+    false
+}
+
+#[cfg(test)]
+fn take_migration_mutation_panic_fault() -> bool {
+    take_migration_transaction_fault(MigrationTransactionFault::MutationPanic)
+}
+
+#[cfg(not(test))]
+const fn take_migration_commit_fault() -> bool {
+    false
+}
+
+#[cfg(test)]
+fn take_migration_commit_fault() -> bool {
+    take_migration_transaction_fault(MigrationTransactionFault::Commit)
+}
+
+#[cfg(not(test))]
+const fn take_migration_rollback_fault() -> bool {
+    false
+}
+
+#[cfg(test)]
+fn take_migration_rollback_fault() -> bool {
+    take_migration_transaction_fault(MigrationTransactionFault::Rollback)
+}
+
+#[cfg(not(test))]
+const fn take_migration_closure_verification_fault() -> bool {
+    false
+}
+
+#[cfg(test)]
+fn take_migration_closure_verification_fault() -> bool {
+    take_migration_transaction_fault(MigrationTransactionFault::ClosureVerification)
+}
+
+fn migration_connection_is_query_only(conn: &Connection) -> Result<bool> {
+    match frankenterm_sigpipe::catch_recoverable(
+        frankenterm_sigpipe::RecoverablePanicSite::StorageWriter,
+        std::panic::AssertUnwindSafe(|| {
+            conn.query_row("PRAGMA query_only", [], |row| row.get::<_, i64>(0))
+        }),
+    ) {
+        Ok(Ok(enabled)) => Ok(enabled != 0),
+        Ok(Err(_)) | Err(_) => Err(StorageError::MigrationFailed(
+            "failed to verify migration connection write authority".to_string(),
+        )
+        .into()),
+    }
+}
+
+fn poison_migration_connection_epoch(conn: &Connection) -> crate::error::Error {
+    // query_only is connection-local and survives transaction closure. It is a
+    // second fail-closed fence in addition to the typed terminal error: even a
+    // caller that mistakenly retains this Connection cannot issue another
+    // schema or ordinary write. Reopening the database creates a fresh epoch.
+    let _ = frankenterm_sigpipe::catch_recoverable(
+        frankenterm_sigpipe::RecoverablePanicSite::StorageWriter,
+        std::panic::AssertUnwindSafe(|| conn.execute_batch("PRAGMA query_only = ON")),
+    );
+    StorageError::MigrationEpochPoisoned.into()
+}
+
+fn migration_transaction_closed(conn: &Connection) -> bool {
+    !take_migration_closure_verification_fault() && conn.is_autocommit()
+}
+
+fn rollback_migration_transaction(
+    mut transaction: Transaction<'_>,
+    primary: crate::error::Error,
+) -> Result<()> {
+    if take_migration_rollback_fault() {
+        // Deterministically model a rollback API failure without allowing the
+        // rusqlite Drop fallback to hide the open-transaction outcome.
+        transaction.set_drop_behavior(DropBehavior::Ignore);
+        return Err(poison_migration_connection_epoch(&transaction));
+    }
+
+    let rollback = frankenterm_sigpipe::catch_recoverable(
+        frankenterm_sigpipe::RecoverablePanicSite::StorageWriter,
+        std::panic::AssertUnwindSafe(|| transaction.execute_batch("ROLLBACK")),
+    );
+    if !matches!(rollback, Ok(Ok(()))) {
+        transaction.set_drop_behavior(DropBehavior::Ignore);
+        return Err(poison_migration_connection_epoch(&transaction));
+    }
+    if !migration_transaction_closed(&transaction) {
+        transaction.set_drop_behavior(DropBehavior::Ignore);
+        return Err(poison_migration_connection_epoch(&transaction));
+    }
+    Err(primary)
+}
+
+fn run_owned_migration_transaction(
+    conn: &Connection,
+    context: &'static str,
+    operation: impl FnOnce(&Transaction<'_>) -> Result<()>,
+) -> Result<()> {
+    if !conn.is_autocommit() || migration_connection_is_query_only(conn)? {
+        return Err(poison_migration_connection_epoch(conn));
+    }
+    if take_migration_begin_fault() {
+        return Err(StorageError::MigrationFailed(format!(
+            "{context}: failed to begin migration transaction"
+        ))
+        .into());
+    }
+
+    let begin = frankenterm_sigpipe::catch_recoverable(
+        frankenterm_sigpipe::RecoverablePanicSite::StorageWriter,
+        std::panic::AssertUnwindSafe(|| {
+            Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
+        }),
+    );
+    let mut transaction = match begin {
+        Ok(Ok(transaction)) => transaction,
+        Ok(Err(_)) | Err(_) => {
+            if conn.is_autocommit() {
+                return Err(StorageError::MigrationFailed(format!(
+                    "{context}: failed to begin migration transaction"
+                ))
+                .into());
+            }
+            return Err(poison_migration_connection_epoch(conn));
+        }
+    };
+
+    let mutation = frankenterm_sigpipe::catch_recoverable(
+        frankenterm_sigpipe::RecoverablePanicSite::StorageWriter,
+        std::panic::AssertUnwindSafe(|| {
+            let result = operation(&transaction);
+            assert!(
+                !take_migration_mutation_panic_fault(),
+                "synthetic migration mutation panic"
+            );
+            result
+        }),
+    );
+    match mutation {
+        Err(_panic) => rollback_migration_transaction(
+            transaction,
+            StorageError::MigrationFailed(format!(
+                "{context}: migration mutation panicked"
+            ))
+            .into(),
+        ),
+        Ok(Err(_error)) => rollback_migration_transaction(
+            transaction,
+            StorageError::MigrationFailed(format!(
+                "{context}: migration mutation failed"
+            ))
+            .into(),
+        ),
+        Ok(Ok(())) => {
+            let commit_failed = take_migration_commit_fault()
+                || !matches!(
+                    frankenterm_sigpipe::catch_recoverable(
+                        frankenterm_sigpipe::RecoverablePanicSite::StorageWriter,
+                        std::panic::AssertUnwindSafe(|| transaction.execute_batch("COMMIT")),
+                    ),
+                    Ok(Ok(()))
+                );
+            if commit_failed {
+                if transaction.is_autocommit() {
+                    transaction.set_drop_behavior(DropBehavior::Ignore);
+                    return Err(poison_migration_connection_epoch(&transaction));
+                }
+                return rollback_migration_transaction(
+                    transaction,
+                    StorageError::MigrationFailed(format!(
+                        "{context}: failed to commit migration transaction"
+                    ))
+                    .into(),
+                );
+            }
+            if !migration_transaction_closed(&transaction) {
+                transaction.set_drop_behavior(DropBehavior::Ignore);
+                return Err(poison_migration_connection_epoch(&transaction));
+            }
+            Ok(())
+        }
+    }
+}
+
 /// Atomically run the v0-existing-database init triple (ft-k542h):
 /// `repair_existing_v0_tables_before_schema_sql` → `SCHEMA_SQL` →
 /// `run_migrations(0)` → `ensure_ft_meta`, all inside one BEGIN IMMEDIATE /
@@ -2805,50 +3042,58 @@ pub(crate) fn split_schema_sql_pragmas() -> (String, String) {
 /// rejects `journal_mode` / `synchronous` changes inside a transaction.
 /// The PRAGMAs are connection-level settings and idempotent, so applying
 /// them up-front does not affect atomicity of the table/index work.
-fn run_v0_init_in_transaction(conn: &Connection) -> Result<()> {
+fn run_v0_init_in_transaction(conn: &Connection, stamp_fresh_fts_index: bool) -> Result<()> {
     let (pragma_preamble, schema_body) = split_schema_sql_pragmas();
 
     if !pragma_preamble.trim().is_empty() {
-        conn.execute_batch(&pragma_preamble).map_err(|e| {
-            StorageError::MigrationFailed(format!("Schema PRAGMA preamble failed: {e}"))
-        })?;
+        let applied = frankenterm_sigpipe::catch_recoverable(
+            frankenterm_sigpipe::RecoverablePanicSite::StorageWriter,
+            std::panic::AssertUnwindSafe(|| conn.execute_batch(&pragma_preamble)),
+        );
+        if !matches!(applied, Ok(Ok(()))) {
+            return Err(StorageError::MigrationFailed(
+                "v0 init: schema PRAGMA preamble failed".to_string(),
+            )
+            .into());
+        }
     }
 
-    conn.execute_batch("BEGIN IMMEDIATE").map_err(|e| {
-        StorageError::MigrationFailed(format!("v0 init: failed to begin transaction: {e}"))
-    })?;
-
-    let result: Result<()> = (|| {
-        repair_existing_v0_tables_before_schema_sql(conn)?;
+    run_owned_migration_transaction(conn, "v0 init", |transaction| {
+        repair_existing_v0_tables_before_schema_sql(transaction)?;
         #[cfg(test)]
         check_v0_init_fault(V0InitStep::RepairComplete)?;
 
-        conn.execute_batch(&schema_body)
+        transaction
+            .execute_batch(&schema_body)
             .map_err(|e| StorageError::MigrationFailed(format!("Schema init failed: {e}")))?;
         #[cfg(test)]
         check_v0_init_fault(V0InitStep::SchemaSqlApplied)?;
 
-        run_migrations(conn, 0)?;
+        run_migrations_in_existing_transaction(transaction, 0)?;
         #[cfg(test)]
         check_v0_init_fault(V0InitStep::MigrationsApplied)?;
 
-        ensure_ft_meta(conn, SCHEMA_VERSION)?;
+        ensure_ft_meta(transaction, SCHEMA_VERSION)?;
+        if stamp_fresh_fts_index {
+            // A genuinely fresh database has no historical postings to
+            // repair. Keep this authority stamp in the same transaction as
+            // schema creation so a failed update cannot expose a committed
+            // schema with an indeterminate index-version marker.
+            transaction
+                .execute(
+                    "UPDATE fts_index_state
+                     SET index_version = ?1, updated_at = strftime('%s', 'now') * 1000
+                     WHERE id = 1",
+                    params![i64::from(super::FTS_INDEX_VERSION)],
+                )
+                .map_err(|_| {
+                    StorageError::MigrationFailed(
+                        "v0 init: failed to stamp fresh FTS index authority".to_string(),
+                    )
+                })?;
+        }
         Ok(())
-    })();
-
-    match result {
-        Ok(()) => {
-            conn.execute_batch("COMMIT").map_err(|e| {
-                StorageError::MigrationFailed(format!("v0 init: failed to commit: {e}"))
-            })?;
-            Ok(())
-        }
-        Err(err) => {
-            // Best-effort rollback; the original error is what the caller cares about.
-            let _ = conn.execute_batch("ROLLBACK");
-            Err(err)
-        }
-    }
+    })
 }
 
 fn repair_existing_v0_tables_before_schema_sql(conn: &Connection) -> Result<()> {
@@ -2976,30 +3221,12 @@ pub(crate) fn build_migration_plan(from_version: i32, to_version: i32) -> Result
     })
 }
 
-pub(crate) fn apply_migration_step(conn: &Connection, step: &MigrationStep) -> Result<()> {
-    let Some(migration) = migration_for_version(step.migration_version) else {
-        return Err(StorageError::MigrationFailed(format!(
-            "Unknown migration version {}",
-            step.migration_version
-        ))
-        .into());
-    };
-
-    // ft-k542h: when an outer caller (e.g., `run_v0_init_in_transaction`) has
-    // already opened a transaction, skip the per-step BEGIN/COMMIT/ROLLBACK.
-    // SQLite rejects nested BEGIN with an error, and the outer transaction's
-    // ROLLBACK on failure already provides atomicity for the wrapped scope.
-    let owns_tx = conn.is_autocommit();
-    if owns_tx {
-        conn.execute_batch("BEGIN IMMEDIATE").map_err(|e| {
-            StorageError::MigrationFailed(format!(
-                "Failed to start migration transaction for v{}: {e}",
-                migration.version
-            ))
-        })?;
-    }
-
-    let result: Result<()> = match step.direction {
+fn apply_migration_mutation(
+    conn: &Connection,
+    step: &MigrationStep,
+    migration: &Migration,
+) -> Result<()> {
+    match step.direction {
         MigrationDirection::Up => {
             let mut apply_raw_up_sql = true;
             match migration.version {
@@ -3093,29 +3320,21 @@ pub(crate) fn apply_migration_step(conn: &Connection, step: &MigrationStep) -> R
             )?;
             Ok(())
         }
+    }
+}
+
+pub(crate) fn apply_migration_step(conn: &Connection, step: &MigrationStep) -> Result<()> {
+    let Some(migration) = migration_for_version(step.migration_version) else {
+        return Err(StorageError::MigrationFailed(format!(
+            "Unknown migration version {}",
+            step.migration_version
+        ))
+        .into());
     };
 
-    match (result, owns_tx) {
-        (Ok(()), true) => {
-            conn.execute_batch("COMMIT").map_err(|e| {
-                StorageError::MigrationFailed(format!(
-                    "Failed to commit migration transaction for v{}: {e}",
-                    migration.version
-                ))
-            })?;
-            Ok(())
-        }
-        (Ok(()), false) => Ok(()),
-        (Err(err), true) => {
-            let _ = conn.execute_batch("ROLLBACK");
-            Err(err)
-        }
-        (Err(err), false) => {
-            // Outer caller owns the transaction and is responsible for the
-            // ROLLBACK; just surface the error.
-            Err(err)
-        }
-    }
+    run_owned_migration_transaction(conn, "migration step", |transaction| {
+        apply_migration_mutation(transaction, step, migration)
+    })
 }
 
 pub(crate) fn apply_migration_plan(conn: &Connection, plan: &MigrationPlan) -> Result<()> {
@@ -3132,6 +3351,29 @@ pub(crate) fn apply_migration_plan(conn: &Connection, plan: &MigrationPlan) -> R
     Ok(())
 }
 
+fn apply_migration_plan_in_existing_transaction(
+    conn: &Connection,
+    plan: &MigrationPlan,
+) -> Result<()> {
+    if conn.is_autocommit() {
+        return Err(StorageError::MigrationFailed(
+            "outer migration transaction is not active".to_string(),
+        )
+        .into());
+    }
+    for step in &plan.steps {
+        let Some(migration) = migration_for_version(step.migration_version) else {
+            return Err(StorageError::MigrationFailed(format!(
+                "Unknown migration version {}",
+                step.migration_version
+            ))
+            .into());
+        };
+        apply_migration_mutation(conn, step, migration)?;
+    }
+    Ok(())
+}
+
 /// Apply all pending migrations from the current version to SCHEMA_VERSION.
 ///
 /// Each migration is applied in order, and the user_version is updated after
@@ -3141,6 +3383,11 @@ pub(crate) fn apply_migration_plan(conn: &Connection, plan: &MigrationPlan) -> R
 fn run_migrations(conn: &Connection, from_version: i32) -> Result<()> {
     let plan = build_migration_plan(from_version, SCHEMA_VERSION)?;
     apply_migration_plan(conn, &plan)
+}
+
+fn run_migrations_in_existing_transaction(conn: &Connection, from_version: i32) -> Result<()> {
+    let plan = build_migration_plan(from_version, SCHEMA_VERSION)?;
+    apply_migration_plan_in_existing_transaction(conn, &plan)
 }
 
 /// Get the current schema version from the schema_version audit table.
@@ -3478,12 +3725,178 @@ pub fn migrate_database_to_version(db_path: &Path, target_version: i32) -> Resul
 
     let plan = build_migration_plan(current, target_version)?;
     apply_migration_plan(&conn, &plan)?;
+    run_owned_migration_transaction(&conn, "schema metadata", |transaction| {
+        ensure_ft_meta(transaction, target_version)
+    })?;
     Ok(plan)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn is_migration_epoch_poisoned(error: &crate::error::Error) -> bool {
+        matches!(
+            error,
+            crate::error::Error::Storage(StorageError::MigrationEpochPoisoned)
+        )
+    }
+
+    fn execute_migration_test_sql(conn: &Connection, sql: &str) -> Result<()> {
+        conn.execute_batch(sql).map_err(|_| {
+            StorageError::MigrationFailed("test migration SQL failed".to_string()).into()
+        })
+    }
+
+    #[test]
+    fn migration_begin_failure_does_not_mutate_or_poison_connection() {
+        let conn = Connection::open_in_memory().expect("in-memory database");
+        set_migration_transaction_fault_for_test(Some(MigrationTransactionFault::Begin));
+        let error = run_owned_migration_transaction(&conn, "migration step", |transaction| {
+            execute_migration_test_sql(transaction, "CREATE TABLE begin_probe(id INTEGER)")?;
+            Ok(())
+        })
+        .expect_err("injected begin failure must be visible");
+
+        assert!(error.to_string().contains("failed to begin"));
+        assert!(conn.is_autocommit());
+        assert!(!migration_connection_is_query_only(&conn).unwrap());
+        assert!(!table_exists(&conn, "begin_probe").unwrap());
+
+        run_owned_migration_transaction(&conn, "migration step", |transaction| {
+            execute_migration_test_sql(transaction, "CREATE TABLE begin_probe(id INTEGER)")?;
+            Ok(())
+        })
+        .expect("one-shot begin fault must permit a clean retry");
+        assert!(table_exists(&conn, "begin_probe").unwrap());
+    }
+
+    #[cfg(panic = "unwind")]
+    #[test]
+    fn migration_mutation_panic_rolls_back_schema_and_version_before_retry() {
+        let conn = Connection::open_in_memory().expect("in-memory database");
+        set_migration_transaction_fault_for_test(Some(
+            MigrationTransactionFault::MutationPanic,
+        ));
+        let error = run_owned_migration_transaction(&conn, "migration step", |transaction| {
+            execute_migration_test_sql(transaction, "CREATE TABLE panic_probe(id INTEGER)")?;
+            set_user_version(transaction, 17)?;
+            Ok(())
+        })
+        .expect_err("injected mutation panic must be contained");
+
+        assert!(error.to_string().contains("migration mutation panicked"));
+        assert!(!error.to_string().contains("synthetic migration"));
+        assert!(conn.is_autocommit());
+        assert!(!migration_connection_is_query_only(&conn).unwrap());
+        assert!(!table_exists(&conn, "panic_probe").unwrap());
+        assert_eq!(get_user_version(&conn).unwrap(), 0);
+
+        run_owned_migration_transaction(&conn, "migration step", |transaction| {
+            execute_migration_test_sql(transaction, "CREATE TABLE panic_probe(id INTEGER)")?;
+            set_user_version(transaction, 17)?;
+            Ok(())
+        })
+        .expect("connection must remain reusable after a proven rollback");
+        assert!(table_exists(&conn, "panic_probe").unwrap());
+        assert_eq!(get_user_version(&conn).unwrap(), 17);
+    }
+
+    #[test]
+    fn migration_mutation_error_is_finite_after_proven_rollback() {
+        let conn = Connection::open_in_memory().expect("in-memory database");
+        let error = run_owned_migration_transaction(&conn, "migration step", |transaction| {
+            execute_migration_test_sql(transaction, "CREATE TABLE error_probe(id INTEGER)")?;
+            Err(StorageError::MigrationFailed("synthetic mutation failure".to_string()).into())
+        })
+        .expect_err("mutation error must be visible");
+
+        assert!(error.to_string().contains("migration mutation failed"));
+        assert!(!error.to_string().contains("synthetic mutation failure"));
+        assert!(conn.is_autocommit());
+        assert!(!migration_connection_is_query_only(&conn).unwrap());
+        assert!(!table_exists(&conn, "error_probe").unwrap());
+    }
+
+    #[test]
+    fn migration_commit_failure_rolls_back_before_connection_reuse() {
+        let conn = Connection::open_in_memory().expect("in-memory database");
+        set_migration_transaction_fault_for_test(Some(MigrationTransactionFault::Commit));
+        let error = run_owned_migration_transaction(&conn, "migration step", |transaction| {
+            execute_migration_test_sql(transaction, "CREATE TABLE commit_probe(id INTEGER)")?;
+            set_user_version(transaction, 23)?;
+            Ok(())
+        })
+        .expect_err("injected commit failure must be visible");
+
+        assert!(error.to_string().contains("failed to commit"));
+        assert!(conn.is_autocommit());
+        assert!(!migration_connection_is_query_only(&conn).unwrap());
+        assert!(!table_exists(&conn, "commit_probe").unwrap());
+        assert_eq!(get_user_version(&conn).unwrap(), 0);
+    }
+
+    #[test]
+    fn migration_rollback_failure_poison_fences_same_connection_epoch() {
+        let conn = Connection::open_in_memory().expect("in-memory database");
+        set_migration_transaction_fault_for_test(Some(MigrationTransactionFault::Rollback));
+        let error = run_owned_migration_transaction(&conn, "migration step", |transaction| {
+            execute_migration_test_sql(transaction, "CREATE TABLE rollback_probe(id INTEGER)")?;
+            Err(StorageError::MigrationFailed("force rollback".to_string()).into())
+        })
+        .expect_err("rollback failure must poison the epoch");
+
+        assert!(is_migration_epoch_poisoned(&error));
+        assert!(!conn.is_autocommit());
+        assert!(migration_connection_is_query_only(&conn).unwrap());
+        assert!(
+            conn.execute_batch("CREATE TABLE forbidden_after_poison(id INTEGER)")
+                .is_err(),
+            "query_only must fence ordinary writes in the poisoned epoch"
+        );
+        let later = run_owned_migration_transaction(&conn, "migration step", |_| Ok(()))
+            .expect_err("later migration must not enter the poisoned epoch");
+        assert!(is_migration_epoch_poisoned(&later));
+
+        // Test cleanup only: production callers retire the Connection instead.
+        conn.execute_batch("ROLLBACK").expect("cleanup open test transaction");
+        conn.execute_batch("PRAGMA query_only = OFF")
+            .expect("cleanup test query_only fence");
+    }
+
+    #[test]
+    fn migration_unverifiable_closure_requires_fresh_connection_epoch() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("migration-epoch.sqlite3");
+        let conn = Connection::open(&path).expect("open test database");
+        set_migration_transaction_fault_for_test(Some(
+            MigrationTransactionFault::ClosureVerification,
+        ));
+        let error = run_owned_migration_transaction(&conn, "migration step", |transaction| {
+            execute_migration_test_sql(transaction, "CREATE TABLE closure_probe(id INTEGER)")?;
+            Err(StorageError::MigrationFailed("force rollback".to_string()).into())
+        })
+        .expect_err("unverifiable closure must poison the epoch");
+
+        assert!(is_migration_epoch_poisoned(&error));
+        assert!(conn.is_autocommit());
+        assert!(migration_connection_is_query_only(&conn).unwrap());
+        assert!(!table_exists(&conn, "closure_probe").unwrap());
+        assert!(
+            conn.execute_batch("CREATE TABLE forbidden_after_closure(id INTEGER)")
+                .is_err()
+        );
+        drop(conn);
+
+        let reopened = Connection::open(&path).expect("reopen fresh connection epoch");
+        assert!(!migration_connection_is_query_only(&reopened).unwrap());
+        run_owned_migration_transaction(&reopened, "migration step", |transaction| {
+            execute_migration_test_sql(transaction, "CREATE TABLE closure_probe(id INTEGER)")?;
+            Ok(())
+        })
+        .expect("fresh connection epoch must permit retry");
+        assert!(table_exists(&reopened, "closure_probe").unwrap());
+    }
 
     #[test]
     fn pending_migrations_reports_all_versions_from_zero() {
