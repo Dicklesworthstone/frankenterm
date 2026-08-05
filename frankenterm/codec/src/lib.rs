@@ -2321,12 +2321,16 @@ macro_rules! pdu {
                     Pdu::Invalid{..} => bail!("attempted to serialize Pdu::Invalid"),
                     $(
                         Pdu::$name(s) => {
-                            let serialized = serialize_pdu_payload(
-                                s,
-                                &<$name as PduWireIdent>::WIRE_SPEC,
-                                serial,
-                                compression_mode,
-                            )?;
+                            let serialized = {
+                                let _scope =
+                                    ValidatedOrderedSnapshotSerializationScope::for_pdu(self)?;
+                                serialize_pdu_payload(
+                                    s,
+                                    &<$name as PduWireIdent>::WIRE_SPEC,
+                                    serial,
+                                    compression_mode,
+                                )?
+                            };
                             let encoded_size = encode_raw(
                                 $vers,
                                 serial,
@@ -2380,16 +2384,33 @@ macro_rules! pdu {
                 record_metrics: bool,
             ) -> Result<Vec<u8>, Error> {
                 self.validate_before_encode()?;
+                self.encode_frame_with_mode_after_validation(
+                    serial,
+                    compression_mode,
+                    record_metrics,
+                )
+            }
+
+            fn encode_frame_with_mode_after_validation(
+                &self,
+                serial: u64,
+                compression_mode: CompressionMode,
+                record_metrics: bool,
+            ) -> Result<Vec<u8>, Error> {
                 match self {
                     Pdu::Invalid{..} => bail!("attempted to serialize Pdu::Invalid"),
                     $(
                         Pdu::$name(s) => {
-                            let serialized = serialize_pdu_payload(
-                                s,
-                                &<$name as PduWireIdent>::WIRE_SPEC,
-                                serial,
-                                compression_mode,
-                            )?;
+                            let serialized = {
+                                let _scope =
+                                    ValidatedOrderedSnapshotSerializationScope::for_pdu(self)?;
+                                serialize_pdu_payload(
+                                    s,
+                                    &<$name as PduWireIdent>::WIRE_SPEC,
+                                    serial,
+                                    compression_mode,
+                                )?
+                            };
                             let frame = prepend_frame_header_to_owned_payload(
                                 $vers,
                                 serial,
@@ -2430,12 +2451,16 @@ macro_rules! pdu {
                     Pdu::Invalid{..} => bail!("attempted to measure Pdu::Invalid"),
                     $(
                         Pdu::$name(s) => {
-                            let serialized = serialize_pdu_payload(
-                                s,
-                                &<$name as PduWireIdent>::WIRE_SPEC,
-                                serial,
-                                compression_mode,
-                            )?;
+                            let serialized = {
+                                let _scope =
+                                    ValidatedOrderedSnapshotSerializationScope::for_pdu(self)?;
+                                serialize_pdu_payload(
+                                    s,
+                                    &<$name as PduWireIdent>::WIRE_SPEC,
+                                    serial,
+                                    compression_mode,
+                                )?
+                            };
                             encoded_frame_len(
                                 $vers,
                                 serial,
@@ -2462,12 +2487,19 @@ macro_rules! pdu {
                     Pdu::Invalid{..} => bail!("attempted to serialize Pdu::Invalid"),
                     $(
                         Pdu::$name(s) => {
-                            let serialized = serialize_pdu_payload(
-                                s,
-                                &<$name as PduWireIdent>::WIRE_SPEC,
-                                serial,
-                                compression_mode,
-                            )?;
+                            // Keep the thread-local proof scope synchronous: an
+                            // async writer may move this future to another
+                            // executor thread after the payload is owned.
+                            let serialized = {
+                                let _scope =
+                                    ValidatedOrderedSnapshotSerializationScope::for_pdu(self)?;
+                                serialize_pdu_payload(
+                                    s,
+                                    &<$name as PduWireIdent>::WIRE_SPEC,
+                                    serial,
+                                    compression_mode,
+                                )?
+                            };
                             let encoded_size = encode_raw_async(
                                 $vers,
                                 serial,
@@ -2960,9 +2992,7 @@ impl Pdu {
     fn validate_before_encode(&self) -> Result<(), Error> {
         match self {
             Self::ListPanesOrderedV1(value) => value.validate()?,
-            Self::ListPanesOrderedV1Response(value) => {
-                value.validate_around_bounded_snapshot_section()?
-            }
+            Self::ListPanesOrderedV1Response(value) => value.validate()?,
             Self::ReorderWindowTabsV1(value) => value.validate()?,
             Self::ReorderWindowTabsV1Response(value) => value.validate()?,
             Self::WindowOrderEventV1(value) => value.validate()?,
@@ -3647,7 +3677,7 @@ fn deserialize_list_panes_ordered_v1_response(
         "ListPanesOrderedV1Response",
         MAX_LIST_PANES_ORDERED_V1_RESPONSE_DECOMPRESSED_BYTES,
     )?;
-    response.validate_around_bounded_snapshot_section()?;
+    response.validate_after_bounded_snapshot_deserialization()?;
     Ok(response)
 }
 
@@ -4218,6 +4248,59 @@ pub const MAX_REORDER_WINDOW_TABS_DECOMPRESSED_BYTES: usize = 512 * 1024;
 pub const MAX_REORDER_WINDOW_TABS_ZSTD_ENCODED_BYTES: usize =
     MAX_REORDER_WINDOW_TABS_DECOMPRESSED_BYTES;
 
+/// Debug-build counters for deterministic validation-complexity tests.
+///
+/// Thread-local storage keeps parallel tests independent. Release builds carry
+/// neither these counters nor increments on the interactive PDU 87 path.
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct OrderedSnapshotValidationPasses {
+    pub pane_arena: usize,
+    pub ordered_windows: usize,
+}
+
+#[cfg(debug_assertions)]
+std::thread_local! {
+    static DEBUG_ORDERED_SNAPSHOT_VALIDATION_PASSES:
+        std::cell::Cell<OrderedSnapshotValidationPasses> =
+            const { std::cell::Cell::new(OrderedSnapshotValidationPasses {
+                pane_arena: 0,
+                ordered_windows: 0,
+            }) };
+}
+
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn debug_reset_ordered_snapshot_validation_passes() {
+    DEBUG_ORDERED_SNAPSHOT_VALIDATION_PASSES.set(OrderedSnapshotValidationPasses::default());
+}
+
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+#[must_use]
+pub fn debug_ordered_snapshot_validation_passes() -> OrderedSnapshotValidationPasses {
+    DEBUG_ORDERED_SNAPSHOT_VALIDATION_PASSES.get()
+}
+
+#[cfg(debug_assertions)]
+fn debug_record_ordered_pane_arena_validation_pass() {
+    let passes = DEBUG_ORDERED_SNAPSHOT_VALIDATION_PASSES.get();
+    DEBUG_ORDERED_SNAPSHOT_VALIDATION_PASSES.set(OrderedSnapshotValidationPasses {
+        pane_arena: passes.pane_arena.saturating_add(1),
+        ..passes
+    });
+}
+
+#[cfg(debug_assertions)]
+fn debug_record_ordered_window_validation_pass() {
+    let passes = DEBUG_ORDERED_SNAPSHOT_VALIDATION_PASSES.get();
+    DEBUG_ORDERED_SNAPSHOT_VALIDATION_PASSES.set(OrderedSnapshotValidationPasses {
+        ordered_windows: passes.ordered_windows.saturating_add(1),
+        ..passes
+    });
+}
+
 /// A single committed transition can freeze one affected window or both sides
 /// of one cross-window move. Publishing separate same-revision events would be
 /// ambiguous to revision-keyed consumers.
@@ -4389,12 +4472,16 @@ pub struct OrderedPaneSnapshotV1 {
 }
 
 impl OrderedPaneSnapshotV1 {
-    fn validate_envelope_and_panes(&self) -> Result<(), OrderedWindowProtocolError> {
+    fn validate_envelope(&self) -> Result<(), OrderedWindowProtocolError> {
         validate_nonzero_identity(
             "session_incarnation",
             self.session_incarnation.as_bytes(),
         )?;
-        validate_topology_revision(self.topology_revision)?;
+        validate_topology_revision(self.topology_revision)
+    }
+
+    fn validate_envelope_and_panes(&self) -> Result<(), OrderedWindowProtocolError> {
+        self.validate_envelope()?;
         validate_ordered_pane_arena(&self.panes)
     }
 
@@ -4495,19 +4582,17 @@ pub struct ListPanesOrderedV1Response {
 }
 
 impl ListPanesOrderedV1Response {
-    fn validate_around_bounded_snapshot_section(&self) -> Result<(), OrderedWindowProtocolError> {
+    /// Complete the outer PDU checks after the custom bounded field decoders
+    /// have already validated the exact pane arena and ordered-window section.
+    fn validate_after_bounded_snapshot_deserialization(
+        &self,
+    ) -> Result<(), OrderedWindowProtocolError> {
         validate_protocol_version(self.protocol_version)?;
         validate_nonzero_identity("domain_binding_id", self.domain_binding_id.as_bytes())?;
         self.negotiated.validate()?;
         validate_nonzero_identity("stream_id", self.stream_id.as_bytes())?;
         match &self.outcome {
-            ListPanesOrderedV1Outcome::Snapshot(snapshot) => {
-                // The custom field decoder/serializer already enforced both
-                // ordered-window structure and its exact byte ceiling. Avoid
-                // a second O(q) scan plus canonical re-serialization on the
-                // interactive bootstrap path.
-                snapshot.validate_envelope_and_panes()?;
-            }
+            ListPanesOrderedV1Outcome::Snapshot(snapshot) => snapshot.validate_envelope()?,
             other => other.validate()?,
         }
         if matches!(&self.outcome, ListPanesOrderedV1Outcome::Snapshot(_)) {
@@ -4579,6 +4664,125 @@ impl ListPanesOrderedV1Response {
         }
         Ok(())
     }
+
+    /// Consume and bind this response to the exact request that authorized it.
+    ///
+    /// The returned owner has no public constructor and cannot be cloned or
+    /// separated from the value it proves. Its encoder therefore reuses this
+    /// completed validation instead of rescanning the potentially q-sized pane
+    /// arena and ordered-window graph. Borrowed validation and every ordinary
+    /// [`Pdu`] encoding entry point remain independently fail-closed.
+    pub fn validate_for_request_owned(
+        self,
+        request: &ListPanesOrderedV1,
+    ) -> Result<ValidatedListPanesOrderedV1Response, OrderedWindowProtocolError> {
+        self.validate_for_request(request)?;
+        Ok(ValidatedListPanesOrderedV1Response { response: self })
+    }
+}
+
+/// Opaque ownership proof for one request-correlated PDU 87 response.
+///
+/// Only [`ListPanesOrderedV1Response::validate_for_request_owned`] can create
+/// this type. Keeping the validated value private prevents callers from
+/// pairing a proof with a different response after validation.
+#[must_use = "a validated ordered-pane response should be encoded or inspected"]
+#[derive(Debug)]
+pub struct ValidatedListPanesOrderedV1Response {
+    response: ListPanesOrderedV1Response,
+}
+
+impl ValidatedListPanesOrderedV1Response {
+    /// Borrow the exact response retained by this validation proof.
+    #[must_use]
+    pub const fn as_response(&self) -> &ListPanesOrderedV1Response {
+        &self.response
+    }
+
+    /// Encode the request-correlated response without repeating structural
+    /// validation of the exact owned pane arena or ordered-window graph.
+    ///
+    /// This is deliberately narrower than the public [`Pdu`] encoders: it
+    /// always emits one ordinary auto-compressed PDU 87 frame and consumes the
+    /// proof owner. Untrusted values must use the public validation/encoding
+    /// entry points or first acquire this proof from the exact PDU 86 request.
+    pub fn encode_frame(self, serial: u64) -> Result<Vec<u8>, Error> {
+        Pdu::ListPanesOrderedV1Response(self.response)
+            .encode_frame_with_mode_after_validation(serial, CompressionMode::Auto, true)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ValidatedOrderedSnapshotSerializationTarget {
+    panes: *const PaneArena,
+    windows: *const OrderedWindowStateV1,
+    windows_len: usize,
+}
+
+std::thread_local! {
+    /// Exact-object capability active only during the synchronous serde pass
+    /// of an already validated PDU 87. Raw pointers are compared but never
+    /// dereferenced; the borrowed PDU outlives the scope that installs them.
+    static VALIDATED_ORDERED_SNAPSHOT_SERIALIZATION:
+        std::cell::Cell<Option<ValidatedOrderedSnapshotSerializationTarget>> =
+            const { std::cell::Cell::new(None) };
+}
+
+/// Synchronous, thread-affine capability for eliding field-level validation
+/// of one exact snapshot. It never crosses an async write await point.
+struct ValidatedOrderedSnapshotSerializationScope;
+
+impl ValidatedOrderedSnapshotSerializationScope {
+    fn for_pdu(pdu: &Pdu) -> Result<Option<Self>, Error> {
+        let Pdu::ListPanesOrderedV1Response(ListPanesOrderedV1Response {
+            outcome: ListPanesOrderedV1Outcome::Snapshot(snapshot),
+            ..
+        }) = pdu
+        else {
+            return Ok(None);
+        };
+        let target = ValidatedOrderedSnapshotSerializationTarget {
+            panes: std::ptr::from_ref(&snapshot.panes),
+            windows: snapshot.ordered_windows.as_ptr(),
+            windows_len: snapshot.ordered_windows.len(),
+        };
+        VALIDATED_ORDERED_SNAPSHOT_SERIALIZATION.with(|active| {
+            if let Some(previous) = active.replace(Some(target)) {
+                active.set(Some(previous));
+                bail!("nested validated ordered-snapshot serialization is not supported");
+            }
+            Ok(())
+        })?;
+        Ok(Some(Self))
+    }
+}
+
+impl Drop for ValidatedOrderedSnapshotSerializationScope {
+    fn drop(&mut self) {
+        VALIDATED_ORDERED_SNAPSHOT_SERIALIZATION.with(|active| {
+            debug_assert!(
+                active.replace(None).is_some(),
+                "validated ordered-snapshot serialization scope lost its exact-object target"
+            );
+        });
+    }
+}
+
+fn ordered_pane_arena_has_serialization_proof(panes: &PaneArena) -> bool {
+    VALIDATED_ORDERED_SNAPSHOT_SERIALIZATION.with(|active| {
+        active
+            .get()
+            .is_some_and(|target| std::ptr::eq(target.panes, panes))
+    })
+}
+
+fn ordered_windows_have_serialization_proof(windows: &[OrderedWindowStateV1]) -> bool {
+    VALIDATED_ORDERED_SNAPSHOT_SERIALIZATION.with(|active| {
+        active.get().is_some_and(|target| {
+            target.windows_len == windows.len()
+                && std::ptr::eq(target.windows, windows.as_ptr())
+        })
+    })
 }
 
 /// One exact, bounded, idempotent pure-window reorder compare-and-set.
@@ -5014,6 +5218,9 @@ fn validate_ordered_windows_structure(
     windows: &[OrderedWindowStateV1],
     require_nonempty: bool,
 ) -> Result<(), OrderedWindowProtocolError> {
+    #[cfg(debug_assertions)]
+    debug_record_ordered_window_validation_pass();
+
     if require_nonempty && windows.is_empty() {
         return Err(OrderedWindowProtocolError::EmptyWindowEvent);
     }
@@ -5285,7 +5492,9 @@ fn serialize_ordered_panes<S>(
 where
     S: serde::Serializer,
 {
-    validate_ordered_pane_arena(panes).map_err(serde::ser::Error::custom)?;
+    if !ordered_pane_arena_has_serialization_proof(panes) {
+        validate_ordered_pane_arena(panes).map_err(serde::ser::Error::custom)?;
+    }
     PaneArenaWireRef {
         trees: PaneArenaTreesWire(panes.trees()),
         nodes: PaneArenaNodesWire(panes.nodes()),
@@ -5774,6 +5983,9 @@ struct OrderedPanesFlatWireOwned {
 pub fn validate_ordered_pane_arena(
     panes: &PaneArena,
 ) -> Result<(), OrderedWindowProtocolError> {
+    #[cfg(debug_assertions)]
+    debug_record_ordered_pane_arena_validation_pass();
+
     let trees = panes.trees();
     let nodes = panes.nodes();
     let window_titles = panes.window_titles();
@@ -6232,7 +6444,9 @@ fn serialize_ordered_window_section<S>(
 where
     S: serde::Serializer,
 {
-    validate_ordered_windows_structure(values, false).map_err(serde::ser::Error::custom)?;
+    if !ordered_windows_have_serialization_proof(values) {
+        validate_ordered_windows_structure(values, false).map_err(serde::ser::Error::custom)?;
+    }
 
     let mut section = BoundedSerializeBuffer::new(MAX_ORDERED_WINDOW_SECTION_BYTES);
     let serialize_result = {
@@ -14923,6 +15137,109 @@ mod test {
                 "the PDU 87 total-body ceiling must not spread to ident {ident}",
             );
         }
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn pdu87_validated_owner_and_public_encoder_each_scan_snapshot_once() {
+        let mut samples = sample_ordered_window_pdus();
+        let (_, Pdu::ListPanesOrderedV1(request)) = samples.remove(0) else {
+            panic!("first ordered-window sample must be PDU 86");
+        };
+        let (_, Pdu::ListPanesOrderedV1Response(response)) = samples.remove(0) else {
+            panic!("second ordered-window sample must be PDU 87");
+        };
+
+        debug_reset_ordered_snapshot_validation_passes();
+        let public_frame = Pdu::ListPanesOrderedV1Response(response.clone())
+            .encode_frame(0x871)
+            .expect("ordinary public PDU 87 encoding must remain safe");
+        assert_eq!(
+            debug_ordered_snapshot_validation_passes(),
+            OrderedSnapshotValidationPasses {
+                pane_arena: 1,
+                ordered_windows: 1,
+            },
+            "public pre-encode validation must authorize its exact field serialization",
+        );
+
+        debug_reset_ordered_snapshot_validation_passes();
+        let validated = response
+            .validate_for_request_owned(&request)
+            .expect("sample PDU 87 must bind to its exact PDU 86");
+        assert_eq!(
+            debug_ordered_snapshot_validation_passes(),
+            OrderedSnapshotValidationPasses {
+                pane_arena: 1,
+                ordered_windows: 1,
+            },
+            "request binding must perform the sole structural validation pass",
+        );
+        let validated_frame = validated
+            .encode_frame(0x871)
+            .expect("validated PDU 87 owner must encode");
+        assert_eq!(
+            debug_ordered_snapshot_validation_passes(),
+            OrderedSnapshotValidationPasses {
+                pane_arena: 1,
+                ordered_windows: 1,
+            },
+            "validated-owner encoding must not rescan the arena or window graph",
+        );
+        assert_eq!(validated_frame, public_frame);
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn pdu87_validated_owner_cannot_be_acquired_for_malformed_arena() {
+        let mut samples = sample_ordered_window_pdus();
+        let (_, Pdu::ListPanesOrderedV1(request)) = samples.remove(0) else {
+            panic!("first ordered-window sample must be PDU 86");
+        };
+        let (_, Pdu::ListPanesOrderedV1Response(mut malformed)) = samples.remove(0) else {
+            panic!("second ordered-window sample must be PDU 87");
+        };
+        let ListPanesOrderedV1Outcome::Snapshot(snapshot) = &mut malformed.outcome else {
+            panic!("sample PDU 87 must contain a snapshot");
+        };
+        let (trees, mut nodes, window_titles) = snapshot.panes.clone().into_parts();
+        nodes.push(PaneArenaNode::Empty);
+        snapshot.panes = PaneArena::from_unvalidated_parts(trees, nodes, window_titles);
+
+        debug_reset_ordered_snapshot_validation_passes();
+        let error = malformed
+            .clone()
+            .validate_for_request_owned(&request)
+            .expect_err("malformed arena must not acquire an encoding proof");
+        assert!(matches!(
+            error,
+            OrderedWindowProtocolError::PaneArenaCardinalityMismatch { .. }
+        ));
+        assert_eq!(
+            debug_ordered_snapshot_validation_passes(),
+            OrderedSnapshotValidationPasses {
+                pane_arena: 1,
+                ordered_windows: 0,
+            },
+        );
+
+        debug_reset_ordered_snapshot_validation_passes();
+        let error = Pdu::ListPanesOrderedV1Response(malformed)
+            .encode_frame(0x872)
+            .expect_err("ordinary public encoding must also reject the malformed arena");
+        assert!(error
+            .downcast_ref::<OrderedWindowProtocolError>()
+            .is_some_and(|error| matches!(
+                error,
+                OrderedWindowProtocolError::PaneArenaCardinalityMismatch { .. }
+            )));
+        assert_eq!(
+            debug_ordered_snapshot_validation_passes(),
+            OrderedSnapshotValidationPasses {
+                pane_arena: 1,
+                ordered_windows: 0,
+            },
+        );
     }
 
     #[test]

@@ -170,6 +170,18 @@ impl EncodedPduAuthority {
         }
     }
 
+    fn capture_wire(
+        wire_spec: &'static codec::PduWireSpec,
+        serial: u64,
+        emission: ServerEmissionAuthority,
+    ) -> Self {
+        Self {
+            wire_spec: Some(wire_spec),
+            serial,
+            emission,
+        }
+    }
+
     fn validate(self, terminal: &DispatchTerminal) -> anyhow::Result<()> {
         validate_server_wire_emission_authority(
             self.wire_spec,
@@ -1198,25 +1210,18 @@ struct AuthorizedOrderedSnapshotFrame {
 
 impl AuthorizedOrderedSnapshotFrame {
     fn encode(
-        pdu: Pdu,
+        response: codec::ValidatedListPanesOrderedV1Response,
         serial: u64,
         terminal: &DispatchTerminal,
     ) -> anyhow::Result<Self> {
-        if !matches!(&pdu, Pdu::ListPanesOrderedV1Response(_)) {
-            terminal.trip(DORMANT_OUTBOUND_PROTOCOL_FAILURE);
-            anyhow::bail!(
-                "ordered snapshot encoder rejected non-PDU87 family {}",
-                pdu.pdu_name(),
-            );
-        }
-        let authority = EncodedPduAuthority::capture(
-            &pdu,
+        let authority = EncodedPduAuthority::capture_wire(
+            &<codec::ListPanesOrderedV1Response as codec::PduWireIdent>::WIRE_SPEC,
             serial,
             ServerEmissionAuthority::OrderedSnapshotFence,
         );
         authority.validate(terminal)?;
-        let bytes = pdu
-            .encode_frame_with_mode(serial, codec::CompressionMode::Auto)
+        let bytes = response
+            .encode_frame(serial)
             .context("encoding request-correlated PDU87 outside the coordinator lock")?;
         Ok(Self { bytes, authority })
     }
@@ -2879,15 +2884,17 @@ impl TopologyStreamCoordinator {
             &self.terminal,
             &self.outbound_budget,
         )?;
-        response
-            .validate_for_request(&request_generation)
+        let response = response
+            .validate_for_request_owned(&request_generation)
             .context("validating request-correlated PDU87 at the dispatch fence")?;
-        if let codec::ListPanesOrderedV1Outcome::Snapshot(snapshot) = &response.outcome {
+        if let codec::ListPanesOrderedV1Outcome::Snapshot(snapshot) =
+            &response.as_response().outcome
+        {
             validate_ordered_snapshot_projection(snapshot)
                 .context("validating PDU87 pane/order projection at the dispatch fence")?;
         }
 
-        let outcome = match &response.outcome {
+        let outcome = match &response.as_response().outcome {
             codec::ListPanesOrderedV1Outcome::Snapshot(snapshot) => {
                 OrderedFenceOutcomeAuthority::Snapshot {
                     session_incarnation: snapshot.session_incarnation,
@@ -2904,10 +2911,10 @@ impl TopologyStreamCoordinator {
                 OrderedFenceOutcomeAuthority::Unsupported
             }
         };
-        let response_stream_id = response.stream_id;
-        let response_negotiated = response.negotiated;
+        let response_stream_id = response.as_response().stream_id;
+        let response_negotiated = response.as_response().negotiated;
         let frame = AuthorizedOrderedSnapshotFrame::encode(
-            Pdu::ListPanesOrderedV1Response(response),
+            response,
             serial,
             &self.terminal,
         )?
@@ -8931,6 +8938,115 @@ mod tests {
         assert_outbound_live_counters_zero(&coordinator);
     }
 
+    #[cfg(debug_assertions)]
+    #[test]
+    fn ordered_snapshot_dispatch_validates_arena_and_windows_exactly_once() {
+        let (coordinator, item_rx, terminal_rx, session_incarnation, stream_id) =
+            bound_topology_coordinator();
+        let request = ordered_snapshot_request(true);
+        coordinator
+            .begin_ordered_fence_with_server_capabilities(
+                0x871,
+                &request,
+                ordered_window_capabilities(true),
+            )
+            .expect("begin future-enabled ordered topology fence");
+        let response = ordered_snapshot_response(
+            &request,
+            stream_id,
+            session_incarnation,
+            TopologyRevision::INITIAL,
+        );
+
+        codec::debug_reset_ordered_snapshot_validation_passes();
+        coordinator
+            .queue_response(
+                DecodedPdu {
+                    serial: 0x871,
+                    pdu: Pdu::ListPanesOrderedV1Response(response),
+                },
+                PduDeliveryClass::Control,
+            )
+            .expect("valid ordered snapshot must enqueue");
+        assert_eq!(
+            codec::debug_ordered_snapshot_validation_passes(),
+            codec::OrderedSnapshotValidationPasses {
+                pane_arena: 1,
+                ordered_windows: 1,
+            },
+            "dispatch request binding must be the sole q-sized structural scan",
+        );
+
+        let queued = take_written_pdu(&item_rx);
+        assert_eq!(queued.serial, 0x871);
+        assert!(matches!(
+            queued.pdu,
+            Pdu::ListPanesOrderedV1Response(_)
+        ));
+        assert!(item_rx.is_empty());
+        assert!(terminal_rx.is_empty());
+        assert_outbound_live_counters_zero(&coordinator);
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn ordered_snapshot_dispatch_rejects_malformed_arena_before_proof_or_encoding() {
+        let (coordinator, item_rx, terminal_rx, session_incarnation, stream_id) =
+            bound_topology_coordinator();
+        let request = ordered_snapshot_request(true);
+        coordinator
+            .begin_ordered_fence_with_server_capabilities(
+                0x872,
+                &request,
+                ordered_window_capabilities(true),
+            )
+            .expect("begin future-enabled ordered topology fence");
+        let mut response = ordered_snapshot_response(
+            &request,
+            stream_id,
+            session_incarnation,
+            TopologyRevision::INITIAL,
+        );
+        let codec::ListPanesOrderedV1Outcome::Snapshot(snapshot) = &mut response.outcome else {
+            panic!("ordered snapshot fixture must contain a snapshot");
+        };
+        let (trees, mut nodes, window_titles) = snapshot.panes.clone().into_parts();
+        nodes.push(mux::tab::PaneArenaNode::Empty);
+        snapshot.panes =
+            mux::tab::PaneArena::from_unvalidated_parts(trees, nodes, window_titles);
+
+        codec::debug_reset_ordered_snapshot_validation_passes();
+        let error = coordinator
+            .queue_response(
+                DecodedPdu {
+                    serial: 0x872,
+                    pdu: Pdu::ListPanesOrderedV1Response(response),
+                },
+                PduDeliveryClass::Control,
+            )
+            .expect_err("malformed arena must never acquire dispatch encoding authority");
+        assert!(
+            format!("{error:#}").contains("pane arena references 0 nodes but carries 1"),
+            "unexpected malformed-arena rejection: {error:#}",
+        );
+        assert_eq!(
+            codec::debug_ordered_snapshot_validation_passes(),
+            codec::OrderedSnapshotValidationPasses {
+                pane_arena: 1,
+                ordered_windows: 0,
+            },
+            "failed validation must not fall through to field serialization",
+        );
+        assert!(item_rx.is_empty());
+        assert_eq!(
+            terminal_rx
+                .try_recv()
+                .expect("malformed ordered snapshot must trip the connection"),
+            TOPOLOGY_PROTOCOL_FAILURE,
+        );
+        assert_outbound_budget_live_counters_zero(&coordinator.outbound_budget);
+    }
+
     #[test]
     fn ordered_snapshot_exact_reservation_rejects_class_overflow_and_releases_outside_fence() {
         let (coordinator, item_rx, terminal_rx, session_incarnation, stream_id) =
@@ -9603,57 +9719,21 @@ mod tests {
     }
 
     #[test]
-    fn ordered_snapshot_encoded_route_rejects_wrong_family_zero_serial_and_raw_bytes() {
+    fn ordered_snapshot_encoded_route_rejects_zero_serial_and_raw_bytes() {
         let request = ordered_snapshot_request(true);
         let stream_id = TopologyStreamId::from_bytes([0x5a; 16]);
         let session_incarnation = MuxSessionIncarnation::from_bytes([0xa5; 16]);
-        let wrong_family_cases = [
-            (
-                "ordinary Pong",
-                Pdu::Pong(Pong {}),
-                201,
-            ),
-            (
-                "PDU89",
-                dormant_reorder_response(stream_id, session_incarnation),
-                202,
-            ),
-            (
-                "PDU90",
-                Pdu::WindowOrderEventV1(codec::WindowOrderEventV1 {
-                    protocol_version: codec::ORDERED_WINDOW_PROTOCOL_VERSION,
-                    stream_id,
-                    session_incarnation,
-                    topology_revision: TopologyRevision::new(1),
-                    windows: Vec::new(),
-                }),
-                0,
-            ),
-        ];
-        for (name, pdu, serial) in wrong_family_cases {
-            let (terminal, terminal_rx) = DispatchTerminal::channel();
-            let error = AuthorizedOrderedSnapshotFrame::encode(pdu, serial, &terminal)
-                .expect_err("only a typed PDU87 may construct the ordered snapshot owner");
-            assert!(
-                format!("{error:#}").contains("non-PDU87 family"),
-                "unexpected {name} rejection: {error:#}"
-            );
-            assert_eq!(
-                terminal_rx
-                    .try_recv()
-                    .expect("wrong ordered-snapshot family must trip the connection"),
-                DORMANT_OUTBOUND_PROTOCOL_FAILURE,
-            );
-        }
-
         let (zero_terminal, zero_terminal_rx) = DispatchTerminal::channel();
+        let zero_response = ordered_snapshot_response(
+            &request,
+            stream_id,
+            session_incarnation,
+            TopologyRevision::INITIAL,
+        )
+        .validate_for_request_owned(&request)
+        .expect("zero-serial fixture must otherwise be request-correlated");
         let zero_error = AuthorizedOrderedSnapshotFrame::encode(
-            Pdu::ListPanesOrderedV1Response(ordered_snapshot_response(
-                &request,
-                stream_id,
-                session_incarnation,
-                TopologyRevision::INITIAL,
-            )),
+            zero_response,
             0,
             &zero_terminal,
         )
