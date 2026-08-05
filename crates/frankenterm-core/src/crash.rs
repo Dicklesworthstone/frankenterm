@@ -18,6 +18,7 @@
 use std::backtrace::Backtrace;
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::ffi::OsStr;
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -27,9 +28,11 @@ use std::sync::RwLock;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt};
 #[cfg(unix)]
 use cap_fs_ext::OpenOptionsSyncExt;
+use cap_fs_ext::{
+    DirEntryExt, DirExt, FollowSymlinks, MetadataExt as CapMetadataExt, OpenOptionsFollowExt,
+};
 use cap_std::fs::{Dir as CapDir, OpenOptions as CapOpenOptions};
 use serde::{Deserialize, Serialize};
 
@@ -182,9 +185,7 @@ fn record_crash_bundle_parse_drop(
     phase: &'static str,
     _error: &dyn std::fmt::Display,
 ) {
-    let dropped = CRASH_BUNDLE_PARSE_DROP_COUNT
-        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        .saturating_add(1);
+    let dropped = increment_saturating_crash_bundle_counter(&CRASH_BUNDLE_PARSE_DROP_COUNT);
     let log_index = claim_bounded_crash_bundle_log_slot(
         &CRASH_BUNDLE_PARSE_DROP_LOG_COUNT,
         CRASH_BUNDLE_PARSE_DROP_LOG_LIMIT,
@@ -206,6 +207,22 @@ fn record_crash_bundle_parse_drop(
             "further crash bundle parse-drop warnings are suppressed"
         );
     }
+}
+
+/// Increment a process-lifetime diagnostic counter without ever wrapping.
+///
+/// These counters can be driven by untrusted directory contents. Their public
+/// contract is cumulative, so wrapping to zero would turn a large failure
+/// count into a false clean state. `update` also keeps this correct under
+/// concurrent crash-directory refreshes.
+fn increment_saturating_crash_bundle_counter(counter: &std::sync::atomic::AtomicU64) -> u64 {
+    counter
+        .update(
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+            |current| current.saturating_add(1),
+        )
+        .saturating_add(1)
 }
 
 /// Claim one of a finite number of process-lifetime warning slots.
@@ -241,9 +258,8 @@ fn record_crash_bundle_discovery_incomplete(
     payload_files_opened: usize,
     payload_bytes_read: u64,
 ) {
-    let incomplete = CRASH_BUNDLE_DISCOVERY_INCOMPLETE_COUNT
-        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        .saturating_add(1);
+    let incomplete =
+        increment_saturating_crash_bundle_counter(&CRASH_BUNDLE_DISCOVERY_INCOMPLETE_COUNT);
     let log_index = claim_bounded_crash_bundle_log_slot(
         &CRASH_BUNDLE_DISCOVERY_INCOMPLETE_LOG_COUNT,
         CRASH_BUNDLE_DISCOVERY_INCOMPLETE_LOG_LIMIT,
@@ -262,9 +278,7 @@ fn record_crash_bundle_discovery_incomplete(
             payload_bytes_read,
             "crash-bundle result is withheld because bounded discovery was incomplete"
         );
-    } else if log_index
-        == Some(CRASH_BUNDLE_DISCOVERY_INCOMPLETE_LOG_LIMIT.saturating_add(1))
-    {
+    } else if log_index == Some(CRASH_BUNDLE_DISCOVERY_INCOMPLETE_LOG_LIMIT.saturating_add(1)) {
         tracing::warn!(
             target: "ft.crash.bundle",
             event = "crash_bundle_discovery_incomplete_suppressed",
@@ -280,6 +294,22 @@ struct CrashBundlePayloadReadStats {
     files_opened: usize,
     bytes_read: u64,
     authority_unreadable: bool,
+    metadata_unreadable: bool,
+    filesystem_changed: bool,
+}
+
+struct OpenedCrashBundlePayload {
+    file: cap_std::fs::File,
+    snapshot: CrashBundleFilesystemSnapshot,
+    metadata_unreadable: bool,
+}
+
+struct CrashBundlePayloadValidation {
+    file: cap_std::fs::File,
+    relative: PathBuf,
+    snapshot: CrashBundleFilesystemSnapshot,
+    bytes: Vec<u8>,
+    max_bytes: u64,
 }
 
 fn crash_bundle_io_error_withholds_authority(error: &std::io::Error) -> bool {
@@ -314,7 +344,7 @@ fn open_crash_bundle_dir_nofollow(bundle_path: &Path) -> std::io::Result<CapDir>
 fn open_regular_crash_bundle_payload(
     bundle_dir: &CapDir,
     relative: &Path,
-) -> std::io::Result<cap_std::fs::File> {
+) -> std::io::Result<OpenedCrashBundlePayload> {
     if relative.components().count() != 1 {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -335,13 +365,19 @@ fn open_regular_crash_bundle_payload(
     #[cfg(unix)]
     options.nonblock(true);
     let file = bundle_dir.open_with(relative, &options)?;
-    if !file.metadata()?.is_file() {
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "crash bundle payload is not a regular file",
         ));
     }
-    Ok(file)
+    let (snapshot, metadata_unreadable) = crash_bundle_filesystem_snapshot(&metadata);
+    Ok(OpenedCrashBundlePayload {
+        file,
+        snapshot,
+        metadata_unreadable,
+    })
 }
 
 fn read_optional_json_from_bundle_dir_bounded<T: serde::de::DeserializeOwned>(
@@ -352,6 +388,7 @@ fn read_optional_json_from_bundle_dir_bounded<T: serde::de::DeserializeOwned>(
     parse_fail_phase: &'static str,
     max_bytes: u64,
     stats: &mut CrashBundlePayloadReadStats,
+    validations: &mut Vec<CrashBundlePayloadValidation>,
 ) -> Option<T> {
     let relative = match file_path.strip_prefix(bundle_path) {
         Ok(relative) => relative,
@@ -360,8 +397,8 @@ fn read_optional_json_from_bundle_dir_bounded<T: serde::de::DeserializeOwned>(
             return None;
         }
     };
-    let mut file = match open_regular_crash_bundle_payload(bundle_dir, relative) {
-        Ok(file) => file,
+    let opened = match open_regular_crash_bundle_payload(bundle_dir, relative) {
+        Ok(opened) => opened,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
         Err(error) => {
             stats.authority_unreadable |= crash_bundle_io_error_withholds_authority(&error);
@@ -369,6 +406,9 @@ fn read_optional_json_from_bundle_dir_bounded<T: serde::de::DeserializeOwned>(
             return None;
         }
     };
+    stats.metadata_unreadable |= opened.metadata_unreadable;
+    let snapshot_before_read = opened.snapshot;
+    let mut file = opened.file;
     stats.files_opened = stats.files_opened.saturating_add(1);
     let mut raw = Vec::new();
     let read_result = (&mut file)
@@ -382,21 +422,146 @@ fn read_optional_json_from_bundle_dir_bounded<T: serde::de::DeserializeOwned>(
         record_crash_bundle_parse_drop(bundle_path, read_fail_phase, &error);
         return None;
     }
-    if u64::try_from(raw.len()).unwrap_or(u64::MAX) > max_bytes {
+    let (snapshot_after_read, metadata_unreadable_after_read) = match file.metadata() {
+        Ok(metadata) => crash_bundle_filesystem_snapshot(&metadata),
+        Err(error) => {
+            stats.authority_unreadable = true;
+            record_crash_bundle_parse_drop(bundle_path, read_fail_phase, &error);
+            return None;
+        }
+    };
+    stats.metadata_unreadable |= metadata_unreadable_after_read;
+    if !crash_bundle_candidate_snapshot_matches(snapshot_before_read, snapshot_after_read) {
+        stats.filesystem_changed = true;
+        return None;
+    }
+
+    let parsed = if u64::try_from(raw.len()).unwrap_or(u64::MAX) > max_bytes {
         let error = std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "crash bundle payload exceeds its byte limit",
         );
         record_crash_bundle_parse_drop(bundle_path, read_fail_phase, &error);
-        return None;
-    }
-    match serde_json::from_slice::<T>(&raw) {
-        Ok(parsed) => Some(parsed),
-        Err(error) => {
-            record_crash_bundle_parse_drop(bundle_path, parse_fail_phase, &error);
-            None
+        None
+    } else {
+        match serde_json::from_slice::<T>(&raw) {
+            Ok(parsed) => Some(parsed),
+            Err(error) => {
+                record_crash_bundle_parse_drop(bundle_path, parse_fail_phase, &error);
+                None
+            }
+        }
+    };
+    validations.push(CrashBundlePayloadValidation {
+        file,
+        relative: relative.to_path_buf(),
+        snapshot: snapshot_after_read,
+        bytes: raw,
+        max_bytes,
+    });
+    parsed
+}
+
+fn revalidate_crash_bundle_payloads(
+    validations: &[CrashBundlePayloadValidation],
+    bundle_dir: &CapDir,
+    bundle_path: &Path,
+    stats: &mut CrashBundlePayloadReadStats,
+) -> bool {
+    for validation in validations {
+        let (held_snapshot, held_metadata_unreadable) =
+            match validation.file.metadata() {
+                Ok(metadata) => crash_bundle_filesystem_snapshot(&metadata),
+                Err(error) => {
+                    stats.authority_unreadable = true;
+                    record_crash_bundle_parse_drop(
+                        bundle_path,
+                        "payload_revalidation_metadata_fail",
+                        &error,
+                    );
+                    return false;
+                }
+            };
+        stats.metadata_unreadable |= held_metadata_unreadable;
+        if !crash_bundle_candidate_snapshot_matches(validation.snapshot, held_snapshot) {
+            stats.filesystem_changed = true;
+            return false;
+        }
+
+        // Reopen the leaf through the retained directory capability rather
+        // than seeking the original handle. Keeping the original handle lets
+        // us detect in-place mutation, while reopening binds the bytes below
+        // to the leaf that is currently named by the bundle directory. This
+        // closes the atomic-replacement gap that handle-only revalidation
+        // would otherwise leave.
+        let reopened = match open_regular_crash_bundle_payload(bundle_dir, &validation.relative) {
+            Ok(reopened) => reopened,
+            Err(error) => {
+                if crash_bundle_io_error_withholds_authority(&error) {
+                    stats.authority_unreadable = true;
+                } else {
+                    stats.filesystem_changed = true;
+                }
+                record_crash_bundle_parse_drop(
+                    bundle_path,
+                    "payload_revalidation_open_fail",
+                    &error,
+                );
+                return false;
+            }
+        };
+        stats.files_opened = stats.files_opened.saturating_add(1);
+        stats.metadata_unreadable |= reopened.metadata_unreadable;
+        if !crash_bundle_candidate_snapshot_matches(validation.snapshot, reopened.snapshot) {
+            stats.filesystem_changed = true;
+            return false;
+        }
+
+        let snapshot_before_reread = reopened.snapshot;
+        let mut file = reopened.file;
+        let mut reread = Vec::new();
+        let read_result = (&mut file)
+            .take(validation.max_bytes.saturating_add(1))
+            .read_to_end(&mut reread);
+        stats.bytes_read = stats
+            .bytes_read
+            .saturating_add(u64::try_from(reread.len()).unwrap_or(u64::MAX));
+        if let Err(error) = read_result {
+            stats.authority_unreadable = true;
+            record_crash_bundle_parse_drop(
+                bundle_path,
+                "payload_revalidation_read_fail",
+                &error,
+            );
+            return false;
+        }
+
+        let (snapshot_after_reread, metadata_unreadable_after_reread) =
+            match file.metadata() {
+                Ok(metadata) => crash_bundle_filesystem_snapshot(&metadata),
+                Err(error) => {
+                    stats.authority_unreadable = true;
+                    record_crash_bundle_parse_drop(
+                        bundle_path,
+                        "payload_revalidation_metadata_fail",
+                        &error,
+                    );
+                    return false;
+                }
+            };
+        stats.metadata_unreadable |= metadata_unreadable_after_reread;
+        if reread != validation.bytes
+            || !crash_bundle_candidate_snapshot_matches(
+                snapshot_before_reread,
+                snapshot_after_reread,
+            )
+            || !crash_bundle_candidate_snapshot_matches(validation.snapshot, snapshot_after_reread)
+        {
+            stats.filesystem_changed = true;
+            return false;
         }
     }
+    true
 }
 
 #[cfg(test)]
@@ -416,7 +581,8 @@ fn read_optional_json_bundle_file_bounded<T: serde::de::DeserializeOwned>(
             return None;
         }
     };
-    read_optional_json_from_bundle_dir_bounded(
+    let mut validations = Vec::with_capacity(1);
+    let parsed = read_optional_json_from_bundle_dir_bounded(
         &bundle_dir,
         bundle_path,
         file_path,
@@ -424,7 +590,13 @@ fn read_optional_json_bundle_file_bounded<T: serde::de::DeserializeOwned>(
         parse_fail_phase,
         max_bytes,
         stats,
-    )
+        &mut validations,
+    );
+    if revalidate_crash_bundle_payloads(&validations, &bundle_dir, bundle_path, stats) {
+        parsed
+    } else {
+        None
+    }
 }
 
 /// br-ft-94cdu: read+parse a JSON file, treating file-not-found as
@@ -1700,9 +1872,7 @@ impl HealthSnapshot {
     /// This is reserved for panic-hook collection, where blocking on a lock
     /// owned by the panicking thread would deadlock the process.
     fn try_get_global_for_panic() -> Option<Self> {
-        GLOBAL_HEALTH
-            .get()
-            .and_then(try_clone_diagnostic_snapshot)
+        GLOBAL_HEALTH.get().and_then(try_clone_diagnostic_snapshot)
     }
 }
 
@@ -1894,10 +2064,8 @@ pub fn write_crash_bundle(
             ));
         }
         staging_attempts += 1;
-        let sequence = CRASH_BUNDLE_WRITE_SEQUENCE.fetch_add(
-            1,
-            std::sync::atomic::Ordering::Relaxed,
-        );
+        let sequence =
+            CRASH_BUNDLE_WRITE_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let unique_name = format!("{bundle_prefix}_p{process_id}_{sequence}");
         let candidate_final = crash_dir.join(&unique_name);
         let candidate_tmp = crash_dir.join(format!(".{unique_name}.tmp"));
@@ -1976,8 +2144,7 @@ pub fn write_crash_bundle(
     // 2. Write health_snapshot.json (if available)
     let has_health = if let Some(snap) = health {
         let redacted_health = redacted_health_snapshot(snap, &redactor);
-        let json =
-            serde_json::to_string_pretty(&redacted_health).map_err(std::io::Error::other)?;
+        let json = serde_json::to_string_pretty(&redacted_health).map_err(std::io::Error::other)?;
         let bytes = json.as_bytes();
         maybe_write_bounded("health_snapshot.json", bytes)?
     } else {
@@ -2114,15 +2281,16 @@ pub struct CrashBundleSummary {
 
 /// Maximum number of name-rankable candidates whose payloads may be opened by
 /// one latest-bundle discovery. At the per-file caps above, the hard aggregate
-/// read ceiling is below 8 MiB (40 × (64 KiB + 128 KiB), plus one byte per
-/// file used for oversize detection, including the unranked fallback window).
+/// read ceiling is below 16 MiB (40 × 2 validation reads × (64 KiB + 128 KiB),
+/// plus one byte per file/read for oversize detection, including the unranked
+/// fallback window).
 const LATEST_CRASH_BUNDLE_CANDIDATE_WINDOW: usize = 32;
 /// Public list requests retain at most this many results. Without a hard cap,
 /// an adversarial `usize::MAX` request could turn the heap itself into the
 /// unbounded operation this path is designed to avoid. At the maximum request,
 /// the ranked result-plus-invalid slack and the legacy fallback can inspect at
-/// most 104 candidates (208 payload opens and less than 20 MiB of payload
-/// bytes, including oversize sentinels).
+/// most 104 candidates (416 payload opens and less than 40 MiB of payload
+/// bytes across initial reads and revalidation, including oversize sentinels).
 const MAX_CRASH_BUNDLE_LIST_RESULTS: usize = 64;
 /// Extra ranked candidates inspected when malformed payloads occupy the newest
 /// names. Discovery reports incompleteness instead of scanning indefinitely if
@@ -2137,7 +2305,8 @@ const LATEST_CRASH_BUNDLE_UNRANKED_WINDOW: usize = 8;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CrashBundleDiscoveryIncompleteReason {
-    /// At least one directory entry or its file type could not be inspected.
+    /// The crash root or at least one directory entry/type could not be
+    /// inspected.
     DirectoryEntryUnreadable,
     /// A matching directory's modification time could not be read, so an
     /// mtime-dependent tie-break or legacy-name rank could not be proven.
@@ -2153,6 +2322,10 @@ pub enum CrashBundleDiscoveryIncompleteReason {
     UnrankedCandidateWindowExceeded,
     /// The caller requested more results than the hard bounded result cap.
     RequestedLimitExceeded,
+    /// The crash root or a retained bundle directory changed identity or
+    /// metadata while discovery was in progress. The bounded result therefore
+    /// cannot represent one stable filesystem view.
+    FilesystemChangedDuringDiscovery,
 }
 
 /// Whether bounded latest-bundle discovery produced an authoritative answer.
@@ -2190,9 +2363,10 @@ pub struct LatestCrashBundleDiscovery {
     pub ranked_candidates: usize,
     /// Legacy or malformed names requiring payload/modification-time fallback.
     pub unranked_candidates: usize,
-    /// Payload files successfully opened during bounded discovery.
+    /// Payload files successfully opened for initial reads and revalidation.
     pub payload_files_opened: usize,
-    /// Payload bytes read, including the one-byte oversize sentinel.
+    /// Payload bytes read across initial reads and stability revalidation,
+    /// including each one-byte oversize sentinel.
     pub payload_bytes_read: u64,
 }
 
@@ -2218,30 +2392,52 @@ pub struct CrashBundleListDiscovery {
     pub ranked_candidates: usize,
     /// Legacy or malformed names requiring payload/modification-time fallback.
     pub unranked_candidates: usize,
-    /// Payload files successfully opened during bounded discovery.
+    /// Payload files successfully opened for initial reads and revalidation.
     pub payload_files_opened: usize,
-    /// Payload bytes read, including the one-byte oversize sentinel.
+    /// Payload bytes read across initial reads and stability revalidation,
+    /// including each one-byte oversize sentinel.
     pub payload_bytes_read: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct CrashBundleChronologicalKey {
+    year: u64,
+    month: u64,
+    day: u64,
+    hour: u64,
+    minute: u64,
+    second: u64,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct CrashBundleFilesystemSnapshot {
+    device: u64,
+    inode: u64,
+    modified: Option<SystemTime>,
+    len: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct RankedCrashBundleCandidate {
+    authority_timestamp: CrashBundleChronologicalKey,
     timestamp: String,
     modified: Option<SystemTime>,
     process_sequence: Option<(u32, u64)>,
     path: PathBuf,
+    filesystem_snapshot: CrashBundleFilesystemSnapshot,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct UnrankedCrashBundleCandidate {
     modified: Option<SystemTime>,
     path: PathBuf,
+    filesystem_snapshot: CrashBundleFilesystemSnapshot,
 }
 
 #[derive(Debug)]
 struct LoadedCrashBundleCandidate {
     summary: CrashBundleSummary,
-    authority_timestamp: Option<String>,
+    authority_timestamp: Option<CrashBundleChronologicalKey>,
     modified: Option<SystemTime>,
     process_sequence: Option<(u32, u64)>,
 }
@@ -2254,12 +2450,70 @@ fn retain_newest_candidate<T: Ord>(heap: &mut BinaryHeap<Reverse<T>>, candidate:
         heap.push(Reverse(candidate));
         return;
     }
-    if heap.peek().is_some_and(|oldest_retained| {
-        candidate.cmp(&oldest_retained.0).is_gt()
-    }) {
+    if heap
+        .peek()
+        .is_some_and(|oldest_retained| candidate.cmp(&oldest_retained.0).is_gt())
+    {
         heap.pop();
         heap.push(Reverse(candidate));
     }
+}
+
+fn crash_bundle_filesystem_snapshot(
+    metadata: &cap_std::fs::Metadata,
+) -> (CrashBundleFilesystemSnapshot, bool) {
+    let mut metadata_unreadable = false;
+    let modified = crash_bundle_candidate_modified(
+        metadata.modified().map(cap_std::time::SystemTime::into_std),
+        &mut metadata_unreadable,
+    );
+    (
+        CrashBundleFilesystemSnapshot {
+            device: CapMetadataExt::dev(metadata),
+            inode: CapMetadataExt::ino(metadata),
+            modified,
+            len: metadata.len(),
+        },
+        metadata_unreadable,
+    )
+}
+
+fn crash_bundle_directory_snapshot(
+    directory: &CapDir,
+) -> std::io::Result<(CrashBundleFilesystemSnapshot, bool)> {
+    let metadata = directory.dir_metadata()?;
+    Ok(crash_bundle_filesystem_snapshot(&metadata))
+}
+
+fn crash_bundle_candidate_snapshot_matches(
+    expected: CrashBundleFilesystemSnapshot,
+    observed: CrashBundleFilesystemSnapshot,
+) -> bool {
+    expected.device == observed.device
+        && expected.inode == observed.inode
+        && expected.len == observed.len
+        && match (expected.modified, observed.modified) {
+            (Some(expected), Some(observed)) => expected == observed,
+            _ => true,
+        }
+}
+
+fn crash_bundle_chronological_key_from_epoch(epoch_secs: u64) -> CrashBundleChronologicalKey {
+    let days = epoch_secs / 86_400;
+    let time_secs = epoch_secs % 86_400;
+    let (year, month, day) = days_to_ymd(days);
+    CrashBundleChronologicalKey {
+        year,
+        month,
+        day,
+        hour: time_secs / 3_600,
+        minute: (time_secs % 3_600) / 60,
+        second: time_secs % 60,
+    }
+}
+
+fn crash_bundle_name_has_prefix(name: &OsStr) -> bool {
+    name.as_encoded_bytes().starts_with(b"ft_crash_")
 }
 
 fn crash_bundle_candidate_modified(
@@ -2275,7 +2529,9 @@ fn crash_bundle_candidate_modified(
     }
 }
 
-fn crash_bundle_name_key(path: &Path) -> Option<(String, Option<(u32, u64)>)> {
+fn crash_bundle_name_key(
+    path: &Path,
+) -> Option<(String, CrashBundleChronologicalKey, Option<(u32, u64)>)> {
     let name = path.file_name()?.to_str()?;
     let suffix = name.strip_prefix("ft_crash_")?;
     let timestamp = suffix.get(..15)?;
@@ -2306,11 +2562,7 @@ fn crash_bundle_name_key(path: &Path) -> Option<(String, Option<(u32, u64)>)> {
         2 => 28,
         _ => return None,
     };
-    if !(1..=days_in_month).contains(&day)
-        || hour > 23
-        || minute > 59
-        || second > 59
-    {
+    if !(1..=days_in_month).contains(&day) || hour > 23 || minute > 59 || second > 59 {
         return None;
     }
     let process_suffix = suffix.get(15..)?;
@@ -2320,7 +2572,18 @@ fn crash_bundle_name_key(path: &Path) -> Option<(String, Option<(u32, u64)>)> {
         let (process_id, sequence) = process_suffix.strip_prefix("_p")?.rsplit_once('_')?;
         Some((process_id.parse().ok()?, sequence.parse().ok()?))
     };
-    Some((timestamp.to_string(), process_sequence))
+    Some((
+        timestamp.to_string(),
+        CrashBundleChronologicalKey {
+            year: u64::from(year),
+            month: u64::from(month),
+            day: u64::from(day),
+            hour: u64::from(hour),
+            minute: u64::from(minute),
+            second: u64::from(second),
+        },
+        process_sequence,
+    ))
 }
 
 fn crash_bundle_timestamp_iso8601(timestamp: &str) -> Option<String> {
@@ -2335,12 +2598,38 @@ fn crash_bundle_timestamp_iso8601(timestamp: &str) -> Option<String> {
     ))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CrashBundlePayloadReadCheckpoint {
+    AfterManifest,
+    AfterReport,
+}
+
 fn read_crash_bundle_summary_from_dir_bounded(
     bundle_dir: &CapDir,
     path: PathBuf,
     expected_timestamp: Option<&str>,
     stats: &mut CrashBundlePayloadReadStats,
 ) -> Option<CrashBundleSummary> {
+    read_crash_bundle_summary_from_dir_bounded_with_checkpoint(
+        bundle_dir,
+        path,
+        expected_timestamp,
+        stats,
+        |_| {},
+    )
+}
+
+fn read_crash_bundle_summary_from_dir_bounded_with_checkpoint<F>(
+    bundle_dir: &CapDir,
+    path: PathBuf,
+    expected_timestamp: Option<&str>,
+    stats: &mut CrashBundlePayloadReadStats,
+    mut checkpoint: F,
+) -> Option<CrashBundleSummary>
+where
+    F: FnMut(CrashBundlePayloadReadCheckpoint),
+{
+    let mut validations = Vec::with_capacity(2);
     let manifest_path = path.join("manifest.json");
     let mut manifest = read_optional_json_from_bundle_dir_bounded::<CrashManifest>(
         bundle_dir,
@@ -2350,7 +2639,9 @@ fn read_crash_bundle_summary_from_dir_bounded(
         "manifest_parse_fail",
         MAX_CRASH_MANIFEST_JSON_READ_BYTES,
         stats,
+        &mut validations,
     );
+    checkpoint(CrashBundlePayloadReadCheckpoint::AfterManifest);
     let report_path = path.join("crash_report.json");
     let mut report = read_optional_json_from_bundle_dir_bounded::<CrashReport>(
         bundle_dir,
@@ -2360,7 +2651,12 @@ fn read_crash_bundle_summary_from_dir_bounded(
         "report_parse_fail",
         MAX_CRASH_REPORT_JSON_READ_BYTES,
         stats,
+        &mut validations,
     );
+    checkpoint(CrashBundlePayloadReadCheckpoint::AfterReport);
+    if !revalidate_crash_bundle_payloads(&validations, bundle_dir, &path, stats) {
+        return None;
+    }
 
     if let Some(timestamp) = expected_timestamp {
         if manifest.as_ref().is_some_and(|manifest| {
@@ -2402,24 +2698,64 @@ fn read_crash_bundle_summary_from_root_bounded(
     crash_root: &CapDir,
     path: PathBuf,
     expected_timestamp: Option<&str>,
+    expected_filesystem_snapshot: CrashBundleFilesystemSnapshot,
     stats: &mut CrashBundlePayloadReadStats,
 ) -> Option<CrashBundleSummary> {
     let name = path.file_name()?;
     let bundle_dir = match crash_root.open_dir_nofollow(name) {
         Ok(bundle_dir) => bundle_dir,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            stats.filesystem_changed = true;
+            return None;
+        }
         Err(error) => {
-            stats.authority_unreadable |= crash_bundle_io_error_withholds_authority(&error);
+            if crash_bundle_io_error_withholds_authority(&error) {
+                stats.authority_unreadable = true;
+            } else {
+                stats.filesystem_changed = true;
+            }
             record_crash_bundle_parse_drop(&path, "bundle_dir_open_fail", &error);
             return None;
         }
     };
-    read_crash_bundle_summary_from_dir_bounded(
+    let (opened_before, metadata_unreadable_before) =
+        match crash_bundle_directory_snapshot(&bundle_dir) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                stats.authority_unreadable = true;
+                record_crash_bundle_parse_drop(&path, "bundle_dir_metadata_fail", &error);
+                return None;
+            }
+        };
+    stats.metadata_unreadable |= metadata_unreadable_before;
+    if !crash_bundle_candidate_snapshot_matches(expected_filesystem_snapshot, opened_before) {
+        stats.filesystem_changed = true;
+        return None;
+    }
+
+    let summary = read_crash_bundle_summary_from_dir_bounded(
         &bundle_dir,
-        path,
+        path.clone(),
         expected_timestamp,
         stats,
-    )
+    );
+    let (opened_after, metadata_unreadable_after) =
+        match crash_bundle_directory_snapshot(&bundle_dir) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                stats.authority_unreadable = true;
+                record_crash_bundle_parse_drop(&path, "bundle_dir_metadata_fail", &error);
+                return None;
+            }
+        };
+    stats.metadata_unreadable |= metadata_unreadable_after;
+    if !crash_bundle_candidate_snapshot_matches(opened_before, opened_after)
+        || !crash_bundle_candidate_snapshot_matches(expected_filesystem_snapshot, opened_after)
+    {
+        stats.filesystem_changed = true;
+        return None;
+    }
+    summary
 }
 
 fn crash_bundle_process_sequence(path: &Path) -> Option<(u32, u64)> {
@@ -2440,11 +2776,13 @@ fn compare_loaded_crash_bundle_order(
         .then_with(|| b.summary.path.cmp(&a.summary.path))
 }
 
-fn unranked_crash_bundle_authority_timestamp(summary: &CrashBundleSummary) -> Option<String> {
+fn unranked_crash_bundle_authority_timestamp(
+    summary: &CrashBundleSummary,
+) -> Option<CrashBundleChronologicalKey> {
     summary
         .report
         .as_ref()
-        .map(|report| format_timestamp(report.timestamp))
+        .map(|report| crash_bundle_chronological_key_from_epoch(report.timestamp))
 }
 
 fn discover_crash_bundles_bounded(
@@ -2484,20 +2822,25 @@ fn discover_crash_bundles_bounded(
             return result;
         }
         Err(_) => {
-            incomplete_reasons
-                .push(CrashBundleDiscoveryIncompleteReason::DirectoryEntryUnreadable);
-            result.completeness =
-                CrashBundleDiscoveryCompleteness::Incomplete { reasons: incomplete_reasons };
+            incomplete_reasons.push(CrashBundleDiscoveryIncompleteReason::DirectoryEntryUnreadable);
+            result.completeness = CrashBundleDiscoveryCompleteness::Incomplete {
+                reasons: incomplete_reasons,
+            };
             return result;
         }
     };
+    let (root_snapshot_before, mut root_metadata_unreadable) =
+        match crash_bundle_directory_snapshot(&crash_root) {
+            Ok((snapshot, metadata_unreadable)) => (Some(snapshot), metadata_unreadable),
+            Err(_) => (None, true),
+        };
     let entries = match crash_root.entries() {
         Ok(entries) => entries,
         Err(_) => {
-            incomplete_reasons
-                .push(CrashBundleDiscoveryIncompleteReason::DirectoryEntryUnreadable);
-            result.completeness =
-                CrashBundleDiscoveryCompleteness::Incomplete { reasons: incomplete_reasons };
+            incomplete_reasons.push(CrashBundleDiscoveryIncompleteReason::DirectoryEntryUnreadable);
+            result.completeness = CrashBundleDiscoveryCompleteness::Incomplete {
+                reasons: incomplete_reasons,
+            };
             return result;
         }
     };
@@ -2515,40 +2858,39 @@ fn discover_crash_bundles_bounded(
                 continue;
             }
         };
-        let file_type = match entry.file_type() {
-            Ok(file_type) => file_type,
+        let file_name = entry.file_name();
+        if !crash_bundle_name_has_prefix(&file_name) {
+            continue;
+        }
+        let metadata = match entry.full_metadata() {
+            Ok(metadata) => metadata,
             Err(_) => {
                 entry_unreadable = true;
                 continue;
             }
         };
-        if !file_type.is_dir()
-            || !entry
-                .file_name()
-                .to_str()
-                .is_some_and(|name| name.starts_with("ft_crash_"))
-        {
+        if !metadata.is_dir() {
             continue;
         }
 
-        let path = crash_dir.join(entry.file_name());
-        let modified = crash_bundle_candidate_modified(
-            entry.metadata().and_then(|metadata| {
-                metadata
-                    .modified()
-                    .map(cap_std::time::SystemTime::into_std)
-            }),
-            &mut metadata_unreadable,
-        );
-        if let Some((timestamp, process_sequence)) = crash_bundle_name_key(&path) {
+        let path = crash_dir.join(file_name);
+        let (filesystem_snapshot, candidate_metadata_unreadable) =
+            crash_bundle_filesystem_snapshot(&metadata);
+        metadata_unreadable |= candidate_metadata_unreadable;
+        let modified = filesystem_snapshot.modified;
+        if let Some((timestamp, authority_timestamp, process_sequence)) =
+            crash_bundle_name_key(&path)
+        {
             result.ranked_candidates = result.ranked_candidates.saturating_add(1);
             retain_newest_candidate(
                 &mut ranked,
                 RankedCrashBundleCandidate {
+                    authority_timestamp,
                     timestamp,
                     modified,
                     process_sequence,
                     path,
+                    filesystem_snapshot,
                 },
                 ranked_candidate_window,
             );
@@ -2556,16 +2898,19 @@ fn discover_crash_bundles_bounded(
             result.unranked_candidates = result.unranked_candidates.saturating_add(1);
             retain_newest_candidate(
                 &mut unranked,
-                UnrankedCrashBundleCandidate { modified, path },
+                UnrankedCrashBundleCandidate {
+                    modified,
+                    path,
+                    filesystem_snapshot,
+                },
                 LATEST_CRASH_BUNDLE_UNRANKED_WINDOW,
             );
         }
     }
 
     let mut payload_stats = CrashBundlePayloadReadStats::default();
-    let mut loaded = Vec::with_capacity(
-        effective_limit.saturating_add(LATEST_CRASH_BUNDLE_UNRANKED_WINDOW),
-    );
+    let mut loaded =
+        Vec::with_capacity(effective_limit.saturating_add(LATEST_CRASH_BUNDLE_UNRANKED_WINDOW));
     let mut ranked_candidates = ranked
         .into_iter()
         .map(|candidate| candidate.0)
@@ -2576,11 +2921,12 @@ fn discover_crash_bundles_bounded(
         if ranked_loaded >= effective_limit {
             break;
         }
-        let authority_timestamp = candidate.timestamp.clone();
+        let authority_timestamp = candidate.authority_timestamp;
         if let Some(summary) = read_crash_bundle_summary_from_root_bounded(
             &crash_root,
             candidate.path,
             Some(&candidate.timestamp),
+            candidate.filesystem_snapshot,
             &mut payload_stats,
         ) {
             loaded.push(LoadedCrashBundleCandidate {
@@ -2603,9 +2949,9 @@ fn discover_crash_bundles_bounded(
             &crash_root,
             candidate.path,
             None,
+            candidate.filesystem_snapshot,
             &mut payload_stats,
-        )
-        {
+        ) {
             let process_sequence = crash_bundle_process_sequence(&summary.path);
             loaded.push(LoadedCrashBundleCandidate {
                 authority_timestamp: unranked_crash_bundle_authority_timestamp(&summary),
@@ -2625,26 +2971,42 @@ fn discover_crash_bundles_bounded(
     result.payload_files_opened = payload_stats.files_opened;
     result.payload_bytes_read = payload_stats.bytes_read;
 
-    if entry_unreadable {
+    match CapDir::open_ambient_dir(crash_dir, cap_std::ambient_authority())
+        .and_then(|current_root| crash_bundle_directory_snapshot(&current_root))
+    {
+        Ok((root_snapshot_after, metadata_unreadable_after)) => {
+            root_metadata_unreadable |= metadata_unreadable_after;
+            if root_snapshot_before.is_some_and(|before| {
+                !crash_bundle_candidate_snapshot_matches(before, root_snapshot_after)
+            }) {
+                payload_stats.filesystem_changed = true;
+            }
+        }
+        Err(_) => {
+            payload_stats.filesystem_changed = true;
+        }
+    }
+
+    if entry_unreadable || root_metadata_unreadable {
         incomplete_reasons.push(CrashBundleDiscoveryIncompleteReason::DirectoryEntryUnreadable);
     }
-    if metadata_unreadable {
-        incomplete_reasons
-            .push(CrashBundleDiscoveryIncompleteReason::CandidateMetadataUnreadable);
+    if metadata_unreadable || payload_stats.metadata_unreadable {
+        incomplete_reasons.push(CrashBundleDiscoveryIncompleteReason::CandidateMetadataUnreadable);
     }
     if payload_stats.authority_unreadable {
-        incomplete_reasons
-            .push(CrashBundleDiscoveryIncompleteReason::CandidatePayloadUnreadable);
+        incomplete_reasons.push(CrashBundleDiscoveryIncompleteReason::CandidatePayloadUnreadable);
     }
-    if ranked_loaded < effective_limit
-        && result.ranked_candidates > ranked_candidate_window
-    {
+    if ranked_loaded < effective_limit && result.ranked_candidates > ranked_candidate_window {
         incomplete_reasons
             .push(CrashBundleDiscoveryIncompleteReason::RankedCandidateWindowExhausted);
     }
     if result.unranked_candidates > LATEST_CRASH_BUNDLE_UNRANKED_WINDOW {
         incomplete_reasons
             .push(CrashBundleDiscoveryIncompleteReason::UnrankedCandidateWindowExceeded);
+    }
+    if payload_stats.filesystem_changed {
+        incomplete_reasons
+            .push(CrashBundleDiscoveryIncompleteReason::FilesystemChangedDuringDiscovery);
     }
     if !incomplete_reasons.is_empty() {
         result.completeness = CrashBundleDiscoveryCompleteness::Incomplete {
@@ -2705,12 +3067,8 @@ pub fn list_crash_bundles(crash_dir: &Path, limit: usize) -> Vec<CrashBundleSumm
 /// `completeness` is incomplete; authority-bearing callers must check it.
 #[must_use]
 pub fn discover_latest_crash_bundle(crash_dir: &Path) -> LatestCrashBundleDiscovery {
-    let mut discovery = discover_crash_bundles_bounded(
-        crash_dir,
-        1,
-        1,
-        LATEST_CRASH_BUNDLE_CANDIDATE_WINDOW,
-    );
+    let mut discovery =
+        discover_crash_bundles_bounded(crash_dir, 1, 1, LATEST_CRASH_BUNDLE_CANDIDATE_WINDOW);
     LatestCrashBundleDiscovery {
         bundle: discovery.bundles.pop(),
         completeness: discovery.completeness,
@@ -9391,7 +9749,11 @@ mod tests {
             .expect("every concurrent crash bundle");
         assert_eq!(paths.len(), WRITERS);
         for path in &paths {
-            assert!(path.is_dir(), "missing completed bundle: {}", path.display());
+            assert!(
+                path.is_dir(),
+                "missing completed bundle: {}",
+                path.display()
+            );
             assert!(path.join("crash_report.json").is_file());
             assert!(path.join("manifest.json").is_file());
         }
@@ -9962,16 +10324,24 @@ mod tests {
     #[test]
     fn latest_discovery_keeps_selection_memory_bounded_across_10k_names() {
         let mut heap = BinaryHeap::new();
+        let authority_timestamp = CrashBundleChronologicalKey {
+            year: 2026,
+            month: 8,
+            day: 5,
+            hour: 12,
+            minute: 0,
+            second: 0,
+        };
         for sequence in 0_u64..10_000 {
             retain_newest_candidate(
                 &mut heap,
                 RankedCrashBundleCandidate {
+                    authority_timestamp,
                     timestamp: "20260805_120000".to_string(),
                     modified: Some(UNIX_EPOCH),
                     process_sequence: Some((7, sequence)),
-                    path: PathBuf::from(format!(
-                        "ft_crash_20260805_120000_p7_{sequence}"
-                    )),
+                    path: PathBuf::from(format!("ft_crash_20260805_120000_p7_{sequence}")),
+                    filesystem_snapshot: CrashBundleFilesystemSnapshot::default(),
                 },
                 LATEST_CRASH_BUNDLE_CANDIDATE_WINDOW,
             );
@@ -9998,6 +10368,14 @@ mod tests {
     }
 
     #[test]
+    fn crash_bundle_timestamp_iso8601_uses_exact_generated_fields() {
+        assert_eq!(
+            crash_bundle_timestamp_iso8601("20260805_123456").as_deref(),
+            Some("2026-08-05T12:34:56Z")
+        );
+    }
+
+    #[test]
     fn candidate_metadata_failure_is_explicitly_incomplete_authority() {
         let mut metadata_unreadable = false;
         let modified = crash_bundle_candidate_modified(
@@ -10012,6 +10390,271 @@ mod tests {
     }
 
     #[test]
+    fn crash_bundle_cumulative_counter_saturates_instead_of_wrapping() {
+        let counter = std::sync::atomic::AtomicU64::new(u64::MAX - 1);
+        assert_eq!(
+            increment_saturating_crash_bundle_counter(&counter),
+            u64::MAX
+        );
+        assert_eq!(
+            increment_saturating_crash_bundle_counter(&counter),
+            u64::MAX
+        );
+        assert_eq!(counter.load(std::sync::atomic::Ordering::Relaxed), u64::MAX);
+    }
+
+    #[test]
+    fn chronological_authority_orders_beyond_four_digit_display_years() {
+        let last_four_digit_year = crash_bundle_chronological_key_from_epoch(253_402_300_799);
+        let far_future = crash_bundle_chronological_key_from_epoch(u64::MAX);
+        assert_eq!(last_four_digit_year.year, 9_999);
+        assert!(far_future.year > 9_999);
+        assert!(far_future > last_four_digit_year);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retained_candidate_replacement_withholds_authority() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bundle_name = "ft_crash_19700101_003320_p7_1";
+        let bundle_path = tmp.path().join(bundle_name);
+        fs::create_dir(&bundle_path).unwrap();
+        let mut report = test_report();
+        report.timestamp = 2_000;
+        fs::write(
+            bundle_path.join("crash_report.json"),
+            serde_json::to_vec(&report).unwrap(),
+        )
+        .unwrap();
+
+        let crash_root =
+            CapDir::open_ambient_dir(tmp.path(), cap_std::ambient_authority()).unwrap();
+        let metadata = crash_root.symlink_metadata(bundle_name).unwrap();
+        let (expected_snapshot, metadata_unreadable) = crash_bundle_filesystem_snapshot(&metadata);
+        assert!(!metadata_unreadable);
+
+        let original_path = tmp.path().join("original_bundle");
+        fs::rename(&bundle_path, original_path).unwrap();
+        fs::create_dir(&bundle_path).unwrap();
+        fs::write(
+            bundle_path.join("crash_report.json"),
+            serde_json::to_vec(&report).unwrap(),
+        )
+        .unwrap();
+
+        let mut stats = CrashBundlePayloadReadStats::default();
+        let summary = read_crash_bundle_summary_from_root_bounded(
+            &crash_root,
+            bundle_path,
+            Some("19700101_003320"),
+            expected_snapshot,
+            &mut stats,
+        );
+        assert!(summary.is_none());
+        assert!(stats.filesystem_changed);
+        assert_eq!(stats.files_opened, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn root_snapshot_distinguishes_ambient_path_replacement() {
+        let tmp = tempfile::tempdir().unwrap();
+        let crash_path = tmp.path().join("crash");
+        fs::create_dir(&crash_path).unwrap();
+        let original_root =
+            CapDir::open_ambient_dir(&crash_path, cap_std::ambient_authority()).unwrap();
+        let (before, before_metadata_unreadable) =
+            crash_bundle_directory_snapshot(&original_root).unwrap();
+        assert!(!before_metadata_unreadable);
+
+        fs::rename(&crash_path, tmp.path().join("original_crash")).unwrap();
+        fs::create_dir(&crash_path).unwrap();
+        let replacement_root =
+            CapDir::open_ambient_dir(&crash_path, cap_std::ambient_authority()).unwrap();
+        let (after, after_metadata_unreadable) =
+            crash_bundle_directory_snapshot(&replacement_root).unwrap();
+        assert!(!after_metadata_unreadable);
+        assert_ne!(before, after);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cross_payload_revalidation_detects_same_metadata_manifest_rewrite() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bundle_path = tmp.path().join("ft_crash_legacy_cross_payload");
+        fs::create_dir(&bundle_path).unwrap();
+
+        let manifest_before = CrashManifest {
+            wa_version: "aaaaaa".to_string(),
+            created_at: "2026-08-05T12:34:56Z".to_string(),
+            files: vec!["crash_report.json".to_string()],
+            has_health_snapshot: false,
+            has_resize_forensics: false,
+            has_environment_markers: false,
+            bundle_size_bytes: 0,
+        };
+        let mut manifest_after = manifest_before.clone();
+        manifest_after.wa_version = "bbbbbb".to_string();
+        let manifest_before_bytes = serde_json::to_vec(&manifest_before).unwrap();
+        let manifest_after_bytes = serde_json::to_vec(&manifest_after).unwrap();
+        assert_eq!(manifest_before_bytes.len(), manifest_after_bytes.len());
+
+        let manifest_path = bundle_path.join("manifest.json");
+        fs::write(&manifest_path, &manifest_before_bytes).unwrap();
+        let original_metadata = fs::metadata(&manifest_path).unwrap();
+        let original_modified = original_metadata.modified().unwrap();
+        fs::write(
+            bundle_path.join("crash_report.json"),
+            serde_json::to_vec(&test_report()).unwrap(),
+        )
+        .unwrap();
+
+        let bundle_dir = open_crash_bundle_dir_nofollow(&bundle_path).unwrap();
+        let mut stats = CrashBundlePayloadReadStats::default();
+        let mut rewrote_manifest = false;
+        let summary = read_crash_bundle_summary_from_dir_bounded_with_checkpoint(
+            &bundle_dir,
+            bundle_path,
+            None,
+            &mut stats,
+            |checkpoint| {
+                if checkpoint == CrashBundlePayloadReadCheckpoint::AfterManifest {
+                    fs::write(&manifest_path, &manifest_after_bytes).unwrap();
+                    let manifest_file = fs::OpenOptions::new()
+                        .write(true)
+                        .open(&manifest_path)
+                        .unwrap();
+                    manifest_file
+                        .set_times(fs::FileTimes::new().set_modified(original_modified))
+                        .unwrap();
+                    let rewritten_metadata = fs::metadata(&manifest_path).unwrap();
+                    assert_eq!(rewritten_metadata.len(), original_metadata.len());
+                    assert_eq!(rewritten_metadata.modified().unwrap(), original_modified);
+                    assert_eq!(
+                        std::os::unix::fs::MetadataExt::dev(&rewritten_metadata),
+                        std::os::unix::fs::MetadataExt::dev(&original_metadata)
+                    );
+                    assert_eq!(
+                        std::os::unix::fs::MetadataExt::ino(&rewritten_metadata),
+                        std::os::unix::fs::MetadataExt::ino(&original_metadata)
+                    );
+                    rewrote_manifest = true;
+                }
+            },
+        );
+
+        assert!(rewrote_manifest);
+        assert!(summary.is_none());
+        assert!(stats.filesystem_changed);
+        assert!(!stats.authority_unreadable);
+        assert!(!stats.metadata_unreadable);
+        assert_eq!(stats.files_opened, 3);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cross_payload_revalidation_detects_atomic_manifest_replacement() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bundle_path = tmp.path().join("ft_crash_legacy_cross_payload_replace");
+        fs::create_dir(&bundle_path).unwrap();
+
+        let manifest_before = CrashManifest {
+            wa_version: "aaaaaa".to_string(),
+            created_at: "2026-08-05T12:34:56Z".to_string(),
+            files: vec!["crash_report.json".to_string()],
+            has_health_snapshot: false,
+            has_resize_forensics: false,
+            has_environment_markers: false,
+            bundle_size_bytes: 0,
+        };
+        let mut manifest_after = manifest_before.clone();
+        manifest_after.wa_version = "bbbbbb".to_string();
+        let manifest_before_bytes = serde_json::to_vec(&manifest_before).unwrap();
+        let manifest_after_bytes = serde_json::to_vec(&manifest_after).unwrap();
+        assert_eq!(manifest_before_bytes.len(), manifest_after_bytes.len());
+
+        let manifest_path = bundle_path.join("manifest.json");
+        fs::write(&manifest_path, &manifest_before_bytes).unwrap();
+        let original_metadata = fs::metadata(&manifest_path).unwrap();
+        let original_modified = original_metadata.modified().unwrap();
+        fs::write(
+            bundle_path.join("crash_report.json"),
+            serde_json::to_vec(&test_report()).unwrap(),
+        )
+        .unwrap();
+
+        let bundle_dir = open_crash_bundle_dir_nofollow(&bundle_path).unwrap();
+        let mut stats = CrashBundlePayloadReadStats::default();
+        let mut replaced_manifest = false;
+        let summary = read_crash_bundle_summary_from_dir_bounded_with_checkpoint(
+            &bundle_dir,
+            bundle_path.clone(),
+            None,
+            &mut stats,
+            |checkpoint| {
+                if checkpoint == CrashBundlePayloadReadCheckpoint::AfterManifest {
+                    let replacement_path = bundle_path.join("manifest.next.json");
+                    fs::write(&replacement_path, &manifest_after_bytes).unwrap();
+                    let replacement_file = fs::OpenOptions::new()
+                        .write(true)
+                        .open(&replacement_path)
+                        .unwrap();
+                    replacement_file
+                        .set_times(fs::FileTimes::new().set_modified(original_modified))
+                        .unwrap();
+                    fs::rename(replacement_path, &manifest_path).unwrap();
+                    let replacement_metadata = fs::metadata(&manifest_path).unwrap();
+                    assert_eq!(replacement_metadata.len(), original_metadata.len());
+                    assert_eq!(replacement_metadata.modified().unwrap(), original_modified);
+                    assert_eq!(
+                        std::os::unix::fs::MetadataExt::dev(&replacement_metadata),
+                        std::os::unix::fs::MetadataExt::dev(&original_metadata)
+                    );
+                    assert_ne!(
+                        std::os::unix::fs::MetadataExt::ino(&replacement_metadata),
+                        std::os::unix::fs::MetadataExt::ino(&original_metadata)
+                    );
+                    replaced_manifest = true;
+                }
+            },
+        );
+
+        assert!(replaced_manifest);
+        assert!(summary.is_none());
+        assert!(stats.filesystem_changed);
+        assert!(!stats.authority_unreadable);
+        assert!(!stats.metadata_unreadable);
+        assert_eq!(stats.files_opened, 3);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_prefixed_bundle_uses_unranked_fallback() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut older = test_report();
+        older.timestamp = 1_000;
+        write_crash_bundle(tmp.path(), &older, None, None).unwrap();
+
+        let raw_name = std::ffi::OsString::from_vec(b"ft_crash_legacy_\xff".to_vec());
+        let raw_path = tmp.path().join(raw_name);
+        fs::create_dir(&raw_path).unwrap();
+        let mut newer = test_report();
+        newer.timestamp = 2_000;
+        fs::write(
+            raw_path.join("crash_report.json"),
+            serde_json::to_vec(&newer).unwrap(),
+        )
+        .unwrap();
+
+        let discovery = discover_latest_crash_bundle(tmp.path());
+        assert!(discovery.completeness.is_complete());
+        assert_eq!(discovery.unranked_candidates, 1);
+        assert_eq!(discovery.bundle.unwrap().path, raw_path);
+    }
+
+    #[test]
     fn candidate_payload_io_classification_distinguishes_invalid_from_unreadable() {
         assert!(crash_bundle_io_error_withholds_authority(
             &std::io::Error::new(std::io::ErrorKind::PermissionDenied, "synthetic denial")
@@ -10023,7 +10666,10 @@ mod tests {
             &std::io::Error::other("synthetic unclassified failure")
         ));
         assert!(!crash_bundle_io_error_withholds_authority(
-            &std::io::Error::new(std::io::ErrorKind::InvalidData, "synthetic malformed payload")
+            &std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "synthetic malformed payload"
+            )
         ));
         assert!(!crash_bundle_io_error_withholds_authority(
             &std::io::Error::new(std::io::ErrorKind::NotFound, "synthetic absence")
@@ -10048,10 +10694,8 @@ mod tests {
     #[test]
     fn bounded_list_reports_requested_limit_cap_even_for_empty_directory() {
         let tmp = tempfile::tempdir().unwrap();
-        let discovery = discover_crash_bundles(
-            tmp.path(),
-            MAX_CRASH_BUNDLE_LIST_RESULTS.saturating_add(1),
-        );
+        let discovery =
+            discover_crash_bundles(tmp.path(), MAX_CRASH_BUNDLE_LIST_RESULTS.saturating_add(1));
         assert_eq!(discovery.effective_limit, MAX_CRASH_BUNDLE_LIST_RESULTS);
         assert_eq!(
             discovery.completeness,
@@ -10084,7 +10728,7 @@ mod tests {
         let discovery = discover_crash_bundles(tmp.path(), 1);
         assert!(discovery.bundles.is_empty());
         assert_eq!(discovery.ranked_candidates, 100);
-        assert_eq!(discovery.payload_files_opened, ranked_window * 2);
+        assert_eq!(discovery.payload_files_opened, ranked_window * 4);
         assert_eq!(
             crash_bundle_parse_drop_count(),
             u64::try_from(ranked_window * 2).unwrap()
@@ -10097,9 +10741,7 @@ mod tests {
         assert_eq!(
             discovery.completeness,
             CrashBundleDiscoveryCompleteness::Incomplete {
-                reasons: vec![
-                    CrashBundleDiscoveryIncompleteReason::RankedCandidateWindowExhausted,
-                ],
+                reasons: vec![CrashBundleDiscoveryIncompleteReason::RankedCandidateWindowExhausted,],
             }
         );
     }
@@ -10121,11 +10763,13 @@ mod tests {
 
         let discovery = discover_latest_crash_bundle(tmp.path());
         assert!(discovery.completeness.is_complete());
-        let bundle = discovery.bundle.expect("newest manifest remains authoritative");
+        let bundle = discovery
+            .bundle
+            .expect("newest manifest remains authoritative");
         assert_eq!(bundle.path, newer_path);
         assert!(bundle.manifest.is_some());
         assert!(bundle.report.is_none());
-        assert_eq!(discovery.payload_files_opened, 2);
+        assert_eq!(discovery.payload_files_opened, 4);
     }
 
     #[test]
@@ -10139,20 +10783,11 @@ mod tests {
         };
         let calls = CRASH_BUNDLE_DISCOVERY_INCOMPLETE_LOG_LIMIT.saturating_add(9);
         for _ in 0..calls {
-            record_crash_bundle_discovery_incomplete(
-                "test",
-                &completeness,
-                0,
-                0,
-                0,
-                0,
-                0,
-            );
+            record_crash_bundle_discovery_incomplete("test", &completeness, 0, 0, 0, 0, 0);
         }
         assert_eq!(crash_bundle_discovery_incomplete_count(), calls);
         assert_eq!(
-            CRASH_BUNDLE_DISCOVERY_INCOMPLETE_LOG_COUNT
-                .load(std::sync::atomic::Ordering::Relaxed),
+            CRASH_BUNDLE_DISCOVERY_INCOMPLETE_LOG_COUNT.load(std::sync::atomic::Ordering::Relaxed),
             CRASH_BUNDLE_DISCOVERY_INCOMPLETE_LOG_LIMIT.saturating_add(1)
         );
     }
@@ -10181,15 +10816,12 @@ mod tests {
 
         let discovery = discover_latest_crash_bundle(tmp.path());
         assert!(discovery.completeness.is_complete());
-        assert_eq!(discovery.payload_files_opened, 2);
+        assert_eq!(discovery.payload_files_opened, 4);
         assert!(
             discovery.payload_bytes_read
-                <= MAX_CRASH_MANIFEST_JSON_READ_BYTES + MAX_CRASH_REPORT_JSON_READ_BYTES
+                <= 2 * (MAX_CRASH_MANIFEST_JSON_READ_BYTES + MAX_CRASH_REPORT_JSON_READ_BYTES)
         );
-        assert_eq!(
-            discovery.bundle.unwrap().report.unwrap().message,
-            "newer"
-        );
+        assert_eq!(discovery.bundle.unwrap().report.unwrap().message, "newer");
         assert_eq!(crash_bundle_parse_drop_count(), 0);
     }
 
@@ -10212,11 +10844,8 @@ mod tests {
 
         let discovery = discover_latest_crash_bundle(tmp.path());
         assert!(discovery.completeness.is_complete());
-        assert_eq!(discovery.payload_files_opened, 4);
-        assert_eq!(
-            discovery.bundle.unwrap().report.unwrap().message,
-            "older"
-        );
+        assert_eq!(discovery.payload_files_opened, 8);
+        assert_eq!(discovery.bundle.unwrap().report.unwrap().message, "older");
         assert_eq!(crash_bundle_parse_drop_count(), 2);
     }
 
@@ -10244,14 +10873,12 @@ mod tests {
 
         let discovery = discover_latest_crash_bundle(tmp.path());
         assert_eq!(discovery.ranked_candidates, 34);
-        assert_eq!(discovery.payload_files_opened, 64);
+        assert_eq!(discovery.payload_files_opened, 128);
         assert!(discovery.bundle.is_none());
         assert_eq!(
             discovery.completeness,
             CrashBundleDiscoveryCompleteness::Incomplete {
-                reasons: vec![
-                    CrashBundleDiscoveryIncompleteReason::RankedCandidateWindowExhausted,
-                ],
+                reasons: vec![CrashBundleDiscoveryIncompleteReason::RankedCandidateWindowExhausted,],
             }
         );
         assert!(latest_crash_bundle(tmp.path()).is_none());
@@ -10298,8 +10925,11 @@ mod tests {
             &mut stats,
         );
         assert!(result.is_none());
-        assert_eq!(stats.files_opened, 1);
-        assert_eq!(stats.bytes_read, MAX_CRASH_MANIFEST_JSON_READ_BYTES + 1);
+        assert_eq!(stats.files_opened, 2);
+        assert_eq!(
+            stats.bytes_read,
+            2 * (MAX_CRASH_MANIFEST_JSON_READ_BYTES + 1)
+        );
         assert_eq!(crash_bundle_parse_drop_count(), 1);
     }
 
