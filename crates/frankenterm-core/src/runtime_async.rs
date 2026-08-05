@@ -944,7 +944,15 @@ pub mod task {
                 .store(true, std::sync::atomic::Ordering::Release);
             // br-ft-iaxog: abort wake site.
             if let Some(waker) = lock_abort_waker_recovering(&self.abort_waker).take() {
-                waker.wake();
+                // Abort authority is already committed and the stored waker
+                // has been retired. An executor-provided `Wake`
+                // implementation may still panic; contain that callback so
+                // it cannot unwind through the cancelling caller or undo the
+                // next-poll cancellation result.
+                let _ = frankenterm_sigpipe::catch_recoverable(
+                    frankenterm_sigpipe::RecoverablePanicSite::CoreAsyncTaskJoin,
+                    std::panic::AssertUnwindSafe(|| waker.wake()),
+                );
             }
         }
     }
@@ -5666,6 +5674,51 @@ mod tests {
             assert!(matches!(
                 result,
                 std::task::Poll::Ready(Err(ref err)) if err.is_cancelled()
+            ));
+        });
+    }
+
+    #[test]
+    fn task_abort_contains_panicking_waker_and_preserves_cancellation() {
+        use std::sync::Arc;
+        use std::task::{Wake, Waker};
+
+        struct PanickingWaker;
+
+        impl Wake for PanickingWaker {
+            fn wake(self: Arc<Self>) {
+                panic!("executor waker panic must remain contained");
+            }
+
+            fn wake_by_ref(self: &Arc<Self>) {
+                panic!("executor waker panic must remain contained");
+            }
+        }
+
+        let rt = RuntimeBuilder::current_thread().build().unwrap();
+        rt.block_on(async {
+            let handle = task::spawn(std::future::poll_fn(|_| std::task::Poll::<()>::Pending));
+            let waker = Waker::from(Arc::new(PanickingWaker));
+            let mut cx = std::task::Context::from_waker(&waker);
+            let mut pinned = std::pin::pin!(handle);
+
+            assert!(matches!(
+                pinned.as_mut().poll(&mut cx),
+                std::task::Poll::Pending
+            ));
+
+            let abort_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                pinned.as_ref().get_ref().abort();
+            }));
+            assert!(
+                abort_result.is_ok(),
+                "an executor waker panic must not escape task abort"
+            );
+
+            let result = pinned.as_mut().poll(&mut cx);
+            assert!(matches!(
+                result,
+                std::task::Poll::Ready(Err(ref error)) if error.is_cancelled()
             ));
         });
     }
