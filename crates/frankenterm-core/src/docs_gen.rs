@@ -517,6 +517,7 @@ const STANDARD_ROBOT_ERROR_CODES: &[&str] = &[
     "robot.wezterm_parse_error",
     "robot.circuit_open",
     "robot.storage_error",
+    "robot.cursor_discontinuity",
     "robot.fts_query_error",
     "robot.policy_denied",
     "robot.require_approval",
@@ -587,6 +588,9 @@ fn error_code_description(code: &str) -> &'static str {
             "Terminal backend circuit breaker is open after repeated recent failures"
         }
         "robot.storage_error" => "Database or storage layer error",
+        "robot.cursor_discontinuity" => {
+            "Durable event cursor cannot be resumed without acknowledging a retention, epoch, scope, or authority discontinuity"
+        }
         "robot.fts_query_error" => "Full-text search query was invalid or could not be executed",
         "robot.policy_denied" => "Action denied by safety policy",
         "robot.require_approval" => {

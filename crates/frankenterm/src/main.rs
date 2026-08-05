@@ -3745,9 +3745,33 @@ enum RobotCommands {
         #[arg(long)]
         cursor: Option<i64>,
 
+        /// Retention epoch paired with --cursor. Use the epoch returned beside
+        /// the prior cursor; integer IDs are not authoritative across pruning
+        /// history upgrades or bounded ledger rotation.
+        #[arg(long, requires = "cursor")]
+        cursor_epoch: Option<String>,
+
+        /// SHA-256 scope fingerprint paired with --cursor. Copy it from the
+        /// prior response; changing membership filters requires a fresh start.
+        #[arg(long, requires = "cursor")]
+        cursor_scope: Option<String>,
+
         /// Bounded replay window for cursor/event retrieval (defaults to --limit)
-        #[arg(long)]
+        #[arg(long, requires = "cursor")]
         replay_limit: Option<usize>,
+
+        /// Establish an atomic fresh cursor at the current durable tail without
+        /// replaying historical events. The response contains `next_cursor`
+        /// `next_cursor_epoch`, and `next_cursor_scope` for a subsequent
+        /// cursor-mode request.
+        #[arg(
+            long,
+            conflicts_with = "cursor",
+            conflicts_with = "cursor_epoch",
+            conflicts_with = "cursor_scope",
+            conflicts_with = "replay_limit"
+        )]
+        start_at_tail: bool,
 
         /// Preview which workflows would handle these events (no execution)
         #[arg(long)]
@@ -3772,9 +3796,11 @@ enum RobotCommands {
     /// (and may re-deliver). Live-only pane lifecycle signals cannot be
     /// reconstructed from storage; follow mode emits a typed `gap` whenever
     /// their IPC transport is unavailable or disconnects instead of silently
-    /// implying complete delivery. A `--cursor` that predates retained events
-    /// emits a typed `cursor_expired` record and re-baselines to the oldest
-    /// retained event (ft-7h5da.4.2).
+    /// implying complete delivery. A resume cursor must be paired with its
+    /// retention epoch and scope fingerprint. Any pruned, legacy-ambiguous,
+    /// stale-epoch, wrong-scope, or ahead-of-authority cursor emits a typed
+    /// terminal discontinuity; the follower never silently re-baselines
+    /// (ft-7h5da.4.2).
     #[command(visible_alias = "watch-event")]
     WatchEvents {
         /// Follow mode: keep tailing new events (like `tail -f`). Without it,
@@ -3782,7 +3808,7 @@ enum RobotCommands {
         #[arg(long)]
         follow: bool,
 
-        /// Filter by severity (case-insensitive exact: "critical", "warning", or "info")
+        /// Filter by severity (case-insensitive exact: "critical", "error", "warning", or "info")
         #[arg(long)]
         severity: Option<String>,
 
@@ -3810,6 +3836,16 @@ enum RobotCommands {
         #[arg(long)]
         cursor: Option<i64>,
 
+        /// Retention epoch paired with --cursor. Copy it from the prior event,
+        /// heartbeat, or gap record.
+        #[arg(long, requires = "cursor")]
+        cursor_epoch: Option<String>,
+
+        /// SHA-256 scope fingerprint paired with --cursor. Copy it from the
+        /// prior stream record; changing filters requires a fresh start.
+        #[arg(long, requires = "cursor")]
+        cursor_scope: Option<String>,
+
         /// Max events fetched per poll batch (1..=1000)
         #[arg(long, default_value = "100")]
         limit: usize,
@@ -3828,12 +3864,15 @@ enum RobotCommands {
         max_hz: u32,
     },
 
-    /// Block until composite conditions match (or timeout), then emit one
-    /// `await_result` NDJSON record. Conditions compose: every `--all` must
-    /// match AND (if any `--any` is given) at least one `--any` must match.
-    /// Supported source in DB-cursor mode: `rule:<glob>` (an event whose
-    /// rule-id matches appears). `state:`/`quiescence:` sources require the
-    /// watcher IPC transport (ft-7h5da.4.3 follow-on). Generalizes wait-for.
+    /// Block until composite conditions match (or timeout), then emit a
+    /// terminal `await_result` NDJSON record. A cursorless await first emits a
+    /// committed `cursor_checkpoint` baseline record. Conditions compose:
+    /// every `--all` must match AND (if any `--any` is given) at least one
+    /// `--any` must match.
+    /// Supported DB-cursor sources are `rule:<glob>` (an event whose rule-id
+    /// matches appears) and `quiescence:<pane>[:<idle_ms>]` (storage-derived
+    /// output silence). `state:` requires the watcher IPC transport because it
+    /// depends on live input-sent tracking. Generalizes wait-for.
     Await {
         /// Condition where ANY match satisfies (repeatable). E.g. `rule:codex.*`
         #[arg(long = "any")]
@@ -3855,6 +3894,16 @@ enum RobotCommands {
         /// only events that arrive after the await starts)
         #[arg(long)]
         cursor: Option<i64>,
+
+        /// Retention epoch paired with --cursor. Copy it from the prior
+        /// await_result or event-stream record.
+        #[arg(long, requires = "cursor")]
+        cursor_epoch: Option<String>,
+
+        /// SHA-256 scope fingerprint paired with --cursor. Copy it from the
+        /// prior await result; changing conditions requires a fresh start.
+        #[arg(long, requires = "cursor")]
+        cursor_scope: Option<String>,
     },
 
     /// Workflow management commands
@@ -6840,6 +6889,7 @@ const ROBOT_ERR_APPROVAL: &str = "robot.approval_error";
 const ROBOT_ERR_PANE_NOT_FOUND: &str = "robot.pane_not_found";
 const ROBOT_ERR_RESERVATION_CONFLICT: &str = "robot.reservation_conflict";
 const ROBOT_ERR_STORAGE: &str = "robot.storage_error";
+const ROBOT_ERR_CURSOR_DISCONTINUITY: &str = "robot.cursor_discontinuity";
 const ROBOT_ERR_FEATURE_NOT_AVAILABLE: &str = "robot.feature_not_available";
 const ROBOT_ERR_POLICY_DENIED: &str = "robot.policy_denied";
 const ROBOT_ERR_TIMEOUT: &str = "robot.timeout";
@@ -8111,16 +8161,12 @@ const ROBOT_RESPONSE_SCHEMA_VERSION: u32 =
     frankenterm_core::robot_types::RobotResponse::<()>::SCHEMA_VERSION;
 
 /// JSON envelope for robot mode responses
-#[derive(serde::Serialize)]
 struct RobotResponse<T> {
     ok: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
     data: Option<T>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    error_data: Option<serde_json::Value>,
     error: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     error_code: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     hint: Option<String>,
     elapsed_ms: u64,
     version: String,
@@ -8128,11 +8174,56 @@ struct RobotResponse<T> {
     schema_version: u32,
 }
 
+impl<T: serde::Serialize> serde::Serialize for RobotResponse<T> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+
+        let wire_data_present = if self.ok {
+            self.data.is_some()
+        } else {
+            self.error_data.is_some()
+        };
+        let mut state = serializer.serialize_struct(
+            "RobotResponse",
+            5 + usize::from(wire_data_present)
+                + usize::from(self.error.is_some())
+                + usize::from(self.error_code.is_some())
+                + usize::from(self.hint.is_some()),
+        )?;
+        state.serialize_field("ok", &self.ok)?;
+        if self.ok {
+            if let Some(data) = &self.data {
+                state.serialize_field("data", data)?;
+            }
+        } else if let Some(error_data) = &self.error_data {
+            state.serialize_field("data", error_data)?;
+        }
+        if let Some(error) = &self.error {
+            state.serialize_field("error", error)?;
+        }
+        if let Some(error_code) = &self.error_code {
+            state.serialize_field("error_code", error_code)?;
+        }
+        if let Some(hint) = &self.hint {
+            state.serialize_field("hint", hint)?;
+        }
+        state.serialize_field("elapsed_ms", &self.elapsed_ms)?;
+        state.serialize_field("version", &self.version)?;
+        state.serialize_field("now", &self.now)?;
+        state.serialize_field("schema_version", &self.schema_version)?;
+        state.end()
+    }
+}
+
 impl<T> RobotResponse<T> {
     fn success(data: T, elapsed_ms: u64) -> Self {
         Self {
             ok: true,
             data: Some(data),
+            error_data: None,
             error: None,
             error_code: None,
             hint: None,
@@ -8154,6 +8245,7 @@ impl<T> RobotResponse<T> {
         Self {
             ok: false,
             data: None,
+            error_data: None,
             error: Some(redact_for_output(&msg)),
             error_code: Some(code.to_string()),
             hint,
@@ -8162,6 +8254,18 @@ impl<T> RobotResponse<T> {
             now: now_ms(),
             schema_version: ROBOT_RESPONSE_SCHEMA_VERSION,
         }
+    }
+
+    fn error_with_code_and_data(
+        code: &str,
+        msg: impl Into<String>,
+        hint: Option<String>,
+        error_data: serde_json::Value,
+        elapsed_ms: u64,
+    ) -> Self {
+        let mut response = Self::error_with_code(code, msg, hint, elapsed_ms);
+        response.error_data = Some(error_data);
+        response
     }
 }
 
@@ -11978,11 +12082,21 @@ struct RobotEventsData {
     #[serde(skip_serializing_if = "Option::is_none")]
     cursor: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    cursor_epoch: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cursor_scope: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     next_cursor: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    next_cursor_epoch: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    next_cursor_scope: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     replay_limit: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     order: Option<String>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    start_at_tail: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pane_filter: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -15996,17 +16110,7 @@ fn robot_fleet_error_with_data(
     data: serde_json::Value,
     elapsed_ms: u64,
 ) -> RobotResponse<serde_json::Value> {
-    RobotResponse {
-        ok: false,
-        data: Some(data),
-        error: Some(message.into()),
-        error_code: Some(code.to_string()),
-        hint,
-        elapsed_ms,
-        version: frankenterm_core::VERSION.to_string(),
-        now: now_ms(),
-        schema_version: ROBOT_RESPONSE_SCHEMA_VERSION,
-    }
+    RobotResponse::error_with_code_and_data(code, message, hint, data, elapsed_ms)
 }
 
 async fn robot_fleet_command_response(
@@ -22958,11 +23062,198 @@ fn validate_robot_events_cursor(cursor: Option<i64>) -> Result<(), &'static str>
     }
 }
 
-fn validate_robot_events_replay_limit(replay_limit: Option<usize>) -> Result<(), &'static str> {
-    if matches!(replay_limit, Some(0)) {
-        Err("Invalid --replay-limit: must be >= 1")
+const EVENT_CURSOR_EPOCH_HEX_LEN: usize = 32;
+const EVENT_CURSOR_SCOPE_HEX_LEN: usize = 64;
+const ROBOT_EVENTS_QUERY_LIMIT_MAX: usize = 4_096;
+
+fn event_cursor_epoch_is_canonical(cursor_epoch: &str) -> bool {
+    cursor_epoch.len() == EVENT_CURSOR_EPOCH_HEX_LEN
+        && cursor_epoch
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn event_cursor_scope_is_canonical(cursor_scope: &str) -> bool {
+    cursor_scope.len() == EVENT_CURSOR_SCOPE_HEX_LEN
+        && cursor_scope
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn validate_event_cursor_token_parts(
+    cursor: Option<i64>,
+    cursor_epoch: Option<&str>,
+    cursor_scope: Option<&str>,
+) -> Result<(), &'static str> {
+    match (cursor, cursor_epoch, cursor_scope) {
+        (Some(_), None, _) => Err(
+            "Invalid cursor: --cursor-epoch and --cursor-scope are required with --cursor",
+        ),
+        (Some(_), Some(_), None) => {
+            Err("Invalid cursor: --cursor-scope is required with --cursor")
+        }
+        (None, Some(_), _) => Err("Invalid cursor: --cursor-epoch requires --cursor"),
+        (None, None, Some(_)) => Err("Invalid cursor: --cursor-scope requires --cursor"),
+        (Some(_), Some(epoch), Some(_)) if !event_cursor_epoch_is_canonical(epoch) => Err(
+            "Invalid --cursor-epoch: expected exactly 32 lowercase hexadecimal characters",
+        ),
+        (Some(_), Some(_), Some(scope)) if !event_cursor_scope_is_canonical(scope) => Err(
+            "Invalid --cursor-scope: expected exactly 64 lowercase hexadecimal characters",
+        ),
+        _ => Ok(()),
+    }
+}
+
+fn event_cursor_scope_digest<'a, I>(surface: &str, fields: I) -> String
+where
+    I: IntoIterator<Item = (&'a str, String)>,
+{
+    use sha2::{Digest, Sha256};
+
+    fn hash_component(hasher: &mut Sha256, value: &[u8]) {
+        hasher.update(u64::try_from(value.len()).unwrap_or(u64::MAX).to_be_bytes());
+        hasher.update(value);
+    }
+
+    let mut hasher = Sha256::new();
+    hash_component(&mut hasher, b"frankenterm-event-cursor-scope-v1");
+    hash_component(&mut hasher, surface.as_bytes());
+    for (name, value) in fields {
+        hash_component(&mut hasher, name.as_bytes());
+        hash_component(&mut hasher, value.as_bytes());
+    }
+    hex::encode(hasher.finalize())
+}
+
+fn cursor_scope_value<T: serde::Serialize>(value: &T) -> String {
+    serde_json::to_string(value).expect("cursor scope values are serializable")
+}
+
+#[allow(clippy::too_many_arguments)]
+fn robot_events_cursor_scope(
+    pane: Option<u64>,
+    rule_id: Option<&str>,
+    event_type: Option<&str>,
+    triage_state: Option<&str>,
+    label: Option<&str>,
+    unhandled: bool,
+    since: Option<i64>,
+) -> String {
+    event_cursor_scope_digest(
+        "robot.events",
+        [
+            ("pane", cursor_scope_value(&pane)),
+            ("rule_id", cursor_scope_value(&rule_id)),
+            ("event_type", cursor_scope_value(&event_type)),
+            ("triage_state", cursor_scope_value(&triage_state)),
+            ("label", cursor_scope_value(&label)),
+            ("unhandled", cursor_scope_value(&unhandled)),
+            ("since", cursor_scope_value(&since)),
+        ],
+    )
+}
+
+fn watch_events_cursor_scope(
+    pane: Option<u64>,
+    severity: Option<&str>,
+    rule_glob: Option<&str>,
+    unhandled: bool,
+    claim: bool,
+) -> String {
+    event_cursor_scope_digest(
+        "robot.watch-events",
+        [
+            ("pane", cursor_scope_value(&pane)),
+            ("severity", cursor_scope_value(&severity)),
+            ("rule_glob", cursor_scope_value(&rule_glob)),
+            (
+                "effective_unhandled",
+                cursor_scope_value(&(unhandled || claim)),
+            ),
+            ("claim", cursor_scope_value(&claim)),
+        ],
+    )
+}
+
+fn await_cursor_scope(
+    any: &[AwaitCondition],
+    all: &[AwaitCondition],
+    config: &frankenterm_core::agent_pane_state::AgentDetectionConfig,
+) -> String {
+    let canonical = |condition: &AwaitCondition| match condition {
+        AwaitCondition::Rule(glob) => format!("rule:{glob}"),
+        AwaitCondition::Quiescence { pane_id, idle_ms } => format!(
+            "quiescence:{pane_id}:{}",
+            idle_ms.unwrap_or(config.idle_silence_ms)
+        ),
+    };
+    let mut any = any.iter().map(canonical).collect::<Vec<_>>();
+    let mut all = all.iter().map(canonical).collect::<Vec<_>>();
+    any.sort_unstable();
+    all.sort_unstable();
+    any.dedup();
+    all.dedup();
+    event_cursor_scope_digest(
+        "robot.await",
+        [
+            ("any", cursor_scope_value(&any)),
+            ("all", cursor_scope_value(&all)),
+        ],
+    )
+}
+
+fn validate_event_cursor_scope_matches(
+    supplied_scope: Option<&str>,
+    expected_scope: &str,
+) -> Result<(), &'static str> {
+    if supplied_scope.is_some_and(|scope| scope != expected_scope) {
+        Err("Invalid cursor: --cursor-scope does not match the active filters or conditions")
     } else {
         Ok(())
+    }
+}
+
+fn event_cursor_scope_discontinuity_ndjson(
+    cursor: i64,
+    cursor_epoch: &str,
+    supplied_scope: &str,
+    expected_scope: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "type": "cursor_discontinuity",
+        "terminal": true,
+        "reason": "cursor_scope_mismatch",
+        "requested_cursor": cursor,
+        "requested_cursor_epoch": cursor_epoch,
+        "requested_cursor_scope": supplied_scope,
+        "expected_cursor_scope": expected_scope,
+        "message": "the supplied cursor was issued for different filters or conditions",
+    })
+}
+
+fn validate_robot_events_since(since: Option<i64>) -> Result<(), &'static str> {
+    if since.is_some_and(|timestamp| timestamp < 0) {
+        Err("Invalid --since: epoch milliseconds must be non-negative")
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_robot_events_replay_limit(replay_limit: Option<usize>) -> Result<(), &'static str> {
+    match replay_limit {
+        Some(0) => Err("Invalid --replay-limit: must be >= 1"),
+        Some(limit) if limit > ROBOT_EVENTS_QUERY_LIMIT_MAX => {
+            Err("Invalid --replay-limit: must be <= 4096")
+        }
+        _ => Ok(()),
+    }
+}
+
+fn validate_robot_events_limit(limit: usize) -> Result<(), &'static str> {
+    if (1..=ROBOT_EVENTS_QUERY_LIMIT_MAX).contains(&limit) {
+        Ok(())
+    } else {
+        Err("Invalid --limit: must be in 1..=4096")
     }
 }
 
@@ -22990,10 +23281,11 @@ fn normalize_watch_severity(value: Option<&str>) -> Result<Option<String>, &'sta
         None => Ok(None),
         Some(value) if value.eq_ignore_ascii_case("info") => Ok(Some("info".to_string())),
         Some(value) if value.eq_ignore_ascii_case("warning") => Ok(Some("warning".to_string())),
+        Some(value) if value.eq_ignore_ascii_case("error") => Ok(Some("error".to_string())),
         Some(value) if value.eq_ignore_ascii_case("critical") => {
             Ok(Some("critical".to_string()))
         }
-        Some(_) => Err("Invalid --severity: expected info, warning, or critical"),
+        Some(_) => Err("Invalid --severity: expected info, warning, error, or critical"),
     }
 }
 
@@ -23027,8 +23319,6 @@ const WATCH_EVENTS_BATCH_LIMIT_ERROR: &str = "Invalid --limit: must be in 1..=10
 const WATCH_EVENTS_POLL_INTERVAL_MS_MIN: u64 = 10;
 const WATCH_EVENTS_CANCELLATION_CHECK_INTERVAL: std::time::Duration =
     std::time::Duration::from_millis(500);
-const WATCH_EVENTS_RETENTION_RECONCILE_INTERVAL: std::time::Duration =
-    std::time::Duration::from_secs(30);
 
 fn watch_events_unhandled_only(unhandled: bool, claim: bool) -> bool {
     unhandled || claim
@@ -23311,6 +23601,8 @@ async fn pace_watch_event(
     last_event_emit: Option<std::time::Instant>,
     stdout: &std::io::Stdout,
     cursor: Option<i64>,
+    cursor_epoch: Option<&str>,
+    cursor_scope: Option<&str>,
     heartbeat_interval_ms: u64,
     heartbeat: std::time::Duration,
     last_emit: &mut std::time::Instant,
@@ -23326,6 +23618,8 @@ async fn pace_watch_event(
         if !emit_watch_heartbeat_if_due(
             stdout,
             cursor,
+            cursor_epoch,
+            cursor_scope,
             heartbeat_interval_ms,
             heartbeat,
             last_emit,
@@ -23434,7 +23728,10 @@ fn watch_delay_bounded_by_heartbeat(
     wait.min(heartbeat.saturating_sub(elapsed_since_emit))
 }
 
-fn annotate_watch_event_claim_delivery(record: &mut serde_json::Value) -> std::io::Result<()> {
+fn annotate_watch_event_claim_delivery(
+    record: &mut serde_json::Value,
+    event_id: i64,
+) -> std::io::Result<()> {
     let object = record.as_object_mut().ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -23444,6 +23741,14 @@ fn annotate_watch_event_claim_delivery(record: &mut serde_json::Value) -> std::i
     object.insert(
         "claim_delivery".to_string(),
         serde_json::Value::String("finalize_after_output_flush".to_string()),
+    );
+    object.insert(
+        "cursor_commit_state".to_string(),
+        serde_json::Value::String("pending_finalize".to_string()),
+    );
+    object.insert(
+        "candidate_cursor".to_string(),
+        serde_json::Value::from(event_id),
     );
     Ok(())
 }
@@ -23455,8 +23760,9 @@ fn annotate_watch_event_claim_delivery(record: &mut serde_json::Value) -> std::i
 /// release/finalize run under a fresh bounded completion Cx so cancellation of
 /// the caller cannot suppress compensation after output returns. Cursor
 /// ownership remains with the caller and must advance only for
-/// [`WatchEventClaimDelivery::Delivered`] or
-/// [`WatchEventClaimDelivery::AlreadyHandledOrMissing`].
+/// [`WatchEventClaimDelivery::Delivered`]. An
+/// [`WatchEventClaimDelivery::AlreadyHandledOrMissing`] result requires an
+/// exact row/retention reconciliation before the caller may advance.
 ///
 /// The supplied writer is synchronous. This function can bound settlement
 /// after it returns, but cannot preempt a blocking OS write from this layer.
@@ -23474,7 +23780,7 @@ where
 
     // Validate and annotate the record before acquiring durable ownership so a
     // local serialization-shape bug cannot strand a known lease until expiry.
-    annotate_watch_event_claim_delivery(&mut record)?;
+    annotate_watch_event_claim_delivery(&mut record, event_id)?;
     let reservation = storage
         .reserve_event_delivery_with_cx(cx, event_id, WATCH_EVENTS_CLAIM_LEASE_TTL)
         .await
@@ -23572,16 +23878,99 @@ where
     })
 }
 
-/// NDJSON envelope for one watched event. `cursor` equals the event id so a
-/// follower can resume after it. The caller redacts the event first via
+#[derive(Debug)]
+enum WatchClaimSkipResolution {
+    Handled,
+    CursorDiscontinuity(frankenterm_core::storage::EventRetentionCheck),
+    Unhandled(String),
+    Inconsistent(String),
+}
+
+/// Resolve the deliberately compact `AlreadyHandledOrMissing` reservation
+/// result without guessing. A handled row is safe to skip. A missing row is
+/// safe only as a terminal retention discontinuity; absence with complete
+/// retention evidence is an invariant violation and must retain the cursor.
+async fn resolve_watch_claim_skip_with_cx(
+    cx: &frankenterm_core::cx::Cx,
+    storage: &frankenterm_core::storage::StorageHandle,
+    event_id: i64,
+    cursor_epoch: &str,
+) -> frankenterm_core::Result<WatchClaimSkipResolution> {
+    let page = storage
+        .get_events_stream_page_with_cx(
+            cx,
+            frankenterm_core::storage::EventStreamQuery {
+                after_id: Some(event_id.saturating_sub(1)),
+                limit: Some(1),
+                pane_id: None,
+                rule_id: None,
+                event_type: None,
+                triage_state: None,
+                label: None,
+                unhandled_only: false,
+                since: None,
+                until: None,
+            },
+        )
+        .await?;
+    let check = storage
+        .check_event_retention_in_epoch_with_cx(
+            cx,
+            event_id.saturating_sub(1),
+            event_id,
+            cursor_epoch,
+        )
+        .await?;
+    cx.checkpoint()
+        .map_err(|error| frankenterm_core::Error::Cancelled(error.to_string()))?;
+
+    if !matches!(
+        &check.status,
+        frankenterm_core::storage::EventRetentionStatus::CompleteNoPruning
+    ) {
+        return Ok(WatchClaimSkipResolution::CursorDiscontinuity(check));
+    }
+
+    match page.events.first() {
+        Some(event) if event.id == event_id && event.handled_at.is_some() => {
+            Ok(WatchClaimSkipResolution::Handled)
+        }
+        Some(event) if event.id == event_id => Ok(WatchClaimSkipResolution::Unhandled(
+            format!(
+                "event {event_id} remained unhandled after delivery reservation classified it as handled or missing"
+            ),
+        )),
+        Some(next) => Ok(WatchClaimSkipResolution::Inconsistent(format!(
+            "event {event_id} is missing without retention evidence; the next durable event is {}",
+            next.id
+        ))),
+        None => Ok(WatchClaimSkipResolution::Inconsistent(format!(
+            "event {event_id} is missing without retention evidence at high-water mark {}",
+            page.retention.max_event_id
+        ))),
+    }
+}
+
+/// NDJSON envelope for one watched event. In ordinary delivery, `cursor`
+/// equals the event id. Claim delivery deliberately supplies the last
+/// *committed* cursor instead: the event record is annotated as pending, and a
+/// separate `cursor_checkpoint` record is emitted only after durable claim
+/// finalization succeeds. The caller redacts the event first via
 /// `frankenterm_core::export::redact_event` (matched_text + nested secrets in
 /// the structured `extracted` payload), so this serializes already-redacted
 /// fields (ft-7h5da.4.4 — redaction-before-emission reused from the export
 /// streamer, not reimplemented).
-fn watch_event_ndjson(event: &frankenterm_core::storage::StoredEvent) -> serde_json::Value {
+fn watch_event_ndjson(
+    event: &frankenterm_core::storage::StoredEvent,
+    cursor: Option<i64>,
+    cursor_epoch: &str,
+    cursor_scope: &str,
+) -> serde_json::Value {
     serde_json::json!({
         "type": "event",
-        "cursor": event.id,
+        "cursor": cursor,
+        "cursor_epoch": cursor_epoch,
+        "cursor_scope": cursor_scope,
         "id": event.id,
         "pane_id": event.pane_id,
         "rule_id": event.rule_id,
@@ -23595,6 +23984,124 @@ fn watch_event_ndjson(event: &frankenterm_core::storage::StoredEvent) -> serde_j
         "handled": event.handled_at.is_some(),
         "handled_status": event.handled_status,
     })
+}
+
+fn watch_claim_checkpoint_ndjson(
+    cursor: i64,
+    cursor_epoch: &str,
+    cursor_scope: &str,
+    disposition: &str,
+    event_id: Option<i64>,
+) -> serde_json::Value {
+    let mut record = watch_cursor_checkpoint_ndjson(
+        cursor,
+        cursor_epoch,
+        cursor_scope,
+        "claim_delivery_committed",
+    );
+    record["claim_delivery"] = serde_json::Value::String(disposition.to_string());
+    if let Some(event_id) = event_id {
+        record["event_id"] = serde_json::Value::from(event_id);
+    }
+    record
+}
+
+fn watch_cursor_checkpoint_ndjson(
+    cursor: i64,
+    cursor_epoch: &str,
+    cursor_scope: &str,
+    reason: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "type": "cursor_checkpoint",
+        "cursor": cursor,
+        "cursor_epoch": cursor_epoch,
+        "cursor_scope": cursor_scope,
+        "cursor_commit_state": "committed",
+        "reason": reason,
+    })
+}
+
+fn watch_claim_deferred_ndjson(
+    cursor: Option<i64>,
+    cursor_epoch: &str,
+    cursor_scope: &str,
+    event_id: i64,
+    reason: &str,
+    retry_after_ms: Option<i64>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "type": "claim_deferred",
+        "terminal": true,
+        "retryable": true,
+        "reason": reason,
+        "cursor": cursor,
+        "cursor_epoch": cursor_epoch,
+        "cursor_scope": cursor_scope,
+        "candidate_cursor": event_id,
+        "retry_after_ms": retry_after_ms,
+        "message": "the event cursor remains uncommitted; resume with the unchanged cursor, epoch, and scope",
+    })
+}
+
+fn watch_terminal_error_ndjson(
+    code: &str,
+    message: impl Into<String>,
+    hint: Option<String>,
+    cursor: Option<i64>,
+    cursor_epoch: Option<&str>,
+    cursor_scope: Option<&str>,
+    retryable: bool,
+) -> serde_json::Value {
+    serde_json::json!({
+        "type": "error",
+        "terminal": true,
+        "retryable": retryable,
+        "code": code,
+        "message": message.into(),
+        "hint": hint,
+        "cursor": cursor,
+        "cursor_epoch": cursor_epoch,
+        "cursor_scope": cursor_scope,
+    })
+}
+
+fn write_terminal_stream_error_ndjson(
+    code: &str,
+    message: impl Into<String>,
+    hint: Option<String>,
+    cursor: Option<i64>,
+    cursor_epoch: Option<&str>,
+    cursor_scope: Option<&str>,
+    retryable: bool,
+) -> std::io::Result<bool> {
+    let record = watch_terminal_error_ndjson(
+        code,
+        message,
+        hint,
+        cursor,
+        cursor_epoch,
+        cursor_scope,
+        retryable,
+    );
+    let stdout = std::io::stdout();
+    let mut lock = stdout.lock();
+    write_ndjson_line(&mut lock, &record)
+}
+
+fn emit_watch_stream_record(
+    stdout: &std::io::Stdout,
+    record: &serde_json::Value,
+    last_emit: &mut std::time::Instant,
+) -> std::io::Result<bool> {
+    let continue_writing = {
+        let mut lock = stdout.lock();
+        write_ndjson_line(&mut lock, record)?
+    };
+    if continue_writing {
+        note_watch_output_emitted(last_emit);
+    }
+    Ok(continue_writing)
 }
 
 /// Minimum inter-event interval for `ft robot watch-events --max-hz N`
@@ -23691,7 +24198,24 @@ fn await_condition_matches_quiescence(
     }
 }
 
+fn refresh_await_condition_state(
+    condition: &AwaitCondition,
+    prior_met: bool,
+    last_output_at: Option<i64>,
+    now_ms: u64,
+    config: &frankenterm_core::agent_pane_state::AgentDetectionConfig,
+) -> bool {
+    match condition {
+        AwaitCondition::Rule(_) => prior_met,
+        AwaitCondition::Quiescence { .. } => {
+            await_condition_matches_quiescence(condition, last_output_at, now_ms, config)
+                .unwrap_or(false)
+        }
+    }
+}
+
 async fn update_await_quiescence_conditions(
+    cx: &frankenterm_core::cx::Cx,
     storage: &frankenterm_core::storage::StorageHandle,
     config: &frankenterm_core::agent_pane_state::AgentDetectionConfig,
     conditions: &[AwaitCondition],
@@ -23699,18 +24223,20 @@ async fn update_await_quiescence_conditions(
 ) -> frankenterm_core::Result<()> {
     let now = now_ms();
     for (condition, is_met) in conditions.iter().zip(met.iter_mut()) {
-        if *is_met {
-            continue;
-        }
         let AwaitCondition::Quiescence { pane_id, .. } = condition else {
             continue;
         };
-        let last_output_at = storage.pane_last_output_at(*pane_id).await?;
-        if await_condition_matches_quiescence(condition, last_output_at, now, config)
-            .unwrap_or(false)
-        {
-            *is_met = true;
-        }
+        let last_output_at = storage.pane_last_output_at_with_cx(cx, *pane_id).await?;
+        // Unlike a rule occurrence, quiescence is a level-triggered state, not
+        // a historical latch. New output must be able to turn a previously
+        // satisfied condition false before the composite is evaluated.
+        *is_met = refresh_await_condition_state(
+            condition,
+            *is_met,
+            last_output_at,
+            now,
+            config,
+        );
     }
     Ok(())
 }
@@ -23730,6 +24256,8 @@ fn await_result_ndjson(
     timed_out: bool,
     elapsed_ms: u64,
     final_cursor: Option<i64>,
+    final_cursor_epoch: Option<&str>,
+    final_cursor_scope: Option<&str>,
     any: &[(String, bool)],
     all: &[(String, bool)],
 ) -> serde_json::Value {
@@ -23745,14 +24273,27 @@ fn await_result_ndjson(
         "timed_out": timed_out,
         "elapsed_ms": elapsed_ms,
         "final_cursor": final_cursor,
+        "final_cursor_epoch": final_cursor_epoch,
+        "final_cursor_scope": final_cursor_scope,
         "any": render(any),
         "all": render(all),
     })
 }
 
 /// NDJSON idle-heartbeat record for `ft robot watch-events --follow`.
-fn watch_heartbeat_ndjson(cursor: Option<i64>, now: i64) -> serde_json::Value {
-    serde_json::json!({ "type": "heartbeat", "cursor": cursor, "now": now })
+fn watch_heartbeat_ndjson(
+    cursor: Option<i64>,
+    cursor_epoch: Option<&str>,
+    cursor_scope: Option<&str>,
+    now: i64,
+) -> serde_json::Value {
+    serde_json::json!({
+        "type": "heartbeat",
+        "cursor": cursor,
+        "cursor_epoch": cursor_epoch,
+        "cursor_scope": cursor_scope,
+        "now": now,
+    })
 }
 
 fn watch_heartbeat_is_due(
@@ -23776,6 +24317,8 @@ fn note_watch_output_emitted(last_emit: &mut std::time::Instant) {
 fn emit_watch_heartbeat_if_due(
     stdout: &std::io::Stdout,
     cursor: Option<i64>,
+    cursor_epoch: Option<&str>,
+    cursor_scope: Option<&str>,
     heartbeat_interval_ms: u64,
     heartbeat: std::time::Duration,
     last_emit: &mut std::time::Instant,
@@ -23784,7 +24327,8 @@ fn emit_watch_heartbeat_if_due(
         return Ok(true);
     }
 
-    let heartbeat_record = watch_heartbeat_ndjson(cursor, now_ms_i64());
+    let heartbeat_record =
+        watch_heartbeat_ndjson(cursor, cursor_epoch, cursor_scope, now_ms_i64());
     let continue_writing = {
         let mut lock = stdout.lock();
         write_ndjson_line(&mut lock, &heartbeat_record)?
@@ -23795,99 +24339,173 @@ fn emit_watch_heartbeat_if_due(
     Ok(continue_writing)
 }
 
-/// Detect a pruned (expired) resume cursor for `ft robot watch-events`
-/// (ft-7h5da.4.2). Returns `Some(oldest_retained)` when `requested` points
-/// before the oldest globally-retained event id — i.e. events in
-/// `(requested, oldest)` were removed by retention, so resuming silently would
-/// skip them. Returns `None` when the cursor is still within the retained
-/// window (contiguous or ahead), or when there is no cursor / no events.
-/// Pruning is global, so this is checked against the global oldest id, not a
-/// pane-filtered one.
-fn watch_cursor_expiry(requested: Option<i64>, oldest_retained: Option<i64>) -> Option<i64> {
-    match (requested, oldest_retained) {
-        (Some(c), Some(oldest)) if c >= 0 && oldest > 0 && c < oldest - 1 => Some(oldest),
-        _ => None,
+/// Upper bound covered by one storage-authoritative page reconciliation.
+/// A full page proves only through its final row; a short/empty page is caught
+/// up through the durable allocation high-water mark observed by the same SQL
+/// statement. Filtered IDs are deliberate omissions, never inferred loss.
+fn event_stream_page_checked_through(
+    page: &frankenterm_core::storage::EventStreamPage,
+    page_limit: usize,
+) -> i64 {
+    if page.events.len() >= page_limit {
+        page.events
+            .last()
+            .map_or(page.retention.max_event_id, |event| event.id)
+    } else {
+        page.retention.max_event_id
     }
 }
 
-/// Reconcile retention initially, periodically while idle, and immediately
-/// whenever the filtered batch begins after a discontinuous event ID. The
-/// discontinuity probe catches a follower that fell behind prefix pruning
-/// before it emits a later row; the periodic probe also catches an empty
-/// filtered stream. Contiguous hot-path batches do not pay for an extra global
-/// oldest-row lookup on every loop.
-fn watch_retention_reconciliation_is_due(
-    cursor: Option<i64>,
-    first_batch_event_id: Option<i64>,
-    last_reconciled_at: Option<std::time::Instant>,
-    now: std::time::Instant,
-) -> bool {
-    let Some(cursor) = cursor else {
-        return false;
-    };
-    let Some(last_reconciled_at) = last_reconciled_at else {
-        return true;
-    };
-    let discontinuous_batch = first_batch_event_id.is_some_and(|first_id| {
-        cursor
-            .checked_add(1)
-            .is_some_and(|next_expected| first_id > next_expected)
+fn fresh_event_cursor_baseline(
+    snapshot: &frankenterm_core::storage::EventRetentionSnapshot,
+) -> i64 {
+    // A cursor token carries `(id, epoch, scope)`, but not the retention
+    // generation at which a caller accepted historical loss. Starting below
+    // the atomic high-water mark would therefore be unsound: a deletion above
+    // that baseline but before token issuance would look indistinguishable
+    // from post-issuance loss on reconnect. Fresh streams consequently start
+    // at the page's atomic tail and observe future IDs only.
+    snapshot.max_event_id
+}
+
+fn event_retention_status_reason(
+    status: &frankenterm_core::storage::EventRetentionStatus,
+) -> &'static str {
+    use frankenterm_core::storage::EventRetentionStatus;
+    match status {
+        EventRetentionStatus::CompleteNoPruning => "complete",
+        EventRetentionStatus::Pruned { .. } => "retention_pruned",
+        EventRetentionStatus::LegacyHistoryUnavailable { .. } => {
+            "legacy_history_unavailable"
+        }
+        EventRetentionStatus::CursorEpochMismatch => "cursor_epoch_mismatch",
+        EventRetentionStatus::CursorAheadOfHighWater { .. } => "cursor_ahead_of_high_water",
+    }
+}
+
+fn event_cursor_discontinuity_message(
+    status: &frankenterm_core::storage::EventRetentionStatus,
+) -> &'static str {
+    use frankenterm_core::storage::EventRetentionStatus;
+    match status {
+        EventRetentionStatus::CompleteNoPruning => "cursor history is complete",
+        EventRetentionStatus::Pruned { .. } => {
+            "retention deleted at least one event after the supplied cursor"
+        }
+        EventRetentionStatus::LegacyHistoryUnavailable { .. } => {
+            "the supplied cursor predates authoritative retention evidence"
+        }
+        EventRetentionStatus::CursorEpochMismatch => {
+            "the supplied cursor belongs to a different retention epoch"
+        }
+        EventRetentionStatus::CursorAheadOfHighWater { .. } => {
+            "the supplied cursor is beyond the durable event high-water mark"
+        }
+    }
+}
+
+/// Typed terminal discontinuity. Consumers must explicitly choose a fresh
+/// start after observing this record; FrankenTerm never guesses a new cursor.
+fn event_cursor_discontinuity_ndjson(
+    check: &frankenterm_core::storage::EventRetentionCheck,
+    requested_epoch: &str,
+    requested_scope: &str,
+) -> Option<serde_json::Value> {
+    use frankenterm_core::storage::EventRetentionStatus;
+    if matches!(
+        &check.status,
+        EventRetentionStatus::CompleteNoPruning
+    ) {
+        return None;
+    }
+    let mut record = serde_json::json!({
+        "type": "cursor_discontinuity",
+        "terminal": true,
+        "reason": event_retention_status_reason(&check.status),
+        "requested_cursor": check.requested_after_id,
+        "requested_cursor_epoch": requested_epoch,
+        "requested_cursor_scope": requested_scope,
+        "checked_through": check.checked_through_id,
+        "current_cursor_epoch": check.snapshot.cursor_epoch.as_str(),
+        "current_cursor_scope": requested_scope,
+        "evidence_from_event_id": check.snapshot.evidence_from_event_id,
+        "max_event_id": check.snapshot.max_event_id,
+        "message": event_cursor_discontinuity_message(&check.status),
     });
-    discontinuous_batch
-        || now.saturating_duration_since(last_reconciled_at)
-            >= WATCH_EVENTS_RETENTION_RECONCILE_INTERVAL
-}
-
-fn validate_watch_oldest_retained_event_id(oldest: Option<i64>) -> Result<Option<i64>, String> {
-    match oldest {
-        Some(event_id) if event_id <= 0 => Err(format!(
-            "storage returned a non-positive oldest event id: {event_id}"
-        )),
-        _ => Ok(oldest),
+    if let EventRetentionStatus::Pruned { interval } = &check.status {
+        record["deleted_interval"] = serde_json::json!({
+            "start_id": interval.start_id,
+            "end_id": interval.end_id,
+            "first_generation": interval.first_generation,
+            "last_generation": interval.last_generation,
+        });
     }
+    Some(record)
 }
 
-async fn watch_oldest_retained_event_id(
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EventRetentionCoverage {
+    cursor_epoch: String,
+    generation: i64,
+    covered_after_id: i64,
+    checked_through_id: i64,
+}
+
+fn event_retention_coverage_contains(
+    coverage: Option<&EventRetentionCoverage>,
+    snapshot: &frankenterm_core::storage::EventRetentionSnapshot,
+    cursor_epoch: &str,
+    after_id: i64,
+    through_id: i64,
+) -> bool {
+    coverage.is_some_and(|coverage| {
+        coverage.cursor_epoch == cursor_epoch
+            && snapshot.cursor_epoch == cursor_epoch
+            && coverage.generation == snapshot.generation
+            && coverage.covered_after_id <= after_id
+            && coverage.checked_through_id >= through_id
+    })
+}
+
+async fn reconcile_event_stream_cursor_page(
     cx: &frankenterm_core::cx::Cx,
     storage: &frankenterm_core::storage::StorageHandle,
-) -> frankenterm_core::Result<Option<i64>> {
-    let query = frankenterm_core::storage::EventStreamQuery {
-        after_id: None,
-        limit: Some(1),
-        pane_id: None,
-        rule_id: None,
-        event_type: None,
-        triage_state: None,
-        label: None,
-        unhandled_only: false,
-        since: None,
-        until: None,
-    };
-    let events = storage.get_events_stream_with_cx(cx, query).await?;
+    after_id: i64,
+    cursor_epoch: &str,
+    page: &frankenterm_core::storage::EventStreamPage,
+    page_limit: usize,
+    retention_coverage: &mut Option<EventRetentionCoverage>,
+) -> frankenterm_core::Result<Option<frankenterm_core::storage::EventRetentionCheck>> {
+    let through_id = event_stream_page_checked_through(page, page_limit).max(after_id);
+    if event_retention_coverage_contains(
+        retention_coverage.as_ref(),
+        &page.retention,
+        cursor_epoch,
+        after_id,
+        through_id,
+    ) {
+        return Ok(None);
+    }
+
+    let check = storage
+        .check_event_retention_in_epoch_with_cx(cx, after_id, through_id, cursor_epoch)
+        .await?;
     cx.checkpoint()
         .map_err(|error| frankenterm_core::Error::Cancelled(error.to_string()))?;
-    let oldest = events.first().map(|event| event.id);
-    validate_watch_oldest_retained_event_id(oldest)
-        .map_err(|error| frankenterm_core::StorageError::Database(error).into())
-}
-
-/// Typed `cursor_expired` NDJSON record: the requested resume cursor fell behind
-/// retention pruning, so events were lost. Never a silent skip (no-silent-gaps
-/// capture doctrine) — the stream then re-baselines and resumes from
-/// `oldest_available` (at-least-once for still-retained events).
-fn watch_cursor_expired_ndjson(requested: i64, oldest_available: i64) -> serde_json::Value {
-    serde_json::json!({
-        "type": "cursor_expired",
-        "requested_cursor": requested,
-        "oldest_available": oldest_available,
-        "message": "resume cursor predates retained events (retention pruned the gap); \
-                    resuming from oldest_available",
-    })
+    *retention_coverage = Some(EventRetentionCoverage {
+        cursor_epoch: check.snapshot.cursor_epoch.clone(),
+        generation: check.snapshot.generation,
+        covered_after_id: after_id,
+        checked_through_id: check.checked_through_id,
+    });
+    Ok(Some(check))
 }
 
 #[cfg(unix)]
 fn watch_ipc_protocol_fault_ndjson(
     cursor: Option<i64>,
+    cursor_epoch: Option<&str>,
+    cursor_scope: Option<&str>,
     fault: IpcRelayProtocolFault,
     now: i64,
 ) -> serde_json::Value {
@@ -23895,6 +24513,8 @@ fn watch_ipc_protocol_fault_ndjson(
         "type": "gap",
         "reason": "ipc_protocol_fault",
         "cursor": cursor,
+        "cursor_epoch": cursor_epoch,
+        "cursor_scope": cursor_scope,
         "fault_kind": fault.as_str(),
         "now": now,
         "message": "the IPC event stream violated its closed record contract; persisted detections will be backfilled from the durable cursor, while live-only pane signals may have been missed",
@@ -23926,6 +24546,8 @@ impl IpcTransportGapReason {
 #[cfg(unix)]
 fn watch_ipc_transport_gap_ndjson(
     cursor: Option<i64>,
+    cursor_epoch: Option<&str>,
+    cursor_scope: Option<&str>,
     reason: IpcTransportGapReason,
     now: i64,
 ) -> serde_json::Value {
@@ -23933,6 +24555,8 @@ fn watch_ipc_transport_gap_ndjson(
         "type": "gap",
         "reason": reason.as_str(),
         "cursor": cursor,
+        "cursor_epoch": cursor_epoch,
+        "cursor_scope": cursor_scope,
         "now": now,
         "persisted_detection_recovery": "durable_cursor_backfill",
         "live_only_signal_recovery": "unavailable",
@@ -23951,13 +24575,16 @@ fn write_ipc_transport_gap_once<W: std::io::Write>(
     writer: &mut W,
     gap_open: &mut bool,
     cursor: Option<i64>,
+    cursor_epoch: Option<&str>,
+    cursor_scope: Option<&str>,
     reason: IpcTransportGapReason,
     now: i64,
 ) -> std::io::Result<bool> {
     if *gap_open {
         return Ok(true);
     }
-    let record = watch_ipc_transport_gap_ndjson(cursor, reason, now);
+    let record =
+        watch_ipc_transport_gap_ndjson(cursor, cursor_epoch, cursor_scope, reason, now);
     let continue_writing = write_ndjson_line(writer, &record)?;
     if continue_writing {
         *gap_open = true;
@@ -23973,13 +24600,21 @@ fn write_ipc_protocol_fault_once<W: std::io::Write>(
     writer: &mut W,
     gap_open: &mut bool,
     cursor: Option<i64>,
+    cursor_epoch: Option<&str>,
+    cursor_scope: Option<&str>,
     fault: IpcRelayProtocolFault,
     now: i64,
 ) -> std::io::Result<bool> {
     if *gap_open {
         return Ok(true);
     }
-    let record = watch_ipc_protocol_fault_ndjson(cursor, fault, now);
+    let record = watch_ipc_protocol_fault_ndjson(
+        cursor,
+        cursor_epoch,
+        cursor_scope,
+        fault,
+        now,
+    );
     let continue_writing = write_ndjson_line(writer, &record)?;
     if continue_writing {
         *gap_open = true;
@@ -24460,7 +25095,9 @@ fn ipc_event_cursor(
         && value
             .get("severity")
             .and_then(serde_json::Value::as_str)
-            .is_some_and(|severity| matches!(severity, "info" | "warning" | "critical"))
+            .is_some_and(|severity| {
+                matches!(severity, "info" | "warning" | "error" | "critical")
+            })
         && value
             .get("confidence")
             .and_then(serde_json::Value::as_f64)
@@ -24546,8 +25183,14 @@ fn validate_ipc_gap_record(value: &serde_json::Value) -> Result<(), IpcRelayProt
 fn ipc_gap_with_follower_cursor(
     mut value: serde_json::Value,
     current_cursor: Option<i64>,
+    current_cursor_epoch: Option<&str>,
+    current_cursor_scope: Option<&str>,
 ) -> serde_json::Value {
     value["cursor"] = current_cursor.map_or(serde_json::Value::Null, serde_json::Value::from);
+    value["cursor_epoch"] = current_cursor_epoch
+        .map_or(serde_json::Value::Null, serde_json::Value::from);
+    value["cursor_scope"] = current_cursor_scope
+        .map_or(serde_json::Value::Null, serde_json::Value::from);
     value
 }
 
@@ -24583,6 +25226,8 @@ async fn relay_ipc_event_line(
     stdout: &std::io::Stdout,
     line: &str,
     current_cursor: &mut Option<i64>,
+    current_cursor_epoch: Option<&str>,
+    current_cursor_scope: Option<&str>,
     max_hz_interval: Option<std::time::Duration>,
     last_event_emit: &mut Option<std::time::Instant>,
     heartbeat_interval_ms: u64,
@@ -24622,6 +25267,8 @@ async fn relay_ipc_event_line(
                 *last_event_emit,
                 stdout,
                 *current_cursor,
+                current_cursor_epoch,
+                current_cursor_scope,
                 heartbeat_interval_ms,
                 heartbeat,
                 last_emit,
@@ -24634,6 +25281,13 @@ async fn relay_ipc_event_line(
             // Cursorless pane lifecycle records cannot participate in durable
             // claims; they remain best-effort live notifications.
             watch_checkpoint(cx, "IPC lifecycle output")?;
+            let mut value = value;
+            value["cursor"] = (*current_cursor)
+                .map_or(serde_json::Value::Null, serde_json::Value::from);
+            value["cursor_epoch"] = current_cursor_epoch
+                .map_or(serde_json::Value::Null, serde_json::Value::from);
+            value["cursor_scope"] = current_cursor_scope
+                .map_or(serde_json::Value::Null, serde_json::Value::from);
             let mut lock = stdout.lock();
             let continue_writing = write_ndjson_line(&mut lock, &value)?;
             drop(lock);
@@ -24658,6 +25312,8 @@ async fn relay_ipc_event_line(
             if !emit_watch_heartbeat_if_due(
                 stdout,
                 *current_cursor,
+                current_cursor_epoch,
+                current_cursor_scope,
                 heartbeat_interval_ms,
                 heartbeat,
                 last_emit,
@@ -24674,7 +25330,12 @@ async fn relay_ipc_event_line(
             // signal the relay loop to re-drain the DB cursor so the dropped
             // (but persisted) events are backfilled at-least-once
             // (ft-7h5da.4.2, no-silent-gaps).
-            let output = ipc_gap_with_follower_cursor(value, *current_cursor);
+            let output = ipc_gap_with_follower_cursor(
+                value,
+                *current_cursor,
+                current_cursor_epoch,
+                current_cursor_scope,
+            );
             watch_checkpoint(cx, "IPC lag-gap output")?;
             let mut lock = stdout.lock();
             let cont = write_ndjson_line(&mut lock, &output)?;
@@ -24693,6 +25354,10 @@ mod watch_events_tests {
     use super::*;
     use frankenterm_core::runtime_async::CompatRuntime;
     use frankenterm_core::storage::StoredEvent;
+
+    const TEST_CURSOR_EPOCH: &str = "0123456789abcdef0123456789abcdef";
+    const TEST_CURSOR_SCOPE: &str =
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
     fn ev(id: i64, rule_id: &str, severity: &str, matched: Option<&str>) -> StoredEvent {
         StoredEvent {
@@ -24776,9 +25441,12 @@ mod watch_events_tests {
             connection
                 .execute(
                     "INSERT INTO events (
-                         pane_id, rule_id, agent_type, event_type, severity,
+                         id, pane_id, rule_id, agent_type, event_type, severity,
                          confidence, detected_at
-                     ) VALUES (?1, ?2, 'codex', 'detection', 'warning', 0.9, ?3)",
+                     )
+                     SELECT max_event_id + 1, ?1, ?2, 'codex', 'detection',
+                            'warning', 0.9, ?3
+                     FROM event_retention_state WHERE singleton = 1",
                     rusqlite::params![
                         7_i64,
                         format!("watch.claim.{index}"),
@@ -24863,6 +25531,8 @@ mod watch_events_tests {
         assert!(watch_event_passes_filters(&e, None, None));
         assert!(!watch_event_passes_filters(&e, Some("error"), None));
         assert!(!watch_event_passes_filters(&e, None, Some("claude.*")));
+        let error = ev(2, "build.failed", "error", None);
+        assert!(watch_event_passes_filters(&error, Some("error"), None));
     }
 
     #[test]
@@ -24882,11 +25552,11 @@ mod watch_events_tests {
         );
         assert_eq!(
             normalize_watch_severity(Some("error")),
-            Err("Invalid --severity: expected info, warning, or critical")
+            Ok(Some("error".to_string()))
         );
         assert_eq!(
             normalize_watch_severity(Some("warn")),
-            Err("Invalid --severity: expected info, warning, or critical")
+            Err("Invalid --severity: expected info, warning, error, or critical")
         );
     }
 
@@ -24946,6 +25616,8 @@ mod watch_events_tests {
                 &stdout,
                 &line,
                 &mut cursor,
+                Some("0123456789abcdef0123456789abcdef"),
+                Some(TEST_CURSOR_SCOPE),
                 None,
                 &mut last_event_emit,
                 0,
@@ -25288,9 +25960,16 @@ mod watch_events_tests {
         e.extracted = Some(serde_json::json!({"key": "AKIAIOSFODNN7EXAMPLE", "count": 3}));
         let redacted =
             frankenterm_core::export::redact_event(e, &frankenterm_core::redactor::Redactor::new());
-        let v = watch_event_ndjson(&redacted);
+        let v = watch_event_ndjson(
+            &redacted,
+            Some(42),
+            TEST_CURSOR_EPOCH,
+            TEST_CURSOR_SCOPE,
+        );
         assert_eq!(v["type"], "event");
         assert_eq!(v["cursor"], 42);
+        assert_eq!(v["cursor_epoch"], TEST_CURSOR_EPOCH);
+        assert_eq!(v["cursor_scope"], TEST_CURSOR_SCOPE);
         assert_eq!(v["id"], 42);
         assert_eq!(v["severity"], "error");
         assert_eq!(v["handled"], false);
@@ -25301,6 +25980,69 @@ mod watch_events_tests {
         );
         // Non-secret structured data survives redaction.
         assert_eq!(v["extracted"]["count"], 3);
+    }
+
+    #[test]
+    fn claim_control_records_distinguish_pending_deferred_and_committed_cursors() {
+        let checkpoint = watch_claim_checkpoint_ndjson(
+            42,
+            TEST_CURSOR_EPOCH,
+            TEST_CURSOR_SCOPE,
+            "finalized_after_output_flush",
+            Some(42),
+        );
+        assert_eq!(checkpoint["type"], "cursor_checkpoint");
+        assert_eq!(checkpoint["cursor"], 42);
+        assert_eq!(checkpoint["cursor_epoch"], TEST_CURSOR_EPOCH);
+        assert_eq!(checkpoint["cursor_scope"], TEST_CURSOR_SCOPE);
+        assert_eq!(checkpoint["cursor_commit_state"], "committed");
+        assert_eq!(checkpoint["claim_delivery"], "finalized_after_output_flush");
+        assert_eq!(checkpoint["event_id"], 42);
+
+        let page_checkpoint = watch_cursor_checkpoint_ndjson(
+            50,
+            TEST_CURSOR_EPOCH,
+            TEST_CURSOR_SCOPE,
+            "examined_through_page",
+        );
+        assert_eq!(page_checkpoint["cursor"], 50);
+        assert!(page_checkpoint.get("event_id").is_none());
+
+        let deferred = watch_claim_deferred_ndjson(
+            Some(41),
+            TEST_CURSOR_EPOCH,
+            TEST_CURSOR_SCOPE,
+            42,
+            "delivery_lease_active",
+            Some(9_999),
+        );
+        assert_eq!(deferred["type"], "claim_deferred");
+        assert_eq!(deferred["terminal"], true);
+        assert_eq!(deferred["retryable"], true);
+        assert_eq!(deferred["cursor"], 41);
+        assert_eq!(deferred["candidate_cursor"], 42);
+        assert_eq!(deferred["retry_after_ms"], 9_999);
+    }
+
+    #[test]
+    fn terminal_watch_errors_remain_single_ndjson_records_with_a_checkpoint() {
+        let error = watch_terminal_error_ndjson(
+            ROBOT_ERR_STORAGE,
+            "storage unavailable",
+            Some("retry later".to_string()),
+            Some(41),
+            Some(TEST_CURSOR_EPOCH),
+            Some(TEST_CURSOR_SCOPE),
+            true,
+        );
+        assert_eq!(error["type"], "error");
+        assert_eq!(error["terminal"], true);
+        assert_eq!(error["retryable"], true);
+        assert_eq!(error["code"], ROBOT_ERR_STORAGE);
+        assert_eq!(error["cursor"], 41);
+        assert_eq!(error["cursor_epoch"], TEST_CURSOR_EPOCH);
+        let encoded = serde_json::to_string(&error).expect("serialize terminal error");
+        assert!(!encoded.contains('\n'));
     }
 
     #[test]
@@ -25372,11 +26114,15 @@ mod watch_events_tests {
 
             let success_id = event_ids[0];
             let mut success_output = Vec::new();
+            let mut success_record = ipc_persisted_event(success_id);
+            success_record["cursor"] = serde_json::Value::from(0);
+            success_record["cursor_epoch"] =
+                serde_json::Value::String(TEST_CURSOR_EPOCH.to_string());
             let success = deliver_claimed_watch_event(
                 &cx,
                 &storage,
                 success_id,
-                ipc_persisted_event(success_id),
+                success_record,
                 |record| write_ndjson_line(&mut success_output, record),
             )
             .await
@@ -25393,6 +26139,10 @@ mod watch_events_tests {
                 emitted["claim_delivery"],
                 "finalize_after_output_flush"
             );
+            assert_eq!(emitted["cursor_commit_state"], "pending_finalize");
+            assert_eq!(emitted["cursor"], 0);
+            assert_eq!(emitted["cursor_epoch"], TEST_CURSOR_EPOCH);
+            assert_eq!(emitted["candidate_cursor"], success_id);
             let stored = storage
                 .get_events_stream(watch_claim_query(success_id - 1))
                 .await
@@ -25838,12 +26588,48 @@ mod watch_events_tests {
     }
 
     #[test]
+    fn quiescence_state_does_not_latch_after_output_resumes() {
+        let config = frankenterm_core::agent_pane_state::AgentDetectionConfig::default();
+        let quiescence = AwaitCondition::Quiescence {
+            pane_id: 7,
+            idle_ms: Some(500),
+        };
+        let quiet = refresh_await_condition_state(
+            &quiescence,
+            false,
+            Some(1_000),
+            1_500,
+            &config,
+        );
+        assert!(quiet);
+        let resumed = refresh_await_condition_state(
+            &quiescence,
+            quiet,
+            Some(1_499),
+            1_500,
+            &config,
+        );
+        assert!(
+            !resumed,
+            "new pane output must clear a previously met quiescence condition"
+        );
+
+        let rule = AwaitCondition::Rule("build.done".to_string());
+        assert!(
+            refresh_await_condition_state(&rule, true, None, 1_500, &config),
+            "historical rule occurrences remain latched"
+        );
+    }
+
+    #[test]
     fn await_result_envelope_shape() {
         let v = await_result_ndjson(
             true,
             false,
             1200,
             Some(42),
+            Some(TEST_CURSOR_EPOCH),
+            Some(TEST_CURSOR_SCOPE),
             &[("rule:a".to_string(), true)],
             &[("rule:b".to_string(), true)],
         );
@@ -25851,6 +26637,8 @@ mod watch_events_tests {
         assert_eq!(v["satisfied"], true);
         assert_eq!(v["timed_out"], false);
         assert_eq!(v["final_cursor"], 42);
+        assert_eq!(v["final_cursor_epoch"], TEST_CURSOR_EPOCH);
+        assert_eq!(v["final_cursor_scope"], TEST_CURSOR_SCOPE);
         assert_eq!(v["any"][0]["condition"], "rule:a");
         assert_eq!(v["any"][0]["met"], true);
         assert_eq!(v["all"][0]["condition"], "rule:b");
@@ -25858,9 +26646,16 @@ mod watch_events_tests {
 
     #[test]
     fn heartbeat_envelope_shape() {
-        let v = watch_heartbeat_ndjson(Some(7), 12345);
+        let v = watch_heartbeat_ndjson(
+            Some(7),
+            Some(TEST_CURSOR_EPOCH),
+            Some(TEST_CURSOR_SCOPE),
+            12345,
+        );
         assert_eq!(v["type"], "heartbeat");
         assert_eq!(v["cursor"], 7);
+        assert_eq!(v["cursor_epoch"], TEST_CURSOR_EPOCH);
+        assert_eq!(v["cursor_scope"], TEST_CURSOR_SCOPE);
         assert_eq!(v["now"], 12345);
     }
 
@@ -26004,10 +26799,18 @@ mod watch_events_tests {
             IpcTransportGapReason::StreamEof,
             IpcTransportGapReason::StreamReadFailure,
         ] {
-            let gap = watch_ipc_transport_gap_ndjson(Some(17), reason, 12_345);
+            let gap = watch_ipc_transport_gap_ndjson(
+                Some(17),
+                Some(TEST_CURSOR_EPOCH),
+                Some(TEST_CURSOR_SCOPE),
+                reason,
+                12_345,
+            );
             assert_eq!(gap["type"], "gap");
             assert_eq!(gap["reason"], reason.as_str());
             assert_eq!(gap["cursor"], 17);
+            assert_eq!(gap["cursor_epoch"], TEST_CURSOR_EPOCH);
+            assert_eq!(gap["cursor_scope"], TEST_CURSOR_SCOPE);
             assert_eq!(gap["now"], 12_345);
             assert_eq!(
                 gap["persisted_detection_recovery"],
@@ -26028,6 +26831,8 @@ mod watch_events_tests {
                 &mut output,
                 &mut gap_open,
                 Some(17),
+                Some(TEST_CURSOR_EPOCH),
+                Some(TEST_CURSOR_SCOPE),
                 IpcTransportGapReason::StreamEof,
                 12_345,
             )
@@ -26040,6 +26845,8 @@ mod watch_events_tests {
                 &mut output,
                 &mut gap_open,
                 Some(17),
+                Some(TEST_CURSOR_EPOCH),
+                Some(TEST_CURSOR_SCOPE),
                 IpcTransportGapReason::StreamReadFailure,
                 12_346,
             )
@@ -26053,6 +26860,8 @@ mod watch_events_tests {
                 &mut output,
                 &mut gap_open,
                 Some(18),
+                Some(TEST_CURSOR_EPOCH),
+                Some(TEST_CURSOR_SCOPE),
                 IpcTransportGapReason::StreamReadFailure,
                 12_347,
             )
@@ -26073,6 +26882,8 @@ mod watch_events_tests {
                 &mut output,
                 &mut gap_open,
                 Some(17),
+                Some(TEST_CURSOR_EPOCH),
+                Some(TEST_CURSOR_SCOPE),
                 IpcTransportGapReason::StreamEof,
                 12_345,
             )
@@ -26088,6 +26899,8 @@ mod watch_events_tests {
                 &mut output,
                 &mut gap_open,
                 Some(17),
+                Some(TEST_CURSOR_EPOCH),
+                Some(TEST_CURSOR_SCOPE),
                 IpcTransportGapReason::StreamEof,
                 12_346,
             )
@@ -26122,6 +26935,8 @@ mod watch_events_tests {
                 &mut output,
                 &mut gap_open,
                 Some(18),
+                Some(TEST_CURSOR_EPOCH),
+                Some(TEST_CURSOR_SCOPE),
                 IpcTransportGapReason::StreamReadFailure,
                 12_347,
             )
@@ -26146,6 +26961,8 @@ mod watch_events_tests {
                     &mut output,
                     &mut gap_open,
                     Some(17),
+                    Some(TEST_CURSOR_EPOCH),
+                    Some(TEST_CURSOR_SCOPE),
                     fault,
                     now,
                 )
@@ -26164,6 +26981,8 @@ mod watch_events_tests {
             &mut output,
             &mut gap_open,
             Some(18),
+            Some(TEST_CURSOR_EPOCH),
+            Some(TEST_CURSOR_SCOPE),
             IpcRelayProtocolFault::MalformedJson,
             12_347,
         )
@@ -26183,6 +27002,8 @@ mod watch_events_tests {
         let error = write_ipc_transport_gap_once(
             &mut writer,
             &mut gap_open,
+            None,
+            None,
             None,
             IpcTransportGapReason::SubscribeUnavailable,
             12_345,
@@ -26390,6 +27211,13 @@ mod watch_events_tests {
     #[test]
     fn ipc_relay_protocol_accepts_persisted_and_declared_live_only_cursors() {
         assert_eq!(ipc_event_cursor(&ipc_persisted_event(1)), Ok(Some(1)));
+        let mut error_event = ipc_persisted_event(3);
+        error_event["severity"] = serde_json::json!("error");
+        assert_eq!(
+            ipc_event_cursor(&error_event),
+            Ok(Some(3)),
+            "durable error-severity events must remain healthy IPC wakeups"
+        );
         for event_type in ["pane_discovered", "pane_disappeared"] {
             let mut persisted = ipc_persisted_event(2);
             persisted["event_type"] = serde_json::json!(event_type);
@@ -26422,6 +27250,8 @@ mod watch_events_tests {
                     &stdout,
                     &line,
                     &mut cursor,
+                    Some("0123456789abcdef0123456789abcdef"),
+                    Some(TEST_CURSOR_SCOPE),
                     None,
                     &mut last_event_emit,
                     0,
@@ -26515,13 +27345,21 @@ mod watch_events_tests {
         });
         assert_eq!(validate_ipc_gap_record(&private_record), Ok(()));
 
-        let public_record = ipc_gap_with_follower_cursor(private_record.clone(), Some(73));
+        let public_record = ipc_gap_with_follower_cursor(
+            private_record.clone(),
+            Some(73),
+            Some(TEST_CURSOR_EPOCH),
+            Some(TEST_CURSOR_SCOPE),
+        );
         assert_eq!(public_record["cursor"], 73);
+        assert_eq!(public_record["cursor_epoch"], TEST_CURSOR_EPOCH);
+        assert_eq!(public_record["cursor_scope"], TEST_CURSOR_SCOPE);
         assert_eq!(public_record["reason"], "broadcast_lag");
         assert_eq!(public_record["missed_count"], 3);
 
-        let no_checkpoint = ipc_gap_with_follower_cursor(private_record, None);
+        let no_checkpoint = ipc_gap_with_follower_cursor(private_record, None, None, None);
         assert!(no_checkpoint["cursor"].is_null());
+        assert!(no_checkpoint["cursor_epoch"].is_null());
     }
 
     #[cfg(unix)]
@@ -26529,12 +27367,16 @@ mod watch_events_tests {
     fn ipc_protocol_fault_gap_discloses_unrecoverable_live_signal_risk() {
         let gap = watch_ipc_protocol_fault_ndjson(
             Some(41),
+            Some(TEST_CURSOR_EPOCH),
+            Some(TEST_CURSOR_SCOPE),
             IpcRelayProtocolFault::MalformedJson,
             12_345,
         );
         assert_eq!(gap["type"], "gap");
         assert_eq!(gap["reason"], "ipc_protocol_fault");
         assert_eq!(gap["cursor"], 41);
+        assert_eq!(gap["cursor_epoch"], TEST_CURSOR_EPOCH);
+        assert_eq!(gap["cursor_scope"], TEST_CURSOR_SCOPE);
         assert_eq!(gap["fault_kind"], "malformed_json");
         assert_eq!(gap["now"], 12_345);
         let message = gap["message"].as_str().expect("gap message");
@@ -26542,88 +27384,255 @@ mod watch_events_tests {
         assert!(message.contains("live-only pane signals may have been missed"));
     }
 
-    #[test]
-    fn cursor_expiry_detects_pruned_gap_only() {
-        // events 6..9 pruned: requested=5, oldest=10 => expired, re-baseline 10.
-        assert_eq!(watch_cursor_expiry(Some(5), Some(10)), Some(10));
-        // contiguous (oldest == requested+1) => not expired.
-        assert_eq!(watch_cursor_expiry(Some(9), Some(10)), None);
-        // cursor within / ahead of the retained window => not expired.
-        assert_eq!(watch_cursor_expiry(Some(10), Some(10)), None);
-        assert_eq!(watch_cursor_expiry(Some(15), Some(10)), None);
-        // no cursor / no retained events => not expired.
-        assert_eq!(watch_cursor_expiry(None, Some(10)), None);
-        assert_eq!(watch_cursor_expiry(Some(5), None), None);
-
-        // Valid positive event IDs preserve ordering without overflowing the
-        // upper edge of the signed storage domain.
-        assert_eq!(watch_cursor_expiry(Some(i64::MAX), Some(i64::MAX)), None);
-        assert_eq!(watch_cursor_expiry(Some(0), Some(i64::MAX)), Some(i64::MAX));
-        // Negative cursors and non-positive row IDs are outside the public and
-        // SQLite row-id contracts and must never authorize re-baselining.
-        assert_eq!(watch_cursor_expiry(Some(i64::MIN), Some(i64::MIN)), None);
-        assert_eq!(watch_cursor_expiry(Some(i64::MIN), Some(10)), None);
-        assert_eq!(watch_cursor_expiry(Some(0), Some(i64::MIN)), None);
+    fn retention_snapshot(max_event_id: i64) -> frankenterm_core::storage::EventRetentionSnapshot {
+        frankenterm_core::storage::EventRetentionSnapshot {
+            cursor_epoch: TEST_CURSOR_EPOCH.to_string(),
+            legacy_history_complete: true,
+            generation: 0,
+            evidence_from_event_id: 1,
+            max_event_id,
+            deleted_event_count: 0,
+            last_deleted_at: None,
+        }
     }
 
     #[test]
-    fn retention_reconciliation_is_bounded_but_catches_discontinuous_batches() {
-        let reconciled_at = std::time::Instant::now();
-        let reconcile_due_at = reconciled_at + WATCH_EVENTS_RETENTION_RECONCILE_INTERVAL;
-        assert!(watch_retention_reconciliation_is_due(
-            Some(5),
-            Some(6),
-            None,
-            reconciled_at,
+    fn stream_page_checked_through_uses_row_for_full_page_and_high_water_for_short_page() {
+        let full = frankenterm_core::storage::EventStreamPage {
+            events: vec![ev(9, "codex.done", "info", None)],
+            retention: retention_snapshot(100),
+        };
+        assert_eq!(event_stream_page_checked_through(&full, 1), 9);
+        assert_eq!(event_stream_page_checked_through(&full, 2), 100);
+
+        let empty = frankenterm_core::storage::EventStreamPage {
+            events: Vec::new(),
+            retention: retention_snapshot(100),
+        };
+        assert_eq!(event_stream_page_checked_through(&empty, 1), 100);
+    }
+
+    #[test]
+    fn fresh_cursor_baseline_is_the_atomic_allocation_tail() {
+        let fresh = retention_snapshot(100);
+        assert_eq!(fresh_event_cursor_baseline(&fresh), 100);
+
+        let rotated = frankenterm_core::storage::EventRetentionSnapshot {
+            legacy_history_complete: false,
+            evidence_from_event_id: 101,
+            ..retention_snapshot(100)
+        };
+        assert_eq!(fresh_event_cursor_baseline(&rotated), 100);
+    }
+
+    #[test]
+    fn retention_coverage_never_skips_a_same_generation_interval_extension() {
+        let coverage = EventRetentionCoverage {
+            cursor_epoch: TEST_CURSOR_EPOCH.to_string(),
+            generation: 3,
+            covered_after_id: 0,
+            checked_through_id: 100,
+        };
+        let snapshot = frankenterm_core::storage::EventRetentionSnapshot {
+            generation: 3,
+            deleted_event_count: 1,
+            last_deleted_at: Some(1_000),
+            ..retention_snapshot(200)
+        };
+
+        assert!(event_retention_coverage_contains(
+            Some(&coverage),
+            &snapshot,
+            TEST_CURSOR_EPOCH,
+            50,
+            100,
         ));
-        assert!(!watch_retention_reconciliation_is_due(
-            Some(5),
-            Some(6),
-            Some(reconciled_at),
-            reconciled_at,
-        ));
-        assert!(watch_retention_reconciliation_is_due(
-            Some(5),
-            Some(10),
-            Some(reconciled_at),
-            reconciled_at,
-        ));
-        assert!(!watch_retention_reconciliation_is_due(
-            Some(5),
-            None,
-            Some(reconciled_at),
-            reconciled_at,
-        ));
-        assert!(watch_retention_reconciliation_is_due(
-            Some(5),
-            None,
-            Some(reconciled_at),
-            reconcile_due_at,
-        ));
-        assert!(!watch_retention_reconciliation_is_due(
-            None,
-            Some(10),
-            None,
-            reconciled_at,
+        assert!(!event_retention_coverage_contains(
+            Some(&coverage),
+            &snapshot,
+            TEST_CURSOR_EPOCH,
+            100,
+            200,
         ));
 
-        assert_eq!(validate_watch_oldest_retained_event_id(None), Ok(None));
-        assert_eq!(validate_watch_oldest_retained_event_id(Some(1)), Ok(Some(1)));
+        let newer_generation = frankenterm_core::storage::EventRetentionSnapshot {
+            generation: 4,
+            ..snapshot.clone()
+        };
+        assert!(!event_retention_coverage_contains(
+            Some(&coverage),
+            &newer_generation,
+            TEST_CURSOR_EPOCH,
+            50,
+            100,
+        ));
+        assert!(!event_retention_coverage_contains(
+            Some(&coverage),
+            &snapshot,
+            "fedcba9876543210fedcba9876543210",
+            50,
+            100,
+        ));
+    }
+
+    #[test]
+    fn cursor_token_requires_canonical_id_epoch_and_scope_together() {
+        assert_eq!(validate_event_cursor_token_parts(None, None, None), Ok(()));
         assert_eq!(
-            validate_watch_oldest_retained_event_id(Some(i64::MAX)),
-            Ok(Some(i64::MAX))
+            validate_event_cursor_token_parts(
+                Some(7),
+                Some(TEST_CURSOR_EPOCH),
+                Some(TEST_CURSOR_SCOPE),
+            ),
+            Ok(())
         );
-        assert!(validate_watch_oldest_retained_event_id(Some(0)).is_err());
-        assert!(validate_watch_oldest_retained_event_id(Some(i64::MIN)).is_err());
+        assert!(validate_event_cursor_token_parts(Some(7), None, None).is_err());
+        assert!(
+            validate_event_cursor_token_parts(Some(7), Some(TEST_CURSOR_EPOCH), None).is_err()
+        );
+        assert!(
+            validate_event_cursor_token_parts(None, Some(TEST_CURSOR_EPOCH), None).is_err()
+        );
+        assert!(validate_event_cursor_token_parts(None, None, Some(TEST_CURSOR_SCOPE)).is_err());
+        assert!(
+            validate_event_cursor_token_parts(
+                Some(7),
+                Some("0123456789ABCDEF0123456789ABCDEF"),
+                Some(TEST_CURSOR_SCOPE),
+            )
+            .is_err()
+        );
+        assert!(
+            validate_event_cursor_token_parts(
+                Some(7),
+                Some("abc"),
+                Some(TEST_CURSOR_SCOPE),
+            )
+            .is_err()
+        );
+        assert!(
+            validate_event_cursor_token_parts(
+                Some(7),
+                Some(TEST_CURSOR_EPOCH),
+                Some("ABC"),
+            )
+            .is_err()
+        );
     }
 
     #[test]
-    fn cursor_expired_envelope_shape() {
-        let v = watch_cursor_expired_ndjson(5, 10);
-        assert_eq!(v["type"], "cursor_expired");
-        assert_eq!(v["requested_cursor"], 5);
-        assert_eq!(v["oldest_available"], 10);
-        assert!(v["message"].as_str().expect("message").contains("retained"));
+    fn cursor_scope_changes_when_membership_filters_change() {
+        let events_scope = robot_events_cursor_scope(None, None, None, None, None, false, None);
+        assert_eq!(events_scope.len(), EVENT_CURSOR_SCOPE_HEX_LEN);
+        assert!(event_cursor_scope_is_canonical(&events_scope));
+        assert_ne!(
+            events_scope,
+            robot_events_cursor_scope(Some(7), None, None, None, None, false, None)
+        );
+
+        let watch_scope = watch_events_cursor_scope(None, None, None, false, false);
+        assert_ne!(
+            watch_scope,
+            watch_events_cursor_scope(None, Some("warning"), None, false, false)
+        );
+        assert!(
+            validate_event_cursor_scope_matches(Some(&watch_scope), &watch_scope).is_ok()
+        );
+        assert!(
+            validate_event_cursor_scope_matches(Some(&events_scope), &watch_scope).is_err()
+        );
+
+        let mut config =
+            frankenterm_core::agent_pane_state::AgentDetectionConfig::default();
+        config.idle_silence_ms = 500;
+        let implicit = [AwaitCondition::Quiescence {
+            pane_id: 7,
+            idle_ms: None,
+        }];
+        let explicit = [AwaitCondition::Quiescence {
+            pane_id: 7,
+            idle_ms: Some(500),
+        }];
+        assert_eq!(
+            await_cursor_scope(&implicit, &[], &config),
+            await_cursor_scope(&explicit, &[], &config),
+            "implicit and explicit equivalent quiescence thresholds share a scope"
+        );
+        let old_scope = await_cursor_scope(&implicit, &[], &config);
+        config.idle_silence_ms = 750;
+        assert_ne!(
+            old_scope,
+            await_cursor_scope(&implicit, &[], &config),
+            "changing the effective quiescence default must invalidate a resume token"
+        );
+    }
+
+    #[test]
+    fn cursor_scope_mismatch_does_not_invent_current_epoch_authority() {
+        let value = event_cursor_scope_discontinuity_ndjson(
+            7,
+            TEST_CURSOR_EPOCH,
+            TEST_CURSOR_SCOPE,
+            &"f".repeat(EVENT_CURSOR_SCOPE_HEX_LEN),
+        );
+        assert_eq!(value["reason"], "cursor_scope_mismatch");
+        assert_eq!(value["requested_cursor_epoch"], TEST_CURSOR_EPOCH);
+        assert_eq!(value["requested_cursor_scope"], TEST_CURSOR_SCOPE);
+        assert_eq!(
+            value["expected_cursor_scope"],
+            "f".repeat(EVENT_CURSOR_SCOPE_HEX_LEN)
+        );
+        assert!(
+            value.get("current_cursor_epoch").is_none(),
+            "scope validation happens before storage opens and cannot claim a current epoch"
+        );
+    }
+
+    #[test]
+    fn robot_events_since_rejects_negative_epoch_milliseconds() {
+        assert!(validate_robot_events_since(Some(-1)).is_err());
+        assert_eq!(validate_robot_events_since(Some(0)), Ok(()));
+        assert_eq!(validate_robot_events_since(None), Ok(()));
+    }
+
+    #[test]
+    fn cursor_discontinuity_envelope_is_terminal_and_epoch_qualified() {
+        let check = frankenterm_core::storage::EventRetentionCheck {
+            requested_after_id: 5,
+            requested_through_id: 10,
+            checked_through_id: 10,
+            snapshot: frankenterm_core::storage::EventRetentionSnapshot {
+                generation: 3,
+                deleted_event_count: 3,
+                last_deleted_at: Some(2_000),
+                ..retention_snapshot(100)
+            },
+            status: frankenterm_core::storage::EventRetentionStatus::Pruned {
+                interval: frankenterm_core::storage::EventRetentionInterval {
+                    start_id: 6,
+                    end_id: 8,
+                    first_generation: 2,
+                    last_generation: 3,
+                    first_deleted_at: 1_000,
+                    last_deleted_at: 2_000,
+                },
+            },
+        };
+        let value = event_cursor_discontinuity_ndjson(
+            &check,
+            TEST_CURSOR_EPOCH,
+            TEST_CURSOR_SCOPE,
+        )
+            .expect("pruning is terminal");
+        assert_eq!(value["type"], "cursor_discontinuity");
+        assert_eq!(value["terminal"], true);
+        assert_eq!(value["reason"], "retention_pruned");
+        assert_eq!(value["requested_cursor_epoch"], TEST_CURSOR_EPOCH);
+        assert_eq!(value["current_cursor_epoch"], TEST_CURSOR_EPOCH);
+        assert_eq!(value["requested_cursor_scope"], TEST_CURSOR_SCOPE);
+        assert_eq!(value["current_cursor_scope"], TEST_CURSOR_SCOPE);
+        assert_eq!(value["deleted_interval"]["start_id"], 6);
+        assert_eq!(value["deleted_interval"]["end_id"], 8);
     }
 }
 
@@ -37887,7 +38896,10 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             unhandled,
                             since,
                             cursor,
+                            cursor_epoch,
+                            cursor_scope,
                             replay_limit,
+                            start_at_tail,
                             would_handle,
                             dry_run,
                             command,
@@ -38482,6 +39494,83 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                 print_robot_response(&response, format, stats)?;
                                 return Ok(());
                             }
+                            if let Err(message) = validate_robot_events_since(since) {
+                                let response = RobotResponse::<RobotEventsData>::error_with_code(
+                                    ROBOT_ERR_INVALID_ARGS,
+                                    message.to_string(),
+                                    Some(
+                                        "Pass a Unix epoch timestamp in milliseconds, such as 1767225600000."
+                                            .to_string(),
+                                    ),
+                                    elapsed_ms(start),
+                                );
+                                print_robot_response(&response, format, stats)?;
+                                return Ok(());
+                            }
+                            let expected_cursor_scope = robot_events_cursor_scope(
+                                pane,
+                                rule_id.as_deref(),
+                                event_type.as_deref(),
+                                triage_state.as_deref(),
+                                label.as_deref(),
+                                unhandled,
+                                since,
+                            );
+                            if let Err(message) = validate_event_cursor_token_parts(
+                                cursor,
+                                cursor_epoch.as_deref(),
+                                cursor_scope.as_deref(),
+                            )
+                            {
+                                let response = RobotResponse::<RobotEventsData>::error_with_code(
+                                    ROBOT_ERR_INVALID_ARGS,
+                                    message.to_string(),
+                                    Some(
+                                        "Copy next_cursor, next_cursor_epoch, and next_cursor_scope from the prior response."
+                                            .to_string(),
+                                    ),
+                                    elapsed_ms(start),
+                                );
+                                print_robot_response(&response, format, stats)?;
+                                return Ok(());
+                            }
+                            if let Err(message) = validate_event_cursor_scope_matches(
+                                cursor_scope.as_deref(),
+                                &expected_cursor_scope,
+                            ) {
+                                let discontinuity = event_cursor_scope_discontinuity_ndjson(
+                                    cursor.expect("validated scoped token has a cursor"),
+                                    cursor_epoch
+                                        .as_deref()
+                                        .expect("validated scoped token has an epoch"),
+                                    cursor_scope
+                                        .as_deref()
+                                        .expect("scope mismatch has a supplied scope"),
+                                    &expected_cursor_scope,
+                                );
+                                let response = RobotResponse::<RobotEventsData>::error_with_code_and_data(
+                                    ROBOT_ERR_CURSOR_DISCONTINUITY,
+                                    message.to_string(),
+                                    Some(
+                                        "Resume with exactly the same membership filters, or use --start-at-tail to establish a new scope."
+                                            .to_string(),
+                                    ),
+                                    discontinuity,
+                                    elapsed_ms(start),
+                                );
+                                print_robot_response(&response, format, stats)?;
+                                return Ok(());
+                            }
+                            if let Err(message) = validate_robot_events_limit(limit) {
+                                let response = RobotResponse::<RobotEventsData>::error_with_code(
+                                    ROBOT_ERR_INVALID_ARGS,
+                                    message.to_string(),
+                                    None,
+                                    elapsed_ms(start),
+                                );
+                                print_robot_response(&response, format, stats)?;
+                                return Ok(());
+                            }
                             if let Err(message) = validate_robot_events_replay_limit(replay_limit) {
                                 let response = RobotResponse::<RobotEventsData>::error_with_code(
                                     ROBOT_ERR_INVALID_ARGS,
@@ -38492,32 +39581,175 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                 print_robot_response(&response, format, stats)?;
                                 return Ok(());
                             }
+                            if replay_limit.is_some() && cursor.is_none() {
+                                let response = RobotResponse::<RobotEventsData>::error_with_code(
+                                    ROBOT_ERR_INVALID_ARGS,
+                                    "--replay-limit requires --cursor, --cursor-epoch, and --cursor-scope"
+                                        .to_string(),
+                                    Some(
+                                        "Use --limit for ordinary newest-first listing, or establish a cursor with --start-at-tail."
+                                            .to_string(),
+                                    ),
+                                    elapsed_ms(start),
+                                );
+                                print_robot_response(&response, format, stats)?;
+                                return Ok(());
+                            }
                             let effective_limit = replay_limit.unwrap_or(limit);
-                            let cursor_mode = cursor.is_some();
+                            let cursor_mode = cursor.is_some() || start_at_tail;
                             let order = if cursor_mode {
                                 Some("id_asc".to_string())
                             } else {
                                 None
                             };
 
-                            // Query events
-                            let events_result = if cursor_mode {
-                                storage
-                                    .get_events_stream(
-                                        frankenterm_core::storage::EventStreamQuery {
-                                            after_id: cursor,
-                                            limit: Some(effective_limit),
-                                            pane_id: pane,
-                                            rule_id: rule_id.clone(),
-                                            event_type: event_type.clone(),
-                                            triage_state: triage_state.clone(),
-                                            label: label.clone(),
-                                            unhandled_only: unhandled,
-                                            since,
-                                            until: None,
-                                        },
-                                    )
+                            // Query events. Cursor mode couples the ordered page
+                            // to exact retention evidence; integer IDs alone are
+                            // never accepted as durable resume authority.
+                            let mut authoritative_next_cursor = None;
+                            let mut response_cursor_epoch = None;
+                            let events_result = if start_at_tail {
+                                let event_cx = frankenterm_core::cx::Cx::current()
+                                    .unwrap_or_else(frankenterm_core::cx::for_request);
+                                let query = frankenterm_core::storage::EventStreamQuery {
+                                    after_id: None,
+                                    limit: Some(1),
+                                    pane_id: pane,
+                                    rule_id: rule_id.clone(),
+                                    event_type: event_type.clone(),
+                                    triage_state: triage_state.clone(),
+                                    label: label.clone(),
+                                    unhandled_only: unhandled,
+                                    since,
+                                    until: None,
+                                };
+                                match storage
+                                    .get_events_stream_page_with_cx(&event_cx, query)
                                     .await
+                                {
+                                    Ok(page) => {
+                                        authoritative_next_cursor =
+                                            Some(fresh_event_cursor_baseline(&page.retention));
+                                        response_cursor_epoch =
+                                            Some(page.retention.cursor_epoch.clone());
+                                        Ok(Vec::new())
+                                    }
+                                    Err(error)
+                                        if watch_core_failure_source(&error)
+                                            == WatchFailureSource::Cancellation =>
+                                    {
+                                        return Err(error.into());
+                                    }
+                                    Err(error) => Err(error),
+                                }
+                            } else if cursor_mode {
+                                let after_id = cursor.expect("cursor mode requires cursor");
+                                let epoch = cursor_epoch
+                                    .as_deref()
+                                    .expect("validated cursor mode requires epoch");
+                                let query = frankenterm_core::storage::EventStreamQuery {
+                                    after_id: cursor,
+                                    limit: Some(effective_limit),
+                                    pane_id: pane,
+                                    rule_id: rule_id.clone(),
+                                    event_type: event_type.clone(),
+                                    triage_state: triage_state.clone(),
+                                    label: label.clone(),
+                                    unhandled_only: unhandled,
+                                    since,
+                                    until: None,
+                                };
+                                let event_cx = frankenterm_core::cx::Cx::current()
+                                    .unwrap_or_else(frankenterm_core::cx::for_request);
+                                match storage
+                                    .get_events_stream_page_with_cx(&event_cx, query)
+                                    .await
+                                {
+                                    Ok(page) => {
+                                        let mut retention_coverage = None;
+                                        match reconcile_event_stream_cursor_page(
+                                            &event_cx,
+                                            &storage,
+                                            after_id,
+                                            epoch,
+                                            &page,
+                                            effective_limit,
+                                            &mut retention_coverage,
+                                        )
+                                        .await
+                                        {
+                                            Ok(Some(check)) => {
+                                                if let Some(discontinuity) =
+                                                    event_cursor_discontinuity_ndjson(
+                                                        &check,
+                                                        epoch,
+                                                        &expected_cursor_scope,
+                                                    )
+                                                {
+                                                    let response = RobotResponse::<
+                                                        RobotEventsData,
+                                                    >::error_with_code_and_data(
+                                                        ROBOT_ERR_CURSOR_DISCONTINUITY,
+                                                        event_cursor_discontinuity_message(
+                                                            &check.status,
+                                                        )
+                                                        .to_string(),
+                                                        Some(
+                                                            "Acknowledge the structured discontinuity data, then use --start-at-tail to establish a fresh token."
+                                                                .to_string(),
+                                                        ),
+                                                        discontinuity,
+                                                        elapsed_ms(start),
+                                                    );
+                                                    print_robot_response(
+                                                        &response, format, stats,
+                                                    )?;
+                                                    return Ok(());
+                                                }
+                                            }
+                                            Ok(None) => {}
+                                            Err(error) => {
+                                                if watch_core_failure_source(&error)
+                                                    == WatchFailureSource::Cancellation
+                                                {
+                                                    return Err(error.into());
+                                                }
+                                                let response = RobotResponse::<
+                                                    RobotEventsData,
+                                                >::error_with_code(
+                                                    ROBOT_ERR_STORAGE,
+                                                    format!(
+                                                        "Failed to reconcile the events cursor with retention: {error}"
+                                                    ),
+                                                    Some(
+                                                        "Retry after storage recovers; no cursor was advanced."
+                                                            .to_string(),
+                                                    ),
+                                                    elapsed_ms(start),
+                                                );
+                                                print_robot_response(
+                                                    &response, format, stats,
+                                                )?;
+                                                return Ok(());
+                                            }
+                                        }
+                                        authoritative_next_cursor = Some(
+                                            event_stream_page_checked_through(
+                                                &page,
+                                                effective_limit,
+                                            ),
+                                        );
+                                        response_cursor_epoch = Some(epoch.to_string());
+                                        Ok(page.events)
+                                    }
+                                    Err(error)
+                                        if watch_core_failure_source(&error)
+                                            == WatchFailureSource::Cancellation =>
+                                    {
+                                        return Err(error.into());
+                                    }
+                                    Err(error) => Err(error),
+                                }
                             } else {
                                 storage
                                     .get_events(frankenterm_core::storage::EventQuery {
@@ -38563,10 +39795,12 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                         None
                                     };
                                     let total_count = events.len();
-                                    let next_cursor = next_robot_events_cursor(
-                                        cursor,
-                                        events.iter().map(|event| event.id),
-                                    );
+                                    let next_cursor = authoritative_next_cursor.or_else(|| {
+                                        next_robot_events_cursor(
+                                            cursor,
+                                            events.iter().map(|event| event.id),
+                                        )
+                                    });
                                     let mut items: Vec<RobotEventItem> =
                                         Vec::with_capacity(events.len());
                                     for e in events {
@@ -38616,9 +39850,15 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                         total_count,
                                         limit: effective_limit,
                                         cursor,
+                                        cursor_epoch: cursor_epoch.clone(),
+                                        cursor_scope: cursor_scope.clone(),
                                         next_cursor,
+                                        next_cursor_epoch: response_cursor_epoch,
+                                        next_cursor_scope: cursor_mode
+                                            .then_some(expected_cursor_scope.clone()),
                                         replay_limit,
                                         order,
+                                        start_at_tail,
                                         pane_filter: pane,
                                         rule_id_filter: rule_id,
                                         event_type_filter: event_type,
@@ -38652,61 +39892,116 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             unhandled,
                             claim,
                             cursor,
+                            cursor_epoch,
+                            cursor_scope,
                             limit,
                             heartbeat_interval_ms,
                             poll_interval_ms,
                             max_hz,
                         } => {
                             if cursor.is_some_and(|c| c < 0) {
-                                let response = RobotResponse::<serde_json::Value>::error_with_code(
+                                let _ = write_terminal_stream_error_ndjson(
                                     ROBOT_ERR_INVALID_ARGS,
-                                    "Invalid --cursor: must be non-negative".to_string(),
+                                    "Invalid --cursor: must be non-negative",
                                     None,
-                                    elapsed_ms(start),
-                                );
-                                print_robot_response(&response, format, stats)?;
+                                    cursor,
+                                    cursor_epoch.as_deref(),
+                                    cursor_scope.as_deref(),
+                                    false,
+                                )?;
+                                return Ok(());
+                            }
+                            if let Err(message) = validate_event_cursor_token_parts(
+                                cursor,
+                                cursor_epoch.as_deref(),
+                                cursor_scope.as_deref(),
+                            )
+                            {
+                                let _ = write_terminal_stream_error_ndjson(
+                                    ROBOT_ERR_INVALID_ARGS,
+                                    message,
+                                    Some(
+                                        "Copy cursor, cursor_epoch, and cursor_scope from the prior stream record."
+                                            .to_string(),
+                                    ),
+                                    cursor,
+                                    cursor_epoch.as_deref(),
+                                    cursor_scope.as_deref(),
+                                    false,
+                                )?;
                                 return Ok(());
                             }
                             if let Err(message) = validate_watch_events_limit(limit) {
-                                let response = RobotResponse::<serde_json::Value>::error_with_code(
+                                let _ = write_terminal_stream_error_ndjson(
                                     ROBOT_ERR_INVALID_ARGS,
-                                    message.to_string(),
+                                    message,
                                     Some(format!(
                                         "Choose a bounded poll batch between 1 and {WATCH_EVENTS_BATCH_LIMIT_MAX}."
                                     )),
-                                    elapsed_ms(start),
-                                );
-                                print_robot_response(&response, format, stats)?;
+                                    cursor,
+                                    cursor_epoch.as_deref(),
+                                    cursor_scope.as_deref(),
+                                    false,
+                                )?;
                                 return Ok(());
                             }
                             let severity = match normalize_watch_severity(severity.as_deref()) {
                                 Ok(severity) => severity,
                                 Err(message) => {
-                                    let response =
-                                        RobotResponse::<serde_json::Value>::error_with_code(
-                                            ROBOT_ERR_INVALID_ARGS,
-                                            message.to_string(),
-                                            Some(
-                                                "Use one of: --severity info, --severity warning, or --severity critical. Matching is case-insensitive."
-                                                    .to_string(),
-                                            ),
-                                            elapsed_ms(start),
-                                        );
-                                    print_robot_response(&response, format, stats)?;
+                                    let _ = write_terminal_stream_error_ndjson(
+                                        ROBOT_ERR_INVALID_ARGS,
+                                        message,
+                                        Some(
+                                            "Use one of: --severity info, --severity warning, --severity error, or --severity critical. Matching is case-insensitive."
+                                                .to_string(),
+                                        ),
+                                        cursor,
+                                        cursor_epoch.as_deref(),
+                                        cursor_scope.as_deref(),
+                                        false,
+                                    )?;
                                     return Ok(());
                                 }
                             };
+                            let expected_cursor_scope = watch_events_cursor_scope(
+                                pane,
+                                severity.as_deref(),
+                                rule_id.as_deref(),
+                                unhandled,
+                                claim,
+                            );
+                            if validate_event_cursor_scope_matches(
+                                cursor_scope.as_deref(),
+                                &expected_cursor_scope,
+                            )
+                            .is_err()
+                            {
+                                let discontinuity = event_cursor_scope_discontinuity_ndjson(
+                                    cursor.expect("validated scoped token has a cursor"),
+                                    cursor_epoch
+                                        .as_deref()
+                                        .expect("validated scoped token has an epoch"),
+                                    cursor_scope
+                                        .as_deref()
+                                        .expect("scope mismatch has a supplied scope"),
+                                    &expected_cursor_scope,
+                                );
+                                let mut lock = std::io::stdout().lock();
+                                let _ = write_ndjson_line(&mut lock, &discontinuity)?;
+                                return Ok(());
+                            }
                             let layout = match config.workspace_layout(Some(&workspace_root)) {
                                 Ok(l) => l,
                                 Err(e) => {
-                                    let response =
-                                        RobotResponse::<serde_json::Value>::error_with_code(
-                                            ROBOT_ERR_CONFIG,
-                                            format!("Failed to get workspace layout: {e}"),
-                                            Some("Check --workspace or FT_WORKSPACE".to_string()),
-                                            elapsed_ms(start),
-                                        );
-                                    print_robot_response(&response, format, stats)?;
+                                    let _ = write_terminal_stream_error_ndjson(
+                                        ROBOT_ERR_CONFIG,
+                                        format!("Failed to get workspace layout: {e}"),
+                                        Some("Check --workspace or FT_WORKSPACE".to_string()),
+                                        cursor,
+                                        cursor_epoch.as_deref(),
+                                        Some(&expected_cursor_scope),
+                                        false,
+                                    )?;
                                     return Ok(());
                                 }
                             };
@@ -38718,13 +40013,15 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             {
                                 Ok(s) => s,
                                 Err(e) => {
-                                    let response = RobotResponse::<serde_json::Value>::error_with_code(
+                                    let _ = write_terminal_stream_error_ndjson(
                                         ROBOT_ERR_STORAGE,
                                         format!("Failed to open storage: {e}"),
                                         Some("Is the database initialized? Run 'ft watch' first.".to_string()),
-                                        elapsed_ms(start),
-                                    );
-                                    print_robot_response(&response, format, stats)?;
+                                        cursor,
+                                        cursor_epoch.as_deref(),
+                                        Some(&expected_cursor_scope),
+                                        true,
+                                    )?;
                                     return Ok(());
                                 }
                             };
@@ -38745,12 +40042,13 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             let redactor = frankenterm_core::redactor::Redactor::new();
                             let max_hz_interval = watch_max_hz_interval(max_hz);
                             let mut current_cursor = cursor;
+                            let mut current_cursor_epoch = cursor_epoch;
                             let mut last_emit = std::time::Instant::now();
                             let mut last_event_emit: Option<std::time::Instant> = None;
                             let stdout = std::io::stdout();
                             let cx = frankenterm_core::cx::Cx::current()
                                 .unwrap_or_else(frankenterm_core::cx::for_request);
-                            let mut last_retention_reconciled_at: Option<std::time::Instant> = None;
+                            let mut retention_coverage: Option<EventRetentionCoverage> = None;
 
                             // ft-7h5da.4.1: live IPC transport state. Persisted
                             // EventBus records are low-latency wakeups only;
@@ -38786,11 +40084,11 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                     since: None,
                                     until: None,
                                 };
-                                let events = match storage
-                                    .get_events_stream_with_cx(&cx, query)
+                                let page = match storage
+                                    .get_events_stream_page_with_cx(&cx, query)
                                     .await
                                 {
-                                    Ok(e) => e,
+                                    Ok(page) => page,
                                     Err(e) => {
                                         match classify_watch_outer_failure(
                                             &cx,
@@ -38802,30 +40100,75 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                             }
                                             WatchOuterFailure::Degraded => {}
                                         }
-                                        let response =
-                                            RobotResponse::<serde_json::Value>::error_with_code(
-                                                ROBOT_ERR_STORAGE,
-                                                format!("Failed to query events: {e}"),
-                                                None,
-                                                elapsed_ms(start),
-                                            );
                                         watch_checkpoint(&cx, "storage error response")?;
-                                        print_robot_response(&response, format, stats)?;
+                                        let record = watch_terminal_error_ndjson(
+                                            ROBOT_ERR_STORAGE,
+                                            format!("Failed to query events: {e}"),
+                                            Some(
+                                                "Retry after storage recovers; the durable cursor was retained."
+                                                    .to_string(),
+                                            ),
+                                            current_cursor,
+                                            current_cursor_epoch.as_deref(),
+                                            Some(&expected_cursor_scope),
+                                            true,
+                                        );
+                                        let _ = emit_watch_stream_record(
+                                            &stdout,
+                                            &record,
+                                            &mut last_emit,
+                                        )?;
                                         break 'follow;
                                     }
                                 };
                                 watch_checkpoint(&cx, "durable event query completion")?;
-                                let reconciliation_now = std::time::Instant::now();
-                                if watch_retention_reconciliation_is_due(
-                                    current_cursor,
-                                    events.first().map(|event| event.id),
-                                    last_retention_reconciled_at,
-                                    reconciliation_now,
-                                ) {
-                                    let oldest = match watch_oldest_retained_event_id(&cx, &storage)
-                                        .await
+                                if current_cursor.is_none() {
+                                    // No external resume claim exists yet. Adopt
+                                    // the atomic page epoch and allocation tail
+                                    // as the fresh baseline. The provisional
+                                    // page was not queried after that baseline,
+                                    // so discard it unconditionally and requery.
+                                    // This also prevents pre-token deletion
+                                    // intervals from becoming false future-loss
+                                    // reports on reconnect.
+                                    current_cursor_epoch =
+                                        Some(page.retention.cursor_epoch.clone());
+                                    current_cursor =
+                                        Some(fresh_event_cursor_baseline(&page.retention));
+                                    let checkpoint = watch_cursor_checkpoint_ndjson(
+                                        current_cursor.expect("fresh baseline was assigned"),
+                                        current_cursor_epoch
+                                            .as_deref()
+                                            .expect("fresh baseline epoch was assigned"),
+                                        &expected_cursor_scope,
+                                        "fresh_tail_baseline",
+                                    );
+                                    if !emit_watch_stream_record(
+                                        &stdout,
+                                        &checkpoint,
+                                        &mut last_emit,
+                                    )? {
+                                        break 'follow;
+                                    }
+                                    continue 'follow;
+                                } else {
+                                    let requested = current_cursor
+                                        .expect("cursor branch requires a cursor");
+                                    let epoch = current_cursor_epoch
+                                        .as_deref()
+                                        .expect("validated durable cursor requires an epoch");
+                                    let check = match reconcile_event_stream_cursor_page(
+                                        &cx,
+                                        &storage,
+                                        requested,
+                                        epoch,
+                                        &page,
+                                        batch_limit,
+                                        &mut retention_coverage,
+                                    )
+                                    .await
                                     {
-                                        Ok(oldest) => oldest,
+                                        Ok(check) => check,
                                         Err(error) => {
                                             match classify_watch_outer_failure(
                                                 &cx,
@@ -38837,35 +40180,40 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                                 }
                                                 WatchOuterFailure::Degraded => {}
                                             }
-                                            let response =
-                                                RobotResponse::<serde_json::Value>::error_with_code(
-                                                    ROBOT_ERR_STORAGE,
-                                                    format!(
-                                                        "Failed to reconcile the watch-events cursor with retention: {error}"
-                                                    ),
-                                                    Some(
-                                                        "Retry after storage recovers; the follower refused to guess whether retention pruned the durable cursor."
-                                                            .to_string(),
-                                                    ),
-                                                    elapsed_ms(start),
-                                                );
                                             watch_checkpoint(
                                                 &cx,
                                                 "retention error response",
                                             )?;
-                                            print_robot_response(&response, format, stats)?;
+                                            let record = watch_terminal_error_ndjson(
+                                                ROBOT_ERR_STORAGE,
+                                                format!(
+                                                    "Failed to reconcile the watch-events cursor with retention: {error}"
+                                                ),
+                                                Some(
+                                                    "Retry after storage recovers; the follower refused to guess whether retention pruned the durable cursor."
+                                                        .to_string(),
+                                                ),
+                                                current_cursor,
+                                                current_cursor_epoch.as_deref(),
+                                                Some(&expected_cursor_scope),
+                                                true,
+                                            );
+                                            let _ = emit_watch_stream_record(
+                                                &stdout,
+                                                &record,
+                                                &mut last_emit,
+                                            )?;
                                             break 'follow;
                                         }
                                     };
-                                    last_retention_reconciled_at = Some(std::time::Instant::now());
-                                    if let Some(oldest) =
-                                        watch_cursor_expiry(current_cursor, oldest)
-                                    {
-                                        let requested = current_cursor
-                                            .expect("expiry requires a durable cursor");
-                                        let record =
-                                            watch_cursor_expired_ndjson(requested, oldest);
-                                        watch_checkpoint(&cx, "cursor-expired output")?;
+                                    if let Some(record) = check.as_ref().and_then(|check| {
+                                        event_cursor_discontinuity_ndjson(
+                                            check,
+                                            epoch,
+                                            &expected_cursor_scope,
+                                        )
+                                    }) {
+                                        watch_checkpoint(&cx, "cursor-discontinuity output")?;
                                         let continue_writing = {
                                             let mut lock = stdout.lock();
                                             write_ndjson_line(&mut lock, &record)?
@@ -38874,13 +40222,12 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                             break 'follow;
                                         }
                                         note_watch_output_emitted(&mut last_emit);
-                                        // `watch_oldest_retained_event_id` rejects
-                                        // non-positive IDs, so this subtraction
-                                        // is both valid and overflow-free.
-                                        current_cursor = Some(oldest - 1);
-                                        continue 'follow;
+                                        break 'follow;
                                     }
                                 }
+                                let page_checked_through =
+                                    event_stream_page_checked_through(&page, batch_limit);
+                                let events = page.events;
                                 let batch_len = events.len();
                                 let mut claim_retry_hint_ms = None;
 
@@ -38893,7 +40240,10 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                     ) {
                                         // Filtered records were intentionally
                                         // examined and need no delivery claim.
-                                        current_cursor = Some(event.id);
+                                        // Do not mutate the externally committed
+                                        // cursor silently; a later event or the
+                                        // page checkpoint will publish the
+                                        // advancement atomically.
                                         continue;
                                     }
                                     // Pace before acquiring a delivery lease: a
@@ -38905,6 +40255,8 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                         last_event_emit,
                                         &stdout,
                                         current_cursor,
+                                        current_cursor_epoch.as_deref(),
+                                        Some(&expected_cursor_scope),
                                         heartbeat_interval_ms,
                                         heartbeat,
                                         &mut last_emit,
@@ -38918,10 +40270,25 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                     // nested secrets in `extracted`.
                                     let redacted =
                                         frankenterm_core::export::redact_event(event, &redactor);
-                                    let record = watch_event_ndjson(&redacted);
+                                    let page_epoch = current_cursor_epoch
+                                        .as_deref()
+                                        .expect(
+                                            "a durable event page always establishes its cursor epoch",
+                                        )
+                                        .to_string();
+                                    let record = watch_event_ndjson(
+                                        &redacted,
+                                        if claim {
+                                            current_cursor
+                                        } else {
+                                            Some(redacted.id)
+                                        },
+                                        &page_epoch,
+                                        &expected_cursor_scope,
+                                    );
 
                                     if claim {
-                                        let delivery = deliver_claimed_watch_event(
+                                        let delivery = match deliver_claimed_watch_event(
                                             &cx,
                                             &storage,
                                             redacted.id,
@@ -38931,7 +40298,39 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                                 write_ndjson_line(&mut lock, record)
                                             },
                                         )
-                                        .await?;
+                                        .await
+                                        {
+                                            Ok(delivery) => delivery,
+                                            Err(error)
+                                                if error.kind()
+                                                    == std::io::ErrorKind::Interrupted =>
+                                            {
+                                                return Err(error.into());
+                                            }
+                                            Err(error) => {
+                                                let record = watch_terminal_error_ndjson(
+                                                    ROBOT_ERR_STORAGE,
+                                                    format!(
+                                                        "Claim delivery for event {} failed before a committed cursor checkpoint: {error}",
+                                                        redacted.id
+                                                    ),
+                                                    Some(
+                                                        "Resume with the unchanged cursor; the candidate may be redelivered after its lease expires or exact handled state is reconciled."
+                                                            .to_string(),
+                                                    ),
+                                                    current_cursor,
+                                                    Some(&page_epoch),
+                                                    Some(&expected_cursor_scope),
+                                                    true,
+                                                );
+                                                let _ = emit_watch_stream_record(
+                                                    &stdout,
+                                                    &record,
+                                                    &mut last_emit,
+                                                )?;
+                                                break 'follow;
+                                            }
+                                        };
                                         note_watch_claim_output_emitted(
                                             delivery,
                                             &mut last_emit,
@@ -38939,28 +40338,287 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                         );
                                         match delivery {
                                             WatchEventClaimDelivery::Delivered { .. } => {
+                                                let checkpoint = watch_claim_checkpoint_ndjson(
+                                                    redacted.id,
+                                                    &page_epoch,
+                                                    &expected_cursor_scope,
+                                                    "finalized_after_output_flush",
+                                                    Some(redacted.id),
+                                                );
+                                                watch_checkpoint(
+                                                    &cx,
+                                                    "claim checkpoint output",
+                                                )?;
+                                                if !emit_watch_stream_record(
+                                                    &stdout,
+                                                    &checkpoint,
+                                                    &mut last_emit,
+                                                )? {
+                                                    break 'follow;
+                                                }
                                                 current_cursor = Some(redacted.id);
                                             }
                                             WatchEventClaimDelivery::PipeClosed => break 'follow,
                                             WatchEventClaimDelivery::AlreadyHandledOrMissing => {
-                                                // Another path completed or removed
-                                                // this exact row after the query.
-                                                current_cursor = Some(redacted.id);
+                                                let resolution = match resolve_watch_claim_skip_with_cx(
+                                                    &cx,
+                                                    &storage,
+                                                    redacted.id,
+                                                    &page_epoch,
+                                                )
+                                                .await
+                                                {
+                                                    Ok(resolution) => resolution,
+                                                    Err(error) => {
+                                                        match classify_watch_outer_failure(
+                                                            &cx,
+                                                            "claim skip reconciliation",
+                                                            watch_core_failure_source(&error),
+                                                        ) {
+                                                            WatchOuterFailure::Cancelled(error) => {
+                                                                return Err(error.into());
+                                                            }
+                                                            WatchOuterFailure::Degraded => {}
+                                                        }
+                                                        let record = watch_terminal_error_ndjson(
+                                                            ROBOT_ERR_STORAGE,
+                                                            format!(
+                                                                "Failed to reconcile event {} after its delivery reservation reported handled or missing: {error}",
+                                                                redacted.id
+                                                            ),
+                                                            Some(
+                                                                "Retry after storage recovers; the cursor was deliberately retained."
+                                                                    .to_string(),
+                                                            ),
+                                                            current_cursor,
+                                                            Some(&page_epoch),
+                                                            Some(&expected_cursor_scope),
+                                                            true,
+                                                        );
+                                                        let _ = emit_watch_stream_record(
+                                                            &stdout,
+                                                            &record,
+                                                            &mut last_emit,
+                                                        )?;
+                                                        break 'follow;
+                                                    }
+                                                };
+                                                match resolution {
+                                                    WatchClaimSkipResolution::Handled => {
+                                                        let checkpoint =
+                                                            watch_claim_checkpoint_ndjson(
+                                                                redacted.id,
+                                                                &page_epoch,
+                                                                &expected_cursor_scope,
+                                                                "already_finalized",
+                                                                Some(redacted.id),
+                                                            );
+                                                        if !emit_watch_stream_record(
+                                                            &stdout,
+                                                            &checkpoint,
+                                                            &mut last_emit,
+                                                        )? {
+                                                            break 'follow;
+                                                        }
+                                                        current_cursor = Some(redacted.id);
+                                                    }
+                                                    WatchClaimSkipResolution::CursorDiscontinuity(
+                                                        check,
+                                                    ) => {
+                                                        let record = event_cursor_discontinuity_ndjson(
+                                                            &check,
+                                                            &page_epoch,
+                                                            &expected_cursor_scope,
+                                                        )
+                                                        .expect(
+                                                            "non-complete claim resolution is a discontinuity",
+                                                        );
+                                                        watch_checkpoint(
+                                                            &cx,
+                                                            "claim discontinuity output",
+                                                        )?;
+                                                        let continue_writing = {
+                                                            let mut lock = stdout.lock();
+                                                            write_ndjson_line(&mut lock, &record)?
+                                                        };
+                                                        if continue_writing {
+                                                            note_watch_output_emitted(
+                                                                &mut last_emit,
+                                                            );
+                                                        }
+                                                        break 'follow;
+                                                    }
+                                                    WatchClaimSkipResolution::Unhandled(message)
+                                                    | WatchClaimSkipResolution::Inconsistent(
+                                                        message,
+                                                    ) => {
+                                                        let record = watch_terminal_error_ndjson(
+                                                            ROBOT_ERR_STORAGE,
+                                                            message,
+                                                            Some(
+                                                                "The durable cursor was retained because exact claim reconciliation did not prove a committed delivery."
+                                                                    .to_string(),
+                                                            ),
+                                                            current_cursor,
+                                                            Some(&page_epoch),
+                                                            Some(&expected_cursor_scope),
+                                                            false,
+                                                        );
+                                                        let _ = emit_watch_stream_record(
+                                                            &stdout,
+                                                            &record,
+                                                            &mut last_emit,
+                                                        )?;
+                                                        break 'follow;
+                                                    }
+                                                }
                                             }
                                             WatchEventClaimDelivery::LeasedUntil {
                                                 expires_at_ms,
                                             } => {
+                                                if !follow {
+                                                    let deferred = watch_claim_deferred_ndjson(
+                                                        current_cursor,
+                                                        &page_epoch,
+                                                        &expected_cursor_scope,
+                                                        redacted.id,
+                                                        "delivery_lease_active",
+                                                        Some(expires_at_ms),
+                                                    );
+                                                    let _ = emit_watch_stream_record(
+                                                        &stdout,
+                                                        &deferred,
+                                                        &mut last_emit,
+                                                    )?;
+                                                    break 'follow;
+                                                }
                                                 claim_retry_hint_ms = Some(expires_at_ms);
                                                 break;
                                             }
                                             WatchEventClaimDelivery::FinalizationLost { .. } => {
-                                                // The record reached the consumer, but
-                                                // ownership changed before the CAS.
-                                                // Retain the cursor and immediately
-                                                // re-establish durable truth; at-least-
-                                                // once duplication is safer than loss.
-                                                claim_retry_hint_ms = Some(now_ms_i64());
-                                                break;
+                                                // The pending record reached the
+                                                // consumer, but ownership changed
+                                                // before our CAS. Resolve exact
+                                                // durable truth before deciding
+                                                // whether a checkpoint is legal.
+                                                let resolution = match resolve_watch_claim_skip_with_cx(
+                                                    &cx,
+                                                    &storage,
+                                                    redacted.id,
+                                                    &page_epoch,
+                                                )
+                                                .await
+                                                {
+                                                    Ok(resolution) => resolution,
+                                                    Err(error) => {
+                                                        if watch_core_failure_source(&error)
+                                                            == WatchFailureSource::Cancellation
+                                                        {
+                                                            return Err(error.into());
+                                                        }
+                                                        let record = watch_terminal_error_ndjson(
+                                                            ROBOT_ERR_STORAGE,
+                                                            format!(
+                                                                "Event {} was flushed, claim ownership changed, and exact reconciliation failed: {error}",
+                                                                redacted.id
+                                                            ),
+                                                            Some(
+                                                                "Resume with the unchanged cursor after storage recovers; duplicate delivery is safer than loss."
+                                                                    .to_string(),
+                                                            ),
+                                                            current_cursor,
+                                                            Some(&page_epoch),
+                                                            Some(&expected_cursor_scope),
+                                                            true,
+                                                        );
+                                                        let _ = emit_watch_stream_record(
+                                                            &stdout,
+                                                            &record,
+                                                            &mut last_emit,
+                                                        )?;
+                                                        break 'follow;
+                                                    }
+                                                };
+                                                match resolution {
+                                                    WatchClaimSkipResolution::Handled => {
+                                                        let checkpoint =
+                                                            watch_claim_checkpoint_ndjson(
+                                                                redacted.id,
+                                                                &page_epoch,
+                                                                &expected_cursor_scope,
+                                                                "finalized_by_competitor",
+                                                                Some(redacted.id),
+                                                            );
+                                                        if !emit_watch_stream_record(
+                                                            &stdout,
+                                                            &checkpoint,
+                                                            &mut last_emit,
+                                                        )? {
+                                                            break 'follow;
+                                                        }
+                                                        current_cursor = Some(redacted.id);
+                                                    }
+                                                    WatchClaimSkipResolution::Unhandled(_) => {
+                                                        if !follow {
+                                                            let deferred = watch_claim_deferred_ndjson(
+                                                                current_cursor,
+                                                                &page_epoch,
+                                                                &expected_cursor_scope,
+                                                                redacted.id,
+                                                                "finalization_ownership_lost_after_output_flush",
+                                                                Some(now_ms_i64()),
+                                                            );
+                                                            let _ = emit_watch_stream_record(
+                                                                &stdout,
+                                                                &deferred,
+                                                                &mut last_emit,
+                                                            )?;
+                                                            break 'follow;
+                                                        }
+                                                        claim_retry_hint_ms = Some(now_ms_i64());
+                                                        break;
+                                                    }
+                                                    WatchClaimSkipResolution::CursorDiscontinuity(
+                                                        check,
+                                                    ) => {
+                                                        let record = event_cursor_discontinuity_ndjson(
+                                                            &check,
+                                                            &page_epoch,
+                                                            &expected_cursor_scope,
+                                                        )
+                                                        .expect(
+                                                            "non-complete claim resolution is a discontinuity",
+                                                        );
+                                                        let _ = emit_watch_stream_record(
+                                                            &stdout,
+                                                            &record,
+                                                            &mut last_emit,
+                                                        )?;
+                                                        break 'follow;
+                                                    }
+                                                    WatchClaimSkipResolution::Inconsistent(
+                                                        message,
+                                                    ) => {
+                                                        let record = watch_terminal_error_ndjson(
+                                                            ROBOT_ERR_STORAGE,
+                                                            message,
+                                                            Some(
+                                                                "The durable cursor was retained because absence without deletion evidence is unsafe."
+                                                                    .to_string(),
+                                                            ),
+                                                            current_cursor,
+                                                            Some(&page_epoch),
+                                                            Some(&expected_cursor_scope),
+                                                            false,
+                                                        );
+                                                        let _ = emit_watch_stream_record(
+                                                            &stdout,
+                                                            &record,
+                                                            &mut last_emit,
+                                                        )?;
+                                                        break 'follow;
+                                                    }
+                                                }
                                             }
                                         }
                                     } else {
@@ -38978,6 +40636,39 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                     }
                                 }
 
+                                if claim_retry_hint_ms.is_none() {
+                                    // A short page's retention sentinel proves
+                                    // the stream was examined through the
+                                    // allocation high-water mark. Advancing to
+                                    // that exact bound avoids rescanning rows
+                                    // deliberately omitted by server filters;
+                                    // claim contention/finalization ambiguity
+                                    // retains the prior cursor above.
+                                    let committed_before_page_checkpoint =
+                                        current_cursor.unwrap_or(0);
+                                    if page_checked_through
+                                        > committed_before_page_checkpoint
+                                    {
+                                        let epoch = current_cursor_epoch
+                                            .as_deref()
+                                            .expect("durable page has an epoch");
+                                        let checkpoint = watch_cursor_checkpoint_ndjson(
+                                            page_checked_through,
+                                            epoch,
+                                            &expected_cursor_scope,
+                                            "examined_through_page",
+                                        );
+                                        if !emit_watch_stream_record(
+                                            &stdout,
+                                            &checkpoint,
+                                            &mut last_emit,
+                                        )? {
+                                            break 'follow;
+                                        }
+                                        current_cursor = Some(page_checked_through);
+                                    }
+                                }
+
                                 if let Some(retry_hint_ms) = claim_retry_hint_ms {
                                     if !follow {
                                         break 'follow;
@@ -38985,6 +40676,8 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                     if !emit_watch_heartbeat_if_due(
                                         &stdout,
                                         current_cursor,
+                                        current_cursor_epoch.as_deref(),
+                                        Some(&expected_cursor_scope),
                                         heartbeat_interval_ms,
                                         heartbeat,
                                         &mut last_emit,
@@ -39018,6 +40711,8 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                     if !emit_watch_heartbeat_if_due(
                                         &stdout,
                                         current_cursor,
+                                        current_cursor_epoch.as_deref(),
+                                        Some(&expected_cursor_scope),
                                         heartbeat_interval_ms,
                                         heartbeat,
                                         &mut last_emit,
@@ -39085,6 +40780,8 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                                         &stdout,
                                                         &line,
                                                         &mut current_cursor,
+                                                        current_cursor_epoch.as_deref(),
+                                                        Some(&expected_cursor_scope),
                                                         max_hz_interval,
                                                         &mut last_event_emit,
                                                         heartbeat_interval_ms,
@@ -39172,6 +40869,8 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                                                     &mut lock,
                                                                     &mut ipc_transport_gap_open,
                                                                     current_cursor,
+                                                                    current_cursor_epoch.as_deref(),
+                                                                    Some(&expected_cursor_scope),
                                                                     fault,
                                                                     now_ms_i64(),
                                                                 )?
@@ -39242,6 +40941,8 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                                             &mut lock,
                                                             &mut ipc_transport_gap_open,
                                                             current_cursor,
+                                                            current_cursor_epoch.as_deref(),
+                                                            Some(&expected_cursor_scope),
                                                             IpcTransportGapReason::StreamEof,
                                                             now_ms_i64(),
                                                         )?
@@ -39286,6 +40987,8 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                                             &mut lock,
                                                             &mut ipc_transport_gap_open,
                                                             current_cursor,
+                                                            current_cursor_epoch.as_deref(),
+                                                            Some(&expected_cursor_scope),
                                                             IpcTransportGapReason::StreamReadFailure,
                                                             now_ms_i64(),
                                                         )?
@@ -39364,6 +41067,8 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                                         &mut lock,
                                                         &mut ipc_transport_gap_open,
                                                         current_cursor,
+                                                        current_cursor_epoch.as_deref(),
+                                                        Some(&expected_cursor_scope),
                                                         IpcTransportGapReason::SubscribeUnavailable,
                                                         now_ms_i64(),
                                                     )?
@@ -39386,6 +41091,8 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                 if !emit_watch_heartbeat_if_due(
                                     &stdout,
                                     current_cursor,
+                                    current_cursor_epoch.as_deref(),
+                                    Some(&expected_cursor_scope),
                                     heartbeat_interval_ms,
                                     heartbeat,
                                     &mut last_emit,
@@ -39411,20 +41118,55 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             timeout_secs,
                             poll_interval_ms,
                             cursor,
+                            cursor_epoch,
+                            cursor_scope,
                         } => {
+                            if let Err(message) = validate_robot_events_cursor(cursor) {
+                                let _ = write_terminal_stream_error_ndjson(
+                                    ROBOT_ERR_INVALID_ARGS,
+                                    message,
+                                    None,
+                                    cursor,
+                                    cursor_epoch.as_deref(),
+                                    cursor_scope.as_deref(),
+                                    false,
+                                )?;
+                                return Ok(());
+                            }
+                            if let Err(message) = validate_event_cursor_token_parts(
+                                cursor,
+                                cursor_epoch.as_deref(),
+                                cursor_scope.as_deref(),
+                            )
+                            {
+                                let _ = write_terminal_stream_error_ndjson(
+                                    ROBOT_ERR_INVALID_ARGS,
+                                    message,
+                                    Some(
+                                        "Copy final_cursor, final_cursor_epoch, and final_cursor_scope from the prior await result."
+                                            .to_string(),
+                                    ),
+                                    cursor,
+                                    cursor_epoch.as_deref(),
+                                    cursor_scope.as_deref(),
+                                    false,
+                                )?;
+                                return Ok(());
+                            }
                             // Parse conditions (fail fast on bad syntax).
                             let mut any_conds: Vec<AwaitCondition> = Vec::with_capacity(any.len());
                             let mut all_conds: Vec<AwaitCondition> = Vec::with_capacity(all.len());
                             for spec in any.iter().chain(all.iter()) {
                                 if let Err(e) = parse_await_condition(spec) {
-                                    let response =
-                                        RobotResponse::<serde_json::Value>::error_with_code(
-                                            ROBOT_ERR_INVALID_ARGS,
-                                            e,
-                                            None,
-                                            elapsed_ms(start),
-                                        );
-                                    print_robot_response(&response, format, stats)?;
+                                    let _ = write_terminal_stream_error_ndjson(
+                                        ROBOT_ERR_INVALID_ARGS,
+                                        e,
+                                        None,
+                                        cursor,
+                                        cursor_epoch.as_deref(),
+                                        cursor_scope.as_deref(),
+                                        false,
+                                    )?;
                                     return Ok(());
                                 }
                             }
@@ -39437,32 +41179,59 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                     .push(parse_await_condition(spec).expect("validated above"));
                             }
                             if any_conds.is_empty() && all_conds.is_empty() {
-                                let response = RobotResponse::<serde_json::Value>::error_with_code(
+                                let _ = write_terminal_stream_error_ndjson(
                                     ROBOT_ERR_INVALID_ARGS,
-                                    "await requires at least one --any or --all condition"
-                                        .to_string(),
+                                    "await requires at least one --any or --all condition",
                                     Some(
                                         "Example: ft robot await --all 'rule:build.done' \
                                              --timeout-secs 60"
                                             .to_string(),
                                     ),
-                                    elapsed_ms(start),
+                                    cursor,
+                                    cursor_epoch.as_deref(),
+                                    cursor_scope.as_deref(),
+                                    false,
+                                )?;
+                                return Ok(());
+                            }
+                            let expected_cursor_scope = await_cursor_scope(
+                                &any_conds,
+                                &all_conds,
+                                &config.agent_detection,
+                            );
+                            if validate_event_cursor_scope_matches(
+                                cursor_scope.as_deref(),
+                                &expected_cursor_scope,
+                            )
+                            .is_err()
+                            {
+                                let discontinuity = event_cursor_scope_discontinuity_ndjson(
+                                    cursor.expect("validated scoped token has a cursor"),
+                                    cursor_epoch
+                                        .as_deref()
+                                        .expect("validated scoped token has an epoch"),
+                                    cursor_scope
+                                        .as_deref()
+                                        .expect("scope mismatch has a supplied scope"),
+                                    &expected_cursor_scope,
                                 );
-                                print_robot_response(&response, format, stats)?;
+                                let mut lock = std::io::stdout().lock();
+                                let _ = write_ndjson_line(&mut lock, &discontinuity)?;
                                 return Ok(());
                             }
 
                             let layout = match config.workspace_layout(Some(&workspace_root)) {
                                 Ok(l) => l,
                                 Err(e) => {
-                                    let response =
-                                        RobotResponse::<serde_json::Value>::error_with_code(
-                                            ROBOT_ERR_CONFIG,
-                                            format!("Failed to get workspace layout: {e}"),
-                                            Some("Check --workspace or FT_WORKSPACE".to_string()),
-                                            elapsed_ms(start),
-                                        );
-                                    print_robot_response(&response, format, stats)?;
+                                    let _ = write_terminal_stream_error_ndjson(
+                                        ROBOT_ERR_CONFIG,
+                                        format!("Failed to get workspace layout: {e}"),
+                                        Some("Check --workspace or FT_WORKSPACE".to_string()),
+                                        cursor,
+                                        cursor_epoch.as_deref(),
+                                        Some(&expected_cursor_scope),
+                                        false,
+                                    )?;
                                     return Ok(());
                                 }
                             };
@@ -39474,25 +41243,29 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             {
                                 Ok(s) => s,
                                 Err(e) => {
-                                    let response = RobotResponse::<serde_json::Value>::error_with_code(
+                                    let _ = write_terminal_stream_error_ndjson(
                                         ROBOT_ERR_STORAGE,
                                         format!("Failed to open storage: {e}"),
                                         Some("Is the database initialized? Run 'ft watch' first.".to_string()),
-                                        elapsed_ms(start),
-                                    );
-                                    print_robot_response(&response, format, stats)?;
+                                        cursor,
+                                        cursor_epoch.as_deref(),
+                                        Some(&expected_cursor_scope),
+                                        true,
+                                    )?;
                                     return Ok(());
                                 }
                             };
 
                             let poll = std::time::Duration::from_millis(poll_interval_ms.max(10));
-                            let start_ms = now_ms_i64();
                             let started = std::time::Instant::now();
                             let mut after_id = cursor;
+                            let mut current_cursor_epoch = cursor_epoch;
+                            let mut retention_coverage: Option<EventRetentionCoverage> = None;
                             let mut any_met = vec![false; any_conds.len()];
                             let mut all_met = vec![false; all_conds.len()];
-                            let mut final_cursor = cursor;
                             let stdout = std::io::stdout();
+                            let cx = frankenterm_core::cx::Cx::current()
+                                .unwrap_or_else(frankenterm_core::cx::for_request);
 
                             let (satisfied, timed_out) = loop {
                                 let query = frankenterm_core::storage::EventStreamQuery {
@@ -39504,34 +41277,126 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                     triage_state: None,
                                     label: None,
                                     unhandled_only: false,
-                                    // Default (no --cursor): only events that
-                                    // arrive after the await starts.
-                                    since: if after_id.is_some() {
-                                        None
-                                    } else {
-                                        Some(start_ms)
-                                    },
+                                    // A cursorless await first establishes an
+                                    // atomic durable tail, then requeries after
+                                    // it. The successful baseline acquisition,
+                                    // rather than process entry, defines when
+                                    // the await starts observing events.
+                                    since: None,
                                     until: None,
                                 };
-                                let events = match storage.get_events_stream(query).await {
-                                    Ok(e) => e,
+                                let page = match storage
+                                    .get_events_stream_page_with_cx(&cx, query)
+                                    .await
+                                {
+                                    Ok(page) => page,
                                     Err(e) => {
-                                        let response =
-                                            RobotResponse::<serde_json::Value>::error_with_code(
-                                                ROBOT_ERR_STORAGE,
-                                                format!("Failed to query events: {e}"),
-                                                None,
-                                                elapsed_ms(start),
-                                            );
-                                        print_robot_response(&response, format, stats)?;
+                                        if watch_core_failure_source(&e)
+                                            == WatchFailureSource::Cancellation
+                                        {
+                                            return Err(e.into());
+                                        }
+                                        let _ = write_terminal_stream_error_ndjson(
+                                            ROBOT_ERR_STORAGE,
+                                            format!("Failed to query events: {e}"),
+                                            None,
+                                            after_id,
+                                            current_cursor_epoch.as_deref(),
+                                            Some(&expected_cursor_scope),
+                                            true,
+                                        )?;
                                         storage.shutdown().await.ok();
                                         return Ok(());
                                     }
                                 };
-                                let batch_len = events.len();
-                                for ev in &events {
-                                    after_id = Some(ev.id);
-                                    final_cursor = Some(ev.id);
+                                if after_id.is_none() {
+                                    current_cursor_epoch =
+                                        Some(page.retention.cursor_epoch.clone());
+                                    after_id =
+                                        Some(fresh_event_cursor_baseline(&page.retention));
+                                    let checkpoint = watch_cursor_checkpoint_ndjson(
+                                        after_id.expect("fresh await baseline was assigned"),
+                                        current_cursor_epoch
+                                            .as_deref()
+                                            .expect("fresh await epoch was assigned"),
+                                        &expected_cursor_scope,
+                                        "fresh_await_tail_baseline",
+                                    );
+                                    watch_checkpoint(&cx, "await baseline output")?;
+                                    let continue_writing = {
+                                        let mut lock = stdout.lock();
+                                        write_ndjson_line(&mut lock, &checkpoint)?
+                                    };
+                                    if !continue_writing {
+                                        storage.shutdown().await.ok();
+                                        return Ok(());
+                                    }
+                                    // The provisional page was not queried
+                                    // after the newly established tail. Never
+                                    // process it or allow its final row to move
+                                    // the public cursor below the safe baseline.
+                                    continue;
+                                } else {
+                                    let requested =
+                                        after_id.expect("cursor branch requires a cursor");
+                                    let epoch = current_cursor_epoch
+                                        .as_deref()
+                                        .expect("an await cursor always has an epoch");
+                                    let check = match reconcile_event_stream_cursor_page(
+                                        &cx,
+                                        &storage,
+                                        requested,
+                                        epoch,
+                                        &page,
+                                        500,
+                                        &mut retention_coverage,
+                                    )
+                                    .await
+                                    {
+                                        Ok(check) => check,
+                                        Err(error) => {
+                                            if watch_core_failure_source(&error)
+                                                == WatchFailureSource::Cancellation
+                                            {
+                                                return Err(error.into());
+                                            }
+                                            let _ = write_terminal_stream_error_ndjson(
+                                                ROBOT_ERR_STORAGE,
+                                                format!(
+                                                    "Failed to reconcile the await cursor with retention: {error}"
+                                                ),
+                                                Some(
+                                                    "Retry after storage recovers; the await refused to guess whether retention pruned the cursor."
+                                                        .to_string(),
+                                                ),
+                                                after_id,
+                                                current_cursor_epoch.as_deref(),
+                                                Some(&expected_cursor_scope),
+                                                true,
+                                            )?;
+                                            storage.shutdown().await.ok();
+                                            return Ok(());
+                                        }
+                                    };
+                                    if let Some(record) = check.as_ref().and_then(|check| {
+                                        event_cursor_discontinuity_ndjson(
+                                            check,
+                                            epoch,
+                                            &expected_cursor_scope,
+                                        )
+                                    }) {
+                                        let mut lock = stdout.lock();
+                                        let _ = write_ndjson_line(&mut lock, &record)?;
+                                        drop(lock);
+                                        storage.shutdown().await.ok();
+                                        return Ok(());
+                                    }
+                                }
+
+                                let checked_through =
+                                    event_stream_page_checked_through(&page, 500);
+                                let batch_len = page.events.len();
+                                for ev in &page.events {
                                     for (i, c) in any_conds.iter().enumerate() {
                                         if !any_met[i] && await_condition_matches(c, ev) {
                                             any_met[i] = true;
@@ -39543,7 +41408,9 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                         }
                                     }
                                 }
+                                after_id = Some(checked_through);
                                 if let Err(e) = update_await_quiescence_conditions(
+                                    &cx,
                                     &storage,
                                     &config.agent_detection,
                                     &any_conds,
@@ -39551,18 +41418,25 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                 )
                                 .await
                                 {
-                                    let response =
-                                        RobotResponse::<serde_json::Value>::error_with_code(
-                                            ROBOT_ERR_STORAGE,
-                                            format!("Failed to query pane output timestamps: {e}"),
-                                            None,
-                                            elapsed_ms(start),
-                                        );
-                                    print_robot_response(&response, format, stats)?;
+                                    if watch_core_failure_source(&e)
+                                        == WatchFailureSource::Cancellation
+                                    {
+                                        return Err(e.into());
+                                    }
+                                    let _ = write_terminal_stream_error_ndjson(
+                                        ROBOT_ERR_STORAGE,
+                                        format!("Failed to query pane output timestamps: {e}"),
+                                        None,
+                                        after_id,
+                                        current_cursor_epoch.as_deref(),
+                                        Some(&expected_cursor_scope),
+                                        true,
+                                    )?;
                                     storage.shutdown().await.ok();
                                     return Ok(());
                                 }
                                 if let Err(e) = update_await_quiescence_conditions(
+                                    &cx,
                                     &storage,
                                     &config.agent_detection,
                                     &all_conds,
@@ -39570,38 +41444,40 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                 )
                                 .await
                                 {
-                                    let response =
-                                        RobotResponse::<serde_json::Value>::error_with_code(
-                                            ROBOT_ERR_STORAGE,
-                                            format!("Failed to query pane output timestamps: {e}"),
-                                            None,
-                                            elapsed_ms(start),
-                                        );
-                                    print_robot_response(&response, format, stats)?;
+                                    if watch_core_failure_source(&e)
+                                        == WatchFailureSource::Cancellation
+                                    {
+                                        return Err(e.into());
+                                    }
+                                    let _ = write_terminal_stream_error_ndjson(
+                                        ROBOT_ERR_STORAGE,
+                                        format!("Failed to query pane output timestamps: {e}"),
+                                        None,
+                                        after_id,
+                                        current_cursor_epoch.as_deref(),
+                                        Some(&expected_cursor_scope),
+                                        true,
+                                    )?;
                                     storage.shutdown().await.ok();
                                     return Ok(());
                                 }
                                 if await_is_satisfied(&any_met, &all_met) {
                                     break (true, false);
                                 }
-                                // Drain a full backlog batch before idling.
+                                let timeout = (timeout_secs > 0)
+                                    .then(|| std::time::Duration::from_secs(timeout_secs));
+                                if timeout.is_some_and(|timeout| started.elapsed() >= timeout) {
+                                    break (false, true);
+                                }
+                                // Drain a full backlog batch before idling, but
+                                // never let backlog volume bypass the timeout.
                                 if batch_len >= 500 {
                                     continue;
                                 }
-                                if timeout_secs > 0
-                                    && started.elapsed()
-                                        >= std::time::Duration::from_secs(timeout_secs)
-                                {
-                                    break (false, true);
-                                }
-                                // Inter-poll delay. The robot dispatch has no
-                                // ambient timer-capable cx, so an async timer
-                                // sleep hangs; offload to the blocking pool.
-                                let _ =
-                                    frankenterm_core::runtime_async::spawn_blocking(move || {
-                                        std::thread::sleep(poll);
-                                    })
-                                    .await;
+                                let wait = timeout.map_or(poll, |timeout| {
+                                    poll.min(timeout.saturating_sub(started.elapsed()))
+                                });
+                                sleep_watch_delay_with_cx(&cx, wait, "await poll delay").await?;
                             };
 
                             let any_status: Vec<(String, bool)> =
@@ -39612,10 +41488,13 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                 satisfied,
                                 timed_out,
                                 elapsed_ms(start),
-                                final_cursor,
+                                after_id,
+                                current_cursor_epoch.as_deref(),
+                                Some(&expected_cursor_scope),
                                 &any_status,
                                 &all_status,
                             );
+                            watch_checkpoint(&cx, "await result output")?;
                             {
                                 let mut lock = stdout.lock();
                                 let _ = write_ndjson_line(&mut lock, &result)?;
@@ -79892,13 +81771,19 @@ log_level = "debug"
     }
 
     #[test]
-    fn robot_events_replay_limit_validation_rejects_zero() {
+    fn robot_events_query_limits_enforce_hard_bounds() {
         assert_eq!(
             validate_robot_events_replay_limit(Some(0)),
             Err("Invalid --replay-limit: must be >= 1")
         );
         assert!(validate_robot_events_replay_limit(Some(1)).is_ok());
+        assert!(validate_robot_events_replay_limit(Some(4_096)).is_ok());
+        assert!(validate_robot_events_replay_limit(Some(4_097)).is_err());
         assert!(validate_robot_events_replay_limit(None).is_ok());
+        assert!(validate_robot_events_limit(1).is_ok());
+        assert!(validate_robot_events_limit(4_096).is_ok());
+        assert!(validate_robot_events_limit(0).is_err());
+        assert!(validate_robot_events_limit(4_097).is_err());
     }
 
     #[test]
@@ -89377,7 +91262,10 @@ A  docs/new-proof.md\n";
                     unhandled,
                     since,
                     cursor,
+                    cursor_epoch,
+                    cursor_scope,
                     replay_limit,
+                    start_at_tail,
                     would_handle,
                     dry_run,
                     command,
@@ -89391,7 +91279,10 @@ A  docs/new-proof.md\n";
                     assert!(!unhandled);
                     assert_eq!(since, None);
                     assert_eq!(cursor, None);
+                    assert_eq!(cursor_epoch, None);
+                    assert_eq!(cursor_scope, None);
                     assert_eq!(replay_limit, None);
+                    assert!(!start_at_tail);
                     assert!(!would_handle);
                     assert!(!dry_run);
                     assert!(command.is_none());
@@ -89426,6 +91317,10 @@ A  docs/new-proof.md\n";
             "events",
             "--cursor",
             "42",
+            "--cursor-epoch",
+            "0123456789abcdef0123456789abcdef",
+            "--cursor-scope",
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
             "--replay-limit",
             "7",
         ])
@@ -89435,16 +91330,74 @@ A  docs/new-proof.md\n";
             Some(Commands::Robot { command, .. }) => match command {
                 Some(RobotCommands::Events {
                     cursor,
+                    cursor_epoch,
+                    cursor_scope,
                     replay_limit,
                     ..
                 }) => {
                     assert_eq!(cursor, Some(42));
+                    assert_eq!(
+                        cursor_epoch.as_deref(),
+                        Some("0123456789abcdef0123456789abcdef")
+                    );
+                    assert_eq!(
+                        cursor_scope.as_deref(),
+                        Some(
+                            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                        )
+                    );
                     assert_eq!(replay_limit, Some(7));
                 }
                 _ => panic!("expected RobotCommands::Events"),
             },
             _ => panic!("expected Robot command"),
         }
+    }
+
+    #[test]
+    fn cli_robot_events_start_at_tail_is_an_explicit_cursor_bootstrap() {
+        let cli = Cli::try_parse_from(["ft", "robot", "events", "--start-at-tail"])
+            .expect("fresh tail bootstrap should parse");
+        match cli.command.map(|b| *b) {
+            Some(Commands::Robot { command, .. }) => match command {
+                Some(RobotCommands::Events {
+                    start_at_tail,
+                    cursor,
+                    cursor_epoch,
+                    cursor_scope,
+                    ..
+                }) => {
+                    assert!(start_at_tail);
+                    assert_eq!(cursor, None);
+                    assert_eq!(cursor_epoch, None);
+                    assert_eq!(cursor_scope, None);
+                }
+                _ => panic!("expected RobotCommands::Events"),
+            },
+            _ => panic!("expected Robot command"),
+        }
+
+        assert!(
+            Cli::try_parse_from(["ft", "robot", "events", "--replay-limit", "7"])
+                .is_err(),
+            "replay-limit without a paired resume cursor must be rejected"
+        );
+        assert!(
+            Cli::try_parse_from([
+                "ft",
+                "robot",
+                "events",
+                "--start-at-tail",
+                "--cursor",
+                "7",
+                "--cursor-epoch",
+                "0123456789abcdef0123456789abcdef",
+                "--cursor-scope",
+                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            ])
+            .is_err(),
+            "fresh bootstrap and resume cursor are mutually exclusive"
+        );
     }
 
     #[test]

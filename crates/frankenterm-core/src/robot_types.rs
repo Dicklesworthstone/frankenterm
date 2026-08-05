@@ -342,7 +342,8 @@ impl ErrorCode {
             "robot.storage_error"
             | "robot.fts_query_error"
             | "robot.reservation_conflict"
-            | "robot.event_not_found" => ErrorCategory::Storage,
+            | "robot.event_not_found"
+            | "robot.cursor_discontinuity" => ErrorCategory::Storage,
             "robot.rule_not_found" => ErrorCategory::Pattern,
             "robot.config_error"
             | "robot.feature_not_available"
@@ -484,6 +485,9 @@ pub fn hint_for(code: &ErrorCode) -> Option<&'static str> {
         }
         "robot.reservation_conflict" | "robot.event_not_found" => {
             "Refresh local state and retry; the row was modified or removed concurrently."
+        }
+        "robot.cursor_discontinuity" => {
+            "Inspect the structured discontinuity data; resume with the exact original scope or explicitly establish a fresh tail token."
         }
         // Tx contention
         "robot.tx_lock_failed" => {
@@ -1213,23 +1217,41 @@ pub struct EventsData {
     pub events: Vec<EventItem>,
     pub total_count: usize,
     pub limit: usize,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor_epoch: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor_scope: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor_epoch: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor_scope: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replay_limit: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub order: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub start_at_tail: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pane_filter: Option<u64>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rule_id_filter: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub event_type_filter: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub triage_state_filter: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label_filter: Option<String>,
     #[serde(default)]
     pub unhandled_only: bool,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub since_filter: Option<i64>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub would_handle: bool,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub dry_run: bool,
 }
 
@@ -1243,16 +1265,16 @@ pub struct EventItem {
     pub event_type: String,
     pub severity: String,
     pub confidence: f64,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub extracted: Option<serde_json::Value>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub annotations: Option<serde_json::Value>,
     pub captured_at: i64,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub handled_at: Option<i64>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workflow_id: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub would_handle_with: Option<EventWouldHandle>,
 }
 
@@ -1260,15 +1282,15 @@ pub struct EventItem {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EventWouldHandle {
     pub workflow: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preview_command: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub first_step: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub estimated_duration_ms: Option<u64>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub would_run: Option<bool>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
 }
 
@@ -1276,7 +1298,7 @@ pub struct EventWouldHandle {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EventMutationData {
     pub event_id: i64,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub changed: Option<bool>,
     pub annotations: serde_json::Value,
 }
@@ -3893,6 +3915,7 @@ mod tests {
             ("robot.circuit_open", ErrorCategory::Wezterm),
             ("robot.code_not_found", ErrorCategory::Config),
             ("robot.config_error", ErrorCategory::Config),
+            ("robot.cursor_discontinuity", ErrorCategory::Storage),
             ("robot.event_not_found", ErrorCategory::Storage),
             ("robot.feature_not_available", ErrorCategory::Config),
             ("robot.fts_query_error", ErrorCategory::Storage),
@@ -4951,6 +4974,7 @@ mod tests {
             "robot.fts_query_error",
             "robot.reservation_conflict",
             "robot.event_not_found",
+            "robot.cursor_discontinuity",
             "robot.tx_lock_failed",
             "robot.tx_in_progress",
             "robot.tx_oversize",
@@ -5037,6 +5061,7 @@ mod tests {
             "robot.wezterm_parse_error",
             "robot.pane_not_found",
             "robot.storage_error",
+            "robot.cursor_discontinuity",
             "robot.reservation_conflict",
             "robot.policy_denied",
             "robot.require_approval",

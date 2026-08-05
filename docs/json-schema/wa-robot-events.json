@@ -8,7 +8,7 @@
   "properties": {
     "events": {
       "type": "array",
-      "description": "Recent events ordered by detection time (newest first)",
+      "description": "Recent events; cursor mode is ordered by ascending durable event ID, while non-cursor mode returns the legacy recent-event order",
       "items": {
         "$ref": "#/$defs/event"
       }
@@ -21,7 +21,58 @@
     "limit": {
       "type": "integer",
       "minimum": 1,
+      "maximum": 4096,
       "description": "Maximum events returned"
+    },
+    "cursor": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Exclusive durable event-ID checkpoint supplied by the caller"
+    },
+    "cursor_epoch": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{32}$",
+      "description": "Retention epoch paired with cursor; IDs are not authoritative without it"
+    },
+    "cursor_scope": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$",
+      "description": "SHA-256 membership-scope fingerprint paired with cursor"
+    },
+    "next_cursor": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Authoritative inclusive checkpoint through the examined page"
+    },
+    "next_cursor_epoch": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{32}$",
+      "description": "Retention epoch that must be supplied with next_cursor on resume"
+    },
+    "next_cursor_scope": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$",
+      "description": "Membership-scope fingerprint that must be supplied with next_cursor on resume"
+    },
+    "replay_limit": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 4096,
+      "description": "Explicit bounded cursor replay window"
+    },
+    "order": {
+      "type": "string",
+      "enum": ["id_asc"],
+      "description": "Ordering contract used by cursor mode"
+    },
+    "start_at_tail": {
+      "const": true,
+      "description": "The response established an atomic fresh cursor at the durable event tail without replaying history"
+    },
+    "cursor_capability": {
+      "type": "string",
+      "enum": ["non_resumable_newest_first_snapshot"],
+      "description": "Explicit capability marker used by wa.events while that MCP surface exposes only a non-resumable newest-first snapshot"
     },
     "pane_filter": {
       "type": "integer",
@@ -66,6 +117,31 @@
       "description": "If true, this was a dry-run preview (no workflows executed)"
     }
   },
+  "dependentRequired": {
+    "cursor": ["cursor_epoch", "cursor_scope"],
+    "cursor_epoch": ["cursor", "cursor_scope"],
+    "cursor_scope": ["cursor", "cursor_epoch"],
+    "next_cursor": ["next_cursor_epoch", "next_cursor_scope"],
+    "next_cursor_epoch": ["next_cursor", "next_cursor_scope"],
+    "next_cursor_scope": ["next_cursor", "next_cursor_epoch"],
+    "replay_limit": ["cursor", "cursor_epoch", "cursor_scope"]
+  },
+  "allOf": [
+    {
+      "if": { "required": ["cursor"] },
+      "then": { "required": ["order"] }
+    },
+    {
+      "if": { "required": ["next_cursor"] },
+      "then": { "required": ["order"] }
+    },
+    {
+      "if": { "required": ["start_at_tail"] },
+      "then": {
+        "required": ["next_cursor", "next_cursor_epoch", "next_cursor_scope", "order"]
+      }
+    }
+  ],
   "additionalProperties": false,
   "$defs": {
     "event": {
@@ -102,7 +178,7 @@
         },
         "severity": {
           "type": "string",
-          "enum": ["info", "warning", "critical"],
+          "enum": ["info", "warning", "error", "critical"],
           "description": "Event severity level"
         },
         "confidence": {

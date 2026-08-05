@@ -119,6 +119,23 @@ fn ft(ws: &Path) -> Command {
     cmd
 }
 
+fn current_cursor_epoch(ws: &Path) -> String {
+    let db_path = Config::default().effective_db_path(ws);
+    let connection = rusqlite::Connection::open(db_path).expect("open cursor epoch database");
+    connection
+        .query_row(
+            "SELECT cursor_epoch FROM event_retention_state WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )
+        .expect("read current event cursor epoch")
+}
+
+fn different_cursor_epoch(epoch: &str) -> String {
+    let replacement = if epoch.starts_with('0') { '1' } else { '0' };
+    format!("{replacement}{}", &epoch[1..])
+}
+
 fn stdout_of(assert: assert_cmd::assert::Assert) -> String {
     String::from_utf8(assert.get_output().stdout.clone()).expect("utf8 stdout")
 }
@@ -140,6 +157,10 @@ fn watch_events_emits_ndjson_with_cursor_and_redacts_canary() {
     assert!(
         out.contains("\"cursor\":"),
         "missing per-record cursor: {out}"
+    );
+    assert!(
+        out.contains("\"cursor_epoch\":"),
+        "missing per-record cursor epoch: {out}"
     );
     assert!(
         out.contains("codex.usage_reached"),
@@ -179,8 +200,35 @@ fn watch_events_rule_glob_filter_excludes_non_matches() {
 }
 
 #[test]
+fn watch_events_stale_epoch_is_terminal_and_never_rebaselines() {
+    let ws = seed_workspace();
+    let stale_epoch = different_cursor_epoch(&current_cursor_epoch(ws.path()));
+    let out = stdout_of(
+        ft(ws.path())
+            .args([
+                "robot",
+                "watch-events",
+                "--cursor",
+                "0",
+                "--cursor-epoch",
+                stale_epoch.as_str(),
+            ])
+            .assert()
+            .success(),
+    );
+    assert!(out.contains("\"type\":\"cursor_discontinuity\""), "{out}");
+    assert!(out.contains("\"terminal\":true"), "{out}");
+    assert!(out.contains("\"reason\":\"cursor_epoch_mismatch\""), "{out}");
+    assert!(
+        !out.contains("\"type\":\"event\""),
+        "a stale epoch must not emit or rebaseline onto retained events: {out}"
+    );
+}
+
+#[test]
 fn await_satisfies_on_matching_all_rule() {
     let ws = seed_workspace();
+    let cursor_epoch = current_cursor_epoch(ws.path());
     // `--cursor 0` considers the already-seeded events.
     let out = stdout_of(
         ft(ws.path())
@@ -191,6 +239,8 @@ fn await_satisfies_on_matching_all_rule() {
                 "rule:codex.usage_reached",
                 "--cursor",
                 "0",
+                "--cursor-epoch",
+                cursor_epoch.as_str(),
                 "--timeout-secs",
                 "5",
             ])
@@ -208,6 +258,7 @@ fn await_satisfies_on_matching_all_rule() {
 #[test]
 fn await_any_satisfies_via_glob() {
     let ws = seed_workspace();
+    let cursor_epoch = current_cursor_epoch(ws.path());
     let out = stdout_of(
         ft(ws.path())
             .args([
@@ -219,6 +270,8 @@ fn await_any_satisfies_via_glob() {
                 "rule:build.*",
                 "--cursor",
                 "0",
+                "--cursor-epoch",
+                cursor_epoch.as_str(),
                 "--timeout-secs",
                 "5",
             ])
@@ -234,6 +287,7 @@ fn await_any_satisfies_via_glob() {
 #[test]
 fn await_times_out_when_no_condition_matches() {
     let ws = seed_workspace();
+    let cursor_epoch = current_cursor_epoch(ws.path());
     let out = stdout_of(
         ft(ws.path())
             .args([
@@ -243,6 +297,8 @@ fn await_times_out_when_no_condition_matches() {
                 "rule:does.not.exist",
                 "--cursor",
                 "0",
+                "--cursor-epoch",
+                cursor_epoch.as_str(),
                 "--timeout-secs",
                 "1",
             ])
@@ -256,8 +312,10 @@ fn await_times_out_when_no_condition_matches() {
 #[test]
 fn await_rejects_unsupported_condition_sources() {
     let ws = seed_workspace();
-    // state:/quiescence: require the watcher IPC transport — a clear typed
-    // rejection, never a silent hang or mis-evaluation.
+    let cursor_epoch = current_cursor_epoch(ws.path());
+    // state: requires the watcher IPC transport — a clear typed rejection,
+    // never a silent hang or mis-evaluation. Storage-backed quiescence is
+    // supported independently.
     ft(ws.path())
         .args([
             "robot",
@@ -266,6 +324,8 @@ fn await_rejects_unsupported_condition_sources() {
             "state:1:stuck",
             "--cursor",
             "0",
+            "--cursor-epoch",
+            cursor_epoch.as_str(),
             "--timeout-secs",
             "1",
         ])

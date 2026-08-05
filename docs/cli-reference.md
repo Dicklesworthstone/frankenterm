@@ -271,7 +271,7 @@ ft robot search-index reindex [--pane <id>] [--batch-size <n>] [--since <epoch_m
 ft robot cass status
 ft robot cass search "<query>" [--agent <kind>] [--workspace <substr>] [--days <n>] [--limit <n>]
 ft robot cass view <source_path> <line_number> [--context-lines <n>]
-ft robot events [--unhandled] [--pane <id>] [--rule-id <id>] [--event-type <type>] [--triage-state <state>] [--label <label>]
+ft robot events [--unhandled] [--pane <id>] [--rule-id <id>] [--event-type <type>] [--triage-state <state>] [--label <label>] [--since <nonnegative-epoch-ms>] [--limit <1..4096>] [--cursor <id> --cursor-epoch <32-lowercase-hex> --cursor-scope <64-lowercase-hex>] [--replay-limit <1..4096>] [--start-at-tail]
 ft robot events annotate <event_id> --note "<text>" [--by <actor>]
 ft robot events annotate <event_id> --clear [--by <actor>]
 ft robot events triage <event_id> --state <state> [--by <actor>]
@@ -279,8 +279,8 @@ ft robot events triage <event_id> --clear [--by <actor>]
 ft robot events label <event_id> --add <label> [--by <actor>]
 ft robot events label <event_id> --remove <label>
 ft robot events label <event_id> --list
-ft robot watch-events [--follow] [--severity <critical|warning|info>] [--rule-id <glob>] [--pane <id>] [--unhandled] [--claim] [--cursor <id>] [--limit <n>] [--heartbeat-interval-ms <ms>] [--poll-interval-ms <ms>] [--max-hz <n>]
-ft robot await [--any 'rule:<glob>'] [--all 'rule:<glob>'] [--timeout-secs <n>] [--poll-interval-ms <ms>] [--cursor <id>]
+ft robot watch-events [--follow] [--severity <critical|error|warning|info>] [--rule-id <glob>] [--pane <id>] [--unhandled] [--claim] [--cursor <id> --cursor-epoch <32-lowercase-hex> --cursor-scope <64-lowercase-hex>] [--limit <n>] [--heartbeat-interval-ms <ms>] [--poll-interval-ms <ms>] [--max-hz <n>]
+ft robot await [--any 'rule:<glob>'|'quiescence:<pane>[:<idle_ms>]'] [--all 'rule:<glob>'|'quiescence:<pane>[:<idle_ms>]'] [--timeout-secs <n>] [--poll-interval-ms <ms>] [--cursor <id> --cursor-epoch <32-lowercase-hex> --cursor-scope <64-lowercase-hex>]
 
 ft robot workflow list
 ft robot workflow run <name> <pane_id> [--force] [--dry-run]
@@ -311,17 +311,52 @@ ft robot fleet status|scale|rebalance|agents
 ft robot profile list|show|apply|validate
 ```
 
+`ft robot events` has three deliberately distinct modes. With no cursor options
+it preserves the legacy newest-first snapshot and is not resumable. With
+`--start-at-tail` it returns no historical events and establishes an atomic
+durable-tail checkpoint in `next_cursor`, `next_cursor_epoch`, and
+`next_cursor_scope`. Supplying that complete triple enters resumable
+ascending-ID mode; `--replay-limit` is valid only in this mode. The scope is a
+SHA-256 fingerprint of every membership filter, including `--since`, so a
+token cannot be reused after changing filters. `--since` is a nonnegative Unix
+epoch timestamp in milliseconds.
+
+`ft robot watch-events` and `ft robot await` are fixed compact-NDJSON streams;
+their success, control, and error records do not switch encoding when the
+global `--format` setting is JSON-pretty or TOON. Omitting the cursor triple
+does not replay existing rows. The command first acquires the current durable
+tail atomically and emits a committed `cursor_checkpoint`; only events created
+after that successful acquisition are eligible. A fresh await therefore emits
+at least two records: the baseline checkpoint and one terminal `await_result`.
+Resume by copying the complete cursor/epoch/scope triple. Await conditions may
+combine rule globs with storage-derived pane quiescence; an omitted quiescence
+idle threshold is canonicalized to the configured default and is part of the
+scope fingerprint.
+
 `ft robot watch-events --claim` is flush-before-handle and at-least-once. It
-atomically leases each persisted event, emits and flushes a record whose
-`handled` field is still truthfully `false` and whose `claim_delivery` is
-`finalize_after_output_flush`, then token-CAS marks the row handled. A known
-write or flush failure attempts an immediate token-CAS lease release. If that
-release cannot reach storage, lease expiry remains the recovery path; a crash
-also leaves the event eligible for redelivery after expiry. The durable cursor
-advances only after successful finalization (or after another path already
-handled/removed the row), so finalization races can duplicate but cannot
-silently skip an event. Live-only `pane_discovered` and `pane_disappeared`
-notifications have no durable row and are not claimable.
+atomically leases each persisted event, emits and flushes a pending record whose
+public `cursor` is still the last committed checkpoint, whose
+`candidate_cursor` identifies the leased event, and whose `pending_finalize`
+field is true. It then token-CAS marks the row handled and emits a committed
+`cursor_checkpoint`. A known write or flush failure attempts an immediate
+token-CAS lease release. If release cannot reach storage, lease expiry remains
+the recovery path; a crash also leaves the event eligible for redelivery after
+expiry. The durable cursor advances only after successful finalization or
+exact evidence that another path already handled the row. Ambiguous
+finalization emits `claim_deferred` with the unchanged committed triple, and a
+missing row advances no cursor without authoritative retention evidence.
+Finalization races can therefore duplicate but cannot silently skip an event.
+Live-only `pane_discovered` and `pane_disappeared` notifications have no
+durable row and are not claimable.
+
+Every durable event cursor is a three-part token: a nonnegative event ID, a
+128-bit lowercase-hex retention epoch, and a 256-bit lowercase-hex scope
+fingerprint. Resume commands require all three values. Cursor pages advance
+through the exact examined high-water mark even when filters omit rows, while
+any pruned, legacy-ambiguous, stale-epoch, wrong-scope, or ahead-of-authority
+cursor fails closed with a typed terminal discontinuity. FrankenTerm never
+silently re-baselines a durable consumer; intentionally starting fresh uses
+`events --start-at-tail` or omits the complete triple for Watch/Await.
 
 In follow mode, a persisted detection received from the live IPC EventBus is a
 low-latency wakeup, not an ordering or payload authority. FrankenTerm re-enters

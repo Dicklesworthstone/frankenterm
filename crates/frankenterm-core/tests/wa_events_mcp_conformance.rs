@@ -653,13 +653,166 @@ fn call_events(harness: &mut TestHarness, args: Value) -> Value {
     )
 }
 
+fn current_event_cursor_epoch(db_path: &std::path::Path) -> String {
+    let connection = rusqlite::Connection::open(db_path).expect("open cursor epoch fixture DB");
+    connection
+        .query_row(
+            "SELECT cursor_epoch FROM event_retention_state WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )
+        .expect("read current event cursor epoch")
+}
+
+fn hash_await_event_scope_field(hasher: &mut sha2::Sha256, field: &[u8]) {
+    use sha2::Digest;
+
+    let length = u64::try_from(field.len()).expect("MCP conformance scope field length fits u64");
+    hasher.update(length.to_be_bytes());
+    hasher.update(field);
+}
+
+fn hash_await_event_scope_conditions(
+    hasher: &mut sha2::Sha256,
+    set_name: &[u8],
+    args: &Value,
+) {
+    let mut conditions = args
+        .get(std::str::from_utf8(set_name).expect("ASCII condition-set name"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .map(|condition| {
+            condition
+                .as_str()
+                .expect("MCP conformance condition string")
+                .trim()
+                .strip_prefix("rule:")
+                .expect("MCP conformance uses supported rule conditions")
+                .to_string()
+        })
+        .collect::<Vec<_>>();
+    conditions.sort_unstable();
+    conditions.dedup();
+
+    hash_await_event_scope_field(hasher, set_name);
+    hash_await_event_scope_field(hasher, conditions.len().to_string().as_bytes());
+    for glob in conditions {
+        hash_await_event_scope_field(hasher, b"rule");
+        hash_await_event_scope_field(hasher, glob.as_bytes());
+    }
+}
+
+fn canonical_await_event_cursor_scope(args: &Value) -> String {
+    use sha2::{Digest, Sha256};
+
+    let mut hasher = Sha256::new();
+    hash_await_event_scope_field(
+        &mut hasher,
+        b"frankenterm.wa.await_event.cursor-scope.v1",
+    );
+    hash_await_event_scope_conditions(&mut hasher, b"any", args);
+    hash_await_event_scope_conditions(&mut hasher, b"all", args);
+    hash_await_event_scope_field(&mut hasher, b"pane");
+    if let Some(pane_id) = args.get("pane").and_then(Value::as_u64) {
+        hash_await_event_scope_field(&mut hasher, b"some");
+        hash_await_event_scope_field(&mut hasher, &pane_id.to_be_bytes());
+    } else {
+        hash_await_event_scope_field(&mut hasher, b"none");
+    }
+    let claim = args.get("claim").and_then(Value::as_bool).unwrap_or(false);
+    let unhandled_only = args
+        .get("unhandled")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        || claim;
+    hash_await_event_scope_field(&mut hasher, b"unhandled_only");
+    hash_await_event_scope_field(&mut hasher, &[u8::from(unhandled_only)]);
+    hash_await_event_scope_field(&mut hasher, b"claim");
+    hash_await_event_scope_field(&mut hasher, &[u8::from(claim)]);
+    hash_await_event_scope_field(&mut hasher, b"quiescence_mode");
+    hash_await_event_scope_field(&mut hasher, b"unsupported-db-events-only");
+    hex::encode(hasher.finalize())
+}
+
+fn with_canonical_await_event_cursor_scope(mut args: Value) -> Value {
+    if args.get("cursor").is_some() && args.get("cursor_scope").is_none() {
+        args["cursor_scope"] = Value::String(canonical_await_event_cursor_scope(&args));
+    }
+    args
+}
+
+fn with_current_event_cursor_token(db_path: &std::path::Path, mut args: Value) -> Value {
+    if args.get("cursor").is_some() {
+        if args.get("cursor_epoch").is_none() {
+            args["cursor_epoch"] = Value::String(current_event_cursor_epoch(db_path));
+        }
+        args = with_canonical_await_event_cursor_scope(args);
+    }
+    args
+}
+
+fn assert_canonical_cursor_epoch(value: &Value) {
+    let epoch = value.as_str().expect("cursor epoch string");
+    assert_eq!(epoch.len(), 32, "cursor epoch is a 128-bit hex token");
+    assert!(
+        epoch
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+        "cursor epoch must be canonical lowercase hexadecimal"
+    );
+}
+
+fn assert_canonical_cursor_scope(value: &Value) {
+    let scope = value.as_str().expect("cursor scope string");
+    assert_eq!(scope.len(), 64, "cursor scope is a SHA-256 hex token");
+    assert!(
+        scope
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+        "cursor scope must be canonical lowercase hexadecimal"
+    );
+}
+
+fn assert_await_event_cursor_contract(envelope: &Value, args: &Value) {
+    if envelope["ok"] != Value::Bool(true) || !envelope["data"]["final_cursor"].is_number() {
+        return;
+    }
+    assert_canonical_cursor_epoch(&envelope["data"]["final_cursor_epoch"]);
+    assert_canonical_cursor_scope(&envelope["data"]["final_cursor_scope"]);
+    assert_eq!(
+        envelope["data"]["final_cursor_scope"],
+        canonical_await_event_cursor_scope(args),
+        "the emitted cursor must remain bound to the semantic request scope"
+    );
+    if let Some(expected_cursor_epoch) = args.get("cursor_epoch") {
+        assert_eq!(
+            envelope["data"]["final_cursor_epoch"], expected_cursor_epoch,
+            "a current-epoch resume must preserve its cursor epoch"
+        );
+    }
+    if let Some(expected_cursor_scope) = args.get("cursor_scope") {
+        assert_eq!(
+            envelope["data"]["final_cursor_scope"], expected_cursor_scope,
+            "a valid resume must preserve its canonical cursor scope"
+        );
+    }
+    assert!(
+        envelope["data"]["pending_finalize"].is_boolean(),
+        "successful cursor results expose finalization state"
+    );
+}
+
 fn call_await_event(harness: &mut TestHarness, args: Value) -> Value {
-    parse_tool_envelope(
+    let args = with_current_event_cursor_token(&harness.db_path, args);
+    let envelope = parse_tool_envelope(
         &harness
             .client
-            .call_tool("wa.await_event", args)
+            .call_tool("wa.await_event", args.clone())
             .expect("call wa.await_event"),
-    )
+    );
+    assert_await_event_cursor_contract(&envelope, &args);
+    envelope
 }
 
 fn assert_await_event_success_data(envelope: &Value, claim: bool) {
@@ -669,16 +822,22 @@ fn assert_await_event_success_data(envelope: &Value, claim: bool) {
     assert_eq!(data["type"], Value::String("await_result".to_string()));
     assert_eq!(data["satisfied"], Value::Bool(true));
     assert_eq!(data["timed_out"], Value::Bool(false));
-    assert_eq!(data["final_cursor"], Value::from(1));
+    assert_eq!(data["final_cursor"], Value::from(if claim { 0 } else { 1 }));
+    assert_canonical_cursor_epoch(&data["final_cursor_epoch"]);
+    assert_canonical_cursor_scope(&data["final_cursor_scope"]);
     assert_eq!(data["unhandled_only"], Value::Bool(claim));
     assert_eq!(data["claim"], Value::Bool(claim));
     if claim {
         assert_eq!(
             data["claim_delivery"],
-            Value::String("finalize_after_delivery_ack".to_string())
+            Value::String("pending_finalize_after_delivery_ack".to_string())
         );
+        assert_eq!(data["candidate_cursor"], Value::from(1));
+        assert_eq!(data["pending_finalize"], Value::Bool(true));
     } else {
         assert!(data.get("claim_delivery").is_none());
+        assert!(data.get("candidate_cursor").is_none());
+        assert_eq!(data["pending_finalize"], Value::Bool(false));
     }
     assert_eq!(data["any"][0]["condition"], "rule:codex.*");
     assert_eq!(data["any"][0]["met"], Value::Bool(true));
@@ -832,23 +991,25 @@ fn mcp_conformance_wa_await_event_claim_toon_finalizes_after_transport() {
     let mut harness = new_harness();
     seed_events_fixture(&harness);
 
+    let arguments = with_current_event_cursor_token(
+        &harness.db_path,
+        json!({
+            "any": ["rule:codex.*"],
+            "cursor": 0,
+            "pane": FIXTURE_PANE_ID,
+            "timeout_secs": 1,
+            "poll_interval_ms": 10,
+            "claim": true,
+            "format": "toon"
+        }),
+    );
     let contents = harness
         .client
-        .call_tool(
-            "wa.await_event",
-            json!({
-                "any": ["rule:codex.*"],
-                "cursor": 0,
-                "pane": FIXTURE_PANE_ID,
-                "timeout_secs": 1,
-                "poll_interval_ms": 10,
-                "claim": true,
-                "format": "toon"
-            }),
-        )
+        .call_tool("wa.await_event", arguments.clone())
         .expect("call TOON wa.await_event claim");
     let envelope = parse_toon_tool_envelope(&contents);
     assert_success_envelope_shape(&envelope);
+    assert_await_event_cursor_contract(&envelope, &arguments);
     assert_await_event_success_data(&envelope, true);
 
     // A memory-transport peer can receive the response after its channel send
@@ -871,19 +1032,23 @@ fn mcp_conformance_idless_long_poll_is_rejected_before_dispatch() {
     let mut harness = new_harness();
     seed_events_fixture(&harness);
     let cx = frankenterm_core::cx::Cx::for_request();
+    let notification_arguments = with_current_event_cursor_token(
+        &harness.db_path,
+        json!({
+            "any": ["rule:never.matches"],
+            "cursor": 0,
+            "pane": FIXTURE_PANE_ID,
+            "timeout_secs": 6,
+            "poll_interval_ms": 1_000,
+            "claim": true
+        }),
+    );
     let notification: FrameworkJsonRpcMessage = serde_json::from_value(json!({
         "jsonrpc": "2.0",
         "method": "tools/call",
         "params": {
             "name": "wa.await_event",
-            "arguments": {
-                "any": ["rule:never.matches"],
-                "cursor": 0,
-                "pane": FIXTURE_PANE_ID,
-                "timeout_secs": 6,
-                "poll_interval_ms": 1_000,
-                "claim": true
-            }
+            "arguments": notification_arguments
         }
     }))
     .expect("construct id-less tools/call notification");
@@ -954,14 +1119,14 @@ fn assert_await_event_claim_send_failure_releases_lease(
     client.initialize().expect("initialize MCP client");
     seed_events_fixture_at(&db_path);
 
-    let mut arguments = json!({
+    let mut arguments = with_current_event_cursor_token(&db_path, json!({
         "any": ["rule:codex.*"],
         "cursor": 0,
         "pane": FIXTURE_PANE_ID,
         "timeout_secs": 1,
         "poll_interval_ms": 10,
         "claim": true
-    });
+    }));
     if let Some(format) = requested_format {
         arguments["format"] = Value::String(format.to_string());
     }
@@ -1163,20 +1328,22 @@ fn mcp_conformance_foreign_hole_outlives_met_mask_until_exact_refetch() {
 
     let db_path = harness.db_path.clone();
     let mut await_client = spawn_client(Some(db_path.clone()));
+    let await_arguments = with_current_event_cursor_token(
+        &db_path,
+        json!({
+            "all": ["rule:rule.a", "rule:rule.b"],
+            "cursor": 0,
+            "pane": FIXTURE_PANE_ID,
+            "timeout_secs": 5,
+            "poll_interval_ms": 10,
+            "claim": true
+        }),
+    );
+    let expected_cursor_epoch = await_arguments["cursor_epoch"].clone();
     let waiter = std::thread::spawn(move || {
         let envelope = parse_tool_envelope(
             &await_client
-                .call_tool(
-                    "wa.await_event",
-                    json!({
-                        "all": ["rule:rule.a", "rule:rule.b"],
-                        "cursor": 0,
-                        "pane": FIXTURE_PANE_ID,
-                        "timeout_secs": 5,
-                        "poll_interval_ms": 10,
-                        "claim": true
-                    }),
-                )
+                .call_tool("wa.await_event", await_arguments)
                 .expect("call delayed-B A/A/B await"),
         );
         await_client
@@ -1199,6 +1366,9 @@ fn mcp_conformance_foreign_hole_outlives_met_mask_until_exact_refetch() {
     assert_eq!(acquired["data"]["satisfied"], Value::Bool(true));
     assert_eq!(acquired["data"]["timed_out"], Value::Bool(false));
     assert_eq!(acquired["data"]["final_cursor"], Value::from(3));
+    assert_eq!(
+        acquired["data"]["final_cursor_epoch"], expected_cursor_epoch
+    );
     assert_eq!(
         acquired["data"]["events"]
             .as_array()
@@ -1236,20 +1406,22 @@ fn mcp_conformance_exact_hole_refetch_does_not_substitute_next_unhandled_row() {
 
     let db_path = harness.db_path.clone();
     let mut await_client = spawn_client(Some(db_path.clone()));
+    let await_arguments = with_current_event_cursor_token(
+        &db_path,
+        json!({
+            "all": ["rule:rule.a", "rule:rule.b"],
+            "cursor": 0,
+            "pane": FIXTURE_PANE_ID,
+            "timeout_secs": 5,
+            "poll_interval_ms": 10,
+            "claim": true
+        }),
+    );
+    let expected_cursor_epoch = await_arguments["cursor_epoch"].clone();
     let waiter = std::thread::spawn(move || {
         let envelope = parse_tool_envelope(
             &await_client
-                .call_tool(
-                    "wa.await_event",
-                    json!({
-                        "all": ["rule:rule.a", "rule:rule.b"],
-                        "cursor": 0,
-                        "pane": FIXTURE_PANE_ID,
-                        "timeout_secs": 5,
-                        "poll_interval_ms": 10,
-                        "claim": true
-                    }),
-                )
+                .call_tool("wa.await_event", await_arguments)
                 .expect("call exact-refetch await"),
         );
         await_client
@@ -1271,6 +1443,9 @@ fn mcp_conformance_exact_hole_refetch_does_not_substitute_next_unhandled_row() {
     let acquired = waiter.join().expect("join exact-refetch waiter");
     assert_success_envelope_shape(&acquired);
     assert_eq!(acquired["data"]["final_cursor"], Value::from(3));
+    assert_eq!(
+        acquired["data"]["final_cursor_epoch"], expected_cursor_epoch
+    );
     assert_eq!(
         acquired["data"]["events"]
             .as_array()
@@ -1368,6 +1543,7 @@ fn mcp_conformance_storage_paths_are_redacted_from_event_tool_errors() {
             json!({
                 "any": ["rule:rule.a"],
                 "cursor": 0,
+                "cursor_epoch": "00000000000000000000000000000000",
                 "timeout_secs": 1,
                 "poll_interval_ms": 10
             }),
@@ -1442,9 +1618,11 @@ fn mcp_conformance_no_cursor_boundary_precedes_delayed_storage_open() {
     lock_connection
         .execute(
             "INSERT INTO events (
-                pane_id, rule_id, agent_type, event_type, severity, confidence,
+                id, pane_id, rule_id, agent_type, event_type, severity, confidence,
                 matched_text, detected_at, dedupe_key
-             ) VALUES (?1, ?2, 'codex', 'usage_limit', 'warning', 0.5, ?3, ?4, ?5)",
+             ) SELECT max_event_id + 1, ?1, ?2, 'codex', 'usage_limit', 'warning',
+                      0.5, ?3, ?4, ?5
+               FROM event_retention_state WHERE singleton = 1",
             rusqlite::params![
                 i64::try_from(FIXTURE_PANE_ID).expect("fixture pane id fits i64"),
                 "rule.open_window",
@@ -1467,6 +1645,7 @@ fn mcp_conformance_no_cursor_boundary_precedes_delayed_storage_open() {
     assert_eq!(envelope["data"]["satisfied"], Value::Bool(true));
     assert_eq!(envelope["data"]["timed_out"], Value::Bool(false));
     assert_eq!(envelope["data"]["events"][0]["id"], Value::from(1));
+    assert_canonical_cursor_epoch(&envelope["data"]["final_cursor_epoch"]);
 }
 
 #[test]
@@ -1517,14 +1696,18 @@ fn mcp_conformance_wa_await_event_concurrent_claimers_emit_event_once() {
     let mut client_a = spawn_client(Some(db_path.clone()));
     let mut client_b = spawn_client(Some(db_path.clone()));
     seed_events_fixture_at(&db_path);
-    let args = json!({
-        "any": ["rule:codex.*"],
-        "cursor": 0,
-        "pane": FIXTURE_PANE_ID,
-        "timeout_secs": 1,
-        "poll_interval_ms": 10,
-        "claim": true
-    });
+    let args = with_current_event_cursor_token(
+        &db_path,
+        json!({
+            "any": ["rule:codex.*"],
+            "cursor": 0,
+            "pane": FIXTURE_PANE_ID,
+            "timeout_secs": 1,
+            "poll_interval_ms": 10,
+            "claim": true
+        }),
+    );
+    let expected_cursor_epoch = args["cursor_epoch"].clone();
     let args_b = args.clone();
 
     let claim_a = std::thread::spawn(move || {
@@ -1551,6 +1734,12 @@ fn mcp_conformance_wa_await_event_concurrent_claimers_emit_event_once() {
     });
     let envelope_a = claim_a.join().expect("join claimant A");
     let envelope_b = claim_b.join().expect("join claimant B");
+    assert_eq!(
+        envelope_a["data"]["final_cursor_epoch"], expected_cursor_epoch
+    );
+    assert_eq!(
+        envelope_b["data"]["final_cursor_epoch"], expected_cursor_epoch
+    );
 
     let emitted_a = envelope_a["data"]["events"]
         .as_array()

@@ -2177,6 +2177,9 @@ proptest! {
     fn rt77_events_data_serde(total in 0usize..1000, limit in 1usize..100) {
         let data = EventsData {
             events: vec![], total_count: total, limit,
+            cursor: None, cursor_epoch: None, cursor_scope: None,
+            next_cursor: None, next_cursor_epoch: None, next_cursor_scope: None,
+            replay_limit: None, order: None, start_at_tail: false,
             pane_filter: None, rule_id_filter: None, event_type_filter: None,
             triage_state_filter: None, label_filter: None,
             unhandled_only: false, since_filter: None, would_handle: false, dry_run: false,

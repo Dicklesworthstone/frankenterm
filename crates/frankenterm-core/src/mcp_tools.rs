@@ -91,7 +91,10 @@ use crate::robot_types::{
     WorkflowStatusListData, WorkflowStepLog,
 };
 use crate::runtime_async::{CompatRuntime, RuntimeBuilder as CompatRuntimeBuilder};
-use crate::storage::{EventDeliveryLease, EventDeliveryReservation, EventStreamQuery};
+use crate::storage::{
+    EventDeliveryLease, EventDeliveryReservation, EventRetentionCheck, EventRetentionStatus,
+    EventStreamPage, EventStreamQuery,
+};
 use crate::workflows::ManualWorkflowRunOutcome;
 
 /// br-ft-pgjat: route silent `record_audit_action_redacted_with_cx`
@@ -3945,12 +3948,38 @@ const MCP_AWAIT_EVENT_POLL_INTERVAL_MS_MAX: u64 = 30_000;
 const MCP_AWAIT_EVENT_CONDITION_SET_MAX: usize = 16;
 const MCP_AWAIT_EVENT_CONDITION_MAX_BYTES: usize = 256;
 const MCP_AWAIT_EVENT_BATCH_LIMIT: usize = 500;
+const MCP_AWAIT_EVENT_BASELINE_LIMIT: usize = 0;
 const MCP_AWAIT_EVENT_BLOCKED_EVENT_MAX: usize = MCP_AWAIT_EVENT_BATCH_LIMIT;
+const MCP_AWAIT_EVENT_CURSOR_EPOCH_HEX_LEN: usize = 32;
+const MCP_AWAIT_EVENT_CURSOR_SCOPE_HEX_LEN: usize = 64;
+const MCP_AWAIT_EVENT_CURSOR_SCOPE_DOMAIN: &[u8] =
+    b"frankenterm.wa.await_event.cursor-scope.v1";
+const MCP_AWAIT_EVENT_CURSOR_SCOPE_QUIESCENCE_MODE: &[u8] =
+    b"unsupported-db-events-only";
+const MCP_ERR_CURSOR_DISCONTINUITY: &str = "FT-MCP-0016";
 pub(crate) const MCP_AWAIT_EVENT_DELIVERY_FINALIZE_GRACE_SECS: u64 = 30;
 const MCP_AWAIT_EVENT_CANCEL_POLL_INTERVAL: std::time::Duration =
     std::time::Duration::from_millis(50);
 const MCP_AWAIT_EVENT_CLAIM_WORKFLOW_ID: &str = "mcp.wa.await_event";
 const MCP_AWAIT_EVENT_CLAIM_STATUS: &str = "claimed";
+
+#[derive(Debug, serde::Serialize)]
+struct McpAwaitEventResponseData {
+    #[serde(flatten)]
+    data: McpAwaitEventData,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    final_cursor_epoch: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    final_cursor_scope: Option<String>,
+    /// Highest cursor that could become authoritative if every locally owned
+    /// delivery candidate durably finalizes. This is diagnostic state, not a
+    /// resume token, and must never be copied into `cursor` pre-finalization.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    candidate_cursor: Option<i64>,
+    pending_finalize: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bootstrap_state: Option<&'static str>,
+}
 
 fn mcp_request_checkpoint(cx: &crate::cx::Cx, operation: &str) -> crate::Result<()> {
     cx.checkpoint().map_err(|error| {
@@ -4202,30 +4231,379 @@ fn mcp_await_event_safe_cursor(
         })
 }
 
-async fn mcp_await_event_refetch_exact_unhandled_event(
+/// Cursor that is durable before response delivery. Locally-owned delivery
+/// leases are unresolved until their handled-state finalization commits, so
+/// they are cursor holes just like third-party leases. This cursor may advance
+/// over rows examined before the earliest hole, but never through a claimed
+/// event merely because its response bytes were prepared or flushed.
+fn mcp_await_event_committed_cursor(
+    scan_after_id: Option<i64>,
+    blocked_events: &[McpAwaitBlockedEvent],
+    delivery_leases: &[EventDeliveryLease],
+) -> Option<i64> {
+    blocked_events
+        .iter()
+        .map(|blocked| blocked.event_id)
+        .chain(delivery_leases.iter().map(EventDeliveryLease::event_id))
+        .min()
+        .map_or(scan_after_id, |first_pending_id| {
+            Some(first_pending_id.saturating_sub(1))
+        })
+}
+
+fn mcp_await_event_cursor_epoch_is_canonical(cursor_epoch: &str) -> bool {
+    cursor_epoch.len() == MCP_AWAIT_EVENT_CURSOR_EPOCH_HEX_LEN
+        && cursor_epoch
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn mcp_await_event_cursor_scope_is_canonical(cursor_scope: &str) -> bool {
+    cursor_scope.len() == MCP_AWAIT_EVENT_CURSOR_SCOPE_HEX_LEN
+        && cursor_scope
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn mcp_await_event_hash_scope_field(
+    hasher: &mut sha2::Sha256,
+    field: &[u8],
+) {
+    use sha2::Digest;
+
+    let len = u64::try_from(field.len()).unwrap_or(u64::MAX);
+    hasher.update(len.to_be_bytes());
+    hasher.update(field);
+}
+
+fn mcp_await_event_hash_canonical_conditions(
+    hasher: &mut sha2::Sha256,
+    set_name: &[u8],
+    conditions: &[McpAwaitEventCondition],
+) {
+    let mut canonical = conditions
+        .iter()
+        .map(|condition| match condition {
+            McpAwaitEventCondition::Rule(glob) => glob.as_str(),
+        })
+        .collect::<Vec<_>>();
+    canonical.sort_unstable();
+    canonical.dedup();
+
+    mcp_await_event_hash_scope_field(hasher, set_name);
+    mcp_await_event_hash_scope_field(hasher, canonical.len().to_string().as_bytes());
+    for glob in canonical {
+        mcp_await_event_hash_scope_field(hasher, b"rule");
+        mcp_await_event_hash_scope_field(hasher, glob.as_bytes());
+    }
+}
+
+/// Bind a resume cursor to the semantic event-selection scope that produced
+/// it. Timing controls are deliberately excluded because they cannot change
+/// which rows are eligible. Parsed condition sets are sorted and deduplicated
+/// because their order and duplicates do not change `any`/`all` semantics.
+fn mcp_await_event_cursor_scope(
+    any_conditions: &[McpAwaitEventCondition],
+    all_conditions: &[McpAwaitEventCondition],
+    pane: Option<u64>,
+    unhandled_only: bool,
+    claim: bool,
+) -> String {
+    use sha2::{Digest, Sha256};
+
+    let mut hasher = Sha256::new();
+    mcp_await_event_hash_scope_field(&mut hasher, MCP_AWAIT_EVENT_CURSOR_SCOPE_DOMAIN);
+    mcp_await_event_hash_canonical_conditions(&mut hasher, b"any", any_conditions);
+    mcp_await_event_hash_canonical_conditions(&mut hasher, b"all", all_conditions);
+    mcp_await_event_hash_scope_field(&mut hasher, b"pane");
+    match pane {
+        Some(pane_id) => {
+            mcp_await_event_hash_scope_field(&mut hasher, b"some");
+            mcp_await_event_hash_scope_field(&mut hasher, &pane_id.to_be_bytes());
+        }
+        None => mcp_await_event_hash_scope_field(&mut hasher, b"none"),
+    }
+    mcp_await_event_hash_scope_field(&mut hasher, b"unhandled_only");
+    mcp_await_event_hash_scope_field(&mut hasher, &[u8::from(unhandled_only)]);
+    mcp_await_event_hash_scope_field(&mut hasher, b"claim");
+    mcp_await_event_hash_scope_field(&mut hasher, &[u8::from(claim)]);
+    // MCP currently rejects state/quiescence conditions. Keeping the effective
+    // mode in the v1 digest prevents a future implementation/default from
+    // accidentally inheriting authority from today's DB-event-only cursors.
+    mcp_await_event_hash_scope_field(&mut hasher, b"quiescence_mode");
+    mcp_await_event_hash_scope_field(
+        &mut hasher,
+        MCP_AWAIT_EVENT_CURSOR_SCOPE_QUIESCENCE_MODE,
+    );
+    hex::encode(hasher.finalize())
+}
+
+fn validate_mcp_await_event_cursor_token(
+    cursor: Option<i64>,
+    cursor_epoch: Option<&str>,
+    cursor_scope: Option<&str>,
+) -> std::result::Result<(), String> {
+    match (cursor, cursor_epoch, cursor_scope) {
+        (None, None, None) => Ok(()),
+        (Some(_), Some(epoch), Some(scope)) => {
+            if !mcp_await_event_cursor_epoch_is_canonical(epoch) {
+                return Err(format!(
+                    "cursor_epoch must be exactly {MCP_AWAIT_EVENT_CURSOR_EPOCH_HEX_LEN} lowercase hexadecimal characters"
+                ));
+            }
+            if !mcp_await_event_cursor_scope_is_canonical(scope) {
+                return Err(format!(
+                    "cursor_scope must be exactly {MCP_AWAIT_EVENT_CURSOR_SCOPE_HEX_LEN} lowercase hexadecimal characters"
+                ));
+            }
+            Ok(())
+        }
+        _ => Err(
+            "cursor, cursor_epoch, and cursor_scope must be supplied together as one authoritative resume token"
+                .to_string(),
+        ),
+    }
+}
+
+fn mcp_await_event_cursor_scope_mismatch_error(
+    supplied_scope: &str,
+    expected_scope: &str,
+) -> McpToolError {
+    McpToolError::new(
+        MCP_ERR_CURSOR_DISCONTINUITY,
+        format!(
+            "wa.await_event cursor scope mismatch: supplied scope {supplied_scope} does not authorize the canonical request scope {expected_scope}"
+        ),
+        Some(
+            "Do not reuse a cursor after changing any/all conditions, pane, unhandled, claim, or quiescence semantics. Restore the exact prior request scope, or explicitly start without a cursor after accepting a fresh baseline."
+                .to_string(),
+        ),
+    )
+}
+
+/// Upper bound covered by a page at the page's storage linearization point.
+/// A full page is known only through its final returned row. A short page is
+/// caught up through the durable allocation high-water mark; filter gaps are
+/// deliberate omissions and are not treated as evidence of deletion.
+fn mcp_await_event_page_checked_through(page: &EventStreamPage) -> i64 {
+    if page.events.len() >= MCP_AWAIT_EVENT_BATCH_LIMIT {
+        page.events
+            .last()
+            .map_or(page.retention.max_event_id, |event| event.id)
+    } else {
+        page.retention.max_event_id
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct McpAwaitRetentionCoverage {
+    cursor_epoch: String,
+    generation: i64,
+    covered_after_id: i64,
+    checked_through_id: i64,
+}
+
+impl McpAwaitRetentionCoverage {
+    fn covers(
+        &self,
+        cursor_epoch: &str,
+        page: &EventStreamPage,
+        after_id: i64,
+        through_id: i64,
+    ) -> bool {
+        self.cursor_epoch == cursor_epoch
+            && page.retention.cursor_epoch == cursor_epoch
+            && self.generation == page.retention.generation
+            && self.covered_after_id <= after_id
+            && self.checked_through_id >= through_id
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct McpAwaitFreshBaseline {
+    cursor: i64,
+    cursor_epoch: String,
+    retention_coverage: McpAwaitRetentionCoverage,
+}
+
+/// Establish a fresh await at the exact allocation tail observed with the
+/// retention snapshot. Event rows in the bootstrap page are deliberately not
+/// exposed: without a caller-supplied cursor they are provisional history, not
+/// an authoritative resume interval.
+fn mcp_await_event_fresh_baseline(page: &EventStreamPage) -> McpAwaitFreshBaseline {
+    let cursor = page.retention.max_event_id;
+    let cursor_epoch = page.retention.cursor_epoch.clone();
+    McpAwaitFreshBaseline {
+        cursor,
+        cursor_epoch: cursor_epoch.clone(),
+        retention_coverage: McpAwaitRetentionCoverage {
+            cursor_epoch,
+            generation: page.retention.generation,
+            covered_after_id: cursor,
+            checked_through_id: cursor,
+        },
+    }
+}
+
+fn mcp_await_event_cursor_discontinuity_error(
+    check: &EventRetentionCheck,
+    requested_epoch: &str,
+    cursor_scope: &str,
+) -> Option<McpToolError> {
+    let detail = match &check.status {
+        EventRetentionStatus::CompleteNoPruning => return None,
+        EventRetentionStatus::Pruned { interval } => format!(
+            "retention deleted event IDs {}..={} after the supplied cursor",
+            interval.start_id, interval.end_id
+        ),
+        EventRetentionStatus::LegacyHistoryUnavailable {
+            evidence_from_event_id,
+        } => format!(
+            "the supplied cursor predates authoritative retention evidence beginning at event ID {evidence_from_event_id}"
+        ),
+        EventRetentionStatus::CursorEpochMismatch => {
+            "the supplied cursor belongs to a different retention epoch".to_string()
+        }
+        EventRetentionStatus::CursorAheadOfHighWater { max_event_id } => format!(
+            "the supplied cursor is beyond the durable event high-water mark {max_event_id}"
+        ),
+    };
+    Some(McpToolError::new(
+        MCP_ERR_CURSOR_DISCONTINUITY,
+        format!(
+            "wa.await_event cursor discontinuity: {detail}; requested cursor={} epoch={requested_epoch} scope={cursor_scope}, current epoch={}, checked through={}",
+            check.requested_after_id,
+            check.snapshot.cursor_epoch,
+            check.checked_through_id,
+        ),
+        Some(
+            "Do not silently rebaseline. Retry with the same cursor, epoch, and scope only after resolving storage state, or explicitly start without a cursor after accepting the reported history loss."
+                .to_string(),
+        ),
+    ))
+}
+
+async fn mcp_await_event_reconcile_page(
+    storage: &StorageHandle,
+    cx: &crate::cx::Cx,
+    committed_after_id: i64,
+    cursor_epoch: &str,
+    cursor_scope: &str,
+    page: &EventStreamPage,
+    retention_coverage: &mut Option<McpAwaitRetentionCoverage>,
+) -> std::result::Result<(), McpToolError> {
+    let through_id = mcp_await_event_page_checked_through(page).max(committed_after_id);
+    if retention_coverage.as_ref().is_some_and(|coverage| {
+        coverage.covers(cursor_epoch, page, committed_after_id, through_id)
+    }) {
+        return Ok(());
+    }
+
+    let check_result = storage
+        .check_event_retention_in_epoch_with_cx(
+            cx,
+            committed_after_id,
+            through_id,
+            cursor_epoch,
+        )
+        .await;
+    mcp_await_event_checkpoint(cx).map_err(McpToolError::from_error)?;
+    let check = check_result.map_err(McpToolError::from_error)?;
+    if let Some(error) =
+        mcp_await_event_cursor_discontinuity_error(&check, cursor_epoch, cursor_scope)
+    {
+        return Err(error);
+    }
+    *retention_coverage = Some(McpAwaitRetentionCoverage {
+        cursor_epoch: check.snapshot.cursor_epoch,
+        generation: check.snapshot.generation,
+        covered_after_id: committed_after_id,
+        checked_through_id: check.checked_through_id,
+    });
+    Ok(())
+}
+
+#[derive(Debug)]
+enum McpAwaitExactEventResolution {
+    Unhandled(crate::storage::StoredEvent),
+    Handled,
+    MissingWithoutRetentionEvidence,
+}
+
+/// Re-read one event without pane/handled filters, then classify any absence
+/// using the retention ledger. This is the only safe follow-up to
+/// `AlreadyHandledOrMissing`: a filtered miss alone cannot distinguish a
+/// concurrent handler from retention, corruption, or an impossible race.
+async fn mcp_await_event_resolve_exact_event(
     storage: &StorageHandle,
     cx: &crate::cx::Cx,
     event_id: i64,
-    pane_id: Option<u64>,
-) -> crate::Result<Option<crate::storage::StoredEvent>> {
-    let events = storage
-        .get_events_stream_with_cx(
+    cursor_epoch: &str,
+    cursor_scope: &str,
+) -> std::result::Result<McpAwaitExactEventResolution, McpToolError> {
+    if event_id <= 0 {
+        return Ok(McpAwaitExactEventResolution::MissingWithoutRetentionEvidence);
+    }
+
+    let page_result = storage
+        .get_events_stream_page_with_cx(
             cx,
             EventStreamQuery {
-                after_id: Some(event_id.saturating_sub(1)),
+                after_id: Some(event_id - 1),
                 limit: Some(1),
-                pane_id,
+                pane_id: None,
                 rule_id: None,
                 event_type: None,
                 triage_state: None,
                 label: None,
-                unhandled_only: true,
+                unhandled_only: false,
                 since: None,
                 until: None,
             },
         )
-        .await?;
-    Ok(events.into_iter().next().filter(|event| event.id == event_id))
+        .await;
+    mcp_await_event_checkpoint(cx).map_err(McpToolError::from_error)?;
+    let page = page_result.map_err(McpToolError::from_error)?;
+
+    let check_result = storage
+        .check_event_retention_in_epoch_with_cx(cx, event_id - 1, event_id, cursor_epoch)
+        .await;
+    mcp_await_event_checkpoint(cx).map_err(McpToolError::from_error)?;
+    let check = check_result.map_err(McpToolError::from_error)?;
+    if let Some(error) =
+        mcp_await_event_cursor_discontinuity_error(&check, cursor_epoch, cursor_scope)
+    {
+        return Err(error);
+    }
+
+    match page
+        .events
+        .into_iter()
+        .next()
+        .filter(|event| event.id == event_id)
+    {
+        Some(event) if event.handled_at.is_some() => Ok(McpAwaitExactEventResolution::Handled),
+        Some(event) => Ok(McpAwaitExactEventResolution::Unhandled(event)),
+        None => Ok(McpAwaitExactEventResolution::MissingWithoutRetentionEvidence),
+    }
+}
+
+fn mcp_await_event_ambiguous_exact_event_error(
+    event_id: i64,
+    committed_cursor: Option<i64>,
+    cursor_epoch: &str,
+    cursor_scope: &str,
+) -> McpToolError {
+    let committed_cursor = committed_cursor.unwrap_or(0);
+    McpToolError::new(
+        MCP_ERR_STORAGE,
+        format!(
+            "wa.await_event could not authoritatively classify event {event_id} after a delivery reservation conflict; committed cursor remains {committed_cursor} in epoch {cursor_epoch} and scope {cursor_scope}"
+        ),
+        Some(format!(
+            "Retry with cursor={committed_cursor}, cursor_epoch={cursor_epoch}, and cursor_scope={cursor_scope}; the request refused to advance over an ambiguous event."
+        )),
+    )
 }
 
 fn mcp_await_event_blocked_capacity_error() -> McpToolError {
@@ -4301,6 +4679,15 @@ pub(super) struct WaEventsTool {
     db_path: Arc<PathBuf>,
 }
 
+const MCP_EVENTS_CURSOR_CAPABILITY: &str = "non_resumable_newest_first_snapshot";
+
+#[derive(Debug, serde::Serialize)]
+struct McpEventsSnapshotResponseData {
+    #[serde(flatten)]
+    data: McpEventsData,
+    cursor_capability: &'static str,
+}
+
 impl WaEventsTool {
     pub(super) fn new(db_path: Arc<PathBuf>) -> Self {
         Self { db_path }
@@ -4311,7 +4698,10 @@ impl ToolHandler for WaEventsTool {
     fn definition(&self) -> Tool {
         Tool {
             name: "wa.events".to_string(),
-            description: Some("Get pattern detection events (robot parity)".to_string()),
+            description: Some(
+                "Get a bounded, non-resumable newest-first snapshot of pattern detection events. This tool has no replay cursor; use wa.await_event for storage-authoritative resumable delivery."
+                    .to_string(),
+            ),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -4322,14 +4712,14 @@ impl ToolHandler for WaEventsTool {
                     "triage_state": { "type": "string", "description": "Filter by triage state (exact match)" },
                     "label": { "type": "string", "description": "Filter by label (exact match)" },
                     "unhandled": { "type": "boolean", "default": false, "description": "Only return unhandled events" },
-                    "since": { "type": "integer", "description": "Filter by time (epoch ms)" }
+                    "since": { "type": "integer", "minimum": 0, "description": "Filter by time (non-negative epoch ms)" }
                 },
                 "additionalProperties": false
             }),
             output_schema: None,
             icon: None,
             version: Some(crate::VERSION.to_string()),
-            tags: vec!["wa".to_string(), "robot".to_string(), "events".to_string()],
+            tags: vec!["wa".to_string(), "snapshot".to_string(), "events".to_string()],
             annotations: None,
         }
     }
@@ -4372,6 +4762,15 @@ impl ToolHandler for WaEventsTool {
                     "The wa.events tool schema declares limit ∈ [{LIMIT_MIN}, {LIMIT_MAX}]; \
                      clamp your request or omit the field to use the default (20)."
                 )),
+                elapsed_ms(start),
+            );
+            return envelope_to_content(envelope);
+        }
+        if params.since.is_some_and(|since| since < 0) {
+            let envelope = McpEnvelope::<()>::error(
+                MCP_ERR_INVALID_ARGS,
+                "since must be a non-negative epoch-millisecond timestamp".to_string(),
+                Some("Use since=0 for the beginning of the Unix epoch, or omit the filter.".to_string()),
                 elapsed_ms(start),
             );
             return envelope_to_content(envelope);
@@ -4455,7 +4854,13 @@ impl ToolHandler for WaEventsTool {
 
         match result {
             Ok(data) => {
-                let envelope = McpEnvelope::success(data, elapsed_ms(start));
+                let envelope = McpEnvelope::success(
+                    McpEventsSnapshotResponseData {
+                        data,
+                        cursor_capability: MCP_EVENTS_CURSOR_CAPABILITY,
+                    },
+                    elapsed_ms(start),
+                );
                 envelope_to_content(envelope)
             }
             Err(err) => {
@@ -4498,7 +4903,8 @@ impl ToolHandler for WaAwaitEventTool {
         Tool {
             name: "wa.await_event".to_string(),
             description: Some(
-                "Long-poll for pattern events with ft robot await envelope parity".to_string(),
+                "Long-poll DB-backed rule events with storage-authoritative scope-bound cursor tokens, optional transport-acknowledged claim leases, and an immediate checkpoint-only tail bootstrap. Live pane-state and quiescence conditions are not supported."
+                    .to_string(),
             ),
             input_schema: serde_json::json!({
                 "type": "object",
@@ -4534,7 +4940,21 @@ impl ToolHandler for WaAwaitEventTool {
                     "cursor": {
                         "type": "integer",
                         "minimum": 0,
-                        "description": "Resume cursor; only events with id greater than this are considered"
+                        "description": "Resume cursor; must be paired with cursor_epoch and cursor_scope from the same prior result"
+                    },
+                    "cursor_epoch": {
+                        "type": "string",
+                        "minLength": MCP_AWAIT_EVENT_CURSOR_EPOCH_HEX_LEN,
+                        "maxLength": MCP_AWAIT_EVENT_CURSOR_EPOCH_HEX_LEN,
+                        "pattern": "^[0-9a-f]{32}$",
+                        "description": "Retention epoch paired with cursor; copy final_cursor_epoch from the same prior result"
+                    },
+                    "cursor_scope": {
+                        "type": "string",
+                        "minLength": MCP_AWAIT_EVENT_CURSOR_SCOPE_HEX_LEN,
+                        "maxLength": MCP_AWAIT_EVENT_CURSOR_SCOPE_HEX_LEN,
+                        "pattern": "^[0-9a-f]{64}$",
+                        "description": "SHA-256 request-scope authority paired with cursor; copy final_cursor_scope from the same prior result"
                     },
                     "pane": {
                         "type": "integer",
@@ -4550,7 +4970,17 @@ impl ToolHandler for WaAwaitEventTool {
                         "type": "boolean",
                         "default": false,
                         "description": "Atomically lease matched emitted events; finalize handled only after successful requested-format response delivery, and release leases on known delivery failure"
+                    },
+                    "checkpoint_only": {
+                        "type": "boolean",
+                        "default": false,
+                        "description": "Without a cursor/token or claim, atomically return the current storage-tail cursor token immediately without replaying or waiting"
                     }
+                },
+                "dependentRequired": {
+                    "cursor": ["cursor_epoch", "cursor_scope"],
+                    "cursor_epoch": ["cursor", "cursor_scope"],
+                    "cursor_scope": ["cursor", "cursor_epoch"]
                 },
                 "additionalProperties": false
             }),
@@ -4564,11 +4994,82 @@ impl ToolHandler for WaAwaitEventTool {
 
     fn call(&self, ctx: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
         let start = Instant::now();
-        // Capture the no-cursor lower bound at request entry. Storage opening
-        // may block on SQLite initialization or another writer; taking this
-        // timestamp after open would permanently exclude events detected in
-        // that interval.
-        let request_boundary_ms = mcp_now_ms_i64();
+
+        let mut arguments = arguments;
+        let mut cursor_epoch = None;
+        let mut cursor_scope = None;
+        let mut checkpoint_only = false;
+        if let Some(object) = arguments.as_object_mut() {
+            if let Some(value) = object.remove("cursor_epoch") {
+                let serde_json::Value::String(epoch) = value else {
+                    let envelope = McpEnvelope::<()>::error(
+                        MCP_ERR_INVALID_ARGS,
+                        "cursor_epoch must be a string".to_string(),
+                        Some(
+                            "Copy final_cursor_epoch exactly from the prior wa.await_event result."
+                                .to_string(),
+                        ),
+                        elapsed_ms(start),
+                    );
+                    return envelope_to_content(envelope);
+                };
+                cursor_epoch = Some(epoch);
+            }
+            if let Some(value) = object.remove("cursor_scope") {
+                let serde_json::Value::String(scope) = value else {
+                    let envelope = McpEnvelope::<()>::error(
+                        MCP_ERR_INVALID_ARGS,
+                        "cursor_scope must be a string".to_string(),
+                        Some(
+                            "Copy final_cursor_scope exactly from the same prior wa.await_event result."
+                                .to_string(),
+                        ),
+                        elapsed_ms(start),
+                    );
+                    return envelope_to_content(envelope);
+                };
+                cursor_scope = Some(scope);
+            }
+            if let Some(value) = object.remove("checkpoint_only") {
+                let serde_json::Value::Bool(enabled) = value else {
+                    let envelope = McpEnvelope::<()>::error(
+                        MCP_ERR_INVALID_ARGS,
+                        "checkpoint_only must be a boolean".to_string(),
+                        Some(
+                            "Use checkpoint_only=true only to acquire a fresh storage-tail cursor token."
+                                .to_string(),
+                        ),
+                        elapsed_ms(start),
+                    );
+                    return envelope_to_content(envelope);
+                };
+                checkpoint_only = enabled;
+            }
+            if let Some(unknown) = object.keys().find(|key| {
+                !matches!(
+                    key.as_str(),
+                    "any"
+                        | "all"
+                        | "timeout_secs"
+                        | "poll_interval_ms"
+                        | "cursor"
+                        | "pane"
+                        | "unhandled"
+                        | "claim"
+                )
+            }) {
+                let envelope = McpEnvelope::<()>::error(
+                    MCP_ERR_INVALID_ARGS,
+                    format!("unknown wa.await_event parameter `{unknown}`"),
+                    Some(
+                        "Use only the fields advertised by the wa.await_event input schema."
+                            .to_string(),
+                    ),
+                    elapsed_ms(start),
+                );
+                return envelope_to_content(envelope);
+            }
+        }
 
         let params: AwaitEventParams = if arguments.is_null() {
             AwaitEventParams::default()
@@ -4576,7 +5077,7 @@ impl ToolHandler for WaAwaitEventTool {
             match parse_mcp_tool_params(
                 "wa.await_event",
                 arguments,
-                "Expected object with any/all rule:<glob> conditions plus optional timeout_secs, poll_interval_ms, cursor, pane, unhandled, claim",
+                "Expected object with any/all rule:<glob> conditions plus optional timeout_secs, poll_interval_ms, paired cursor/cursor_epoch/cursor_scope, pane, unhandled, claim, checkpoint_only",
                 start,
             ) {
                 Ok(p) => p,
@@ -4661,20 +5162,35 @@ impl ToolHandler for WaAwaitEventTool {
             );
             return envelope_to_content(envelope);
         }
-        if params.claim && self.response_delivery.is_none() {
+        if let Err(message) = validate_mcp_await_event_cursor_token(
+            params.cursor,
+            cursor_epoch.as_deref(),
+            cursor_scope.as_deref(),
+        ) {
             let envelope = McpEnvelope::<()>::error(
-                MCP_ERR_CONFIG,
-                "wa.await_event claim requires an acknowledgment-aware MCP response transport"
-                    .to_string(),
+                MCP_ERR_INVALID_ARGS,
+                message,
                 Some(
-                    "Run wa.await_event through the FrankenTerm MCP server transport; direct handler dispatch cannot safely claim events"
+                    "Copy final_cursor, final_cursor_epoch, and final_cursor_scope from the same prior wa.await_event result."
                         .to_string(),
                 ),
                 elapsed_ms(start),
             );
             return envelope_to_content(envelope);
         }
-
+        if checkpoint_only && (params.cursor.is_some() || params.claim) {
+            let envelope = McpEnvelope::<()>::error(
+                MCP_ERR_INVALID_ARGS,
+                "checkpoint_only requires a fresh request without cursor/token and with claim=false"
+                    .to_string(),
+                Some(
+                    "Remove cursor, cursor_epoch, cursor_scope, and claim; keep the intended any/all, pane, and unhandled scope."
+                        .to_string(),
+                ),
+                elapsed_ms(start),
+            );
+            return envelope_to_content(envelope);
+        }
         let any_conditions: Vec<McpAwaitEventCondition> = match params
             .any
             .iter()
@@ -4701,6 +5217,41 @@ impl ToolHandler for WaAwaitEventTool {
                 return envelope_to_content(envelope);
             }
         };
+        let canonical_cursor_scope = mcp_await_event_cursor_scope(
+            &any_conditions,
+            &all_conditions,
+            params.pane,
+            params.unhandled || params.claim,
+            params.claim,
+        );
+        if let Some(supplied_scope) = cursor_scope.as_deref() {
+            if supplied_scope != canonical_cursor_scope {
+                let err = mcp_await_event_cursor_scope_mismatch_error(
+                    supplied_scope,
+                    &canonical_cursor_scope,
+                );
+                let envelope = McpEnvelope::<()>::error(
+                    err.code,
+                    err.message,
+                    err.hint,
+                    elapsed_ms(start),
+                );
+                return envelope_to_content(envelope);
+            }
+        }
+        if params.claim && self.response_delivery.is_none() {
+            let envelope = McpEnvelope::<()>::error(
+                MCP_ERR_CONFIG,
+                "wa.await_event claim requires an acknowledgment-aware MCP response transport"
+                    .to_string(),
+                Some(
+                    "Run wa.await_event through the FrankenTerm MCP server transport; direct handler dispatch cannot safely claim events"
+                        .to_string(),
+                ),
+                elapsed_ms(start),
+            );
+            return envelope_to_content(envelope);
+        }
 
         let db_path = Arc::clone(&self.db_path);
         let request_cx = ctx.cx().clone();
@@ -4709,7 +5260,7 @@ impl ToolHandler for WaAwaitEventTool {
             .map_err(|e| McpError::internal_error(format!("MCP runtime init failed: {e}")))?;
 
         let (result, delivery_leases): (
-            std::result::Result<McpAwaitEventData, McpToolError>,
+            std::result::Result<McpAwaitEventResponseData, McpToolError>,
             Vec<EventDeliveryLease>,
         ) = runtime.block_on(async {
             let mut delivery_leases = Vec::new();
@@ -4745,6 +5296,8 @@ impl ToolHandler for WaAwaitEventTool {
             // every poll.
             let mut scan_after_id = params.cursor;
             let mut final_cursor = params.cursor;
+            let mut current_cursor_epoch = cursor_epoch.clone();
+            let mut retention_coverage = None;
             let mut any_met = vec![false; any_conditions.len()];
             let mut all_met = vec![false; all_conditions.len()];
             let mut matched_events = Vec::new();
@@ -4754,9 +5307,39 @@ impl ToolHandler for WaAwaitEventTool {
                 Vec::<McpAwaitBlockedEvent>::with_capacity(MCP_AWAIT_EVENT_BLOCKED_EVENT_MAX);
             let mut retry_blocked_events = true;
 
-            let operation: std::result::Result<McpAwaitEventData, McpToolError> = async {
+            let operation: std::result::Result<McpAwaitEventResponseData, McpToolError> = async {
+                if scan_after_id.is_none() {
+                    let baseline_result = storage
+                        .get_events_stream_page_with_cx(
+                            &cx,
+                            EventStreamQuery {
+                                after_id: None,
+                                limit: Some(MCP_AWAIT_EVENT_BASELINE_LIMIT),
+                                pane_id: None,
+                                rule_id: None,
+                                event_type: None,
+                                triage_state: None,
+                                label: None,
+                                unhandled_only: false,
+                                since: None,
+                                until: None,
+                            },
+                        )
+                        .await;
+                    mcp_await_event_checkpoint(&cx).map_err(McpToolError::from_error)?;
+                    let baseline_page = baseline_result.map_err(McpToolError::from_error)?;
+                    let baseline = mcp_await_event_fresh_baseline(&baseline_page);
+                    scan_after_id = Some(baseline.cursor);
+                    final_cursor = Some(baseline.cursor);
+                    current_cursor_epoch = Some(baseline.cursor_epoch);
+                    retention_coverage = Some(baseline.retention_coverage);
+                }
+
                 let (satisfied, timed_out) = loop {
                     mcp_await_event_checkpoint(&cx).map_err(McpToolError::from_error)?;
+                    if checkpoint_only {
+                        break (false, false);
+                    }
                     if started.elapsed() >= timeout {
                         break (false, true);
                     }
@@ -4770,17 +5353,36 @@ impl ToolHandler for WaAwaitEventTool {
                             // event has since satisfied the same condition. An
                             // exact durable refetch proves handled/deleted state
                             // without accidentally substituting the next row.
-                            let event_result = mcp_await_event_refetch_exact_unhandled_event(
+                            let cursor_epoch = current_cursor_epoch.as_deref().ok_or_else(|| {
+                                McpToolError::new(
+                                    MCP_ERR_STORAGE,
+                                    "wa.await_event lost its cursor token while retrying a leased event"
+                                        .to_string(),
+                                    Some(
+                                        "Retry from the last emitted cursor, cursor epoch, and cursor scope."
+                                            .to_string(),
+                                    ),
+                                )
+                            })?;
+                            let event = match mcp_await_event_resolve_exact_event(
                                 &storage,
                                 &cx,
                                 blocked.event_id,
-                                params.pane,
+                                cursor_epoch,
+                                &canonical_cursor_scope,
                             )
-                            .await;
-                            mcp_await_event_checkpoint(&cx)
-                                .map_err(McpToolError::from_error)?;
-                            let Some(event) = event_result.map_err(McpToolError::from_error)? else {
-                                continue;
+                            .await?
+                            {
+                                McpAwaitExactEventResolution::Unhandled(event) => event,
+                                McpAwaitExactEventResolution::Handled => continue,
+                                McpAwaitExactEventResolution::MissingWithoutRetentionEvidence => {
+                                    return Err(mcp_await_event_ambiguous_exact_event_error(
+                                        blocked.event_id,
+                                        final_cursor,
+                                        cursor_epoch,
+                                        &canonical_cursor_scope,
+                                    ));
+                                }
                             };
 
                             let remaining = timeout.saturating_sub(started.elapsed());
@@ -4816,7 +5418,28 @@ impl ToolHandler for WaAwaitEventTool {
                                 Ok(EventDeliveryReservation::AlreadyHandledOrMissing) => {
                                     mcp_await_event_checkpoint(&cx)
                                         .map_err(McpToolError::from_error)?;
-                                    None
+                                    match mcp_await_event_resolve_exact_event(
+                                        &storage,
+                                        &cx,
+                                        blocked.event_id,
+                                        cursor_epoch,
+                                        &canonical_cursor_scope,
+                                    )
+                                    .await?
+                                    {
+                                        McpAwaitExactEventResolution::Handled => None,
+                                        McpAwaitExactEventResolution::Unhandled(_)
+                                        | McpAwaitExactEventResolution::MissingWithoutRetentionEvidence => {
+                                            return Err(
+                                                mcp_await_event_ambiguous_exact_event_error(
+                                                    blocked.event_id,
+                                                    final_cursor,
+                                                    cursor_epoch,
+                                                    &canonical_cursor_scope,
+                                                ),
+                                            );
+                                        }
+                                    }
                                 }
                                 Err(error) => {
                                     mcp_await_event_checkpoint(&cx)
@@ -4847,8 +5470,11 @@ impl ToolHandler for WaAwaitEventTool {
                                 .map_err(McpToolError::from_error)?;
                             matched_events.push(item);
                         }
-                        final_cursor =
-                            mcp_await_event_safe_cursor(scan_after_id, &blocked_events);
+                        final_cursor = mcp_await_event_committed_cursor(
+                            scan_after_id,
+                            &blocked_events,
+                            &delivery_leases,
+                        );
                         if mcp_await_event_is_satisfied(&any_met, &all_met) {
                             break (true, false);
                         }
@@ -4863,19 +5489,47 @@ impl ToolHandler for WaAwaitEventTool {
                         triage_state: None,
                         label: None,
                         unhandled_only: params.unhandled || params.claim,
-                        since: if scan_after_id.is_some() {
-                            None
-                        } else {
-                            Some(request_boundary_ms)
-                        },
+                        since: None,
                         until: None,
                     };
-                    let events_result = storage.get_events_stream_with_cx(&cx, query).await;
+                    let page_result = storage
+                        .get_events_stream_page_with_cx(&cx, query)
+                        .await;
                     mcp_await_event_checkpoint(&cx).map_err(McpToolError::from_error)?;
-                    let events = events_result.map_err(McpToolError::from_error)?;
-                    let batch_len = events.len();
+                    let page = page_result.map_err(McpToolError::from_error)?;
+                    let cursor_epoch = current_cursor_epoch.as_deref().ok_or_else(|| {
+                        McpToolError::new(
+                            MCP_ERR_STORAGE,
+                            "wa.await_event lost its cursor token before retention reconciliation"
+                                .to_string(),
+                            Some(
+                                "Retry from the last emitted cursor, cursor epoch, and cursor scope."
+                                    .to_string(),
+                            ),
+                        )
+                    })?;
+                    let committed_cursor = mcp_await_event_committed_cursor(
+                        scan_after_id,
+                        &blocked_events,
+                        &delivery_leases,
+                    )
+                    .or(final_cursor)
+                    .unwrap_or(0);
+                    mcp_await_event_reconcile_page(
+                        &storage,
+                        &cx,
+                        committed_cursor,
+                        cursor_epoch,
+                        &canonical_cursor_scope,
+                        &page,
+                        &mut retention_coverage,
+                    )
+                    .await?;
+                    let checked_through = mcp_await_event_page_checked_through(&page);
+                    let batch_len = page.events.len();
+                    let mut processed_all_events = true;
 
-                    for event in events {
+                    for (event_index, event) in page.events.into_iter().enumerate() {
                         let event_id = event.id;
                         let matching_any = mcp_await_event_unmet_match_mask(
                             &any_conditions,
@@ -4940,10 +5594,44 @@ impl ToolHandler for WaAwaitEventTool {
                                 Ok(EventDeliveryReservation::AlreadyHandledOrMissing) => {
                                     mcp_await_event_checkpoint(&cx)
                                         .map_err(McpToolError::from_error)?;
-                                    // A concurrent handler completed it after our read. It is no
-                                    // longer a delivery candidate, so moving past it is safe.
-                                    scan_after_id = Some(event_id);
-                                    continue;
+                                    let cursor_epoch = current_cursor_epoch
+                                        .as_deref()
+                                        .ok_or_else(|| {
+                                            McpToolError::new(
+                                                MCP_ERR_STORAGE,
+                                                "wa.await_event lost its cursor token while classifying a delivery reservation"
+                                                    .to_string(),
+                                                Some(
+                                                    "Retry from the last emitted cursor, cursor epoch, and cursor scope."
+                                                        .to_string(),
+                                                ),
+                                            )
+                                        })?;
+                                    match mcp_await_event_resolve_exact_event(
+                                        &storage,
+                                        &cx,
+                                        event_id,
+                                        cursor_epoch,
+                                        &canonical_cursor_scope,
+                                    )
+                                    .await?
+                                    {
+                                        McpAwaitExactEventResolution::Handled => {
+                                            scan_after_id = Some(event_id);
+                                            continue;
+                                        }
+                                        McpAwaitExactEventResolution::Unhandled(_)
+                                        | McpAwaitExactEventResolution::MissingWithoutRetentionEvidence => {
+                                            return Err(
+                                                mcp_await_event_ambiguous_exact_event_error(
+                                                    event_id,
+                                                    final_cursor,
+                                                    cursor_epoch,
+                                                    &canonical_cursor_scope,
+                                                ),
+                                            );
+                                        }
+                                    }
                                 }
                                 Err(error) => {
                                     mcp_await_event_checkpoint(&cx)
@@ -4961,11 +5649,24 @@ impl ToolHandler for WaAwaitEventTool {
                         mcp_await_event_checkpoint(&cx).map_err(McpToolError::from_error)?;
                         matched_events.push(item);
                         if mcp_await_event_is_satisfied(&any_met, &all_met) {
+                            processed_all_events = event_index + 1 == batch_len;
                             break;
                         }
                     }
 
-                    final_cursor = mcp_await_event_safe_cursor(scan_after_id, &blocked_events);
+                    if processed_all_events && batch_len < MCP_AWAIT_EVENT_BATCH_LIMIT {
+                        scan_after_id = Some(
+                            scan_after_id.map_or(checked_through, |after_id| {
+                                after_id.max(checked_through)
+                            }),
+                        );
+                    }
+
+                    final_cursor = mcp_await_event_committed_cursor(
+                        scan_after_id,
+                        &blocked_events,
+                        &delivery_leases,
+                    );
                     mcp_await_event_checkpoint(&cx).map_err(McpToolError::from_error)?;
                     if mcp_await_event_is_satisfied(&any_met, &all_met) {
                         break (true, false);
@@ -5003,18 +5704,51 @@ impl ToolHandler for WaAwaitEventTool {
 
                 matched_events.sort_by_key(|event| event.id);
 
-                Ok(McpAwaitEventData {
-                    record_type: "await_result",
-                    satisfied,
-                    timed_out,
-                    elapsed_ms: elapsed_ms(start),
-                    final_cursor,
-                    any: mcp_await_condition_status(&params.any, &any_met),
-                    all: mcp_await_condition_status(&params.all, &all_met),
-                    events: matched_events,
-                    unhandled_only: params.unhandled || params.claim,
-                    claim: params.claim,
-                    claim_delivery: params.claim.then_some("finalize_after_delivery_ack"),
+                let pending_finalize = !delivery_leases.is_empty();
+                let candidate_cursor = if pending_finalize {
+                    mcp_await_event_safe_cursor(scan_after_id, &blocked_events)
+                } else {
+                    None
+                };
+                let final_cursor_epoch = if final_cursor.is_some() {
+                    current_cursor_epoch.clone()
+                } else {
+                    None
+                };
+                let final_cursor_scope = final_cursor
+                    .is_some()
+                    .then(|| canonical_cursor_scope.clone());
+                if final_cursor.is_some() != final_cursor_epoch.is_some()
+                    || final_cursor.is_some() != final_cursor_scope.is_some()
+                {
+                    return Err(McpToolError::new(
+                        MCP_ERR_STORAGE,
+                        "wa.await_event produced an incomplete cursor token; refusing to emit it"
+                            .to_string(),
+                        Some("Retry the request without changing its cursor inputs.".to_string()),
+                    ));
+                }
+
+                Ok(McpAwaitEventResponseData {
+                    data: McpAwaitEventData {
+                        record_type: "await_result",
+                        satisfied,
+                        timed_out,
+                        elapsed_ms: elapsed_ms(start),
+                        final_cursor,
+                        any: mcp_await_condition_status(&params.any, &any_met),
+                        all: mcp_await_condition_status(&params.all, &all_met),
+                        events: matched_events,
+                        unhandled_only: params.unhandled || params.claim,
+                        claim: params.claim,
+                        claim_delivery: pending_finalize
+                            .then_some("pending_finalize_after_delivery_ack"),
+                    },
+                    final_cursor_epoch,
+                    final_cursor_scope,
+                    candidate_cursor,
+                    pending_finalize,
+                    bootstrap_state: checkpoint_only.then_some("storage_tail_checkpoint"),
                 })
             }
             .await;
@@ -10410,6 +11144,136 @@ mod tests {
         })
     }
 
+    fn seed_events_with_rules(db_path: &Path, rule_ids: &[&str]) -> Vec<i64> {
+        let runtime = CompatRuntimeBuilder::current_thread().build().unwrap();
+        runtime.block_on(async {
+            let storage = StorageHandle::new(&db_path.to_string_lossy())
+                .await
+                .unwrap();
+            storage
+                .upsert_pane(crate::storage::PaneRecord {
+                    pane_id: 7,
+                    pane_uuid: None,
+                    domain: "local".to_string(),
+                    window_id: None,
+                    tab_id: None,
+                    title: Some("test-pane".to_string()),
+                    cwd: None,
+                    tty_name: None,
+                    first_seen_at: 1_700_000_000_000,
+                    last_seen_at: 1_700_000_000_000,
+                    observed: true,
+                    ignore_reason: None,
+                    last_decision_at: None,
+                })
+                .await
+                .unwrap();
+            let mut event_ids = Vec::with_capacity(rule_ids.len());
+            for (index, rule_id) in rule_ids.iter().enumerate() {
+                event_ids.push(
+                    storage
+                        .record_event(crate::storage::StoredEvent {
+                            id: 0,
+                            pane_id: 7,
+                            rule_id: (*rule_id).to_string(),
+                            agent_type: "codex".to_string(),
+                            event_type: "test".to_string(),
+                            severity: "warning".to_string(),
+                            confidence: 0.95,
+                            extracted: None,
+                            matched_text: Some(format!("event {index}")),
+                            segment_id: None,
+                            detected_at: 1_700_000_000_000
+                                + i64::try_from(index).unwrap(),
+                            dedupe_key: None,
+                            handled_at: None,
+                            handled_by_workflow_id: None,
+                            handled_status: None,
+                        })
+                        .await
+                        .unwrap(),
+                );
+            }
+            storage.shutdown().await.unwrap();
+            event_ids
+        })
+    }
+
+    fn event_cursor_epoch(db_path: &Path) -> String {
+        let runtime = CompatRuntimeBuilder::current_thread().build().unwrap();
+        runtime.block_on(async {
+            let storage = StorageHandle::new(&db_path.to_string_lossy())
+                .await
+                .unwrap();
+            let snapshot = storage.get_event_retention_snapshot().await.unwrap();
+            storage.shutdown().await.unwrap();
+            snapshot.cursor_epoch
+        })
+    }
+
+    fn await_event_cursor_scope(
+        any: &[&str],
+        all: &[&str],
+        pane: Option<u64>,
+        unhandled: bool,
+        claim: bool,
+    ) -> String {
+        let any = any
+            .iter()
+            .map(|condition| super::parse_mcp_await_event_condition(condition).unwrap())
+            .collect::<Vec<_>>();
+        let all = all
+            .iter()
+            .map(|condition| super::parse_mcp_await_event_condition(condition).unwrap())
+            .collect::<Vec<_>>();
+        super::mcp_await_event_cursor_scope(
+            &any,
+            &all,
+            pane,
+            unhandled || claim,
+            claim,
+        )
+    }
+
+    fn cursor_test_event(event_id: i64) -> crate::storage::StoredEvent {
+        crate::storage::StoredEvent {
+            id: event_id,
+            pane_id: 7,
+            rule_id: "codex.test".to_string(),
+            agent_type: "codex".to_string(),
+            event_type: "test".to_string(),
+            severity: "info".to_string(),
+            confidence: 1.0,
+            extracted: None,
+            matched_text: None,
+            segment_id: None,
+            detected_at: event_id,
+            dedupe_key: None,
+            handled_at: None,
+            handled_by_workflow_id: None,
+            handled_status: None,
+        }
+    }
+
+    fn cursor_test_page(
+        events: Vec<crate::storage::StoredEvent>,
+        max_event_id: i64,
+        generation: i64,
+    ) -> crate::storage::EventStreamPage {
+        crate::storage::EventStreamPage {
+            events,
+            retention: crate::storage::EventRetentionSnapshot {
+                cursor_epoch: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+                legacy_history_complete: true,
+                generation,
+                evidence_from_event_id: 1,
+                max_event_id,
+                deleted_event_count: if generation > 0 { 1 } else { 0 },
+                last_deleted_at: (generation > 0).then_some(1),
+            },
+        }
+    }
+
     fn latest_audit_action(db_path: &Path, action_kind: &str) -> crate::storage::AuditActionRecord {
         let runtime = CompatRuntimeBuilder::current_thread().build().unwrap();
         runtime.block_on(async {
@@ -10864,6 +11728,627 @@ mod tests {
     }
 
     #[test]
+    fn await_event_schema_requires_complete_canonical_cursor_token() {
+        let (_dir, db_path) = temp_db_path();
+        let definition = WaAwaitEventTool::new(db_path).definition();
+
+        let description = definition.description.as_deref().unwrap();
+        assert!(description.contains("storage-authoritative scope-bound cursor"));
+        assert!(description.contains("quiescence conditions are not supported"));
+        assert!(!description.contains("robot await envelope parity"));
+
+        assert_eq!(
+            definition.input_schema["properties"]["cursor_epoch"]["pattern"],
+            "^[0-9a-f]{32}$"
+        );
+        assert_eq!(
+            definition.input_schema["properties"]["cursor_scope"]["pattern"],
+            "^[0-9a-f]{64}$"
+        );
+        assert_eq!(
+            definition.input_schema["dependentRequired"]["cursor"],
+            serde_json::json!(["cursor_epoch", "cursor_scope"])
+        );
+        assert_eq!(
+            definition.input_schema["dependentRequired"]["cursor_epoch"],
+            serde_json::json!(["cursor", "cursor_scope"])
+        );
+        assert_eq!(
+            definition.input_schema["dependentRequired"]["cursor_scope"],
+            serde_json::json!(["cursor", "cursor_epoch"])
+        );
+    }
+
+    #[test]
+    fn await_event_cursor_scope_canonicalizes_order_but_binds_semantics() {
+        let canonical = await_event_cursor_scope(
+            &["rule:beta.*", " rule:alpha.* ", "rule:beta.*"],
+            &["rule:gamma.*"],
+            Some(7),
+            false,
+            false,
+        );
+        let reordered = await_event_cursor_scope(
+            &["rule:alpha.*", "rule:beta.*"],
+            &["rule:gamma.*"],
+            Some(7),
+            false,
+            false,
+        );
+        assert_eq!(canonical, reordered);
+        assert_eq!(canonical.len(), super::MCP_AWAIT_EVENT_CURSOR_SCOPE_HEX_LEN);
+        assert!(super::mcp_await_event_cursor_scope_is_canonical(
+            &canonical
+        ));
+
+        assert_ne!(
+            canonical,
+            await_event_cursor_scope(
+                &["rule:alpha.*", "rule:beta.*"],
+                &["rule:gamma.*"],
+                Some(8),
+                false,
+                false,
+            ),
+            "pane selection must be scope-bound"
+        );
+        assert_ne!(
+            canonical,
+            await_event_cursor_scope(
+                &["rule:alpha.*", "rule:beta.*"],
+                &["rule:gamma.*"],
+                Some(7),
+                false,
+                true,
+            ),
+            "claim and its effective unhandled mode must be scope-bound"
+        );
+    }
+
+    #[test]
+    fn await_event_same_generation_cache_does_not_cover_interval_extension() {
+        let first_page = cursor_test_page(Vec::new(), 50, 3);
+        let extended_page = cursor_test_page(Vec::new(), 100, 3);
+        let coverage = super::McpAwaitRetentionCoverage {
+            cursor_epoch: first_page.retention.cursor_epoch.clone(),
+            generation: first_page.retention.generation,
+            covered_after_id: 0,
+            checked_through_id: 50,
+        };
+
+        assert!(coverage.covers(
+            &first_page.retention.cursor_epoch,
+            &first_page,
+            25,
+            50,
+        ));
+        assert!(
+            !coverage.covers(
+                &extended_page.retention.cursor_epoch,
+                &extended_page,
+                50,
+                100,
+            ),
+            "an unchanged generation cannot skip checking IDs beyond the prior covered interval"
+        );
+    }
+
+    #[test]
+    fn await_event_fresh_baseline_discards_a_full_provisional_page_at_atomic_tail() {
+        let provisional_events = (1..=super::MCP_AWAIT_EVENT_BATCH_LIMIT)
+            .map(|event_id| cursor_test_event(i64::try_from(event_id).unwrap()))
+            .collect::<Vec<_>>();
+        let page = cursor_test_page(provisional_events, 900, 0);
+
+        let baseline = super::mcp_await_event_fresh_baseline(&page);
+
+        assert_eq!(page.events.len(), super::MCP_AWAIT_EVENT_BATCH_LIMIT);
+        assert_eq!(page.events.last().map(|event| event.id), Some(500));
+        assert_eq!(baseline.cursor, 900);
+        assert_eq!(baseline.cursor_epoch, page.retention.cursor_epoch);
+        assert_eq!(baseline.retention_coverage.covered_after_id, 900);
+        assert_eq!(baseline.retention_coverage.checked_through_id, 900);
+    }
+
+    #[test]
+    fn await_event_without_cursor_starts_after_existing_matching_history() {
+        let (_dir, db_path) = temp_db_path();
+        let event_id = seed_event(db_path.as_ref().as_path());
+        let cursor_epoch = event_cursor_epoch(db_path.as_ref().as_path());
+        let cursor_scope = await_event_cursor_scope(
+            &["rule:codex.*"],
+            &[],
+            None,
+            false,
+            false,
+        );
+        let tool = WaAwaitEventTool::new(db_path);
+
+        let envelope = parse_json_content(
+            tool.call(
+                &test_mcp_context(),
+                serde_json::json!({
+                    "any": ["rule:codex.*"],
+                    "timeout_secs": 1,
+                    "poll_interval_ms": 1_000
+                }),
+            )
+            .expect("fresh await should return a timeout result"),
+        );
+
+        assert_eq!(envelope["ok"], true, "unexpected envelope: {envelope}");
+        assert_eq!(envelope["data"]["satisfied"], false);
+        assert_eq!(envelope["data"]["timed_out"], true);
+        assert_eq!(envelope["data"]["events"], serde_json::json!([]));
+        assert_eq!(envelope["data"]["final_cursor"], event_id);
+        assert_eq!(envelope["data"]["final_cursor_epoch"], cursor_epoch);
+        assert_eq!(envelope["data"]["final_cursor_scope"], cursor_scope);
+        assert_eq!(envelope["data"]["candidate_cursor"], serde_json::Value::Null);
+        assert_eq!(envelope["data"]["pending_finalize"], false);
+    }
+
+    #[test]
+    fn await_event_checkpoint_only_returns_immediate_usable_storage_tail_token() {
+        let (_dir, db_path) = temp_db_path();
+        let initial_event_id = seed_event(db_path.as_ref().as_path());
+        let tool = WaAwaitEventTool::new(Arc::clone(&db_path));
+
+        let checkpoint = parse_json_content(
+            tool.call(
+                &test_mcp_context(),
+                serde_json::json!({
+                    "any": ["rule:codex.*"],
+                    "timeout_secs": 300,
+                    "poll_interval_ms": 30_000,
+                    "checkpoint_only": true
+                }),
+            )
+            .expect("checkpoint-only await should return the atomic storage tail"),
+        );
+
+        assert_eq!(checkpoint["ok"], true, "unexpected envelope: {checkpoint}");
+        assert_eq!(checkpoint["data"]["satisfied"], false);
+        assert_eq!(checkpoint["data"]["timed_out"], false);
+        assert_eq!(
+            checkpoint["data"]["bootstrap_state"],
+            "storage_tail_checkpoint"
+        );
+        assert_eq!(checkpoint["data"]["events"], serde_json::json!([]));
+        assert_eq!(checkpoint["data"]["final_cursor"], initial_event_id);
+        assert_eq!(checkpoint["data"]["pending_finalize"], false);
+        let cursor_epoch = checkpoint["data"]["final_cursor_epoch"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let cursor_scope = checkpoint["data"]["final_cursor_scope"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let next_event_id = seed_events_with_rules(
+            db_path.as_ref().as_path(),
+            &["codex.after.checkpoint"],
+        )[0];
+        let resumed = parse_json_content(
+            tool.call(
+                &test_mcp_context(),
+                serde_json::json!({
+                    "any": ["rule:codex.*"],
+                    "cursor": initial_event_id,
+                    "cursor_epoch": cursor_epoch,
+                    "cursor_scope": cursor_scope,
+                    "timeout_secs": 1,
+                    "poll_interval_ms": 10
+                }),
+            )
+            .expect("checkpoint token should resume the identical request scope"),
+        );
+        assert_eq!(resumed["ok"], true, "unexpected envelope: {resumed}");
+        assert_eq!(resumed["data"]["satisfied"], true);
+        assert_eq!(resumed["data"]["events"][0]["id"], next_event_id);
+    }
+
+    #[test]
+    fn await_event_checkpoint_only_rejects_resume_tokens_and_claims() {
+        let (_dir, db_path) = temp_db_path();
+        let cursor_epoch = event_cursor_epoch(db_path.as_ref().as_path());
+        let cursor_scope = await_event_cursor_scope(
+            &["rule:codex.*"],
+            &[],
+            None,
+            false,
+            false,
+        );
+        let tool = WaAwaitEventTool::new(db_path);
+
+        for arguments in [
+            serde_json::json!({
+                "any": ["rule:codex.*"],
+                "cursor": 0,
+                "cursor_epoch": cursor_epoch,
+                "cursor_scope": cursor_scope,
+                "checkpoint_only": true
+            }),
+            serde_json::json!({
+                "any": ["rule:codex.*"],
+                "claim": true,
+                "checkpoint_only": true
+            }),
+        ] {
+            let envelope = parse_json_content(
+                tool.call(&test_mcp_context(), arguments)
+                    .expect("invalid checkpoint mode should return an error envelope"),
+            );
+            assert_eq!(envelope["ok"], false);
+            assert_eq!(envelope["error_code"], MCP_ERR_INVALID_ARGS);
+        }
+    }
+
+    #[test]
+    fn await_event_rejects_incomplete_or_noncanonical_cursor_token() {
+        let (_dir, db_path) = temp_db_path();
+        let tool = WaAwaitEventTool::new(db_path);
+        for arguments in [
+            serde_json::json!({
+                "any": ["rule:codex.*"],
+                "cursor": 0,
+                "timeout_secs": 1,
+                "poll_interval_ms": 10
+            }),
+            serde_json::json!({
+                "any": ["rule:codex.*"],
+                "cursor": 0,
+                "cursor_epoch": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "timeout_secs": 1,
+                "poll_interval_ms": 10
+            }),
+            serde_json::json!({
+                "any": ["rule:codex.*"],
+                "cursor_scope": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "timeout_secs": 1,
+                "poll_interval_ms": 10
+            }),
+            serde_json::json!({
+                "any": ["rule:codex.*"],
+                "cursor": 0,
+                "cursor_epoch": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+                "cursor_scope": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "timeout_secs": 1,
+                "poll_interval_ms": 10
+            }),
+            serde_json::json!({
+                "any": ["rule:codex.*"],
+                "cursor": 0,
+                "cursor_epoch": "abc",
+                "cursor_scope": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "timeout_secs": 1,
+                "poll_interval_ms": 10
+            }),
+            serde_json::json!({
+                "any": ["rule:codex.*"],
+                "cursor": 0,
+                "cursor_epoch": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "cursor_scope": "ABCDEF",
+                "timeout_secs": 1,
+                "poll_interval_ms": 10
+            }),
+        ] {
+            let envelope = parse_json_content(
+                tool.call(&test_mcp_context(), arguments)
+                    .expect("invalid cursor token should return an error envelope"),
+            );
+            assert_eq!(envelope["ok"], false);
+            assert_eq!(envelope["error_code"], MCP_ERR_INVALID_ARGS);
+        }
+    }
+
+    #[test]
+    fn await_event_emits_final_cursor_token_from_storage_and_request_scope() {
+        let (_dir, db_path) = temp_db_path();
+        let event_id = seed_event(db_path.as_ref().as_path());
+        let cursor_epoch = event_cursor_epoch(db_path.as_ref().as_path());
+        let cursor_scope = await_event_cursor_scope(
+            &["rule:codex.*"],
+            &[],
+            None,
+            false,
+            false,
+        );
+        let tool = WaAwaitEventTool::new(db_path);
+
+        let envelope = parse_json_content(
+            tool.call(
+                &test_mcp_context(),
+                serde_json::json!({
+                    "any": ["rule:codex.*"],
+                    "cursor": 0,
+                    "cursor_epoch": cursor_epoch,
+                    "cursor_scope": cursor_scope,
+                    "timeout_secs": 1,
+                    "poll_interval_ms": 10
+                }),
+            )
+            .expect("authoritative cursor token should produce an await result"),
+        );
+
+        assert_eq!(envelope["ok"], true, "unexpected envelope: {envelope}");
+        assert_eq!(envelope["data"]["satisfied"], true);
+        assert_eq!(envelope["data"]["final_cursor"], event_id);
+        assert_eq!(envelope["data"]["final_cursor_epoch"], cursor_epoch);
+        assert_eq!(envelope["data"]["final_cursor_scope"], cursor_scope);
+        assert_eq!(envelope["data"]["pending_finalize"], false);
+    }
+
+    #[test]
+    fn await_event_rejects_cursor_reuse_after_request_scope_changes() {
+        let (_dir, db_path) = temp_db_path();
+        let cursor_epoch = event_cursor_epoch(db_path.as_ref().as_path());
+        let original_scope = await_event_cursor_scope(
+            &["rule:codex.*"],
+            &[],
+            None,
+            false,
+            false,
+        );
+        let tool = WaAwaitEventTool::new(db_path);
+
+        for changed_arguments in [
+            serde_json::json!({
+                "any": ["rule:claude.*"],
+                "cursor": 0,
+                "cursor_epoch": cursor_epoch.clone(),
+                "cursor_scope": original_scope.clone(),
+                "timeout_secs": 1,
+                "poll_interval_ms": 10
+            }),
+            serde_json::json!({
+                "any": ["rule:codex.*"],
+                "pane": 7,
+                "cursor": 0,
+                "cursor_epoch": cursor_epoch.clone(),
+                "cursor_scope": original_scope.clone(),
+                "timeout_secs": 1,
+                "poll_interval_ms": 10
+            }),
+            serde_json::json!({
+                "any": ["rule:codex.*"],
+                "unhandled": true,
+                "cursor": 0,
+                "cursor_epoch": cursor_epoch.clone(),
+                "cursor_scope": original_scope.clone(),
+                "timeout_secs": 1,
+                "poll_interval_ms": 10
+            }),
+            serde_json::json!({
+                "any": ["rule:codex.*"],
+                "claim": true,
+                "cursor": 0,
+                "cursor_epoch": cursor_epoch,
+                "cursor_scope": original_scope,
+                "timeout_secs": 1,
+                "poll_interval_ms": 10
+            }),
+        ] {
+            let envelope = parse_json_content(
+                tool.call(&test_mcp_context(), changed_arguments)
+                    .expect("changed cursor scope should return a typed error envelope"),
+            );
+            assert_eq!(envelope["ok"], false);
+            assert_eq!(
+                envelope["error_code"],
+                super::MCP_ERR_CURSOR_DISCONTINUITY
+            );
+            assert!(
+                envelope["error"]
+                    .as_str()
+                    .is_some_and(|message| message.contains("cursor scope mismatch")),
+                "changed semantics must be rejected before polling: {envelope}"
+            );
+        }
+    }
+
+    #[test]
+    fn await_event_fails_closed_on_cursor_epoch_mismatch() {
+        let (_dir, db_path) = temp_db_path();
+        let _event_id = seed_event(db_path.as_ref().as_path());
+        let current_epoch = event_cursor_epoch(db_path.as_ref().as_path());
+        let stale_epoch = if current_epoch == "00000000000000000000000000000000" {
+            "11111111111111111111111111111111"
+        } else {
+            "00000000000000000000000000000000"
+        };
+        let cursor_scope = await_event_cursor_scope(
+            &["rule:codex.*"],
+            &[],
+            None,
+            false,
+            false,
+        );
+        let tool = WaAwaitEventTool::new(db_path);
+
+        let envelope = parse_json_content(
+            tool.call(
+                &test_mcp_context(),
+                serde_json::json!({
+                    "any": ["rule:codex.*"],
+                    "cursor": 0,
+                    "cursor_epoch": stale_epoch,
+                    "cursor_scope": cursor_scope,
+                    "timeout_secs": 1,
+                    "poll_interval_ms": 10
+                }),
+            )
+            .expect("stale cursor epoch should return a typed error envelope"),
+        );
+
+        assert_eq!(envelope["ok"], false);
+        assert_eq!(
+            envelope["error_code"],
+            super::MCP_ERR_CURSOR_DISCONTINUITY
+        );
+        assert!(
+            envelope["error"]
+                .as_str()
+                .is_some_and(|message| message.contains("different retention epoch")),
+            "epoch mismatch must be explicit: {envelope}"
+        );
+    }
+
+    #[test]
+    fn await_event_fails_closed_on_cursor_ahead_of_high_water() {
+        let (_dir, db_path) = temp_db_path();
+        let event_id = seed_event(db_path.as_ref().as_path());
+        let cursor_epoch = event_cursor_epoch(db_path.as_ref().as_path());
+        let cursor_scope = await_event_cursor_scope(
+            &["rule:codex.*"],
+            &[],
+            None,
+            false,
+            false,
+        );
+        let ahead_cursor = event_id + 1;
+        let tool = WaAwaitEventTool::new(db_path);
+
+        let envelope = parse_json_content(
+            tool.call(
+                &test_mcp_context(),
+                serde_json::json!({
+                    "any": ["rule:codex.*"],
+                    "cursor": ahead_cursor,
+                    "cursor_epoch": cursor_epoch,
+                    "cursor_scope": cursor_scope,
+                    "timeout_secs": 1,
+                    "poll_interval_ms": 10
+                }),
+            )
+            .expect("ahead cursor should return a typed error envelope"),
+        );
+
+        assert_eq!(envelope["ok"], false);
+        assert_eq!(
+            envelope["error_code"],
+            super::MCP_ERR_CURSOR_DISCONTINUITY
+        );
+        assert!(
+            envelope["error"]
+                .as_str()
+                .is_some_and(|message| message.contains("beyond the durable event high-water")),
+            "ahead cursor must be explicit: {envelope}"
+        );
+    }
+
+    #[test]
+    fn await_event_fails_closed_when_retention_pruned_resume_range() {
+        let (_dir, db_path) = temp_db_path();
+        let _event_id = seed_event(db_path.as_ref().as_path());
+        let cursor_epoch = event_cursor_epoch(db_path.as_ref().as_path());
+        let cursor_scope = await_event_cursor_scope(
+            &["rule:codex.*"],
+            &[],
+            None,
+            false,
+            false,
+        );
+        let runtime = CompatRuntimeBuilder::current_thread().build().unwrap();
+        runtime.block_on(async {
+            let storage = StorageHandle::new(&db_path.to_string_lossy()).await.unwrap();
+            assert_eq!(
+                storage
+                    .delete_events_before(1_700_000_000_001, 10)
+                    .await
+                    .unwrap(),
+                1
+            );
+            storage.shutdown().await.unwrap();
+        });
+        let tool = WaAwaitEventTool::new(db_path);
+
+        let envelope = parse_json_content(
+            tool.call(
+                &test_mcp_context(),
+                serde_json::json!({
+                    "any": ["rule:codex.*"],
+                    "cursor": 0,
+                    "cursor_epoch": cursor_epoch,
+                    "cursor_scope": cursor_scope,
+                    "timeout_secs": 1,
+                    "poll_interval_ms": 10
+                }),
+            )
+            .expect("pruned cursor should return a typed error envelope"),
+        );
+
+        assert_eq!(envelope["ok"], false);
+        assert_eq!(
+            envelope["error_code"],
+            super::MCP_ERR_CURSOR_DISCONTINUITY
+        );
+        assert!(
+            envelope["error"]
+                .as_str()
+                .is_some_and(|message| message.contains("retention deleted")),
+            "retention loss must be explicit: {envelope}"
+        );
+    }
+
+    #[test]
+    fn await_event_exact_resolution_classifies_an_unfiltered_handled_row() {
+        let (_dir, db_path) = temp_db_path();
+        let event_id = seed_event(db_path.as_ref().as_path());
+        let cursor_epoch = event_cursor_epoch(db_path.as_ref().as_path());
+        let cursor_scope = await_event_cursor_scope(
+            &["rule:codex.*"],
+            &[],
+            None,
+            true,
+            false,
+        );
+        let runtime = CompatRuntimeBuilder::current_thread().build().unwrap();
+        runtime.block_on(async {
+            let storage = StorageHandle::new(&db_path.to_string_lossy()).await.unwrap();
+            storage
+                .mark_event_handled(event_id, Some("test.workflow".to_string()), "handled")
+                .await
+                .unwrap();
+            let cx = crate::cx::Cx::for_testing();
+            assert!(matches!(
+                super::mcp_await_event_resolve_exact_event(
+                    &storage,
+                    &cx,
+                    event_id,
+                    &cursor_epoch,
+                    &cursor_scope,
+                )
+                .await
+                .unwrap(),
+                super::McpAwaitExactEventResolution::Handled
+            ));
+            storage.shutdown().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn await_event_ambiguity_error_preserves_committed_cursor_token() {
+        let error = super::mcp_await_event_ambiguous_exact_event_error(
+            12,
+            Some(7),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        );
+
+        assert_eq!(error.code, MCP_ERR_STORAGE);
+        assert!(error.message.contains("committed cursor remains 7"));
+        assert!(
+            error.hint.as_deref().is_some_and(|hint| {
+                hint.contains("cursor=7")
+                    && hint.contains("cursor_epoch=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+                    && hint.contains("cursor_scope=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+            }),
+            "ambiguity remediation must preserve the exact safe cursor token: {error:?}"
+        );
+    }
+
+    #[test]
     fn await_event_enforces_condition_set_bounds_without_relying_on_client_schema_validation() {
         let (_dir, db_path) = temp_db_path();
         let tool = WaAwaitEventTool::new(Arc::clone(&db_path));
@@ -10923,9 +12408,260 @@ mod tests {
     }
 
     #[test]
+    fn await_event_claim_commits_filtered_prefix_but_not_pending_candidate() {
+        let (_dir, db_path) = temp_db_path();
+        let event_ids = seed_events_with_rules(
+            db_path.as_ref().as_path(),
+            &["other.filtered", "codex.claim"],
+        );
+        let cursor_epoch = event_cursor_epoch(db_path.as_ref().as_path());
+        let cursor_scope = await_event_cursor_scope(
+            &["rule:codex.*"],
+            &[],
+            None,
+            false,
+            true,
+        );
+        let response_delivery = Arc::new(
+            super::FrameworkResponseDeliveryCoordinator::default(),
+        );
+        let tool = WaAwaitEventTool::new_with_response_delivery(
+            Arc::clone(&db_path),
+            Arc::clone(&response_delivery),
+        );
+
+        let envelope = parse_json_content(
+            tool.call(
+                &test_mcp_context(),
+                serde_json::json!({
+                    "any": ["rule:codex.*"],
+                    "cursor": 0,
+                    "cursor_epoch": cursor_epoch,
+                    "cursor_scope": cursor_scope,
+                    "timeout_secs": 1,
+                    "poll_interval_ms": 10,
+                    "claim": true
+                }),
+            )
+            .expect("claim should produce a pending-finalize response"),
+        );
+
+        assert_eq!(envelope["ok"], true, "unexpected envelope: {envelope}");
+        assert_eq!(envelope["data"]["satisfied"], true);
+        assert_eq!(envelope["data"]["final_cursor"], event_ids[0]);
+        assert_eq!(envelope["data"]["candidate_cursor"], event_ids[1]);
+        assert_eq!(envelope["data"]["pending_finalize"], true);
+        assert_eq!(envelope["data"]["final_cursor_epoch"], cursor_epoch);
+        assert_eq!(envelope["data"]["final_cursor_scope"], cursor_scope);
+        assert!(
+            envelope["data"]["final_cursor"].as_i64().unwrap()
+                < envelope["data"]["candidate_cursor"].as_i64().unwrap(),
+            "the durable cursor must remain strictly before the pending claimed event"
+        );
+
+        // No transport response is sent in this direct test, so release the
+        // prepared delivery instead of leaving its lease to expire.
+        response_delivery.fail_all();
+    }
+
+    #[test]
+    fn await_event_claim_timeout_without_candidate_has_no_pending_finalize_state() {
+        let (_dir, db_path) = temp_db_path();
+        let cursor_epoch = event_cursor_epoch(db_path.as_ref().as_path());
+        let cursor_scope = await_event_cursor_scope(
+            &["rule:never.matches"],
+            &[],
+            None,
+            false,
+            true,
+        );
+        let response_delivery = Arc::new(
+            super::FrameworkResponseDeliveryCoordinator::default(),
+        );
+        let tool = WaAwaitEventTool::new_with_response_delivery(
+            Arc::clone(&db_path),
+            Arc::clone(&response_delivery),
+        );
+
+        let envelope = parse_json_content(
+            tool.call(
+                &test_mcp_context(),
+                serde_json::json!({
+                    "any": ["rule:never.matches"],
+                    "cursor": 0,
+                    "cursor_epoch": cursor_epoch,
+                    "cursor_scope": cursor_scope,
+                    "timeout_secs": 1,
+                    "poll_interval_ms": 1_000,
+                    "claim": true
+                }),
+            )
+            .expect("empty claim await should return a timeout result"),
+        );
+
+        assert_eq!(envelope["ok"], true, "unexpected envelope: {envelope}");
+        assert_eq!(envelope["data"]["satisfied"], false);
+        assert_eq!(envelope["data"]["timed_out"], true);
+        assert_eq!(envelope["data"]["pending_finalize"], false);
+        assert_eq!(envelope["data"]["candidate_cursor"], serde_json::Value::Null);
+        assert_eq!(envelope["data"]["claim_delivery"], serde_json::Value::Null);
+        response_delivery.fail_all();
+    }
+
+    #[test]
+    fn await_event_finalize_ownership_loss_keeps_candidate_retryable() {
+        let (_dir, db_path) = temp_db_path();
+        let event_id = seed_event(db_path.as_ref().as_path());
+        let cursor_epoch = event_cursor_epoch(db_path.as_ref().as_path());
+        let cursor_scope = await_event_cursor_scope(
+            &["rule:codex.*"],
+            &[],
+            None,
+            false,
+            true,
+        );
+        let runtime = CompatRuntimeBuilder::current_thread().build().unwrap();
+        let (stale_lease, successor_lease) = runtime.block_on(async {
+            let storage = StorageHandle::new(&db_path.to_string_lossy()).await.unwrap();
+            let stale_lease = match storage
+                .reserve_event_delivery(event_id, std::time::Duration::from_millis(1))
+                .await
+                .unwrap()
+            {
+                crate::storage::EventDeliveryReservation::Acquired(lease) => lease,
+                other => panic!("expected initial lease, got {other:?}"),
+            };
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            let successor_lease = match storage
+                .reserve_event_delivery(event_id, std::time::Duration::from_secs(1))
+                .await
+                .unwrap()
+            {
+                crate::storage::EventDeliveryReservation::Acquired(lease) => lease,
+                other => panic!("expected expired lease takeover, got {other:?}"),
+            };
+            storage.shutdown().await.unwrap();
+            (stale_lease, successor_lease)
+        });
+
+        super::complete_mcp_await_event_deliveries(
+            Arc::clone(&db_path),
+            vec![stale_lease],
+            super::FrameworkResponseDeliveryOutcome::DeliveryAcknowledged,
+        );
+        runtime.block_on(async {
+            let storage = StorageHandle::new(&db_path.to_string_lossy()).await.unwrap();
+            assert!(storage.release_event_delivery(&successor_lease).await.unwrap());
+            storage.shutdown().await.unwrap();
+        });
+
+        let response_delivery = Arc::new(
+            super::FrameworkResponseDeliveryCoordinator::default(),
+        );
+        let tool = WaAwaitEventTool::new_with_response_delivery(
+            Arc::clone(&db_path),
+            Arc::clone(&response_delivery),
+        );
+        let envelope = parse_json_content(
+            tool.call(
+                &test_mcp_context(),
+                serde_json::json!({
+                    "any": ["rule:codex.*"],
+                    "cursor": 0,
+                    "cursor_epoch": cursor_epoch,
+                    "cursor_scope": cursor_scope,
+                    "timeout_secs": 1,
+                    "poll_interval_ms": 10,
+                    "claim": true
+                }),
+            )
+            .expect("event must remain retryable after stale-token finalization returns false"),
+        );
+        assert_eq!(envelope["ok"], true, "unexpected envelope: {envelope}");
+        assert_eq!(envelope["data"]["final_cursor"], 0);
+        assert_eq!(envelope["data"]["candidate_cursor"], event_id);
+        assert_eq!(envelope["data"]["pending_finalize"], true);
+        response_delivery.fail_all();
+    }
+
+    #[test]
+    fn await_event_finalize_storage_error_keeps_candidate_retryable_after_expiry() {
+        let (dir, db_path) = temp_db_path();
+        let event_id = seed_event(db_path.as_ref().as_path());
+        let cursor_epoch = event_cursor_epoch(db_path.as_ref().as_path());
+        let cursor_scope = await_event_cursor_scope(
+            &["rule:codex.*"],
+            &[],
+            None,
+            false,
+            true,
+        );
+        let runtime = CompatRuntimeBuilder::current_thread().build().unwrap();
+        let lease = runtime.block_on(async {
+            let storage = StorageHandle::new(&db_path.to_string_lossy()).await.unwrap();
+            let lease = match storage
+                .reserve_event_delivery(event_id, std::time::Duration::from_millis(1))
+                .await
+                .unwrap()
+            {
+                crate::storage::EventDeliveryReservation::Acquired(lease) => lease,
+                other => panic!("expected initial lease, got {other:?}"),
+            };
+            storage.shutdown().await.unwrap();
+            lease
+        });
+
+        // A directory cannot be opened as this SQLite database. The completion
+        // path must leave recovery to lease expiry rather than implying that
+        // the candidate became a durable cursor.
+        super::complete_mcp_await_event_deliveries(
+            Arc::new(dir.path().to_path_buf()),
+            vec![lease],
+            super::FrameworkResponseDeliveryOutcome::DeliveryAcknowledged,
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+
+        let response_delivery = Arc::new(
+            super::FrameworkResponseDeliveryCoordinator::default(),
+        );
+        let tool = WaAwaitEventTool::new_with_response_delivery(
+            Arc::clone(&db_path),
+            Arc::clone(&response_delivery),
+        );
+        let envelope = parse_json_content(
+            tool.call(
+                &test_mcp_context(),
+                serde_json::json!({
+                    "any": ["rule:codex.*"],
+                    "cursor": 0,
+                    "cursor_epoch": cursor_epoch,
+                    "cursor_scope": cursor_scope,
+                    "timeout_secs": 1,
+                    "poll_interval_ms": 10,
+                    "claim": true
+                }),
+            )
+            .expect("event must remain retryable after finalize storage failure and lease expiry"),
+        );
+        assert_eq!(envelope["ok"], true, "unexpected envelope: {envelope}");
+        assert_eq!(envelope["data"]["final_cursor"], 0);
+        assert_eq!(envelope["data"]["candidate_cursor"], event_id);
+        assert_eq!(envelope["data"]["pending_finalize"], true);
+        response_delivery.fail_all();
+    }
+
+    #[test]
     fn await_event_claim_direct_handler_dispatch_fails_closed_without_a_lease() {
         let (_dir, db_path) = temp_db_path();
         let event_id = seed_event(db_path.as_ref().as_path());
+        let cursor_epoch = event_cursor_epoch(db_path.as_ref().as_path());
+        let cursor_scope = await_event_cursor_scope(
+            &["rule:codex.*"],
+            &[],
+            None,
+            false,
+            true,
+        );
         let tool = WaAwaitEventTool::new(Arc::clone(&db_path));
 
         let envelope = parse_json_content(
@@ -10934,6 +12670,8 @@ mod tests {
                 serde_json::json!({
                     "any": ["rule:codex.*"],
                     "cursor": 0,
+                    "cursor_epoch": cursor_epoch,
+                    "cursor_scope": cursor_scope,
                     "timeout_secs": 1,
                     "poll_interval_ms": 10,
                     "claim": true
@@ -10980,7 +12718,7 @@ mod tests {
         let cx = crate::cx::Cx::for_testing();
         cx.set_cancel_requested(true);
         let context = McpContext::new(cx, 2);
-        let started = Instant::now();
+        let started = std::time::Instant::now();
 
         let envelope = parse_json_content(
             tool.call(
@@ -11025,7 +12763,7 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(100));
             cancel_cx.set_cancel_requested(true);
         });
-        let started = Instant::now();
+        let started = std::time::Instant::now();
 
         let envelope = parse_json_content(
             tool.call(
@@ -14852,6 +16590,62 @@ exit 17",
             !envelope.to_string().contains(&redaction_test_prefix()),
             "malformed wa.events args leaked the caller-supplied secret"
         );
+    }
+
+    #[test]
+    fn wa_events_rejects_negative_since_at_schema_and_handler_boundaries() {
+        let tool = WaEventsTool::new(db_path());
+        let definition = tool.definition();
+        assert_eq!(
+            definition.input_schema["properties"]["since"]["minimum"],
+            0
+        );
+
+        let envelope = parse_json_content(
+            tool.call(
+                &test_mcp_context(),
+                serde_json::json!({"since": -1}),
+            )
+            .expect("negative since should return an invalid-args envelope"),
+        );
+        assert_eq!(envelope["ok"], false);
+        assert_eq!(envelope["error_code"], MCP_ERR_INVALID_ARGS);
+        assert!(
+            envelope["error"]
+                .as_str()
+                .is_some_and(|message| message.contains("non-negative"))
+        );
+    }
+
+    #[test]
+    fn wa_events_identifies_its_non_resumable_snapshot_capability() {
+        let (_dir, db_path) = temp_db_path();
+        let _event_id = seed_event(db_path.as_ref().as_path());
+        let tool = WaEventsTool::new(db_path);
+        let definition = tool.definition();
+        assert!(
+            definition
+                .description
+                .as_deref()
+                .is_some_and(|description| {
+                    description.contains("non-resumable newest-first snapshot")
+                        && description.contains("wa.await_event")
+                })
+        );
+        assert!(definition.tags.contains(&"snapshot".to_string()));
+        assert!(!definition.tags.contains(&"robot".to_string()));
+
+        let envelope = parse_json_content(
+            tool.call(&test_mcp_context(), serde_json::json!({"limit": 1}))
+                .expect("wa.events snapshot should return an envelope"),
+        );
+        assert_eq!(envelope["ok"], true, "unexpected envelope: {envelope}");
+        assert_eq!(
+            envelope["data"]["cursor_capability"],
+            super::MCP_EVENTS_CURSOR_CAPABILITY
+        );
+        assert!(envelope["data"].get("final_cursor").is_none());
+        assert!(envelope["data"].get("cursor_epoch").is_none());
     }
 
     #[test]

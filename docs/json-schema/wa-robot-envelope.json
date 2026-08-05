@@ -89,6 +89,7 @@
         "robot.wezterm_parse_error",
         "robot.circuit_open",
         "robot.storage_error",
+        "robot.cursor_discontinuity",
         "robot.fts_query_error",
         "robot.policy_denied",
         "robot.require_approval",

@@ -1217,15 +1217,21 @@ fn setup_populated_workspace() -> (TempDir, String) {
 
     // Insert events (schema: pane_id, rule_id, agent_type, event_type, severity, confidence, detected_at)
     conn.execute(
-        "INSERT INTO events (pane_id, rule_id, agent_type, event_type, severity, confidence, matched_text, detected_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        "INSERT INTO events (id, pane_id, rule_id, agent_type, event_type, severity, confidence, matched_text, detected_at)
+         SELECT max_event_id + 1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8
+         FROM event_retention_state WHERE singleton = 1",
         rusqlite::params![1, "usage.high_tokens", "claude_code", "usage_warning", "warning", 0.9f64, "Token usage above 80%", 1_700_000_050_000i64],
     ).expect("insert event 1");
     conn.execute(
-        "INSERT INTO events (pane_id, rule_id, agent_type, event_type, severity, confidence, matched_text, detected_at, handled_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        "INSERT INTO events (id, pane_id, rule_id, agent_type, event_type, severity, confidence, matched_text, detected_at, handled_at)
+         SELECT max_event_id + 1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9
+         FROM event_retention_state WHERE singleton = 1",
         rusqlite::params![1, "compaction.stale", "codex", "compaction_warning", "info", 0.8f64, "Stale compaction detected", 1_700_000_040_000i64, 1_700_000_060_000i64],
     ).expect("insert event 2");
     conn.execute(
-        "INSERT INTO events (pane_id, rule_id, agent_type, event_type, severity, confidence, matched_text, detected_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        "INSERT INTO events (id, pane_id, rule_id, agent_type, event_type, severity, confidence, matched_text, detected_at)
+         SELECT max_event_id + 1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8
+         FROM event_retention_state WHERE singleton = 1",
         rusqlite::params![2, "error.panic", "unknown", "error_detected", "error", 0.95f64, "Panic in agent process", 1_700_000_090_000i64],
     ).expect("insert event 3");
 
