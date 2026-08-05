@@ -843,7 +843,9 @@ proptest! {
         prop_assert!(debug.len() < 16 * 1_024);
         if report.shards.len() > 16 {
             let omitted = report.shards.len() - 16;
-            prop_assert!(debug.contains(&format!("omitted_shards: {omitted}")));
+            // `prop_assert!` expands through `concat!`, so implicit format
+            // captures are ambiguous inside its condition on this toolchain.
+            prop_assert!(debug.contains(&format!("omitted_shards: {}", omitted)));
         }
     }
 
