@@ -483,6 +483,28 @@
       "description": "Long-poll DB-backed rule events with storage-authoritative scope-bound cursor tokens, optional transport-acknowledged claim leases, and an immediate checkpoint-only tail bootstrap. Live pane-state and quiescence conditions are not supported.",
       "input_schema": {
         "additionalProperties": false,
+        "anyOf": [
+          {
+            "properties": {
+              "any": {
+                "minItems": 1
+              }
+            },
+            "required": [
+              "any"
+            ]
+          },
+          {
+            "properties": {
+              "all": {
+                "minItems": 1
+              }
+            },
+            "required": [
+              "all"
+            ]
+          }
+        ],
         "dependentRequired": {
           "cursor": [
             "cursor_epoch",
@@ -497,9 +519,18 @@
             "cursor_epoch"
           ]
         },
+        "if": {
+          "properties": {
+            "checkpoint_only": {
+              "const": true
+            }
+          },
+          "required": [
+            "checkpoint_only"
+          ]
+        },
         "properties": {
           "all": {
-            "default": [],
             "description": "Every condition in this set must match; supported condition: rule:<glob>",
             "items": {
               "maxLength": 256,
@@ -510,7 +541,6 @@
             "type": "array"
           },
           "any": {
-            "default": [],
             "description": "At least one condition in this set must match; supported condition: rule:<glob>",
             "items": {
               "maxLength": 256,
@@ -581,6 +611,32 @@
             "default": false,
             "description": "Only consider unhandled events",
             "type": "boolean"
+          }
+        },
+        "then": {
+          "not": {
+            "anyOf": [
+              {
+                "required": [
+                  "cursor"
+                ]
+              },
+              {
+                "required": [
+                  "cursor_epoch"
+                ]
+              },
+              {
+                "required": [
+                  "cursor_scope"
+                ]
+              }
+            ]
+          },
+          "properties": {
+            "claim": {
+              "const": false
+            }
           }
         },
         "type": "object"

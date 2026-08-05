@@ -2,12 +2,15 @@
 
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
 #[cfg(all(test, unix))]
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
+#[cfg(test)]
+use frankenterm_sigpipe::catch_recoverable;
+use frankenterm_sigpipe::{RecoverablePanicSite, catch_recoverable_future};
 use serde::de::DeserializeOwned;
 
 use super::mcp_missions::mcp_save_mission_tx_contract_to_path;
@@ -92,8 +95,8 @@ use crate::robot_types::{
 };
 use crate::runtime_async::{CompatRuntime, RuntimeBuilder as CompatRuntimeBuilder};
 use crate::storage::{
-    EventDeliveryLease, EventDeliveryReservation, EventRetentionCheck, EventRetentionStatus,
-    EventStreamPage, EventStreamQuery,
+    EVENT_DELIVERY_LEASE_BULK_MAX, EventDeliveryLease, EventDeliveryReservation,
+    EventRetentionCheck, EventRetentionStatus, EventStreamPage, EventStreamQuery,
 };
 use crate::workflows::ManualWorkflowRunOutcome;
 
@@ -3942,7 +3945,7 @@ impl ToolHandler for WaSearchTool {
 }
 
 const MCP_AWAIT_EVENT_TIMEOUT_SECS_MIN: u64 = 1;
-pub(crate) const MCP_AWAIT_EVENT_TIMEOUT_SECS_MAX: u64 = 300;
+pub const MCP_AWAIT_EVENT_TIMEOUT_SECS_MAX: u64 = 300;
 const MCP_AWAIT_EVENT_POLL_INTERVAL_MS_MIN: u64 = 10;
 const MCP_AWAIT_EVENT_POLL_INTERVAL_MS_MAX: u64 = 30_000;
 const MCP_AWAIT_EVENT_CONDITION_SET_MAX: usize = 16;
@@ -3956,15 +3959,34 @@ const MCP_AWAIT_EVENT_CURSOR_SCOPE_DOMAIN: &[u8] =
     b"frankenterm.wa.await_event.cursor-scope.v1";
 const MCP_AWAIT_EVENT_CURSOR_SCOPE_QUIESCENCE_MODE: &[u8] =
     b"unsupported-db-events-only";
-pub(crate) const MCP_AWAIT_EVENT_DELIVERY_FINALIZE_GRACE_SECS: u64 = 30;
+pub const MCP_AWAIT_EVENT_DELIVERY_FINALIZE_GRACE_SECS: u64 = 30;
 const MCP_AWAIT_EVENT_CANCEL_POLL_INTERVAL: std::time::Duration =
     std::time::Duration::from_millis(50);
 const MCP_AWAIT_EVENT_CLAIM_WORKFLOW_ID: &str = "mcp.wa.await_event";
 const MCP_AWAIT_EVENT_CLAIM_STATUS: &str = "claimed";
-const MCP_AWAIT_EVENT_COMPLETION_WORKERS: usize = 2;
+#[cfg(test)]
+const MCP_AWAIT_EVENT_COMPLETION_WORKERS: usize = 1;
 const MCP_AWAIT_EVENT_COMPLETION_QUEUE_CAPACITY: usize = 64;
 const MCP_AWAIT_EVENT_COMPLETION_SHUTDOWN_POLL: std::time::Duration =
     std::time::Duration::from_millis(50);
+const MCP_AWAIT_EVENT_COMPLETION_RECONNECT_BACKOFF_MIN: std::time::Duration =
+    std::time::Duration::from_millis(50);
+const MCP_AWAIT_EVENT_COMPLETION_RECONNECT_BACKOFF_MAX: std::time::Duration =
+    std::time::Duration::from_secs(5);
+const MCP_AWAIT_EVENT_COMPLETION_STORAGE_SHUTDOWN_GRACE: std::time::Duration =
+    std::time::Duration::from_secs(5);
+#[cfg(not(test))]
+const MCP_AWAIT_EVENT_COMPLETION_EXECUTOR_DROP_GRACE: std::time::Duration =
+    std::time::Duration::from_secs(6);
+#[cfg(test)]
+const MCP_AWAIT_EVENT_COMPLETION_EXECUTOR_DROP_GRACE: std::time::Duration =
+    std::time::Duration::from_millis(250);
+#[cfg(test)]
+const MCP_AWAIT_EVENT_COMPLETION_BLOCKING_THREADS: usize = 1;
+const MCP_AWAIT_EVENT_REQUEST_ADMISSION_CAPACITY: u64 = 16;
+const MCP_AWAIT_EVENT_REQUEST_CONCURRENCY: usize = 8;
+const MCP_AWAIT_EVENT_SERVICE_RUNTIME_WORKERS: usize = 4;
+const MCP_AWAIT_EVENT_SERVICE_BLOCKING_THREADS: usize = 8;
 
 #[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3977,57 +3999,703 @@ enum McpAwaitEventIterationPhase {
 type McpAwaitEventIterationObserver =
     Arc<dyn Fn(McpAwaitEventIterationPhase, i64) + Send + Sync + 'static>;
 
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum McpAwaitEventCompletionBatchPhase {
+    BulkAttempt,
+    PerLeaseFallback,
+}
+
+#[cfg(test)]
+type McpAwaitEventCompletionBatchObserver =
+    Arc<dyn Fn(McpAwaitEventCompletionBatchPhase, usize) + Send + Sync + 'static>;
+
+#[cfg(test)]
+std::thread_local! {
+    static MCP_AWAIT_EVENT_COMPLETION_BATCH_OBSERVER:
+        RefCell<Option<McpAwaitEventCompletionBatchObserver>> = const { RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn set_mcp_await_event_completion_batch_observer(
+    observer: Option<McpAwaitEventCompletionBatchObserver>,
+) {
+    MCP_AWAIT_EVENT_COMPLETION_BATCH_OBSERVER.with(|slot| {
+        *slot.borrow_mut() = observer;
+    });
+}
+
+#[cfg(test)]
+fn observe_mcp_await_event_completion_batch(
+    phase: McpAwaitEventCompletionBatchPhase,
+    lease_count: usize,
+) {
+    let observer = MCP_AWAIT_EVENT_COMPLETION_BATCH_OBSERVER
+        .with(|slot| slot.borrow().as_ref().map(Arc::clone));
+    if let Some(observer) = observer {
+        // Do not hold the RefCell borrow across user-controlled test code: an
+        // observer may safely replace or clear itself without a re-entrant
+        // borrow panic.
+        observer(phase, lease_count);
+    }
+}
+
 struct McpAwaitEventDeliveryCompletionJob {
-    db_path: Arc<PathBuf>,
     leases: Vec<EventDeliveryLease>,
     outcome: FrameworkResponseDeliveryOutcome,
     enqueued_at: Instant,
 }
 
+fn try_enqueue_mcp_await_event_delivery_completion(
+    sender: &crossbeam::channel::Sender<McpAwaitEventDeliveryCompletionJob>,
+    leases: Vec<EventDeliveryLease>,
+    outcome: FrameworkResponseDeliveryOutcome,
+) -> bool {
+    if leases.is_empty() {
+        return true;
+    }
+    let job = McpAwaitEventDeliveryCompletionJob {
+        leases,
+        outcome,
+        enqueued_at: Instant::now(),
+    };
+    match sender.try_send(job) {
+        Ok(()) => true,
+        Err(crossbeam::channel::TrySendError::Full(job)) => {
+            tracing::error!(
+                delivery_count = job.leases.len(),
+                ?job.outcome,
+                queue_capacity = MCP_AWAIT_EVENT_COMPLETION_QUEUE_CAPACITY,
+                "MCP event-delivery completion queue saturated; lease expiry remains authoritative"
+            );
+            false
+        }
+        Err(crossbeam::channel::TrySendError::Disconnected(job)) => {
+            tracing::error!(
+                delivery_count = job.leases.len(),
+                ?job.outcome,
+                "MCP event-delivery completion queue disconnected; lease expiry remains authoritative"
+            );
+            false
+        }
+    }
+}
+
+type McpAwaitEventRequestResult = (
+    std::result::Result<McpAwaitEventData, McpToolError>,
+    Vec<EventDeliveryLease>,
+);
+
+struct McpAwaitEventRequestTaskOutput {
+    response: McpAwaitEventRequestResult,
+    storage_reusable: bool,
+}
+
+impl McpAwaitEventRequestTaskOutput {
+    fn new(
+        result: std::result::Result<McpAwaitEventData, McpToolError>,
+        delivery_leases: Vec<EventDeliveryLease>,
+        storage_reusable: bool,
+    ) -> Self {
+        Self {
+            response: (result, delivery_leases),
+            storage_reusable,
+        }
+    }
+}
+
+type McpAwaitEventRequestFuture = std::pin::Pin<
+    Box<dyn std::future::Future<Output = McpAwaitEventRequestTaskOutput> + Send + 'static>,
+>;
+type McpAwaitEventRequestOperation =
+    Box<dyn FnOnce(StorageHandle) -> McpAwaitEventRequestFuture + Send + 'static>;
+
+struct McpAwaitEventRequestAdmissionGuard {
+    admissions: Arc<AtomicU64>,
+}
+
+impl Drop for McpAwaitEventRequestAdmissionGuard {
+    fn drop(&mut self) {
+        if self
+            .admissions
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |admitted| {
+                admitted.checked_sub(1)
+            })
+            .is_err()
+        {
+            tracing::error!(
+                "MCP await request admission guard observed an invariant underflow; leaving the bounded count at zero"
+            );
+        }
+    }
+}
+
+struct McpAwaitEventRequestJob {
+    request_id: u64,
+    cx: crate::cx::Cx,
+    operation: McpAwaitEventRequestOperation,
+    reply: crossbeam::channel::Sender<McpAwaitEventRequestResult>,
+    reply_abandoned: Arc<std::sync::atomic::AtomicBool>,
+    _admission: McpAwaitEventRequestAdmissionGuard,
+    enqueued_at: Instant,
+}
+
+enum McpAwaitEventServiceTaskFinished {
+    Request {
+        request_id: u64,
+        storage_epoch: u64,
+        storage_reusable: bool,
+    },
+    Completion {
+        storage_epoch: u64,
+        storage_reusable: bool,
+    },
+}
+
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum McpAwaitEventCompletionWorkerPhase {
+    Starting = 0,
+    InitializingStorage = 1,
+    ReadyIdle = 2,
+    CompletingDelivery = 3,
+    ShuttingDownStorage = 4,
+    Stopped = 5,
+    ServingRequests = 6,
+}
+
+impl McpAwaitEventCompletionWorkerPhase {
+    fn load(phase: &AtomicU8) -> Self {
+        match phase.load(Ordering::Acquire) {
+            0 => Self::Starting,
+            1 => Self::InitializingStorage,
+            2 => Self::ReadyIdle,
+            3 => Self::CompletingDelivery,
+            4 => Self::ShuttingDownStorage,
+            5 => Self::Stopped,
+            6 => Self::ServingRequests,
+            _ => Self::ShuttingDownStorage,
+        }
+    }
+
+    fn store(self, phase: &AtomicU8) {
+        phase.store(self as u8, Ordering::Release);
+    }
+}
+
+#[cfg(test)]
 type McpAwaitEventDeliveryCompletionHandler =
     Arc<dyn Fn(McpAwaitEventDeliveryCompletionJob) + Send + Sync + 'static>;
 
-/// Bounded blocking lane for post-transport lease completion.
+#[derive(Default)]
+struct McpAwaitEventDeliveryCompletionStats {
+    worker_starts: AtomicU64,
+    worker_stops: AtomicU64,
+    worker_handoffs: AtomicU64,
+    worker_initialization_handoffs: AtomicU64,
+    worker_completion_handoffs: AtomicU64,
+    worker_request_handoffs: AtomicU64,
+    worker_shutdown_handoffs: AtomicU64,
+    runtime_initializations: AtomicU64,
+    storage_initialization_attempts: AtomicU64,
+    #[cfg(test)]
+    storage_initialization_stalls: AtomicU64,
+    storage_initialization_failures: AtomicU64,
+    storage_initializations: AtomicU64,
+    storage_readiness_publications: AtomicU64,
+    storage_shutdowns: AtomicU64,
+    storage_shutdown_failures: AtomicU64,
+    storage_reconnects: AtomicU64,
+    reconnect_backoff_waits: AtomicU64,
+    reconnect_backoff_ms_total: AtomicU64,
+    completion_batches: AtomicU64,
+    completion_attempts_finished: AtomicU64,
+    completion_attempts_storage_reusable: AtomicU64,
+    completion_attempts_storage_unusable: AtomicU64,
+    completion_panics: AtomicU64,
+    #[cfg(test)]
+    completion_stalls: AtomicU64,
+    completion_jobs: AtomicU64,
+    completion_leases: AtomicU64,
+    coalesced_jobs: AtomicU64,
+    claim_admission_rejections_unready: AtomicU64,
+    request_admissions: AtomicU64,
+    request_admission_rejections_unready: AtomicU64,
+    request_admission_rejections_saturated: AtomicU64,
+    request_jobs_started: AtomicU64,
+    request_jobs_finished: AtomicU64,
+    request_jobs_cancelled_for_epoch: AtomicU64,
+    request_jobs_cancelled_for_shutdown: AtomicU64,
+    request_jobs_rejected_for_epoch: AtomicU64,
+    request_jobs_rejected_for_shutdown: AtomicU64,
+    request_jobs_rejected_cancelled: AtomicU64,
+    request_waiter_cancellations: AtomicU64,
+    request_panics: AtomicU64,
+    active_requests: AtomicU64,
+    active_requests_high_water: AtomicU64,
+    request_queue_delay_us_max: AtomicU64,
+    request_execution_us_total: AtomicU64,
+    request_execution_us_max: AtomicU64,
+    completion_schedule_delay_ms_max: AtomicU64,
+}
+
+impl McpAwaitEventDeliveryCompletionStats {
+    fn record_completion_batch(&self, job_count: usize, lease_count: usize) {
+        self.completion_batches.fetch_add(1, Ordering::Relaxed);
+        self.completion_jobs.fetch_add(
+            u64::try_from(job_count).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        self.completion_leases.fetch_add(
+            u64::try_from(lease_count).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        self.coalesced_jobs.fetch_add(
+            u64::try_from(job_count.saturating_sub(1)).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+    }
+
+    fn record_reconnect_backoff(&self, wait: std::time::Duration) {
+        self.reconnect_backoff_waits.fetch_add(1, Ordering::Relaxed);
+        self.reconnect_backoff_ms_total.fetch_add(
+            u64::try_from(wait.as_millis()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+    }
+
+    fn record_active_requests(&self, active: usize) {
+        let active = u64::try_from(active).unwrap_or(u64::MAX);
+        self.active_requests.store(active, Ordering::Relaxed);
+        self.active_requests_high_water
+            .fetch_max(active, Ordering::Relaxed);
+    }
+
+    fn record_request_timing(
+        &self,
+        queue_delay: std::time::Duration,
+        execution: std::time::Duration,
+    ) {
+        let queue_delay_us = u64::try_from(queue_delay.as_micros()).unwrap_or(u64::MAX);
+        let execution_us = u64::try_from(execution.as_micros()).unwrap_or(u64::MAX);
+        self.request_queue_delay_us_max
+            .fetch_max(queue_delay_us, Ordering::Relaxed);
+        self.request_execution_us_total
+            .fetch_add(execution_us, Ordering::Relaxed);
+        self.request_execution_us_max
+            .fetch_max(execution_us, Ordering::Relaxed);
+    }
+
+    fn record_completion_schedule_delay(&self, delay: std::time::Duration) {
+        self.completion_schedule_delay_ms_max.fetch_max(
+            u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+    }
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct McpAwaitEventDeliveryCompletionStatsSnapshot {
+    worker_starts: u64,
+    worker_stops: u64,
+    worker_handoffs: u64,
+    worker_initialization_handoffs: u64,
+    worker_completion_handoffs: u64,
+    worker_request_handoffs: u64,
+    worker_shutdown_handoffs: u64,
+    runtime_initializations: u64,
+    storage_initialization_attempts: u64,
+    storage_initialization_stalls: u64,
+    storage_initialization_failures: u64,
+    storage_initializations: u64,
+    storage_readiness_publications: u64,
+    storage_shutdowns: u64,
+    storage_shutdown_failures: u64,
+    storage_reconnects: u64,
+    reconnect_backoff_waits: u64,
+    reconnect_backoff_ms_total: u64,
+    completion_batches: u64,
+    completion_attempts_finished: u64,
+    completion_attempts_storage_reusable: u64,
+    completion_attempts_storage_unusable: u64,
+    completion_panics: u64,
+    completion_stalls: u64,
+    completion_jobs: u64,
+    completion_leases: u64,
+    coalesced_jobs: u64,
+    claim_admission_rejections_unready: u64,
+    request_admissions: u64,
+    request_admission_rejections_unready: u64,
+    request_admission_rejections_saturated: u64,
+    request_jobs_started: u64,
+    request_jobs_finished: u64,
+    request_jobs_cancelled_for_epoch: u64,
+    request_jobs_cancelled_for_shutdown: u64,
+    request_jobs_rejected_for_epoch: u64,
+    request_jobs_rejected_for_shutdown: u64,
+    request_jobs_rejected_cancelled: u64,
+    request_waiter_cancellations: u64,
+    request_panics: u64,
+    active_requests: u64,
+    active_requests_high_water: u64,
+    request_queue_delay_us_max: u64,
+    request_execution_us_total: u64,
+    request_execution_us_max: u64,
+    completion_schedule_delay_ms_max: u64,
+}
+
+#[cfg(test)]
+impl McpAwaitEventDeliveryCompletionStats {
+    fn snapshot(&self) -> McpAwaitEventDeliveryCompletionStatsSnapshot {
+        McpAwaitEventDeliveryCompletionStatsSnapshot {
+            worker_starts: self.worker_starts.load(Ordering::Relaxed),
+            worker_stops: self.worker_stops.load(Ordering::Relaxed),
+            worker_handoffs: self.worker_handoffs.load(Ordering::Relaxed),
+            worker_initialization_handoffs: self
+                .worker_initialization_handoffs
+                .load(Ordering::Relaxed),
+            worker_completion_handoffs: self
+                .worker_completion_handoffs
+                .load(Ordering::Relaxed),
+            worker_request_handoffs: self.worker_request_handoffs.load(Ordering::Relaxed),
+            worker_shutdown_handoffs: self
+                .worker_shutdown_handoffs
+                .load(Ordering::Relaxed),
+            runtime_initializations: self.runtime_initializations.load(Ordering::Relaxed),
+            storage_initialization_attempts: self
+                .storage_initialization_attempts
+                .load(Ordering::Relaxed),
+            storage_initialization_stalls: self
+                .storage_initialization_stalls
+                .load(Ordering::Relaxed),
+            storage_initialization_failures: self
+                .storage_initialization_failures
+                .load(Ordering::Relaxed),
+            storage_initializations: self.storage_initializations.load(Ordering::Relaxed),
+            storage_readiness_publications: self
+                .storage_readiness_publications
+                .load(Ordering::Relaxed),
+            storage_shutdowns: self.storage_shutdowns.load(Ordering::Relaxed),
+            storage_shutdown_failures: self.storage_shutdown_failures.load(Ordering::Relaxed),
+            storage_reconnects: self.storage_reconnects.load(Ordering::Relaxed),
+            reconnect_backoff_waits: self.reconnect_backoff_waits.load(Ordering::Relaxed),
+            reconnect_backoff_ms_total: self.reconnect_backoff_ms_total.load(Ordering::Relaxed),
+            completion_batches: self.completion_batches.load(Ordering::Relaxed),
+            completion_attempts_finished: self
+                .completion_attempts_finished
+                .load(Ordering::Relaxed),
+            completion_attempts_storage_reusable: self
+                .completion_attempts_storage_reusable
+                .load(Ordering::Relaxed),
+            completion_attempts_storage_unusable: self
+                .completion_attempts_storage_unusable
+                .load(Ordering::Relaxed),
+            completion_panics: self.completion_panics.load(Ordering::Relaxed),
+            completion_stalls: self.completion_stalls.load(Ordering::Relaxed),
+            completion_jobs: self.completion_jobs.load(Ordering::Relaxed),
+            completion_leases: self.completion_leases.load(Ordering::Relaxed),
+            coalesced_jobs: self.coalesced_jobs.load(Ordering::Relaxed),
+            claim_admission_rejections_unready: self
+                .claim_admission_rejections_unready
+                .load(Ordering::Relaxed),
+            request_admissions: self.request_admissions.load(Ordering::Relaxed),
+            request_admission_rejections_unready: self
+                .request_admission_rejections_unready
+                .load(Ordering::Relaxed),
+            request_admission_rejections_saturated: self
+                .request_admission_rejections_saturated
+                .load(Ordering::Relaxed),
+            request_jobs_started: self.request_jobs_started.load(Ordering::Relaxed),
+            request_jobs_finished: self.request_jobs_finished.load(Ordering::Relaxed),
+            request_jobs_cancelled_for_epoch: self
+                .request_jobs_cancelled_for_epoch
+                .load(Ordering::Relaxed),
+            request_jobs_cancelled_for_shutdown: self
+                .request_jobs_cancelled_for_shutdown
+                .load(Ordering::Relaxed),
+            request_jobs_rejected_for_epoch: self
+                .request_jobs_rejected_for_epoch
+                .load(Ordering::Relaxed),
+            request_jobs_rejected_for_shutdown: self
+                .request_jobs_rejected_for_shutdown
+                .load(Ordering::Relaxed),
+            request_jobs_rejected_cancelled: self
+                .request_jobs_rejected_cancelled
+                .load(Ordering::Relaxed),
+            request_waiter_cancellations: self
+                .request_waiter_cancellations
+                .load(Ordering::Relaxed),
+            request_panics: self.request_panics.load(Ordering::Relaxed),
+            active_requests: self.active_requests.load(Ordering::Relaxed),
+            active_requests_high_water: self
+                .active_requests_high_water
+                .load(Ordering::Relaxed),
+            request_queue_delay_us_max: self
+                .request_queue_delay_us_max
+                .load(Ordering::Relaxed),
+            request_execution_us_total: self
+                .request_execution_us_total
+                .load(Ordering::Relaxed),
+            request_execution_us_max: self
+                .request_execution_us_max
+                .load(Ordering::Relaxed),
+            completion_schedule_delay_ms_max: self
+                .completion_schedule_delay_ms_max
+                .load(Ordering::Relaxed),
+        }
+    }
+}
+
+struct McpAwaitEventActiveCxGuard<'a> {
+    slot: &'a std::sync::Mutex<Option<crate::cx::Cx>>,
+}
+
+impl<'a> McpAwaitEventActiveCxGuard<'a> {
+    fn install(
+        slot: &'a std::sync::Mutex<Option<crate::cx::Cx>>,
+        cx: &crate::cx::Cx,
+    ) -> Self {
+        *slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(cx.clone());
+        Self { slot }
+    }
+}
+
+impl Drop for McpAwaitEventActiveCxGuard<'_> {
+    fn drop(&mut self) {
+        *self
+            .slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    }
+}
+
+struct McpAwaitEventCompletionWorkerLifecycleGuard<'a> {
+    ready: &'a std::sync::atomic::AtomicBool,
+    phase: &'a AtomicU8,
+    stats: &'a McpAwaitEventDeliveryCompletionStats,
+}
+
+impl Drop for McpAwaitEventCompletionWorkerLifecycleGuard<'_> {
+    fn drop(&mut self) {
+        self.ready
+            .store(false, std::sync::atomic::Ordering::Release);
+        McpAwaitEventCompletionWorkerPhase::Stopped.store(self.phase);
+        self.stats.worker_stops.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Server-owned, bounded service for `wa.await_event` requests and completion.
 ///
-/// SQLite completion must never run inline in the sequential MCP transport's
-/// `send` callback: a busy database can otherwise freeze every subsequent MCP
-/// request for the full finalize deadline. Two fixed workers are intentional;
-/// adding CPU-count workers only increases contention on the SQLite writer.
+/// One dedicated coordinator owns one multi-thread asupersync runtime for the
+/// server lifetime and one `StorageHandle` writer per healthy database epoch.
+/// Ordinary long polls and post-transport lease completion use separate bounded
+/// admission classes and run concurrently on that runtime. Completion has its
+/// own one-at-a-time slot, so saturated long polls cannot delay its scheduling;
+/// request admission remains capped independently to bound memory and writer
+/// contention. No request or completion callback opens a competing MCP writer.
 struct McpAwaitEventDeliveryCompletionExecutor {
     sender: crossbeam::channel::Sender<McpAwaitEventDeliveryCompletionJob>,
+    request_sender: crossbeam::channel::Sender<McpAwaitEventRequestJob>,
+    request_admissions: Arc<AtomicU64>,
+    request_sequence: AtomicU64,
     shutdown: Arc<std::sync::atomic::AtomicBool>,
+    ready: Arc<std::sync::atomic::AtomicBool>,
+    phase: Arc<AtomicU8>,
+    lifecycle_gate: Arc<std::sync::Mutex<()>>,
+    active_completion_cx: Arc<std::sync::Mutex<Option<crate::cx::Cx>>>,
+    active_request_cxs: Arc<std::sync::Mutex<std::collections::HashMap<u64, crate::cx::Cx>>>,
+    stats: Arc<McpAwaitEventDeliveryCompletionStats>,
     workers: Vec<std::thread::JoinHandle<()>>,
 }
 
 impl McpAwaitEventDeliveryCompletionExecutor {
-    fn new() -> std::io::Result<Self> {
-        Self::new_with_handler(Arc::new(|job| {
-            let queue_delay = job.enqueued_at.elapsed();
-            tracing::debug!(
-                queue_delay_ms = u64::try_from(queue_delay.as_millis()).unwrap_or(u64::MAX),
-                delivery_count = job.leases.len(),
-                ?job.outcome,
-                "Processing queued MCP event-delivery completion"
-            );
-            complete_mcp_await_event_deliveries(job.db_path, job.leases, job.outcome);
-        }))
+    fn new(db_path: Arc<PathBuf>) -> std::io::Result<Self> {
+        Self::new_production(
+            db_path,
+            #[cfg(test)]
+            0,
+            #[cfg(test)]
+            0,
+            #[cfg(test)]
+            None,
+            #[cfg(test)]
+            None,
+        )
     }
 
+    fn new_production(
+        db_path: Arc<PathBuf>,
+        #[cfg(test)] synthetic_storage_init_failures: u64,
+        #[cfg(test)] synthetic_storage_epoch_failures: u64,
+        #[cfg(test)] synthetic_storage_init_stall: Option<Arc<std::sync::atomic::AtomicBool>>,
+        #[cfg(test)] synthetic_completion_stall: Option<Arc<std::sync::atomic::AtomicBool>>,
+    ) -> std::io::Result<Self> {
+        let (sender, receiver): (
+            crossbeam::channel::Sender<McpAwaitEventDeliveryCompletionJob>,
+            crossbeam::channel::Receiver<McpAwaitEventDeliveryCompletionJob>,
+        ) = crossbeam::channel::bounded(MCP_AWAIT_EVENT_COMPLETION_QUEUE_CAPACITY);
+        let (request_sender, request_receiver): (
+            crossbeam::channel::Sender<McpAwaitEventRequestJob>,
+            crossbeam::channel::Receiver<McpAwaitEventRequestJob>,
+        ) = crossbeam::channel::bounded(
+            usize::try_from(MCP_AWAIT_EVENT_REQUEST_ADMISSION_CAPACITY)
+                .unwrap_or(usize::MAX),
+        );
+        let request_admissions = Arc::new(AtomicU64::new(0));
+        let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let phase = Arc::new(AtomicU8::new(
+            McpAwaitEventCompletionWorkerPhase::Starting as u8,
+        ));
+        let lifecycle_gate = Arc::new(std::sync::Mutex::new(()));
+        let active_completion_cx = Arc::new(std::sync::Mutex::new(None));
+        let active_request_cxs = Arc::new(std::sync::Mutex::new(
+            std::collections::HashMap::new(),
+        ));
+        let stats = Arc::new(McpAwaitEventDeliveryCompletionStats::default());
+        #[cfg(test)]
+        let synthetic_storage_init_failures = Arc::new(AtomicU64::new(
+            synthetic_storage_init_failures,
+        ));
+        #[cfg(test)]
+        let synthetic_storage_epoch_failures =
+            Arc::new(AtomicU64::new(synthetic_storage_epoch_failures));
+
+        let worker_receiver = receiver.clone();
+        let worker_completion_sender = sender.clone();
+        let worker_request_receiver = request_receiver.clone();
+        let worker_shutdown = Arc::clone(&shutdown);
+        let worker_ready = Arc::clone(&ready);
+        let worker_phase = Arc::clone(&phase);
+        let worker_lifecycle_gate = Arc::clone(&lifecycle_gate);
+        let worker_active_completion_cx = Arc::clone(&active_completion_cx);
+        let worker_active_request_cxs = Arc::clone(&active_request_cxs);
+        let worker_stats = Arc::clone(&stats);
+        let worker_db_path = Arc::clone(&db_path);
+        #[cfg(test)]
+        let worker_synthetic_storage_init_failures =
+            Arc::clone(&synthetic_storage_init_failures);
+        #[cfg(test)]
+        let worker_synthetic_storage_epoch_failures =
+            Arc::clone(&synthetic_storage_epoch_failures);
+        #[cfg(test)]
+        let worker_synthetic_storage_init_stall = synthetic_storage_init_stall;
+        #[cfg(test)]
+        let worker_synthetic_completion_stall = synthetic_completion_stall;
+        let worker = std::thread::Builder::new()
+            .name("ft-mcp-await-service-0".to_string())
+            .spawn(move || {
+                run_mcp_await_event_delivery_completion_worker(
+                    worker_receiver,
+                    worker_completion_sender,
+                    worker_request_receiver,
+                    worker_shutdown,
+                    worker_ready,
+                    worker_phase,
+                    worker_lifecycle_gate,
+                    worker_active_completion_cx,
+                    worker_active_request_cxs,
+                    worker_stats,
+                    worker_db_path,
+                    #[cfg(test)]
+                    worker_synthetic_storage_init_failures,
+                    #[cfg(test)]
+                    worker_synthetic_storage_epoch_failures,
+                    #[cfg(test)]
+                    worker_synthetic_storage_init_stall,
+                    #[cfg(test)]
+                    worker_synthetic_completion_stall,
+                );
+            })?;
+
+        Ok(Self {
+            sender,
+            request_sender,
+            request_admissions,
+            request_sequence: AtomicU64::new(1),
+            shutdown,
+            ready,
+            phase,
+            lifecycle_gate,
+            active_completion_cx,
+            active_request_cxs,
+            stats,
+            workers: vec![worker],
+        })
+    }
+
+    #[cfg(test)]
+    fn new_with_storage_init_failures_for_test(
+        db_path: Arc<PathBuf>,
+        synthetic_storage_init_failures: u64,
+    ) -> std::io::Result<Self> {
+        Self::new_production(db_path, synthetic_storage_init_failures, 0, None, None)
+    }
+
+    #[cfg(test)]
+    fn new_with_storage_epoch_failures_for_test(
+        db_path: Arc<PathBuf>,
+        synthetic_storage_epoch_failures: u64,
+    ) -> std::io::Result<Self> {
+        Self::new_production(db_path, 0, synthetic_storage_epoch_failures, None, None)
+    }
+
+    #[cfg(test)]
+    fn new_with_storage_init_stall_for_test(
+        db_path: Arc<PathBuf>,
+        synthetic_storage_init_stall: Arc<std::sync::atomic::AtomicBool>,
+    ) -> std::io::Result<Self> {
+        Self::new_production(db_path, 0, 0, Some(synthetic_storage_init_stall), None)
+    }
+
+    #[cfg(test)]
+    fn new_with_completion_stall_for_test(
+        db_path: Arc<PathBuf>,
+        synthetic_completion_stall: Arc<std::sync::atomic::AtomicBool>,
+    ) -> std::io::Result<Self> {
+        Self::new_production(db_path, 0, 0, None, Some(synthetic_completion_stall))
+    }
+
+    #[cfg(test)]
     fn new_with_handler(handler: McpAwaitEventDeliveryCompletionHandler) -> std::io::Result<Self> {
         let (sender, receiver): (
             crossbeam::channel::Sender<McpAwaitEventDeliveryCompletionJob>,
             crossbeam::channel::Receiver<McpAwaitEventDeliveryCompletionJob>,
         ) = crossbeam::channel::bounded(MCP_AWAIT_EVENT_COMPLETION_QUEUE_CAPACITY);
+        let (request_sender, _request_receiver): (
+            crossbeam::channel::Sender<McpAwaitEventRequestJob>,
+            crossbeam::channel::Receiver<McpAwaitEventRequestJob>,
+        ) = crossbeam::channel::bounded(
+            usize::try_from(MCP_AWAIT_EVENT_REQUEST_ADMISSION_CAPACITY)
+                .unwrap_or(usize::MAX),
+        );
+        let request_admissions = Arc::new(AtomicU64::new(0));
         let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ready = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let phase = Arc::new(AtomicU8::new(
+            McpAwaitEventCompletionWorkerPhase::ReadyIdle as u8,
+        ));
+        let lifecycle_gate = Arc::new(std::sync::Mutex::new(()));
+        let active_completion_cx = Arc::new(std::sync::Mutex::new(None));
+        let active_request_cxs = Arc::new(std::sync::Mutex::new(
+            std::collections::HashMap::new(),
+        ));
+        let stats = Arc::new(McpAwaitEventDeliveryCompletionStats::default());
         let mut workers = Vec::with_capacity(MCP_AWAIT_EVENT_COMPLETION_WORKERS);
 
         for worker_index in 0..MCP_AWAIT_EVENT_COMPLETION_WORKERS {
             let worker_receiver = receiver.clone();
             let worker_shutdown = Arc::clone(&shutdown);
             let worker_handler = Arc::clone(&handler);
+            let worker_stats = Arc::clone(&stats);
+            let worker_phase = Arc::clone(&phase);
             let spawn_result = std::thread::Builder::new()
                 .name(format!("ft-mcp-claim-completion-{worker_index}"))
                 .spawn(move || {
+                    worker_stats.worker_starts.fetch_add(1, Ordering::Relaxed);
                     while !worker_shutdown.load(std::sync::atomic::Ordering::Acquire) {
                         match worker_receiver.recv_timeout(
                             MCP_AWAIT_EVENT_COMPLETION_SHUTDOWN_POLL,
@@ -4043,22 +4711,33 @@ impl McpAwaitEventDeliveryCompletionExecutor {
                                 }
                                 let delivery_count = job.leases.len();
                                 let outcome = job.outcome;
-                                if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                    worker_handler(job);
-                                }))
+                                McpAwaitEventCompletionWorkerPhase::CompletingDelivery
+                                    .store(&worker_phase);
+                                if catch_recoverable(
+                                    RecoverablePanicSite::McpEventDeliveryCompletion,
+                                    std::panic::AssertUnwindSafe(|| worker_handler(job)),
+                                )
                                 .is_err()
                                 {
+                                    worker_stats
+                                        .completion_panics
+                                        .fetch_add(1, Ordering::Relaxed);
                                     tracing::error!(
                                         delivery_count,
                                         ?outcome,
+                                        panic_site = RecoverablePanicSite::McpEventDeliveryCompletion.as_str(),
                                         "MCP event-delivery completion handler panicked; lease expiry remains authoritative"
                                     );
                                 }
+                                McpAwaitEventCompletionWorkerPhase::ReadyIdle
+                                    .store(&worker_phase);
                             }
                             Err(crossbeam::channel::RecvTimeoutError::Timeout) => {}
                             Err(crossbeam::channel::RecvTimeoutError::Disconnected) => break,
                         }
                     }
+                    McpAwaitEventCompletionWorkerPhase::Stopped.store(&worker_phase);
+                    worker_stats.worker_stops.fetch_add(1, Ordering::Relaxed);
                 });
             match spawn_result {
                 Ok(worker) => workers.push(worker),
@@ -4079,60 +4758,1066 @@ impl McpAwaitEventDeliveryCompletionExecutor {
 
         Ok(Self {
             sender,
+            request_sender,
+            request_admissions,
+            request_sequence: AtomicU64::new(1),
             shutdown,
+            ready,
+            phase,
+            lifecycle_gate,
+            active_completion_cx,
+            active_request_cxs,
+            stats,
             workers,
         })
     }
 
+    fn is_ready(&self) -> bool {
+        self.ready.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn wake_workers(&self) {
+        for worker in &self.workers {
+            worker.thread().unpark();
+        }
+    }
+
+    fn begin_shutdown(&self) {
+        {
+            let _lifecycle_guard = self
+                .lifecycle_gate
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            self.shutdown.store(true, Ordering::Release);
+            self.ready.store(false, Ordering::Release);
+        }
+        self.wake_workers();
+    }
+
+    fn record_unready_claim_admission(&self) {
+        self.stats
+            .claim_admission_rejections_unready
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn execute_request(
+        &self,
+        cx: crate::cx::Cx,
+        operation: McpAwaitEventRequestOperation,
+    ) -> std::result::Result<McpAwaitEventRequestResult, McpToolError> {
+        let lifecycle_guard = self
+            .lifecycle_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.shutdown.load(Ordering::Acquire) || !self.is_ready() {
+            self.stats
+                .request_admission_rejections_unready
+                .fetch_add(1, Ordering::Relaxed);
+            return Err(mcp_await_event_service_unready_error());
+        }
+
+        if self
+            .request_admissions
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |admitted| {
+                (admitted < MCP_AWAIT_EVENT_REQUEST_ADMISSION_CAPACITY)
+                    .then(|| admitted.saturating_add(1))
+            })
+            .is_err()
+        {
+            self.stats
+                .request_admission_rejections_saturated
+                .fetch_add(1, Ordering::Relaxed);
+            return Err(mcp_await_event_service_saturated_error());
+        }
+        let request_id = self.request_sequence.fetch_add(1, Ordering::Relaxed);
+        let (reply, response) = crossbeam::channel::bounded(1);
+        let reply_abandoned = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let response_cx = cx.clone();
+        let job = McpAwaitEventRequestJob {
+            request_id,
+            cx,
+            operation,
+            reply,
+            reply_abandoned: Arc::clone(&reply_abandoned),
+            _admission: McpAwaitEventRequestAdmissionGuard {
+                admissions: Arc::clone(&self.request_admissions),
+            },
+            enqueued_at: Instant::now(),
+        };
+        let send_result = self.request_sender.try_send(job);
+        drop(lifecycle_guard);
+
+        match send_result {
+            Ok(()) => {
+                self.stats
+                    .request_admissions
+                    .fetch_add(1, Ordering::Relaxed);
+                self.wake_workers();
+                loop {
+                    match response.recv_timeout(MCP_AWAIT_EVENT_CANCEL_POLL_INTERVAL) {
+                        Ok(output) => break Ok(output),
+                        Err(crossbeam::channel::RecvTimeoutError::Disconnected) => {
+                            break Err(mcp_await_event_service_disconnected_error());
+                        }
+                        Err(crossbeam::channel::RecvTimeoutError::Timeout) => {
+                            let Err(cancellation) = mcp_await_event_checkpoint(&response_cx)
+                            else {
+                                continue;
+                            };
+                            reply_abandoned.store(true, Ordering::Release);
+                            self.stats
+                                .request_waiter_cancellations
+                                .fetch_add(1, Ordering::Relaxed);
+                            self.wake_workers();
+                            if let Ok((_result, leases)) = response.try_recv() {
+                                let _queued = self.try_submit(
+                                    leases,
+                                    FrameworkResponseDeliveryOutcome::Failed,
+                                );
+                            }
+                            break Ok((
+                                Err(McpToolError::from_error(cancellation)),
+                                Vec::new(),
+                            ));
+                        }
+                    }
+                }
+            }
+            Err(crossbeam::channel::TrySendError::Full(_job)) => {
+                self.stats
+                    .request_admission_rejections_saturated
+                    .fetch_add(1, Ordering::Relaxed);
+                Err(mcp_await_event_service_saturated_error())
+            }
+            Err(crossbeam::channel::TrySendError::Disconnected(_job)) => {
+                Err(mcp_await_event_service_disconnected_error())
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn stats_for_test(&self) -> Arc<McpAwaitEventDeliveryCompletionStats> {
+        Arc::clone(&self.stats)
+    }
+
+    #[cfg(test)]
+    fn wait_until_ready_for_test(&self, timeout: std::time::Duration) -> bool {
+        let started = Instant::now();
+        while !self.is_ready() {
+            if started.elapsed() >= timeout {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        true
+    }
+
     /// Queue completion without ever waiting for worker or SQLite capacity.
-    /// A full/disconnected lane deliberately leaves leases untouched: their
+    /// Jobs already admitted while the storage epoch was healthy remain queued
+    /// across a reconnect, closing the readiness-check/enqueue race. A
+    /// full/disconnected lane deliberately leaves leases untouched: their
     /// durable TTL is the fail-safe authority and makes the events retryable.
     fn try_submit(
         &self,
-        db_path: Arc<PathBuf>,
         leases: Vec<EventDeliveryLease>,
         outcome: FrameworkResponseDeliveryOutcome,
     ) -> bool {
-        if leases.is_empty() {
-            return true;
-        }
-        let job = McpAwaitEventDeliveryCompletionJob {
-            db_path,
+        let queued = try_enqueue_mcp_await_event_delivery_completion(
+            &self.sender,
             leases,
             outcome,
-            enqueued_at: Instant::now(),
-        };
-        match self.sender.try_send(job) {
-            Ok(()) => true,
-            Err(crossbeam::channel::TrySendError::Full(job)) => {
-                tracing::error!(
-                    delivery_count = job.leases.len(),
-                    ?job.outcome,
-                    queue_capacity = MCP_AWAIT_EVENT_COMPLETION_QUEUE_CAPACITY,
-                    "MCP event-delivery completion queue saturated; lease expiry remains authoritative"
-                );
-                false
+        );
+        if queued {
+            self.wake_workers();
+        }
+        queued
+    }
+}
+
+fn wait_for_mcp_await_event_completion_reconnect(
+    shutdown: &std::sync::atomic::AtomicBool,
+    wait: std::time::Duration,
+) -> bool {
+    let started = Instant::now();
+    loop {
+        if shutdown.load(std::sync::atomic::Ordering::Acquire) {
+            return false;
+        }
+        let remaining = wait.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            return true;
+        }
+        std::thread::park_timeout(remaining.min(MCP_AWAIT_EVENT_COMPLETION_SHUTDOWN_POLL));
+    }
+}
+
+fn shutdown_mcp_await_event_completion_storage(
+    runtime: &impl CompatRuntime,
+    stats: &McpAwaitEventDeliveryCompletionStats,
+    storage: StorageHandle,
+) {
+    let cx = crate::cx::for_request();
+    let shutdown = runtime.block_on(crate::runtime_async::timeout_with_cx(
+        &cx,
+        MCP_AWAIT_EVENT_COMPLETION_STORAGE_SHUTDOWN_GRACE,
+        storage.shutdown_with_cx(&cx),
+    ));
+    let shutdown_error = match shutdown {
+        Ok(Ok(())) => None,
+        Ok(Err(error)) => Some(error.to_string()),
+        Err(error) => Some(error),
+    };
+    if let Some(error) = shutdown_error {
+        stats
+            .storage_shutdown_failures
+            .fetch_add(1, Ordering::Relaxed);
+        tracing::warn!(
+            error,
+            shutdown_grace_ms = u64::try_from(
+                MCP_AWAIT_EVENT_COMPLETION_STORAGE_SHUTDOWN_GRACE.as_millis()
+            )
+            .unwrap_or(u64::MAX),
+            "Long-lived MCP event-delivery completion storage shutdown failed or timed out"
+        );
+    }
+    stats.storage_shutdowns.fetch_add(1, Ordering::Relaxed);
+}
+
+#[derive(Clone, Copy)]
+enum McpAwaitEventRequestStopCause {
+    EpochInvalidated,
+    ServiceShutdown,
+}
+
+fn reject_queued_mcp_await_event_requests(
+    receiver: &crossbeam::channel::Receiver<McpAwaitEventRequestJob>,
+    pending_requests: &mut std::collections::VecDeque<McpAwaitEventRequestJob>,
+    stats: &McpAwaitEventDeliveryCompletionStats,
+    cause: McpAwaitEventRequestStopCause,
+) {
+    let reject = |job: McpAwaitEventRequestJob| {
+        match cause {
+            McpAwaitEventRequestStopCause::EpochInvalidated => {
+                stats
+                    .request_jobs_rejected_for_epoch
+                    .fetch_add(1, Ordering::Relaxed);
             }
-            Err(crossbeam::channel::TrySendError::Disconnected(job)) => {
-                tracing::error!(
-                    delivery_count = job.leases.len(),
-                    ?job.outcome,
-                    "MCP event-delivery completion queue disconnected; lease expiry remains authoritative"
-                );
-                false
+            McpAwaitEventRequestStopCause::ServiceShutdown => {
+                stats
+                    .request_jobs_rejected_for_shutdown
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        let _ = job.reply.try_send((
+            Err(mcp_await_event_service_unready_error()),
+            Vec::new(),
+        ));
+    };
+    while let Some(job) = pending_requests.pop_front() {
+        reject(job);
+    }
+    while let Ok(job) = receiver.try_recv() {
+        reject(job);
+    }
+}
+
+fn prune_cancelled_mcp_await_event_requests(
+    pending_requests: &mut std::collections::VecDeque<McpAwaitEventRequestJob>,
+    stats: &McpAwaitEventDeliveryCompletionStats,
+) {
+    let pending_count = pending_requests.len();
+    for _ in 0..pending_count {
+        let Some(job) = pending_requests.pop_front() else {
+            break;
+        };
+        match mcp_await_event_checkpoint(&job.cx) {
+            Ok(()) => pending_requests.push_back(job),
+            Err(cancellation) => {
+                stats
+                    .request_jobs_rejected_cancelled
+                    .fetch_add(1, Ordering::Relaxed);
+                let _ = job.reply.try_send((
+                    Err(McpToolError::from_error(cancellation)),
+                    Vec::new(),
+                ));
             }
         }
     }
 }
 
+fn cancel_active_mcp_await_event_requests(
+    active_requests: &std::collections::HashMap<u64, crate::cx::Cx>,
+    stats: &McpAwaitEventDeliveryCompletionStats,
+    cause: McpAwaitEventRequestStopCause,
+    reason: &'static str,
+) {
+    let request_count = u64::try_from(active_requests.len()).unwrap_or(u64::MAX);
+    match cause {
+        McpAwaitEventRequestStopCause::EpochInvalidated => {
+            stats
+                .request_jobs_cancelled_for_epoch
+                .fetch_add(request_count, Ordering::Relaxed);
+        }
+        McpAwaitEventRequestStopCause::ServiceShutdown => {
+            stats
+                .request_jobs_cancelled_for_shutdown
+                .fetch_add(request_count, Ordering::Relaxed);
+        }
+    }
+    for request_cx in active_requests.values() {
+        request_cx.cancel_with(crate::outcome::CancelKind::User, Some(reason));
+    }
+}
+
+fn spawn_mcp_await_event_request(
+    runtime: &impl CompatRuntime,
+    coordinator_thread: &std::thread::Thread,
+    ready: &Arc<std::sync::atomic::AtomicBool>,
+    lifecycle_gate: &Arc<std::sync::Mutex<()>>,
+    storage: &StorageHandle,
+    storage_epoch: u64,
+    job: McpAwaitEventRequestJob,
+    active_requests: &mut std::collections::HashMap<u64, crate::cx::Cx>,
+    shared_active_requests: &std::sync::Mutex<
+        std::collections::HashMap<u64, crate::cx::Cx>,
+    >,
+    completion_sender: &crossbeam::channel::Sender<McpAwaitEventDeliveryCompletionJob>,
+    stats: &Arc<McpAwaitEventDeliveryCompletionStats>,
+    task_finished_tx: &crossbeam::channel::Sender<McpAwaitEventServiceTaskFinished>,
+) {
+    let request_id = job.request_id;
+    active_requests.insert(request_id, job.cx.clone());
+    shared_active_requests
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(request_id, job.cx.clone());
+    stats.record_active_requests(active_requests.len());
+    stats.request_jobs_started.fetch_add(1, Ordering::Relaxed);
+
+    let storage = storage.clone();
+    let coordinator_thread = coordinator_thread.clone();
+    let ready = Arc::clone(ready);
+    let lifecycle_gate = Arc::clone(lifecycle_gate);
+    let completion_sender = completion_sender.clone();
+    let stats = Arc::clone(stats);
+    let task_finished_tx = task_finished_tx.clone();
+    let McpAwaitEventRequestJob {
+        operation,
+        reply,
+        reply_abandoned,
+        _admission,
+        enqueued_at,
+        ..
+    } = job;
+    runtime.spawn_detached(async move {
+        let queue_delay = enqueued_at.elapsed();
+        tracing::debug!(
+            request_id,
+            storage_epoch,
+            queue_delay_ms = u64::try_from(queue_delay.as_millis()).unwrap_or(u64::MAX),
+            "Starting bounded MCP await-event request on the shared storage epoch"
+        );
+        let execution_started = Instant::now();
+        let recovered = catch_recoverable_future(
+            RecoverablePanicSite::McpAwaitEventRequest,
+            operation(storage),
+        )
+        .await;
+        let execution = execution_started.elapsed();
+        stats.record_request_timing(queue_delay, execution);
+        let (output, storage_reusable) = match recovered {
+            Ok(output) => (output.response, output.storage_reusable),
+            Err(_) => {
+                stats.request_panics.fetch_add(1, Ordering::Relaxed);
+                tracing::error!(
+                    request_id,
+                    storage_epoch,
+                    panic_site = RecoverablePanicSite::McpAwaitEventRequest.as_str(),
+                    "MCP await-event request task panicked; restarting the shared storage epoch"
+                );
+                (
+                    (
+                        Err(McpToolError::new(
+                            MCP_ERR_STORAGE,
+                            "wa.await_event request failed inside its isolated service task"
+                                .to_string(),
+                            Some("Retry from the last authoritative cursor token".to_string()),
+                        )),
+                        Vec::new(),
+                    ),
+                    false,
+                )
+            }
+        };
+        tracing::debug!(
+            request_id,
+            storage_epoch,
+            storage_reusable,
+            execution_us = u64::try_from(execution.as_micros()).unwrap_or(u64::MAX),
+            "Finished isolated MCP await-event request on the shared storage epoch"
+        );
+        if !storage_reusable {
+            let _lifecycle_guard = lifecycle_gate
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            ready.store(false, Ordering::Release);
+        }
+        let undelivered_output = if reply_abandoned.load(Ordering::Acquire) {
+            Some(output)
+        } else {
+            match reply.try_send(output) {
+                Ok(()) => None,
+                Err(crossbeam::channel::TrySendError::Full(output))
+                | Err(crossbeam::channel::TrySendError::Disconnected(output)) => Some(output),
+            }
+        };
+        if let Some((_result, delivery_leases)) = undelivered_output
+            && try_enqueue_mcp_await_event_delivery_completion(
+                &completion_sender,
+                delivery_leases,
+                FrameworkResponseDeliveryOutcome::Failed,
+            )
+        {
+            coordinator_thread.unpark();
+        }
+        stats.request_jobs_finished.fetch_add(1, Ordering::Relaxed);
+        let _ = task_finished_tx.send(McpAwaitEventServiceTaskFinished::Request {
+            request_id,
+            storage_epoch,
+            storage_reusable,
+        });
+        coordinator_thread.unpark();
+        drop(_admission);
+    });
+}
+
+/// Own the sole MCP await runtime and SQLite writer epoch for
+/// `ft-interactive-systems-performance-4tenz.18` and `.22`.
+///
+/// A healthy epoch initializes each exactly once, no matter how many requests
+/// and response completions pass through it. Failed initialization and a
+/// demonstrably unusable writer cancel isolated in-flight request Cx values,
+/// reject queued requests, drain the one completion task, and transition
+/// through bounded exponential reconnect backoff without rebuilding runtime.
+fn run_mcp_await_event_delivery_completion_worker(
+    receiver: crossbeam::channel::Receiver<McpAwaitEventDeliveryCompletionJob>,
+    completion_sender: crossbeam::channel::Sender<McpAwaitEventDeliveryCompletionJob>,
+    request_receiver: crossbeam::channel::Receiver<McpAwaitEventRequestJob>,
+    shutdown: Arc<std::sync::atomic::AtomicBool>,
+    ready: Arc<std::sync::atomic::AtomicBool>,
+    phase: Arc<AtomicU8>,
+    lifecycle_gate: Arc<std::sync::Mutex<()>>,
+    active_completion_cx: Arc<std::sync::Mutex<Option<crate::cx::Cx>>>,
+    active_request_cxs: Arc<
+        std::sync::Mutex<std::collections::HashMap<u64, crate::cx::Cx>>,
+    >,
+    stats: Arc<McpAwaitEventDeliveryCompletionStats>,
+    db_path: Arc<PathBuf>,
+    #[cfg(test)] synthetic_storage_init_failures: Arc<AtomicU64>,
+    #[cfg(test)] synthetic_storage_epoch_failures: Arc<AtomicU64>,
+    #[cfg(test)] synthetic_storage_init_stall: Option<Arc<std::sync::atomic::AtomicBool>>,
+    #[cfg(test)] synthetic_completion_stall: Option<Arc<std::sync::atomic::AtomicBool>>,
+) {
+    stats.worker_starts.fetch_add(1, Ordering::Relaxed);
+    let coordinator_thread = std::thread::current();
+    let _lifecycle = McpAwaitEventCompletionWorkerLifecycleGuard {
+        ready: &ready,
+        phase: &phase,
+        stats: &stats,
+    };
+    let runtime = match CompatRuntimeBuilder::multi_thread()
+        .worker_threads(MCP_AWAIT_EVENT_SERVICE_RUNTIME_WORKERS)
+        .max_blocking_threads(MCP_AWAIT_EVENT_SERVICE_BLOCKING_THREADS)
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            tracing::error!(
+                error = %error,
+                "Unable to build the long-lived shared MCP await-event runtime"
+            );
+            return;
+        }
+    };
+    stats
+        .runtime_initializations
+        .fetch_add(1, Ordering::Relaxed);
+
+    let db_path_text = db_path.to_string_lossy().into_owned();
+    let mut storage = None;
+    let mut storage_epoch = 0_u64;
+    let mut reconnect_backoff = MCP_AWAIT_EVENT_COMPLETION_RECONNECT_BACKOFF_MIN;
+    let mut deferred_job: Option<McpAwaitEventDeliveryCompletionJob> = None;
+    let (task_finished_tx, task_finished_rx) =
+        crossbeam::channel::unbounded::<McpAwaitEventServiceTaskFinished>();
+    let mut active_requests = std::collections::HashMap::<u64, crate::cx::Cx>::new();
+    let mut pending_requests = std::collections::VecDeque::<McpAwaitEventRequestJob>::new();
+    let mut completion_in_flight = false;
+    let mut storage_epoch_invalidated = false;
+
+    let mut shutdown_cancellation_sent = false;
+    loop {
+        let mut invalidate_epoch_now = false;
+        while let Ok(finished) = task_finished_rx.try_recv() {
+            match finished {
+                McpAwaitEventServiceTaskFinished::Request {
+                    request_id,
+                    storage_epoch: finished_epoch,
+                    storage_reusable,
+                } => {
+                    active_requests.remove(&request_id);
+                    active_request_cxs
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .remove(&request_id);
+                    stats.record_active_requests(active_requests.len());
+                    if finished_epoch == storage_epoch && !storage_reusable {
+                        invalidate_epoch_now = true;
+                    } else if storage_reusable {
+                        reconnect_backoff = MCP_AWAIT_EVENT_COMPLETION_RECONNECT_BACKOFF_MIN;
+                    }
+                }
+                McpAwaitEventServiceTaskFinished::Completion {
+                    storage_epoch: finished_epoch,
+                    storage_reusable,
+                } => {
+                    completion_in_flight = false;
+                    if finished_epoch == storage_epoch && !storage_reusable {
+                        invalidate_epoch_now = true;
+                    } else if storage_reusable {
+                        reconnect_backoff = MCP_AWAIT_EVENT_COMPLETION_RECONNECT_BACKOFF_MIN;
+                    }
+                }
+            }
+        }
+        while let Ok(request) = request_receiver.try_recv() {
+            pending_requests.push_back(request);
+        }
+        prune_cancelled_mcp_await_event_requests(&mut pending_requests, &stats);
+
+        if invalidate_epoch_now && !storage_epoch_invalidated {
+            {
+                let _lifecycle_guard = lifecycle_gate
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                ready.store(false, Ordering::Release);
+            }
+            storage_epoch_invalidated = true;
+            stats.storage_reconnects.fetch_add(1, Ordering::Relaxed);
+            cancel_active_mcp_await_event_requests(
+                &active_requests,
+                &stats,
+                McpAwaitEventRequestStopCause::EpochInvalidated,
+                "MCP await shared storage epoch invalidated",
+            );
+            if let Some(completion_cx) = active_completion_cx
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+            {
+                completion_cx.cancel_with(
+                    crate::outcome::CancelKind::User,
+                    Some("MCP await shared storage epoch invalidated"),
+                );
+            }
+            reject_queued_mcp_await_event_requests(
+                &request_receiver,
+                &mut pending_requests,
+                &stats,
+                McpAwaitEventRequestStopCause::EpochInvalidated,
+            );
+        }
+
+        if shutdown.load(Ordering::Acquire) {
+            if !shutdown_cancellation_sent {
+                {
+                    let _lifecycle_guard = lifecycle_gate
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    ready.store(false, Ordering::Release);
+                }
+                // Epoch invalidation has already cancelled and classified
+                // every active job. Do not double-count the same work as a
+                // shutdown cancellation when teardown races the drain.
+                if !storage_epoch_invalidated {
+                    cancel_active_mcp_await_event_requests(
+                        &active_requests,
+                        &stats,
+                        McpAwaitEventRequestStopCause::ServiceShutdown,
+                        "MCP await shared service shutdown",
+                    );
+                    if let Some(completion_cx) = active_completion_cx
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .clone()
+                    {
+                        completion_cx.cancel_with(
+                            crate::outcome::CancelKind::User,
+                            Some("MCP await shared service shutdown"),
+                        );
+                    }
+                }
+                shutdown_cancellation_sent = true;
+            }
+            reject_queued_mcp_await_event_requests(
+                &request_receiver,
+                &mut pending_requests,
+                &stats,
+                McpAwaitEventRequestStopCause::ServiceShutdown,
+            );
+            if active_requests.is_empty() && !completion_in_flight {
+                break;
+            }
+            if completion_in_flight {
+                McpAwaitEventCompletionWorkerPhase::CompletingDelivery.store(&phase);
+            } else {
+                McpAwaitEventCompletionWorkerPhase::ServingRequests.store(&phase);
+            }
+            std::thread::park();
+            continue;
+        }
+
+        if storage_epoch_invalidated {
+            reject_queued_mcp_await_event_requests(
+                &request_receiver,
+                &mut pending_requests,
+                &stats,
+                McpAwaitEventRequestStopCause::EpochInvalidated,
+            );
+            if !active_requests.is_empty() || completion_in_flight {
+                if completion_in_flight {
+                    McpAwaitEventCompletionWorkerPhase::CompletingDelivery.store(&phase);
+                } else {
+                    McpAwaitEventCompletionWorkerPhase::ServingRequests.store(&phase);
+                }
+                std::thread::park();
+                continue;
+            }
+
+            McpAwaitEventCompletionWorkerPhase::ShuttingDownStorage.store(&phase);
+            if let Some(unusable_storage) = storage.take() {
+                shutdown_mcp_await_event_completion_storage(
+                    &runtime,
+                    &stats,
+                    unusable_storage,
+                );
+            }
+            stats.record_reconnect_backoff(reconnect_backoff);
+            if !wait_for_mcp_await_event_completion_reconnect(&shutdown, reconnect_backoff) {
+                continue;
+            }
+            reconnect_backoff = reconnect_backoff
+                .saturating_mul(2)
+                .min(MCP_AWAIT_EVENT_COMPLETION_RECONNECT_BACKOFF_MAX);
+            storage_epoch_invalidated = false;
+            continue;
+        }
+
+        if storage.is_none() {
+            McpAwaitEventCompletionWorkerPhase::InitializingStorage.store(&phase);
+            stats
+                .storage_initialization_attempts
+                .fetch_add(1, Ordering::Relaxed);
+            #[cfg(test)]
+            let synthetic_failure = synthetic_storage_init_failures
+                .try_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok();
+            #[cfg(not(test))]
+            let synthetic_failure = false;
+
+            let initialization = if synthetic_failure {
+                Err("synthetic test storage initialization failure".to_string())
+            } else {
+                let cx = crate::cx::for_request();
+                let _active_cx =
+                    McpAwaitEventActiveCxGuard::install(&active_completion_cx, &cx);
+                runtime
+                    .block_on(StorageHandle::new_with_cx(&cx, &db_path_text))
+                    .map_err(|error| error.to_string())
+            };
+
+            #[cfg(test)]
+            if let Some(stall) = synthetic_storage_init_stall
+                .as_ref()
+                .filter(|stall| stall.load(Ordering::Acquire))
+            {
+                stats
+                    .storage_initialization_stalls
+                    .fetch_add(1, Ordering::Relaxed);
+                while stall.load(Ordering::Acquire) {
+                    std::thread::park_timeout(MCP_AWAIT_EVENT_COMPLETION_SHUTDOWN_POLL);
+                }
+            }
+
+            match initialization {
+                Ok(initialized_storage) => {
+                    storage_epoch = storage_epoch.saturating_add(1);
+                    stats
+                        .storage_initializations
+                        .fetch_add(1, Ordering::Relaxed);
+                    let lifecycle_guard = lifecycle_gate
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if shutdown.load(Ordering::Acquire) {
+                        drop(lifecycle_guard);
+                        McpAwaitEventCompletionWorkerPhase::ShuttingDownStorage.store(&phase);
+                        shutdown_mcp_await_event_completion_storage(
+                            &runtime,
+                            &stats,
+                            initialized_storage,
+                        );
+                        continue;
+                    }
+                    storage = Some(initialized_storage);
+                    stats
+                        .storage_readiness_publications
+                        .fetch_add(1, Ordering::Relaxed);
+                    ready.store(true, Ordering::Release);
+                    McpAwaitEventCompletionWorkerPhase::ReadyIdle.store(&phase);
+                    drop(lifecycle_guard);
+                    tracing::info!(
+                        storage_epoch,
+                        db_path = %db_path_text,
+                        "Initialized one shared MCP await-event storage epoch"
+                    );
+                }
+                Err(error) => {
+                    ready.store(false, Ordering::Release);
+                    stats
+                        .storage_initialization_failures
+                        .fetch_add(1, Ordering::Relaxed);
+                    tracing::error!(
+                        error,
+                        reconnect_backoff_ms = u64::try_from(reconnect_backoff.as_millis())
+                            .unwrap_or(u64::MAX),
+                        db_path = %db_path_text,
+                        "Unable to initialize shared MCP await-event storage; all await admission remains fail-closed"
+                    );
+                    stats.record_reconnect_backoff(reconnect_backoff);
+                    if !wait_for_mcp_await_event_completion_reconnect(
+                        &shutdown,
+                        reconnect_backoff,
+                    ) {
+                        continue;
+                    }
+                    reconnect_backoff = reconnect_backoff
+                        .saturating_mul(2)
+                        .min(MCP_AWAIT_EVENT_COMPLETION_RECONNECT_BACKOFF_MAX);
+                    continue;
+                }
+            }
+        }
+
+        if !ready.load(Ordering::Acquire) {
+            // A request/completion task clears readiness under the lifecycle
+            // gate before publishing an unusable-epoch result. Do not admit
+            // queued work onto that suspect writer during the narrow handoff
+            // before the coordinator consumes the task-finished record.
+            std::thread::park();
+            continue;
+        }
+
+        if !completion_in_flight {
+            let first_job = deferred_job.take().or_else(|| receiver.try_recv().ok());
+            if let Some(first_job) = first_job {
+                let outcome = first_job.outcome;
+                let oldest_enqueued_at = first_job.enqueued_at;
+                let mut leases = first_job.leases;
+                let mut job_count = 1_usize;
+                while leases.len() < EVENT_DELIVERY_LEASE_BULK_MAX {
+                    match receiver.try_recv() {
+                        Ok(mut next_job)
+                            if next_job.outcome == outcome
+                                && next_job.leases.len()
+                                    <= EVENT_DELIVERY_LEASE_BULK_MAX
+                                        .saturating_sub(leases.len()) =>
+                        {
+                            job_count = job_count.saturating_add(1);
+                            leases.append(&mut next_job.leases);
+                        }
+                        Ok(next_job) => {
+                            deferred_job = Some(next_job);
+                            break;
+                        }
+                        Err(crossbeam::channel::TryRecvError::Empty)
+                        | Err(crossbeam::channel::TryRecvError::Disconnected) => break,
+                    }
+                }
+
+                let queue_delay = oldest_enqueued_at.elapsed();
+                stats.record_completion_batch(job_count, leases.len());
+                stats.record_completion_schedule_delay(queue_delay);
+                tracing::debug!(
+                    queue_delay_ms = u64::try_from(queue_delay.as_millis()).unwrap_or(u64::MAX),
+                    job_count,
+                    delivery_count = leases.len(),
+                    storage_epoch,
+                    ?outcome,
+                    "Scheduling queued MCP event-delivery completion on the shared runtime"
+                );
+
+                #[cfg(test)]
+                let completion_stall = synthetic_completion_stall.clone();
+                #[cfg(test)]
+                let synthetic_epoch_failure = synthetic_storage_epoch_failures
+                    .try_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+                        remaining.checked_sub(1)
+                    })
+                    .is_ok();
+                #[cfg(not(test))]
+                let synthetic_epoch_failure = false;
+                let completion_storage = storage
+                    .as_ref()
+                    .expect("shared storage exists after successful initialization")
+                    .clone();
+                let completion_active_cx = Arc::clone(&active_completion_cx);
+                let completion_stats = Arc::clone(&stats);
+                let completion_finished_tx = task_finished_tx.clone();
+                let completion_coordinator_thread = coordinator_thread.clone();
+                let completion_ready = Arc::clone(&ready);
+                let completion_lifecycle_gate = Arc::clone(&lifecycle_gate);
+                let completion_epoch = storage_epoch;
+                completion_in_flight = true;
+                McpAwaitEventCompletionWorkerPhase::CompletingDelivery.store(&phase);
+                runtime.spawn_detached(async move {
+                    #[cfg(test)]
+                    if let Some(stall) = completion_stall
+                        .as_ref()
+                        .filter(|stall| stall.load(Ordering::Acquire))
+                    {
+                        completion_stats
+                            .completion_stalls
+                            .fetch_add(1, Ordering::Relaxed);
+                        while stall.load(Ordering::Acquire) {
+                            std::thread::park_timeout(
+                                MCP_AWAIT_EVENT_COMPLETION_SHUTDOWN_POLL,
+                            );
+                        }
+                    }
+
+                    let storage_reusable = if synthetic_epoch_failure {
+                        tracing::warn!(
+                            job_count,
+                            ?outcome,
+                            "Injecting a synthetic shared MCP storage-epoch failure"
+                        );
+                        false
+                    } else {
+                        match catch_recoverable_future(
+                            RecoverablePanicSite::McpEventDeliveryCompletion,
+                            complete_mcp_await_event_deliveries_with_storage(
+                                &completion_storage,
+                                &completion_active_cx,
+                                leases,
+                                outcome,
+                            ),
+                        )
+                        .await
+                        {
+                            Ok(storage_reusable) => storage_reusable,
+                            Err(_) => {
+                                completion_stats
+                                    .completion_panics
+                                    .fetch_add(1, Ordering::Relaxed);
+                                tracing::error!(
+                                    job_count,
+                                    ?outcome,
+                                    panic_site = RecoverablePanicSite::McpEventDeliveryCompletion.as_str(),
+                                    "MCP event-delivery completion panicked; restarting the shared storage epoch"
+                                );
+                                false
+                            }
+                        }
+                    };
+                    completion_stats
+                        .completion_attempts_finished
+                        .fetch_add(1, Ordering::Relaxed);
+                    if storage_reusable {
+                        completion_stats
+                            .completion_attempts_storage_reusable
+                            .fetch_add(1, Ordering::Relaxed);
+                    } else {
+                        completion_stats
+                            .completion_attempts_storage_unusable
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                    if !storage_reusable {
+                        let _lifecycle_guard = completion_lifecycle_gate
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        completion_ready.store(false, Ordering::Release);
+                    }
+                    let _ = completion_finished_tx.send(
+                        McpAwaitEventServiceTaskFinished::Completion {
+                            storage_epoch: completion_epoch,
+                            storage_reusable,
+                        },
+                    );
+                    completion_coordinator_thread.unpark();
+                });
+            }
+        }
+
+        while active_requests.len() < MCP_AWAIT_EVENT_REQUEST_CONCURRENCY {
+            let Some(request_job) = pending_requests.pop_front() else {
+                break;
+            };
+            spawn_mcp_await_event_request(
+                &runtime,
+                &coordinator_thread,
+                &ready,
+                &lifecycle_gate,
+                storage
+                    .as_ref()
+                    .expect("shared storage exists after successful initialization"),
+                storage_epoch,
+                request_job,
+                &mut active_requests,
+                &active_request_cxs,
+                &completion_sender,
+                &stats,
+                &task_finished_tx,
+            );
+        }
+
+        if completion_in_flight {
+            McpAwaitEventCompletionWorkerPhase::CompletingDelivery.store(&phase);
+        } else if active_requests.is_empty() {
+            McpAwaitEventCompletionWorkerPhase::ReadyIdle.store(&phase);
+        } else {
+            McpAwaitEventCompletionWorkerPhase::ServingRequests.store(&phase);
+        }
+        // Every state transition that can make progress (new request,
+        // completion, task finish, or shutdown) unparks this coordinator.
+        // Sleeping until a notification avoids a permanent 2 ms idle poll in
+        // every MCP server while preserving missed-wakeup safety through the
+        // standard thread unpark token.
+        std::thread::park();
+    }
+
+    if let Some(active_storage) = storage {
+        McpAwaitEventCompletionWorkerPhase::ShuttingDownStorage.store(&phase);
+        shutdown_mcp_await_event_completion_storage(
+            &runtime,
+            &stats,
+            active_storage,
+        );
+    }
+}
+
+/// Orderly teardown first cancels active work and waits for the bounded grace.
+/// If a non-preemptible SQLite phase outlives that grace, dropping its
+/// `JoinHandle` is an explicit ownership handoff to the self-owning worker, not
+/// an anonymous fire-and-forget task: the closure owns every Arc/path/receiver
+/// it can access, readiness is already false, the final sender owner is being
+/// destroyed, queued jobs are abandoned, and at most the one already-admitted
+/// exact token-CAS obligation may finish before the worker shuts its storage
+/// epoch down and exits. Phase-specific counters make that rare handoff
+/// observable and regression-testable.
 impl Drop for McpAwaitEventDeliveryCompletionExecutor {
     fn drop(&mut self) {
-        self.shutdown
-            .store(true, std::sync::atomic::Ordering::Release);
+        self.begin_shutdown();
         let queued_at_shutdown = self.sender.len();
+        let queued_requests_at_shutdown = self.request_sender.len();
+        let shutdown_started = Instant::now();
         for worker in self.workers.drain(..) {
-            if worker.join().is_err() {
-                tracing::error!("MCP event-delivery completion worker panicked");
+            while !worker.is_finished() {
+                let remaining = MCP_AWAIT_EVENT_COMPLETION_EXECUTOR_DROP_GRACE
+                    .saturating_sub(shutdown_started.elapsed());
+                if remaining.is_zero() {
+                    break;
+                }
+                let active_completion_cx = self
+                    .active_completion_cx
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone();
+                if let Some(active_completion_cx) = active_completion_cx {
+                    active_completion_cx.cancel_with(
+                        crate::outcome::CancelKind::User,
+                        Some("MCP await shared service shutdown"),
+                    );
+                }
+                let active_request_cxs = self
+                    .active_request_cxs
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .values()
+                    .cloned()
+                    .collect::<Vec<_>>();
+                for request_cx in active_request_cxs {
+                    request_cx.cancel_with(
+                        crate::outcome::CancelKind::User,
+                        Some("MCP await shared service shutdown"),
+                    );
+                }
+                std::thread::park_timeout(
+                    remaining.min(MCP_AWAIT_EVENT_COMPLETION_SHUTDOWN_POLL),
+                );
+            }
+            if worker.is_finished() {
+                if worker.join().is_err() {
+                    tracing::error!("MCP event-delivery completion worker panicked");
+                }
+            } else {
+                let handoff_phase = McpAwaitEventCompletionWorkerPhase::load(&self.phase);
+                let active_request_handoff_count = self
+                    .active_request_cxs
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .len();
+                let completion_handoff =
+                    handoff_phase == McpAwaitEventCompletionWorkerPhase::CompletingDelivery;
+                self.stats.worker_handoffs.fetch_add(1, Ordering::Relaxed);
+                match handoff_phase {
+                    McpAwaitEventCompletionWorkerPhase::Starting
+                    | McpAwaitEventCompletionWorkerPhase::InitializingStorage => {
+                        self.stats
+                            .worker_initialization_handoffs
+                            .fetch_add(1, Ordering::Relaxed);
+                        tracing::error!(
+                            ?handoff_phase,
+                            shutdown_grace_ms = u64::try_from(
+                                MCP_AWAIT_EVENT_COMPLETION_EXECUTOR_DROP_GRACE.as_millis()
+                            )
+                            .unwrap_or(u64::MAX),
+                            "Transferring a stalled initialization worker to its self-owning terminal handoff; readiness remains false and no delivery mutation was admitted"
+                        );
+                    }
+                    McpAwaitEventCompletionWorkerPhase::CompletingDelivery
+                    | McpAwaitEventCompletionWorkerPhase::ServingRequests
+                    | McpAwaitEventCompletionWorkerPhase::ReadyIdle
+                    | McpAwaitEventCompletionWorkerPhase::ShuttingDownStorage
+                    | McpAwaitEventCompletionWorkerPhase::Stopped => {
+                        if completion_handoff {
+                            self.stats
+                                .worker_completion_handoffs
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
+                        if active_request_handoff_count > 0 {
+                            self.stats
+                                .worker_request_handoffs
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
+                        if !completion_handoff && active_request_handoff_count == 0 {
+                            self.stats
+                                .worker_shutdown_handoffs
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
+                        tracing::error!(
+                            ?handoff_phase,
+                            completion_handoff,
+                            active_request_handoff_count,
+                            shutdown_grace_ms = u64::try_from(
+                                MCP_AWAIT_EVENT_COMPLETION_EXECUTOR_DROP_GRACE.as_millis()
+                            )
+                            .unwrap_or(u64::MAX),
+                            "Transferring unfinished MCP await service ownership to its self-owning terminal handoff; readiness is false, no new admission is possible, and only already-admitted exact completion authority may mutate a lease"
+                        );
+                    }
+                }
             }
         }
         if queued_at_shutdown > 0 {
@@ -4141,12 +5826,17 @@ impl Drop for McpAwaitEventDeliveryCompletionExecutor {
                 "Abandoned queued MCP event-delivery completions during orderly shutdown; lease expiry remains authoritative"
             );
         }
+        if queued_requests_at_shutdown > 0 {
+            tracing::warn!(
+                queued_requests_at_shutdown,
+                "Rejected queued MCP await-event requests during orderly shared-service shutdown"
+            );
+        }
     }
 }
 
 fn enqueue_mcp_await_event_deliveries(
     executor: Option<&Arc<McpAwaitEventDeliveryCompletionExecutor>>,
-    db_path: Arc<PathBuf>,
     leases: Vec<EventDeliveryLease>,
     outcome: FrameworkResponseDeliveryOutcome,
 ) {
@@ -4162,7 +5852,7 @@ fn enqueue_mcp_await_event_deliveries(
         );
         return;
     };
-    let _queued = executor.try_submit(db_path, leases, outcome);
+    let _queued = executor.try_submit(leases, outcome);
 }
 
 fn mcp_request_checkpoint(cx: &crate::cx::Cx, operation: &str) -> crate::Result<()> {
@@ -4200,6 +5890,221 @@ async fn mcp_await_event_wait_with_cx(
     }
 }
 
+async fn complete_mcp_await_event_deliveries_with_storage(
+    storage: &StorageHandle,
+    active_cx: &std::sync::Mutex<Option<crate::cx::Cx>>,
+    leases: Vec<EventDeliveryLease>,
+    outcome: FrameworkResponseDeliveryOutcome,
+) -> bool {
+    if leases.is_empty() {
+        return true;
+    }
+
+    let delivery_count = leases.len();
+    let cx = crate::cx::for_request();
+    let operation_cx = cx.clone();
+    let _active_cx = McpAwaitEventActiveCxGuard::install(active_cx, &cx);
+    let completion = crate::runtime_async::timeout_with_cx(
+        &cx,
+        std::time::Duration::from_secs(MCP_AWAIT_EVENT_DELIVERY_FINALIZE_GRACE_SECS),
+        async move {
+                // Successful composite waits normally settle in one writer
+                // transaction instead of one SQLite round trip per event.
+                // Canonicalizing exact duplicates also prevents a duplicate
+                // lease from spilling into a later chunk after the first copy
+                // has already been settled.
+                let mut canonical_leases = leases.iter().collect::<Vec<_>>();
+                canonical_leases.sort_unstable_by(|left, right| {
+                    left.event_id()
+                        .cmp(&right.event_id())
+                        .then_with(|| left.token().cmp(right.token()))
+                });
+                canonical_leases.dedup_by(|left, right| {
+                    left.event_id() == right.event_id() && left.token() == right.token()
+                });
+                let handled_at_ms = mcp_now_ms_i64();
+                let mut storage_reusable = true;
+
+                'remaining_batches: for lease_batch in
+                    canonical_leases.chunks(EVENT_DELIVERY_LEASE_BULK_MAX)
+                {
+                    if let Err(err) = mcp_request_checkpoint(
+                        &operation_cx,
+                        "wa.await_event delivery completion batch",
+                    ) {
+                        tracing::error!(
+                            error = %err,
+                            remaining_delivery_count = lease_batch.len(),
+                            ?outcome,
+                            "MCP event-delivery completion was cancelled before the next batch; lease expiry remains the recovery authority"
+                        );
+                        break;
+                    }
+
+                    let lease_pairs = lease_batch
+                        .iter()
+                        .map(|lease| (lease.event_id(), lease.token().to_string()))
+                        .collect::<Vec<_>>();
+                    #[cfg(test)]
+                    observe_mcp_await_event_completion_batch(
+                        McpAwaitEventCompletionBatchPhase::BulkAttempt,
+                        lease_pairs.len(),
+                    );
+                    let bulk_completion = match outcome {
+                        FrameworkResponseDeliveryOutcome::DeliveryAcknowledged => {
+                            storage
+                                .finalize_event_delivery_leases_bulk_with_cx(
+                                    &operation_cx,
+                                    &lease_pairs,
+                                    handled_at_ms,
+                                    Some(MCP_AWAIT_EVENT_CLAIM_WORKFLOW_ID),
+                                    MCP_AWAIT_EVENT_CLAIM_STATUS,
+                                )
+                                .await
+                        }
+                        FrameworkResponseDeliveryOutcome::Failed => {
+                            storage
+                                .release_event_delivery_leases_bulk_with_cx(
+                                    &operation_cx,
+                                    &lease_pairs,
+                                )
+                                .await
+                        }
+                    };
+
+                    let fallback_required = match bulk_completion {
+                        Ok(settled_count) if settled_count == lease_pairs.len() => {
+                            storage_reusable = true;
+                            false
+                        }
+                        Ok(settled_count) => {
+                            // Storage promises exact all-or-rollback results.
+                            // Treat a future implementation that violates that
+                            // invariant as a recoverable partial result instead
+                            // of silently stranding unsettled leases.
+                            tracing::error!(
+                                settled_count,
+                                requested_count = lease_pairs.len(),
+                                ?outcome,
+                                "MCP event-delivery bulk completion returned a non-exact success count; retrying exact leases individually"
+                            );
+                            storage_reusable = true;
+                            true
+                        }
+                        Err(batch_error) => {
+                            tracing::warn!(
+                                error = %batch_error,
+                                delivery_count = lease_batch.len(),
+                                ?outcome,
+                                "MCP event-delivery bulk completion failed; retrying exact leases individually"
+                            );
+                            storage_reusable = false;
+                            true
+                        }
+                    };
+                    if fallback_required {
+                        // The exact bulk primitive rolls its whole batch back
+                        // when even one token has gone stale. Recover useful
+                        // work by retrying each CAS independently; the
+                        // surrounding hard deadline still bounds a generic
+                        // storage-failure or cancellation path.
+                        #[cfg(test)]
+                        observe_mcp_await_event_completion_batch(
+                            McpAwaitEventCompletionBatchPhase::PerLeaseFallback,
+                            lease_batch.len(),
+                        );
+
+                        let mut fallback_observed_writer_response = false;
+                        for lease in lease_batch {
+                            if let Err(err) = mcp_request_checkpoint(
+                                &operation_cx,
+                                "wa.await_event delivery completion fallback",
+                            ) {
+                                tracing::error!(
+                                    error = %err,
+                                    event_id = lease.event_id(),
+                                    ?outcome,
+                                    "MCP event-delivery fallback was cancelled; remaining leases will recover by expiry"
+                                );
+                                break 'remaining_batches;
+                            }
+
+                            let completion = match outcome {
+                                FrameworkResponseDeliveryOutcome::DeliveryAcknowledged => {
+                                    storage
+                                        .finalize_event_delivery_with_cx(
+                                            &operation_cx,
+                                            lease,
+                                            Some(MCP_AWAIT_EVENT_CLAIM_WORKFLOW_ID.to_string()),
+                                            MCP_AWAIT_EVENT_CLAIM_STATUS,
+                                        )
+                                        .await
+                                }
+                                FrameworkResponseDeliveryOutcome::Failed => {
+                                    storage
+                                        .release_event_delivery_with_cx(
+                                            &operation_cx,
+                                            lease,
+                                        )
+                                        .await
+                                }
+                            };
+
+                            match completion {
+                                Ok(true) => {
+                                    fallback_observed_writer_response = true;
+                                }
+                                Ok(false) => {
+                                    fallback_observed_writer_response = true;
+                                    tracing::warn!(
+                                        event_id = lease.event_id(),
+                                        ?outcome,
+                                        "MCP event-delivery completion lost lease ownership; no handled-state mutation was made"
+                                    );
+                                }
+                                Err(err) => {
+                                    tracing::error!(
+                                        error = %err,
+                                        event_id = lease.event_id(),
+                                        ?outcome,
+                                        "MCP event-delivery completion failed; lease expiry remains the recovery authority"
+                                    );
+                                }
+                            }
+                        }
+                        storage_reusable = fallback_observed_writer_response;
+                        if !storage_reusable {
+                            tracing::error!(
+                                delivery_count = lease_batch.len(),
+                                ?outcome,
+                                "Every MCP event-delivery fallback failed; the completion storage epoch will be restarted"
+                            );
+                            break;
+                        }
+                    }
+                }
+
+                storage_reusable
+        },
+    )
+    .await;
+
+    match completion {
+        Ok(storage_reusable) => storage_reusable,
+        Err(err) => {
+            tracing::error!(
+                error = %err,
+                delivery_count,
+                finalize_grace_secs = MCP_AWAIT_EVENT_DELIVERY_FINALIZE_GRACE_SECS,
+                ?outcome,
+                "MCP event-delivery completion exceeded its hard deadline; the completion storage epoch will be restarted and lease expiry remains the recovery authority"
+            );
+            false
+        }
+    }
+}
+
+#[cfg(test)]
 fn complete_mcp_await_event_deliveries(
     db_path: Arc<PathBuf>,
     leases: Vec<EventDeliveryLease>,
@@ -4209,103 +6114,49 @@ fn complete_mcp_await_event_deliveries(
         return;
     }
 
-    let runtime = match CompatRuntimeBuilder::current_thread().build() {
+    let runtime = match CompatRuntimeBuilder::current_thread()
+        .max_blocking_threads(MCP_AWAIT_EVENT_COMPLETION_BLOCKING_THREADS)
+        .build()
+    {
         Ok(runtime) => runtime,
-        Err(err) => {
+        Err(error) => {
             tracing::error!(
-                error = %err,
+                error = %error,
                 delivery_count = leases.len(),
                 ?outcome,
-                "Unable to build runtime for MCP event-delivery completion; leases will recover by expiry"
+                "Unable to build test runtime for MCP event-delivery completion; leases will recover by expiry"
             );
             return;
         }
     };
-
-    let delivery_count = leases.len();
-    let completion = runtime.block_on(async move {
-        let cx = crate::cx::for_request();
-        let operation_cx = cx.clone();
-        crate::runtime_async::timeout_with_cx(
-            &cx,
-            std::time::Duration::from_secs(MCP_AWAIT_EVENT_DELIVERY_FINALIZE_GRACE_SECS),
-            async move {
-                let storage = match StorageHandle::new_with_cx(
-                    &operation_cx,
-                    &db_path.to_string_lossy(),
-                )
-                .await
-                {
-                    Ok(storage) => storage,
-                    Err(err) => {
-                        tracing::error!(
-                            error = %err,
-                            delivery_count = leases.len(),
-                            ?outcome,
-                            "Unable to open storage for MCP event-delivery completion; leases will recover by expiry"
-                        );
-                        return;
-                    }
-                };
-
-                for lease in &leases {
-                    let completion = match outcome {
-                        FrameworkResponseDeliveryOutcome::DeliveryAcknowledged => {
-                            storage
-                                .finalize_event_delivery_with_cx(
-                                    &operation_cx,
-                                    lease,
-                                    Some(MCP_AWAIT_EVENT_CLAIM_WORKFLOW_ID.to_string()),
-                                    MCP_AWAIT_EVENT_CLAIM_STATUS,
-                                )
-                                .await
-                        }
-                        FrameworkResponseDeliveryOutcome::Failed => {
-                            storage
-                                .release_event_delivery_with_cx(&operation_cx, lease)
-                                .await
-                        }
-                    };
-
-                    match completion {
-                        Ok(true) => {}
-                        Ok(false) => {
-                            tracing::warn!(
-                                event_id = lease.event_id(),
-                                ?outcome,
-                                "MCP event-delivery completion lost lease ownership; no handled-state mutation was made"
-                            );
-                        }
-                        Err(err) => {
-                            tracing::error!(
-                                error = %err,
-                                event_id = lease.event_id(),
-                                ?outcome,
-                                "MCP event-delivery completion failed; lease expiry remains the recovery authority"
-                            );
-                        }
-                    }
-                }
-
-                if let Err(err) = storage.shutdown().await {
-                    tracing::warn!(
-                        error = %err,
-                        ?outcome,
-                        "MCP event-delivery completion storage shutdown failed"
-                    );
-                }
-            },
-        )
-        .await
-    });
-
-    if let Err(err) = completion {
-        tracing::error!(
-            error = %err,
-            delivery_count,
-            finalize_grace_secs = MCP_AWAIT_EVENT_DELIVERY_FINALIZE_GRACE_SECS,
+    let active_cx = std::sync::Mutex::new(None);
+    let cx = crate::cx::for_request();
+    let storage = match runtime.block_on(StorageHandle::new_with_cx(
+        &cx,
+        &db_path.to_string_lossy(),
+    )) {
+        Ok(storage) => storage,
+        Err(error) => {
+            tracing::error!(
+                error = %error,
+                delivery_count = leases.len(),
+                ?outcome,
+                "Unable to open test storage for MCP event-delivery completion; leases will recover by expiry"
+            );
+            return;
+        }
+    };
+    let _storage_reusable = runtime.block_on(complete_mcp_await_event_deliveries_with_storage(
+        &storage,
+        &active_cx,
+        leases,
+        outcome,
+    ));
+    if let Err(error) = runtime.block_on(storage.shutdown_with_cx(&cx)) {
+        tracing::warn!(
+            error = %error,
             ?outcome,
-            "MCP event-delivery completion exceeded its hard deadline; lease expiry remains the recovery authority"
+            "Test MCP event-delivery completion storage shutdown failed"
         );
     }
 }
@@ -4670,6 +6521,7 @@ fn mcp_await_event_cursor_discontinuity_error(
 async fn mcp_await_event_reconcile_page(
     storage: &StorageHandle,
     cx: &crate::cx::Cx,
+    storage_reusable: &std::sync::atomic::AtomicBool,
     committed_after_id: i64,
     cursor_epoch: &str,
     cursor_scope: &str,
@@ -4691,6 +6543,7 @@ async fn mcp_await_event_reconcile_page(
             cursor_epoch,
         )
         .await;
+    mcp_await_event_record_storage_call_health(storage_reusable, &check_result);
     mcp_await_event_checkpoint(cx).map_err(McpToolError::from_error)?;
     let check = check_result.map_err(McpToolError::from_error)?;
     if let Some(error) =
@@ -4708,11 +6561,13 @@ async fn mcp_await_event_reconcile_page(
 }
 
 #[derive(Debug)]
-enum McpAwaitExactEventResolution {
-    Unhandled(crate::storage::StoredEvent),
+enum McpAwaitExactEventAbsence {
     Handled,
     MissingWithoutRetentionEvidence,
 }
+
+type McpAwaitExactEventResolution =
+    std::result::Result<crate::storage::StoredEvent, McpAwaitExactEventAbsence>;
 
 /// Re-read one event without pane/handled filters, then classify any absence
 /// using the retention ledger. This is the only safe follow-up to
@@ -4721,12 +6576,15 @@ enum McpAwaitExactEventResolution {
 async fn mcp_await_event_resolve_exact_event(
     storage: &StorageHandle,
     cx: &crate::cx::Cx,
+    storage_reusable: &std::sync::atomic::AtomicBool,
     event_id: i64,
     cursor_epoch: &str,
     cursor_scope: &str,
 ) -> std::result::Result<McpAwaitExactEventResolution, McpToolError> {
     if event_id <= 0 {
-        return Ok(McpAwaitExactEventResolution::MissingWithoutRetentionEvidence);
+        return Ok(Err(
+            McpAwaitExactEventAbsence::MissingWithoutRetentionEvidence,
+        ));
     }
 
     let page_result = storage
@@ -4746,12 +6604,14 @@ async fn mcp_await_event_resolve_exact_event(
             },
         )
         .await;
+    mcp_await_event_record_storage_call_health(storage_reusable, &page_result);
     mcp_await_event_checkpoint(cx).map_err(McpToolError::from_error)?;
     let page = page_result.map_err(McpToolError::from_error)?;
 
     let check_result = storage
         .check_event_retention_in_epoch_with_cx(cx, event_id - 1, event_id, cursor_epoch)
         .await;
+    mcp_await_event_record_storage_call_health(storage_reusable, &check_result);
     mcp_await_event_checkpoint(cx).map_err(McpToolError::from_error)?;
     let check = check_result.map_err(McpToolError::from_error)?;
     if let Some(error) =
@@ -4766,9 +6626,13 @@ async fn mcp_await_event_resolve_exact_event(
         .next()
         .filter(|event| event.id == event_id)
     {
-        Some(event) if event.handled_at.is_some() => Ok(McpAwaitExactEventResolution::Handled),
-        Some(event) => Ok(McpAwaitExactEventResolution::Unhandled(event)),
-        None => Ok(McpAwaitExactEventResolution::MissingWithoutRetentionEvidence),
+        Some(event) if event.handled_at.is_some() => {
+            Ok(Err(McpAwaitExactEventAbsence::Handled))
+        }
+        Some(event) => Ok(Ok(event)),
+        None => Ok(Err(
+            McpAwaitExactEventAbsence::MissingWithoutRetentionEvidence,
+        )),
     }
 }
 
@@ -4801,6 +6665,91 @@ fn mcp_await_event_blocked_capacity_error() -> McpToolError {
                 .to_string(),
         ),
     )
+}
+
+fn mcp_await_event_require_claim_completion_ready(
+    delivery_completion: Option<&Arc<McpAwaitEventDeliveryCompletionExecutor>>,
+) -> std::result::Result<(), McpToolError> {
+    let Some(delivery_completion) = delivery_completion else {
+        return Err(McpToolError::new(
+            MCP_ERR_CONFIG,
+            "wa.await_event claim completion lane is unavailable".to_string(),
+            Some(
+                "Retry after the MCP server can establish its bounded claim-completion lane"
+                    .to_string(),
+            ),
+        ));
+    };
+    if !delivery_completion.is_ready() {
+        delivery_completion.record_unready_claim_admission();
+        return Err(McpToolError::new(
+            MCP_ERR_CONFIG,
+            "wa.await_event claim completion storage is initializing or reconnecting"
+                .to_string(),
+            Some(
+                "Retry after the MCP server reports its durable claim-completion lane ready"
+                    .to_string(),
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn mcp_await_event_service_unready_error() -> McpToolError {
+    McpToolError::new(
+        MCP_ERR_CONFIG,
+        "wa.await_event shared storage service is initializing, reconnecting, or shutting down"
+            .to_string(),
+        Some("Retry after the MCP server reports its shared await service ready".to_string()),
+    )
+}
+
+fn mcp_await_event_service_saturated_error() -> McpToolError {
+    McpToolError::new(
+        MCP_ERR_CONFIG,
+        format!(
+            "wa.await_event shared service has reached its bounded admission limit of {MCP_AWAIT_EVENT_REQUEST_ADMISSION_CAPACITY} requests"
+        ),
+        Some(
+            "Wait for an in-flight await to finish or cancel one before retrying".to_string(),
+        ),
+    )
+}
+
+fn mcp_await_event_service_disconnected_error() -> McpToolError {
+    McpToolError::new(
+        MCP_ERR_CONFIG,
+        "wa.await_event shared storage service disconnected before returning a result".to_string(),
+        Some("Restart the MCP server before retrying the await".to_string()),
+    )
+}
+
+/// Classify only failures that make the shared writer epoch suspect. Request
+/// cancellation and logical storage-domain results (for example a missing row
+/// or a cursor discontinuity) are request-local and must not cancel unrelated
+/// waits or churn an otherwise healthy writer.
+fn mcp_await_event_error_invalidates_storage_epoch(error: &crate::Error) -> bool {
+    matches!(
+        error,
+        crate::Error::Storage(
+            crate::error::StorageError::Database(_)
+                | crate::error::StorageError::MigrationFailed(_)
+                | crate::error::StorageError::SchemaTooNew { .. }
+                | crate::error::StorageError::WaTooOld { .. }
+                | crate::error::StorageError::Corruption { .. }
+        )
+    )
+}
+
+fn mcp_await_event_record_storage_call_health<T>(
+    storage_reusable: &std::sync::atomic::AtomicBool,
+    result: &crate::Result<T>,
+) {
+    if let Err(error) = result
+        && mcp_await_event_error_invalidates_storage_epoch(error)
+    {
+        storage_reusable.store(false, Ordering::Release);
+    }
 }
 
 fn mcp_await_event_is_satisfied(any_met: &[bool], all_met: &[bool]) -> bool {
@@ -5091,8 +7040,10 @@ impl ToolHandler for WaEventsTool {
 }
 
 pub(super) struct WaAwaitEventTool {
+    #[cfg(test)]
     db_path: Arc<PathBuf>,
     response_delivery: Option<Arc<FrameworkResponseDeliveryCoordinator>>,
+    request_service: Option<Arc<McpAwaitEventDeliveryCompletionExecutor>>,
     delivery_completion: Option<Arc<McpAwaitEventDeliveryCompletionExecutor>>,
     #[cfg(test)]
     blocked_retry_observer: Option<Arc<dyn Fn(usize) + Send + Sync + 'static>>,
@@ -5104,8 +7055,10 @@ impl WaAwaitEventTool {
     #[cfg(test)]
     pub(super) fn new(db_path: Arc<PathBuf>) -> Self {
         Self {
+            #[cfg(test)]
             db_path,
             response_delivery: None,
+            request_service: None,
             delivery_completion: None,
             blocked_retry_observer: None,
             iteration_observer: None,
@@ -5116,21 +7069,23 @@ impl WaAwaitEventTool {
         db_path: Arc<PathBuf>,
         response_delivery: Arc<FrameworkResponseDeliveryCoordinator>,
     ) -> Self {
-        let delivery_completion =
-            match McpAwaitEventDeliveryCompletionExecutor::new() {
+        let await_service =
+            match McpAwaitEventDeliveryCompletionExecutor::new(Arc::clone(&db_path)) {
                 Ok(executor) => Some(Arc::new(executor)),
                 Err(error) => {
                     tracing::error!(
                         error = %error,
-                        "Unable to start bounded MCP event-delivery completion workers; claim requests will fail closed"
+                        "Unable to start the shared MCP await-event service; all await requests will fail closed"
                     );
                     None
                 }
             };
         Self {
+            #[cfg(test)]
             db_path,
             response_delivery: Some(response_delivery),
-            delivery_completion,
+            request_service: await_service.as_ref().map(Arc::clone),
+            delivery_completion: await_service,
             #[cfg(test)]
             blocked_retry_observer: None,
             #[cfg(test)]
@@ -5145,13 +7100,15 @@ impl WaAwaitEventTool {
         completion_handler: McpAwaitEventDeliveryCompletionHandler,
     ) -> Self {
         Self {
+            #[cfg(test)]
             db_path,
             response_delivery: Some(response_delivery),
+            request_service: None,
             delivery_completion: Some(Arc::new(
                 McpAwaitEventDeliveryCompletionExecutor::new_with_handler(
                     completion_handler,
                 )
-                .expect("test completion workers must start"),
+                .expect("test completion lane must start"),
             )),
             blocked_retry_observer: None,
             iteration_observer: None,
@@ -5172,6 +7129,18 @@ impl WaAwaitEventTool {
         self.iteration_observer = Some(observer);
         self
     }
+
+    #[cfg(test)]
+    fn wait_for_delivery_completion_ready_for_test(&self) {
+        let executor = self
+            .delivery_completion
+            .as_ref()
+            .expect("test claim-completion executor must exist");
+        assert!(
+            executor.wait_until_ready_for_test(std::time::Duration::from_secs(5)),
+            "test claim-completion storage did not become ready"
+        );
+    }
 }
 
 impl ToolHandler for WaAwaitEventTool {
@@ -5188,14 +7157,12 @@ impl ToolHandler for WaAwaitEventTool {
                     "any": {
                         "type": "array",
                         "items": { "type": "string", "minLength": 1, "maxLength": MCP_AWAIT_EVENT_CONDITION_MAX_BYTES },
-                        "default": [],
                         "maxItems": MCP_AWAIT_EVENT_CONDITION_SET_MAX,
                         "description": "At least one condition in this set must match; supported condition: rule:<glob>"
                     },
                     "all": {
                         "type": "array",
                         "items": { "type": "string", "minLength": 1, "maxLength": MCP_AWAIT_EVENT_CONDITION_MAX_BYTES },
-                        "default": [],
                         "maxItems": MCP_AWAIT_EVENT_CONDITION_SET_MAX,
                         "description": "Every condition in this set must match; supported condition: rule:<glob>"
                     },
@@ -5251,6 +7218,30 @@ impl ToolHandler for WaAwaitEventTool {
                         "type": "boolean",
                         "default": false,
                         "description": "Without a cursor/token or claim, atomically return the current storage-tail cursor token immediately without replaying or waiting"
+                    }
+                },
+                "anyOf": [
+                    {
+                        "required": ["any"],
+                        "properties": { "any": { "minItems": 1 } }
+                    },
+                    {
+                        "required": ["all"],
+                        "properties": { "all": { "minItems": 1 } }
+                    }
+                ],
+                "if": {
+                    "required": ["checkpoint_only"],
+                    "properties": { "checkpoint_only": { "const": true } }
+                },
+                "then": {
+                    "properties": { "claim": { "const": false } },
+                    "not": {
+                        "anyOf": [
+                            { "required": ["cursor"] },
+                            { "required": ["cursor_epoch"] },
+                            { "required": ["cursor_scope"] }
+                        ]
                     }
                 },
                 "dependentRequired": {
@@ -5452,56 +7443,42 @@ impl ToolHandler for WaAwaitEventTool {
             );
             return envelope_to_content(envelope);
         }
-        if params.claim && self.delivery_completion.is_none() {
+        if params.claim
+            && let Err(err) = mcp_await_event_require_claim_completion_ready(
+                self.delivery_completion.as_ref(),
+            )
+        {
             let envelope = McpEnvelope::<()>::error(
-                MCP_ERR_CONFIG,
-                "wa.await_event claim completion workers are unavailable".to_string(),
-                Some(
-                    "Retry after the MCP server can establish its bounded claim-completion lane"
-                        .to_string(),
-                ),
+                err.code,
+                err.message,
+                err.hint,
                 elapsed_ms(start),
             );
             return envelope_to_content(envelope);
         }
 
+        #[cfg(test)]
         let db_path = Arc::clone(&self.db_path);
         let request_cx = ctx.cx().clone();
         let delivery_completion = self.delivery_completion.as_ref().map(Arc::clone);
+        let request_delivery_completion = delivery_completion.as_ref().map(Arc::clone);
         #[cfg(test)]
         let blocked_retry_observer = self.blocked_retry_observer.as_ref().map(Arc::clone);
         #[cfg(test)]
         let iteration_observer = self.iteration_observer.as_ref().map(Arc::clone);
-        let runtime = CompatRuntimeBuilder::current_thread()
-            .build()
-            .map_err(|e| McpError::internal_error(format!("MCP runtime init failed: {e}")))?;
-
-        let (result, mut delivery_leases): (
-            std::result::Result<McpAwaitEventData, McpToolError>,
-            Vec<EventDeliveryLease>,
-        ) = runtime.block_on(async {
-            let mut delivery_leases = Vec::new();
-            let cx = request_cx;
-            if let Err(error) = mcp_await_event_checkpoint(&cx) {
-                return (Err(McpToolError::from_error(error)), delivery_leases);
-            }
-            let storage_result =
-                StorageHandle::new_with_cx(&cx, &db_path.to_string_lossy()).await;
-            if let Err(error) = mcp_await_event_checkpoint(&cx) {
-                if let Ok(storage) = storage_result {
-                    if let Err(shutdown_error) = storage.shutdown().await {
-                        tracing::warn!(
-                            error = %shutdown_error,
-                            "wa.await_event cancelled after storage open; shutdown failed"
-                        );
-                    }
+        let request_cx_for_operation = request_cx.clone();
+        let request_operation: McpAwaitEventRequestOperation = Box::new(move |storage| {
+            Box::pin(async move {
+                let mut delivery_leases = Vec::new();
+                let storage_reusable = std::sync::atomic::AtomicBool::new(true);
+                let cx = request_cx_for_operation;
+                if let Err(error) = mcp_await_event_checkpoint(&cx) {
+                    return McpAwaitEventRequestTaskOutput::new(
+                        Err(McpToolError::from_error(error)),
+                        delivery_leases,
+                        true,
+                    );
                 }
-                return (Err(McpToolError::from_error(error)), delivery_leases);
-            }
-            let storage = match storage_result {
-                Ok(storage) => storage,
-                Err(err) => return (Err(McpToolError::from_error(err)), delivery_leases),
-            };
             let redactor = crate::redactor::Redactor::new();
             let started = Instant::now();
             let timeout = std::time::Duration::from_secs(params.timeout_secs);
@@ -5525,7 +7502,7 @@ impl ToolHandler for WaAwaitEventTool {
                 Vec::<McpAwaitBlockedEvent>::with_capacity(MCP_AWAIT_EVENT_BLOCKED_EVENT_MAX);
             let mut retry_blocked_events = true;
 
-            let operation: std::result::Result<McpAwaitEventData, McpToolError> = async {
+                let operation: std::result::Result<McpAwaitEventData, McpToolError> = async {
                 if scan_after_id.is_none() {
                     let baseline_result = storage
                         .get_events_stream_page_with_cx(
@@ -5544,6 +7521,10 @@ impl ToolHandler for WaAwaitEventTool {
                             },
                         )
                         .await;
+                    mcp_await_event_record_storage_call_health(
+                        &storage_reusable,
+                        &baseline_result,
+                    );
                     mcp_await_event_checkpoint(&cx).map_err(McpToolError::from_error)?;
                     let baseline_page = baseline_result.map_err(McpToolError::from_error)?;
                     let baseline = mcp_await_event_fresh_baseline(&baseline_page);
@@ -5568,8 +7549,11 @@ impl ToolHandler for WaAwaitEventTool {
                         let mut retry_timeout_unleased_event = None;
                         debug_assert!(blocked_retry_scratch.is_empty());
                         std::mem::swap(&mut blocked_events, &mut blocked_retry_scratch);
-                        let mut blocked_retry_iter = blocked_retry_scratch.drain(..);
-                        for blocked in blocked_retry_iter.by_ref() {
+                        let mut blocked_retry_index = 0;
+                        while let Some(&blocked) =
+                            blocked_retry_scratch.get(blocked_retry_index)
+                        {
+                            blocked_retry_index += 1;
                             #[cfg(test)]
                             if let Some(observer) = iteration_observer.as_ref() {
                                 observer(
@@ -5597,18 +7581,21 @@ impl ToolHandler for WaAwaitEventTool {
                                     ),
                                 )
                             })?;
-                            let event = match mcp_await_event_resolve_exact_event(
+                            let exact_event_result = mcp_await_event_resolve_exact_event(
                                 &storage,
                                 &cx,
+                                &storage_reusable,
                                 blocked.event_id,
                                 cursor_epoch,
                                 &canonical_cursor_scope,
                             )
-                            .await?
-                            {
-                                McpAwaitExactEventResolution::Unhandled(event) => event,
-                                McpAwaitExactEventResolution::Handled => continue,
-                                McpAwaitExactEventResolution::MissingWithoutRetentionEvidence => {
+                            .await;
+                            let event = match exact_event_result? {
+                                Ok(event) => event,
+                                Err(McpAwaitExactEventAbsence::Handled) => continue,
+                                Err(
+                                    McpAwaitExactEventAbsence::MissingWithoutRetentionEvidence,
+                                ) => {
                                     return Err(mcp_await_event_ambiguous_exact_event_error(
                                         blocked.event_id,
                                         mcp_await_event_authoritative_cursor(
@@ -5634,9 +7621,16 @@ impl ToolHandler for WaAwaitEventTool {
                                     MCP_AWAIT_EVENT_DELIVERY_FINALIZE_GRACE_SECS,
                                 ),
                             );
+                            mcp_await_event_require_claim_completion_ready(
+                                request_delivery_completion.as_ref(),
+                            )?;
                             let reservation_result = storage
                                 .reserve_event_delivery_with_cx(&cx, blocked.event_id, lease_ttl)
                                 .await;
+                            mcp_await_event_record_storage_call_health(
+                                &storage_reusable,
+                                &reservation_result,
+                            );
                             let acquired_event = match reservation_result {
                                 Ok(EventDeliveryReservation::Acquired(lease)) => {
                                     // Record ownership before the checkpoint so
@@ -5661,18 +7655,21 @@ impl ToolHandler for WaAwaitEventTool {
                                 Ok(EventDeliveryReservation::AlreadyHandledOrMissing) => {
                                     mcp_await_event_checkpoint(&cx)
                                         .map_err(McpToolError::from_error)?;
-                                    match mcp_await_event_resolve_exact_event(
+                                    let exact_event_result = mcp_await_event_resolve_exact_event(
                                         &storage,
                                         &cx,
+                                        &storage_reusable,
                                         blocked.event_id,
                                         cursor_epoch,
                                         &canonical_cursor_scope,
                                     )
-                                    .await?
-                                    {
-                                        McpAwaitExactEventResolution::Handled => None,
-                                        McpAwaitExactEventResolution::Unhandled(_)
-                                        | McpAwaitExactEventResolution::MissingWithoutRetentionEvidence => {
+                                    .await;
+                                    match exact_event_result? {
+                                        Err(McpAwaitExactEventAbsence::Handled) => None,
+                                        Ok(_)
+                                        | Err(
+                                            McpAwaitExactEventAbsence::MissingWithoutRetentionEvidence,
+                                        ) => {
                                             return Err(
                                                 mcp_await_event_ambiguous_exact_event_error(
                                                     blocked.event_id,
@@ -5743,8 +7740,11 @@ impl ToolHandler for WaAwaitEventTool {
                             blocked_events.push(blocked);
                         }
                         if retry_timed_out || mcp_await_event_is_satisfied(&any_met, &all_met) {
-                            blocked_events.extend(blocked_retry_iter);
+                            blocked_events.extend_from_slice(
+                                &blocked_retry_scratch[blocked_retry_index..],
+                            );
                         }
+                        blocked_retry_scratch.clear();
                         final_cursor = mcp_await_event_committed_cursor(
                             scan_after_id,
                             &blocked_events,
@@ -5773,6 +7773,10 @@ impl ToolHandler for WaAwaitEventTool {
                     let page_result = storage
                         .get_events_stream_page_with_cx(&cx, query)
                         .await;
+                    mcp_await_event_record_storage_call_health(
+                        &storage_reusable,
+                        &page_result,
+                    );
                     mcp_await_event_checkpoint(&cx).map_err(McpToolError::from_error)?;
                     let page = page_result.map_err(McpToolError::from_error)?;
                     let cursor_epoch = current_cursor_epoch.as_deref().ok_or_else(|| {
@@ -5799,16 +7803,18 @@ impl ToolHandler for WaAwaitEventTool {
                         &all_met,
                     )
                     .unwrap_or(0);
-                    mcp_await_event_reconcile_page(
+                    let reconciliation = mcp_await_event_reconcile_page(
                         &storage,
                         &cx,
+                        &storage_reusable,
                         committed_cursor,
                         cursor_epoch,
                         &canonical_cursor_scope,
                         &page,
                         &mut retention_coverage,
                     )
-                    .await?;
+                    .await;
+                    reconciliation?;
                     let checked_through = mcp_await_event_page_checked_through(&page);
                     let batch_len = page.events.len();
                     let mut processed_all_events = true;
@@ -5851,9 +7857,16 @@ impl ToolHandler for WaAwaitEventTool {
                                     MCP_AWAIT_EVENT_DELIVERY_FINALIZE_GRACE_SECS,
                                 ),
                             );
+                            mcp_await_event_require_claim_completion_ready(
+                                request_delivery_completion.as_ref(),
+                            )?;
                             let reservation_result = storage
                                 .reserve_event_delivery_with_cx(&cx, event_id, lease_ttl)
                                 .await;
+                            mcp_await_event_record_storage_call_health(
+                                &storage_reusable,
+                                &reservation_result,
+                            );
                             match reservation_result {
                                 Ok(EventDeliveryReservation::Acquired(lease)) => {
                                     delivery_leases.push(lease);
@@ -5903,21 +7916,24 @@ impl ToolHandler for WaAwaitEventTool {
                                                 ),
                                             )
                                         })?;
-                                    match mcp_await_event_resolve_exact_event(
+                                    let exact_event_result = mcp_await_event_resolve_exact_event(
                                         &storage,
                                         &cx,
+                                        &storage_reusable,
                                         event_id,
                                         cursor_epoch,
                                         &canonical_cursor_scope,
                                     )
-                                    .await?
-                                    {
-                                        McpAwaitExactEventResolution::Handled => {
+                                    .await;
+                                    match exact_event_result? {
+                                        Err(McpAwaitExactEventAbsence::Handled) => {
                                             scan_after_id = Some(event_id);
                                             continue;
                                         }
-                                        McpAwaitExactEventResolution::Unhandled(_)
-                                        | McpAwaitExactEventResolution::MissingWithoutRetentionEvidence => {
+                                        Ok(_)
+                                        | Err(
+                                            McpAwaitExactEventAbsence::MissingWithoutRetentionEvidence,
+                                        ) => {
                                             return Err(
                                                 mcp_await_event_ambiguous_exact_event_error(
                                                     event_id,
@@ -6025,6 +8041,10 @@ impl ToolHandler for WaAwaitEventTool {
                 let annotations_result = storage
                     .get_event_annotations_bulk_with_cx(&cx, &matched_event_ids)
                     .await;
+                mcp_await_event_record_storage_call_health(
+                    &storage_reusable,
+                    &annotations_result,
+                );
                 mcp_await_event_checkpoint(&cx).map_err(McpToolError::from_error)?;
                 let mut annotations_by_event =
                     annotations_result.map_err(McpToolError::from_error)?;
@@ -6095,17 +8115,73 @@ impl ToolHandler for WaAwaitEventTool {
                     claim_delivery: pending_finalize
                         .then_some("pending_finalize_after_delivery_ack"),
                 })
-            }
-            .await;
-
-            if let Err(err) = storage.shutdown().await {
-                tracing::warn!(
-                    error = %err,
-                    "wa.await_event storage shutdown failed"
-                );
-            }
-            (operation, delivery_leases)
+                }
+                .await;
+                let storage_reusable = storage_reusable.load(Ordering::Acquire);
+                McpAwaitEventRequestTaskOutput::new(
+                    operation,
+                    delivery_leases,
+                    storage_reusable,
+                )
+            })
         });
+
+        let request_execution = if let Some(request_service) = self.request_service.as_ref() {
+            request_service.execute_request(request_cx, request_operation)
+        } else {
+            #[cfg(test)]
+            {
+                let runtime = CompatRuntimeBuilder::current_thread().build().map_err(|error| {
+                    McpToolError::new(
+                        MCP_ERR_CONFIG,
+                        format!("MCP test runtime init failed: {error}"),
+                        None,
+                    )
+                });
+                match runtime {
+                    Ok(runtime) => {
+                        let open_cx = crate::cx::for_request();
+                        match runtime.block_on(StorageHandle::new_with_cx(
+                            &open_cx,
+                            &db_path.to_string_lossy(),
+                        )) {
+                            Ok(storage) => {
+                                let output = runtime.block_on(request_operation(storage.clone()));
+                                if let Err(error) = runtime.block_on(storage.shutdown_with_cx(&open_cx)) {
+                                    tracing::warn!(
+                                        error = %error,
+                                        "Test-only direct wa.await_event storage shutdown failed"
+                                    );
+                                }
+                                Ok(output.response)
+                            }
+                            Err(error) => Ok((
+                                Err(McpToolError::from_error(error)),
+                                Vec::new(),
+                            )),
+                        }
+                    }
+                    Err(error) => Err(error),
+                }
+            }
+            #[cfg(not(test))]
+            {
+                Err(mcp_await_event_service_unready_error())
+            }
+        };
+
+        let (result, mut delivery_leases) = match request_execution {
+            Ok(output) => output,
+            Err(err) => {
+                let envelope = McpEnvelope::<()>::error(
+                    err.code,
+                    err.message,
+                    err.hint,
+                    elapsed_ms(start),
+                );
+                return envelope_to_content(envelope);
+            }
+        };
 
         if result
             .as_ref()
@@ -6114,7 +8190,6 @@ impl ToolHandler for WaAwaitEventTool {
         {
             enqueue_mcp_await_event_deliveries(
                 delivery_completion.as_ref(),
-                Arc::clone(&self.db_path),
                 std::mem::take(&mut delivery_leases),
                 FrameworkResponseDeliveryOutcome::Failed,
             );
@@ -6128,7 +8203,6 @@ impl ToolHandler for WaAwaitEventTool {
                     Err(err) => {
                         enqueue_mcp_await_event_deliveries(
                             delivery_completion.as_ref(),
-                            Arc::clone(&self.db_path),
                             delivery_leases,
                             FrameworkResponseDeliveryOutcome::Failed,
                         );
@@ -6143,7 +8217,6 @@ impl ToolHandler for WaAwaitEventTool {
                 let Some(response_delivery) = self.response_delivery.as_ref() else {
                     enqueue_mcp_await_event_deliveries(
                         delivery_completion.as_ref(),
-                        Arc::clone(&self.db_path),
                         delivery_leases,
                         FrameworkResponseDeliveryOutcome::Failed,
                     );
@@ -6157,12 +8230,10 @@ impl ToolHandler for WaAwaitEventTool {
                     return envelope_to_content(envelope);
                 };
 
-                let completion_db_path = Arc::clone(&self.db_path);
                 let completion_executor = delivery_completion.as_ref().map(Arc::clone);
                 let action = Box::new(move |outcome| {
                     enqueue_mcp_await_event_deliveries(
                         completion_executor.as_ref(),
-                        completion_db_path,
                         delivery_leases,
                         outcome,
                     );
@@ -6188,7 +8259,6 @@ impl ToolHandler for WaAwaitEventTool {
             Err(err) => {
                 enqueue_mcp_await_event_deliveries(
                     delivery_completion.as_ref(),
-                    Arc::clone(&self.db_path),
                     delivery_leases,
                     FrameworkResponseDeliveryOutcome::Failed,
                 );
@@ -11197,7 +13267,8 @@ mod tests {
         MAX_MCP_RULES_TEST_TEXT_BYTES, MAX_MCP_SEARCH_QUERY_BYTES,
         MAX_MCP_STATE_AGENT_FILTER_BYTES, MAX_MCP_SUBMIT_IDEMPOTENCY_KEY_BYTES,
         MAX_MCP_WAIT_PATTERN_BYTES, MAX_MCP_WAIT_TIMEOUT_SECS, MAX_SEND_TEXT_BYTES, McpContext,
-        PaneCapabilities, PaneFilterConfig, PolicySurface, StorageHandle, Tool, ToolHandler,
+        PaneCapabilities, PaneFilterConfig, PolicySurface, RecoverablePanicSite, StorageHandle, Tool,
+        ToolHandler,
         WaAccountsRefreshTool, WaAccountsTool, WaAttentionTool, WaAwaitEventTool, WaCassSearchTool,
         WaCassStatusTool, WaCassViewTool, WaDomTool, WaEventsAnnotateTool, WaEventsLabelTool,
         WaEventsTool, WaEventsTriageTool, WaGetTextTool, WaMissionAbortTool, WaMissionExplainTool,
@@ -11207,7 +13278,8 @@ mod tests {
         WaSteerPlanTool, WaTxPlanTool, WaTxRollbackTool, WaTxRunTool, WaTxShowTool, WaWaitForTool,
         WaWorkflowRunTool, WaWorkflowStatusTool, accounts_refresh_policy_input,
         audit_mcp_policy_denial_async, authorize_mcp_policy_call, build_mcp_shared_rate_limiter,
-        build_policy_engine_with_shared_rate_limiter, mcp_event_mutation_decision_context,
+        build_policy_engine_with_shared_rate_limiter, catch_recoverable,
+        mcp_event_mutation_decision_context,
         mcp_get_text_policy_input, mcp_load_mission_tx_contract_from_path, mcp_now_ms_i64,
         mcp_release_pane_policy_input, mcp_reserve_pane_policy_input,
         mcp_search_output_policy_input, mcp_send_text_policy_input, mcp_workflow_run_policy_input,
@@ -11263,6 +13335,63 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("mcp-tools-test.db");
         (dir, Arc::new(path))
+    }
+
+    fn wait_for_completion_stats(
+        stats: &super::McpAwaitEventDeliveryCompletionStats,
+        description: &str,
+        predicate: impl Fn(super::McpAwaitEventDeliveryCompletionStatsSnapshot) -> bool,
+    ) -> super::McpAwaitEventDeliveryCompletionStatsSnapshot {
+        let started = std::time::Instant::now();
+        loop {
+            let snapshot = stats.snapshot();
+            if predicate(snapshot) {
+                return snapshot;
+            }
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(5),
+                "timed out waiting for {description}; last completion stats: {snapshot:?}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    fn gated_await_request_operation(
+        cx: crate::cx::Cx,
+        gate: Arc<std::sync::atomic::AtomicBool>,
+        entered: Arc<std::sync::atomic::AtomicU64>,
+        label: String,
+    ) -> super::McpAwaitEventRequestOperation {
+        Box::new(move |_storage| {
+            Box::pin(async move {
+                entered.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                while gate.load(std::sync::atomic::Ordering::Acquire) {
+                    if super::mcp_await_event_wait_with_cx(
+                        &cx,
+                        std::time::Duration::from_millis(5),
+                    )
+                    .await
+                    .is_err()
+                    {
+                        break;
+                    }
+                }
+                let state = if cx.checkpoint().is_err() {
+                    "cancelled"
+                } else {
+                    "completed"
+                };
+                super::McpAwaitEventRequestTaskOutput::new(
+                    Err(super::McpToolError::new(
+                        super::MCP_ERR_CONFIG,
+                        format!("{state}:{label}"),
+                        None,
+                    )),
+                    Vec::new(),
+                    true,
+                )
+            })
+        })
     }
 
     fn workspace_tempdir() -> TempDir {
@@ -12120,6 +14249,120 @@ mod tests {
             definition.input_schema["dependentRequired"]["cursor_scope"],
             serde_json::json!(["cursor", "cursor_epoch"])
         );
+        assert_eq!(
+            definition.input_schema["anyOf"],
+            serde_json::json!([
+                {
+                    "required": ["any"],
+                    "properties": { "any": { "minItems": 1 } }
+                },
+                {
+                    "required": ["all"],
+                    "properties": { "all": { "minItems": 1 } }
+                }
+            ])
+        );
+        assert_eq!(
+            definition.input_schema["then"]["properties"]["claim"]["const"],
+            false
+        );
+        assert_eq!(
+            definition.input_schema["then"]["not"]["anyOf"],
+            serde_json::json!([
+                { "required": ["cursor"] },
+                { "required": ["cursor_epoch"] },
+                { "required": ["cursor_scope"] }
+            ])
+        );
+        assert!(
+            definition.input_schema["properties"]["any"]
+                .get("default")
+                .is_none(),
+            "the schema must not advertise an all-empty default that runtime rejects"
+        );
+        assert!(
+            definition.input_schema["properties"]["all"]
+                .get("default")
+                .is_none(),
+            "the schema must not advertise an all-empty default that runtime rejects"
+        );
+    }
+
+    #[test]
+    fn await_event_schema_matches_required_conditions_and_checkpoint_runtime_guards() {
+        let (_dir, db_path) = temp_db_path();
+        let tool = WaAwaitEventTool::new(db_path);
+        let definition = tool.definition();
+        let validator = jsonschema::draft202012::options()
+            .build(&definition.input_schema)
+            .expect("wa.await_event input schema compiles as Draft 2020-12");
+
+        for arguments in [
+            serde_json::json!({"any": ["rule:codex.*"]}),
+            serde_json::json!({"all": ["rule:codex.*"]}),
+            serde_json::json!({"any": [], "all": ["rule:codex.*"]}),
+            serde_json::json!({"any": ["rule:codex.*"], "all": []}),
+            serde_json::json!({
+                "all": ["rule:codex.*"],
+                "checkpoint_only": true,
+                "claim": false
+            }),
+        ] {
+            let errors = validator
+                .iter_errors(&arguments)
+                .map(|error| error.to_string())
+                .collect::<Vec<_>>();
+            assert!(
+                errors.is_empty(),
+                "runtime-valid arguments must satisfy the published schema: {arguments}; errors={errors:?}"
+            );
+        }
+
+        let checkpoint = parse_json_content(
+            tool.call(
+                &test_mcp_context(),
+                serde_json::json!({
+                    "all": ["rule:codex.*"],
+                    "checkpoint_only": true,
+                    "claim": false
+                }),
+            )
+            .expect("schema-valid checkpoint request should return immediately"),
+        );
+        assert_eq!(checkpoint["ok"], true, "unexpected envelope: {checkpoint}");
+
+        for arguments in [
+            serde_json::json!({}),
+            serde_json::json!({"any": []}),
+            serde_json::json!({"all": []}),
+            serde_json::json!({"any": [], "all": []}),
+            serde_json::json!({
+                "any": ["rule:codex.*"],
+                "checkpoint_only": true,
+                "claim": true
+            }),
+            serde_json::json!({
+                "all": ["rule:codex.*"],
+                "checkpoint_only": true,
+                "cursor": 0,
+                "cursor_epoch": "a".repeat(32),
+                "cursor_scope": "b".repeat(64)
+            }),
+        ] {
+            assert!(
+                !validator.is_valid(&arguments),
+                "runtime-invalid arguments must be rejected by the published schema: {arguments}"
+            );
+            let envelope = parse_json_content(
+                tool.call(&test_mcp_context(), arguments.clone())
+                    .expect("invalid request should return a typed error envelope"),
+            );
+            assert_eq!(envelope["ok"], false, "unexpected envelope: {envelope}");
+            assert_eq!(
+                envelope["error_code"], MCP_ERR_INVALID_ARGS,
+                "schema-invalid request must fail the same runtime guard: {arguments}"
+            );
+        }
     }
 
     #[test]
@@ -12742,17 +14985,19 @@ mod tests {
                 .await
                 .unwrap();
             let cx = crate::cx::Cx::for_testing();
+            let storage_reusable = std::sync::atomic::AtomicBool::new(true);
             assert!(matches!(
                 super::mcp_await_event_resolve_exact_event(
                     &storage,
                     &cx,
+                    &storage_reusable,
                     event_id,
                     &cursor_epoch,
                     &cursor_scope,
                 )
                 .await
                 .unwrap(),
-                super::McpAwaitExactEventResolution::Handled
+                Err(super::McpAwaitExactEventAbsence::Handled)
             ));
             storage.shutdown().await.unwrap();
         });
@@ -12860,6 +15105,7 @@ mod tests {
             Arc::clone(&db_path),
             Arc::clone(&response_delivery),
         );
+        tool.wait_for_delivery_completion_ready_for_test();
 
         let envelope = parse_json_content(
             tool.call(
@@ -13012,6 +15258,7 @@ mod tests {
             response_delivery,
         )
         .with_iteration_observer(iteration_observer);
+        tool.wait_for_delivery_completion_ready_for_test();
 
         let envelope = parse_json_content(
             tool.call(
@@ -13057,6 +15304,1397 @@ mod tests {
     }
 
     #[test]
+    fn await_event_service_reuses_one_runtime_and_storage_epoch_for_sequential_requests() {
+        let (_dir, db_path) = temp_db_path();
+        let tool = WaAwaitEventTool::new_with_response_delivery(
+            Arc::clone(&db_path),
+            Arc::new(super::FrameworkResponseDeliveryCoordinator::default()),
+        );
+        assert!(Arc::ptr_eq(
+            tool.request_service
+                .as_ref()
+                .expect("request service must exist"),
+            tool.delivery_completion
+                .as_ref()
+                .expect("completion service must exist"),
+        ));
+        tool.wait_for_delivery_completion_ready_for_test();
+        let stats = tool
+            .request_service
+            .as_ref()
+            .expect("production await service must exist")
+            .stats_for_test();
+
+        for _ in 0..4 {
+            let envelope = parse_json_content(
+                tool.call(
+                    &test_mcp_context(),
+                    serde_json::json!({
+                        "any": ["rule:never.matches"],
+                        "checkpoint_only": true
+                    }),
+                )
+                .expect("shared-service checkpoint await must return content"),
+            );
+            assert_eq!(envelope["ok"], true, "unexpected envelope: {envelope}");
+            assert_eq!(
+                envelope["data"]["bootstrap_state"],
+                "storage_tail_checkpoint"
+            );
+        }
+
+        let running = wait_for_completion_stats(
+            &stats,
+            "four sequential shared-service await requests",
+            |snapshot| snapshot.request_jobs_finished == 4 && snapshot.active_requests == 0,
+        );
+        assert_eq!(running.worker_starts, 1);
+        assert_eq!(running.runtime_initializations, 1);
+        assert_eq!(running.storage_initialization_attempts, 1);
+        assert_eq!(running.storage_initializations, 1);
+        assert_eq!(running.storage_shutdowns, 0);
+        assert_eq!(running.request_admissions, 4);
+        assert_eq!(running.request_jobs_started, 4);
+        assert_eq!(running.request_jobs_finished, 4);
+        assert_eq!(running.request_admission_rejections_unready, 0);
+        assert_eq!(running.request_admission_rejections_saturated, 0);
+        assert_eq!(running.active_requests_high_water, 1);
+
+        drop(tool);
+        let stopped = wait_for_completion_stats(&stats, "shared await service shutdown", |snapshot| {
+            snapshot.worker_stops == 1
+        });
+        assert_eq!(stopped.runtime_initializations, 1);
+        assert_eq!(stopped.storage_initializations, 1);
+        assert_eq!(stopped.storage_shutdowns, 1);
+    }
+
+    #[test]
+    #[ignore = "exact-source lifecycle/latency A/B; run explicitly with --nocapture"]
+    fn await_event_service_exact_source_ab_records_lifecycle_and_request_latency() {
+        const SAMPLE_COUNT: usize = 32;
+
+        fn checkpoint_latency_samples(tool: &WaAwaitEventTool, sample_count: usize) -> Vec<u64> {
+            (0..sample_count)
+                .map(|_| {
+                    let started = std::time::Instant::now();
+                    let envelope = parse_json_content(
+                        tool.call(
+                            &test_mcp_context(),
+                            serde_json::json!({
+                                "any": ["rule:never.matches"],
+                                "checkpoint_only": true
+                            }),
+                        )
+                        .expect("A/B checkpoint await must return content"),
+                    );
+                    assert_eq!(envelope["ok"], true, "unexpected A/B envelope: {envelope}");
+                    assert_eq!(
+                        envelope["data"]["bootstrap_state"],
+                        "storage_tail_checkpoint"
+                    );
+                    u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX)
+                })
+                .collect()
+        }
+
+        fn percentile(sorted_samples: &[u64], percentile: usize) -> u64 {
+            let index = sorted_samples
+                .len()
+                .saturating_sub(1)
+                .saturating_mul(percentile)
+                / 100;
+            sorted_samples[index]
+        }
+
+        let (_baseline_dir, baseline_db_path) = temp_db_path();
+        let baseline_tool = WaAwaitEventTool::new(baseline_db_path);
+        let mut baseline_us = checkpoint_latency_samples(&baseline_tool, SAMPLE_COUNT);
+        baseline_us.sort_unstable();
+
+        let (_shared_dir, shared_db_path) = temp_db_path();
+        let shared_tool = WaAwaitEventTool::new_with_response_delivery(
+            shared_db_path,
+            Arc::new(super::FrameworkResponseDeliveryCoordinator::default()),
+        );
+        shared_tool.wait_for_delivery_completion_ready_for_test();
+        let shared_stats = shared_tool
+            .request_service
+            .as_ref()
+            .expect("A/B shared await service must exist")
+            .stats_for_test();
+        let mut shared_us = checkpoint_latency_samples(&shared_tool, SAMPLE_COUNT);
+        shared_us.sort_unstable();
+        let shared_lifecycle = wait_for_completion_stats(
+            &shared_stats,
+            "A/B shared request completion",
+            |snapshot| {
+                snapshot.request_jobs_finished == u64::try_from(SAMPLE_COUNT).unwrap()
+                    && snapshot.active_requests == 0
+            },
+        );
+
+        let baseline_p50_us = percentile(&baseline_us, 50);
+        let baseline_p95_us = percentile(&baseline_us, 95);
+        let shared_p50_us = percentile(&shared_us, 50);
+        let shared_p95_us = percentile(&shared_us, 95);
+        println!(
+            "MCP_AWAIT_EVENT_EXACT_SOURCE_AB_V1 {}",
+            serde_json::json!({
+                "samples_per_arm": SAMPLE_COUNT,
+                "baseline_path": "test-only legacy per-request runtime+storage",
+                "shared_path": "production shared await service",
+                "baseline_runtime_builds": SAMPLE_COUNT,
+                "baseline_storage_epochs": SAMPLE_COUNT,
+                "baseline_p50_us": baseline_p50_us,
+                "baseline_p95_us": baseline_p95_us,
+                "shared_runtime_builds": shared_lifecycle.runtime_initializations,
+                "shared_storage_epochs": shared_lifecycle.storage_initializations,
+                "shared_p50_us": shared_p50_us,
+                "shared_p95_us": shared_p95_us,
+                "shared_queue_delay_us_max": shared_lifecycle.request_queue_delay_us_max,
+                "shared_internal_execution_us_total": shared_lifecycle.request_execution_us_total,
+                "shared_internal_execution_us_max": shared_lifecycle.request_execution_us_max,
+                "correctness_oracle": "checkpoint envelopes validated per sample"
+            })
+        );
+
+        assert_eq!(shared_lifecycle.runtime_initializations, 1);
+        assert_eq!(shared_lifecycle.storage_initializations, 1);
+        assert_eq!(
+            shared_lifecycle.request_admissions,
+            u64::try_from(SAMPLE_COUNT).unwrap()
+        );
+        assert_eq!(
+            shared_lifecycle.request_jobs_finished,
+            u64::try_from(SAMPLE_COUNT).unwrap()
+        );
+        assert!(
+            shared_p50_us < baseline_p50_us,
+            "shared p50 must beat per-request lifecycle baseline: shared={shared_p50_us}us baseline={baseline_p50_us}us"
+        );
+        assert!(
+            shared_p95_us < baseline_p95_us,
+            "shared p95 must beat per-request lifecycle baseline: shared={shared_p95_us}us baseline={baseline_p95_us}us"
+        );
+    }
+
+    #[test]
+    fn await_event_service_does_not_count_disconnected_request_as_admitted() {
+        let handler: super::McpAwaitEventDeliveryCompletionHandler = Arc::new(|_job| {});
+        let service =
+            super::McpAwaitEventDeliveryCompletionExecutor::new_with_handler(handler)
+                .expect("test completion-only service must start");
+        let stats = service.stats_for_test();
+        let operation: super::McpAwaitEventRequestOperation = Box::new(|_storage| {
+            Box::pin(async {
+                super::McpAwaitEventRequestTaskOutput::new(
+                    Err(super::McpToolError::new(
+                        super::MCP_ERR_CONFIG,
+                        "must not run".to_string(),
+                        None,
+                    )),
+                    Vec::new(),
+                    true,
+                )
+            })
+        });
+
+        let error = service
+            .execute_request(crate::cx::for_request(), operation)
+            .expect_err("completion-only test service has no request receiver");
+        assert!(error.message.contains("disconnected"));
+        let snapshot = stats.snapshot();
+        assert_eq!(snapshot.request_admissions, 0);
+        assert_eq!(snapshot.request_admission_rejections_saturated, 0);
+        drop(service);
+        wait_for_completion_stats(&stats, "completion-only service shutdown", |snapshot| {
+            snapshot.worker_stops == 1
+        });
+    }
+
+    #[test]
+    fn await_event_service_bounds_concurrency_and_keeps_request_results_isolated() {
+        let (_dir, db_path) = temp_db_path();
+        let service = Arc::new(
+            super::McpAwaitEventDeliveryCompletionExecutor::new(db_path)
+                .expect("bounded shared await service must start"),
+        );
+        let stats = service.stats_for_test();
+        assert!(
+            service.wait_until_ready_for_test(std::time::Duration::from_secs(5)),
+            "shared await storage did not become ready"
+        );
+        let gate = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let entered = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let mut callers = Vec::new();
+        for index in 0..super::MCP_AWAIT_EVENT_REQUEST_ADMISSION_CAPACITY {
+            let service = Arc::clone(&service);
+            let gate = Arc::clone(&gate);
+            let entered = Arc::clone(&entered);
+            callers.push(std::thread::spawn(move || {
+                let cx = crate::cx::for_request();
+                let operation = gated_await_request_operation(
+                    cx.clone(),
+                    gate,
+                    entered,
+                    format!("request-{index}"),
+                );
+                service.execute_request(cx, operation)
+            }));
+        }
+
+        let saturated = wait_for_completion_stats(
+            &stats,
+            "bounded shared await admission",
+            |snapshot| {
+                snapshot.request_admissions
+                    == super::MCP_AWAIT_EVENT_REQUEST_ADMISSION_CAPACITY
+                    && snapshot.active_requests
+                        == u64::try_from(super::MCP_AWAIT_EVENT_REQUEST_CONCURRENCY).unwrap()
+            },
+        );
+        assert_eq!(
+            saturated.active_requests_high_water,
+            u64::try_from(super::MCP_AWAIT_EVENT_REQUEST_CONCURRENCY).unwrap()
+        );
+
+        let probe_cx = crate::cx::for_request();
+        let probe_operation: super::McpAwaitEventRequestOperation = Box::new(|_storage| {
+            Box::pin(async {
+                super::McpAwaitEventRequestTaskOutput::new(
+                    Err(super::McpToolError::new(
+                        super::MCP_ERR_CONFIG,
+                        "unexpected admission".to_string(),
+                        None,
+                    )),
+                    Vec::new(),
+                    true,
+                )
+            })
+        });
+        let saturation_error = service
+            .execute_request(probe_cx, probe_operation)
+            .expect_err("the seventeenth request must fail bounded admission immediately");
+        assert!(saturation_error.message.contains("bounded admission limit"));
+
+        gate.store(false, std::sync::atomic::Ordering::Release);
+        let mut results = std::collections::BTreeSet::new();
+        for caller in callers {
+            let (result, leases) = caller
+                .join()
+                .expect("bounded request caller must not panic")
+                .expect("admitted request must receive its isolated result");
+            assert!(leases.is_empty());
+            let error = result.expect_err("gated test request returns its identity as an error");
+            assert!(results.insert(error.message));
+        }
+        assert_eq!(
+            results.len(),
+            usize::try_from(super::MCP_AWAIT_EVENT_REQUEST_ADMISSION_CAPACITY).unwrap()
+        );
+        assert!(results.iter().all(|message| message.starts_with("completed:request-")));
+
+        let drained = wait_for_completion_stats(&stats, "bounded request drain", |snapshot| {
+            snapshot.request_jobs_finished
+                == super::MCP_AWAIT_EVENT_REQUEST_ADMISSION_CAPACITY
+                && snapshot.active_requests == 0
+        });
+        assert_eq!(drained.request_admission_rejections_saturated, 1);
+        assert_eq!(drained.runtime_initializations, 1);
+        assert_eq!(drained.storage_initializations, 1);
+        assert_eq!(drained.active_requests_high_water, 8);
+        drop(service);
+        wait_for_completion_stats(&stats, "bounded service shutdown", |snapshot| {
+            snapshot.worker_stops == 1
+        });
+    }
+
+    #[test]
+    fn await_event_service_schedules_completion_while_all_request_slots_are_busy() {
+        let (_dir, db_path) = temp_db_path();
+        let event_id = seed_event(db_path.as_ref().as_path());
+        let probe_runtime = CompatRuntimeBuilder::current_thread().build().unwrap();
+        let lease = probe_runtime.block_on(async {
+            let storage = StorageHandle::new(&db_path.to_string_lossy()).await.unwrap();
+            let reservation = storage
+                .reserve_event_delivery(event_id, std::time::Duration::from_secs(60))
+                .await
+                .unwrap();
+            storage.shutdown().await.unwrap();
+            let crate::storage::EventDeliveryReservation::Acquired(lease) = reservation else {
+                panic!("expected fairness-test lease, got {reservation:?}");
+            };
+            lease
+        });
+
+        let service = Arc::new(
+            super::McpAwaitEventDeliveryCompletionExecutor::new(Arc::clone(&db_path))
+                .expect("fair shared await service must start"),
+        );
+        let stats = service.stats_for_test();
+        assert!(
+            service.wait_until_ready_for_test(std::time::Duration::from_secs(5)),
+            "fairness-test shared storage did not become ready"
+        );
+        let gate = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let entered = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let mut callers = Vec::new();
+        for index in 0..super::MCP_AWAIT_EVENT_REQUEST_CONCURRENCY {
+            let service = Arc::clone(&service);
+            let gate = Arc::clone(&gate);
+            let entered = Arc::clone(&entered);
+            callers.push(std::thread::spawn(move || {
+                let cx = crate::cx::for_request();
+                service.execute_request(
+                    cx.clone(),
+                    gated_await_request_operation(
+                        cx,
+                        gate,
+                        entered,
+                        format!("fairness-{index}"),
+                    ),
+                )
+            }));
+        }
+        wait_for_completion_stats(&stats, "all shared request slots busy", |snapshot| {
+            snapshot.active_requests
+                == u64::try_from(super::MCP_AWAIT_EVENT_REQUEST_CONCURRENCY).unwrap()
+        });
+
+        assert!(service.try_submit(
+            vec![lease.clone()],
+            super::FrameworkResponseDeliveryOutcome::Failed,
+        ));
+        let completion = wait_for_completion_stats(
+            &stats,
+            "completion fairness with saturated request concurrency",
+            |snapshot| snapshot.completion_attempts_finished == 1,
+        );
+        assert_eq!(
+            completion.active_requests,
+            u64::try_from(super::MCP_AWAIT_EVENT_REQUEST_CONCURRENCY).unwrap(),
+            "completion must finish without waiting for a request slot"
+        );
+        assert_eq!(completion.completion_attempts_storage_reusable, 1);
+
+        gate.store(false, std::sync::atomic::Ordering::Release);
+        for caller in callers {
+            let _ = caller
+                .join()
+                .expect("fairness request caller must not panic")
+                .expect("fairness request must receive a result");
+        }
+        let drained = wait_for_completion_stats(&stats, "fairness request drain", |snapshot| {
+            snapshot.active_requests == 0
+                && snapshot.request_jobs_finished
+                    == u64::try_from(super::MCP_AWAIT_EVENT_REQUEST_CONCURRENCY).unwrap()
+        });
+        assert_eq!(drained.runtime_initializations, 1);
+        assert_eq!(drained.storage_initializations, 1);
+        assert_eq!(drained.completion_attempts_finished, 1);
+        assert_eq!(
+            drained.active_requests_high_water,
+            u64::try_from(super::MCP_AWAIT_EVENT_REQUEST_CONCURRENCY).unwrap()
+        );
+        drop(service);
+        wait_for_completion_stats(&stats, "fairness service shutdown", |snapshot| {
+            snapshot.worker_stops == 1
+        });
+
+        probe_runtime.block_on(async {
+            let storage = StorageHandle::new(&db_path.to_string_lossy()).await.unwrap();
+            assert!(
+                !storage.release_event_delivery(&lease).await.unwrap(),
+                "the prioritized completion must already have released its exact token"
+            );
+            storage.shutdown().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn await_event_service_cancellation_is_request_local() {
+        let (_dir, db_path) = temp_db_path();
+        let service = Arc::new(
+            super::McpAwaitEventDeliveryCompletionExecutor::new(db_path)
+                .expect("cancellation-isolation await service must start"),
+        );
+        let stats = service.stats_for_test();
+        assert!(
+            service.wait_until_ready_for_test(std::time::Duration::from_secs(5)),
+            "cancellation-isolation storage did not become ready"
+        );
+        let gate = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let entered = Arc::new(std::sync::atomic::AtomicU64::new(0));
+
+        let first_cx = crate::cx::for_request();
+        let first_cancel = first_cx.clone();
+        let first_service = Arc::clone(&service);
+        let first_gate = Arc::clone(&gate);
+        let first_entered = Arc::clone(&entered);
+        let first = std::thread::spawn(move || {
+            first_service.execute_request(
+                first_cx.clone(),
+                gated_await_request_operation(
+                    first_cx,
+                    first_gate,
+                    first_entered,
+                    "first".to_string(),
+                ),
+            )
+        });
+
+        let second_cx = crate::cx::for_request();
+        let second_service = Arc::clone(&service);
+        let second_gate = Arc::clone(&gate);
+        let second_entered = Arc::clone(&entered);
+        let second = std::thread::spawn(move || {
+            second_service.execute_request(
+                second_cx.clone(),
+                gated_await_request_operation(
+                    second_cx,
+                    second_gate,
+                    second_entered,
+                    "second".to_string(),
+                ),
+            )
+        });
+
+        wait_for_completion_stats(&stats, "two isolated await requests", |snapshot| {
+            snapshot.active_requests == 2
+                && entered.load(std::sync::atomic::Ordering::Acquire) == 2
+        });
+        first_cancel.cancel_with(
+            crate::outcome::CancelKind::User,
+            Some("test one-request cancellation"),
+        );
+        let (first_result, first_leases) = first
+            .join()
+            .expect("cancelled request caller must not panic")
+            .expect("cancelled request must receive an isolated result");
+        assert!(first_leases.is_empty());
+        assert_eq!(
+            first_result
+                .expect_err("cancelled gated request returns a typed error")
+                .message,
+            "cancelled:first"
+        );
+        let one_remaining = wait_for_completion_stats(
+            &stats,
+            "uncancelled request remains active",
+            |snapshot| snapshot.active_requests == 1 && snapshot.request_jobs_finished == 1,
+        );
+        assert_eq!(one_remaining.request_jobs_cancelled_for_epoch, 0);
+
+        gate.store(false, std::sync::atomic::Ordering::Release);
+        let (second_result, second_leases) = second
+            .join()
+            .expect("uncancelled request caller must not panic")
+            .expect("uncancelled request must receive its result");
+        assert!(second_leases.is_empty());
+        assert_eq!(
+            second_result
+                .expect_err("gated request returns its identity as a typed error")
+                .message,
+            "completed:second"
+        );
+        let drained = wait_for_completion_stats(&stats, "isolated cancellation drain", |snapshot| {
+            snapshot.active_requests == 0 && snapshot.request_jobs_finished == 2
+        });
+        assert_eq!(drained.runtime_initializations, 1);
+        assert_eq!(drained.storage_initializations, 1);
+        assert_eq!(drained.request_jobs_cancelled_for_epoch, 0);
+        drop(service);
+        wait_for_completion_stats(&stats, "cancellation service shutdown", |snapshot| {
+            snapshot.worker_stops == 1
+        });
+    }
+
+    #[test]
+    fn await_event_service_prunes_a_cancelled_queued_request_promptly() {
+        let (_dir, db_path) = temp_db_path();
+        let service = Arc::new(
+            super::McpAwaitEventDeliveryCompletionExecutor::new(db_path)
+                .expect("queued-cancellation await service must start"),
+        );
+        let stats = service.stats_for_test();
+        assert!(
+            service.wait_until_ready_for_test(std::time::Duration::from_secs(5)),
+            "queued-cancellation storage did not become ready"
+        );
+        let gate = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let entered = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let mut active_callers = Vec::new();
+        for index in 0..super::MCP_AWAIT_EVENT_REQUEST_CONCURRENCY {
+            let service = Arc::clone(&service);
+            let gate = Arc::clone(&gate);
+            let entered = Arc::clone(&entered);
+            active_callers.push(std::thread::spawn(move || {
+                let cx = crate::cx::for_request();
+                service.execute_request(
+                    cx.clone(),
+                    gated_await_request_operation(
+                        cx,
+                        gate,
+                        entered,
+                        format!("active-{index}"),
+                    ),
+                )
+            }));
+        }
+        wait_for_completion_stats(&stats, "all request slots occupied", |snapshot| {
+            snapshot.active_requests
+                == u64::try_from(super::MCP_AWAIT_EVENT_REQUEST_CONCURRENCY).unwrap()
+                && entered.load(std::sync::atomic::Ordering::Acquire)
+                    == u64::try_from(super::MCP_AWAIT_EVENT_REQUEST_CONCURRENCY).unwrap()
+        });
+
+        let queued_cx = crate::cx::for_request();
+        let queued_cancel = queued_cx.clone();
+        let queued_service = Arc::clone(&service);
+        let queued_gate = Arc::clone(&gate);
+        let queued_entered = Arc::clone(&entered);
+        let queued = std::thread::spawn(move || {
+            queued_service.execute_request(
+                queued_cx.clone(),
+                gated_await_request_operation(
+                    queued_cx,
+                    queued_gate,
+                    queued_entered,
+                    "queued".to_string(),
+                ),
+            )
+        });
+        wait_for_completion_stats(&stats, "one request queued behind active slots", |snapshot| {
+            snapshot.request_admissions
+                == u64::try_from(super::MCP_AWAIT_EVENT_REQUEST_CONCURRENCY + 1).unwrap()
+                && snapshot.active_requests
+                    == u64::try_from(super::MCP_AWAIT_EVENT_REQUEST_CONCURRENCY).unwrap()
+        });
+
+        let cancellation_started = std::time::Instant::now();
+        queued_cancel.cancel_with(
+            crate::outcome::CancelKind::User,
+            Some("test queued-request cancellation"),
+        );
+        let (queued_result, queued_leases) = queued
+            .join()
+            .expect("queued request caller must not panic")
+            .expect("queued cancellation must return a typed result");
+        assert!(queued_leases.is_empty());
+        assert_eq!(
+            queued_result
+                .expect_err("cancelled queued request must not execute")
+                .code,
+            super::MCP_ERR_TIMEOUT
+        );
+        assert!(
+            cancellation_started.elapsed() < std::time::Duration::from_secs(1),
+            "queued cancellation must not wait for an occupied request slot"
+        );
+        let pruned = wait_for_completion_stats(&stats, "cancelled queued request pruning", |snapshot| {
+            snapshot.request_jobs_rejected_cancelled == 1
+        });
+        assert!(pruned.request_waiter_cancellations <= 1);
+        assert_eq!(
+            pruned.request_jobs_started,
+            u64::try_from(super::MCP_AWAIT_EVENT_REQUEST_CONCURRENCY).unwrap()
+        );
+        assert_eq!(
+            entered.load(std::sync::atomic::Ordering::Acquire),
+            u64::try_from(super::MCP_AWAIT_EVENT_REQUEST_CONCURRENCY).unwrap()
+        );
+
+        gate.store(false, std::sync::atomic::Ordering::Release);
+        for caller in active_callers {
+            let _ = caller
+                .join()
+                .expect("active request caller must not panic")
+                .expect("active request must receive its result");
+        }
+        let drained = wait_for_completion_stats(&stats, "queued-cancellation drain", |snapshot| {
+            snapshot.request_jobs_finished
+                == u64::try_from(super::MCP_AWAIT_EVENT_REQUEST_CONCURRENCY).unwrap()
+                && snapshot.active_requests == 0
+        });
+        assert_eq!(drained.request_jobs_rejected_cancelled, 1);
+        assert_eq!(drained.storage_reconnects, 0);
+        drop(service);
+        wait_for_completion_stats(&stats, "queued-cancellation service shutdown", |snapshot| {
+            snapshot.worker_stops == 1
+        });
+    }
+
+    #[test]
+    fn await_event_service_shutdown_cancels_active_and_rejects_queued_requests() {
+        let (_dir, db_path) = temp_db_path();
+        let service = Arc::new(
+            super::McpAwaitEventDeliveryCompletionExecutor::new(db_path)
+                .expect("shutdown-isolation await service must start"),
+        );
+        let stats = service.stats_for_test();
+        assert!(
+            service.wait_until_ready_for_test(std::time::Duration::from_secs(5)),
+            "shutdown-isolation storage did not become ready"
+        );
+        let gate = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let entered = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let request_count = super::MCP_AWAIT_EVENT_REQUEST_CONCURRENCY + 1;
+        let mut callers = Vec::with_capacity(request_count);
+        for index in 0..request_count {
+            let service = Arc::clone(&service);
+            let gate = Arc::clone(&gate);
+            let entered = Arc::clone(&entered);
+            callers.push(std::thread::spawn(move || {
+                let cx = crate::cx::for_request();
+                service.execute_request(
+                    cx.clone(),
+                    gated_await_request_operation(
+                        cx,
+                        gate,
+                        entered,
+                        format!("shutdown-{index}"),
+                    ),
+                )
+            }));
+        }
+        wait_for_completion_stats(&stats, "active and queued shutdown requests", |snapshot| {
+            snapshot.request_admissions == u64::try_from(request_count).unwrap()
+                && snapshot.active_requests
+                    == u64::try_from(super::MCP_AWAIT_EVENT_REQUEST_CONCURRENCY).unwrap()
+                && entered.load(std::sync::atomic::Ordering::Acquire)
+                    == u64::try_from(super::MCP_AWAIT_EVENT_REQUEST_CONCURRENCY).unwrap()
+        });
+
+        service.begin_shutdown();
+        let post_shutdown_operation: super::McpAwaitEventRequestOperation =
+            Box::new(|_storage| {
+                Box::pin(async {
+                    super::McpAwaitEventRequestTaskOutput::new(
+                        Err(super::McpToolError::new(
+                            super::MCP_ERR_CONFIG,
+                            "must not run after shutdown".to_string(),
+                            None,
+                        )),
+                        Vec::new(),
+                        true,
+                    )
+                })
+            });
+        let post_shutdown_error = service
+            .execute_request(crate::cx::for_request(), post_shutdown_operation)
+            .expect_err("request admission must fail closed after shutdown begins");
+        assert!(post_shutdown_error.message.contains("shutting down"));
+
+        let mut cancelled_requests = 0_usize;
+        let mut rejected_requests = 0_usize;
+        for caller in callers {
+            let (request_result, request_leases) = caller
+                .join()
+                .expect("shutdown-stopped request caller must not panic")
+                .expect("shutdown-stopped request must receive its isolated result");
+            assert!(request_leases.is_empty());
+            let error = request_result
+                .expect_err("shutdown-stopped gated request returns a typed error");
+            if error.message.starts_with("cancelled:shutdown-") {
+                cancelled_requests = cancelled_requests.saturating_add(1);
+            } else {
+                assert!(error.message.contains("shutting down"));
+                rejected_requests = rejected_requests.saturating_add(1);
+            }
+        }
+        assert_eq!(
+            cancelled_requests,
+            super::MCP_AWAIT_EVENT_REQUEST_CONCURRENCY
+        );
+        assert_eq!(rejected_requests, 1);
+
+        let stopped = wait_for_completion_stats(&stats, "shared service shutdown", |snapshot| {
+            snapshot.worker_stops == 1
+        });
+        assert_eq!(
+            stopped.request_jobs_cancelled_for_shutdown,
+            u64::try_from(super::MCP_AWAIT_EVENT_REQUEST_CONCURRENCY).unwrap()
+        );
+        assert_eq!(stopped.request_jobs_rejected_for_shutdown, 1);
+        assert_eq!(stopped.request_jobs_cancelled_for_epoch, 0);
+        assert_eq!(stopped.request_jobs_rejected_for_epoch, 0);
+        assert_eq!(stopped.request_admission_rejections_unready, 1);
+        assert_eq!(stopped.storage_shutdowns, 1);
+        assert_eq!(stopped.runtime_initializations, 1);
+        assert_eq!(stopped.storage_initializations, 1);
+
+        drop(service);
+    }
+
+    #[test]
+    fn await_event_service_does_not_reconnect_for_request_local_storage_domain_errors() {
+        let (_dir, db_path) = temp_db_path();
+        let service = super::McpAwaitEventDeliveryCompletionExecutor::new(db_path)
+            .expect("request-local-error await service must start");
+        let stats = service.stats_for_test();
+        assert!(
+            service.wait_until_ready_for_test(std::time::Duration::from_secs(5)),
+            "request-local-error storage did not become ready"
+        );
+
+        let operation: super::McpAwaitEventRequestOperation = Box::new(|_storage| {
+            Box::pin(async {
+                super::McpAwaitEventRequestTaskOutput::new(
+                    Err(super::mcp_await_event_blocked_capacity_error()),
+                    Vec::new(),
+                    true,
+                )
+            })
+        });
+        let (result, leases) = service
+            .execute_request(crate::cx::for_request(), operation)
+            .expect("request-local storage-domain error must be returned normally");
+        assert!(leases.is_empty());
+        assert_eq!(
+            result
+                .expect_err("blocked-capacity result must remain a typed request error")
+                .code,
+            super::MCP_ERR_STORAGE
+        );
+
+        let finished = wait_for_completion_stats(
+            &stats,
+            "request-local storage-domain error completion",
+            |snapshot| snapshot.request_jobs_finished == 1 && snapshot.active_requests == 0,
+        );
+        assert_eq!(finished.storage_reconnects, 0);
+        assert_eq!(finished.storage_initializations, 1);
+        assert_eq!(finished.runtime_initializations, 1);
+
+        drop(service);
+        let stopped = wait_for_completion_stats(
+            &stats,
+            "request-local-error service shutdown",
+            |snapshot| snapshot.worker_stops == 1,
+        );
+        assert_eq!(stopped.storage_shutdowns, 1);
+        assert_eq!(stopped.storage_initializations, 1);
+    }
+
+    #[test]
+    fn await_event_storage_epoch_health_classification_is_narrow() {
+        assert!(super::mcp_await_event_error_invalidates_storage_epoch(
+            &crate::Error::Storage(crate::StorageError::Database("unavailable".to_string()))
+        ));
+        assert!(super::mcp_await_event_error_invalidates_storage_epoch(
+            &crate::Error::Storage(crate::StorageError::Corruption {
+                details: "invalid page".to_string(),
+            })
+        ));
+        for request_local_error in [
+            crate::Error::Storage(crate::StorageError::NotFound("event".to_string())),
+            crate::Error::Storage(crate::StorageError::ReservationConflict {
+                pane_id: 7,
+                existing_id: 11,
+            }),
+            crate::Error::Storage(crate::StorageError::SequenceDiscontinuity {
+                expected: 8,
+                actual: 9,
+            }),
+            crate::Error::Cancelled("request cancelled".to_string()),
+        ] {
+            assert!(
+                !super::mcp_await_event_error_invalidates_storage_epoch(&request_local_error),
+                "request-local error must not invalidate the shared writer: {request_local_error}"
+            );
+        }
+    }
+
+    #[test]
+    fn await_event_service_contains_request_panic_and_restarts_only_storage_epoch() {
+        const SENTINEL: &str = "mcp-await-request-private-panic-payload-b218";
+        let (_dir, db_path) = temp_db_path();
+        let service = super::McpAwaitEventDeliveryCompletionExecutor::new(db_path)
+            .expect("panic-contained await service must start");
+        let stats = service.stats_for_test();
+        assert!(
+            service.wait_until_ready_for_test(std::time::Duration::from_secs(5)),
+            "panic-containment storage did not become ready"
+        );
+        let operation: super::McpAwaitEventRequestOperation = Box::new(|_storage| {
+            Box::pin(async {
+                std::panic::panic_any(SENTINEL.to_string());
+                #[allow(unreachable_code)]
+                super::McpAwaitEventRequestTaskOutput::new(
+                    Err(super::McpToolError::new(
+                        super::MCP_ERR_CONFIG,
+                        "unreachable".to_string(),
+                        None,
+                    )),
+                    Vec::new(),
+                    true,
+                )
+            })
+        });
+        let (result, leases) = service
+            .execute_request(crate::cx::for_request(), operation)
+            .expect("contained request panic must return a sanitized result");
+        assert!(leases.is_empty());
+        let error = result.expect_err("contained request panic returns a typed error");
+        assert!(!error.message.contains(SENTINEL));
+        let recovered = wait_for_completion_stats(
+            &stats,
+            "storage reconnect after contained request panic",
+            |snapshot| {
+                snapshot.request_panics == 1
+                    && snapshot.storage_reconnects == 1
+                    && snapshot.storage_initializations == 2
+            },
+        );
+        assert_eq!(recovered.runtime_initializations, 1);
+        assert_eq!(recovered.request_jobs_finished, 1);
+        assert_eq!(recovered.storage_shutdowns, 1);
+        assert!(
+            service.wait_until_ready_for_test(std::time::Duration::from_secs(5)),
+            "shared service must be ready on its replacement epoch"
+        );
+        drop(service);
+        let stopped = wait_for_completion_stats(&stats, "panic-contained service shutdown", |snapshot| {
+            snapshot.worker_stops == 1
+        });
+        assert_eq!(stopped.storage_shutdowns, 2);
+        assert_eq!(stopped.runtime_initializations, 1);
+    }
+
+    #[test]
+    fn await_event_completion_reuses_one_runtime_and_storage_epoch_across_responses() {
+        let (_dir, db_path) = temp_db_path();
+        let event_ids = seed_events_with_rules(
+            db_path.as_ref().as_path(),
+            &["codex.reuse.first", "codex.reuse.second"],
+        );
+        let runtime = CompatRuntimeBuilder::current_thread().build().unwrap();
+        let leases = runtime.block_on(async {
+            let storage = StorageHandle::new(&db_path.to_string_lossy()).await.unwrap();
+            let mut leases = Vec::with_capacity(event_ids.len());
+            for event_id in &event_ids {
+                let reservation = storage
+                    .reserve_event_delivery(*event_id, std::time::Duration::from_secs(60))
+                    .await
+                    .unwrap();
+                let crate::storage::EventDeliveryReservation::Acquired(lease) = reservation else {
+                    panic!("expected lifecycle-test lease, got {reservation:?}");
+                };
+                leases.push(lease);
+            }
+            storage.shutdown().await.unwrap();
+            leases
+        });
+
+        let executor = super::McpAwaitEventDeliveryCompletionExecutor::new(Arc::clone(&db_path))
+            .expect("long-lived completion worker must start");
+        let stats = executor.stats_for_test();
+        assert!(
+            executor.wait_until_ready_for_test(std::time::Duration::from_secs(5)),
+            "long-lived completion storage did not become ready"
+        );
+
+        for (index, lease) in leases.into_iter().enumerate() {
+            assert!(executor.try_submit(
+                vec![lease],
+                super::FrameworkResponseDeliveryOutcome::DeliveryAcknowledged,
+            ));
+            let expected_completed = u64::try_from(index + 1).unwrap();
+            wait_for_completion_stats(&stats, "sequential completion batch", |snapshot| {
+                snapshot.completion_attempts_finished >= expected_completed
+            });
+        }
+
+        let running = stats.snapshot();
+        assert_eq!(running.worker_starts, 1);
+        assert_eq!(running.worker_handoffs, 0);
+        assert_eq!(running.worker_initialization_handoffs, 0);
+        assert_eq!(running.worker_completion_handoffs, 0);
+        assert_eq!(running.worker_shutdown_handoffs, 0);
+        assert_eq!(running.runtime_initializations, 1);
+        assert_eq!(running.storage_initialization_attempts, 1);
+        assert_eq!(running.storage_initialization_stalls, 0);
+        assert_eq!(running.storage_initialization_failures, 0);
+        assert_eq!(running.storage_initializations, 1);
+        assert_eq!(running.storage_readiness_publications, 1);
+        assert_eq!(running.storage_reconnects, 0);
+        assert_eq!(running.reconnect_backoff_waits, 0);
+        assert_eq!(running.reconnect_backoff_ms_total, 0);
+        assert_eq!(running.storage_shutdowns, 0);
+        assert_eq!(running.storage_shutdown_failures, 0);
+        assert_eq!(running.completion_batches, 2);
+        assert_eq!(running.completion_attempts_finished, 2);
+        assert_eq!(running.completion_attempts_storage_reusable, 2);
+        assert_eq!(running.completion_attempts_storage_unusable, 0);
+        assert_eq!(running.completion_panics, 0);
+        assert_eq!(running.completion_jobs, 2);
+        assert_eq!(running.completion_leases, 2);
+        assert_eq!(running.coalesced_jobs, 0);
+        assert_eq!(running.claim_admission_rejections_unready, 0);
+
+        drop(executor);
+        let stopped = wait_for_completion_stats(&stats, "completion worker shutdown", |snapshot| {
+            snapshot.worker_stops == 1
+        });
+        assert_eq!(stopped.storage_shutdowns, 1);
+        assert_eq!(stopped.storage_shutdown_failures, 0);
+        assert_eq!(stopped.storage_initializations, 1);
+        assert_eq!(stopped.runtime_initializations, 1);
+
+        runtime.block_on(async {
+            let storage = StorageHandle::new(&db_path.to_string_lossy()).await.unwrap();
+            for event_id in event_ids {
+                assert!(matches!(
+                    storage
+                        .reserve_event_delivery(event_id, std::time::Duration::from_secs(60))
+                        .await
+                        .unwrap(),
+                    crate::storage::EventDeliveryReservation::AlreadyHandledOrMissing
+                ));
+            }
+            storage.shutdown().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn await_event_completion_contains_handler_panic_without_reflecting_payload() {
+        const SENTINEL: &str = "mcp-completion-private-panic-payload-7f9c";
+        let recovered = catch_recoverable(
+            RecoverablePanicSite::McpEventDeliveryCompletion,
+            std::panic::AssertUnwindSafe(|| {
+                std::panic::panic_any(SENTINEL.to_string());
+            }),
+        )
+        .expect_err("sentinel panic must be contained");
+        let rendered = format!("{recovered:?} {recovered}");
+        assert!(
+            !rendered.contains(SENTINEL),
+            "sanitized recovery evidence must not reflect the panic payload"
+        );
+        assert_eq!(
+            recovered.site(),
+            RecoverablePanicSite::McpEventDeliveryCompletion
+        );
+
+        let handler_calls = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let handler_calls_for_worker = Arc::clone(&handler_calls);
+        let completion_handler: super::McpAwaitEventDeliveryCompletionHandler =
+            Arc::new(move |_job| {
+                let call_index = handler_calls_for_worker
+                    .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                if call_index == 0 {
+                    std::panic::panic_any(SENTINEL.to_string());
+                }
+            });
+        let executor = super::McpAwaitEventDeliveryCompletionExecutor::new_with_handler(
+            completion_handler,
+        )
+        .expect("panic-containment completion lane must start");
+        let stats = executor.stats_for_test();
+
+        for event_id in [81_i64, 82_i64] {
+            let expected_calls = if event_id == 81 { 1 } else { 2 };
+            assert!(executor.try_submit(
+                vec![crate::storage::EventDeliveryLease::new(
+                    event_id,
+                    format!("panic-containment-{event_id}"),
+                    0,
+                    i64::MAX,
+                )],
+                super::FrameworkResponseDeliveryOutcome::Failed,
+            ));
+            wait_for_completion_stats(&stats, "contained completion handler panic", |snapshot| {
+                handler_calls.load(std::sync::atomic::Ordering::Acquire)
+                    >= expected_calls
+                    && (event_id != 81 || snapshot.completion_panics == 1)
+            });
+        }
+
+        drop(executor);
+        let stopped = wait_for_completion_stats(&stats, "panic-contained worker shutdown", |snapshot| {
+            snapshot.worker_stops == 1
+        });
+        assert_eq!(stopped.worker_starts, 1);
+        assert_eq!(stopped.worker_stops, 1);
+        assert_eq!(stopped.completion_panics, 1);
+        assert_eq!(handler_calls.load(std::sync::atomic::Ordering::Acquire), 2);
+    }
+
+    #[test]
+    fn await_event_completion_retries_storage_init_without_rebuilding_runtime() {
+        let (_dir, db_path) = temp_db_path();
+        let executor =
+            super::McpAwaitEventDeliveryCompletionExecutor::new_with_storage_init_failures_for_test(
+                db_path,
+                2,
+            )
+            .expect("completion worker with synthetic init failures must start");
+        let stats = executor.stats_for_test();
+        assert!(
+            executor.wait_until_ready_for_test(std::time::Duration::from_secs(5)),
+            "completion storage did not recover from bounded synthetic init failures"
+        );
+        let recovered = stats.snapshot();
+        assert_eq!(recovered.worker_starts, 1);
+        assert_eq!(recovered.worker_handoffs, 0);
+        assert_eq!(recovered.worker_initialization_handoffs, 0);
+        assert_eq!(recovered.worker_completion_handoffs, 0);
+        assert_eq!(recovered.worker_shutdown_handoffs, 0);
+        assert_eq!(recovered.runtime_initializations, 1);
+        assert_eq!(recovered.storage_initialization_attempts, 3);
+        assert_eq!(recovered.storage_initialization_stalls, 0);
+        assert_eq!(recovered.storage_initialization_failures, 2);
+        assert_eq!(recovered.storage_initializations, 1);
+        assert_eq!(recovered.storage_readiness_publications, 1);
+        assert_eq!(recovered.storage_reconnects, 0);
+        assert_eq!(recovered.reconnect_backoff_waits, 2);
+        assert_eq!(recovered.reconnect_backoff_ms_total, 150);
+        assert_eq!(recovered.storage_shutdowns, 0);
+        assert_eq!(recovered.storage_shutdown_failures, 0);
+
+        drop(executor);
+        let stopped = wait_for_completion_stats(&stats, "recovered worker shutdown", |snapshot| {
+            snapshot.worker_stops == 1
+        });
+        assert_eq!(stopped.runtime_initializations, 1);
+        assert_eq!(stopped.storage_shutdowns, 1);
+        assert_eq!(stopped.storage_shutdown_failures, 0);
+    }
+
+    #[test]
+    fn await_event_completion_drop_is_bounded_during_nonpreemptible_storage_init() {
+        let (_dir, db_path) = temp_db_path();
+        let stall = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let executor =
+            super::McpAwaitEventDeliveryCompletionExecutor::new_with_storage_init_stall_for_test(
+                db_path,
+                Arc::clone(&stall),
+            )
+            .expect("completion worker with synthetic init stall must start");
+        let stats = executor.stats_for_test();
+        wait_for_completion_stats(&stats, "non-preemptible storage initialization", |snapshot| {
+            snapshot.storage_initialization_stalls == 1
+        });
+        let request_operation: super::McpAwaitEventRequestOperation = Box::new(|_storage| {
+            Box::pin(async {
+                super::McpAwaitEventRequestTaskOutput::new(
+                    Err(super::McpToolError::new(
+                        super::MCP_ERR_CONFIG,
+                        "must not run before readiness".to_string(),
+                        None,
+                    )),
+                    Vec::new(),
+                    true,
+                )
+            })
+        });
+        let admission_error = executor
+            .execute_request(crate::cx::for_request(), request_operation)
+            .expect_err("ordinary await admission must fail closed before readiness");
+        assert!(admission_error.message.contains("initializing"));
+        let before_drop = stats.snapshot();
+        assert_eq!(before_drop.request_admissions, 0);
+        assert_eq!(before_drop.request_admission_rejections_unready, 1);
+
+        let drop_started = std::time::Instant::now();
+        drop(executor);
+        let drop_elapsed = drop_started.elapsed();
+        assert!(
+            drop_elapsed < std::time::Duration::from_secs(1),
+            "executor Drop must honor its terminal bound during a non-preemptible init phase; elapsed={drop_elapsed:?}"
+        );
+        let handed_off = stats.snapshot();
+        assert_eq!(handed_off.worker_handoffs, 1);
+        assert_eq!(handed_off.worker_initialization_handoffs, 1);
+        assert_eq!(handed_off.worker_completion_handoffs, 0);
+        assert_eq!(handed_off.worker_shutdown_handoffs, 0);
+        assert_eq!(handed_off.worker_stops, 0);
+        assert_eq!(handed_off.storage_initializations, 0);
+        assert_eq!(handed_off.storage_readiness_publications, 0);
+
+        stall.store(false, std::sync::atomic::Ordering::Release);
+        let stopped = wait_for_completion_stats(&stats, "handed-off worker exit", |snapshot| {
+            snapshot.worker_stops == 1
+        });
+        assert_eq!(stopped.worker_handoffs, 1);
+        assert_eq!(stopped.worker_initialization_handoffs, 1);
+        assert_eq!(stopped.worker_completion_handoffs, 0);
+        assert_eq!(stopped.worker_shutdown_handoffs, 0);
+        assert_eq!(stopped.storage_initializations, 1);
+        assert_eq!(stopped.storage_readiness_publications, 0);
+        assert_eq!(stopped.storage_shutdowns, 1);
+        assert_eq!(stopped.storage_shutdown_failures, 0);
+    }
+
+    #[test]
+    fn await_event_completion_hands_off_already_admitted_cas_during_drop() {
+        let (_dir, db_path) = temp_db_path();
+        let event_id = seed_event(db_path.as_ref().as_path());
+        let runtime = CompatRuntimeBuilder::current_thread().build().unwrap();
+        let lease = runtime.block_on(async {
+            let storage = StorageHandle::new(&db_path.to_string_lossy()).await.unwrap();
+            let reservation = storage
+                .reserve_event_delivery(event_id, std::time::Duration::from_secs(60))
+                .await
+                .unwrap();
+            storage.shutdown().await.unwrap();
+            let crate::storage::EventDeliveryReservation::Acquired(lease) = reservation else {
+                panic!("expected completion-handoff test lease, got {reservation:?}");
+            };
+            lease
+        });
+
+        let stall = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let executor =
+            super::McpAwaitEventDeliveryCompletionExecutor::new_with_completion_stall_for_test(
+                Arc::clone(&db_path),
+                Arc::clone(&stall),
+            )
+            .expect("completion worker with synthetic completion stall must start");
+        let stats = executor.stats_for_test();
+        assert!(
+            executor.wait_until_ready_for_test(std::time::Duration::from_secs(5)),
+            "completion storage did not become ready"
+        );
+        assert!(executor.try_submit(
+            vec![lease.clone()],
+            super::FrameworkResponseDeliveryOutcome::Failed,
+        ));
+        wait_for_completion_stats(&stats, "non-preemptible admitted completion", |snapshot| {
+            snapshot.completion_stalls == 1
+        });
+
+        let drop_started = std::time::Instant::now();
+        drop(executor);
+        let drop_elapsed = drop_started.elapsed();
+        assert!(
+            drop_elapsed < std::time::Duration::from_secs(1),
+            "executor Drop must hand off an already-admitted non-preemptible CAS within its terminal bound; elapsed={drop_elapsed:?}"
+        );
+        let handed_off = stats.snapshot();
+        assert_eq!(handed_off.worker_handoffs, 1);
+        assert_eq!(handed_off.worker_initialization_handoffs, 0);
+        assert_eq!(handed_off.worker_completion_handoffs, 1);
+        assert_eq!(handed_off.worker_shutdown_handoffs, 0);
+        assert_eq!(handed_off.worker_stops, 0);
+        assert_eq!(handed_off.storage_readiness_publications, 1);
+        assert_eq!(handed_off.completion_attempts_finished, 0);
+
+        runtime.block_on(async {
+            let storage = StorageHandle::new(&db_path.to_string_lossy()).await.unwrap();
+            assert!(
+                matches!(
+                    storage
+                        .reserve_event_delivery(event_id, std::time::Duration::from_secs(60))
+                        .await
+                        .unwrap(),
+                    crate::storage::EventDeliveryReservation::LeasedUntil { .. }
+                ),
+                "the exact release CAS must remain unapplied while its admitted worker is stalled"
+            );
+            storage.shutdown().await.unwrap();
+        });
+
+        stall.store(false, std::sync::atomic::Ordering::Release);
+        let stopped = wait_for_completion_stats(&stats, "handed-off completion exit", |snapshot| {
+            snapshot.worker_stops == 1
+        });
+        assert_eq!(stopped.worker_handoffs, 1);
+        assert_eq!(stopped.worker_completion_handoffs, 1);
+        assert_eq!(stopped.completion_attempts_finished, 1);
+        assert_eq!(stopped.completion_attempts_storage_reusable, 1);
+        assert_eq!(stopped.completion_attempts_storage_unusable, 0);
+        assert_eq!(stopped.storage_shutdowns, 1);
+        assert_eq!(stopped.storage_shutdown_failures, 0);
+
+        runtime.block_on(async {
+            let storage = StorageHandle::new(&db_path.to_string_lossy()).await.unwrap();
+            let reservation = storage
+                .reserve_event_delivery(event_id, std::time::Duration::from_secs(60))
+                .await
+                .unwrap();
+            let crate::storage::EventDeliveryReservation::Acquired(probe_lease) = reservation else {
+                panic!(
+                    "the handed-off exact release CAS must make the event retryable, got {reservation:?}"
+                );
+            };
+            assert!(storage.release_event_delivery(&probe_lease).await.unwrap());
+            storage.shutdown().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn await_event_completion_reconnects_storage_without_rebuilding_runtime() {
+        let (_dir, db_path) = temp_db_path();
+        let event_id = seed_event(db_path.as_ref().as_path());
+        let runtime = CompatRuntimeBuilder::current_thread().build().unwrap();
+        let lease = runtime.block_on(async {
+            let storage = StorageHandle::new(&db_path.to_string_lossy()).await.unwrap();
+            let reservation = storage
+                .reserve_event_delivery(event_id, std::time::Duration::from_secs(60))
+                .await
+                .unwrap();
+            storage.shutdown().await.unwrap();
+            let crate::storage::EventDeliveryReservation::Acquired(lease) = reservation else {
+                panic!("expected reconnect-test lease, got {reservation:?}");
+            };
+            lease
+        });
+
+        let executor = Arc::new(
+            super::McpAwaitEventDeliveryCompletionExecutor::new_with_storage_epoch_failures_for_test(
+                Arc::clone(&db_path),
+                1,
+            )
+            .expect("completion worker with synthetic epoch failure must start"),
+        );
+        let stats = executor.stats_for_test();
+        assert!(
+            executor.wait_until_ready_for_test(std::time::Duration::from_secs(5)),
+            "initial completion storage did not become ready"
+        );
+        let gate = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let entered = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let doomed_request_count = super::MCP_AWAIT_EVENT_REQUEST_CONCURRENCY + 1;
+        let mut doomed_requests = Vec::with_capacity(doomed_request_count);
+        for index in 0..doomed_request_count {
+            let active_request_executor = Arc::clone(&executor);
+            let active_request_gate = Arc::clone(&gate);
+            let active_request_entered = Arc::clone(&entered);
+            doomed_requests.push(std::thread::spawn(move || {
+                let cx = crate::cx::for_request();
+                active_request_executor.execute_request(
+                    cx.clone(),
+                    gated_await_request_operation(
+                        cx,
+                        active_request_gate,
+                        active_request_entered,
+                        format!("invalidated-epoch-{index}"),
+                    ),
+                )
+            }));
+        }
+        wait_for_completion_stats(&stats, "active and queued requests on doomed storage epoch", |snapshot| {
+            snapshot.request_admissions == u64::try_from(doomed_request_count).unwrap()
+                && snapshot.active_requests
+                    == u64::try_from(super::MCP_AWAIT_EVENT_REQUEST_CONCURRENCY).unwrap()
+                && entered.load(std::sync::atomic::Ordering::Acquire)
+                    == u64::try_from(super::MCP_AWAIT_EVENT_REQUEST_CONCURRENCY).unwrap()
+        });
+        assert!(executor.try_submit(
+            vec![lease.clone()],
+            super::FrameworkResponseDeliveryOutcome::Failed,
+        ));
+        wait_for_completion_stats(&stats, "completion storage reconnect", |snapshot| {
+            snapshot.storage_reconnects == 1 && snapshot.storage_initializations == 2
+        });
+        assert!(
+            executor.wait_until_ready_for_test(std::time::Duration::from_secs(5)),
+            "replacement completion storage epoch did not become ready"
+        );
+        let mut cancelled_requests = 0_usize;
+        let mut rejected_requests = 0_usize;
+        for doomed_request in doomed_requests {
+            let (request_result, request_leases) = doomed_request
+                .join()
+                .expect("epoch-stopped request caller must not panic")
+                .expect("epoch-stopped request must receive its isolated result");
+            assert!(request_leases.is_empty());
+            let error = request_result
+                .expect_err("epoch-stopped gated request returns a typed error");
+            if error.message.starts_with("cancelled:invalidated-epoch-") {
+                cancelled_requests = cancelled_requests.saturating_add(1);
+            } else {
+                assert!(
+                    error.message.contains("initializing, reconnecting, or shutting down"),
+                    "unexpected queued-request rejection: {error:?}"
+                );
+                rejected_requests = rejected_requests.saturating_add(1);
+            }
+        }
+        assert_eq!(
+            cancelled_requests,
+            super::MCP_AWAIT_EVENT_REQUEST_CONCURRENCY
+        );
+        assert_eq!(rejected_requests, 1);
+        let request_cx = crate::cx::for_request();
+        let request_operation: super::McpAwaitEventRequestOperation = Box::new(|storage| {
+            Box::pin(async move {
+                let observed_path = storage.db_path().to_string();
+                super::McpAwaitEventRequestTaskOutput::new(
+                    Err(super::McpToolError::new(
+                        super::MCP_ERR_CONFIG,
+                        observed_path,
+                        None,
+                    )),
+                    Vec::new(),
+                    true,
+                )
+            })
+        });
+        let (request_result, request_leases) = executor
+            .execute_request(request_cx, request_operation)
+            .expect("replacement epoch must serve an ordinary await request");
+        assert!(request_leases.is_empty());
+        assert_eq!(
+            request_result
+                .expect_err("test request returns its observed database path")
+                .message,
+            db_path.to_string_lossy()
+        );
+        wait_for_completion_stats(&stats, "request on replacement storage epoch", |snapshot| {
+            snapshot.request_jobs_finished
+                == u64::try_from(super::MCP_AWAIT_EVENT_REQUEST_CONCURRENCY + 1).unwrap()
+                && snapshot.active_requests == 0
+        });
+
+        drop(executor);
+        let stopped = wait_for_completion_stats(&stats, "reconnected worker shutdown", |snapshot| {
+            snapshot.worker_stops == 1
+        });
+        assert_eq!(stopped.runtime_initializations, 1);
+        assert_eq!(stopped.storage_initialization_attempts, 2);
+        assert_eq!(stopped.storage_initialization_failures, 0);
+        assert_eq!(stopped.storage_initializations, 2);
+        assert_eq!(stopped.storage_reconnects, 1);
+        assert_eq!(stopped.reconnect_backoff_waits, 1);
+        assert_eq!(stopped.reconnect_backoff_ms_total, 50);
+        assert_eq!(stopped.storage_shutdowns, 2);
+        assert_eq!(stopped.storage_shutdown_failures, 0);
+        assert_eq!(stopped.completion_batches, 1);
+        assert_eq!(stopped.completion_attempts_finished, 1);
+        assert_eq!(stopped.completion_attempts_storage_reusable, 0);
+        assert_eq!(stopped.completion_attempts_storage_unusable, 1);
+        assert_eq!(stopped.completion_jobs, 1);
+        assert_eq!(stopped.completion_leases, 1);
+        assert_eq!(
+            stopped.request_jobs_started,
+            u64::try_from(super::MCP_AWAIT_EVENT_REQUEST_CONCURRENCY + 1).unwrap()
+        );
+        assert_eq!(
+            stopped.request_jobs_finished,
+            u64::try_from(super::MCP_AWAIT_EVENT_REQUEST_CONCURRENCY + 1).unwrap()
+        );
+        assert_eq!(
+            stopped.request_jobs_cancelled_for_epoch,
+            u64::try_from(super::MCP_AWAIT_EVENT_REQUEST_CONCURRENCY).unwrap()
+        );
+        assert_eq!(stopped.request_jobs_cancelled_for_shutdown, 0);
+        assert_eq!(stopped.request_jobs_rejected_for_epoch, 1);
+        assert_eq!(stopped.request_jobs_rejected_for_shutdown, 0);
+
+        runtime.block_on(async {
+            let storage = StorageHandle::new(&db_path.to_string_lossy()).await.unwrap();
+            assert!(
+                storage.release_event_delivery(&lease).await.unwrap(),
+                "synthetic epoch failure must leave the durable lease token untouched"
+            );
+            storage.shutdown().await.unwrap();
+        });
+    }
+
+    #[test]
     fn await_event_completion_queue_saturation_leaves_lease_authority_untouched() {
         let (_dir, db_path) = temp_db_path();
         let event_id = seed_event(db_path.as_ref().as_path());
@@ -13092,7 +16730,6 @@ mod tests {
             completion_handler,
         )
         .unwrap();
-        let fake_db_path = Arc::new(PathBuf::from("unused-test-completion.sqlite3"));
 
         for worker_index in 0..super::MCP_AWAIT_EVENT_COMPLETION_WORKERS {
             let fake_lease = crate::storage::EventDeliveryLease::new(
@@ -13102,7 +16739,6 @@ mod tests {
                 i64::MAX,
             );
             assert!(executor.try_submit(
-                Arc::clone(&fake_db_path),
                 vec![fake_lease],
                 super::FrameworkResponseDeliveryOutcome::Failed,
             ));
@@ -13121,14 +16757,12 @@ mod tests {
                 i64::MAX,
             );
             assert!(executor.try_submit(
-                Arc::clone(&fake_db_path),
                 vec![fake_lease],
                 super::FrameworkResponseDeliveryOutcome::Failed,
             ));
         }
         assert!(
             !executor.try_submit(
-                Arc::clone(&db_path),
                 vec![lease.clone()],
                 super::FrameworkResponseDeliveryOutcome::Failed,
             ),
@@ -13219,6 +16853,7 @@ mod tests {
             Arc::clone(&response_delivery),
         )
         .with_blocked_retry_observer(blocked_retry_observer);
+        tool.wait_for_delivery_completion_ready_for_test();
         let envelope = parse_json_content(
             tool.call(
                 &test_mcp_context(),
@@ -13325,6 +16960,7 @@ mod tests {
         )
         .with_blocked_retry_observer(blocked_retry_observer)
         .with_iteration_observer(iteration_observer);
+        tool.wait_for_delivery_completion_ready_for_test();
 
         let envelope = parse_json_content(
             tool.call(
@@ -13386,6 +17022,7 @@ mod tests {
             Arc::clone(&db_path),
             Arc::clone(&response_delivery),
         );
+        tool.wait_for_delivery_completion_ready_for_test();
 
         let envelope = parse_json_content(
             tool.call(
@@ -13434,6 +17071,7 @@ mod tests {
             Arc::clone(&db_path),
             Arc::clone(&response_delivery),
         );
+        tool.wait_for_delivery_completion_ready_for_test();
 
         let partial = parse_json_content(
             tool.call(
@@ -13519,6 +17157,247 @@ mod tests {
     }
 
     #[test]
+    fn await_event_completion_uses_one_bulk_batch_for_multi_event_common_path() {
+        let (_dir, db_path) = temp_db_path();
+        let event_ids = seed_events_with_rules(
+            db_path.as_ref().as_path(),
+            &["codex.batch.first", "codex.batch.second"],
+        );
+        let runtime = CompatRuntimeBuilder::current_thread().build().unwrap();
+        let leases = runtime.block_on(async {
+            let storage = StorageHandle::new(&db_path.to_string_lossy()).await.unwrap();
+            let mut leases = Vec::new();
+            for event_id in &event_ids {
+                let reservation = storage
+                    .reserve_event_delivery(*event_id, std::time::Duration::from_secs(60))
+                    .await
+                    .unwrap();
+                let crate::storage::EventDeliveryReservation::Acquired(lease) = reservation else {
+                    panic!("expected initial lease, got {reservation:?}");
+                };
+                leases.push(lease);
+            }
+            storage.shutdown().await.unwrap();
+            leases
+        });
+
+        let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed_for_hook = Arc::clone(&observed);
+        super::set_mcp_await_event_completion_batch_observer(Some(Arc::new(
+            move |phase, lease_count| {
+                observed_for_hook
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push((phase, lease_count));
+            },
+        )));
+        super::complete_mcp_await_event_deliveries(
+            Arc::clone(&db_path),
+            leases,
+            super::FrameworkResponseDeliveryOutcome::DeliveryAcknowledged,
+        );
+        super::set_mcp_await_event_completion_batch_observer(None);
+
+        assert_eq!(
+            *observed
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            vec![(super::McpAwaitEventCompletionBatchPhase::BulkAttempt, 2)],
+            "the uncontended multi-event path must use one exact bulk transaction without fallback"
+        );
+        runtime.block_on(async {
+            let storage = StorageHandle::new(&db_path.to_string_lossy()).await.unwrap();
+            for event_id in event_ids {
+                assert!(matches!(
+                    storage
+                        .reserve_event_delivery(event_id, std::time::Duration::from_secs(60))
+                        .await
+                        .unwrap(),
+                    crate::storage::EventDeliveryReservation::AlreadyHandledOrMissing
+                ));
+            }
+            storage.shutdown().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn await_event_bulk_finalize_conflict_falls_back_and_settles_valid_lease() {
+        let (_dir, db_path) = temp_db_path();
+        let event_ids = seed_events_with_rules(
+            db_path.as_ref().as_path(),
+            &["codex.stale", "codex.valid"],
+        );
+        let runtime = CompatRuntimeBuilder::current_thread().build().unwrap();
+        let (stale_lease, valid_lease, successor_lease) = runtime.block_on(async {
+            let storage = StorageHandle::new(&db_path.to_string_lossy()).await.unwrap();
+            let stale_lease = match storage
+                .reserve_event_delivery(event_ids[0], std::time::Duration::from_millis(1))
+                .await
+                .unwrap()
+            {
+                crate::storage::EventDeliveryReservation::Acquired(lease) => lease,
+                other => panic!("expected expiring lease, got {other:?}"),
+            };
+            let valid_lease = match storage
+                .reserve_event_delivery(event_ids[1], std::time::Duration::from_secs(60))
+                .await
+                .unwrap()
+            {
+                crate::storage::EventDeliveryReservation::Acquired(lease) => lease,
+                other => panic!("expected valid lease, got {other:?}"),
+            };
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            let successor_lease = match storage
+                .reserve_event_delivery(event_ids[0], std::time::Duration::from_secs(60))
+                .await
+                .unwrap()
+            {
+                crate::storage::EventDeliveryReservation::Acquired(lease) => lease,
+                other => panic!("expected expired lease takeover, got {other:?}"),
+            };
+            storage.shutdown().await.unwrap();
+            (stale_lease, valid_lease, successor_lease)
+        });
+
+        let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed_for_hook = Arc::clone(&observed);
+        super::set_mcp_await_event_completion_batch_observer(Some(Arc::new(
+            move |phase, lease_count| {
+                observed_for_hook
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push((phase, lease_count));
+            },
+        )));
+        super::complete_mcp_await_event_deliveries(
+            Arc::clone(&db_path),
+            vec![stale_lease, valid_lease],
+            super::FrameworkResponseDeliveryOutcome::DeliveryAcknowledged,
+        );
+        super::set_mcp_await_event_completion_batch_observer(None);
+
+        assert_eq!(
+            *observed
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            vec![
+                (super::McpAwaitEventCompletionBatchPhase::BulkAttempt, 2),
+                (
+                    super::McpAwaitEventCompletionBatchPhase::PerLeaseFallback,
+                    2,
+                ),
+            ],
+            "one stale token must roll back the exact batch before per-lease recovery"
+        );
+        runtime.block_on(async {
+            let storage = StorageHandle::new(&db_path.to_string_lossy()).await.unwrap();
+            assert!(
+                storage.release_event_delivery(&successor_lease).await.unwrap(),
+                "stale fallback must not disturb the successor owner"
+            );
+            assert!(matches!(
+                storage
+                    .reserve_event_delivery(event_ids[1], std::time::Duration::from_secs(60))
+                    .await
+                    .unwrap(),
+                crate::storage::EventDeliveryReservation::AlreadyHandledOrMissing
+            ), "the independently valid lease must still finalize after bulk rollback");
+            storage.shutdown().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn await_event_bulk_release_conflict_falls_back_and_releases_valid_lease() {
+        let (_dir, db_path) = temp_db_path();
+        let event_ids = seed_events_with_rules(
+            db_path.as_ref().as_path(),
+            &["codex.stale", "codex.valid"],
+        );
+        let runtime = CompatRuntimeBuilder::current_thread().build().unwrap();
+        let (stale_lease, valid_lease, successor_lease) = runtime.block_on(async {
+            let storage = StorageHandle::new(&db_path.to_string_lossy()).await.unwrap();
+            let stale_lease = match storage
+                .reserve_event_delivery(event_ids[0], std::time::Duration::from_millis(1))
+                .await
+                .unwrap()
+            {
+                crate::storage::EventDeliveryReservation::Acquired(lease) => lease,
+                other => panic!("expected expiring lease, got {other:?}"),
+            };
+            let valid_lease = match storage
+                .reserve_event_delivery(event_ids[1], std::time::Duration::from_secs(60))
+                .await
+                .unwrap()
+            {
+                crate::storage::EventDeliveryReservation::Acquired(lease) => lease,
+                other => panic!("expected valid lease, got {other:?}"),
+            };
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            let successor_lease = match storage
+                .reserve_event_delivery(event_ids[0], std::time::Duration::from_secs(60))
+                .await
+                .unwrap()
+            {
+                crate::storage::EventDeliveryReservation::Acquired(lease) => lease,
+                other => panic!("expected expired lease takeover, got {other:?}"),
+            };
+            storage.shutdown().await.unwrap();
+            (stale_lease, valid_lease, successor_lease)
+        });
+
+        let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed_for_hook = Arc::clone(&observed);
+        super::set_mcp_await_event_completion_batch_observer(Some(Arc::new(
+            move |phase, lease_count| {
+                observed_for_hook
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push((phase, lease_count));
+            },
+        )));
+        super::complete_mcp_await_event_deliveries(
+            Arc::clone(&db_path),
+            vec![stale_lease, valid_lease.clone()],
+            super::FrameworkResponseDeliveryOutcome::Failed,
+        );
+        super::set_mcp_await_event_completion_batch_observer(None);
+
+        assert_eq!(
+            *observed
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            vec![
+                (super::McpAwaitEventCompletionBatchPhase::BulkAttempt, 2),
+                (
+                    super::McpAwaitEventCompletionBatchPhase::PerLeaseFallback,
+                    2,
+                ),
+            ]
+        );
+        runtime.block_on(async {
+            let storage = StorageHandle::new(&db_path.to_string_lossy()).await.unwrap();
+            assert!(
+                storage.release_event_delivery(&successor_lease).await.unwrap(),
+                "stale release fallback must not disturb the successor owner"
+            );
+            assert!(
+                !storage.release_event_delivery(&valid_lease).await.unwrap(),
+                "the independently valid lease must already be released by fallback"
+            );
+            let probe_lease = match storage
+                .reserve_event_delivery(event_ids[1], std::time::Duration::from_secs(60))
+                .await
+                .unwrap()
+            {
+                crate::storage::EventDeliveryReservation::Acquired(lease) => lease,
+                other => panic!("released valid event must be immediately retryable, got {other:?}"),
+            };
+            assert!(storage.release_event_delivery(&probe_lease).await.unwrap());
+            storage.shutdown().await.unwrap();
+        });
+    }
+
+    #[test]
     fn await_event_finalize_ownership_loss_keeps_candidate_retryable() {
         let (_dir, db_path) = temp_db_path();
         let event_id = seed_event(db_path.as_ref().as_path());
@@ -13572,6 +17451,7 @@ mod tests {
             Arc::clone(&db_path),
             Arc::clone(&response_delivery),
         );
+        tool.wait_for_delivery_completion_ready_for_test();
         let envelope = parse_json_content(
             tool.call(
                 &test_mcp_context(),
@@ -13638,6 +17518,7 @@ mod tests {
             Arc::clone(&db_path),
             Arc::clone(&response_delivery),
         );
+        tool.wait_for_delivery_completion_ready_for_test();
         let envelope = parse_json_content(
             tool.call(
                 &test_mcp_context(),
@@ -13722,7 +17603,183 @@ mod tests {
     }
 
     #[test]
-    fn await_event_claim_fails_closed_when_completion_workers_are_unavailable() {
+    fn await_event_claim_fails_closed_while_completion_storage_is_unready() {
+        let (_dir, db_path) = temp_db_path();
+        let event_id = seed_event(db_path.as_ref().as_path());
+        let cursor_epoch = event_cursor_epoch(db_path.as_ref().as_path());
+        let cursor_scope = await_event_cursor_scope(
+            &["rule:codex.*"],
+            &[],
+            None,
+            false,
+            true,
+        );
+        let completion = Arc::new(
+            super::McpAwaitEventDeliveryCompletionExecutor::new_with_storage_init_failures_for_test(
+                Arc::clone(&db_path),
+                u64::MAX,
+            )
+            .expect("unready test completion worker must start"),
+        );
+        let stats = completion.stats_for_test();
+        let tool = WaAwaitEventTool {
+            db_path: Arc::clone(&db_path),
+            response_delivery: Some(Arc::new(
+                super::FrameworkResponseDeliveryCoordinator::default(),
+            )),
+            request_service: Some(Arc::clone(&completion)),
+            delivery_completion: Some(completion),
+            blocked_retry_observer: None,
+            iteration_observer: None,
+        };
+
+        let envelope = parse_json_content(
+            tool.call(
+                &test_mcp_context(),
+                serde_json::json!({
+                    "any": ["rule:codex.*"],
+                    "cursor": 0,
+                    "cursor_epoch": cursor_epoch,
+                    "cursor_scope": cursor_scope,
+                    "timeout_secs": 1,
+                    "poll_interval_ms": 10,
+                    "claim": true
+                }),
+            )
+            .expect("unready completion storage should return a fail-closed envelope"),
+        );
+        assert_eq!(envelope["ok"], false);
+        assert_eq!(envelope["error_code"], MCP_ERR_CONFIG);
+        assert!(
+            envelope["error"]
+                .as_str()
+                .is_some_and(|message| message.contains("initializing or reconnecting")),
+            "readiness rejection must identify the transient completion state: {envelope}"
+        );
+        let rejected = stats.snapshot();
+        assert_eq!(rejected.claim_admission_rejections_unready, 1);
+        assert_eq!(rejected.completion_jobs, 0);
+
+        drop(tool);
+        let stopped = wait_for_completion_stats(&stats, "unready worker shutdown", |snapshot| {
+            snapshot.worker_stops == 1
+        });
+        assert_eq!(stopped.claim_admission_rejections_unready, 1);
+
+        let runtime = CompatRuntimeBuilder::current_thread().build().unwrap();
+        runtime.block_on(async {
+            let storage = StorageHandle::new(&db_path.to_string_lossy()).await.unwrap();
+            let reservation = storage
+                .reserve_event_delivery(event_id, std::time::Duration::from_secs(1))
+                .await
+                .unwrap();
+            let crate::storage::EventDeliveryReservation::Acquired(lease) = reservation else {
+                panic!("unready claim rejection must not leave a lease, got {reservation:?}");
+            };
+            assert!(storage.release_event_delivery(&lease).await.unwrap());
+            storage.shutdown().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn await_event_claim_rechecks_completion_readiness_immediately_before_reservation() {
+        let (_dir, db_path) = temp_db_path();
+        let event_id = seed_event(db_path.as_ref().as_path());
+        let cursor_epoch = event_cursor_epoch(db_path.as_ref().as_path());
+        let cursor_scope = await_event_cursor_scope(
+            &["rule:codex.*"],
+            &[],
+            None,
+            false,
+            true,
+        );
+        let response_delivery = Arc::new(
+            super::FrameworkResponseDeliveryCoordinator::default(),
+        );
+        let mut tool = WaAwaitEventTool::new_with_response_delivery(
+            Arc::clone(&db_path),
+            response_delivery,
+        );
+        tool.wait_for_delivery_completion_ready_for_test();
+        let completion = Arc::clone(
+            tool.delivery_completion
+                .as_ref()
+                .expect("claim completion executor must exist"),
+        );
+        let stats = completion.stats_for_test();
+        let readiness_revoked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let readiness_revoked_for_observer = Arc::clone(&readiness_revoked);
+        let iteration_observer: super::McpAwaitEventIterationObserver =
+            Arc::new(move |phase, observed_event_id| {
+                if phase == super::McpAwaitEventIterationPhase::PageScan
+                    && observed_event_id == event_id
+                    && !readiness_revoked_for_observer.swap(
+                        true,
+                        std::sync::atomic::Ordering::AcqRel,
+                    )
+                {
+                    completion
+                        .ready
+                        .store(false, std::sync::atomic::Ordering::Release);
+                }
+            });
+        tool = tool.with_iteration_observer(iteration_observer);
+
+        let envelope = parse_json_content(
+            tool.call(
+                &test_mcp_context(),
+                serde_json::json!({
+                    "any": ["rule:codex.*"],
+                    "cursor": 0,
+                    "cursor_epoch": cursor_epoch,
+                    "cursor_scope": cursor_scope,
+                    "timeout_secs": 1,
+                    "poll_interval_ms": 10,
+                    "claim": true
+                }),
+            )
+            .expect("readiness loss before reservation should return a fail-closed envelope"),
+        );
+        assert!(readiness_revoked.load(std::sync::atomic::Ordering::Acquire));
+        assert_eq!(envelope["ok"], false);
+        assert_eq!(envelope["error_code"], MCP_ERR_CONFIG);
+        assert!(
+            envelope["error"]
+                .as_str()
+                .is_some_and(|message| message.contains("initializing or reconnecting")),
+            "reservation-time readiness rejection must identify the transient completion state: {envelope}"
+        );
+        let rejected = stats.snapshot();
+        assert_eq!(rejected.claim_admission_rejections_unready, 1);
+        assert_eq!(rejected.completion_jobs, 0);
+
+        drop(tool);
+        let stopped = wait_for_completion_stats(
+            &stats,
+            "reservation-time readiness rejection shutdown",
+            |snapshot| snapshot.worker_stops == 1,
+        );
+        assert_eq!(stopped.claim_admission_rejections_unready, 1);
+
+        let runtime = CompatRuntimeBuilder::current_thread().build().unwrap();
+        runtime.block_on(async {
+            let storage = StorageHandle::new(&db_path.to_string_lossy()).await.unwrap();
+            let reservation = storage
+                .reserve_event_delivery(event_id, std::time::Duration::from_secs(1))
+                .await
+                .unwrap();
+            let crate::storage::EventDeliveryReservation::Acquired(lease) = reservation else {
+                panic!(
+                    "reservation-time readiness rejection must not leave a lease, got {reservation:?}"
+                );
+            };
+            assert!(storage.release_event_delivery(&lease).await.unwrap());
+            storage.shutdown().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn await_event_claim_fails_closed_when_completion_lane_is_unavailable() {
         let (_dir, db_path) = temp_db_path();
         let event_id = seed_event(db_path.as_ref().as_path());
         let cursor_epoch = event_cursor_epoch(db_path.as_ref().as_path());
@@ -13755,14 +17812,14 @@ mod tests {
                     "claim": true
                 }),
             )
-            .expect("missing completion workers should return a fail-closed envelope"),
+            .expect("missing completion lane should return a fail-closed envelope"),
         );
         assert_eq!(envelope["ok"], false);
         assert_eq!(envelope["error_code"], MCP_ERR_CONFIG);
         assert!(
             envelope["error"]
                 .as_str()
-                .is_some_and(|message| message.contains("completion workers")),
+                .is_some_and(|message| message.contains("completion lane")),
             "configuration error must identify the unavailable completion lane: {envelope}"
         );
 
