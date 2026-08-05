@@ -485,7 +485,8 @@ pub(crate) struct DiscoveredFrameworkServers {
 #[cfg(feature = "mcp-client")]
 pub(crate) struct OutboundFrameworkClient {
     inner: FrameworkClient,
-    /// Connect-time timeout (ms) cached for forensic visibility. [ft-bd3vr]
+    /// Configured FastMCP response-timeout value, cached for forensic
+    /// visibility. [ft-bd3vr]
     ///
     /// `FrameworkClientBuilder::timeout_ms` is consumed when the
     /// `FrameworkClient` is built; the constructed client offers no
@@ -495,15 +496,13 @@ pub(crate) struct OutboundFrameworkClient {
     ///   1. Operators inspecting an `OutboundFrameworkClient` instance
     ///      can see the timeout the wrapper is enforcing without
     ///      cross-referencing the originating `McpClientConfig`.
-    ///   2. Future upstream support for per-call deadline propagation
-    ///      (tracked under ft-bd3vr) has a stable wrapper-side field
-    ///      to bind against.
-    ///   3. The field name itself documents the contract — this is a
-    ///      CONNECT-time timeout, not per-call. Per-call deadline
-    ///      enforcement requires `fastmcp::Client::call_tool` to
-    ///      acquire a per-call timeout parameter; that's a fastmcp
-    ///      upstream change.
-    connect_timeout_ms: u64,
+    ///   2. Future upstream support for caller-specific deadline propagation
+    ///      (tracked under ft-bd3vr) has a stable wrapper-side field to bind
+    ///      against.
+    ///   3. Diagnostics do not mistake configuration for enforcement. At the
+    ///      pinned FastMCP revision, the deadline is checked only between
+    ///      receive attempts; synchronous stdio `read_line` can block past it.
+    configured_response_timeout_ms: u64,
 }
 
 #[cfg(feature = "mcp-client")]
@@ -535,37 +534,34 @@ impl OutboundFrameworkClient {
         let client = builder.connect_stdio(&server.command, &args_ref)?;
         Ok(Self {
             inner: client,
-            connect_timeout_ms: settings.timeout_ms,
+            configured_response_timeout_ms: settings.timeout_ms,
         })
     }
 
-    /// Connect-time timeout (ms) the wrapped `FrameworkClient` is
-    /// enforcing on each call. [ft-bd3vr]
+    /// Response-timeout value configured on the wrapped `FrameworkClient`.
+    /// [ft-bd3vr]
     ///
-    /// **CONTRACT**: this is the timeout-per-call as locked in at
-    /// `connect_stdio` time from `McpClientConfig::timeout_ms`. It
-    /// applies to every `list_tool_definitions` / `call_tool_content`
-    /// invocation but cannot be overridden per call until fastmcp
-    /// upstream exposes a per-call timeout parameter on
-    /// `Client::call_tool`. Callers needing a tighter per-call
-    /// budget must construct a separate `OutboundFrameworkClient`
-    /// with a different `McpClientConfig.timeout_ms` — there is no
-    /// runtime override.
+    /// **CONTRACT**: this is diagnostic configuration, not a proven wall-clock
+    /// upper bound. The pinned FastMCP client checks the deadline only before
+    /// each synchronous transport receive; its stdio `read_line` can remain
+    /// blocked after the configured duration. It also cannot be overridden by
+    /// an individual caller until FastMCP exposes a Cx/deadline-aware call API.
     ///
     /// Forensic / diagnostic tooling can read this to verify which
     /// timeout an operator-configured config actually settled on
     /// after defaults / merges.
     #[must_use]
-    pub(crate) fn connect_timeout_ms(&self) -> u64 {
-        self.connect_timeout_ms
+    pub(crate) fn configured_response_timeout_ms(&self) -> u64 {
+        self.configured_response_timeout_ms
     }
 
     /// List tools from the connected server.
     ///
-    /// Bounded by [`Self::connect_timeout_ms`] (the connect-time
-    /// timeout); per-call deadline propagation from a caller's `Cx`
-    /// budget is not enforced at this layer (ft-bd3vr — blocked on
-    /// fastmcp upstream API). The proxy layer at
+    /// FastMCP receives [`Self::configured_response_timeout_ms`] as its
+    /// request-timeout setting, but the synchronous stdio receive can block
+    /// beyond that value. Per-call deadline propagation from a caller's `Cx`
+    /// budget is not enforced at this layer (ft-bd3vr — blocked on a
+    /// cancellation-safe FastMCP transport/call API). The proxy layer at
     /// `mcp_proxy::RemoteProxyToolHandler::call` performs a Cx
     /// pre-flight checkpoint (br-ft-xhj38) so PRE-EXPIRED callers
     /// short-circuit before reaching this point; that's the
@@ -585,9 +581,9 @@ impl OutboundFrameworkClient {
 
     /// Call a remote tool.
     ///
-    /// Bounded by [`Self::connect_timeout_ms`]. See
-    /// [`Self::list_tool_definitions`] for the per-call deadline
-    /// propagation contract (ft-bd3vr, blocked on fastmcp upstream).
+    /// Uses the configured FastMCP response-timeout policy but is not a hard
+    /// wall-clock-bounded operation. See [`Self::list_tool_definitions`] for
+    /// the exact deadline limitation (ft-bd3vr).
     pub(crate) fn call_tool_content(
         &mut self,
         name: &str,

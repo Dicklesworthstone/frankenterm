@@ -2658,6 +2658,29 @@ experiment. It is not converted into a flattering keep or a durable rejection.
 - **Primary retry condition:**
   > Promote any Apple-silicon or Threadripper performance claim only after exact-source baseline/candidate A/B runs retain target identity, workload and font/config hashes, p50/p95/p99/p999 with uncertainty, visual/state equivalence, RSS and allocation slopes, thermal/energy context, and rollback evidence for quiet plus q20/q50/q200 long-session workloads.
 
+### IS-N084 — A deadline check before blocking stdio is not a response timeout
+
+- **Classification:** false timeout-authority rejection; upstream transport
+  blocker remains open
+- **Bead:** `ft-bd3vr`
+- **Rejected inference:** forwarding `McpClientConfig.timeout_ms` into the
+  pinned FastMCP `ClientBuilder` proves that outbound tool calls return within
+  that duration.
+- **Negative evidence:** FastMCP revision
+  `1038dd4e64cc7df8ea8122dbfb8806b0b04a7130` computes a response deadline and
+  checks it before each receive attempt, but the synchronous stdio transport
+  then calls blocking `BufRead::read_line`. A silent subprocess can therefore
+  remain inside one receive beyond the configured deadline, and a caller's
+  `Cx` cannot interrupt that read. The previous `connect_timeout_ms` naming and
+  “bounded by” rustdoc promoted configuration into authority it did not have.
+- **Decision:** rename the mirrored value as configured response-timeout
+  telemetry, state explicitly that it is not a hard wall-clock bound, and
+  reopen `ft-bd3vr`. Do not add a wrapper parameter that FastMCP cannot enforce.
+  A real fix requires cancellation-safe transport I/O plus caller-specific
+  deadline propagation and teardown of a timed-out subprocess/client.
+- **Primary retry condition:**
+  > Claim an outbound MCP response timeout only after a silent-subprocess fixture proves the exact call returns by the caller deadline, cancels or closes the blocked transport without leaking its reader thread or child process, and leaves later calls in a deterministic usable-or-closed state.
+
 ## Open hypothesis register
 
 These are not negative results. Each remains open until a retained same-window

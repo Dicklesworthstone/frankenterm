@@ -64,7 +64,7 @@ impl FtMcpClient {
         let start = Instant::now();
         let client = OutboundFrameworkClient::connect_stdio(&server, settings)
             .map_err(|err| map_mcp_error(&server.name, err))?;
-        let connect_timeout_ms = client.connect_timeout_ms();
+        let configured_response_timeout_ms = client.configured_response_timeout_ms();
         let log_server = redact_mcp_client_text(&server.name);
         let log_command = redact_mcp_client_text(&server.command);
 
@@ -73,7 +73,7 @@ impl FtMcpClient {
             event = "mcp_client_connect",
             server = %log_server,
             command = %log_command,
-            connect_timeout_ms,
+            configured_response_timeout_ms,
             elapsed_ms = start.elapsed().as_millis(),
             "Connected outbound MCP client"
         );
