@@ -7,6 +7,9 @@ const GOLDEN_CASE: &[u8] =
 
 fn parse_actions(input: &[u8]) -> Vec<Action> {
     let mut parser = Parser::new();
+    // The golden captures the batched action representation, so select that
+    // representation explicitly instead of inheriting ambient env policy.
+    parser.set_print_batching(true);
     parser.parse_as_vec(input)
 }
 

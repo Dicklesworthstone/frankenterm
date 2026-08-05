@@ -1219,6 +1219,10 @@ mod test {
 
         fn parse(bytes: &[u8]) -> Vec<Action> {
             let mut p = Parser::new();
+            // Renderer assertions below intentionally inspect scalar actions;
+            // print batching is a parser representation detail, not the
+            // renderer behavior under test.
+            p.set_print_batching(false);
             p.parse_as_vec(bytes)
         }
     }
@@ -1325,6 +1329,9 @@ mod test {
 
         fn parse(&self) -> Vec<Action> {
             let mut p = Parser::new();
+            // Keep renderer expectations independent of the parser's default
+            // printable-run batching policy.
+            p.set_print_batching(false);
             p.parse_as_vec(&self.write.buf)
         }
 

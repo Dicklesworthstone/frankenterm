@@ -11,7 +11,29 @@
 
 use frankenterm_escape_parser::Action;
 use frankenterm_escape_parser::parser::Parser;
-use std::path::PathBuf;
+use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
+
+type TestResult<T = ()> = Result<T, String>;
+
+/// Keep this exact path set synchronized with the input artifacts declared by
+/// `terminal-conformance/manifest.json` and its minimized-case metadata. A
+/// floor such as "at least six inputs" can silently pass after a fixture is
+/// omitted, unreadable, or malformed; this closed manifest cannot.
+const EXPECTED_CORPUS_PATHS: &[&str] = &[
+    "minimized/tc-minimized-synthetic-failure-001.hex",
+    "transcripts/tc-alt-screen-001.hex",
+    "transcripts/tc-bracketed-paste-focus-001.hex",
+    "transcripts/tc-cursor-mode-001.hex",
+    "transcripts/tc-graphics-negative-001.hex",
+    "transcripts/tc-osc8-hyperlink-001.hex",
+    "transcripts/tc-resize-wrap-001.hex",
+    "transcripts/tc-utf8-grapheme-001.hex",
+];
+
+fn fixture_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/terminal-conformance")
+}
 
 fn parse_whole(bytes: &[u8], table_dispatch: bool) -> Vec<Action> {
     let mut p = Parser::new();
@@ -206,56 +228,200 @@ fn sanitize(s: &str) -> String {
         .collect()
 }
 
-fn corpus_inputs() -> Vec<(String, Vec<u8>)> {
-    let root =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/terminal-conformance");
-    let mut out = Vec::new();
-    for sub in ["transcripts", "minimized"] {
-        let dir = root.join(sub);
-        let Ok(entries) = std::fs::read_dir(&dir) else {
+fn collect_hex_paths(root: &Path, dir: &Path, paths: &mut Vec<(String, PathBuf)>) -> TestResult {
+    let entries = std::fs::read_dir(dir)
+        .map_err(|err| format!("failed to read required corpus directory {}: {err}", dir.display()))?;
+    for entry in entries {
+        let entry = entry
+            .map_err(|err| format!("failed to read an entry in {}: {err}", dir.display()))?;
+        let path = entry.path();
+        let file_type = entry
+            .file_type()
+            .map_err(|err| format!("failed to inspect corpus entry {}: {err}", path.display()))?;
+        if file_type.is_dir() {
+            collect_hex_paths(root, &path, paths)?;
             continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("hex") {
-                continue;
-            }
-            let Ok(text) = std::fs::read_to_string(&path) else {
-                continue;
-            };
-            if let Some(bytes) = decode_hex(&text) {
-                let name = path
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("?")
-                    .to_string();
-                out.push((name, bytes));
-            }
         }
+        if path.extension().and_then(|extension| extension.to_str()) != Some("hex") {
+            continue;
+        }
+        let relative = path
+            .strip_prefix(root)
+            .map_err(|err| {
+                format!(
+                    "corpus path {} escaped fixture root {}: {err}",
+                    path.display(),
+                    root.display()
+                )
+            })?
+            .to_str()
+            .ok_or_else(|| format!("corpus path is not valid UTF-8: {}", path.display()))?
+            .replace(std::path::MAIN_SEPARATOR, "/");
+        paths.push((relative, path));
     }
-    out
+    Ok(())
 }
 
-fn decode_hex(text: &str) -> Option<Vec<u8>> {
-    let clean: Vec<u8> = text.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
-    if !clean.len().is_multiple_of(2) {
-        return None;
+fn validate_corpus_paths(mut actual: Vec<String>) -> TestResult<Vec<String>> {
+    actual.sort_unstable();
+    let actual_set = actual.iter().map(String::as_str).collect::<BTreeSet<_>>();
+    let expected_set = EXPECTED_CORPUS_PATHS.iter().copied().collect::<BTreeSet<_>>();
+    let missing = expected_set
+        .difference(&actual_set)
+        .copied()
+        .collect::<Vec<_>>();
+    let unexpected = actual_set
+        .difference(&expected_set)
+        .copied()
+        .collect::<Vec<_>>();
+    if !missing.is_empty() || !unexpected.is_empty() || actual.len() != actual_set.len() {
+        return Err(format!(
+            "terminal-conformance hex manifest mismatch: missing={missing:?}, unexpected={unexpected:?}, duplicate_paths={}",
+            actual.len().saturating_sub(actual_set.len())
+        ));
     }
-    let nibble = |b: u8| -> Option<u8> {
-        match b {
-            b'0'..=b'9' => Some(b - b'0'),
-            b'a'..=b'f' => Some(b - b'a' + 10),
-            b'A'..=b'F' => Some(b - b'A' + 10),
-            _ => None,
-        }
+    Ok(actual)
+}
+
+fn corpus_inputs_from_root(root: &Path) -> TestResult<Vec<(String, Vec<u8>)>> {
+    let mut paths = Vec::new();
+    for required_subdir in ["transcripts", "minimized"] {
+        collect_hex_paths(root, &root.join(required_subdir), &mut paths)?;
+    }
+    paths.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+    let names = paths
+        .iter()
+        .map(|(relative, _)| relative.clone())
+        .collect();
+    let names = validate_corpus_paths(names)?;
+
+    paths
+        .into_iter()
+        .zip(names)
+        .map(|((relative, path), expected_relative)| {
+            if relative != expected_relative {
+                return Err(format!(
+                    "internal corpus ordering mismatch: discovered={relative}, validated={expected_relative}"
+                ));
+            }
+            let bytes = read_corpus_hex(&path, &relative)?;
+            Ok((relative, bytes))
+        })
+        .collect()
+}
+
+fn corpus_inputs() -> TestResult<Vec<(String, Vec<u8>)>> {
+    corpus_inputs_from_root(&fixture_root())
+}
+
+fn read_corpus_hex(path: &Path, relative: &str) -> TestResult<Vec<u8>> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|err| format!("failed to read corpus input {}: {err}", path.display()))?;
+    decode_hex(&text, relative)
+}
+
+fn decode_hex(text: &str, label: &str) -> TestResult<Vec<u8>> {
+    let clean: Vec<u8> = text.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
+    if clean.is_empty() {
+        return Err(format!("empty hex input in {label}"));
+    }
+    if !clean.len().is_multiple_of(2) {
+        return Err(format!("odd-length hex in {label}"));
+    }
+    let nibble = |byte: u8, pair_index: usize, half: &str| -> TestResult<u8> {
+        let value = match byte {
+            b'0'..=b'9' => byte - b'0',
+            b'a'..=b'f' => byte - b'a' + 10,
+            b'A'..=b'F' => byte - b'A' + 10,
+            _ => {
+                return Err(format!(
+                    "invalid {half} hex nibble {:?} at byte pair {pair_index} in {label}",
+                    byte as char
+                ));
+            }
+        };
+        Ok(value)
     };
     let mut out = Vec::with_capacity(clean.len() / 2);
-    let (pairs, remainder) = clean.as_chunks::<2>();
-    debug_assert!(remainder.is_empty(), "even-length hex has no remainder");
-    for pair in pairs {
-        out.push((nibble(pair[0])? << 4) | nibble(pair[1])?);
+    for (pair_index, pair) in clean.chunks_exact(2).enumerate() {
+        out.push(
+            (nibble(pair[0], pair_index, "high")? << 4)
+                | nibble(pair[1], pair_index, "low")?,
+        );
     }
-    Some(out)
+    Ok(out)
+}
+
+#[test]
+fn corpus_path_contract_is_exact_and_deterministic() -> TestResult {
+    let reversed = EXPECTED_CORPUS_PATHS
+        .iter()
+        .rev()
+        .map(ToString::to_string)
+        .collect();
+    let ordered = validate_corpus_paths(reversed)?;
+    assert_eq!(
+        ordered.iter().map(String::as_str).collect::<Vec<_>>(),
+        EXPECTED_CORPUS_PATHS
+    );
+
+    let mut missing = EXPECTED_CORPUS_PATHS
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    let missing_path = missing.pop().expect("the pinned corpus is non-empty");
+    let error = validate_corpus_paths(missing).expect_err("a missing fixture must fail closed");
+    assert!(
+        error.contains(missing_path.as_str()),
+        "unexpected error: {error}"
+    );
+
+    let mut unexpected = EXPECTED_CORPUS_PATHS
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    unexpected.push("transcripts/unexpected.hex".to_owned());
+    let error =
+        validate_corpus_paths(unexpected).expect_err("an unexpected fixture must fail closed");
+    assert!(error.contains("unexpected.hex"), "unexpected error: {error}");
+    Ok(())
+}
+
+#[test]
+fn corpus_loader_rejects_missing_required_directories() {
+    let missing_root = fixture_root().join("definitely-not-a-corpus-root");
+    let error = corpus_inputs_from_root(&missing_root)
+        .expect_err("missing required corpus directories must fail closed");
+    assert!(
+        error.contains("failed to read required corpus directory"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
+fn corpus_reader_propagates_input_read_errors() {
+    let error = read_corpus_hex(&fixture_root(), "fixture-root")
+        .expect_err("attempting to read a directory as hex must fail closed");
+    assert!(
+        error.contains("failed to read corpus input"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
+fn corpus_hex_decoder_rejects_odd_and_invalid_text() {
+    let odd = decode_hex("0a f", "odd.hex").expect_err("odd-length hex must fail closed");
+    assert!(odd.contains("odd-length hex"), "unexpected error: {odd}");
+
+    let invalid =
+        decode_hex("0g", "invalid.hex").expect_err("invalid hex must fail closed");
+    assert!(
+        invalid.contains("invalid low hex nibble"),
+        "unexpected error: {invalid}"
+    );
+
+    let empty = decode_hex(" \n\t", "empty.hex").expect_err("empty hex must fail closed");
+    assert!(empty.contains("empty hex input"), "unexpected error: {empty}");
 }
 
 #[test]
@@ -268,18 +434,14 @@ fn whole_buffer_equivalence_battery() {
 }
 
 #[test]
-fn whole_buffer_equivalence_corpus() {
-    let inputs = corpus_inputs();
-    assert!(
-        inputs.len() >= 6,
-        "expected to load the terminal-conformance corpus, got {} inputs",
-        inputs.len()
-    );
+fn whole_buffer_equivalence_corpus() -> TestResult {
+    let inputs = corpus_inputs()?;
     for (name, bytes) in inputs {
         let off = parse_whole(&bytes, false);
         let on = parse_whole(&bytes, true);
         assert_eq!(off, on, "table-dispatch corpus parse diverged for {name}");
     }
+    Ok(())
 }
 
 #[test]
@@ -306,8 +468,8 @@ fn chunk_boundary_equivalence_battery() {
 }
 
 #[test]
-fn chunk_boundary_equivalence_corpus() {
-    for (name, bytes) in corpus_inputs() {
+fn chunk_boundary_equivalence_corpus() -> TestResult {
+    for (name, bytes) in corpus_inputs()? {
         for split in 0..=bytes.len() {
             let off = parse_chunked(&bytes, split, false);
             let on = parse_chunked(&bytes, split, true);
@@ -317,14 +479,16 @@ fn chunk_boundary_equivalence_corpus() {
             );
         }
     }
+    Ok(())
 }
 
-/// Sanity: the gate is genuinely off without the toggle and the SGR fast path
-/// produces the expected actions when on (so the gate isn't vacuous).
+/// Sanity: the gate can be forced off and the SGR fast path engages when it is
+/// forced on, independent of compile-time features or process environment.
 #[test]
-fn gate_is_off_by_default_and_engages() {
+fn gate_toggle_is_environment_independent_and_engages() {
     let mut p = Parser::new();
-    assert!(!p.table_dispatch(), "table dispatch must default OFF");
+    p.set_table_dispatch(false);
+    assert!(!p.table_dispatch());
     p.set_table_dispatch(true);
     assert!(p.table_dispatch());
 

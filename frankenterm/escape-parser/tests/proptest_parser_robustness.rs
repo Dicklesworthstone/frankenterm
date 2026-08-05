@@ -151,6 +151,38 @@ fn parse_chunked(bytes: &[u8], chunk_sizes: &[usize]) -> Vec<Action> {
     actions
 }
 
+/// Canonicalize the parser's two equivalent printable-text representations.
+///
+/// `Parser::parse` deliberately flushes a pending printable run at each API
+/// call boundary. A bulk parse can therefore emit one `PrintString`, while a
+/// byte-at-a-time parse emits the same characters as several `Print` or
+/// `PrintString` actions. Coalescing only adjacent printable actions lets the
+/// chunk-boundary property compare their terminal semantics without weakening
+/// the exact ordering or identity requirement for any non-print action.
+fn normalize_print_runs(actions: Vec<Action>) -> Vec<Action> {
+    let mut normalized = Vec::with_capacity(actions.len());
+    let mut pending = String::new();
+
+    for action in actions {
+        match action {
+            Action::Print(c) => pending.push(c),
+            Action::PrintString(s) => pending.push_str(&s),
+            other => {
+                if !pending.is_empty() {
+                    normalized.push(Action::PrintString(std::mem::take(&mut pending)));
+                }
+                normalized.push(other);
+            }
+        }
+    }
+
+    if !pending.is_empty() {
+        normalized.push(Action::PrintString(pending));
+    }
+
+    normalized
+}
+
 fn render_canonical_actions(actions: &[Action]) -> String {
     let mut rendered = String::new();
     let mut skip_next_st = false;
@@ -236,16 +268,18 @@ proptest! {
     }
 
     /// PTY reads may split escape sequences at any byte boundary. Parsing a
-    /// mixed stream all at once must produce the same actions as feeding the
-    /// same bytes through a long-lived parser in generated chunk sizes.
+    /// mixed stream all at once must preserve the same terminal semantics as
+    /// feeding the same bytes through a long-lived parser in generated chunk
+    /// sizes. Only the segmentation of adjacent printable actions may differ;
+    /// every non-print action must remain exactly ordered and identical.
     #[test]
     fn mixed_stream_chunk_boundaries_match_bulk_parse(
         bytes in arb_mixed_terminal_stream(),
         chunk_sizes in proptest::collection::vec(1usize..=32, 1..64),
     ) {
         let mut bulk_parser = Parser::new();
-        let bulk_actions = bulk_parser.parse_as_vec(&bytes);
-        let chunked_actions = parse_chunked(&bytes, &chunk_sizes);
+        let bulk_actions = normalize_print_runs(bulk_parser.parse_as_vec(&bytes));
+        let chunked_actions = normalize_print_runs(parse_chunked(&bytes, &chunk_sizes));
 
         prop_assert_eq!(
             chunked_actions,

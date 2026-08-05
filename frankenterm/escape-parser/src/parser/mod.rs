@@ -23,12 +23,14 @@ const MAX_TCAP_CURRENT_BYTES: usize = 1_048_576;
 /// Set-wide escape hatch for the Round-7 moonshot-recommended default-on set.
 /// Falsey values disable promoted recommended gates while leaving unrelated
 /// moonshots alone.
+#[cfg(feature = "std")]
 const MOONSHOT_RECOMMENDED_ENV: &str = "FT_MOONSHOT_RECOMMENDED";
 
 /// Env gate for the Round-5 D1 printable-run batching optimization
 /// (ft-round5-gauntlet-lw0s7.10). Round-7 promotes this to default-ON as part
 /// of the dense-ASCII term-render stack; falsey values disable it for newly
 /// constructed parsers.
+#[cfg(feature = "std")]
 const PRINT_BATCHING_ENV: &str = "FT_MOONSHOT_PARSER_PRINT_BATCHING";
 
 /// Resolve the default `print_batching` setting for a freshly constructed
@@ -37,7 +39,29 @@ const PRINT_BATCHING_ENV: &str = "FT_MOONSHOT_PARSER_PRINT_BATCHING";
 /// `std`-only; `no_std` builds use the promoted default.
 #[inline]
 fn default_print_batching() -> bool {
-    !env_flag_falsey(MOONSHOT_RECOMMENDED_ENV) && !env_flag_falsey(PRINT_BATCHING_ENV)
+    #[cfg(feature = "std")]
+    {
+        let recommended = std::env::var(MOONSHOT_RECOMMENDED_ENV).ok();
+        let print_batching = std::env::var(PRINT_BATCHING_ENV).ok();
+        return print_batching_default_for_values(
+            recommended.as_deref(),
+            print_batching.as_deref(),
+        );
+    }
+    #[cfg(not(feature = "std"))]
+    print_batching_default_for_values(None, None)
+}
+
+/// Pure policy core for [`default_print_batching`]. Keeping environment I/O at
+/// the boundary lets the full default/escape-hatch matrix be tested without
+/// mutating process-global environment variables in a parallel test suite.
+#[inline]
+fn print_batching_default_for_values(
+    recommended: Option<&str>,
+    print_batching: Option<&str>,
+) -> bool {
+    !recommended.is_some_and(env_value_is_falsey)
+        && !print_batching.is_some_and(env_value_is_falsey)
 }
 
 /// Env gate for the Round-5 D2 table-driven CSI/OSC dispatch optimization
@@ -71,19 +95,13 @@ fn env_flag_truthy(_name: &str) -> bool {
 }
 
 #[inline]
-fn env_flag_falsey(_name: &str) -> bool {
-    #[cfg(feature = "std")]
-    {
-        if let Ok(value) = std::env::var(_name) {
-            let value = value.trim();
-            return value.is_empty()
-                || value == "0"
-                || value.eq_ignore_ascii_case("false")
-                || value.eq_ignore_ascii_case("off")
-                || value.eq_ignore_ascii_case("no");
-        }
-    }
-    false
+fn env_value_is_falsey(value: &str) -> bool {
+    let value = value.trim();
+    value.is_empty()
+        || value == "0"
+        || value.eq_ignore_ascii_case("false")
+        || value.eq_ignore_ascii_case("off")
+        || value.eq_ignore_ascii_case("no")
 }
 
 #[derive(Default)]
@@ -162,8 +180,10 @@ pub struct Parser {
     /// Round-5 D1 (ft-round5-gauntlet-lw0s7.10): when set, [`Parser::parse`]
     /// coalesces maximal ground-state printable UTF-8 runs into a single
     /// `Action::PrintString` instead of emitting one `Action::Print(char)` per
-    /// codepoint. Default-OFF; flipped on by the `parser-print-batching`
-    /// feature or at runtime via [`Parser::set_print_batching`].
+    /// codepoint. The promoted default is on; a falsey
+    /// `FT_MOONSHOT_RECOMMENDED` or `FT_MOONSHOT_PARSER_PRINT_BATCHING` value
+    /// disables it for newly constructed parsers, and
+    /// [`Parser::set_print_batching`] overrides the resolved default.
     print_batching: bool,
 }
 
@@ -187,8 +207,9 @@ impl Parser {
     }
 
     /// Enable or disable ground-state printable-run coalescing (Round-5 D1,
-    /// ft-round5-gauntlet-lw0s7.10). Default is off unless the
-    /// `parser-print-batching` feature is enabled.
+    /// ft-round5-gauntlet-lw0s7.10). Newly constructed parsers use the promoted
+    /// default-on policy from [`default_print_batching`]; this setter is the
+    /// explicit per-parser override used by A/B and equivalence proofs.
     ///
     /// When enabled, contiguous printable codepoints parsed in the VT *Ground*
     /// state are emitted as one `Action::PrintString` rather than a `Print`
@@ -703,6 +724,22 @@ mod test {
         String::from_utf8(res).unwrap()
     }
 
+    #[test]
+    fn print_batching_default_policy_is_on_unless_either_gate_is_falsey() {
+        assert!(print_batching_default_for_values(None, None));
+        assert!(print_batching_default_for_values(Some("true"), Some("on")));
+        assert!(print_batching_default_for_values(Some("future-value"), Some("1")));
+
+        for falsey in ["", "0", "false", "FALSE", " off ", "No"] {
+            assert!(!print_batching_default_for_values(Some(falsey), None));
+            assert!(!print_batching_default_for_values(None, Some(falsey)));
+            assert!(!print_batching_default_for_values(
+                Some("true"),
+                Some(falsey),
+            ));
+        }
+    }
+
     // <https://github.com/markbt/streampager/issues/57>
     #[test]
     fn osc_bel_parse_first_as_vec() {
@@ -878,17 +915,12 @@ mod test {
     #[test]
     fn basic_parse() {
         let mut p = Parser::new();
+        // This assertion is intentionally representation-specific.  Pin the
+        // mode so the supported environment-level batching opt-out cannot
+        // turn an otherwise-correct test run red.
+        p.set_print_batching(true);
         let actions = p.parse_as_vec(b"hello");
-        assert_eq!(
-            vec![
-                Action::Print('h'),
-                Action::Print('e'),
-                Action::Print('l'),
-                Action::Print('l'),
-                Action::Print('o'),
-            ],
-            actions
-        );
+        assert_eq!(vec![Action::PrintString("hello".to_string())], actions);
         assert_eq!(encode(&actions), "hello");
     }
 
@@ -1138,15 +1170,14 @@ mod test {
     #[test]
     fn tmux_title_escape() {
         let mut p = Parser::new();
+        // The expected action stream below proves batched representation,
+        // independent of the process-wide default/escape-hatch setting.
+        p.set_print_batching(true);
         let actions = p.parse_as_vec(b"\x1bktitle\x1b\\");
         assert_eq!(
             vec![
                 Action::Esc(Esc::Code(EscCode::TmuxTitle)),
-                Action::Print('t'),
-                Action::Print('i'),
-                Action::Print('t'),
-                Action::Print('l'),
-                Action::Print('e'),
+                Action::PrintString("title".to_string()),
                 Action::Esc(Esc::Code(EscCode::StringTerminator)),
             ],
             actions
