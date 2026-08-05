@@ -1767,7 +1767,9 @@ pub mod process {
         /// its cx surfaces as `io::ErrorKind::Interrupted` within
         /// ~10ms of the signal (one PROCESS_POLL_INTERVAL tick),
         /// including for long-running child processes that would
-        /// otherwise block the spawn_blocking indefinitely.
+        /// otherwise block the spawn_blocking indefinitely. Finite Cx
+        /// deadlines and watcher-timer failures take the same fail-closed
+        /// child-cancellation path.
         ///
         /// Kill-on-drop semantics are preserved: if the future is
         /// dropped before completion and kill_on_drop was set, the
@@ -1806,11 +1808,22 @@ pub mod process {
             let watcher_handle =
                 super::task::spawn_with_cx(&watcher_spawn_cx, move |_child_cx| async move {
                     while !watcher_done_inner.load(Ordering::SeqCst) {
-                        if watcher_cx.is_cancel_requested() {
+                        if watcher_cx.checkpoint().is_err() {
                             watcher_cancel.store(true, Ordering::SeqCst);
                             return;
                         }
-                        let _ = super::sleep_with_cx(&watcher_cx, PROCESS_POLL_INTERVAL).await;
+                        if super::sleep_with_cx(&watcher_cx, PROCESS_POLL_INTERVAL)
+                            .await
+                            .is_err()
+                        {
+                            // A finite budget can wake `sleep_with_cx` with an
+                            // error before the Cx cancellation bit is latched.
+                            // Fail closed and stop the child instead of
+                            // spinning this watcher without yielding.
+                            let _ = watcher_cx.checkpoint();
+                            watcher_cancel.store(true, Ordering::SeqCst);
+                            return;
+                        }
                     }
                 });
 
@@ -2319,14 +2332,12 @@ impl RuntimeBuilder {
     }
 }
 
-/// Runtime builder wrapper for the active backend.
 /// Sleep for the specified duration using the active runtime backend.
 pub async fn sleep(duration: Duration) {
     let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
     let _ = sleep_with_cx(&cx, duration).await;
 }
 
-/// Sleep for the specified duration using the active runtime backend.
 /// Sleep for the requested duration while respecting the provided `Cx`.
 ///
 /// This is the Cx-first sleep seam used by the ft-xbnl0.2.2 migration. Call
@@ -2407,7 +2418,6 @@ fn cx_timer_now(cx: &crate::cx::Cx) -> asupersync::Time {
         .map_or_else(asupersync::time::wall_now, |driver| driver.now())
 }
 
-/// Runs `future` with a timeout using the active runtime backend.
 /// Runs blocking work on the active runtime's blocking executor.
 ///
 /// Returns the closure output when successful, or a stringified join/runtime
@@ -2417,7 +2427,27 @@ where
     T: Send + 'static,
     F: FnOnce() -> T + Send + 'static,
 {
-    Ok(asupersync::runtime::spawn_blocking(work).await)
+    use futures::FutureExt;
+
+    std::panic::AssertUnwindSafe(asupersync::runtime::spawn_blocking(work))
+        .catch_unwind()
+        .await
+        .map_err(|payload| {
+            format!(
+                "blocking task panicked: {}",
+                blocking_panic_payload_detail(payload.as_ref())
+            )
+        })
+}
+
+fn blocking_panic_payload_detail(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(message) = payload.downcast_ref::<&'static str>() {
+        (*message).to_string()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "non-string panic payload".to_string()
+    }
 }
 
 /// Typed failure from [`spawn_blocking_with_cx`].
@@ -2483,8 +2513,8 @@ fn map_spawn_blocking_runtime_result<T>(
 /// **Mid-flight cancel:** if the Cx cancels while the blocking
 /// work is running, the await resolves with
 /// [`SpawnBlockingWithCxError::CancelledMidFlight`] within ~50–100 ms
-/// (the cancel-watcher polls `cx.is_cancel_requested()` on a
-/// 50 ms cadence). The orphaned blocking task **continues to
+/// (the cancel-watcher checkpoints the Cx on a 50 ms cadence). The
+/// orphaned blocking task **continues to
 /// run** on the blocking thread pool until the closure returns
 /// naturally — its result is discarded. The blocking work
 /// itself does not see the cancel signal; if the closure
@@ -2530,21 +2560,37 @@ where
     let cancel_watcher = std::pin::pin!(async {
         loop {
             // 50 ms poll mirrors distributed::race_with_cx_cancel
-            // (tick 387). The sleep is itself cx-aware so a
-            // pre-cancelled cx returns Err promptly and the
-            // watcher resolves on the next branch tick.
-            let _ = sleep_with_cx(cx, std::time::Duration::from_millis(50)).await;
-            if cx.is_cancel_requested() {
-                return;
+            // (tick 387). A budget deadline can make `sleep_with_cx`
+            // return `Err` without first latching the cancellation bit, so
+            // every wakeup must run a checkpoint. Ignoring that error used
+            // to turn an expired finite budget into a non-yielding hot loop
+            // until the blocking closure happened to finish.
+            if let Err(sleep_error) =
+                sleep_with_cx(cx, std::time::Duration::from_millis(50)).await
+            {
+                if cx.checkpoint().is_err() {
+                    return Ok(());
+                }
+                return Err(format!(
+                    "blocking cancellation watcher sleep failed: {sleep_error}"
+                ));
+            }
+            if cx.checkpoint().is_err() {
+                return Ok(());
             }
         }
     });
 
     match select(join_fut, cancel_watcher).await {
         Either::Left((result, _)) => map_spawn_blocking_runtime_result(result),
-        Either::Right(((), _)) => Err(SpawnBlockingWithCxError::CancelledMidFlight {
-            kind: cx.cancel_reason().map(|reason| reason.kind),
-        }),
+        Either::Right((Ok(()), _)) => {
+            Err(SpawnBlockingWithCxError::CancelledMidFlight {
+                kind: cx.cancel_reason().map(|reason| reason.kind),
+            })
+        }
+        Either::Right((Err(detail), _)) => {
+            Err(SpawnBlockingWithCxError::RuntimeFailure { detail })
+        }
     }
 }
 
@@ -4841,17 +4887,66 @@ mod tests {
 
     #[test]
     fn spawn_blocking_with_cx_runtime_failure_is_not_cancellation() {
-        let error = map_spawn_blocking_runtime_result::<u64>(Err(
-            "blocking executor unavailable".to_string(),
-        ))
-        .expect_err("runtime failure must remain an error");
+        let rt = RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let cx = crate::cx::Cx::for_testing();
+            let error = spawn_blocking_with_cx(&cx, || -> u64 {
+                panic!("injected blocking closure panic")
+            })
+            .await
+            .expect_err("blocking closure panic must become a typed runtime failure");
 
-        match error {
-            SpawnBlockingWithCxError::RuntimeFailure { detail } => {
-                assert_eq!(detail, "blocking executor unavailable");
+            match error {
+                SpawnBlockingWithCxError::RuntimeFailure { detail } => {
+                    assert!(
+                        detail.contains("injected blocking closure panic"),
+                        "runtime failure must preserve the panic detail; got: {detail}"
+                    );
+                }
+                other => {
+                    panic!("runtime failure must not be classified as cancellation: {other:?}")
+                }
             }
-            other => panic!("runtime failure must not be classified as cancellation: {other:?}"),
-        }
+        });
+    }
+
+    #[test]
+    fn spawn_blocking_with_cx_deadline_cancels_without_hot_looping() {
+        let rt = RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let probe = crate::cx::Cx::for_testing();
+            let budget = asupersync::types::Budget::new()
+                .with_deadline(cx_timer_now(&probe) + Duration::from_millis(40));
+            let cx = crate::cx::Cx::for_testing_with_budget(budget);
+
+            let started = std::time::Instant::now();
+            let result = spawn_blocking_with_cx(&cx, || {
+                std::thread::sleep(Duration::from_millis(400));
+                42_u64
+            })
+            .await;
+            let elapsed = started.elapsed();
+
+            assert!(
+                matches!(
+                    &result,
+                    Err(SpawnBlockingWithCxError::CancelledMidFlight {
+                        kind: Some(crate::outcome::CancelKind::Deadline)
+                    })
+                ),
+                "finite Cx deadline must surface as typed mid-flight cancellation; got: {result:?}"
+            );
+            assert!(
+                elapsed < Duration::from_millis(300),
+                "deadline watcher must return before the blocking closure completes; took {elapsed:?}"
+            );
+        });
     }
 
     // -- task::spawn --
@@ -5301,6 +5396,37 @@ mod tests {
             assert!(
                 elapsed < Duration::from_secs(5),
                 "cancellation should surface promptly (got {elapsed:?}); the 10s sleep would dominate if cx was ignored"
+            );
+        });
+    }
+
+    #[cfg(all(feature = "asupersync-runtime", unix))]
+    #[test]
+    fn process_command_output_with_cx_deadline_surfaces_as_interrupted() {
+        run_async_test_isolated(|| async {
+            let probe = crate::cx::Cx::for_testing();
+            let budget = asupersync::types::Budget::new()
+                .with_deadline(cx_timer_now(&probe) + Duration::from_millis(40));
+            let cx = crate::cx::Cx::for_testing_with_budget(budget);
+
+            let mut cmd = process::Command::new("sh");
+            cmd.arg("-c");
+            cmd.arg("sleep 2");
+            cmd.kill_on_drop(true);
+
+            let started = std::time::Instant::now();
+            let result = cmd.output_with_cx(&cx).await;
+            let elapsed = started.elapsed();
+
+            let error = result.expect_err("Cx deadline must stop the child process");
+            assert_eq!(
+                error.kind(),
+                std::io::ErrorKind::Interrupted,
+                "deadline-cancelled process output must surface as Interrupted: {error}"
+            );
+            assert!(
+                elapsed < Duration::from_secs(1),
+                "deadline must stop the child before its 2 s sleep completes; took {elapsed:?}"
             );
         });
     }
