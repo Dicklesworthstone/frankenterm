@@ -398,12 +398,19 @@ fn cleanup_receipt_record(
 
 async fn begin_cleanup_apply_receipt(storage: &StorageHandle) -> crate::Result<i64> {
     let receipt_cx = crate::cx::Cx::for_request_with_budget(crate::cx::Budget::MINIMAL);
-    storage
+    let maintenance_id = storage
         .record_maintenance_with_cx(
             &receipt_cx,
             cleanup_receipt_record(0, "in_progress", &CleanupPlan::default()),
         )
-        .await
+        .await?;
+    if maintenance_id <= 0 {
+        return Err(crate::error::StorageError::Database(
+            "tiered cleanup receipt creation returned a non-positive id".to_string(),
+        )
+        .into());
+    }
+    Ok(maintenance_id)
 }
 
 async fn finish_cleanup_apply_outcome(
@@ -424,7 +431,16 @@ async fn finish_cleanup_apply_outcome(
         .record_maintenance_with_cx(&receipt_cx, pending_record.clone())
         .await;
     let audit = match receipt {
-        Ok(maintenance_id) => CleanupAuditStatus::Recorded { maintenance_id },
+        Ok(recorded_id) if recorded_id == maintenance_id => CleanupAuditStatus::Recorded {
+            maintenance_id: recorded_id,
+        },
+        Ok(_) => CleanupAuditStatus::Failed {
+            error: crate::error::StorageError::Database(
+                "tiered cleanup finalization returned a different receipt id".to_string(),
+            )
+            .into(),
+            pending_record,
+        },
         Err(error) => CleanupAuditStatus::Failed {
             error,
             pending_record,

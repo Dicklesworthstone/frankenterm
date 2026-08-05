@@ -18130,6 +18130,9 @@ fn advance_tiered_cleanup_receipt_backend(
         )
         .into());
     }
+    if deleted_delta == 0 {
+        return Ok(());
+    }
     let row = backend
         .query_row_typed(
             "SELECT metadata FROM maintenance_log

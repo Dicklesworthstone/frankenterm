@@ -3795,6 +3795,7 @@ impl ObservationRuntime {
                     // applies RETENTION_MAINTENANCE_RETRY_DELAY after failure.
                     let mut retention_succeeded = true;
                     if let Some(pending) = pending_cleanup_receipt.clone() {
+                        let expected_maintenance_id = pending.id;
                         let receipt_cx = crate::cx::Cx::for_request_with_budget(
                             crate::cx::Budget::MINIMAL,
                         );
@@ -3802,11 +3803,20 @@ impl ObservationRuntime {
                             .record_maintenance_with_cx(&receipt_cx, pending)
                             .await
                         {
-                            Ok(maintenance_id) => {
+                            Ok(maintenance_id)
+                                if maintenance_id == expected_maintenance_id =>
+                            {
                                 pending_cleanup_receipt = None;
                                 info!(
                                     maintenance_id,
                                     "Retried pending tiered-cleanup audit receipt"
+                                );
+                            }
+                            Ok(_) => {
+                                retention_succeeded = false;
+                                error!(
+                                    error_class = "tiered_cleanup_receipt_identity_mismatch",
+                                    "Pending tiered-cleanup audit receipt returned a different identity; deferring new age-retention cleanup"
                                 );
                             }
                             Err(_error) => {
