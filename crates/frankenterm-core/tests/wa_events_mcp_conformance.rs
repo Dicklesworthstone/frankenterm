@@ -450,11 +450,15 @@ fn make_event_with(id_hint: u64, rule_id: &str, detected_at: i64) -> StoredEvent
 }
 
 fn seed_many_events(harness: &TestHarness, events: Vec<StoredEvent>) {
+    seed_many_events_at(&harness.db_path, events);
+}
+
+fn seed_many_events_at(db_path: &PathBuf, events: Vec<StoredEvent>) {
     let runtime = RuntimeBuilder::current_thread()
         .build()
         .expect("build runtime");
     runtime.block_on(async {
-        let storage = StorageHandle::new(&harness.db_path.to_string_lossy())
+        let storage = StorageHandle::new(&db_path.to_string_lossy())
             .await
             .expect("open storage");
         storage
@@ -527,7 +531,11 @@ fn reserve_fixture_event(db_path: &PathBuf, ttl: std::time::Duration) -> EventDe
     reserve_fixture_event_id(db_path, 1, ttl)
 }
 
-fn release_fixture_event(db_path: &PathBuf, lease: &EventDeliveryLease) {
+fn reserve_fixture_event_ids(
+    db_path: &PathBuf,
+    event_ids: impl IntoIterator<Item = i64>,
+    ttl: std::time::Duration,
+) -> Vec<EventDeliveryLease> {
     let runtime = RuntimeBuilder::current_thread()
         .build()
         .expect("build runtime");
@@ -535,15 +543,75 @@ fn release_fixture_event(db_path: &PathBuf, lease: &EventDeliveryLease) {
         let storage = StorageHandle::new(&db_path.to_string_lossy())
             .await
             .expect("open storage");
-        assert!(
-            storage
-                .release_event_delivery(lease)
+        let mut leases = Vec::new();
+        for event_id in event_ids {
+            let reservation = storage
+                .reserve_event_delivery(event_id, ttl)
                 .await
-                .expect("release fixture event"),
-            "fixture lease must still be owned"
-        );
+                .unwrap_or_else(|error| panic!("reserve fixture event {event_id}: {error}"));
+            match reservation {
+                EventDeliveryReservation::Acquired(lease) => leases.push(lease),
+                other => panic!("expected fixture delivery lease for {event_id}, got {other:?}"),
+            }
+        }
+        storage.shutdown().await.expect("shutdown storage");
+        leases
+    })
+}
+
+fn release_fixture_event(db_path: &PathBuf, lease: &EventDeliveryLease) {
+    release_fixture_events(db_path, std::slice::from_ref(lease));
+}
+
+fn release_fixture_events(db_path: &PathBuf, leases: &[EventDeliveryLease]) {
+    let runtime = RuntimeBuilder::current_thread()
+        .build()
+        .expect("build runtime");
+    runtime.block_on(async {
+        let storage = StorageHandle::new(&db_path.to_string_lossy())
+            .await
+            .expect("open storage");
+        for lease in leases {
+            assert!(
+                storage
+                    .release_event_delivery(lease)
+                    .await
+                    .expect("release fixture event"),
+                "fixture lease for event {} must still be owned",
+                lease.event_id()
+            );
+        }
         storage.shutdown().await.expect("shutdown storage");
     });
+}
+
+fn wait_for_event_delivery_lease(
+    db_path: &PathBuf,
+    event_id: i64,
+    watchdog: std::time::Duration,
+) {
+    let connection = rusqlite::Connection::open(db_path).expect("open lease observer");
+    connection
+        .busy_timeout(std::time::Duration::from_secs(1))
+        .expect("configure lease observer busy timeout");
+    let started = std::time::Instant::now();
+    loop {
+        let leased: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE id = ?1 AND delivery_lease_token IS NOT NULL",
+                [event_id],
+                |row| row.get(0),
+            )
+            .expect("query event delivery lease state");
+        if leased == 1 {
+            return;
+        }
+        assert!(
+            started.elapsed() < watchdog,
+            "event {event_id} was not leased within {watchdog:?}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
 }
 
 fn call_events(harness: &mut TestHarness, args: Value) -> Value {
@@ -782,8 +850,8 @@ fn mcp_conformance_idless_long_poll_is_rejected_before_dispatch() {
                 "any": ["rule:never.matches"],
                 "cursor": 0,
                 "pane": FIXTURE_PANE_ID,
-                "timeout_secs": 300,
-                "poll_interval_ms": 30_000,
+                "timeout_secs": 6,
+                "poll_interval_ms": 1_000,
                 "claim": true
             }
         }
@@ -797,25 +865,45 @@ fn mcp_conformance_idless_long_poll_is_rejected_before_dispatch() {
         .expect("send claim-capable notification");
     // The server processes transport messages sequentially. This ordinary
     // request forces it past the notification and proves the notification's
-    // unresolved action was released before this response was written.
-    let barrier_started = std::time::Instant::now();
-    harness
-        .client
-        .list_tools()
+    // unresolved action was released before this response was written. Use a
+    // synchronization channel and a generous watchdog instead of a brittle
+    // sub-second wall-time assertion. The notification's own six-second bound
+    // ensures the worker can still be joined after a failure without leaving a
+    // long-running detached test thread.
+    let TestHarness {
+        _workspace,
+        db_path,
+        mut client,
+    } = harness;
+    let (barrier_tx, barrier_rx) = std::sync::mpsc::sync_channel(1);
+    let barrier_worker = std::thread::spawn(move || {
+        let result = client.list_tools().map(|_| ());
+        let _ = barrier_tx.send(result);
+    });
+    let barrier_result = barrier_rx.recv_timeout(std::time::Duration::from_secs(5));
+    if barrier_result.is_err() {
+        barrier_worker
+            .join()
+            .expect("join delayed post-notification barrier worker");
+        panic!(
+            "an id-less long poll monopolized the sequential server beyond the five-second watchdog"
+        );
+    }
+    barrier_result
+        .expect("barrier result checked above")
         .expect("send post-notification response barrier");
-    assert!(
-        barrier_started.elapsed() < std::time::Duration::from_secs(1),
-        "an id-less long poll must be rejected before it can monopolize the sequential server"
-    );
+    barrier_worker
+        .join()
+        .expect("join post-notification barrier worker");
 
-    let events = load_fixture_events(&harness.db_path);
+    let events = load_fixture_events(&db_path);
     assert_eq!(events.len(), 1);
     assert!(
         events[0].handled_at.is_none(),
         "an id-less tool call has no response boundary and must never dispatch/finalize"
     );
-    let lease = reserve_fixture_event(&harness.db_path, std::time::Duration::from_secs(1));
-    release_fixture_event(&harness.db_path, &lease);
+    let lease = reserve_fixture_event(&db_path, std::time::Duration::from_secs(1));
+    release_fixture_event(&db_path, &lease);
 }
 
 fn assert_await_event_claim_send_failure_releases_lease(
