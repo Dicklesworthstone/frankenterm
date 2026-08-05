@@ -1,7 +1,7 @@
 //! MCP error code definitions and error mapping utilities.
 
-use crate::cass::{CassError, CassErrorRemediationExt};
-use crate::caut::{CautError, CautErrorRemediationExt};
+use crate::cass::CassError;
+use crate::caut::CautError;
 use crate::error::{Error, StorageError, WeztermError};
 
 pub(crate) const MCP_ERR_INVALID_ARGS: &str = "FT-MCP-0001";
@@ -50,34 +50,50 @@ impl McpToolError {
         let (code, hint) = map_caut_error(&err);
         Self {
             code,
-            message: err.to_string(),
+            message: classified_auxiliary_mcp_error_message("caut", code),
             hint,
         }
     }
 
-    #[allow(dead_code)] // symmetric with from_caut_error; cass handlers inline the logic today
     pub(crate) fn from_cass_error(err: CassError) -> Self {
         let (code, hint) = map_cass_error(&err);
         Self {
             code,
-            message: err.to_string(),
+            message: classified_auxiliary_mcp_error_message("cass", code),
             hint,
         }
     }
 }
 
+fn classified_auxiliary_mcp_error_message(tool: &'static str, code: &'static str) -> String {
+    match code {
+        MCP_ERR_CONFIG => format!("{tool} is unavailable"),
+        MCP_ERR_TIMEOUT => format!("{tool} request timed out"),
+        _ => format!("{tool} request failed"),
+    }
+}
+
 fn redacted_mcp_error_message(error: &Error, code: &'static str) -> String {
-    // MCP_ERR_INTERNAL is the catch-all bucket in `map_mcp_error`.
-    // Any variant falling through carries unstructured Display output that
-    // may expose filesystem paths (Error::Io), config paths (Error::SetupError),
-    // runtime internals (Error::RuntimeOperation, Error::Cancelled), or raw
-    // serde detail (Error::Json). Redact the whole bucket, not just Error::Runtime.
-    match (code, error) {
-        (MCP_ERR_STORAGE, _) => "Storage unavailable".to_string(),
-        (MCP_ERR_INTERNAL, _) => "Internal error".to_string(),
-        (MCP_ERR_CONFIG, _) => "Configuration unavailable".to_string(),
-        (MCP_ERR_NOT_IMPLEMENTED, _) => "MCP surface unavailable".to_string(),
-        _ => error.to_string(),
+    // Classify before rendering. Calling `Display` first can allocate and copy
+    // an arbitrarily large backend/storage/policy string even when the generic
+    // MCP envelope later redacts or truncates it.
+    match code {
+        MCP_ERR_PANE_NOT_FOUND => match error {
+            Error::Wezterm(WeztermError::PaneNotFound(pane_id)) => {
+                format!("Pane not found: {pane_id}")
+            }
+            _ => "Pane not found".to_string(),
+        },
+        MCP_ERR_TIMEOUT => "Request timed out or was cancelled".to_string(),
+        MCP_ERR_WEZTERM => "Backend bridge request failed".to_string(),
+        MCP_ERR_STORAGE => "Storage unavailable".to_string(),
+        MCP_ERR_FTS_QUERY => "Search query rejected".to_string(),
+        MCP_ERR_RESERVATION_CONFLICT => "Reservation conflict".to_string(),
+        MCP_ERR_CONFIG => "Configuration unavailable".to_string(),
+        MCP_ERR_WORKFLOW => "Workflow request failed".to_string(),
+        MCP_ERR_POLICY => "Policy rejected the request".to_string(),
+        MCP_ERR_NOT_IMPLEMENTED => "MCP surface unavailable".to_string(),
+        _ => "Internal error".to_string(),
     }
 }
 
@@ -91,7 +107,22 @@ pub(crate) fn map_caut_error(error: &CautError) -> (&'static str, Option<String>
             MCP_ERR_TIMEOUT,
             Some("Retry the refresh or increase caut timeout.".to_string()),
         ),
-        _ => (MCP_ERR_CAUT, Some(error.remediation().summary.to_string())),
+        CautError::NonZeroExit { .. } => (
+            MCP_ERR_CAUT,
+            Some("Check caut authentication and logs, then retry.".to_string()),
+        ),
+        CautError::OutputTooLarge { .. } => (
+            MCP_ERR_CAUT,
+            Some("Reduce the caut account set or output size, then retry.".to_string()),
+        ),
+        CautError::InvalidJson { .. } => (
+            MCP_ERR_CAUT,
+            Some("Upgrade caut or verify its JSON output format.".to_string()),
+        ),
+        CautError::Io { .. } => (
+            MCP_ERR_CAUT,
+            Some("Check caut binary permissions and retry.".to_string()),
+        ),
     }
 }
 
@@ -105,7 +136,26 @@ pub(crate) fn map_cass_error(error: &CassError) -> (&'static str, Option<String>
             MCP_ERR_TIMEOUT,
             Some("Retry the query or increase cass timeout.".to_string()),
         ),
-        _ => (MCP_ERR_CASS, Some(error.remediation().summary.to_string())),
+        CassError::NonZeroExit { .. } => (
+            MCP_ERR_CASS,
+            Some("Check cass status and diagnostics, then retry.".to_string()),
+        ),
+        CassError::OutputTooLarge { .. } => (
+            MCP_ERR_CASS,
+            Some("Reduce the result limit or request minimal fields.".to_string()),
+        ),
+        CassError::InvalidJson { .. } => (
+            MCP_ERR_CASS,
+            Some("Upgrade cass or verify its JSON output format.".to_string()),
+        ),
+        CassError::NoResults { .. } => (
+            MCP_ERR_CASS,
+            Some("Broaden the search query or verify the cass index.".to_string()),
+        ),
+        CassError::Io { .. } => (
+            MCP_ERR_CASS,
+            Some("Check cass binary permissions and retry.".to_string()),
+        ),
     }
 }
 
@@ -335,6 +385,24 @@ mod tests {
         assert_eq!(io_err.code, MCP_ERR_INTERNAL);
         assert_eq!(io_err.message, "Internal error");
         assert!(!io_err.message.contains("id_rsa"));
+
+        let secret = format!("backend-secret-{}", "x".repeat(128 * 1024));
+        let wezterm = McpToolError::from_error(Error::Wezterm(
+            WeztermError::CommandFailed(secret.clone()),
+        ));
+        assert_eq!(wezterm.code, MCP_ERR_WEZTERM);
+        assert_eq!(wezterm.message, "Backend bridge request failed");
+        assert!(!wezterm.message.contains("backend-secret"));
+
+        let workflow = McpToolError::from_error(Error::Workflow(
+            crate::error::WorkflowError::Aborted(secret.clone()),
+        ));
+        assert_eq!(workflow.code, MCP_ERR_WORKFLOW);
+        assert_eq!(workflow.message, "Workflow request failed");
+
+        let policy = McpToolError::from_error(Error::Policy(secret));
+        assert_eq!(policy.code, MCP_ERR_POLICY);
+        assert_eq!(policy.message, "Policy rejected the request");
     }
 
     #[test]
@@ -521,18 +589,35 @@ mod tests {
         assert!(hint.is_some());
     }
 
+    #[test]
+    fn auxiliary_tool_errors_classify_before_rendering_untrusted_detail() {
+        let secret = format!("aux-secret-{}", "z".repeat(128 * 1024));
+        let caut = McpToolError::from_caut_error(CautError::Io {
+            message: secret.clone(),
+        });
+        assert_eq!(caut.code, MCP_ERR_CAUT);
+        assert_eq!(caut.message, "caut request failed");
+        assert!(!caut.message.contains("aux-secret"));
+        assert!(caut.hint.is_some_and(|hint| hint.len() < 256));
+
+        let cass = McpToolError::from_cass_error(CassError::NoResults { query: secret });
+        assert_eq!(cass.code, MCP_ERR_CASS);
+        assert_eq!(cass.message, "cass request failed");
+        assert!(!cass.message.contains("aux-secret"));
+        assert!(cass.hint.is_some_and(|hint| hint.len() < 256));
+    }
+
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(64))]
 
         #[test]
         fn prop_mcp_tool_error_from_caut_timeout_aligns_with_mapper(timeout_secs in any::<u64>()) {
             let err = CautError::Timeout { timeout_secs };
-            let message = err.to_string();
             let (code, hint) = map_caut_error(&err);
             let tool_err = McpToolError::from_caut_error(err);
 
             prop_assert_eq!(tool_err.code, code);
-            prop_assert_eq!(tool_err.message, message);
+            prop_assert_eq!(tool_err.message, "caut request timed out");
             prop_assert_eq!(tool_err.hint, hint);
             prop_assert_eq!(tool_err.code, MCP_ERR_TIMEOUT);
         }
@@ -540,12 +625,11 @@ mod tests {
         #[test]
         fn prop_mcp_tool_error_from_cass_timeout_aligns_with_mapper(timeout_secs in any::<u64>()) {
             let err = CassError::Timeout { timeout_secs };
-            let message = err.to_string();
             let (code, hint) = map_cass_error(&err);
             let tool_err = McpToolError::from_cass_error(err);
 
             prop_assert_eq!(tool_err.code, code);
-            prop_assert_eq!(tool_err.message, message);
+            prop_assert_eq!(tool_err.message, "cass request timed out");
             prop_assert_eq!(tool_err.hint, hint);
             prop_assert_eq!(tool_err.code, MCP_ERR_TIMEOUT);
         }
@@ -553,12 +637,11 @@ mod tests {
         #[test]
         fn prop_mcp_tool_error_from_error_aligns_with_mapper_for_pane_not_found(pane_id in any::<u64>()) {
             let err = Error::Wezterm(WeztermError::PaneNotFound(pane_id));
-            let message = err.to_string();
             let (code, hint) = map_mcp_error(&err);
             let tool_err = McpToolError::from_error(err);
 
             prop_assert_eq!(tool_err.code, code);
-            prop_assert_eq!(tool_err.message, message);
+            prop_assert_eq!(tool_err.message, format!("Pane not found: {pane_id}"));
             prop_assert_eq!(tool_err.hint, hint);
             prop_assert_eq!(tool_err.code, MCP_ERR_PANE_NOT_FOUND);
         }

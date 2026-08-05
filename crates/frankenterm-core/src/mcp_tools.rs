@@ -22,8 +22,9 @@ use super::mcp_types::{
     McpEventMutationData, McpEventsData, McpGetTextData, McpMissionControlData,
     McpMissionExplainData, McpMissionStateData, McpPaneState, McpReleaseData, McpReservationInfo,
     McpReservationsData, McpReserveData, McpRuleItem, McpRuleMatchItem, McpRuleTraceInfo,
-    McpRulesListData, McpRulesTestData, McpSearchData, McpSearchHit, McpSendData, McpTxPlanData,
-    McpTxRollbackData, McpTxRunData, McpTxShowData, McpWaitForData, McpWorkflowRunData,
+    McpRulesListData, McpRulesTestData, McpSearchData, McpSearchHit, McpSendData,
+    McpSendOutputOmissions, McpTxPlanData, McpTxRollbackData, McpTxRunData, McpTxShowData,
+    McpWaitForData, McpWorkflowRunData,
     MissionAbortParams, MissionExplainParams, MissionObjectivePlanParams, MissionPauseParams,
     MissionResumeParams, MissionStateParams, OperatingEnvelopeParams, RehearsalScoreParams,
     ReleaseParams, ReservationsParams, ReserveParams, RulesListParams, RulesTestParams,
@@ -48,8 +49,7 @@ use super::{
     build_mcp_workflow_assembly, build_policy_engine_with_shared_rate_limiter,
     effective_search_fusion_backend, effective_search_fusion_weights,
     effective_search_quality_timeout_ms, effective_search_rrf_k, elapsed_ms, envelope_to_content,
-    map_cass_error, map_caut_error, map_mcp_error, mcp_build_mission_assignments,
-    mcp_build_tx_compensation_inputs, mcp_load_mission_from_path,
+    mcp_build_mission_assignments, mcp_build_tx_compensation_inputs, mcp_load_mission_from_path,
     mcp_load_mission_tx_contract_from_path, mcp_mission_failure_catalog,
     mcp_mission_lifecycle_transitions, mcp_parse_mission_kill_switch,
     mcp_resolve_mission_file_path, mcp_resolve_mission_tx_file_path, mcp_save_mission_to_path,
@@ -181,6 +181,12 @@ pub const MAX_SEND_TEXT_BYTES: usize = 4 * 1024 * 1024;
 const MCP_SEND_OUTPUT_INPUT_MAX_BYTES: usize = 64 * 1024;
 const MCP_SEND_OUTPUT_MAX_COLUMNS: usize = 400;
 const MCP_SEND_OUTPUT_MAX_BYTES: usize = 1_600;
+/// Response-projection cardinality caps. Full policy/receipt authority remains
+/// in the audit and storage paths; exact omitted counts travel with `wa.send`.
+const MCP_SEND_OUTPUT_RULE_LIMIT: usize = 32;
+const MCP_SEND_OUTPUT_EVIDENCE_LIMIT: usize = 32;
+const MCP_SEND_OUTPUT_RISK_FACTOR_LIMIT: usize = 16;
+const MCP_SEND_OUTPUT_RECEIPT_EVIDENCE_LIMIT: usize = 32;
 
 /// Per-field response limits for mux/DB metadata returned by `wa.state`.
 /// State inventories can contain many panes, so every field must reject a
@@ -714,17 +720,14 @@ fn acquire_mcp_tx_contract_lock(
         Ok(false) => {
             return Err(McpToolError::new(
                 MCP_ERR_WORKFLOW,
-                format!("Tx contract file not found: {}", path.display()),
+                "Transaction contract file not found".to_string(),
                 Some("Pass contract_file or create .ft/mission/tx-active.json.".to_string()),
             ));
         }
-        Err(err) => {
+        Err(_error) => {
             return Err(McpToolError::new(
                 MCP_ERR_STORAGE,
-                format!(
-                    "Failed to inspect tx contract before locking {}: {err}",
-                    path.display()
-                ),
+                "Unable to inspect transaction contract before locking".to_string(),
                 Some("Fix access to the transaction contract path, then retry.".to_string()),
             ));
         }
@@ -737,7 +740,11 @@ fn acquire_mcp_tx_contract_lock(
             } else {
                 MCP_ERR_STORAGE
             },
-            err.to_string(),
+            if in_progress {
+                "Transaction contract is already being mutated".to_string()
+            } else {
+                "Unable to acquire transaction contract lock".to_string()
+            },
             Some(if in_progress {
                 "Wait for the in-flight transaction mutation to finish, then retry.".to_string()
             } else {
@@ -750,7 +757,6 @@ fn acquire_mcp_tx_contract_lock(
 fn load_mcp_tx_contract_from_guard(
     guard: &crate::tx_execution::TxContractLockGuard,
 ) -> std::result::Result<crate::plan::MissionTxContract, McpToolError> {
-    let path = guard.authoritative_path();
     let raw = guard.read_authoritative_contract_bytes().map_err(|err| {
         let oversize = err.kind() == crate::tx_execution::TxContractStoreErrorKind::TooLarge;
         McpToolError::new(
@@ -759,7 +765,11 @@ fn load_mcp_tx_contract_from_guard(
             } else {
                 MCP_ERR_STORAGE
             },
-            err.to_string(),
+            if oversize {
+                "Transaction contract exceeds the supported byte limit".to_string()
+            } else {
+                "Unable to read the pinned transaction contract".to_string()
+            },
             Some(if oversize {
                 "Reduce the transaction contract below the supported byte limit before retrying."
                     .to_string()
@@ -769,17 +779,17 @@ fn load_mcp_tx_contract_from_guard(
             }),
         )
     })?;
-    let contract: crate::plan::MissionTxContract = serde_json::from_slice(&raw).map_err(|err| {
+    let contract: crate::plan::MissionTxContract = serde_json::from_slice(&raw).map_err(|_error| {
         McpToolError::new(
             MCP_ERR_INVALID_ARGS,
-            format!("Invalid tx contract JSON in {}: {err}", path.display()),
+            "Invalid transaction contract JSON".to_string(),
             Some("Ensure the file matches the MissionTxContract schema.".to_string()),
         )
     })?;
-    contract.validate().map_err(|err| {
+    contract.validate().map_err(|_error| {
         McpToolError::new(
             MCP_ERR_INVALID_ARGS,
-            format!("Tx contract validation failed: {err}"),
+            "Transaction contract validation failed".to_string(),
             Some("Inspect contract via wa.tx_show include_contract=true.".to_string()),
         )
     })?;
@@ -2168,11 +2178,11 @@ impl ToolHandler for WaCassSearchTool {
                 envelope_to_content(envelope)
             }
             Err(err) => {
-                let (code, hint) = map_cass_error(&err);
+                let err = McpToolError::from_cass_error(err);
                 let envelope = McpEnvelope::<()>::error(
-                    code,
-                    format!("cass search failed: {err}"),
-                    hint,
+                    err.code,
+                    err.message,
+                    err.hint,
                     elapsed_ms(start),
                 );
                 envelope_to_content(envelope)
@@ -2302,11 +2312,11 @@ impl ToolHandler for WaCassViewTool {
                 envelope_to_content(envelope)
             }
             Err(err) => {
-                let (code, hint) = map_cass_error(&err);
+                let err = McpToolError::from_cass_error(err);
                 let envelope = McpEnvelope::<()>::error(
-                    code,
-                    format!("cass view failed: {err}"),
-                    hint,
+                    err.code,
+                    err.message,
+                    err.hint,
                     elapsed_ms(start),
                 );
                 envelope_to_content(envelope)
@@ -2387,11 +2397,11 @@ impl ToolHandler for WaCassStatusTool {
                 envelope_to_content(envelope)
             }
             Err(err) => {
-                let (code, hint) = map_cass_error(&err);
+                let err = McpToolError::from_cass_error(err);
                 let envelope = McpEnvelope::<()>::error(
-                    code,
-                    format!("cass status failed: {err}"),
-                    hint,
+                    err.code,
+                    err.message,
+                    err.hint,
                     elapsed_ms(start),
                 );
                 envelope_to_content(envelope)
@@ -2535,7 +2545,10 @@ fn bounded_mcp_send_response_text(text: &str) -> String {
     )
 }
 
-fn bound_mcp_send_decision_context_output(context: &mut DecisionContext) {
+fn bound_mcp_send_decision_context_output(
+    context: &mut DecisionContext,
+) -> McpSendOutputOmissions {
+    let mut omissions = McpSendOutputOmissions::default();
     for value in [
         &mut context.domain,
         &mut context.text_summary,
@@ -2547,6 +2560,12 @@ fn bound_mcp_send_decision_context_output(context: &mut DecisionContext) {
             *value = bounded_mcp_send_response_text(value);
         }
     }
+
+    omissions.rules_evaluated = context
+        .rules_evaluated
+        .len()
+        .saturating_sub(MCP_SEND_OUTPUT_RULE_LIMIT);
+    context.rules_evaluated.truncate(MCP_SEND_OUTPUT_RULE_LIMIT);
     for rule in &mut context.rules_evaluated {
         rule.rule_id = bounded_mcp_send_response_text(&rule.rule_id);
         if let Some(decision) = rule.decision.as_mut() {
@@ -2556,6 +2575,12 @@ fn bound_mcp_send_decision_context_output(context: &mut DecisionContext) {
             *reason = bounded_mcp_send_response_text(reason);
         }
     }
+
+    omissions.decision_evidence = context
+        .evidence
+        .len()
+        .saturating_sub(MCP_SEND_OUTPUT_EVIDENCE_LIMIT);
+    context.evidence.truncate(MCP_SEND_OUTPUT_EVIDENCE_LIMIT);
     for evidence in &mut context.evidence {
         evidence.key = bounded_mcp_send_response_text(&evidence.key);
         evidence.value = bounded_mcp_send_response_text(&evidence.value);
@@ -2566,14 +2591,23 @@ fn bound_mcp_send_decision_context_output(context: &mut DecisionContext) {
     }
     if let Some(risk) = context.risk.as_mut() {
         risk.summary = bounded_mcp_send_response_text(&risk.summary);
+        omissions.risk_factors = risk
+            .factors
+            .len()
+            .saturating_sub(MCP_SEND_OUTPUT_RISK_FACTOR_LIMIT);
+        risk.factors.truncate(MCP_SEND_OUTPUT_RISK_FACTOR_LIMIT);
         for factor in &mut risk.factors {
             factor.id = bounded_mcp_send_response_text(&factor.id);
             factor.explanation = bounded_mcp_send_response_text(&factor.explanation);
         }
     }
+
+    omissions
 }
 
-fn bound_mcp_send_policy_decision_output(decision: &mut PolicyDecision) {
+fn bound_mcp_send_policy_decision_output(
+    decision: &mut PolicyDecision,
+) -> McpSendOutputOmissions {
     let (rule_id, context) = match decision {
         PolicyDecision::Allow { rule_id, context } => (rule_id, context),
         PolicyDecision::Deny {
@@ -2603,12 +2637,16 @@ fn bound_mcp_send_policy_decision_output(decision: &mut PolicyDecision) {
     if let Some(rule_id) = rule_id.as_mut() {
         *rule_id = bounded_mcp_send_response_text(rule_id);
     }
-    if let Some(context) = context.as_mut() {
-        bound_mcp_send_decision_context_output(context);
-    }
+    context
+        .as_mut()
+        .map_or_else(McpSendOutputOmissions::default, |context| {
+            bound_mcp_send_decision_context_output(context)
+        })
 }
 
-fn bound_mcp_send_submit_receipt_output(receipt: &mut crate::robot_types::SubmitReceipt) {
+fn bound_mcp_send_submit_receipt_output(
+    receipt: &mut crate::robot_types::SubmitReceipt,
+) -> usize {
     if let Some(agent_type) = receipt.agent_type.as_mut() {
         *agent_type = bounded_mcp_send_response_text(agent_type);
     }
@@ -2618,13 +2656,27 @@ fn bound_mcp_send_submit_receipt_output(receipt: &mut crate::robot_types::Submit
     if let Some(profile_version) = receipt.profile_version.as_mut() {
         *profile_version = bounded_mcp_send_response_text(profile_version);
     }
+    let omitted = receipt
+        .evidence_rule_ids
+        .len()
+        .saturating_sub(MCP_SEND_OUTPUT_RECEIPT_EVIDENCE_LIMIT);
+    receipt
+        .evidence_rule_ids
+        .truncate(MCP_SEND_OUTPUT_RECEIPT_EVIDENCE_LIMIT);
     for rule_id in &mut receipt.evidence_rule_ids {
         *rule_id = bounded_mcp_send_response_text(rule_id);
     }
+    for cursor in [&mut receipt.cursor_before, &mut receipt.cursor_after] {
+        if let Some(cursor) = cursor.as_mut() {
+            *cursor = bounded_mcp_send_response_text(cursor);
+        }
+    }
+    receipt.idempotency_key = bounded_mcp_send_response_text(&receipt.idempotency_key);
+    omitted
 }
 
 fn bound_mcp_send_data_output(data: &mut McpSendData) {
-    match &mut data.injection {
+    let mut omissions = match &mut data.injection {
         InjectionResult::Allowed {
             decision, summary, ..
         }
@@ -2634,16 +2686,18 @@ fn bound_mcp_send_data_output(data: &mut McpSendData) {
         | InjectionResult::RequiresApproval {
             decision, summary, ..
         } => {
-            bound_mcp_send_policy_decision_output(decision);
+            let omissions = bound_mcp_send_policy_decision_output(decision);
             *summary = bounded_mcp_send_response_text(summary);
+            omissions
         }
         InjectionResult::Error {
             decision, error, ..
         } => {
-            bound_mcp_send_policy_decision_output(decision);
+            let omissions = bound_mcp_send_policy_decision_output(decision);
             *error = bounded_mcp_send_response_text(error);
+            omissions
         }
-    }
+    };
     if let Some(wait_for) = data.wait_for.as_mut() {
         wait_for.pattern = bounded_mcp_send_response_text(&wait_for.pattern);
     }
@@ -2651,8 +2705,9 @@ fn bound_mcp_send_data_output(data: &mut McpSendData) {
         *error = bounded_mcp_send_response_text(error);
     }
     if let Some(submit) = data.submit.as_mut() {
-        bound_mcp_send_submit_receipt_output(submit);
+        omissions.submit_evidence_rule_ids = bound_mcp_send_submit_receipt_output(submit);
     }
+    data.output_omissions = (!omissions.is_empty()).then_some(omissions);
 }
 
 fn redact_mcp_pane_text_with_escape_contract(
@@ -2824,9 +2879,13 @@ impl ToolHandler for WaStateTool {
                 envelope_to_content(envelope)
             }
             Err(err) => {
-                let (code, hint) = map_mcp_error(&err);
-                let envelope =
-                    McpEnvelope::<()>::error(code, err.to_string(), hint, elapsed_ms(start));
+                let err = McpToolError::from_error(err);
+                let envelope = McpEnvelope::<()>::error(
+                    err.code,
+                    err.message,
+                    err.hint,
+                    elapsed_ms(start),
+                );
                 envelope_to_content(envelope)
             }
         }
@@ -5383,17 +5442,17 @@ fn shutdown_mcp_await_event_completion_storage(
         MCP_AWAIT_EVENT_COMPLETION_STORAGE_SHUTDOWN_GRACE,
         storage.shutdown_with_cx(&cx),
     ));
-    let shutdown_error = match shutdown {
+    let shutdown_error_class = match shutdown {
         Ok(Ok(())) => None,
-        Ok(Err(error)) => Some(error.to_string()),
-        Err(error) => Some(error),
+        Ok(Err(_error)) => Some("storage_shutdown_failed"),
+        Err(_timeout) => Some("storage_shutdown_timed_out"),
     };
-    if let Some(error) = shutdown_error {
+    if let Some(error_class) = shutdown_error_class {
         stats
             .storage_shutdown_failures
             .fetch_add(1, Ordering::Relaxed);
         tracing::warn!(
-            error,
+            error_class,
             shutdown_grace_ms = u64::try_from(
                 MCP_AWAIT_EVENT_COMPLETION_STORAGE_SHUTDOWN_GRACE.as_millis()
             )
@@ -8890,12 +8949,10 @@ fn mcp_submit_idempotency_key(params: &SendParams) -> Option<String> {
 }
 
 fn mcp_submit_idempotency_storage_error(
-    operation: &str,
-    key: &str,
-    error: impl std::fmt::Display,
+    operation: &'static str,
 ) -> crate::Error {
     crate::Error::Storage(crate::StorageError::Database(format!(
-        "submit idempotency {operation} failed for key {key}: {error}"
+        "submit idempotency {operation} failed"
     )))
 }
 
@@ -9250,7 +9307,7 @@ impl ToolHandler for WaSendTool {
         let submit_idempotency_key = mcp_submit_idempotency_key(&params);
         let runtime = CompatRuntimeBuilder::current_thread()
             .build()
-            .map_err(|e| McpError::internal_error(format!("MCP runtime init failed: {e}")))?;
+            .map_err(|_error| McpError::internal_error("MCP runtime initialization failed"))?;
 
         let result = runtime.block_on(async move {
             // ft-xbnl0.2.3 tick 303: cx-first MCP pane-state storage open (reuse wezterm_cx).
@@ -9258,25 +9315,24 @@ impl ToolHandler for WaSendTool {
             let storage =
                 StorageHandle::new_with_cx(&wezterm_cx, &db_path.to_string_lossy()).await?;
             let ft_dir = db_path.parent().ok_or_else(|| {
-                crate::Error::Config(crate::error::ConfigError::ValidationError(format!(
-                    "database path has no parent directory: {}",
-                    db_path.display()
-                )))
+                crate::Error::Config(crate::error::ConfigError::ValidationError(
+                    "database path has no parent directory".to_string(),
+                ))
             })?;
             if !params.dry_run {
                 if let Some(key) = submit_idempotency_key.as_deref() {
                     let key_path =
-                        crate::submit_idempotency_store::key_path(ft_dir, key).map_err(|error| {
-                            mcp_submit_idempotency_storage_error("key validation", key, error)
+                        crate::submit_idempotency_store::key_path(ft_dir, key).map_err(|_error| {
+                            mcp_submit_idempotency_storage_error("key validation")
                         })?;
                     if let Some(store_dir) = key_path.parent() {
-                        std::fs::create_dir_all(store_dir).map_err(|error| {
-                            mcp_submit_idempotency_storage_error("preflight", key, error)
+                        std::fs::create_dir_all(store_dir).map_err(|_error| {
+                            mcp_submit_idempotency_storage_error("preflight")
                         })?;
                     }
                     let (outcome, prior) = crate::submit_idempotency_store::decide(ft_dir, key)
-                        .map_err(|error| {
-                            mcp_submit_idempotency_storage_error("lookup", key, error)
+                        .map_err(|_error| {
+                            mcp_submit_idempotency_storage_error("lookup")
                         })?;
                     if matches!(
                         outcome,
@@ -9314,6 +9370,7 @@ impl ToolHandler for WaSendTool {
                             wait_for: None,
                             verification_error,
                             submit: Some(submit),
+                            output_omissions: None,
                             dry_run: false,
                         });
                     }
@@ -9388,6 +9445,7 @@ impl ToolHandler for WaSendTool {
                     wait_for: None,
                     verification_error: None,
                     submit: None,
+                    output_omissions: None,
                     dry_run: true,
                 });
             }
@@ -9497,7 +9555,7 @@ impl ToolHandler for WaSendTool {
                             verification_error =
                                 Some(format!("Timeout waiting for pattern '{pattern_out}'"));
                         }
-                        Ok(WaitResult::Cancelled { reason, polls }) => {
+                        Ok(WaitResult::Cancelled { reason: _, polls }) => {
                             let pattern_out =
                                 redacted_wait_for.as_deref().unwrap_or(pattern).to_string();
                             wait_for_data = Some(McpWaitForData {
@@ -9508,10 +9566,10 @@ impl ToolHandler for WaSendTool {
                                 polls,
                                 is_regex: params.wait_for_regex,
                             });
-                            verification_error = Some(format!("Wait cancelled: {reason}"));
+                            verification_error = Some("Wait cancelled".to_string());
                         }
-                        Err(e) => {
-                            verification_error = Some(format!("wait-for failed: {e}"));
+                        Err(_error) => {
+                            verification_error = Some("Wait-for failed".to_string());
                         }
                     }
                 }
@@ -9564,13 +9622,13 @@ impl ToolHandler for WaSendTool {
                     .await;
                 if let Some(key) = submit_idempotency_key.as_deref() {
                     let report = mcp_verified_report_from_submit_receipt(&receipt);
-                    if let Err(error) = crate::submit_idempotency_store::record(ft_dir, key, &report)
+                    if let Err(_error) = crate::submit_idempotency_store::record(ft_dir, key, &report)
                     {
                         verification_error = Some(match verification_error.take() {
                             Some(existing) => {
-                                format!("{existing}; submit idempotency record failed: {error}")
+                                format!("{existing}; submit idempotency record failed")
                             }
-                            None => format!("submit idempotency record failed: {error}"),
+                            None => "submit idempotency record failed".to_string(),
                         });
                     }
                 }
@@ -9583,6 +9641,7 @@ impl ToolHandler for WaSendTool {
                 wait_for: wait_for_data,
                 verification_error,
                 submit,
+                output_omissions: None,
                 dry_run: false,
             })
         });
@@ -9594,12 +9653,13 @@ impl ToolHandler for WaSendTool {
                 envelope_to_content(envelope)
             }
             Err(err) => {
-                let (code, hint) = map_mcp_error(&err);
-                // The wait_for compile error (and any other error from this
-                // block) is reflected verbatim into the message; redact
-                // secret-shaped tokens before they reach the MCP client.
-                let message = bounded_mcp_send_response_text(&err.to_string());
-                let envelope = McpEnvelope::<()>::error(code, message, hint, elapsed_ms(start));
+                let err = McpToolError::from_error(err);
+                let envelope = McpEnvelope::<()>::error(
+                    err.code,
+                    err.message,
+                    err.hint,
+                    elapsed_ms(start),
+                );
                 envelope_to_content(envelope)
             }
         }
@@ -11204,9 +11264,13 @@ impl ToolHandler for WaReservationsTool {
                 envelope_to_content(envelope)
             }
             Err(err) => {
-                let (code, hint) = map_mcp_error(&err);
-                let envelope =
-                    McpEnvelope::<()>::error(code, err.to_string(), hint, elapsed_ms(start));
+                let err = McpToolError::from_error(err);
+                let envelope = McpEnvelope::<()>::error(
+                    err.code,
+                    err.message,
+                    err.hint,
+                    elapsed_ms(start),
+                );
                 envelope_to_content(envelope)
             }
         }
@@ -11662,9 +11726,13 @@ impl ToolHandler for WaAccountsTool {
                 envelope_to_content(envelope)
             }
             Err(err) => {
-                let (code, hint) = map_mcp_error(&err);
-                let envelope =
-                    McpEnvelope::<()>::error(code, err.to_string(), hint, elapsed_ms(start));
+                let err = McpToolError::from_error(err);
+                let envelope = McpEnvelope::<()>::error(
+                    err.code,
+                    err.message,
+                    err.hint,
+                    elapsed_ms(start),
+                );
                 envelope_to_content(envelope)
             }
         }
@@ -13353,9 +13421,13 @@ impl ToolHandler for WaEventsAnnotateTool {
                 envelope_to_content(envelope)
             }
             Err(err) => {
-                let (code, hint) = map_mcp_error(&err);
-                let envelope =
-                    McpEnvelope::<()>::error(code, err.to_string(), hint, elapsed_ms(start));
+                let err = McpToolError::from_error(err);
+                let envelope = McpEnvelope::<()>::error(
+                    err.code,
+                    err.message,
+                    err.hint,
+                    elapsed_ms(start),
+                );
                 envelope_to_content(envelope)
             }
         }
@@ -13569,9 +13641,13 @@ impl ToolHandler for WaEventsTriageTool {
                 envelope_to_content(envelope)
             }
             Err(err) => {
-                let (code, hint) = map_mcp_error(&err);
-                let envelope =
-                    McpEnvelope::<()>::error(code, err.to_string(), hint, elapsed_ms(start));
+                let err = McpToolError::from_error(err);
+                let envelope = McpEnvelope::<()>::error(
+                    err.code,
+                    err.message,
+                    err.hint,
+                    elapsed_ms(start),
+                );
                 envelope_to_content(envelope)
             }
         }
@@ -13851,9 +13927,13 @@ impl ToolHandler for WaEventsLabelTool {
                 envelope_to_content(envelope)
             }
             Err(err) => {
-                let (code, hint) = map_mcp_error(&err);
-                let envelope =
-                    McpEnvelope::<()>::error(code, err.to_string(), hint, elapsed_ms(start));
+                let err = McpToolError::from_error(err);
+                let envelope = McpEnvelope::<()>::error(
+                    err.code,
+                    err.message,
+                    err.hint,
+                    elapsed_ms(start),
+                );
                 envelope_to_content(envelope)
             }
         }
@@ -23455,6 +23535,31 @@ exit 17",
             Some(hostile.clone()),
         );
         decision_context.add_evidence(hostile.clone(), hostile.clone());
+        decision_context.rules_evaluated = (0..super::MCP_SEND_OUTPUT_RULE_LIMIT + 7)
+            .map(|_| crate::policy::RuleEvaluation {
+                rule_id: hostile.clone(),
+                matched: true,
+                decision: Some("allow".to_string()),
+                reason: Some(hostile.clone()),
+            })
+            .collect();
+        decision_context.evidence = (0..super::MCP_SEND_OUTPUT_EVIDENCE_LIMIT + 5)
+            .map(|_| crate::policy::DecisionEvidence {
+                key: hostile.clone(),
+                value: hostile.clone(),
+            })
+            .collect();
+        decision_context.risk = Some(crate::policy::RiskScore {
+            score: 50,
+            factors: (0..super::MCP_SEND_OUTPUT_RISK_FACTOR_LIMIT + 3)
+                .map(|_| crate::policy::AppliedRiskFactor {
+                    id: hostile.clone(),
+                    weight: 1,
+                    explanation: hostile.clone(),
+                })
+                .collect(),
+            summary: hostile.clone(),
+        });
         let mut data = super::McpSendData {
             pane_id: 17,
             injection: super::InjectionResult::Allowed {
@@ -23482,18 +23587,27 @@ exit 17",
                 profile_id: Some(hostile.clone()),
                 profile_version: Some(hostile.clone()),
                 attempts: 1,
-                evidence_rule_ids: vec![hostile.clone()],
+                evidence_rule_ids: vec![
+                    hostile.clone();
+                    super::MCP_SEND_OUTPUT_RECEIPT_EVIDENCE_LIMIT + 11
+                ],
                 elapsed_ms: 1,
                 polls: 1,
-                cursor_before: Some("pane:17:capture:sha256:safe-before".to_string()),
-                cursor_after: Some("pane:17:capture:sha256:safe-after".to_string()),
+                cursor_before: Some(hostile.clone()),
+                cursor_after: Some(hostile.clone()),
                 idempotency_key: "sha256:safe-idempotency-key".to_string(),
             }),
+            output_omissions: None,
             dry_run: false,
         };
 
         super::bound_mcp_send_data_output(&mut data);
         let json = serde_json::to_string(&data).expect("serialize bounded wa.send response");
+        assert!(
+            json.len() <= 384 * 1024,
+            "cardinality and field caps must keep the hostile response projection bounded: {} bytes",
+            json.len()
+        );
         assert!(!json.contains(&secret));
         assert!(!json.contains("\\u001b"));
         assert!(!json.contains('\u{202e}'));
@@ -23516,11 +23630,44 @@ exit 17",
             value["submit"]["profile_id"].as_str(),
             value["submit"]["profile_version"].as_str(),
             value["submit"]["evidence_rule_ids"][0].as_str(),
+            value["submit"]["cursor_before"].as_str(),
+            value["submit"]["cursor_after"].as_str(),
         ] {
             assert!(
                 field.is_some_and(|field| field.len() <= super::MCP_SEND_OUTPUT_MAX_BYTES)
             );
         }
+        assert_eq!(
+            value["injection"]["decision"]["context"]["rules_evaluated"]
+                .as_array()
+                .map(Vec::len),
+            Some(super::MCP_SEND_OUTPUT_RULE_LIMIT)
+        );
+        assert_eq!(
+            value["injection"]["decision"]["context"]["evidence"]
+                .as_array()
+                .map(Vec::len),
+            Some(super::MCP_SEND_OUTPUT_EVIDENCE_LIMIT)
+        );
+        assert_eq!(
+            value["injection"]["decision"]["context"]["risk"]["factors"]
+                .as_array()
+                .map(Vec::len),
+            Some(super::MCP_SEND_OUTPUT_RISK_FACTOR_LIMIT)
+        );
+        assert_eq!(
+            value["submit"]["evidence_rule_ids"]
+                .as_array()
+                .map(Vec::len),
+            Some(super::MCP_SEND_OUTPUT_RECEIPT_EVIDENCE_LIMIT)
+        );
+        assert_eq!(value["output_omissions"]["rules_evaluated"], 7);
+        assert_eq!(value["output_omissions"]["decision_evidence"], 5);
+        assert_eq!(value["output_omissions"]["risk_factors"], 3);
+        assert_eq!(
+            value["output_omissions"]["submit_evidence_rule_ids"],
+            11
+        );
     }
 
     #[test]

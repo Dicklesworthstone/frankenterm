@@ -422,8 +422,33 @@ pub(super) struct McpSendData {
     pub verification_error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub submit: Option<SubmitReceipt>,
+    /// Exact cardinality omitted only from this response projection. The
+    /// policy decision and submit receipt retain their full authority in the
+    /// audit/storage paths; this field prevents a bounded client response from
+    /// silently masquerading as the complete evidence set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_omissions: Option<McpSendOutputOmissions>,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub dry_run: bool,
+}
+
+/// Cardinality omitted from a bounded `wa.send` response projection.
+#[derive(Debug, Default, Serialize)]
+pub(super) struct McpSendOutputOmissions {
+    pub rules_evaluated: usize,
+    pub decision_evidence: usize,
+    pub risk_factors: usize,
+    pub submit_evidence_rule_ids: usize,
+}
+
+impl McpSendOutputOmissions {
+    #[must_use]
+    pub(super) const fn is_empty(&self) -> bool {
+        self.rules_evaluated == 0
+            && self.decision_evidence == 0
+            && self.risk_factors == 0
+            && self.submit_evidence_rule_ids == 0
+    }
 }
 
 // ── Workflow ─────────────────────────────────────────────────────────────
