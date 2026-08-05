@@ -69,11 +69,7 @@ fn build_sharded_handle(
         });
 
         let handle: WeztermHandle = backend;
-        backends.push(ShardBackend::new(
-            ShardId(shard_idx),
-            format!("shard-{shard_idx}"),
-            handle,
-        ));
+        backends.push(ShardBackend::new(ShardId(shard_idx), handle));
     }
 
     let client = ShardedWeztermClient::new(backends, AssignmentStrategy::RoundRobin)

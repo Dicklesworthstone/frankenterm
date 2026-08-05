@@ -1,8 +1,8 @@
 //! LabRuntime-ported sharding tests for deterministic async testing.
 //!
-//! Ports all 14 `#[tokio::test]` functions from `sharding.rs` to asupersync-based
-//! `RuntimeFixture`, gaining deterministic scheduling for `MockWezterm`-backed
-//! `ShardedWeztermClient` operations.
+//! Ports the sharding tests that can be exercised through the public API to the
+//! asupersync-based `RuntimeFixture`, gaining deterministic scheduling for
+//! `MockWezterm`-backed `ShardedWeztermClient` operations.
 //!
 //! The sharding module uses `runtime_async::RwLock` for pane routing tables
 //! and `WeztermHandle` async trait methods — both compatible with the asupersync
@@ -47,8 +47,8 @@ fn sharding_list_panes_aggregates_and_routes_text() {
 
         let client = ShardedWeztermClient::new(
             vec![
-                ShardBackend::new(ShardId(0), "zero", handle0),
-                ShardBackend::new(ShardId(1), "one", handle1),
+                ShardBackend::new(ShardId(0), handle0),
+                ShardBackend::new(ShardId(1), handle1),
             ],
             AssignmentStrategy::RoundRobin,
         )
@@ -100,8 +100,8 @@ fn sharding_spawn_round_robin_across_shards() {
 
         let client = ShardedWeztermClient::new(
             vec![
-                ShardBackend::new(ShardId(0), "zero", handle0),
-                ShardBackend::new(ShardId(1), "one", handle1),
+                ShardBackend::new(ShardId(0), handle0),
+                ShardBackend::new(ShardId(1), handle1),
             ],
             AssignmentStrategy::RoundRobin,
         )
@@ -128,8 +128,8 @@ fn sharding_spawn_with_agent_hint_uses_agent_assignment() {
 
         let client = ShardedWeztermClient::new(
             vec![
-                ShardBackend::new(ShardId(0), "zero", handle0),
-                ShardBackend::new(ShardId(1), "one", handle1),
+                ShardBackend::new(ShardId(0), handle0),
+                ShardBackend::new(ShardId(1), handle1),
             ],
             AssignmentStrategy::ByAgentType {
                 agent_to_shard: HashMap::from([
@@ -166,7 +166,6 @@ fn sharding_get_pane_routes_to_correct_shard() {
         let client = ShardedWeztermClient::new(
             vec![ShardBackend::new(
                 ShardId(0),
-                "s0",
                 shard0.clone() as WeztermHandle,
             )],
             AssignmentStrategy::RoundRobin,
@@ -194,8 +193,8 @@ fn sharding_send_text_routes_to_correct_shard() {
 
         let client = ShardedWeztermClient::new(
             vec![
-                ShardBackend::new(ShardId(0), "s0", shard0.clone() as WeztermHandle),
-                ShardBackend::new(ShardId(1), "s1", shard1.clone() as WeztermHandle),
+                ShardBackend::new(ShardId(0), shard0.clone() as WeztermHandle),
+                ShardBackend::new(ShardId(1), shard1.clone() as WeztermHandle),
             ],
             AssignmentStrategy::RoundRobin,
         )
@@ -224,7 +223,7 @@ fn sharding_split_pane_encodes_global_id() {
         shard0.add_default_pane(1).await;
 
         let client = ShardedWeztermClient::new(
-            vec![ShardBackend::new(ShardId(0), "s0", shard0 as WeztermHandle)],
+            vec![ShardBackend::new(ShardId(0), shard0 as WeztermHandle)],
             AssignmentStrategy::RoundRobin,
         )
         .unwrap();
@@ -249,7 +248,7 @@ fn sharding_kill_pane_removes_from_routes() {
         shard0.add_default_pane(1).await;
 
         let client = ShardedWeztermClient::new(
-            vec![ShardBackend::new(ShardId(0), "s0", shard0 as WeztermHandle)],
+            vec![ShardBackend::new(ShardId(0), shard0 as WeztermHandle)],
             AssignmentStrategy::RoundRobin,
         )
         .unwrap();
@@ -278,7 +277,6 @@ fn sharding_circuit_status_aggregates_worst_state() {
         let client = ShardedWeztermClient::new(
             vec![ShardBackend::new(
                 ShardId(0),
-                "s0",
                 healthy as WeztermHandle,
             )],
             AssignmentStrategy::RoundRobin,
@@ -298,7 +296,7 @@ fn sharding_activate_pane_routes_correctly() {
         shard0.add_default_pane(3).await;
 
         let client = ShardedWeztermClient::new(
-            vec![ShardBackend::new(ShardId(0), "s0", shard0 as WeztermHandle)],
+            vec![ShardBackend::new(ShardId(0), shard0 as WeztermHandle)],
             AssignmentStrategy::RoundRobin,
         )
         .unwrap();
@@ -316,7 +314,7 @@ fn sharding_zoom_pane_routes_correctly() {
         shard0.add_default_pane(3).await;
 
         let client = ShardedWeztermClient::new(
-            vec![ShardBackend::new(ShardId(0), "s0", shard0 as WeztermHandle)],
+            vec![ShardBackend::new(ShardId(0), shard0 as WeztermHandle)],
             AssignmentStrategy::RoundRobin,
         )
         .unwrap();
@@ -334,7 +332,7 @@ fn sharding_route_for_unknown_pane_single_backend_uses_raw_id() {
         shard0.add_default_pane(42).await;
 
         let client = ShardedWeztermClient::new(
-            vec![ShardBackend::new(ShardId(0), "s0", shard0 as WeztermHandle)],
+            vec![ShardBackend::new(ShardId(0), shard0 as WeztermHandle)],
             AssignmentStrategy::RoundRobin,
         )
         .unwrap();
@@ -355,7 +353,7 @@ fn sharding_send_ctrl_c_routes_correctly() {
         shard0.add_default_pane(1).await;
 
         let client = ShardedWeztermClient::new(
-            vec![ShardBackend::new(ShardId(0), "s0", shard0 as WeztermHandle)],
+            vec![ShardBackend::new(ShardId(0), shard0 as WeztermHandle)],
             AssignmentStrategy::RoundRobin,
         )
         .unwrap();
@@ -373,7 +371,7 @@ fn sharding_send_ctrl_d_routes_correctly() {
         shard0.add_default_pane(1).await;
 
         let client = ShardedWeztermClient::new(
-            vec![ShardBackend::new(ShardId(0), "s0", shard0 as WeztermHandle)],
+            vec![ShardBackend::new(ShardId(0), shard0 as WeztermHandle)],
             AssignmentStrategy::RoundRobin,
         )
         .unwrap();
@@ -386,10 +384,7 @@ fn sharding_send_ctrl_d_routes_correctly() {
 // ===========================================================================
 // Note: LabRuntime sections (2-5) omitted for sharding tests.
 //
-// The ShardedWeztermClient uses `runtime_async::RwLock` (tokio::sync::RwLock)
-// for pane routing tables. Under the LabRuntime's deterministic scheduler,
-// tokio-backed RwLock contention may not resolve properly since waker
-// notifications flow through tokio's task system rather than the LabRuntime
-// scheduler. The RuntimeFixture ports above (Section 1) use the full
-// asupersync runtime where async primitives interoperate correctly.
+// The ShardedWeztermClient uses the canonical asupersync-backed
+// `runtime_async::RwLock` for pane routing tables. The RuntimeFixture ports
+// above therefore exercise those primitives on the supported project runtime.
 // ===========================================================================
