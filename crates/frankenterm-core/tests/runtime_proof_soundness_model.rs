@@ -3,6 +3,7 @@
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 #[test]
 fn lean_model_runtime_proof_impls_match_rust_impls() {
@@ -33,6 +34,36 @@ fn lean_model_runtime_proof_impls_match_rust_impls() {
         runtime_impls, sealed_impls,
         "Every RuntimeProof impl must have exactly one matching sealed::Sealed impl"
     );
+}
+
+/// Cargo-addressable form of the Lean/e2e gate for strict remote workers.
+///
+/// The ordinary model-consistency test above needs no external toolchain.
+/// This test is ignored by default because it intentionally requires the
+/// repository-pinned Lean executable; proof lanes invoke it explicitly with
+/// `--ignored --exact` so a missing Lean installation fails closed.
+#[test]
+#[ignore = "requires the repository-pinned Lean toolchain"]
+fn lean_runtime_proof_soundness_e2e() {
+    let root = repo_root();
+    let script = root.join("tests/e2e/test_runtime_proof_check.sh");
+    let output = Command::new("bash")
+        .arg(&script)
+        .current_dir(&root)
+        .output()
+        .unwrap_or_else(|err| panic!("run {}: {err}", script.display()));
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "runtime-proof Lean/e2e gate failed (status={}):\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        stdout,
+        stderr,
+    );
+    print!("{stdout}");
+    eprint!("{stderr}");
 }
 
 fn repo_root() -> PathBuf {
