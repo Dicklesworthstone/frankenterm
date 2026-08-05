@@ -2420,6 +2420,54 @@ where
     Ok(asupersync::runtime::spawn_blocking(work).await)
 }
 
+/// Typed failure from [`spawn_blocking_with_cx`].
+///
+/// Cancellation phase is deliberately structural rather than encoded in a
+/// message so callers can distinguish a caller-requested stop from an
+/// executor/runtime failure without parsing text.
+#[derive(Debug, thiserror::Error)]
+pub enum SpawnBlockingWithCxError {
+    /// The Cx was already cancelled, so the blocking closure was not spawned.
+    #[error("blocking task cancelled before spawn (kind={kind:?})")]
+    CancelledBeforeSpawn {
+        /// Structured cancellation kind, when the Cx carries one.
+        kind: Option<crate::outcome::CancelKind>,
+    },
+    /// The Cx cancelled while the blocking closure was running.
+    ///
+    /// The blocking closure itself continues to completion on the blocking
+    /// pool; only the caller's await is released.
+    #[error("blocking task cancelled mid-flight (kind={kind:?})")]
+    CancelledMidFlight {
+        /// Structured cancellation kind, when the Cx carries one.
+        kind: Option<crate::outcome::CancelKind>,
+    },
+    /// The blocking executor or join surface failed independently of Cx
+    /// cancellation.
+    #[error("blocking task runtime failure: {detail}")]
+    RuntimeFailure {
+        /// Runtime/join failure detail.
+        detail: String,
+    },
+}
+
+impl SpawnBlockingWithCxError {
+    /// Whether this error is one of the two caller-Cx cancellation phases.
+    #[must_use]
+    pub const fn is_cancelled(&self) -> bool {
+        matches!(
+            self,
+            Self::CancelledBeforeSpawn { .. } | Self::CancelledMidFlight { .. }
+        )
+    }
+}
+
+fn map_spawn_blocking_runtime_result<T>(
+    result: Result<T, String>,
+) -> Result<T, SpawnBlockingWithCxError> {
+    result.map_err(|detail| SpawnBlockingWithCxError::RuntimeFailure { detail })
+}
+
 /// br-ft-6qoxd: Cx-aware [`spawn_blocking`] that select-races the
 /// blocking JoinHandle against the caller's Cx cancellation
 /// watcher.
@@ -2434,7 +2482,7 @@ where
 ///
 /// **Mid-flight cancel:** if the Cx cancels while the blocking
 /// work is running, the await resolves with
-/// `Err("spawn_blocking_with_cx cancelled")` within ~50–100 ms
+/// [`SpawnBlockingWithCxError::CancelledMidFlight`] within ~50–100 ms
 /// (the cancel-watcher polls `cx.is_cancel_requested()` on a
 /// 50 ms cadence). The orphaned blocking task **continues to
 /// run** on the blocking thread pool until the closure returns
@@ -2459,7 +2507,10 @@ where
 /// observed cancellation. Callers that need write-side abort
 /// must layer their own cancellation token through the closure
 /// (e.g., a `&AtomicBool` checked between SQLite statements).
-pub async fn spawn_blocking_with_cx<T, F>(cx: &crate::cx::Cx, work: F) -> Result<T, String>
+pub async fn spawn_blocking_with_cx<T, F>(
+    cx: &crate::cx::Cx,
+    work: F,
+) -> Result<T, SpawnBlockingWithCxError>
 where
     T: Send + 'static,
     F: FnOnce() -> T + Send + 'static,
@@ -2468,10 +2519,9 @@ where
     // even spawn the blocking work. Saves a thread-pool slot +
     // matches the eager-cancel-shape callers expect.
     if cx.checkpoint().is_err() {
-        return Err(format!(
-            "spawn_blocking_with_cx cancelled before spawn (kind={:?})",
-            cx.cancel_reason().map(|reason| reason.kind)
-        ));
+        return Err(SpawnBlockingWithCxError::CancelledBeforeSpawn {
+            kind: cx.cancel_reason().map(|reason| reason.kind),
+        });
     }
 
     use futures::future::{Either, select};
@@ -2491,11 +2541,10 @@ where
     });
 
     match select(join_fut, cancel_watcher).await {
-        Either::Left((result, _)) => result,
-        Either::Right(((), _)) => Err(format!(
-            "spawn_blocking_with_cx cancelled mid-flight (kind={:?})",
-            cx.cancel_reason().map(|reason| reason.kind)
-        )),
+        Either::Left((result, _)) => map_spawn_blocking_runtime_result(result),
+        Either::Right(((), _)) => Err(SpawnBlockingWithCxError::CancelledMidFlight {
+            kind: cx.cancel_reason().map(|reason| reason.kind),
+        }),
     }
 }
 
@@ -4683,20 +4732,21 @@ mod tests {
             let work_ran = std::sync::Arc::new(AtomicBool::new(false));
             let work_ran_clone = std::sync::Arc::clone(&work_ran);
 
-            let result: Result<u64, String> = spawn_blocking_with_cx(&cx, move || {
+            let result: Result<u64, SpawnBlockingWithCxError> =
+                spawn_blocking_with_cx(&cx, move || {
                 work_ran_clone.store(true, Ordering::SeqCst);
                 42
             })
             .await;
 
-            assert!(result.is_err(), "pre-cancel must short-circuit to Err");
             assert!(
-                result
-                    .as_ref()
-                    .err()
-                    .map(|m| m.contains("cancelled before spawn"))
-                    .unwrap_or(false),
-                "pre-cancel error must be tagged 'cancelled before spawn', got: {result:?}"
+                matches!(
+                    &result,
+                    Err(SpawnBlockingWithCxError::CancelledBeforeSpawn {
+                        kind: Some(crate::outcome::CancelKind::User)
+                    })
+                ),
+                "pre-cancel must return the exact typed phase and kind; got: {result:?}"
             );
             assert!(
                 !work_ran.load(Ordering::SeqCst),
@@ -4764,7 +4814,7 @@ mod tests {
             });
 
             let started = std::time::Instant::now();
-            let result: Result<u64, String> = spawn_blocking_with_cx(&cx, || {
+            let result: Result<u64, SpawnBlockingWithCxError> = spawn_blocking_with_cx(&cx, || {
                 std::thread::sleep(Duration::from_secs(5));
                 42
             })
@@ -4772,16 +4822,13 @@ mod tests {
             let elapsed = started.elapsed();
 
             assert!(
-                result.is_err(),
-                "mid-flight cancel must resolve the await with Err"
-            );
-            assert!(
-                result
-                    .as_ref()
-                    .err()
-                    .map(|m| m.contains("cancelled mid-flight"))
-                    .unwrap_or(false),
-                "mid-flight cancel error must be tagged 'cancelled mid-flight', got: {result:?}"
+                matches!(
+                    &result,
+                    Err(SpawnBlockingWithCxError::CancelledMidFlight {
+                        kind: Some(crate::outcome::CancelKind::User)
+                    })
+                ),
+                "mid-flight cancel must return the exact typed phase and kind; got: {result:?}"
             );
             assert!(
                 elapsed < Duration::from_secs(2),
@@ -4790,6 +4837,21 @@ mod tests {
                  took {elapsed:?}"
             );
         });
+    }
+
+    #[test]
+    fn spawn_blocking_with_cx_runtime_failure_is_not_cancellation() {
+        let error = map_spawn_blocking_runtime_result::<u64>(Err(
+            "blocking executor unavailable".to_string(),
+        ))
+        .expect_err("runtime failure must remain an error");
+
+        match error {
+            SpawnBlockingWithCxError::RuntimeFailure { detail } => {
+                assert_eq!(detail, "blocking executor unavailable");
+            }
+            other => panic!("runtime failure must not be classified as cancellation: {other:?}"),
+        }
     }
 
     // -- task::spawn --
