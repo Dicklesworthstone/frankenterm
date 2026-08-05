@@ -17,9 +17,10 @@ use std::collections::HashMap;
 use frankenterm_core::circuit_breaker::CircuitBreakerStatus;
 use frankenterm_core::patterns::AgentType;
 use frankenterm_core::sharding::{
-    AssignmentStrategy, LOCAL_PANE_ID_MASK, SHARD_ID_BITS, ShardHealthEntry, ShardHealthReport,
-    ShardId, assign_pane_with_strategy, decode_sharded_pane_id, encode_sharded_pane_id,
-    infer_agent_type, is_sharded_pane_id,
+    AssignmentStrategy, LOCAL_PANE_ID_BITS, LOCAL_PANE_ID_MASK, MAX_GLOBAL_PANE_ID, MAX_SHARD_ID,
+    SHARD_ID_BITS, ShardHealthEntry, ShardHealthReport, ShardId, assign_pane_with_strategy,
+    decode_sharded_pane_id, encode_sharded_pane_id, infer_agent_type, is_sharded_pane_id,
+    try_decode_sharded_pane_id, try_encode_sharded_pane_id,
 };
 use frankenterm_core::watchdog::HealthStatus;
 use frankenterm_core::wezterm::PaneInfo;
@@ -29,15 +30,14 @@ use frankenterm_core::wezterm::PaneInfo;
 // =============================================================================
 
 #[test]
-fn shard_id_bits_is_16() {
-    assert_eq!(SHARD_ID_BITS, 16);
+fn pane_id_layout_reserves_the_sqlite_sign_bit() {
+    assert_eq!(SHARD_ID_BITS, 15);
+    assert_eq!(LOCAL_PANE_ID_BITS, 48);
+    assert_eq!(SHARD_ID_BITS + LOCAL_PANE_ID_BITS, 63);
 }
 
 #[test]
 fn local_pane_id_mask_has_correct_width() {
-    // With 16 shard bits, local pane ID should use 48 bits
-    let expected_bits = 64 - SHARD_ID_BITS;
-    assert_eq!(expected_bits, 48);
     assert_eq!(LOCAL_PANE_ID_MASK, (1u64 << 48) - 1);
     // Verify the mask has exactly 48 set bits
     assert_eq!(LOCAL_PANE_ID_MASK.count_ones(), 48);
@@ -59,8 +59,7 @@ fn encode_decode_roundtrip_shard_zero() {
 
 #[test]
 fn encode_decode_roundtrip_max_shard() {
-    // Max shard value that fits in 16 bits: 65535
-    let shard = ShardId(0xFFFF);
+    let shard = ShardId(MAX_SHARD_ID);
     let local = 1;
     let encoded = encode_sharded_pane_id(shard, local);
     let (decoded_shard, decoded_local) = decode_sharded_pane_id(encoded);
@@ -80,10 +79,11 @@ fn encode_decode_roundtrip_max_local_pane_id() {
 
 #[test]
 fn encode_decode_roundtrip_both_max() {
-    let shard = ShardId(0xFFFF);
+    let shard = ShardId(MAX_SHARD_ID);
     let local = LOCAL_PANE_ID_MASK;
     let encoded = encode_sharded_pane_id(shard, local);
-    assert_eq!(encoded, u64::MAX); // all 64 bits set
+    assert_eq!(encoded, MAX_GLOBAL_PANE_ID);
+    assert_eq!(i64::try_from(encoded).unwrap(), i64::MAX);
     let (decoded_shard, decoded_local) = decode_sharded_pane_id(encoded);
     assert_eq!(decoded_shard, shard);
     assert_eq!(decoded_local, local);
@@ -101,15 +101,9 @@ fn encode_decode_roundtrip_both_zero() {
 }
 
 #[test]
-fn encode_local_pane_id_overflow_is_masked() {
-    // Local pane ID that exceeds 48 bits should be masked
-    let shard = ShardId(1);
-    let local = u64::MAX; // all 64 bits set
-    let encoded = encode_sharded_pane_id(shard, local);
-    let (decoded_shard, decoded_local) = decode_sharded_pane_id(encoded);
-    assert_eq!(decoded_shard, shard);
-    // High bits of local are masked off
-    assert_eq!(decoded_local, LOCAL_PANE_ID_MASK);
+fn encode_local_pane_id_overflow_is_rejected_without_aliasing() {
+    assert!(try_encode_sharded_pane_id(ShardId(1), LOCAL_PANE_ID_MASK + 1).is_err());
+    assert!(try_encode_sharded_pane_id(ShardId(1), u64::MAX).is_err());
 }
 
 #[test]
@@ -117,8 +111,8 @@ fn encode_preserves_shard_id_in_high_bits() {
     let shard = ShardId(42);
     let local = 0u64;
     let encoded = encode_sharded_pane_id(shard, local);
-    // Shard should be in the top 16 bits
-    let high_bits = encoded >> (64 - SHARD_ID_BITS);
+    // Shard bits start immediately above the 48-bit local field.
+    let high_bits = encoded >> LOCAL_PANE_ID_BITS;
     assert_eq!(high_bits, 42);
 }
 
@@ -142,7 +136,7 @@ fn different_shards_different_encoded_ids() {
 
 #[test]
 fn same_local_id_different_shards_decode_correctly() {
-    for shard_idx in [0, 1, 100, 1000, 65535] {
+    for shard_idx in [0, 1, 100, 1000, MAX_SHARD_ID] {
         let shard = ShardId(shard_idx);
         let local = 7;
         let encoded = encode_sharded_pane_id(shard, local);
@@ -158,7 +152,7 @@ fn same_local_id_different_shards_decode_correctly() {
 
 #[test]
 fn shard_zero_local_nonzero_is_not_sharded() {
-    // Shard 0 means the top 16 bits are zero
+    // Shard 0 means all 15 shard bits are zero.
     let encoded = encode_sharded_pane_id(ShardId(0), 42);
     assert!(!is_sharded_pane_id(encoded));
 }
@@ -181,14 +175,16 @@ fn max_local_shard_zero_is_not_sharded() {
 }
 
 #[test]
-fn all_bits_set_is_sharded() {
+fn out_of_domain_value_is_bitwise_sharded_but_codec_rejects_it() {
     assert!(is_sharded_pane_id(u64::MAX));
+    assert!(try_decode_sharded_pane_id(u64::MAX).is_err());
+    assert!(std::panic::catch_unwind(|| decode_sharded_pane_id(u64::MAX)).is_err());
 }
 
 #[test]
 fn just_one_shard_bit_set_is_sharded() {
     // Set only the lowest shard bit (bit 48)
-    let pane_id = 1u64 << (64 - SHARD_ID_BITS);
+    let pane_id = 1u64 << LOCAL_PANE_ID_BITS;
     assert!(is_sharded_pane_id(pane_id));
 }
 
@@ -207,12 +203,12 @@ fn shard_id_ordering() {
 fn shard_id_display() {
     assert_eq!(format!("{}", ShardId(0)), "0");
     assert_eq!(format!("{}", ShardId(42)), "42");
-    assert_eq!(format!("{}", ShardId(65535)), "65535");
+    assert_eq!(format!("{}", ShardId(MAX_SHARD_ID)), "32767");
 }
 
 #[test]
 fn shard_id_serde_roundtrip() {
-    for idx in [0, 1, 42, 1000, 65535] {
+    for idx in [0, 1, 42, 1000, MAX_SHARD_ID] {
         let shard = ShardId(idx);
         let json = serde_json::to_string(&shard).unwrap();
         let back: ShardId = serde_json::from_str(&json).unwrap();
@@ -860,13 +856,15 @@ fn encode_decode_boundary_local_ids() {
 #[test]
 fn encode_decode_boundary_shard_ids() {
     let local = 42u64;
-    for shard_idx in [0, 1, 2, 255, 256, 32767, 32768, 65534, 65535] {
+    for shard_idx in [0, 1, 2, 255, 256, MAX_SHARD_ID - 1, MAX_SHARD_ID] {
         let shard = ShardId(shard_idx);
         let encoded = encode_sharded_pane_id(shard, local);
         let (ds, dl) = decode_sharded_pane_id(encoded);
         assert_eq!(ds, shard, "shard mismatch for shard_idx={shard_idx}");
         assert_eq!(dl, local, "local mismatch for shard_idx={shard_idx}");
     }
+
+    assert!(try_encode_sharded_pane_id(ShardId(MAX_SHARD_ID + 1), local).is_err());
 }
 
 #[test]

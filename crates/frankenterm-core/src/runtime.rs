@@ -81,7 +81,7 @@ use crate::resize_scheduler::{ResizeSchedulerDebugSnapshot, ResizeStalledTransac
 use crate::runtime_async::{RwLock, mpsc, task::JoinHandle, watch};
 use crate::scrollback_tiers::ScrollbackTierSnapshot;
 #[cfg(all(feature = "vendored", unix))]
-use crate::sharding::{ShardId, decode_sharded_pane_id};
+use crate::sharding::{ShardId, try_decode_sharded_pane_id};
 use crate::spsc_ring_buffer::{SpscConsumer, SpscProducer, channel as spsc_channel};
 #[cfg(feature = "native-wezterm")]
 use crate::storage::PaneRecord;
@@ -389,9 +389,10 @@ struct StreamingSubscriptionIdentity {
 
 /// Identifies one spawned task for exit reconciliation only.
 ///
-/// This token does not stamp `CaptureEvent` values that have already entered
-/// the shared capture queues.  A generation/source-epoch envelope must reach
-/// persistence before queued old-generation output can be rejected there.
+/// This token is deliberately separate from the immutable `CaptureStamp` that
+/// every `CaptureEvent` carries through both shared queues.  Exit reconciliation
+/// uses the task token; persistence fencing uses the pane-incarnation and
+/// source-epoch stamp, so neither identity mechanism can stand in for the other.
 #[cfg(all(feature = "vendored", unix))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct StreamingTaskToken(u64);
@@ -2043,9 +2044,13 @@ fn vendored_streaming_route_for_pane(
         return None;
     }
     if socket_paths.len() == 1 {
-        return Some((ShardId(0), global_pane_id, socket_paths[0].clone()));
+        let (shard_id, local_pane_id) = try_decode_sharded_pane_id(global_pane_id).ok()?;
+        if shard_id != ShardId(0) {
+            return None;
+        }
+        return Some((ShardId(0), local_pane_id, socket_paths[0].clone()));
     }
-    let (shard_id, local_pane_id) = decode_sharded_pane_id(global_pane_id);
+    let (shard_id, local_pane_id) = try_decode_sharded_pane_id(global_pane_id).ok()?;
     socket_paths
         .get(shard_id.0)
         .cloned()
@@ -6604,38 +6609,47 @@ impl ObservationRuntime {
                                     }
                                 };
                                 match storage
-                                    .record_capture_event_with_cx(
+                                    .record_capture_event_outcome_with_cx(
                                         &loop_cx,
                                         stored_event,
                                         delegated_hold,
                                     )
                                     .await
                                 {
-                                    Ok(event_id) => {
-                                        metrics.events_recorded.increment();
+                                    Ok(outcome) => {
+                                        if let Some(event_id) = outcome.inserted_event_id() {
+                                            metrics.events_recorded.increment();
 
-                                        // Publish to event bus for workflow runners (if configured)
-                                        if let Some(ref bus) = event_bus {
-                                            // FND-010 / INV-RED-1: the stored row is
-                                            // redacted, but the live event bus was
-                                            // publishing the RAW in-memory detection
-                                            // (matched_text can contain a secret) to
-                                            // subscribers (web SSE, workflow runners).
-                                            // Redact the emitted copy too.
-                                            let event = crate::events::Event::PatternDetected {
-                                                pane_id,
-                                                pane_uuid: pane_uuid.clone(),
-                                                detection: redact_detection(&detection),
-                                                event_id: Some(event_id),
-                                            };
-                                            let delivered = bus.publish(event);
-                                            if delivered == 0 {
-                                                debug!(
-                                                    pane_id = pane_id,
-                                                    rule_id = %detection.rule_id,
-                                                    "No subscribers for detection event bus"
-                                                );
+                                            // Publish to event bus for workflow runners (if configured)
+                                            if let Some(ref bus) = event_bus {
+                                                // FND-010 / INV-RED-1: the stored row is
+                                                // redacted, but the live event bus was
+                                                // publishing the RAW in-memory detection
+                                                // (matched_text can contain a secret) to
+                                                // subscribers (web SSE, workflow runners).
+                                                // Redact the emitted copy too.
+                                                let event = crate::events::Event::PatternDetected {
+                                                    pane_id,
+                                                    pane_uuid: pane_uuid.clone(),
+                                                    detection: redact_detection(&detection),
+                                                    event_id: Some(event_id),
+                                                };
+                                                let delivered = bus.publish(event);
+                                                if delivered == 0 {
+                                                    debug!(
+                                                        pane_id = pane_id,
+                                                        rule_id = %detection.rule_id,
+                                                        "No subscribers for detection event bus"
+                                                    );
+                                                }
                                             }
+                                        } else {
+                                            debug!(
+                                                pane_id,
+                                                rule_id = %detection.rule_id,
+                                                event_id = outcome.event_id(),
+                                                "Suppressed duplicate detection after durable dedupe"
+                                            );
                                         }
                                     }
                                     Err(e) => {
@@ -9874,6 +9888,248 @@ mod tests {
     }
 
     #[test]
+    fn queued_predecessor_events_on_both_queues_have_zero_real_persistence_side_effects() {
+        run_async_test_isolated(|| async {
+            let pane_id = 77;
+            let predecessor_revision = DiscoveryRevision(10);
+            let successor_revision = DiscoveryRevision(11);
+            let (_dir, db_path) = temp_db_path();
+            let storage = StorageHandle::new(&db_path).await.expect("test storage");
+            storage
+                .upsert_pane(test_pane_record(pane_id))
+                .await
+                .expect("persist test pane");
+
+            let event_bus = Arc::new(EventBus::new(16));
+            let mut event_subscriber = event_bus.subscribe();
+            let wezterm: WeztermHandle = Arc::new(crate::wezterm::MockWezterm::new());
+            let runtime = ObservationRuntime::new(
+                RuntimeConfig::default(),
+                storage.clone(),
+                Arc::new(RwLock::new(PatternEngine::new())),
+            )
+            .with_event_bus(Arc::clone(&event_bus))
+            .with_wezterm_handle(wezterm);
+
+            let predecessor = runtime
+                .capture_authority
+                .activate_pane(pane_id)
+                .expect("predecessor pane");
+            let predecessor_lease = runtime
+                .capture_authority
+                .issue_source(predecessor, CaptureSourceKind::Polling)
+                .expect("predecessor source");
+            runtime.capture_metadata.write().await.insert(
+                predecessor.pane_incarnation(),
+                CapturePaneMetadata {
+                    pane_uuid: "predecessor-uuid".to_string(),
+                    discovery_generation: 0,
+                    discovery_revision: predecessor_revision,
+                },
+            );
+
+            let (publication_tx, publication_rx) = watch::channel(
+                DiscoveryCapturePublication {
+                    epoch: 1,
+                    observed_panes: Arc::new(HashMap::from([(
+                        pane_id,
+                        ObservedCapturePane {
+                            info: make_pane(pane_id, "predecessor"),
+                            generation: 0,
+                            pane_uuid: "predecessor-uuid".to_string(),
+                            revision: predecessor_revision,
+                            requires_storage_resync: false,
+                        },
+                    )])),
+                    transitioning_pane_ids: Arc::new(HashSet::new()),
+                    transitions: Arc::new(HashMap::new()),
+                },
+            );
+
+            let (mpsc_decision, mpsc_receipt) = CaptureResyncDecision::channel();
+            let stale_mpsc = test_capture_event_for_lease(pane_id, 0, &predecessor_lease)
+                .with_resync_decision(mpsc_decision);
+            let (spsc_decision, spsc_receipt) = CaptureResyncDecision::channel();
+            let stale_spsc = test_capture_event_for_lease(pane_id, 1, &predecessor_lease)
+                .with_resync_decision(spsc_decision);
+
+            publication_tx
+                .send(DiscoveryCapturePublication {
+                    epoch: 2,
+                    observed_panes: Arc::new(HashMap::from([(
+                        pane_id,
+                        ObservedCapturePane {
+                            info: make_pane(pane_id, "successor"),
+                            generation: 1,
+                            pane_uuid: "successor-uuid".to_string(),
+                            revision: successor_revision,
+                            requires_storage_resync: true,
+                        },
+                    )])),
+                    transitioning_pane_ids: Arc::new(HashSet::new()),
+                    transitions: Arc::new(HashMap::new()),
+                })
+                .expect("publish successor view");
+            assert!(
+                runtime
+                    .capture_authority
+                    .retire_pane_if_drained(predecessor)
+                    .expect("retire predecessor"),
+                "predecessor has no live guards after both events own their immutable stamps"
+            );
+
+            let successor = runtime
+                .capture_authority
+                .activate_pane(pane_id)
+                .expect("successor pane");
+            let successor_lease = runtime
+                .capture_authority
+                .issue_source(successor, CaptureSourceKind::Polling)
+                .expect("successor source");
+            runtime.capture_metadata.write().await.insert(
+                successor.pane_incarnation(),
+                CapturePaneMetadata {
+                    pane_uuid: "successor-uuid".to_string(),
+                    discovery_generation: 1,
+                    discovery_revision: successor_revision,
+                },
+            );
+
+            let successor_segment = {
+                let mut cursors = runtime.cursors.write().await;
+                let cursor = cursors
+                    .entry(pane_id)
+                    .or_insert_with(|| PaneCursor::new(pane_id));
+                cursor.capture_generation_resync(
+                    "successor snapshot",
+                    "capture_generation_resync",
+                )
+            };
+            let (successor_decision, successor_receipt) = CaptureResyncDecision::channel();
+            let successor_event = test_capture_event_from_segment_for_lease(
+                successor_segment,
+                &successor_lease,
+            )
+            .with_resync_decision(successor_decision);
+
+            let (ingress_tx, ingress_rx) = mpsc::channel(2);
+            let (ring_tx, ring_rx) = spsc_channel(4);
+            ring_tx
+                .try_send(stale_spsc)
+                .expect("park predecessor event in SPSC");
+            ingress_tx
+                .try_send(stale_mpsc)
+                .expect("park predecessor event in MPSC");
+            ingress_tx
+                .try_send(successor_event)
+                .expect("queue successor resync behind predecessor");
+            drop(ingress_tx);
+
+            let checkpoints: CaptureCheckpointCache =
+                Arc::new(StdMutex::new(LruCache::new(4)));
+            let _ = checkpoints
+                .lock()
+                .expect("capture checkpoint cache")
+                .put(
+                    pane_id,
+                    CachedCaptureCheckpoint::Certain(CaptureDurabilityCheckpoint {
+                        revision: successor_revision,
+                        next_seq: 0,
+                        raw_tail: String::new(),
+                    }),
+                );
+            let relay = runtime.spawn_capture_relay_task(ingress_rx, ring_tx);
+            let persistence = runtime.spawn_persistence_task(
+                ring_rx,
+                Arc::clone(&runtime.cursors),
+                publication_rx,
+                Arc::clone(&checkpoints),
+            );
+            relay.await.expect("capture relay task");
+            persistence.await.expect("capture persistence task");
+
+            assert!(
+                spsc_receipt
+                    .outcome()
+                    .expect("stale SPSC decision")
+                    .is_err(),
+                "the direct SPSC predecessor must fail closed"
+            );
+            assert!(
+                mpsc_receipt
+                    .outcome()
+                    .expect("stale MPSC decision")
+                    .is_err(),
+                "the relayed MPSC predecessor must fail closed"
+            );
+            assert_eq!(
+                successor_receipt.outcome(),
+                Some(Ok(0)),
+                "the exact successor gets one durable sequence acknowledgement"
+            );
+
+            let segments = storage
+                .get_segments(pane_id, 10)
+                .await
+                .expect("read persisted successor");
+            assert_eq!(segments.len(), 1, "stale events must not reach storage");
+            assert_eq!(segments[0].seq, 0);
+            assert_eq!(segments[0].content, "successor snapshot");
+            let gaps = storage.get_gaps().await.expect("read successor gap");
+            assert_eq!(gaps.len(), 1, "one successor resync emits one durable gap");
+            assert_eq!(gaps[0].pane_id, pane_id);
+            assert!(
+                gaps[0].reason.contains("capture_generation_resync"),
+                "the durable gap retains its resync justification"
+            );
+            assert!(
+                storage
+                    .get_events(crate::storage::EventQuery::default())
+                    .await
+                    .expect("read detection events")
+                    .is_empty(),
+                "stale text must not create detection rows"
+            );
+
+            let cursor = runtime
+                .cursors
+                .read()
+                .await
+                .get(&pane_id)
+                .cloned()
+                .expect("successor cursor");
+            assert_eq!(cursor.next_seq, 1);
+            assert_eq!(cursor.last_snapshot, "successor snapshot");
+            assert!(cursor.in_gap);
+            let checkpoint = certain_capture_checkpoint(&checkpoints, pane_id, successor_revision)
+                .expect("durable successor checkpoint");
+            assert_eq!(checkpoint.next_seq, 1);
+            assert_eq!(checkpoint.raw_tail, "successor snapshot");
+
+            assert_eq!(runtime.metrics.capture_authority_rejections(), 2);
+            assert_eq!(runtime.metrics.segments_persisted(), 1);
+            assert_eq!(runtime.metrics.events_recorded(), 0);
+            assert!(runtime.detection_contexts.read().await.contains_key(&pane_id));
+
+            let mut published = Vec::new();
+            while let Some(event) = event_subscriber.try_recv() {
+                published.push(event.expect("event bus receive"));
+            }
+            assert_eq!(published.len(), 2, "one segment and one gap are published");
+            assert!(published.iter().any(|event| matches!(
+                event,
+                Event::SegmentCaptured { pane_id: id, seq: 0, .. } if *id == pane_id
+            )));
+            assert!(published.iter().any(|event| matches!(
+                event,
+                Event::GapDetected { pane_id: id, .. } if *id == pane_id
+            )));
+
+            storage.shutdown().await.expect("shutdown test storage");
+        });
+    }
+
+    #[test]
     fn connector_outbound_runtime_event_dispatches_through_mesh_and_host_runtime() {
         let mut bridge = crate::connector_outbound_bridge::ConnectorOutboundBridge::new(
             crate::connector_outbound_bridge::ConnectorOutboundBridgeConfig::default(),
@@ -10325,10 +10581,7 @@ mod tests {
         seq: u64,
         lease: &CaptureLease,
     ) -> CaptureEvent {
-        let guard = lease
-            .try_acquire_producer(lease.stamp(), pane_id)
-            .expect("test producer authority");
-        CaptureEvent::from_producer(
+        test_capture_event_from_segment_for_lease(
             CapturedSegment {
                 pane_id,
                 seq,
@@ -10336,9 +10589,18 @@ mod tests {
                 kind: crate::ingest::CapturedSegmentKind::Delta,
                 captured_at: epoch_ms(),
             },
-            &guard,
+            lease,
         )
-        .expect("stamped test capture event")
+    }
+
+    fn test_capture_event_from_segment_for_lease(
+        segment: CapturedSegment,
+        lease: &CaptureLease,
+    ) -> CaptureEvent {
+        let guard = lease
+            .try_acquire_producer(lease.stamp(), segment.pane_id)
+            .expect("test producer authority");
+        CaptureEvent::from_producer(segment, &guard).expect("stamped test capture event")
     }
 
     fn test_bocpd_segment(pane_id: u64, content: String, captured_at: i64) -> CapturedSegment {
@@ -13716,6 +13978,30 @@ mod tests {
 
     #[cfg(all(feature = "vendored", unix))]
     #[test]
+    fn vendored_streaming_route_rejects_non_persistable_or_wrong_shard_id() {
+        let one_socket = vec![PathBuf::from("/tmp/wa.sock")];
+        let two_sockets = vec![
+            PathBuf::from("/tmp/wa-0.sock"),
+            PathBuf::from("/tmp/wa-1.sock"),
+        ];
+        let shard_one =
+            crate::sharding::encode_sharded_pane_id(crate::sharding::ShardId(1), 7);
+
+        assert!(vendored_streaming_route_for_pane(&one_socket, u64::MAX).is_none());
+        assert!(vendored_streaming_route_for_pane(&one_socket, shard_one).is_none());
+        assert!(vendored_streaming_route_for_pane(&two_sockets, u64::MAX).is_none());
+        assert_eq!(
+            vendored_streaming_route_for_pane(&one_socket, 7),
+            Some((ShardId(0), 7, one_socket[0].clone()))
+        );
+        assert_eq!(
+            vendored_streaming_route_for_pane(&two_sockets, shard_one),
+            Some((ShardId(1), 7, two_sockets[1].clone()))
+        );
+    }
+
+    #[cfg(all(feature = "vendored", unix))]
+    #[test]
     fn vendored_streaming_remaps_equal_local_ids_on_two_shards_for_every_delta_variant() {
         let socket_paths = vec![
             PathBuf::from("/tmp/wa-0.sock"),
@@ -13801,6 +14087,216 @@ mod tests {
                     if pane_id == identity.global_pane_id && reason == "ended"
             ));
         }
+    }
+
+    #[cfg(all(feature = "vendored", unix))]
+    #[test]
+    fn equal_local_ids_on_two_shards_persist_under_distinct_global_ids() {
+        run_async_test_isolated(|| async {
+            let socket_paths = vec![
+                PathBuf::from("/tmp/wa-0.sock"),
+                PathBuf::from("/tmp/wa-1.sock"),
+            ];
+            let local_pane_id = 7;
+            let global_zero = crate::sharding::encode_sharded_pane_id(
+                crate::sharding::ShardId(0),
+                local_pane_id,
+            );
+            let global_one = crate::sharding::encode_sharded_pane_id(
+                crate::sharding::ShardId(1),
+                local_pane_id,
+            );
+            assert_ne!(global_zero, global_one);
+
+            let (_dir, db_path) = temp_db_path();
+            let storage = StorageHandle::new(&db_path).await.expect("test storage");
+            for pane_id in [global_zero, global_one] {
+                storage
+                    .upsert_pane(test_pane_record(pane_id))
+                    .await
+                    .expect("persist sharded test pane");
+            }
+            let wezterm: WeztermHandle = Arc::new(crate::wezterm::MockWezterm::new());
+            let runtime = ObservationRuntime::new(
+                RuntimeConfig::default(),
+                storage.clone(),
+                Arc::new(RwLock::new(PatternEngine::new())),
+            )
+            .with_wezterm_handle(wezterm);
+
+            let pane_zero = runtime
+                .capture_authority
+                .activate_pane(global_zero)
+                .expect("activate shard zero pane");
+            let pane_one = runtime
+                .capture_authority
+                .activate_pane(global_one)
+                .expect("activate shard one pane");
+            let lease_zero = runtime
+                .capture_authority
+                .issue_source(pane_zero, CaptureSourceKind::VendoredStreaming)
+                .expect("issue shard zero source");
+            let lease_one = runtime
+                .capture_authority
+                .issue_source(pane_one, CaptureSourceKind::VendoredStreaming)
+                .expect("issue shard one source");
+            let identity_zero = vendored_streaming_identity_for_pane(
+                &socket_paths,
+                global_zero,
+                2,
+                lease_zero.stamp(),
+            )
+            .expect("shard zero identity");
+            let identity_one = vendored_streaming_identity_for_pane(
+                &socket_paths,
+                global_one,
+                4,
+                lease_one.stamp(),
+            )
+            .expect("shard one identity");
+            assert_eq!(identity_zero.local_pane_id, identity_one.local_pane_id);
+
+            let revision_zero = DiscoveryRevision(20);
+            let revision_one = DiscoveryRevision(21);
+            runtime.capture_metadata.write().await.extend([
+                (
+                    pane_zero.pane_incarnation(),
+                    CapturePaneMetadata {
+                        pane_uuid: "shard-zero-uuid".to_string(),
+                        discovery_generation: 2,
+                        discovery_revision: revision_zero,
+                    },
+                ),
+                (
+                    pane_one.pane_incarnation(),
+                    CapturePaneMetadata {
+                        pane_uuid: "shard-one-uuid".to_string(),
+                        discovery_generation: 4,
+                        discovery_revision: revision_one,
+                    },
+                ),
+            ]);
+            let (_publication_tx, publication_rx) = watch::channel(
+                DiscoveryCapturePublication {
+                    epoch: 1,
+                    observed_panes: Arc::new(HashMap::from([
+                        (
+                            global_zero,
+                            ObservedCapturePane {
+                                info: make_pane(global_zero, "shard-zero"),
+                                generation: 2,
+                                pane_uuid: "shard-zero-uuid".to_string(),
+                                revision: revision_zero,
+                                requires_storage_resync: false,
+                            },
+                        ),
+                        (
+                            global_one,
+                            ObservedCapturePane {
+                                info: make_pane(global_one, "shard-one"),
+                                generation: 4,
+                                pane_uuid: "shard-one-uuid".to_string(),
+                                revision: revision_one,
+                                requires_storage_resync: false,
+                            },
+                        ),
+                    ])),
+                    transitioning_pane_ids: Arc::new(HashSet::new()),
+                    transitions: Arc::new(HashMap::new()),
+                },
+            );
+
+            let (capture_tx, capture_rx) = mpsc::channel(4);
+            let loop_cx = runtime_loop_cx();
+            let mut bridge_zero = StreamingBridge::new();
+            let mut bridge_one = StreamingBridge::new();
+            assert!(
+                forward_vendored_streaming_delta(
+                    &loop_cx,
+                    &mut bridge_zero,
+                    &capture_tx,
+                    &identity_zero,
+                    &lease_zero,
+                    PaneDelta::Output {
+                        pane_id: local_pane_id,
+                        seqno: 1,
+                        delta_text: "output from shard zero".to_string(),
+                        title: "zero".to_string(),
+                        dirty_range_count: 1,
+                        dirty_row_count: 1,
+                    },
+                )
+                .await
+                .is_none()
+            );
+            assert!(
+                forward_vendored_streaming_delta(
+                    &loop_cx,
+                    &mut bridge_one,
+                    &capture_tx,
+                    &identity_one,
+                    &lease_one,
+                    PaneDelta::Output {
+                        pane_id: local_pane_id,
+                        seqno: 1,
+                        delta_text: "output from shard one".to_string(),
+                        title: "one".to_string(),
+                        dirty_range_count: 1,
+                        dirty_row_count: 1,
+                    },
+                )
+                .await
+                .is_none()
+            );
+            drop(capture_tx);
+
+            assert_eq!(
+                bridge_zero
+                    .render_metadata(global_zero)
+                    .map(|metadata| metadata.title.as_str()),
+                Some("zero")
+            );
+            assert!(bridge_zero.render_metadata(global_one).is_none());
+            assert_eq!(
+                bridge_one
+                    .render_metadata(global_one)
+                    .map(|metadata| metadata.title.as_str()),
+                Some("one")
+            );
+            assert!(bridge_one.render_metadata(global_zero).is_none());
+
+            let (ring_tx, ring_rx) = spsc_channel(4);
+            let relay = runtime.spawn_capture_relay_task(capture_rx, ring_tx);
+            let checkpoints: CaptureCheckpointCache =
+                Arc::new(StdMutex::new(LruCache::new(4)));
+            let persistence = runtime.spawn_persistence_task(
+                ring_rx,
+                Arc::clone(&runtime.cursors),
+                publication_rx,
+                checkpoints,
+            );
+            relay.await.expect("capture relay task");
+            persistence.await.expect("capture persistence task");
+
+            let shard_zero_segments = storage
+                .get_segments(global_zero, 10)
+                .await
+                .expect("read shard zero segments");
+            let shard_one_segments = storage
+                .get_segments(global_one, 10)
+                .await
+                .expect("read shard one segments");
+            assert_eq!(shard_zero_segments.len(), 1);
+            assert_eq!(shard_one_segments.len(), 1);
+            assert_eq!(shard_zero_segments[0].pane_id, global_zero);
+            assert_eq!(shard_one_segments[0].pane_id, global_one);
+            assert_eq!(shard_zero_segments[0].content, "output from shard zero");
+            assert_eq!(shard_one_segments[0].content, "output from shard one");
+            assert_eq!(runtime.metrics.segments_persisted(), 2);
+            assert_eq!(runtime.metrics.capture_authority_rejections(), 0);
+
+            storage.shutdown().await.expect("shutdown test storage");
+        });
     }
 
     #[cfg(all(feature = "vendored", unix))]

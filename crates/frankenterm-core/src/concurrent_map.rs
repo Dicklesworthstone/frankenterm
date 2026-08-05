@@ -627,6 +627,45 @@ impl<V> PaneMap<V> {
         result
     }
 
+    /// Replace every entry while holding every shard's write lock.
+    ///
+    /// Replacement maps are prepared before any lock is acquired, then all
+    /// shard locks are acquired in stable index order. This serializes
+    /// concurrent replacements and prevents a pane lookup from observing the
+    /// clear-and-refill gap for its shard. A sequence of separate lookups can
+    /// still span two generations if another replacement starts between those
+    /// calls; callers that need a multi-key transaction must provide a
+    /// higher-level snapshot contract.
+    pub fn replace_all(&self, entries: HashMap<u64, V>) {
+        let mut replacements: Vec<HashMap<u64, V>> =
+            (0..self.shard_count).map(|_| HashMap::new()).collect();
+        for (pane_id, value) in entries {
+            let idx = self.shard_idx(pane_id);
+            replacements[idx].insert(pane_id, value);
+        }
+
+        // All multi-shard writers acquire locks in ascending shard order, so
+        // two concurrent replacements cannot deadlock or interleave shards.
+        let mut guards = self
+            .shards
+            .iter()
+            .map(|shard| {
+                shard
+                    .map
+                    .write()
+                    .unwrap_or_else(record_poison_and_recover)
+            })
+            .collect::<Vec<_>>();
+        for (guard, replacement) in guards.iter_mut().zip(&mut replacements) {
+            std::mem::swap(&mut **guard, replacement);
+        }
+        drop(guards);
+        // Retire old generations after releasing every shard lock. This keeps
+        // destruction cost (and any user-defined `V::drop`) off the lookup
+        // critical section.
+        drop(replacements);
+    }
+
     /// Clear all entries.
     pub fn clear(&self) {
         for shard in &self.shards {
@@ -961,6 +1000,78 @@ mod tests {
         map.retain(|id, _| id % 3 == 0);
         // Kept: 0, 3, 6, 9, 12, 15, 18 = 7 entries
         assert_eq!(map.len(), 7);
+    }
+
+    #[test]
+    fn pane_map_replace_all_removes_stale_entries_and_installs_new_generation() {
+        let map = PaneMap::<u64>::with_shards(8);
+        map.insert(1, 10);
+        map.insert(2, 20);
+        map.insert(3, 30);
+
+        map.replace_all(HashMap::from([(2, 200), (4, 400), (5, 500)]));
+
+        assert_eq!(map.get(1), None);
+        assert_eq!(map.get(2), Some(200));
+        assert_eq!(map.get(3), None);
+        assert_eq!(map.get(4), Some(400));
+        assert_eq!(map.get(5), Some(500));
+        assert_eq!(map.len(), 3);
+    }
+
+    #[test]
+    fn pane_map_concurrent_replacements_are_serialized_without_lookup_gap() {
+        let generation_a = HashMap::from([(7, 100), (11, 110), (13, 130)]);
+        let generation_b = HashMap::from([(7, 200), (17, 170), (19, 190)]);
+        let map = Arc::new(PaneMap::<u64>::with_shards(8));
+        map.replace_all(generation_a.clone());
+
+        let start = Arc::new(std::sync::Barrier::new(3));
+        let writers_done = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let writer_a = {
+            let map = Arc::clone(&map);
+            let start = Arc::clone(&start);
+            let writers_done = Arc::clone(&writers_done);
+            let generation = generation_a.clone();
+            std::thread::spawn(move || {
+                start.wait();
+                for _ in 0..500 {
+                    map.replace_all(generation.clone());
+                }
+                writers_done.fetch_add(1, Ordering::Release);
+            })
+        };
+        let writer_b = {
+            let map = Arc::clone(&map);
+            let start = Arc::clone(&start);
+            let writers_done = Arc::clone(&writers_done);
+            let generation = generation_b.clone();
+            std::thread::spawn(move || {
+                start.wait();
+                for _ in 0..500 {
+                    map.replace_all(generation.clone());
+                }
+                writers_done.fetch_add(1, Ordering::Release);
+            })
+        };
+
+        start.wait();
+        while writers_done.load(Ordering::Acquire) != 2 {
+            assert!(
+                matches!(map.get(7), Some(100) | Some(200)),
+                "a key present in both generations must never expose a clear/refill gap"
+            );
+            std::thread::yield_now();
+        }
+
+        writer_a.join().unwrap();
+        writer_b.join().unwrap();
+        let final_generation = map.entries().into_iter().collect::<HashMap<_, _>>();
+        assert!(
+            final_generation == generation_a || final_generation == generation_b,
+            "concurrent whole-map replacements must not publish an interleaved generation"
+        );
     }
 
     #[test]

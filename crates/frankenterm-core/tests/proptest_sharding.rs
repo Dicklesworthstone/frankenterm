@@ -8,8 +8,10 @@ use frankenterm_core::circuit_breaker::CircuitBreakerStatus;
 use frankenterm_core::config::{Config, VendoredShardingConfig};
 use frankenterm_core::patterns::AgentType;
 use frankenterm_core::sharding::{
-    AssignmentStrategy, ShardHealthEntry, ShardHealthReport, ShardId, assign_pane_with_strategy,
+    AssignmentStrategy, LOCAL_PANE_ID_BITS, LOCAL_PANE_ID_MASK, MAX_GLOBAL_PANE_ID, MAX_SHARD_ID,
+    ShardHealthEntry, ShardHealthReport, ShardId, assign_pane_with_strategy,
     decode_sharded_pane_id, encode_sharded_pane_id, is_sharded_pane_id,
+    try_decode_sharded_pane_id, try_encode_sharded_pane_id,
 };
 use frankenterm_core::watchdog::HealthStatus;
 
@@ -167,20 +169,22 @@ proptest! {
 
     #[test]
     fn prop_encode_decode_roundtrip(
-        shard in 0usize..=65535,
-        local in any::<u64>(),
+        shard in 0usize..=MAX_SHARD_ID,
+        local in 0u64..=LOCAL_PANE_ID_MASK,
     ) {
         let encoded = encode_sharded_pane_id(ShardId(shard), local);
         let (decoded_shard, decoded_local) = decode_sharded_pane_id(encoded);
         prop_assert_eq!(decoded_shard, ShardId(shard));
-        prop_assert_eq!(decoded_local, local & ((1u64 << 48) - 1));
+        prop_assert_eq!(decoded_local, local);
+        prop_assert!(encoded <= MAX_GLOBAL_PANE_ID);
+        prop_assert!(i64::try_from(encoded).is_ok());
     }
 
     /// is_sharded_pane_id is consistent with encode for non-zero shards.
     #[test]
     fn prop_is_sharded_consistent_with_encode(
-        shard in 1usize..=65535,
-        local in any::<u64>(),
+        shard in 1usize..=MAX_SHARD_ID,
+        local in 0u64..=LOCAL_PANE_ID_MASK,
     ) {
         let encoded = encode_sharded_pane_id(ShardId(shard), local);
         prop_assert!(
@@ -192,7 +196,7 @@ proptest! {
 
     /// Shard 0 encodes produce non-sharded IDs (shard bits are zero).
     #[test]
-    fn prop_shard_zero_not_sharded(local in any::<u64>()) {
+    fn prop_shard_zero_not_sharded(local in 0u64..=LOCAL_PANE_ID_MASK) {
         let encoded = encode_sharded_pane_id(ShardId(0), local);
         prop_assert!(
             !is_sharded_pane_id(encoded),
@@ -203,10 +207,10 @@ proptest! {
     /// Different shard+local pairs produce different encoded values.
     #[test]
     fn prop_encode_unique(
-        shard1 in 0usize..=65535,
-        shard2 in 0usize..=65535,
-        local1 in 0u64..(1u64 << 48),
-        local2 in 0u64..(1u64 << 48),
+        shard1 in 0usize..=MAX_SHARD_ID,
+        shard2 in 0usize..=MAX_SHARD_ID,
+        local1 in 0u64..=LOCAL_PANE_ID_MASK,
+        local2 in 0u64..=LOCAL_PANE_ID_MASK,
     ) {
         prop_assume!(shard1 != shard2 || local1 != local2);
         let enc1 = encode_sharded_pane_id(ShardId(shard1), local1);
@@ -588,22 +592,37 @@ proptest! {
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(300))]
 
-    /// encode_sharded_pane_id always returns a value.
+    /// Every in-domain pair encodes to a persistence-safe value.
     #[test]
-    fn prop_encode_always_produces(shard in 0usize..=65535, local in any::<u64>()) {
-        let encoded = encode_sharded_pane_id(ShardId(shard), local);
-        // Decoding should always succeed
-        let (dec_shard, _dec_local) = decode_sharded_pane_id(encoded);
+    fn prop_encode_always_produces(
+        shard in 0usize..=MAX_SHARD_ID,
+        local in 0u64..=LOCAL_PANE_ID_MASK,
+    ) {
+        let encoded = try_encode_sharded_pane_id(ShardId(shard), local).unwrap();
+        let (dec_shard, dec_local) = try_decode_sharded_pane_id(encoded).unwrap();
         prop_assert_eq!(dec_shard, ShardId(shard));
+        prop_assert_eq!(dec_local, local);
+        prop_assert!(encoded <= MAX_GLOBAL_PANE_ID);
     }
 
-    /// Local bits are masked to 48 bits.
+    /// Oversized local ids are rejected instead of aliases being created.
     #[test]
-    fn prop_local_bits_masked(shard in 0usize..=65535, local in any::<u64>()) {
-        let encoded = encode_sharded_pane_id(ShardId(shard), local);
-        let (_dec_shard, dec_local) = decode_sharded_pane_id(encoded);
-        prop_assert!(dec_local < (1u64 << 48),
-            "decoded local {} should be < 2^48", dec_local);
+    fn prop_local_overflow_rejected(
+        shard in 0usize..=MAX_SHARD_ID,
+        overflow in 1u64..=(u64::MAX - LOCAL_PANE_ID_MASK),
+    ) {
+        let local = LOCAL_PANE_ID_MASK + overflow;
+        prop_assert!(try_encode_sharded_pane_id(ShardId(shard), local).is_err());
+    }
+
+    /// The reserved sign-bit shard range is rejected at both codec boundaries.
+    #[test]
+    fn prop_reserved_sign_bit_rejected(local in 0u64..=LOCAL_PANE_ID_MASK) {
+        let invalid_shard = MAX_SHARD_ID + 1;
+        prop_assert!(try_encode_sharded_pane_id(ShardId(invalid_shard), local).is_err());
+        let invalid_global = (invalid_shard as u64) << LOCAL_PANE_ID_BITS | local;
+        prop_assert!(invalid_global > MAX_GLOBAL_PANE_ID);
+        prop_assert!(try_decode_sharded_pane_id(invalid_global).is_err());
     }
 }
 

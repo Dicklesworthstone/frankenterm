@@ -7,17 +7,18 @@
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use futures::FutureExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::Result;
 use crate::circuit_breaker::{CircuitBreakerStatus, CircuitStateKind};
+use crate::concurrent_map::PaneMap;
 use crate::consistent_hash::HashRing;
 use crate::error::WeztermError;
 use crate::patterns::AgentType;
-use crate::runtime_async::RwLock;
 use crate::watchdog::HealthStatus;
 use crate::wezterm::{
     MoveDirection, MuxSemanticSnapshot, PaneInfo, PaneTieredScrollbackSummary, SpawnTarget,
@@ -57,14 +58,31 @@ pub struct ShardingTelemetrySnapshot {
     pub route_lookups: u64,
 }
 
-/// Number of high bits reserved for shard id in encoded pane ids.
-pub const SHARD_ID_BITS: u32 = 16;
+/// Number of shard-id bits in the persistence-safe encoded pane-id domain.
+///
+/// SQLite stores pane ids in signed `INTEGER` columns throughout the storage
+/// layer. The sign bit is therefore deliberately left unused: 15 shard bits
+/// plus 48 local-pane bits produce a non-negative 63-bit identifier.
+pub const SHARD_ID_BITS: u32 = 15;
+
+/// Number of low bits reserved for the backend-local pane id.
+pub const LOCAL_PANE_ID_BITS: u32 = 48;
 
 /// Mask for local pane id bits in encoded pane ids.
-pub const LOCAL_PANE_ID_MASK: u64 = (1u64 << (64 - SHARD_ID_BITS)) - 1;
+pub const LOCAL_PANE_ID_MASK: u64 = (1u64 << LOCAL_PANE_ID_BITS) - 1;
 
 /// Maximum shard id representable in encoded pane ids.
 pub const MAX_SHARD_ID: usize = ((1u64 << SHARD_ID_BITS) - 1) as usize;
+
+/// Largest global pane id that every signed-64 persistence boundary accepts.
+pub const MAX_GLOBAL_PANE_ID: u64 = (1u64 << 63) - 1;
+
+/// Hard ceiling for rollback after a backend creates an unencodable pane.
+///
+/// The backend's normal command timeout is currently 30 seconds. Matching it
+/// here prevents a compensating task from outliving its useful recovery window
+/// even if a custom backend ignores Cx budgets.
+const PANE_CREATION_ROLLBACK_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Identifier for a mux shard.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -76,30 +94,79 @@ impl std::fmt::Display for ShardId {
     }
 }
 
+/// Fallibly encode `(shard_id, local_pane_id)` into a globally unique,
+/// persistence-safe pane id.
+///
+/// The 63-bit layout is `[unused sign bit][15-bit shard][48-bit local]`.
+/// Existing ids for shards `0..=32767` retain exactly the same bit pattern as
+/// the former 16+48 layout. Inputs outside either field are rejected instead
+/// of being truncated or allowed to cross SQLite's signed-integer boundary.
+pub fn try_encode_sharded_pane_id(shard_id: ShardId, local_pane_id: u64) -> Result<u64> {
+    if shard_id.0 > MAX_SHARD_ID {
+        return Err(crate::Error::Wezterm(WeztermError::CommandFailed(
+            format!(
+                "shard id {} exceeds {}-bit persistence-safe encoded capacity (max={MAX_SHARD_ID})",
+                shard_id.0, SHARD_ID_BITS
+            ),
+        )));
+    }
+    if local_pane_id > LOCAL_PANE_ID_MASK {
+        return Err(crate::Error::Wezterm(WeztermError::CommandFailed(
+            format!(
+                "local pane id {local_pane_id} exceeds {LOCAL_PANE_ID_BITS}-bit encoded capacity (max={LOCAL_PANE_ID_MASK})"
+            ),
+        )));
+    }
+
+    let encoded = ((shard_id.0 as u64) << LOCAL_PANE_ID_BITS) | local_pane_id;
+    debug_assert!(encoded <= MAX_GLOBAL_PANE_ID);
+    Ok(encoded)
+}
+
 /// Encode `(shard_id, local_pane_id)` into a globally unique pane id.
+///
+/// # Panics
+///
+/// Panics when either input is outside the persistence-safe encoded domain.
+/// Production mux paths use [`try_encode_sharded_pane_id`] so an invalid
+/// backend response becomes a normal error rather than a process panic.
 #[must_use]
 pub fn encode_sharded_pane_id(shard_id: ShardId, local_pane_id: u64) -> u64 {
-    assert!(
-        shard_id.0 <= MAX_SHARD_ID,
-        "shard id {} exceeds {}-bit encoded capacity (max={MAX_SHARD_ID})",
-        shard_id.0,
-        SHARD_ID_BITS
-    );
-    ((shard_id.0 as u64) << (64 - SHARD_ID_BITS)) | (local_pane_id & LOCAL_PANE_ID_MASK)
+    try_encode_sharded_pane_id(shard_id, local_pane_id)
+        .unwrap_or_else(|err| panic!("{err}"))
+}
+
+/// Fallibly decode a persistence-safe global pane id.
+pub fn try_decode_sharded_pane_id(global_pane_id: u64) -> Result<(ShardId, u64)> {
+    if global_pane_id > MAX_GLOBAL_PANE_ID {
+        return Err(crate::Error::Wezterm(WeztermError::CommandFailed(
+            format!(
+                "global pane id {global_pane_id} exceeds persistence-safe signed-64 range (max={MAX_GLOBAL_PANE_ID})"
+            ),
+        )));
+    }
+
+    let shard_idx = (global_pane_id >> LOCAL_PANE_ID_BITS) as usize;
+    let local = global_pane_id & LOCAL_PANE_ID_MASK;
+    Ok((ShardId(shard_idx), local))
 }
 
 /// Decode a globally encoded pane id into `(shard_id, local_pane_id)`.
+///
+/// # Panics
+///
+/// Panics when `global_pane_id` is outside the persistence-safe encoded
+/// domain. Production routing paths use [`try_decode_sharded_pane_id`] so
+/// untrusted or stale ids become normal errors rather than process panics.
 #[must_use]
 pub fn decode_sharded_pane_id(global_pane_id: u64) -> (ShardId, u64) {
-    let shard_idx = (global_pane_id >> (64 - SHARD_ID_BITS)) as usize;
-    let local = global_pane_id & LOCAL_PANE_ID_MASK;
-    (ShardId(shard_idx), local)
+    try_decode_sharded_pane_id(global_pane_id).unwrap_or_else(|err| panic!("{err}"))
 }
 
 /// Returns true when a pane id has non-zero shard bits.
 #[must_use]
 pub fn is_sharded_pane_id(pane_id: u64) -> bool {
-    (pane_id >> (64 - SHARD_ID_BITS)) != 0
+    (pane_id >> LOCAL_PANE_ID_BITS) != 0
 }
 
 /// Serialize HashMap<u64, V> as a map with string keys for JSON compatibility.
@@ -426,7 +493,7 @@ pub struct ShardedWeztermClient {
     backends: Vec<ShardBackend>,
     backend_index: HashMap<ShardId, usize>,
     strategy: AssignmentStrategy,
-    pane_routes: RwLock<HashMap<u64, PaneRoute>>,
+    pane_routes: PaneMap<PaneRoute>,
     round_robin_cursor: AtomicUsize,
     hash_ring: Option<HashRing<ShardId>>,
     telemetry: ShardingTelemetry,
@@ -451,7 +518,7 @@ impl ShardedWeztermClient {
         }
         if let Some(invalid) = ids.iter().find(|id| id.0 > MAX_SHARD_ID) {
             return Err(crate::Error::Wezterm(WeztermError::CommandFailed(format!(
-                "shard id {} exceeds {}-bit encoded pane id capacity (max {})",
+                "shard id {} exceeds {}-bit persistence-safe encoded pane id capacity (max {})",
                 invalid.0, SHARD_ID_BITS, MAX_SHARD_ID
             ))));
         }
@@ -475,7 +542,7 @@ impl ShardedWeztermClient {
             backends,
             backend_index,
             strategy,
-            pane_routes: RwLock::new(HashMap::new()),
+            pane_routes: PaneMap::new(),
             round_robin_cursor: AtomicUsize::new(0),
             hash_ring,
             telemetry: ShardingTelemetry::default(),
@@ -533,6 +600,201 @@ impl ShardedWeztermClient {
         )))
     }
 
+    fn codec_error_with_cleanup_failure(
+        primary: crate::Error,
+        creation_op: &'static str,
+        cleanup_op: &'static str,
+        backend: &ShardBackend,
+        local_pane_id: u64,
+        cleanup_error: crate::Error,
+    ) -> crate::Error {
+        // `try_encode_sharded_pane_id` currently returns this exact typed
+        // shape. Keep the codec failure first and in the same error variant so
+        // rollback trouble adds evidence without replacing the root cause.
+        let primary_detail = match primary {
+            crate::Error::Wezterm(WeztermError::CommandFailed(detail)) => detail,
+            other => other.to_string(),
+        };
+        crate::Error::Wezterm(WeztermError::CommandFailed(format!(
+            "{primary_detail}; best-effort rollback after {creation_op} failed: {cleanup_op} for local pane {local_pane_id} on {} ({}) returned: {cleanup_error}",
+            backend.label, backend.id
+        )))
+    }
+
+    async fn encode_created_pane_or_rollback(
+        backend: &ShardBackend,
+        shard_id: ShardId,
+        local_pane_id: u64,
+        creation_op: &'static str,
+    ) -> Result<u64> {
+        let primary = match try_encode_sharded_pane_id(shard_id, local_pane_id) {
+            Ok(global_pane_id) => return Ok(global_pane_id),
+            Err(primary) => primary,
+        };
+
+        match backend.handle.kill_pane(local_pane_id).await {
+            Ok(()) => Err(primary),
+            Err(cleanup_error) => Err(Self::codec_error_with_cleanup_failure(
+                primary,
+                creation_op,
+                "kill_pane",
+                backend,
+                local_pane_id,
+                cleanup_error,
+            )),
+        }
+    }
+
+    async fn run_bounded_pane_creation_rollback(
+        cleanup_cx: &crate::cx::Cx,
+        handle: &WeztermHandle,
+        local_pane_id: u64,
+    ) -> Result<()> {
+        match crate::runtime_async::timeout_with_cx(
+            cleanup_cx,
+            PANE_CREATION_ROLLBACK_TIMEOUT,
+            handle.kill_pane_with_cx(cleanup_cx, local_pane_id),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(timeout_error) => Err(crate::Error::Wezterm(WeztermError::CommandFailed(
+                format!(
+                    "pane-creation rollback exceeded its {}s hard limit: {timeout_error}",
+                    PANE_CREATION_ROLLBACK_TIMEOUT.as_secs()
+                ),
+            ))),
+        }
+    }
+
+    fn pane_creation_rollback_panic_error(
+        phase: &str,
+        payload: Box<dyn std::any::Any + Send>,
+    ) -> crate::Error {
+        let panic_detail = if let Some(message) = payload.downcast_ref::<&'static str>() {
+            (*message).to_string()
+        } else if let Some(message) = payload.downcast_ref::<String>() {
+            message.clone()
+        } else {
+            "non-string panic payload".to_string()
+        };
+        crate::Error::Wezterm(WeztermError::CommandFailed(format!(
+            "pane-creation rollback {phase} panicked: {panic_detail}"
+        )))
+    }
+
+    async fn run_pane_creation_rollback_catching_panic(
+        cleanup_cx: &crate::cx::Cx,
+        handle: &WeztermHandle,
+        local_pane_id: u64,
+    ) -> Result<()> {
+        let rollback = std::panic::AssertUnwindSafe(Self::run_bounded_pane_creation_rollback(
+            cleanup_cx,
+            handle,
+            local_pane_id,
+        ))
+        .catch_unwind()
+        .await;
+        match rollback {
+            Ok(result) => result,
+            Err(payload) => Err(Self::pane_creation_rollback_panic_error(
+                "operation",
+                payload,
+            )),
+        }
+    }
+
+    async fn rollback_unencodable_pane_with_fresh_cx(
+        backend: &ShardBackend,
+        local_pane_id: u64,
+    ) -> Result<()> {
+        // Compensation must not inherit cancellation from the request that
+        // already caused the creation result to become unreturnable. A
+        // minimal cleanup budget plus an explicit wall-time ceiling keeps the
+        // independent capability tightly bounded.
+        let cleanup_cx = crate::cx::Cx::for_request_with_budget(crate::cx::Budget::MINIMAL);
+
+        if let Some(runtime_handle) = crate::runtime_async::current_runtime_handle() {
+            let cleanup_handle = backend.handle.clone();
+            match crate::cx::try_spawn_with_cx(
+                &runtime_handle,
+                &cleanup_cx,
+                move |cleanup_cx| async move {
+                    Self::run_pane_creation_rollback_catching_panic(
+                        &cleanup_cx,
+                        &cleanup_handle,
+                        local_pane_id,
+                    )
+                    .await
+                },
+            ) {
+                Ok(join) => {
+                    // Normally this is structured: the creator awaits the
+                    // compensator. If the creator future itself is dropped,
+                    // dropping asupersync's JoinHandle detaches rather than
+                    // aborts, so the independently bounded rollback survives.
+                    return match std::panic::AssertUnwindSafe(join).catch_unwind().await {
+                        Ok(result) => result,
+                        Err(payload) => Err(Self::pane_creation_rollback_panic_error(
+                            "join",
+                            payload,
+                        )),
+                    };
+                }
+                Err(admission_error) => {
+                    // Runtime shutdown or admission pressure can prevent task
+                    // creation. Inline cleanup remains the strongest available
+                    // fallback; retain both errors if that attempt also fails.
+                    return Self::run_pane_creation_rollback_catching_panic(
+                        &cleanup_cx,
+                        &backend.handle,
+                        local_pane_id,
+                    )
+                    .await
+                    .map_err(|cleanup_error| {
+                        crate::Error::Wezterm(WeztermError::CommandFailed(format!(
+                            "bounded rollback task admission failed: {admission_error}; inline bounded rollback also failed: {cleanup_error}"
+                        )))
+                    });
+                }
+            }
+        }
+
+        // Compatibility fallback for callers polling this future outside the
+        // FrankenTerm runtime. It is still caller-Cx-independent and bounded,
+        // but cannot gain the runtime task's survive-parent-drop property.
+        Self::run_pane_creation_rollback_catching_panic(
+            &cleanup_cx,
+            &backend.handle,
+            local_pane_id,
+        )
+        .await
+    }
+
+    async fn encode_created_pane_or_rollback_after_cx_creation(
+        backend: &ShardBackend,
+        shard_id: ShardId,
+        local_pane_id: u64,
+        creation_op: &'static str,
+    ) -> Result<u64> {
+        let primary = match try_encode_sharded_pane_id(shard_id, local_pane_id) {
+            Ok(global_pane_id) => return Ok(global_pane_id),
+            Err(primary) => primary,
+        };
+
+        match Self::rollback_unencodable_pane_with_fresh_cx(backend, local_pane_id).await {
+            Ok(()) => Err(primary),
+            Err(cleanup_error) => Err(Self::codec_error_with_cleanup_failure(
+                primary,
+                creation_op,
+                "kill_pane_with_fresh_cleanup_cx",
+                backend,
+                local_pane_id,
+                cleanup_error,
+            )),
+        }
+    }
+
     fn next_round_robin_shard(&self) -> ShardId {
         let backend_count = self.backends.len().max(1);
         let idx = self.round_robin_cursor.fetch_add(1, Ordering::Relaxed) % backend_count;
@@ -578,8 +840,9 @@ impl ShardedWeztermClient {
             .spawn(cwd, domain_name)
             .await
             .map_err(|err| self.backend_error(shard, "spawn", None, err))?;
-        let global_id = encode_sharded_pane_id(shard, local_id);
-        self.pane_routes.write().await.insert(
+        let global_id =
+            Self::encode_created_pane_or_rollback(backend, shard, local_id, "spawn").await?;
+        self.pane_routes.insert(
             global_id,
             PaneRoute {
                 shard_id: shard,
@@ -593,12 +856,14 @@ impl ShardedWeztermClient {
     /// caller's asupersync capability context (ft-xbnl0.2.3 Cx-first
     /// entry point).
     ///
-    /// Routes `cx` through both the subprocess I/O via
-    /// [`WeztermInterface::spawn_with_cx`] (landed in tick 46) AND
-    /// the internal `pane_routes` RwLock acquire via
-    /// [`crate::runtime_async::RwLock::write_with_cx`], so caller
-    /// cancellation/budget/virtual time propagate end-to-end through
-    /// the entire spawn pipeline.
+    /// Routes `cx` through subprocess I/O via
+    /// [`WeztermInterface::spawn_with_cx`]. Once the backend has created a
+    /// pane, the route-cache commit is deliberately synchronous and
+    /// non-yielding: cancellation cannot strand a successfully created pane
+    /// between the backend response and local route publication. If the
+    /// backend returns an unencodable local id, rollback runs under a fresh
+    /// minimal-budget Cx with a hard timeout; the normally joined compensator
+    /// remains bounded but survives an abrupt drop of this creator future.
     pub async fn spawn_with_hints_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -614,8 +879,14 @@ impl ShardedWeztermClient {
             .spawn_with_cx(cx, cwd, domain_name)
             .await
             .map_err(|err| self.backend_error(shard, "spawn", None, err))?;
-        let global_id = encode_sharded_pane_id(shard, local_id);
-        self.pane_routes.write_with_cx(cx).await.insert(
+        let global_id = Self::encode_created_pane_or_rollback_after_cx_creation(
+            backend,
+            shard,
+            local_id,
+            "spawn",
+        )
+        .await?;
+        self.pane_routes.insert(
             global_id,
             PaneRoute {
                 shard_id: shard,
@@ -638,7 +909,7 @@ impl ShardedWeztermClient {
 
             for mut pane in panes {
                 let local_pane_id = pane.pane_id;
-                let global_pane_id = encode_sharded_pane_id(backend.id, local_pane_id);
+                let global_pane_id = try_encode_sharded_pane_id(backend.id, local_pane_id)?;
                 pane.pane_id = global_pane_id;
                 pane.extra
                     .insert("shard_id".to_string(), Value::from(backend.id.0 as u64));
@@ -663,8 +934,7 @@ impl ShardedWeztermClient {
     pub async fn list_all_panes(&self) -> Result<Vec<PaneInfo>> {
         self.telemetry.pane_listings.fetch_add(1, Ordering::Relaxed);
         let (panes, routes) = self.collect_panes().await?;
-        let mut guard = self.pane_routes.write().await;
-        *guard = routes;
+        self.pane_routes.replace_all(routes);
         Ok(panes)
     }
 
@@ -690,7 +960,7 @@ impl ShardedWeztermClient {
 
             for mut pane in panes {
                 let local_pane_id = pane.pane_id;
-                let global_pane_id = encode_sharded_pane_id(backend.id, local_pane_id);
+                let global_pane_id = try_encode_sharded_pane_id(backend.id, local_pane_id)?;
                 pane.pane_id = global_pane_id;
                 pane.extra
                     .insert("shard_id".to_string(), Value::from(backend.id.0 as u64));
@@ -718,14 +988,14 @@ impl ShardedWeztermClient {
     /// Uses `collect_panes_with_cx(cx)` so per-backend `list_panes`
     /// calls flow through `WeztermInterface::list_panes_with_cx`
     /// (tick 27 trait extension); the concrete `WeztermClient` impl
-    /// routes to `MuxPool::list_panes_with_cx` on the fast path.
-    /// The internal `pane_routes` RwLock acquire uses
-    /// `write_with_cx(cx)` (the primitive from tick 9).
+    /// routes to `MuxPool::list_panes_with_cx` on the fast path. Publishing
+    /// the completed route snapshot is synchronous and non-yielding, so a
+    /// cancellation observed after discovery cannot leave a half-refreshed
+    /// cache.
     pub async fn list_all_panes_with_cx(&self, cx: &crate::cx::Cx) -> Result<Vec<PaneInfo>> {
         self.telemetry.pane_listings.fetch_add(1, Ordering::Relaxed);
         let (panes, routes) = self.collect_panes_with_cx(cx).await?;
-        let mut guard = self.pane_routes.write_with_cx(cx).await;
-        *guard = routes;
+        self.pane_routes.replace_all(routes);
         Ok(panes)
     }
 
@@ -838,80 +1108,59 @@ impl ShardedWeztermClient {
 
     async fn route_for_global_pane_id(&self, pane_id: u64) -> Result<PaneRoute> {
         self.telemetry.route_lookups.fetch_add(1, Ordering::Relaxed);
-        if let Some(route) = self.pane_routes.read().await.get(&pane_id).copied() {
+        if let Some(route) = self.pane_routes.get(pane_id) {
             return Ok(route);
         }
 
         let (_panes, routes) = self.collect_panes().await?;
-        {
-            let mut guard = self.pane_routes.write().await;
-            *guard = routes;
-            if let Some(route) = guard.get(&pane_id).copied() {
-                return Ok(route);
-            }
+        self.pane_routes.replace_all(routes);
+        if let Some(route) = self.pane_routes.get(pane_id) {
+            return Ok(route);
         }
 
-        if self.backends.len() == 1 {
-            return Ok(PaneRoute {
-                shard_id: self.backends[0].id,
-                local_pane_id: pane_id,
-            });
-        }
-
-        let (decoded_shard, decoded_local) = decode_sharded_pane_id(pane_id);
-        if self.backend_index.contains_key(&decoded_shard) {
-            return Ok(PaneRoute {
-                shard_id: decoded_shard,
-                local_pane_id: decoded_local,
-            });
-        }
-
-        Err(crate::Error::Wezterm(WeztermError::PaneNotFound(pane_id)))
+        self.resolve_uncached_pane_route(pane_id)
     }
 
     /// Resolve a global pane_id to a `PaneRoute` bound to the caller's
     /// asupersync capability context (ft-xbnl0.2.3 Cx-first internal
     /// helper).
     ///
-    /// Uses `pane_routes.read_with_cx(cx)` / `write_with_cx(cx)` (the
-    /// primitives from tick 9) and `collect_panes_with_cx(cx)` so the
-    /// full route-discovery path threads cx end-to-end. Callers that
-    /// have already-Cx-first `_with_cx` handle methods should use this
-    /// internal helper to avoid breaking the Cx-first chain at the
-    /// route-lookup boundary.
+    /// Backend discovery uses `collect_panes_with_cx(cx)` so cancellable I/O
+    /// remains bound to the caller. Cache probes and snapshot publication are
+    /// synchronous and non-yielding; callers with an existing Cx should use
+    /// this helper so every blocking backend operation remains Cx-aware.
     async fn route_for_global_pane_id_with_cx(
         &self,
         cx: &crate::cx::Cx,
         pane_id: u64,
     ) -> Result<PaneRoute> {
         self.telemetry.route_lookups.fetch_add(1, Ordering::Relaxed);
-        if let Some(route) = self
-            .pane_routes
-            .read_with_cx(cx)
-            .await
-            .get(&pane_id)
-            .copied()
-        {
+        if let Some(route) = self.pane_routes.get(pane_id) {
             return Ok(route);
         }
 
         let (_panes, routes) = self.collect_panes_with_cx(cx).await?;
-        {
-            let mut guard = self.pane_routes.write_with_cx(cx).await;
-            *guard = routes;
-            if let Some(route) = guard.get(&pane_id).copied() {
-                return Ok(route);
-            }
+        self.pane_routes.replace_all(routes);
+        if let Some(route) = self.pane_routes.get(pane_id) {
+            return Ok(route);
         }
 
-        if self.backends.len() == 1 {
+        self.resolve_uncached_pane_route(pane_id)
+    }
+
+    fn resolve_uncached_pane_route(&self, pane_id: u64) -> Result<PaneRoute> {
+        // A one-backend client historically accepts raw backend-local ids. Keep
+        // that useful behavior, but only inside the actual 48-bit local field.
+        // Larger values must be interpreted as encoded globals (or rejected),
+        // never forwarded verbatim to the backend.
+        if self.backends.len() == 1 && pane_id <= LOCAL_PANE_ID_MASK {
             return Ok(PaneRoute {
                 shard_id: self.backends[0].id,
                 local_pane_id: pane_id,
             });
         }
 
-        let (decoded_shard, decoded_local) = decode_sharded_pane_id(pane_id);
+        let (decoded_shard, decoded_local) = try_decode_sharded_pane_id(pane_id)?;
         if self.backend_index.contains_key(&decoded_shard) {
             return Ok(PaneRoute {
                 shard_id: decoded_shard,
@@ -935,13 +1184,12 @@ impl ShardedWeztermClient {
     /// caller's asupersync capability context (ft-xbnl0.2.3 Cx-first
     /// internal helper).
     ///
-    /// Uses [`Self::list_all_panes_with_cx`] so the underlying
-    /// per-backend `list_panes_with_cx` calls (and the
-    /// `pane_routes.write_with_cx` refresh) all honor caller
-    /// cancellation/budget/virtual time. Shares the pure
-    /// `resolve_window_shard` matcher with the legacy
-    /// `route_for_window_id` so both variants produce bit-for-bit
-    /// identical decisions for the same shard state.
+    /// Uses [`Self::list_all_panes_with_cx`] so the underlying per-backend
+    /// `list_panes_with_cx` calls honor caller cancellation, budget, and
+    /// virtual time. The completed route snapshot publishes synchronously.
+    /// Shares the pure `resolve_window_shard` matcher with the legacy
+    /// `route_for_window_id` so both variants produce bit-for-bit identical
+    /// decisions for the same shard state.
     async fn route_for_window_id_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -998,7 +1246,8 @@ impl WeztermInterface for ShardedWeztermClient {
                 .map_err(|err| {
                     self.backend_error(route.shard_id, "get_pane", Some(pane_id), err)
                 })?;
-            pane.pane_id = encode_sharded_pane_id(route.shard_id, route.local_pane_id);
+            pane.pane_id =
+                try_encode_sharded_pane_id(route.shard_id, route.local_pane_id)?;
             pane.extra
                 .insert("shard_id".to_string(), Value::from(route.shard_id.0 as u64));
             pane.extra.insert(
@@ -1140,8 +1389,14 @@ impl WeztermInterface for ShardedWeztermClient {
                 .spawn_targeted(cwd.as_deref(), domain_name.as_deref(), target)
                 .await
                 .map_err(|err| self.backend_error(shard, "spawn_targeted", None, err))?;
-            let global_id = encode_sharded_pane_id(shard, local_id);
-            self.pane_routes.write().await.insert(
+            let global_id = Self::encode_created_pane_or_rollback(
+                backend,
+                shard,
+                local_id,
+                "spawn_targeted",
+            )
+            .await?;
+            self.pane_routes.insert(
                 global_id,
                 PaneRoute {
                     shard_id: shard,
@@ -1171,8 +1426,14 @@ impl WeztermInterface for ShardedWeztermClient {
                     self.backend_error(route.shard_id, "split_pane", Some(pane_id), err)
                 })?;
 
-            let global_new = encode_sharded_pane_id(route.shard_id, local_new);
-            self.pane_routes.write().await.insert(
+            let global_new = Self::encode_created_pane_or_rollback(
+                backend,
+                route.shard_id,
+                local_new,
+                "split_pane",
+            )
+            .await?;
+            self.pane_routes.insert(
                 global_new,
                 PaneRoute {
                     shard_id: route.shard_id,
@@ -1214,8 +1475,8 @@ impl WeztermInterface for ShardedWeztermClient {
                 })?;
 
             if let Some(local_id) = next_local {
-                let global_id = encode_sharded_pane_id(route.shard_id, local_id);
-                self.pane_routes.write().await.insert(
+                let global_id = try_encode_sharded_pane_id(route.shard_id, local_id)?;
+                self.pane_routes.insert(
                     global_id,
                     PaneRoute {
                         shard_id: route.shard_id,
@@ -1240,7 +1501,7 @@ impl WeztermInterface for ShardedWeztermClient {
                 .map_err(|err| {
                     self.backend_error(route.shard_id, "kill_pane", Some(pane_id), err)
                 })?;
-            self.pane_routes.write().await.remove(&pane_id);
+            self.pane_routes.remove(pane_id);
             Ok(())
         })
     }
@@ -1309,16 +1570,12 @@ impl WeztermInterface for ShardedWeztermClient {
     // Same rationale as tick 30 (Arc<dyn>) and tick 31 (UnifiedClient):
     // without explicit _with_cx overrides, calls fall through to the
     // trait default which loses cx at the ShardedWezterm hop. Each
-    // override routes the pane_id through `route_for_global_pane_id`
-    // and forwards cx through `backend.handle.METHOD_with_cx(cx, ...)`
-    // so the concrete inner impl's Cx-first path (e.g.
-    // WeztermClient → MuxPool → DirectMuxClient) runs cx-aware.
-    //
-    // Route lookups (`route_for_global_pane_id`) still use ambient Cx
-    // — they hit the `pane_routes` RwLock which has its own cx-first
-    // `read_with_cx`/`write_with_cx` primitives but no current caller
-    // has cx in hand at this dispatch point. Follow-up: thread cx
-    // through route_for_global_pane_id too.
+    // override routes pane ids through `route_for_global_pane_id_with_cx`
+    // (and targeted window ids through `route_for_window_id_with_cx`),
+    // then forwards cx through `backend.handle.METHOD_with_cx(cx, ...)`.
+    // The route-cache locks, backend discovery, and concrete inner path
+    // (e.g. WeztermClient → MuxPool → DirectMuxClient) therefore all
+    // share the caller's cancellation, budget, and virtual-time context.
 
     fn list_panes_with_cx<'a>(&'a self, cx: &'a crate::cx::Cx) -> WeztermFuture<'a, Vec<PaneInfo>> {
         Box::pin(async move { self.list_all_panes_with_cx(cx).await })
@@ -1339,7 +1596,8 @@ impl WeztermInterface for ShardedWeztermClient {
                 .map_err(|err| {
                     self.backend_error(route.shard_id, "get_pane", Some(pane_id), err)
                 })?;
-            pane.pane_id = encode_sharded_pane_id(route.shard_id, route.local_pane_id);
+            pane.pane_id =
+                try_encode_sharded_pane_id(route.shard_id, route.local_pane_id)?;
             pane.extra
                 .insert("shard_id".to_string(), Value::from(route.shard_id.0 as u64));
             pane.extra.insert(
@@ -1524,7 +1782,11 @@ impl WeztermInterface for ShardedWeztermClient {
                 .handle
                 .kill_pane_with_cx(cx, route.local_pane_id)
                 .await
-                .map_err(|err| self.backend_error(route.shard_id, "kill_pane", Some(pane_id), err))
+                .map_err(|err| {
+                    self.backend_error(route.shard_id, "kill_pane", Some(pane_id), err)
+                })?;
+            self.pane_routes.remove(pane_id);
+            Ok(())
         })
     }
 
@@ -1580,8 +1842,14 @@ impl WeztermInterface for ShardedWeztermClient {
                 .spawn_targeted_with_cx(cx, cwd, domain_name, target)
                 .await
                 .map_err(|err| self.backend_error(shard, "spawn_targeted", None, err))?;
-            let global_id = encode_sharded_pane_id(shard, local_id);
-            self.pane_routes.write_with_cx(cx).await.insert(
+            let global_id = Self::encode_created_pane_or_rollback_after_cx_creation(
+                backend,
+                shard,
+                local_id,
+                "spawn_targeted",
+            )
+            .await?;
+            self.pane_routes.insert(
                 global_id,
                 PaneRoute {
                     shard_id: shard,
@@ -1611,8 +1879,14 @@ impl WeztermInterface for ShardedWeztermClient {
                     self.backend_error(route.shard_id, "split_pane", Some(pane_id), err)
                 })?;
 
-            let global_new = encode_sharded_pane_id(route.shard_id, local_new);
-            self.pane_routes.write_with_cx(cx).await.insert(
+            let global_new = Self::encode_created_pane_or_rollback_after_cx_creation(
+                backend,
+                route.shard_id,
+                local_new,
+                "split_pane",
+            )
+            .await?;
+            self.pane_routes.insert(
                 global_new,
                 PaneRoute {
                     shard_id: route.shard_id,
@@ -1679,6 +1953,408 @@ mod tests {
         }
     }
 
+    struct CreationBoundaryBackend {
+        ambient_kills: AtomicUsize,
+        ambient_last_killed: AtomicU64,
+        cx_kills: AtomicUsize,
+        cx_last_killed: AtomicU64,
+        cx_kills_with_cancelled_context: AtomicUsize,
+        created_local_pane_id: u64,
+        cancel_after_cx_creation: bool,
+        fail_cleanup: bool,
+    }
+
+    impl CreationBoundaryBackend {
+        const CLEANUP_FAILURE: &str = "injected rollback kill failure";
+        const OVERSIZED_LOCAL_PANE_ID: u64 = LOCAL_PANE_ID_MASK + 1;
+        const VALID_LOCAL_PANE_ID: u64 = 41;
+
+        const fn new(
+            created_local_pane_id: u64,
+            cancel_after_cx_creation: bool,
+            fail_cleanup: bool,
+        ) -> Self {
+            Self {
+                ambient_kills: AtomicUsize::new(0),
+                ambient_last_killed: AtomicU64::new(0),
+                cx_kills: AtomicUsize::new(0),
+                cx_last_killed: AtomicU64::new(0),
+                cx_kills_with_cancelled_context: AtomicUsize::new(0),
+                created_local_pane_id,
+                cancel_after_cx_creation,
+                fail_cleanup,
+            }
+        }
+
+        const fn oversized(fail_cleanup: bool) -> Self {
+            Self::new(Self::OVERSIZED_LOCAL_PANE_ID, false, fail_cleanup)
+        }
+
+        const fn cancel_after_valid_creation() -> Self {
+            Self::new(Self::VALID_LOCAL_PANE_ID, true, false)
+        }
+
+        const fn cancel_after_oversized_creation() -> Self {
+            Self::new(Self::OVERSIZED_LOCAL_PANE_ID, true, false)
+        }
+
+        fn cancel_after_creation_if_requested(&self, cx: &crate::cx::Cx) {
+            if self.cancel_after_cx_creation {
+                cx.cancel_with(
+                    crate::outcome::CancelKind::User,
+                    Some("injected cancellation after backend pane creation"),
+                );
+            }
+        }
+
+        fn cleanup_result(&self) -> Result<()> {
+            if self.fail_cleanup {
+                Err(crate::Error::Wezterm(WeztermError::CommandFailed(
+                    Self::CLEANUP_FAILURE.to_string(),
+                )))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    impl WeztermInterface for CreationBoundaryBackend {
+        fn list_panes(&self) -> WeztermFuture<'_, Vec<PaneInfo>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+
+        fn get_pane(&self, pane_id: u64) -> WeztermFuture<'_, PaneInfo> {
+            Box::pin(async move { Err(crate::Error::Wezterm(WeztermError::PaneNotFound(pane_id))) })
+        }
+
+        fn get_text(&self, _pane_id: u64, _escapes: bool) -> WeztermFuture<'_, String> {
+            Box::pin(async { Ok(String::new()) })
+        }
+
+        fn send_text(&self, _pane_id: u64, _text: &str) -> WeztermFuture<'_, ()> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn send_text_no_paste(&self, _pane_id: u64, _text: &str) -> WeztermFuture<'_, ()> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn send_text_with_options(
+            &self,
+            _pane_id: u64,
+            _text: &str,
+            _no_paste: bool,
+            _no_newline: bool,
+        ) -> WeztermFuture<'_, ()> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn send_control(&self, _pane_id: u64, _control_char: &str) -> WeztermFuture<'_, ()> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn send_ctrl_c(&self, _pane_id: u64) -> WeztermFuture<'_, ()> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn send_ctrl_d(&self, _pane_id: u64) -> WeztermFuture<'_, ()> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn spawn(
+            &self,
+            _cwd: Option<&str>,
+            _domain_name: Option<&str>,
+        ) -> WeztermFuture<'_, u64> {
+            Box::pin(async { Ok(self.created_local_pane_id) })
+        }
+
+        fn spawn_targeted(
+            &self,
+            _cwd: Option<&str>,
+            _domain_name: Option<&str>,
+            _target: SpawnTarget,
+        ) -> WeztermFuture<'_, u64> {
+            Box::pin(async { Ok(self.created_local_pane_id) })
+        }
+
+        fn split_pane(
+            &self,
+            _pane_id: u64,
+            _direction: SplitDirection,
+            _cwd: Option<&str>,
+            _percent: Option<u8>,
+        ) -> WeztermFuture<'_, u64> {
+            Box::pin(async { Ok(self.created_local_pane_id) })
+        }
+
+        fn spawn_with_cx<'a>(
+            &'a self,
+            cx: &'a crate::cx::Cx,
+            _cwd: Option<&'a str>,
+            _domain_name: Option<&'a str>,
+        ) -> WeztermFuture<'a, u64> {
+            Box::pin(async move {
+                self.cancel_after_creation_if_requested(cx);
+                Ok(self.created_local_pane_id)
+            })
+        }
+
+        fn spawn_targeted_with_cx<'a>(
+            &'a self,
+            cx: &'a crate::cx::Cx,
+            _cwd: Option<&'a str>,
+            _domain_name: Option<&'a str>,
+            _target: SpawnTarget,
+        ) -> WeztermFuture<'a, u64> {
+            Box::pin(async move {
+                self.cancel_after_creation_if_requested(cx);
+                Ok(self.created_local_pane_id)
+            })
+        }
+
+        fn split_pane_with_cx<'a>(
+            &'a self,
+            cx: &'a crate::cx::Cx,
+            _pane_id: u64,
+            _direction: SplitDirection,
+            _cwd: Option<&'a str>,
+            _percent: Option<u8>,
+        ) -> WeztermFuture<'a, u64> {
+            Box::pin(async move {
+                self.cancel_after_creation_if_requested(cx);
+                Ok(self.created_local_pane_id)
+            })
+        }
+
+        fn activate_pane(&self, _pane_id: u64) -> WeztermFuture<'_, ()> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn get_pane_direction(
+            &self,
+            _pane_id: u64,
+            _direction: MoveDirection,
+        ) -> WeztermFuture<'_, Option<u64>> {
+            Box::pin(async { Ok(None) })
+        }
+
+        fn kill_pane(&self, pane_id: u64) -> WeztermFuture<'_, ()> {
+            Box::pin(async move {
+                self.ambient_kills.fetch_add(1, Ordering::Relaxed);
+                self.ambient_last_killed.store(pane_id, Ordering::Relaxed);
+                self.cleanup_result()
+            })
+        }
+
+        fn kill_pane_with_cx<'a>(
+            &'a self,
+            cx: &'a crate::cx::Cx,
+            pane_id: u64,
+        ) -> WeztermFuture<'a, ()> {
+            Box::pin(async move {
+                // Force one scheduler boundary so the drop-safety regression
+                // can discard the creator while this bounded compensator is
+                // still in flight.
+                crate::runtime_async::task::yield_now().await;
+                self.cx_kills.fetch_add(1, Ordering::Relaxed);
+                self.cx_last_killed.store(pane_id, Ordering::Relaxed);
+                if cx.is_cancel_requested() {
+                    self.cx_kills_with_cancelled_context
+                        .fetch_add(1, Ordering::Relaxed);
+                    return Err(crate::Error::Wezterm(WeztermError::CommandFailed(
+                        "rollback received the already-cancelled caller Cx".to_string(),
+                    )));
+                }
+                self.cleanup_result()
+            })
+        }
+
+        fn zoom_pane(&self, _pane_id: u64, _zoom: bool) -> WeztermFuture<'_, ()> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn circuit_status(&self) -> CircuitBreakerStatus {
+            CircuitBreakerStatus::default()
+        }
+    }
+
+    fn oversized_creation_client(
+        fail_cleanup: bool,
+    ) -> (ShardedWeztermClient, Arc<CreationBoundaryBackend>) {
+        let backend = Arc::new(CreationBoundaryBackend::oversized(fail_cleanup));
+        let handle: WeztermHandle = backend.clone();
+        let client = ShardedWeztermClient::new(
+            vec![ShardBackend::new(ShardId(0), "oversized", handle)],
+            AssignmentStrategy::RoundRobin,
+        )
+        .unwrap();
+        (client, backend)
+    }
+
+    fn cancelling_creation_client() -> (ShardedWeztermClient, Arc<CreationBoundaryBackend>) {
+        let backend = Arc::new(CreationBoundaryBackend::cancel_after_valid_creation());
+        let handle: WeztermHandle = backend.clone();
+        let client = ShardedWeztermClient::new(
+            vec![ShardBackend::new(ShardId(0), "cancelling", handle)],
+            AssignmentStrategy::RoundRobin,
+        )
+        .unwrap();
+        (client, backend)
+    }
+
+    fn cancelling_oversized_creation_client() -> (
+        ShardedWeztermClient,
+        Arc<CreationBoundaryBackend>,
+    ) {
+        let backend = Arc::new(CreationBoundaryBackend::cancel_after_oversized_creation());
+        let handle: WeztermHandle = backend.clone();
+        let client = ShardedWeztermClient::new(
+            vec![ShardBackend::new(
+                ShardId(0),
+                "cancelling-oversized",
+                handle,
+            )],
+            AssignmentStrategy::RoundRobin,
+        )
+        .unwrap();
+        (client, backend)
+    }
+
+    fn seed_split_parent_route(client: &ShardedWeztermClient) -> u64 {
+        let parent_id = try_encode_sharded_pane_id(ShardId(0), 7).unwrap();
+        client.pane_routes.insert(
+            parent_id,
+            PaneRoute {
+                shard_id: ShardId(0),
+                local_pane_id: 7,
+            },
+        );
+        parent_id
+    }
+
+    fn assert_unmasked_codec_error(error: &crate::Error) {
+        let expected = try_encode_sharded_pane_id(
+            ShardId(0),
+            CreationBoundaryBackend::OVERSIZED_LOCAL_PANE_ID,
+        )
+        .unwrap_err()
+        .to_string();
+        assert_eq!(error.to_string(), expected);
+    }
+
+    fn assert_ambient_cleanup(backend: &CreationBoundaryBackend) {
+        assert_eq!(backend.ambient_kills.load(Ordering::Relaxed), 1);
+        assert_eq!(backend.cx_kills.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            backend.ambient_last_killed.load(Ordering::Relaxed),
+            CreationBoundaryBackend::OVERSIZED_LOCAL_PANE_ID
+        );
+    }
+
+    fn assert_cx_cleanup(backend: &CreationBoundaryBackend) {
+        assert_eq!(backend.ambient_kills.load(Ordering::Relaxed), 0);
+        assert_eq!(backend.cx_kills.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            backend
+                .cx_kills_with_cancelled_context
+                .load(Ordering::Relaxed),
+            0,
+            "rollback must use a fresh cleanup Cx, never the cancelled caller Cx"
+        );
+        assert_eq!(
+            backend.cx_last_killed.load(Ordering::Relaxed),
+            CreationBoundaryBackend::OVERSIZED_LOCAL_PANE_ID
+        );
+    }
+
+    fn assert_cancelled_cx_rollback(
+        caller_cx: &crate::cx::Cx,
+        backend: &CreationBoundaryBackend,
+        error: &crate::Error,
+    ) {
+        assert!(
+            caller_cx.is_cancel_requested(),
+            "creation backend must cancel the caller Cx before returning its invalid id"
+        );
+        assert_unmasked_codec_error(error);
+        assert_cx_cleanup(backend);
+    }
+
+    fn assert_post_backend_cancellation_commit(
+        cx: &crate::cx::Cx,
+        client: &ShardedWeztermClient,
+        backend: &CreationBoundaryBackend,
+        global_pane_id: u64,
+    ) {
+        assert!(
+            cx.is_cancel_requested(),
+            "the backend must inject cancellation immediately before returning success"
+        );
+        assert_eq!(
+            global_pane_id,
+            try_encode_sharded_pane_id(ShardId(0), backend.created_local_pane_id).unwrap()
+        );
+        let route = client
+            .pane_routes
+            .get(global_pane_id)
+            .expect("successful backend creation must publish its route despite cancellation");
+        assert_eq!(route.shard_id, ShardId(0));
+        assert_eq!(route.local_pane_id, backend.created_local_pane_id);
+        assert_eq!(backend.ambient_kills.load(Ordering::Relaxed), 0);
+        assert_eq!(backend.cx_kills.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            backend
+                .cx_kills_with_cancelled_context
+                .load(Ordering::Relaxed),
+            0
+        );
+    }
+
+    fn assert_dual_codec_cleanup_error(
+        error: &crate::Error,
+        creation_op: &str,
+        cleanup_op: &str,
+    ) {
+        let rendered = error.to_string();
+        let primary = try_encode_sharded_pane_id(
+            ShardId(0),
+            CreationBoundaryBackend::OVERSIZED_LOCAL_PANE_ID,
+        )
+        .unwrap_err()
+        .to_string();
+        let cleanup = crate::Error::Wezterm(WeztermError::CommandFailed(
+            CreationBoundaryBackend::CLEANUP_FAILURE.to_string(),
+        ))
+        .to_string();
+        assert!(
+            rendered.starts_with(&primary),
+            "primary codec error must remain the leading error: {rendered}"
+        );
+        assert!(
+            rendered.ends_with(&cleanup),
+            "cleanup error must remain intact as trailing evidence: {rendered}"
+        );
+        let codec_position = rendered
+            .find("local pane id")
+            .expect("primary pane-id codec error must remain present");
+        let cleanup_position = rendered
+            .find("best-effort rollback")
+            .expect("cleanup failure context must be present");
+        assert!(
+            codec_position < cleanup_position,
+            "primary codec error must precede cleanup evidence: {rendered}"
+        );
+        assert!(rendered.contains(&format!("rollback after {creation_op} failed")));
+        assert!(rendered.contains(cleanup_op));
+        assert!(rendered.contains(&format!(
+            "local pane {}",
+            CreationBoundaryBackend::OVERSIZED_LOCAL_PANE_ID
+        )));
+        assert!(rendered.contains("oversized (0)"));
+        assert!(rendered.contains(CreationBoundaryBackend::CLEANUP_FAILURE));
+    }
+
     #[test]
     fn encode_decode_roundtrip() {
         let shard = ShardId(37);
@@ -1686,7 +2362,7 @@ mod tests {
         let encoded = encode_sharded_pane_id(shard, local);
         let (decoded_shard, decoded_local) = decode_sharded_pane_id(encoded);
         assert_eq!(decoded_shard, shard);
-        assert_eq!(decoded_local, local & LOCAL_PANE_ID_MASK);
+        assert_eq!(decoded_local, local);
     }
 
     #[test]
@@ -1788,6 +2464,64 @@ mod tests {
     }
 
     #[test]
+    fn list_all_panes_replaces_stale_route_generation() {
+        run_async_test(async {
+            let shard = Arc::new(MockWezterm::new());
+            shard.add_default_pane(7).await;
+            let client = ShardedWeztermClient::new(
+                vec![ShardBackend::new(
+                    ShardId(0),
+                    "only",
+                    shard as WeztermHandle,
+                )],
+                AssignmentStrategy::RoundRobin,
+            )
+            .unwrap();
+            let stale_pane_id = try_encode_sharded_pane_id(ShardId(0), 999).unwrap();
+            client.pane_routes.insert(
+                stale_pane_id,
+                PaneRoute {
+                    shard_id: ShardId(0),
+                    local_pane_id: 999,
+                },
+            );
+
+            let panes = client.list_all_panes().await.unwrap();
+            assert_eq!(panes.len(), 1);
+            assert!(client.pane_routes.contains(panes[0].pane_id));
+            assert!(
+                !client.pane_routes.contains(stale_pane_id),
+                "whole-generation refresh must remove routes absent from discovery"
+            );
+            assert_eq!(client.pane_routes.len(), 1);
+        });
+    }
+
+    #[test]
+    fn list_panes_rejects_backend_local_id_outside_encoded_domain() {
+        run_async_test(async {
+            let shard = Arc::new(MockWezterm::new());
+            shard.add_default_pane(LOCAL_PANE_ID_MASK + 1).await;
+            let client = ShardedWeztermClient::new(
+                vec![ShardBackend::new(
+                    ShardId(0),
+                    "oversized-local",
+                    shard as WeztermHandle,
+                )],
+                AssignmentStrategy::RoundRobin,
+            )
+            .unwrap();
+
+            let err = client.list_panes().await.unwrap_err();
+            assert!(
+                err.to_string().contains("local pane id"),
+                "unexpected error: {err}"
+            );
+            assert!(err.to_string().contains("48-bit encoded capacity"));
+        });
+    }
+
+    #[test]
     fn spawn_round_robin_across_shards() {
         run_async_test(async {
             let shard0 = Arc::new(MockWezterm::new());
@@ -1854,9 +2588,8 @@ mod tests {
     /// cx-aware). Mirrors `spawn_with_agent_hint_uses_agent_assignment`
     /// but drives the Cx-first entry point with a fresh `Cx`,
     /// asserting the agent-hint routing logic + pane route insertion
-    /// work end-to-end when cx is threaded through both the
-    /// subprocess hop AND the `pane_routes.write_with_cx` RwLock
-    /// acquire.
+    /// work end-to-end when cx is threaded through the subprocess hop and the
+    /// resulting route is committed synchronously after backend success.
     #[test]
     fn spawn_with_hints_with_cx_routes_and_records() {
         run_async_test(async {
@@ -1896,8 +2629,10 @@ mod tests {
             assert_eq!(shard1.pane_count().await, 1);
 
             // Pane route recorded for subsequent lookups.
-            let routes = client.pane_routes.read_with_cx(&cx).await;
-            let recorded = routes.get(&pane).expect("pane route must be recorded");
+            let recorded = client
+                .pane_routes
+                .get(pane)
+                .expect("pane route must be recorded");
             assert_eq!(recorded.shard_id, ShardId(1));
             assert_eq!(recorded.local_pane_id, 0);
         });
@@ -1952,9 +2687,9 @@ mod tests {
 
     /// ft-xbnl0.2.3 Cx-first: `spawn_targeted_with_cx` with a
     /// `window_id` hint must route through
-    /// `route_for_window_id_with_cx` (tick 48 helper) so the
-    /// underlying `list_panes_with_cx` + `pane_routes.write_with_cx`
-    /// calls propagate cx end-to-end. Mirrors the legacy
+    /// `route_for_window_id_with_cx` (tick 48 helper) so the underlying
+    /// `list_panes_with_cx` calls propagate cx through backend I/O before the
+    /// route snapshot publishes synchronously. Mirrors the legacy
     /// `spawn_targeted_routes_existing_window_to_matching_shard`
     /// topology exactly — if tick 48's Cx-first window-routing
     /// regressed the matcher semantics (matching_shards set
@@ -2012,14 +2747,8 @@ mod tests {
             assert_eq!(shard0.pane_count().await, 2);
             assert_eq!(shard1.pane_count().await, 0);
 
-            // Cx-first path also recorded the new pane in
-            // pane_routes (route_for_window_id_with_cx was called,
-            // followed by pane_routes.write_with_cx). Using the cx
-            // reader to prove the recording happened under the
-            // Cx-first path.
-            let routes = client.pane_routes.read_with_cx(&cx).await;
             assert!(
-                routes.contains_key(&spawned),
+                client.pane_routes.contains(spawned),
                 "Cx-first spawn_targeted must record new pane in pane_routes"
             );
         });
@@ -2106,20 +2835,271 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "exceeds 16-bit encoded capacity")]
+    #[should_panic(expected = "exceeds 15-bit persistence-safe encoded capacity")]
     fn encode_shard_overflow_panics() {
         let _ = encode_sharded_pane_id(ShardId(MAX_SHARD_ID + 1), 42);
     }
 
     #[test]
-    fn encode_local_overflow_masked() {
-        let shard = ShardId(1);
-        // Pass a value larger than LOCAL_PANE_ID_MASK; high bits should be masked.
-        let big_local = LOCAL_PANE_ID_MASK + 1;
-        let encoded = encode_sharded_pane_id(shard, big_local);
-        let (s, l) = decode_sharded_pane_id(encoded);
-        assert_eq!(s, shard);
-        assert_eq!(l, 0); // Overflow wraps to 0 after mask.
+    fn checked_codec_rejects_every_out_of_domain_boundary() {
+        assert!(
+            try_encode_sharded_pane_id(ShardId(MAX_SHARD_ID + 1), 0).is_err(),
+            "the reserved sign-bit shard range must fail closed"
+        );
+        assert!(
+            try_encode_sharded_pane_id(ShardId(0), LOCAL_PANE_ID_MASK + 1).is_err(),
+            "oversized local ids must never be silently truncated"
+        );
+        assert!(
+            try_decode_sharded_pane_id(MAX_GLOBAL_PANE_ID + 1).is_err(),
+            "negative-as-i64 global ids must not enter routing"
+        );
+    }
+
+    #[test]
+    fn maximum_encoded_id_is_exactly_sqlite_i64_max() {
+        let encoded =
+            try_encode_sharded_pane_id(ShardId(MAX_SHARD_ID), LOCAL_PANE_ID_MASK).unwrap();
+        assert_eq!(encoded, MAX_GLOBAL_PANE_ID);
+        assert_eq!(i64::try_from(encoded).unwrap(), i64::MAX);
+        assert_eq!(
+            try_decode_sharded_pane_id(encoded).unwrap(),
+            (ShardId(MAX_SHARD_ID), LOCAL_PANE_ID_MASK)
+        );
+    }
+
+    #[test]
+    fn ambient_creation_paths_rollback_unencodable_panes() {
+        run_async_test(async {
+            let (spawn_client, spawn_backend) = oversized_creation_client(false);
+            let spawn_error = spawn_client
+                .spawn_with_hints(None, None, None)
+                .await
+                .unwrap_err();
+            assert_unmasked_codec_error(&spawn_error);
+            assert_ambient_cleanup(&spawn_backend);
+
+            let (targeted_client, targeted_backend) = oversized_creation_client(false);
+            let targeted_error = targeted_client
+                .spawn_targeted(
+                    None,
+                    None,
+                    SpawnTarget {
+                        window_id: None,
+                        new_window: true,
+                    },
+                )
+                .await
+                .unwrap_err();
+            assert_unmasked_codec_error(&targeted_error);
+            assert_ambient_cleanup(&targeted_backend);
+
+            let (split_client, split_backend) = oversized_creation_client(false);
+            let parent_id = seed_split_parent_route(&split_client);
+            let split_error = split_client
+                .split_pane(parent_id, SplitDirection::Right, None, None)
+                .await
+                .unwrap_err();
+            assert_unmasked_codec_error(&split_error);
+            assert_ambient_cleanup(&split_backend);
+        });
+    }
+
+    #[test]
+    fn cx_creation_paths_rollback_unencodable_panes_with_cx() {
+        run_async_test(async {
+            let cx = crate::cx::for_request();
+            let (spawn_client, spawn_backend) = oversized_creation_client(false);
+            let spawn_error = spawn_client
+                .spawn_with_hints_with_cx(&cx, None, None, None)
+                .await
+                .unwrap_err();
+            assert_unmasked_codec_error(&spawn_error);
+            assert_cx_cleanup(&spawn_backend);
+
+            let (targeted_client, targeted_backend) = oversized_creation_client(false);
+            let targeted_error = targeted_client
+                .spawn_targeted_with_cx(
+                    &cx,
+                    None,
+                    None,
+                    SpawnTarget {
+                        window_id: None,
+                        new_window: true,
+                    },
+                )
+                .await
+                .unwrap_err();
+            assert_unmasked_codec_error(&targeted_error);
+            assert_cx_cleanup(&targeted_backend);
+
+            let (split_client, split_backend) = oversized_creation_client(false);
+            let parent_id = seed_split_parent_route(&split_client);
+            let split_error = split_client
+                .split_pane_with_cx(&cx, parent_id, SplitDirection::Right, None, None)
+                .await
+                .unwrap_err();
+            assert_unmasked_codec_error(&split_error);
+            assert_cx_cleanup(&split_backend);
+        });
+    }
+
+    #[test]
+    fn cx_unencodable_creation_rollback_uses_fresh_bounded_cleanup_context() {
+        run_async_test(async {
+            let spawn_cx = crate::cx::for_request();
+            let (spawn_client, spawn_backend) = cancelling_oversized_creation_client();
+            let spawn_error = spawn_client
+                .spawn_with_hints_with_cx(&spawn_cx, None, None, None)
+                .await
+                .expect_err("oversized pane id must fail after bounded compensation");
+            assert_cancelled_cx_rollback(&spawn_cx, &spawn_backend, &spawn_error);
+
+            let targeted_cx = crate::cx::for_request();
+            let (targeted_client, targeted_backend) = cancelling_oversized_creation_client();
+            let targeted_error = targeted_client
+                .spawn_targeted_with_cx(
+                    &targeted_cx,
+                    None,
+                    None,
+                    SpawnTarget {
+                        window_id: None,
+                        new_window: true,
+                    },
+                )
+                .await
+                .expect_err("targeted oversized pane id must be compensated");
+            assert_cancelled_cx_rollback(
+                &targeted_cx,
+                &targeted_backend,
+                &targeted_error,
+            );
+
+            let split_cx = crate::cx::for_request();
+            let (split_client, split_backend) = cancelling_oversized_creation_client();
+            let parent_id = seed_split_parent_route(&split_client);
+            let split_error = split_client
+                .split_pane_with_cx(&split_cx, parent_id, SplitDirection::Right, None, None)
+                .await
+                .expect_err("split oversized pane id must be compensated");
+            assert_cancelled_cx_rollback(&split_cx, &split_backend, &split_error);
+        });
+    }
+
+    #[test]
+    fn bounded_unencodable_creation_rollback_survives_creator_future_drop() {
+        run_async_test(async {
+            let caller_cx = crate::cx::for_request();
+            let (client, backend) = cancelling_oversized_creation_client();
+            let mut creation = Box::pin(client.spawn_with_hints_with_cx(
+                &caller_cx,
+                None,
+                None,
+                None,
+            ));
+
+            assert!(
+                futures::poll!(creation.as_mut()).is_pending(),
+                "creator must be waiting on the independently spawned compensator"
+            );
+            assert!(caller_cx.is_cancel_requested());
+            drop(creation);
+
+            for _ in 0..32 {
+                if backend.cx_kills.load(Ordering::Acquire) == 1 {
+                    break;
+                }
+                crate::runtime_async::task::yield_now().await;
+            }
+            assert_cx_cleanup(&backend);
+        });
+    }
+
+    #[test]
+    fn cx_creation_routes_commit_when_backend_cancels_before_returning_success() {
+        run_async_test(async {
+            let spawn_cx = crate::cx::for_request();
+            let (spawn_client, spawn_backend) = cancelling_creation_client();
+            let spawned = spawn_client
+                .spawn_with_hints_with_cx(&spawn_cx, None, None, None)
+                .await
+                .expect("post-success cancellation must not strand an unrecorded pane");
+            assert_post_backend_cancellation_commit(
+                &spawn_cx,
+                &spawn_client,
+                &spawn_backend,
+                spawned,
+            );
+
+            let targeted_cx = crate::cx::for_request();
+            let (targeted_client, targeted_backend) = cancelling_creation_client();
+            let targeted = targeted_client
+                .spawn_targeted_with_cx(
+                    &targeted_cx,
+                    None,
+                    None,
+                    SpawnTarget {
+                        window_id: None,
+                        new_window: true,
+                    },
+                )
+                .await
+                .expect("targeted creation must commit after backend success");
+            assert_post_backend_cancellation_commit(
+                &targeted_cx,
+                &targeted_client,
+                &targeted_backend,
+                targeted,
+            );
+
+            let split_cx = crate::cx::for_request();
+            let (split_client, split_backend) = cancelling_creation_client();
+            let parent_id = seed_split_parent_route(&split_client);
+            let split = split_client
+                .split_pane_with_cx(&split_cx, parent_id, SplitDirection::Right, None, None)
+                .await
+                .expect("split creation must commit after backend success");
+            assert_post_backend_cancellation_commit(
+                &split_cx,
+                &split_client,
+                &split_backend,
+                split,
+            );
+        });
+    }
+
+    #[test]
+    fn creation_codec_errors_retain_cleanup_failure_evidence() {
+        run_async_test(async {
+            let (ambient_client, ambient_backend) = oversized_creation_client(true);
+            let ambient_error = ambient_client
+                .spawn_with_hints(None, None, None)
+                .await
+                .unwrap_err();
+            assert_dual_codec_cleanup_error(&ambient_error, "spawn", "kill_pane");
+            assert_ambient_cleanup(&ambient_backend);
+
+            let cx = crate::cx::for_request();
+            let (cx_client, cx_backend) = oversized_creation_client(true);
+            let cx_error = cx_client
+                .spawn_targeted_with_cx(
+                    &cx,
+                    None,
+                    None,
+                    SpawnTarget {
+                        window_id: None,
+                        new_window: true,
+                    },
+                )
+                .await
+                .unwrap_err();
+            assert_dual_codec_cleanup_error(
+                &cx_error,
+                "spawn_targeted",
+                "kill_pane_with_fresh_cleanup_cx",
+            );
+            assert_cx_cleanup(&cx_backend);
+        });
     }
 
     // -----------------------------------------------------------------------
@@ -2732,7 +3712,23 @@ mod tests {
             result
                 .unwrap_err()
                 .to_string()
-                .contains("exceeds 16-bit encoded pane id capacity")
+                .contains("exceeds 15-bit persistence-safe encoded pane id capacity")
+        );
+    }
+
+    #[test]
+    fn one_backend_uncached_route_rejects_non_persistable_global_id() {
+        let mock = Arc::new(MockWezterm::new()) as WeztermHandle;
+        let client = ShardedWeztermClient::new(
+            vec![ShardBackend::new(ShardId(0), "only", mock)],
+            AssignmentStrategy::RoundRobin,
+        )
+        .unwrap();
+
+        let err = client.resolve_uncached_pane_route(u64::MAX).unwrap_err();
+        assert!(
+            err.to_string().contains("persistence-safe signed-64 range"),
+            "unexpected error: {err}"
         );
     }
 
@@ -3049,8 +4045,72 @@ mod tests {
             client.kill_pane(global_id).await.unwrap();
 
             // Route should be removed
-            let routes = client.pane_routes.read().await;
-            assert!(!routes.contains_key(&global_id));
+            assert!(!client.pane_routes.contains(global_id));
+        });
+    }
+
+    #[test]
+    fn kill_pane_with_cx_removes_route_only_after_backend_success() {
+        run_async_test(async {
+            let cx = crate::cx::for_request();
+            let shard0 = Arc::new(MockWezterm::new());
+            shard0.add_default_pane(1).await;
+
+            let client = ShardedWeztermClient::new(
+                vec![ShardBackend::new(
+                    ShardId(0),
+                    "s0",
+                    shard0 as WeztermHandle,
+                )],
+                AssignmentStrategy::RoundRobin,
+            )
+            .unwrap();
+
+            let panes = client.list_all_panes_with_cx(&cx).await.unwrap();
+            assert_eq!(panes.len(), 1);
+            let global_id = panes[0].pane_id;
+            assert!(
+                client.pane_routes.contains(global_id),
+                "list_all_panes_with_cx must seed the route before the kill"
+            );
+
+            client.kill_pane_with_cx(&cx, global_id).await.unwrap();
+
+            assert!(
+                !client.pane_routes.contains(global_id),
+                "a successful Cx-aware backend kill must evict its cached route"
+            );
+
+            let failing_client = ShardedWeztermClient::new(
+                vec![ShardBackend::new(
+                    ShardId(0),
+                    "failing",
+                    crate::wezterm::mock_wezterm_handle_failing(),
+                )],
+                AssignmentStrategy::RoundRobin,
+            )
+            .unwrap();
+            let failed_global_id = try_encode_sharded_pane_id(ShardId(0), 7).unwrap();
+            failing_client.pane_routes.insert(
+                failed_global_id,
+                PaneRoute {
+                    shard_id: ShardId(0),
+                    local_pane_id: 7,
+                },
+            );
+
+            let error = failing_client
+                .kill_pane_with_cx(&cx, failed_global_id)
+                .await
+                .expect_err("failing backend kill must propagate its error");
+            assert!(
+                error.to_string().contains("kill_pane failed on failing"),
+                "unexpected backend error: {error}"
+            );
+            assert!(
+                failing_client.pane_routes.contains(failed_global_id),
+                "a failed Cx-aware backend kill must preserve its cached route"
+            );
         });
     }
 
@@ -3208,8 +4268,10 @@ mod tests {
 
     #[test]
     fn shard_id_bits_and_mask_are_consistent() {
-        assert_eq!(SHARD_ID_BITS, 16);
-        assert_eq!(LOCAL_PANE_ID_MASK, (1u64 << 48) - 1);
+        assert_eq!(SHARD_ID_BITS, 15);
+        assert_eq!(LOCAL_PANE_ID_BITS, 48);
+        assert_eq!(SHARD_ID_BITS + LOCAL_PANE_ID_BITS, 63);
+        assert_eq!(LOCAL_PANE_ID_MASK, (1u64 << LOCAL_PANE_ID_BITS) - 1);
     }
 
     // -- Batch: DarkBadger wa-1u90p.7.1 ----------------------------------------
@@ -3218,7 +4280,7 @@ mod tests {
     fn shard_id_display_v2() {
         assert_eq!(ShardId(0).to_string(), "0");
         assert_eq!(ShardId(42).to_string(), "42");
-        assert_eq!(ShardId(65535).to_string(), "65535");
+        assert_eq!(ShardId(MAX_SHARD_ID).to_string(), "32767");
     }
 
     #[test]
@@ -3341,11 +4403,9 @@ mod tests {
     }
 
     #[test]
-    fn encode_local_id_overflow_is_masked() {
-        // local_pane_id larger than LOCAL_PANE_ID_MASK gets masked
+    fn encode_local_id_overflow_panics_in_infallible_helper() {
         let big_local = LOCAL_PANE_ID_MASK + 1;
-        let encoded = encode_sharded_pane_id(ShardId(0), big_local);
-        let (_, local) = decode_sharded_pane_id(encoded);
-        assert_eq!(local, 0); // overflow bit masked off
+        let panic = std::panic::catch_unwind(|| encode_sharded_pane_id(ShardId(0), big_local));
+        assert!(panic.is_err());
     }
 }
