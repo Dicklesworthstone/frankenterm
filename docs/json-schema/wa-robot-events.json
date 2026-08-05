@@ -4,7 +4,7 @@
   "title": "WA Robot Events Response",
   "description": "Schema for the data field when calling 'wa robot events'. Returns recent detected events and optional workflow previews.",
   "type": "object",
-  "required": ["events"],
+  "required": ["events", "total_count", "limit", "unhandled_only"],
   "properties": {
     "events": {
       "type": "array",
@@ -129,7 +129,9 @@
   "allOf": [
     {
       "if": { "required": ["cursor"] },
-      "then": { "required": ["order"] }
+      "then": {
+        "required": ["next_cursor", "next_cursor_epoch", "next_cursor_scope", "order"]
+      }
     },
     {
       "if": { "required": ["next_cursor"] },
@@ -138,7 +140,38 @@
     {
       "if": { "required": ["start_at_tail"] },
       "then": {
-        "required": ["next_cursor", "next_cursor_epoch", "next_cursor_scope", "order"]
+        "required": ["next_cursor", "next_cursor_epoch", "next_cursor_scope", "order"],
+        "properties": {
+          "events": { "maxItems": 0 }
+        },
+        "not": { "required": ["cursor"] }
+      }
+    },
+    {
+      "if": { "required": ["order"] },
+      "then": {
+        "anyOf": [
+          { "required": ["cursor"] },
+          { "required": ["start_at_tail"] }
+        ]
+      }
+    },
+    {
+      "if": { "required": ["cursor_capability"] },
+      "then": {
+        "not": {
+          "anyOf": [
+            { "required": ["cursor"] },
+            { "required": ["cursor_epoch"] },
+            { "required": ["cursor_scope"] },
+            { "required": ["next_cursor"] },
+            { "required": ["next_cursor_epoch"] },
+            { "required": ["next_cursor_scope"] },
+            { "required": ["replay_limit"] },
+            { "required": ["order"] },
+            { "required": ["start_at_tail"] }
+          ]
+        }
       }
     }
   ],

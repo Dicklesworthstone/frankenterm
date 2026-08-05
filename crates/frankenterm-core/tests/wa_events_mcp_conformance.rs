@@ -950,6 +950,55 @@ fn mcp_conformance_wa_await_event_contract_matches_expected_envelope() {
 }
 
 #[test]
+fn mcp_conformance_wa_await_event_checkpoint_bootstraps_a_usable_scope_bound_token() {
+    let mut harness = new_harness();
+    seed_events_fixture(&harness);
+
+    let checkpoint = call_await_event(
+        &mut harness,
+        json!({
+            "any": ["rule:codex.*"],
+            "pane": FIXTURE_PANE_ID,
+            "checkpoint_only": true
+        }),
+    );
+    assert_success_envelope_shape(&checkpoint);
+    assert_eq!(checkpoint["data"]["satisfied"], Value::Bool(false));
+    assert_eq!(checkpoint["data"]["timed_out"], Value::Bool(false));
+    assert_eq!(checkpoint["data"]["events"], json!([]));
+    assert_eq!(checkpoint["data"]["final_cursor"], Value::from(1));
+    assert_eq!(
+        checkpoint["data"]["bootstrap_state"],
+        Value::String("storage_tail_checkpoint".to_string())
+    );
+    assert!(checkpoint["data"].get("candidate_cursor").is_none());
+    assert_eq!(checkpoint["data"]["pending_finalize"], Value::Bool(false));
+
+    seed_many_events(
+        &harness,
+        vec![make_event_with(2, FIXTURE_RULE_ID, FIXTURE_TS + 1)],
+    );
+    let resumed = call_await_event(
+        &mut harness,
+        json!({
+            "any": ["rule:codex.*"],
+            "cursor": checkpoint["data"]["final_cursor"].clone(),
+            "cursor_epoch": checkpoint["data"]["final_cursor_epoch"].clone(),
+            "cursor_scope": checkpoint["data"]["final_cursor_scope"].clone(),
+            "pane": FIXTURE_PANE_ID,
+            "timeout_secs": 1,
+            "poll_interval_ms": 10
+        }),
+    );
+    assert_success_envelope_shape(&resumed);
+    assert_eq!(resumed["data"]["satisfied"], Value::Bool(true));
+    assert_eq!(resumed["data"]["events"][0]["id"], Value::from(2));
+    assert_eq!(resumed["data"]["final_cursor"], Value::from(2));
+    assert!(resumed["data"].get("candidate_cursor").is_none());
+    assert_eq!(resumed["data"]["pending_finalize"], Value::Bool(false));
+}
+
+#[test]
 fn mcp_conformance_wa_await_event_claim_marks_event_handled() {
     let mut harness = new_harness();
     seed_events_fixture(&harness);
@@ -1191,6 +1240,9 @@ fn mcp_conformance_wa_await_event_live_lease_retains_cursor_until_retry() {
     assert_eq!(timed_out["data"]["timed_out"], Value::Bool(true));
     assert_eq!(timed_out["data"]["final_cursor"], Value::from(0));
     assert_eq!(timed_out["data"]["events"], json!([]));
+    assert!(timed_out["data"].get("candidate_cursor").is_none());
+    assert!(timed_out["data"].get("claim_delivery").is_none());
+    assert_eq!(timed_out["data"]["pending_finalize"], Value::Bool(false));
 
     release_fixture_event(&harness.db_path, &competing_lease);
     let retried = call_await_event(
@@ -1278,7 +1330,9 @@ fn mcp_conformance_retried_hole_across_large_backlog_preserves_order_and_cursor(
     assert_success_envelope_shape(&acquired);
     assert_eq!(acquired["data"]["satisfied"], Value::Bool(true));
     assert_eq!(acquired["data"]["timed_out"], Value::Bool(false));
-    assert_eq!(acquired["data"]["final_cursor"], Value::from(502));
+    assert_eq!(acquired["data"]["final_cursor"], Value::from(0));
+    assert_eq!(acquired["data"]["candidate_cursor"], Value::from(502));
+    assert_eq!(acquired["data"]["pending_finalize"], Value::Bool(true));
     assert_eq!(
         acquired["data"]["events"]
             .as_array()
@@ -1340,6 +1394,7 @@ fn mcp_conformance_foreign_hole_outlives_met_mask_until_exact_refetch() {
         }),
     );
     let expected_cursor_epoch = await_arguments["cursor_epoch"].clone();
+    let expected_cursor_scope = await_arguments["cursor_scope"].clone();
     let waiter = std::thread::spawn(move || {
         let envelope = parse_tool_envelope(
             &await_client
@@ -1365,9 +1420,14 @@ fn mcp_conformance_foreign_hole_outlives_met_mask_until_exact_refetch() {
     assert_success_envelope_shape(&acquired);
     assert_eq!(acquired["data"]["satisfied"], Value::Bool(true));
     assert_eq!(acquired["data"]["timed_out"], Value::Bool(false));
-    assert_eq!(acquired["data"]["final_cursor"], Value::from(3));
+    assert_eq!(acquired["data"]["final_cursor"], Value::from(0));
+    assert_eq!(acquired["data"]["candidate_cursor"], Value::from(3));
+    assert_eq!(acquired["data"]["pending_finalize"], Value::Bool(true));
     assert_eq!(
         acquired["data"]["final_cursor_epoch"], expected_cursor_epoch
+    );
+    assert_eq!(
+        acquired["data"]["final_cursor_scope"], expected_cursor_scope
     );
     assert_eq!(
         acquired["data"]["events"]
@@ -1418,6 +1478,7 @@ fn mcp_conformance_exact_hole_refetch_does_not_substitute_next_unhandled_row() {
         }),
     );
     let expected_cursor_epoch = await_arguments["cursor_epoch"].clone();
+    let expected_cursor_scope = await_arguments["cursor_scope"].clone();
     let waiter = std::thread::spawn(move || {
         let envelope = parse_tool_envelope(
             &await_client
@@ -1442,9 +1503,14 @@ fn mcp_conformance_exact_hole_refetch_does_not_substitute_next_unhandled_row() {
 
     let acquired = waiter.join().expect("join exact-refetch waiter");
     assert_success_envelope_shape(&acquired);
-    assert_eq!(acquired["data"]["final_cursor"], Value::from(3));
+    assert_eq!(acquired["data"]["final_cursor"], Value::from(1));
+    assert_eq!(acquired["data"]["candidate_cursor"], Value::from(3));
+    assert_eq!(acquired["data"]["pending_finalize"], Value::Bool(true));
     assert_eq!(
         acquired["data"]["final_cursor_epoch"], expected_cursor_epoch
+    );
+    assert_eq!(
+        acquired["data"]["final_cursor_scope"], expected_cursor_scope
     );
     assert_eq!(
         acquired["data"]["events"]
@@ -1523,7 +1589,9 @@ fn mcp_conformance_blocked_hole_cap_fails_closed_across_pages() {
     );
     assert_success_envelope_shape(&retried);
     assert_eq!(retried["data"]["events"][0]["id"], Value::from(1));
-    assert_eq!(retried["data"]["final_cursor"], Value::from(1));
+    assert_eq!(retried["data"]["final_cursor"], Value::from(0));
+    assert_eq!(retried["data"]["candidate_cursor"], Value::from(1));
+    assert_eq!(retried["data"]["pending_finalize"], Value::Bool(true));
     let _delivery_barrier = call_events(&mut harness, json!({"limit": 1}));
     release_fixture_events(&harness.db_path, &competing_leases[1..]);
 }
@@ -1540,13 +1608,13 @@ fn mcp_conformance_storage_paths_are_redacted_from_event_tool_errors() {
         ("wa.events", json!({"limit": 1})),
         (
             "wa.await_event",
-            json!({
-                "any": ["rule:rule.a"],
-                "cursor": 0,
-                "cursor_epoch": "00000000000000000000000000000000",
-                "timeout_secs": 1,
-                "poll_interval_ms": 10
-            }),
+            with_canonical_await_event_cursor_scope(json!({
+                    "any": ["rule:rule.a"],
+                    "cursor": 0,
+                    "cursor_epoch": "00000000000000000000000000000000",
+                    "timeout_secs": 1,
+                    "poll_interval_ms": 10
+                })),
         ),
     ] {
         let envelope = parse_tool_envelope(
@@ -1646,6 +1714,9 @@ fn mcp_conformance_no_cursor_boundary_precedes_delayed_storage_open() {
     assert_eq!(envelope["data"]["timed_out"], Value::Bool(false));
     assert_eq!(envelope["data"]["events"][0]["id"], Value::from(1));
     assert_canonical_cursor_epoch(&envelope["data"]["final_cursor_epoch"]);
+    assert_canonical_cursor_scope(&envelope["data"]["final_cursor_scope"]);
+    assert!(envelope["data"].get("candidate_cursor").is_none());
+    assert_eq!(envelope["data"]["pending_finalize"], Value::Bool(false));
 }
 
 #[test]
@@ -1681,6 +1752,8 @@ fn mcp_conformance_live_lease_does_not_block_a_later_matching_event() {
         Value::from(0),
         "the exposed cursor must remain before the still-leased id=1 hole"
     );
+    assert_eq!(claimed["data"]["candidate_cursor"], Value::from(0));
+    assert_eq!(claimed["data"]["pending_finalize"], Value::Bool(true));
 
     let _delivery_barrier = call_events(&mut harness, json!({"limit": 1}));
     let events = load_fixture_events(&harness.db_path);
@@ -1708,6 +1781,7 @@ fn mcp_conformance_wa_await_event_concurrent_claimers_emit_event_once() {
         }),
     );
     let expected_cursor_epoch = args["cursor_epoch"].clone();
+    let expected_cursor_scope = args["cursor_scope"].clone();
     let args_b = args.clone();
 
     let claim_a = std::thread::spawn(move || {
@@ -1740,6 +1814,12 @@ fn mcp_conformance_wa_await_event_concurrent_claimers_emit_event_once() {
     assert_eq!(
         envelope_b["data"]["final_cursor_epoch"], expected_cursor_epoch
     );
+    assert_eq!(
+        envelope_a["data"]["final_cursor_scope"], expected_cursor_scope
+    );
+    assert_eq!(
+        envelope_b["data"]["final_cursor_scope"], expected_cursor_scope
+    );
 
     let emitted_a = envelope_a["data"]["events"]
         .as_array()
@@ -1755,13 +1835,33 @@ fn mcp_conformance_wa_await_event_concurrent_claimers_emit_event_once() {
         "atomic reservation must permit exactly one emitted claim"
     );
     assert_eq!(
-        [envelope_a, envelope_b]
+        [&envelope_a, &envelope_b]
             .iter()
             .filter(|envelope| envelope["data"]["satisfied"] == Value::Bool(true))
             .count(),
         1,
         "exactly one concurrent claimant must satisfy on the single event"
     );
+
+    for envelope in [&envelope_a, &envelope_b] {
+        let emitted = envelope["data"]["events"]
+            .as_array()
+            .expect("concurrent claimant events")
+            .len();
+        if emitted == 1 {
+            assert_eq!(envelope["data"]["final_cursor"], Value::from(0));
+            assert_eq!(envelope["data"]["candidate_cursor"], Value::from(1));
+            assert_eq!(envelope["data"]["pending_finalize"], Value::Bool(true));
+        } else {
+            let loser_cursor = envelope["data"]["final_cursor"].as_i64();
+            assert!(
+                loser_cursor == Some(0) || loser_cursor == Some(1),
+                "the losing claimant may retain the live hole or observe its finalization"
+            );
+            assert!(envelope["data"].get("candidate_cursor").is_none());
+            assert_eq!(envelope["data"]["pending_finalize"], Value::Bool(false));
+        }
+    }
 
     let events = load_fixture_events(&db_path);
     assert_eq!(events.len(), 1);
