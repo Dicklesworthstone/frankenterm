@@ -6482,12 +6482,13 @@ mod tests {
     #[cfg(panic = "unwind")]
     #[test]
     fn task_panic_becomes_content_free_join_error() {
+        async fn panic_at_join_boundary() {
+            panic!("task-secret-that-must-not-reach-the-join-error");
+        }
+
         let rt = RuntimeBuilder::current_thread().build().unwrap();
         rt.block_on(async {
-            let result = task::spawn(async {
-                panic!("task-secret-that-must-not-reach-the-join-error");
-            })
-            .await;
+            let result = task::spawn(panic_at_join_boundary()).await;
             let Err(error) = result else {
                 panic!("panicking task must fail its JoinHandle");
             };
