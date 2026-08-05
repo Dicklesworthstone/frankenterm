@@ -418,12 +418,12 @@ impl Drop for FrameWriter {
     /// swallowed: Drop cannot fail, and the underlying file may already
     /// be gone in the shutdown path.
     ///
-    /// The canonical recovery helper contains a finalization panic when this
-    /// destructor runs normally. If an outer unwind is already active, Rust
-    /// cannot recover a second panic; the helper deliberately removes the
-    /// recoverable marker and lets the fatal hook report that nested failure
-    /// before the runtime aborts. Healthy finalization is still attempted in
-    /// both cases. The `AssertUnwindSafe` wrap is sound here because: (i) we
+    /// The canonical recovery helper contains a finalization panic both during
+    /// normal teardown and while an outer unwind is already active. It catches
+    /// the nested unwind before it can escape this destructor, so the original
+    /// panic remains the one that propagates. Healthy finalization is still
+    /// attempted in both cases. The `AssertUnwindSafe` wrap is sound here
+    /// because: (i) we
     /// discard the closure's `Result`, (ii) we never observe `&mut self` again
     /// after the closure returns, and (iii) the only surviving state is
     /// `self.buffer` / `self.writer`, both of which are about to be dropped.
@@ -1739,9 +1739,10 @@ mod tests {
     #[test]
     fn frame_writer_drop_completes_during_panic_unwind_without_aborting() {
         // A healthy finalization remains safe and useful while an outer panic
-        // is unwinding. A *panicking* finalizer cannot be recovered in that
-        // state; the subprocess panic-contract tests cover the required fatal
-        // reporting path for that nested-panic case.
+        // is unwinding. The shared recovery helper also contains a panicking
+        // finalizer in that state; its focused nested-unwind regression lives
+        // in `frankenterm-sigpipe`, where a deterministic panicking Drop type
+        // can exercise the boundary directly.
         let dir = tempdir().unwrap();
         let path = dir.path().join("panic-during-drop.war");
 

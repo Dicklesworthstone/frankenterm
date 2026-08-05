@@ -116,11 +116,11 @@ impl<T> Drop for Promise<T> {
         };
 
         if let Some(waker) = waker {
-            // Outside an outer unwind, isolate an executor-provided waker
-            // panic from the already-committed broken-promise state. During
-            // an outer unwind, Rust cannot recover a second panic; the shared
-            // helper force-enables fatal reporting instead of falsely marking
-            // that nested panic recoverable before the runtime aborts.
+            // Isolate an executor-provided waker panic from the
+            // already-committed broken-promise state. This includes Drop
+            // during an outer unwind: the shared helper catches the nested
+            // unwind before it can escape this destructor, allowing the
+            // original panic to continue.
             let _ = frankenterm_sigpipe::catch_recoverable(
                 frankenterm_sigpipe::RecoverablePanicSite::PromiseWaker,
                 std::panic::AssertUnwindSafe(|| waker.wake()),
@@ -276,6 +276,30 @@ mod tests {
             StdFuture::poll(Pin::new(&mut future), &mut cx),
             Poll::Ready(Err(_))
         ));
+    }
+
+    #[cfg(panic = "unwind")]
+    #[test]
+    fn dropping_incomplete_promise_contains_waker_panic_during_outer_unwind() {
+        let outer = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut promise: Promise<i32> = Promise::new();
+            let mut future = promise.get_future().expect("future");
+            let waker = panic_waker();
+            let mut cx = Context::from_waker(&waker);
+            assert!(matches!(
+                StdFuture::poll(Pin::new(&mut future), &mut cx),
+                Poll::Pending
+            ));
+
+            panic!("outer unwind must remain authoritative");
+        }))
+        .expect_err("the outer panic must propagate after Promise::drop");
+
+        assert_eq!(
+            outer.downcast_ref::<&str>().copied(),
+            Some("outer unwind must remain authoritative"),
+            "the contained waker panic must not replace the outer payload"
+        );
     }
 
     #[test]
