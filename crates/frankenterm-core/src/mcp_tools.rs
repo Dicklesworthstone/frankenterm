@@ -4007,66 +4007,92 @@ fn complete_mcp_await_event_deliveries(
         }
     };
 
-    runtime.block_on(async move {
+    let delivery_count = leases.len();
+    let completion = runtime.block_on(async move {
         let cx = crate::cx::for_request();
-        let storage = match StorageHandle::new_with_cx(&cx, &db_path.to_string_lossy()).await {
-            Ok(storage) => storage,
-            Err(err) => {
-                tracing::error!(
-                    error = %err,
-                    delivery_count = leases.len(),
-                    ?outcome,
-                    "Unable to open storage for MCP event-delivery completion; leases will recover by expiry"
-                );
-                return;
-            }
-        };
+        let operation_cx = cx.clone();
+        crate::runtime_async::timeout_with_cx(
+            &cx,
+            std::time::Duration::from_secs(MCP_AWAIT_EVENT_DELIVERY_FINALIZE_GRACE_SECS),
+            async move {
+                let storage = match StorageHandle::new_with_cx(
+                    &operation_cx,
+                    &db_path.to_string_lossy(),
+                )
+                .await
+                {
+                    Ok(storage) => storage,
+                    Err(err) => {
+                        tracing::error!(
+                            error = %err,
+                            delivery_count = leases.len(),
+                            ?outcome,
+                            "Unable to open storage for MCP event-delivery completion; leases will recover by expiry"
+                        );
+                        return;
+                    }
+                };
 
-        for lease in &leases {
-            let completion = match outcome {
-                FrameworkResponseDeliveryOutcome::DeliveryAcknowledged => {
-                    storage
-                        .finalize_event_delivery_with_cx(
-                            &cx,
-                            lease,
-                            Some(MCP_AWAIT_EVENT_CLAIM_WORKFLOW_ID.to_string()),
-                            MCP_AWAIT_EVENT_CLAIM_STATUS,
-                        )
-                        .await
-                }
-                FrameworkResponseDeliveryOutcome::Failed => {
-                    storage.release_event_delivery_with_cx(&cx, lease).await
-                }
-            };
+                for lease in &leases {
+                    let completion = match outcome {
+                        FrameworkResponseDeliveryOutcome::DeliveryAcknowledged => {
+                            storage
+                                .finalize_event_delivery_with_cx(
+                                    &operation_cx,
+                                    lease,
+                                    Some(MCP_AWAIT_EVENT_CLAIM_WORKFLOW_ID.to_string()),
+                                    MCP_AWAIT_EVENT_CLAIM_STATUS,
+                                )
+                                .await
+                        }
+                        FrameworkResponseDeliveryOutcome::Failed => {
+                            storage
+                                .release_event_delivery_with_cx(&operation_cx, lease)
+                                .await
+                        }
+                    };
 
-            match completion {
-                Ok(true) => {}
-                Ok(false) => {
+                    match completion {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            tracing::warn!(
+                                event_id = lease.event_id(),
+                                ?outcome,
+                                "MCP event-delivery completion lost lease ownership; no handled-state mutation was made"
+                            );
+                        }
+                        Err(err) => {
+                            tracing::error!(
+                                error = %err,
+                                event_id = lease.event_id(),
+                                ?outcome,
+                                "MCP event-delivery completion failed; lease expiry remains the recovery authority"
+                            );
+                        }
+                    }
+                }
+
+                if let Err(err) = storage.shutdown().await {
                     tracing::warn!(
-                        event_id = lease.event_id(),
-                        ?outcome,
-                        "MCP event-delivery completion lost lease ownership; no handled-state mutation was made"
-                    );
-                }
-                Err(err) => {
-                    tracing::error!(
                         error = %err,
-                        event_id = lease.event_id(),
                         ?outcome,
-                        "MCP event-delivery completion failed; lease expiry remains the recovery authority"
+                        "MCP event-delivery completion storage shutdown failed"
                     );
                 }
-            }
-        }
-
-        if let Err(err) = storage.shutdown().await {
-            tracing::warn!(
-                error = %err,
-                ?outcome,
-                "MCP event-delivery completion storage shutdown failed"
-            );
-        }
+            },
+        )
+        .await
     });
+
+    if let Err(err) = completion {
+        tracing::error!(
+            error = %err,
+            delivery_count,
+            finalize_grace_secs = MCP_AWAIT_EVENT_DELIVERY_FINALIZE_GRACE_SECS,
+            ?outcome,
+            "MCP event-delivery completion exceeded its hard deadline; lease expiry remains the recovery authority"
+        );
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

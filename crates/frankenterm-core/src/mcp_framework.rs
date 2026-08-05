@@ -638,7 +638,19 @@ impl OutboundFrameworkClient {
 
 #[cfg(feature = "mcp-client")]
 pub(crate) fn discover_server_configs(settings: &McpClientConfig) -> DiscoveredFrameworkServers {
-    let loader = build_loader(settings);
+    let Some(loader) = build_loader(settings) else {
+        tracing::warn!(
+            target: "ft::mcp_framework",
+            event = "mcp_framework_loader_unconfigured",
+            "mcp_client.include_default_paths=false with empty discovery_paths; \
+             no MCP configuration sources are enabled. Set discovery_paths or \
+             enable include_default_paths to discover remote MCP servers."
+        );
+        return DiscoveredFrameworkServers {
+            search_paths: Vec::new(),
+            servers: Vec::new(),
+        };
+    };
     let search_paths = loader
         .search_paths()
         .iter()
@@ -671,57 +683,24 @@ pub(crate) fn discover_server_configs(settings: &McpClientConfig) -> DiscoveredF
 }
 
 #[cfg(feature = "mcp-client")]
-fn build_loader(settings: &McpClientConfig) -> FrameworkConfigLoader {
+fn build_loader(settings: &McpClientConfig) -> Option<FrameworkConfigLoader> {
     let mut loader = if settings.include_default_paths {
         FrameworkConfigLoader::new()
     } else {
         let mut paths = settings.discovery_paths.iter();
-        if let Some(first) = paths.next() {
-            let mut loader = FrameworkConfigLoader::from_path(first.clone());
-            for path in paths {
-                loader = loader.with_path(path.clone());
-            }
-            return loader;
+        let first = paths.next()?;
+        let mut loader = FrameworkConfigLoader::from_path(first.clone());
+        for path in paths {
+            loader = loader.with_path(path.clone());
         }
-
-        // [ft-zfbqo] Default paths disabled AND no custom discovery_paths
-        // configured. The loader needs SOME path; return a guaranteed-
-        // nonexistent placeholder under the platform's temp dir so the
-        // loader finds no servers without panicking.
-        //
-        // Pre-fix this used the literal "/dev/null", which:
-        //   1. Doesn't exist on Windows (future portability landmine).
-        //   2. Was silent — operators with proxy_enabled=true who
-        //      forgot to set discovery_paths got a zero-discovery
-        //      proxy with no signal that misconfiguration was at
-        //      fault. The downstream "no remote MCP servers selected"
-        //      warn at compose_proxy_tools fired but couldn't
-        //      distinguish "genuinely no servers" from "loader was
-        //      misconfigured upstream".
-        //
-        // Post-fix:
-        //   - Path is platform-portable (lives under temp_dir).
-        //   - Suffix is unique enough that an operator inspecting
-        //     /tmp can't mistake it for a real config.
-        //   - Emits a tracing::warn so the misconfiguration is
-        //     visible without log scraping the downstream call site.
-        let placeholder = std::env::temp_dir().join("__ft_mcp_unconfigured_loader_no_op__");
-        tracing::warn!(
-            target: "ft::mcp_framework",
-            event = "mcp_framework_loader_unconfigured",
-            placeholder = %placeholder.display(),
-            "mcp_client.include_default_paths=false with empty discovery_paths; \
-             loader will discover zero MCP servers. Set discovery_paths or \
-             enable include_default_paths to fix."
-        );
-        return FrameworkConfigLoader::from_path(placeholder);
+        return Some(loader);
     };
 
     for path in settings.discovery_paths.iter().rev() {
         loader = loader.with_priority_path(path.clone());
     }
 
-    loader
+    Some(loader)
 }
 
 #[cfg(all(test, feature = "mcp-client"))]
@@ -731,15 +710,15 @@ mod tests {
     use proptest::prelude::*;
 
     /// [ft-zfbqo] When mcp_client.include_default_paths=false AND
-    /// discovery_paths is empty, the loader must:
+    /// discovery_paths is empty, discovery must:
     ///   1. Return zero discovered servers (no panic, no error).
-    ///   2. Use a platform-portable placeholder path (no /dev/null).
+    ///   2. Return zero search paths without consulting a placeholder.
     ///
-    /// Pre-fix the placeholder was the Unix-specific literal "/dev/null"
-    /// which would fail on Windows. Post-fix the placeholder lives under
-    /// the platform's temp_dir so the same code works on any target.
+    /// A predictable fake pathname is not equivalent to an empty source set:
+    /// another local process could create that pathname between construction
+    /// and loading and inject a server into explicitly disabled discovery.
     #[test]
-    fn ft_zfbqo_unconfigured_loader_returns_empty_on_any_platform() {
+    fn ft_zfbqo_unconfigured_loader_has_no_sources_on_any_platform() {
         let mut settings = McpClientConfig {
             include_default_paths: false,
             ..Default::default()
@@ -753,28 +732,10 @@ mod tests {
             "unconfigured loader must discover zero servers, got {:?}",
             discovered.servers
         );
-
-        // Platform-portable placeholder: must NOT be the legacy
-        // /dev/null path (would fail on Windows).
-        for path in &discovered.search_paths {
-            assert!(
-                !path.starts_with("/dev/"),
-                "ft-zfbqo: placeholder must not live under /dev/ \
-                 (Unix-specific, fails on Windows); got {path}"
-            );
-        }
-
-        // The placeholder we use lives under std::env::temp_dir() and
-        // contains a unique sentinel suffix so operators inspecting
-        // discovery state can spot the misconfiguration immediately.
-        let temp_marker = std::env::temp_dir().display().to_string();
-        let has_temp_placeholder = discovered.search_paths.iter().any(|p| {
-            p.starts_with(&temp_marker) && p.contains("__ft_mcp_unconfigured_loader_no_op__")
-        });
         assert!(
-            has_temp_placeholder,
-            "ft-zfbqo: search_paths must include the temp_dir-based \
-             unconfigured placeholder; got {:?}",
+            discovered.search_paths.is_empty(),
+            "disabled discovery with no configured paths must expose no \
+             filesystem source, got {:?}",
             discovered.search_paths
         );
     }
