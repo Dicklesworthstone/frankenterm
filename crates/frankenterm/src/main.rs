@@ -23129,13 +23129,9 @@ fn classify_watch_outer_failure(
 /// independent chance to settle durable ownership. The finite deadline and
 /// minimal poll quota prevent cleanup from becoming an unbounded escape path.
 fn watch_claim_completion_cx() -> frankenterm_core::cx::Cx {
-    let seed = frankenterm_core::cx::Cx::for_request();
-    let now = seed
-        .timer_driver()
-        .map_or_else(asupersync::time::wall_now, |driver| driver.now());
-    frankenterm_core::cx::Cx::for_request_with_budget(
-        frankenterm_core::cx::Budget::MINIMAL
-            .with_deadline(now + WATCH_EVENTS_CLAIM_COMPLETION_TIMEOUT),
+    frankenterm_core::runtime_async::fresh_request_cx_with_budget_timeout(
+        frankenterm_core::cx::Budget::MINIMAL,
+        WATCH_EVENTS_CLAIM_COMPLETION_TIMEOUT,
     )
 }
 
@@ -65116,13 +65112,9 @@ fn session_mmap_replay_json(
 }
 
 fn session_recovery_deadline_cx(timeout_seconds: u64) -> frankenterm_core::cx::Cx {
-    let seed = frankenterm_core::cx::Cx::for_request();
-    let now = seed
-        .timer_driver()
-        .map_or_else(asupersync::time::wall_now, |driver| driver.now());
-    frankenterm_core::cx::Cx::for_request_with_budget(
-        frankenterm_core::cx::Budget::new()
-            .with_deadline(now + std::time::Duration::from_secs(timeout_seconds.max(1))),
+    frankenterm_core::runtime_async::fresh_request_cx_with_budget_timeout(
+        frankenterm_core::cx::Budget::new(),
+        std::time::Duration::from_secs(timeout_seconds.max(1)),
     )
 }
 

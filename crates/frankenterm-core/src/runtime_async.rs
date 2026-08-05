@@ -2418,6 +2418,24 @@ fn cx_timer_now(cx: &crate::cx::Cx) -> asupersync::Time {
         .map_or_else(asupersync::time::wall_now, |driver| driver.now())
 }
 
+/// Mint an independent request capability with both a caller-selected budget
+/// and a relative deadline.
+///
+/// Capability constructors outside this module should not reach through to
+/// asupersync's clock directly: doing so bypasses the runtime-owned timer
+/// driver under deterministic runtimes. The seed context supplies that clock;
+/// the returned context is fresh, so cancellation of an unrelated caller
+/// cannot suppress bounded cleanup or compensation work.
+#[must_use]
+pub fn fresh_request_cx_with_budget_timeout(
+    budget: crate::cx::Budget,
+    timeout: Duration,
+) -> crate::cx::Cx {
+    let seed = crate::cx::Cx::for_request();
+    let deadline = cx_timer_now(&seed) + timeout;
+    crate::cx::Cx::for_request_with_budget(budget.with_deadline(deadline))
+}
+
 /// Runs blocking work on the active runtime's blocking executor.
 ///
 /// Returns the closure output when successful, or a stringified join/runtime
