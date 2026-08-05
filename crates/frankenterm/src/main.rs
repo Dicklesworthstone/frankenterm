@@ -24513,6 +24513,79 @@ mod watch_events_tests {
     }
 
     #[test]
+    fn watch_events_limit_enforces_documented_hard_bounds() {
+        assert_eq!(
+            validate_watch_events_limit(0),
+            Err("Invalid --limit: must be in 1..=1000")
+        );
+        assert_eq!(validate_watch_events_limit(1), Ok(()));
+        assert_eq!(
+            validate_watch_events_limit(WATCH_EVENTS_BATCH_LIMIT_MAX),
+            Ok(())
+        );
+        assert_eq!(
+            validate_watch_events_limit(WATCH_EVENTS_BATCH_LIMIT_MAX + 1),
+            Err("Invalid --limit: must be in 1..=1000")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_idle_ipc_stream_heartbeat_cannot_starve_durable_polling() {
+        assert_eq!(watch_ipc_durable_poll_heartbeat_interval_ms(0, 500), 500);
+        assert_eq!(
+            watch_ipc_durable_poll_heartbeat_interval_ms(5_000, 500),
+            500,
+            "the private wakeup must be no slower than the DB poll cadence"
+        );
+        assert_eq!(
+            watch_ipc_durable_poll_heartbeat_interval_ms(100, 500),
+            100,
+            "a faster user-visible heartbeat cadence remains intact"
+        );
+        assert_eq!(
+            watch_ipc_durable_poll_heartbeat_interval_ms(0, 0),
+            WATCH_EVENTS_POLL_INTERVAL_MS_MIN,
+            "a zero poll interval still uses the bounded polling floor"
+        );
+
+        run_watch_claim_async(async move {
+            let stdout = std::io::stdout();
+            let mut cursor = Some(7);
+            let mut last_event_emit = None;
+            let mut last_emit = std::time::Instant::now();
+            let initial_last_emit = last_emit;
+            let line = serde_json::json!({
+                "type": "heartbeat",
+                "cursor": null,
+                "now": 12_345,
+            })
+            .to_string();
+
+            let action = relay_ipc_event_line(
+                &stdout,
+                &line,
+                &mut cursor,
+                None,
+                &mut last_event_emit,
+                0,
+                std::time::Duration::ZERO,
+                &mut last_emit,
+            )
+            .await
+            .expect("classify private IPC heartbeat");
+
+            assert_eq!(action, IpcRelayAction::DurablePoll);
+            assert_eq!(cursor, Some(7), "a heartbeat cannot advance the cursor");
+            assert_eq!(last_event_emit, None, "a heartbeat is not an event");
+            assert_eq!(
+                last_emit, initial_last_emit,
+                "output-disabled private heartbeats must not claim a stdout write"
+            );
+        });
+    }
+
+    #[test]
     fn a_control_record_resets_the_idle_heartbeat_deadline() {
         let heartbeat = std::time::Duration::from_millis(100);
         let mut last_emit = std::time::Instant::now() - heartbeat;
@@ -24634,7 +24707,10 @@ mod watch_events_tests {
             )
             .await
             .expect("deliver claimed event");
-            assert_eq!(success, WatchEventClaimDelivery::Delivered);
+            assert!(matches!(
+                success,
+                WatchEventClaimDelivery::Delivered { .. }
+            ));
             let emitted: serde_json::Value = serde_json::from_slice(&success_output)
                 .expect("parse claimed NDJSON record");
             assert_eq!(emitted["handled"].as_bool(), Some(false));
@@ -24801,7 +24877,10 @@ mod watch_events_tests {
             )
             .await
             .expect("lost token-CAS is a typed at-least-once outcome");
-            assert_eq!(lost, WatchEventClaimDelivery::FinalizationLost);
+            assert!(matches!(
+                lost,
+                WatchEventClaimDelivery::FinalizationLost { .. }
+            ));
             assert!(!lost_output.is_empty(), "the consumer received the record");
             let stored = storage
                 .get_events_stream(watch_claim_query(finalization_lost_id - 1))
@@ -24818,6 +24897,40 @@ mod watch_events_tests {
 
             storage.shutdown().await.expect("shutdown watch claim storage");
         });
+    }
+
+    #[test]
+    fn finalization_lost_uses_actual_flush_time_for_rate_and_heartbeat_clocks() {
+        let flushed_at = std::time::Instant::now() - std::time::Duration::from_secs(2);
+        let mut last_emit = std::time::Instant::now();
+        let mut last_event_emit = None;
+
+        note_watch_claim_output_emitted(
+            WatchEventClaimDelivery::FinalizationLost { flushed_at },
+            &mut last_emit,
+            &mut last_event_emit,
+        );
+
+        assert_eq!(last_emit, flushed_at);
+        assert_eq!(last_event_emit, Some(flushed_at));
+        assert!(
+            watch_heartbeat_is_due(
+                1_000,
+                std::time::Duration::from_secs(1),
+                last_emit,
+            ),
+            "heartbeat accounting must start at the completed output flush"
+        );
+        assert_eq!(
+            watch_delay_bounded_by_heartbeat(
+                std::time::Duration::from_secs(5),
+                1_000,
+                std::time::Duration::from_secs(1),
+                last_emit.elapsed(),
+            ),
+            std::time::Duration::ZERO,
+            "post-finalization pacing must not hide an already-due heartbeat"
+        );
     }
 
     #[test]
@@ -38027,10 +38140,11 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                 {
                                     if let Some(mut stream) = ipc_stream.take() {
                                         // `take()` leaves `ipc_stream` None;
-                                        // Consume wakeups and cursorless live
-                                        // records until the watcher closes the
-                                        // stream (or the consumer closes the
-                                        // pipe).
+                                        // Consume records until an event or
+                                        // private heartbeat returns the outer
+                                        // loop to the durable drain, the watcher
+                                        // closes the stream, or the consumer
+                                        // closes the pipe.
                                         loop {
                                             match stream.next_line_with_cx(&cx).await {
                                                 Ok(Some(line)) => {
@@ -38132,7 +38246,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                                                 observe_ipc_fallback(
                                                                     &mut ipc_diagnostics,
                                                                     IpcFallbackObservation::StreamValidated,
-                                                                    "server produced a contract-valid event or heartbeat record",
+                                                                    "server produced a contract-valid cursorless live event record",
                                                                 );
                                                             }
                                                         }

@@ -315,19 +315,24 @@ ft robot profile list|show|apply|validate
 atomically leases each persisted event, emits and flushes a record whose
 `handled` field is still truthfully `false` and whose `claim_delivery` is
 `finalize_after_output_flush`, then token-CAS marks the row handled. A known
-write or flush failure releases the lease immediately; a crash leaves it
-eligible for redelivery after expiry. The durable cursor advances only after
-successful finalization (or after another path already handled/removed the
-row), so finalization races can duplicate but cannot silently skip an event.
-Live-only `pane_discovered` and `pane_disappeared` notifications have no
-durable row and are not claimable.
+write or flush failure attempts an immediate token-CAS lease release. If that
+release cannot reach storage, lease expiry remains the recovery path; a crash
+also leaves the event eligible for redelivery after expiry. The durable cursor
+advances only after successful finalization (or after another path already
+handled/removed the row), so finalization races can duplicate but cannot
+silently skip an event. Live-only `pane_discovered` and `pane_disappeared`
+notifications have no durable row and are not claimable.
 
 In follow mode, a persisted detection received from the live IPC EventBus is a
 low-latency wakeup, not an ordering or payload authority. FrankenTerm re-enters
 the SQLite cursor drain and emits the exact stored rows in increasing event-ID
 order; this prevents out-of-order EventBus publication or dedupe conflicts from
 advancing the resumable cursor past an unseen row. Cursorless pane-lifecycle
-notifications remain direct, best-effort live records.
+notifications remain direct, best-effort live records. The private IPC
+subscription requests a heartbeat no slower than the configured durable DB
+poll cadence, and each private heartbeat returns the follower to the SQLite
+drain. `--heartbeat-interval-ms 0` disables user-visible heartbeat records,
+not this private durability wakeup.
 
 `ft robot send` keeps the default fast path unless the caller asks for delivery
 proof. `--verify-submit` returns a submitted-level `submit` receipt; `--submit-level`
