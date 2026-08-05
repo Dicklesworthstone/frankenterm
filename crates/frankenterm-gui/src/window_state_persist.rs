@@ -5275,6 +5275,9 @@ mod tests {
     use std::sync::Barrier;
 
     const CONTROLLED_WORKER_WATCHDOG: Duration = Duration::from_secs(5);
+    // The terminal numeric identity is reserved; its predecessor retains the
+    // same 20-digit serialized width for maximum-budget coverage.
+    const MAX_ADMISSIBLE_REMOTE_ID: u64 = u64::MAX - 1;
     const CROSS_PROCESS_GROWTH_HELPER: &str =
         "window_state_persist::tests::near_ceiling_external_growth_process_helper";
     const CROSS_PROCESS_STATE_PATH_ENV: &str = "FT_TEST_WINDOW_STATE_PATH";
@@ -5589,7 +5592,10 @@ mod tests {
 
     fn indexed_binding_id(index: u64) -> DomainBindingId {
         let mut bytes = [0u8; 16];
-        bytes[..8].copy_from_slice(&index.to_le_bytes());
+        let nonzero_ordinal = index
+            .checked_add(1)
+            .expect("test binding index has a nonzero successor");
+        bytes[..8].copy_from_slice(&nonzero_ordinal.to_le_bytes());
         DomainBindingId::from_bytes(bytes)
     }
 
@@ -5820,8 +5826,8 @@ mod tests {
                                 103,
                                 global_tab_index,
                             )),
-                            u64::MAX,
-                            u64::MAX,
+                            MAX_ADMISSIBLE_REMOTE_ID,
+                            MAX_ADMISSIBLE_REMOTE_ID,
                         )
                     })
                     .collect::<Vec<_>>()
@@ -7640,8 +7646,8 @@ mod tests {
         let maximum_remote_slot_bytes = encoded_json_len(&StableTabSlot::remote(
             DomainBindingId::from_bytes([u8::MAX; 16]),
             StableMuxSessionId::from_bytes([u8::MAX; 16]),
-            u64::MAX,
-            u64::MAX,
+            MAX_ADMISSIBLE_REMOTE_ID,
+            MAX_ADMISSIBLE_REMOTE_ID,
         ))
         .expect("count canonical maximum-width remote slot");
         for slot in state
@@ -7660,8 +7666,8 @@ mod tests {
             };
             assert!(binding_id.as_bytes().iter().all(|byte| *byte >= 100));
             assert!(session_id.as_bytes().iter().all(|byte| *byte >= 100));
-            assert_eq!(*remote_window_id, u64::MAX);
-            assert_eq!(*remote_tab_id, u64::MAX);
+            assert_eq!(*remote_window_id, MAX_ADMISSIBLE_REMOTE_ID);
+            assert_eq!(*remote_tab_id, MAX_ADMISSIBLE_REMOTE_ID);
             assert_eq!(
                 encoded_json_len(slot).expect("count maximum-width remote slot"),
                 maximum_remote_slot_bytes
@@ -8255,7 +8261,7 @@ mod tests {
             .insert(workspace.clone(), PersistedWindowState::default());
         state.domain_bindings.push(DomainBindingRecord {
             target_fingerprint: PrivacySafeTargetFingerprint::from_bytes([0; 32]),
-            binding_id: DomainBindingId::from_bytes([0; 16]),
+            binding_id: indexed_binding_id(0),
         });
         canonicalize_state(&mut state);
         let reduced_state = PersistedWindowState {
@@ -8307,7 +8313,7 @@ mod tests {
             .insert(workspace.clone(), PersistedWindowState::default());
         state.domain_bindings.push(DomainBindingRecord {
             target_fingerprint: PrivacySafeTargetFingerprint::from_bytes([0; 32]),
-            binding_id: DomainBindingId::from_bytes([0; 16]),
+            binding_id: indexed_binding_id(0),
         });
         canonicalize_state(&mut state);
 
@@ -8369,7 +8375,7 @@ mod tests {
             .insert("old".to_string(), PersistedWindowState::default());
         state.domain_bindings.push(DomainBindingRecord {
             target_fingerprint: PrivacySafeTargetFingerprint::from_bytes([0; 32]),
-            binding_id: DomainBindingId::from_bytes([0; 16]),
+            binding_id: indexed_binding_id(0),
         });
         state.overlays.push(old_overlay.clone());
         canonicalize_state(&mut state);
@@ -12284,7 +12290,7 @@ mod tests {
                         binding_byte;
                         32
                     ]),
-                    binding_id: DomainBindingId::from_bytes([binding_byte; 16]),
+                    binding_id: DomainBindingId::from_bytes([binding_byte.max(1); 16]),
                 });
             }
             tab_bytes.sort_unstable();
