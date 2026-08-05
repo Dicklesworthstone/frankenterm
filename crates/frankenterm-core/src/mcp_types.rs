@@ -1396,7 +1396,7 @@ mod tests {
         let envelope = McpEnvelope::<()>::error(
             "FT-MCP-0001",
             &oversized,
-            Some(oversized),
+            Some(oversized.clone()),
             0,
         );
         assert_eq!(envelope.error.as_deref(), Some(MCP_ENVELOPE_TEXT_OVERSIZE));
