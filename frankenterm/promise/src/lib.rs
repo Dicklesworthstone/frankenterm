@@ -18,14 +18,44 @@ struct Core<T> {
     producer_completed: bool,
 }
 
+static CORE_LOCK_POISONED_COUNT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Return the number of promise-core mutex poison events recovered by this
+/// process.
+#[must_use]
+pub fn core_lock_poisoned_count() -> u64 {
+    CORE_LOCK_POISONED_COUNT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[cfg(test)]
+fn reset_core_lock_poisoned_count_for_test() {
+    CORE_LOCK_POISONED_COUNT.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
 fn lock_core<T>(core: &Mutex<Core<T>>) -> MutexGuard<'_, Core<T>> {
     match core.lock() {
         Ok(guard) => guard,
         Err(poisoned) => {
+            CORE_LOCK_POISONED_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             core.clear_poison();
             poisoned.into_inner()
         }
     }
+}
+
+fn wake_caller(waker: Waker) {
+    let _ = frankenterm_sigpipe::catch_recoverable(
+        frankenterm_sigpipe::RecoverablePanicSite::PromiseWaker,
+        std::panic::AssertUnwindSafe(|| waker.wake()),
+    );
+}
+
+fn dispose_caller(waker: Waker) {
+    let _ = frankenterm_sigpipe::catch_recoverable(
+        frankenterm_sigpipe::RecoverablePanicSite::PromiseWaker,
+        std::panic::AssertUnwindSafe(|| drop(waker)),
+    );
 }
 
 pub struct Promise<T> {
@@ -94,10 +124,7 @@ impl<T> Promise<T> {
             // executor-provided waker panic must not unwind through the
             // producer and cannot invalidate the ready result; isolate it at
             // the same audited boundary used by the broken-promise Drop path.
-            let _ = frankenterm_sigpipe::catch_recoverable(
-                frankenterm_sigpipe::RecoverablePanicSite::PromiseWaker,
-                std::panic::AssertUnwindSafe(|| waker.wake()),
-            );
+            wake_caller(waker);
         }
         true
     }
@@ -121,10 +148,7 @@ impl<T> Drop for Promise<T> {
             // during an outer unwind: the shared helper catches the nested
             // unwind before it can escape this destructor, allowing the
             // original panic to continue.
-            let _ = frankenterm_sigpipe::catch_recoverable(
-                frankenterm_sigpipe::RecoverablePanicSite::PromiseWaker,
-                std::panic::AssertUnwindSafe(|| waker.wake()),
-            );
+            wake_caller(waker);
         }
     }
 }
@@ -155,23 +179,119 @@ impl<T: Send + 'static> Future<T> {
             completed: false,
         }
     }
+
+    fn poll_with_waker_clone(
+        self: Pin<&mut Self>,
+        ctx: &mut Context<'_>,
+        clone_waker: impl FnOnce(&Waker) -> Waker,
+    ) -> Poll<Result<T, Error>> {
+        let this = self.get_mut();
+        assert!(!this.completed, "promise future polled after completion");
+
+        // A ready value requires no registration. In particular, do not invoke
+        // an executor-owned RawWaker clone callback after the producer has
+        // already committed the result.
+        let (ready, retired, already_registered) = {
+            let mut core = lock_core(&this.core);
+            if let Some(result) = core.result.take() {
+                (Some(result), core.waker.take(), false)
+            } else {
+                let already_registered = core
+                    .waker
+                    .as_ref()
+                    .is_some_and(|current| current.will_wake(ctx.waker()));
+                (None, None, already_registered)
+            }
+        };
+        if let Some(retired) = retired {
+            dispose_caller(retired);
+        }
+        if let Some(result) = ready {
+            this.completed = true;
+            return Poll::Ready(result);
+        }
+        if already_registered {
+            return Poll::Pending;
+        }
+
+        // Caller-controlled clone code runs without the core lock. A failure
+        // is converted into one finite terminal error rather than escaping the
+        // Future boundary or leaving an obsolete registration behind.
+        let candidate = frankenterm_sigpipe::catch_recoverable(
+            frankenterm_sigpipe::RecoverablePanicSite::PromiseWaker,
+            std::panic::AssertUnwindSafe(|| clone_waker(ctx.waker())),
+        );
+        let Ok(candidate) = candidate else {
+            let (ready, retired) = {
+                let mut core = lock_core(&this.core);
+                (core.result.take(), core.waker.take())
+            };
+            if let Some(retired) = retired {
+                dispose_caller(retired);
+            }
+            this.completed = true;
+            return Poll::Ready(ready.unwrap_or_else(|| {
+                Err(anyhow::anyhow!("promise caller waker registration failed"))
+            }));
+        };
+
+        // Recheck after cloning: the producer may have completed, or another
+        // poll may already have published an equivalent waker, while the
+        // clone callback was running. Move both redundant and retired wakers
+        // out of the critical section before their destructors can run.
+        let mut candidate = Some(candidate);
+        let (ready, retired) = {
+            let mut core = lock_core(&this.core);
+            if let Some(result) = core.result.take() {
+                (Some(result), core.waker.take())
+            } else if core
+                .waker
+                .as_ref()
+                .is_some_and(|current| current.will_wake(ctx.waker()))
+            {
+                (None, None)
+            } else {
+                let replacement = candidate
+                    .take()
+                    .expect("candidate exists until registration commits");
+                (None, core.waker.replace(replacement))
+            }
+        };
+
+        if let Some(retired) = retired {
+            dispose_caller(retired);
+        }
+        if let Some(redundant) = candidate {
+            dispose_caller(redundant);
+        }
+        if let Some(result) = ready {
+            this.completed = true;
+            Poll::Ready(result)
+        } else {
+            Poll::Pending
+        }
+    }
 }
 
 impl<T: Send + 'static> std::future::Future for Future<T> {
     type Output = Result<T, Error>;
 
     fn poll(self: Pin<&mut Self>, ctx: &mut Context) -> Poll<Self::Output> {
-        let this = self.get_mut();
-        assert!(!this.completed, "promise future polled after completion");
-        let waker = ctx.waker().clone();
+        self.poll_with_waker_clone(ctx, Waker::clone)
+    }
+}
 
-        let mut core = lock_core(&this.core);
-        if let Some(result) = core.result.take() {
-            this.completed = true;
-            Poll::Ready(result)
-        } else {
-            core.waker.replace(waker);
-            Poll::Pending
+impl<T> Drop for Future<T> {
+    fn drop(&mut self) {
+        // Clear defensively even after a terminal poll. The state machine does
+        // not normally retain a waker alongside a ready result, but poison
+        // recovery must not turn that invariant into an uncontained destructor.
+        let retired = {
+            let mut core = lock_core(&self.core);
+            core.waker.take()
+        };
+        if let Some(retired) = retired {
+            dispose_caller(retired);
         }
     }
 }
@@ -200,6 +320,36 @@ mod tests {
 
     fn panic_waker() -> Waker {
         Waker::from(Arc::new(PanicWake))
+    }
+
+    #[cfg(panic = "unwind")]
+    struct PanicOnFinalDrop {
+        drops: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[cfg(panic = "unwind")]
+    impl Wake for PanicOnFinalDrop {
+        fn wake(self: Arc<Self>) {}
+
+        fn wake_by_ref(self: &Arc<Self>) {}
+    }
+
+    #[cfg(panic = "unwind")]
+    impl Drop for PanicOnFinalDrop {
+        fn drop(&mut self) {
+            self.drops
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            panic!("synthetic caller waker final-drop panic");
+        }
+    }
+
+    #[cfg(panic = "unwind")]
+    fn final_drop_panicking_waker() -> (Arc<std::sync::atomic::AtomicUsize>, Waker) {
+        let drops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let waker = Waker::from(Arc::new(PanicOnFinalDrop {
+            drops: Arc::clone(&drops),
+        }));
+        (drops, waker)
     }
 
     // ── BrokenPromise ──────────────────────────────────────────
@@ -498,7 +648,129 @@ mod tests {
     }
 
     #[test]
+    fn ready_future_never_clones_caller_waker() {
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut future = Future::ok(17i32);
+        let result = Pin::new(&mut future).poll_with_waker_clone(&mut cx, |_| {
+            panic!("ready future must not clone its caller waker");
+        });
+        assert!(matches!(result, Poll::Ready(Ok(17))));
+    }
+
+    #[cfg(panic = "unwind")]
+    #[test]
+    fn caller_waker_clone_failure_is_finite_and_retires_stale_registration() {
+        let mut promise: Promise<i32> = Promise::new();
+        let mut future = promise.get_future().expect("future");
+        let first = panic_waker();
+        let mut first_cx = Context::from_waker(&first);
+        assert!(matches!(
+            StdFuture::poll(Pin::new(&mut future), &mut first_cx),
+            Poll::Pending
+        ));
+
+        let replacement = noop_waker();
+        let mut replacement_cx = Context::from_waker(&replacement);
+        let result = Pin::new(&mut future).poll_with_waker_clone(&mut replacement_cx, |_| {
+            panic!("synthetic caller-waker clone failure");
+        });
+        let Poll::Ready(Err(error)) = result else {
+            panic!("clone failure must produce one finite terminal error");
+        };
+        assert_eq!(
+            error.to_string(),
+            "promise caller waker registration failed"
+        );
+        assert!(lock_core(&promise.core).waker.is_none());
+        assert!(promise.ok(18));
+    }
+
+    #[cfg(panic = "unwind")]
+    #[test]
+    fn replacement_disposes_hostile_waker_outside_core_lock() {
+        let mut promise: Promise<i32> = Promise::new();
+        let mut future = promise.get_future().expect("future");
+        let (drops, hostile) = final_drop_panicking_waker();
+        {
+            let mut hostile_cx = Context::from_waker(&hostile);
+            assert!(matches!(
+                StdFuture::poll(Pin::new(&mut future), &mut hostile_cx),
+                Poll::Pending
+            ));
+        }
+        drop(hostile);
+
+        let replacement = noop_waker();
+        let mut replacement_cx = Context::from_waker(&replacement);
+        assert!(matches!(
+            StdFuture::poll(Pin::new(&mut future), &mut replacement_cx),
+            Poll::Pending
+        ));
+        assert_eq!(drops.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(!promise.core.is_poisoned());
+        assert!(promise.ok(19));
+    }
+
+    #[test]
+    fn dropping_pending_future_retires_waker_before_later_completion() {
+        struct CountWake(Arc<std::sync::atomic::AtomicUsize>);
+
+        impl Wake for CountWake {
+            fn wake(self: Arc<Self>) {
+                self.0
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+
+        let wakes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let waker = Waker::from(Arc::new(CountWake(Arc::clone(&wakes))));
+        let mut promise: Promise<i32> = Promise::new();
+        let mut future = promise.get_future().expect("future");
+        let mut cx = Context::from_waker(&waker);
+        assert!(matches!(
+            StdFuture::poll(Pin::new(&mut future), &mut cx),
+            Poll::Pending
+        ));
+
+        drop(future);
+        assert!(promise.ok(20));
+        assert_eq!(wakes.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[cfg(panic = "unwind")]
+    #[test]
+    fn dropping_pending_future_contains_hostile_waker_drop_during_outer_unwind() {
+        let mut promise: Promise<i32> = Promise::new();
+        let mut future = promise.get_future().expect("future");
+        let (drops, hostile) = final_drop_panicking_waker();
+        {
+            let mut cx = Context::from_waker(&hostile);
+            assert!(matches!(
+                StdFuture::poll(Pin::new(&mut future), &mut cx),
+                Poll::Pending
+            ));
+        }
+        drop(hostile);
+
+        let outer = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _future_dropped_during_unwind = future;
+            panic!("outer promise-future unwind remains authoritative");
+        }))
+        .expect_err("outer panic must propagate");
+        assert_eq!(
+            outer.downcast_ref::<&str>().copied(),
+            Some("outer promise-future unwind remains authoritative")
+        );
+        assert_eq!(drops.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(promise.ok(21));
+    }
+
+    #[test]
     fn promise_clears_core_poison_after_recovery() {
+        static TEST_LOCK: Mutex<()> = Mutex::new(());
+        let _test_guard = TEST_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
+        reset_core_lock_poisoned_count_for_test();
         let mut p: Promise<i32> = Promise::new();
         let mut fut = p.get_future().unwrap();
 
@@ -511,6 +783,7 @@ mod tests {
 
         assert!(p.ok(42));
         assert!(!p.core.is_poisoned());
+        assert_eq!(core_lock_poisoned_count(), 1);
 
         let waker = noop_waker();
         let mut cx = Context::from_waker(&waker);
