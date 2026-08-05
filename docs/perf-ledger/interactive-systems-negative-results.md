@@ -2681,6 +2681,118 @@ experiment. It is not converted into a flattering keep or a durable rejection.
 - **Primary retry condition:**
   > Claim an outbound MCP response timeout only after a silent-subprocess fixture proves the exact call returns by the caller deadline, cancels or closes the blocked transport without leaking its reader thread or child process, and leaves later calls in a deterministic usable-or-closed state.
 
+### IS-N085 — A shaping generation bump is not cache invalidation
+
+- **Classification:** stale-render-state rejection; structural fix retained
+- **Bead:** `ft-interactive-systems-performance-4tenz.8`
+- **Rejected inference:** incrementing the GUI shaping-input generation is
+  sufficient to invalidate every line-shaping result after a scale, font, or
+  configuration transition.
+- **Negative evidence:** the generation changed, but the HarfBuzz shape cache
+  and `line_to_ele_shape_cache` still retained entries computed from the prior
+  shaping inputs. Repeated resize/zoom/font transitions could therefore retain
+  stale work and grow LFU state even though the glyph atlas remained reusable.
+- **Decision:** route shaping-input transitions through one saturating helper
+  that advances the generation and clears both shaping-result caches while
+  preserving atlas-only reuse. Do not claim a resize/zoom latency win from the
+  invalidation correction alone.
+- **Primary retry condition:**
+  > Keep a more selective shaping-cache reuse policy only after scale, font, fallback-font, DPI, configuration, resize-storm, and generation-exhaustion tests prove byte/visual equivalence and retained M4/M5 timing shows a statistically meaningful win without stale entries or unbounded cache growth.
+
+### IS-N086 — Receiver limits do not bound producer traversal and callbacks
+
+- **Classification:** wrong-boundary rejection; bounded producer preflight
+  retained
+- **Rejected inference:** validating the final ordered pane arena against wire
+  depth and node ceilings is enough to bound snapshot production.
+- **Negative evidence:** the producer could recursively census a malformed or
+  over-limit tree, traverse hidden stacks/floating/zoom carriers, allocate
+  observation state, and invoke `Pane::pane_id` before the codec rejected the
+  result. A unique-identity cap also failed to bound repeated raw carriers, and
+  coupling census capacity to remaining aggregate arena space made acceptance
+  depend on tab position.
+- **Decision:** perform an iterative callback-free preflight with independent
+  tree-node/depth and stable raw-carrier budgets, exact ownership validation,
+  fallible geometric allocation, active-pane capture, bounded retries, and
+  rollback before any pane callback or arena append.
+- **Primary retry condition:**
+  > Relax or remove producer preflight only after adversarial depth, node, repeated-Arc, empty-stack, hidden/floating/zoom alias, malformed split, invalid-active, callback-mutation, allocation-failure, and q4096 tests prove every rejected topology consumes bounded work and performs zero pane callbacks or caller-arena mutation.
+
+### IS-N087 — A complete shard snapshot is not authoritative without a generation fence
+
+- **Classification:** stale-publication rejection; linearized route snapshot
+  retained
+- **Beads:** `ft-interactive-systems-performance-4tenz.5.5.3.5.8.5.1` and
+  `ft-interactive-systems-performance-4tenz.5.5.13.1.1`
+- **Rejected inference:** replacing the global route cache after a full shard
+  discovery pass is safe because the pass observed every backend.
+- **Negative evidence:** a concurrent route insert/remove can commit after the
+  discovery pass starts and before its replacement publication. Without a
+  generation fence, the older full snapshot overwrites that newer delta.
+  Wrapping the generation counter would eventually let an ancient snapshot
+  appear current again.
+- **Decision:** publish only against the exact captured generation, linearize
+  delta updates with snapshot publication, and fail closed at the saturated
+  generation sentinel rather than wrapping.
+- **Primary retry condition:**
+  > Replace the generation fence only after a deterministic insert/remove/full-scan interleaving model plus generation-exhaustion tests prove no committed newer route can be lost, resurrected, or misrouted and global window/tab/pane identities remain collision-free across every shard.
+
+### IS-N088 — Global `MIN(id)` is not retention-gap authority
+
+- **Classification:** false no-gap inference; transactional deletion evidence
+  required
+- **Bead:** `ft-7h5da.4.8`
+- **Rejected inference:** if a resume cursor is not below the oldest surviving
+  event ID, no retention deletion intersects the requested history.
+- **Negative evidence:** cleanup deletes by timestamp and tier predicates, not
+  by an ID prefix. With ID 1 retained, ID 2 tier-expired, and ID 3 retained, a
+  cursor at 1 sees global minimum 1 and then advances to 3, silently losing ID
+  2. Filtered or unhandled-only streams naturally have sparse IDs, so probing
+  global minimum on every discontinuity also adds pathological extra SQLite
+  work while confusing filtering with pruning.
+- **Decision:** do not infer deletion from page sparsity or global minimum.
+  Every resumable deletion must atomically record exact coalesced ID evidence;
+  resume validation must carry a cursor epoch and reconcile the requested
+  interval against that evidence in the storage snapshot.
+- **Primary retry condition:**
+  > Claim no-silent-gaps only after fresh and upgraded databases prove epoch mismatch and legacy uncertainty fail closed, every flat/tiered/interior/full-prune deletion commits exact non-overlapping intervals atomically, sparse filtered pages add no false probe, and concurrent cleanup/resume cannot skip a deleted or reuse-ambiguous ID.
+
+### IS-N089 — Caller cancellation cannot own post-delivery lease settlement
+
+- **Classification:** cancellation-authority rejection; bounded completion
+  capability retained
+- **Bead:** `ft-7h5da.4.8`
+- **Rejected inference:** using the request `Cx` for reserve, output, release,
+  and finalization is uniformly cancel-correct.
+- **Negative evidence:** after reservation succeeds, the writer can cancel the
+  caller. Reusing that cancelled `Cx` makes release/finalize fail their
+  preflight, stranding the lease until TTL; after a successful flush it can
+  also leave delivered output unhandled and eligible for redelivery.
+- **Decision:** keep acquisition caller-cancellable, checkpoint before starting
+  synchronous output, then give release/finalize one independent finite
+  completion capability after ownership has been acquired.
+- **Primary retry condition:**
+  > Change the completion boundary only after deterministic cancellation before write and inside successful, closed-pipe, and failed writers proves every acquired lease is finalized exactly after acknowledged flush or released promptly after known failure, with bounded settlement time and no cross-request ownership.
+
+### IS-N090 — A Cx checkpoint cannot preempt a blocked synchronous output pipe
+
+- **Classification:** false cancellation/backpressure bound; architectural
+  follow-on required
+- **Beads:** `ft-7h5da.4.8` and `ft-7h5da.4.10`
+- **Rejected inference:** checking cancellation immediately before
+  `StdoutLock::write`/flush makes watch-event output bounded and cancellable.
+- **Negative evidence:** a full but still-open downstream pipe can block the
+  async worker inside synchronous stdio indefinitely. No later checkpoint,
+  heartbeat, lease finalization, or shutdown observation can run, and a
+  delivery lease can outlive its intended settlement window.
+- **Decision:** retain pre/post checkpoints as correctness guards for ready
+  I/O, but make no hard output-timeout claim. The durable fix needs one bounded
+  dedicated/asynchronous writer, explicit queue/backpressure policy, flush
+  acknowledgments coupled to claim finalization, cancellation-aware teardown,
+  and deterministic stalled-consumer behavior.
+- **Primary retry condition:**
+  > Claim bounded watch output only after a stalled-but-open pipe fixture proves queue admission, cancellation, shutdown, writer teardown, lease release/finalization, memory growth, and cursor behavior remain bounded under partial writes, flush stalls, pipe closure, and sustained producer overload.
+
 ## Open hypothesis register
 
 These are not negative results. Each remains open until a retained same-window
