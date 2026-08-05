@@ -49,7 +49,7 @@
 | Auditing the claims | [Trust & Attestation](#trust--attestation) → [Threat Model](#deep-dive-threat-model) → [Formal Methods](#deep-dive-formal-methods-in-this-repo) |
 | Reading the algorithms | [Algorithm & Data Structure Catalog](#algorithm--data-structure-catalog) → [Pattern Engine](#deep-dive-pattern-engine-architecture) → [Cx Cancellation Model](#deep-dive-the-cx-cancellation-model) |
 
-**A swarm-native terminal platform that observes, controls, and audits fleets of 200+ concurrent AI coding agents.** <!--count:workspace_members-->77<!--/count--> workspace crates, <!--count:core_subcrates-->19<!--/count--> sub-crates carved out of the core, <!--count:core_top_level_modules-->531<!--/count--> core-library modules, <!--count:core_loc-->1089341<!--/count-->+ lines of Rust, <!--count:test_count-->57556<!--/count-->+ test annotations across <!--count:core_rust_test_files-->984<!--/count--> integration test files.
+**A swarm-native terminal platform designed to observe, control, and audit large fleets of concurrent AI coding agents.** The retained 200-pane figures are synthetic benchmark-lane results, not a qualified native or target-class operating envelope. <!--count:workspace_members-->77<!--/count--> workspace crates, <!--count:core_subcrates-->19<!--/count--> sub-crates carved out of the core, <!--count:core_top_level_modules-->531<!--/count--> core-library modules, <!--count:core_loc-->1089341<!--/count-->+ lines of Rust, <!--count:test_count-->57556<!--/count-->+ test annotations across <!--count:core_rust_test_files-->984<!--/count--> integration test files.
 
 _Counts are auto-stamped by `scripts/stamp-readme-counts.sh` and drift fast. See [Maintainers: how counts stay honest](#maintainers-how-counts-stay-honest) at the bottom for the exact recipe. Developer checks use the live worktree by default; release snapshots use `--source=head` so unrelated dirty files cannot alter the attested counts._
 
@@ -70,7 +70,7 @@ cargo install --profile release-interactive --git https://github.com/Dickleswort
 
 **The Problem.** Running large AI coding swarms across ad-hoc terminal panes is chaos. When you're driving 50–200 Claude Code / Codex / Gemini agents at once, a single undetected rate limit wastes hours of compute. A stuck agent silently burns tokens. An auth failure goes unnoticed for thirty minutes. You have no search across agent output, no audit trail, no way for one AI to safely control another, and no way to know whether your swarm is operating inside or outside its safe envelope.
 
-**The Solution.** `ft` is a **full terminal platform for agent swarms** with deep observability, deterministic eventing, policy-gated automation, machine-native control surfaces (Robot Mode + MCP), and a fail-closed operating-envelope contract. It captures bounded terminal-output deltas across observed panes and records explicit gaps whenever continuity cannot be established, detects state transitions via multi-pattern matching plus Bayesian change-point detection, triggers transactional workflows in response, and exposes those surfaces through a JSON API built for AI-to-AI orchestration. The closest analogy is Kubernetes for terminal-based AI agents: observe, detect, react, audit, and refuse to drive the swarm outside its proven safe envelope.
+**The Solution.** `ft` is a **full terminal platform for agent swarms** with deep observability, deterministic eventing, policy-gated automation, machine-native control surfaces (Robot Mode + MCP), and a fail-closed operating-envelope contract. It captures bounded terminal-output deltas across observed panes and records explicit gaps whenever continuity cannot be established, detects state transitions via multi-pattern matching plus Bayesian change-point detection, triggers transactional workflows in response, and exposes those surfaces through a JSON API built for AI-to-AI orchestration. The closest analogy is Kubernetes for terminal-based AI agents: observe, detect, react, audit, and refuse admission outside the envelope justified by the telemetry and evidence currently available. That envelope is deliberately narrower than the eventual 200-pane target while target-class proof remains blocked.
 
 **Runtime model.** Fully `Cx`-aware, structured, cancel-correct async on **asupersync**. Direct `tokio` usage is **banned at the dependency level** via `cargo-deny` and at the type level via the `RuntimeProof` sealed trait. The `runtime_async` module is the canonical asupersync wrapper that every first-party crate imports. The dual-runtime era is over.
 
@@ -301,7 +301,7 @@ Now that you've seen it run, here's the full capability surface:
 | **Operating Envelope Contract** | `ft.operating_envelope.v1` planner module decides whether new pane work is admitted based on system pressure; fails closed when telemetry is missing |
 | **Policy Engine** | 14-subsystem policy framework with per-subsystem health verdicts, capability gates, rate limiting, audit trails, and approval tokens |
 | **Transactional Mission Orchestration** | Prepare/commit/compensate lifecycle, idempotency ledger, deterministic replay, kill switches, capacity-aware objective planner |
-| **Tiered Scrollback** | Three-tier memory management (hot/warm/cold) with worst-of fleet memory controller for 200+ pane fleets[^ft-attest-perf-headline] |
+| **Tiered Scrollback** | Three-tier memory management (hot/warm/cold) with a worst-of fleet memory controller; 200-pane capacity and memory figures are benchmark-lane results, not a target-class or live-session guarantee[^ft-attest-perf-headline] |
 | **Incident Bundles** | Crash and swarm-incident bundles wire to live collectors (process tree, GPU state, mux state, render state, beads coordination snapshot) |
 | **Replay & Forensics** | Capture, replay, and diff decision graphs for post-incident analysis and regression testing |
 | **Distributed Mode** | Optional agent-to-aggregator streaming with per-agent dedup, versioned wire protocol, and stale-session pruning[^ft-attest-distributed-threat] |
@@ -316,7 +316,7 @@ Now that you've seen it run, here's the full capability surface:
 
 The phrase has a concrete meaning here:
 
-1. **The minimum-useful-unit is the fleet, not the pane.** Every primary subsystem (storage, search, policy, workflows, mission, tx, distributed) assumes there are dozens to hundreds of panes and was engineered for that scale from the start, rather than retrofitted from a single-pane assumption.
+1. **The minimum-useful-unit is the fleet, not the pane.** Every primary subsystem (storage, search, policy, workflows, mission, tx, distributed) models fleets rather than a single-pane-only world. The architecture targets dozens to hundreds of panes; the upper end remains a benchmark target until live and target-class qualification closes.
 2. **Fleet pressure is a first-class signal.** The operating envelope, fleet memory controller, and backpressure tiers compose pressure across the entire fleet, not per-pane in isolation. A single hot pane can throttle the rest of the fleet's poll cadence; a healthy fleet runs at full speed.
 3. **One AI can drive another safely.** Robot Mode, MCP, and the policy gate exist specifically so AI agents can control other AI agents without writing brittle text-parsing glue. The JSON envelopes are the contract.
 4. **Coordination primitives are built in.** Beads issue tracking, Agent Mail file reservations, work claim queues (`ft robot work`), and tx idempotency ledgers exist because swarm work needs coordination, not just observation.
@@ -326,7 +326,7 @@ The phrase has a concrete meaning here:
 
 - **Anyone running 2+ AI coding agents in parallel** and tired of writing bash glue to coordinate them
 - **Anyone building meta-agents** (one AI driving N specialized AIs) who needs a structured control plane
-- **Operators of large swarms (50–200+ panes)** who need fleet-wide observability, memory bounds, and capacity admission
+- **Operators targeting large swarms (50–200+ panes)** who need fleet-wide observability, memory bounds, and capacity admission and can honor the current provisional capacity envelope
 - **Anyone who has to audit what an AI did** in a terminal session after the fact
 - **Anyone who has lost work to a rate limit they didn't notice for 30 minutes**
 - **Anyone who wants their multi-agent infrastructure to fail closed rather than silently degrade**
@@ -517,7 +517,7 @@ The `ft attestation` family is a thin Rust wrapper over [`scripts/attestation-ve
 
 | Feature | ft | WezTerm | Zellij | Ghostty |
 |---|---|---|---|---|
-| Swarm-native orchestration | First-class (200+ panes) | External glue required | External glue required | External glue required |
+| Swarm-native orchestration | Built in; 200-pane scale is benchmark-lane only, pending target qualification | External glue required | External glue required | External glue required |
 | Event-driven automation | Built-in workflows + policy gate | Not native | Not native | Not native |
 | Machine API for agents | Robot Mode + MCP + TOON | None | None | None |
 | Operating-envelope safety | Native fail-closed contract | None | None | None |
@@ -536,7 +536,7 @@ The `ft attestation` family is a thin Rust wrapper over [`scripts/attestation-ve
 - Running 2+ AI coding agents that need coordination
 - Building automation that reacts to terminal output
 - Debugging multi-agent workflows with full observability
-- Operating large agent swarms (50–200+ panes) with memory and backpressure control
+- Operating agent swarms with memory and backpressure control, while treating the published 50–200-pane figures as provisional benchmark bounds until the target-class gate passes
 - Anywhere a swarm controller needs *attestable* safety bounds
 
 **When ft might not be ideal:**
@@ -1354,7 +1354,7 @@ stuck_silence_ms = 30000              # No output for 30s after input → Stuck 
 idle_silence_ms = 60000               # No activity for 60s → Idle (gray)
 ```
 
-Operator-tunable runtime constants live under `[tuning]` sections such as `[tuning.runtime]`, `[tuning.patterns]`, and `[tuning.search]`. See [`docs/tuning-reference.md`](docs/tuning-reference.md) for every key, default, unit, validation guard, and starting ranges for 10-pane, 50-pane, and 200+-pane fleets.
+Operator-tunable runtime constants live under `[tuning]` sections such as `[tuning.runtime]`, `[tuning.patterns]`, and `[tuning.search]`. See [`docs/tuning-reference.md`](docs/tuning-reference.md) for every key, default, unit, validation guard, and provisional starting ranges for 10-pane, 50-pane, and 200+-pane benchmark workloads. Those ranges are not target-class certification.
 
 ### Environment variables
 
@@ -1515,7 +1515,7 @@ frankenterm/                              # 77 workspace members (auto-stamped)
 | Search | FTS5 lexical + Tantivy + optional ML embeddings (fastembed) | Lexical, semantic, and hybrid modes via FrankenSearch RRF fusion |
 | Change-point detection | BOCPD (Bayesian Online Change-Point Detection) | Catch novel failure modes regex patterns miss |
 | Backpressure | Four-tier model (Green/Yellow/Red/Black) with queue-depth gauges | Prevent OOM and cascading latency under load |
-| Fleet memory | Worst-of tier synthesis with asymmetric hysteresis | Coordinated pressure response across 200+ panes |
+| Fleet memory | Worst-of tier synthesis with asymmetric hysteresis | Coordinated fleet-wide pressure response; 200-pane qualification remains pending |
 | Scrollback | Hot (RAM) → Warm (zstd compressed) → Cold (evicted) tiering | Memory-efficient scrollback for large pane counts |
 | Tx execution | Prepare/commit/compensate with idempotency ledger | Safe multi-pane transactional operations |
 | Operating envelope | Side-effect-free planner over RCH + network + process pressure | Refuse admission when telemetry missing / critical |
@@ -2100,7 +2100,11 @@ During incidents, the [resource-pressure cockpit contract](docs/resource-pressur
 
 ## Deep Dive: Three-Tier Scrollback
 
-Stock terminal emulators keep all scrollback uncompressed in RAM. A 200-pane fleet doing that consumes ~4 GB+ just for backbuffers. `ft` keeps scrollback in three tiers and migrates lines between them based on access patterns and pressure.
+In a simple sizing model, 200 panes retaining roughly 20 MB of uncompressed
+backbuffer each consume about 4 GB before other process costs. That is an
+illustrative calculation, not a measured comparison against every stock
+terminal. `ft` keeps scrollback in three tiers and migrates lines between them
+based on access patterns and pressure.
 
 ### Tier transitions
 
@@ -2359,11 +2363,14 @@ Retractions are append-only and visible to anyone who verifies the bundle; this 
                                           ▼ tick end
 ```
 
-### Tick budget bands
+### Provisional tick-budget bands
 
-- **10-pane fleet**: tick budget ~200 ms is comfortable (default).
-- **50-pane fleet**: tighten poll interval if pressure tier stays Normal; consider per-pane priority bumps for hot panes.
-- **200+-pane fleet**: native push events become essential; the operating envelope + fleet memory controller take over throttling decisions when pressure rises.
+- **10-pane fleet**: the current planning default is ~200 ms.
+- **50-pane fleet**: evaluate a tighter poll interval only while the measured pressure tier stays Normal; consider per-pane priority bumps for hot panes.
+- **200+-pane target**: treat native push events and fleet-pressure throttling as required design assumptions, then qualify the exact host and workload before deployment.
+
+These are starting hypotheses for measurement, not release-qualified latency or
+capacity guarantees.
 
 ### When the loop throttles
 
@@ -2991,22 +2998,25 @@ Priority directly affects the watcher's round-robin scheduling; high-priority pa
 
 ## Deep Dive: Capacity Planning
 
-Rough sizing guidance, gathered from operator practice and the perf substrate.
+Provisional sizing hypotheses gathered from operator practice and the perf
+substrate. They are inputs to measurement, not qualified upper bounds. In
+particular, the 100/200-pane memory rows are synthetic benchmark-lane budgets,
+and per-pane disk volume depends directly on output rate and retention.
 
 ### Per-pane resource footprint (defaults)
 
-- **CPU**: ~50 µs per pane per tick when idle (just polling + delta check).
-- **Memory (hot scrollback)**: ~200 KB per 1000 lines of recent output.
-- **Memory (warm scrollback)**: ~40 KB per 1000 lines (5:1 zstd typical).
-- **Disk**: ~10 MB/day per actively-producing pane (compressed deltas + FTS5 index).
+- **CPU planning target**: ~50 µs per pane per idle benchmark tick (poll + delta check); remeasure the production path on the deployment host.
+- **Hot-scrollback model**: ~200 KB per 1000 representative lines.
+- **Warm-scrollback model**: ~40 KB per 1000 representative lines at the assumed 5:1 compression ratio.
+- **Disk planning example**: ~10 MB/day for the declared compressed-delta + FTS5 workload; this is not a per-pane production upper bound.
 
 ### Fleet sizes
 
 | Fleet size | Recommended `poll_interval_ms` | Memory envelope | Native push events | Distributed mode |
 |---|---|---|---|---|
-| 1–10 panes | 200 (default) | ~50 MB | optional | not needed |
-| 11–50 panes | 200–300 | ~100 MB | recommended | not needed |
-| 51–200 panes | 300–500 | ~200 MB | **required** | optional |
+| 1–10 panes | 200 (default) | planning budget: ~50 MB | optional | not needed |
+| 11–50 panes | 200–300 | provisional extrapolation: ~100 MB | recommended | not needed |
+| 51–200 panes | 300–500 | synthetic benchmark budget: ~200 MB | **required** | optional |
 | 200+ panes | 500–1000 + per-pane priorities | target-class artifact required (see [target hardware](docs/perf/target-class-hardware.md)) | required | recommended (split across aggregators) |
 
 ### When to enable each feature flag
@@ -3019,7 +3029,7 @@ Rough sizing guidance, gathered from operator practice and the perf substrate.
 
 ### Tuning knobs
 
-The full [`docs/tuning-reference.md`](docs/tuning-reference.md) catalogs every `[tuning.*]` key with default, unit, validation guard, and starting ranges for 10/50/200+-pane fleets. The most commonly tuned:
+The full [`docs/tuning-reference.md`](docs/tuning-reference.md) catalogs every `[tuning.*]` key with default, unit, validation guard, and provisional starting ranges for 10/50/200+-pane workloads. The most commonly tuned:
 
 - `[tuning.runtime].max_concurrent_captures` — bounds per-tick capture parallelism
 - `[tuning.search].fts_query_timeout_ms` — caps FTS5 query time
@@ -3750,7 +3760,12 @@ This section catalogues the non-obvious design decisions the project has made, t
 - **Hot/cold is the easy two-tier design.** It also wastes RAM: a line accessed five minutes ago doesn't need to be in `VecDeque`, but it doesn't need to be evicted to SQLite either.
 - **Warm (compressed in RAM)** is the sweet spot for the 5-30 minute window: ~5× smaller than hot, but still in-process, decompressible on demand.
 - **Cold (SQLite-backed)** is the queryable safety net for everything older.
-- **Empirically**: a 200-pane fleet stays under ~200 MB with default tier boundaries, vs. ~4 GB+ for naive single-tier scrollback.
+- **Benchmark-lane observation**: the retained five-minute synthetic workload records
+  a ~200 MB ceiling for 200 simulated panes with its declared tier boundaries.
+  This is not evidence for native GUI/mux operation, a long-running production
+  session, or the M4/M5/high-core target classes. The fail-closed
+  [`swarm-capacity-envelope`](docs/attestations/perf/swarm-capacity-envelope.json)
+  currently forbids promoting it to a high-scale memory guarantee.
 
 ### Why fail-closed instead of fail-open for missing telemetry?
 
@@ -4076,10 +4091,12 @@ Validate with `ft rules test "FATAL ERROR: database connection lost"` and lint w
 
 ### What's the performance overhead?
 
-- **CPU**: <1% during idle; brief spikes during pattern detection
-- **Memory**: ~50 MB for watcher with 100 panes (with tiered scrollback); ~200 MB for 200 panes
-- **Disk**: ~10 MB/day for typical multi-agent usage (compressed deltas)
-- **Latency**: <50 ms capture-lag benchmark target; 200-pane or target-class claims must cite the capture fairness proof artifact
+The current numbers are benchmark budgets, not production guarantees:
+
+- **CPU**: <1% idle is a target that still requires current-source native workload proof
+- **Memory**: the retained benchmark lane budgets ~50 MB at 100 simulated panes and ~200 MB at 200 simulated panes; target-class promotion is currently blocked
+- **Disk**: ~10 MB/day is a planning estimate for a typical compressed-delta workload, not a qualified upper bound
+- **Latency**: <50 ms is the capture-lag benchmark target; it does not prove native key-to-photon, LAN, resize, zoom, or long-session responsiveness
 
 ### How does the transaction system work?
 
@@ -4097,7 +4114,9 @@ The planner reads RCH cluster pressure, network pressure, process snapshots, fle
 
 ### How does tiered scrollback save memory?
 
-For 200 panes, stock terminal emulators keep all scrollback uncompressed in RAM (~4 GB+). `ft` organizes scrollback into three tiers:
+For the illustrative 200-pane/20-MB-per-backbuffer model above, uncompressed
+scrollback alone is about 4 GB. This is a sizing example, not a measured
+cross-terminal claim. `ft` organizes scrollback into three tiers:
 
 | Tier | Storage | Access | Memory per 1000 lines |
 |---|---|---|---|

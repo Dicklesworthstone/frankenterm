@@ -1076,13 +1076,18 @@ live rollback during an active performance experiment.
 The planning pass produced two linked umbrellas:
 
 1. `ft-interactive-systems-performance-4tenz` remains the causal performance
-   campaign. It has 90 descendants: 11 direct children and 79 implementation,
-   measurement, test, and certification leaves under `.2-.9`.
+   campaign.
 2. `ft-interactive-swarm-product-convergence-7xqz4` is the product-convergence
-   umbrella. It has 118 descendants: 12 workstream epics and 106 leaves.
+   umbrella.
 
-Together they contain 210 issues: two roots, 20 child epics, and 188 granular
-leaves. Every new implementation leaf carries Background, Technical Approach,
+These are live graphs and their descendant totals change whenever the campaign
+discovers or closes work. Do not copy an old count into a completion claim. The
+2026-08-05 reality audit observed 287 descendants under the performance root
+and 170 under the product-convergence root; those values are a dated snapshot,
+not an implementation percentage. Query the current graph with
+`bv --robot-graph --graph-root <root-id> --graph-depth 0` before reporting it.
+
+Every new implementation leaf carries Background, Technical Approach,
 Success Criteria, Test Plan, Observability/Artifacts, and
 Considerations/Non-claims. The 14 field-journey leaves use the equivalent
 Background/User Value, SETUP/ACT, Success/ASSERT, Test Variants/TEARDOWN,
