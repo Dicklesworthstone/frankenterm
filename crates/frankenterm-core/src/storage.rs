@@ -16103,6 +16103,16 @@ fn validate_event_delivery_bulk_returned_ids(
     Ok(())
 }
 
+const fn event_delivery_backend_error_class(error: &BackendError) -> &'static str {
+    match error {
+        BackendError::Connect(_) => "connect",
+        BackendError::Query(_) => "query",
+        BackendError::TxPoisoned => "transaction_poisoned",
+        BackendError::Schema(_) => "schema",
+        BackendError::Other(_) => "other",
+    }
+}
+
 fn execute_event_delivery_bulk_transaction<F>(
     backend: &dyn StorageBackend,
     leases: &[(i64, String)],
@@ -16167,7 +16177,7 @@ where
     if let Err(rollback_error) = backend.execute("ROLLBACK") {
         tracing::error!(
             operation,
-            error = %rollback_error,
+            error_class = event_delivery_backend_error_class(&rollback_error),
             "event delivery bulk rollback failed"
         );
         // A logical ownership conflict is safe for exact per-lease fallback
@@ -26850,6 +26860,24 @@ fn newest_event_queries_break_timestamp_ties_by_descending_id() {
     )
     .unwrap();
     assert!(query_unhandled_event_counts(&backend).is_err());
+}
+
+#[test]
+fn event_delivery_backend_error_class_is_finite_and_content_free() {
+    let sensitive = "/private/database/path.sqlite: injected SQL detail";
+    let cases = [
+        (BackendError::Connect(sensitive.to_string()), "connect"),
+        (BackendError::Query(sensitive.to_string()), "query"),
+        (BackendError::TxPoisoned, "transaction_poisoned"),
+        (BackendError::Schema(sensitive.to_string()), "schema"),
+        (BackendError::Other(sensitive.to_string()), "other"),
+    ];
+
+    for (error, expected) in &cases {
+        let class = event_delivery_backend_error_class(error);
+        assert_eq!(class, *expected);
+        assert!(!class.contains(sensitive));
+    }
 }
 
 #[test]
