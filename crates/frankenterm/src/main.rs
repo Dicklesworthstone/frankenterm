@@ -23056,6 +23056,43 @@ fn watch_ipc_durable_poll_heartbeat_interval_ms(
     }
 }
 
+#[cfg(unix)]
+#[derive(Debug, PartialEq, Eq)]
+enum WatchIpcStreamRead {
+    Line(Option<String>),
+    DurablePollDeadline,
+}
+
+/// Bound one IPC read by the storage poll cadence.
+///
+/// The private server heartbeat is the cheap normal wakeup, but it is not an
+/// authority: a connected peer can stall without closing its socket. Dropping
+/// the pending `Lines::next` future at the deadline is cancellation-safe because
+/// the line reader owns its partial buffer; the caller retains the stream and
+/// re-enters the ordered SQLite drain before polling it again.
+#[cfg(unix)]
+async fn read_watch_ipc_line_until_durable_poll<F>(
+    cx: &frankenterm_core::cx::Cx,
+    poll: std::time::Duration,
+    read: F,
+) -> std::io::Result<WatchIpcStreamRead>
+where
+    F: std::future::Future<Output = std::io::Result<Option<String>>>,
+{
+    match frankenterm_core::runtime_async::timeout_with_cx(cx, poll, read).await {
+        Ok(line) => line.map(WatchIpcStreamRead::Line),
+        Err(_deadline) => {
+            cx.checkpoint().map_err(|error| {
+                std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    format!("watch-events IPC read cancelled: {error}"),
+                )
+            })?;
+            Ok(WatchIpcStreamRead::DurablePollDeadline)
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WatchEventClaimDelivery {
     Delivered {
@@ -24533,7 +24570,7 @@ mod watch_events_tests {
 
     #[cfg(unix)]
     #[test]
-    fn open_idle_ipc_stream_heartbeat_cannot_starve_durable_polling() {
+    fn private_ipc_heartbeat_respects_durable_poll_cadence() {
         assert_eq!(watch_ipc_durable_poll_heartbeat_interval_ms(0, 500), 500);
         assert_eq!(
             watch_ipc_durable_poll_heartbeat_interval_ms(5_000, 500),
@@ -24584,6 +24621,32 @@ mod watch_events_tests {
                 last_emit, initial_last_emit,
                 "output-disabled private heartbeats must not claim a stdout write"
             );
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stalled_ipc_read_reaches_independent_durable_poll_deadline() {
+        run_watch_claim_async(async move {
+            let cx = frankenterm_core::cx::for_testing();
+            let outcome = read_watch_ipc_line_until_durable_poll(
+                &cx,
+                std::time::Duration::from_millis(5),
+                std::future::pending::<std::io::Result<Option<String>>>(),
+            )
+            .await
+            .expect("deadline is a normal durable-poll wakeup");
+
+            assert_eq!(outcome, WatchIpcStreamRead::DurablePollDeadline);
+
+            let ready = read_watch_ipc_line_until_durable_poll(
+                &cx,
+                std::time::Duration::from_secs(1),
+                std::future::ready(Ok(Some("line".to_string()))),
+            )
+            .await
+            .expect("ready line");
+            assert_eq!(ready, WatchIpcStreamRead::Line(Some("line".to_string())));
         });
     }
 
@@ -38154,8 +38217,23 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                         // closes the stream, or the consumer
                                         // closes the pipe.
                                         loop {
-                                            match stream.next_line_with_cx(&cx).await {
-                                                Ok(Some(line)) => {
+                                            match read_watch_ipc_line_until_durable_poll(
+                                                &cx,
+                                                poll,
+                                                stream.next_line_with_cx(&cx),
+                                            )
+                                            .await
+                                            {
+                                                Ok(WatchIpcStreamRead::DurablePollDeadline) => {
+                                                    // A connected peer can stall without
+                                                    // closing its socket or sending its private
+                                                    // heartbeat. Keep the stream, emit no false
+                                                    // transport gap, and let SQLite determine
+                                                    // whether durable work arrived meanwhile.
+                                                    ipc_stream = Some(stream);
+                                                    continue 'follow;
+                                                }
+                                                Ok(WatchIpcStreamRead::Line(Some(line))) => {
                                                     match relay_ipc_event_line(
                                                         &stdout,
                                                         &line,
@@ -38273,7 +38351,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                                         }
                                                     }
                                                 }
-                                                Ok(None) => {
+                                                Ok(WatchIpcStreamRead::Line(None)) => {
                                                     observe_ipc_fallback(
                                                         &mut ipc_diagnostics,
                                                         IpcFallbackObservation::StreamEof,
