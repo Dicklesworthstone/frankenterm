@@ -23028,32 +23028,6 @@ fn count_events_before_backend(backend: &dyn StorageBackend, before_ts: i64) -> 
 }
 
 #[cfg(test)]
-fn count_events_by_tier_backend(
-    backend: &dyn StorageBackend,
-    before_ts: i64,
-    severities: &[String],
-    event_types: &[String],
-    handled: Option<bool>,
-) -> Result<usize> {
-    let (sql, params) = build_tier_query(
-        "SELECT COUNT(*) FROM events",
-        before_ts,
-        severities,
-        event_types,
-        handled,
-    );
-    let row = backend
-        .query_row_typed(&sql, &params)
-        .map_err(|err| storage_backend_error("Failed to count events by tier", err))?
-        .ok_or_else(|| {
-            StorageError::Database(
-                "Failed to count events by tier: query returned no row".to_string(),
-            )
-        })?;
-    count_query_row_to_usize(&row, "Failed to count events by tier row")
-}
-
-#[cfg(test)]
 fn count_events_by_retention_rule_backend(
     backend: &dyn StorageBackend,
     before_ts: i64,
