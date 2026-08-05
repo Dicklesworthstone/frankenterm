@@ -49,6 +49,15 @@ const RETRYABLE_APPROVAL_REQUIRED: i64 = 2;
 // bridge. Keep lock acquisition fail-fast so contention cannot consume scarce
 // blocking workers for the former five-second timeout; callers receive `Busy`.
 const BUSY_TIMEOUT: Duration = Duration::from_millis(25);
+// Claim acquisition is pre-effect and therefore safe to retry as a whole when
+// SQLite reports BUSY. Keep retries store-local so direct and MCP callers obey
+// the same one-owner contract instead of exposing scheduler-dependent lock
+// failures. Eight attempts cap SQLite busy-wait plus scheduled backoff below
+// 300 ms; capability-path and schema validation time remains separately
+// bounded by ordinary filesystem/SQLite calls.
+const CLAIM_BUSY_MAX_ATTEMPTS: usize = 8;
+const CLAIM_BUSY_INITIAL_BACKOFF_MS: u64 = 1;
+const CLAIM_BUSY_MAX_BACKOFF_MS: u64 = 32;
 const OWNER_NONCE_BYTES: usize = 32;
 const OWNER_LEASE_DURATION_MS: i64 = 60_000;
 const MAX_OWNER_LEASE_FUTURE_MS: i64 = OWNER_LEASE_DURATION_MS * 2;
@@ -1466,13 +1475,25 @@ pub fn claim(
     ft_dir: &Path,
     binding: &SubmitIdempotencyBinding,
 ) -> Result<ClaimOutcome, SubmitIdempotencyError> {
-    claim_with_nonce_factory_limits_and_clock(
-        ft_dir,
-        binding,
-        fresh_owner_nonce,
-        PRODUCTION_LIMITS,
-        now_unix_ms,
-    )
+    let mut backoff_ms = CLAIM_BUSY_INITIAL_BACKOFF_MS;
+    for attempt in 1..=CLAIM_BUSY_MAX_ATTEMPTS {
+        match claim_with_nonce_factory_limits_and_clock(
+            ft_dir,
+            binding,
+            fresh_owner_nonce,
+            PRODUCTION_LIMITS,
+            now_unix_ms,
+        ) {
+            Err(SubmitIdempotencyError::Busy) if attempt < CLAIM_BUSY_MAX_ATTEMPTS => {
+                std::thread::sleep(Duration::from_millis(backoff_ms));
+                backoff_ms = backoff_ms
+                    .saturating_mul(2)
+                    .min(CLAIM_BUSY_MAX_BACKOFF_MS);
+            }
+            result => return result,
+        }
+    }
+    unreachable!("bounded claim retry loop always returns on its final attempt")
 }
 
 #[cfg(test)]

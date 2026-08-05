@@ -76,6 +76,20 @@ mod socket_transport {
         pub type LineReader<T> = asupersync::io::Lines<BufReader<T>>;
 
         pub async fn bind<P: AsRef<Path>>(path: P) -> io::Result<UnixListener> {
+            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+            bind_with_cx(&cx, path).await
+        }
+
+        pub async fn bind_with_cx<P: AsRef<Path>>(
+            cx: &crate::cx::Cx,
+            path: P,
+        ) -> io::Result<UnixListener> {
+            cx.checkpoint().map_err(|err| {
+                io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    format!("bind cancelled: {err}"),
+                )
+            })?;
             let inner = frankenterm_uds::UnixListener::bind(path)?;
             inner.set_nonblocking(true)?;
             Ok(UnixListener { inner })

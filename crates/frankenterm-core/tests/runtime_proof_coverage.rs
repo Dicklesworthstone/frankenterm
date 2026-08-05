@@ -41,17 +41,14 @@ fn runtime_proof_coverage_does_not_regress() {
         script.display()
     );
 
-    // Look up python3; on the developer machine and on every CI runner
-    // we use, it is preinstalled. If the env doesn't have it, skip
-    // rather than fail — the CI gate at `.github/workflows/ci.yml`
-    // catches that case authoritatively.
-    let python = match which_python3() {
-        Some(p) => p,
-        None => {
-            eprintln!("ft-3kv6e: python3 not on PATH — skipping local coverage check");
-            return;
-        }
-    };
+    // The Python checker is the source of truth for this Cargo-addressable
+    // gate. Missing tooling must fail closed: returning success here would let
+    // an exact-SHA proof lane report a zero-work false positive.
+    let python = which_python3().unwrap_or_else(|| {
+        panic!(
+            "ft-3kv6e: python3/python is required to execute the RuntimeProof coverage gate"
+        )
+    });
 
     let output = Command::new(python)
         .arg(&script)

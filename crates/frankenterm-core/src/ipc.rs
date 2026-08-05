@@ -60,6 +60,20 @@ mod socket_transport {
         pub type LineReader<T> = asupersync::io::Lines<BufReader<T>>;
 
         pub async fn bind<P: AsRef<Path>>(path: P) -> io::Result<UnixListener> {
+            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+            bind_with_cx(&cx, path).await
+        }
+
+        pub async fn bind_with_cx<P: AsRef<Path>>(
+            cx: &crate::cx::Cx,
+            path: P,
+        ) -> io::Result<UnixListener> {
+            cx.checkpoint().map_err(|err| {
+                io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    format!("bind cancelled: {err}"),
+                )
+            })?;
             let inner = frankenterm_uds::UnixListener::bind(path)?;
             inner.set_nonblocking(true)?;
             Ok(UnixListener { inner })
@@ -933,7 +947,8 @@ impl IpcServer {
     /// # Errors
     /// Returns error if socket binding fails.
     pub async fn bind(socket_path: impl AsRef<Path>) -> std::io::Result<Self> {
-        Self::bind_with_permissions(socket_path, Some(0o600)).await
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        Self::bind_with_cx(&cx, socket_path).await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`bind`].
@@ -1079,7 +1094,8 @@ impl IpcServer {
     /// * `event_bus` - Event bus to publish received events
     /// * `shutdown_rx` - Channel to receive shutdown signal
     pub async fn run(self, event_bus: Arc<EventBus>, shutdown_rx: mpsc::Receiver<()>) {
-        self.run_with_auth(event_bus, None, shutdown_rx).await;
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.run_with_cx(&cx, event_bus, shutdown_rx).await;
     }
 
     /// Run the IPC server with full handler context (including pane registry).
@@ -1096,7 +1112,8 @@ impl IpcServer {
         registry: Arc<RwLock<PaneRegistry>>,
         shutdown_rx: mpsc::Receiver<()>,
     ) {
-        self.run_with_registry_and_auth(event_bus, registry, None, shutdown_rx)
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.run_with_registry_with_cx(&cx, event_bus, registry, shutdown_rx)
             .await;
     }
 
@@ -1358,6 +1375,25 @@ impl IpcServer {
     /// # Errors
     /// Returns error on non-unix platforms (IPC sockets are unix-only).
     pub async fn bind(socket_path: impl AsRef<Path>) -> std::io::Result<Self> {
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        Self::bind_with_cx(&cx, socket_path).await
+    }
+
+    /// Cx-first unsupported-platform bind result.
+    ///
+    /// # Errors
+    /// Returns cancellation when the caller is already cancelled, otherwise
+    /// reports that local IPC sockets are unsupported on this platform.
+    pub async fn bind_with_cx(
+        cx: &crate::cx::Cx,
+        socket_path: impl AsRef<Path>,
+    ) -> std::io::Result<Self> {
+        cx.checkpoint().map_err(|err| {
+            std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                format!("ipc bind cancelled: {err}"),
+            )
+        })?;
         let socket_path = socket_path.as_ref().to_path_buf();
         Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
@@ -1374,67 +1410,163 @@ impl IpcServer {
         &self.socket_path
     }
 
-    async fn recv_shutdown(shutdown_rx: &mut mpsc::Receiver<()>) {
-        let _ = mpsc_recv_state(shutdown_rx).await;
+    async fn recv_shutdown_with_cx(cx: &crate::cx::Cx, shutdown_rx: &mut mpsc::Receiver<()>) {
+        let _ = mpsc_recv_state_with_cx(shutdown_rx, cx).await;
     }
 
     /// Run the IPC server (no-op on non-unix platforms).
-    pub async fn run(self, _event_bus: Arc<EventBus>, mut shutdown_rx: mpsc::Receiver<()>) {
+    pub async fn run(self, event_bus: Arc<EventBus>, shutdown_rx: mpsc::Receiver<()>) {
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.run_with_cx(&cx, event_bus, shutdown_rx).await;
+    }
+
+    /// Cx-first unsupported-platform server wait.
+    pub async fn run_with_cx(
+        self,
+        cx: &crate::cx::Cx,
+        _event_bus: Arc<EventBus>,
+        mut shutdown_rx: mpsc::Receiver<()>,
+    ) {
         tracing::warn!("IPC server not supported on this platform");
-        Self::recv_shutdown(&mut shutdown_rx).await;
+        Self::recv_shutdown_with_cx(cx, &mut shutdown_rx).await;
     }
 
     /// Run the IPC server with registry (no-op on non-unix platforms).
     pub async fn run_with_registry(
         self,
+        event_bus: Arc<EventBus>,
+        registry: Arc<RwLock<PaneRegistry>>,
+        shutdown_rx: mpsc::Receiver<()>,
+    ) {
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.run_with_registry_with_cx(&cx, event_bus, registry, shutdown_rx)
+            .await;
+    }
+
+    /// Cx-first unsupported-platform server wait with a pane registry.
+    pub async fn run_with_registry_with_cx(
+        self,
+        cx: &crate::cx::Cx,
         _event_bus: Arc<EventBus>,
         _registry: Arc<RwLock<PaneRegistry>>,
         mut shutdown_rx: mpsc::Receiver<()>,
     ) {
         tracing::warn!("IPC server not supported on this platform");
-        Self::recv_shutdown(&mut shutdown_rx).await;
+        Self::recv_shutdown_with_cx(cx, &mut shutdown_rx).await;
     }
 
     /// Run the IPC server with optional auth configuration (no-op on non-unix platforms).
     pub async fn run_with_auth(
         self,
+        event_bus: Arc<EventBus>,
+        auth: Option<IpcAuth>,
+        shutdown_rx: mpsc::Receiver<()>,
+    ) {
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.run_with_auth_with_cx(&cx, event_bus, auth, shutdown_rx)
+            .await;
+    }
+
+    /// Cx-first unsupported-platform server wait with auth configuration.
+    pub async fn run_with_auth_with_cx(
+        self,
+        cx: &crate::cx::Cx,
         _event_bus: Arc<EventBus>,
         _auth: Option<IpcAuth>,
         mut shutdown_rx: mpsc::Receiver<()>,
     ) {
         tracing::warn!("IPC server not supported on this platform");
-        Self::recv_shutdown(&mut shutdown_rx).await;
+        Self::recv_shutdown_with_cx(cx, &mut shutdown_rx).await;
     }
 
     /// Run the IPC server with registry and auth (no-op on non-unix platforms).
     pub async fn run_with_registry_and_auth(
         self,
+        event_bus: Arc<EventBus>,
+        registry: Arc<RwLock<PaneRegistry>>,
+        auth: Option<IpcAuth>,
+        shutdown_rx: mpsc::Receiver<()>,
+    ) {
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.run_with_registry_and_auth_with_cx(&cx, event_bus, registry, auth, shutdown_rx)
+            .await;
+    }
+
+    /// Cx-first unsupported-platform server wait with registry and auth.
+    pub async fn run_with_registry_and_auth_with_cx(
+        self,
+        cx: &crate::cx::Cx,
         _event_bus: Arc<EventBus>,
         _registry: Arc<RwLock<PaneRegistry>>,
         _auth: Option<IpcAuth>,
         mut shutdown_rx: mpsc::Receiver<()>,
     ) {
         tracing::warn!("IPC server not supported on this platform");
-        Self::recv_shutdown(&mut shutdown_rx).await;
+        Self::recv_shutdown_with_cx(cx, &mut shutdown_rx).await;
     }
 
     /// Run the IPC server with registry, auth, and RPC handler (no-op on non-unix platforms).
     pub async fn run_with_registry_auth_and_rpc(
         self,
+        event_bus: Arc<EventBus>,
+        registry: Arc<RwLock<PaneRegistry>>,
+        auth: Option<IpcAuth>,
+        rpc_handler: Option<IpcRpcHandler>,
+        shutdown_rx: mpsc::Receiver<()>,
+    ) {
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.run_with_registry_auth_and_rpc_with_cx(
+            &cx,
+            event_bus,
+            registry,
+            auth,
+            rpc_handler,
+            shutdown_rx,
+        )
+        .await;
+    }
+
+    /// Cx-first unsupported-platform server wait with registry, auth, and RPC.
+    pub async fn run_with_registry_auth_and_rpc_with_cx(
+        self,
+        cx: &crate::cx::Cx,
         _event_bus: Arc<EventBus>,
         _registry: Arc<RwLock<PaneRegistry>>,
         _auth: Option<IpcAuth>,
         _rpc_handler: Option<IpcRpcHandler>,
-        shutdown_rx: mpsc::Receiver<()>,
+        mut shutdown_rx: mpsc::Receiver<()>,
     ) {
         tracing::warn!("IPC server not supported on this platform");
-        let mut shutdown_rx = shutdown_rx;
-        Self::recv_shutdown(&mut shutdown_rx).await;
+        Self::recv_shutdown_with_cx(cx, &mut shutdown_rx).await;
     }
 
     /// Run the IPC server with registry, auth, RPC handler, and search config (no-op on non-unix platforms).
     pub async fn run_with_registry_auth_rpc_and_search_config(
         self,
+        event_bus: Arc<EventBus>,
+        registry: Arc<RwLock<PaneRegistry>>,
+        auth: Option<IpcAuth>,
+        rpc_handler: Option<IpcRpcHandler>,
+        search_config: Option<SearchConfig>,
+        shutdown_rx: mpsc::Receiver<()>,
+    ) {
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.run_with_registry_auth_rpc_and_search_config_with_cx(
+            &cx,
+            event_bus,
+            registry,
+            auth,
+            rpc_handler,
+            search_config,
+            shutdown_rx,
+        )
+        .await;
+    }
+
+    /// Cx-first unsupported-platform server wait with all optional context.
+    pub async fn run_with_registry_auth_rpc_and_search_config_with_cx(
+        self,
+        cx: &crate::cx::Cx,
         _event_bus: Arc<EventBus>,
         _registry: Arc<RwLock<PaneRegistry>>,
         _auth: Option<IpcAuth>,
@@ -1443,7 +1575,7 @@ impl IpcServer {
         mut shutdown_rx: mpsc::Receiver<()>,
     ) {
         tracing::warn!("IPC server not supported on this platform");
-        Self::recv_shutdown(&mut shutdown_rx).await;
+        Self::recv_shutdown_with_cx(cx, &mut shutdown_rx).await;
     }
 }
 

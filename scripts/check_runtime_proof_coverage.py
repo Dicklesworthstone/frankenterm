@@ -31,6 +31,7 @@ Cross-references:
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 import json
 import re
 import sys
@@ -63,14 +64,10 @@ EXEMPT_FILES: set[str] = {
 # the allowlist can't drift into a silent escape hatch.
 WRAPPER_EXEMPTIONS: set[tuple[str, str]] = {
     # ft-4ku44: ipc.rs ergonomic wrappers. Each entry below is a
-    # non-Cx public method whose body either constructs a default
-    # `Cx` (`Cx::current().unwrap_or_else(for_request)`) and delegates
-    # to the `_with_cx` sibling, or — for the cfg(not(unix)) Windows
-    # stubs in the second `impl IpcServer` / `impl IpcClient` blocks —
-    # is a tracing::warn no-op that doesn't touch any runtime primitive
-    # directly. Either way the seal is preserved: every concrete
-    # async-await against a runtime primitive lives in the
-    # `_with_cx` covered sibling.
+    # non-Cx public method whose body constructs a default `Cx`
+    # (`Cx::current().unwrap_or_else(for_request)`) and delegates to
+    # the `_with_cx` sibling. Platform stubs follow the same rule so a
+    # covered implementation under one cfg cannot hide a non-Cx variant.
     ("ipc.rs", "bind"),
     ("ipc.rs", "connect"),
     ("ipc.rs", "accept"),
@@ -687,8 +684,9 @@ def signature_blocks(path: Path):
             while i < len(lines):
                 line = lines[i]
                 buf.append(line)
-                if "{" in line or line.rstrip().endswith(";") or re.search(r"\bwhere\b", line):
-                    if re.search(r"\bwhere\b", line):
+                has_terminator = "{" in line or line.rstrip().endswith(";")
+                if has_terminator or re.search(r"\bwhere\b", line):
+                    if re.search(r"\bwhere\b", line) and not has_terminator:
                         # Consume up to the next `{` or `;`
                         j = i + 1
                         while j < len(lines) and "{" not in lines[j] and ";" not in lines[j]:
@@ -731,25 +729,27 @@ def audit() -> dict:
         is_exempt_file = path.name in EXEMPT_FILES
         # Index function names per file so we can sanity-check the
         # WRAPPER_EXEMPTIONS allowlist.
-        fn_names: set[str] = set()
-        covered_fn_names: set[str] = set()
+        fn_names: Counter[str] = Counter()
+        covered_fn_names: Counter[str] = Counter()
+        wrapper_fn_names: Counter[str] = Counter()
         local_total = local_covered = local_uncovered = local_wrapper = 0
         local_uncovered_lines = []
         for line_no, name, sig in signature_blocks(path):
             results["total_sites"] += 1
             local_total += 1
-            fn_names.add(name)
+            fn_names[name] += 1
             if is_exempt_file:
                 results["exempt_files_sites"] += 1
                 continue
             if is_covered(sig):
                 results["covered_sites"] += 1
                 local_covered += 1
-                covered_fn_names.add(name)
+                covered_fn_names[name] += 1
                 continue
             if (rel, name) in WRAPPER_EXEMPTIONS:
                 results["wrapper_exempt_sites"] += 1
                 local_wrapper += 1
+                wrapper_fn_names[name] += 1
                 continue
             results["uncovered_sites"] += 1
             local_uncovered += 1
@@ -772,17 +772,25 @@ def audit() -> dict:
                     )
                     continue
                 expected_siblings = [f"{ename}_with_cx", f"{ename}_cx"]
-                present_siblings = [s for s in expected_siblings if s in fn_names]
+                present_siblings = [s for s in expected_siblings if fn_names[s] > 0]
                 if not present_siblings:
                     results["wrapper_audit_errors"].append(
                         f"{rel}::{ename} wrapper-exempt but no _with_cx/_cx sibling found"
                     )
                     continue
-                if not any(s in covered_fn_names for s in present_siblings):
+                covered_sibling_count = sum(covered_fn_names[s] for s in present_siblings)
+                if covered_sibling_count == 0:
                     siblings = ", ".join(present_siblings)
                     results["wrapper_audit_errors"].append(
                         f"{rel}::{ename} wrapper sibling is not Cx/RuntimeProof covered: "
                         f"{siblings}"
+                    )
+                    continue
+                wrapper_count = wrapper_fn_names[ename]
+                if covered_sibling_count < wrapper_count:
+                    results["wrapper_audit_errors"].append(
+                        f"{rel}::{ename} has {wrapper_count} wrapper occurrences but only "
+                        f"{covered_sibling_count} covered sibling occurrences"
                     )
         file_data[rel] = {
             "exempt_file": is_exempt_file,

@@ -1396,30 +1396,6 @@ impl<'a> RenderBatchGuard<'a> {
         Ok(())
     }
 
-    async fn send_next(&mut self) -> Result<bool, DirectMuxError> {
-        if !self.can_admit() {
-            return Ok(false);
-        }
-        let request_idx = self.next_request_idx;
-        let pane_id = *self.pane_ids.get(request_idx).ok_or(
-            DirectMuxError::RetainedStateAccounting {
-                resource: "render batch ambient request index",
-            },
-        )?;
-        let serial = self
-            .client
-            .send_request_only_tracking(
-                Pdu::GetPaneRenderChanges(GetPaneRenderChanges {
-                    pane_id: pane_id as usize,
-                }),
-                Some(&mut self.transport_ambiguous),
-            )
-            .await?;
-        self.batch_progressed = true;
-        self.record_issued(request_idx, serial)?;
-        Ok(true)
-    }
-
     async fn send_next_with_cx(&mut self, cx: &Cx) -> Result<bool, DirectMuxError> {
         if !self.can_admit() {
             return Ok(false);
@@ -1644,28 +1620,6 @@ impl<'a> RenderBatchGuard<'a> {
             self.transport_ambiguous = false;
         }
         Ok(true)
-    }
-
-    async fn run(&mut self, depth: usize) -> Result<(), DirectMuxError> {
-        while self.in_flight.len() < depth {
-            if !self.send_next().await? {
-                break;
-            }
-        }
-
-        while !self.in_flight.is_empty() {
-            let decoded = self
-                .client
-                .read_next_pdu_with_retention_metadata()
-                .await?;
-            let completed_batch_request = self.handle_decoded(decoded)?;
-            if completed_batch_request && self.can_admit() && !self.send_next().await? {
-                return Err(DirectMuxError::RetainedStateAccounting {
-                    resource: "render batch ambient admission",
-                });
-            }
-        }
-        Ok(())
     }
 
     async fn run_with_cx(&mut self, cx: &Cx, depth: usize) -> Result<(), DirectMuxError> {
