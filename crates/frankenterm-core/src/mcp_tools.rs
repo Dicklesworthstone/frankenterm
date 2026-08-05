@@ -182,6 +182,15 @@ const MCP_SEND_OUTPUT_INPUT_MAX_BYTES: usize = 64 * 1024;
 const MCP_SEND_OUTPUT_MAX_COLUMNS: usize = 400;
 const MCP_SEND_OUTPUT_MAX_BYTES: usize = 1_600;
 
+/// Per-field response limits for mux/DB metadata returned by `wa.state`.
+/// State inventories can contain many panes, so every field must reject a
+/// pathological source value before normalization/redaction would scan and
+/// clone it into another unbounded allocation.
+const MCP_STATE_FIELD_INPUT_MAX_BYTES: usize = 64 * 1024;
+const MCP_STATE_FIELD_MAX_COLUMNS: usize = 400;
+const MCP_STATE_FIELD_MAX_BYTES: usize = 1_600;
+const MCP_STATE_FIELD_OVERSIZE: &str = "pane state field omitted: input exceeds safety limit";
+
 /// Hard cap for MCP wait pattern strings before substring matching or regex
 /// compilation.
 ///
@@ -2400,20 +2409,17 @@ pub(super) struct WaStateTool {
 fn redact_mcp_pane_state_fields(states: &mut [McpPaneState]) {
     for state in states {
         if let Some(pane_uuid) = state.pane_uuid.as_mut() {
-            *pane_uuid = redact_mcp_single_line_output_secrets(pane_uuid);
+            *pane_uuid = bounded_mcp_pane_state_field(pane_uuid);
         }
-        state.domain = redact_mcp_single_line_output_secrets(&state.domain);
+        state.domain = bounded_mcp_pane_state_field(&state.domain);
         if let Some(title) = state.title.as_mut() {
-            let redacted = redact_mcp_single_line_output_secrets(title);
-            *title = redacted;
+            *title = bounded_mcp_pane_state_field(title);
         }
         if let Some(cwd) = state.cwd.as_mut() {
-            let redacted = redact_mcp_single_line_output_secrets(cwd);
-            *cwd = redacted;
+            *cwd = bounded_mcp_pane_state_field(cwd);
         }
         if let Some(ignore_reason) = state.ignore_reason.as_mut() {
-            let redacted = redact_mcp_single_line_output_secrets(ignore_reason);
-            *ignore_reason = redacted;
+            *ignore_reason = bounded_mcp_pane_state_field(ignore_reason);
         }
     }
 }
@@ -2490,9 +2496,16 @@ fn redact_mcp_output_secrets(text: &str) -> String {
     MCP_OUTPUT_REDACTOR.redact(&normalized)
 }
 
-fn redact_mcp_single_line_output_secrets(text: &str) -> String {
-    let normalized = crate::output::sanitize_terminal_text(text);
-    MCP_OUTPUT_REDACTOR.redact(&normalized)
+fn bounded_mcp_pane_state_field(text: &str) -> String {
+    if text.len() > MCP_STATE_FIELD_INPUT_MAX_BYTES {
+        return MCP_STATE_FIELD_OVERSIZE.to_string();
+    }
+    crate::output::sanitize_redact_truncate_bounded(
+        text,
+        MCP_STATE_FIELD_MAX_COLUMNS,
+        MCP_STATE_FIELD_MAX_BYTES,
+        |normalized| MCP_OUTPUT_REDACTOR.redact(normalized),
+    )
 }
 
 fn bounded_mcp_send_text_summary(engine: &PolicyEngine, text: &str) -> String {
@@ -2558,19 +2571,21 @@ fn bound_mcp_send_decision_context_output(context: &mut DecisionContext) {
 }
 
 fn bound_mcp_send_policy_decision_output(decision: &mut PolicyDecision) {
-    let context = match decision {
-        PolicyDecision::Allow { context, .. } => context,
+    let (rule_id, context) = match decision {
+        PolicyDecision::Allow { rule_id, context } => (rule_id, context),
         PolicyDecision::Deny {
-            reason, context, ..
+            reason,
+            rule_id,
+            context,
         } => {
             *reason = bounded_mcp_send_response_text(reason);
-            context
+            (rule_id, context)
         }
         PolicyDecision::RequireApproval {
             reason,
+            rule_id,
             approval,
             context,
-            ..
         } => {
             *reason = bounded_mcp_send_response_text(reason);
             if let Some(approval) = approval.as_mut() {
@@ -2579,9 +2594,12 @@ fn bound_mcp_send_policy_decision_output(decision: &mut PolicyDecision) {
                 // carry caller-controlled text.
                 approval.summary = bounded_mcp_send_response_text(&approval.summary);
             }
-            context
+            (rule_id, context)
         }
     };
+    if let Some(rule_id) = rule_id.as_mut() {
+        *rule_id = bounded_mcp_send_response_text(rule_id);
+    }
     if let Some(context) = context.as_mut() {
         bound_mcp_send_decision_context_output(context);
     }
@@ -13836,9 +13854,10 @@ mod tests {
         MAX_MCP_CASS_AGENT_FILTER_BYTES, MAX_MCP_CASS_QUERY_BYTES, MAX_MCP_RULES_AGENT_TYPE_BYTES,
         MAX_MCP_RULES_TEST_TEXT_BYTES, MAX_MCP_SEARCH_QUERY_BYTES,
         MAX_MCP_STATE_AGENT_FILTER_BYTES, MAX_MCP_SUBMIT_IDEMPOTENCY_KEY_BYTES,
-        MAX_MCP_WAIT_PATTERN_BYTES, MAX_MCP_WAIT_TIMEOUT_SECS, MAX_SEND_TEXT_BYTES, McpContext,
-        PaneCapabilities, PaneFilterConfig, PolicySurface, RecoverablePanicSite, StorageHandle, Tool,
-        ToolHandler,
+        MAX_MCP_WAIT_PATTERN_BYTES, MAX_MCP_WAIT_TIMEOUT_SECS, MAX_SEND_TEXT_BYTES,
+        MCP_STATE_FIELD_INPUT_MAX_BYTES, MCP_STATE_FIELD_MAX_BYTES, MCP_STATE_FIELD_OVERSIZE,
+        McpContext, PaneCapabilities, PaneFilterConfig, PolicySurface, RecoverablePanicSite,
+        StorageHandle, Tool, ToolHandler,
         WaAccountsRefreshTool, WaAccountsTool, WaAttentionTool, WaAwaitEventTool, WaCassSearchTool,
         WaCassStatusTool, WaCassViewTool, WaDomTool, WaEventsAnnotateTool, WaEventsLabelTool,
         WaEventsTool, WaEventsTriageTool, WaGetTextTool, WaMissionAbortTool, WaMissionExplainTool,
@@ -22716,6 +22735,74 @@ exit 17",
     }
 
     #[test]
+    fn wa_state_redaction_preflights_and_bounds_every_string_field() {
+        let secret = redaction_test_token();
+        let split_at = secret.len() / 2;
+        let hostile = format!(
+            "{}\x1b[31m{}\x1b[0m\u{202e}\n{}",
+            &secret[..split_at],
+            &secret[split_at..],
+            "x".repeat(4_000)
+        );
+        let mut states = vec![McpPaneState {
+            pane_id: 42,
+            pane_uuid: Some(hostile.clone()),
+            tab_id: 7,
+            window_id: 3,
+            domain: hostile.clone(),
+            title: Some(hostile.clone()),
+            cwd: Some(hostile.clone()),
+            observed: true,
+            ignore_reason: Some(hostile),
+        }];
+
+        redact_mcp_pane_state_fields(&mut states);
+
+        let state = &states[0];
+        let fields = [
+            state.pane_uuid.as_deref().expect("pane_uuid"),
+            state.domain.as_str(),
+            state.title.as_deref().expect("title"),
+            state.cwd.as_deref().expect("cwd"),
+            state.ignore_reason.as_deref().expect("ignore_reason"),
+        ];
+        for field in fields {
+            assert!(!field.contains(&secret));
+            assert!(field.contains("[REDACTED]"));
+            assert!(!field.contains('\x1b'));
+            assert!(!field.contains('\u{202e}'));
+            assert!(!field.contains('\n'));
+            assert!(field.len() <= MCP_STATE_FIELD_MAX_BYTES);
+        }
+
+        let oversized = "x".repeat(MCP_STATE_FIELD_INPUT_MAX_BYTES + 1);
+        let mut states = vec![McpPaneState {
+            pane_id: 42,
+            pane_uuid: Some(oversized.clone()),
+            tab_id: 7,
+            window_id: 3,
+            domain: oversized.clone(),
+            title: Some(oversized.clone()),
+            cwd: Some(oversized.clone()),
+            observed: true,
+            ignore_reason: Some(oversized),
+        }];
+
+        redact_mcp_pane_state_fields(&mut states);
+
+        let state = &states[0];
+        for field in [
+            state.pane_uuid.as_deref().expect("pane_uuid"),
+            state.domain.as_str(),
+            state.title.as_deref().expect("title"),
+            state.cwd.as_deref().expect("cwd"),
+            state.ignore_reason.as_deref().expect("ignore_reason"),
+        ] {
+            assert_eq!(field, MCP_STATE_FIELD_OVERSIZE);
+        }
+    }
+
+    #[test]
     fn wa_state_malformed_args_redacts_serde_error_value() {
         let tool = WaStateTool::new(Arc::new(Config::default()), PaneFilterConfig::default(), None);
         let redaction_sample = redaction_test_token();
@@ -23345,7 +23432,7 @@ exit 17",
         let mut data = super::McpSendData {
             pane_id: 17,
             injection: super::InjectionResult::Allowed {
-                decision: super::PolicyDecision::allow_with_rule("test.wa_send_output")
+                decision: super::PolicyDecision::allow_with_rule(hostile.clone())
                     .with_context(decision_context),
                 summary: hostile.clone(),
                 pane_id: 17,
@@ -23374,6 +23461,7 @@ exit 17",
             serde_json::from_str(&json).expect("parse bounded wa.send response");
         for field in [
             value["injection"]["summary"].as_str(),
+            value["injection"]["decision"]["rule_id"].as_str(),
             value["injection"]["decision"]["context"]["domain"].as_str(),
             value["injection"]["decision"]["context"]["text_summary"].as_str(),
             value["injection"]["decision"]["context"]["workflow_id"].as_str(),

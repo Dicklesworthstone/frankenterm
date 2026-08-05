@@ -446,7 +446,7 @@ async fn semantic_zone_type_for_captured_segment(
         Err(_error) => {
             debug!(
                 pane_id = captured.pane_id,
-                error = %err,
+                error_class = "semantic_zone_snapshot_unavailable",
                 "semantic zone snapshot unavailable while stamping captured segment"
             );
             None
@@ -7678,7 +7678,7 @@ fn process_connector_outbound_runtime_event(
                 );
             }
         }
-        Err(err) => {
+        Err(_error) => {
             warn!(
                 event_type = %outbound_event.event_type,
                 source = %outbound_event.source,

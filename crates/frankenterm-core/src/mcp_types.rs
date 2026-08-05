@@ -986,7 +986,7 @@ impl<T> McpEnvelope<T> {
         elapsed_ms: u64,
     ) -> Self {
         let msg = redact_mcp_envelope_text(msg.as_ref());
-        let hint = hint.map(|hint| redact_mcp_envelope_text(&hint));
+        let hint = hint.as_deref().map(redact_mcp_envelope_text);
         Self {
             ok: false,
             data: None,
@@ -2302,7 +2302,7 @@ mod tests {
         ) {
             let expected_msg = redact_mcp_envelope_text(&msg);
             let expected_hint = hint.as_deref().map(redact_mcp_envelope_text);
-            let envelope = McpEnvelope::<()>::error(&code, msg.clone(), hint.clone(), elapsed_ms);
+            let envelope = McpEnvelope::<()>::error(&code, &msg, hint, elapsed_ms);
             prop_assert!(!envelope.ok);
             prop_assert!(envelope.data.is_none());
             prop_assert_eq!(envelope.error.as_deref(), Some(expected_msg.as_str()));
