@@ -9006,6 +9006,51 @@ where
     }
 }
 
+// A transient 25 ms SQLite writer collision after pane dispatch must not turn
+// into a permanent pending/in-doubt key merely because the MCP caller cannot
+// replay an owner token. Keep the retry loop inside the detached blocking
+// closure: dropping the request then drops only its join handle, not the
+// authority transition. `TransitionFailed` remains non-retryable to external
+// callers, but repeating the same owner-token CAS internally is idempotent and
+// is the only way to resolve an ambiguous SQLite execute/commit return. The
+// bounded backoff caps one worker's worst-case residency while giving
+// FULL-sync concurrent writers time to drain.
+const MCP_SUBMIT_POST_EFFECT_MAX_ATTEMPTS: usize = 16;
+const MCP_SUBMIT_POST_EFFECT_INITIAL_BACKOFF_MS: u64 = 2;
+const MCP_SUBMIT_POST_EFFECT_MAX_BACKOFF_MS: u64 = 64;
+
+fn mcp_submit_idempotency_should_retry_post_effect(
+    error: crate::submit_idempotency_store::SubmitIdempotencyError,
+) -> bool {
+    error.is_retryable()
+        || error
+            == crate::submit_idempotency_store::SubmitIdempotencyError::TransitionFailed
+}
+
+fn mcp_submit_idempotency_retry_post_effect<T, F>(
+    mut work: F,
+) -> Result<T, crate::submit_idempotency_store::SubmitIdempotencyError>
+where
+    F: FnMut() -> Result<T, crate::submit_idempotency_store::SubmitIdempotencyError>,
+{
+    let mut backoff_ms = MCP_SUBMIT_POST_EFFECT_INITIAL_BACKOFF_MS;
+    for attempt in 1..=MCP_SUBMIT_POST_EFFECT_MAX_ATTEMPTS {
+        match work() {
+            Err(error)
+                if mcp_submit_idempotency_should_retry_post_effect(error)
+                    && attempt < MCP_SUBMIT_POST_EFFECT_MAX_ATTEMPTS =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(backoff_ms));
+                backoff_ms = backoff_ms
+                    .saturating_mul(2)
+                    .min(MCP_SUBMIT_POST_EFFECT_MAX_BACKOFF_MS);
+            }
+            result => return result,
+        }
+    }
+    unreachable!("bounded post-effect retry loop always returns on its final attempt")
+}
+
 async fn mcp_submit_idempotency_claim(
     ft_dir: &Path,
     binding: &crate::verified_submit::SubmitIdempotencyBinding,
@@ -9039,20 +9084,22 @@ async fn mcp_submit_idempotency_transition(
     let binding = binding.clone();
     mcp_submit_idempotency_spawn_blocking(
         crate::submit_idempotency_store::SubmitIdempotencyError::TransitionFailed,
-        move || match transition {
-            McpSubmitIdempotencyTransition::EffectAppliedReceiptPending => {
-                crate::submit_idempotency_store::mark_effect_applied_receipt_pending(
-                    &ft_dir, &binding, token,
-                )
-            }
-            McpSubmitIdempotencyTransition::InDoubt => {
-                crate::submit_idempotency_store::mark_in_doubt(&ft_dir, &binding, token)
-            }
-            McpSubmitIdempotencyTransition::Retryable(reason) => {
-                crate::submit_idempotency_store::mark_retryable(
-                    &ft_dir, &binding, token, reason,
-                )
-            }
+        move || {
+            mcp_submit_idempotency_retry_post_effect(|| match transition {
+                McpSubmitIdempotencyTransition::EffectAppliedReceiptPending => {
+                    crate::submit_idempotency_store::mark_effect_applied_receipt_pending(
+                        &ft_dir, &binding, token,
+                    )
+                }
+                McpSubmitIdempotencyTransition::InDoubt => {
+                    crate::submit_idempotency_store::mark_in_doubt(&ft_dir, &binding, token)
+                }
+                McpSubmitIdempotencyTransition::Retryable(reason) => {
+                    crate::submit_idempotency_store::mark_retryable(
+                        &ft_dir, &binding, token, reason,
+                    )
+                }
+            })
         },
     )
     .await
@@ -9069,7 +9116,13 @@ async fn mcp_submit_idempotency_complete(
     let receipt = receipt.clone();
     mcp_submit_idempotency_spawn_blocking(
         crate::submit_idempotency_store::SubmitIdempotencyError::TransitionFailed,
-        move || crate::submit_idempotency_store::complete(&ft_dir, &binding, token, &receipt),
+        move || {
+            mcp_submit_idempotency_retry_post_effect(|| {
+                crate::submit_idempotency_store::complete(
+                    &ft_dir, &binding, token, &receipt,
+                )
+            })
+        },
     )
     .await
 }
@@ -20260,6 +20313,43 @@ mod tests {
             blocking_thread, request_thread,
             "submit-idempotency filesystem/SQLite work must not run on the MCP executor thread"
         );
+    }
+
+    #[test]
+    fn submit_idempotency_post_effect_retry_is_finite_and_typed() {
+        use crate::submit_idempotency_store::SubmitIdempotencyError;
+
+        let mut transient_attempts = 0_usize;
+        let recovered = super::mcp_submit_idempotency_retry_post_effect(|| {
+            transient_attempts = transient_attempts.saturating_add(1);
+            if transient_attempts < 3 {
+                Err(SubmitIdempotencyError::Busy)
+            } else {
+                Ok("persisted")
+            }
+        });
+        assert_eq!(recovered, Ok("persisted"));
+        assert_eq!(transient_attempts, 3);
+
+        let mut ambiguous_transition_attempts = 0_usize;
+        let reconciled = super::mcp_submit_idempotency_retry_post_effect(|| {
+            ambiguous_transition_attempts = ambiguous_transition_attempts.saturating_add(1);
+            if ambiguous_transition_attempts == 1 {
+                Err(SubmitIdempotencyError::TransitionFailed)
+            } else {
+                Ok("reconciled")
+            }
+        });
+        assert_eq!(reconciled, Ok("reconciled"));
+        assert_eq!(ambiguous_transition_attempts, 2);
+
+        let mut permanent_attempts = 0_usize;
+        let permanent = super::mcp_submit_idempotency_retry_post_effect(|| {
+            permanent_attempts = permanent_attempts.saturating_add(1);
+            Err::<(), _>(SubmitIdempotencyError::InvalidTransition)
+        });
+        assert_eq!(permanent, Err(SubmitIdempotencyError::InvalidTransition));
+        assert_eq!(permanent_attempts, 1);
     }
 
     #[test]

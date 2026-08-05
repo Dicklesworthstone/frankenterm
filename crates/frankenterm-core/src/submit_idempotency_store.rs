@@ -1475,6 +1475,7 @@ pub fn claim(
     )
 }
 
+#[cfg(test)]
 fn claim_with_nonce_limits_and_time(
     ft_dir: &Path,
     binding: &SubmitIdempotencyBinding,
@@ -1485,6 +1486,7 @@ fn claim_with_nonce_limits_and_time(
     claim_with_nonce_limits_and_clock(ft_dir, binding, owner_nonce, limits, move || now)
 }
 
+#[cfg(test)]
 fn claim_with_nonce_limits_and_clock<F>(
     ft_dir: &Path,
     binding: &SubmitIdempotencyBinding,
@@ -1701,6 +1703,7 @@ pub fn complete(
     complete_with_clock(ft_dir, binding, token, receipt, now_unix_ms)
 }
 
+#[cfg(test)]
 fn complete_at(
     ft_dir: &Path,
     binding: &SubmitIdempotencyBinding,
@@ -1793,6 +1796,7 @@ fn transition_from_active_owner(
     )
 }
 
+#[cfg(test)]
 fn transition_from_active_owner_at(
     ft_dir: &Path,
     binding: &SubmitIdempotencyBinding,
@@ -1903,6 +1907,7 @@ pub fn renew_claim(
     renew_claim_with_clock(ft_dir, binding, token, now_unix_ms)
 }
 
+#[cfg(test)]
 fn renew_claim_at(
     ft_dir: &Path,
     binding: &SubmitIdempotencyBinding,

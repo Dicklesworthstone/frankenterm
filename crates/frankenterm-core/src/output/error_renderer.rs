@@ -134,6 +134,16 @@ impl ErrorRenderer {
             obj["category"] = serde_json::json!(def.category);
         }
 
+        // FT-2054 intentionally groups the finite submit-idempotency store
+        // taxonomy under one operator-facing catalog code. Preserve the
+        // stable store-local class in machine output so automation never has
+        // to parse a human error string to distinguish retryable contention
+        // from a deterministic authority or schema failure.
+        if let Error::Storage(StorageError::SubmitIdempotency(submit_error)) = error {
+            obj["error_class"] = serde_json::json!(submit_error.error_class());
+            obj["retryable"] = serde_json::json!(submit_error.is_retryable());
+        }
+
         if let Some(remediation) = error.remediation() {
             obj["hint"] = serde_json::json!(remediation.summary.clone());
             obj["remediation"] = serde_json::json!({
@@ -453,6 +463,29 @@ mod tests {
         assert_eq!(parsed["ok"], false);
         assert_eq!(parsed["code"], "FT-1002");
         assert!(parsed["error"].is_string());
+    }
+
+    #[test]
+    fn render_json_preserves_finite_submit_idempotency_class_and_retryability() {
+        use crate::submit_idempotency_store::SubmitIdempotencyError;
+
+        for (submit_error, expected_class, expected_retryable) in [
+            (SubmitIdempotencyError::Busy, "busy", true),
+            (
+                SubmitIdempotencyError::SchemaMismatch,
+                "schema_mismatch",
+                false,
+            ),
+        ] {
+            let error = Error::Storage(StorageError::SubmitIdempotency(submit_error));
+            let output = ErrorRenderer::new(OutputFormat::Json).render(&error);
+            let parsed: serde_json::Value =
+                serde_json::from_str(&output).expect("valid submit-idempotency JSON");
+
+            assert_eq!(parsed["code"], "FT-2054");
+            assert_eq!(parsed["error_class"], expected_class);
+            assert_eq!(parsed["retryable"], expected_retryable);
+        }
     }
 
     #[test]

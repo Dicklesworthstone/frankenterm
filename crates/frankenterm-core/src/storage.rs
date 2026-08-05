@@ -14159,7 +14159,22 @@ mod writer_io_scheduler_tests {
         initialize_schema(&conn).expect("initialize writer test schema");
         let backend = RusqliteBackend::new(conn);
         for &pane_id in pane_ids {
-            upsert_pane_backend(&backend, &e8hd7_pane(pane_id))
+            let pane = PaneRecord {
+                pane_id,
+                pane_uuid: None,
+                domain: "local".to_string(),
+                window_id: None,
+                tab_id: None,
+                title: Some("append rollback fixture".to_string()),
+                cwd: None,
+                tty_name: None,
+                first_seen_at: 1_700_000_000_000,
+                last_seen_at: 1_700_000_000_000,
+                observed: true,
+                ignore_reason: None,
+                last_decision_at: None,
+            };
+            upsert_pane_backend(&backend, &pane)
                 .expect("seed append rollback pane");
         }
         backend
@@ -14191,15 +14206,17 @@ mod writer_io_scheduler_tests {
         let redactors_before = redactors.clone();
 
         set_append_commit_fault_for_test(AppendCommitFaultForTest::SingletonAfterRedaction);
-        let error = append_segment_commit_backend(
+        let error = match append_segment_commit_backend(
             &backend,
             71,
             "abcdefghijklmnopqrstuvwxyz suffix",
             None,
             None,
             &mut redactors,
-        )
-        .expect_err("post-redaction singleton fault must roll back");
+        ) {
+            Ok(_) => panic!("post-redaction singleton fault must roll back"),
+            Err(error) => error,
+        };
 
         assert!(
             matches!(&error, crate::Error::Storage(StorageError::Database(_))),
@@ -14267,8 +14284,14 @@ mod writer_io_scheduler_tests {
         ];
 
         set_append_commit_fault_for_test(AppendCommitFaultForTest::GroupAfterRedaction(1));
-        let error = append_segment_group_commit_backend(&backend, &writes, &mut redactors)
-            .expect_err("fault after the second redactor mutation must roll back the group");
+        let error = match append_segment_group_commit_backend(
+            &backend,
+            &writes,
+            &mut redactors,
+        ) {
+            Ok(_) => panic!("fault after the second redactor mutation must roll back the group"),
+            Err(error) => error,
+        };
 
         assert!(
             matches!(&error, crate::Error::Storage(StorageError::Database(_))),

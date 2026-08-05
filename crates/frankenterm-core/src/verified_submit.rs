@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::sync::Arc;
 
 use crate::patterns::{AgentType, SubmitProfile};
 use crate::policy::InjectionResult;
@@ -61,7 +62,10 @@ pub struct SubmitIdempotencyBinding {
     caller_key: String,
     guarantee_level: SubmitGuaranteeLevel,
     verification_canary: Option<String>,
-    outbound_text: String,
+    // The MCP durability path moves a binding through claim, post-effect,
+    // and completion blocking tasks. Keep the potentially multi-megabyte
+    // exact payload shared so those authority transitions do not copy it.
+    outbound_text: Arc<str>,
 }
 
 impl std::fmt::Debug for SubmitIdempotencyBinding {
@@ -129,7 +133,7 @@ impl SubmitIdempotencyBinding {
     /// durable effect digest with a different arbitrary input string.
     #[must_use]
     pub fn outbound_text(&self) -> &str {
-        &self.outbound_text
+        self.outbound_text.as_ref()
     }
 
     /// Recompute the internal key from the exact caller nonce and validate all
@@ -148,7 +152,7 @@ impl SubmitIdempotencyBinding {
                     })
             })
             && self.effect_sha256
-                == hex::encode(submit_effect_digest(self.pane_id, &self.outbound_text))
+                == hex::encode(submit_effect_digest(self.pane_id, self.outbound_text.as_ref()))
     }
 }
 
@@ -657,7 +661,7 @@ pub fn idempotency_binding(request: SubmitIdempotencyRequest<'_>) -> SubmitIdemp
         caller_key: request.caller_key.to_string(),
         guarantee_level: request.guarantee_level,
         verification_canary,
-        outbound_text,
+        outbound_text: outbound_text.into(),
     }
 }
 

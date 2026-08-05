@@ -14,9 +14,11 @@
 //! supertrait `sealed::Sealed` lives in a private module that external crates
 //! cannot name.
 //!
-//! Adding new tokio re-exports to runtime_async would require also adding
-//! them to the sealed-impl list here. Forgetting to do that is loud (the
-//! type stops being usable in any sealed-bound API) instead of silent.
+//! Adding a new project-owned runtime wrapper requires also adding it to the
+//! sealed-impl list here. Forgetting to do that is loud (the wrapper stops
+//! being usable in any sealed-bound API) instead of silent. A direct foreign
+//! re-export cannot be sealed here because Rust's orphan rules forbid that
+//! implementation; such a surface must first be wrapped in a local type.
 //!
 //! # How to use
 //!

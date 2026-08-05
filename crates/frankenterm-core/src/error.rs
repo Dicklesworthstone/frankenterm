@@ -1746,6 +1746,22 @@ mod tests {
     }
 
     #[test]
+    fn submit_idempotency_error_kind_follows_the_finite_retry_contract() {
+        use crate::network_reliability::NetworkErrorKind;
+        use crate::submit_idempotency_store::SubmitIdempotencyError;
+
+        let busy = Error::Storage(StorageError::SubmitIdempotency(
+            SubmitIdempotencyError::Busy,
+        ));
+        assert_eq!(busy.error_kind(), NetworkErrorKind::Transient);
+
+        let schema = Error::Storage(StorageError::SubmitIdempotency(
+            SubmitIdempotencyError::SchemaMismatch,
+        ));
+        assert_eq!(schema.error_kind(), NetworkErrorKind::Permanent);
+    }
+
+    #[test]
     fn structured_error_pane_operation_not_found_is_permanent() {
         use crate::network_reliability::NetworkErrorKind;
         let err = Error::PaneOperation {
