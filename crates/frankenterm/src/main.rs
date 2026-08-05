@@ -23063,23 +23063,35 @@ enum WatchIpcStreamRead {
     DurablePollDeadline,
 }
 
-/// Bound one IPC read by the storage poll cadence.
+/// Bound one IPC read by the current storage-poll deadline.
 ///
 /// The private server heartbeat is the cheap normal wakeup, but it is not an
-/// authority: a connected peer can stall without closing its socket. Dropping
-/// the pending `Lines::next` future at the deadline is cancellation-safe because
-/// the line reader owns its partial buffer; the caller retains the stream and
-/// re-enters the ordered SQLite drain before polling it again.
+/// authority: a connected peer can stall without closing its socket or can
+/// continuously send ready-but-nonauthoritative records. The caller reuses one
+/// absolute deadline across the entire relay stint, so neither case can starve
+/// the ordered SQLite drain. Dropping a pending `Lines::next` future at the
+/// deadline is cancellation-safe because the line reader owns its partial
+/// buffer; the caller retains the stream and polls it again after the drain.
 #[cfg(unix)]
 async fn read_watch_ipc_line_until_durable_poll<F>(
     cx: &frankenterm_core::cx::Cx,
-    poll: std::time::Duration,
+    durable_poll_deadline: std::time::Instant,
     read: F,
 ) -> std::io::Result<WatchIpcStreamRead>
 where
     F: std::future::Future<Output = std::io::Result<Option<String>>>,
 {
-    match frankenterm_core::runtime_async::timeout_with_cx(cx, poll, read).await {
+    let remaining = durable_poll_deadline.saturating_duration_since(std::time::Instant::now());
+    if remaining.is_zero() {
+        cx.checkpoint().map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                format!("watch-events IPC read cancelled: {error}"),
+            )
+        })?;
+        return Ok(WatchIpcStreamRead::DurablePollDeadline);
+    }
+    match frankenterm_core::runtime_async::timeout_with_cx(cx, remaining, read).await {
         Ok(line) => line.map(WatchIpcStreamRead::Line),
         Err(_deadline) => {
             cx.checkpoint().map_err(|error| {
@@ -24631,7 +24643,7 @@ mod watch_events_tests {
             let cx = frankenterm_core::cx::for_testing();
             let outcome = read_watch_ipc_line_until_durable_poll(
                 &cx,
-                std::time::Duration::from_millis(5),
+                std::time::Instant::now() + std::time::Duration::from_millis(5),
                 std::future::pending::<std::io::Result<Option<String>>>(),
             )
             .await
@@ -24641,12 +24653,47 @@ mod watch_events_tests {
 
             let ready = read_watch_ipc_line_until_durable_poll(
                 &cx,
-                std::time::Duration::from_secs(1),
+                std::time::Instant::now() + std::time::Duration::from_secs(1),
                 std::future::ready(Ok(Some("line".to_string()))),
             )
             .await
             .expect("ready line");
             assert_eq!(ready, WatchIpcStreamRead::Line(Some("line".to_string())));
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ready_ipc_lines_cannot_extend_the_absolute_durable_poll_deadline() {
+        run_watch_claim_async(async move {
+            let cx = frankenterm_core::cx::for_testing();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(5);
+            let first = read_watch_ipc_line_until_durable_poll(
+                &cx,
+                deadline,
+                std::future::ready(Ok(Some("first".to_string()))),
+            )
+            .await
+            .expect("first ready line");
+            assert_eq!(
+                first,
+                WatchIpcStreamRead::Line(Some("first".to_string()))
+            );
+
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            let second_read_was_polled = std::cell::Cell::new(false);
+            let second = read_watch_ipc_line_until_durable_poll(&cx, deadline, async {
+                second_read_was_polled.set(true);
+                Ok(Some("second".to_string()))
+            })
+            .await
+            .expect("expired absolute deadline is a normal durable-poll wakeup");
+
+            assert_eq!(second, WatchIpcStreamRead::DurablePollDeadline);
+            assert!(
+                !second_read_was_polled.get(),
+                "an already-expired relay stint must return to storage before polling another ready line"
+            );
         });
     }
 
@@ -38216,10 +38263,13 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                         // loop to the durable drain, the watcher
                                         // closes the stream, or the consumer
                                         // closes the pipe.
+                                        let durable_poll_deadline = std::time::Instant::now()
+                                            .checked_add(poll)
+                                            .unwrap_or_else(std::time::Instant::now);
                                         loop {
                                             match read_watch_ipc_line_until_durable_poll(
                                                 &cx,
-                                                poll,
+                                                durable_poll_deadline,
                                                 stream.next_line_with_cx(&cx),
                                             )
                                             .await
