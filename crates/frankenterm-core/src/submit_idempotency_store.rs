@@ -32,6 +32,7 @@ const RETRYABLE_APPROVAL_REQUIRED: i64 = 2;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const OWNER_NONCE_BYTES: usize = 32;
 const OWNER_LEASE_DURATION_MS: i64 = 60_000;
+const MAX_OWNER_LEASE_FUTURE_MS: i64 = OWNER_LEASE_DURATION_MS * 2;
 const MAX_RECEIPT_JSON_BYTES: usize = 64 * 1024;
 const MAX_RECEIPT_EVIDENCE_ITEMS: usize = 64;
 const MAX_RECEIPT_FIELD_BYTES: usize = 1024;
@@ -740,7 +741,7 @@ fn read_header(
     let row = map_sqlite(
         conn
         .query_row(
-            "SELECT schema_version, length(CAST(idempotency_key AS BLOB)), substr(CAST(idempotency_key AS BLOB), 1, 90), length(CAST(pane_id AS BLOB)), substr(CAST(pane_id AS BLOB), 1, 21), length(CAST(request_sha256 AS BLOB)), substr(CAST(request_sha256 AS BLOB), 1, 65), length(CAST(effect_sha256 AS BLOB)), substr(CAST(effect_sha256 AS BLOB), 1, 65), state, retryable_reason, length(CAST(receipt_json AS BLOB)), generation, length(owner_nonce), substr(owner_nonce, 1, 33) FROM verified_submit_idempotency WHERE idempotency_key COLLATE BINARY = ?1 COLLATE BINARY",
+            "SELECT schema_version, length(CAST(idempotency_key AS BLOB)), substr(CAST(idempotency_key AS BLOB), 1, 91), length(CAST(pane_id AS BLOB)), substr(CAST(pane_id AS BLOB), 1, 21), length(CAST(request_sha256 AS BLOB)), substr(CAST(request_sha256 AS BLOB), 1, 65), length(CAST(effect_sha256 AS BLOB)), substr(CAST(effect_sha256 AS BLOB), 1, 65), state, retryable_reason, length(CAST(receipt_json AS BLOB)), generation, length(owner_nonce), substr(owner_nonce, 1, 33), lease_expires_unix_ms FROM verified_submit_idempotency WHERE idempotency_key COLLATE BINARY = ?1 COLLATE BINARY",
             [binding.key()],
             |row| {
                 Ok((
@@ -759,6 +760,7 @@ fn read_header(
                     row.get::<_, i64>(12)?,
                     row.get::<_, i64>(13)?,
                     row.get::<_, Vec<u8>>(14)?,
+                    row.get::<_, Option<i64>>(15)?,
                 ))
             },
         )
@@ -781,6 +783,7 @@ fn read_header(
         generation,
         nonce_len,
         nonce,
+        lease_expires_unix_ms,
     )) = row
     else {
         return Ok(None);
@@ -807,11 +810,17 @@ fn read_header(
         return Err(SubmitIdempotencyError::RequestConflict);
     }
     let shape_ok = match state {
-        STATE_ACTIVE_OWNER | STATE_EFFECT_APPLIED_RECEIPT_PENDING | STATE_IN_DOUBT => {
-            reason.is_none() && bytes.is_none()
+        STATE_ACTIVE_OWNER => {
+            reason.is_none()
+                && bytes.is_none()
+                && lease_expires_unix_ms.is_some_and(|expires| expires >= 0)
+        }
+        STATE_EFFECT_APPLIED_RECEIPT_PENDING | STATE_IN_DOUBT => {
+            reason.is_none() && bytes.is_none() && lease_expires_unix_ms.is_none()
         }
         STATE_COMPLETED => {
             reason.is_none()
+                && lease_expires_unix_ms.is_none()
                 && bytes.is_some_and(|value| {
                     value >= 0
                         && usize::try_from(value)
@@ -820,6 +829,7 @@ fn read_header(
         }
         STATE_RETRYABLE => {
             bytes.is_none()
+                && lease_expires_unix_ms.is_none()
                 && reason.is_some_and(|value| RetryableReason::from_db(value).is_ok())
         }
         _ => false,
@@ -841,6 +851,7 @@ fn read_header(
         retryable_reason: reason,
         generation,
         owner_nonce,
+        lease_expires_unix_ms,
     }))
 }
 
@@ -1028,6 +1039,38 @@ fn ensure_reclaim_capacity(
     }
 }
 
+fn expire_active_owner_locked(
+    conn: &Connection,
+    binding: &SubmitIdempotencyBinding,
+    header: StoredHeader,
+    now: i64,
+    fallback: SubmitIdempotencyError,
+) -> Result<(), SubmitIdempotencyError> {
+    let lease_expires = header
+        .lease_expires_unix_ms
+        .ok_or(SubmitIdempotencyError::RecordCorrupt)?;
+    let changed = map_sqlite(
+        conn.execute(
+            "UPDATE verified_submit_idempotency SET state = ?2, lease_expires_unix_ms = NULL, updated_unix_ms = ?3 WHERE idempotency_key COLLATE BINARY = ?1 COLLATE BINARY AND state = ?4 AND generation = ?5 AND owner_nonce = ?6 AND lease_expires_unix_ms = ?7",
+            params![
+                binding.key(),
+                STATE_IN_DOUBT,
+                now,
+                STATE_ACTIVE_OWNER,
+                header.generation,
+                &header.owner_nonce[..],
+                lease_expires,
+            ],
+        ),
+        fallback,
+    )?;
+    if changed == 1 {
+        Ok(())
+    } else {
+        Err(fallback)
+    }
+}
+
 /// Atomically claim a request before any possible injection side effect.
 ///
 /// A `Retryable` row is atomically re-claimed. `InDoubt` never auto-retries;
@@ -1041,14 +1084,21 @@ pub fn claim(
     ft_dir: &Path,
     binding: &SubmitIdempotencyBinding,
 ) -> Result<ClaimOutcome, SubmitIdempotencyError> {
-    claim_with_nonce_and_limits(ft_dir, binding, fresh_owner_nonce()?, PRODUCTION_LIMITS)
+    claim_with_nonce_limits_and_time(
+        ft_dir,
+        binding,
+        fresh_owner_nonce()?,
+        PRODUCTION_LIMITS,
+        now_unix_ms(),
+    )
 }
 
-fn claim_with_nonce_and_limits(
+fn claim_with_nonce_limits_and_time(
     ft_dir: &Path,
     binding: &SubmitIdempotencyBinding,
     owner_nonce: [u8; OWNER_NONCE_BYTES],
     limits: StoreLimits,
+    now: i64,
 ) -> Result<ClaimOutcome, SubmitIdempotencyError> {
     validate_binding(binding)?;
     if limits.max_records < 1
@@ -1068,13 +1118,15 @@ fn claim_with_nonce_and_limits(
     match read_header(&tx, binding, SubmitIdempotencyError::ClaimFailed)? {
         None => {
             ensure_new_record_capacity(&tx, binding, limits)?;
-            let now = now_unix_ms();
+            let lease_expires = now
+                .checked_add(OWNER_LEASE_DURATION_MS)
+                .ok_or(SubmitIdempotencyError::ClaimFailed)?;
             let changed = map_sqlite(
                 tx.execute(
                 "INSERT INTO verified_submit_idempotency \
                  (idempotency_key, schema_version, pane_id, request_sha256, effect_sha256, state, \
-                  retryable_reason, receipt_json, generation, owner_nonce, created_unix_ms, updated_unix_ms) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, NULL, 1, ?7, ?8, ?8)",
+                  retryable_reason, receipt_json, generation, owner_nonce, lease_expires_unix_ms, created_unix_ms, updated_unix_ms) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, NULL, 1, ?7, ?8, ?9, ?9)",
                 params![
                     binding.key(),
                     STORE_SCHEMA_VERSION,
@@ -1083,6 +1135,7 @@ fn claim_with_nonce_and_limits(
                     binding.effect_sha256(),
                     STATE_ACTIVE_OWNER,
                     &owner_nonce[..],
+                    lease_expires,
                     now,
                 ],
                 ),
@@ -1098,8 +1151,33 @@ fn claim_with_nonce_and_limits(
             }))
         }
         Some(header) if header.state == STATE_ACTIVE_OWNER => {
+            let lease_expires = header
+                .lease_expires_unix_ms
+                .ok_or(SubmitIdempotencyError::RecordCorrupt)?;
+            if lease_expires > now {
+                map_sqlite(tx.commit(), SubmitIdempotencyError::ClaimFailed)?;
+                return Ok(ClaimOutcome::InFlight);
+            }
+            let changed = map_sqlite(
+                tx.execute(
+                    "UPDATE verified_submit_idempotency SET state = ?2, lease_expires_unix_ms = NULL, updated_unix_ms = ?3 WHERE idempotency_key COLLATE BINARY = ?1 COLLATE BINARY AND state = ?4 AND generation = ?5 AND owner_nonce = ?6 AND lease_expires_unix_ms = ?7",
+                    params![
+                        binding.key(),
+                        STATE_IN_DOUBT,
+                        now,
+                        STATE_ACTIVE_OWNER,
+                        header.generation,
+                        &header.owner_nonce[..],
+                        lease_expires,
+                    ],
+                ),
+                SubmitIdempotencyError::ClaimFailed,
+            )?;
+            if changed != 1 {
+                return Err(SubmitIdempotencyError::ClaimFailed);
+            }
             map_sqlite(tx.commit(), SubmitIdempotencyError::ClaimFailed)?;
-            Ok(ClaimOutcome::InFlight)
+            Ok(ClaimOutcome::InDoubt)
         }
         Some(header) if header.state == STATE_EFFECT_APPLIED_RECEIPT_PENDING => {
             map_sqlite(tx.commit(), SubmitIdempotencyError::ClaimFailed)?;
@@ -1120,19 +1198,23 @@ fn claim_with_nonce_and_limits(
                 .generation
                 .checked_add(1)
                 .ok_or(SubmitIdempotencyError::RecordCorrupt)?;
+            let lease_expires = now
+                .checked_add(OWNER_LEASE_DURATION_MS)
+                .ok_or(SubmitIdempotencyError::ClaimFailed)?;
             let changed = map_sqlite(
                 tx.execute(
                     "UPDATE verified_submit_idempotency \
                      SET state = ?2, retryable_reason = NULL, receipt_json = NULL, \
-                         generation = ?3, owner_nonce = ?4, updated_unix_ms = ?5 \
-                     WHERE idempotency_key COLLATE BINARY = ?1 COLLATE BINARY AND state = ?6 \
-                       AND generation = ?7 AND owner_nonce = ?8",
+                         generation = ?3, owner_nonce = ?4, lease_expires_unix_ms = ?5, updated_unix_ms = ?6 \
+                     WHERE idempotency_key COLLATE BINARY = ?1 COLLATE BINARY AND state = ?7 \
+                       AND generation = ?8 AND owner_nonce = ?9",
                     params![
                         binding.key(),
                         STATE_ACTIVE_OWNER,
                         next_generation,
                         &owner_nonce[..],
-                        now_unix_ms(),
+                        lease_expires,
+                        now,
                         STATE_RETRYABLE,
                         header.generation,
                         &header.owner_nonce[..],
