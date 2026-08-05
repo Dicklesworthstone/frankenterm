@@ -635,6 +635,7 @@ harness = false
 [[bench]]
 name = "lfucache_s3fifo"
 harness = false
+required-features = ["frankenterm-deps"]
 
 [[bench]]
 name = "interval_tree_bench"
