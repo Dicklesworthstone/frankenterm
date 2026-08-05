@@ -3987,6 +3987,8 @@ const MCP_AWAIT_EVENT_REQUEST_ADMISSION_CAPACITY: u64 = 16;
 const MCP_AWAIT_EVENT_REQUEST_CONCURRENCY: usize = 8;
 const MCP_AWAIT_EVENT_SERVICE_RUNTIME_WORKERS: usize = 4;
 const MCP_AWAIT_EVENT_SERVICE_BLOCKING_THREADS: usize = 8;
+const MCP_AWAIT_EVENT_TASK_FINISHED_CAPACITY: usize =
+    MCP_AWAIT_EVENT_REQUEST_CONCURRENCY + 1;
 
 #[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4135,9 +4137,57 @@ struct McpAwaitEventRequestJob {
     cx: crate::cx::Cx,
     operation: McpAwaitEventRequestOperation,
     reply: crossbeam::channel::Sender<McpAwaitEventRequestResult>,
-    reply_abandoned: Arc<std::sync::atomic::AtomicBool>,
+    reply_handoff: Arc<std::sync::Mutex<McpAwaitEventRequestReplyHandoff>>,
     _admission: McpAwaitEventRequestAdmissionGuard,
     enqueued_at: Instant,
+}
+
+#[derive(Default)]
+struct McpAwaitEventRequestReplyHandoff {
+    abandoned: bool,
+}
+
+/// Deliver a finished request only while its synchronous caller still owns
+/// the receiving side.  The same lock guards the caller's abandon-and-drain
+/// transition, so these are the only two possible orderings:
+///
+/// 1. delivery wins the lock and the abandoning caller drains the reply; or
+/// 2. abandonment wins the lock and the task retains the output for durable
+///    lease release.
+///
+/// An atomic flag alone cannot provide this guarantee: the task can read
+/// `false`, the caller can observe an empty channel and return, and the task
+/// can then send lease authority into the newly disconnected channel.
+fn deliver_mcp_await_event_request_reply(
+    reply: &crossbeam::channel::Sender<McpAwaitEventRequestResult>,
+    handoff: &std::sync::Mutex<McpAwaitEventRequestReplyHandoff>,
+    output: McpAwaitEventRequestResult,
+) -> Option<McpAwaitEventRequestResult> {
+    let handoff = handoff
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if handoff.abandoned {
+        return Some(output);
+    }
+    match reply.try_send(output) {
+        Ok(()) => None,
+        Err(crossbeam::channel::TrySendError::Full(output))
+        | Err(crossbeam::channel::TrySendError::Disconnected(output)) => Some(output),
+    }
+}
+
+fn abandon_mcp_await_event_request_reply(
+    response: &crossbeam::channel::Receiver<McpAwaitEventRequestResult>,
+    handoff: &std::sync::Mutex<McpAwaitEventRequestReplyHandoff>,
+) -> Option<McpAwaitEventRequestResult> {
+    let mut handoff = handoff
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    handoff.abandoned = true;
+    // Keep the handoff lock through the drain.  A delivery that already won
+    // the lock is now in the channel; a delivery that has not won cannot race
+    // an empty observation and will retain its output after this returns.
+    response.try_recv().ok()
 }
 
 enum McpAwaitEventServiceTaskFinished {
@@ -4218,10 +4268,14 @@ struct McpAwaitEventDeliveryCompletionStats {
     completion_jobs: AtomicU64,
     completion_leases: AtomicU64,
     coalesced_jobs: AtomicU64,
+    completion_jobs_abandoned_shutdown: AtomicU64,
+    completion_leases_abandoned_shutdown: AtomicU64,
+    completion_leases_rejected_shutdown: AtomicU64,
     claim_admission_rejections_unready: AtomicU64,
     request_admissions: AtomicU64,
     request_admission_rejections_unready: AtomicU64,
     request_admission_rejections_saturated: AtomicU64,
+    request_admission_rejections_cancelled: AtomicU64,
     request_jobs_started: AtomicU64,
     request_jobs_finished: AtomicU64,
     request_jobs_cancelled_for_epoch: AtomicU64,
@@ -4230,6 +4284,9 @@ struct McpAwaitEventDeliveryCompletionStats {
     request_jobs_rejected_for_shutdown: AtomicU64,
     request_jobs_rejected_cancelled: AtomicU64,
     request_waiter_cancellations: AtomicU64,
+    request_reply_outputs_reclaimed: AtomicU64,
+    request_reply_completion_leases_queued: AtomicU64,
+    request_reply_completion_leases_rejected: AtomicU64,
     request_panics: AtomicU64,
     active_requests: AtomicU64,
     active_requests_high_water: AtomicU64,
@@ -4266,9 +4323,11 @@ impl McpAwaitEventDeliveryCompletionStats {
 
     fn record_active_requests(&self, active: usize) {
         let active = u64::try_from(active).unwrap_or(u64::MAX);
-        self.active_requests.store(active, Ordering::Relaxed);
         self.active_requests_high_water
             .fetch_max(active, Ordering::Relaxed);
+        // Publish the current count after its high-water update so an Acquire
+        // observer cannot see a new active level with a stale peak.
+        self.active_requests.store(active, Ordering::Release);
     }
 
     fn record_request_timing(
@@ -4324,10 +4383,14 @@ struct McpAwaitEventDeliveryCompletionStatsSnapshot {
     completion_jobs: u64,
     completion_leases: u64,
     coalesced_jobs: u64,
+    completion_jobs_abandoned_shutdown: u64,
+    completion_leases_abandoned_shutdown: u64,
+    completion_leases_rejected_shutdown: u64,
     claim_admission_rejections_unready: u64,
     request_admissions: u64,
     request_admission_rejections_unready: u64,
     request_admission_rejections_saturated: u64,
+    request_admission_rejections_cancelled: u64,
     request_jobs_started: u64,
     request_jobs_finished: u64,
     request_jobs_cancelled_for_epoch: u64,
@@ -4336,6 +4399,9 @@ struct McpAwaitEventDeliveryCompletionStatsSnapshot {
     request_jobs_rejected_for_shutdown: u64,
     request_jobs_rejected_cancelled: u64,
     request_waiter_cancellations: u64,
+    request_reply_outputs_reclaimed: u64,
+    request_reply_completion_leases_queued: u64,
+    request_reply_completion_leases_rejected: u64,
     request_panics: u64,
     active_requests: u64,
     active_requests_high_water: u64,
@@ -4350,7 +4416,7 @@ impl McpAwaitEventDeliveryCompletionStats {
     fn snapshot(&self) -> McpAwaitEventDeliveryCompletionStatsSnapshot {
         McpAwaitEventDeliveryCompletionStatsSnapshot {
             worker_starts: self.worker_starts.load(Ordering::Relaxed),
-            worker_stops: self.worker_stops.load(Ordering::Relaxed),
+            worker_stops: self.worker_stops.load(Ordering::Acquire),
             worker_handoffs: self.worker_handoffs.load(Ordering::Relaxed),
             worker_initialization_handoffs: self
                 .worker_initialization_handoffs
@@ -4384,7 +4450,7 @@ impl McpAwaitEventDeliveryCompletionStats {
             completion_batches: self.completion_batches.load(Ordering::Relaxed),
             completion_attempts_finished: self
                 .completion_attempts_finished
-                .load(Ordering::Relaxed),
+                .load(Ordering::Acquire),
             completion_attempts_storage_reusable: self
                 .completion_attempts_storage_reusable
                 .load(Ordering::Relaxed),
@@ -4396,6 +4462,15 @@ impl McpAwaitEventDeliveryCompletionStats {
             completion_jobs: self.completion_jobs.load(Ordering::Relaxed),
             completion_leases: self.completion_leases.load(Ordering::Relaxed),
             coalesced_jobs: self.coalesced_jobs.load(Ordering::Relaxed),
+            completion_jobs_abandoned_shutdown: self
+                .completion_jobs_abandoned_shutdown
+                .load(Ordering::Relaxed),
+            completion_leases_abandoned_shutdown: self
+                .completion_leases_abandoned_shutdown
+                .load(Ordering::Relaxed),
+            completion_leases_rejected_shutdown: self
+                .completion_leases_rejected_shutdown
+                .load(Ordering::Relaxed),
             claim_admission_rejections_unready: self
                 .claim_admission_rejections_unready
                 .load(Ordering::Relaxed),
@@ -4406,8 +4481,11 @@ impl McpAwaitEventDeliveryCompletionStats {
             request_admission_rejections_saturated: self
                 .request_admission_rejections_saturated
                 .load(Ordering::Relaxed),
+            request_admission_rejections_cancelled: self
+                .request_admission_rejections_cancelled
+                .load(Ordering::Relaxed),
             request_jobs_started: self.request_jobs_started.load(Ordering::Relaxed),
-            request_jobs_finished: self.request_jobs_finished.load(Ordering::Relaxed),
+            request_jobs_finished: self.request_jobs_finished.load(Ordering::Acquire),
             request_jobs_cancelled_for_epoch: self
                 .request_jobs_cancelled_for_epoch
                 .load(Ordering::Relaxed),
@@ -4426,8 +4504,17 @@ impl McpAwaitEventDeliveryCompletionStats {
             request_waiter_cancellations: self
                 .request_waiter_cancellations
                 .load(Ordering::Relaxed),
+            request_reply_outputs_reclaimed: self
+                .request_reply_outputs_reclaimed
+                .load(Ordering::Relaxed),
+            request_reply_completion_leases_queued: self
+                .request_reply_completion_leases_queued
+                .load(Ordering::Relaxed),
+            request_reply_completion_leases_rejected: self
+                .request_reply_completion_leases_rejected
+                .load(Ordering::Relaxed),
             request_panics: self.request_panics.load(Ordering::Relaxed),
-            active_requests: self.active_requests.load(Ordering::Relaxed),
+            active_requests: self.active_requests.load(Ordering::Acquire),
             active_requests_high_water: self
                 .active_requests_high_water
                 .load(Ordering::Relaxed),
@@ -4483,7 +4570,7 @@ impl Drop for McpAwaitEventCompletionWorkerLifecycleGuard<'_> {
         self.ready
             .store(false, std::sync::atomic::Ordering::Release);
         McpAwaitEventCompletionWorkerPhase::Stopped.store(self.phase);
-        self.stats.worker_stops.fetch_add(1, Ordering::Relaxed);
+        self.stats.worker_stops.fetch_add(1, Ordering::Release);
     }
 }
 
@@ -4737,7 +4824,7 @@ impl McpAwaitEventDeliveryCompletionExecutor {
                         }
                     }
                     McpAwaitEventCompletionWorkerPhase::Stopped.store(&worker_phase);
-                    worker_stats.worker_stops.fetch_add(1, Ordering::Relaxed);
+                    worker_stats.worker_stops.fetch_add(1, Ordering::Release);
                 });
             match spawn_result {
                 Ok(worker) => workers.push(worker),
@@ -4805,6 +4892,15 @@ impl McpAwaitEventDeliveryCompletionExecutor {
         cx: crate::cx::Cx,
         operation: McpAwaitEventRequestOperation,
     ) -> std::result::Result<McpAwaitEventRequestResult, McpToolError> {
+        if let Err(cancellation) = mcp_await_event_checkpoint(&cx) {
+            self.stats
+                .request_admission_rejections_cancelled
+                .fetch_add(1, Ordering::Relaxed);
+            return Ok((
+                Err(McpToolError::from_error(cancellation)),
+                Vec::new(),
+            ));
+        }
         let lifecycle_guard = self
             .lifecycle_gate
             .lock()
@@ -4831,14 +4927,16 @@ impl McpAwaitEventDeliveryCompletionExecutor {
         }
         let request_id = self.request_sequence.fetch_add(1, Ordering::Relaxed);
         let (reply, response) = crossbeam::channel::bounded(1);
-        let reply_abandoned = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let reply_handoff = Arc::new(std::sync::Mutex::new(
+            McpAwaitEventRequestReplyHandoff::default(),
+        ));
         let response_cx = cx.clone();
         let job = McpAwaitEventRequestJob {
             request_id,
             cx,
             operation,
             reply,
-            reply_abandoned: Arc::clone(&reply_abandoned),
+            reply_handoff: Arc::clone(&reply_handoff),
             _admission: McpAwaitEventRequestAdmissionGuard {
                 admissions: Arc::clone(&self.request_admissions),
             },
@@ -4864,16 +4962,21 @@ impl McpAwaitEventDeliveryCompletionExecutor {
                             else {
                                 continue;
                             };
-                            reply_abandoned.store(true, Ordering::Release);
                             self.stats
                                 .request_waiter_cancellations
                                 .fetch_add(1, Ordering::Relaxed);
                             self.wake_workers();
-                            if let Ok((_result, leases)) = response.try_recv() {
-                                let _queued = self.try_submit(
-                                    leases,
-                                    FrameworkResponseDeliveryOutcome::Failed,
-                                );
+                            if let Some(undelivered_output) =
+                                abandon_mcp_await_event_request_reply(
+                                    &response,
+                                    &reply_handoff,
+                                ) && reclaim_mcp_await_event_request_reply(
+                                    &self.sender,
+                                    &self.stats,
+                                    undelivered_output,
+                                )
+                            {
+                                self.wake_workers();
                             }
                             break Ok((
                                 Err(McpToolError::from_error(cancellation)),
@@ -4922,11 +5025,32 @@ impl McpAwaitEventDeliveryCompletionExecutor {
         leases: Vec<EventDeliveryLease>,
         outcome: FrameworkResponseDeliveryOutcome,
     ) -> bool {
+        if leases.is_empty() {
+            return true;
+        }
+        let lifecycle_guard = self
+            .lifecycle_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.shutdown.load(Ordering::Acquire) {
+            let delivery_count = leases.len();
+            self.stats.completion_leases_rejected_shutdown.fetch_add(
+                u64::try_from(delivery_count).unwrap_or(u64::MAX),
+                Ordering::Relaxed,
+            );
+            tracing::warn!(
+                delivery_count,
+                ?outcome,
+                "Rejected MCP event-delivery completion after shared-service shutdown began; lease expiry remains authoritative"
+            );
+            return false;
+        }
         let queued = try_enqueue_mcp_await_event_delivery_completion(
             &self.sender,
             leases,
             outcome,
         );
+        drop(lifecycle_guard);
         if queued {
             self.wake_workers();
         }
@@ -4989,6 +5113,41 @@ enum McpAwaitEventRequestStopCause {
     ServiceShutdown,
 }
 
+fn abandon_queued_mcp_await_event_completions(
+    receiver: &crossbeam::channel::Receiver<McpAwaitEventDeliveryCompletionJob>,
+    deferred_job: &mut Option<McpAwaitEventDeliveryCompletionJob>,
+    stats: &McpAwaitEventDeliveryCompletionStats,
+) {
+    let mut abandoned_jobs = 0_u64;
+    let mut abandoned_leases = 0_u64;
+    let mut record = |job: McpAwaitEventDeliveryCompletionJob| {
+        abandoned_jobs = abandoned_jobs.saturating_add(1);
+        abandoned_leases = abandoned_leases.saturating_add(
+            u64::try_from(job.leases.len()).unwrap_or(u64::MAX),
+        );
+    };
+    if let Some(job) = deferred_job.take() {
+        record(job);
+    }
+    while let Ok(job) = receiver.try_recv() {
+        record(job);
+    }
+    if abandoned_jobs == 0 {
+        return;
+    }
+    stats
+        .completion_jobs_abandoned_shutdown
+        .fetch_add(abandoned_jobs, Ordering::Relaxed);
+    stats
+        .completion_leases_abandoned_shutdown
+        .fetch_add(abandoned_leases, Ordering::Relaxed);
+    tracing::warn!(
+        abandoned_jobs,
+        abandoned_leases,
+        "Abandoned queued MCP event-delivery completions during orderly shutdown; lease expiry remains authoritative"
+    );
+}
+
 fn reject_queued_mcp_await_event_requests(
     receiver: &crossbeam::channel::Receiver<McpAwaitEventRequestJob>,
     pending_requests: &mut std::collections::VecDeque<McpAwaitEventRequestJob>,
@@ -5008,10 +5167,11 @@ fn reject_queued_mcp_await_event_requests(
                     .fetch_add(1, Ordering::Relaxed);
             }
         }
-        let _ = job.reply.try_send((
-            Err(mcp_await_event_service_unready_error()),
-            Vec::new(),
-        ));
+        let _undelivered = deliver_mcp_await_event_request_reply(
+            &job.reply,
+            &job.reply_handoff,
+            (Err(mcp_await_event_service_unready_error()), Vec::new()),
+        );
     };
     while let Some(job) = pending_requests.pop_front() {
         reject(job);
@@ -5036,10 +5196,11 @@ fn prune_cancelled_mcp_await_event_requests(
                 stats
                     .request_jobs_rejected_cancelled
                     .fetch_add(1, Ordering::Relaxed);
-                let _ = job.reply.try_send((
-                    Err(McpToolError::from_error(cancellation)),
-                    Vec::new(),
-                ));
+                let _undelivered = deliver_mcp_await_event_request_reply(
+                    &job.reply,
+                    &job.reply_handoff,
+                    (Err(McpToolError::from_error(cancellation)), Vec::new()),
+                );
             }
         }
     }
@@ -5066,6 +5227,38 @@ fn cancel_active_mcp_await_event_requests(
     }
     for request_cx in active_requests.values() {
         request_cx.cancel_with(crate::outcome::CancelKind::User, Some(reason));
+    }
+}
+
+fn reclaim_mcp_await_event_request_reply(
+    completion_sender: &crossbeam::channel::Sender<McpAwaitEventDeliveryCompletionJob>,
+    stats: &McpAwaitEventDeliveryCompletionStats,
+    output: McpAwaitEventRequestResult,
+) -> bool {
+    stats
+        .request_reply_outputs_reclaimed
+        .fetch_add(1, Ordering::Relaxed);
+    let (_result, delivery_leases) = output;
+    let delivery_count = delivery_leases.len();
+    if delivery_count == 0 {
+        return false;
+    }
+    if try_enqueue_mcp_await_event_delivery_completion(
+        completion_sender,
+        delivery_leases,
+        FrameworkResponseDeliveryOutcome::Failed,
+    ) {
+        stats.request_reply_completion_leases_queued.fetch_add(
+            u64::try_from(delivery_count).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        true
+    } else {
+        stats.request_reply_completion_leases_rejected.fetch_add(
+            u64::try_from(delivery_count).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        false
     }
 }
 
@@ -5104,7 +5297,7 @@ fn spawn_mcp_await_event_request(
     let McpAwaitEventRequestJob {
         operation,
         reply,
-        reply_abandoned,
+        reply_handoff,
         _admission,
         enqueued_at,
         ..
@@ -5162,32 +5355,29 @@ fn spawn_mcp_await_event_request(
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             ready.store(false, Ordering::Release);
         }
-        let undelivered_output = if reply_abandoned.load(Ordering::Acquire) {
-            Some(output)
-        } else {
-            match reply.try_send(output) {
-                Ok(()) => None,
-                Err(crossbeam::channel::TrySendError::Full(output))
-                | Err(crossbeam::channel::TrySendError::Disconnected(output)) => Some(output),
-            }
-        };
-        if let Some((_result, delivery_leases)) = undelivered_output
-            && try_enqueue_mcp_await_event_delivery_completion(
-                &completion_sender,
-                delivery_leases,
-                FrameworkResponseDeliveryOutcome::Failed,
-            )
-        {
+        // The request operation is complete before reply handoff.  Release
+        // bounded admission first so a caller awakened by this reply can
+        // immediately submit replacement work instead of observing a stale
+        // saturation count while this task performs terminal bookkeeping.
+        drop(_admission);
+        if let Some(undelivered_output) = deliver_mcp_await_event_request_reply(
+            &reply,
+            &reply_handoff,
+            output,
+        ) && reclaim_mcp_await_event_request_reply(
+            &completion_sender,
+            &stats,
+            undelivered_output,
+        ) {
             coordinator_thread.unpark();
         }
-        stats.request_jobs_finished.fetch_add(1, Ordering::Relaxed);
+        stats.request_jobs_finished.fetch_add(1, Ordering::Release);
         let _ = task_finished_tx.send(McpAwaitEventServiceTaskFinished::Request {
             request_id,
             storage_epoch,
             storage_reusable,
         });
         coordinator_thread.unpark();
-        drop(_admission);
     });
 }
 
@@ -5248,8 +5438,14 @@ fn run_mcp_await_event_delivery_completion_worker(
     let mut storage_epoch = 0_u64;
     let mut reconnect_backoff = MCP_AWAIT_EVENT_COMPLETION_RECONNECT_BACKOFF_MIN;
     let mut deferred_job: Option<McpAwaitEventDeliveryCompletionJob> = None;
+    // Exactly one completion plus at most `REQUEST_CONCURRENCY` request tasks
+    // can be live, and each publishes exactly one terminal record.  Keep the
+    // coordinator mailbox physically bounded by that invariant rather than
+    // relying on an unbounded channel whose safety exists only in comments.
     let (task_finished_tx, task_finished_rx) =
-        crossbeam::channel::unbounded::<McpAwaitEventServiceTaskFinished>();
+        crossbeam::channel::bounded::<McpAwaitEventServiceTaskFinished>(
+            MCP_AWAIT_EVENT_TASK_FINISHED_CAPACITY,
+        );
     let mut active_requests = std::collections::HashMap::<u64, crate::cx::Cx>::new();
     let mut pending_requests = std::collections::VecDeque::<McpAwaitEventRequestJob>::new();
     let mut completion_in_flight = false;
@@ -5359,6 +5555,11 @@ fn run_mcp_await_event_delivery_completion_worker(
                 }
                 shutdown_cancellation_sent = true;
             }
+            abandon_queued_mcp_await_event_completions(
+                &receiver,
+                &mut deferred_job,
+                &stats,
+            );
             reject_queued_mcp_await_event_requests(
                 &request_receiver,
                 &mut pending_requests,
@@ -5631,9 +5832,6 @@ fn run_mcp_await_event_delivery_completion_worker(
                             }
                         }
                     };
-                    completion_stats
-                        .completion_attempts_finished
-                        .fetch_add(1, Ordering::Relaxed);
                     if storage_reusable {
                         completion_stats
                             .completion_attempts_storage_reusable
@@ -5643,6 +5841,13 @@ fn run_mcp_await_event_delivery_completion_worker(
                             .completion_attempts_storage_unusable
                             .fetch_add(1, Ordering::Relaxed);
                     }
+                    // Publish the terminal count only after the exact outcome
+                    // counters are durable in this stats snapshot.  Tests and
+                    // diagnostics use an Acquire load of `finished` as the
+                    // completion record's release/acquire handoff.
+                    completion_stats
+                        .completion_attempts_finished
+                        .fetch_add(1, Ordering::Release);
                     if !storage_reusable {
                         let _lifecycle_guard = completion_lifecycle_gate
                             .lock()
@@ -5719,7 +5924,6 @@ fn run_mcp_await_event_delivery_completion_worker(
 impl Drop for McpAwaitEventDeliveryCompletionExecutor {
     fn drop(&mut self) {
         self.begin_shutdown();
-        let queued_at_shutdown = self.sender.len();
         let queued_requests_at_shutdown = self.request_sender.len();
         let shutdown_started = Instant::now();
         for worker in self.workers.drain(..) {
@@ -5819,12 +6023,6 @@ impl Drop for McpAwaitEventDeliveryCompletionExecutor {
                     }
                 }
             }
-        }
-        if queued_at_shutdown > 0 {
-            tracing::warn!(
-                queued_at_shutdown,
-                "Abandoned queued MCP event-delivery completions during orderly shutdown; lease expiry remains authoritative"
-            );
         }
         if queued_requests_at_shutdown > 0 {
             tracing::warn!(
@@ -5991,6 +6189,20 @@ async fn complete_mcp_await_event_deliveries_with_storage(
                             storage_reusable = true;
                             true
                         }
+                        Err(batch_error)
+                            if mcp_await_event_error_invalidates_storage_epoch(
+                                &batch_error,
+                            ) =>
+                        {
+                            tracing::error!(
+                                error = %batch_error,
+                                delivery_count = lease_batch.len(),
+                                ?outcome,
+                                "MCP event-delivery bulk completion invalidated the shared storage epoch; remaining leases recover by expiry"
+                            );
+                            storage_reusable = false;
+                            break 'remaining_batches;
+                        }
                         Err(batch_error) => {
                             tracing::warn!(
                                 error = %batch_error,
@@ -6015,6 +6227,7 @@ async fn complete_mcp_await_event_deliveries_with_storage(
                         );
 
                         let mut fallback_observed_writer_response = false;
+                        let mut fallback_invalidated_storage = false;
                         for lease in lease_batch {
                             if let Err(err) = mcp_request_checkpoint(
                                 &operation_cx,
@@ -6069,8 +6282,21 @@ async fn complete_mcp_await_event_deliveries_with_storage(
                                         ?outcome,
                                         "MCP event-delivery completion failed; lease expiry remains the recovery authority"
                                     );
+                                    if mcp_await_event_error_invalidates_storage_epoch(&err) {
+                                        fallback_invalidated_storage = true;
+                                        break;
+                                    }
                                 }
                             }
+                        }
+                        if fallback_invalidated_storage {
+                            storage_reusable = false;
+                            tracing::error!(
+                                delivery_count = lease_batch.len(),
+                                ?outcome,
+                                "MCP event-delivery fallback invalidated the shared storage epoch; remaining leases recover by expiry"
+                            );
+                            break;
                         }
                         storage_reusable = fallback_observed_writer_response;
                         if !storage_reusable {
@@ -7148,7 +7374,7 @@ impl ToolHandler for WaAwaitEventTool {
         Tool {
             name: "wa.await_event".to_string(),
             description: Some(
-                "Long-poll DB-backed rule events with storage-authoritative scope-bound cursor tokens, optional transport-acknowledged claim leases, and an immediate checkpoint-only tail bootstrap. Live pane-state and quiescence conditions are not supported."
+                "Long-poll DB-backed rule events with storage-authoritative scope-bound cursor tokens, optional claim leases finalized after sender-side response transport completion, and an immediate checkpoint-only tail bootstrap. Live pane-state and quiescence conditions are not supported."
                     .to_string(),
             ),
             input_schema: serde_json::json!({
@@ -7158,13 +7384,13 @@ impl ToolHandler for WaAwaitEventTool {
                         "type": "array",
                         "items": { "type": "string", "minLength": 1, "maxLength": MCP_AWAIT_EVENT_CONDITION_MAX_BYTES },
                         "maxItems": MCP_AWAIT_EVENT_CONDITION_SET_MAX,
-                        "description": "At least one condition in this set must match; supported condition: rule:<glob>"
+                        "description": "At least one condition in this set must match; supported condition: rule:<glob>. Each input condition is limited to 256 UTF-8 bytes; JSON Schema maxLength alone counts characters and is not the byte-limit authority"
                     },
                     "all": {
                         "type": "array",
                         "items": { "type": "string", "minLength": 1, "maxLength": MCP_AWAIT_EVENT_CONDITION_MAX_BYTES },
                         "maxItems": MCP_AWAIT_EVENT_CONDITION_SET_MAX,
-                        "description": "Every condition in this set must match; supported condition: rule:<glob>"
+                        "description": "Every condition in this set must match; supported condition: rule:<glob>. Each input condition is limited to 256 UTF-8 bytes; JSON Schema maxLength alone counts characters and is not the byte-limit authority"
                     },
                     "timeout_secs": {
                         "type": "integer",
@@ -7212,7 +7438,7 @@ impl ToolHandler for WaAwaitEventTool {
                     "claim": {
                         "type": "boolean",
                         "default": false,
-                        "description": "Atomically lease matched emitted events; finalize handled only after successful requested-format response delivery, and release leases on known delivery failure"
+                        "description": "Atomically lease matched emitted events; finalize handled only after the complete requested-format response crosses the server's sender-side transport boundary, and release leases on known delivery failure. This does not assert that the client parsed or acted on the response"
                     },
                     "checkpoint_only": {
                         "type": "boolean",
@@ -7433,7 +7659,7 @@ impl ToolHandler for WaAwaitEventTool {
         if params.claim && self.response_delivery.is_none() {
             let envelope = McpEnvelope::<()>::error(
                 MCP_ERR_CONFIG,
-                "wa.await_event claim requires an acknowledgment-aware MCP response transport"
+                "wa.await_event claim requires a sender-side completion-aware MCP response transport"
                     .to_string(),
                 Some(
                     "Run wa.await_event through the FrankenTerm MCP server transport; direct handler dispatch cannot safely claim events"
@@ -8222,7 +8448,7 @@ impl ToolHandler for WaAwaitEventTool {
                     );
                     let envelope = McpEnvelope::<()>::error(
                         MCP_ERR_CONFIG,
-                        "wa.await_event claim response has no acknowledgment-aware transport"
+                        "wa.await_event claim response has no sender-side completion-aware transport"
                             .to_string(),
                         None,
                         elapsed_ms(start),
@@ -15514,6 +15740,235 @@ mod tests {
     }
 
     #[test]
+    fn await_event_request_reply_handoff_preserves_lease_authority_in_both_orderings() {
+        fn lease_bearing_output(
+            event_id: i64,
+            token: &str,
+        ) -> super::McpAwaitEventRequestResult {
+            (
+                Err(super::McpToolError::new(
+                    super::MCP_ERR_TIMEOUT,
+                    "synthetic abandoned request".to_string(),
+                    None,
+                )),
+                vec![crate::storage::EventDeliveryLease::new(
+                    event_id,
+                    token.to_string(),
+                    0,
+                    i64::MAX,
+                )],
+            )
+        }
+
+        // If task delivery wins the serialized handoff, cancellation must
+        // drain the already-enqueued output before returning.
+        let (first_reply, first_response) = crossbeam::channel::bounded(1);
+        let first_handoff = std::sync::Mutex::new(
+            super::McpAwaitEventRequestReplyHandoff::default(),
+        );
+        assert!(
+            super::deliver_mcp_await_event_request_reply(
+                &first_reply,
+                &first_handoff,
+                lease_bearing_output(41, "delivered-first"),
+            )
+            .is_none()
+        );
+        let first_reclaimed = super::abandon_mcp_await_event_request_reply(
+            &first_response,
+            &first_handoff,
+        )
+        .expect("abandonment must drain a reply delivered first");
+        assert_eq!(first_reclaimed.1.len(), 1);
+        assert_eq!(first_reclaimed.1[0].event_id(), 41);
+
+        // If cancellation wins, the task must retain the output rather than
+        // enqueueing it into a receiver that the caller is about to drop.
+        let (second_reply, second_response) = crossbeam::channel::bounded(1);
+        let second_handoff = std::sync::Mutex::new(
+            super::McpAwaitEventRequestReplyHandoff::default(),
+        );
+        assert!(
+            super::abandon_mcp_await_event_request_reply(
+                &second_response,
+                &second_handoff,
+            )
+            .is_none()
+        );
+        let second_reclaimed = super::deliver_mcp_await_event_request_reply(
+            &second_reply,
+            &second_handoff,
+            lease_bearing_output(42, "abandoned-first"),
+        )
+        .expect("delivery after abandonment must retain lease authority");
+        assert_eq!(second_reclaimed.1.len(), 1);
+        assert_eq!(second_reclaimed.1[0].event_id(), 42);
+        assert!(second_response.try_recv().is_err());
+    }
+
+    #[test]
+    fn await_event_reclaimed_reply_accounts_for_queued_and_rejected_leases() {
+        let stats = super::McpAwaitEventDeliveryCompletionStats::default();
+        let (completion_sender, completion_receiver) = crossbeam::channel::bounded(1);
+        let output = (
+            Err(super::McpToolError::new(
+                super::MCP_ERR_TIMEOUT,
+                "synthetic reclaimed output".to_string(),
+                None,
+            )),
+            vec![
+                crate::storage::EventDeliveryLease::new(
+                    51,
+                    "queued-first".to_string(),
+                    0,
+                    i64::MAX,
+                ),
+                crate::storage::EventDeliveryLease::new(
+                    52,
+                    "queued-second".to_string(),
+                    0,
+                    i64::MAX,
+                ),
+            ],
+        );
+        assert!(super::reclaim_mcp_await_event_request_reply(
+            &completion_sender,
+            &stats,
+            output,
+        ));
+        let queued = completion_receiver
+            .try_recv()
+            .expect("reclaimed leases must enter the bounded completion lane");
+        assert_eq!(queued.leases.len(), 2);
+        let queued_snapshot = stats.snapshot();
+        assert_eq!(queued_snapshot.request_reply_outputs_reclaimed, 1);
+        assert_eq!(queued_snapshot.request_reply_completion_leases_queued, 2);
+        assert_eq!(queued_snapshot.request_reply_completion_leases_rejected, 0);
+
+        drop(completion_receiver);
+        let rejected_output = (
+            Err(super::McpToolError::new(
+                super::MCP_ERR_TIMEOUT,
+                "synthetic disconnected completion lane".to_string(),
+                None,
+            )),
+            vec![crate::storage::EventDeliveryLease::new(
+                53,
+                "rejected".to_string(),
+                0,
+                i64::MAX,
+            )],
+        );
+        assert!(!super::reclaim_mcp_await_event_request_reply(
+            &completion_sender,
+            &stats,
+            rejected_output,
+        ));
+        let rejected_snapshot = stats.snapshot();
+        assert_eq!(rejected_snapshot.request_reply_outputs_reclaimed, 2);
+        assert_eq!(rejected_snapshot.request_reply_completion_leases_queued, 2);
+        assert_eq!(
+            rejected_snapshot.request_reply_completion_leases_rejected,
+            1
+        );
+    }
+
+    #[test]
+    fn await_event_shutdown_abandonment_drains_and_accounts_for_all_queued_completions() {
+        let stats = super::McpAwaitEventDeliveryCompletionStats::default();
+        let (sender, receiver) = crossbeam::channel::bounded(2);
+        let mut deferred_job = Some(super::McpAwaitEventDeliveryCompletionJob {
+            leases: vec![crate::storage::EventDeliveryLease::new(
+                54,
+                "deferred".to_string(),
+                0,
+                i64::MAX,
+            )],
+            outcome: super::FrameworkResponseDeliveryOutcome::Failed,
+            enqueued_at: std::time::Instant::now(),
+        });
+        assert!(super::try_enqueue_mcp_await_event_delivery_completion(
+            &sender,
+            vec![
+                crate::storage::EventDeliveryLease::new(
+                    55,
+                    "queued-first".to_string(),
+                    0,
+                    i64::MAX,
+                ),
+                crate::storage::EventDeliveryLease::new(
+                    56,
+                    "queued-second".to_string(),
+                    0,
+                    i64::MAX,
+                ),
+            ],
+            super::FrameworkResponseDeliveryOutcome::DeliveryAcknowledged,
+        ));
+
+        super::abandon_queued_mcp_await_event_completions(
+            &receiver,
+            &mut deferred_job,
+            &stats,
+        );
+
+        assert!(deferred_job.is_none());
+        assert!(receiver.try_recv().is_err());
+        let snapshot = stats.snapshot();
+        assert_eq!(snapshot.completion_jobs_abandoned_shutdown, 2);
+        assert_eq!(snapshot.completion_leases_abandoned_shutdown, 3);
+    }
+
+    #[test]
+    fn await_event_service_rejects_pre_cancelled_request_before_admission() {
+        let (_dir, db_path) = temp_db_path();
+        let service = super::McpAwaitEventDeliveryCompletionExecutor::new(db_path)
+            .expect("pre-cancellation await service must start");
+        let stats = service.stats_for_test();
+        assert!(
+            service.wait_until_ready_for_test(std::time::Duration::from_secs(5)),
+            "pre-cancellation storage did not become ready"
+        );
+        let operation_ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let operation_ran_for_task = Arc::clone(&operation_ran);
+        let operation: super::McpAwaitEventRequestOperation = Box::new(move |_storage| {
+            operation_ran_for_task.store(true, std::sync::atomic::Ordering::Release);
+            Box::pin(async {
+                super::McpAwaitEventRequestTaskOutput::new(
+                    Err(super::McpToolError::new(
+                        super::MCP_ERR_CONFIG,
+                        "pre-cancelled operation must not run".to_string(),
+                        None,
+                    )),
+                    Vec::new(),
+                    true,
+                )
+            })
+        });
+        let request_cx = crate::cx::for_request();
+        request_cx.cancel_with(
+            crate::outcome::CancelKind::User,
+            Some("synthetic pre-admission cancellation"),
+        );
+
+        let (result, leases) = service
+            .execute_request(request_cx, operation)
+            .expect("pre-cancellation is a request-local result");
+        assert!(leases.is_empty());
+        assert_eq!(
+            result
+                .expect_err("pre-cancelled await must return a typed cancellation")
+                .code,
+            super::MCP_ERR_TIMEOUT
+        );
+        assert!(!operation_ran.load(std::sync::atomic::Ordering::Acquire));
+        let snapshot = stats.snapshot();
+        assert_eq!(snapshot.request_admissions, 0);
+        assert_eq!(snapshot.request_admission_rejections_cancelled, 1);
+        assert_eq!(snapshot.request_jobs_started, 0);
+    }
+
+    #[test]
     fn await_event_service_bounds_concurrency_and_keeps_request_results_isolated() {
         let (_dir, db_path) = temp_db_path();
         let service = Arc::new(
@@ -15967,6 +16422,18 @@ mod tests {
         });
 
         service.begin_shutdown();
+        assert!(
+            !service.try_submit(
+                vec![crate::storage::EventDeliveryLease::new(
+                    61,
+                    "post-shutdown".to_string(),
+                    0,
+                    i64::MAX,
+                )],
+                super::FrameworkResponseDeliveryOutcome::Failed,
+            ),
+            "completion admission must fail closed after shutdown begins"
+        );
         let post_shutdown_operation: super::McpAwaitEventRequestOperation =
             Box::new(|_storage| {
                 Box::pin(async {
@@ -16020,6 +16487,7 @@ mod tests {
         assert_eq!(stopped.request_jobs_cancelled_for_epoch, 0);
         assert_eq!(stopped.request_jobs_rejected_for_epoch, 0);
         assert_eq!(stopped.request_admission_rejections_unready, 1);
+        assert_eq!(stopped.completion_leases_rejected_shutdown, 1);
         assert_eq!(stopped.storage_shutdowns, 1);
         assert_eq!(stopped.runtime_initializations, 1);
         assert_eq!(stopped.storage_initializations, 1);
@@ -16085,6 +16553,23 @@ mod tests {
         assert!(super::mcp_await_event_error_invalidates_storage_epoch(
             &crate::Error::Storage(crate::StorageError::Corruption {
                 details: "invalid page".to_string(),
+            })
+        ));
+        assert!(super::mcp_await_event_error_invalidates_storage_epoch(
+            &crate::Error::Storage(crate::StorageError::MigrationFailed(
+                "migration".to_string(),
+            ))
+        ));
+        assert!(super::mcp_await_event_error_invalidates_storage_epoch(
+            &crate::Error::Storage(crate::StorageError::SchemaTooNew {
+                current: 36,
+                supported: 35,
+            })
+        ));
+        assert!(super::mcp_await_event_error_invalidates_storage_epoch(
+            &crate::Error::Storage(crate::StorageError::WaTooOld {
+                current: "0.11.0".to_string(),
+                min_compatible: "0.12.0".to_string(),
             })
         ));
         for request_local_error in [
@@ -17221,6 +17706,51 @@ mod tests {
     }
 
     #[test]
+    fn await_event_completion_does_not_retry_an_epoch_invalidating_bulk_error() {
+        let (_dir, db_path) = temp_db_path();
+        let runtime = CompatRuntimeBuilder::current_thread().build().unwrap();
+        let storage = runtime.block_on(async {
+            let storage = StorageHandle::new(&db_path.to_string_lossy()).await.unwrap();
+            storage.shutdown().await.unwrap();
+            storage
+        });
+        let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed_for_hook = Arc::clone(&observed);
+        super::set_mcp_await_event_completion_batch_observer(Some(Arc::new(
+            move |phase, lease_count| {
+                observed_for_hook
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push((phase, lease_count));
+            },
+        )));
+        let active_cx = std::sync::Mutex::new(None);
+        let storage_reusable = runtime.block_on(
+            super::complete_mcp_await_event_deliveries_with_storage(
+                &storage,
+                &active_cx,
+                vec![crate::storage::EventDeliveryLease::new(
+                    71,
+                    "closed-writer".to_string(),
+                    0,
+                    i64::MAX,
+                )],
+                super::FrameworkResponseDeliveryOutcome::Failed,
+            ),
+        );
+        super::set_mcp_await_event_completion_batch_observer(None);
+
+        assert!(!storage_reusable);
+        assert_eq!(
+            *observed
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            vec![(super::McpAwaitEventCompletionBatchPhase::BulkAttempt, 1)],
+            "a closed writer invalidates the epoch and must not be hammered by per-lease retries"
+        );
+    }
+
+    #[test]
     fn await_event_bulk_finalize_conflict_falls_back_and_settles_valid_lease() {
         let (_dir, db_path) = temp_db_path();
         let event_ids = seed_events_with_rules(
@@ -17575,7 +18105,7 @@ mod tests {
         assert!(
             envelope["error"]
                 .as_str()
-                .is_some_and(|message| message.contains("acknowledgment-aware")),
+                .is_some_and(|message| message.contains("sender-side completion-aware")),
             "direct claim rejection must explain the missing delivery boundary: {envelope}"
         );
 

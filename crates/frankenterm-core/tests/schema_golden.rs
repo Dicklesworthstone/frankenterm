@@ -1665,6 +1665,28 @@ fn event_stream_schema_covers_every_closed_record_family() {
         &canonical_error_token,
     );
 
+    let mut oversized_error_message = records
+        .iter()
+        .find(|record| record["type"].as_str() == Some("error"))
+        .expect("terminal error fixture")
+        .clone();
+    oversized_error_message["message"] = json!("x".repeat(16_385));
+    assert!(
+        !validator.is_valid(&oversized_error_message),
+        "terminal error messages must remain inside the schema's coarse character ceiling; the producer separately enforces bytes"
+    );
+
+    let mut oversized_error_hint = records
+        .iter()
+        .find(|record| record["type"].as_str() == Some("error"))
+        .expect("terminal error fixture")
+        .clone();
+    oversized_error_hint["hint"] = json!("x".repeat(16_385));
+    assert!(
+        !validator.is_valid(&oversized_error_hint),
+        "terminal error hints must remain inside the schema's coarse character ceiling; the producer separately enforces bytes"
+    );
+
     let mut impossible_await = records
         .iter()
         .find(|record| {

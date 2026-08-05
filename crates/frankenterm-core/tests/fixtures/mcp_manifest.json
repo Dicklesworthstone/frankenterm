@@ -480,7 +480,7 @@
     },
     {
       "annotations": null,
-      "description": "Long-poll DB-backed rule events with storage-authoritative scope-bound cursor tokens, optional transport-acknowledged claim leases, and an immediate checkpoint-only tail bootstrap. Live pane-state and quiescence conditions are not supported.",
+      "description": "Long-poll DB-backed rule events with storage-authoritative scope-bound cursor tokens, optional claim leases finalized after sender-side response transport completion, and an immediate checkpoint-only tail bootstrap. Live pane-state and quiescence conditions are not supported.",
       "input_schema": {
         "additionalProperties": false,
         "anyOf": [
@@ -531,7 +531,7 @@
         },
         "properties": {
           "all": {
-            "description": "Every condition in this set must match; supported condition: rule:<glob>",
+            "description": "Every condition in this set must match; supported condition: rule:<glob>. Each input condition is limited to 256 UTF-8 bytes; JSON Schema maxLength alone counts characters and is not the byte-limit authority",
             "items": {
               "maxLength": 256,
               "minLength": 1,
@@ -541,7 +541,7 @@
             "type": "array"
           },
           "any": {
-            "description": "At least one condition in this set must match; supported condition: rule:<glob>",
+            "description": "At least one condition in this set must match; supported condition: rule:<glob>. Each input condition is limited to 256 UTF-8 bytes; JSON Schema maxLength alone counts characters and is not the byte-limit authority",
             "items": {
               "maxLength": 256,
               "minLength": 1,
@@ -557,7 +557,7 @@
           },
           "claim": {
             "default": false,
-            "description": "Atomically lease matched emitted events; finalize handled only after successful requested-format response delivery, and release leases on known delivery failure",
+            "description": "Atomically lease matched emitted events; finalize handled only after the complete requested-format response crosses the server's sender-side transport boundary, and release leases on known delivery failure. This does not assert that the client parsed or acted on the response",
             "type": "boolean"
           },
           "cursor": {

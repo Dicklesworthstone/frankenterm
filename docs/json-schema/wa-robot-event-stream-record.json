@@ -282,8 +282,17 @@
         "terminal": { "const": true },
         "retryable": { "type": "boolean" },
         "code": { "type": "string", "pattern": "^robot\\.[a-z0-9_.-]+$" },
-        "message": { "type": "string", "minLength": 1 },
-        "hint": { "type": ["string", "null"] },
+        "message": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 16384,
+          "description": "Terminal-safe diagnostic. The producer additionally enforces a 16384-byte UTF-8 ceiling."
+        },
+        "hint": {
+          "type": ["string", "null"],
+          "maxLength": 16384,
+          "description": "Optional terminal-safe diagnostic. The producer additionally enforces a 16384-byte UTF-8 ceiling."
+        },
         "cursor": { "$ref": "#/$defs/cursor" },
         "cursor_epoch": { "$ref": "#/$defs/cursor_epoch" },
         "cursor_scope": { "$ref": "#/$defs/cursor_scope" }
