@@ -58,6 +58,31 @@ fn dispose_caller(waker: Waker) {
     );
 }
 
+fn dispose_result<T>(result: anyhow::Result<T>) {
+    let _ = frankenterm_sigpipe::catch_recoverable(
+        frankenterm_sigpipe::RecoverablePanicSite::PromisePayload,
+        std::panic::AssertUnwindSafe(|| drop(result)),
+    );
+}
+
+impl<T> Drop for Core<T> {
+    fn drop(&mut self) {
+        // Core is being destroyed after the final Arc has gone away, so no
+        // mutex guard is live here. Take both caller-controlled fields before
+        // invoking either destructor and quarantine them independently. In
+        // particular, a retained T must not create a nested panic while this
+        // Core is itself being dropped during an unrelated unwind.
+        let retained_waker = self.waker.take();
+        let retained_result = self.result.take();
+        if let Some(waker) = retained_waker {
+            dispose_caller(waker);
+        }
+        if let Some(result) = retained_result {
+            dispose_result(result);
+        }
+    }
+}
+
 pub struct Promise<T> {
     core: Arc<Mutex<Core<T>>>,
 }
@@ -109,15 +134,32 @@ impl<T> Promise<T> {
     }
 
     pub fn result(&mut self, result: Result<T, Error>) -> bool {
-        let waker = {
+        let mut result = Some(result);
+        let (accepted, waker, retired_result) = {
             let mut core = lock_core(&self.core);
             if core.producer_completed {
-                return false;
+                (false, None, None)
+            } else {
+                core.producer_completed = true;
+                let replacement = result
+                    .take()
+                    .expect("accepted promise resolution retains its result");
+                let retired_result = core.result.replace(replacement);
+                (true, core.waker.take(), retired_result)
             }
-            core.producer_completed = true;
-            core.result = Some(result);
-            core.waker.take()
         };
+
+        if !accepted {
+            if let Some(rejected) = result {
+                dispose_result(rejected);
+            }
+            return false;
+        }
+        if let Some(retired_result) = retired_result {
+            // Poison recovery may expose a stale payload despite the normal
+            // single-assignment invariant. Never destroy it under the mutex.
+            dispose_result(retired_result);
+        }
 
         if let Some(waker) = waker {
             // Completion is already committed under the mutex. An
@@ -132,15 +174,19 @@ impl<T> Promise<T> {
 
 impl<T> Drop for Promise<T> {
     fn drop(&mut self) {
-        let waker = {
+        let (waker, retired_result) = {
             let mut core = lock_core(&self.core);
             if core.producer_completed {
                 return;
             }
             core.producer_completed = true;
-            core.result = Some(Err(BrokenPromise {}.into()));
-            core.waker.take()
+            let retired_result = core.result.replace(Err(BrokenPromise {}.into()));
+            (core.waker.take(), retired_result)
         };
+
+        if let Some(retired_result) = retired_result {
+            dispose_result(retired_result);
+        }
 
         if let Some(waker) = waker {
             // Isolate an executor-provided waker panic from the
@@ -344,12 +390,99 @@ mod tests {
     }
 
     #[cfg(panic = "unwind")]
+    struct PanicOnPayloadDrop {
+        drops: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[cfg(panic = "unwind")]
+    impl Drop for PanicOnPayloadDrop {
+        fn drop(&mut self) {
+            self.drops
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            panic!("synthetic retained promise payload drop panic");
+        }
+    }
+
+    #[cfg(panic = "unwind")]
     fn final_drop_panicking_waker() -> (Arc<std::sync::atomic::AtomicUsize>, Waker) {
         let drops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let waker = Waker::from(Arc::new(PanicOnFinalDrop {
             drops: Arc::clone(&drops),
         }));
         (drops, waker)
+    }
+
+    #[cfg(panic = "unwind")]
+    #[test]
+    fn final_core_drop_contains_unconsumed_result_payload_panic() {
+        let drops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let future = Future::ok(PanicOnPayloadDrop {
+            drops: Arc::clone(&drops),
+        });
+
+        drop(future);
+
+        assert_eq!(drops.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[cfg(panic = "unwind")]
+    #[test]
+    fn retained_payload_drop_preserves_authoritative_outer_panic() {
+        let drops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let payload_drops = Arc::clone(&drops);
+        let outer = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _future_dropped_during_unwind = Future::ok(PanicOnPayloadDrop {
+                drops: payload_drops,
+            });
+            panic!("outer promise payload unwind remains authoritative");
+        }))
+        .expect_err("outer panic must propagate");
+
+        assert_eq!(
+            outer.downcast_ref::<&str>().copied(),
+            Some("outer promise payload unwind remains authoritative")
+        );
+        assert_eq!(drops.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[cfg(panic = "unwind")]
+    #[test]
+    fn duplicate_resolution_contains_rejected_payload_drop() {
+        let drops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut promise = Promise::new();
+        assert!(promise.ok(PanicOnPayloadDrop {
+            drops: Arc::clone(&drops),
+        }));
+        assert!(!promise.ok(PanicOnPayloadDrop {
+            drops: Arc::clone(&drops),
+        }));
+        assert_eq!(drops.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        drop(promise);
+        assert_eq!(drops.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[cfg(panic = "unwind")]
+    #[test]
+    fn stale_retained_payload_is_disposed_outside_core_lock() {
+        let drops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut promise = Promise::new();
+        {
+            let mut core = lock_core(&promise.core);
+            core.result = Some(Ok(PanicOnPayloadDrop {
+                drops: Arc::clone(&drops),
+            }));
+            core.producer_completed = false;
+        }
+
+        assert!(promise.ok(PanicOnPayloadDrop {
+            drops: Arc::clone(&drops),
+        }));
+        assert_eq!(drops.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(!promise.core.is_poisoned());
+
+        drop(promise);
+        assert_eq!(drops.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
     // ── BrokenPromise ──────────────────────────────────────────

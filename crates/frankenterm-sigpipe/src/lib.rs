@@ -92,6 +92,8 @@ pub enum RecoverablePanicSite {
     ShardingRollback,
     /// A promise waker isolated from the promise state machine.
     PromiseWaker,
+    /// A retained promise result isolated during final state destruction.
+    PromisePayload,
     /// A native-window callback isolated at an operating-system boundary.
     PlatformWindowCallback,
     /// An OpenSSL callback isolated from async connection cleanup.
@@ -123,6 +125,7 @@ impl RecoverablePanicSite {
             Self::CoreAsyncTaskJoin => "core.async_task_join",
             Self::ShardingRollback => "sharding.rollback",
             Self::PromiseWaker => "promise.waker",
+            Self::PromisePayload => "promise.payload",
             Self::PlatformWindowCallback => "window.platform_callback",
             Self::AsyncOpenSslCallback => "async_ossl.callback",
             Self::ClientCallback => "client.callback",
@@ -763,6 +766,7 @@ mod tests {
             RecoverablePanicSite::CoreAsyncTaskJoin,
             RecoverablePanicSite::ShardingRollback,
             RecoverablePanicSite::PromiseWaker,
+            RecoverablePanicSite::PromisePayload,
             RecoverablePanicSite::PlatformWindowCallback,
             RecoverablePanicSite::AsyncOpenSslCallback,
             RecoverablePanicSite::ClientCallback,
