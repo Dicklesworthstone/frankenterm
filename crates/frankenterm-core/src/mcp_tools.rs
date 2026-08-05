@@ -4439,9 +4439,9 @@ impl ToolHandler for WaEventsTool {
                 envelope_to_content(envelope)
             }
             Err(err) => {
-                let (code, hint) = map_mcp_error(&err);
+                let err = McpToolError::from_error(err);
                 let envelope =
-                    McpEnvelope::<()>::error(code, err.to_string(), hint, elapsed_ms(start));
+                    McpEnvelope::<()>::error(err.code, err.message, err.hint, elapsed_ms(start));
                 envelope_to_content(envelope)
             }
         }
