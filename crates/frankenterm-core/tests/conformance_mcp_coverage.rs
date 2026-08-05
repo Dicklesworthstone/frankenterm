@@ -112,13 +112,22 @@ fn collect_ids(line: &str) -> Vec<String> {
     found
 }
 
-fn collect_annotations_in(path: &std::path::Path, found: &mut Vec<String>) -> std::io::Result<()> {
+#[derive(Debug, Default)]
+struct TestAnnotations {
+    ids: Vec<String>,
+    orphaned: Vec<String>,
+}
+
+fn collect_annotations_in(
+    path: &std::path::Path,
+    annotations: &mut TestAnnotations,
+) -> std::io::Result<()> {
     for entry in std::fs::read_dir(path)? {
         let entry = entry?;
         let path = entry.path();
         let file_type = entry.file_type()?;
         if file_type.is_dir() {
-            collect_annotations_in(&path, found)?;
+            collect_annotations_in(&path, annotations)?;
             continue;
         }
         if path.extension().and_then(|s| s.to_str()) != Some("rs") {
@@ -128,19 +137,38 @@ fn collect_annotations_in(path: &std::path::Path, found: &mut Vec<String>) -> st
             Ok(s) => s,
             Err(_) => continue,
         };
-        for line in body.lines() {
-            found.extend(collect_ids(line));
+        let lines = body.lines().collect::<Vec<_>>();
+        for (index, line) in lines.iter().enumerate() {
+            let ids = collect_ids(line);
+            if ids.is_empty() {
+                continue;
+            }
+            let window_start = index.saturating_sub(3);
+            let window_end = (index + 4).min(lines.len());
+            if lines[window_start..window_end]
+                .iter()
+                .any(|nearby| nearby.trim() == "#[test]")
+            {
+                annotations.ids.extend(ids);
+            } else {
+                annotations.orphaned.push(format!(
+                    "{}:{}: {}",
+                    path.display(),
+                    index + 1,
+                    line.trim()
+                ));
+            }
         }
     }
     Ok(())
 }
 
-fn collect_annotations(source_roots: &[PathBuf]) -> std::io::Result<Vec<String>> {
-    let mut found = Vec::new();
+fn collect_annotations(source_roots: &[PathBuf]) -> std::io::Result<TestAnnotations> {
+    let mut annotations = TestAnnotations::default();
     for root in source_roots {
-        collect_annotations_in(root, &mut found)?;
+        collect_annotations_in(root, &mut annotations)?;
     }
-    Ok(found)
+    Ok(annotations)
 }
 
 fn is_normative_spec_line(line: &str) -> bool {
@@ -210,6 +238,11 @@ fn every_tested_clause_has_at_least_one_annotation() {
 
     let annotations = collect_annotations(&test_source_roots())
         .expect("walk src/ and tests/ for MCP-V1-NNN annotations");
+    assert!(
+        annotations.orphaned.is_empty(),
+        "MCP clause annotations must be adjacent to an actual #[test] attribute: {:?}",
+        annotations.orphaned
+    );
 
     let mut missing = Vec::new();
     let mut counts = Vec::new();
@@ -217,7 +250,11 @@ fn every_tested_clause_has_at_least_one_annotation() {
         if clause.status != "TESTED" {
             continue;
         }
-        let n = annotations.iter().filter(|a| a == &&clause.id).count();
+        let n = annotations
+            .ids
+            .iter()
+            .filter(|annotation| annotation == &&clause.id)
+            .count();
         counts.push((clause.id.clone(), n));
         if n == 0 {
             missing.push(clause.id.clone());
@@ -254,6 +291,7 @@ fn every_annotation_corresponds_to_a_matrix_clause() {
         .expect("walk src/ and tests/ for MCP-V1-NNN annotations");
 
     let unknown: Vec<String> = annotations
+        .ids
         .iter()
         .filter(|a| !known_ids.contains(a.as_str()))
         .cloned()
