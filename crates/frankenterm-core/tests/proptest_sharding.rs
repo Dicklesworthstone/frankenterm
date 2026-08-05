@@ -127,42 +127,41 @@ fn arb_circuit_breaker_status() -> impl Strategy<Value = CircuitBreakerStatus> {
         )
 }
 
+fn arb_backend_error_class() -> impl Strategy<Value = ShardBackendErrorClass> {
+    prop_oneof![
+        Just(ShardBackendErrorClass::Unavailable),
+        Just(ShardBackendErrorClass::PaneNotFound),
+        Just(ShardBackendErrorClass::CommandFailed),
+        Just(ShardBackendErrorClass::InvalidResponse),
+        Just(ShardBackendErrorClass::OutputTooLarge),
+        Just(ShardBackendErrorClass::TimedOut),
+        Just(ShardBackendErrorClass::CircuitOpen),
+        Just(ShardBackendErrorClass::Cancelled),
+        Just(ShardBackendErrorClass::Panicked),
+        Just(ShardBackendErrorClass::Io),
+        Just(ShardBackendErrorClass::Other),
+    ]
+}
+
+fn arb_probe_outcome() -> impl Strategy<Value = ShardHealthProbeOutcome> {
+    prop_oneof![
+        Just(ShardHealthProbeOutcome::Complete),
+        arb_backend_error_class().prop_map(ShardHealthProbeOutcome::Failed),
+        Just(ShardHealthProbeOutcome::Cancelled),
+        Just(ShardHealthProbeOutcome::NotStarted),
+    ]
+}
+
 fn arb_shard_health_entry() -> impl Strategy<Value = ShardHealthEntry> {
     (
-        0usize..100,   // shard_id
-        "[a-z]{3,12}", // label
+        0usize..100, // shard_id
         arb_health_status(),
         proptest::option::of(0usize..1000), // pane_count
         arb_circuit_breaker_status(),
-        prop_oneof![
-            Just(None),
-            Just(Some("scan_cancelled".to_owned())),
-            Just(Some("not_started".to_owned())),
-            Just(Some("command_failed".to_owned())),
-            Just(Some("timed_out".to_owned())),
-            Just(Some("backend_panicked".to_owned())),
-            proptest::option::of("[a-z ]{3,30}"),
-        ],
+        arb_probe_outcome(),
     )
         .prop_map(
-            |(shard_id, label, mut status, mut pane_count, circuit, error)| {
-                let probe_outcome = match error.as_deref() {
-                    None => ShardHealthProbeOutcome::Complete,
-                    Some("scan_cancelled") => ShardHealthProbeOutcome::Cancelled,
-                    Some("not_started") => ShardHealthProbeOutcome::NotStarted,
-                    Some("command_failed") => ShardHealthProbeOutcome::Failed(
-                        ShardBackendErrorClass::CommandFailed,
-                    ),
-                    Some("timed_out") => {
-                        ShardHealthProbeOutcome::Failed(ShardBackendErrorClass::TimedOut)
-                    }
-                    Some("backend_panicked") => ShardHealthProbeOutcome::Failed(
-                        ShardBackendErrorClass::Panicked,
-                    ),
-                    Some(_) => {
-                        ShardHealthProbeOutcome::Failed(ShardBackendErrorClass::Other)
-                    }
-                };
+            |(shard_id, mut status, mut pane_count, circuit, probe_outcome)| {
                 if probe_outcome != ShardHealthProbeOutcome::Complete
                     && status == HealthStatus::Healthy
                 {
@@ -176,11 +175,10 @@ fn arb_shard_health_entry() -> impl Strategy<Value = ShardHealthEntry> {
                 }
                 ShardHealthEntry {
                     shard_id: ShardId(shard_id),
-                    label,
                     status,
                     pane_count,
                     circuit,
-                    error,
+                    probe_outcome,
                 }
             },
         )
@@ -270,29 +268,25 @@ proptest! {
 #[test]
 fn health_probe_wire_uses_typed_finite_outcomes_only() {
     let cases = [
-        (None, ShardHealthProbeOutcome::Complete),
-        (
-            Some("command_failed".to_owned()),
-            ShardHealthProbeOutcome::Failed(ShardBackendErrorClass::CommandFailed),
-        ),
-        (
-            Some("backend-secret-that-is-not-a-class".to_owned()),
-            ShardHealthProbeOutcome::Failed(ShardBackendErrorClass::Other),
-        ),
-        (
-            Some("scan_cancelled".to_owned()),
-            ShardHealthProbeOutcome::Cancelled,
-        ),
-        (
-            Some("not_started".to_owned()),
-            ShardHealthProbeOutcome::NotStarted,
-        ),
+        ShardHealthProbeOutcome::Complete,
+        ShardHealthProbeOutcome::Failed(ShardBackendErrorClass::Unavailable),
+        ShardHealthProbeOutcome::Failed(ShardBackendErrorClass::PaneNotFound),
+        ShardHealthProbeOutcome::Failed(ShardBackendErrorClass::CommandFailed),
+        ShardHealthProbeOutcome::Failed(ShardBackendErrorClass::InvalidResponse),
+        ShardHealthProbeOutcome::Failed(ShardBackendErrorClass::OutputTooLarge),
+        ShardHealthProbeOutcome::Failed(ShardBackendErrorClass::TimedOut),
+        ShardHealthProbeOutcome::Failed(ShardBackendErrorClass::CircuitOpen),
+        ShardHealthProbeOutcome::Failed(ShardBackendErrorClass::Cancelled),
+        ShardHealthProbeOutcome::Failed(ShardBackendErrorClass::Panicked),
+        ShardHealthProbeOutcome::Failed(ShardBackendErrorClass::Io),
+        ShardHealthProbeOutcome::Failed(ShardBackendErrorClass::Other),
+        ShardHealthProbeOutcome::Cancelled,
+        ShardHealthProbeOutcome::NotStarted,
     ];
 
-    for (index, (error, expected)) in cases.into_iter().enumerate() {
+    for (index, expected) in cases.into_iter().enumerate() {
         let entry = ShardHealthEntry {
             shard_id: ShardId(index),
-            label: "label-secret-that-must-not-be-projected".to_owned(),
             status: match expected {
                 ShardHealthProbeOutcome::Complete => HealthStatus::Healthy,
                 ShardHealthProbeOutcome::Failed(_) => HealthStatus::Hung,
@@ -302,15 +296,13 @@ fn health_probe_wire_uses_typed_finite_outcomes_only() {
             },
             pane_count: None,
             circuit: CircuitBreakerStatus::default(),
-            error,
+            probe_outcome: expected,
         };
         let json = serde_json::to_string(&entry).unwrap();
-        assert!(!json.contains("label-secret"));
-        assert!(!json.contains("backend-secret"));
         assert!(!json.contains("\"label\""));
         assert!(!json.contains("\"error\""));
         let back: ShardHealthEntry = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.probe_outcome(), expected);
+        assert_eq!(back.probe_outcome, expected);
     }
 }
 
@@ -583,20 +575,18 @@ proptest! {
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(60))]
 
-    /// ShardHealthEntry serde emits only typed, finite authority and restores
-    /// compatibility fields from that typed outcome.
+    /// ShardHealthEntry serde preserves its sole typed, finite authority.
     #[test]
     fn prop_health_entry_serde_roundtrip(entry in arb_shard_health_entry()) {
-        let expected_outcome = entry.probe_outcome();
+        let expected_outcome = entry.probe_outcome;
         let json = serde_json::to_string(&entry).unwrap();
         let projection: serde_json::Value = serde_json::from_str(&json).unwrap();
         let back: ShardHealthEntry = serde_json::from_str(&json).unwrap();
         prop_assert_eq!(back.shard_id, entry.shard_id);
-        prop_assert!(back.label.is_empty());
         prop_assert_eq!(back.status, entry.status);
         prop_assert_eq!(back.pane_count, entry.pane_count);
         prop_assert_eq!(back.circuit.state, entry.circuit.state);
-        prop_assert_eq!(back.probe_outcome(), expected_outcome);
+        prop_assert_eq!(back.probe_outcome, expected_outcome);
         prop_assert!(projection.get("label").is_none());
         prop_assert!(projection.get("error").is_none());
         prop_assert!(projection.get("probe_outcome").is_some());
@@ -617,8 +607,7 @@ proptest! {
         for (b, r) in back.shards.iter().zip(report.shards.iter()) {
             prop_assert_eq!(b.shard_id, r.shard_id);
             prop_assert_eq!(b.status, r.status);
-            prop_assert_eq!(b.probe_outcome(), r.probe_outcome());
-            prop_assert!(b.label.is_empty());
+            prop_assert_eq!(b.probe_outcome, r.probe_outcome);
         }
         let expected_outcome_name = match expected_outcome {
             ShardHealthReportOutcome::Complete => "complete",
@@ -873,7 +862,6 @@ proptest! {
     ) {
         let shards: Vec<ShardHealthEntry> = (0..count).map(|i| ShardHealthEntry {
             shard_id: ShardId(i),
-            label: format!("shard-{}", i),
             status: HealthStatus::Healthy,
             pane_count: Some(10),
             circuit: CircuitBreakerStatus {
@@ -886,7 +874,7 @@ proptest! {
                 cooldown_remaining_ms: None,
                 half_open_successes: None,
             },
-            error: None,
+            probe_outcome: ShardHealthProbeOutcome::Complete,
         }).collect();
         let report = ShardHealthReport {
             timestamp_ms: 100,
