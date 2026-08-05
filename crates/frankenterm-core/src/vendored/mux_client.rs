@@ -13451,8 +13451,10 @@ mod tests {
                 (1, true, 50, true),
                 (2, false, 52, true),
                 (3, true, 52, true),
-                (4, false, 53, false),
-                (5, true, 53, false),
+                (4, false, 53, true),
+                (5, true, 53, true),
+                (6, false, codec::ORDERED_WINDOW_V1_MIN_CODEC_VERSION, false),
+                (7, true, codec::ORDERED_WINDOW_V1_MIN_CODEC_VERSION, false),
             ] {
                 let temp_dir = tempfile::tempdir().expect("tempdir");
                 let socket_path = temp_dir
@@ -13518,18 +13520,17 @@ mod tests {
                         .expect_err("inactive ordered-window request must be rejected")
                 };
                 if expected_dialect_rejection {
-                    assert!(matches!(
-                        direct_error,
+                    match direct_error {
                         DirectMuxError::OutboundPduRequiresCodec {
-                            agreed: 50,
-                            required: 53,
-                            ..
-                        } | DirectMuxError::OutboundPduRequiresCodec {
-                            agreed: 52,
-                            required: 53,
-                            ..
+                            agreed, required, ..
+                        } => {
+                            assert_eq!(agreed, remote_max);
+                            assert_eq!(required, codec::ORDERED_WINDOW_V1_MIN_CODEC_VERSION);
                         }
-                    ));
+                        other => {
+                            panic!("expected ordered-window codec rejection, got {other}")
+                        }
+                    }
                 } else {
                     assert!(matches!(
                         direct_error,
@@ -13579,8 +13580,10 @@ mod tests {
                 (1, true, 50, false),
                 (2, false, 52, false),
                 (3, true, 52, false),
-                (4, false, 53, true),
-                (5, true, 53, true),
+                (4, false, 53, false),
+                (5, true, 53, false),
+                (6, false, codec::ORDERED_WINDOW_V1_MIN_CODEC_VERSION, true),
+                (7, true, codec::ORDERED_WINDOW_V1_MIN_CODEC_VERSION, true),
             ] {
                 let temp_dir = tempfile::tempdir().expect("tempdir");
                 let socket_path = temp_dir
@@ -13642,14 +13645,18 @@ mod tests {
                         .await
                         .expect_err("forbidden ordered-window PDU must fail")
                 };
-                if remote_max < 53 {
-                    assert!(matches!(
-                        error,
+                if remote_max < codec::ORDERED_WINDOW_V1_MIN_CODEC_VERSION {
+                    match error {
                         DirectMuxError::InboundPduRequiresCodec {
-                            required: 53,
-                            ..
+                            agreed, required, ..
+                        } => {
+                            assert_eq!(agreed, remote_max);
+                            assert_eq!(required, codec::ORDERED_WINDOW_V1_MIN_CODEC_VERSION);
                         }
-                    ));
+                        other => {
+                            panic!("expected ordered-window codec rejection, got {other}")
+                        }
+                    }
                 } else {
                     assert!(matches!(
                         error,

@@ -3767,11 +3767,14 @@ enum RobotCommands {
     /// heartbeats. Filters: severity, rule-id glob, pane. Kills the
     /// `while sleep 5` polling anti-pattern (ft-7h5da.4.1).
     ///
-    /// Resume is at-least-once: each record's `cursor` is its resume point, so
-    /// reconnecting with `--cursor` replays anything missed (may re-deliver,
-    /// never drops). A `--cursor` that predates retained events emits a typed
-    /// `cursor_expired` record and re-baselines to the oldest retained event —
-    /// never a silent skip (ft-7h5da.4.2).
+    /// Persisted detections resume at-least-once: each record's `cursor` is its
+    /// resume point, so reconnecting with `--cursor` replays anything missed
+    /// (and may re-deliver). Live-only pane lifecycle signals cannot be
+    /// reconstructed from storage; follow mode emits a typed `gap` whenever
+    /// their IPC transport is unavailable or disconnects instead of silently
+    /// implying complete delivery. A `--cursor` that predates retained events
+    /// emits a typed `cursor_expired` record and re-baselines to the oldest
+    /// retained event (ft-7h5da.4.2).
     #[command(visible_alias = "watch-event")]
     WatchEvents {
         /// Follow mode: keep tailing new events (like `tail -f`). Without it,
@@ -3779,7 +3782,7 @@ enum RobotCommands {
         #[arg(long)]
         follow: bool,
 
-        /// Filter by severity (case-insensitive exact; e.g. "error", "warning", "info")
+        /// Filter by severity (case-insensitive exact: "critical", "warning", or "info")
         #[arg(long)]
         severity: Option<String>,
 
@@ -3795,7 +3798,10 @@ enum RobotCommands {
         #[arg(long, visible_alias = "unhandled-only")]
         unhandled: bool,
 
-        /// Mark emitted events handled by this stream
+        /// Atomically reserve each persisted event, write and flush it, then
+        /// mark it handled. A crash leaves an expiring lease for redelivery;
+        /// write/flush failures release immediately. Live-only pane lifecycle
+        /// notifications are not claimable.
         #[arg(long)]
         claim: bool,
 
@@ -22973,6 +22979,22 @@ fn watch_rule_glob_matches(pattern: &str, rule_id: &str) -> bool {
     frankenterm_core::events::rule_glob_matches(pattern, rule_id)
 }
 
+/// Normalize the closed severity vocabulary accepted by `watch-events`.
+///
+/// Validation happens before workspace discovery or storage is opened so a
+/// typo cannot masquerade as a healthy follower that simply matches nothing.
+fn normalize_watch_severity(value: Option<&str>) -> Result<Option<String>, &'static str> {
+    match value {
+        None => Ok(None),
+        Some(value) if value.eq_ignore_ascii_case("info") => Ok(Some("info".to_string())),
+        Some(value) if value.eq_ignore_ascii_case("warning") => Ok(Some("warning".to_string())),
+        Some(value) if value.eq_ignore_ascii_case("critical") => {
+            Ok(Some("critical".to_string()))
+        }
+        Some(_) => Err("Invalid --severity: expected info, warning, or critical"),
+    }
+}
+
 /// Client-side severity (case-insensitive exact) + rule-id glob filter for
 /// `ft robot watch-events`. Pane is filtered server-side via `EventStreamQuery`.
 fn watch_event_passes_filters(
@@ -22995,28 +23017,198 @@ fn watch_event_passes_filters(
 
 const WATCH_EVENTS_CLAIM_WORKFLOW_ID: &str = "robot.watch_events";
 const WATCH_EVENTS_CLAIM_STATUS: &str = "claimed";
+const WATCH_EVENTS_CLAIM_LEASE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
 
 fn watch_events_unhandled_only(unhandled: bool, claim: bool) -> bool {
     unhandled || claim
 }
 
-async fn mark_watch_event_claimed(
-    storage: &frankenterm_core::storage::StorageHandle,
-    event: &mut frankenterm_core::storage::StoredEvent,
-) -> frankenterm_core::Result<()> {
-    if event.handled_at.is_none() {
-        storage
-            .mark_event_handled(
-                event.id,
-                Some(WATCH_EVENTS_CLAIM_WORKFLOW_ID.to_string()),
-                WATCH_EVENTS_CLAIM_STATUS,
-            )
-            .await?;
-        event.handled_at = Some(now_ms_i64());
-        event.handled_by_workflow_id = Some(WATCH_EVENTS_CLAIM_WORKFLOW_ID.to_string());
-        event.handled_status = Some(WATCH_EVENTS_CLAIM_STATUS.to_string());
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WatchEventClaimDelivery {
+    Delivered,
+    PipeClosed,
+    LeasedUntil { expires_at_ms: i64 },
+    AlreadyHandledOrMissing,
+    FinalizationLost,
+}
+
+async fn pace_watch_event(
+    max_hz_interval: Option<std::time::Duration>,
+    last_event_emit: Option<std::time::Instant>,
+    stdout: &std::io::Stdout,
+    cursor: Option<i64>,
+    heartbeat_interval_ms: u64,
+    heartbeat: std::time::Duration,
+    last_emit: &mut std::time::Instant,
+) -> std::io::Result<bool> {
+    let (Some(minimum), Some(previous)) = (max_hz_interval, last_event_emit) else {
+        return Ok(true);
+    };
+    loop {
+        let elapsed = previous.elapsed();
+        if elapsed >= minimum {
+            return Ok(true);
+        }
+        if !emit_watch_heartbeat_if_due(
+            stdout,
+            cursor,
+            heartbeat_interval_ms,
+            heartbeat,
+            last_emit,
+        )? {
+            return Ok(false);
+        }
+        let wait = watch_delay_bounded_by_heartbeat(
+            minimum.saturating_sub(previous.elapsed()),
+            heartbeat_interval_ms,
+            heartbeat,
+            last_emit.elapsed(),
+        );
+        if wait.is_zero() {
+            continue;
+        }
+        frankenterm_core::runtime_async::spawn_blocking(move || std::thread::sleep(wait))
+            .await
+            .map_err(|error| std::io::Error::other(format!("watch-events pacing failed: {error}")))?;
     }
+}
+
+fn watch_claim_retry_delay(
+    now_ms: i64,
+    expires_at_ms: i64,
+    poll: std::time::Duration,
+) -> std::time::Duration {
+    let until_expiry_ms = expires_at_ms
+        .saturating_sub(now_ms)
+        .try_into()
+        .unwrap_or(0);
+    poll.min(std::time::Duration::from_millis(until_expiry_ms))
+}
+
+fn watch_delay_bounded_by_heartbeat(
+    wait: std::time::Duration,
+    heartbeat_interval_ms: u64,
+    heartbeat: std::time::Duration,
+    elapsed_since_emit: std::time::Duration,
+) -> std::time::Duration {
+    if heartbeat_interval_ms == 0 {
+        return wait;
+    }
+    wait.min(heartbeat.saturating_sub(elapsed_since_emit))
+}
+
+fn annotate_watch_event_claim_delivery(record: &mut serde_json::Value) -> std::io::Result<()> {
+    let object = record.as_object_mut().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "watch-events event record must be a JSON object",
+        )
+    })?;
+    object.insert(
+        "claim_delivery".to_string(),
+        serde_json::Value::String("finalize_after_output_flush".to_string()),
+    );
     Ok(())
+}
+
+/// Reserve one event, write and flush its truthful pre-finalization record,
+/// then atomically mark it handled. A process crash leaves an expiring lease;
+/// a known output failure releases it immediately. Cursor ownership remains
+/// with the caller and must advance only for [`WatchEventClaimDelivery::Delivered`]
+/// or [`WatchEventClaimDelivery::AlreadyHandledOrMissing`].
+async fn deliver_claimed_watch_event<F>(
+    storage: &frankenterm_core::storage::StorageHandle,
+    event_id: i64,
+    mut record: serde_json::Value,
+    write_and_flush: F,
+) -> std::io::Result<WatchEventClaimDelivery>
+where
+    F: FnOnce(&serde_json::Value) -> std::io::Result<bool>,
+{
+    use frankenterm_core::storage::EventDeliveryReservation;
+
+    // Validate and annotate the record before acquiring durable ownership so a
+    // local serialization-shape bug cannot strand a known lease until expiry.
+    annotate_watch_event_claim_delivery(&mut record)?;
+    let reservation = storage
+        .reserve_event_delivery(event_id, WATCH_EVENTS_CLAIM_LEASE_TTL)
+        .await
+        .map_err(|error| {
+            std::io::Error::other(format!(
+                "failed to reserve watch event {event_id} for delivery: {error}"
+            ))
+        })?;
+    let lease = match reservation {
+        EventDeliveryReservation::Acquired(lease) => lease,
+        EventDeliveryReservation::LeasedUntil { expires_at_ms } => {
+            return Ok(WatchEventClaimDelivery::LeasedUntil { expires_at_ms });
+        }
+        EventDeliveryReservation::AlreadyHandledOrMissing => {
+            return Ok(WatchEventClaimDelivery::AlreadyHandledOrMissing);
+        }
+    };
+
+    match write_and_flush(&record) {
+        Ok(true) => {}
+        Ok(false) => {
+            match storage.release_event_delivery(&lease).await {
+                Ok(true) => {}
+                Ok(false) => tracing::warn!(
+                    event_id,
+                    "watch-events output pipe closed after delivery-lease ownership was lost"
+                ),
+                Err(release_error) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        format!(
+                            "watch-events output pipe closed and event {event_id} lease release failed: {release_error}"
+                        ),
+                    ));
+                }
+            }
+            return Ok(WatchEventClaimDelivery::PipeClosed);
+        }
+        Err(write_error) => {
+            let error_kind = write_error.kind();
+            let error_message = write_error.to_string();
+            match storage.release_event_delivery(&lease).await {
+                Ok(true) => return Err(write_error),
+                Ok(false) => {
+                    tracing::warn!(
+                        event_id,
+                        "watch-events output failed after delivery-lease ownership was lost"
+                    );
+                    return Err(write_error);
+                }
+                Err(release_error) => {
+                    return Err(std::io::Error::new(
+                        error_kind,
+                        format!(
+                            "{error_message}; event {event_id} lease release also failed: {release_error}"
+                        ),
+                    ));
+                }
+            }
+        }
+    }
+
+    let finalized = storage
+        .finalize_event_delivery(
+            &lease,
+            Some(WATCH_EVENTS_CLAIM_WORKFLOW_ID.to_string()),
+            WATCH_EVENTS_CLAIM_STATUS,
+        )
+        .await
+        .map_err(|error| {
+            std::io::Error::other(format!(
+                "event {event_id} was flushed but delivery finalization failed: {error}"
+            ))
+        })?;
+    Ok(if finalized {
+        WatchEventClaimDelivery::Delivered
+    } else {
+        WatchEventClaimDelivery::FinalizationLost
+    })
 }
 
 /// NDJSON envelope for one watched event. `cursor` equals the event id so a
@@ -23045,13 +23237,17 @@ fn watch_event_ndjson(event: &frankenterm_core::storage::StoredEvent) -> serde_j
 }
 
 /// Minimum inter-event interval for `ft robot watch-events --max-hz N`
-/// (ft-7h5da.4.4). `0` (unlimited) → `None`; otherwise `1000/N` ms, so at most
-/// `N` events are emitted per second.
+/// (ft-7h5da.4.4). `0` (unlimited) maps to `None`; otherwise the interval is
+/// `ceil(1 second / N)` in nanoseconds. Ceiling division is required for the
+/// advertised hard upper bound: millisecond truncation exceeds rates such as
+/// 3 Hz and collapses every value above 1000 Hz to an unlimited zero delay.
 fn watch_max_hz_interval(max_hz: u32) -> Option<std::time::Duration> {
     if max_hz == 0 {
         None
     } else {
-        Some(std::time::Duration::from_millis(1000 / u64::from(max_hz)))
+        const NANOS_PER_SECOND: u64 = 1_000_000_000;
+        let interval_ns = NANOS_PER_SECOND.div_ceil(u64::from(max_hz));
+        Some(std::time::Duration::from_nanos(interval_ns))
     }
 }
 
@@ -23198,6 +23394,46 @@ fn watch_heartbeat_ndjson(cursor: Option<i64>, now: i64) -> serde_json::Value {
     serde_json::json!({ "type": "heartbeat", "cursor": cursor, "now": now })
 }
 
+fn watch_heartbeat_is_due(
+    heartbeat_interval_ms: u64,
+    heartbeat: std::time::Duration,
+    last_emit: std::time::Instant,
+) -> bool {
+    heartbeat_interval_ms != 0 && last_emit.elapsed() >= heartbeat
+}
+
+fn note_watch_output_emitted(last_emit: &mut std::time::Instant) {
+    *last_emit = std::time::Instant::now();
+}
+
+/// Emit a follower heartbeat when its configured idle deadline is due.
+///
+/// This helper is deliberately called before every DB-loop fast path that can
+/// retain/revisit a cursor. Otherwise a contended delivery lease or a sustained
+/// full batch of client-filtered records can keep the loop busy forever while
+/// suppressing the only liveness signal visible to the consumer.
+fn emit_watch_heartbeat_if_due(
+    stdout: &std::io::Stdout,
+    cursor: Option<i64>,
+    heartbeat_interval_ms: u64,
+    heartbeat: std::time::Duration,
+    last_emit: &mut std::time::Instant,
+) -> std::io::Result<bool> {
+    if !watch_heartbeat_is_due(heartbeat_interval_ms, heartbeat, *last_emit) {
+        return Ok(true);
+    }
+
+    let heartbeat_record = watch_heartbeat_ndjson(cursor, now_ms_i64());
+    let continue_writing = {
+        let mut lock = stdout.lock();
+        write_ndjson_line(&mut lock, &heartbeat_record)?
+    };
+    if continue_writing {
+        note_watch_output_emitted(last_emit);
+    }
+    Ok(continue_writing)
+}
+
 /// Detect a pruned (expired) resume cursor for `ft robot watch-events`
 /// (ft-7h5da.4.2). Returns `Some(oldest_retained)` when `requested` points
 /// before the oldest globally-retained event id — i.e. events in
@@ -23208,7 +23444,13 @@ fn watch_heartbeat_ndjson(cursor: Option<i64>, now: i64) -> serde_json::Value {
 /// pane-filtered one.
 fn watch_cursor_expiry(requested: Option<i64>, oldest_retained: Option<i64>) -> Option<i64> {
     match (requested, oldest_retained) {
-        (Some(c), Some(oldest)) if oldest > c + 1 => Some(oldest),
+        (Some(c), Some(oldest))
+            if oldest
+                .checked_sub(1)
+                .is_some_and(|last_pruned| c < last_pruned) =>
+        {
+            Some(oldest)
+        }
         _ => None,
     }
 }
@@ -23227,14 +23469,121 @@ fn watch_cursor_expired_ndjson(requested: i64, oldest_available: i64) -> serde_j
     })
 }
 
-/// Write one compact NDJSON line. Returns `Ok(false)` if the consumer closed
-/// the pipe (caller should stop cleanly); `Ok(true)` otherwise.
+#[cfg(unix)]
+fn watch_ipc_protocol_fault_ndjson(
+    cursor: Option<i64>,
+    fault: IpcRelayProtocolFault,
+    now: i64,
+) -> serde_json::Value {
+    serde_json::json!({
+        "type": "gap",
+        "reason": "ipc_protocol_fault",
+        "cursor": cursor,
+        "fault_kind": fault.as_str(),
+        "now": now,
+        "message": "the IPC event stream violated its closed record contract; persisted detections will be backfilled from the durable cursor, while live-only pane signals may have been missed",
+    })
+}
+
+/// Consumer-visible reason that the live-only portion of the IPC stream is
+/// incomplete. Persisted detections remain recoverable through the durable DB
+/// cursor; pane lifecycle signals have no durable source to replay from.
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IpcTransportGapReason {
+    SubscribeUnavailable,
+    StreamEof,
+    StreamReadFailure,
+}
+
+#[cfg(unix)]
+impl IpcTransportGapReason {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::SubscribeUnavailable => "ipc_subscribe_unavailable",
+            Self::StreamEof => "ipc_stream_eof",
+            Self::StreamReadFailure => "ipc_stream_read_failure",
+        }
+    }
+}
+
+#[cfg(unix)]
+fn watch_ipc_transport_gap_ndjson(
+    cursor: Option<i64>,
+    reason: IpcTransportGapReason,
+    now: i64,
+) -> serde_json::Value {
+    serde_json::json!({
+        "type": "gap",
+        "reason": reason.as_str(),
+        "cursor": cursor,
+        "now": now,
+        "persisted_detection_recovery": "durable_cursor_backfill",
+        "live_only_signal_recovery": "unavailable",
+        "live_only_signals_at_risk": ["pane_discovered", "pane_disappeared"],
+        "message": "the live IPC transport is degraded; persisted detections will be backfilled from the durable cursor, but live-only pane lifecycle signals may have been missed",
+    })
+}
+
+/// Open at most one consumer-visible transport gap for a contiguous degraded
+/// interval. The first contract-valid record on a new stream resets
+/// `gap_open`, allowing a later disconnect to produce a new record. The state
+/// flips only after a complete write and flush; a failed output attempt is
+/// never silently remembered.
+#[cfg(unix)]
+fn write_ipc_transport_gap_once<W: std::io::Write>(
+    writer: &mut W,
+    gap_open: &mut bool,
+    cursor: Option<i64>,
+    reason: IpcTransportGapReason,
+    now: i64,
+) -> std::io::Result<bool> {
+    if *gap_open {
+        return Ok(true);
+    }
+    let record = watch_ipc_transport_gap_ndjson(cursor, reason, now);
+    let continue_writing = write_ndjson_line(writer, &record)?;
+    if continue_writing {
+        *gap_open = true;
+    }
+    Ok(continue_writing)
+}
+
+/// Emit at most one protocol-fault record during a contiguous degraded IPC
+/// interval. Malformed-first-record reconnect loops otherwise bypass the
+/// transport-gap coalescer and can flood the downstream NDJSON consumer.
+#[cfg(unix)]
+fn write_ipc_protocol_fault_once<W: std::io::Write>(
+    writer: &mut W,
+    gap_open: &mut bool,
+    cursor: Option<i64>,
+    fault: IpcRelayProtocolFault,
+    now: i64,
+) -> std::io::Result<bool> {
+    if *gap_open {
+        return Ok(true);
+    }
+    let record = watch_ipc_protocol_fault_ndjson(cursor, fault, now);
+    let continue_writing = write_ndjson_line(writer, &record)?;
+    if continue_writing {
+        *gap_open = true;
+    }
+    Ok(continue_writing)
+}
+
+/// Write and flush one compact NDJSON line. Returns `Ok(false)` if the consumer
+/// closed the pipe during either phase (caller should stop cleanly);
+/// `Ok(true)` means the complete line was written and successfully flushed.
 fn write_ndjson_line<W: std::io::Write>(
     writer: &mut W,
     value: &serde_json::Value,
 ) -> std::io::Result<bool> {
     match writeln!(writer, "{value}") {
-        Ok(()) => Ok(true),
+        Ok(()) => match writer.flush() {
+            Ok(()) => Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(false),
+            Err(e) => Err(e),
+        },
         Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(false),
         Err(e) => Err(e),
     }
@@ -23249,11 +23598,313 @@ enum IpcRelayAction {
     Emitted,
     /// A duplicate event (cursor already emitted via the DB drain) was skipped.
     Skipped,
+    /// A persisted-event notification woke the follower. Its in-memory payload
+    /// is never emitted or claimed because EventBus publication order and
+    /// dedupe-conflict payload identity are not SQLite cursor authorities. Keep
+    /// the healthy subscription and re-enter the ordered durable DB drain.
+    DurableWakeup,
     /// A broadcast-lag gap record was emitted; the follower must re-drain the
     /// DB cursor to backfill the dropped-but-persisted events (ft-7h5da.4.2).
     Resync,
+    /// The stream violated its closed NDJSON contract. Nothing from this
+    /// record was emitted; the follower must re-drain durable storage before
+    /// attempting a fresh subscription.
+    ProtocolFault(IpcRelayProtocolFault),
     /// The downstream consumer closed the pipe; the follower should stop.
     PipeClosed,
+}
+
+/// Record recovery only after the newly connected stream produces a
+/// contract-valid record. A completed connect/request write is not sufficient:
+/// an accept-then-close peer must remain part of the same degraded interval and
+/// must not reopen the consumer-visible gap floodgate on every reconnect.
+#[cfg(unix)]
+fn note_valid_ipc_stream_record(
+    action: IpcRelayAction,
+    stream_validated: &mut bool,
+    transport_gap_open: &mut bool,
+) -> bool {
+    if *stream_validated
+        || !matches!(
+            action,
+            IpcRelayAction::Emitted
+                | IpcRelayAction::Skipped
+                | IpcRelayAction::DurableWakeup
+        )
+    {
+        return false;
+    }
+    *stream_validated = true;
+    *transport_gap_open = false;
+    true
+}
+
+/// Closed-contract failures that require abandoning the current IPC stream.
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IpcRelayProtocolFault {
+    MalformedJson,
+    InvalidEventCursor,
+    InvalidRecordShape,
+    UnknownRecordType,
+}
+
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IpcRelayRecordType {
+    Event,
+    Heartbeat,
+    Gap,
+}
+
+#[cfg(unix)]
+impl IpcRelayProtocolFault {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::MalformedJson => "malformed_json",
+            Self::InvalidEventCursor => "invalid_event_cursor",
+            Self::InvalidRecordShape => "invalid_record_shape",
+            Self::UnknownRecordType => "unknown_record_type",
+        }
+    }
+}
+
+/// One bounded diagnostic observation about the live IPC transport used by
+/// `robot watch-events --follow`.
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IpcFallbackObservation {
+    SubscribeFailed,
+    StreamReadFailed,
+    StreamEof,
+    LagResync,
+    ProtocolFault,
+    StreamValidated,
+}
+
+/// Rate-limit buckets are deliberately split by failure/recovery category.
+/// This guarantees that the first recovery after a degraded period remains
+/// observable even if the initial-subscribe success category was logged only
+/// moments earlier.
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IpcFallbackDiagnosticKind {
+    SubscribeFailure,
+    StreamReadFailure,
+    StreamEof,
+    LagResync,
+    ProtocolFault,
+    SubscribeEstablished,
+    SubscribeRecovered,
+}
+
+#[cfg(unix)]
+impl IpcFallbackDiagnosticKind {
+    const COUNT: usize = 7;
+
+    const fn index(self) -> usize {
+        match self {
+            Self::SubscribeFailure => 0,
+            Self::StreamReadFailure => 1,
+            Self::StreamEof => 2,
+            Self::LagResync => 3,
+            Self::ProtocolFault => 4,
+            Self::SubscribeEstablished => 5,
+            Self::SubscribeRecovered => 6,
+        }
+    }
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::SubscribeFailure => "subscribe_failure",
+            Self::StreamReadFailure => "stream_read_failure",
+            Self::StreamEof => "stream_eof",
+            Self::LagResync => "lag_resync",
+            Self::ProtocolFault => "protocol_fault",
+            Self::SubscribeEstablished => "subscribe_established",
+            Self::SubscribeRecovered => "subscribe_recovered",
+        }
+    }
+}
+
+#[cfg(unix)]
+const IPC_FALLBACK_DIAGNOSTIC_INTERVAL: std::time::Duration =
+    std::time::Duration::from_secs(30);
+
+/// Fixed-size transport counters plus one timestamp/suppression bucket per
+/// category. Nothing here grows with session duration, reconnect count, or
+/// error text. Counters saturate instead of wrapping in very long sessions.
+#[cfg(unix)]
+#[derive(Debug, Clone)]
+struct IpcFallbackDiagnostics {
+    subscribe_failures: u64,
+    stream_read_failures: u64,
+    stream_eof_disconnects: u64,
+    lag_resyncs: u64,
+    protocol_faults: u64,
+    validated_streams: u64,
+    suppressed_reports_total: u64,
+    recovery_pending: bool,
+    last_reported_at: [Option<std::time::Instant>; IpcFallbackDiagnosticKind::COUNT],
+    suppressed_since_report: [u64; IpcFallbackDiagnosticKind::COUNT],
+}
+
+#[cfg(unix)]
+impl Default for IpcFallbackDiagnostics {
+    fn default() -> Self {
+        Self {
+            subscribe_failures: 0,
+            stream_read_failures: 0,
+            stream_eof_disconnects: 0,
+            lag_resyncs: 0,
+            protocol_faults: 0,
+            validated_streams: 0,
+            suppressed_reports_total: 0,
+            recovery_pending: false,
+            last_reported_at: [None; IpcFallbackDiagnosticKind::COUNT],
+            suppressed_since_report: [0; IpcFallbackDiagnosticKind::COUNT],
+        }
+    }
+}
+
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct IpcFallbackDiagnosticReport {
+    kind: IpcFallbackDiagnosticKind,
+    suppressed_same_kind: u64,
+}
+
+#[cfg(unix)]
+impl IpcFallbackDiagnostics {
+    fn observe(
+        &mut self,
+        observation: IpcFallbackObservation,
+        now: std::time::Instant,
+    ) -> Option<IpcFallbackDiagnosticReport> {
+        let kind = match observation {
+            IpcFallbackObservation::SubscribeFailed => {
+                self.subscribe_failures = self.subscribe_failures.saturating_add(1);
+                self.recovery_pending = true;
+                IpcFallbackDiagnosticKind::SubscribeFailure
+            }
+            IpcFallbackObservation::StreamReadFailed => {
+                self.stream_read_failures = self.stream_read_failures.saturating_add(1);
+                self.recovery_pending = true;
+                IpcFallbackDiagnosticKind::StreamReadFailure
+            }
+            IpcFallbackObservation::StreamEof => {
+                self.stream_eof_disconnects = self.stream_eof_disconnects.saturating_add(1);
+                self.recovery_pending = true;
+                IpcFallbackDiagnosticKind::StreamEof
+            }
+            IpcFallbackObservation::LagResync => {
+                self.lag_resyncs = self.lag_resyncs.saturating_add(1);
+                self.recovery_pending = true;
+                IpcFallbackDiagnosticKind::LagResync
+            }
+            IpcFallbackObservation::ProtocolFault => {
+                self.protocol_faults = self.protocol_faults.saturating_add(1);
+                self.recovery_pending = true;
+                IpcFallbackDiagnosticKind::ProtocolFault
+            }
+            IpcFallbackObservation::StreamValidated => {
+                self.validated_streams = self.validated_streams.saturating_add(1);
+                if self.recovery_pending {
+                    self.recovery_pending = false;
+                    IpcFallbackDiagnosticKind::SubscribeRecovered
+                } else {
+                    IpcFallbackDiagnosticKind::SubscribeEstablished
+                }
+            }
+        };
+
+        let index = kind.index();
+        let should_report = self.last_reported_at[index].is_none_or(|last| {
+            now.saturating_duration_since(last) >= IPC_FALLBACK_DIAGNOSTIC_INTERVAL
+        });
+        if !should_report {
+            self.suppressed_since_report[index] =
+                self.suppressed_since_report[index].saturating_add(1);
+            self.suppressed_reports_total = self.suppressed_reports_total.saturating_add(1);
+            return None;
+        }
+
+        self.last_reported_at[index] = Some(now);
+        Some(IpcFallbackDiagnosticReport {
+            kind,
+            suppressed_same_kind: std::mem::take(&mut self.suppressed_since_report[index]),
+        })
+    }
+}
+
+/// Record one transport transition and, when its fixed-window limiter allows,
+/// emit a structured diagnostic containing cumulative counters. Error strings
+/// are logged at the observation boundary and are never retained.
+#[cfg(unix)]
+fn observe_ipc_fallback(
+    diagnostics: &mut IpcFallbackDiagnostics,
+    observation: IpcFallbackObservation,
+    detail: impl std::fmt::Display,
+) {
+    let Some(report) = diagnostics.observe(observation, std::time::Instant::now()) else {
+        return;
+    };
+    let kind = report.kind.as_str();
+
+    match report.kind {
+        IpcFallbackDiagnosticKind::SubscribeEstablished => {
+            tracing::info!(
+                transport = "watch_events_ipc",
+                diagnostic_kind = kind,
+                detail = %detail,
+                subscribe_failures = diagnostics.subscribe_failures,
+                stream_read_failures = diagnostics.stream_read_failures,
+                stream_eof_disconnects = diagnostics.stream_eof_disconnects,
+                lag_resyncs = diagnostics.lag_resyncs,
+                protocol_faults = diagnostics.protocol_faults,
+                validated_streams = diagnostics.validated_streams,
+                suppressed_same_kind = report.suppressed_same_kind,
+                suppressed_reports_total = diagnostics.suppressed_reports_total,
+                "watch-events IPC subscription established"
+            );
+        }
+        IpcFallbackDiagnosticKind::SubscribeRecovered => {
+            tracing::info!(
+                transport = "watch_events_ipc",
+                diagnostic_kind = kind,
+                detail = %detail,
+                subscribe_failures = diagnostics.subscribe_failures,
+                stream_read_failures = diagnostics.stream_read_failures,
+                stream_eof_disconnects = diagnostics.stream_eof_disconnects,
+                lag_resyncs = diagnostics.lag_resyncs,
+                protocol_faults = diagnostics.protocol_faults,
+                validated_streams = diagnostics.validated_streams,
+                suppressed_same_kind = report.suppressed_same_kind,
+                suppressed_reports_total = diagnostics.suppressed_reports_total,
+                "watch-events IPC subscription restored after durable DB-cursor fallback"
+            );
+        }
+        IpcFallbackDiagnosticKind::SubscribeFailure
+        | IpcFallbackDiagnosticKind::StreamReadFailure
+        | IpcFallbackDiagnosticKind::StreamEof
+        | IpcFallbackDiagnosticKind::LagResync
+        | IpcFallbackDiagnosticKind::ProtocolFault => {
+            tracing::warn!(
+                transport = "watch_events_ipc",
+                diagnostic_kind = kind,
+                detail = %detail,
+                subscribe_failures = diagnostics.subscribe_failures,
+                stream_read_failures = diagnostics.stream_read_failures,
+                stream_eof_disconnects = diagnostics.stream_eof_disconnects,
+                lag_resyncs = diagnostics.lag_resyncs,
+                protocol_faults = diagnostics.protocol_faults,
+                validated_streams = diagnostics.validated_streams,
+                suppressed_same_kind = report.suppressed_same_kind,
+                suppressed_reports_total = diagnostics.suppressed_reports_total,
+                "watch-events IPC transport degraded; using durable DB-cursor fallback"
+            );
+        }
+    }
 }
 
 /// Decide whether a live IPC event record with the given `cursor` is a
@@ -23269,13 +23920,226 @@ fn ipc_event_is_duplicate(cursor: Option<i64>, current_cursor: Option<i64>) -> b
     }
 }
 
-/// Relay one NDJSON line received from the watcher's IPC `SubscribeEvents`
-/// stream to stdout (ft-7h5da.4.1). Event records are de-duplicated against
-/// `current_cursor` (the follower may have already emitted them via the
-/// DB-cursor backlog drain) and advance the cursor; heartbeats are re-emitted
-/// carrying the follower's own cursor; any other control record passes through.
-/// `max_hz` pacing mirrors the DB path; the server already redacts event
-/// payloads before sending.
+/// Validate the cursor contract for one IPC event record.
+///
+/// Persisted detections always carry a positive SQLite event ID. The only
+/// cursorless records admitted by the server contract are the two live-only
+/// pane lifecycle signals; they cannot be reconstructed by the DB backfill.
+#[cfg(unix)]
+fn ipc_event_cursor(
+    value: &serde_json::Value,
+) -> Result<Option<i64>, IpcRelayProtocolFault> {
+    const EVENT_KEYS: [&str; 14] = [
+        "type",
+        "cursor",
+        "id",
+        "pane_id",
+        "rule_id",
+        "agent_type",
+        "event_type",
+        "severity",
+        "confidence",
+        "detected_at",
+        "matched_text",
+        "extracted",
+        "handled",
+        "handled_status",
+    ];
+    if !json_object_has_exact_keys(value, &EVENT_KEYS) {
+        return Err(IpcRelayProtocolFault::InvalidRecordShape);
+    }
+
+    let event_type = value.get("event_type").and_then(serde_json::Value::as_str);
+    let cursor_value = value.get("cursor");
+    let cursor = cursor_value.and_then(serde_json::Value::as_i64);
+    let pane_id_is_valid = value
+        .get("pane_id")
+        .and_then(serde_json::Value::as_u64)
+        .is_some();
+    let common_shape_is_valid = value.get("type").and_then(serde_json::Value::as_str)
+        == Some("event")
+        && value
+            .get("detected_at")
+            .and_then(serde_json::Value::as_i64)
+            .is_some_and(|timestamp| timestamp >= 0)
+        && value.get("handled").and_then(serde_json::Value::as_bool) == Some(false)
+        && value
+            .get("handled_status")
+            .is_some_and(serde_json::Value::is_null)
+        && json_is_null_or_string(value.get("matched_text"));
+    if !common_shape_is_valid {
+        return Err(IpcRelayProtocolFault::InvalidRecordShape);
+    }
+
+    let live_shape_is_valid = match event_type {
+        Some("pane_discovered") => {
+            value.get("id").is_some_and(serde_json::Value::is_null)
+                && pane_id_is_valid
+                && value.get("rule_id").is_some_and(serde_json::Value::is_null)
+                && value
+                    .get("agent_type")
+                    .is_some_and(serde_json::Value::is_null)
+                && value.get("severity").is_some_and(serde_json::Value::is_null)
+                && value
+                    .get("confidence")
+                    .is_some_and(serde_json::Value::is_null)
+                && value
+                    .get("matched_text")
+                    .is_some_and(serde_json::Value::is_null)
+                && value
+                    .pointer("/extracted/domain")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some()
+                && value
+                    .pointer("/extracted/title")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some()
+                && value
+                    .get("extracted")
+                    .and_then(serde_json::Value::as_object)
+                    .is_some_and(|object| object.len() == 2)
+        }
+        Some("pane_disappeared") => {
+            value.get("id").is_some_and(serde_json::Value::is_null)
+                && pane_id_is_valid
+                && value.get("rule_id").is_some_and(serde_json::Value::is_null)
+                && value
+                    .get("agent_type")
+                    .is_some_and(serde_json::Value::is_null)
+                && value.get("severity").is_some_and(serde_json::Value::is_null)
+                && value
+                    .get("confidence")
+                    .is_some_and(serde_json::Value::is_null)
+                && value
+                    .get("matched_text")
+                    .is_some_and(serde_json::Value::is_null)
+                && value
+                    .get("extracted")
+                    .and_then(serde_json::Value::as_object)
+                    .is_some_and(|object| object.is_empty())
+        }
+        _ => false,
+    };
+
+    // Live lifecycle records are identified by their cursorless/null-metadata
+    // shape, not by globally reserving their event_type strings. User rule
+    // packs may legally persist detections with either lifecycle-like name.
+    let persisted_shape_is_valid = event_type.is_some_and(|event_type| !event_type.is_empty())
+        && pane_id_is_valid
+        && value
+            .get("rule_id")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|text| !text.is_empty())
+        && value
+            .get("agent_type")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|text| !text.is_empty())
+        && value
+            .get("severity")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|severity| matches!(severity, "info" | "warning" | "critical"))
+        && value
+            .get("confidence")
+            .and_then(serde_json::Value::as_f64)
+            .is_some_and(|confidence| confidence.is_finite() && (0.0..=1.0).contains(&confidence))
+        && value
+            .get("extracted")
+            .is_some_and(|extracted| extracted.is_null() || extracted.is_object());
+
+    match (live_shape_is_valid, cursor_value, cursor) {
+        (true, Some(raw), None) if raw.is_null() => Ok(None),
+        (false, Some(_), Some(cursor))
+            if cursor > 0
+                && persisted_shape_is_valid
+                && value.get("id").and_then(serde_json::Value::as_i64) == Some(cursor) =>
+        {
+            Ok(Some(cursor))
+        }
+        (false, _, _) if persisted_shape_is_valid => {
+            Err(IpcRelayProtocolFault::InvalidEventCursor)
+        }
+        _ => Err(IpcRelayProtocolFault::InvalidRecordShape),
+    }
+}
+
+#[cfg(unix)]
+fn json_object_has_exact_keys(value: &serde_json::Value, expected: &[&str]) -> bool {
+    value.as_object().is_some_and(|object| {
+        object.len() == expected.len() && expected.iter().all(|key| object.contains_key(*key))
+    })
+}
+
+#[cfg(unix)]
+fn json_is_null_or_string(value: Option<&serde_json::Value>) -> bool {
+    value.is_some_and(|value| value.is_null() || value.is_string())
+}
+
+#[cfg(unix)]
+fn validate_ipc_heartbeat_record(
+    value: &serde_json::Value,
+) -> Result<(), IpcRelayProtocolFault> {
+    const HEARTBEAT_KEYS: [&str; 3] = ["type", "cursor", "now"];
+    let valid = json_object_has_exact_keys(value, &HEARTBEAT_KEYS)
+        && value.get("type").and_then(serde_json::Value::as_str) == Some("heartbeat")
+        && value.get("cursor").is_some_and(serde_json::Value::is_null)
+        && value
+            .get("now")
+            .and_then(serde_json::Value::as_i64)
+            .is_some_and(|timestamp| timestamp >= 0);
+    if valid {
+        Ok(())
+    } else {
+        Err(IpcRelayProtocolFault::InvalidRecordShape)
+    }
+}
+
+#[cfg(unix)]
+fn validate_ipc_gap_record(value: &serde_json::Value) -> Result<(), IpcRelayProtocolFault> {
+    const GAP_KEYS: [&str; 5] = ["type", "reason", "missed_count", "cursor", "message"];
+    let valid = json_object_has_exact_keys(value, &GAP_KEYS)
+        && value.get("type").and_then(serde_json::Value::as_str) == Some("gap")
+        && value.get("reason").and_then(serde_json::Value::as_str) == Some("broadcast_lag")
+        && value
+            .get("missed_count")
+            .and_then(serde_json::Value::as_u64)
+            .is_some_and(|missed| missed > 0)
+        && value.get("cursor").is_some_and(serde_json::Value::is_null)
+        && value
+            .get("message")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|message| !message.is_empty());
+    if valid {
+        Ok(())
+    } else {
+        Err(IpcRelayProtocolFault::InvalidRecordShape)
+    }
+}
+
+#[cfg(unix)]
+fn decode_ipc_relay_record(
+    line: &str,
+) -> Result<serde_json::Value, IpcRelayProtocolFault> {
+    serde_json::from_str(line).map_err(|_| IpcRelayProtocolFault::MalformedJson)
+}
+
+#[cfg(unix)]
+fn ipc_relay_record_type(
+    value: &serde_json::Value,
+) -> Result<IpcRelayRecordType, IpcRelayProtocolFault> {
+    match value.get("type").and_then(serde_json::Value::as_str) {
+        Some("event") => Ok(IpcRelayRecordType::Event),
+        Some("heartbeat") => Ok(IpcRelayRecordType::Heartbeat),
+        Some("gap") => Ok(IpcRelayRecordType::Gap),
+        Some(_) | None => Err(IpcRelayProtocolFault::UnknownRecordType),
+    }
+}
+
+/// Process one NDJSON line received from the watcher's IPC `SubscribeEvents`
+/// stream (ft-7h5da.4.1). Persisted events are low-latency wakeups only: the
+/// ordered DB cursor is the sole payload, identity, claim, and ordering
+/// authority. Cursorless lifecycle records remain direct best-effort output;
+/// heartbeats are re-emitted with the follower cursor; gaps trigger durable
+/// backfill; malformed/unknown records abandon the stream fail-closed.
 #[cfg(unix)]
 async fn relay_ipc_event_line(
     stdout: &std::io::Stdout,
@@ -23283,103 +24147,95 @@ async fn relay_ipc_event_line(
     current_cursor: &mut Option<i64>,
     max_hz_interval: Option<std::time::Duration>,
     last_event_emit: &mut Option<std::time::Instant>,
-    claim_storage: Option<&frankenterm_core::storage::StorageHandle>,
+    heartbeat_interval_ms: u64,
+    heartbeat: std::time::Duration,
+    last_emit: &mut std::time::Instant,
 ) -> std::io::Result<IpcRelayAction> {
-    use std::io::Write as _;
-    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(line) else {
-        // Unparseable line — skip defensively rather than corrupt the stream.
-        return Ok(IpcRelayAction::Skipped);
+    let value = match decode_ipc_relay_record(line) {
+        Ok(value) => value,
+        Err(fault) => return Ok(IpcRelayAction::ProtocolFault(fault)),
     };
-    let record_type = value.get("type").and_then(|v| v.as_str()).unwrap_or("");
+    let record_type = match ipc_relay_record_type(&value) {
+        Ok(record_type) => record_type,
+        Err(fault) => return Ok(IpcRelayAction::ProtocolFault(fault)),
+    };
     match record_type {
-        "event" => {
-            let cursor = value.get("cursor").and_then(serde_json::Value::as_i64);
+        IpcRelayRecordType::Event => {
+            let cursor = match ipc_event_cursor(&value) {
+                Ok(cursor) => cursor,
+                Err(fault) => return Ok(IpcRelayAction::ProtocolFault(fault)),
+            };
             if ipc_event_is_duplicate(cursor, *current_cursor) {
                 return Ok(IpcRelayAction::Skipped); // already emitted via DB drain
             }
-            if let (Some(storage), Some(event_id)) = (claim_storage, cursor) {
-                storage
-                    .mark_event_handled(
-                        event_id,
-                        Some(WATCH_EVENTS_CLAIM_WORKFLOW_ID.to_string()),
-                        WATCH_EVENTS_CLAIM_STATUS,
-                    )
-                    .await
-                    .map_err(|err| {
-                        std::io::Error::other(format!(
-                            "failed to claim IPC event {event_id}: {err}"
-                        ))
-                    })?;
-                if let Some(object) = value.as_object_mut() {
-                    object.insert("handled".to_string(), serde_json::Value::Bool(true));
-                    object.insert(
-                        "handled_status".to_string(),
-                        serde_json::Value::String(WATCH_EVENTS_CLAIM_STATUS.to_string()),
-                    );
-                }
+            if cursor.is_some() {
+                // EventBus publication can be out of SQLite-id order, and a
+                // dedupe conflict can pair a current detection payload with an
+                // older stored id. The in-memory record is therefore only a
+                // wakeup; the outer DB drain fetches the exact StoredEvent.
+                return Ok(IpcRelayAction::DurableWakeup);
             }
-            // max_hz pacing on emitted events (blocking sleep off the runtime
-            // thread, mirroring the DB-cursor path).
-            if let (Some(min), Some(prev)) = (max_hz_interval, *last_event_emit) {
-                let elapsed = prev.elapsed();
-                if elapsed < min {
-                    let wait = min.saturating_sub(elapsed);
-                    let _ = frankenterm_core::runtime_async::spawn_blocking(move || {
-                        std::thread::sleep(wait);
-                    })
-                    .await;
-                }
-            }
-            let mut lock = stdout.lock();
-            let cont = write_ndjson_line(&mut lock, &value)?;
-            let _ = lock.flush();
-            drop(lock);
-            if !cont {
+            // Cursorless lifecycle signals are emitted directly and still
+            // participate in the configured output-rate bound.
+            if !pace_watch_event(
+                max_hz_interval,
+                *last_event_emit,
+                stdout,
+                *current_cursor,
+                heartbeat_interval_ms,
+                heartbeat,
+                last_emit,
+            )
+            .await?
+            {
                 return Ok(IpcRelayAction::PipeClosed);
             }
-            if let Some(c) = cursor {
-                *current_cursor = Some(c);
+
+            // Cursorless pane lifecycle records cannot participate in durable
+            // claims; they remain best-effort live notifications.
+            let mut lock = stdout.lock();
+            let continue_writing = write_ndjson_line(&mut lock, &value)?;
+            drop(lock);
+            if !continue_writing {
+                return Ok(IpcRelayAction::PipeClosed);
             }
-            *last_event_emit = Some(std::time::Instant::now());
+            let emitted_at = std::time::Instant::now();
+            *last_event_emit = Some(emitted_at);
+            *last_emit = emitted_at;
             Ok(IpcRelayAction::Emitted)
         }
-        "heartbeat" => {
+        IpcRelayRecordType::Heartbeat => {
+            if let Err(fault) = validate_ipc_heartbeat_record(&value) {
+                return Ok(IpcRelayAction::ProtocolFault(fault));
+            }
             // Re-emit with the follower's own cursor (the server sends a null
             // cursor since it doesn't track the follower's position).
             let hb = watch_heartbeat_ndjson(*current_cursor, now_ms_i64());
             let mut lock = stdout.lock();
             let cont = write_ndjson_line(&mut lock, &hb)?;
-            let _ = lock.flush();
             drop(lock);
             if !cont {
                 return Ok(IpcRelayAction::PipeClosed);
             }
+            note_watch_output_emitted(last_emit);
             Ok(IpcRelayAction::Emitted)
         }
-        "gap" => {
+        IpcRelayRecordType::Gap => {
+            if let Err(fault) = validate_ipc_gap_record(&value) {
+                return Ok(IpcRelayAction::ProtocolFault(fault));
+            }
             // Pass the explicit broadcast-lag gap through to the consumer, then
             // signal the relay loop to re-drain the DB cursor so the dropped
             // (but persisted) events are backfilled at-least-once
             // (ft-7h5da.4.2, no-silent-gaps).
             let mut lock = stdout.lock();
             let cont = write_ndjson_line(&mut lock, &value)?;
-            let _ = lock.flush();
             drop(lock);
             if !cont {
                 return Ok(IpcRelayAction::PipeClosed);
             }
+            note_watch_output_emitted(last_emit);
             Ok(IpcRelayAction::Resync)
-        }
-        _ => {
-            // Pass through any other control record unchanged.
-            let mut lock = stdout.lock();
-            let cont = write_ndjson_line(&mut lock, &value)?;
-            let _ = lock.flush();
-            drop(lock);
-            if !cont {
-                return Ok(IpcRelayAction::PipeClosed);
-            }
-            Ok(IpcRelayAction::Emitted)
         }
     }
 }
@@ -23406,6 +24262,116 @@ mod watch_events_tests {
             handled_at: None,
             handled_by_workflow_id: None,
             handled_status: None,
+        }
+    }
+
+    fn ipc_persisted_event(id: i64) -> serde_json::Value {
+        serde_json::json!({
+            "type": "event",
+            "cursor": id,
+            "id": id,
+            "pane_id": 7,
+            "rule_id": "codex.usage",
+            "agent_type": "codex",
+            "event_type": "detection",
+            "severity": "warning",
+            "confidence": 0.9,
+            "detected_at": 12_345,
+            "matched_text": null,
+            "extracted": {},
+            "handled": false,
+            "handled_status": null,
+        })
+    }
+
+    #[cfg(unix)]
+    fn ipc_live_event(event_type: &str) -> serde_json::Value {
+        let extracted = if event_type == "pane_discovered" {
+            serde_json::json!({"domain": "local", "title": "shell"})
+        } else {
+            serde_json::json!({})
+        };
+        serde_json::json!({
+            "type": "event",
+            "cursor": null,
+            "id": null,
+            "pane_id": 7,
+            "rule_id": null,
+            "agent_type": null,
+            "event_type": event_type,
+            "severity": null,
+            "confidence": null,
+            "detected_at": 12_345,
+            "matched_text": null,
+            "extracted": extracted,
+            "handled": false,
+            "handled_status": null,
+        })
+    }
+
+    fn watch_claim_fixture(event_count: usize) -> (tempfile::TempDir, String, Vec<i64>) {
+        let directory = tempfile::tempdir().expect("create watch claim fixture directory");
+        let path = directory.path().join("watch-claim.sqlite3");
+        let connection = rusqlite::Connection::open(&path).expect("open watch claim fixture");
+        frankenterm_core::storage::initialize_schema(&connection)
+            .expect("initialize watch claim fixture");
+        connection
+            .execute(
+                "INSERT INTO panes (pane_id, first_seen_at, last_seen_at)
+                 VALUES (7, 1, 1)",
+                [],
+            )
+            .expect("insert watch claim fixture pane");
+        let mut event_ids = Vec::with_capacity(event_count);
+        for index in 0..event_count {
+            connection
+                .execute(
+                    "INSERT INTO events (
+                         pane_id, rule_id, agent_type, event_type, severity,
+                         confidence, detected_at
+                     ) VALUES (?1, ?2, 'codex', 'detection', 'warning', 0.9, ?3)",
+                    rusqlite::params![
+                        7_i64,
+                        format!("watch.claim.{index}"),
+                        10_000_i64 + i64::try_from(index).expect("fixture index fits i64"),
+                    ],
+                )
+                .expect("insert watch claim fixture event");
+            event_ids.push(connection.last_insert_rowid());
+        }
+        drop(connection);
+        (directory, path.to_string_lossy().into_owned(), event_ids)
+    }
+
+    fn run_watch_claim_async(future: impl std::future::Future<Output = ()>) {
+        let runtime = frankenterm_core::runtime_async::RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .expect("build watch claim test runtime");
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            runtime.block_on(future);
+        }));
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(runtime)));
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            frankenterm_core::runtime_async::clear_runtime_handle();
+        }));
+        if let Err(panic) = result {
+            std::panic::resume_unwind(panic);
+        }
+    }
+
+    fn watch_claim_query(after_id: i64) -> frankenterm_core::storage::EventStreamQuery {
+        frankenterm_core::storage::EventStreamQuery {
+            after_id: Some(after_id),
+            limit: Some(1),
+            pane_id: None,
+            rule_id: None,
+            event_type: None,
+            triage_state: None,
+            label: None,
+            unhandled_only: false,
+            since: None,
+            until: None,
         }
     }
 
@@ -23451,6 +24417,49 @@ mod watch_events_tests {
     }
 
     #[test]
+    fn watch_severity_normalizes_the_closed_vocabulary_and_rejects_typos() {
+        assert_eq!(normalize_watch_severity(None), Ok(None));
+        assert_eq!(
+            normalize_watch_severity(Some("InFo")),
+            Ok(Some("info".to_string()))
+        );
+        assert_eq!(
+            normalize_watch_severity(Some("WARNING")),
+            Ok(Some("warning".to_string()))
+        );
+        assert_eq!(
+            normalize_watch_severity(Some("critical")),
+            Ok(Some("critical".to_string()))
+        );
+        assert_eq!(
+            normalize_watch_severity(Some("error")),
+            Err("Invalid --severity: expected info, warning, or critical")
+        );
+        assert_eq!(
+            normalize_watch_severity(Some("warn")),
+            Err("Invalid --severity: expected info, warning, or critical")
+        );
+    }
+
+    #[test]
+    fn a_control_record_resets_the_idle_heartbeat_deadline() {
+        let heartbeat = std::time::Duration::from_millis(100);
+        let mut last_emit = std::time::Instant::now() - heartbeat;
+        assert!(watch_heartbeat_is_due(100, heartbeat, last_emit));
+
+        note_watch_output_emitted(&mut last_emit);
+
+        assert!(
+            !watch_heartbeat_is_due(100, heartbeat, last_emit),
+            "a just-flushed control record must not be followed by an immediate heartbeat"
+        );
+        assert!(
+            !watch_heartbeat_is_due(0, std::time::Duration::ZERO, last_emit),
+            "zero disables follower heartbeats even when the duration is due"
+        );
+    }
+
+    #[test]
     fn envelope_cursor_equals_id_and_redacts_matched_text_and_extracted() {
         let mut e = ev(
             42,
@@ -23489,6 +24498,255 @@ mod watch_events_tests {
             watch_max_hz_interval(1000),
             Some(std::time::Duration::from_millis(1))
         );
+        assert_eq!(
+            watch_max_hz_interval(3),
+            Some(std::time::Duration::from_nanos(333_333_334))
+        );
+        assert_eq!(
+            watch_max_hz_interval(1001),
+            Some(std::time::Duration::from_nanos(999_001))
+        );
+        assert_eq!(
+            watch_max_hz_interval(u32::MAX),
+            Some(std::time::Duration::from_nanos(1))
+        );
+
+        for max_hz in [1, 3, 10, 1001, 1_000_000, u32::MAX] {
+            let interval = watch_max_hz_interval(max_hz).expect("nonzero rate");
+            assert!(
+                interval.as_nanos() * u128::from(max_hz) >= 1_000_000_000,
+                "interval must never permit more than {max_hz} events per second"
+            );
+        }
+    }
+
+    #[test]
+    fn claim_retry_delay_polls_for_early_release_without_stealing_early() {
+        let poll = std::time::Duration::from_millis(500);
+        assert_eq!(
+            watch_claim_retry_delay(1_000, 31_000, poll),
+            poll,
+            "a long live lease must be rechecked for an early release"
+        );
+        assert_eq!(
+            watch_claim_retry_delay(1_000, 1_125, poll),
+            std::time::Duration::from_millis(125),
+            "the expiry boundary must wake sooner than the normal poll"
+        );
+        assert_eq!(
+            watch_claim_retry_delay(1_000, 999, poll),
+            std::time::Duration::ZERO,
+            "an already stealable lease retries immediately"
+        );
+        assert_eq!(
+            watch_claim_retry_delay(-1, i64::MAX, poll),
+            poll,
+            "extreme/corrupt deadlines remain bounded by the poll interval"
+        );
+    }
+
+    #[test]
+    fn claimed_delivery_is_flush_before_handle_and_releases_known_failures() {
+        let (_directory, database_path, event_ids) = watch_claim_fixture(6);
+        run_watch_claim_async(async move {
+            let storage = frankenterm_core::storage::StorageHandle::new(&database_path)
+                .await
+                .expect("open watch claim storage");
+
+            let success_id = event_ids[0];
+            let mut success_output = Vec::new();
+            let success = deliver_claimed_watch_event(
+                &storage,
+                success_id,
+                ipc_persisted_event(success_id),
+                |record| write_ndjson_line(&mut success_output, record),
+            )
+            .await
+            .expect("deliver claimed event");
+            assert_eq!(success, WatchEventClaimDelivery::Delivered);
+            let emitted: serde_json::Value = serde_json::from_slice(&success_output)
+                .expect("parse claimed NDJSON record");
+            assert_eq!(emitted["handled"].as_bool(), Some(false));
+            assert!(emitted["handled_status"].is_null());
+            assert_eq!(
+                emitted["claim_delivery"],
+                "finalize_after_output_flush"
+            );
+            let stored = storage
+                .get_events_stream(watch_claim_query(success_id - 1))
+                .await
+                .expect("load finalized event")
+                .into_iter()
+                .next()
+                .expect("finalized event remains queryable");
+            assert_eq!(stored.id, success_id);
+            assert!(stored.handled_at.is_some());
+            assert_eq!(stored.handled_status.as_deref(), Some(WATCH_EVENTS_CLAIM_STATUS));
+
+            let write_failure_id = event_ids[1];
+            let write_error = deliver_claimed_watch_event(
+                &storage,
+                write_failure_id,
+                ipc_persisted_event(write_failure_id),
+                |_record| {
+                    Err(std::io::Error::other("injected watch write failure"))
+                },
+            )
+            .await
+            .expect_err("write failure must propagate");
+            assert_eq!(write_error.kind(), std::io::ErrorKind::Other);
+            let reacquired = storage
+                .reserve_event_delivery(write_failure_id, WATCH_EVENTS_CLAIM_LEASE_TTL)
+                .await
+                .expect("known write failure must release immediately");
+            let reacquired = match reacquired {
+                frankenterm_core::storage::EventDeliveryReservation::Acquired(lease) => lease,
+                other => panic!("write-failed event was not immediately reacquired: {other:?}"),
+            };
+            assert!(
+                storage
+                    .release_event_delivery(&reacquired)
+                    .await
+                    .expect("release reacquired write-failure lease")
+            );
+
+            let broken_pipe_id = event_ids[2];
+            let broken_pipe = deliver_claimed_watch_event(
+                &storage,
+                broken_pipe_id,
+                ipc_persisted_event(broken_pipe_id),
+                |record| {
+                    let mut writer = FlushErrorWriter {
+                        bytes: Vec::new(),
+                        error_kind: std::io::ErrorKind::BrokenPipe,
+                    };
+                    write_ndjson_line(&mut writer, record)
+                },
+            )
+            .await
+            .expect("BrokenPipe with successful release is a clean close");
+            assert_eq!(broken_pipe, WatchEventClaimDelivery::PipeClosed);
+            let reacquired = storage
+                .reserve_event_delivery(broken_pipe_id, WATCH_EVENTS_CLAIM_LEASE_TTL)
+                .await
+                .expect("BrokenPipe must release immediately");
+            let reacquired = match reacquired {
+                frankenterm_core::storage::EventDeliveryReservation::Acquired(lease) => lease,
+                other => panic!("pipe-closed event was not immediately reacquired: {other:?}"),
+            };
+            assert!(
+                storage
+                    .release_event_delivery(&reacquired)
+                    .await
+                    .expect("release reacquired pipe-close lease")
+            );
+
+            let contended_id = event_ids[3];
+            let held = storage
+                .reserve_event_delivery(contended_id, WATCH_EVENTS_CLAIM_LEASE_TTL)
+                .await
+                .expect("seed competing lease");
+            let held = match held {
+                frankenterm_core::storage::EventDeliveryReservation::Acquired(lease) => lease,
+                other => panic!("failed to seed competing lease: {other:?}"),
+            };
+            let writer_called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let writer_called_in_closure = std::sync::Arc::clone(&writer_called);
+            let contended = deliver_claimed_watch_event(
+                &storage,
+                contended_id,
+                ipc_persisted_event(contended_id),
+                move |_record| {
+                    writer_called_in_closure.store(true, std::sync::atomic::Ordering::SeqCst);
+                    Ok(true)
+                },
+            )
+            .await
+            .expect("classify competing lease");
+            assert_eq!(
+                contended,
+                WatchEventClaimDelivery::LeasedUntil {
+                    expires_at_ms: held.expires_at_ms()
+                }
+            );
+            assert!(!writer_called.load(std::sync::atomic::Ordering::SeqCst));
+            assert!(
+                storage
+                    .release_event_delivery(&held)
+                    .await
+                    .expect("release competing lease")
+            );
+
+            let already_handled_id = event_ids[4];
+            storage
+                .mark_event_handled(already_handled_id, None, "other-path")
+                .await
+                .expect("mark fixture event handled through another path");
+            let already_writer_called =
+                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let already_writer_called_in_closure = std::sync::Arc::clone(&already_writer_called);
+            let already = deliver_claimed_watch_event(
+                &storage,
+                already_handled_id,
+                ipc_persisted_event(already_handled_id),
+                move |_record| {
+                    already_writer_called_in_closure
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                    Ok(true)
+                },
+            )
+            .await
+            .expect("classify already-handled event");
+            assert_eq!(already, WatchEventClaimDelivery::AlreadyHandledOrMissing);
+            assert!(!already_writer_called.load(std::sync::atomic::Ordering::SeqCst));
+
+            let finalization_lost_id = event_ids[5];
+            let mut lost_output = Vec::new();
+            let stolen_database_path = database_path.clone();
+            let lost = deliver_claimed_watch_event(
+                &storage,
+                finalization_lost_id,
+                ipc_persisted_event(finalization_lost_id),
+                |record| {
+                    assert!(write_ndjson_line(&mut lost_output, record)?);
+                    let connection = rusqlite::Connection::open(&stolen_database_path)
+                        .map_err(std::io::Error::other)?;
+                    connection
+                        .execute(
+                            "UPDATE events
+                             SET delivery_lease_token = 'successor-token',
+                                 delivery_lease_acquired_at = ?1,
+                                 delivery_lease_expires_at = ?2
+                             WHERE id = ?3",
+                            rusqlite::params![
+                                now_ms_i64(),
+                                now_ms_i64().saturating_add(60_000),
+                                finalization_lost_id,
+                            ],
+                        )
+                        .map_err(std::io::Error::other)?;
+                    Ok(true)
+                },
+            )
+            .await
+            .expect("lost token-CAS is a typed at-least-once outcome");
+            assert_eq!(lost, WatchEventClaimDelivery::FinalizationLost);
+            assert!(!lost_output.is_empty(), "the consumer received the record");
+            let stored = storage
+                .get_events_stream(watch_claim_query(finalization_lost_id - 1))
+                .await
+                .expect("load finalization-race event")
+                .into_iter()
+                .next()
+                .expect("race event remains queryable");
+            assert_eq!(stored.id, finalization_lost_id);
+            assert!(
+                stored.handled_at.is_none(),
+                "lost finalization ownership must not mark the event handled"
+            );
+
+            storage.shutdown().await.expect("shutdown watch claim storage");
+        });
     }
 
     #[test]
@@ -23615,12 +24873,449 @@ mod watch_events_tests {
     }
 
     #[test]
-    fn write_ndjson_line_signals_broken_pipe() {
+    fn watch_delays_never_sleep_past_the_next_heartbeat() {
+        let poll = std::time::Duration::from_secs(30);
+        let heartbeat = std::time::Duration::from_secs(1);
+
+        assert_eq!(
+            watch_delay_bounded_by_heartbeat(
+                poll,
+                1_000,
+                heartbeat,
+                std::time::Duration::from_millis(250),
+            ),
+            std::time::Duration::from_millis(750)
+        );
+        assert_eq!(
+            watch_delay_bounded_by_heartbeat(
+                std::time::Duration::from_millis(100),
+                1_000,
+                heartbeat,
+                std::time::Duration::from_millis(250),
+            ),
+            std::time::Duration::from_millis(100)
+        );
+        assert_eq!(
+            watch_delay_bounded_by_heartbeat(
+                std::time::Duration::from_secs(1),
+                100,
+                std::time::Duration::from_millis(100),
+                std::time::Duration::ZERO,
+            ),
+            std::time::Duration::from_millis(100),
+            "max-hz pacing must wake for a shorter heartbeat deadline"
+        );
+        assert_eq!(
+            watch_delay_bounded_by_heartbeat(
+                poll,
+                1_000,
+                heartbeat,
+                std::time::Duration::from_secs(2),
+            ),
+            std::time::Duration::ZERO
+        );
+        assert_eq!(
+            watch_delay_bounded_by_heartbeat(
+                poll,
+                0,
+                std::time::Duration::ZERO,
+                std::time::Duration::from_secs(60),
+            ),
+            poll
+        );
+    }
+
+    #[test]
+    fn write_ndjson_line_writes_compact_record() {
         // A Vec<u8> never errors -> Ok(true).
         let mut buf: Vec<u8> = Vec::new();
         let v = serde_json::json!({"a": 1});
         assert!(write_ndjson_line(&mut buf, &v).unwrap());
         assert_eq!(buf, b"{\"a\":1}\n");
+    }
+
+    struct FlushErrorWriter {
+        bytes: Vec<u8>,
+        error_kind: std::io::ErrorKind,
+    }
+
+    impl std::io::Write for FlushErrorWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.bytes.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Err(std::io::Error::new(self.error_kind, "injected flush failure"))
+        }
+    }
+
+    #[test]
+    fn write_ndjson_line_classifies_flush_broken_pipe_as_closed_consumer() {
+        let mut writer = FlushErrorWriter {
+            bytes: Vec::new(),
+            error_kind: std::io::ErrorKind::BrokenPipe,
+        };
+        assert!(!write_ndjson_line(&mut writer, &serde_json::json!({"id": 7})).unwrap());
+        assert_eq!(writer.bytes, b"{\"id\":7}\n");
+    }
+
+    #[test]
+    fn write_ndjson_line_propagates_non_pipe_flush_failure() {
+        let mut writer = FlushErrorWriter {
+            bytes: Vec::new(),
+            error_kind: std::io::ErrorKind::Other,
+        };
+        let error = write_ndjson_line(&mut writer, &serde_json::json!({"id": 8}))
+            .expect_err("non-pipe flush failures must remain observable");
+        assert_eq!(error.kind(), std::io::ErrorKind::Other);
+        assert_eq!(writer.bytes, b"{\"id\":8}\n");
+    }
+
+    struct WriteErrorWriter {
+        error_kind: std::io::ErrorKind,
+    }
+
+    impl std::io::Write for WriteErrorWriter {
+        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::new(self.error_kind, "injected write failure"))
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn write_ndjson_line_classifies_write_broken_pipe_as_closed_consumer() {
+        let mut writer = WriteErrorWriter {
+            error_kind: std::io::ErrorKind::BrokenPipe,
+        };
+        assert!(!write_ndjson_line(&mut writer, &serde_json::json!({"id": 9})).unwrap());
+    }
+
+    #[test]
+    fn write_ndjson_line_propagates_non_pipe_write_failure() {
+        let mut writer = WriteErrorWriter {
+            error_kind: std::io::ErrorKind::Other,
+        };
+        let error = write_ndjson_line(&mut writer, &serde_json::json!({"id": 10}))
+            .expect_err("non-pipe write failures must remain observable");
+        assert_eq!(error.kind(), std::io::ErrorKind::Other);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ipc_transport_gap_is_bounded_truthful_and_once_per_degraded_interval() {
+        for reason in [
+            IpcTransportGapReason::SubscribeUnavailable,
+            IpcTransportGapReason::StreamEof,
+            IpcTransportGapReason::StreamReadFailure,
+        ] {
+            let gap = watch_ipc_transport_gap_ndjson(Some(17), reason, 12_345);
+            assert_eq!(gap["type"], "gap");
+            assert_eq!(gap["reason"], reason.as_str());
+            assert_eq!(gap["cursor"], 17);
+            assert_eq!(gap["now"], 12_345);
+            assert_eq!(
+                gap["persisted_detection_recovery"],
+                "durable_cursor_backfill"
+            );
+            assert_eq!(gap["live_only_signal_recovery"], "unavailable");
+            assert_eq!(gap["live_only_signals_at_risk"][0], "pane_discovered");
+            assert_eq!(
+                gap["live_only_signals_at_risk"][1],
+                "pane_disappeared"
+            );
+        }
+
+        let mut output = Vec::new();
+        let mut gap_open = false;
+        assert!(
+            write_ipc_transport_gap_once(
+                &mut output,
+                &mut gap_open,
+                Some(17),
+                IpcTransportGapReason::StreamEof,
+                12_345,
+            )
+            .unwrap()
+        );
+        let first_len = output.len();
+        assert!(gap_open);
+        assert!(
+            write_ipc_transport_gap_once(
+                &mut output,
+                &mut gap_open,
+                Some(17),
+                IpcTransportGapReason::StreamReadFailure,
+                12_346,
+            )
+            .unwrap()
+        );
+        assert_eq!(output.len(), first_len, "an open interval is coalesced");
+
+        gap_open = false; // a contract-valid record closes the interval
+        assert!(
+            write_ipc_transport_gap_once(
+                &mut output,
+                &mut gap_open,
+                Some(18),
+                IpcTransportGapReason::StreamReadFailure,
+                12_347,
+            )
+            .unwrap()
+        );
+        assert!(output.len() > first_len, "a later interval is observable");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reconnect_does_not_close_gap_until_first_contract_valid_record() {
+        let mut output = Vec::new();
+        let mut gap_open = false;
+        let mut stream_validated = false;
+
+        assert!(
+            write_ipc_transport_gap_once(
+                &mut output,
+                &mut gap_open,
+                Some(17),
+                IpcTransportGapReason::StreamEof,
+                12_345,
+            )
+            .unwrap()
+        );
+        let first_gap_len = output.len();
+
+        // A reconnect only creates the pending (`stream_validated == false`)
+        // stream. Repeated accept-then-EOF cycles remain one degraded interval
+        // and therefore one gap record.
+        assert!(
+            write_ipc_transport_gap_once(
+                &mut output,
+                &mut gap_open,
+                Some(17),
+                IpcTransportGapReason::StreamEof,
+                12_346,
+            )
+            .unwrap()
+        );
+        assert_eq!(output.len(), first_gap_len);
+
+        assert!(!note_valid_ipc_stream_record(
+            IpcRelayAction::ProtocolFault(IpcRelayProtocolFault::MalformedJson),
+            &mut stream_validated,
+            &mut gap_open,
+        ));
+        assert!(gap_open);
+        assert!(!stream_validated);
+
+        assert!(note_valid_ipc_stream_record(
+            IpcRelayAction::Emitted,
+            &mut stream_validated,
+            &mut gap_open,
+        ));
+        assert!(stream_validated);
+        assert!(!gap_open);
+        assert!(!note_valid_ipc_stream_record(
+            IpcRelayAction::Skipped,
+            &mut stream_validated,
+            &mut gap_open,
+        ));
+
+        // A disconnect after genuine recovery starts a new visible interval.
+        assert!(
+            write_ipc_transport_gap_once(
+                &mut output,
+                &mut gap_open,
+                Some(18),
+                IpcTransportGapReason::StreamReadFailure,
+                12_347,
+            )
+            .unwrap()
+        );
+        assert!(output.len() > first_gap_len);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn malformed_first_record_reconnects_emit_one_gap_until_validated() {
+        let mut output = Vec::new();
+        let mut gap_open = false;
+        let mut stream_validated = false;
+
+        for now in [12_345, 12_346] {
+            let fault = decode_ipc_relay_record("{")
+                .expect_err("truncated JSON must be a protocol fault");
+            assert_eq!(fault, IpcRelayProtocolFault::MalformedJson);
+            assert!(
+                write_ipc_protocol_fault_once(
+                    &mut output,
+                    &mut gap_open,
+                    Some(17),
+                    fault,
+                    now,
+                )
+                .unwrap()
+            );
+        }
+        let first_interval_len = output.len();
+        assert_eq!(output.iter().filter(|&&byte| byte == b'\n').count(), 1);
+
+        assert!(note_valid_ipc_stream_record(
+            IpcRelayAction::Emitted,
+            &mut stream_validated,
+            &mut gap_open,
+        ));
+        assert!(write_ipc_protocol_fault_once(
+            &mut output,
+            &mut gap_open,
+            Some(18),
+            IpcRelayProtocolFault::MalformedJson,
+            12_347,
+        )
+        .unwrap());
+        assert!(output.len() > first_interval_len);
+        assert_eq!(output.iter().filter(|&&byte| byte == b'\n').count(), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_transport_gap_flush_does_not_silently_open_interval() {
+        let mut writer = FlushErrorWriter {
+            bytes: Vec::new(),
+            error_kind: std::io::ErrorKind::Other,
+        };
+        let mut gap_open = false;
+        let error = write_ipc_transport_gap_once(
+            &mut writer,
+            &mut gap_open,
+            None,
+            IpcTransportGapReason::SubscribeUnavailable,
+            12_345,
+        )
+        .expect_err("flush failure must propagate");
+        assert_eq!(error.kind(), std::io::ErrorKind::Other);
+        assert!(!gap_open);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ipc_fallback_diagnostics_count_failures_resyncs_and_recovery() {
+        let now = std::time::Instant::now();
+        let mut diagnostics = IpcFallbackDiagnostics::default();
+
+        let established = diagnostics
+            .observe(IpcFallbackObservation::StreamValidated, now)
+            .expect("first validated stream must be reported");
+        assert_eq!(
+            established.kind,
+            IpcFallbackDiagnosticKind::SubscribeEstablished
+        );
+        assert!(!diagnostics.recovery_pending);
+
+        let subscribe_failure = diagnostics
+            .observe(IpcFallbackObservation::SubscribeFailed, now)
+            .expect("first subscription failure must be reported");
+        assert_eq!(
+            subscribe_failure.kind,
+            IpcFallbackDiagnosticKind::SubscribeFailure
+        );
+        assert!(diagnostics.recovery_pending);
+
+        let recovered = diagnostics
+            .observe(IpcFallbackObservation::StreamValidated, now)
+            .expect("first recovery has its own report bucket");
+        assert_eq!(
+            recovered.kind,
+            IpcFallbackDiagnosticKind::SubscribeRecovered
+        );
+        assert!(!diagnostics.recovery_pending);
+
+        assert_eq!(
+            diagnostics
+                .observe(IpcFallbackObservation::StreamReadFailed, now)
+                .expect("first read failure must be reported")
+                .kind,
+            IpcFallbackDiagnosticKind::StreamReadFailure
+        );
+        assert_eq!(
+            diagnostics
+                .observe(IpcFallbackObservation::StreamEof, now)
+                .expect("first EOF must be reported")
+                .kind,
+            IpcFallbackDiagnosticKind::StreamEof
+        );
+        assert_eq!(
+            diagnostics
+                .observe(IpcFallbackObservation::LagResync, now)
+                .expect("first lag resync must be reported")
+                .kind,
+            IpcFallbackDiagnosticKind::LagResync
+        );
+        assert_eq!(
+            diagnostics
+                .observe(IpcFallbackObservation::ProtocolFault, now)
+                .expect("first protocol fault must be reported")
+                .kind,
+            IpcFallbackDiagnosticKind::ProtocolFault
+        );
+
+        assert_eq!(diagnostics.subscribe_failures, 1);
+        assert_eq!(diagnostics.stream_read_failures, 1);
+        assert_eq!(diagnostics.stream_eof_disconnects, 1);
+        assert_eq!(diagnostics.lag_resyncs, 1);
+        assert_eq!(diagnostics.protocol_faults, 1);
+        assert_eq!(diagnostics.validated_streams, 2);
+        assert!(diagnostics.recovery_pending);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ipc_fallback_diagnostics_rate_limit_repeats_without_counter_wrap() {
+        let start = std::time::Instant::now();
+        let mut diagnostics = IpcFallbackDiagnostics::default();
+
+        assert!(
+            diagnostics
+                .observe(IpcFallbackObservation::SubscribeFailed, start)
+                .is_some()
+        );
+        assert!(
+            diagnostics
+                .observe(
+                    IpcFallbackObservation::SubscribeFailed,
+                    start + std::time::Duration::from_secs(1),
+                )
+                .is_none()
+        );
+        let resumed_report = diagnostics
+            .observe(
+                IpcFallbackObservation::SubscribeFailed,
+                start + IPC_FALLBACK_DIAGNOSTIC_INTERVAL,
+            )
+            .expect("category becomes reportable after the fixed interval");
+        assert_eq!(resumed_report.suppressed_same_kind, 1);
+        assert_eq!(diagnostics.subscribe_failures, 3);
+        assert_eq!(diagnostics.suppressed_reports_total, 1);
+
+        diagnostics.subscribe_failures = u64::MAX;
+        diagnostics.suppressed_reports_total = u64::MAX;
+        let index = IpcFallbackDiagnosticKind::SubscribeFailure.index();
+        diagnostics.suppressed_since_report[index] = u64::MAX;
+        assert!(
+            diagnostics
+                .observe(
+                    IpcFallbackObservation::SubscribeFailed,
+                    start + IPC_FALLBACK_DIAGNOSTIC_INTERVAL,
+                )
+                .is_none(),
+            "same-timestamp repeat remains suppressed"
+        );
+        assert_eq!(diagnostics.subscribe_failures, u64::MAX);
+        assert_eq!(diagnostics.suppressed_reports_total, u64::MAX);
+        assert_eq!(diagnostics.suppressed_since_report[index], u64::MAX);
     }
 
     #[cfg(unix)]
@@ -23638,6 +25333,200 @@ mod watch_events_tests {
         assert!(!ipc_event_is_duplicate(None, Some(5)));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn ipc_relay_protocol_rejects_malformed_unknown_and_invalid_cursor_records() {
+        assert_eq!(
+            decode_ipc_relay_record("{not-json")
+                .expect_err("malformed stream JSON must fail closed"),
+            IpcRelayProtocolFault::MalformedJson
+        );
+        assert_eq!(
+            ipc_relay_record_type(&serde_json::json!({"type": "future-control"}))
+                .expect_err("unknown stream records require version-aware recovery"),
+            IpcRelayProtocolFault::UnknownRecordType
+        );
+
+        let mut invalid_cursors = Vec::new();
+        for cursor in [
+            serde_json::Value::Null,
+            serde_json::json!("9"),
+            serde_json::json!(-1),
+            serde_json::json!(0),
+        ] {
+            let mut invalid = ipc_persisted_event(9);
+            invalid["cursor"] = cursor;
+            invalid_cursors.push(invalid);
+        }
+        let mut mismatched_id = ipc_persisted_event(9);
+        mismatched_id["id"] = serde_json::json!(8);
+        invalid_cursors.push(mismatched_id);
+
+        for invalid in invalid_cursors {
+            assert_eq!(
+                ipc_event_cursor(&invalid).expect_err("invalid event cursor must fail closed"),
+                IpcRelayProtocolFault::InvalidEventCursor,
+                "unexpectedly admitted {invalid}"
+            );
+        }
+
+        let mut extra_field = ipc_persisted_event(9);
+        extra_field["future_field"] = serde_json::json!(true);
+        let mut handled = ipc_persisted_event(9);
+        handled["handled"] = serde_json::json!(true);
+        let mut invalid_severity = ipc_persisted_event(9);
+        invalid_severity["severity"] = serde_json::json!("future-severity");
+        let mut malformed_live = ipc_live_event("pane_discovered");
+        malformed_live["extracted"] = serde_json::json!({"domain": "local"});
+        for invalid in [
+            serde_json::json!({"type": "event", "event_type": "detection"}),
+            extra_field,
+            handled,
+            invalid_severity,
+            ipc_live_event("unknown_live_signal"),
+            malformed_live,
+        ] {
+            assert_eq!(
+                ipc_event_cursor(&invalid).expect_err("invalid event shape must fail closed"),
+                IpcRelayProtocolFault::InvalidRecordShape,
+                "unexpectedly admitted {invalid}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ipc_relay_protocol_accepts_persisted_and_declared_live_only_cursors() {
+        assert_eq!(ipc_event_cursor(&ipc_persisted_event(1)), Ok(Some(1)));
+        for event_type in ["pane_discovered", "pane_disappeared"] {
+            let mut persisted = ipc_persisted_event(2);
+            persisted["event_type"] = serde_json::json!(event_type);
+            assert_eq!(
+                ipc_event_cursor(&persisted),
+                Ok(Some(2)),
+                "positive cursor/id and persisted metadata disambiguate a user rule event"
+            );
+            assert_eq!(ipc_event_cursor(&ipc_live_event(event_type)), Ok(None));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persisted_ipc_records_are_wakeups_until_the_ordered_db_drain_advances() {
+        let (_directory, database_path, event_ids) = watch_claim_fixture(2);
+        run_watch_claim_async(async move {
+            let stdout = std::io::stdout();
+            let mut cursor = Some(0);
+            let mut last_event_emit = None;
+            let mut last_emit = std::time::Instant::now();
+            let initial_last_emit = last_emit;
+
+            for id in [event_ids[1], event_ids[0]] {
+                let line = serde_json::to_string(&ipc_persisted_event(id))
+                    .expect("serialize persisted IPC wakeup");
+                let action = relay_ipc_event_line(
+                    &stdout,
+                    &line,
+                    &mut cursor,
+                    None,
+                    &mut last_event_emit,
+                    0,
+                    std::time::Duration::ZERO,
+                    &mut last_emit,
+                )
+                .await
+                .expect("classify persisted IPC wakeup");
+                assert_eq!(action, IpcRelayAction::DurableWakeup);
+                assert_eq!(cursor, Some(0), "IPC publication order is not a cursor");
+                assert_eq!(last_event_emit, None, "a wakeup emits no event payload");
+                assert_eq!(last_emit, initial_last_emit, "a wakeup writes no record");
+            }
+
+            let storage = frankenterm_core::storage::StorageHandle::new(&database_path)
+                .await
+                .expect("open durable wakeup fixture");
+            let mut query = watch_claim_query(0);
+            query.limit = Some(10);
+            let stored = storage
+                .get_events_stream(query)
+                .await
+                .expect("drain durable events in SQLite-id order");
+            assert_eq!(
+                stored.iter().map(|event| event.id).collect::<Vec<_>>(),
+                event_ids,
+                "an out-of-order 2 then 1 wakeup must still drain as 1 then 2"
+            );
+            for event in stored {
+                assert!(event.id > cursor.expect("fixture cursor"));
+                cursor = Some(event.id);
+            }
+            assert_eq!(cursor, event_ids.last().copied());
+            storage.shutdown().await.expect("shutdown wakeup fixture");
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ipc_relay_protocol_validates_closed_heartbeat_and_gap_shapes() {
+        assert_eq!(
+            validate_ipc_heartbeat_record(&serde_json::json!({
+                "type": "heartbeat",
+                "cursor": null,
+                "now": 12_345,
+            })),
+            Ok(())
+        );
+        assert_eq!(
+            validate_ipc_gap_record(&serde_json::json!({
+                "type": "gap",
+                "reason": "broadcast_lag",
+                "missed_count": 3,
+                "cursor": null,
+                "message": "three records were missed",
+            })),
+            Ok(())
+        );
+
+        for invalid in [
+            serde_json::json!({"type": "heartbeat", "cursor": 1, "now": 12_345}),
+            serde_json::json!({"type": "heartbeat", "cursor": null, "now": -1}),
+            serde_json::json!({"type": "heartbeat", "cursor": null, "now": 12_345, "extra": true}),
+        ] {
+            assert_eq!(
+                validate_ipc_heartbeat_record(&invalid),
+                Err(IpcRelayProtocolFault::InvalidRecordShape)
+            );
+        }
+        for invalid in [
+            serde_json::json!({"type": "gap", "reason": "other", "missed_count": 3, "cursor": null, "message": "x"}),
+            serde_json::json!({"type": "gap", "reason": "broadcast_lag", "missed_count": 0, "cursor": null, "message": "x"}),
+            serde_json::json!({"type": "gap", "reason": "broadcast_lag", "missed_count": 3, "cursor": 9, "message": "x"}),
+        ] {
+            assert_eq!(
+                validate_ipc_gap_record(&invalid),
+                Err(IpcRelayProtocolFault::InvalidRecordShape)
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ipc_protocol_fault_gap_discloses_unrecoverable_live_signal_risk() {
+        let gap = watch_ipc_protocol_fault_ndjson(
+            Some(41),
+            IpcRelayProtocolFault::MalformedJson,
+            12_345,
+        );
+        assert_eq!(gap["type"], "gap");
+        assert_eq!(gap["reason"], "ipc_protocol_fault");
+        assert_eq!(gap["cursor"], 41);
+        assert_eq!(gap["fault_kind"], "malformed_json");
+        assert_eq!(gap["now"], 12_345);
+        let message = gap["message"].as_str().expect("gap message");
+        assert!(message.contains("persisted detections"));
+        assert!(message.contains("live-only pane signals may have been missed"));
+    }
+
     #[test]
     fn cursor_expiry_detects_pruned_gap_only() {
         // events 6..9 pruned: requested=5, oldest=10 => expired, re-baseline 10.
@@ -23650,6 +25539,19 @@ mod watch_events_tests {
         // no cursor / no retained events => not expired.
         assert_eq!(watch_cursor_expiry(None, Some(10)), None);
         assert_eq!(watch_cursor_expiry(Some(5), None), None);
+
+        // Boundary cursors must preserve the same ordering semantics without
+        // overflowing either side of the signed event-ID domain.
+        assert_eq!(watch_cursor_expiry(Some(i64::MAX), Some(i64::MAX)), None);
+        assert_eq!(watch_cursor_expiry(Some(i64::MIN), Some(i64::MIN)), None);
+        assert_eq!(
+            watch_cursor_expiry(Some(i64::MIN), Some(i64::MIN + 1)),
+            None
+        );
+        assert_eq!(
+            watch_cursor_expiry(Some(i64::MIN), Some(i64::MIN + 2)),
+            Some(i64::MIN + 2)
+        );
     }
 
     #[test]
@@ -27614,17 +29516,25 @@ async fn distributed_persist_payload(
                 None,
                 detected_at,
             );
-            let event_id = storage_handle
-                .record_event_with_cx(&persist_cx, stored_event)
+            let outcome = storage_handle
+                .record_event_outcome_with_cx(&persist_cx, stored_event)
                 .await?;
             drop(storage_handle);
 
-            let _ = event_bus.publish(Event::PatternDetected {
-                pane_id: remote_pane_id,
-                pane_uuid,
-                detection,
-                event_id: Some(event_id),
-            });
+            if let Some(event_id) = outcome.inserted_event_id() {
+                let _ = event_bus.publish(Event::PatternDetected {
+                    pane_id: remote_pane_id,
+                    pane_uuid,
+                    detection,
+                    event_id: Some(event_id),
+                });
+            } else {
+                tracing::debug!(
+                    pane_id = remote_pane_id,
+                    event_id = outcome.event_id(),
+                    "Distributed ingest suppressed duplicate detection after durable dedupe"
+                );
+            }
         }
         WirePayload::PanesMeta(panes_meta) => {
             for pane in panes_meta.panes {
@@ -31162,11 +33072,11 @@ async fn run_saved_search_scheduler(
             // ft-xbnl0.2.3 tick 237: cx-first storage write.
             let storage_cx = frankenterm_core::cx::Cx::current()
                 .unwrap_or_else(frankenterm_core::cx::for_request);
-            let event_id = match storage
-                .record_event_with_cx(&storage_cx, stored_event)
+            let outcome = match storage
+                .record_event_outcome_with_cx(&storage_cx, stored_event)
                 .await
             {
-                Ok(id) => id,
+                Ok(outcome) => outcome,
                 Err(err) => {
                     tracing::warn!(
                         pane_id = pane_id_for_event,
@@ -31178,17 +33088,26 @@ async fn run_saved_search_scheduler(
                 }
             };
 
-            let delivered = event_bus.publish(Event::PatternDetected {
-                pane_id: pane_id_for_event,
-                pane_uuid: None,
-                detection,
-                event_id: Some(event_id),
-            });
-            if delivered == 0 {
+            if let Some(event_id) = outcome.inserted_event_id() {
+                let delivered = event_bus.publish(Event::PatternDetected {
+                    pane_id: pane_id_for_event,
+                    pane_uuid: None,
+                    detection,
+                    event_id: Some(event_id),
+                });
+                if delivered == 0 {
+                    tracing::debug!(
+                        pane_id = pane_id_for_event,
+                        search = %search_id,
+                        "Saved search scheduler: alert published but no subscribers"
+                    );
+                }
+            } else {
                 tracing::debug!(
                     pane_id = pane_id_for_event,
                     search = %search_id,
-                    "Saved search scheduler: alert published but no subscribers"
+                    event_id = outcome.event_id(),
+                    "Saved search scheduler: suppressed duplicate alert after durable dedupe"
                 );
             }
 
@@ -35675,7 +37594,6 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             poll_interval_ms,
                             max_hz,
                         } => {
-                            use std::io::Write as _;
                             if cursor.is_some_and(|c| c < 0) {
                                 let response = RobotResponse::<serde_json::Value>::error_with_code(
                                     ROBOT_ERR_INVALID_ARGS,
@@ -35686,6 +37604,23 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                 print_robot_response(&response, format, stats)?;
                                 return Ok(());
                             }
+                            let severity = match normalize_watch_severity(severity.as_deref()) {
+                                Ok(severity) => severity,
+                                Err(message) => {
+                                    let response =
+                                        RobotResponse::<serde_json::Value>::error_with_code(
+                                            ROBOT_ERR_INVALID_ARGS,
+                                            message.to_string(),
+                                            Some(
+                                                "Use one of: --severity info, --severity warning, or --severity critical. Matching is case-insensitive."
+                                                    .to_string(),
+                                            ),
+                                            elapsed_ms(start),
+                                        );
+                                    print_robot_response(&response, format, stats)?;
+                                    return Ok(());
+                                }
+                            };
                             let layout = match config.workspace_layout(Some(&workspace_root)) {
                                 Ok(l) => l,
                                 Err(e) => {
@@ -35731,13 +37666,15 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             let mut last_event_emit: Option<std::time::Instant> = None;
                             let stdout = std::io::stdout();
 
-                            // ft-7h5da.4.1: live IPC transport state. When the
-                            // watcher is up, `--follow` subscribes to its
-                            // EventBus over IPC and relays detections as they
-                            // happen (low latency); when the watcher is down or
-                            // dies mid-stream, it transparently falls back to the
-                            // DB-cursor poll loop below. Unix-only optimization —
-                            // other platforms always use the DB path.
+                            // ft-7h5da.4.1: live IPC transport state. Persisted
+                            // EventBus records are low-latency wakeups only;
+                            // exact payload, identity, ordering, claims, and
+                            // cursor movement always come from the subsequent
+                            // durable DB drain. Cursorless pane lifecycle records
+                            // are relayed best-effort. When the watcher is down or
+                            // dies mid-stream, the same DB-cursor loop remains the
+                            // fallback. Unix-only optimization — other platforms
+                            // always use the DB path.
                             #[cfg(unix)]
                             let cx = frankenterm_core::cx::Cx::current()
                                 .unwrap_or_else(frankenterm_core::cx::for_request);
@@ -35745,6 +37682,12 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             let mut ipc_stream: Option<
                                 frankenterm_core::ipc::IpcEventStream,
                             > = None;
+                            #[cfg(unix)]
+                            let mut ipc_stream_validated = false;
+                            #[cfg(unix)]
+                            let mut ipc_diagnostics = IpcFallbackDiagnostics::default();
+                            #[cfg(unix)]
+                            let mut ipc_transport_gap_open = false;
 
                             // ft-7h5da.4.2: typed cursor_expired. If --cursor
                             // predates the oldest globally-retained event,
@@ -35766,23 +37709,38 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                     since: None,
                                     until: None,
                                 };
-                                let oldest = storage
+                                let oldest_events = match storage
                                     .get_events_stream(oldest_query)
                                     .await
-                                    .ok()
-                                    .and_then(|evs| evs.first().map(|e| e.id));
+                                {
+                                    Ok(events) => events,
+                                    Err(error) => {
+                                        let response = RobotResponse::<serde_json::Value>::error_with_code(
+                                            ROBOT_ERR_STORAGE,
+                                            format!("Failed to establish the oldest retained event before cursor resumption: {error}"),
+                                            Some(
+                                                "Retry after storage recovers; the follower refused to guess whether retention pruned the requested cursor."
+                                                    .to_string(),
+                                            ),
+                                            elapsed_ms(start),
+                                        );
+                                        print_robot_response(&response, format, stats)?;
+                                        storage.shutdown().await.ok();
+                                        return Ok(());
+                                    }
+                                };
+                                let oldest = oldest_events.first().map(|event| event.id);
                                 if let Some(oldest) = watch_cursor_expiry(Some(requested), oldest) {
                                     let rec = watch_cursor_expired_ndjson(requested, oldest);
                                     let cont = {
                                         let mut lock = stdout.lock();
-                                        let cont = write_ndjson_line(&mut lock, &rec)?;
-                                        let _ = lock.flush();
-                                        cont
+                                        write_ndjson_line(&mut lock, &rec)?
                                     };
                                     if !cont {
                                         storage.shutdown().await.ok();
                                         return Ok(());
                                     }
+                                    note_watch_output_emitted(&mut last_emit);
                                     current_cursor = Some(oldest - 1);
                                 }
                             }
@@ -35815,51 +37773,34 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                     }
                                 };
                                 let batch_len = events.len();
+                                let mut claim_retry_hint_ms = None;
 
-                                for mut event in events {
-                                    // Advance the cursor past every scanned event
-                                    // (even filtered ones) so the follower never
-                                    // re-scans them.
-                                    current_cursor = Some(event.id);
+                                for event in events {
                                     if !watch_event_passes_filters(
                                         &event,
                                         severity_filter,
                                         rule_glob,
                                     ) {
+                                        // Filtered records were intentionally
+                                        // examined and need no delivery claim.
+                                        current_cursor = Some(event.id);
                                         continue;
                                     }
-                                    if claim {
-                                        if let Err(e) =
-                                            mark_watch_event_claimed(&storage, &mut event).await
-                                        {
-                                            let response =
-                                                RobotResponse::<serde_json::Value>::error_with_code(
-                                                    ROBOT_ERR_STORAGE,
-                                                    format!(
-                                                        "Failed to claim event {}: {e}",
-                                                        event.id
-                                                    ),
-                                                    None,
-                                                    elapsed_ms(start),
-                                                );
-                                            print_robot_response(&response, format, stats)?;
-                                            break 'follow;
-                                        }
-                                    }
-                                    // max_hz: pace emissions with an async sleep
-                                    // (outside the stdout lock) so throughput is
-                                    // bounded to N events/sec (ft-7h5da.4.4).
-                                    if let Some(min) = max_hz_interval {
-                                        if let Some(prev) = last_event_emit {
-                                            let elapsed = prev.elapsed();
-                                            if elapsed < min {
-                                                let wait = min.saturating_sub(elapsed);
-                                                let _ = frankenterm_core::runtime_async::spawn_blocking(
-                                                    move || std::thread::sleep(wait),
-                                                )
-                                                .await;
-                                            }
-                                        }
+                                    // Pace before acquiring a delivery lease: a
+                                    // slow configured rate must never consume a
+                                    // lease's ownership window while sleeping.
+                                    if !pace_watch_event(
+                                        max_hz_interval,
+                                        last_event_emit,
+                                        &stdout,
+                                        current_cursor,
+                                        heartbeat_interval_ms,
+                                        heartbeat,
+                                        &mut last_emit,
+                                    )
+                                    .await?
+                                    {
+                                        break 'follow;
                                     }
                                     // Redaction-before-emission, reused verbatim
                                     // from the export streamer: matched_text +
@@ -35867,73 +37808,306 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                     let redacted =
                                         frankenterm_core::export::redact_event(event, &redactor);
                                     let record = watch_event_ndjson(&redacted);
-                                    let cont = {
-                                        let mut lock = stdout.lock();
-                                        let cont = write_ndjson_line(&mut lock, &record)?;
-                                        let _ = lock.flush();
-                                        cont
-                                    };
-                                    if !cont {
-                                        break 'follow; // consumer closed the pipe
+
+                                    if claim {
+                                        match deliver_claimed_watch_event(
+                                            &storage,
+                                            redacted.id,
+                                            record,
+                                            |record| {
+                                                let mut lock = stdout.lock();
+                                                write_ndjson_line(&mut lock, record)
+                                            },
+                                        )
+                                        .await?
+                                        {
+                                            WatchEventClaimDelivery::Delivered => {
+                                                current_cursor = Some(redacted.id);
+                                                let now = std::time::Instant::now();
+                                                last_emit = now;
+                                                last_event_emit = Some(now);
+                                            }
+                                            WatchEventClaimDelivery::PipeClosed => break 'follow,
+                                            WatchEventClaimDelivery::AlreadyHandledOrMissing => {
+                                                // Another path completed or removed
+                                                // this exact row after the query.
+                                                current_cursor = Some(redacted.id);
+                                            }
+                                            WatchEventClaimDelivery::LeasedUntil {
+                                                expires_at_ms,
+                                            } => {
+                                                claim_retry_hint_ms = Some(expires_at_ms);
+                                                break;
+                                            }
+                                            WatchEventClaimDelivery::FinalizationLost => {
+                                                // The record reached the consumer, but
+                                                // ownership changed before the CAS.
+                                                // Retain the cursor and immediately
+                                                // re-establish durable truth; at-least-
+                                                // once duplication is safer than loss.
+                                                claim_retry_hint_ms = Some(now_ms_i64());
+                                                break;
+                                            }
+                                        }
+                                    } else {
+                                        let continue_writing = {
+                                            let mut lock = stdout.lock();
+                                            write_ndjson_line(&mut lock, &record)?
+                                        };
+                                        if !continue_writing {
+                                            break 'follow;
+                                        }
+                                        current_cursor = Some(redacted.id);
+                                        let now = std::time::Instant::now();
+                                        last_emit = now;
+                                        last_event_emit = Some(now);
                                     }
-                                    let now = std::time::Instant::now();
-                                    last_emit = now;
-                                    last_event_emit = Some(now);
                                 }
 
+                                if let Some(retry_hint_ms) = claim_retry_hint_ms {
+                                    if !follow {
+                                        break 'follow;
+                                    }
+                                    if !emit_watch_heartbeat_if_due(
+                                        &stdout,
+                                        current_cursor,
+                                        heartbeat_interval_ms,
+                                        heartbeat,
+                                        &mut last_emit,
+                                    )? {
+                                        break 'follow;
+                                    }
+                                    // Recheck on the configured bounded poll so
+                                    // an owner that releases early wakes this
+                                    // follower before the original expiry. The
+                                    // storage CAS still prevents an early steal.
+                                    let wait = watch_claim_retry_delay(
+                                        now_ms_i64(),
+                                        retry_hint_ms,
+                                        poll,
+                                    );
+                                    let wait = watch_delay_bounded_by_heartbeat(
+                                        wait,
+                                        heartbeat_interval_ms,
+                                        heartbeat,
+                                        last_emit.elapsed(),
+                                    );
+                                    if !wait.is_zero() {
+                                        frankenterm_core::runtime_async::spawn_blocking(move || {
+                                            std::thread::sleep(wait);
+                                        })
+                                        .await
+                                        .map_err(|error| {
+                                            std::io::Error::other(format!(
+                                                "watch-events lease retry delay failed: {error}"
+                                            ))
+                                        })?;
+                                    }
+                                    continue 'follow;
+                                }
                                 if !follow {
                                     break 'follow;
                                 }
                                 // Full batch => keep draining before idling.
                                 if batch_len >= batch_limit {
+                                    if !emit_watch_heartbeat_if_due(
+                                        &stdout,
+                                        current_cursor,
+                                        heartbeat_interval_ms,
+                                        heartbeat,
+                                        &mut last_emit,
+                                    )? {
+                                        break 'follow;
+                                    }
                                     continue 'follow;
                                 }
 
                                 // ft-7h5da.4.1: caught up on the DB backlog.
-                                // Prefer the live IPC transport when the watcher
-                                // is up; relay events as they're detected instead
-                                // of DB-polling. Falls back transparently to the
-                                // heartbeat+poll tail below when the watcher is
-                                // down or closes the stream.
+                                // Prefer IPC wakeups over sleeping for the next
+                                // DB poll when the watcher is up. Persisted-event
+                                // wakeups immediately re-enter the ordered DB
+                                // drain; only cursorless lifecycle records and
+                                // control records are emitted directly. Falls
+                                // back transparently to heartbeat+poll when the
+                                // watcher is down or closes the stream.
                                 #[cfg(unix)]
                                 {
                                     if let Some(mut stream) = ipc_stream.take() {
                                         // `take()` leaves `ipc_stream` None;
-                                        // relay live events until the watcher
-                                        // closes the stream (or the consumer
-                                        // closes the pipe).
-                                        while let Ok(Some(line)) =
-                                            stream.next_line_with_cx(&cx).await
-                                        {
-                                            match relay_ipc_event_line(
-                                                &stdout,
-                                                &line,
-                                                &mut current_cursor,
-                                                max_hz_interval,
-                                                &mut last_event_emit,
-                                                claim.then_some(&storage),
-                                            )
-                                            .await?
-                                            {
-                                                IpcRelayAction::PipeClosed => {
-                                                    break 'follow;
+                                        // Consume wakeups and cursorless live
+                                        // records until the watcher closes the
+                                        // stream (or the consumer closes the
+                                        // pipe).
+                                        loop {
+                                            match stream.next_line_with_cx(&cx).await {
+                                                Ok(Some(line)) => {
+                                                    match relay_ipc_event_line(
+                                                        &stdout,
+                                                        &line,
+                                                        &mut current_cursor,
+                                                        max_hz_interval,
+                                                        &mut last_event_emit,
+                                                        heartbeat_interval_ms,
+                                                        heartbeat,
+                                                        &mut last_emit,
+                                                    )
+                                                    .await?
+                                                    {
+                                                        IpcRelayAction::PipeClosed => {
+                                                            break 'follow;
+                                                        }
+                                                        action @ IpcRelayAction::DurableWakeup => {
+                                                            if note_valid_ipc_stream_record(
+                                                                action,
+                                                                &mut ipc_stream_validated,
+                                                                &mut ipc_transport_gap_open,
+                                                            ) {
+                                                                observe_ipc_fallback(
+                                                                    &mut ipc_diagnostics,
+                                                                    IpcFallbackObservation::StreamValidated,
+                                                                    "server produced a contract-valid persisted-event wakeup",
+                                                                );
+                                                            }
+                                                            // Keep the healthy subscription while the
+                                                            // outer loop drains exact stored rows in
+                                                            // monotonically increasing SQLite-id order.
+                                                            ipc_stream = Some(stream);
+                                                            continue 'follow;
+                                                        }
+                                                        // Broadcast lag: drop out of
+                                                        // the relay so the outer loop
+                                                        // re-drains the DB cursor
+                                                        // (backfilling missed events)
+                                                        // and then re-subscribes.
+                                                        IpcRelayAction::Resync => {
+                                                            observe_ipc_fallback(
+                                                                &mut ipc_diagnostics,
+                                                                IpcFallbackObservation::LagResync,
+                                                                "server reported a broadcast-lag gap",
+                                                            );
+                                                            // The server gap was already relayed to
+                                                            // the consumer by `relay_ipc_event_line`.
+                                                            ipc_transport_gap_open = true;
+                                                            continue 'follow;
+                                                        }
+                                                        IpcRelayAction::ProtocolFault(fault) => {
+                                                            observe_ipc_fallback(
+                                                                &mut ipc_diagnostics,
+                                                                IpcFallbackObservation::ProtocolFault,
+                                                                fault.as_str(),
+                                                            );
+                                                            let gap_was_open =
+                                                                ipc_transport_gap_open;
+                                                            let continue_writing = {
+                                                                let mut lock = stdout.lock();
+                                                                write_ipc_protocol_fault_once(
+                                                                    &mut lock,
+                                                                    &mut ipc_transport_gap_open,
+                                                                    current_cursor,
+                                                                    fault,
+                                                                    now_ms_i64(),
+                                                                )?
+                                                            };
+                                                            if !continue_writing {
+                                                                break 'follow;
+                                                            }
+                                                            if !gap_was_open {
+                                                                note_watch_output_emitted(
+                                                                    &mut last_emit,
+                                                                );
+                                                            }
+                                                            continue 'follow;
+                                                        }
+                                                        action @ IpcRelayAction::Emitted => {
+                                                            if note_valid_ipc_stream_record(
+                                                                action,
+                                                                &mut ipc_stream_validated,
+                                                                &mut ipc_transport_gap_open,
+                                                            ) {
+                                                                observe_ipc_fallback(
+                                                                    &mut ipc_diagnostics,
+                                                                    IpcFallbackObservation::StreamValidated,
+                                                                    "server produced a contract-valid event or heartbeat record",
+                                                                );
+                                                            }
+                                                        }
+                                                        action @ IpcRelayAction::Skipped => {
+                                                            if note_valid_ipc_stream_record(
+                                                                action,
+                                                                &mut ipc_stream_validated,
+                                                                &mut ipc_transport_gap_open,
+                                                            ) {
+                                                                observe_ipc_fallback(
+                                                                    &mut ipc_diagnostics,
+                                                                    IpcFallbackObservation::StreamValidated,
+                                                                    "server produced a contract-valid event record",
+                                                                );
+                                                            }
+                                                        }
+                                                    }
                                                 }
-                                                // Broadcast lag: drop out of the
-                                                // relay so the outer loop re-drains
-                                                // the DB cursor (backfilling missed
-                                                // events) and then re-subscribes.
-                                                IpcRelayAction::Resync => {
+                                                Ok(None) => {
+                                                    observe_ipc_fallback(
+                                                        &mut ipc_diagnostics,
+                                                        IpcFallbackObservation::StreamEof,
+                                                        "watcher closed the IPC event stream",
+                                                    );
+                                                    let gap_was_open =
+                                                        ipc_transport_gap_open;
+                                                    let continue_writing = {
+                                                        let mut lock = stdout.lock();
+                                                        write_ipc_transport_gap_once(
+                                                            &mut lock,
+                                                            &mut ipc_transport_gap_open,
+                                                            current_cursor,
+                                                            IpcTransportGapReason::StreamEof,
+                                                            now_ms_i64(),
+                                                        )?
+                                                    };
+                                                    if !continue_writing {
+                                                        break 'follow;
+                                                    }
+                                                    if !gap_was_open {
+                                                        note_watch_output_emitted(
+                                                            &mut last_emit,
+                                                        );
+                                                    }
                                                     break;
                                                 }
-                                                IpcRelayAction::Emitted
-                                                | IpcRelayAction::Skipped => {
-                                                    last_emit = std::time::Instant::now();
+                                                Err(error) => {
+                                                    observe_ipc_fallback(
+                                                        &mut ipc_diagnostics,
+                                                        IpcFallbackObservation::StreamReadFailed,
+                                                        &error,
+                                                    );
+                                                    let gap_was_open =
+                                                        ipc_transport_gap_open;
+                                                    let continue_writing = {
+                                                        let mut lock = stdout.lock();
+                                                        write_ipc_transport_gap_once(
+                                                            &mut lock,
+                                                            &mut ipc_transport_gap_open,
+                                                            current_cursor,
+                                                            IpcTransportGapReason::StreamReadFailure,
+                                                            now_ms_i64(),
+                                                        )?
+                                                    };
+                                                    if !continue_writing {
+                                                        break 'follow;
+                                                    }
+                                                    if !gap_was_open {
+                                                        note_watch_output_emitted(
+                                                            &mut last_emit,
+                                                        );
+                                                    }
+                                                    break;
                                                 }
                                             }
                                         }
-                                        // Watcher closure or a read failure leaves
-                                        // `ipc_stream` as None, so the DB-poll
-                                        // fallback retries IPC on the next iteration.
+                                        // A lag gap, watcher closure, or read
+                                        // failure leaves `ipc_stream` as None,
+                                        // so the durable DB-cursor fallback
+                                        // repairs/drains before retrying IPC.
                                     } else {
                                         // Not subscribed yet: try now. On success
                                         // loop back to drain any gap between the
@@ -35943,7 +38117,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                         let client = frankenterm_core::ipc::IpcClient::new(
                                             &layout.ipc_socket_path,
                                         );
-                                        if let Ok(stream) = client
+                                        match client
                                             .subscribe_events_with_cx(
                                                 &cx,
                                                 pane,
@@ -35953,34 +38127,76 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                             )
                                             .await
                                         {
-                                            ipc_stream = Some(stream);
-                                            continue 'follow;
+                                            Ok(stream) => {
+                                                // Connecting and flushing the subscribe request
+                                                // does not prove the peer can produce the stream
+                                                // contract. Keep a prior degraded interval open
+                                                // until the relay accepts its first valid record.
+                                                ipc_stream_validated = false;
+                                                ipc_stream = Some(stream);
+                                                continue 'follow;
+                                            }
+                                            Err(error) => {
+                                                observe_ipc_fallback(
+                                                    &mut ipc_diagnostics,
+                                                    IpcFallbackObservation::SubscribeFailed,
+                                                    &error,
+                                                );
+                                                let gap_was_open =
+                                                    ipc_transport_gap_open;
+                                                let continue_writing = {
+                                                    let mut lock = stdout.lock();
+                                                    write_ipc_transport_gap_once(
+                                                        &mut lock,
+                                                        &mut ipc_transport_gap_open,
+                                                        current_cursor,
+                                                        IpcTransportGapReason::SubscribeUnavailable,
+                                                        now_ms_i64(),
+                                                    )?
+                                                };
+                                                if !continue_writing {
+                                                    break 'follow;
+                                                }
+                                                if !gap_was_open {
+                                                    note_watch_output_emitted(
+                                                        &mut last_emit,
+                                                    );
+                                                }
+                                            }
                                         }
                                         // Watcher down: fall through to DB poll.
                                     }
                                 }
 
                                 // Idle: emit a heartbeat if enabled and due.
-                                if heartbeat_interval_ms > 0 && last_emit.elapsed() >= heartbeat {
-                                    let hb = watch_heartbeat_ndjson(current_cursor, now_ms_i64());
-                                    let cont = {
-                                        let mut lock = stdout.lock();
-                                        let cont = write_ndjson_line(&mut lock, &hb)?;
-                                        let _ = lock.flush();
-                                        cont
-                                    };
-                                    if !cont {
-                                        break 'follow;
-                                    }
-                                    last_emit = std::time::Instant::now();
+                                if !emit_watch_heartbeat_if_due(
+                                    &stdout,
+                                    current_cursor,
+                                    heartbeat_interval_ms,
+                                    heartbeat,
+                                    &mut last_emit,
+                                )? {
+                                    break 'follow;
                                 }
                                 // See above: blocking-pool delay (async timer
                                 // sleep hangs without a timer-capable cx).
-                                let _ =
+                                let wait = watch_delay_bounded_by_heartbeat(
+                                    poll,
+                                    heartbeat_interval_ms,
+                                    heartbeat,
+                                    last_emit.elapsed(),
+                                );
+                                if !wait.is_zero() {
                                     frankenterm_core::runtime_async::spawn_blocking(move || {
-                                        std::thread::sleep(poll);
+                                        std::thread::sleep(wait);
                                     })
-                                    .await;
+                                    .await
+                                    .map_err(|error| {
+                                        std::io::Error::other(format!(
+                                            "watch-events idle poll delay failed: {error}"
+                                        ))
+                                    })?;
+                                }
                             }
 
                             storage.shutdown().await.ok();
@@ -35992,7 +38208,6 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             poll_interval_ms,
                             cursor,
                         } => {
-                            use std::io::Write as _;
                             // Parse conditions (fail fast on bad syntax).
                             let mut any_conds: Vec<AwaitCondition> = Vec::with_capacity(any.len());
                             let mut all_conds: Vec<AwaitCondition> = Vec::with_capacity(all.len());
@@ -36200,7 +38415,6 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             {
                                 let mut lock = stdout.lock();
                                 let _ = write_ndjson_line(&mut lock, &result)?;
-                                let _ = lock.flush();
                             }
                             storage.shutdown().await.ok();
                         }
@@ -70962,6 +73176,98 @@ recorder_backend = "frankensqlite"
                 let storage_handle = storage.lock().await.clone(); // ubs:ignore
                 storage_handle.shutdown().await.unwrap();
             }
+            drop(storage);
+            let _ = std::fs::remove_file(&db_path);
+            let _ = std::fs::remove_file(format!("{db_path}-wal"));
+            let _ = std::fs::remove_file(format!("{db_path}-shm"));
+        });
+    }
+
+    #[cfg(feature = "distributed")]
+    #[test]
+    fn distributed_detection_dedupe_retry_is_not_republished() {
+        run_async_test(async {
+            use frankenterm_core::patterns::{AgentType, Severity};
+            use frankenterm_core::storage::EventQuery;
+            use frankenterm_core::wire_protocol::{DetectionNotice, WirePayload};
+
+            let (storage_handle, db_path) =
+                setup_storage("distributed_detection_dedupe_retry").await;
+            let storage =
+                std::sync::Arc::new(frankenterm_core::runtime_async::Mutex::new(storage_handle));
+            let event_bus = std::sync::Arc::new(frankenterm_core::events::EventBus::new(64));
+            let mut subscriber = event_bus.subscribe_detections();
+            let pane_seq_by_sender =
+                frankenterm_core::runtime_async::Mutex::new(std::collections::HashMap::<
+                    (String, u64),
+                    u64,
+                >::new());
+
+            let sender = "agent-detection-dedupe";
+            let source_pane_id = 29;
+            let remote_pane_id = distributed_remote_pane_id(sender, source_pane_id);
+            let notice = DetectionNotice {
+                rule_id: "codex.usage.reached".to_string(),
+                agent_type: AgentType::Codex,
+                event_type: "usage.reached".to_string(),
+                severity: Severity::Warning,
+                confidence: 0.95,
+                extracted: serde_json::json!({"remaining": 0}),
+                matched_text: "usage limit reached".to_string(),
+                pane_id: source_pane_id,
+                pane_uuid: Some("remote-dedupe-pane".to_string()),
+                detected_at_ms: 1_700_000_003_000,
+            };
+
+            distributed_persist_payload(
+                sender,
+                None,
+                WirePayload::Detection(notice.clone()),
+                &storage,
+                &event_bus,
+                &pane_seq_by_sender,
+            )
+            .await
+            .unwrap();
+            let first = subscriber
+                .try_recv()
+                .expect("newly inserted distributed detection should be published")
+                .expect("event bus delivery should succeed");
+            assert!(matches!(
+                first,
+                frankenterm_core::events::Event::PatternDetected {
+                    pane_id,
+                    event_id: Some(_),
+                    ..
+                } if pane_id == remote_pane_id
+            ));
+
+            distributed_persist_payload(
+                sender,
+                None,
+                WirePayload::Detection(notice),
+                &storage,
+                &event_bus,
+                &pane_seq_by_sender,
+            )
+            .await
+            .unwrap();
+            assert!(
+                subscriber.try_recv().is_none(),
+                "a deduplicated retry must not masquerade as a new live detection"
+            );
+
+            let storage_handle = storage.lock().await.clone(); // ubs:ignore
+            let events = storage_handle
+                .get_events(EventQuery {
+                    pane_id: Some(remote_pane_id),
+                    limit: Some(10),
+                    ..EventQuery::default()
+                })
+                .await
+                .unwrap();
+            assert_eq!(events.len(), 1, "the retry must retain one durable row");
+            storage_handle.shutdown().await.unwrap();
             drop(storage);
             let _ = std::fs::remove_file(&db_path);
             let _ = std::fs::remove_file(format!("{db_path}-wal"));

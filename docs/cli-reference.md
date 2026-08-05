@@ -279,7 +279,7 @@ ft robot events triage <event_id> --clear [--by <actor>]
 ft robot events label <event_id> --add <label> [--by <actor>]
 ft robot events label <event_id> --remove <label>
 ft robot events label <event_id> --list
-ft robot watch-events [--follow] [--severity <sev>] [--rule-id <glob>] [--pane <id>] [--cursor <id>] [--limit <n>] [--heartbeat-interval-ms <ms>] [--poll-interval-ms <ms>] [--max-hz <n>]
+ft robot watch-events [--follow] [--severity <critical|warning|info>] [--rule-id <glob>] [--pane <id>] [--unhandled] [--claim] [--cursor <id>] [--limit <n>] [--heartbeat-interval-ms <ms>] [--poll-interval-ms <ms>] [--max-hz <n>]
 ft robot await [--any 'rule:<glob>'] [--all 'rule:<glob>'] [--timeout-secs <n>] [--poll-interval-ms <ms>] [--cursor <id>]
 
 ft robot workflow list
@@ -310,6 +310,24 @@ ft robot work claim|release|complete|list|ready|assign
 ft robot fleet status|scale|rebalance|agents
 ft robot profile list|show|apply|validate
 ```
+
+`ft robot watch-events --claim` is flush-before-handle and at-least-once. It
+atomically leases each persisted event, emits and flushes a record whose
+`handled` field is still truthfully `false` and whose `claim_delivery` is
+`finalize_after_output_flush`, then token-CAS marks the row handled. A known
+write or flush failure releases the lease immediately; a crash leaves it
+eligible for redelivery after expiry. The durable cursor advances only after
+successful finalization (or after another path already handled/removed the
+row), so finalization races can duplicate but cannot silently skip an event.
+Live-only `pane_discovered` and `pane_disappeared` notifications have no
+durable row and are not claimable.
+
+In follow mode, a persisted detection received from the live IPC EventBus is a
+low-latency wakeup, not an ordering or payload authority. FrankenTerm re-enters
+the SQLite cursor drain and emits the exact stored rows in increasing event-ID
+order; this prevents out-of-order EventBus publication or dedupe conflicts from
+advancing the resumable cursor past an unseen row. Cursorless pane-lifecycle
+notifications remain direct, best-effort live records.
 
 `ft robot send` keeps the default fast path unless the caller asks for delivery
 proof. `--verify-submit` returns a submitted-level `submit` receipt; `--submit-level`
