@@ -4734,10 +4734,10 @@ mod tests {
 
             let result: Result<u64, SpawnBlockingWithCxError> =
                 spawn_blocking_with_cx(&cx, move || {
-                work_ran_clone.store(true, Ordering::SeqCst);
-                42
-            })
-            .await;
+                    work_ran_clone.store(true, Ordering::SeqCst);
+                    42
+                })
+                .await;
 
             assert!(
                 matches!(

@@ -41,7 +41,7 @@ use std::{
     time::Instant,
 };
 
-use crate::runtime_async::oneshot;
+use crate::runtime_async::{SpawnBlockingWithCxError, oneshot};
 use frankenterm_core_audit_types::storage_audit::AuditFieldRedactor;
 use serde::{Deserialize, Serialize};
 
@@ -2216,12 +2216,13 @@ impl StorageHandle {
     {
         match crate::runtime_async::spawn_blocking_with_cx(cx, work).await {
             Ok(result) => result,
-            Err(error) if error.starts_with("spawn_blocking_with_cx cancelled") => {
+            Err(error @ SpawnBlockingWithCxError::CancelledBeforeSpawn { .. })
+            | Err(error @ SpawnBlockingWithCxError::CancelledMidFlight { .. }) => {
                 Err(crate::Error::Cancelled(format!(
                     "{join_error_prefix}: {error}"
                 )))
             }
-            Err(error) => {
+            Err(error @ SpawnBlockingWithCxError::RuntimeFailure { .. }) => {
                 Err(StorageError::Database(format!("{join_error_prefix}: {error}")).into())
             }
         }

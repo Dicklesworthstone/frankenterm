@@ -24,6 +24,8 @@ use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info_span, warn};
 
+use crate::runtime_async::SpawnBlockingWithCxError;
+
 // =============================================================================
 // Clock anomaly observability
 // =============================================================================
@@ -1154,6 +1156,37 @@ impl TelemetryCollector {
         self.run_cx(&cx).await;
     }
 
+    /// Record a typed blocking-probe failure and report whether collection
+    /// should stop. Cx cancellation ends the loop; an executor/runtime failure
+    /// is an ordinary failed sample and collection retries after the normal
+    /// sampling interval.
+    fn handle_blocking_probe_error(
+        &self,
+        pid: u32,
+        error: &SpawnBlockingWithCxError,
+    ) -> bool {
+        match error {
+            SpawnBlockingWithCxError::CancelledBeforeSpawn { .. }
+            | SpawnBlockingWithCxError::CancelledMidFlight { .. } => {
+                debug!(
+                    pid,
+                    %error,
+                    "Telemetry collector exiting via Cx cancellation (blocking collection)"
+                );
+                self.registry
+                    .increment_counter("telemetry.collector.cancelled");
+                true
+            }
+            SpawnBlockingWithCxError::RuntimeFailure { .. } => {
+                warn!(pid, %error, "Telemetry blocking probe runtime failure");
+                self.registry.increment_counter("telemetry.sample_failure");
+                self.registry
+                    .increment_counter("telemetry.resource_probe.runtime_failure");
+                false
+            }
+        }
+    }
+
     /// Run the collection loop under an explicit `&Cx` (ft-xbnl0.2.2
     /// Cx-first API).
     ///
@@ -1213,19 +1246,13 @@ impl TelemetryCollector {
                 Ok(None) => {
                     warn!(pid, "Failed to collect telemetry sample");
                     self.registry.increment_counter("telemetry.sample_failure");
-                }
-                Err(reason) => {
-                    // Pre/mid-flight Cx cancellation (or a join failure) from the
-                    // blocking probe — propagate by exiting the loop and record
-                    // the typed cancellation outcome.
-                    debug!(
-                        pid,
-                        %reason,
-                        "Telemetry collector exiting via Cx cancellation (blocking collection)"
-                    );
                     self.registry
-                        .increment_counter("telemetry.collector.cancelled");
-                    break;
+                        .increment_counter("telemetry.resource_probe.probe_failure");
+                }
+                Err(error) => {
+                    if self.handle_blocking_probe_error(pid, &error) {
+                        break;
+                    }
                 }
             }
         }
@@ -2775,6 +2802,59 @@ mod tests {
         let collector = TelemetryCollector::new(TelemetryConfig::default());
         assert_eq!(collector.sample_count(), 0);
         assert!(!collector.is_shutdown());
+    }
+
+    #[test]
+    fn collector_classifies_typed_blocking_probe_failures() {
+        let cancellation_collector = TelemetryCollector::new(TelemetryConfig::default());
+        for error in [
+            SpawnBlockingWithCxError::CancelledBeforeSpawn {
+                kind: Some(crate::outcome::CancelKind::User),
+            },
+            SpawnBlockingWithCxError::CancelledMidFlight {
+                kind: Some(crate::outcome::CancelKind::Timeout),
+            },
+        ] {
+            assert!(
+                cancellation_collector.handle_blocking_probe_error(7, &error),
+                "both typed Cx cancellation phases must stop collection: {error:?}"
+            );
+        }
+        let cancellation_metrics = cancellation_collector.registry();
+        assert_eq!(
+            cancellation_metrics.counter_value("telemetry.collector.cancelled"),
+            2
+        );
+        assert_eq!(
+            cancellation_metrics.counter_value("telemetry.sample_failure"),
+            0
+        );
+        assert_eq!(
+            cancellation_metrics.counter_value("telemetry.resource_probe.runtime_failure"),
+            0
+        );
+
+        let runtime_collector = TelemetryCollector::new(TelemetryConfig::default());
+        let runtime_error = SpawnBlockingWithCxError::RuntimeFailure {
+            detail: "blocking executor unavailable".to_string(),
+        };
+        assert!(
+            !runtime_collector.handle_blocking_probe_error(7, &runtime_error),
+            "runtime failure must retain the collector for a later retry"
+        );
+        let runtime_metrics = runtime_collector.registry();
+        assert_eq!(
+            runtime_metrics.counter_value("telemetry.collector.cancelled"),
+            0
+        );
+        assert_eq!(
+            runtime_metrics.counter_value("telemetry.sample_failure"),
+            1
+        );
+        assert_eq!(
+            runtime_metrics.counter_value("telemetry.resource_probe.runtime_failure"),
+            1
+        );
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
