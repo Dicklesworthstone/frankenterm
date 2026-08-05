@@ -23072,9 +23072,17 @@ enum WatchIpcStreamRead {
 
 fn watch_checkpoint(cx: &frankenterm_core::cx::Cx, operation: &str) -> std::io::Result<()> {
     cx.checkpoint().map_err(|error| {
+        let reason = cx
+            .cancel_reason()
+            .and_then(|reason| reason.message)
+            .filter(|message| !message.is_empty());
+        let detail = reason.map_or_else(
+            || error.to_string(),
+            |message| format!("{error}; reason: {message}"),
+        );
         std::io::Error::new(
             std::io::ErrorKind::Interrupted,
-            format!("watch-events {operation} cancelled: {error}"),
+            format!("watch-events {operation} cancelled: {detail}"),
         )
     })
 }
