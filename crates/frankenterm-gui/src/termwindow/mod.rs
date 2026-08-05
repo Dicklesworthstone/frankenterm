@@ -3759,8 +3759,7 @@ impl TermWindow {
 
         match notif {
             TermWindowNotif::InvalidateShapeCache => {
-                self.shape_generation += 1;
-                self.shape_cache.borrow_mut().clear();
+                self.advance_shaping_input_generation();
                 self.invalidate_modal();
                 // ft-mpc9b.1.2: shape-cache invalidation covers
                 // font change and other render-shape-affecting
@@ -4654,17 +4653,13 @@ impl TermWindow {
         );
 
         self.show_scroll_bar = config.enable_scroll_bar;
-        self.shape_generation += 1;
-        {
-            let mut shape_cache = self.shape_cache.borrow_mut();
-            shape_cache.update_config(&config);
-            shape_cache.clear();
-        }
+        self.shape_cache.borrow_mut().update_config(&config);
         self.line_state_cache.borrow_mut().update_config(&config);
         self.line_quad_cache.borrow_mut().update_config(&config);
         self.line_to_ele_shape_cache
             .borrow_mut()
             .update_config(&config);
+        self.advance_shaping_input_generation();
         self.fancy_tab_bar.take();
         self.invalidate_fancy_tab_bar();
         self.invalidate_modal();

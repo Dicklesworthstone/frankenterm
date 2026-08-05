@@ -1,9 +1,12 @@
 use crate::resize_increment_calculator::ResizeIncrementCalculator;
+use crate::termwindow::render::{LineToEleShapeCacheKey, LineToElementShapeItem};
 use crate::utilsprites::RenderMetrics;
 use ::window::{Dimensions, ResizeIncrement, Window, WindowOps, WindowState};
 use config::{ConfigHandle, DimensionContext};
 use frankenterm_font::FontConfiguration;
+use lfucache::LfuCache;
 use mux::Mux;
+use std::cell::RefCell;
 use std::rc::Rc;
 use wezterm_term::TerminalSize;
 
@@ -16,8 +19,22 @@ use wezterm_term::TerminalSize;
 /// renderer_slo bench unblocks (mcp_middleware cfg(test) fix, p4).
 const SCALE_CHANGE_GLYPH_WARMUP_BUDGET: std::time::Duration = std::time::Duration::from_millis(16);
 
-fn next_shape_generation_for_scale_change(shape_generation: usize) -> usize {
+fn next_shape_generation_for_shaping_input_change(shape_generation: usize) -> usize {
     shape_generation.saturating_add(1)
+}
+
+/// Drop line-shaping results keyed by a superseded shaping-input generation.
+///
+/// Unlike the lower-level HarfBuzz `shape_cache`, these entries include the
+/// pixel-scale-dependent glyph resolution produced by `render_screen_line`.
+/// A generation bump makes every prior entry unreachable, and leaving hot
+/// unreachable entries in the LFU can crowd out newly shaped lines. Atlas-only
+/// generation changes retain the HarfBuzz cache through their separate path,
+/// but every font/config/scale input change must clear this derived cache.
+fn clear_generation_keyed_line_shape_cache(
+    cache: &RefCell<LfuCache<LineToEleShapeCacheKey, LineToElementShapeItem>>,
+) {
+    cache.borrow_mut().clear();
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -33,6 +50,19 @@ pub enum ScaleChange {
 }
 
 impl super::TermWindow {
+    /// Advance the shaping-input generation and retire both shaping-specific
+    /// caches whose contents depend on those inputs.
+    ///
+    /// Texture-atlas rebuilds intentionally use a separate invalidation path:
+    /// they retain `shape_cache` because HarfBuzz output is atlas-independent,
+    /// while still clearing the line cache whose glyph sprites are not.
+    pub(super) fn advance_shaping_input_generation(&mut self) {
+        self.shape_generation =
+            next_shape_generation_for_shaping_input_change(self.shape_generation);
+        self.shape_cache.borrow_mut().clear();
+        clear_generation_keyed_line_shape_cache(&self.line_to_ele_shape_cache);
+    }
+
     pub fn resize(
         &mut self,
         dimensions: Dimensions,
@@ -164,8 +194,6 @@ impl super::TermWindow {
                 // already bump this (mod.rs); scale changes must too. Bump only
                 // in the Ok arm: on metric failure we roll back below, so the
                 // old cache stays consistent with the old metrics.
-                self.shape_generation =
-                    next_shape_generation_for_scale_change(self.shape_generation);
                 // A scale change alters per-glyph PIXEL advances, so the cached
                 // shaping is genuinely stale — not merely its atlas sprites.
                 // Clear the shape cache so the next paint re-SHAPES at the new
@@ -175,7 +203,7 @@ impl super::TermWindow {
                 // only entries that survive a `shape_generation` bump are those
                 // that saw an *atlas* rebuild — for which re-resolving sprites
                 // (without re-shaping) is correct.
-                self.shape_cache.borrow_mut().clear();
+                self.advance_shaping_input_generation();
                 // ft-uroqc: warm-rasterize the common ASCII/Latin glyph set at
                 // the NEW CellMetricKey so the first paint after a scale change
                 // finds them already in the atlas instead of synchronously
@@ -696,14 +724,39 @@ pub fn effective_right_padding(config: &ConfigHandle, context: DimensionContext)
 
 #[cfg(test)]
 mod tests {
-    use super::next_shape_generation_for_scale_change;
+    use super::{
+        clear_generation_keyed_line_shape_cache,
+        next_shape_generation_for_shaping_input_change,
+    };
+    use crate::termwindow::render::{LineToEleShapeCacheKey, LineToElementShapeItem};
+    use config::ConfigHandle;
+    use lfucache::LfuCache;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    fn line_shape_key(shape_generation: usize, index: usize) -> LineToEleShapeCacheKey {
+        LineToEleShapeCacheKey {
+            shape_hash: u128::from(index).to_le_bytes(),
+            composing: None,
+            shape_generation,
+        }
+    }
+
+    fn empty_line_shape_item() -> LineToElementShapeItem {
+        LineToElementShapeItem {
+            expires: None,
+            shaped: Rc::new(Vec::new()),
+            current_highlight: None,
+            invalidate_on_hover_change: false,
+        }
+    }
 
     #[test]
     fn scale_change_advances_shape_generation_for_kerning_cache_invalidation() {
-        assert_eq!(next_shape_generation_for_scale_change(0), 1);
-        assert_eq!(next_shape_generation_for_scale_change(41), 42);
+        assert_eq!(next_shape_generation_for_shaping_input_change(0), 1);
+        assert_eq!(next_shape_generation_for_shaping_input_change(41), 42);
         assert_eq!(
-            next_shape_generation_for_scale_change(usize::MAX),
+            next_shape_generation_for_shaping_input_change(usize::MAX),
             usize::MAX,
             "generation bump should saturate instead of wrapping cache keys"
         );
@@ -712,19 +765,76 @@ mod tests {
     #[test]
     fn scale_change_shape_generation_bump_saturates_without_wrapping() {
         // saturating_add(1): a plain increment everywhere below the ceiling...
-        assert_eq!(next_shape_generation_for_scale_change(1), 2);
+        assert_eq!(next_shape_generation_for_shaping_input_change(1), 2);
         // ...reaching usize::MAX exactly from one below it.
         assert_eq!(
-            next_shape_generation_for_scale_change(usize::MAX - 1),
+            next_shape_generation_for_shaping_input_change(usize::MAX - 1),
             usize::MAX
         );
         // At the ceiling it must clamp, never wrap to 0 — a wrapped generation
         // would alias an already-issued shape generation and poison the kerning
         // cache rather than invalidating it.
         assert_eq!(
-            next_shape_generation_for_scale_change(usize::MAX),
+            next_shape_generation_for_shaping_input_change(usize::MAX),
             usize::MAX
         );
-        assert_ne!(next_shape_generation_for_scale_change(usize::MAX), 0);
+        assert_ne!(
+            next_shape_generation_for_shaping_input_change(usize::MAX),
+            0
+        );
+    }
+
+    #[test]
+    fn shaping_input_change_clears_hot_stale_line_shape_generation() {
+        let config = ConfigHandle::default_config();
+        let capacity = config.line_to_ele_shape_cache_size;
+        assert!(capacity > 1, "test requires a multi-entry line-shape cache");
+        let cache: RefCell<LfuCache<LineToEleShapeCacheKey, LineToElementShapeItem>> =
+            RefCell::new(LfuCache::new(
+                "test.line_to_ele_shape_cache.hit",
+                "test.line_to_ele_shape_cache.miss",
+                |config| config.line_to_ele_shape_cache_size,
+                &config,
+            ));
+        let old_generation = 41;
+
+        for index in 0..capacity {
+            cache
+                .borrow_mut()
+                .put(line_shape_key(old_generation, index), empty_line_shape_item());
+        }
+        // Make every stale entry hot. Without a generation-boundary clear,
+        // these unreachable entries would beat fresh frequency-zero entries
+        // in LFU eviction and repeatedly evict newly shaped lines.
+        for _ in 0..4 {
+            for index in 0..capacity {
+                assert!(
+                    cache
+                        .borrow_mut()
+                        .get(&line_shape_key(old_generation, index))
+                        .is_some()
+                );
+            }
+        }
+
+        clear_generation_keyed_line_shape_cache(&cache);
+        assert!(cache.borrow().is_empty());
+
+        let new_generation = next_shape_generation_for_shaping_input_change(old_generation);
+        for index in 0..capacity {
+            cache
+                .borrow_mut()
+                .put(line_shape_key(new_generation, index), empty_line_shape_item());
+        }
+        assert_eq!(cache.borrow().len(), capacity);
+        for index in 0..capacity {
+            assert!(
+                cache
+                    .borrow_mut()
+                    .get(&line_shape_key(new_generation, index))
+                    .is_some(),
+                "new-generation line shape {index} was crowded out by stale entries"
+            );
+        }
     }
 }
