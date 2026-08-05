@@ -29,10 +29,12 @@
 //! - [`canary_rehearsal`] — canary rollout rehearsal + fail-safe drill
 //!   modeling.
 //!
-//! All modules above are leaf-clean (only `std` + `serde` (+ `serde_json`
-//! in `forensic_export`) imports) per the ft-8nqx0 boundary scan, which
-//! is what makes them safe to lift without a parallel API redesign in
-//! their callers.
+//! The crate remains leaf-oriented: it has no dependency on
+//! `frankenterm-core` or its operational runtime/storage clusters. Its live
+//! manifest contains `serde`, `serde_json`, `tracing`, and one leaf-to-leaf
+//! edge to `frankenterm-core-replay-types`; keeping that boundary explicit is
+//! what makes these DTOs safe to lift without a parallel API redesign in their
+//! callers.
 //!
 //! ## What stays in `frankenterm-core` (for now)
 //!

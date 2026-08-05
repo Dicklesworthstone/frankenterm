@@ -6,9 +6,10 @@ use std::path::{Path, PathBuf};
 
 use frankenterm_core::product_journey_catalog::{
     ActorMode, CatalogClaimState, CatalogValidationCode, ContradictionStatus, EvidenceState,
-    FleetPoint, FreshnessState, JourneyVariant, ProducerCoverage, ProductJourneyCatalog,
-    REQUIRED_COVERAGE_CELL_COUNT, ReleaseRequirement, ReviewAuthorityKind, ReviewDisposition,
-    RunVerdict, SupportDeclaration, TargetAvailability, TargetMode, Topology, Transport,
+    FleetPoint, FreshnessState, JourneyVariant, MAX_PRODUCT_JOURNEY_CATALOG_BYTES,
+    ProducerCoverage, ProductJourneyCatalog, ProductJourneyDecodeCode, REQUIRED_COVERAGE_CELL_COUNT,
+    ReleaseRequirement, ReviewAuthorityKind, ReviewDisposition, RunVerdict, SupportDeclaration,
+    TargetAvailability, TargetMode, Topology, Transport,
 };
 use jsonschema::{Draft, Validator};
 use proptest::prelude::*;
@@ -39,8 +40,92 @@ fn load_catalog_value(root: &Path) -> Value {
 
 fn load_catalog(root: &Path) -> ProductJourneyCatalog {
     let path = root.join(CATALOG_RELATIVE_PATH);
-    serde_json::from_value(read_json(&path))
-        .unwrap_or_else(|error| panic!("catalog {} failed typed decode: {error}", path.display()))
+    let bytes = fs::read(&path)
+        .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
+    assert!(
+        bytes.len() <= MAX_PRODUCT_JOURNEY_CATALOG_BYTES,
+        "checked-in catalog exceeds its public bounded-decoder limit"
+    );
+    ProductJourneyCatalog::decode_json_bounded(&bytes).unwrap_or_else(|error| {
+        panic!(
+            "catalog {} failed bounded typed decode: {error}",
+            path.display()
+        )
+    })
+}
+
+#[derive(Debug, Clone, Copy)]
+enum DuplicateFieldOrder {
+    BeforeOriginal,
+    AfterOriginal,
+}
+
+fn duplicate_scalar_field(
+    raw: &[u8],
+    key: &str,
+    occurrence: usize,
+    duplicate_json: &str,
+    order: DuplicateFieldOrder,
+) -> Vec<u8> {
+    let text = std::str::from_utf8(raw).expect("catalog JSON is UTF-8");
+    let marker = format!("\"{key}\"");
+    let field_start = text
+        .match_indices(&marker)
+        .filter(|(start, _)| {
+            text[*start + marker.len()..]
+                .trim_start()
+                .starts_with(':')
+        })
+        .nth(occurrence)
+        .map(|(start, _)| start)
+        .unwrap_or_else(|| panic!("catalog contains field occurrence {occurrence} of `{key}`"));
+    let after_key = field_start + marker.len();
+    let colon = after_key
+        + text[after_key..]
+            .find(':')
+            .unwrap_or_else(|| panic!("catalog field `{key}` has a colon"));
+    let value_start = colon
+        + 1
+        + raw[colon + 1..]
+            .iter()
+            .take_while(|byte| byte.is_ascii_whitespace())
+            .count();
+    let value_end = if raw.get(value_start) == Some(&b'"') {
+        let mut escaped = false;
+        let mut end = None;
+        for (offset, byte) in raw[value_start + 1..].iter().copied().enumerate() {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                end = Some(value_start + offset + 2);
+                break;
+            }
+        }
+        end.unwrap_or_else(|| panic!("catalog string field `{key}` is terminated"))
+    } else {
+        value_start
+            + raw[value_start..]
+                .iter()
+                .position(|byte| {
+                    byte.is_ascii_whitespace() || matches!(*byte, b',' | b'}' | b']')
+                })
+                .unwrap_or(raw.len() - value_start)
+    };
+    let (insertion_at, insertion) = match order {
+        DuplicateFieldOrder::BeforeOriginal => {
+            (field_start, format!("\"{key}\":{duplicate_json},"))
+        }
+        DuplicateFieldOrder::AfterOriginal => {
+            (value_end, format!(",\"{key}\":{duplicate_json}"))
+        }
+    };
+    let mut mutated = Vec::with_capacity(raw.len() + insertion.len());
+    mutated.extend_from_slice(&raw[..insertion_at]);
+    mutated.extend_from_slice(insertion.as_bytes());
+    mutated.extend_from_slice(&raw[insertion_at..]);
+    mutated
 }
 
 fn load_schema_validator(root: &Path) -> Validator {
@@ -402,14 +487,135 @@ fn checked_in_catalog_passes_typed_semantic_validation() {
 fn checked_in_catalog_round_trips_without_shape_loss() {
     let root = repository_root();
     let original = load_catalog_value(&root);
-    let typed: ProductJourneyCatalog = serde_json::from_value(original.clone())
-        .expect("checked-in catalog should decode through the public DTO");
-    let encoded =
-        serde_json::to_value(typed).expect("public catalog DTO should serialize back to JSON");
+    let typed = load_catalog(&root);
+    let encoded = serde_json::to_value(&typed)
+        .expect("public catalog DTO should serialize back to JSON");
     assert_eq!(
         encoded, original,
         "serde DTO shape drifted from the checked-in public JSON contract"
     );
+    let first = serde_json::to_vec(&typed).expect("product catalog should encode");
+    let second = serde_json::to_vec(&typed).expect("product catalog should encode again");
+    assert_eq!(first, second, "typed encoding must be deterministic");
+    assert_eq!(
+        ProductJourneyCatalog::decode_json_bounded(&first)
+            .expect("deterministic encoding should decode"),
+        typed
+    );
+}
+
+#[test]
+fn bounded_decoder_stably_classifies_malformed_trailing_and_oversized_documents() {
+    for malformed in [b"".as_slice(), b"{".as_slice(), b"null".as_slice()] {
+        let error = ProductJourneyCatalog::decode_json_bounded(malformed)
+            .expect_err("malformed document must be rejected");
+        assert_eq!(error.code(), ProductJourneyDecodeCode::InvalidJson);
+        assert!(
+            error
+                .to_string()
+                .starts_with(ProductJourneyDecodeCode::InvalidJson.as_str()),
+            "invalid-JSON diagnostic must retain its stable code"
+        );
+    }
+
+    let root = repository_root();
+    let mut unknown = load_catalog_value(&root);
+    unknown["silent_support_promotion"] = json!(true);
+    assert_eq!(
+        ProductJourneyCatalog::decode_json_bounded(
+            &serde_json::to_vec(&unknown).expect("unknown-field mutation should encode")
+        )
+        .expect_err("unknown root field must be rejected")
+        .code(),
+        ProductJourneyDecodeCode::InvalidJson
+    );
+
+    let mut trailing = fs::read(root.join(CATALOG_RELATIVE_PATH))
+        .expect("checked-in product catalog should be readable");
+    trailing.extend_from_slice(b"\n{}");
+    let trailing_error = ProductJourneyCatalog::decode_json_bounded(&trailing)
+        .expect_err("trailing second value must be rejected");
+    assert_eq!(
+        trailing_error.code(),
+        ProductJourneyDecodeCode::TrailingData
+    );
+    assert!(
+        trailing_error
+            .to_string()
+            .starts_with(ProductJourneyDecodeCode::TrailingData.as_str()),
+        "trailing-data diagnostic must retain its stable code"
+    );
+
+    let oversized = vec![b' '; MAX_PRODUCT_JOURNEY_CATALOG_BYTES + 1];
+    let oversized_error = ProductJourneyCatalog::decode_json_bounded(&oversized)
+        .expect_err("oversized document must be rejected before parsing");
+    assert_eq!(
+        oversized_error.code(),
+        ProductJourneyDecodeCode::PayloadTooLarge
+    );
+    assert!(
+        oversized_error
+            .to_string()
+            .starts_with(ProductJourneyDecodeCode::PayloadTooLarge.as_str()),
+        "payload-too-large diagnostic must retain its stable code"
+    );
+}
+
+#[test]
+fn bounded_decoder_rejects_duplicate_fields_at_every_authority_boundary() {
+    let raw = fs::read(repository_root().join(CATALOG_RELATIVE_PATH))
+        .expect("checked-in product catalog should be readable");
+    let cases = [
+        ("contract_id", 0, "\"ft.product_journey_catalog.invalid\""),
+        ("schema_version", 0, "2"),
+        ("title", 0, "\"duplicate nested persona title\""),
+        ("pane_count", 0, "999"),
+        ("claim_id", 0, "\"claim.duplicate\""),
+        ("state", 0, "\"conditional\""),
+        ("reason", 0, "\"duplicate tagged payload reason\""),
+    ];
+    for (key, occurrence, duplicate_json) in cases {
+        for order in [
+            DuplicateFieldOrder::BeforeOriginal,
+            DuplicateFieldOrder::AfterOriginal,
+        ] {
+            let mutated = duplicate_scalar_field(&raw, key, occurrence, duplicate_json, order);
+            let error = ProductJourneyCatalog::decode_json_bounded(&mutated)
+                .expect_err("duplicate field must fail closed");
+            assert_eq!(
+                error.code(),
+                ProductJourneyDecodeCode::InvalidJson,
+                "duplicate `{key}` occurrence {occurrence} in {order:?} order was misclassified"
+            );
+        }
+    }
+}
+
+#[test]
+fn bounded_decoder_rejects_duplicate_claim_id_for_every_variant_and_key_order() {
+    let raw = fs::read(repository_root().join(CATALOG_RELATIVE_PATH))
+        .expect("checked-in product catalog should be readable");
+    for index in 0..REQUIRED_COVERAGE_CELL_COUNT {
+        for order in [
+            DuplicateFieldOrder::BeforeOriginal,
+            DuplicateFieldOrder::AfterOriginal,
+        ] {
+            let mutated = duplicate_scalar_field(
+                &raw,
+                "claim_id",
+                index,
+                "\"claim.deterministic_canary\"",
+                order,
+            );
+            let error = ProductJourneyCatalog::decode_json_bounded(&mutated)
+                .expect_err("every duplicate claim_id must fail closed");
+            assert_eq!(
+                error.code(),
+                ProductJourneyDecodeCode::InvalidJson,
+                "variant {index} duplicate in {order:?} order was misclassified"
+            );
+        }
+    }
 }
 
 #[test]

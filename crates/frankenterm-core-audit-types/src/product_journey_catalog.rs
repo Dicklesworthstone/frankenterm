@@ -7,10 +7,12 @@
 //! support claim.
 //!
 //! This module is leaf-clean: it performs no file I/O and depends only on
-//! `serde` and `std`.  Repository-path and Beads existence checks belong in the
-//! integration test that loads the checked-in catalog.
+//! `serde`, `serde_json`, and `std`. Repository-path and Beads existence checks
+//! belong in the integration test that loads the checked-in catalog.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::error::Error;
+use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
@@ -23,6 +25,9 @@ pub const PRODUCT_JOURNEY_SCHEMA_VERSION: u32 = 1;
 /// The Bead that owns version 1 of the product-journey contract.
 pub const PRODUCT_JOURNEY_SOURCE_BEAD_ID: &str =
     "ft-interactive-swarm-product-convergence-7xqz4.1.1";
+
+/// Maximum raw JSON document accepted by the bounded decoder.
+pub const MAX_PRODUCT_JOURNEY_CATALOG_BYTES: usize = 2 * 1024 * 1024;
 
 /// Number of required product-journey coverage cells.
 pub const REQUIRED_COVERAGE_CELL_COUNT: usize = 32;
@@ -860,11 +865,126 @@ pub struct ProductJourneyCatalog {
 }
 
 impl ProductJourneyCatalog {
+    /// Decode one bounded JSON document and reject unknown or trailing data.
+    pub fn decode_json_bounded(raw: &[u8]) -> Result<Self, ProductJourneyDecodeError> {
+        decode_product_journey_catalog(raw)
+    }
+
     /// Validate all semantic invariants that JSON Schema cannot express.
     #[must_use]
     pub fn validate(&self) -> CatalogValidationReport {
         validate_product_journey_catalog(self)
     }
+}
+
+/// Stable bounded-decoder failure category.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProductJourneyDecodeCode {
+    /// Raw bytes exceed the catalog limit.
+    PayloadTooLarge,
+    /// The first JSON value is malformed or has the wrong closed shape.
+    InvalidJson,
+    /// Non-whitespace data follows the first valid catalog value.
+    TrailingData,
+}
+
+impl ProductJourneyDecodeCode {
+    /// Stable machine-facing code.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::PayloadTooLarge => "PJC-DECODE-001",
+            Self::InvalidJson => "PJC-DECODE-002",
+            Self::TrailingData => "PJC-DECODE-003",
+        }
+    }
+}
+
+/// Failure returned by [`decode_product_journey_catalog`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ProductJourneyDecodeError {
+    /// Raw input exceeds the pre-deserialization limit.
+    PayloadTooLarge {
+        /// Observed byte count.
+        actual_bytes: usize,
+        /// Configured maximum byte count.
+        max_bytes: usize,
+    },
+    /// Serde rejected malformed JSON, an unknown field, or a wrong type/value.
+    InvalidJson {
+        /// Parser diagnostic; callers should route on [`Self::code`].
+        detail: String,
+    },
+    /// A valid first value was followed by non-whitespace data.
+    TrailingData {
+        /// Parser diagnostic; callers should route on [`Self::code`].
+        detail: String,
+    },
+}
+
+impl ProductJourneyDecodeError {
+    /// Stable decoder category.
+    #[must_use]
+    pub const fn code(&self) -> ProductJourneyDecodeCode {
+        match self {
+            Self::PayloadTooLarge { .. } => ProductJourneyDecodeCode::PayloadTooLarge,
+            Self::InvalidJson { .. } => ProductJourneyDecodeCode::InvalidJson,
+            Self::TrailingData { .. } => ProductJourneyDecodeCode::TrailingData,
+        }
+    }
+}
+
+impl fmt::Display for ProductJourneyDecodeError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::PayloadTooLarge {
+                actual_bytes,
+                max_bytes,
+            } => write!(
+                formatter,
+                "{}: product journey catalog is {actual_bytes} bytes (maximum {max_bytes})",
+                self.code().as_str()
+            ),
+            Self::InvalidJson { detail } | Self::TrailingData { detail } => {
+                write!(formatter, "{}: {detail}", self.code().as_str())
+            }
+        }
+    }
+}
+
+impl Error for ProductJourneyDecodeError {}
+
+/// Decode one bounded, closed-shape JSON catalog.
+///
+/// The byte limit is checked before Serde allocates catalog vectors. Serde's
+/// `deny_unknown_fields` annotations reject schema drift and duplicate struct
+/// or tagged-enum fields, while `end()` rejects any second value or other
+/// trailing non-whitespace input. Semantic validation remains a separate,
+/// explicit step so decoding cannot be mistaken for product-proof authority.
+pub fn decode_product_journey_catalog(
+    raw: &[u8],
+) -> Result<ProductJourneyCatalog, ProductJourneyDecodeError> {
+    if raw.len() > MAX_PRODUCT_JOURNEY_CATALOG_BYTES {
+        return Err(ProductJourneyDecodeError::PayloadTooLarge {
+            actual_bytes: raw.len(),
+            max_bytes: MAX_PRODUCT_JOURNEY_CATALOG_BYTES,
+        });
+    }
+
+    let mut decoder = serde_json::Deserializer::from_slice(raw);
+    let catalog = ProductJourneyCatalog::deserialize(&mut decoder).map_err(|error| {
+        ProductJourneyDecodeError::InvalidJson {
+            detail: error.to_string(),
+        }
+    })?;
+    decoder
+        .end()
+        .map_err(|error| ProductJourneyDecodeError::TrailingData {
+            detail: error.to_string(),
+        })?;
+    Ok(catalog)
 }
 
 /// Stable semantic validation category.
