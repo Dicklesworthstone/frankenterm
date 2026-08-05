@@ -501,16 +501,16 @@ impl QueryClient for ProductionQueryClient {
                     live_pane_unhandled,
                     live_pane_activity
                 );
-                let unhandled_by_pane = unhandled_res.unwrap_or_else(|error| {
+                let unhandled_by_pane = unhandled_res.unwrap_or_else(|_error| {
                     tracing::warn!(
-                        error = %error,
+                        error_class = "tui_unhandled_event_counts_unavailable",
                         "TUI pane refresh could not load unhandled-event counts"
                     );
                     std::collections::HashMap::new()
                 });
-                let last_activity_by_pane = last_activity_res.unwrap_or_else(|error| {
+                let last_activity_by_pane = last_activity_res.unwrap_or_else(|_error| {
                     tracing::warn!(
-                        error = %error,
+                        error_class = "tui_live_pane_activity_unavailable",
                         "TUI pane refresh could not load live-pane activity"
                     );
                     std::collections::HashMap::new()
@@ -580,12 +580,12 @@ impl QueryClient for ProductionQueryClient {
                             }
                         }
                     }
-                    Err(error) => {
+                    Err(_error) => {
                         // Preserve the prior fail-soft behavior: only this
                         // bounded page defaults, while successful pages remain
                         // visible and output ordering stays event-query order.
                         tracing::warn!(
-                            error = %error,
+                            error_class = "tui_annotation_page_unavailable",
                             page_index,
                             event_count = event_id_chunk.len(),
                             first_event_id = ?event_id_chunk.first().copied(),
