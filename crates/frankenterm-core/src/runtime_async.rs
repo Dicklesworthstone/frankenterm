@@ -20,6 +20,12 @@ use std::time::Duration;
 /// This constant is retained only for surface guard test compatibility.
 pub const RAW_TOKIO_RUNTIME_BUILDER_QUARANTINE_V1: &[&str] = &[];
 
+/// Negative-evidence ledger for raw channel values that can retain caller
+/// wakers. An empty inventory means every such value published by this module
+/// is a project-owned wrapper; only payload-free error and telemetry types are
+/// re-exported from asupersync.
+pub const RAW_ASUPERSYNC_RETAINED_CHANNEL_WAKER_EXPOSURES_V1: &[&str] = &[];
+
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 
@@ -5258,6 +5264,89 @@ mod tests {
         drop(broadcast_future);
         assert!(broadcast_completed.load(std::sync::atomic::Ordering::SeqCst));
         assert_eq!(broadcast_rx.try_recv(), Ok(97));
+    }
+
+    #[cfg(panic = "unwind")]
+    #[test]
+    fn pending_channel_future_drops_contain_hostile_waker_destructors() {
+        let cx = asupersync::Cx::for_testing();
+
+        let (reserve_tx, mut reserve_rx) = mpsc::channel::<u8>(1);
+        reserve_tx.try_send(1).expect("fill reserve channel");
+        let (reserve_drop_count, reserve_waker) = drop_panicking_waker();
+        let mut reserve_future = Box::pin(reserve_tx.reserve(&cx));
+        let mut reserve_cx = std::task::Context::from_waker(&reserve_waker);
+        assert!(reserve_future
+            .as_mut()
+            .poll(&mut reserve_cx)
+            .is_pending());
+        drop(reserve_cx);
+        drop(reserve_waker);
+        let reserve_before = mpsc::retained_waker_callback_panic_count();
+        drop(reserve_future);
+        assert_eq!(
+            reserve_drop_count.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert!(
+            mpsc::retained_waker_callback_panic_count() >= reserve_before.saturating_add(1)
+        );
+        assert_eq!(reserve_rx.try_recv(), Ok(1));
+
+        let (_mpsc_tx, mut mpsc_rx) = mpsc::channel::<u8>(1);
+        let (mpsc_drop_count, mpsc_waker) = drop_panicking_waker();
+        let mut mpsc_future = Box::pin(mpsc_rx.recv(&cx));
+        let mut mpsc_cx = std::task::Context::from_waker(&mpsc_waker);
+        assert!(mpsc_future.as_mut().poll(&mut mpsc_cx).is_pending());
+        drop(mpsc_cx);
+        drop(mpsc_waker);
+        let mpsc_before = mpsc::retained_waker_callback_panic_count();
+        drop(mpsc_future);
+        assert_eq!(
+            mpsc_drop_count.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert!(
+            mpsc::retained_waker_callback_panic_count() >= mpsc_before.saturating_add(1)
+        );
+
+        let (_watch_tx, mut watch_rx) = watch::channel(0u8);
+        let (watch_drop_count, watch_waker) = drop_panicking_waker();
+        let mut watch_future = Box::pin(watch_rx.changed(&cx));
+        let mut watch_cx = std::task::Context::from_waker(&watch_waker);
+        assert!(watch_future.as_mut().poll(&mut watch_cx).is_pending());
+        drop(watch_cx);
+        drop(watch_waker);
+        let watch_before = watch::retained_waker_callback_panic_count();
+        drop(watch_future);
+        assert_eq!(
+            watch_drop_count.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert!(
+            watch::retained_waker_callback_panic_count() >= watch_before.saturating_add(1)
+        );
+
+        let (_broadcast_tx, mut broadcast_rx) = broadcast::channel::<u8>(1);
+        let (broadcast_drop_count, broadcast_waker) = drop_panicking_waker();
+        let mut broadcast_future = Box::pin(broadcast_rx.recv_with_cx(&cx));
+        let mut broadcast_cx = std::task::Context::from_waker(&broadcast_waker);
+        assert!(broadcast_future
+            .as_mut()
+            .poll(&mut broadcast_cx)
+            .is_pending());
+        drop(broadcast_cx);
+        drop(broadcast_waker);
+        let broadcast_before = broadcast::retained_waker_callback_panic_count();
+        drop(broadcast_future);
+        assert_eq!(
+            broadcast_drop_count.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert!(
+            broadcast::retained_waker_callback_panic_count()
+                >= broadcast_before.saturating_add(1)
+        );
     }
 
     #[cfg(panic = "unwind")]
