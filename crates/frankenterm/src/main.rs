@@ -25201,7 +25201,7 @@ mod watch_events_tests {
                 std::sync::Condvar::new(),
             ));
             let worker_gate = std::sync::Arc::clone(&gate);
-            let sleeper = std::sync::Arc::new(move |_slice: std::time::Duration| {
+            let sleeper = move |_slice: std::time::Duration| {
                 cancel_cx.cancel_with(
                     frankenterm_core::outcome::CancelKind::User,
                     Some("blocking delay cancelled from worker"),
@@ -25225,7 +25225,7 @@ mod watch_events_tests {
                 }
                 state.1 = true;
                 wake.notify_all();
-            });
+            };
 
             let error = sleep_watch_delay_with_cx_using(
                 &cx,
