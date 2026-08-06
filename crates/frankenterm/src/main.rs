@@ -30525,6 +30525,59 @@ fn add_distributed_remote_pane_text_placeholders(
     }
 }
 
+fn runtime_task_join_failure(
+    operation: &'static str,
+    error: frankenterm_core::runtime_async::task::JoinError,
+) -> frankenterm_core::Error {
+    let source = if error.is_cancelled() {
+        frankenterm_core::error::RuntimeOperationSource::Cancelled(
+            "runtime task aborted".to_string(),
+        )
+    } else {
+        frankenterm_core::error::RuntimeOperationSource::Backend(
+            "runtime task failed at join boundary".to_string(),
+        )
+    };
+    frankenterm_core::Error::RuntimeOperation { operation, source }
+}
+
+#[cfg(test)]
+#[test]
+fn runtime_task_join_failure_preserves_cancellation_vs_failure_class() {
+    let cancelled = runtime_task_join_failure(
+        "test.cancelled",
+        frankenterm_core::runtime_async::task::JoinError::new("task aborted"),
+    );
+    match cancelled {
+        frankenterm_core::Error::RuntimeOperation {
+            operation,
+            source: frankenterm_core::error::RuntimeOperationSource::Cancelled(detail),
+        } => {
+            assert_eq!(operation, "test.cancelled");
+            assert_eq!(detail, "runtime task aborted");
+        }
+        other => panic!("aborted join must remain cancellation, got {other:?}"),
+    }
+
+    let failed = runtime_task_join_failure(
+        "test.failed",
+        frankenterm_core::runtime_async::task::JoinError::new(
+            "SECRET task failed at join boundary",
+        ),
+    );
+    match failed {
+        frankenterm_core::Error::RuntimeOperation {
+            operation,
+            source: frankenterm_core::error::RuntimeOperationSource::Backend(detail),
+        } => {
+            assert_eq!(operation, "test.failed");
+            assert_eq!(detail, "runtime task failed at join boundary");
+            assert!(!detail.contains("SECRET"));
+        }
+        other => panic!("non-abort join must remain backend failure, got {other:?}"),
+    }
+}
+
 async fn robot_list_panes_on_runtime_task(
     wezterm: frankenterm_core::wezterm::WeztermHandle,
 ) -> frankenterm_core::Result<Vec<frankenterm_core::wezterm::PaneInfo>> {
@@ -30534,10 +30587,7 @@ async fn robot_list_panes_on_runtime_task(
         wezterm.list_panes_with_cx(&cx).await
     });
     task.await
-        .map_err(|err| frankenterm_core::Error::RuntimeOperation {
-            operation: "robot.list_panes.await_task",
-            source: frankenterm_core::error::RuntimeOperationSource::Cancelled(err.to_string()),
-        })?
+        .map_err(|error| runtime_task_join_failure("robot.list_panes.await_task", error))?
 }
 
 async fn robot_get_text_on_runtime_task(
@@ -30551,10 +30601,7 @@ async fn robot_get_text_on_runtime_task(
         wezterm.get_text_with_cx(&cx, pane_id, escapes).await
     });
     task.await
-        .map_err(|err| frankenterm_core::Error::RuntimeOperation {
-            operation: "robot.get_text.await_task",
-            source: frankenterm_core::error::RuntimeOperationSource::Cancelled(err.to_string()),
-        })?
+        .map_err(|error| runtime_task_join_failure("robot.get_text.await_task", error))?
 }
 
 async fn robot_get_semantic_snapshot_on_runtime_task(
@@ -30567,10 +30614,7 @@ async fn robot_get_semantic_snapshot_on_runtime_task(
         wezterm.get_semantic_zones_with_cx(&cx, pane_id).await
     });
     task.await
-        .map_err(|err| frankenterm_core::Error::RuntimeOperation {
-            operation: "robot.dom.await_task",
-            source: frankenterm_core::error::RuntimeOperationSource::Cancelled(err.to_string()),
-        })?
+        .map_err(|error| runtime_task_join_failure("robot.dom.await_task", error))?
 }
 
 fn robot_dom_unavailable(
@@ -30646,10 +30690,10 @@ async fn batch_get_pane_text(
     for (pane_id, task) in tasks {
         let result = match task.await {
             Ok(result) => result,
-            Err(err) => Err(frankenterm_core::Error::RuntimeOperation {
-                operation: "batch_get_text.await_task",
-                source: frankenterm_core::error::RuntimeOperationSource::Cancelled(err.to_string()),
-            }),
+            Err(error) => Err(runtime_task_join_failure(
+                "batch_get_text.await_task",
+                error,
+            )),
         };
 
         match result {
@@ -68186,7 +68230,7 @@ fn session_mmap_replay_json(
 }
 
 fn session_recovery_operation_cx() -> frankenterm_core::cx::Cx {
-    frankenterm_core::cx::for_request()
+    frankenterm_core::cx::Cx::current().unwrap_or_else(frankenterm_core::cx::for_request)
 }
 
 async fn session_recovery_create_pane(
@@ -68237,9 +68281,8 @@ async fn session_recovery_list_panes_on_runtime_task(
         }
     });
     task.await
-        .map_err(|err| frankenterm_core::Error::RuntimeOperation {
-            operation: "session.recovery.list_panes.await_task",
-            source: frankenterm_core::error::RuntimeOperationSource::Cancelled(err.to_string()),
+        .map_err(|error| {
+            runtime_task_join_failure("session.recovery.list_panes.await_task", error)
         })?
 }
 
@@ -68271,9 +68314,8 @@ async fn session_recovery_split_pane_on_runtime_task(
         }
     });
     task.await
-        .map_err(|err| frankenterm_core::Error::RuntimeOperation {
-            operation: "session.recovery.split_pane.await_task",
-            source: frankenterm_core::error::RuntimeOperationSource::Cancelled(err.to_string()),
+        .map_err(|error| {
+            runtime_task_join_failure("session.recovery.split_pane.await_task", error)
         })?
 }
 
@@ -68300,9 +68342,8 @@ async fn session_recovery_send_text_on_runtime_task(
         }
     });
     task.await
-        .map_err(|err| frankenterm_core::Error::RuntimeOperation {
-            operation: "session.recovery.send_text.await_task",
-            source: frankenterm_core::error::RuntimeOperationSource::Cancelled(err.to_string()),
+        .map_err(|error| {
+            runtime_task_join_failure("session.recovery.send_text.await_task", error)
         })?
 }
 

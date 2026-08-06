@@ -4807,6 +4807,91 @@ mod tests {
         });
     }
 
+    struct JumpCyclePersistenceProbeWorkflow;
+
+    impl Workflow for JumpCyclePersistenceProbeWorkflow {
+        fn name(&self) -> &'static str {
+            "jump_cycle_persistence_probe"
+        }
+
+        fn description(&self) -> &'static str {
+            "Loops until the runner's jump-cycle guard aborts"
+        }
+
+        fn handles(&self, _detection: &crate::patterns::Detection) -> bool {
+            true
+        }
+
+        fn steps(&self) -> Vec<WorkflowStep> {
+            vec![WorkflowStep::new("loop", "Loop")]
+        }
+
+        fn execute_step(
+            &self,
+            _ctx: &mut WorkflowContext,
+            _step_idx: usize,
+        ) -> BoxFuture<'_, StepResult> {
+            Box::pin(async move { StepResult::JumpTo { step: 0 } })
+        }
+    }
+
+    #[test]
+    fn workflow_jump_cycle_guard_persists_terminal_state() {
+        run_async_test(async {
+            let temp_dir = tempfile::TempDir::new().unwrap();
+            let db_path = temp_dir
+                .path()
+                .join("jump_cycle_guard_terminal_state.db")
+                .to_string_lossy()
+                .to_string();
+            let storage = Arc::new(crate::storage::StorageHandle::new(&db_path).await.unwrap());
+            let handle: crate::wezterm::WeztermHandle =
+                Arc::new(crate::wezterm::MockWezterm::new());
+            let injector = CxPolicyInjector::new(crate::policy::PolicyGatedInjector::new(
+                crate::policy::PolicyEngine::permissive(),
+                handle,
+            ));
+            let runner = WorkflowRunner::new(
+                WorkflowEngine::default(),
+                Arc::new(PaneWorkflowLockManager::new()),
+                Arc::clone(&storage),
+                injector,
+                WorkflowRunnerConfig::default(),
+            );
+            let execution_id = "jump-cycle-terminal-state";
+            let cx = crate::cx::for_testing();
+            let outcome = runner
+                .run_workflow_manual_with_cx(
+                    &cx,
+                    77,
+                    Arc::new(JumpCyclePersistenceProbeWorkflow),
+                    execution_id,
+                    None,
+                )
+                .await;
+
+            match outcome {
+                ManualWorkflowRunOutcome::Ran(WorkflowExecutionResult::Aborted {
+                    reason,
+                    ..
+                }) => assert!(reason.contains("exceeded maximum jump count")),
+                other => panic!("jump cycle should terminate as a durable abort: {other:?}"),
+            }
+
+            let record = storage
+                .get_workflow_with_cx(&cx, execution_id)
+                .await
+                .expect("terminal workflow lookup should succeed")
+                .expect("manual workflow record should exist");
+            assert!(
+                matches!(record.status.as_str(), "failed" | "aborted"),
+                "jump-cycle guard must not leave a resumable record: {record:?}"
+            );
+
+            storage.shutdown().await.unwrap();
+        });
+    }
+
     #[test]
     fn jump_target_inside_step_range_is_valid() {
         assert!(invalid_jump_target_reason(0, 1).is_none());

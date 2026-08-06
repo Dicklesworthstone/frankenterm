@@ -3787,44 +3787,78 @@ pub struct CodexSummaryWaitResult {
     pub last_markers: CodexSummaryMarkers,
 }
 
-fn wait_deadline_after(start: Instant, timeout: Duration, label: &str) -> Option<Instant> {
-    let deadline = start.checked_add(timeout);
-    if deadline.is_none() {
-        tracing::warn!(
-            timeout_ms = %timeout.as_millis(),
-            label,
-            "wezterm wait timeout is too large for Instant; relying on max_polls"
-        );
-    }
-    deadline
+fn wait_deadline_after(start: asupersync::Time, timeout: Duration) -> asupersync::Time {
+    start + timeout
 }
 
-fn wait_timed_out(deadline: Option<Instant>, now: Instant) -> bool {
-    deadline.is_some_and(|deadline| now >= deadline)
+fn wait_timed_out(deadline: asupersync::Time, now: asupersync::Time) -> bool {
+    now >= deadline
 }
 
-fn wait_remaining(deadline: Option<Instant>, now: Instant, fallback: Duration) -> Duration {
-    deadline
-        .map(|deadline| deadline.saturating_duration_since(now))
-        .unwrap_or(fallback)
+fn wait_remaining(deadline: asupersync::Time, now: asupersync::Time) -> Duration {
+    Duration::from_nanos(deadline.duration_since(now))
 }
 
 const WAIT_CX_CHECK_INTERVAL: Duration = Duration::from_millis(100);
 
+fn wezterm_wait_cx_error(
+    cx: &crate::cx::Cx,
+    operation: &'static str,
+    fallback: &'static str,
+) -> crate::Error {
+    use crate::outcome::CancelKind;
+
+    match cx.root_cancel_cause().map(|reason| reason.kind) {
+        Some(CancelKind::Deadline) => {
+            crate::Error::runtime_backend(operation, "capability deadline exceeded")
+        }
+        Some(CancelKind::PollQuota) => {
+            crate::Error::runtime_backend(operation, "capability poll quota exhausted")
+        }
+        Some(CancelKind::CostBudget) => {
+            crate::Error::runtime_backend(operation, "capability cost budget exhausted")
+        }
+        Some(
+            CancelKind::User
+            | CancelKind::Timeout
+            | CancelKind::FailFast
+            | CancelKind::RaceLost
+            | CancelKind::ParentCancelled
+            | CancelKind::ResourceUnavailable
+            | CancelKind::Shutdown
+            | CancelKind::LinkedExit,
+        ) => crate::Error::runtime_cancelled(operation, "capability context cancelled"),
+        None => crate::Error::runtime_backend(operation, fallback),
+    }
+}
+
+fn wezterm_wait_is_cancelled(error: &crate::Error) -> bool {
+    matches!(
+        error,
+        crate::Error::Cancelled(_)
+            | crate::Error::RuntimeOperation {
+                source: crate::error::RuntimeOperationSource::Cancelled(_),
+                ..
+            }
+    )
+}
+
 async fn wait_backoff_with_cx(cx: &crate::cx::Cx, duration: Duration) -> Result<()> {
     let mut remaining = duration;
     while !remaining.is_zero() {
-        cx.checkpoint().map_err(|error| {
-            crate::Error::runtime_cancelled("wezterm wait backoff", error.to_string())
+        cx.checkpoint().map_err(|_| {
+            wezterm_wait_cx_error(cx, "wezterm wait backoff", "capability checkpoint failed")
         })?;
         let step = remaining.min(WAIT_CX_CHECK_INTERVAL);
         crate::runtime_async::sleep_with_cx(cx, step)
             .await
-            .map_err(|error| crate::Error::runtime_cancelled("wezterm wait backoff", error))?;
+            .map_err(|_| {
+                wezterm_wait_cx_error(cx, "wezterm wait backoff", "capability timer failed")
+            })?;
         remaining = remaining.saturating_sub(step);
     }
-    cx.checkpoint().map_err(|error| {
-        crate::Error::runtime_cancelled("wezterm wait backoff", error.to_string())
+    cx.checkpoint().map_err(|_| {
+        wezterm_wait_cx_error(cx, "wezterm wait backoff", "capability checkpoint failed")
     })
 }
 
@@ -3895,15 +3929,23 @@ impl<'a, S: PaneTextSource + Sync + ?Sized> PaneWaiter<'a, S> {
         timeout: Duration,
     ) -> Result<WaitResult> {
         if cx.checkpoint().is_err() {
-            return Ok(WaitResult::Cancelled {
-                reason: "capability context already cancelled".to_string(),
-                polls: 0,
-            });
+            let error = wezterm_wait_cx_error(
+                cx,
+                "wezterm pane wait",
+                "capability checkpoint failed before wait",
+            );
+            if wezterm_wait_is_cancelled(&error) {
+                return Ok(WaitResult::Cancelled {
+                    reason: "capability context cancelled before wait".to_string(),
+                    polls: 0,
+                });
+            }
+            return Err(error);
         }
 
         let matcher_desc = matcher.description();
-        let start = Instant::now();
-        let deadline = wait_deadline_after(start, timeout, "wait_for_with_cx");
+        let start = crate::runtime_async::timer_now_with_cx(cx);
+        let deadline = wait_deadline_after(start, timeout);
         let mut polls = 0usize;
         let mut interval = self.options.poll_initial;
         tracing::info!(
@@ -3924,7 +3966,7 @@ impl<'a, S: PaneTextSource + Sync + ?Sized> PaneWaiter<'a, S> {
             let tail_hash = stable_hash(tail.as_bytes());
 
             if matcher.matches(&tail)? {
-                let elapsed_ms = elapsed_ms(start);
+                let elapsed_ms = elapsed_ms(cx, start);
                 tracing::info!(
                     pane_id,
                     elapsed_ms,
@@ -3935,9 +3977,9 @@ impl<'a, S: PaneTextSource + Sync + ?Sized> PaneWaiter<'a, S> {
                 return Ok(WaitResult::Matched { elapsed_ms, polls });
             }
 
-            let now = Instant::now();
+            let now = crate::runtime_async::timer_now_with_cx(cx);
             if wait_timed_out(deadline, now) || polls >= self.options.max_polls {
-                let elapsed_ms = elapsed_ms(start);
+                let elapsed_ms = elapsed_ms(cx, start);
                 tracing::info!(
                     pane_id,
                     elapsed_ms,
@@ -3953,40 +3995,51 @@ impl<'a, S: PaneTextSource + Sync + ?Sized> PaneWaiter<'a, S> {
             }
 
             if cx.checkpoint().is_err() {
-                let elapsed_ms = elapsed_ms(start);
-                tracing::info!(
-                    pane_id,
-                    elapsed_ms,
-                    polls,
-                    matcher = %matcher_desc,
-                    "wait_for_with_cx cancelled mid-loop"
+                let error = wezterm_wait_cx_error(
+                    cx,
+                    "wezterm pane wait",
+                    "capability checkpoint failed during wait",
                 );
-                return Ok(WaitResult::Cancelled {
-                    reason: "capability context cancelled during wait".to_string(),
-                    polls,
-                });
+                if wezterm_wait_is_cancelled(&error) {
+                    let elapsed_ms = elapsed_ms(cx, start);
+                    tracing::info!(
+                        pane_id,
+                        elapsed_ms,
+                        polls,
+                        matcher = %matcher_desc,
+                        "wait_for_with_cx cancelled mid-loop"
+                    );
+                    return Ok(WaitResult::Cancelled {
+                        reason: "capability context cancelled during wait".to_string(),
+                        polls,
+                    });
+                }
+                return Err(error);
             }
 
-            let remaining = wait_remaining(deadline, now, interval);
+            let remaining = wait_remaining(deadline, now);
             let sleep_duration = if interval > remaining {
                 remaining
             } else {
                 interval
             };
 
-            if wait_backoff_with_cx(cx, sleep_duration).await.is_err() {
-                let elapsed_ms = elapsed_ms(start);
-                tracing::info!(
-                    pane_id,
-                    elapsed_ms,
-                    polls,
-                    matcher = %matcher_desc,
-                    "wait_for_with_cx cancelled during sleep"
-                );
-                return Ok(WaitResult::Cancelled {
-                    reason: "capability context cancelled during backoff sleep".to_string(),
-                    polls,
-                });
+            if let Err(error) = wait_backoff_with_cx(cx, sleep_duration).await {
+                if wezterm_wait_is_cancelled(&error) {
+                    let elapsed_ms = elapsed_ms(cx, start);
+                    tracing::info!(
+                        pane_id,
+                        elapsed_ms,
+                        polls,
+                        matcher = %matcher_desc,
+                        "wait_for_with_cx cancelled during sleep"
+                    );
+                    return Ok(WaitResult::Cancelled {
+                        reason: "capability context cancelled during backoff sleep".to_string(),
+                        polls,
+                    });
+                }
+                return Err(error);
             }
 
             interval = interval.saturating_mul(2);
@@ -4040,12 +4093,16 @@ pub async fn wait_for_codex_session_summary_with_cx<S: PaneTextSource + Sync + ?
     timeout: Duration,
     options: WaitOptions,
 ) -> Result<CodexSummaryWaitResult> {
-    cx.checkpoint().map_err(|error| {
-        crate::Error::runtime_cancelled("wezterm wait for Codex summary", error.to_string())
+    cx.checkpoint().map_err(|_| {
+        wezterm_wait_cx_error(
+            cx,
+            "wezterm wait for Codex summary",
+            "capability checkpoint failed before wait",
+        )
     })?;
 
-    let start = Instant::now();
-    let deadline = wait_deadline_after(start, timeout, "codex_summary_wait_with_cx");
+    let start = crate::runtime_async::timer_now_with_cx(cx);
+    let deadline = wait_deadline_after(start, timeout);
     let mut polls = 0usize;
     let mut interval = options.poll_initial;
 
@@ -4070,7 +4127,7 @@ pub async fn wait_for_codex_session_summary_with_cx<S: PaneTextSource + Sync + ?
         };
 
         if last_markers.complete() {
-            let elapsed_ms = elapsed_ms(start);
+            let elapsed_ms = elapsed_ms(cx, start);
             tracing::info!(
                 pane_id,
                 elapsed_ms,
@@ -4086,9 +4143,9 @@ pub async fn wait_for_codex_session_summary_with_cx<S: PaneTextSource + Sync + ?
             });
         }
 
-        let now = Instant::now();
+        let now = crate::runtime_async::timer_now_with_cx(cx);
         if wait_timed_out(deadline, now) || polls >= options.max_polls {
-            let elapsed_ms = elapsed_ms(start);
+            let elapsed_ms = elapsed_ms(cx, start);
             tracing::info!(
                 pane_id,
                 elapsed_ms,
@@ -4104,11 +4161,15 @@ pub async fn wait_for_codex_session_summary_with_cx<S: PaneTextSource + Sync + ?
             });
         }
 
-        cx.checkpoint().map_err(|error| {
-            crate::Error::runtime_cancelled("wezterm wait for Codex summary", error.to_string())
+        cx.checkpoint().map_err(|_| {
+            wezterm_wait_cx_error(
+                cx,
+                "wezterm wait for Codex summary",
+                "capability checkpoint failed during wait",
+            )
         })?;
 
-        let remaining = wait_remaining(deadline, now, interval);
+        let remaining = wait_remaining(deadline, now);
         let sleep_duration = if interval > remaining {
             remaining
         } else {
@@ -4125,8 +4186,10 @@ pub async fn wait_for_codex_session_summary_with_cx<S: PaneTextSource + Sync + ?
     }
 }
 
-pub(crate) fn elapsed_ms(start: Instant) -> u64 {
-    u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX)
+pub(crate) fn elapsed_ms(cx: &crate::cx::Cx, start: asupersync::Time) -> u64 {
+    crate::runtime_async::timer_now_with_cx(cx)
+        .duration_since(start)
+        / 1_000_000
 }
 
 pub(crate) fn next_poll_count(polls: usize) -> usize {
