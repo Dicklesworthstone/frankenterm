@@ -164,6 +164,9 @@ uuid = { workspace = true, features = ["v4", "rng"] }
 walkdir.workspace = true
 wgpu.workspace = true
 
+[target.'cfg(all(unix, any(target_vendor = "apple", target_os = "linux", target_os = "android", target_os = "freebsd", target_os = "dragonfly")))'.dependencies]
+socket2 = { workspace = true, features = ["all"] }
+
 [target.'cfg(windows)'.dependencies]
 shared_library.workspace = true
 winapi = { workspace = true, features = [

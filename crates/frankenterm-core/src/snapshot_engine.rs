@@ -1175,14 +1175,32 @@ impl SnapshotEngine {
                 }
             }
             Err(e) => {
-                if latch_session_cleanup_reconciliation(reconciliation_required, e) {
+                let current_requires_reconciliation = e.requires_reconciliation();
+                let reconciliation_latched =
+                    latch_session_cleanup_reconciliation(reconciliation_required, e);
+                if current_requires_reconciliation {
                     tracing::warn!(
                         error = %e,
+                        current_requires_reconciliation = true,
+                        historical_reconciliation_latched = reconciliation_latched,
                         automatic_retry_suppressed = true,
                         "Session retention cleanup outcome is indeterminate; reconcile durable state before restarting cleanup"
                     );
+                } else if reconciliation_latched {
+                    tracing::warn!(
+                        error = %e,
+                        current_requires_reconciliation = false,
+                        historical_reconciliation_latched = true,
+                        automatic_retry_suppressed = true,
+                        "Session retention cleanup failed after an earlier indeterminate outcome; historical reconciliation remains required"
+                    );
                 } else {
-                    tracing::warn!(error = %e, "Session retention cleanup failed");
+                    tracing::warn!(
+                        error = %e,
+                        current_requires_reconciliation = false,
+                        historical_reconciliation_latched = false,
+                        "Session retention cleanup failed"
+                    );
                 }
             }
         }
@@ -1972,9 +1990,11 @@ mod tests {
                 phase: SessionCleanupIndeterminatePhase::BlockingTaskSettlement,
             }
         ));
+        let later_retry_safe = SessionCleanupError::DatabaseOpen;
+        assert!(!later_retry_safe.requires_reconciliation());
         assert!(latch_session_cleanup_reconciliation(
             &mut required,
-            SessionCleanupError::DatabaseOpen
+            later_retry_safe
         ));
     }
 

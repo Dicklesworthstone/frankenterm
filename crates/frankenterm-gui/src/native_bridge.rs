@@ -18,7 +18,7 @@ use mux::{Mux, MuxNotification};
 use std::io::Write;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -34,6 +34,7 @@ const RECV_TIMEOUT: Duration = Duration::from_millis(250);
 const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
 const SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(50);
+const SOCKET_CONNECT_TIMEOUT: Duration = Duration::from_millis(250);
 const SOCKET_WRITE_TIMEOUT: Duration = Duration::from_millis(250);
 const MAX_BRIDGE_TEXT_FIELD_BYTES: usize = 16 * 1024;
 static BRIDGE_QUEUE_FULL_DROPS: AtomicU64 = AtomicU64::new(0);
@@ -267,11 +268,20 @@ impl NativeEventBridge {
         let subscription_id = {
             let tx_clone = tx.clone();
             let shutdown_for_subscription = shutdown.clone();
+            // `Mux` owns its subscriber callbacks, so capture a `Weak` identity
+            // rather than creating Mux -> callback -> Mux reference cycle. The
+            // bridge itself retains the strong originating mux until it first
+            // unsubscribes during Drop.
+            let originating_mux = Arc::downgrade(&mux);
             match mux.subscribe(move |notification| {
                 if shutdown_for_subscription.load(Ordering::Acquire) {
                     return false;
                 }
-                handle_mux_notification(&notification, &tx_clone)
+                let Some(originating_mux) = originating_mux_for_notification(&originating_mux)
+                else {
+                    return false;
+                };
+                handle_mux_notification(originating_mux.as_ref(), &notification, &tx_clone)
             }) {
                 Ok(subscription_id) => subscription_id,
                 Err(err) => {
@@ -296,6 +306,10 @@ impl NativeEventBridge {
             subscription_id: Some(subscription_id),
         })
     }
+}
+
+fn originating_mux_for_notification(originating_mux: &Weak<Mux>) -> Option<Arc<Mux>> {
+    originating_mux.upgrade()
 }
 
 impl Drop for NativeEventBridge {
@@ -340,7 +354,14 @@ fn connect_authenticated_native_event_socket(
     socket_path: &Path,
 ) -> Result<UnixStream, NativeEventError> {
     validate_native_event_socket_endpoint(socket_path)?;
-    let stream = UnixStream::connect(socket_path)?;
+    // A plain UnixStream::connect can block indefinitely when a local listener's
+    // accept backlog wedges. The bridge's Drop implementation joins this sender
+    // thread, so use socket2's safe nonblocking-connect + poll implementation and
+    // retain a finite shutdown bound without detached connector threads.
+    let address = socket2::SockAddr::unix(socket_path)?;
+    let socket = socket2::Socket::new(socket2::Domain::UNIX, socket2::Type::STREAM, None)?;
+    socket.connect_timeout(&address, SOCKET_CONNECT_TIMEOUT)?;
+    let stream: UnixStream = socket.into();
     validate_native_event_peer(&stream)?;
     // The bridge's Drop implementation joins the sender thread. A peer that
     // authenticates and then stops reading must not turn shutdown into an
@@ -451,6 +472,7 @@ fn write_event(stream: &mut UnixStream, event: &WireEvent) -> Result<(), std::io
 
 /// Convert a MuxNotification into a BridgeEvent and send it.
 fn handle_mux_notification(
+    mux: &Mux,
     notification: &MuxNotification,
     tx: &std_mpsc::SyncSender<BridgeEvent>,
 ) -> bool {
@@ -463,13 +485,10 @@ fn handle_mux_notification(
             // delta boundaries and can both duplicate and omit bytes. Polling
             // remains the authoritative text-capture path until the mux reader
             // exposes a bounded raw-byte tap with sequence/gap semantics.
-            build_state_change_event(*pane_id, timestamp_ms)
+            build_state_change_event(mux, *pane_id, timestamp_ms)
         }
 
         MuxNotification::PaneAdded(pane_id) => {
-            let Some(mux) = Mux::try_get() else {
-                return true;
-            };
             let (domain, cwd) = if let Some(pane) = mux.get_pane(*pane_id) {
                 let domain_id = pane.domain_id();
                 let domain_name = mux
@@ -506,13 +525,12 @@ fn handle_mux_notification(
         }),
 
         MuxNotification::TabTitleChanged { tab_id, .. } => {
-            // Title change → emit state change for all panes in the tab
-            let Some(mux) = Mux::try_get() else {
-                return true;
-            };
+            // A tab-title change can affect the active pane's presented title.
+            // Emit one bounded active-pane state hint rather than amplifying a
+            // single tab notification across every pane in a large tab.
             if let Some(tab) = mux.get_tab(*tab_id) {
                 if let Some(pane) = tab.get_active_pane() {
-                    return emit_state_change(pane.pane_id(), timestamp_ms, tx);
+                    return emit_state_change(mux, pane.pane_id(), timestamp_ms, tx);
                 }
             }
             None
@@ -521,7 +539,7 @@ fn handle_mux_notification(
         MuxNotification::Alert {
             pane_id,
             alert: wezterm_term::Alert::CurrentWorkingDirectoryChanged,
-        } => build_state_change_event(*pane_id, timestamp_ms),
+        } => build_state_change_event(mux, *pane_id, timestamp_ms),
 
         MuxNotification::Alert {
             pane_id,
@@ -549,8 +567,11 @@ fn handle_mux_notification(
     event.is_none_or(|event| enqueue_bridge_event(tx, event).keeps_subscription())
 }
 
-fn build_state_change_event(pane_id: PaneId, timestamp_ms: u64) -> Option<BridgeEvent> {
-    let mux = Mux::try_get()?;
+fn build_state_change_event(
+    mux: &Mux,
+    pane_id: PaneId,
+    timestamp_ms: u64,
+) -> Option<BridgeEvent> {
     let pane = mux.get_pane(pane_id)?;
     let dims = pane.get_dimensions();
     let cursor = pane.get_cursor_position();
@@ -575,11 +596,12 @@ fn build_state_change_event(pane_id: PaneId, timestamp_ms: u64) -> Option<Bridge
 }
 
 fn emit_state_change(
+    mux: &Mux,
     pane_id: PaneId,
     timestamp_ms: u64,
     tx: &std_mpsc::SyncSender<BridgeEvent>,
 ) -> bool {
-    build_state_change_event(pane_id, timestamp_ms)
+    build_state_change_event(mux, pane_id, timestamp_ms)
         .is_none_or(|event| enqueue_bridge_event(tx, event).keeps_subscription())
 }
 
@@ -730,6 +752,7 @@ mod tests {
             stream.write_timeout().expect("read write-timeout setting"),
             Some(SOCKET_WRITE_TIMEOUT)
         );
+        assert!(!SOCKET_CONNECT_TIMEOUT.is_zero());
         drop(stream);
 
         std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o666))
@@ -807,5 +830,20 @@ mod tests {
             !original_mux.unsubscribe(subscription_id),
             "drop should unsubscribe from the original mux instance, not the current global mux"
         );
+    }
+
+    #[test]
+    fn notification_lookup_remains_bound_to_originating_mux_after_global_swap() {
+        let original_mux = Arc::new(Mux::new(None));
+        let _mux_guard = TestMuxGuard::install(original_mux.clone());
+        let originating_mux = Arc::downgrade(&original_mux);
+        let replacement_mux = Arc::new(Mux::new(None));
+
+        Mux::set_mux(&replacement_mux);
+        let callback_mux = originating_mux_for_notification(&originating_mux)
+            .expect("bridge retains the originating mux while subscribed");
+
+        assert!(Arc::ptr_eq(&callback_mux, &original_mux));
+        assert!(!Arc::ptr_eq(&callback_mux, &replacement_mux));
     }
 }
