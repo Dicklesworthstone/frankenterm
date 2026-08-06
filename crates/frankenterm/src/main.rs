@@ -31862,7 +31862,12 @@ struct AsupersyncWebhookTransport {
 impl AsupersyncWebhookTransport {
     fn new() -> Self {
         Self {
-            client: frankenterm_core::runtime_async::http::HttpClient::new(),
+            // Webhook requests routinely carry bearer credentials in headers
+            // and sensitive payloads in bodies. Never allow a 307/308 (or any
+            // other redirect) to replay that POST automatically elsewhere.
+            client: frankenterm_core::runtime_async::http::HttpClient::builder()
+                .no_redirects()
+                .build(),
         }
     }
 
@@ -31931,10 +31936,17 @@ impl AsupersyncWebhookTransport {
         use frankenterm_core::webhook::DeliveryResult;
 
         match error {
-            // The client's configured request timeout can expire while the
-            // caller's capability budget remains live, so this discriminant
-            // is authoritative on its own.
-            ClientError::DeadlineExceeded => DeliveryResult::deadline_exceeded(),
+            // `DeadlineExceeded` is overloaded: it can mean either the
+            // caller's capability deadline (which must stop fanout) or this
+            // endpoint's request-local timeout (an ordinary transport failure
+            // after which later endpoints must still be attempted). Consult
+            // the exact caller Cx instead of treating the client discriminant
+            // as authoritative on its own.
+            ClientError::DeadlineExceeded => match cx.checkpoint() {
+                Ok(()) => Self::capability_failure(cx)
+                    .unwrap_or_else(DeliveryResult::transport_failure),
+                Err(error) => Self::checkpoint_failure(cx, &error),
+            },
             // Cancellation initiated through the Cx may have a more precise
             // finite budget class. Never retain or format its free-text cause.
             ClientError::Cancelled => {
@@ -31960,6 +31972,41 @@ impl AsupersyncWebhookTransport {
             | ClientError::ProxyError(_)
             | ClientError::PoolExhausted { .. } => DeliveryResult::transport_failure(),
         }
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct EndpointTimeoutThenSuccessWebhookTransport {
+    calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[cfg(test)]
+impl frankenterm_core::webhook::WebhookTransport for EndpointTimeoutThenSuccessWebhookTransport {
+    fn send_with_cx<'a>(
+        &'a self,
+        cx: &'a frankenterm_core::cx::Cx,
+        _url: &'a str,
+        _headers: &'a std::collections::HashMap<String, String>,
+        _body: &'a serde_json::Value,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = frankenterm_core::webhook::DeliveryResult> + Send + 'a,
+        >,
+    > {
+        let call = self
+            .calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Box::pin(async move {
+            if call == 0 {
+                AsupersyncWebhookTransport::client_failure(
+                    cx,
+                    &frankenterm_core::runtime_async::http::ClientError::DeadlineExceeded,
+                )
+            } else {
+                frankenterm_core::webhook::DeliveryResult::from_http_status(204)
+            }
+        })
     }
 }
 
@@ -32150,7 +32197,7 @@ fn asupersync_webhook_client_failure_preserves_finite_discriminants_without_deta
         AsupersyncWebhookTransport::client_failure(&live, &ClientError::DeadlineExceeded);
     assert_eq!(
         request_timeout.failure_class(),
-        Some(DeliveryFailureClass::DeadlineExceeded)
+        Some(DeliveryFailureClass::Transport)
     );
 
     let cancelled = AsupersyncWebhookTransport::client_failure(&live, &ClientError::Cancelled);
@@ -32162,6 +32209,12 @@ fn asupersync_webhook_client_failure_preserves_finite_discriminants_without_deta
     let deadline = frankenterm_core::cx::Cx::for_testing_with_budget(
         frankenterm_core::cx::Budget::new()
             .with_deadline(frankenterm_core::runtime_async::RuntimeTime::ZERO),
+    );
+    let caller_deadline =
+        AsupersyncWebhookTransport::client_failure(&deadline, &ClientError::DeadlineExceeded);
+    assert_eq!(
+        caller_deadline.failure_class(),
+        Some(DeliveryFailureClass::DeadlineExceeded)
     );
     let cancelled_at_deadline =
         AsupersyncWebhookTransport::client_failure(&deadline, &ClientError::Cancelled);
@@ -32179,6 +32232,107 @@ fn asupersync_webhook_client_failure_preserves_finite_discriminants_without_deta
         Some(DeliveryFailureClass::Transport)
     );
     assert!(!format!("{transport:?}").contains("SECRET"));
+}
+
+#[cfg(test)]
+#[test]
+fn endpoint_local_webhook_timeout_does_not_stop_two_endpoint_fanout() {
+    use frankenterm_core::webhook::{
+        DeliveryFailureClass, WebhookDispatcher, WebhookEndpointConfig, WebhookTemplate,
+    };
+
+    let runtime = frankenterm_core::runtime_async::RuntimeBuilder::current_thread()
+        .enable_all()
+        .build()
+        .expect("webhook fanout test runtime");
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| runtime.block_on(async {
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let transport = EndpointTimeoutThenSuccessWebhookTransport {
+            calls: std::sync::Arc::clone(&calls),
+        };
+        let endpoint = |name: &str| WebhookEndpointConfig {
+            name: name.to_string(),
+            url: format!("https://{name}.invalid/hook"),
+            template: WebhookTemplate::Generic,
+            events: Vec::new(),
+            headers: std::collections::HashMap::new(),
+            enabled: true,
+        };
+        let dispatcher = WebhookDispatcher::new(
+            vec![endpoint("times-out"), endpoint("still-runs")],
+            Box::new(transport),
+        );
+        let payload = frankenterm_core::notifications::NotificationPayload {
+            event_type: "test.webhook".to_string(),
+            pane_id: 7,
+            timestamp: "2026-08-05T00:00:00Z".to_string(),
+            summary: "test".to_string(),
+            description: "test".to_string(),
+            severity: "warning".to_string(),
+            agent_type: "test".to_string(),
+            confidence: 1.0,
+            quick_fix: None,
+            suppressed_since_last: 0,
+        };
+        let cx = frankenterm_core::cx::for_testing();
+
+        let records = dispatcher.dispatch_payload_with_cx(&cx, &payload).await;
+
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "a live caller Cx must allow the second endpoint after a request-local timeout"
+        );
+        assert_eq!(records.len(), 2, "both endpoint attempts must be recorded");
+        assert_eq!(records[0].target, "times-out");
+        assert_eq!(
+            records[0].error.as_deref(),
+            Some(DeliveryFailureClass::Transport.code())
+        );
+        assert_eq!(records[1].target, "still-runs");
+        assert!(records[1].accepted);
+        assert_eq!(records[1].status_code, 204);
+    })));
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(runtime)));
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        frankenterm_core::runtime_async::clear_runtime_handle();
+    }));
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn webhook_http_client_constructor_pins_redirects_disabled() {
+    let source = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"))
+        .expect("webhook redirect guard must read the CLI source");
+    let impl_start = source
+        .find("impl AsupersyncWebhookTransport")
+        .expect("webhook transport impl must exist");
+    let capability_start = source[impl_start..]
+        .find("fn capability_failure")
+        .map(|offset| impl_start + offset)
+        .expect("webhook capability classifier must follow its constructor");
+    let constructor = &source[impl_start..capability_start];
+    let builder_call = ["HttpClient", "::", "builder", "()"].concat();
+    let builder_position = constructor
+        .find(&builder_call)
+        .expect("webhook client must use the fluent builder");
+    let no_redirects_call = ["no", "_", "redirects", "()"].concat();
+    let redirect_disable_position = constructor
+        .find(&no_redirects_call)
+        .expect("webhook client must disable automatic redirects");
+    let build_call = [".", "build", "()"].concat();
+    let final_build_position = constructor
+        .rfind(&build_call)
+        .expect("webhook client builder must be finalized");
+
+    assert!(
+        builder_position < redirect_disable_position
+            && redirect_disable_position < final_build_position,
+        "webhook client construction must call no_redirects() before build()"
+    );
 }
 
 #[cfg(test)]
