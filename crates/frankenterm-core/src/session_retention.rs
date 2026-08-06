@@ -14,8 +14,9 @@
 //! Cascade: session deletion cascades to checkpoints -> pane_state via FK.
 
 use std::sync::Arc;
+use std::time::Duration;
 
-use rusqlite::Connection;
+use rusqlite::{Connection, OpenFlags};
 use tracing::{debug, info, warn};
 
 use crate::config::SessionRetentionConfig;
@@ -244,7 +245,20 @@ fn delete_sessions_by_age(conn: &Connection, max_age_days: u64) -> Result<usize,
                        created_at
                    )
                ) < ?1
-         AND shutdown_clean = 1",
+         AND shutdown_clean = 1
+         AND EXISTS (
+             SELECT 1
+             FROM session_checkpoints AS clean
+             WHERE clean.id = mux_sessions.clean_checkpoint_id
+               AND clean.session_id = mux_sessions.session_id
+               AND clean.id = (
+                   SELECT latest.id
+                   FROM session_checkpoints AS latest
+                   WHERE latest.session_id = mux_sessions.session_id
+                   ORDER BY latest.checkpoint_at DESC, latest.id DESC
+                   LIMIT 1
+               )
+         )",
         [cutoff_ms],
     )?;
     tx.commit()?;
@@ -262,9 +276,35 @@ fn delete_excess_closed_sessions(
     let deleted = tx.execute(
         "DELETE FROM mux_sessions
          WHERE shutdown_clean = 1
+           AND EXISTS (
+               SELECT 1
+               FROM session_checkpoints AS clean
+               WHERE clean.id = mux_sessions.clean_checkpoint_id
+                 AND clean.session_id = mux_sessions.session_id
+                 AND clean.id = (
+                     SELECT latest.id
+                     FROM session_checkpoints AS latest
+                     WHERE latest.session_id = mux_sessions.session_id
+                     ORDER BY latest.checkpoint_at DESC, latest.id DESC
+                     LIMIT 1
+                 )
+           )
          AND session_id NOT IN (
              SELECT session_id FROM mux_sessions
              WHERE shutdown_clean = 1
+               AND EXISTS (
+                   SELECT 1
+                   FROM session_checkpoints AS clean
+                   WHERE clean.id = mux_sessions.clean_checkpoint_id
+                     AND clean.session_id = mux_sessions.session_id
+                     AND clean.id = (
+                         SELECT latest.id
+                         FROM session_checkpoints AS latest
+                         WHERE latest.session_id = mux_sessions.session_id
+                         ORDER BY latest.checkpoint_at DESC, latest.id DESC
+                         LIMIT 1
+                     )
+               )
              ORDER BY MAX(
                           created_at,
                           COALESCE(last_checkpoint_at, created_at),
@@ -339,6 +379,19 @@ fn delete_sessions_by_size(
              FROM mux_sessions s
              LEFT JOIN session_checkpoints c ON c.session_id = s.session_id
              WHERE s.shutdown_clean = 1
+               AND EXISTS (
+                   SELECT 1
+                   FROM session_checkpoints AS clean
+                   WHERE clean.id = s.clean_checkpoint_id
+                     AND clean.session_id = s.session_id
+                     AND clean.id = (
+                         SELECT latest.id
+                         FROM session_checkpoints AS latest
+                         WHERE latest.session_id = s.session_id
+                         ORDER BY latest.checkpoint_at DESC, latest.id DESC
+                         LIMIT 1
+                     )
+               )
              GROUP BY s.session_id
              HAVING COALESCE(SUM(c.total_bytes), 0) > 0
              ORDER BY MAX(
@@ -447,13 +500,16 @@ fn cleanup_orphaned_data(conn: &Connection) -> Result<(usize, usize), rusqlite::
 
 /// Run cleanup asynchronously via spawn_blocking.
 ///
-/// Convenience wrapper for use from async contexts.
+/// Test-only convenience wrapper for exercising the finite blocking-handoff
+/// contract. Production path-owned cleanup must enter through
+/// `SnapshotEngine`, which owns the shared database authority.
 ///
 /// # Errors
 ///
 /// Returns the finite [`SessionCleanupError`] contract from
 /// [`cleanup_sessions_async_cx`].
-pub async fn cleanup_sessions_async(
+#[cfg(test)]
+pub(crate) async fn cleanup_sessions_async(
     db_path: Arc<String>,
     config: SessionRetentionConfig,
 ) -> Result<CleanupResult, SessionCleanupError> {
@@ -461,7 +517,7 @@ pub async fn cleanup_sessions_async(
     cleanup_sessions_async_cx(&cx, db_path, config).await
 }
 
-/// Run cleanup asynchronously under an explicit `&Cx` (ft-xbnl0.2.2).
+/// Test-only cleanup under an explicit `&Cx` (ft-xbnl0.2.2).
 ///
 /// Cx-first entry point: caller-supplied cancellation is honored before the
 /// blocking handoff. After admission, cancellation, executor failure, or result
@@ -473,7 +529,8 @@ pub async fn cleanup_sessions_async(
 /// Returns a finite [`SessionCleanupError`]. In particular, an indeterminate
 /// result requires durable-state reconciliation and is never retry-safe merely
 /// because the async join did not produce a receipt.
-pub async fn cleanup_sessions_async_cx(
+#[cfg(test)]
+pub(crate) async fn cleanup_sessions_async_cx(
     cx: &crate::cx::Cx,
     db_path: Arc<String>,
     config: SessionRetentionConfig,
@@ -483,27 +540,7 @@ pub async fn cleanup_sessions_async_cx(
         .map_err(|_| SessionCleanupError::CancelledBeforeHandoff)?;
 
     let outcome = crate::runtime_async::spawn_blocking_with_cx(cx, move || {
-        let conn = Connection::open(db_path.as_str()).map_err(|error| {
-            warn!(error = %error, "session cleanup database open failed");
-            SessionCleanupError::DatabaseOpen
-        })?;
-        conn.execute_batch(
-            "PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON;",
-        )
-        .map_err(|error| {
-            warn!(error = %error, "session cleanup database preparation failed");
-            SessionCleanupError::DatabasePreparation
-        })?;
-        cleanup_sessions(&conn, &config).map_err(|error| {
-            // The cleanup pipeline currently commits policy phases
-            // independently. Any earlier phase may be durable when a later
-            // phase fails, so a generic database error would fabricate retry
-            // safety until exact partial receipts/continuations land.
-            warn!(error = %error, "session cleanup execution outcome is indeterminate");
-            SessionCleanupError::IndeterminateCleanup {
-                phase: SessionCleanupIndeterminatePhase::CleanupExecution,
-            }
-        })
+        cleanup_sessions_from_path(db_path.as_str(), &config)
     })
     .await;
 
@@ -511,6 +548,55 @@ pub async fn cleanup_sessions_async_cx(
         Ok(result) => result,
         Err(error) => Err(classify_session_cleanup_blocking_failure(error)),
     }
+}
+
+/// Synchronous path-owned cleanup entry used when an outer authority
+/// coordinator owns the exact queued-vs-started blocking handoff. Keeping
+/// connection setup here also gives the test-only async seam the same finite
+/// failure classification without nesting a second blocking task.
+pub(crate) fn cleanup_sessions_from_path(
+    db_path: &str,
+    config: &SessionRetentionConfig,
+) -> Result<CleanupResult, SessionCleanupError> {
+    #[cfg(unix)]
+    const SESSION_RETENTION_SQLITE_DEFAULT_VFS: &str = "unix";
+    #[cfg(windows)]
+    const SESSION_RETENTION_SQLITE_DEFAULT_VFS: &str = "win32";
+
+    #[cfg(any(unix, windows))]
+    let connection = Connection::open_with_flags_and_vfs(
+        db_path,
+        OpenFlags::default() | OpenFlags::SQLITE_OPEN_PRIVATE_CACHE,
+        SESSION_RETENTION_SQLITE_DEFAULT_VFS,
+    );
+    #[cfg(not(any(unix, windows)))]
+    let connection = Connection::open_with_flags(
+        db_path,
+        OpenFlags::default() | OpenFlags::SQLITE_OPEN_PRIVATE_CACHE,
+    );
+    let conn = connection.map_err(|error| {
+        warn!(error = %error, "session cleanup database open failed");
+        SessionCleanupError::DatabaseOpen
+    })?;
+    conn.busy_timeout(Duration::from_secs(5)).map_err(|error| {
+        warn!(error = %error, "session cleanup busy policy setup failed");
+        SessionCleanupError::DatabasePreparation
+    })?;
+    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")
+        .map_err(|error| {
+            warn!(error = %error, "session cleanup database preparation failed");
+            SessionCleanupError::DatabasePreparation
+        })?;
+    cleanup_sessions(&conn, config).map_err(|error| {
+        // The cleanup pipeline currently commits policy phases independently.
+        // Any earlier phase may be durable when a later phase fails, so a
+        // generic database error would fabricate retry safety until exact
+        // partial receipts/continuations land.
+        warn!(error = %error, "session cleanup execution outcome is indeterminate");
+        SessionCleanupError::IndeterminateCleanup {
+            phase: SessionCleanupIndeterminatePhase::CleanupExecution,
+        }
+    })
 }
 
 fn classify_session_cleanup_blocking_failure(
@@ -674,6 +760,26 @@ mod tests {
             rusqlite::params![id, created_at, shutdown_clean as i64],
         )
         .unwrap();
+        if shutdown_clean {
+            conn.execute(
+                "INSERT INTO session_checkpoints
+                 (session_id, checkpoint_at, checkpoint_type, state_hash,
+                  pane_count, total_bytes, metadata_json, checkpoint_role,
+                  topology_json)
+                 VALUES (?1, ?2, 'startup', 'restore', 0, 0,
+                         '{\"old_to_new\":{}}', 'restore_receipt', NULL)",
+                rusqlite::params![id, created_at],
+            )
+            .unwrap();
+            let receipt_id = conn.last_insert_rowid();
+            conn.execute(
+                "UPDATE mux_sessions
+                 SET last_checkpoint_at = ?2, clean_checkpoint_id = ?3
+                 WHERE session_id = ?1",
+                rusqlite::params![id, created_at, receipt_id],
+            )
+            .unwrap();
+        }
     }
 
     fn insert_checkpoint(
@@ -683,13 +789,37 @@ mod tests {
         total_bytes: i64,
     ) -> i64 {
         conn.execute(
+            "DELETE FROM session_checkpoints
+             WHERE id = (
+                 SELECT clean_checkpoint_id
+                 FROM mux_sessions
+                 WHERE session_id = ?1
+             )
+               AND checkpoint_role = 'restore_receipt'
+               AND total_bytes = 0",
+            [session_id],
+        )
+        .unwrap();
+        conn.execute(
             "INSERT INTO session_checkpoints
              (session_id, checkpoint_at, checkpoint_type, state_hash, pane_count, total_bytes)
              VALUES (?1, ?2, 'periodic', 'hash', 1, ?3)",
             rusqlite::params![session_id, checkpoint_at, total_bytes],
         )
         .unwrap();
-        conn.last_insert_rowid()
+        let checkpoint_id = conn.last_insert_rowid();
+        conn.execute(
+            "UPDATE mux_sessions
+             SET last_checkpoint_at = ?2,
+                 clean_checkpoint_id = CASE
+                     WHEN shutdown_clean = 1 THEN ?3
+                     ELSE NULL
+                 END
+             WHERE session_id = ?1",
+            rusqlite::params![session_id, checkpoint_at, checkpoint_id],
+        )
+        .unwrap();
+        checkpoint_id
     }
 
     fn insert_pane_state(conn: &Connection, checkpoint_id: i64, pane_id: u64) {

@@ -66,7 +66,15 @@
 /// newest-output index. These indexes bound the storage work behind large
 /// event streams and pane-activity snapshots without changing persisted
 /// records.
-pub const SCHEMA_VERSION: i32 = 35;
+/// Bumped 35 → 36 to separate restorable snapshots from restore bookkeeping
+/// receipts and bind each snapshot to its own topology instead of the mutable
+/// session-level latest topology. Deterministic per-session, global, and
+/// snapshot-only latest indexes bound newest/list queries without deep sorts.
+/// Bumped 36 → 37 to bind `shutdown_clean = 1` to the exact checkpoint row
+/// whose durable receipt justified that claim. Deleting or pruning that row can
+/// now invalidate clean state deterministically instead of leaving a stale
+/// clean flag behind.
+pub const SCHEMA_VERSION: i32 = 37;
 
 /// [ft-ih4tm] Idempotent re-creation of the three `output_segments` FTS
 /// triggers. Called when a database is opened with
@@ -896,7 +904,9 @@ CREATE TABLE IF NOT EXISTS mux_sessions (
     topology_json TEXT NOT NULL,           -- serialized tab/split tree
     window_metadata_json TEXT,             -- window size, title, position
     ft_version TEXT NOT NULL,              -- binary version at creation
-    host_id TEXT                           -- hostname + boot_id for multi-host disambiguation
+    host_id TEXT,                          -- hostname + boot_id for multi-host disambiguation
+    clean_checkpoint_id INTEGER REFERENCES session_checkpoints(id) ON DELETE SET NULL
+                                            -- exact receipt authorizing shutdown_clean = 1
 );
 
 -- Session checkpoints: individual checkpoint snapshots (many per session)
@@ -905,13 +915,25 @@ CREATE TABLE IF NOT EXISTS session_checkpoints (
     session_id TEXT NOT NULL REFERENCES mux_sessions(session_id) ON DELETE CASCADE,
     checkpoint_at INTEGER NOT NULL,        -- epoch ms
     checkpoint_type TEXT NOT NULL CHECK(checkpoint_type IN ('periodic','event','shutdown','startup')),
-    state_hash TEXT NOT NULL,              -- [ft-ybtyg] SipHash-24 (16-hex-char u64) over the serialized state/inputs; used for dedup-skip + restore-path state witness. Not a cryptographic integrity hash.
+    state_hash TEXT NOT NULL,              -- versioned SHA-256 consistency witness; not authentication
     pane_count INTEGER NOT NULL,
-    total_bytes INTEGER NOT NULL,          -- serialized size for budget tracking
-    metadata_json TEXT                     -- trigger reason for 'event' type
+    total_bytes INTEGER NOT NULL,          -- historical pane-state JSON byte estimate
+    metadata_json TEXT,                    -- trigger reason / operator metadata
+    checkpoint_role TEXT NOT NULL DEFAULT 'snapshot'
+        CHECK(checkpoint_role IN ('snapshot','restore_receipt')),
+    topology_json TEXT                     -- exact topology for this snapshot; NULL for receipts/legacy rows
 );
 
 CREATE INDEX IF NOT EXISTS idx_checkpoints_session ON session_checkpoints(session_id, checkpoint_at);
+CREATE INDEX IF NOT EXISTS idx_checkpoints_session_role_latest
+    ON session_checkpoints(session_id, checkpoint_role, checkpoint_at DESC, id DESC);
+CREATE INDEX IF NOT EXISTS idx_checkpoints_global_latest
+    ON session_checkpoints(checkpoint_at DESC, id DESC);
+CREATE INDEX IF NOT EXISTS idx_checkpoints_global_snapshot_latest
+    ON session_checkpoints(checkpoint_at DESC, id DESC)
+    WHERE checkpoint_role = 'snapshot';
+CREATE INDEX IF NOT EXISTS idx_mux_sessions_clean_checkpoint
+    ON mux_sessions(clean_checkpoint_id);
 
 -- Mux pane state: per-pane state snapshot, linked to a checkpoint
 CREATE TABLE IF NOT EXISTS mux_pane_state (

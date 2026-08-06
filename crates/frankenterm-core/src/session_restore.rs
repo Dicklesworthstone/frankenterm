@@ -11,20 +11,24 @@
 //! Database → SessionCandidate → RestoreDecision → LayoutRestorer → RestoreSummary
 //! ```
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
+use crate::checkpoint_witness::{
+    CHECKPOINT_ROLE_RESTORE_RECEIPT, CHECKPOINT_ROLE_SNAPSHOT, RESTORE_RECEIPT_WITNESS_PREFIX,
+    SNAPSHOT_WITNESS_PREFIX, PersistedPaneState, canonical_json_string, checkpoint_witness,
+};
 use crate::restore_layout::{LayoutRestorer, RestoreConfig, RestoreResult};
 use crate::restore_process::{LaunchConfig, ProcessLauncher};
 use crate::restore_scrollback::{
     InjectionConfig, InjectionReport, ScrollbackData, ScrollbackInjector,
 };
 use crate::session_pane_state::{AgentMetadata, PaneStateSnapshot, ProcessInfo, TerminalState};
-use crate::session_topology::TopologySnapshot;
+use crate::session_topology::{PaneNode, TopologySnapshot};
 use crate::wezterm::WeztermHandle;
 
 // =============================================================================
@@ -58,11 +62,9 @@ pub enum RestoreError {
     #[error("restore bookkeeping failed: {0}")]
     Bookkeeping(String),
 
-    /// [ft-qf3vk] Stored state_hash does not match the recomputed hash from
-    /// the same inputs — row was tampered with, or a pre-ft-ybtyg checkpoint
-    /// carrying the legacy `'restore'` literal is being re-read. Either way,
-    /// refuse to restore from it: a mismatched integrity witness is stronger
-    /// evidence against the row than silence.
+    /// Stored consistency witness does not match the exact persisted
+    /// checkpoint projection. This detects corruption and partial mutation;
+    /// it is not authentication against a writer that can recompute SHA-256.
     #[error(
         "state_hash mismatch on checkpoint {checkpoint_id} \
          (session {session_id}): stored={stored}, recomputed={recomputed}"
@@ -73,6 +75,22 @@ pub enum RestoreError {
         stored: String,
         recomputed: String,
     },
+
+    #[error("invalid checkpoint role on checkpoint {checkpoint_id}: {role}")]
+    InvalidCheckpointRole { checkpoint_id: i64, role: String },
+
+    #[error(
+        "checkpoint {checkpoint_id} has role {role} and is not a restorable session snapshot"
+    )]
+    CheckpointNotRestorable { checkpoint_id: i64, role: String },
+
+    #[error("checkpoint {checkpoint_id} has no checkpoint-local topology")]
+    CheckpointTopologyUnavailable { checkpoint_id: i64 },
+
+    #[error(
+        "legacy-unverified checkpoint {checkpoint_id} requires explicit manual recovery and cannot be auto-restored"
+    )]
+    LegacyCheckpointRequiresManualRestore { checkpoint_id: i64 },
 }
 
 impl From<rusqlite::Error> for RestoreError {
@@ -154,9 +172,60 @@ pub struct SessionCandidate {
     pub session_id: String,
     pub created_at: u64,
     pub last_checkpoint_at: Option<u64>,
+    /// Mutable latest-session summary retained for CLI compatibility. Restore
+    /// authority comes exclusively from `CheckpointData::topology_json`.
     pub topology_json: String,
     pub ft_version: String,
     pub host_id: Option<String>,
+}
+
+/// Durable purpose of a checkpoint row.
+///
+/// Snapshot rows carry restorable topology and pane state. Restore receipts
+/// only attest that a prior restore attempt recorded its old-to-new pane map;
+/// they must never be selected as layout restore points.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckpointRole {
+    Snapshot,
+    RestoreReceipt,
+}
+
+impl CheckpointRole {
+    fn from_db(checkpoint_id: i64, role: &str) -> Result<Self, RestoreError> {
+        match role {
+            CHECKPOINT_ROLE_SNAPSHOT => Ok(Self::Snapshot),
+            CHECKPOINT_ROLE_RESTORE_RECEIPT => Ok(Self::RestoreReceipt),
+            _ => Err(RestoreError::InvalidCheckpointRole {
+                checkpoint_id,
+                role: role.to_string(),
+            }),
+        }
+    }
+
+    const fn as_db_str(self) -> &'static str {
+        match self {
+            Self::Snapshot => CHECKPOINT_ROLE_SNAPSHOT,
+            Self::RestoreReceipt => CHECKPOINT_ROLE_RESTORE_RECEIPT,
+        }
+    }
+}
+
+impl std::fmt::Display for CheckpointRole {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_db_str())
+    }
+}
+
+/// Strength of the consistency evidence carried by a loaded row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckpointVerification {
+    /// Versioned SHA-256 witness recomputed over the exact stored projection.
+    VerifiedV2,
+    /// Historical 16-hex witness or literal `restore`. It is retained for
+    /// explicit manual recovery only and is never eligible for auto-restore.
+    LegacyUnverified,
 }
 
 /// Loaded checkpoint with per-pane state.
@@ -165,8 +234,13 @@ pub struct CheckpointData {
     pub checkpoint_id: i64,
     pub session_id: String,
     pub checkpoint_at: u64,
-    pub checkpoint_type: Option<String>,
+    pub checkpoint_type: String,
+    pub checkpoint_role: CheckpointRole,
+    pub verification: CheckpointVerification,
+    /// Topology owned by this exact checkpoint. Receipts have no topology.
+    pub topology_json: Option<String>,
     pub pane_count: usize,
+    pub total_bytes: usize,
     pub pane_states: Vec<RestoredPaneState>,
 }
 
@@ -267,10 +341,33 @@ fn open_conn(db_path: &str) -> Result<Connection, RestoreError> {
 pub fn find_unclean_sessions(db_path: &str) -> Result<Vec<SessionCandidate>, RestoreError> {
     let conn = open_conn(db_path)?;
     let mut stmt = conn.prepare(
-        "SELECT session_id, created_at, last_checkpoint_at, topology_json, ft_version, host_id,
-                shutdown_clean
-         FROM mux_sessions
-         ORDER BY COALESCE(last_checkpoint_at, created_at) DESC",
+        "SELECT session.session_id,
+                session.created_at,
+                session.last_checkpoint_at,
+                session.topology_json,
+                session.ft_version,
+                session.host_id,
+                CASE
+                    WHEN session.shutdown_clean = 1
+                     AND EXISTS (
+                         SELECT 1
+                         FROM session_checkpoints AS clean
+                         WHERE clean.id = session.clean_checkpoint_id
+                           AND clean.session_id = session.session_id
+                           AND clean.id = (
+                               SELECT latest.id
+                               FROM session_checkpoints AS latest
+                               WHERE latest.session_id = session.session_id
+                               ORDER BY latest.checkpoint_at DESC, latest.id DESC
+                               LIMIT 1
+                           )
+                     )
+                    THEN 1
+                    ELSE 0
+                END AS authoritative_shutdown_clean
+         FROM mux_sessions AS session
+         ORDER BY COALESCE(session.last_checkpoint_at, session.created_at) DESC,
+                  session.session_id ASC",
     )?;
 
     let rows = stmt.query_map([], |row| {
@@ -322,19 +419,15 @@ pub fn load_latest_checkpoint(
 ) -> Result<Option<CheckpointData>, RestoreError> {
     let conn = open_conn(db_path)?;
 
-    // Prefer the latest checkpoint that still has pane state rows.
-    // Restore-created "startup" checkpoints only record pane ID mappings,
-    // so they should not shadow the last usable capture checkpoint.
+    // Purpose is explicit in schema v36. Do not infer it from pane-row
+    // presence or the overloaded `startup` checkpoint type: a genuine empty
+    // snapshot is still a snapshot, while a restore receipt is never one.
     let checkpoint_id = conn.query_row(
         "SELECT c.id
          FROM session_checkpoints c
          WHERE c.session_id = ?1
-         ORDER BY EXISTS(
-             SELECT 1
-             FROM mux_pane_state ps
-             WHERE ps.checkpoint_id = c.id
-         ) DESC,
-         c.checkpoint_at DESC
+           AND c.checkpoint_role = 'snapshot'
+         ORDER BY c.checkpoint_at DESC, c.id DESC
          LIMIT 1",
         [session_id],
         |row| row.get::<_, i64>(0),
@@ -355,8 +448,8 @@ pub fn load_checkpoint_by_id(
     let conn = open_conn(db_path)?;
 
     let checkpoint = conn.query_row(
-        "SELECT session_id, checkpoint_at, checkpoint_type, pane_count,
-                state_hash, metadata_json
+        "SELECT session_id, checkpoint_at, checkpoint_type, checkpoint_role,
+                state_hash, pane_count, total_bytes, metadata_json, topology_json
          FROM session_checkpoints
          WHERE id = ?1",
         [checkpoint_id],
@@ -364,10 +457,13 @@ pub fn load_checkpoint_by_id(
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, i64>(1)?,
-                row.get::<_, Option<String>>(2)?,
-                row.get::<_, i64>(3)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
                 row.get::<_, String>(4)?,
-                row.get::<_, Option<String>>(5)?,
+                row.get::<_, i64>(5)?,
+                row.get::<_, i64>(6)?,
+                row.get::<_, Option<String>>(7)?,
+                row.get::<_, Option<String>>(8)?,
             ))
         },
     );
@@ -376,9 +472,12 @@ pub fn load_checkpoint_by_id(
         session_id,
         checkpoint_at_raw,
         checkpoint_type,
-        pane_count_raw,
+        checkpoint_role_raw,
         stored_state_hash,
+        pane_count_raw,
+        total_bytes_raw,
         metadata_json,
+        topology_json,
     ) = match checkpoint {
         Ok(c) => c,
         Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
@@ -386,73 +485,70 @@ pub fn load_checkpoint_by_id(
     };
     let checkpoint_at = decode_u64(checkpoint_at_raw, "session_checkpoints.checkpoint_at")?;
     let pane_count = decode_usize(pane_count_raw, "session_checkpoints.pane_count")?;
+    let total_bytes = decode_usize(total_bytes_raw, "session_checkpoints.total_bytes")?;
+    let checkpoint_role = CheckpointRole::from_db(checkpoint_id, &checkpoint_role_raw)?;
 
-    // [ft-qf3vk] Integrity check for restore-written checkpoints. ft-ybtyg
-    // stopped writing the `'restore'` literal and started writing a real
-    // SipHash — but never wired the verifier. Close that gap here: for
-    // `checkpoint_type = 'startup'` rows (the ones produced by
-    // `finalize_restore` / `save_restore_checkpoint`), recompute the hash
-    // from the same inputs that were fed to `compute_restore_state_hash` at
-    // write time — `(session_id, pane_id_map, now_ms)` — and refuse to
-    // return the checkpoint if they disagree. The pane_id_map is recovered
-    // from `metadata_json.old_to_new`, which both INSERT sites write.
-    //
-    // Capture checkpoints (checkpoint_type = 'periodic' etc.) use
-    // `snapshot_engine::compute_state_hash` over PaneInfo inputs that are
-    // not reconstructable from session_checkpoints alone, so they are not
-    // verified here — that remains a documented follow-up.
-    if checkpoint_type.as_deref() == Some("startup") {
-        verify_restore_state_hash(
-            checkpoint_id,
-            &session_id,
-            checkpoint_at_raw,
-            metadata_json.as_deref(),
-            &stored_state_hash,
-        )?;
-    }
-
-    // Load pane states for this checkpoint ID.
+    // Load the exact persisted pane projection. `env_json` is deliberately
+    // included even though restore does not re-inject environment variables:
+    // it participates in the row-local v2 consistency witness.
     let mut stmt = conn.prepare(
-        "SELECT pane_id, cwd, command, terminal_state_json, agent_metadata_json,
-                scrollback_checkpoint_seq, last_output_at
+        "SELECT pane_id, cwd, command, env_json, terminal_state_json,
+                agent_metadata_json, scrollback_checkpoint_seq, last_output_at
          FROM mux_pane_state
-         WHERE checkpoint_id = ?1",
+         WHERE checkpoint_id = ?1
+         ORDER BY pane_id ASC, id ASC",
     )?;
 
-    let raw_pane_states = stmt
+    let persisted_panes = stmt
         .query_map([checkpoint_id], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, Option<String>>(1)?,
-                row.get::<_, Option<String>>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, Option<String>>(4)?,
-                row.get::<_, Option<i64>>(5)?,
-                row.get::<_, Option<i64>>(6)?,
-            ))
+            Ok(PersistedPaneState {
+                pane_id: row.get(0)?,
+                cwd: row.get(1)?,
+                command: row.get(2)?,
+                env_json: row.get(3)?,
+                terminal_state_json: row.get(4)?,
+                agent_metadata_json: row.get(5)?,
+                scrollback_checkpoint_seq: row.get(6)?,
+                last_output_at: row.get(7)?,
+            })
         })?
         .collect::<Result<Vec<_>, _>>()?;
 
-    let mut pane_states = Vec::with_capacity(raw_pane_states.len());
-    for (
-        pane_id_raw,
-        cwd,
-        command,
-        terminal_json,
-        agent_json,
-        scrollback_checkpoint_seq,
-        last_output_at,
-    ) in raw_pane_states
-    {
-        let pane_id = decode_u64(pane_id_raw, "mux_pane_state.pane_id")?;
-        let terminal_state =
-            serde_json::from_str::<TerminalState>(&terminal_json).map_err(|error| {
+    validate_checkpoint_structure(
+        checkpoint_id,
+        checkpoint_role,
+        &checkpoint_type,
+        pane_count,
+        total_bytes,
+        metadata_json.as_deref(),
+        topology_json.as_deref(),
+        &persisted_panes,
+    )?;
+    let verification = verify_checkpoint_witness(
+        checkpoint_id,
+        &session_id,
+        checkpoint_at_raw,
+        &checkpoint_type,
+        checkpoint_role,
+        &stored_state_hash,
+        pane_count_raw,
+        total_bytes_raw,
+        metadata_json.as_deref(),
+        topology_json.as_deref(),
+        &persisted_panes,
+    )?;
+
+    let mut pane_states = Vec::with_capacity(persisted_panes.len());
+    for persisted in persisted_panes {
+        let pane_id = decode_u64(persisted.pane_id, "mux_pane_state.pane_id")?;
+        let terminal_state = serde_json::from_str::<TerminalState>(&persisted.terminal_state_json)
+            .map_err(|error| {
                 RestoreError::CorruptCheckpoint(format!(
                     "pane {pane_id} has invalid terminal_state_json: {error}"
                 ))
             })?;
-        let agent_metadata = match agent_json {
-            Some(agent_json) => Some(serde_json::from_str::<AgentMetadata>(&agent_json).map_err(
+        let agent_metadata = match persisted.agent_metadata_json.as_deref() {
+            Some(agent_json) => Some(serde_json::from_str::<AgentMetadata>(agent_json).map_err(
                 |error| {
                     RestoreError::CorruptCheckpoint(format!(
                         "pane {pane_id} has invalid agent_metadata_json: {error}"
@@ -464,15 +560,18 @@ pub fn load_checkpoint_by_id(
 
         pane_states.push(RestoredPaneState {
             pane_id,
-            cwd,
-            command,
+            cwd: persisted.cwd,
+            command: persisted.command,
             terminal_state: Some(terminal_state),
             agent_metadata,
             scrollback_checkpoint_seq: decode_opt_u64(
-                scrollback_checkpoint_seq,
+                persisted.scrollback_checkpoint_seq,
                 "mux_pane_state.scrollback_checkpoint_seq",
             )?,
-            last_output_at: decode_opt_u64(last_output_at, "mux_pane_state.last_output_at")?,
+            last_output_at: decode_opt_u64(
+                persisted.last_output_at,
+                "mux_pane_state.last_output_at",
+            )?,
         });
     }
 
@@ -481,127 +580,308 @@ pub fn load_checkpoint_by_id(
         session_id,
         checkpoint_at,
         checkpoint_type,
+        checkpoint_role,
+        verification,
+        topology_json,
         pane_count,
+        total_bytes,
         pane_states,
     }))
 }
 
-/// Mark a session as restored (set shutdown_clean = 1).
-fn mark_session_restored(db_path: &str, session_id: &str) -> Result<(), RestoreError> {
-    let conn = open_conn(db_path)?;
-    conn.execute(
-        "UPDATE mux_sessions SET shutdown_clean = 1 WHERE session_id = ?1",
-        [session_id],
-    )?;
+#[allow(clippy::too_many_arguments)]
+fn validate_checkpoint_structure(
+    checkpoint_id: i64,
+    role: CheckpointRole,
+    checkpoint_type: &str,
+    pane_count: usize,
+    total_bytes: usize,
+    metadata_json: Option<&str>,
+    topology_json: Option<&str>,
+    panes: &[PersistedPaneState],
+) -> Result<(), RestoreError> {
+    match role {
+        CheckpointRole::Snapshot => {
+            if topology_json.is_none() {
+                return Err(RestoreError::CheckpointTopologyUnavailable { checkpoint_id });
+            }
+            if panes.len() != pane_count {
+                return Err(RestoreError::CorruptCheckpoint(format!(
+                    "checkpoint {checkpoint_id} declares {pane_count} panes but stores {} pane rows",
+                    panes.len()
+                )));
+            }
+            // The loader query orders by pane_id then row id, so duplicates
+            // are adjacent and need no per-checkpoint hash-set allocation.
+            let mut previous_pane_id = None;
+            for pane in panes {
+                decode_u64(pane.pane_id, "mux_pane_state.pane_id")?;
+                if previous_pane_id == Some(pane.pane_id) {
+                    return Err(RestoreError::CorruptCheckpoint(format!(
+                        "checkpoint {checkpoint_id} stores duplicate pane id {}",
+                        pane.pane_id
+                    )));
+                }
+                previous_pane_id = Some(pane.pane_id);
+            }
+        }
+        CheckpointRole::RestoreReceipt => {
+            if checkpoint_type != "startup" {
+                return Err(RestoreError::CorruptCheckpoint(format!(
+                    "restore receipt {checkpoint_id} has checkpoint type {checkpoint_type}, expected startup"
+                )));
+            }
+            if total_bytes != 0 {
+                return Err(RestoreError::CorruptCheckpoint(format!(
+                    "restore receipt {checkpoint_id} declares {total_bytes} payload bytes"
+                )));
+            }
+            if topology_json.is_some() {
+                return Err(RestoreError::CorruptCheckpoint(format!(
+                    "restore receipt {checkpoint_id} unexpectedly carries topology"
+                )));
+            }
+            if !panes.is_empty() {
+                return Err(RestoreError::CorruptCheckpoint(format!(
+                    "restore receipt {checkpoint_id} unexpectedly stores pane-state rows"
+                )));
+            }
+            let mapping_count = restore_receipt_mapping_count(checkpoint_id, metadata_json)?;
+            if mapping_count != pane_count {
+                return Err(RestoreError::CorruptCheckpoint(format!(
+                    "restore receipt {checkpoint_id} declares {pane_count} mappings but metadata stores {mapping_count}"
+                )));
+            }
+        }
+    }
     Ok(())
 }
 
-/// Compute a deterministic SipHash-24 over the restore-time inputs that are
-/// available at session_checkpoint INSERT time.
-///
-/// [ft-ybtyg] The session_checkpoints.state_hash column used to carry the
-/// hardcoded literal `'restore'` on the restore-INSERT path, which meant a
-/// tampered DB row could not be detected by its hash and the column was
-/// effectively unused on that path. This helper produces a real hash derived
-/// from `(session_id, pane_id_map, now_ms)` — the exact inputs that drove
-/// the insert — so a later integrity check can recompute and compare.
-///
-/// Same algorithm as [`crate::snapshot_engine::compute_state_hash`] so the
-/// on-disk format stays consistent: SipHash-24 formatted as a 16-hex-char
-/// u64 string. No new columns, no schema migration, no dependency change.
-pub(super) fn compute_restore_state_hash(
-    session_id: &str,
-    pane_id_map: &HashMap<u64, u64>,
-    now_ms: i64,
-) -> String {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-
-    // Domain separator so a collision with the snapshot_engine dedup
-    // hash is impossible even if the same (session, panes) tuple happens
-    // to produce the same SipHash u64.
-    b"ft-ybtyg:restore-checkpoint-v1".hash(&mut hasher);
-    session_id.hash(&mut hasher);
-    now_ms.hash(&mut hasher);
-
-    // Sort pane_id_map by old_id for deterministic ordering — a
-    // HashMap iterator is insertion-order-dependent on asupersync and
-    // undefined on std::HashMap, so hash inputs must be sorted first.
-    let mut entries: Vec<(u64, u64)> = pane_id_map.iter().map(|(k, v)| (*k, *v)).collect();
-    entries.sort_unstable_by_key(|(old_id, _)| *old_id);
-    for (old_id, new_id) in &entries {
-        old_id.hash(&mut hasher);
-        new_id.hash(&mut hasher);
-    }
-
-    format!("{:016x}", hasher.finish())
-}
-
-/// [ft-qf3vk] Reconstruct the pane_id_map that was fed to
-/// `compute_restore_state_hash` at write time, recompute the hash, and assert
-/// it matches the stored value. Returns `StateHashMismatch` on tampering or
-/// any structural problem in the persisted metadata.
-///
-/// The write-time inputs are:
-///   * `session_id`           — carried verbatim in session_checkpoints
-///   * `pane_id_map`          — serialized as `metadata_json.old_to_new`
-///   * `now_ms`               — stored as `session_checkpoints.checkpoint_at`
-///
-/// A malformed or missing `metadata_json.old_to_new` is treated the same as
-/// a hash mismatch: the row's integrity witness is no longer reliable, so we
-/// refuse to restore from it rather than falling back to "restore anyway".
-fn verify_restore_state_hash(
+fn restore_receipt_mapping_count(
     checkpoint_id: i64,
-    session_id: &str,
-    checkpoint_at_raw: i64,
     metadata_json: Option<&str>,
-    stored_state_hash: &str,
-) -> Result<(), RestoreError> {
-    let mismatch = |recomputed: String| RestoreError::StateHashMismatch {
-        checkpoint_id,
-        session_id: session_id.to_string(),
-        stored: stored_state_hash.to_string(),
-        recomputed,
-    };
-
-    let Some(metadata_json) = metadata_json else {
-        return Err(mismatch(String::from("<metadata_json is NULL>")));
-    };
-
-    let parsed: serde_json::Value = match serde_json::from_str(metadata_json) {
-        Ok(v) => v,
-        Err(_) => return Err(mismatch(String::from("<metadata_json is not JSON>"))),
-    };
-
-    let old_to_new = match parsed.get("old_to_new").and_then(|v| v.as_object()) {
-        Some(map) => map,
-        None => {
-            return Err(mismatch(String::from(
-                "<metadata_json.old_to_new is missing or not an object>",
+) -> Result<usize, RestoreError> {
+    let metadata_json = metadata_json.ok_or_else(|| {
+        RestoreError::CorruptCheckpoint(format!(
+            "restore receipt {checkpoint_id} has NULL metadata_json"
+        ))
+    })?;
+    let metadata: serde_json::Value = serde_json::from_str(metadata_json).map_err(|error| {
+        RestoreError::CorruptCheckpoint(format!(
+            "restore receipt {checkpoint_id} has invalid metadata_json: {error}"
+        ))
+    })?;
+    let mapping = metadata
+        .get("old_to_new")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| {
+            RestoreError::CorruptCheckpoint(format!(
+                "restore receipt {checkpoint_id} metadata has no old_to_new object"
+            ))
+        })?;
+    let mut old_ids = HashSet::with_capacity(mapping.len());
+    let mut new_ids = HashSet::with_capacity(mapping.len());
+    for (old_id, new_id) in mapping {
+        let parsed_old_id = old_id.parse::<u64>().map_err(|_| {
+            RestoreError::CorruptCheckpoint(format!(
+                "restore receipt {checkpoint_id} has non-u64 old pane id {old_id}"
+            ))
+        })?;
+        if !old_ids.insert(parsed_old_id) {
+            return Err(RestoreError::CorruptCheckpoint(format!(
+                "restore receipt {checkpoint_id} contains duplicate encodings of old pane {parsed_old_id}"
             )));
         }
-    };
+        let new_id = new_id.as_u64().ok_or_else(|| {
+            RestoreError::CorruptCheckpoint(format!(
+                "restore receipt {checkpoint_id} has non-u64 new pane id for {old_id}"
+            ))
+        })?;
+        if !new_ids.insert(new_id) {
+            return Err(RestoreError::CorruptCheckpoint(format!(
+                "restore receipt {checkpoint_id} maps more than one old pane to new pane {new_id}"
+            )));
+        }
+    }
+    Ok(mapping.len())
+}
 
-    let mut pane_id_map: HashMap<u64, u64> = HashMap::with_capacity(old_to_new.len());
-    for (old_key, new_value) in old_to_new {
-        let Ok(old_id) = old_key.parse::<u64>() else {
-            return Err(mismatch(format!(
-                "<metadata_json.old_to_new key is not u64: {old_key}>"
-            )));
+#[allow(clippy::too_many_arguments)]
+fn verify_checkpoint_witness(
+    checkpoint_id: i64,
+    session_id: &str,
+    checkpoint_at: i64,
+    checkpoint_type: &str,
+    role: CheckpointRole,
+    stored_state_hash: &str,
+    pane_count: i64,
+    total_bytes: i64,
+    metadata_json: Option<&str>,
+    topology_json: Option<&str>,
+    panes: &[PersistedPaneState],
+) -> Result<CheckpointVerification, RestoreError> {
+    let is_v2 = stored_state_hash.starts_with(SNAPSHOT_WITNESS_PREFIX)
+        || stored_state_hash.starts_with(RESTORE_RECEIPT_WITNESS_PREFIX);
+    if is_v2 {
+        let expected_prefix = match role {
+            CheckpointRole::Snapshot => SNAPSHOT_WITNESS_PREFIX,
+            CheckpointRole::RestoreReceipt => RESTORE_RECEIPT_WITNESS_PREFIX,
         };
-        let Some(new_id) = new_value.as_u64() else {
-            return Err(mismatch(format!(
-                "<metadata_json.old_to_new[{old_key}] is not u64>"
+        if !stored_state_hash.starts_with(expected_prefix) {
+            return Err(RestoreError::CorruptCheckpoint(format!(
+                "checkpoint {checkpoint_id} uses a witness prefix for the wrong checkpoint role"
             )));
-        };
-        pane_id_map.insert(old_id, new_id);
+        }
+        let recomputed = checkpoint_witness(
+            role.as_db_str(),
+            session_id,
+            checkpoint_id,
+            checkpoint_at,
+            checkpoint_type,
+            pane_count,
+            total_bytes,
+            metadata_json,
+            topology_json,
+            panes,
+        )
+        .map_err(|error| {
+            RestoreError::CorruptCheckpoint(format!(
+                "checkpoint {checkpoint_id} witness projection is invalid: {error}"
+            ))
+        })?;
+        if recomputed != stored_state_hash {
+            return Err(RestoreError::StateHashMismatch {
+                checkpoint_id,
+                session_id: session_id.to_string(),
+                stored: stored_state_hash.to_string(),
+                recomputed,
+            });
+        }
+        return Ok(CheckpointVerification::VerifiedV2);
     }
 
-    let recomputed = compute_restore_state_hash(session_id, &pane_id_map, checkpoint_at_raw);
-    if recomputed != stored_state_hash {
-        return Err(mismatch(recomputed));
+    let is_legacy = match role {
+        CheckpointRole::Snapshot => {
+            stored_state_hash.len() == 16
+                && stored_state_hash
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit())
+        }
+        CheckpointRole::RestoreReceipt => stored_state_hash == "restore",
+    };
+    if is_legacy {
+        return Ok(CheckpointVerification::LegacyUnverified);
+    }
+
+    Err(RestoreError::CorruptCheckpoint(format!(
+        "checkpoint {checkpoint_id} has an unknown state_hash encoding"
+    )))
+}
+
+/// Test-only exact-receipt clean transition. Production restore bookkeeping
+/// uses `finalize_restore`, which creates and binds its receipt atomically.
+#[cfg(test)]
+fn mark_session_restored(db_path: &str, session_id: &str) -> Result<(), RestoreError> {
+    let conn = open_conn(db_path)?;
+    let checkpoint_id = conn
+        .query_row(
+            "SELECT id
+             FROM session_checkpoints
+             WHERE session_id = ?1
+             ORDER BY checkpoint_at DESC, id DESC
+             LIMIT 1",
+            [session_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|error| {
+            RestoreError::Bookkeeping(format!(
+                "cannot mark session {session_id} restored without an exact checkpoint receipt: {error}"
+            ))
+        })?;
+    let updated = conn.execute(
+        "UPDATE mux_sessions
+         SET shutdown_clean = 1, clean_checkpoint_id = ?2
+         WHERE session_id = ?1",
+        rusqlite::params![session_id, checkpoint_id],
+    )?;
+    if updated != 1 {
+        return Err(RestoreError::Bookkeeping(format!(
+            "cannot bind clean receipt to missing session {session_id}"
+        )));
     }
     Ok(())
+}
+
+fn prepare_restore_receipt_metadata(
+    pane_id_map: &HashMap<u64, u64>,
+) -> Result<(String, i64), RestoreError> {
+    let pane_count = i64::try_from(pane_id_map.len()).map_err(|_| {
+        RestoreError::Bookkeeping("restore pane mapping count exceeds SQLite INTEGER".to_string())
+    })?;
+    let mut ordered_mapping = BTreeMap::new();
+    let mut new_ids = HashSet::with_capacity(pane_id_map.len());
+    for (&old_id, &new_id) in pane_id_map {
+        if !new_ids.insert(new_id) {
+            return Err(RestoreError::Bookkeeping(format!(
+                "restore mapping assigns new pane {new_id} more than once"
+            )));
+        }
+        ordered_mapping.insert(old_id.to_string(), new_id);
+    }
+    let metadata = serde_json::json!({ "old_to_new": ordered_mapping });
+    let metadata_json = canonical_json_string(&metadata).map_err(|error| {
+        RestoreError::Bookkeeping(format!(
+            "failed to canonicalize restore receipt metadata: {error}"
+        ))
+    })?;
+    Ok((metadata_json, pane_count))
+}
+
+/// Insert one restore receipt and replace its transaction-local placeholder
+/// only after SQLite assigns the row ID that the v2 witness binds.
+fn insert_restore_receipt(
+    tx: &rusqlite::Transaction<'_>,
+    session_id: &str,
+    now_ms: i64,
+    metadata_json: &str,
+    pane_count: i64,
+) -> Result<i64, RestoreError> {
+    tx.execute(
+        "INSERT INTO session_checkpoints
+         (session_id, checkpoint_at, checkpoint_type, state_hash, pane_count,
+          total_bytes, metadata_json, checkpoint_role, topology_json)
+         VALUES (?1, ?2, 'startup', 'pending:rst2', ?3, 0, ?4,
+                 'restore_receipt', NULL)",
+        rusqlite::params![session_id, now_ms, pane_count, metadata_json],
+    )?;
+    let checkpoint_id = tx.last_insert_rowid();
+    let state_hash = checkpoint_witness(
+        CHECKPOINT_ROLE_RESTORE_RECEIPT,
+        session_id,
+        checkpoint_id,
+        now_ms,
+        "startup",
+        pane_count,
+        0,
+        Some(metadata_json),
+        None,
+        &[],
+    )
+    .map_err(|error| {
+        RestoreError::Bookkeeping(format!(
+            "failed to compute restore receipt witness: {error}"
+        ))
+    })?;
+    let updated = tx.execute(
+        "UPDATE session_checkpoints SET state_hash = ?1 WHERE id = ?2",
+        rusqlite::params![state_hash, checkpoint_id],
+    )?;
+    if updated != 1 {
+        return Err(RestoreError::Bookkeeping(format!(
+            "restore receipt witness update changed {updated} rows for checkpoint {checkpoint_id}"
+        )));
+    }
+    Ok(checkpoint_id)
 }
 
 /// Record the pane ID mapping from restore in a new startup checkpoint.
@@ -617,35 +897,24 @@ fn save_restore_checkpoint(
     // for every persisted record (collision on the persisted column).
     let now_ms = crate::clock_anomaly::epoch_ms_i64("ft.session_restore.clock");
 
-    let metadata = serde_json::json!({
-        "old_to_new": pane_id_map.iter()
-            .map(|(k, v)| (k.to_string(), *v))
-            .collect::<HashMap<String, u64>>(),
-    });
-
-    // [ft-ybtyg] replace hardcoded `'restore'` placeholder with a real
-    // SipHash-24 over the restore-time inputs. Same 16-hex-char format
-    // as `compute_state_hash`, so the on-disk column shape is preserved.
-    let state_hash = compute_restore_state_hash(session_id, pane_id_map, now_ms);
+    let (metadata_json, pane_count) = prepare_restore_receipt_metadata(pane_id_map)?;
 
     let tx = conn.transaction()?;
-    tx.execute(
-        "INSERT INTO session_checkpoints
-         (session_id, checkpoint_at, checkpoint_type, state_hash, pane_count, total_bytes, metadata_json)
-         VALUES (?1, ?2, 'startup', ?5, ?3, 0, ?4)",
-        rusqlite::params![
-            session_id,
-            now_ms,
-            pane_id_map.len() as i64,
-            metadata.to_string(),
-            state_hash,
-        ],
-    )?;
-    let checkpoint_id = tx.last_insert_rowid();
-    tx.execute(
-        "UPDATE mux_sessions SET last_checkpoint_at = ?2 WHERE session_id = ?1",
+    let checkpoint_id =
+        insert_restore_receipt(&tx, session_id, now_ms, &metadata_json, pane_count)?;
+    let updated = tx.execute(
+        "UPDATE mux_sessions
+         SET last_checkpoint_at = ?2,
+             shutdown_clean = 0,
+             clean_checkpoint_id = NULL
+         WHERE session_id = ?1",
         rusqlite::params![session_id, now_ms],
     )?;
+    if updated != 1 {
+        return Err(RestoreError::Bookkeeping(format!(
+            "restore receipt references missing session {session_id}"
+        )));
+    }
     tx.commit()?;
 
     Ok(checkpoint_id)
@@ -665,41 +934,34 @@ fn finalize_restore(
     // for every persisted record (collision on the persisted column).
     let now_ms = crate::clock_anomaly::epoch_ms_i64("ft.session_restore.clock");
 
-    let metadata = serde_json::json!({
-        "old_to_new": pane_id_map.iter()
-            .map(|(k, v)| (k.to_string(), *v))
-            .collect::<HashMap<String, u64>>(),
-    });
-
-    // [ft-ybtyg] real state_hash instead of the prior `'restore'` literal.
-    let state_hash = compute_restore_state_hash(session_id, pane_id_map, now_ms);
+    let (metadata_json, pane_count) = prepare_restore_receipt_metadata(pane_id_map)?;
 
     let tx = conn.transaction()?;
-    tx.execute(
-        "INSERT INTO session_checkpoints
-         (session_id, checkpoint_at, checkpoint_type, state_hash, pane_count, total_bytes, metadata_json)
-         VALUES (?1, ?2, 'startup', ?5, ?3, 0, ?4)",
-        rusqlite::params![
-            session_id,
-            now_ms,
-            pane_id_map.len() as i64,
-            metadata.to_string(),
-            state_hash,
-        ],
-    )?;
-    let checkpoint_id = tx.last_insert_rowid();
-    if mark_clean {
+    let checkpoint_id =
+        insert_restore_receipt(&tx, session_id, now_ms, &metadata_json, pane_count)?;
+    let updated = if mark_clean {
         tx.execute(
             "UPDATE mux_sessions
-             SET last_checkpoint_at = ?2, shutdown_clean = 1
+             SET last_checkpoint_at = ?2,
+                 shutdown_clean = 1,
+                 clean_checkpoint_id = ?3
              WHERE session_id = ?1",
-            rusqlite::params![session_id, now_ms],
-        )?;
+            rusqlite::params![session_id, now_ms, checkpoint_id],
+        )?
     } else {
         tx.execute(
-            "UPDATE mux_sessions SET last_checkpoint_at = ?2 WHERE session_id = ?1",
+            "UPDATE mux_sessions
+             SET last_checkpoint_at = ?2,
+                 shutdown_clean = 0,
+                 clean_checkpoint_id = NULL
+             WHERE session_id = ?1",
             rusqlite::params![session_id, now_ms],
-        )?;
+        )?
+    };
+    if updated != 1 {
+        return Err(RestoreError::Bookkeeping(format!(
+            "restore receipt references missing session {session_id}"
+        )));
     }
     tx.commit()?;
 
@@ -816,6 +1078,103 @@ fn launch_snapshot_from_restored_state(
     snapshot
 }
 
+fn validate_restore_topology(
+    checkpoint: &CheckpointData,
+    topology: &TopologySnapshot,
+) -> Result<(), RestoreError> {
+    let mut topology_pane_ids = topology.pane_ids();
+    if topology_pane_ids.len() != checkpoint.pane_count {
+        return Err(RestoreError::CorruptCheckpoint(format!(
+            "checkpoint {} declares {} panes but its topology contains {} pane leaves",
+            checkpoint.checkpoint_id,
+            checkpoint.pane_count,
+            topology_pane_ids.len()
+        )));
+    }
+    topology_pane_ids.sort_unstable();
+    if let Some(duplicate) = topology_pane_ids
+        .windows(2)
+        .find(|ids| ids[0] == ids[1])
+        .map(|ids| ids[0])
+    {
+        return Err(RestoreError::CorruptCheckpoint(format!(
+            "checkpoint {} topology contains duplicate pane id {duplicate}",
+            checkpoint.checkpoint_id
+        )));
+    }
+
+    let mut persisted_pane_ids: Vec<u64> = checkpoint
+        .pane_states
+        .iter()
+        .map(|pane| pane.pane_id)
+        .collect();
+    persisted_pane_ids.sort_unstable();
+    if topology_pane_ids != persisted_pane_ids {
+        return Err(RestoreError::CorruptCheckpoint(format!(
+            "checkpoint {} topology pane IDs do not match its persisted pane-state IDs",
+            checkpoint.checkpoint_id
+        )));
+    }
+
+    for window in &topology.windows {
+        if window
+            .active_tab_index
+            .is_some_and(|active_index| active_index >= window.tabs.len())
+        {
+            return Err(RestoreError::CorruptCheckpoint(format!(
+                "checkpoint {} window {} has an out-of-range active tab index",
+                checkpoint.checkpoint_id, window.window_id
+            )));
+        }
+        for tab in &window.tabs {
+            validate_restore_pane_tree(checkpoint.checkpoint_id, &tab.pane_tree)?;
+            if let Some(active_pane_id) = tab.active_pane_id {
+                let mut tab_pane_ids = Vec::new();
+                tab.pane_tree.collect_pane_ids(&mut tab_pane_ids);
+                if !tab_pane_ids.contains(&active_pane_id) {
+                    return Err(RestoreError::CorruptCheckpoint(format!(
+                        "checkpoint {} tab {} names active pane {} outside its pane tree",
+                        checkpoint.checkpoint_id, tab.tab_id, active_pane_id
+                    )));
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_restore_pane_tree(
+    checkpoint_id: i64,
+    pane_tree: &PaneNode,
+) -> Result<(), RestoreError> {
+    match pane_tree {
+        PaneNode::Leaf { .. } => Ok(()),
+        PaneNode::HSplit { children } | PaneNode::VSplit { children } => {
+            if children.len() < 2 {
+                return Err(RestoreError::CorruptCheckpoint(format!(
+                    "checkpoint {checkpoint_id} topology contains a split with fewer than two children"
+                )));
+            }
+            for (ratio, child) in children {
+                if !ratio.is_finite() || *ratio <= 0.0 {
+                    return Err(RestoreError::CorruptCheckpoint(format!(
+                        "checkpoint {checkpoint_id} topology contains a non-positive split ratio"
+                    )));
+                }
+                validate_restore_pane_tree(checkpoint_id, child)?;
+            }
+            let ratio_sum: f64 = children.iter().map(|(ratio, _)| *ratio).sum();
+            if !ratio_sum.is_finite() {
+                return Err(RestoreError::CorruptCheckpoint(format!(
+                    "checkpoint {checkpoint_id} topology split ratios overflow"
+                )));
+            }
+            Ok(())
+        }
+    }
+}
+
 // =============================================================================
 // CLI query functions
 // =============================================================================
@@ -837,13 +1196,33 @@ pub struct SessionInfo {
 pub fn list_sessions(db_path: &str) -> Result<Vec<SessionInfo>, RestoreError> {
     let conn = open_conn(db_path)?;
     let mut stmt = conn.prepare(
-        "SELECT s.session_id, s.created_at, s.last_checkpoint_at, s.shutdown_clean,
+        "SELECT s.session_id, s.created_at, s.last_checkpoint_at,
+                CASE
+                    WHEN s.shutdown_clean = 1
+                     AND EXISTS (
+                         SELECT 1
+                         FROM session_checkpoints AS clean
+                         WHERE clean.id = s.clean_checkpoint_id
+                           AND clean.session_id = s.session_id
+                           AND clean.id = (
+                               SELECT latest.id
+                               FROM session_checkpoints AS latest
+                               WHERE latest.session_id = s.session_id
+                               ORDER BY latest.checkpoint_at DESC, latest.id DESC
+                               LIMIT 1
+                           )
+                     )
+                    THEN 1
+                    ELSE 0
+                END AS authoritative_shutdown_clean,
                 s.ft_version, s.host_id,
                 (SELECT COUNT(*) FROM session_checkpoints c WHERE c.session_id = s.session_id),
                 (SELECT c.pane_count FROM session_checkpoints c
-                 WHERE c.session_id = s.session_id ORDER BY c.checkpoint_at DESC LIMIT 1)
+                 WHERE c.session_id = s.session_id
+                   AND c.checkpoint_role = 'snapshot'
+                 ORDER BY c.checkpoint_at DESC, c.id DESC LIMIT 1)
          FROM mux_sessions s
-         ORDER BY COALESCE(s.last_checkpoint_at, s.created_at) DESC",
+         ORDER BY COALESCE(s.last_checkpoint_at, s.created_at) DESC, s.session_id ASC",
     )?;
 
     let raw_sessions = stmt
@@ -897,7 +1276,8 @@ pub fn list_sessions(db_path: &str) -> Result<Vec<SessionInfo>, RestoreError> {
 pub struct CheckpointInfo {
     pub id: i64,
     pub checkpoint_at: u64,
-    pub checkpoint_type: Option<String>,
+    pub checkpoint_type: String,
+    pub checkpoint_role: CheckpointRole,
     pub pane_count: usize,
     pub total_bytes: usize,
 }
@@ -941,10 +1321,10 @@ pub fn show_session(
 
     // Get checkpoints
     let mut stmt = conn.prepare(
-        "SELECT id, checkpoint_at, checkpoint_type, pane_count, total_bytes
+        "SELECT id, checkpoint_at, checkpoint_type, checkpoint_role, pane_count, total_bytes
          FROM session_checkpoints
          WHERE session_id = ?1
-         ORDER BY checkpoint_at DESC",
+         ORDER BY checkpoint_at DESC, id DESC",
     )?;
 
     let raw_checkpoints = stmt
@@ -952,9 +1332,10 @@ pub fn show_session(
             Ok((
                 row.get::<_, i64>(0)?,
                 row.get::<_, i64>(1)?,
-                row.get::<_, Option<String>>(2)?,
-                row.get::<_, i64>(3)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
                 row.get::<_, i64>(4)?,
+                row.get::<_, i64>(5)?,
             ))
         })?
         .collect::<Result<Vec<_>, _>>()?;
@@ -962,11 +1343,12 @@ pub fn show_session(
     let checkpoints = raw_checkpoints
         .into_iter()
         .map(
-            |(id, checkpoint_at, checkpoint_type, pane_count, total_bytes)| {
+            |(id, checkpoint_at, checkpoint_type, checkpoint_role, pane_count, total_bytes)| {
                 Ok(CheckpointInfo {
                     id,
                     checkpoint_at: decode_u64(checkpoint_at, "session_checkpoints.checkpoint_at")?,
                     checkpoint_type,
+                    checkpoint_role: CheckpointRole::from_db(id, &checkpoint_role)?,
                     pane_count: decode_usize(pane_count, "session_checkpoints.pane_count")?,
                     total_bytes: decode_usize(total_bytes, "session_checkpoints.total_bytes")?,
                 })
@@ -994,7 +1376,27 @@ pub fn session_doctor(db_path: &str) -> Result<SessionDoctorReport, RestoreError
     let total_sessions: i64 =
         conn.query_row("SELECT COUNT(*) FROM mux_sessions", [], |row| row.get(0))?;
 
-    let mut shutdown_stmt = conn.prepare("SELECT shutdown_clean FROM mux_sessions")?;
+    let mut shutdown_stmt = conn.prepare(
+        "SELECT CASE
+                    WHEN session.shutdown_clean = 1
+                     AND EXISTS (
+                         SELECT 1
+                         FROM session_checkpoints AS clean
+                         WHERE clean.id = session.clean_checkpoint_id
+                           AND clean.session_id = session.session_id
+                           AND clean.id = (
+                               SELECT latest.id
+                               FROM session_checkpoints AS latest
+                               WHERE latest.session_id = session.session_id
+                               ORDER BY latest.checkpoint_at DESC, latest.id DESC
+                               LIMIT 1
+                           )
+                     )
+                    THEN 1
+                    ELSE 0
+                END
+         FROM mux_sessions AS session",
+    )?;
     let shutdown_rows = shutdown_stmt.query_map([], |row| row.get::<_, i64>(0))?;
     let mut unclean_sessions = 0usize;
     for row in shutdown_rows {
@@ -1159,18 +1561,33 @@ impl SessionRestorer {
             "Detected unclean session(s) from previous run"
         );
 
-        let mut best: Option<(SessionCandidate, u64)> = None;
+        let mut best: Option<(SessionCandidate, u64, i64)> = None;
         let mut first_error: Option<RestoreError> = None;
 
         for candidate in candidates {
             match load_latest_checkpoint(&self.db_path, &candidate.session_id) {
+                Ok(Some(checkpoint))
+                    if self.config.auto_restore
+                        && checkpoint.verification == CheckpointVerification::LegacyUnverified =>
+                {
+                    warn!(
+                        session_id = %candidate.session_id,
+                        checkpoint_id = checkpoint.checkpoint_id,
+                        checkpoint_at = checkpoint.checkpoint_at,
+                        "Skipping legacy-unverified checkpoint in auto-restore mode"
+                    );
+                }
                 Ok(Some(checkpoint)) if !checkpoint.pane_states.is_empty() => {
                     let checkpoint_at = checkpoint.checkpoint_at;
+                    let checkpoint_id = checkpoint.checkpoint_id;
                     if best
                         .as_ref()
-                        .is_none_or(|(_, best_checkpoint_at)| checkpoint_at > *best_checkpoint_at)
+                        .is_none_or(|(_, best_checkpoint_at, best_checkpoint_id)| {
+                            (checkpoint_at, checkpoint_id)
+                                > (*best_checkpoint_at, *best_checkpoint_id)
+                        })
                     {
-                        best = Some((candidate, checkpoint_at));
+                        best = Some((candidate, checkpoint_at, checkpoint_id));
                     }
                 }
                 Ok(Some(checkpoint)) => {
@@ -1200,7 +1617,7 @@ impl SessionRestorer {
             }
         }
 
-        let Some((best, checkpoint_at)) = best else {
+        let Some((best, checkpoint_at, checkpoint_id)) = best else {
             if let Some(error) = first_error {
                 return Err(error);
             }
@@ -1210,6 +1627,7 @@ impl SessionRestorer {
 
         info!(
             session_id = %best.session_id,
+            checkpoint_id,
             checkpoint_at,
             ft_version = %best.ft_version,
             "Best restore candidate identified"
@@ -1232,6 +1650,8 @@ impl SessionRestorer {
             session_id = %session.session_id,
             checkpoint_id = checkpoint.checkpoint_id,
             checkpoint_at = checkpoint.checkpoint_at,
+            checkpoint_role = %checkpoint.checkpoint_role,
+            verification = ?checkpoint.verification,
             pane_count = checkpoint.pane_count,
             loaded_panes = checkpoint.pane_states.len(),
             "Loaded checkpoint for restore"
@@ -1276,10 +1696,36 @@ impl SessionRestorer {
         cx.checkpoint()
             .map_err(|err| RestoreError::Wezterm(format!("restore cancelled: {err}")))?;
 
+        if checkpoint.session_id != session.session_id {
+            return Err(RestoreError::CorruptCheckpoint(format!(
+                "checkpoint {} belongs to session {}, not {}",
+                checkpoint.checkpoint_id, checkpoint.session_id, session.session_id
+            )));
+        }
+        if checkpoint.checkpoint_role != CheckpointRole::Snapshot {
+            return Err(RestoreError::CheckpointNotRestorable {
+                checkpoint_id: checkpoint.checkpoint_id,
+                role: checkpoint.checkpoint_role.to_string(),
+            });
+        }
+        if self.config.auto_restore
+            && checkpoint.verification == CheckpointVerification::LegacyUnverified
+        {
+            return Err(RestoreError::LegacyCheckpointRequiresManualRestore {
+                checkpoint_id: checkpoint.checkpoint_id,
+            });
+        }
+
         let start = std::time::Instant::now();
 
-        let topology = TopologySnapshot::from_json(&session.topology_json)
+        let topology_json = checkpoint.topology_json.as_deref().ok_or(
+            RestoreError::CheckpointTopologyUnavailable {
+                checkpoint_id: checkpoint.checkpoint_id,
+            },
+        )?;
+        let topology = TopologySnapshot::from_json(topology_json)
             .map_err(|e| RestoreError::TopologyParse(e.to_string()))?;
+        validate_restore_topology(checkpoint, &topology)?;
 
         let total_panes = topology.pane_count();
 
@@ -1551,9 +1997,9 @@ impl SessionRestorer {
         if checkpoint.pane_states.is_empty() {
             warn!(
                 session_id = %session.session_id,
-                "Checkpoint has no pane states, skipping restore"
+                checkpoint_id = checkpoint.checkpoint_id,
+                "Checkpoint became empty after detection; skipping restore and leaving the session unclean"
             );
-            mark_session_restored(&self.db_path, &session.session_id)?;
             return Ok(None);
         }
 
@@ -1659,128 +2105,12 @@ mod tests {
         }
     }
 
-    // ── ft-ybtyg regression: compute_restore_state_hash ─────────────
+    // ── Schema-v36 role and witness regressions ──────────────────────
 
     #[test]
-    fn compute_restore_state_hash_is_deterministic() {
-        let mut map = HashMap::new();
-        map.insert(1u64, 10u64);
-        map.insert(2u64, 20u64);
-        map.insert(3u64, 30u64);
-        let a = compute_restore_state_hash("sess-alpha", &map, 1_700_000_000_000);
-        let b = compute_restore_state_hash("sess-alpha", &map, 1_700_000_000_000);
-        let c = compute_restore_state_hash("sess-alpha", &map, 1_700_000_000_000);
-        assert_eq!(a, b);
-        assert_eq!(b, c);
-    }
-
-    #[test]
-    fn compute_restore_state_hash_is_16_hex_chars() {
-        let map: HashMap<u64, u64> = HashMap::new();
-        let hash = compute_restore_state_hash("sess", &map, 0);
-        assert_eq!(hash.len(), 16, "hash length drifted: {hash}");
-        assert!(
-            hash.chars().all(|c| c.is_ascii_hexdigit()),
-            "hash must be lowercase hex: {hash}"
-        );
-    }
-
-    #[test]
-    fn compute_restore_state_hash_not_the_literal_restore() {
-        // [ft-ybtyg] the pre-fix INSERT used the literal string
-        // `'restore'` as state_hash. This test guards against
-        // accidentally regressing to a constant by asserting the
-        // new hash is both the correct shape AND different from
-        // the old sentinel.
-        let mut map = HashMap::new();
-        map.insert(1u64, 1u64);
-        let hash = compute_restore_state_hash("sess", &map, 1);
-        assert_ne!(hash, "restore");
-        assert_eq!(hash.len(), 16);
-    }
-
-    #[test]
-    fn compute_restore_state_hash_differs_by_session_id() {
-        let map: HashMap<u64, u64> = std::iter::once((1u64, 1u64)).collect();
-        let a = compute_restore_state_hash("sess-a", &map, 1_000);
-        let b = compute_restore_state_hash("sess-b", &map, 1_000);
-        assert_ne!(a, b, "hash must discriminate on session_id");
-    }
-
-    #[test]
-    fn compute_restore_state_hash_differs_by_pane_map() {
-        let m1: HashMap<u64, u64> = std::iter::once((1u64, 1u64)).collect();
-        let m2: HashMap<u64, u64> = std::iter::once((1u64, 2u64)).collect();
-        let a = compute_restore_state_hash("sess", &m1, 1_000);
-        let b = compute_restore_state_hash("sess", &m2, 1_000);
-        assert_ne!(a, b, "hash must discriminate on new pane id mapping");
-    }
-
-    #[test]
-    fn compute_restore_state_hash_differs_by_timestamp() {
-        let map: HashMap<u64, u64> = std::iter::once((1u64, 1u64)).collect();
-        let a = compute_restore_state_hash("sess", &map, 1_000);
-        let b = compute_restore_state_hash("sess", &map, 2_000);
-        assert_ne!(a, b, "hash must discriminate on checkpoint timestamp");
-    }
-
-    #[test]
-    fn compute_restore_state_hash_insertion_order_independent() {
-        // HashMap iteration order is undefined. The helper sorts by
-        // old_id before hashing so the same (session, pairs, ts)
-        // yields the same hash regardless of insertion order.
-        let mut m1 = HashMap::new();
-        m1.insert(1u64, 10u64);
-        m1.insert(2u64, 20u64);
-        m1.insert(3u64, 30u64);
-
-        let mut m2 = HashMap::new();
-        m2.insert(3u64, 30u64);
-        m2.insert(1u64, 10u64);
-        m2.insert(2u64, 20u64);
-
-        let h1 = compute_restore_state_hash("s", &m1, 1);
-        let h2 = compute_restore_state_hash("s", &m2, 1);
-        assert_eq!(
-            h1, h2,
-            "HashMap insertion order must not affect hash: {h1} vs {h2}"
-        );
-    }
-
-    #[test]
-    fn compute_restore_state_hash_domain_separated_from_dedup_hash() {
-        // The snapshot_engine dedup hash uses the same DefaultHasher
-        // algorithm but NOT the same input schema. A same-length
-        // 16-hex hash coming from one helper must not silently match
-        // the other — domain separator prefix guarantees that.
-        let map: HashMap<u64, u64> = std::iter::once((1u64, 1u64)).collect();
-        let restore_hash = compute_restore_state_hash("sess", &map, 0);
-        // Hash of just "sess" with no prefix, no session, no map.
-        let naive: String = {
-            use std::hash::{Hash, Hasher};
-            let mut h = std::collections::hash_map::DefaultHasher::new();
-            "sess".hash(&mut h);
-            format!("{:016x}", h.finish())
-        };
-        assert_ne!(
-            restore_hash, naive,
-            "domain separator should make hash distinct from naive session hash"
-        );
-    }
-
-    // ── ft-qf3vk regression: load-time state_hash verification ──────
-    //
-    // finalize_restore / save_restore_checkpoint write compute_restore_state_hash
-    // into session_checkpoints.state_hash. load_checkpoint_by_id must recompute
-    // from the same inputs and refuse the row on mismatch — otherwise the hash
-    // column is a false integrity witness.
-
-    #[test]
-    fn load_checkpoint_by_id_accepts_unmodified_restore_checkpoint() {
-        // Baseline: a checkpoint written through finalize_restore loads clean,
-        // so the verification path is wired without breaking the happy case.
-        let (db_path, _conn, _dir) = setup_test_db();
-        insert_session(&_conn, "sess-ok", false);
+    fn load_checkpoint_by_id_verifies_unmodified_restore_receipt() {
+        let (db_path, conn, _dir) = setup_test_db();
+        insert_session(&conn, "sess-ok", false);
 
         let mut mapping = HashMap::new();
         mapping.insert(11u64, 42u64);
@@ -1789,20 +2119,53 @@ mod tests {
         let cp_id =
             finalize_restore(&db_path, "sess-ok", &mapping, true).expect("finalize restore");
 
-        let loaded = load_checkpoint_by_id(&db_path, cp_id).expect("load should not error");
-        assert!(
-            loaded.is_some(),
-            "unmodified startup checkpoint should load"
-        );
+        let loaded = load_checkpoint_by_id(&db_path, cp_id)
+            .expect("load should not error")
+            .expect("receipt row");
+        assert_eq!(loaded.checkpoint_role, CheckpointRole::RestoreReceipt);
+        assert_eq!(loaded.verification, CheckpointVerification::VerifiedV2);
+        assert_eq!(loaded.pane_count, 2);
+        assert!(loaded.pane_states.is_empty());
+        assert!(loaded.topology_json.is_none());
     }
 
     #[test]
-    fn load_checkpoint_by_id_rejects_tampered_state_hash() {
-        // Tamper with the state_hash column only, leaving every other input
-        // that compute_restore_state_hash consumes intact. load_checkpoint_by_id
-        // must return StateHashMismatch — not a silent restore — because the
-        // attacker's goal is exactly this scenario: flip the hash (or some
-        // other field) and ride the "restore" flow.
+    fn restore_receipt_cannot_be_submitted_as_layout_snapshot() {
+        let (db_path, conn, _dir) = setup_test_db();
+        insert_session(&conn, "sess-receipt-role", false);
+        let checkpoint_id = finalize_restore(
+            &db_path,
+            "sess-receipt-role",
+            &HashMap::from([(1_u64, 10_u64)]),
+            false,
+        )
+        .unwrap();
+        let checkpoint = load_checkpoint_by_id(&db_path, checkpoint_id)
+            .unwrap()
+            .unwrap();
+        let (session, _) = show_session(&db_path, "sess-receipt-role").unwrap();
+        let restorer = SessionRestorer::new(
+            Arc::new(db_path),
+            SessionRestoreConfig::default(),
+        );
+
+        let error = run_async_test(restorer.restore(
+            &session,
+            &checkpoint,
+            Arc::new(MockWezterm::new()),
+        ))
+        .expect_err("restore receipts are bookkeeping, not topology snapshots");
+        assert!(matches!(
+            error,
+            RestoreError::CheckpointNotRestorable {
+                checkpoint_id: id,
+                ..
+            } if id == checkpoint_id
+        ));
+    }
+
+    #[test]
+    fn load_checkpoint_by_id_rejects_tampered_v2_state_hash() {
         let (db_path, conn, _dir) = setup_test_db();
         insert_session(&conn, "sess-tampered", false);
 
@@ -1813,7 +2176,9 @@ mod tests {
             finalize_restore(&db_path, "sess-tampered", &mapping, true).expect("finalize restore");
 
         conn.execute(
-            "UPDATE session_checkpoints SET state_hash = 'deadbeefdeadbeef' WHERE id = ?1",
+            "UPDATE session_checkpoints
+             SET state_hash = 'rst2:0000000000000000000000000000000000000000000000000000000000000000'
+             WHERE id = ?1",
             [cp_id],
         )
         .unwrap();
@@ -1828,7 +2193,7 @@ mod tests {
             } => {
                 assert_eq!(checkpoint_id, cp_id);
                 assert_eq!(session_id, "sess-tampered");
-                assert_eq!(stored, "deadbeefdeadbeef");
+                assert!(stored.starts_with(RESTORE_RECEIPT_WITNESS_PREFIX));
             }
             other => panic!("expected StateHashMismatch, got: {other:?}"),
         }
@@ -1836,10 +2201,6 @@ mod tests {
 
     #[test]
     fn load_checkpoint_by_id_rejects_tampered_pane_id_mapping() {
-        // Flipping the pane_id_map in metadata_json without recomputing the
-        // hash must also fail: the mapping is part of the hashed input set,
-        // so a changed map against an unchanged hash is direct evidence of
-        // row-level tampering.
         let (db_path, conn, _dir) = setup_test_db();
         insert_session(&conn, "sess-map-tamper", false);
 
@@ -1866,76 +2227,121 @@ mod tests {
     }
 
     #[test]
-    fn load_checkpoint_by_id_rejects_legacy_restore_literal() {
-        // Pre-ft-ybtyg rows carry state_hash='restore'. That literal is
-        // not a real integrity witness and must not pass verification —
-        // accepting it would re-open the ft-ybtyg trust gap under a new
-        // name.
+    fn load_checkpoint_by_id_labels_legacy_restore_literal_unverified() {
         let (db_path, conn, _dir) = setup_test_db();
         insert_session(&conn, "sess-legacy", false);
 
         conn.execute(
             "INSERT INTO session_checkpoints
              (session_id, checkpoint_at, checkpoint_type, state_hash,
-              pane_count, total_bytes, metadata_json)
-             VALUES (?1, ?2, 'startup', 'restore', 0, 0, ?3)",
+              pane_count, total_bytes, metadata_json, checkpoint_role)
+             VALUES (?1, ?2, 'startup', 'restore', 0, 0, ?3, 'restore_receipt')",
             params!["sess-legacy", 1_700_000_000_000i64, "{\"old_to_new\":{}}"],
         )
         .unwrap();
         let cp_id = conn.last_insert_rowid();
 
-        let err = load_checkpoint_by_id(&db_path, cp_id).expect_err("legacy literal must error");
-        match err {
-            RestoreError::StateHashMismatch { stored, .. } => {
-                assert_eq!(stored, "restore");
-            }
-            other => panic!("expected StateHashMismatch, got: {other:?}"),
-        }
+        let loaded = load_checkpoint_by_id(&db_path, cp_id)
+            .expect("legacy receipt remains inspectable")
+            .expect("legacy receipt row");
+        assert_eq!(loaded.checkpoint_role, CheckpointRole::RestoreReceipt);
+        assert_eq!(
+            loaded.verification,
+            CheckpointVerification::LegacyUnverified
+        );
     }
 
     #[test]
-    fn load_checkpoint_by_id_rejects_missing_metadata_on_startup_row() {
-        // An attacker dropping metadata_json breaks the verifier's ability
-        // to reconstruct pane_id_map. That is itself a tampering signal —
-        // don't fall back to "oh well, load it anyway".
+    fn load_checkpoint_by_id_rejects_missing_metadata_on_restore_receipt() {
         let (db_path, conn, _dir) = setup_test_db();
         insert_session(&conn, "sess-nometa", false);
 
         conn.execute(
             "INSERT INTO session_checkpoints
              (session_id, checkpoint_at, checkpoint_type, state_hash,
-              pane_count, total_bytes, metadata_json)
-             VALUES (?1, ?2, 'startup', ?3, 0, 0, NULL)",
-            params![
-                "sess-nometa",
-                1_700_000_000_000i64,
-                compute_restore_state_hash("sess-nometa", &HashMap::new(), 1_700_000_000_000),
-            ],
+              pane_count, total_bytes, metadata_json, checkpoint_role)
+             VALUES (?1, ?2, 'startup', 'restore', 0, 0, NULL, 'restore_receipt')",
+            params!["sess-nometa", 1_700_000_000_000i64],
         )
         .unwrap();
         let cp_id = conn.last_insert_rowid();
 
         let err = load_checkpoint_by_id(&db_path, cp_id).expect_err("null metadata must error");
         assert!(
-            matches!(err, RestoreError::StateHashMismatch { .. }),
-            "expected StateHashMismatch, got: {err:?}"
+            matches!(err, RestoreError::CorruptCheckpoint(_)),
+            "expected structural corruption, got: {err:?}"
         );
     }
 
     #[test]
-    fn load_checkpoint_by_id_skips_verification_for_non_startup_checkpoints() {
-        // compute_restore_state_hash only applies to checkpoint_type='startup'.
-        // Capture checkpoints are written by snapshot_engine with a different
-        // input schema, and verifying THOSE is tracked as a separate follow-up.
-        // Make sure we don't accidentally reject them here.
+    fn load_checkpoint_by_id_rejects_duplicate_receipt_target_pane_ids() {
+        let (db_path, conn, _dir) = setup_test_db();
+        insert_session(&conn, "sess-duplicate-target", false);
+
+        conn.execute(
+            "INSERT INTO session_checkpoints
+             (session_id, checkpoint_at, checkpoint_type, state_hash,
+              pane_count, total_bytes, metadata_json, checkpoint_role)
+             VALUES (?1, ?2, 'startup', 'restore', 2, 0, ?3, 'restore_receipt')",
+            params![
+                "sess-duplicate-target",
+                1_700_000_000_000i64,
+                r#"{"old_to_new":{"1":99,"2":99}}"#,
+            ],
+        )
+        .unwrap();
+        let checkpoint_id = conn.last_insert_rowid();
+
+        let error = load_checkpoint_by_id(&db_path, checkpoint_id)
+            .expect_err("a receipt mapping must be one-to-one");
+        assert!(matches!(error, RestoreError::CorruptCheckpoint(_)));
+    }
+
+    #[test]
+    fn load_checkpoint_by_id_rejects_aliased_receipt_source_pane_ids() {
+        let (db_path, conn, _dir) = setup_test_db();
+        insert_session(&conn, "sess-aliased-source", false);
+
+        conn.execute(
+            "INSERT INTO session_checkpoints
+             (session_id, checkpoint_at, checkpoint_type, state_hash,
+              pane_count, total_bytes, metadata_json, checkpoint_role)
+             VALUES (?1, ?2, 'startup', 'restore', 2, 0, ?3, 'restore_receipt')",
+            params![
+                "sess-aliased-source",
+                1_700_000_000_000i64,
+                r#"{"old_to_new":{"01":98,"1":99}}"#,
+            ],
+        )
+        .unwrap();
+        let checkpoint_id = conn.last_insert_rowid();
+
+        let error = load_checkpoint_by_id(&db_path, checkpoint_id)
+            .expect_err("numeric aliases must not name the same source pane twice");
+        assert!(matches!(error, RestoreError::CorruptCheckpoint(_)));
+    }
+
+    #[test]
+    fn startup_snapshot_is_not_confused_with_restore_receipt() {
         let (db_path, conn, _dir) = setup_test_db();
         insert_session(&conn, "sess-capture", false);
-        // insert_checkpoint writes checkpoint_type='periodic', state_hash='hash123'.
         let cp_id = insert_checkpoint(&conn, "sess-capture", 1000, 0);
+        conn.execute(
+            "UPDATE session_checkpoints SET checkpoint_type = 'startup' WHERE id = ?1",
+            [cp_id],
+        )
+        .unwrap();
 
         let loaded = load_checkpoint_by_id(&db_path, cp_id)
-            .expect("periodic checkpoint must load without hash verification");
-        assert!(loaded.is_some());
+            .expect("startup snapshot must load")
+            .expect("startup snapshot row");
+        assert_eq!(loaded.checkpoint_role, CheckpointRole::Snapshot);
+        assert_eq!(loaded.checkpoint_type, "startup");
+        assert_eq!(
+            loaded.verification,
+            CheckpointVerification::LegacyUnverified
+        );
+        assert!(loaded.topology_json.is_some());
     }
 
     fn run_async_test<F, T>(future: F) -> T
@@ -2218,18 +2624,23 @@ mod tests {
                 topology_json TEXT NOT NULL,
                 window_metadata_json TEXT,
                 ft_version TEXT NOT NULL,
-                host_id TEXT
+                host_id TEXT,
+                clean_checkpoint_id INTEGER
+                    REFERENCES session_checkpoints(id) ON DELETE SET NULL
             );
 
             CREATE TABLE session_checkpoints (
                 id INTEGER PRIMARY KEY,
                 session_id TEXT NOT NULL,
                 checkpoint_at INTEGER NOT NULL,
-                checkpoint_type TEXT,
+                checkpoint_type TEXT NOT NULL,
                 state_hash TEXT NOT NULL,
                 pane_count INTEGER NOT NULL,
                 total_bytes INTEGER NOT NULL,
-                metadata_json TEXT
+                metadata_json TEXT,
+                checkpoint_role TEXT NOT NULL DEFAULT 'snapshot'
+                    CHECK(checkpoint_role IN ('snapshot','restore_receipt')),
+                topology_json TEXT
             );
 
             CREATE TABLE mux_pane_state (
@@ -2257,6 +2668,8 @@ mod tests {
             );
 
             CREATE INDEX idx_checkpoints_session ON session_checkpoints(session_id, checkpoint_at);
+            CREATE INDEX idx_checkpoints_session_role_latest
+                ON session_checkpoints(session_id, checkpoint_role, checkpoint_at DESC, id DESC);
             CREATE INDEX idx_pane_state_checkpoint ON mux_pane_state(checkpoint_id);
             CREATE INDEX idx_output_segments_pane_seq ON output_segments(pane_id, seq);",
         )
@@ -2273,6 +2686,32 @@ mod tests {
             params![session_id, 1000i64, topology, "0.1.0", shutdown_clean as i64],
         )
         .unwrap();
+        if shutdown_clean {
+            insert_clean_receipt(conn, session_id, 1000);
+        }
+    }
+
+    fn insert_clean_receipt(conn: &Connection, session_id: &str, checkpoint_at: i64) {
+        conn.execute(
+            "INSERT INTO session_checkpoints
+             (session_id, checkpoint_at, checkpoint_type, state_hash,
+              pane_count, total_bytes, metadata_json, checkpoint_role,
+              topology_json)
+             VALUES (?1, ?2, 'startup', 'restore', 0, 0,
+                     '{\"old_to_new\":{}}', 'restore_receipt', NULL)",
+            params![session_id, checkpoint_at],
+        )
+        .unwrap();
+        let receipt_id = conn.last_insert_rowid();
+        conn.execute(
+            "UPDATE mux_sessions
+             SET shutdown_clean = 1,
+                 last_checkpoint_at = ?2,
+                 clean_checkpoint_id = ?3
+             WHERE session_id = ?1",
+            params![session_id, checkpoint_at, receipt_id],
+        )
+        .unwrap();
     }
 
     fn insert_checkpoint(
@@ -2281,10 +2720,20 @@ mod tests {
         checkpoint_at: i64,
         pane_count: usize,
     ) -> i64 {
+        let topology_json: String = conn
+            .query_row(
+                "SELECT topology_json FROM mux_sessions WHERE session_id = ?1",
+                [session_id],
+                |row| row.get(0),
+            )
+            .unwrap();
         conn.execute(
-            "INSERT INTO session_checkpoints (session_id, checkpoint_at, checkpoint_type, state_hash, pane_count, total_bytes)
-             VALUES (?1, ?2, 'periodic', 'hash123', ?3, 1024)",
-            params![session_id, checkpoint_at, pane_count as i64],
+            "INSERT INTO session_checkpoints
+             (session_id, checkpoint_at, checkpoint_type, state_hash, pane_count,
+              total_bytes, checkpoint_role, topology_json)
+             VALUES (?1, ?2, 'periodic', '0123456789abcdef', ?3, 1024,
+                     'snapshot', ?4)",
+            params![session_id, checkpoint_at, pane_count as i64, topology_json],
         )
         .unwrap();
         conn.last_insert_rowid()
@@ -2325,6 +2774,90 @@ mod tests {
             ],
         )
         .unwrap();
+    }
+
+    fn seal_checkpoint_v2(conn: &Connection, checkpoint_id: i64) -> String {
+        let (
+            session_id,
+            checkpoint_at,
+            checkpoint_type,
+            checkpoint_role,
+            pane_count,
+            total_bytes,
+            metadata_json,
+            topology_json,
+        ): (
+            String,
+            i64,
+            String,
+            String,
+            i64,
+            i64,
+            Option<String>,
+            Option<String>,
+        ) = conn
+            .query_row(
+                "SELECT session_id, checkpoint_at, checkpoint_type, checkpoint_role,
+                        pane_count, total_bytes, metadata_json, topology_json
+                 FROM session_checkpoints WHERE id = ?1",
+                [checkpoint_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                    ))
+                },
+            )
+            .unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT pane_id, cwd, command, env_json, terminal_state_json,
+                        agent_metadata_json, scrollback_checkpoint_seq, last_output_at
+                 FROM mux_pane_state WHERE checkpoint_id = ?1
+                 ORDER BY pane_id ASC, id ASC",
+            )
+            .unwrap();
+        let panes = stmt
+            .query_map([checkpoint_id], |row| {
+                Ok(PersistedPaneState {
+                    pane_id: row.get(0)?,
+                    cwd: row.get(1)?,
+                    command: row.get(2)?,
+                    env_json: row.get(3)?,
+                    terminal_state_json: row.get(4)?,
+                    agent_metadata_json: row.get(5)?,
+                    scrollback_checkpoint_seq: row.get(6)?,
+                    last_output_at: row.get(7)?,
+                })
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let state_hash = checkpoint_witness(
+            &checkpoint_role,
+            &session_id,
+            checkpoint_id,
+            checkpoint_at,
+            &checkpoint_type,
+            pane_count,
+            total_bytes,
+            metadata_json.as_deref(),
+            topology_json.as_deref(),
+            &panes,
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE session_checkpoints SET state_hash = ?1 WHERE id = ?2",
+            params![state_hash, checkpoint_id],
+        )
+        .unwrap();
+        state_hash
     }
 
     fn insert_output_segment(
@@ -2375,12 +2908,17 @@ mod tests {
             }],
         };
 
+        let topology_json = topology.to_json().expect("serialize single-pane topology");
         conn.execute(
             "UPDATE mux_sessions SET topology_json = ?2 WHERE session_id = ?1",
-            params![
-                session_id,
-                topology.to_json().expect("serialize single-pane topology"),
-            ],
+            params![session_id, topology_json],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE session_checkpoints
+             SET topology_json = ?2
+             WHERE session_id = ?1 AND checkpoint_role = 'snapshot'",
+            params![session_id, topology_json],
         )
         .unwrap();
     }
@@ -2563,11 +3101,98 @@ mod tests {
     }
 
     #[test]
+    fn load_checkpoint_by_id_verifies_exact_v2_snapshot_projection() {
+        let (db_path, conn, _dir) = setup_test_db();
+        insert_session(&conn, "sess-v2", false);
+        let checkpoint_id = insert_checkpoint(&conn, "sess-v2", 5000, 1);
+        insert_pane_state(&conn, checkpoint_id, 7, Some("/work"), Some("zsh"));
+        conn.execute(
+            "UPDATE mux_pane_state
+             SET env_json = '{\"redacted_count\":0,\"vars\":{\"LANG\":\"C\"}}'
+             WHERE checkpoint_id = ?1",
+            [checkpoint_id],
+        )
+        .unwrap();
+        let state_hash = seal_checkpoint_v2(&conn, checkpoint_id);
+        assert!(state_hash.starts_with(SNAPSHOT_WITNESS_PREFIX));
+
+        let loaded = load_checkpoint_by_id(&db_path, checkpoint_id)
+            .expect("v2 snapshot load")
+            .expect("v2 snapshot row");
+        assert_eq!(loaded.checkpoint_role, CheckpointRole::Snapshot);
+        assert_eq!(loaded.verification, CheckpointVerification::VerifiedV2);
+        assert_eq!(loaded.pane_states.len(), 1);
+    }
+
+    #[test]
+    fn load_checkpoint_by_id_rejects_v2_snapshot_env_mutation() {
+        let (db_path, conn, _dir) = setup_test_db();
+        insert_session(&conn, "sess-v2-env", false);
+        let checkpoint_id = insert_checkpoint(&conn, "sess-v2-env", 5000, 1);
+        insert_pane_state(&conn, checkpoint_id, 7, Some("/work"), Some("zsh"));
+        seal_checkpoint_v2(&conn, checkpoint_id);
+        conn.execute(
+            "UPDATE mux_pane_state SET env_json = '{\"vars\":{\"LANG\":\"changed\"}}'
+             WHERE checkpoint_id = ?1",
+            [checkpoint_id],
+        )
+        .unwrap();
+
+        let error = load_checkpoint_by_id(&db_path, checkpoint_id)
+            .expect_err("env_json participates in the exact snapshot witness");
+        assert!(matches!(error, RestoreError::StateHashMismatch { .. }));
+    }
+
+    #[test]
+    fn load_checkpoint_by_id_rejects_v2_snapshot_topology_mutation() {
+        let (db_path, conn, _dir) = setup_test_db();
+        insert_session(&conn, "sess-v2-topology", false);
+        let checkpoint_id = insert_checkpoint(&conn, "sess-v2-topology", 5000, 0);
+        seal_checkpoint_v2(&conn, checkpoint_id);
+        conn.execute(
+            "UPDATE session_checkpoints
+             SET topology_json = '{\"schema_version\":1,\"captured_at\":9999,\"windows\":[]}'
+             WHERE id = ?1",
+            [checkpoint_id],
+        )
+        .unwrap();
+
+        let error = load_checkpoint_by_id(&db_path, checkpoint_id)
+            .expect_err("checkpoint-local topology participates in the exact snapshot witness");
+        assert!(matches!(error, RestoreError::StateHashMismatch { .. }));
+    }
+
+    #[test]
+    fn load_checkpoint_by_id_rejects_snapshot_pane_count_mismatch() {
+        let (db_path, conn, _dir) = setup_test_db();
+        insert_session(&conn, "sess-count", false);
+        let checkpoint_id = insert_checkpoint(&conn, "sess-count", 5000, 2);
+        insert_pane_state(&conn, checkpoint_id, 7, None, None);
+
+        let error = load_checkpoint_by_id(&db_path, checkpoint_id)
+            .expect_err("declared pane count must match stored rows");
+        assert!(matches!(error, RestoreError::CorruptCheckpoint(_)));
+    }
+
+    #[test]
+    fn load_checkpoint_by_id_rejects_duplicate_snapshot_pane_ids() {
+        let (db_path, conn, _dir) = setup_test_db();
+        insert_session(&conn, "sess-duplicate", false);
+        let checkpoint_id = insert_checkpoint(&conn, "sess-duplicate", 5000, 2);
+        insert_pane_state(&conn, checkpoint_id, 7, None, None);
+        insert_pane_state(&conn, checkpoint_id, 7, Some("/duplicate"), None);
+
+        let error = load_checkpoint_by_id(&db_path, checkpoint_id)
+            .expect_err("duplicate pane IDs make restore ambiguous");
+        assert!(matches!(error, RestoreError::CorruptCheckpoint(_)));
+    }
+
+    #[test]
     fn load_latest_checkpoint_picks_newest() {
         let (db_path, conn, _dir) = setup_test_db();
         insert_session(&conn, "sess-multi", false);
         let old_cp = insert_checkpoint(&conn, "sess-multi", 1000, 1);
-        let new_cp = insert_checkpoint(&conn, "sess-multi", 2000, 3);
+        let new_cp = insert_checkpoint(&conn, "sess-multi", 2000, 1);
         insert_pane_state(&conn, old_cp, 9, Some("/old"), Some("bash"));
         insert_pane_state(&conn, new_cp, 10, Some("/new"), None);
 
@@ -2579,7 +3204,87 @@ mod tests {
     }
 
     #[test]
-    fn load_latest_checkpoint_prefers_usable_capture_over_newer_startup_checkpoint() {
+    fn load_latest_checkpoint_breaks_timestamp_ties_by_row_id() {
+        let (db_path, conn, _dir) = setup_test_db();
+        insert_session(&conn, "sess-tied", false);
+        let older_id = insert_checkpoint(&conn, "sess-tied", 2000, 0);
+        let newer_id = insert_checkpoint(&conn, "sess-tied", 2000, 0);
+        assert!(newer_id > older_id);
+
+        let loaded = load_latest_checkpoint(&db_path, "sess-tied")
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.checkpoint_id, newer_id);
+    }
+
+    #[test]
+    fn load_latest_checkpoint_does_not_fall_back_past_missing_topology() {
+        let (db_path, conn, _dir) = setup_test_db();
+        insert_session(&conn, "sess-topology-gap", false);
+        let older_id = insert_checkpoint(&conn, "sess-topology-gap", 1000, 0);
+        let newer_id = insert_checkpoint(&conn, "sess-topology-gap", 2000, 0);
+        conn.execute(
+            "UPDATE session_checkpoints SET topology_json = NULL WHERE id = ?1",
+            [newer_id],
+        )
+        .unwrap();
+
+        let error = load_latest_checkpoint(&db_path, "sess-topology-gap")
+            .expect_err("an incomplete latest snapshot must fail closed");
+        assert!(matches!(
+            error,
+            RestoreError::CheckpointTopologyUnavailable { checkpoint_id }
+                if checkpoint_id == newer_id
+        ));
+        assert_ne!(older_id, newer_id);
+    }
+
+    #[test]
+    fn checkpoint_load_uses_row_local_topology_not_mutable_session_topology() {
+        let (db_path, conn, _dir) = setup_test_db();
+        insert_session(&conn, "sess-topology", false);
+        let first_id = insert_checkpoint(&conn, "sess-topology", 1000, 0);
+        let first_topology = load_checkpoint_by_id(&db_path, first_id)
+            .unwrap()
+            .unwrap()
+            .topology_json
+            .unwrap();
+
+        let second_topology =
+            r#"{"schema_version":1,"captured_at":2000,"workspace_id":"second","windows":[]}"#;
+        conn.execute(
+            "UPDATE mux_sessions SET topology_json = ?2 WHERE session_id = ?1",
+            params!["sess-topology", second_topology],
+        )
+        .unwrap();
+        let second_id = insert_checkpoint(&conn, "sess-topology", 2000, 0);
+        conn.execute(
+            "UPDATE mux_sessions SET topology_json =
+             '{\"schema_version\":1,\"captured_at\":3000,\"workspace_id\":\"latest-session-only\",\"windows\":[]}'
+             WHERE session_id = 'sess-topology'",
+            [],
+        )
+        .unwrap();
+
+        let first = load_checkpoint_by_id(&db_path, first_id)
+            .unwrap()
+            .unwrap();
+        let second = load_checkpoint_by_id(&db_path, second_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.topology_json.as_deref(), Some(first_topology.as_str()));
+        assert_eq!(second.topology_json.as_deref(), Some(second_topology));
+        assert_eq!(
+            load_latest_checkpoint(&db_path, "sess-topology")
+                .unwrap()
+                .unwrap()
+                .checkpoint_id,
+            second_id
+        );
+    }
+
+    #[test]
+    fn load_latest_checkpoint_ignores_newer_restore_receipt() {
         let (db_path, conn, _dir) = setup_test_db();
         insert_session(&conn, "sess-shadowed", false);
         let capture_cp = insert_checkpoint(&conn, "sess-shadowed", 1000, 1);
@@ -2587,8 +3292,9 @@ mod tests {
 
         conn.execute(
             "INSERT INTO session_checkpoints
-             (session_id, checkpoint_at, checkpoint_type, state_hash, pane_count, total_bytes, metadata_json)
-             VALUES (?1, ?2, 'startup', 'restore', ?3, 0, ?4)",
+             (session_id, checkpoint_at, checkpoint_type, state_hash, pane_count,
+              total_bytes, metadata_json, checkpoint_role)
+             VALUES (?1, ?2, 'startup', 'restore', ?3, 0, ?4, 'restore_receipt')",
             params![
                 "sess-shadowed",
                 2000i64,
@@ -2597,6 +3303,7 @@ mod tests {
             ],
         )
         .unwrap();
+        let receipt_id = conn.last_insert_rowid();
 
         let data = load_latest_checkpoint(&db_path, "sess-shadowed")
             .unwrap()
@@ -2606,14 +3313,26 @@ mod tests {
         assert_eq!(data.pane_states.len(), 1);
         assert_eq!(data.pane_states[0].pane_id, 42);
         assert_eq!(data.pane_states[0].cwd.as_deref(), Some("/real"));
+
+        let sessions = list_sessions(&db_path).unwrap();
+        assert_eq!(sessions[0].checkpoint_count, 2);
+        assert_eq!(sessions[0].pane_count, Some(1));
+        let (_, checkpoints) = show_session(&db_path, "sess-shadowed").unwrap();
+        assert_eq!(checkpoints[0].id, receipt_id);
+        assert_eq!(
+            checkpoints[0].checkpoint_role,
+            CheckpointRole::RestoreReceipt
+        );
+        assert_eq!(checkpoints[1].id, capture_cp);
+        assert_eq!(checkpoints[1].checkpoint_role, CheckpointRole::Snapshot);
     }
 
     #[test]
     fn load_latest_checkpoint_falls_back_to_newest_empty_checkpoint_when_needed() {
         let (db_path, conn, _dir) = setup_test_db();
         insert_session(&conn, "sess-empty-only", false);
-        let old_cp = insert_checkpoint(&conn, "sess-empty-only", 1000, 1);
-        let new_cp = insert_checkpoint(&conn, "sess-empty-only", 2000, 2);
+        let old_cp = insert_checkpoint(&conn, "sess-empty-only", 1000, 0);
+        let new_cp = insert_checkpoint(&conn, "sess-empty-only", 2000, 0);
 
         let data = load_latest_checkpoint(&db_path, "sess-empty-only")
             .unwrap()
@@ -2655,17 +3374,20 @@ mod tests {
     fn mark_session_restored_sets_clean_flag() {
         let (db_path, conn, _dir) = setup_test_db();
         insert_session(&conn, "sess-restore", false);
+        let checkpoint_id = insert_checkpoint(&conn, "sess-restore", 1_000, 0);
 
         mark_session_restored(&db_path, "sess-restore").unwrap();
 
-        let clean: bool = conn
+        let (clean, clean_checkpoint_id): (bool, Option<i64>) = conn
             .query_row(
-                "SELECT shutdown_clean FROM mux_sessions WHERE session_id = 'sess-restore'",
+                "SELECT shutdown_clean, clean_checkpoint_id
+                 FROM mux_sessions WHERE session_id = 'sess-restore'",
                 [],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
         assert!(clean);
+        assert_eq!(clean_checkpoint_id, Some(checkpoint_id));
     }
 
     #[test]
@@ -2680,15 +3402,53 @@ mod tests {
         let cp_id = save_restore_checkpoint(&db_path, "sess-map", &mapping).unwrap();
         assert!(cp_id > 0);
 
-        let (cp_type, metadata_json): (String, String) = conn
+        let (cp_type, cp_role, state_hash, metadata_json, topology_json): (
+            String,
+            String,
+            String,
+            String,
+            Option<String>,
+        ) = conn
             .query_row(
-                "SELECT checkpoint_type, metadata_json FROM session_checkpoints WHERE id = ?1",
+                "SELECT checkpoint_type, checkpoint_role, state_hash, metadata_json, topology_json
+                 FROM session_checkpoints WHERE id = ?1",
                 [cp_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
             )
             .unwrap();
         assert_eq!(cp_type, "startup");
-        assert!(metadata_json.contains("old_to_new"));
+        assert_eq!(cp_role, CHECKPOINT_ROLE_RESTORE_RECEIPT);
+        assert!(state_hash.starts_with(RESTORE_RECEIPT_WITNESS_PREFIX));
+        assert_eq!(metadata_json, r#"{"old_to_new":{"0":5,"1":6}}"#);
+        assert!(topology_json.is_none());
+    }
+
+    #[test]
+    fn save_restore_checkpoint_rejects_duplicate_target_pane_ids() {
+        let (db_path, conn, _dir) = setup_test_db();
+        insert_session(&conn, "sess-duplicate-map", false);
+        let mapping = HashMap::from([(1_u64, 99_u64), (2_u64, 99_u64)]);
+
+        let error = save_restore_checkpoint(&db_path, "sess-duplicate-map", &mapping)
+            .expect_err("receipt writer must reject a non-injective pane mapping");
+        assert!(matches!(error, RestoreError::Bookkeeping(_)));
+        let checkpoint_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM session_checkpoints
+                 WHERE session_id = 'sess-duplicate-map'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(checkpoint_count, 0);
     }
 
     #[test]
@@ -2724,26 +3484,58 @@ mod tests {
         let checkpoint_id =
             finalize_restore(&db_path, "sess-finalize", &mapping, true).expect("finalize restore");
 
-        let (checkpoint_type, metadata_json, last_checkpoint_at, shutdown_clean): (
+        let (checkpoint_type, checkpoint_role, state_hash, metadata_json, last_checkpoint_at, shutdown_clean): (
+            String,
+            String,
             String,
             String,
             Option<i64>,
             bool,
         ) = conn
             .query_row(
-                "SELECT c.checkpoint_type, c.metadata_json, s.last_checkpoint_at, s.shutdown_clean
+                "SELECT c.checkpoint_type, c.checkpoint_role, c.state_hash, c.metadata_json,
+                        s.last_checkpoint_at, s.shutdown_clean
                  FROM session_checkpoints c
                  JOIN mux_sessions s ON s.session_id = c.session_id
                  WHERE c.id = ?1",
                 [checkpoint_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
             )
             .unwrap();
 
         assert_eq!(checkpoint_type, "startup");
+        assert_eq!(checkpoint_role, CHECKPOINT_ROLE_RESTORE_RECEIPT);
+        assert!(state_hash.starts_with(RESTORE_RECEIPT_WITNESS_PREFIX));
         assert!(metadata_json.contains("\"old_to_new\":{\"7\":70}"));
         assert!(last_checkpoint_at.is_some());
         assert!(shutdown_clean);
+    }
+
+    #[test]
+    fn finalize_restore_rejects_missing_session_and_rolls_back_receipt() {
+        let (db_path, conn, _dir) = setup_test_db();
+
+        let error = finalize_restore(&db_path, "sess-missing", &HashMap::new(), true)
+            .expect_err("bookkeeping must not create a receipt without its session");
+        assert!(matches!(error, RestoreError::Bookkeeping(_)));
+        let checkpoint_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM session_checkpoints
+                 WHERE session_id = 'sess-missing'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(checkpoint_count, 0);
     }
 
     #[test]
@@ -2869,6 +3661,120 @@ mod tests {
     }
 
     #[test]
+    fn auto_restore_never_selects_legacy_unverified_checkpoint() {
+        let (db_path, conn, _dir) = setup_test_db();
+        insert_session(&conn, "sess-legacy-auto", false);
+        let checkpoint_id = insert_checkpoint(&conn, "sess-legacy-auto", 5000, 1);
+        insert_pane_state(&conn, checkpoint_id, 7, Some("/restore"), Some("bash"));
+
+        let manual = SessionRestorer::new(
+            Arc::new(db_path.clone()),
+            SessionRestoreConfig::default(),
+        );
+        assert!(manual.detect().unwrap().is_some());
+
+        let automatic = SessionRestorer::new(
+            Arc::new(db_path),
+            SessionRestoreConfig {
+                auto_restore: true,
+                ..SessionRestoreConfig::default()
+            },
+        );
+        assert!(
+            automatic.detect().unwrap().is_none(),
+            "legacy evidence may be offered manually but never auto-restored"
+        );
+    }
+
+    #[test]
+    fn auto_restore_selects_verified_v2_snapshot() {
+        let (db_path, conn, _dir) = setup_test_db();
+        insert_session(&conn, "sess-v2-auto", false);
+        let checkpoint_id = insert_checkpoint(&conn, "sess-v2-auto", 5000, 1);
+        insert_pane_state(&conn, checkpoint_id, 7, Some("/restore"), Some("bash"));
+        seal_checkpoint_v2(&conn, checkpoint_id);
+
+        let automatic = SessionRestorer::new(
+            Arc::new(db_path),
+            SessionRestoreConfig {
+                auto_restore: true,
+                ..SessionRestoreConfig::default()
+            },
+        );
+        let candidate = automatic
+            .detect()
+            .expect("verified auto-detect")
+            .expect("verified v2 snapshot should be eligible for auto-restore");
+        assert_eq!(candidate.session_id, "sess-v2-auto");
+    }
+
+    #[test]
+    fn auto_restore_rejects_direct_legacy_checkpoint_submission() {
+        let (db_path, conn, _dir) = setup_test_db();
+        insert_session(&conn, "sess-direct-legacy", false);
+        set_single_pane_topology(&conn, "sess-direct-legacy", 7, "/restore");
+        let checkpoint_id = insert_checkpoint(&conn, "sess-direct-legacy", 5000, 1);
+        insert_pane_state(&conn, checkpoint_id, 7, Some("/restore"), Some("bash"));
+
+        let automatic = SessionRestorer::new(
+            Arc::new(db_path.clone()),
+            SessionRestoreConfig {
+                auto_restore: true,
+                ..SessionRestoreConfig::default()
+            },
+        );
+        let mut sessions = find_unclean_sessions(&db_path).unwrap();
+        let session = sessions.remove(0);
+        let checkpoint = load_checkpoint_by_id(&db_path, checkpoint_id)
+            .unwrap()
+            .unwrap();
+        let error = run_async_test(automatic.restore(
+            &session,
+            &checkpoint,
+            Arc::new(MockWezterm::new()),
+        ))
+        .expect_err("direct submission must not bypass the auto-restore legacy gate");
+        assert!(matches!(
+            error,
+            RestoreError::LegacyCheckpointRequiresManualRestore {
+                checkpoint_id: id
+            } if id == checkpoint_id
+        ));
+    }
+
+    #[test]
+    fn restore_rejects_topology_and_pane_state_id_mismatch_before_mux_calls() {
+        let (db_path, conn, _dir) = setup_test_db();
+        insert_session(&conn, "sess-id-mismatch", false);
+        set_single_pane_topology(&conn, "sess-id-mismatch", 8, "/topology");
+        let checkpoint_id = insert_checkpoint(&conn, "sess-id-mismatch", 5000, 1);
+        insert_pane_state(
+            &conn,
+            checkpoint_id,
+            7,
+            Some("/pane-state"),
+            Some("bash"),
+        );
+
+        let restorer =
+            SessionRestorer::new(Arc::new(db_path.clone()), SessionRestoreConfig::default());
+        let mut sessions = find_unclean_sessions(&db_path).unwrap();
+        let session = sessions.remove(0);
+        let checkpoint = load_checkpoint_by_id(&db_path, checkpoint_id)
+            .unwrap()
+            .unwrap();
+        let wezterm = Arc::new(MockWezterm::new());
+        let error = run_async_test(restorer.restore(
+            &session,
+            &checkpoint,
+            wezterm.clone(),
+        ))
+        .expect_err("topology and pane-state IDs must agree before restore starts");
+        assert!(matches!(error, RestoreError::CorruptCheckpoint(_)));
+        assert!(run_async_test(wezterm.list_panes()).unwrap().is_empty());
+    }
+
+    #[test]
     fn session_restorer_detect_skips_unclean_sessions_without_checkpoints() {
         let (db_path, conn, _dir) = setup_test_db();
         insert_session(&conn, "sess-empty", false);
@@ -2908,8 +3814,9 @@ mod tests {
         insert_pane_state(&conn, shadowed_capture, 1, Some("/older"), Some("bash"));
         conn.execute(
             "INSERT INTO session_checkpoints
-             (session_id, checkpoint_at, checkpoint_type, state_hash, pane_count, total_bytes, metadata_json)
-             VALUES (?1, ?2, 'startup', 'restore', ?3, 0, ?4)",
+             (session_id, checkpoint_at, checkpoint_type, state_hash, pane_count,
+              total_bytes, metadata_json, checkpoint_role)
+             VALUES (?1, ?2, 'startup', 'restore', ?3, 0, ?4, 'restore_receipt')",
             params![
                 "sess-shadowed",
                 4000i64,
@@ -3158,8 +4065,9 @@ mod tests {
 
         let restorer =
             SessionRestorer::new(Arc::new(db_path.clone()), SessionRestoreConfig::default());
-        let session = restorer.detect().unwrap().expect("restorable session");
+        let mut session = restorer.detect().unwrap().expect("restorable session");
         let checkpoint = restorer.load_checkpoint(&session).unwrap();
+        session.topology_json = "{not authoritative topology}".to_string();
 
         let wezterm = Arc::new(MockWezterm::new());
         let summary =
@@ -3189,8 +4097,8 @@ mod tests {
             .query_row(
                 "SELECT id, metadata_json
                  FROM session_checkpoints
-                 WHERE session_id = ?1 AND checkpoint_type = 'startup'
-                 ORDER BY checkpoint_at DESC
+                 WHERE session_id = ?1 AND checkpoint_role = 'restore_receipt'
+                 ORDER BY checkpoint_at DESC, id DESC
                  LIMIT 1",
                 ["sess-success"],
                 |row| Ok((row.get(0)?, row.get(1)?)),
@@ -3679,7 +4587,22 @@ mod tests {
 
         let a = sessions.iter().find(|s| s.session_id == "sess-a").unwrap();
         assert!(a.shutdown_clean);
-        assert_eq!(a.checkpoint_count, 0);
+        assert_eq!(a.checkpoint_count, 1);
+        assert_eq!(a.pane_count, None);
+    }
+
+    #[test]
+    fn list_and_show_session_break_checkpoint_timestamp_ties_by_id() {
+        let (db_path, conn, _dir) = setup_test_db();
+        insert_session(&conn, "sess-summary-tie", false);
+        let older_id = insert_checkpoint(&conn, "sess-summary-tie", 2000, 1);
+        let newer_id = insert_checkpoint(&conn, "sess-summary-tie", 2000, 2);
+
+        let sessions = list_sessions(&db_path).unwrap();
+        assert_eq!(sessions[0].pane_count, Some(2));
+        let (_, checkpoints) = show_session(&db_path, "sess-summary-tie").unwrap();
+        assert_eq!(checkpoints[0].id, newer_id);
+        assert_eq!(checkpoints[1].id, older_id);
     }
 
     #[test]
@@ -3771,14 +4694,15 @@ mod tests {
     #[test]
     fn session_doctor_healthy() {
         let (db_path, conn, _dir) = setup_test_db();
-        insert_session(&conn, "sess-d", true);
+        insert_session(&conn, "sess-d", false);
         let cp_id = insert_checkpoint(&conn, "sess-d", 1000, 1);
         insert_pane_state(&conn, cp_id, 0, None, None);
+        insert_clean_receipt(&conn, "sess-d", 1001);
 
         let report = session_doctor(&db_path).unwrap();
         assert_eq!(report.total_sessions, 1);
         assert_eq!(report.unclean_sessions, 0);
-        assert_eq!(report.total_checkpoints, 1);
+        assert_eq!(report.total_checkpoints, 2);
         assert_eq!(report.orphaned_pane_states, 0);
     }
 
@@ -3857,7 +4781,14 @@ mod tests {
             "INSERT INTO session_checkpoints
              (session_id, checkpoint_at, checkpoint_type, state_hash, pane_count, total_bytes)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params!["sess-orphan", 1000i64, "periodic", "hash123", 1i64, 64i64],
+            params![
+                "sess-orphan",
+                1000i64,
+                "periodic",
+                "0123456789abcdef",
+                1i64,
+                64i64
+            ],
         )
         .unwrap();
         let checkpoint_id = conn.last_insert_rowid();
@@ -4055,8 +4986,12 @@ mod tests {
             checkpoint_id: 42,
             session_id: "sess-x".to_string(),
             checkpoint_at: 5000,
-            checkpoint_type: Some("periodic".to_string()),
+            checkpoint_type: "periodic".to_string(),
+            checkpoint_role: CheckpointRole::Snapshot,
+            verification: CheckpointVerification::LegacyUnverified,
+            topology_json: Some("{}".to_string()),
             pane_count: 3,
+            total_bytes: 0,
             pane_states: vec![],
         };
         let d2 = d.clone();
@@ -4278,11 +5213,11 @@ mod tests {
     {
       "session_id": "sess-clean",
       "created_at": 1000,
-      "last_checkpoint_at": null,
+      "last_checkpoint_at": 1000,
       "shutdown_clean": true,
       "ft_version": "0.1.0",
       "host_id": null,
-      "checkpoint_count": 0,
+      "checkpoint_count": 1,
       "pane_count": null
     }
   ],
@@ -4297,16 +5232,18 @@ mod tests {
     },
     "checkpoints": [
       {
-        "id": 2,
+        "id": 3,
         "checkpoint_at": 3000,
         "checkpoint_type": "startup",
+        "checkpoint_role": "snapshot",
         "pane_count": 2,
         "total_bytes": 512
       },
       {
-        "id": 1,
+        "id": 2,
         "checkpoint_at": 2000,
         "checkpoint_type": "periodic",
+        "checkpoint_role": "snapshot",
         "pane_count": 1,
         "total_bytes": 2048
       }
@@ -4315,7 +5252,7 @@ mod tests {
   "session_doctor": {
     "total_sessions": 2,
     "unclean_sessions": 1,
-    "total_checkpoints": 2,
+    "total_checkpoints": 3,
     "orphaned_pane_states": 0,
     "total_data_bytes": 2560
   },
@@ -4352,7 +5289,8 @@ mod tests {
         let info = CheckpointInfo {
             id: 99,
             checkpoint_at: 5000,
-            checkpoint_type: Some("periodic".to_string()),
+            checkpoint_type: "periodic".to_string(),
+            checkpoint_role: CheckpointRole::Snapshot,
             pane_count: 4,
             total_bytes: 8192,
         };

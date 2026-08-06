@@ -1878,15 +1878,38 @@ impl HealthSnapshot {
     }
 }
 
+/// A relational invariant in a serialized shutdown summary was violated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum ShutdownSummaryValidationError {
+    /// A positive quiescence claim requires both observed depths to be zero
+    /// and the enclosing shutdown result to be clean.
+    #[error(
+        "managed queue quiescence proof requires clean=true and zero queue depths; clean={clean}, final_capture_queue={final_capture_queue}, final_write_queue={final_write_queue}"
+    )]
+    InvalidManagedQueueQuiescenceProof {
+        clean: bool,
+        final_capture_queue: usize,
+        final_write_queue: usize,
+    },
+}
+
 /// Summary of a graceful shutdown.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct ShutdownSummary {
     /// Total runtime in seconds
     pub elapsed_secs: u64,
-    /// Final capture queue depth
-    pub final_capture_queue: usize,
-    /// Final write queue depth
-    pub final_write_queue: usize,
+    /// Last point-in-time capture queue depth observed during shutdown.
+    /// A zero is not, by itself, proof that managed queues quiesced; consult
+    /// [`Self::managed_queue_quiescence_proven`].
+    final_capture_queue: usize,
+    /// Last point-in-time storage write queue depth observed during shutdown.
+    /// A zero is not, by itself, proof that managed queues quiesced; consult
+    /// [`Self::managed_queue_quiescence_proven`].
+    final_write_queue: usize,
+    /// Whether every shutdown phase needed to establish managed-queue
+    /// quiescence completed cleanly and both point-in-time depths were zero.
+    /// `false` means unknown or non-quiescent, never an inferred success.
+    managed_queue_quiescence_proven: bool,
     /// Total segments persisted
     pub segments_persisted: u64,
     /// Total events recorded
@@ -1894,9 +1917,163 @@ pub struct ShutdownSummary {
     /// Last sequence number per pane
     pub last_seq_by_pane: Vec<(u64, i64)>,
     /// Whether shutdown was clean (no errors)
-    pub clean: bool,
+    clean: bool,
     /// Any warnings during shutdown
     pub warnings: Vec<String>,
+}
+
+/// Untrusted serde shape for [`ShutdownSummary`].
+///
+/// The proof bit defaults to `false` so summaries written before the field
+/// existed, or inputs that omit it, cannot manufacture a positive authority
+/// claim. Conversion into the public type validates the cross-field
+/// invariant before the value becomes usable.
+#[derive(Deserialize)]
+struct ShutdownSummaryWire {
+    elapsed_secs: u64,
+    final_capture_queue: usize,
+    final_write_queue: usize,
+    #[serde(default)]
+    managed_queue_quiescence_proven: bool,
+    segments_persisted: u64,
+    events_recorded: u64,
+    last_seq_by_pane: Vec<(u64, i64)>,
+    clean: bool,
+    warnings: Vec<String>,
+}
+
+impl ShutdownSummary {
+    /// Construct the authoritative in-process runtime summary. The proof bit
+    /// is derived rather than accepted from a caller, so this path cannot
+    /// create an inconsistent positive claim.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_runtime_observation(
+        elapsed_secs: u64,
+        final_capture_queue: usize,
+        final_write_queue: usize,
+        segments_persisted: u64,
+        events_recorded: u64,
+        last_seq_by_pane: Vec<(u64, i64)>,
+        clean: bool,
+        warnings: Vec<String>,
+    ) -> Self {
+        Self {
+            elapsed_secs,
+            final_capture_queue,
+            final_write_queue,
+            managed_queue_quiescence_proven: clean
+                && final_capture_queue == 0
+                && final_write_queue == 0,
+            segments_persisted,
+            events_recorded,
+            last_seq_by_pane,
+            clean,
+            warnings,
+        }
+    }
+
+    /// Construct a summary only when its positive authority claim is
+    /// consistent with the observed shutdown state.
+    ///
+    /// A negative proof is always admissible: zero point-in-time depths can be
+    /// unknown rather than proven when an earlier shutdown phase was unclean.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ShutdownSummaryValidationError`] when a positive proof is
+    /// paired with an unclean shutdown or either nonzero queue depth.
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_new(
+        elapsed_secs: u64,
+        final_capture_queue: usize,
+        final_write_queue: usize,
+        managed_queue_quiescence_proven: bool,
+        segments_persisted: u64,
+        events_recorded: u64,
+        last_seq_by_pane: Vec<(u64, i64)>,
+        clean: bool,
+        warnings: Vec<String>,
+    ) -> Result<Self, ShutdownSummaryValidationError> {
+        let summary = Self {
+            elapsed_secs,
+            final_capture_queue,
+            final_write_queue,
+            managed_queue_quiescence_proven,
+            segments_persisted,
+            events_recorded,
+            last_seq_by_pane,
+            clean,
+            warnings,
+        };
+        summary.validate()?;
+        Ok(summary)
+    }
+
+    /// Validate the proof-bearing relationship among summary fields.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ShutdownSummaryValidationError`] when the positive proof bit
+    /// contradicts the clean flag or observed queue depths.
+    pub const fn validate(&self) -> Result<(), ShutdownSummaryValidationError> {
+        if self.managed_queue_quiescence_proven
+            && (!self.clean || self.final_capture_queue != 0 || self.final_write_queue != 0)
+        {
+            return Err(
+                ShutdownSummaryValidationError::InvalidManagedQueueQuiescenceProof {
+                    clean: self.clean,
+                    final_capture_queue: self.final_capture_queue,
+                    final_write_queue: self.final_write_queue,
+                },
+            );
+        }
+        Ok(())
+    }
+
+    /// Whether managed-queue quiescence was positively established.
+    #[must_use]
+    pub const fn managed_queue_quiescence_proven(&self) -> bool {
+        self.managed_queue_quiescence_proven
+    }
+
+    /// Last point-in-time capture queue depth observed during shutdown.
+    #[must_use]
+    pub const fn final_capture_queue(&self) -> usize {
+        self.final_capture_queue
+    }
+
+    /// Last point-in-time storage write queue depth observed during shutdown.
+    #[must_use]
+    pub const fn final_write_queue(&self) -> usize {
+        self.final_write_queue
+    }
+
+    /// Whether shutdown completed without errors.
+    #[must_use]
+    pub const fn is_clean(&self) -> bool {
+        self.clean
+    }
+}
+
+impl<'de> Deserialize<'de> for ShutdownSummary {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = ShutdownSummaryWire::deserialize(deserializer)?;
+        Self::try_new(
+            wire.elapsed_secs,
+            wire.final_capture_queue,
+            wire.final_write_queue,
+            wire.managed_queue_quiescence_proven,
+            wire.segments_persisted,
+            wire.events_recorded,
+            wire.last_seq_by_pane,
+            wire.clean,
+            wire.warnings,
+        )
+        .map_err(serde::de::Error::custom)
+    }
 }
 
 /// Configuration for crash handling.
@@ -8078,23 +8255,85 @@ mod tests {
 
     #[test]
     fn shutdown_summary_serialization() {
-        let summary = ShutdownSummary {
-            elapsed_secs: 3600,
-            final_capture_queue: 0,
-            final_write_queue: 0,
-            segments_persisted: 1000,
-            events_recorded: 50,
-            last_seq_by_pane: vec![(1, 500)],
-            clean: true,
-            warnings: vec![],
-        };
+        let summary = ShutdownSummary::try_new(
+            3600,
+            0,
+            0,
+            true,
+            1000,
+            50,
+            vec![(1, 500)],
+            true,
+            vec![],
+        )
+        .unwrap();
 
         let json = serde_json::to_string(&summary).unwrap();
         let parsed: ShutdownSummary = serde_json::from_str(&json).unwrap();
 
-        assert_eq!(parsed.elapsed_secs, summary.elapsed_secs);
-        assert_eq!(parsed.segments_persisted, summary.segments_persisted);
-        assert!(parsed.clean);
+        assert_eq!(parsed, summary);
+        assert!(parsed.managed_queue_quiescence_proven());
+    }
+
+    #[test]
+    fn shutdown_summary_missing_quiescence_proof_defaults_false() {
+        let json = r#"{
+            "elapsed_secs": 10,
+            "final_capture_queue": 0,
+            "final_write_queue": 0,
+            "segments_persisted": 2,
+            "events_recorded": 3,
+            "last_seq_by_pane": [],
+            "clean": true,
+            "warnings": []
+        }"#;
+
+        let parsed: ShutdownSummary = serde_json::from_str(json).unwrap();
+        assert!(parsed.is_clean());
+        assert!(!parsed.managed_queue_quiescence_proven());
+        assert!(parsed.validate().is_ok());
+    }
+
+    #[test]
+    fn shutdown_summary_rejects_impossible_positive_quiescence_claims() {
+        for (clean, final_capture_queue, final_write_queue) in
+            [(false, 0, 0), (true, 1, 0), (true, 0, 1)]
+        {
+            let value = serde_json::json!({
+                "elapsed_secs": 10,
+                "final_capture_queue": final_capture_queue,
+                "final_write_queue": final_write_queue,
+                "managed_queue_quiescence_proven": true,
+                "segments_persisted": 2,
+                "events_recorded": 3,
+                "last_seq_by_pane": [],
+                "clean": clean,
+                "warnings": []
+            });
+
+            let error = serde_json::from_value::<ShutdownSummary>(value)
+                .expect_err("inconsistent positive authority claim must fail closed");
+            assert!(
+                error
+                    .to_string()
+                    .contains("managed queue quiescence proof requires"),
+                "unexpected validation error: {error}"
+            );
+            assert!(matches!(
+                ShutdownSummary::try_new(
+                    10,
+                    final_capture_queue,
+                    final_write_queue,
+                    true,
+                    2,
+                    3,
+                    vec![],
+                    clean,
+                    vec![],
+                ),
+                Err(ShutdownSummaryValidationError::InvalidManagedQueueQuiescenceProof { .. })
+            ));
+        }
     }
 
     #[test]
@@ -12996,25 +13235,28 @@ not-json
 
     #[test]
     fn shutdown_summary_with_warnings() {
-        let summary = ShutdownSummary {
-            elapsed_secs: 120,
-            final_capture_queue: 5,
-            final_write_queue: 2,
-            segments_persisted: 50,
-            events_recorded: 10,
-            last_seq_by_pane: vec![(1, 50), (2, 30)],
-            clean: false,
-            warnings: vec![
+        let summary = ShutdownSummary::try_new(
+            120,
+            5,
+            2,
+            false,
+            50,
+            10,
+            vec![(1, 50), (2, 30)],
+            false,
+            vec![
                 "timeout waiting for flush".to_string(),
                 "queue not empty".to_string(),
             ],
-        };
+        )
+        .unwrap();
         let json = serde_json::to_string(&summary).unwrap();
         let parsed: ShutdownSummary = serde_json::from_str(&json).unwrap();
-        assert!(!parsed.clean);
+        assert!(!parsed.is_clean());
         assert_eq!(parsed.warnings.len(), 2);
-        assert_eq!(parsed.final_capture_queue, 5);
-        assert_eq!(parsed.final_write_queue, 2);
+        assert_eq!(parsed.final_capture_queue(), 5);
+        assert_eq!(parsed.final_write_queue(), 2);
+        assert!(!parsed.managed_queue_quiescence_proven());
     }
 
     #[test]

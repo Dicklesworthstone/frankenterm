@@ -156,6 +156,7 @@ pub mod capability_preflight;
 pub mod capability_probe;
 pub mod capacity_governor;
 pub mod capture_authority;
+mod checkpoint_witness;
 #[cfg(feature = "session-resume")]
 pub mod casr_types;
 pub mod cass;

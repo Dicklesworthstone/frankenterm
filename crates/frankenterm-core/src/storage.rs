@@ -49,6 +49,10 @@ use frankenterm_sigpipe::{RecoverablePanicSite, catch_recoverable};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{EventDeliveryLeaseBatchError, Result, StorageError};
+use crate::checkpoint_witness::{
+    CHECKPOINT_ROLE_SNAPSHOT, PersistedPaneState,
+    canonical_json_string as canonical_checkpoint_json_string, checkpoint_witness,
+};
 use crate::capture_authority::CapturePersistenceHold;
 use crate::config::{
     CompiledRetentionPolicy, RetentionTier, compile_retention_policy_tiers,
@@ -1314,12 +1318,8 @@ enum WriteCommand {
     InsertSessionCheckpoint {
         session_id: String,
         checkpoint_type: String,
-        state_hash: String,
-        pane_count: usize,
-        total_bytes: usize,
-        metadata_json: Option<String>,
-        pane_states: Vec<SessionPaneStateRow>,
-        respond: oneshot::Sender<Result<i64>>,
+        prepared: PreparedSessionCheckpoint,
+        respond: oneshot::Sender<Result<SessionCheckpointReceipt>>,
     },
     /// Prune old checkpoints beyond retention limit
     PruneSessionCheckpoints {
@@ -1329,7 +1329,7 @@ enum WriteCommand {
     },
     /// Mark a session as cleanly shut down
     MarkSessionShutdownClean {
-        session_id: String,
+        receipt: SessionCheckpointReceipt,
         respond: oneshot::Sender<Result<()>>,
     },
     /// Test-only command that panics inside the writer dispatch path.
@@ -1454,6 +1454,50 @@ pub struct SessionPaneStateRow {
     pub scrollback_checkpoint_seq: Option<i64>,
     /// Epoch ms of last captured output.
     pub last_output_at: Option<i64>,
+}
+
+/// Exact durable identity returned by the storage checkpoint writer.
+///
+/// The row ID alone is not sufficient authority: SQLite can reuse row IDs
+/// after deletion, and a newer checkpoint can supersede a prior one.  Clean
+/// shutdown admission therefore requires this complete receipt and validates
+/// every field inside the writer transaction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionCheckpointReceipt {
+    /// Session that owns the committed checkpoint.
+    session_id: String,
+    /// SQLite row identity assigned inside the committing transaction.
+    checkpoint_id: i64,
+    /// Persisted checkpoint clock used for deterministic latest ordering.
+    checkpoint_at: i64,
+    /// Versioned witness over the exact row-local topology and pane projection.
+    state_hash: String,
+}
+
+impl SessionCheckpointReceipt {
+    /// Session that owns the committed checkpoint.
+    #[must_use]
+    pub fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
+    /// SQLite row identity assigned inside the committing transaction.
+    #[must_use]
+    pub const fn checkpoint_id(&self) -> i64 {
+        self.checkpoint_id
+    }
+
+    /// Persisted checkpoint clock used for deterministic latest ordering.
+    #[must_use]
+    pub const fn checkpoint_at(&self) -> i64 {
+        self.checkpoint_at
+    }
+
+    /// Versioned witness over the exact row-local topology and pane projection.
+    #[must_use]
+    pub fn state_hash(&self) -> &str {
+        &self.state_hash
+    }
 }
 
 /// Configuration for the storage handle
@@ -7436,28 +7480,22 @@ impl StorageHandle {
         Self::recv_writer_response(rx).await
     }
 
-    /// Insert a session checkpoint with per-pane state rows.
-    /// Returns the checkpoint ID.
-    // Checkpoint insertion keeps session, pane, and resource snapshots explicit at the API boundary.
-    #[allow(clippy::too_many_arguments)]
+    /// Insert a snapshot checkpoint with row-local topology and per-pane state.
+    /// Returns an exact commit receipt suitable for clean-shutdown admission.
     pub async fn insert_session_checkpoint(
         &self,
         session_id: String,
         checkpoint_type: String,
-        state_hash: String,
-        pane_count: usize,
-        total_bytes: usize,
+        topology_json: String,
         metadata_json: Option<String>,
         pane_states: Vec<SessionPaneStateRow>,
-    ) -> Result<i64> {
+    ) -> Result<SessionCheckpointReceipt> {
         let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
         self.insert_session_checkpoint_with_cx(
             &cx,
             session_id,
             checkpoint_type,
-            state_hash,
-            pane_count,
-            total_bytes,
+            topology_json,
             metadata_json,
             pane_states,
         )
@@ -7466,19 +7504,28 @@ impl StorageHandle {
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`insert_session_checkpoint`].
     /// Tick 172: inlined to route the mpsc send through `send_with_cx`.
-    #[allow(clippy::too_many_arguments)]
     pub async fn insert_session_checkpoint_with_cx(
         &self,
         cx: &crate::cx::Cx,
         session_id: String,
         checkpoint_type: String,
-        state_hash: String,
-        pane_count: usize,
-        total_bytes: usize,
+        topology_json: String,
         metadata_json: Option<String>,
         pane_states: Vec<SessionPaneStateRow>,
-    ) -> Result<i64> {
+    ) -> Result<SessionCheckpointReceipt> {
         Self::checkpoint_storage_operation(cx, "insert_session_checkpoint")?;
+        let prepared = Self::spawn_blocking_storage_with_cx_with_join_error(
+            cx,
+            "Session checkpoint preparation failed",
+            move || {
+                prepare_session_checkpoint(
+                    topology_json.as_str(),
+                    metadata_json.as_deref(),
+                    &pane_states,
+                )
+            },
+        )
+        .await?;
         let (tx, rx) = oneshot::channel();
         self.write_tx
             .send_with_cx(
@@ -7486,11 +7533,7 @@ impl StorageHandle {
                 WriteCommand::InsertSessionCheckpoint {
                     session_id,
                     checkpoint_type,
-                    state_hash,
-                    pane_count,
-                    total_bytes,
-                    metadata_json,
-                    pane_states,
+                    prepared,
                     respond: tx,
                 },
             )
@@ -7535,10 +7578,14 @@ impl StorageHandle {
         Self::recv_writer_response(rx).await
     }
 
-    /// Mark a session as cleanly shut down.
-    pub async fn mark_session_shutdown_clean(&self, session_id: String) -> Result<()> {
+    /// Mark a session clean only when `receipt` still names its exact latest
+    /// durable checkpoint.
+    pub async fn mark_session_shutdown_clean(
+        &self,
+        receipt: SessionCheckpointReceipt,
+    ) -> Result<()> {
         let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-        self.mark_session_shutdown_clean_with_cx(&cx, session_id)
+        self.mark_session_shutdown_clean_with_cx(&cx, receipt)
             .await
     }
 
@@ -7547,7 +7594,7 @@ impl StorageHandle {
     pub async fn mark_session_shutdown_clean_with_cx(
         &self,
         cx: &crate::cx::Cx,
-        session_id: String,
+        receipt: SessionCheckpointReceipt,
     ) -> Result<()> {
         Self::checkpoint_storage_operation(cx, "mark_session_shutdown_clean")?;
         let (tx, rx) = oneshot::channel();
@@ -7555,7 +7602,7 @@ impl StorageHandle {
             .send_with_cx(
                 cx,
                 WriteCommand::MarkSessionShutdownClean {
-                    session_id,
+                    receipt,
                     respond: tx,
                 },
             )
@@ -12484,8 +12531,10 @@ fn fail_undispatched_write_command(cmd: WriteCommand, failure: &WriterFailure) -
         | WriteCommand::RecordSecretScanReport { respond, .. }
         | WriteCommand::RecordUsageMetric { respond, .. }
         | WriteCommand::RecordNotification { respond, .. }
-        | WriteCommand::InsertPaneBookmark { respond, .. }
-        | WriteCommand::InsertSessionCheckpoint { respond, .. } => {
+        | WriteCommand::InsertPaneBookmark { respond, .. } => {
+            respond_oneshot_best_effort(respond, failure.result());
+        }
+        WriteCommand::InsertSessionCheckpoint { respond, .. } => {
             respond_oneshot_best_effort(respond, failure.result());
         }
         WriteCommand::UpsertLimitWindow { respond, .. } => {
@@ -17357,11 +17406,7 @@ fn dispatch_write_command_raw(
         WriteCommand::InsertSessionCheckpoint {
             session_id,
             checkpoint_type,
-            state_hash,
-            pane_count,
-            total_bytes,
-            metadata_json,
-            pane_states,
+            prepared,
             respond,
         } => {
             let respond = WriterResultResponder::new(respond);
@@ -17372,11 +17417,7 @@ fn dispatch_write_command_raw(
                 backend,
                 &session_id,
                 &checkpoint_type,
-                &state_hash,
-                pane_count,
-                total_bytes,
-                metadata_json.as_deref(),
-                &pane_states,
+                &prepared,
             );
             respond_oneshot_best_effort(respond, result);
         }
@@ -17393,14 +17434,14 @@ fn dispatch_write_command_raw(
             respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::MarkSessionShutdownClean {
-            session_id,
+            receipt,
             respond,
         } => {
             let respond = WriterResultResponder::new(respond);
             // br-ft-l1jgo: routes through the writer backend trait surface.
             // Replaces the legacy
             // mark_session_shutdown_clean direct-rusqlite path.
-            let result = mark_session_shutdown_clean_backend(backend, &session_id);
+            let result = mark_session_shutdown_clean_backend(backend, &receipt);
             respond_oneshot_best_effort(respond, result);
         }
         #[cfg(test)]
@@ -21912,8 +21953,8 @@ fn agent_profile_from_backend_cells(
 
 /// Insert a new mux_sessions row (writer-thread, backend-trait path).
 ///
-/// br-ft-l1jgo writer-thread migration: replaces the legacy
-/// legacy direct-rusqlite mux-session insert helper. Routes the INSERT through the trait surface using
+/// br-ft-l1jgo writer-thread migration: replaces the legacy direct-rusqlite
+/// mux-session insert helper. Routes the INSERT through the trait surface using
 /// `execute_typed`. Same shape as the
 /// `prune_session_checkpoints_backend` (c72156eb4),
 /// `upsert_action_undo_backend` (81589276c), and
@@ -21927,6 +21968,7 @@ fn insert_mux_session_backend(
     host_id: Option<&str>,
 ) -> Result<()> {
     let now = now_ms();
+    let (_, topology_json) = prepare_checkpoint_topology(topology_json)?;
     let host_id_value = match host_id {
         Some(s) => ToSqlValue::Text(s),
         None => ToSqlValue::Null,
@@ -21938,7 +21980,7 @@ fn insert_mux_session_backend(
         &[
             ToSqlValue::Text(session_id),
             ToSqlValue::Integer(now),
-            ToSqlValue::Text(topology_json),
+            ToSqlValue::Text(topology_json.as_str()),
             ToSqlValue::Text(ft_version),
             host_id_value,
         ],
@@ -21947,61 +21989,191 @@ fn insert_mux_session_backend(
     Ok(())
 }
 
-/// br-ft-l1jgo writer-thread migration: replaces the legacy
-/// legacy direct-rusqlite session-checkpoint insert helper. Preserves the original IMMEDIATE transaction
+#[derive(Debug)]
+struct PreparedSessionCheckpoint {
+    topology_json: String,
+    metadata_json: Option<String>,
+    panes: Vec<PersistedPaneState>,
+    pane_count: i64,
+    total_bytes: i64,
+}
+
+fn checkpoint_json_error(
+    field: &'static str,
+    error: impl std::fmt::Display,
+) -> crate::error::Error {
+    StorageError::Database(format!("Invalid {field} JSON for session checkpoint: {error}")).into()
+}
+
+fn canonicalize_checkpoint_json_text(field: &'static str, raw: &str) -> Result<String> {
+    let value: serde_json::Value =
+        serde_json::from_str(raw).map_err(|error| checkpoint_json_error(field, error))?;
+    canonical_checkpoint_json_string(&value)
+        .map_err(|error| checkpoint_json_error(field, error))
+}
+
+fn prepare_checkpoint_topology(
+    raw: &str,
+) -> Result<(crate::session_topology::TopologySnapshot, String)> {
+    let topology = crate::session_topology::TopologySnapshot::from_json(raw)
+        .map_err(|error| checkpoint_json_error("topology", error))?;
+    if topology.schema_version != crate::session_topology::TOPOLOGY_SCHEMA_VERSION {
+        return Err(StorageError::Database(format!(
+            "Unsupported session checkpoint topology schema version {}; expected {}",
+            topology.schema_version,
+            crate::session_topology::TOPOLOGY_SCHEMA_VERSION
+        ))
+        .into());
+    }
+    let canonical = canonical_checkpoint_json_string(&topology)
+        .map_err(|error| checkpoint_json_error("topology", error))?;
+    Ok((topology, canonical))
+}
+
+fn prepare_session_checkpoint(
+    topology_json: &str,
+    metadata_json: Option<&str>,
+    pane_states: &[SessionPaneStateRow],
+) -> Result<PreparedSessionCheckpoint> {
+    let (topology, topology_json) = prepare_checkpoint_topology(topology_json)?;
+    let metadata_json = metadata_json
+        .map(|json| canonicalize_checkpoint_json_text("metadata", json))
+        .transpose()?;
+    let mut panes = Vec::with_capacity(pane_states.len());
+    let mut total_bytes = 0_usize;
+
+    for pane in pane_states {
+        if pane
+            .scrollback_checkpoint_seq
+            .is_some_and(|sequence| sequence < 0)
+        {
+            return Err(StorageError::Database(format!(
+                "Invalid negative scrollback sequence for pane {}",
+                pane.pane_id
+            ))
+            .into());
+        }
+        if pane.last_output_at.is_some_and(|timestamp| timestamp < 0) {
+            return Err(StorageError::Database(format!(
+                "Invalid negative last-output timestamp for pane {}",
+                pane.pane_id
+            ))
+            .into());
+        }
+
+        let env_json = pane
+            .env_json
+            .as_deref()
+            .map(|json| canonicalize_checkpoint_json_text("pane environment", json))
+            .transpose()?;
+        let terminal_state_json =
+            canonicalize_checkpoint_json_text("pane terminal state", &pane.terminal_state_json)?;
+        let agent_metadata_json = pane
+            .agent_metadata_json
+            .as_deref()
+            .map(|json| canonicalize_checkpoint_json_text("pane agent metadata", json))
+            .transpose()?;
+        let pane_bytes = terminal_state_json
+            .len()
+            .checked_add(env_json.as_ref().map_or(0, String::len))
+            .and_then(|bytes| {
+                bytes.checked_add(agent_metadata_json.as_ref().map_or(0, String::len))
+            })
+            .ok_or_else(|| {
+                StorageError::Database("Session checkpoint byte count overflow".to_string())
+            })?;
+        total_bytes = total_bytes.checked_add(pane_bytes).ok_or_else(|| {
+            StorageError::Database("Session checkpoint byte count overflow".to_string())
+        })?;
+
+        panes.push(PersistedPaneState {
+            pane_id: u64_to_i64(pane.pane_id, "mux_pane_state.pane_id")?,
+            cwd: pane.cwd.clone(),
+            command: pane.command.clone(),
+            env_json,
+            terminal_state_json,
+            agent_metadata_json,
+            scrollback_checkpoint_seq: pane.scrollback_checkpoint_seq,
+            last_output_at: pane.last_output_at,
+        });
+    }
+
+    panes.sort_unstable_by_key(|pane| pane.pane_id);
+    for adjacent in panes.windows(2) {
+        if adjacent[0].pane_id == adjacent[1].pane_id {
+            return Err(StorageError::Database(format!(
+                "Session checkpoint contains duplicate pane id {}",
+                adjacent[0].pane_id
+            ))
+            .into());
+        }
+    }
+    let mut topology_pane_ids = topology
+        .pane_ids()
+        .into_iter()
+        .map(|pane_id| u64_to_i64(pane_id, "session checkpoint topology pane_id"))
+        .collect::<Result<Vec<_>>>()?;
+    topology_pane_ids.sort_unstable();
+    let persisted_pane_ids: Vec<i64> = panes.iter().map(|pane| pane.pane_id).collect();
+    if topology_pane_ids != persisted_pane_ids {
+        let mismatch_index = topology_pane_ids
+            .iter()
+            .zip(&persisted_pane_ids)
+            .position(|(topology_id, persisted_id)| topology_id != persisted_id)
+            .unwrap_or_else(|| topology_pane_ids.len().min(persisted_pane_ids.len()));
+        let topology_id = topology_pane_ids.get(mismatch_index).copied();
+        let persisted_id = persisted_pane_ids.get(mismatch_index).copied();
+        return Err(StorageError::Database(format!(
+            "Session checkpoint topology/pane projection mismatch at index {mismatch_index}: topology={topology_id:?}, persisted={persisted_id:?}, topology_count={}, persisted_count={}",
+            topology_pane_ids.len(),
+            persisted_pane_ids.len()
+        ))
+        .into());
+    }
+
+    Ok(PreparedSessionCheckpoint {
+        topology_json,
+        metadata_json,
+        pane_count: usize_to_i64(panes.len(), "session_checkpoints.pane_count")?,
+        total_bytes: usize_to_i64(total_bytes, "session_checkpoints.total_bytes")?,
+        panes,
+    })
+}
+
+/// br-ft-l1jgo writer-thread migration: replaces the legacy direct-rusqlite
+/// session-checkpoint insert helper. Preserves the original IMMEDIATE transaction
 /// semantics while inserting the checkpoint row, pane-state batch,
 /// and mux-session timestamp update through [`StorageBackend`].
 /// Called from the writer-thread dispatcher.
 // Backend checkpoint writes preserve checkpoint metadata and pane rows as a single transaction.
-#[allow(clippy::too_many_arguments)]
 fn insert_session_checkpoint_backend(
     backend: &dyn StorageBackend,
     session_id: &str,
     checkpoint_type: &str,
-    state_hash: &str,
-    pane_count: usize,
-    total_bytes: usize,
-    metadata_json: Option<&str>,
-    pane_states: &[SessionPaneStateRow],
-) -> Result<i64> {
+    prepared: &PreparedSessionCheckpoint,
+) -> Result<SessionCheckpointReceipt> {
     let now = now_ms();
-    let pane_count_i64 = usize_to_i64(pane_count, "session_checkpoints.pane_count")?;
-    let total_bytes_i64 = usize_to_i64(total_bytes, "session_checkpoints.total_bytes")?;
-    let pane_state_rows: Vec<Vec<ToSqlValue<'_>>> = pane_states
-        .iter()
-        .map(|ps| {
-            Ok(vec![
-                ToSqlValue::Integer(u64_to_i64(ps.pane_id, "mux_pane_state.pane_id")?),
-                ToSqlValue::optional_text(ps.cwd.as_deref()),
-                ToSqlValue::optional_text(ps.command.as_deref()),
-                ToSqlValue::optional_text(ps.env_json.as_deref()),
-                ToSqlValue::Text(ps.terminal_state_json.as_str()),
-                ToSqlValue::optional_text(ps.agent_metadata_json.as_deref()),
-                ToSqlValue::optional_i64(ps.scrollback_checkpoint_seq),
-                ToSqlValue::optional_i64(ps.last_output_at),
-            ])
-        })
-        .collect::<Result<Vec<_>>>()?;
 
     run_writer_transaction(
         backend,
         WriterTransactionBeginMode::Immediate,
         "insert session checkpoint",
-        || -> Result<i64> {
+        || -> Result<SessionCheckpointReceipt> {
             let row = backend
                 .query_row_typed(
                     "INSERT INTO session_checkpoints
-         (session_id, checkpoint_at, checkpoint_type, state_hash, pane_count, total_bytes, metadata_json)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+         (session_id, checkpoint_at, checkpoint_type, state_hash, pane_count,
+          total_bytes, metadata_json, checkpoint_role, topology_json)
+         VALUES (?1, ?2, ?3, 'pending:snp2', ?4, ?5, ?6, 'snapshot', ?7)
          RETURNING id",
                     &[
                         ToSqlValue::Text(session_id),
                         ToSqlValue::Integer(now),
                         ToSqlValue::Text(checkpoint_type),
-                        ToSqlValue::Text(state_hash),
-                        ToSqlValue::Integer(pane_count_i64),
-                        ToSqlValue::Integer(total_bytes_i64),
-                        ToSqlValue::optional_text(metadata_json),
+                        ToSqlValue::Integer(prepared.pane_count),
+                        ToSqlValue::Integer(prepared.total_bytes),
+                        ToSqlValue::optional_text(prepared.metadata_json.as_deref()),
+                        ToSqlValue::Text(prepared.topology_json.as_str()),
                     ],
                 )
                 .map_err(|err| storage_backend_error("Failed to insert session checkpoint", err))?
@@ -22013,14 +22185,62 @@ fn insert_session_checkpoint_backend(
             let checkpoint_id = RowReader::new(&row).i64(0).map_err(|err| {
                 storage_backend_error("Failed to parse session checkpoint id", err)
             })?;
+            let state_hash = checkpoint_witness(
+                CHECKPOINT_ROLE_SNAPSHOT,
+                session_id,
+                checkpoint_id,
+                now,
+                checkpoint_type,
+                prepared.pane_count,
+                prepared.total_bytes,
+                prepared.metadata_json.as_deref(),
+                Some(prepared.topology_json.as_str()),
+                &prepared.panes,
+            )
+            .map_err(|error| {
+                StorageError::Database(format!(
+                    "Failed to compute session checkpoint witness: {error}"
+                ))
+            })?;
+            let updated_witness = backend
+                .query_row_typed(
+                    "UPDATE session_checkpoints
+                     SET state_hash = ?1
+                     WHERE id = ?2
+                       AND session_id = ?3
+                       AND state_hash = 'pending:snp2'
+                     RETURNING id",
+                    &[
+                        ToSqlValue::Text(state_hash.as_str()),
+                        ToSqlValue::Integer(checkpoint_id),
+                        ToSqlValue::Text(session_id),
+                    ],
+                )
+                .map_err(|err| {
+                    storage_backend_error("Failed to finalize session checkpoint witness", err)
+                })?;
+            if updated_witness.is_none() {
+                return Err(StorageError::Database(format!(
+                    "Failed to finalize exact session checkpoint {checkpoint_id} witness"
+                ))
+                .into());
+            }
 
-            let pane_state_param_rows: Vec<Vec<ToSqlValue<'_>>> = pane_state_rows
+            let pane_state_param_rows: Vec<Vec<ToSqlValue<'_>>> = prepared
+                .panes
                 .iter()
-                .map(|row| {
-                    let mut params = Vec::with_capacity(9);
-                    params.push(ToSqlValue::Integer(checkpoint_id));
-                    params.extend(row.iter().cloned());
-                    params
+                .map(|pane| {
+                    vec![
+                        ToSqlValue::Integer(checkpoint_id),
+                        ToSqlValue::Integer(pane.pane_id),
+                        ToSqlValue::optional_text(pane.cwd.as_deref()),
+                        ToSqlValue::optional_text(pane.command.as_deref()),
+                        ToSqlValue::optional_text(pane.env_json.as_deref()),
+                        ToSqlValue::Text(pane.terminal_state_json.as_str()),
+                        ToSqlValue::optional_text(pane.agent_metadata_json.as_deref()),
+                        ToSqlValue::optional_i64(pane.scrollback_checkpoint_seq),
+                        ToSqlValue::optional_i64(pane.last_output_at),
+                    ]
                 })
                 .collect();
 
@@ -22034,16 +22254,37 @@ fn insert_session_checkpoint_backend(
                 )
                 .map_err(|err| storage_backend_error("Failed to insert pane state", err))?;
 
-            execute_typed(
-                backend,
-                "UPDATE mux_sessions SET last_checkpoint_at = ?1 WHERE session_id = ?2",
-                &[ToSqlValue::Integer(now), ToSqlValue::Text(session_id)],
-            )
-            .map_err(|err| {
-                storage_backend_error("Failed to update session checkpoint timestamp", err)
-            })?;
+            let updated_session = backend
+                .query_row_typed(
+                    "UPDATE mux_sessions
+                 SET last_checkpoint_at = ?1,
+                     topology_json = ?2,
+                     shutdown_clean = 0,
+                     clean_checkpoint_id = NULL
+                 WHERE session_id = ?3
+                 RETURNING session_id",
+                    &[
+                        ToSqlValue::Integer(now),
+                        ToSqlValue::Text(prepared.topology_json.as_str()),
+                        ToSqlValue::Text(session_id),
+                    ],
+                )
+                .map_err(|err| {
+                    storage_backend_error("Failed to update session checkpoint summary", err)
+                })?;
+            if updated_session.is_none() {
+                return Err(StorageError::Database(format!(
+                    "Failed to update missing session {session_id} after checkpoint insert"
+                ))
+                .into());
+            }
 
-            Ok(checkpoint_id)
+            Ok(SessionCheckpointReceipt {
+                session_id: session_id.to_string(),
+                checkpoint_id,
+                checkpoint_at: now,
+                state_hash,
+            })
         },
     )
 }
@@ -22051,15 +22292,15 @@ fn insert_session_checkpoint_backend(
 /// Prune session_checkpoints down to the most-recent `retention`
 /// rows per session (writer-thread, backend-trait path).
 ///
-/// br-ft-l1jgo writer-thread migration: replaces the legacy
-/// legacy direct-rusqlite session-checkpoint prune helper. Routes the DELETE through the trait
-/// surface using `RETURNING id` + `query_map_typed`; the affected-
-/// row count is recovered from `returned.len()` without a separate
-/// `SELECT changes()` call — same shape as the
-/// `purge_audit_actions_backend` slice (c64527d9c) and
-/// `delete_events_before_backend` slice (81589276c). The inner
-/// `id NOT IN (...)` subquery preserving the most-recent N rows
-/// is unchanged. Called from the writer-thread dispatcher.
+/// br-ft-l1jgo writer-thread migration: replaces the legacy direct-rusqlite
+/// session-checkpoint prune helper. Routes snapshot-only
+/// deletion and session-authority reconciliation through the trait surface.
+/// A scalar connection-local `changes()` read recovers the affected-row count
+/// without materializing one `RETURNING` row per deleted checkpoint, keeping
+/// cleanup memory bounded for very large sessions. The inner
+/// `id NOT IN (...)` subquery preserves the most-recent N snapshot rows using
+/// the canonical timestamp/ID tie-break; restore receipts have an independent
+/// lifecycle. Called from the writer-thread dispatcher.
 fn prune_session_checkpoints_backend(
     backend: &dyn StorageBackend,
     session_id: &str,
@@ -22072,59 +22313,187 @@ fn prune_session_checkpoints_backend(
         WriterTransactionBeginMode::Immediate,
         "prune session checkpoints",
         || -> Result<usize> {
-            let returned = backend
-                .query_map_typed(
-                    "DELETE FROM session_checkpoints
+            execute_typed(
+                backend,
+                "DELETE FROM session_checkpoints
                  WHERE session_id = ?1
+                 AND checkpoint_role = 'snapshot'
                  AND id NOT IN (
                      SELECT id FROM session_checkpoints
                      WHERE session_id = ?1
-                     ORDER BY checkpoint_at DESC
+                       AND checkpoint_role = 'snapshot'
+                     ORDER BY checkpoint_at DESC, id DESC
                      LIMIT ?2
-                 )
-                 RETURNING id",
-                    &[
-                        ToSqlValue::Text(session_id),
-                        ToSqlValue::Integer(keep_count),
-                    ],
+                 )",
+                &[
+                    ToSqlValue::Text(session_id),
+                    ToSqlValue::Integer(keep_count),
+                ],
+            )
+            .map_err(|err| storage_backend_error("Failed to prune session checkpoints", err))?;
+            let changes_row = backend
+                .query_row_typed("SELECT changes()", &[])
+                .map_err(|err| {
+                    storage_backend_error("Failed to count pruned session checkpoints", err)
+                })?
+                .ok_or_else(|| {
+                    StorageError::Database(
+                        "Failed to count pruned session checkpoints: no row returned".to_string(),
+                    )
+                })?;
+            let deleted = count_query_row_to_usize(
+                &changes_row,
+                "Failed to count pruned session checkpoints",
+            )?;
+
+            let reconciled = backend
+                .query_row_typed(
+                    "UPDATE mux_sessions
+                 SET last_checkpoint_at = (
+                         SELECT checkpoint_at
+                         FROM session_checkpoints
+                         WHERE session_id = ?1
+                         ORDER BY checkpoint_at DESC, id DESC
+                         LIMIT 1
+                     ),
+                     topology_json = COALESCE(
+                         (
+                             SELECT topology_json
+                             FROM session_checkpoints
+                             WHERE session_id = ?1
+                               AND checkpoint_role = 'snapshot'
+                               AND topology_json IS NOT NULL
+                             ORDER BY checkpoint_at DESC, id DESC
+                             LIMIT 1
+                         ),
+                         topology_json
+                     ),
+                     shutdown_clean = CASE
+                         WHEN shutdown_clean = 1
+                          AND EXISTS (
+                              SELECT 1
+                              FROM session_checkpoints AS clean
+                              WHERE clean.id = mux_sessions.clean_checkpoint_id
+                                AND clean.session_id = mux_sessions.session_id
+                                AND clean.id = (
+                                    SELECT latest.id
+                                    FROM session_checkpoints AS latest
+                                    WHERE latest.session_id = mux_sessions.session_id
+                                    ORDER BY latest.checkpoint_at DESC, latest.id DESC
+                                    LIMIT 1
+                                )
+                          )
+                         THEN 1
+                         ELSE 0
+                     END,
+                     clean_checkpoint_id = CASE
+                         WHEN shutdown_clean = 1
+                          AND EXISTS (
+                              SELECT 1
+                              FROM session_checkpoints AS clean
+                              WHERE clean.id = mux_sessions.clean_checkpoint_id
+                                AND clean.session_id = mux_sessions.session_id
+                                AND clean.id = (
+                                    SELECT latest.id
+                                    FROM session_checkpoints AS latest
+                                    WHERE latest.session_id = mux_sessions.session_id
+                                    ORDER BY latest.checkpoint_at DESC, latest.id DESC
+                                    LIMIT 1
+                                )
+                          )
+                         THEN clean_checkpoint_id
+                         ELSE NULL
+                     END
+                 WHERE session_id = ?1
+                 RETURNING session_id",
+                    &[ToSqlValue::Text(session_id)],
                 )
                 .map_err(|err| {
-                    storage_backend_error("Failed to prune session checkpoints", err)
+                    storage_backend_error("Failed to reconcile pruned mux session", err)
                 })?;
 
-            execute_typed(
-                backend,
-                "DELETE FROM mux_sessions
-             WHERE session_id = ?1
-             AND last_checkpoint_at IS NOT NULL
-             AND NOT EXISTS (
-                 SELECT 1 FROM session_checkpoints
-                 WHERE session_id = ?1
-             )",
-                &[ToSqlValue::Text(session_id)],
-            )
-            .map_err(|err| storage_backend_error("Failed to prune empty mux session", err))?;
+            if deleted > 0 {
+                if reconciled.is_none() {
+                    return Err(StorageError::Database(format!(
+                        "Pruned checkpoint rows for missing mux session {session_id}"
+                    ))
+                    .into());
+                }
+                execute_typed(
+                    backend,
+                    "DELETE FROM mux_sessions
+                     WHERE session_id = ?1
+                       AND NOT EXISTS (
+                           SELECT 1 FROM session_checkpoints
+                           WHERE session_id = ?1
+                       )",
+                    &[ToSqlValue::Text(session_id)],
+                )
+                .map_err(|err| storage_backend_error("Failed to prune empty mux session", err))?;
+            }
 
-            Ok(returned.len())
+            Ok(deleted)
         },
     )
 }
 
-/// br-ft-l1jgo writer-thread migration: replaces the legacy
-/// legacy direct-rusqlite session-shutdown helper. Routes through the
-/// StorageBackend trait via `execute_typed`. Called from the writer-thread
-/// dispatcher.
+/// br-ft-l1jgo writer-thread migration: replaces the legacy direct-rusqlite
+/// session-shutdown helper. Routes exact-receipt
+/// validation and the clean transition through the writer transaction
+/// substrate. Called from the writer-thread dispatcher.
 fn mark_session_shutdown_clean_backend(
     backend: &dyn StorageBackend,
-    session_id: &str,
+    receipt: &SessionCheckpointReceipt,
 ) -> Result<()> {
-    execute_typed(
+    run_writer_transaction(
         backend,
-        "UPDATE mux_sessions SET shutdown_clean = 1 WHERE session_id = ?1",
-        &[ToSqlValue::Text(session_id)],
+        WriterTransactionBeginMode::Immediate,
+        "mark session shutdown clean",
+        || {
+            let updated = backend
+                .query_row_typed(
+                    "UPDATE mux_sessions
+         SET shutdown_clean = 1,
+             clean_checkpoint_id = ?2
+         WHERE session_id = ?1
+           AND last_checkpoint_at = ?3
+           AND EXISTS (
+               SELECT 1
+               FROM session_checkpoints AS checkpoint
+               WHERE checkpoint.id = ?2
+                 AND checkpoint.session_id = ?1
+                 AND checkpoint.checkpoint_at = ?3
+                 AND checkpoint.checkpoint_role = 'snapshot'
+                 AND checkpoint.state_hash = ?4
+                 AND checkpoint.id = (
+                     SELECT latest.id
+                     FROM session_checkpoints AS latest
+                     WHERE latest.session_id = ?1
+                     ORDER BY latest.checkpoint_at DESC, latest.id DESC
+                     LIMIT 1
+                 )
+           )
+         RETURNING session_id",
+                    &[
+                        ToSqlValue::Text(receipt.session_id.as_str()),
+                        ToSqlValue::Integer(receipt.checkpoint_id),
+                        ToSqlValue::Integer(receipt.checkpoint_at),
+                        ToSqlValue::Text(receipt.state_hash.as_str()),
+                    ],
+                )
+                .map_err(|err| {
+                    storage_backend_error("Failed to mark session shutdown clean", err)
+                })?;
+            if updated.is_none() {
+                return Err(StorageError::Database(format!(
+                    "Checkpoint {} is not the exact latest durable receipt for session {}",
+                    receipt.checkpoint_id, receipt.session_id
+                ))
+                .into());
+            }
+            Ok(())
+        },
     )
-    .map_err(|err| storage_backend_error("Failed to mark session shutdown clean", err))?;
-    Ok(())
 }
 
 /// `state_hash` is a content hash (SHA-derived) and the column is
@@ -22138,7 +22507,8 @@ fn get_latest_checkpoint_hash_backend(
         .query_row_typed(
             "SELECT state_hash FROM session_checkpoints
              WHERE session_id = ?1
-             ORDER BY checkpoint_at DESC LIMIT 1",
+               AND checkpoint_role = 'snapshot'
+             ORDER BY checkpoint_at DESC, id DESC LIMIT 1",
             &[ToSqlValue::Text(session_id)],
         )
         .map_err(|err| storage_backend_error("Get latest checkpoint hash", err))?;
@@ -36433,6 +36803,9 @@ fn storage_tick143_mux_session_checkpoint_cluster_roundtrip() {
         let db_path_str = db_path.to_string_lossy().to_string();
         let cx = crate::cx::for_testing();
         let storage = StorageHandle::new_with_cx(&cx, &db_path_str).await.unwrap();
+        let empty_topology =
+            "{\"captured_at\":0,\"schema_version\":1,\"windows\":[],\"workspace_id\":null}"
+                .to_string();
 
         // 1. insert_mux_session_with_cx
         let session_id = "sess-tick143".to_string();
@@ -36440,7 +36813,7 @@ fn storage_tick143_mux_session_checkpoint_cluster_roundtrip() {
             .insert_mux_session_with_cx(
                 &cx,
                 session_id.clone(),
-                "{\"panes\":[]}".to_string(),
+                empty_topology.clone(),
                 "test-ft-version".to_string(),
                 Some("host-tick143".to_string()),
             )
@@ -36449,6 +36822,8 @@ fn storage_tick143_mux_session_checkpoint_cluster_roundtrip() {
 
         // 2. insert_session_checkpoint_with_cx — three checkpoints so prune
         //    below has something to remove.
+        let mut first_receipt = None;
+        let mut latest_receipt = None;
         for i in 0..3 {
             let pane_states = if i == 0 {
                 vec![SessionPaneStateRow {
@@ -36464,34 +36839,75 @@ fn storage_tick143_mux_session_checkpoint_cluster_roundtrip() {
             } else {
                 Vec::new()
             };
-            let pane_count = pane_states.len();
-            let total_bytes = pane_states
-                .iter()
-                .map(|ps| ps.terminal_state_json.len())
-                .sum();
+            let topology_json = if pane_states.is_empty() {
+                empty_topology.clone()
+            } else {
+                serde_json::json!({
+                    "captured_at": 0,
+                    "schema_version": 1,
+                    "windows": [{
+                        "active_tab_index": 0,
+                        "position": null,
+                        "size": null,
+                        "tabs": [{
+                            "active_pane_id": 143,
+                            "pane_tree": {
+                                "cols": 80,
+                                "cwd": "/tmp/tick143",
+                                "is_active": true,
+                                "pane_id": 143,
+                                "rows": 24,
+                                "title": null,
+                                "type": "Leaf"
+                            },
+                            "tab_id": 0,
+                            "title": null
+                        }],
+                        "title": null,
+                        "window_id": 0
+                    }],
+                    "workspace_id": null
+                })
+                .to_string()
+            };
             let metadata_json = (i == 0).then(|| "{\"source\":\"tick143\"}".to_string());
-            let checkpoint_id = storage
+            let receipt = storage
                 .insert_session_checkpoint_with_cx(
                     &cx,
                     session_id.clone(),
                     "periodic".to_string(),
-                    format!("state-hash-{i}"),
-                    pane_count,
-                    total_bytes,
+                    topology_json,
                     metadata_json,
                     pane_states,
                 )
                 .await
                 .unwrap();
-            assert!(checkpoint_id > 0);
+            assert!(receipt.checkpoint_id() > 0);
+            assert!(receipt.state_hash().starts_with("snp2:"));
+            if first_receipt.is_none() {
+                first_receipt = Some(receipt.clone());
+            }
+            latest_receipt = Some(receipt);
         }
+        let first_receipt = first_receipt.expect("three checkpoints yield a first receipt");
+        let latest_receipt = latest_receipt.expect("three checkpoints yield a latest receipt");
+        let latest_checkpoint_id = latest_receipt.checkpoint_id();
+        let latest_state_hash = latest_receipt.state_hash().to_string();
+
+        let stale_close = storage
+            .mark_session_shutdown_clean_with_cx(&cx, first_receipt)
+            .await;
+        assert!(
+            stale_close.is_err(),
+            "a superseded checkpoint must not authorize clean shutdown"
+        );
 
         // 3. get_latest_checkpoint_hash_with_cx — should match the last one.
         let latest = storage
             .get_latest_checkpoint_hash_with_cx(&cx, session_id.clone())
             .await
             .unwrap();
-        assert_eq!(latest.as_deref(), Some("state-hash-2"));
+        assert_eq!(latest.as_deref(), Some(latest_receipt.state_hash()));
 
         // 4. prune_session_checkpoints_with_cx — retain 1, should remove 2.
         let pruned = storage
@@ -36503,17 +36919,19 @@ fn storage_tick143_mux_session_checkpoint_cluster_roundtrip() {
             "retention=1 should prune the two older checkpoints"
         );
 
-        // Latest should still be state-hash-2 after pruning.
+        // Latest should still be the exact same receipt after pruning.
         let after_prune = storage
             .get_latest_checkpoint_hash_with_cx(&cx, session_id.clone())
             .await
             .unwrap();
-        assert_eq!(after_prune.as_deref(), Some("state-hash-2"));
+        assert_eq!(
+            after_prune.as_deref(),
+            Some(latest_receipt.state_hash())
+        );
 
-        // 5. mark_session_shutdown_clean_with_cx — doesn't return state,
-        //    just has to succeed.
+        // 5. mark_session_shutdown_clean_with_cx — exact latest receipt only.
         storage
-            .mark_session_shutdown_clean_with_cx(&cx, session_id.clone())
+            .mark_session_shutdown_clean_with_cx(&cx, latest_receipt)
             .await
             .unwrap();
 
@@ -36578,6 +36996,29 @@ fn storage_tick143_mux_session_checkpoint_cluster_roundtrip() {
         assert_eq!(pane_sessions[0].id, agent_session_id);
 
         storage.shutdown_with_cx(&cx).await.unwrap();
+        let conn = rusqlite::Connection::open(&db_path).expect("open checkpoint evidence");
+        let (role, witness, topology): (String, String, Option<String>) = conn
+            .query_row(
+                "SELECT checkpoint_role, state_hash, topology_json
+                 FROM session_checkpoints WHERE id = ?1",
+                [latest_checkpoint_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("load committed checkpoint evidence");
+        assert_eq!(role, "snapshot");
+        assert_eq!(witness, latest_state_hash);
+        assert_eq!(topology.as_deref(), Some(empty_topology.as_str()));
+        let (shutdown_clean, clean_checkpoint_id): (i64, Option<i64>) = conn
+            .query_row(
+                "SELECT shutdown_clean, clean_checkpoint_id
+                 FROM mux_sessions WHERE session_id = ?1",
+                [session_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("load exact clean receipt binding");
+        assert_eq!(shutdown_clean, 1);
+        assert_eq!(clean_checkpoint_id, Some(latest_checkpoint_id));
+        drop(conn);
         let _ = std::fs::remove_file(&db_path);
         let _ = std::fs::remove_file(format!("{db_path_str}-wal"));
         let _ = std::fs::remove_file(format!("{db_path_str}-shm"));
@@ -36592,13 +37033,16 @@ fn prune_session_checkpoints_reclaims_checkpointed_empty_mux_session() {
         let db_path_str = db_path.to_string_lossy().to_string();
         let cx = crate::cx::for_testing();
         let storage = StorageHandle::new_with_cx(&cx, &db_path_str).await.unwrap();
+        let empty_topology =
+            "{\"captured_at\":0,\"schema_version\":1,\"windows\":[],\"workspace_id\":null}"
+                .to_string();
 
         let checkpointed_session = "sess-prune-empty".to_string();
         storage
             .insert_mux_session_with_cx(
                 &cx,
                 checkpointed_session.clone(),
-                "{\"panes\":[]}".to_string(),
+                empty_topology.clone(),
                 "test-ft-version".to_string(),
                 Some("host-prune".to_string()),
             )
@@ -36609,9 +37053,7 @@ fn prune_session_checkpoints_reclaims_checkpointed_empty_mux_session() {
                 &cx,
                 checkpointed_session.clone(),
                 "periodic".to_string(),
-                "state-hash-prune".to_string(),
-                0,
-                0,
+                empty_topology.clone(),
                 None,
                 Vec::new(),
             )
@@ -36623,18 +37065,133 @@ fn prune_session_checkpoints_reclaims_checkpointed_empty_mux_session() {
             .insert_mux_session_with_cx(
                 &cx,
                 pending_session.clone(),
-                "{\"panes\":[]}".to_string(),
+                empty_topology.clone(),
                 "test-ft-version".to_string(),
                 Some("host-prune".to_string()),
             )
             .await
             .unwrap();
 
+        let receipt_session = "sess-prune-receipt".to_string();
+        storage
+            .insert_mux_session_with_cx(
+                &cx,
+                receipt_session.clone(),
+                empty_topology.clone(),
+                "test-ft-version".to_string(),
+                Some("host-prune".to_string()),
+            )
+            .await
+            .unwrap();
+        storage
+            .insert_session_checkpoint_with_cx(
+                &cx,
+                receipt_session.clone(),
+                "periodic".to_string(),
+                empty_topology.clone(),
+                None,
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+
+        // Seed a role-specific restore receipt through an independent test
+        // connection. Production restore code computes this same v2 witness
+        // inside its transaction; this fixture isolates snapshot retention.
+        let receipt_at = i64::MAX - 1;
+        let receipt_metadata = "{\"old_to_new\":{}}";
+        let receipt_conn = rusqlite::Connection::open(&db_path).expect("open receipt seeder");
+        receipt_conn
+            .execute_batch("PRAGMA foreign_keys = ON")
+            .expect("enable receipt seeder foreign keys");
+        receipt_conn
+            .execute(
+                "INSERT INTO session_checkpoints
+                 (session_id, checkpoint_at, checkpoint_type, state_hash,
+                  pane_count, total_bytes, metadata_json, checkpoint_role,
+                  topology_json)
+                 VALUES (?1, ?2, 'startup', 'pending:rst2', 0, 0, ?3,
+                         'restore_receipt', NULL)",
+                rusqlite::params![receipt_session.as_str(), receipt_at, receipt_metadata],
+            )
+            .expect("insert restore receipt fixture");
+        let restore_receipt_id = receipt_conn.last_insert_rowid();
+        let restore_receipt_hash = checkpoint_witness(
+            crate::checkpoint_witness::CHECKPOINT_ROLE_RESTORE_RECEIPT,
+            &receipt_session,
+            restore_receipt_id,
+            receipt_at,
+            "startup",
+            0,
+            0,
+            Some(receipt_metadata),
+            None,
+            &[],
+        )
+        .expect("compute restore receipt witness");
+        receipt_conn
+            .execute(
+                "UPDATE session_checkpoints SET state_hash = ?1 WHERE id = ?2",
+                rusqlite::params![restore_receipt_hash, restore_receipt_id],
+            )
+            .expect("finalize restore receipt witness");
+        receipt_conn
+            .execute(
+                "INSERT INTO session_checkpoints
+                 (session_id, checkpoint_at, checkpoint_type, state_hash,
+                  pane_count, total_bytes, metadata_json, checkpoint_role,
+                  topology_json)
+                 VALUES (?1, ?2, 'shutdown', 'pending:snp2', 0, 0, NULL,
+                         'snapshot', ?3)",
+                rusqlite::params![receipt_session.as_str(), i64::MAX, empty_topology.as_str()],
+            )
+            .expect("insert bound snapshot fixture");
+        let bound_snapshot_id = receipt_conn.last_insert_rowid();
+        let bound_snapshot_hash = checkpoint_witness(
+            CHECKPOINT_ROLE_SNAPSHOT,
+            &receipt_session,
+            bound_snapshot_id,
+            i64::MAX,
+            "shutdown",
+            0,
+            0,
+            None,
+            Some(&empty_topology),
+            &[],
+        )
+        .expect("compute bound snapshot witness");
+        receipt_conn
+            .execute(
+                "UPDATE session_checkpoints SET state_hash = ?1 WHERE id = ?2",
+                rusqlite::params![bound_snapshot_hash, bound_snapshot_id],
+            )
+            .expect("finalize bound snapshot witness");
+        receipt_conn
+            .execute(
+                "UPDATE mux_sessions
+                 SET last_checkpoint_at = ?2,
+                     shutdown_clean = 1,
+                     clean_checkpoint_id = ?3
+                 WHERE session_id = ?1",
+                rusqlite::params![receipt_session.as_str(), i64::MAX, bound_snapshot_id],
+            )
+            .expect("bind exact snapshot receipt fixture");
+        drop(receipt_conn);
+
         let pruned = storage
             .prune_session_checkpoints_with_cx(&cx, checkpointed_session.clone(), 0)
             .await
             .unwrap();
         assert_eq!(pruned, 1, "retention=0 should prune the only checkpoint");
+
+        let receipt_pruned = storage
+            .prune_session_checkpoints_with_cx(&cx, receipt_session.clone(), 0)
+            .await
+            .unwrap();
+        assert_eq!(
+            receipt_pruned, 2,
+            "snapshot retention should prune both snapshots but not the restore receipt"
+        );
 
         let pending_pruned = storage
             .prune_session_checkpoints_with_cx(&cx, pending_session.clone(), 0)
@@ -36672,12 +37229,32 @@ fn prune_session_checkpoints_reclaims_checkpointed_empty_mux_session() {
             "mux session inserted before its first checkpoint must not be reclaimed"
         );
 
+        let (receipt_session_rows, receipt_clean, bound_receipt): (i64, i64, Option<i64>) = conn
+            .query_row(
+                "SELECT 1, shutdown_clean, clean_checkpoint_id
+                 FROM mux_sessions WHERE session_id = ?1",
+                [receipt_session.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("load receipt-backed session");
+        assert_eq!(receipt_session_rows, 1);
+        assert_eq!(receipt_clean, 0);
+        assert_eq!(bound_receipt, None);
+        let remaining_receipt_role: String = conn
+            .query_row(
+                "SELECT checkpoint_role FROM session_checkpoints WHERE id = ?1",
+                [restore_receipt_id],
+                |row| row.get(0),
+            )
+            .expect("restore receipt must survive snapshot retention");
+        assert_eq!(remaining_receipt_role, "restore_receipt");
+
         let remaining_checkpoints: i64 = conn
             .query_row("SELECT COUNT(*) FROM session_checkpoints", [], |row| {
                 row.get(0)
             })
             .expect("count remaining checkpoints");
-        assert_eq!(remaining_checkpoints, 0);
+        assert_eq!(remaining_checkpoints, 1);
 
         drop(conn);
         let _ = std::fs::remove_file(&db_path);
