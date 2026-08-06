@@ -5,15 +5,23 @@
 //! [`WireEvent`] messages. Polling remains authoritative for pane-output text
 //! because mux output notifications do not carry raw PTY bytes.
 
+#![cfg(all(
+    unix,
+    any(
+        target_vendor = "apple",
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "dragonfly"
+    )
+))]
+
 use frankenterm_core::native_events::{
     NativeEventError, WireEvent, WirePaneState, validate_native_event_peer,
     validate_native_event_socket_endpoint,
 };
-use frankenterm_gui::{
-    terminal_pane_id_to_u64, terminal_u16_from_usize, terminal_u32_from_stable_delta,
-    terminal_u32_from_usize,
-};
-use mux::pane::{CachePolicy, PaneId};
+use frankenterm_gui::terminal_pane_id_to_u64;
+use mux::pane::CachePolicy;
 use mux::{Mux, MuxNotification};
 use std::io::Write;
 use std::os::unix::net::UnixStream;
@@ -36,6 +44,8 @@ const MAX_BACKOFF: Duration = Duration::from_secs(30);
 const SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const SOCKET_CONNECT_TIMEOUT: Duration = Duration::from_millis(250);
 const SOCKET_WRITE_TIMEOUT: Duration = Duration::from_millis(250);
+const SOCKET_WRITE_RETRY_INTERVAL: Duration = Duration::from_millis(1);
+const INITIAL_SERIALIZED_EVENT_CAPACITY: usize = 1024;
 const MAX_BRIDGE_TEXT_FIELD_BYTES: usize = 16 * 1024;
 static BRIDGE_QUEUE_FULL_DROPS: AtomicU64 = AtomicU64::new(0);
 static BRIDGE_OVERSIZED_FIELD_DROPS: AtomicU64 = AtomicU64::new(0);
@@ -331,7 +341,7 @@ impl Drop for NativeEventBridge {
 fn wait_for_retry_or_shutdown(delay: Duration, shutdown: &AtomicBool) -> bool {
     let Some(deadline) = Instant::now().checked_add(delay) else {
         log::warn!("native event bridge retry delay is too large for Instant");
-        return true;
+        return false;
     };
     loop {
         if shutdown.load(Ordering::Acquire) {
@@ -363,17 +373,20 @@ fn connect_authenticated_native_event_socket(
     socket.connect_timeout(&address, SOCKET_CONNECT_TIMEOUT)?;
     let stream: UnixStream = socket.into();
     validate_native_event_peer(&stream)?;
-    // The bridge's Drop implementation joins the sender thread. A peer that
-    // authenticates and then stops reading must not turn shutdown into an
-    // unbounded blocking write/join.
-    stream.set_write_timeout(Some(SOCKET_WRITE_TIMEOUT))?;
+    // `SO_SNDTIMEO` bounds each write syscall rather than the complete
+    // `write_all` operation. A peer making slow partial progress could
+    // therefore hold the joined sender thread indefinitely. Keep the stream
+    // nonblocking and enforce one end-to-end deadline in `write_event`.
+    stream.set_nonblocking(true)?;
     Ok(stream)
 }
 
 /// Background thread that reads events from the channel and writes to the socket.
 fn sender_loop(socket_path: &Path, rx: std_mpsc::Receiver<BridgeEvent>, shutdown: &AtomicBool) {
-    let mut backoff = INITIAL_BACKOFF;
+    let mut connect_backoff = INITIAL_BACKOFF;
+    let mut write_failure_backoff = INITIAL_BACKOFF;
     let mut stream: Option<UnixStream> = None;
+    let mut serialized_event = Vec::with_capacity(INITIAL_SERIALIZED_EVENT_CAPACITY);
 
     // Send Hello on first connect
     let mut sent_hello = false;
@@ -388,19 +401,18 @@ fn sender_loop(socket_path: &Path, rx: std_mpsc::Receiver<BridgeEvent>, shutdown
                         socket_path.display()
                     );
                     stream = Some(s);
-                    backoff = INITIAL_BACKOFF;
                     sent_hello = false;
                 }
                 Err(e) => {
                     log::debug!(
                         "Native event bridge: connect failed ({}), backoff {:?}",
                         e,
-                        backoff
+                        connect_backoff
                     );
-                    if !wait_for_retry_or_shutdown(backoff, shutdown) {
+                    if !wait_for_retry_or_shutdown(connect_backoff, shutdown) {
                         break;
                     }
-                    backoff = (backoff * 2).min(MAX_BACKOFF);
+                    connect_backoff = (connect_backoff * 2).min(MAX_BACKOFF);
                     continue;
                 }
             }
@@ -416,12 +428,24 @@ fn sender_loop(socket_path: &Path, rx: std_mpsc::Receiver<BridgeEvent>, shutdown
                     ),
                     ts: Some(now_ms()),
                 };
-                if write_event(s, &hello).is_err() {
-                    log::warn!("Native event bridge: failed to send Hello, reconnecting");
+                if let Err(error) = write_event(s, &hello, &mut serialized_event, shutdown) {
+                    if shutdown.load(Ordering::Acquire) {
+                        break;
+                    }
+                    log::warn!(
+                        "Native event bridge: failed to send Hello ({error}), reconnecting"
+                    );
                     stream = None;
+                    if !wait_for_retry_or_shutdown(connect_backoff, shutdown) {
+                        break;
+                    }
+                    connect_backoff = (connect_backoff * 2).min(MAX_BACKOFF);
                     continue;
                 }
                 sent_hello = true;
+                // Do not call an accepted socket healthy until this side has
+                // written one complete application-protocol frame.
+                connect_backoff = INITIAL_BACKOFF;
             }
         }
 
@@ -431,7 +455,12 @@ fn sender_loop(socket_path: &Path, rx: std_mpsc::Receiver<BridgeEvent>, shutdown
                 let (event_kind, pane_id) = event.metadata();
                 let wire = event.into_wire_event();
                 if let Some(ref mut s) = stream {
-                    if let Err(error) = write_event(s, &wire) {
+                    if let Err(error) =
+                        write_event(s, &wire, &mut serialized_event, shutdown)
+                    {
+                        if shutdown.load(Ordering::Acquire) {
+                            break;
+                        }
                         // A stream write may fail after some or all bytes reached
                         // the receiver. Retrying here could duplicate a mutation,
                         // while dropping it leaves a possible gap. Until the wire
@@ -445,6 +474,13 @@ fn sender_loop(socket_path: &Path, rx: std_mpsc::Receiver<BridgeEvent>, shutdown
                             error
                         );
                         stream = None;
+                        if !wait_for_retry_or_shutdown(write_failure_backoff, shutdown) {
+                            break;
+                        }
+                        write_failure_backoff =
+                            (write_failure_backoff * 2).min(MAX_BACKOFF);
+                    } else {
+                        write_failure_backoff = INITIAL_BACKOFF;
                     }
                 }
             }
@@ -462,12 +498,98 @@ fn sender_loop(socket_path: &Path, rx: std_mpsc::Receiver<BridgeEvent>, shutdown
 }
 
 /// Write a single WireEvent as a JSON line to the stream.
-fn write_event(stream: &mut UnixStream, event: &WireEvent) -> Result<(), std::io::Error> {
-    let json = serde_json::to_string(event)
+fn write_event(
+    stream: &mut UnixStream,
+    event: &WireEvent,
+    serialized_event: &mut Vec<u8>,
+    shutdown: &AtomicBool,
+) -> Result<(), std::io::Error> {
+    if shutdown.load(Ordering::Acquire) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Interrupted,
+            "native event bridge is shutting down",
+        ));
+    }
+
+    let deadline = Instant::now()
+        .checked_add(SOCKET_WRITE_TIMEOUT)
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "native event write timeout exceeds Instant range",
+            )
+        })?;
+    serialized_event.clear();
+    serde_json::to_writer(&mut *serialized_event, event)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    stream.write_all(json.as_bytes())?;
-    stream.write_all(b"\n")?;
-    stream.flush()
+    serialized_event.push(b'\n');
+    write_bytes_with_deadline(
+        stream,
+        serialized_event,
+        shutdown,
+        deadline,
+        Instant::now,
+        std::thread::sleep,
+    )
+}
+
+fn write_bytes_with_deadline<W, Now, Sleep>(
+    writer: &mut W,
+    bytes: &[u8],
+    shutdown: &AtomicBool,
+    deadline: Instant,
+    mut now: Now,
+    mut sleep: Sleep,
+) -> Result<(), std::io::Error>
+where
+    W: Write,
+    Now: FnMut() -> Instant,
+    Sleep: FnMut(Duration),
+{
+    let mut remaining = bytes;
+
+    while !remaining.is_empty() {
+        if shutdown.load(Ordering::Acquire) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "native event bridge is shutting down",
+            ));
+        }
+
+        let Some(time_left) = deadline.checked_duration_since(now()) else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "native event write exceeded its total deadline",
+            ));
+        };
+        if time_left.is_zero() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "native event write exceeded its total deadline",
+            ));
+        }
+
+        match writer.write(remaining) {
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "native event socket accepted no bytes",
+                ));
+            }
+            Ok(written) => remaining = &remaining[written..],
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock
+                ) =>
+            {
+                sleep(time_left.min(SOCKET_WRITE_RETRY_INTERVAL));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    Ok(())
 }
 
 /// Convert a MuxNotification into a BridgeEvent and send it.
@@ -476,17 +598,36 @@ fn handle_mux_notification(
     notification: &MuxNotification,
     tx: &std_mpsc::SyncSender<BridgeEvent>,
 ) -> bool {
+    if matches!(notification, MuxNotification::PaneOutput(_)) {
+        // PaneOutput carries no bytes or new state. Snapshotting title,
+        // geometry, and cursor here cloned pane data on every PTY output
+        // notification and amplified high-throughput sessions into GUI lag,
+        // while polling still remained the only authoritative text source.
+        // The future raw-byte/sequence bridge owns re-enabling this path.
+        // The callback return value controls subscription liveness. Ignoring
+        // this notification must keep the bridge subscribed for later
+        // lifecycle and state notifications.
+        return true;
+    }
+    if matches!(
+        notification,
+        MuxNotification::TabTitleChanged { .. }
+            | MuxNotification::Alert {
+                alert: wezterm_term::Alert::CurrentWorkingDirectoryChanged,
+                ..
+            }
+    ) {
+        // The receiver currently consumes only StateChange::is_alt_screen;
+        // title, geometry, cursor, and cwd are ignored (cwd is not present in
+        // WirePaneState at all). Polling and terminal parsing remain the
+        // authoritative sources, so avoid cloning and serializing a misleading
+        // full pane snapshot for these metadata notifications.
+        return true;
+    }
+
     let timestamp_ms = now_ms();
     let event = match notification {
-        MuxNotification::PaneOutput(pane_id) => {
-            // This notification carries only a pane ID after the raw PTY bytes
-            // have already been parsed. Emit a state hint, but never manufacture
-            // a PaneOutput payload from visible screen state: that would invent
-            // delta boundaries and can both duplicate and omit bytes. Polling
-            // remains the authoritative text-capture path until the mux reader
-            // exposes a bounded raw-byte tap with sequence/gap semantics.
-            build_state_change_event(mux, *pane_id, timestamp_ms)
-        }
+        MuxNotification::PaneOutput(_) => None,
 
         MuxNotification::PaneAdded(pane_id) => {
             let (domain, cwd) = if let Some(pane) = mux.get_pane(*pane_id) {
@@ -524,23 +665,6 @@ fn handle_mux_notification(
             timestamp_ms,
         }),
 
-        MuxNotification::TabTitleChanged { tab_id, .. } => {
-            // A tab-title change can affect the active pane's presented title.
-            // Emit one bounded active-pane state hint rather than amplifying a
-            // single tab notification across every pane in a large tab.
-            if let Some(tab) = mux.get_tab(*tab_id) {
-                if let Some(pane) = tab.get_active_pane() {
-                    return emit_state_change(mux, pane.pane_id(), timestamp_ms, tx);
-                }
-            }
-            None
-        }
-
-        MuxNotification::Alert {
-            pane_id,
-            alert: wezterm_term::Alert::CurrentWorkingDirectoryChanged,
-        } => build_state_change_event(mux, *pane_id, timestamp_ms),
-
         MuxNotification::Alert {
             pane_id,
             alert: wezterm_term::Alert::SetUserVar { name, value },
@@ -567,50 +691,45 @@ fn handle_mux_notification(
     event.is_none_or(|event| enqueue_bridge_event(tx, event).keeps_subscription())
 }
 
-fn build_state_change_event(
-    mux: &Mux,
-    pane_id: PaneId,
-    timestamp_ms: u64,
-) -> Option<BridgeEvent> {
-    let pane = mux.get_pane(pane_id)?;
-    let dims = pane.get_dimensions();
-    let cursor = pane.get_cursor_position();
-    let title = pane.get_title();
-    let wire_pane_id = terminal_pane_id_to_u64(pane_id);
-    if !bridge_text_field_allowed("state_change", wire_pane_id, "title", &title) {
-        return None;
-    }
-
-    Some(BridgeEvent::StateChange {
-        pane_id: wire_pane_id,
-        state: WirePaneState {
-            title,
-            rows: terminal_u16_from_usize(dims.viewport_rows),
-            cols: terminal_u16_from_usize(dims.cols),
-            is_alt_screen: pane.is_alt_screen_active(),
-            cursor_row: terminal_u32_from_stable_delta(cursor.y),
-            cursor_col: terminal_u32_from_usize(cursor.x),
-        },
-        timestamp_ms,
-    })
-}
-
-fn emit_state_change(
-    mux: &Mux,
-    pane_id: PaneId,
-    timestamp_ms: u64,
-    tx: &std_mpsc::SyncSender<BridgeEvent>,
-) -> bool {
-    build_state_change_event(mux, pane_id, timestamp_ms)
-        .is_none_or(|event| enqueue_bridge_event(tx, event).keeps_subscription())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
+    use std::collections::VecDeque;
     use std::os::unix::fs::PermissionsExt;
     use std::sync::atomic::AtomicBool;
     use std::sync::{Arc, Mutex as StdMutex, OnceLock};
+
+    enum ScriptedWrite {
+        Bytes(usize),
+        Error(std::io::ErrorKind),
+    }
+
+    struct ScriptedWriter {
+        steps: VecDeque<ScriptedWrite>,
+        written: Vec<u8>,
+        calls: usize,
+    }
+
+    impl std::io::Write for ScriptedWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.calls = self.calls.saturating_add(1);
+            match self.steps.pop_front().unwrap_or(ScriptedWrite::Error(
+                std::io::ErrorKind::WouldBlock,
+            )) {
+                ScriptedWrite::Bytes(maximum) => {
+                    let written = maximum.min(bytes.len());
+                    self.written.extend_from_slice(&bytes[..written]);
+                    Ok(written)
+                }
+                ScriptedWrite::Error(kind) => Err(std::io::Error::from(kind)),
+            }
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
 
     fn test_lock() -> &'static StdMutex<()> {
         static LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
@@ -748,9 +867,11 @@ mod tests {
 
         let stream = connect_authenticated_native_event_socket(&socket_path)
             .expect("same-user private endpoint should authenticate");
-        assert_eq!(
-            stream.write_timeout().expect("read write-timeout setting"),
-            Some(SOCKET_WRITE_TIMEOUT)
+        assert!(
+            socket2::SockRef::from(&stream)
+                .nonblocking()
+                .expect("read nonblocking socket mode"),
+            "authenticated stream must use nonblocking writes so one total deadline is authoritative"
         );
         assert!(!SOCKET_CONNECT_TIMEOUT.is_zero());
         drop(stream);
@@ -766,6 +887,194 @@ mod tests {
             ))
         ));
         drop(listener);
+    }
+
+    #[test]
+    fn write_event_refuses_io_after_shutdown_is_observed() {
+        use std::io::Read as _;
+
+        let (mut sender, mut receiver) = UnixStream::pair().expect("unix stream pair");
+        sender
+            .set_nonblocking(true)
+            .expect("nonblocking test sender");
+        receiver
+            .set_nonblocking(true)
+            .expect("nonblocking test receiver");
+        let shutdown = AtomicBool::new(true);
+        let event = WireEvent::Hello {
+            proto: Some(1),
+            wezterm_version: None,
+            ts: Some(42),
+        };
+
+        let mut serialized_event = Vec::new();
+        let error = write_event(&mut sender, &event, &mut serialized_event, &shutdown)
+            .expect_err("shutdown must stop a write before socket side effects");
+        assert_eq!(error.kind(), std::io::ErrorKind::Interrupted);
+
+        let mut byte = [0_u8; 1];
+        let read_error = receiver
+            .read(&mut byte)
+            .expect_err("shutdown write must leave the peer empty");
+        assert_eq!(read_error.kind(), std::io::ErrorKind::WouldBlock);
+    }
+
+    #[test]
+    fn pane_output_notification_does_no_state_snapshot_or_queue_work() {
+        let mux = Mux::new(None);
+        let (tx, rx) = std_mpsc::sync_channel(1);
+
+        assert!(
+            handle_mux_notification(&mux, &MuxNotification::PaneOutput(42), &tx),
+            "byte-less PaneOutput must keep the native bridge subscribed"
+        );
+        assert!(matches!(
+            rx.try_recv(),
+            Err(std_mpsc::TryRecvError::Empty)
+        ));
+    }
+
+    #[test]
+    fn unconsumed_metadata_notifications_do_no_snapshot_or_queue_work() {
+        let mux = Mux::new(None);
+        let (tx, rx) = std_mpsc::sync_channel(2);
+
+        assert!(handle_mux_notification(
+            &mux,
+            &MuxNotification::TabTitleChanged {
+                tab_id: 7,
+                title: "ignored-title".to_owned(),
+            },
+            &tx,
+        ));
+        assert!(handle_mux_notification(
+            &mux,
+            &MuxNotification::Alert {
+                pane_id: 8,
+                alert: wezterm_term::Alert::CurrentWorkingDirectoryChanged,
+            },
+            &tx,
+        ));
+        assert!(matches!(
+            rx.try_recv(),
+            Err(std_mpsc::TryRecvError::Empty)
+        ));
+    }
+
+    #[test]
+    fn unrepresentable_retry_delay_stops_instead_of_spinning() {
+        let shutdown = AtomicBool::new(false);
+        assert!(
+            !wait_for_retry_or_shutdown(Duration::MAX, &shutdown),
+            "an unschedulable retry must fail closed instead of hot-spinning"
+        );
+    }
+
+    #[test]
+    fn write_event_emits_one_complete_json_line() {
+        use std::io::BufRead as _;
+
+        let (mut sender, receiver) = UnixStream::pair().expect("unix stream pair");
+        sender
+            .set_nonblocking(true)
+            .expect("nonblocking test sender");
+        receiver
+            .set_read_timeout(Some(Duration::from_millis(250)))
+            .expect("bounded test read");
+        let shutdown = AtomicBool::new(false);
+        let event = WireEvent::Hello {
+            proto: Some(1),
+            wezterm_version: Some("FrankenTerm test".to_string()),
+            ts: Some(42),
+        };
+        let mut serialized_event = Vec::with_capacity(INITIAL_SERIALIZED_EVENT_CAPACITY);
+
+        write_event(&mut sender, &event, &mut serialized_event, &shutdown)
+            .expect("write one complete frame");
+
+        let mut line = String::new();
+        let mut reader = std::io::BufReader::new(receiver);
+        let bytes_read = reader
+            .read_line(&mut line)
+            .expect("read one complete frame");
+        assert_eq!(bytes_read, line.len());
+        assert!(line.ends_with('\n'));
+        assert!(matches!(
+            serde_json::from_str::<WireEvent>(&line).expect("decode emitted frame"),
+            WireEvent::Hello {
+                proto: Some(1),
+                wezterm_version: Some(version),
+                ts: Some(42),
+            } if version == "FrankenTerm test"
+        ));
+    }
+
+    #[test]
+    fn deadline_writer_handles_partial_progress_and_retryable_errors() {
+        let mut writer = ScriptedWriter {
+            steps: VecDeque::from([
+                ScriptedWrite::Bytes(2),
+                ScriptedWrite::Error(std::io::ErrorKind::Interrupted),
+                ScriptedWrite::Error(std::io::ErrorKind::WouldBlock),
+                ScriptedWrite::Bytes(usize::MAX),
+            ]),
+            written: Vec::new(),
+            calls: 0,
+        };
+        let shutdown = AtomicBool::new(false);
+        let start = Instant::now();
+        let clock = Cell::new(start);
+        let deadline = clock
+            .get()
+            .checked_add(Duration::from_millis(10))
+            .expect("test deadline fits Instant");
+
+        write_bytes_with_deadline(
+            &mut writer,
+            b"abcdef",
+            &shutdown,
+            deadline,
+            || clock.get(),
+            |duration| clock.set(clock.get() + duration),
+        )
+        .expect("partial writes and retryable errors complete within one deadline");
+
+        assert_eq!(writer.written, b"abcdef");
+        assert_eq!(writer.calls, 4);
+        assert_eq!(
+            clock.get().duration_since(start),
+            Duration::from_millis(2)
+        );
+    }
+
+    #[test]
+    fn deadline_writer_bounds_repeated_would_block_without_wall_time() {
+        let mut writer = ScriptedWriter {
+            steps: VecDeque::new(),
+            written: Vec::new(),
+            calls: 0,
+        };
+        let shutdown = AtomicBool::new(false);
+        let start = Instant::now();
+        let clock = Cell::new(start);
+        let deadline = start
+            .checked_add(Duration::from_millis(3))
+            .expect("test deadline fits Instant");
+
+        let error = write_bytes_with_deadline(
+            &mut writer,
+            b"blocked",
+            &shutdown,
+            deadline,
+            || clock.get(),
+            |duration| clock.set(clock.get() + duration),
+        )
+        .expect_err("repeated WouldBlock must terminate at the total deadline");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert_eq!(writer.calls, 3);
+        assert_eq!(clock.get().duration_since(start), Duration::from_millis(3));
+        assert!(writer.written.is_empty());
     }
 
     #[test]

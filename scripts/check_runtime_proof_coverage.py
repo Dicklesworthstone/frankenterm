@@ -610,6 +610,19 @@ WRAPPER_EXEMPTIONS: set[tuple[str, str]] = {
     ("workflows/wait_execution.rs", "execute"),
 }
 
+# These ordinary wrappers are deliberately stricter than the historical
+# ergonomic surface: they refuse to mint a fresh request context when no
+# ambient capability is installed.  Their bodies must bind the result of
+# `Cx::current().ok_or{,_else}(...) ?` and then await the exact Cx sibling.
+# They remain part of the ordinary-wrapper census so tightening a wrapper does
+# not make the ratchet appear to have gained or lost a covered public API.
+REQUIRED_AMBIENT_CX_WRAPPERS: set[tuple[str, str]] = {
+    ("native_events.rs", "bind"),
+    ("native_events.rs", "connect"),
+    ("native_events.rs", "accept"),
+    ("native_events.rs", "run"),
+}
+
 # Public cleanup/snapshot adapters whose contract intentionally uses a fresh,
 # independent request context instead of inheriting ambient caller
 # cancellation. These are NOT ordinary ergonomic wrappers: each entry must be
@@ -640,6 +653,8 @@ NEGATIVE_EVIDENCE = [
     "type and module path resolution is lexical; shadowing/aliases require compiler-side proof",
     "proof parameters must be direct values; nested callback/container Cx types are rejected",
     "wrapper proof accepts only canonical ambient-Cx binding plus sibling await and optional literal expect grammar",
+    "required-ambient wrapper proof accepts only Cx::current fail-closed acquisition plus the exact Cx sibling await",
+    "required-ambient error-helper resolution is lexical; direct for_request constructors are rejected, while aliased/helper-body semantics require compiler-side review",
     "independent cleanup proof accepts only fresh for_request plus an exact literal expect adapter",
 ]
 
@@ -1332,6 +1347,50 @@ def _is_ambient_cx_expr(tokens: list[Token]) -> bool:
     return _is_for_request_path(fallback)
 
 
+def _is_required_ambient_cx_expr(tokens: list[Token]) -> bool:
+    """Accept one fail-closed `Cx::current().ok_or{,_else}(...) ?` expression.
+
+    The error expression is intentionally narrow: either one qualified enum
+    variant/path for `ok_or`, or a zero-argument closure that calls one
+    qualified helper for `ok_or_else`. String literals are blanked by the
+    source sanitizer, so a helper invocation with one literal argument has the
+    same token shape as an empty argument list here.
+    """
+    values = [token.value for token in tokens]
+    try:
+        first_open = values.index("(")
+    except ValueError:
+        return False
+    if not _is_current_path(values[:first_open]):
+        return False
+    if values[first_open : first_open + 3] != ["(", ")", "."]:
+        return False
+    if len(values) <= first_open + 4:
+        return False
+    method = values[first_open + 3]
+    rest = values[first_open + 4 :]
+    if len(rest) < 4 or rest[0] != "(" or rest[-2:] != [")", "?"]:
+        return False
+    error_expr = rest[1:-2]
+    if method == "ok_or":
+        return _path_segments(error_expr) is not None
+    if method != "ok_or_else":
+        return False
+    if error_expr[:1] == ["||"]:
+        error_expr = error_expr[1:]
+    elif error_expr[:2] == ["|", "|"]:
+        error_expr = error_expr[2:]
+    else:
+        return False
+    if error_expr[:1] == ["{"] and error_expr[-1:] == ["}"]:
+        error_expr = error_expr[1:-1]
+    if len(error_expr) < 3 or error_expr[-2:] != ["(", ")"]:
+        return False
+    helper_path = error_expr[:-2]
+    helper_segments = _path_segments(helper_path)
+    return bool(helper_segments) and helper_segments[-1] != "for_request"
+
+
 def _is_fresh_request_cx_expr(tokens: list[Token]) -> bool:
     """Accept only a direct `for_request()` constructor, never ambient Cx."""
     values = [token.value for token in tokens]
@@ -1357,7 +1416,10 @@ def _matching_call_open(tokens: list[Token]) -> int | None:
 
 
 def _parse_wrapper(
-    site: FunctionSite, independent_expect: str | None
+    site: FunctionSite,
+    independent_expect: str | None,
+    *,
+    require_existing_ambient: bool = False,
 ) -> tuple[WrapperCall | None, str | None]:
     """Parse one ordinary wrapper or one exact independent-context adapter."""
     if site.body is None:
@@ -1366,10 +1428,12 @@ def _parse_wrapper(
     if not tokens:
         return None, "wrapper body is empty"
     forbidden_values = {
-        "!", "#", "?", "{", "}", "if", "else", "match", "for", "while", "loop",
+        "!", "#", "if", "else", "match", "for", "while", "loop",
         "return", "break", "continue", "async", "fn", "impl", "trait", "mod", "struct",
         "enum", "union", "const", "static", "use", "macro_rules",
     }
+    if not require_existing_ambient:
+        forbidden_values.update({"?", "{", "}"})
     present_forbidden = sorted({token.value for token in tokens if token.value in forbidden_values})
     if present_forbidden:
         return None, f"wrapper uses forbidden/ambiguous syntax: {', '.join(present_forbidden)}"
@@ -1380,7 +1444,7 @@ def _parse_wrapper(
         tokens = tokens[:-1]
     statements = _split_top_level(tokens, ";")
     if len(statements) != 2 or not all(statements):
-        return None, "wrapper must contain exactly one Cx binding and one tail call"
+        return None, "wrapper must contain exactly one Cx binding and one tail-position sibling await"
     binding, tail = statements
 
     values = [token.value for token in binding]
@@ -1402,17 +1466,26 @@ def _parse_wrapper(
     if cursor >= len(values) or values[cursor] != "=":
         return None, "ambient Cx binding may not use a type annotation or pattern"
     cx_expr = binding[cursor + 1 :]
-    if independent_expect is None:
+    if require_existing_ambient:
+        if independent_expect is not None:
+            return None, "required-ambient wrapper cannot be an independent-context adapter"
+        if not _is_required_ambient_cx_expr(cx_expr):
+            return None, "first wrapper statement is not a canonical fail-closed ambient Cx acquisition"
+    elif independent_expect is None:
         if not _is_ambient_cx_expr(cx_expr):
             return None, "first wrapper statement is not a canonical ambient Cx constructor"
     elif not _is_fresh_request_cx_expr(cx_expr):
         return None, "independent adapter must construct a fresh for_request Cx directly"
 
     tail_values = [token.value for token in tail]
+    if any(value in {"?", "{", "}"} for value in tail_values):
+        return None, "sibling await contains forbidden control-flow syntax"
     has_literal_expect = (
         len(tail_values) >= 8
         and tail_values[-4:] == [".", "expect", "(", ")"]
     )
+    if require_existing_ambient and has_literal_expect:
+        return None, "required-ambient wrapper may not panic-adapt the sibling result"
     if independent_expect is not None and not has_literal_expect:
         return None, "independent adapter must end in one literal .expect(...)"
     if has_literal_expect:
@@ -1472,6 +1545,13 @@ def _parse_wrapper(
 def parse_canonical_wrapper(site: FunctionSite) -> tuple[WrapperCall | None, str | None]:
     """Accept ambient Cx + exact sibling await + optional literal expect."""
     return _parse_wrapper(site, None)
+
+
+def parse_required_ambient_wrapper(
+    site: FunctionSite,
+) -> tuple[WrapperCall | None, str | None]:
+    """Accept fail-closed ambient Cx acquisition plus exact sibling await."""
+    return _parse_wrapper(site, None, require_existing_ambient=True)
 
 
 def parse_independent_context_adapter(
@@ -1680,6 +1760,184 @@ pub async fn clear(&self) {
         if error is None:
             failures.append("independent adapter accepted an ambient/current Cx")
 
+    required_ambient_source = """
+pub async fn run(&self) -> Result<(), Error> {
+    let cx = crate::cx::Cx::current().ok_or(Error::ContextUnavailable)?;
+    self.run_with_cx(&cx).await
+}
+pub async fn run_with_cx(&self, cx: &crate::cx::Cx) {}
+"""
+    required_sites, required_errors = discover_functions(required_ambient_source)
+    if required_errors or len(required_sites) != 2:
+        failures.append(
+            f"required-ambient wrapper fixture did not parse: {required_errors!r}"
+        )
+    else:
+        call, error = parse_required_ambient_wrapper(required_sites[0])
+        if error or call != WrapperCall("run_with_cx", 0):
+            failures.append(
+                f"required-ambient wrapper was rejected: call={call!r}, error={error!r}"
+            )
+
+        fallback_sites, _ = discover_functions(
+            required_ambient_source.replace(
+                "crate::cx::Cx::current().ok_or(Error::ContextUnavailable)?",
+                "crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request)",
+            )
+        )
+        if fallback_sites:
+            _, error = parse_required_ambient_wrapper(fallback_sites[0])
+            if error is None:
+                failures.append("required-ambient wrapper accepted a fresh-context fallback")
+
+        fresh_error_sites, _ = discover_functions(
+            required_ambient_source.replace(
+                "crate::cx::Cx::current().ok_or(Error::ContextUnavailable)?",
+                "crate::cx::Cx::current().ok_or_else(|| crate::cx::for_request())?",
+            )
+        )
+        if fresh_error_sites:
+            _, error = parse_required_ambient_wrapper(fresh_error_sites[0])
+            if error is None:
+                failures.append(
+                    "required-ambient wrapper minted a fresh Cx as its missing-context error"
+                )
+
+        tail_try_sites, _ = discover_functions(
+            required_ambient_source.replace(
+                "self.run_with_cx(&cx).await",
+                "self.run_with_cx(&cx).await?",
+            )
+        )
+        if tail_try_sites:
+            _, error = parse_required_ambient_wrapper(tail_try_sites[0])
+            if error is None:
+                failures.append("required-ambient wrapper accepted a fallible/ambiguous tail await")
+
+        discarded_result_sites, _ = discover_functions(
+            required_ambient_source.replace(
+                "self.run_with_cx(&cx).await",
+                "self.run_with_cx(&cx).await;\n    Ok(())",
+            )
+        )
+        if discarded_result_sites:
+            _, error = parse_required_ambient_wrapper(discarded_result_sites[0])
+            if error is None:
+                failures.append(
+                    "required-ambient wrapper discarded its sibling result behind Ok(())"
+                )
+
+        panic_adapter_sites, _ = discover_functions(
+            required_ambient_source.replace(
+                "self.run_with_cx(&cx).await",
+                'self.run_with_cx(&cx).await.expect("listener succeeds")',
+            )
+        )
+        if panic_adapter_sites:
+            _, error = parse_required_ambient_wrapper(panic_adapter_sites[0])
+            if error is None:
+                failures.append(
+                    "required-ambient wrapper panic-adapted its sibling result"
+                )
+
+    required_closure_source = """
+pub async fn bind(path: Path) -> Result<Listener, Error> {
+    let cx = crate::cx::Cx::current().ok_or_else(|| {
+        context_error("bind_context_unavailable")
+    })?;
+    bind_with_cx(&cx, path).await
+}
+pub async fn bind_with_cx(cx: &crate::cx::Cx, path: Path) -> Result<Listener, Error> {}
+"""
+    required_closure_sites, required_closure_errors = discover_functions(
+        required_closure_source
+    )
+    if required_closure_errors or len(required_closure_sites) != 2:
+        failures.append(
+            "required-ambient closure fixture did not parse: "
+            f"{required_closure_errors!r}"
+        )
+    else:
+        call, error = parse_required_ambient_wrapper(required_closure_sites[0])
+        if error or call != WrapperCall("bind_with_cx", 0):
+            failures.append(
+                "required-ambient closure wrapper was rejected: "
+                f"call={call!r}, error={error!r}"
+            )
+
+    cfg_duplicate_source = """
+#[cfg(unix)]
+pub async fn run() -> Result<(), Error> {
+    let cx = crate::cx::Cx::current().ok_or(Error::ContextUnavailable)?;
+    run_with_cx(&cx).await
+}
+#[cfg(unix)]
+pub async fn run_with_cx(cx: &crate::cx::Cx) -> Result<(), Error> {}
+#[cfg(not(unix))]
+pub async fn run() -> Result<(), Error> {
+    let cx = crate::cx::Cx::current().ok_or(Error::ContextUnavailable)?;
+    run_with_cx(&cx).await
+}
+#[cfg(not(unix))]
+pub async fn run_with_cx(cx: &crate::cx::Cx) -> Result<(), Error> {}
+"""
+    cfg_duplicate_sites, cfg_duplicate_errors = discover_functions(
+        cfg_duplicate_source
+    )
+    cfg_wrappers = [site for site in cfg_duplicate_sites if site.name == "run"]
+    cfg_siblings = [
+        site for site in cfg_duplicate_sites if site.name == "run_with_cx"
+    ]
+    if cfg_duplicate_errors or len(cfg_wrappers) != 2 or len(cfg_siblings) != 2:
+        failures.append(
+            "complementary-cfg duplicate wrapper fixture did not parse: "
+            f"{cfg_duplicate_errors!r}"
+        )
+    else:
+        for wrapper in cfg_wrappers:
+            call, error = parse_required_ambient_wrapper(wrapper)
+            candidates = [
+                sibling
+                for sibling in cfg_siblings
+                if call is not None
+                and call.cx_arg_index in proof_param_positions(sibling)
+            ]
+            selected = _select_cfg_siblings(wrapper, candidates)
+            if error or len(selected) != 1 or selected[0].cfg_key != wrapper.cfg_key:
+                failures.append(
+                    "complementary-cfg duplicate wrapper did not select its exact sibling: "
+                    f"call={call!r}, error={error!r}, selected={selected!r}"
+                )
+
+    overlapping_cfg_source = """
+pub async fn run() -> Result<(), Error> {
+    let cx = crate::cx::Cx::current().ok_or(Error::ContextUnavailable)?;
+    run_with_cx(&cx).await
+}
+#[cfg(unix)]
+pub async fn run_with_cx(cx: &crate::cx::Cx) -> Result<(), Error> {}
+#[cfg(windows)]
+pub async fn run_with_cx(cx: &crate::cx::Cx) -> Result<(), Error> {}
+"""
+    overlapping_sites, overlapping_errors = discover_functions(
+        overlapping_cfg_source
+    )
+    if overlapping_errors or len(overlapping_sites) != 3:
+        failures.append(
+            f"overlapping-cfg sibling fixture did not parse: {overlapping_errors!r}"
+        )
+    else:
+        overlapping_wrapper = overlapping_sites[0]
+        overlapping_candidates = [
+            site
+            for site in overlapping_sites[1:]
+            if 0 in proof_param_positions(site)
+        ]
+        if _select_cfg_siblings(overlapping_wrapper, overlapping_candidates):
+            failures.append(
+                "ordinary wrapper accepted overlapping cfg siblings as a complete partition"
+            )
+
     stringify_source = """
 pub async fn run(&self) {
     let _ = stringify!(Cx::current(); self.run_with_cx(&cx).await);
@@ -1692,11 +1950,12 @@ pub async fn run(&self) {
             failures.append("stringify macro token body defeated the wrapper grammar")
 
     baseline_fixture = {
-        "schema_version": 2,
+        "schema_version": 3,
         "total_sites": 1,
         "covered_sites": 0,
         "exempt_files_sites": 0,
         "wrapper_exempt_sites": 1,
+        "required_ambient_wrapper_sites": 1,
         "independent_context_adapter_sites": 0,
         "uncovered_sites": 0,
         "by_file_counts": {
@@ -1705,6 +1964,7 @@ pub async fn run(&self) {
                 "covered": 0,
                 "exempt": 0,
                 "wrapper_exempt": 1,
+                "required_ambient_wrapper": 1,
                 "independent_adapter": 0,
                 "uncovered": 0,
             }
@@ -1715,6 +1975,7 @@ pub async fn run(&self) {
         "covered_sites": 0,
         "exempt_files_sites": 0,
         "wrapper_exempt_sites": 0,
+        "required_ambient_wrapper_sites": 0,
         "independent_context_adapter_sites": 1,
         "uncovered_sites": 0,
         "by_file": {
@@ -1723,6 +1984,7 @@ pub async fn run(&self) {
                 "covered": 0,
                 "exempt": 0,
                 "wrapper_exempt": 0,
+                "required_ambient_wrapper": 0,
                 "independent_adapter": 1,
                 "uncovered": 0,
             }
@@ -1733,6 +1995,41 @@ pub async fn run(&self) {
         failures.append(
             "baseline category ratchet allowed ordinary wrappers to become independent adapters"
         )
+    live_strictness_downgrade = {
+        **live_category_swap,
+        "wrapper_exempt_sites": 1,
+        "independent_context_adapter_sites": 0,
+        "by_file": {
+            "fixture.rs": {
+                **live_category_swap["by_file"]["fixture.rs"],
+                "wrapper_exempt": 1,
+                "independent_adapter": 0,
+            }
+        },
+    }
+    strictness_errors = validate_baseline(live_strictness_downgrade, baseline_fixture)
+    if not any("required-ambient wrapper census collapsed" in error for error in strictness_errors):
+        failures.append(
+            "baseline ratchet allowed a required-ambient wrapper to become an ordinary wrapper"
+        )
+    malformed_subset_baseline = {
+        **baseline_fixture,
+        "required_ambient_wrapper_sites": 2,
+        "by_file_counts": {
+            "fixture.rs": {
+                **baseline_fixture["by_file_counts"]["fixture.rs"],
+                "required_ambient_wrapper": 2,
+            }
+        },
+    }
+    malformed_subset_errors = validate_baseline(
+        live_category_swap,
+        malformed_subset_baseline,
+    )
+    if not any("required-ambient wrapper count exceeds" in error for error in malformed_subset_errors):
+        failures.append(
+            "baseline validator accepted required-ambient wrappers outside the wrapper subset"
+        )
     return failures
 
 
@@ -1741,6 +2038,7 @@ def audit() -> dict:
         "total_sites": 0,
         "exempt_files_sites": 0,
         "wrapper_exempt_sites": 0,
+        "required_ambient_wrapper_sites": 0,
         "independent_context_adapter_sites": 0,
         "covered_sites": 0,
         "uncovered_sites": 0,
@@ -1766,6 +2064,12 @@ def audit() -> dict:
         if exempt_file not in relative_files:
             results["wrapper_audit_errors"].append(
                 f"{exempt_file}::{exempt_name} allowlist entry names a nonexistent file"
+            )
+    for required_wrapper in sorted(REQUIRED_AMBIENT_CX_WRAPPERS):
+        if required_wrapper not in WRAPPER_EXEMPTIONS:
+            results["wrapper_audit_errors"].append(
+                f"{required_wrapper[0]}::{required_wrapper[1]} required-ambient entry "
+                "is not in WRAPPER_EXEMPTIONS"
             )
     for (adapter_file, adapter_name), adapter_message in sorted(
         INDEPENDENT_CONTEXT_ADAPTERS.items()
@@ -1802,6 +2106,7 @@ def audit() -> dict:
         covered_positions: dict[int, tuple[int, ...]] = {}
         wrappers: list[tuple[FunctionSite, WrapperCall]] = []
         local_total = local_covered = local_uncovered = local_wrapper = 0
+        local_required_ambient = 0
         local_independent = local_exempt = 0
         local_uncovered_lines: list[tuple[int, str]] = []
         for site in sites:
@@ -1821,7 +2126,12 @@ def audit() -> dict:
                 results["wrapper_exempt_sites"] += 1
                 local_wrapper += 1
                 ordinary_wrapper_fn_names[site.name] += 1
-                call, error = parse_canonical_wrapper(site)
+                if (rel, site.name) in REQUIRED_AMBIENT_CX_WRAPPERS:
+                    results["required_ambient_wrapper_sites"] += 1
+                    local_required_ambient += 1
+                    call, error = parse_required_ambient_wrapper(site)
+                else:
+                    call, error = parse_canonical_wrapper(site)
                 if error:
                     results["wrapper_audit_errors"].append(
                         f"{rel}:{site.line}::{site.name} {error}"
@@ -1908,6 +2218,7 @@ def audit() -> dict:
             "covered": local_covered,
             "uncovered": local_uncovered,
             "wrapper_exempt": local_wrapper,
+            "required_ambient_wrapper": local_required_ambient,
             "independent_adapter": local_independent,
             "uncovered_lines": local_uncovered_lines,
         }
@@ -1949,13 +2260,16 @@ def load_baseline() -> dict | None:
 
 def save_baseline(audit_data: dict) -> None:
     payload = {
-        "schema_version": 2,
+        "schema_version": 3,
         "comment": "ft-3kv6e fail-closed census ratchet. Update only with an audited source "
                    "change. Generated by scripts/check_runtime_proof_coverage.py.",
         "uncovered_sites": audit_data["uncovered_sites"],
         "covered_sites": audit_data["covered_sites"],
         "exempt_files_sites": audit_data["exempt_files_sites"],
         "wrapper_exempt_sites": audit_data["wrapper_exempt_sites"],
+        "required_ambient_wrapper_sites": audit_data[
+            "required_ambient_wrapper_sites"
+        ],
         "independent_context_adapter_sites": audit_data[
             "independent_context_adapter_sites"
         ],
@@ -1971,6 +2285,7 @@ def save_baseline(audit_data: dict) -> None:
                 "exempt": data["exempt"],
                 "covered": data["covered"],
                 "wrapper_exempt": data["wrapper_exempt"],
+                "required_ambient_wrapper": data["required_ambient_wrapper"],
                 "independent_adapter": data["independent_adapter"],
                 "uncovered": data["uncovered"],
             }
@@ -1991,13 +2306,14 @@ def validate_baseline(data: dict, baseline: dict | None) -> list[str]:
         return [f"required baseline is missing: {BASELINE_PATH}"]
     if not isinstance(baseline, dict):
         return ["baseline root must be a JSON object"]
-    if baseline.get("schema_version") != 2:
+    if baseline.get("schema_version") != 3:
         return [
-            f"{BASELINE_PATH.name} does not use census schema 2; run --update-baseline "
-            "only after reviewing the live schema-v2 census"
+            f"{BASELINE_PATH.name} does not use census schema 3; run --update-baseline "
+            "only after reviewing the live schema-v3 census"
         ]
     required = {
         "total_sites", "covered_sites", "exempt_files_sites", "wrapper_exempt_sites",
+        "required_ambient_wrapper_sites",
         "independent_context_adapter_sites", "uncovered_sites", "by_file_counts",
     }
     missing = sorted(required - baseline.keys())
@@ -2022,6 +2338,16 @@ def validate_baseline(data: dict, baseline: dict | None) -> list[str]:
             "baseline aggregate classification does not add up: "
             f"total={baseline['total_sites']} classified={baseline_classified}"
         )
+    if baseline["required_ambient_wrapper_sites"] > baseline["wrapper_exempt_sites"]:
+        errors.append(
+            "baseline aggregate required-ambient wrapper count exceeds "
+            "the ordinary-wrapper subset"
+        )
+    if data["required_ambient_wrapper_sites"] > data["wrapper_exempt_sites"]:
+        errors.append(
+            "live aggregate required-ambient wrapper count exceeds "
+            "the ordinary-wrapper subset"
+        )
 
     if data["uncovered_sites"] > baseline["uncovered_sites"]:
         errors.append(
@@ -2033,6 +2359,7 @@ def validate_baseline(data: dict, baseline: dict | None) -> list[str]:
         ("covered_sites", "directly covered census"),
         ("exempt_files_sites", "runtime-file exempt census"),
         ("wrapper_exempt_sites", "ordinary-wrapper census"),
+        ("required_ambient_wrapper_sites", "required-ambient wrapper census"),
         ("independent_context_adapter_sites", "independent-context adapter census"),
     ):
         if data[field] < baseline[field]:
@@ -2063,6 +2390,7 @@ def validate_baseline(data: dict, baseline: dict | None) -> list[str]:
         "covered",
         "exempt",
         "wrapper_exempt",
+        "required_ambient_wrapper",
         "independent_adapter",
         "uncovered",
     }
@@ -2113,17 +2441,30 @@ def validate_baseline(data: dict, baseline: dict | None) -> list[str]:
             )
             all_file_counts_valid = False
             continue
+        if expected["required_ambient_wrapper"] > expected["wrapper_exempt"]:
+            errors.append(
+                f"baseline {rel} required-ambient wrapper count exceeds "
+                "the ordinary-wrapper subset"
+            )
+            all_file_counts_valid = False
+            continue
         for field in per_file_fields:
             baseline_file_sums[field] += expected[field]
         live = data["by_file"].get(rel)
         if live is None:
             errors.append(f"per-file census disappeared entirely: {rel}")
             continue
+        if live["required_ambient_wrapper"] > live["wrapper_exempt"]:
+            errors.append(
+                f"live {rel} required-ambient wrapper count exceeds "
+                "the ordinary-wrapper subset"
+            )
         for field in (
             "total",
             "covered",
             "exempt",
             "wrapper_exempt",
+            "required_ambient_wrapper",
             "independent_adapter",
         ):
             floor = expected[field]
@@ -2154,6 +2495,7 @@ def validate_baseline(data: dict, baseline: dict | None) -> list[str]:
             "covered": "covered_sites",
             "exempt": "exempt_files_sites",
             "wrapper_exempt": "wrapper_exempt_sites",
+            "required_ambient_wrapper": "required_ambient_wrapper_sites",
             "independent_adapter": "independent_context_adapter_sites",
             "uncovered": "uncovered_sites",
         }
@@ -2228,6 +2570,7 @@ def main() -> int:
     print(f"  in exempt runtime files : {data['exempt_files_sites']}")
     print(f"  covered (Cx/RuntimeProof): {data['covered_sites']}")
     print(f"  wrapper-exempt          : {data['wrapper_exempt_sites']}")
+    print(f"    required ambient      : {data['required_ambient_wrapper_sites']}")
     print(f"  independent-context     : {data['independent_context_adapter_sites']}")
     print(f"  uncovered               : {data['uncovered_sites']}")
     print()
@@ -2243,7 +2586,7 @@ def main() -> int:
                     file=sys.stderr,
                 )
         return 1
-    print(f"Baseline ({BASELINE_PATH.name}) passed schema-v2 aggregate/category/per-file ratchets.")
+    print(f"Baseline ({BASELINE_PATH.name}) passed schema-v3 aggregate/category/per-file ratchets.")
     return 0
 
 

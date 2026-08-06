@@ -32,7 +32,7 @@ retention_days = 30
 [gc]
 enabled = true
 interval_seconds = 3600
-vacuum_threshold = 0.20           # VACUUM when >20% pages free
+vacuum_threshold = 0.20           # Advise explicit VACUUM when >20% pages are free
 log_report = true
 
 [vendored]

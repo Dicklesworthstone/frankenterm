@@ -28,6 +28,14 @@ harness = false
 name = "input_to_photon_bound"
 path = "../../tests/input_to_photon_bound.rs"
 
+# `native_bridge` is binary-owned, but the GUI binary has `test = false`.
+# Compile that same production source as a test target so its in-file lifecycle
+# and authenticated-socket tests are part of the normal test graph. This
+# harness does not execute `main` or launch a GUI window.
+[[test]]
+name = "native_bridge"
+path = "src/native_bridge.rs"
+
 [[test]]
 name = "ssim_parity"
 path = "tests/ssim_parity.rs"

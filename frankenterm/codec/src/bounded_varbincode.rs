@@ -222,7 +222,7 @@ macro_rules! impl_uint {
             V: de::Visitor<'de>,
         {
             let value = self.$reader_method()?;
-            if value > <$ty>::max_value() as u64 {
+            if value > <$ty>::MAX as u64 {
                 Err(Error::NumberOutOfRange)
             } else {
                 visitor.$visitor_method(value as $ty)
@@ -239,7 +239,7 @@ macro_rules! impl_int {
             V: de::Visitor<'de>,
         {
             let value = self.$reader_method()?;
-            if value < <$ty>::min_value() as i64 || value > <$ty>::max_value() as i64 {
+            if value < <$ty>::MIN as i64 || value > <$ty>::MAX as i64 {
                 Err(Error::NumberOutOfRange)
             } else {
                 visitor.$visitor_method(value as $ty)
