@@ -14,6 +14,34 @@
 use std::future::Future;
 use std::time::Duration;
 
+/// Context-operation failure returned by the canonical async runtime.
+///
+/// This alias keeps first-party callers on FrankenTerm's owned runtime surface
+/// while preserving the structured error value needed for finite
+/// classification at transport boundaries.
+pub use asupersync::error::Error as ContextError;
+
+/// Stable classification for [`ContextError`].
+pub use asupersync::error::ErrorKind as ContextErrorKind;
+
+/// Logical time value used by canonical runtime budget/deadline APIs.
+pub use asupersync::types::Time as RuntimeTime;
+
+/// Narrow HTTP/1 client surface used by first-party transports.
+///
+/// Keep this module deliberately explicit: it is an owned doorway for the
+/// concrete client, method, and client error needed by FrankenTerm, not a
+/// wildcard re-export of Asupersync's HTTP implementation.
+pub mod http {
+    pub use asupersync::http::h1::http_client::ClientError;
+    pub use asupersync::http::h1::{HttpClient, Method};
+}
+
+/// Narrow async-stream trait surface used by first-party streaming APIs.
+pub mod stream {
+    pub use asupersync::stream::Stream;
+}
+
 /// Historical quarantine inventory — kept for audit trail.
 ///
 /// The Tokio runtime builder fallback was removed in ft-xbnl0.2.5.
@@ -391,6 +419,32 @@ thread_local! {
 /// Test fixtures using the raw asupersync runtime should call this manually.
 pub fn install_runtime_handle(handle: asupersync::runtime::RuntimeHandle) {
     ASUPERSYNC_HANDLE.with(|cell| cell.replace(Some(handle)));
+}
+
+/// Per-poll runtime-handle installation guard.
+///
+/// Spawn adapters can be polled while another runtime handle is already
+/// installed on the worker thread. Restoring that prior value on drop keeps a
+/// nested or sequential runtime from leaking its spawn authority into sibling
+/// work after the poll returns.
+pub(crate) struct ScopedRuntimeHandle {
+    previous: Option<asupersync::runtime::RuntimeHandle>,
+}
+
+impl Drop for ScopedRuntimeHandle {
+    fn drop(&mut self) {
+        let _ = ASUPERSYNC_HANDLE.try_with(|cell| {
+            cell.replace(self.previous.take());
+        });
+    }
+}
+
+#[must_use]
+pub(crate) fn install_runtime_handle_scoped(
+    handle: asupersync::runtime::RuntimeHandle,
+) -> ScopedRuntimeHandle {
+    let previous = ASUPERSYNC_HANDLE.with(|cell| cell.replace(Some(handle)));
+    ScopedRuntimeHandle { previous }
 }
 
 /// Return the currently installed asupersync `RuntimeHandle`, if any.
@@ -2043,6 +2097,8 @@ pub mod task {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::task::{Context, Poll};
 
+    pub use crate::cx::SpawnError;
+
     // ─── br-ft-iaxog: JoinHandle downstream-waker poison recovery ──
     //
     // Pre-fix the production lock-sites on JoinHandle's caller-waker slot
@@ -2091,33 +2147,121 @@ pub mod task {
         JOIN_HANDLE_WAKER_CALLBACK_PANIC_COUNT.store(0, Ordering::Relaxed);
     }
 
+    /// Finite failure class for a spawned-task join boundary.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum JoinErrorKind {
+        /// The task future acknowledged an explicit abort request.
+        Aborted,
+        /// The caller's capability context was cancelled.
+        ContextCancelled,
+        /// The caller's capability deadline elapsed.
+        DeadlineExceeded,
+        /// The caller exhausted its cooperative poll quota.
+        PollQuotaExhausted,
+        /// The caller exhausted its cost budget.
+        CostBudgetExhausted,
+        /// A checkpoint failed without an attributable root cause.
+        ContextFailure,
+        /// The task panicked or otherwise failed at its join boundary.
+        TaskFailed,
+        /// The downstream completion waker could not be registered.
+        WakerRegistrationFailed,
+    }
+
     /// Error type returned when a spawned task fails.
     ///
-    /// Wraps asupersync's join error to provide a compatible API surface.
-    #[derive(Debug)]
+    /// Panic payloads, cancellation messages, and caller-provided reason text
+    /// never cross this finite, content-free boundary.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub struct JoinError {
-        msg: String,
+        kind: JoinErrorKind,
     }
 
     impl std::fmt::Display for JoinError {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            write!(f, "JoinError: {}", self.msg)
+            let message = match self.kind {
+                JoinErrorKind::Aborted => "task aborted",
+                JoinErrorKind::ContextCancelled => "join cancelled by capability context",
+                JoinErrorKind::DeadlineExceeded => "capability deadline exceeded at join",
+                JoinErrorKind::PollQuotaExhausted => "capability poll quota exhausted at join",
+                JoinErrorKind::CostBudgetExhausted => "capability cost budget exhausted at join",
+                JoinErrorKind::ContextFailure => "capability checkpoint failed at join",
+                JoinErrorKind::TaskFailed => "task failed at join boundary",
+                JoinErrorKind::WakerRegistrationFailed => {
+                    "join completion waker registration failed"
+                }
+            };
+            write!(f, "JoinError: {message}")
         }
     }
 
     impl JoinError {
-        /// Create a new `JoinError` with the given message.
-        pub fn new(msg: impl Into<String>) -> Self {
-            Self { msg: msg.into() }
+        /// Construct a finite task-aborted error.
+        #[must_use]
+        pub const fn aborted() -> Self {
+            Self {
+                kind: JoinErrorKind::Aborted,
+            }
         }
 
-        /// Returns `true` if the task was cancelled via `JoinHandle::abort()`.
-        pub fn is_cancelled(&self) -> bool {
-            self.msg.contains("aborted")
+        /// Construct a finite task-failed error.
+        #[must_use]
+        pub const fn task_failed() -> Self {
+            Self {
+                kind: JoinErrorKind::TaskFailed,
+            }
+        }
+
+        const fn waker_registration_failed() -> Self {
+            Self {
+                kind: JoinErrorKind::WakerRegistrationFailed,
+            }
+        }
+
+        fn from_context_failure(cx: &crate::cx::Cx) -> Self {
+            use crate::outcome::CancelKind;
+
+            let kind = match cx.root_cancel_cause().map(|reason| reason.kind) {
+                Some(CancelKind::Deadline | CancelKind::Timeout) => {
+                    JoinErrorKind::DeadlineExceeded
+                }
+                Some(CancelKind::PollQuota) => JoinErrorKind::PollQuotaExhausted,
+                Some(CancelKind::CostBudget) => JoinErrorKind::CostBudgetExhausted,
+                Some(
+                    CancelKind::User
+                    | CancelKind::FailFast
+                    | CancelKind::RaceLost
+                    | CancelKind::ParentCancelled
+                    | CancelKind::ResourceUnavailable
+                    | CancelKind::Shutdown
+                    | CancelKind::LinkedExit,
+                ) => JoinErrorKind::ContextCancelled,
+                None => JoinErrorKind::ContextFailure,
+            };
+            Self { kind }
+        }
+
+        /// Return the finite structural failure class.
+        #[must_use]
+        pub const fn kind(&self) -> JoinErrorKind {
+            self.kind
+        }
+
+        /// Return true for task abort or caller-context cancellation.
+        #[must_use]
+        pub const fn is_cancelled(&self) -> bool {
+            matches!(
+                self.kind,
+                JoinErrorKind::Aborted | JoinErrorKind::ContextCancelled
+            )
         }
     }
 
     impl std::error::Error for JoinError {}
+
+    type AbortableTaskJoin<T> = asupersync::runtime::JoinHandle<
+        std::result::Result<T, futures::future::Aborted>,
+    >;
 
     /// Handle to a spawned task. Awaiting it yields the task's output
     /// wrapped in `Result<T, JoinError>` for API compatibility with tokio.
@@ -2125,12 +2269,19 @@ pub mod task {
     /// Uses `Pin<Box<_>>` internally to avoid unsafe pin projection while
     /// maintaining `#![forbid(unsafe_code)]` compliance.
     ///
-    /// The `aborted` flag commits abort authority before the downstream
-    /// wake. When `abort()` is called, subsequent polls immediately return
-    /// `Err(JoinError)` instead of polling the inner future.
+    /// `abort()` signals the abortable task future. Ordinary abort completion
+    /// is reported only after the runtime polls and drops that future, so
+    /// draining an `Aborted` handle acknowledges that the async task future no
+    /// longer exists. `WakerRegistrationFailed` is the sole fail-closed
+    /// exception: the caller waker itself could not be quarantined, so the
+    /// wrapper requests abort and returns an observation-boundary error without
+    /// claiming that the task has acknowledged it.
+    /// If that future already delegated work to a non-interruptible OS thread
+    /// (notably [`spawn_blocking`]), acknowledgement does not prove the
+    /// delegated closure stopped.
     pub struct JoinHandle<T> {
-        inner: Pin<Box<asupersync::runtime::JoinHandle<T>>>,
-        aborted: std::sync::atomic::AtomicBool,
+        inner: Pin<Box<AbortableTaskJoin<T>>>,
+        abort_handle: futures::future::AbortHandle,
         forwarding: std::sync::Arc<super::ContainedForwardingWaker>,
         completion_waker: std::task::Waker,
     }
@@ -2139,23 +2290,16 @@ pub mod task {
         type Output = Result<T, JoinError>;
 
         fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-            if self.aborted.load(std::sync::atomic::Ordering::Acquire) {
-                self.forwarding.clear();
-                return Poll::Ready(Err(JoinError::new("task aborted")));
-            }
-
             // Publish the caller waker before polling the inner join. The
             // asupersync handle sees only `completion_waker`, whose identity
             // remains stable across every poll and whose callback is contained.
             let registration = self.forwarding.register(cx.waker());
-            // Close the narrow register-vs-abort race: abort commits its
-            // authority flag before taking the same downstream slot.
-            if self.aborted.load(std::sync::atomic::Ordering::Acquire) {
+            if registration.is_err() {
+                // If completion can no longer be forwarded, do not silently
+                // detach work whose outcome has become unobservable.
+                self.abort_handle.abort();
                 self.forwarding.clear();
-                return Poll::Ready(Err(JoinError::new("task aborted")));
-            }
-            if let Err(error) = registration {
-                return Poll::Ready(Err(JoinError::new(error.to_string())));
+                return Poll::Ready(Err(JoinError::waker_registration_failed()));
             }
 
             let inner_poll = {
@@ -2169,9 +2313,13 @@ pub mod task {
                 )
             };
             match inner_poll {
-                Ok(Poll::Ready(value)) => {
+                Ok(Poll::Ready(Ok(value))) => {
                     self.forwarding.clear();
                     Poll::Ready(Ok(value))
+                }
+                Ok(Poll::Ready(Err(_aborted))) => {
+                    self.forwarding.clear();
+                    Poll::Ready(Err(JoinError::aborted()))
                 }
                 Ok(Poll::Pending) => Poll::Pending,
                 Err(_panic) => {
@@ -2182,30 +2330,25 @@ pub mod task {
                     // The payload is disposed by `catch_recoverable`; retain
                     // only a finite, content-free failure class.
                     self.forwarding.clear();
-                    Poll::Ready(Err(JoinError::new("task failed at join boundary")))
+                    Poll::Ready(Err(JoinError::task_failed()))
                 }
             }
         }
     }
 
     impl<T> JoinHandle<T> {
-        /// Returns `true` if the task has completed or was aborted.
+        /// Returns `true` once the task has actually reached a terminal state.
         pub fn is_finished(&self) -> bool {
-            self.aborted.load(std::sync::atomic::Ordering::Acquire) || self.inner.is_finished()
+            self.inner.is_finished()
         }
 
         /// Request cancellation of the task.
         ///
-        /// Sets an internal abort flag that causes subsequent polls of this
-        /// handle to return `Err(JoinError)` immediately. The underlying
-        /// asupersync task may continue running, but the caller will observe
-        /// an abort error the next time the handle is polled.
+        /// Wakes both the abortable task and the current join waiter. Awaiting
+        /// the handle reports cancellation only after the task future has been
+        /// dropped by the runtime.
         pub fn abort(&self) {
-            self.aborted
-                .store(true, std::sync::atomic::Ordering::Release);
-            // Abort authority is committed before contending with completion
-            // for the same one-shot downstream slot. Exactly one side can
-            // take it, and invocation is contained by the forwarding state.
+            self.abort_handle.abort();
             self.forwarding.forward_one();
         }
     }
@@ -2288,10 +2431,9 @@ pub mod task {
         /// before scanning the handles so a cancelled caller
         /// surfaces within the same tick as the cancel signal
         /// rather than waiting for the next task completion.
-        /// Returns `Some(Err(JoinError))` on cancellation — the
-        /// JoinError is synthesized from a cancellation reason so
-        /// downstream match arms can fold cancel into their normal
-        /// task-failure path.
+        /// Returns `Some(Err(JoinError))` on context failure. The finite
+        /// `JoinErrorKind` preserves cancellation-vs-budget distinctions
+        /// without copying caller-provided cancellation text.
         ///
         /// Note the local shadowing of `cx`: the poll_fn closure
         /// receives a `std::task::Context` also conventionally
@@ -2305,9 +2447,8 @@ pub mod task {
         /// before any handle polling (pinned by
         /// `join_set_join_next_with_cx_observes_pre_cancel`,
         /// ft-xbnl0.2.4 tick 426). Returns
-        /// `Some(Err(JoinError { msg: "aborted: join_next cancelled: ..." }))`
-        /// — `JoinError::is_cancelled()` returns true so callers can
-        /// fold cancel into their abort path.
+        /// `Some(Err(JoinError))`; `JoinError::is_cancelled()` is true only
+        /// for an actual cancellation class, not deadline/poll/cost budgets.
         ///
         /// Also observes **mid-flight cancel** on any external re-poll
         /// (task completion, external wake) via the per-poll-iteration
@@ -2325,17 +2466,15 @@ pub mod task {
             if self.handles.is_empty() {
                 return None;
             }
-            if let Err(err) = caller_cx.checkpoint() {
-                return Some(Err(JoinError::new(format!(
-                    "aborted: join_next cancelled: {err}"
-                ))));
+            if caller_cx.checkpoint().is_err() {
+                return Some(Err(JoinError::from_context_failure(caller_cx)));
             }
 
             std::future::poll_fn(|cx| {
-                if let Err(err) = caller_cx.checkpoint() {
-                    return std::task::Poll::Ready(Some(Err(JoinError::new(format!(
-                        "aborted: join_next cancelled mid-poll: {err}"
-                    )))));
+                if caller_cx.checkpoint().is_err() {
+                    return std::task::Poll::Ready(Some(Err(
+                        JoinError::from_context_failure(caller_cx),
+                    )));
                 }
                 for i in 0..self.handles.len() {
                     let mut pinned = std::pin::Pin::new(&mut self.handles[i]);
@@ -2357,14 +2496,21 @@ pub mod task {
             // Find the first finished handle
             let pos = self.handles.iter().position(|h| h.is_finished());
             if let Some(idx) = pos {
-                let handle = self.handles.swap_remove(idx);
+                let mut handle = self.handles.swap_remove(idx);
                 // Task is finished, so we can poll it synchronously via a noop waker
                 let waker = futures::task::noop_waker();
                 let mut cx = std::task::Context::from_waker(&waker);
-                let mut pinned = std::pin::pin!(handle);
-                match pinned.as_mut().poll(&mut cx) {
+                match std::pin::Pin::new(&mut handle).poll(&mut cx) {
                     std::task::Poll::Ready(result) => Some(result),
-                    std::task::Poll::Pending => None, // shouldn't happen for finished task
+                    std::task::Poll::Pending => {
+                        // `is_finished` and result publication are expected to
+                        // be atomic from the wrapper's perspective, but retain
+                        // ownership if an underlying runtime ever exposes a
+                        // transient gap. Dropping here would silently detach a
+                        // handle whose result was not actually observable.
+                        self.handles.push(handle);
+                        None
+                    }
                 }
             } else {
                 None
@@ -2373,15 +2519,21 @@ pub mod task {
 
         /// Cancel all tasks in the set.
         ///
-        /// Sets the abort flag on each handle so that any subsequent polls
-        /// return `Err(JoinError)`, then clears the handle set. The
-        /// underlying asupersync tasks may continue running, but callers
-        /// observing these handles will see abort errors.
+        /// Signals every task but retains the handles so callers can drain
+        /// terminal acknowledgements with `join_next`. A returned aborted
+        /// handle means the corresponding task future has been dropped.
         pub fn abort_all(&mut self) {
             for handle in &self.handles {
                 handle.abort();
             }
-            self.handles.clear();
+        }
+    }
+
+    impl<T> Drop for JoinSet<T> {
+        fn drop(&mut self) {
+            for handle in &self.handles {
+                handle.abort();
+            }
         }
     }
 
@@ -2393,6 +2545,14 @@ pub mod task {
     /// futures with the correct runtime context.
     pub(super) struct HandleContextFuture<F> {
         pub(super) handle: asupersync::runtime::RuntimeHandle,
+        /// Explicit task capability context to expose through `Cx::current()`
+        /// for each poll. Plain `task::spawn` leaves this unset so the
+        /// scheduler-owned ambient context remains authoritative.
+        pub(super) task_cx: Option<crate::cx::Cx>,
+        /// Effective capability mask captured once at spawn. A Cx's runtime
+        /// mask is stable, so recomputing its public snapshot on every hot
+        /// poll would add needless branch and snapshot work.
+        pub(super) task_cap_mask: Option<asupersync::cx::CapMask>,
         pub(super) future: Pin<Box<F>>,
     }
 
@@ -2400,9 +2560,20 @@ pub mod task {
         type Output = F::Output;
 
         fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-            super::ASUPERSYNC_HANDLE.with(|cell| {
-                cell.replace(Some(self.handle.clone()));
-            });
+            let _runtime_handle_guard =
+                super::install_runtime_handle_scoped(self.handle.clone());
+            // asupersync installs a scheduler-owned Cx while polling a task,
+            // but `spawn_with_cx` promises that ambient adapters inside the
+            // child observe the explicitly threaded context. Install it only
+            // for this poll and let the guard restore the scheduler context
+            // before returning Pending/Ready.
+            let _task_cx_guard = self
+                .task_cx
+                .as_ref()
+                .map(|task_cx| crate::cx::Cx::set_current(Some(task_cx.clone())));
+            let _task_capability_guard = self
+                .task_cap_mask
+                .map(crate::cx::Cx::push_restriction);
             self.future.as_mut().poll(cx)
         }
     }
@@ -2423,11 +2594,25 @@ pub mod task {
                 .cloned()
                 .expect("task::spawn called outside of Runtime::block_on context")
         });
+        // RuntimeHandle::spawn admits a root scheduler Cx. Capture the ambient
+        // context now and reinstall it on every child poll so a plain nested
+        // spawn inherits cancellation, deadline, identity, and monotone
+        // capability authority rather than escaping into an unrelated root.
+        let task_cx = crate::cx::Cx::current();
+        let task_cap_mask = task_cx
+            .as_ref()
+            .map(crate::cx::effective_cap_mask);
         let wrapped = HandleContextFuture {
             handle: handle.clone(),
+            task_cx,
+            task_cap_mask,
             future: Box::pin(future),
         };
-        let inner = handle.spawn(wrapped);
+        let (abort_handle, abort_registration) = futures::future::AbortHandle::new_pair();
+        let inner = handle.spawn(futures::future::Abortable::new(
+            wrapped,
+            abort_registration,
+        ));
         let (forwarding, completion_waker) = super::ContainedForwardingWaker::new(
             &JOIN_HANDLE_LOCK_POISONED_COUNT,
             &JOIN_HANDLE_WAKER_CALLBACK_PANIC_COUNT,
@@ -2435,7 +2620,7 @@ pub mod task {
         );
         JoinHandle {
             inner: Box::pin(inner),
-            aborted: std::sync::atomic::AtomicBool::new(false),
+            abort_handle,
             forwarding,
             completion_waker,
         }
@@ -2455,11 +2640,18 @@ pub mod task {
                 .expect("task::spawn_with_cx called outside of Runtime::block_on context")
         });
         let child_cx = cx.clone();
+        let child_cap_mask = crate::cx::effective_cap_mask(&child_cx);
         let wrapped = HandleContextFuture {
             handle: handle.clone(),
+            task_cx: Some(child_cx.clone()),
+            task_cap_mask: Some(child_cap_mask),
             future: Box::pin(async move { task(child_cx).await }),
         };
-        let inner = handle.spawn(wrapped);
+        let (abort_handle, abort_registration) = futures::future::AbortHandle::new_pair();
+        let inner = handle.spawn(futures::future::Abortable::new(
+            wrapped,
+            abort_registration,
+        ));
         let (forwarding, completion_waker) = super::ContainedForwardingWaker::new(
             &JOIN_HANDLE_LOCK_POISONED_COUNT,
             &JOIN_HANDLE_WAKER_CALLBACK_PANIC_COUNT,
@@ -2467,25 +2659,91 @@ pub mod task {
         );
         JoinHandle {
             inner: Box::pin(inner),
-            aborted: std::sync::atomic::AtomicBool::new(false),
+            abort_handle,
             forwarding,
             completion_waker,
         }
     }
 
+    /// Fallible Cx-aware spawn on the currently installed runtime.
+    ///
+    /// Unlike [`spawn_with_cx`], this returns a typed admission error instead
+    /// of panicking when no runtime is installed or the runtime rejects the
+    /// task. Every child poll installs the exact explicit Cx identity and its
+    /// captured effective capability mask, including for nested ambient
+    /// runtime helpers.
+    pub fn try_spawn_with_cx<F, Fut, T>(
+        cx: &crate::cx::Cx,
+        task: F,
+    ) -> Result<JoinHandle<T>, SpawnError>
+    where
+        F: FnOnce(crate::cx::Cx) -> Fut + Send + 'static,
+        Fut: Future<Output = T> + Send + 'static,
+        T: Send + 'static,
+    {
+        let handle = super::ASUPERSYNC_HANDLE.with(|cell| cell.borrow().as_ref().cloned())
+            .ok_or(SpawnError::RuntimeUnavailable)?;
+        let child_cx = cx.clone();
+        let child_cap_mask = crate::cx::effective_cap_mask(&child_cx);
+        let wrapped = HandleContextFuture {
+            handle: handle.clone(),
+            task_cx: Some(child_cx.clone()),
+            task_cap_mask: Some(child_cap_mask),
+            future: Box::pin(async move { task(child_cx).await }),
+        };
+        let (abort_handle, abort_registration) = futures::future::AbortHandle::new_pair();
+        let inner = handle.try_spawn(futures::future::Abortable::new(
+            wrapped,
+            abort_registration,
+        ))?;
+        let (forwarding, completion_waker) = super::ContainedForwardingWaker::new(
+            &JOIN_HANDLE_LOCK_POISONED_COUNT,
+            &JOIN_HANDLE_WAKER_CALLBACK_PANIC_COUNT,
+            frankenterm_sigpipe::RecoverablePanicSite::CoreAsyncTaskJoin,
+        );
+        Ok(JoinHandle {
+            inner: Box::pin(inner),
+            abort_handle,
+            forwarding,
+            completion_waker,
+        })
+    }
+
     /// Spawns blocking work on the runtime's blocking thread pool.
     ///
-    /// Returns a `JoinHandle` for API compatibility. Under asupersync,
-    /// this delegates to `asupersync::runtime::spawn_blocking`.
+    /// Returns a `JoinHandle` for API compatibility. The canonical bridge
+    /// selects the installed runtime's configured pool (or a bounded fallback
+    /// thread when no pool exists) through an abortable async wrapper.
+    ///
+    /// Calling [`JoinHandle::abort`] can stop awaiting and delivering the
+    /// closure's result, but an OS/blocking closure that has started is not
+    /// interruptible and continues until it returns naturally. An aborted join
+    /// acknowledgement therefore settles only the async wrapper; shutdown code
+    /// must never report that the blocking closure itself stopped unless it has
+    /// an independent cooperative-cancellation and settlement contract.
     pub fn spawn_blocking<F, T>(f: F) -> JoinHandle<T>
     where
         F: FnOnce() -> T + Send + 'static,
         T: Send + 'static,
     {
-        // For spawn_blocking we need to wrap it differently since
-        // asupersync's spawn_blocking is async and returns T directly.
-        // We spawn a task that calls spawn_blocking internally.
-        spawn(async move { asupersync::runtime::spawn_blocking(f).await })
+        let blocking_context = crate::cx::Cx::current().map(|cx| {
+            let mask = crate::cx::effective_cap_mask(&cx);
+            (cx, mask)
+        });
+        let blocking_runtime_handle = super::current_runtime_handle();
+        // The shared bridge selects the configured pool from the installed
+        // runtime handle rather than the operation Cx. This matters for nested
+        // explicit-Cx tasks: synthetic/request contexts carry no pool and the
+        // raw Asupersync helper would otherwise run `f` inline on the executor.
+        spawn(async move {
+            super::spawn_blocking_in_context(
+                blocking_context,
+                blocking_runtime_handle,
+                f,
+            )
+            .await
+            .unwrap_or_else(|_| panic!("blocking task failed at canonical runtime boundary"))
+        })
     }
 
     /// Yields execution back to the runtime, allowing other tasks to progress.
@@ -2497,16 +2755,12 @@ pub mod task {
     ///
     /// Hot-loop cooperative cancellation point: a pre-flight
     /// `cx.checkpoint()` before the runtime yield turns this into
-    /// a fast cancellation-sensing yield. Returns `Err(String)` with
-    /// the formatted checkpoint error when the caller's cx is
-    /// cancelled so tight poll loops can break out cleanly instead
-    /// of yielding into an infinite retry. The `String` error is
-    /// chosen for cross-module simplicity (callers' error enums
-    /// already have a String variant) rather than re-exporting
-    /// asupersync's `Cancelled` type at this boundary.
-    pub async fn yield_now_with_cx(cx: &crate::cx::Cx) -> std::result::Result<(), String> {
+    /// a fast cancellation-sensing yield. The finite `JoinError` return keeps
+    /// cancellation-vs-budget identity without exposing a caller-provided
+    /// cancellation message.
+    pub async fn yield_now_with_cx(cx: &crate::cx::Cx) -> Result<(), JoinError> {
         cx.checkpoint()
-            .map_err(|err| format!("yield_now_with_cx cancelled: {err}"))?;
+            .map_err(|_| JoinError::from_context_failure(cx))?;
         asupersync::runtime::yield_now().await;
         Ok(())
     }
@@ -3500,14 +3754,14 @@ impl CompatRuntime for Runtime {
         let handle = self.inner.handle();
         ASUPERSYNC_HANDLE.with(|cell| cell.replace(Some(handle)));
         let result = self.inner.block_on(future);
-        // NOTE: We intentionally do NOT clear the handle here. The handle
-        // holds an Arc to shared runtime state, keeping it alive is safe.
-        // Eagerly clearing caused "thread local panicked on drop" aborts
-        // when the Runtime's Drop ran after the handle was cleared, because
-        // the inner runtime's shutdown could access thread-locals that were
-        // already being destroyed during thread exit. Leaving the handle
-        // lets it naturally drain when the thread exits or when the next
-        // block_on call replaces it.
+        // Negative-evidence ledger (ft-2worp): intentionally do NOT clear the
+        // handle at block_on return. Clearing it here previously produced
+        // process-aborting `thread local panicked on drop` failures when the
+        // pinned asupersync Runtime later shut down during thread teardown.
+        // The retained handle owns an Arc and is replaced by the next block_on;
+        // test harnesses clear it only after catching Runtime::drop. Scoped
+        // restoration remains appropriate for spawned-future *polls*, where
+        // the runtime itself is not being torn down.
         result
     }
 
@@ -3516,12 +3770,20 @@ impl CompatRuntime for Runtime {
         F: Future<Output = ()> + Send + 'static,
     {
         let handle = self.inner.handle();
+        let task_cx = crate::cx::Cx::current();
+        let task_cap_mask = task_cx
+            .as_ref()
+            .map(crate::cx::effective_cap_mask);
         // Wrap in HandleContextFuture so that nested task::spawn() calls
         // inside the detached future can find the runtime handle in
-        // thread-local storage. Without this, any nested spawn panics
-        // with "task::spawn called outside of Runtime::block_on context".
+        // thread-local storage. Preserve the ambient Cx and effective
+        // capability mask as well: RuntimeHandle::spawn otherwise supplies a
+        // root scheduler Cx and a detached child could escape cancellation or
+        // regain denied authority.
         let wrapped = task::HandleContextFuture {
             handle: handle.clone(),
+            task_cx,
+            task_cap_mask,
             future: Box::pin(future),
         };
         std::mem::drop(handle.spawn(wrapped));
@@ -3703,21 +3965,133 @@ fn cx_timer_now(cx: &crate::cx::Cx) -> asupersync::Time {
     timer_now_with_cx(cx)
 }
 
+async fn spawn_blocking_in_context<T, F>(
+    blocking_context: Option<(crate::cx::Cx, asupersync::cx::CapMask)>,
+    runtime_handle: Option<asupersync::runtime::RuntimeHandle>,
+    work: F,
+) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    fn run_in_context<T, F>(
+        blocking_context: Option<(crate::cx::Cx, asupersync::cx::CapMask)>,
+        runtime_handle: Option<asupersync::runtime::RuntimeHandle>,
+        work: F,
+    ) -> T
+    where
+        F: FnOnce() -> T,
+    {
+        let _runtime_handle_guard = runtime_handle.map(install_runtime_handle_scoped);
+        let _blocking_cx_guard = blocking_context
+            .as_ref()
+            .map(|(cx, _)| crate::cx::Cx::set_current(Some(cx.clone())));
+        let _blocking_capability_guard = blocking_context
+            .as_ref()
+            .map(|(_, mask)| crate::cx::Cx::push_restriction(*mask));
+        work()
+    }
+
+    struct CancelBlockingTaskOnDrop(
+        Option<asupersync::runtime::blocking_pool::BlockingTaskHandle>,
+    );
+
+    impl CancelBlockingTaskOnDrop {
+        fn disarm(&mut self) {
+            let _ = self.0.take();
+        }
+    }
+
+    impl Drop for CancelBlockingTaskOnDrop {
+        fn drop(&mut self) {
+            if let Some(handle) = self.0.take() {
+                handle.cancel();
+            }
+        }
+    }
+
+    const PANIC_ERROR: &str =
+        "blocking task panicked (error_code=WA-RUNTIME-BLOCKING-PANIC)";
+
+    // Pool selection must come from the installed runtime, not from the
+    // explicit operation Cx. Synthetic/request contexts intentionally carry
+    // no pool handle; letting the free Asupersync helper inspect one would run
+    // the supposedly blocking closure inline on the async worker.
+    let blocking_pool = runtime_handle
+        .as_ref()
+        .and_then(asupersync::runtime::RuntimeHandle::blocking_handle);
+    if let Some(blocking_pool) = blocking_pool {
+        let (result_tx, result_rx) = oneshot::channel();
+        let task_handle = blocking_pool.spawn(move || {
+            let result = frankenterm_sigpipe::catch_recoverable(
+                frankenterm_sigpipe::RecoverablePanicSite::CoreAsyncTaskJoin,
+                std::panic::AssertUnwindSafe(|| {
+                    run_in_context(blocking_context, runtime_handle, work)
+                }),
+            );
+            // Completion delivery is infrastructure cleanup, not caller work.
+            // A fresh live context prevents caller cancellation from trapping
+            // the receiver forever after the closure has already settled.
+            let delivery_cx = crate::cx::for_request();
+            if let Err(undelivered) = result_tx.send_with_cx(&delivery_cx, result) {
+                // Cancellation may have dropped the receiver while the closure
+                // was running. Dispose an arbitrary user result under the same
+                // recovery boundary rather than letting its Drop panic escape
+                // from a shared blocking-pool worker.
+                let _ = frankenterm_sigpipe::catch_recoverable(
+                    frankenterm_sigpipe::RecoverablePanicSite::CoreAsyncTaskJoin,
+                    std::panic::AssertUnwindSafe(|| drop(undelivered)),
+                );
+            }
+        });
+        let mut cancel_on_drop = CancelBlockingTaskOnDrop(Some(task_handle));
+        let receive_cx = crate::cx::for_request();
+        let result = oneshot_recv_with_cx(&receive_cx, result_rx)
+            .await
+            .map_err(|_| "blocking task result channel closed".to_string())?;
+        cancel_on_drop.disarm();
+        return result.map_err(|_| PANIC_ERROR.to_string());
+    }
+
+    // Raw runtimes and deliberately pool-less test runtimes still need an OS
+    // thread. Poll the fallback handoff with no ambient Cx so Asupersync takes
+    // its bounded fallback-thread path instead of its deterministic inline
+    // path. The requested Cx/runtime scopes are installed only in the closure.
+    let mut blocking_future = std::pin::pin!(asupersync::runtime::spawn_blocking(move || {
+        run_in_context(blocking_context, runtime_handle, work)
+    }));
+    let fallback = std::future::poll_fn(|caller_cx| {
+        let _no_ambient_cx = crate::cx::Cx::set_current(None);
+        blocking_future.as_mut().poll(caller_cx)
+    });
+    frankenterm_sigpipe::catch_recoverable_future(
+        frankenterm_sigpipe::RecoverablePanicSite::CoreAsyncTaskJoin,
+        fallback,
+    )
+    .await
+    .map_err(|_| PANIC_ERROR.to_string())
+}
+
 /// Runs blocking work on the active runtime's blocking executor.
 ///
 /// Returns the closure output when successful, or a stringified join/runtime
-/// error when the blocking task could not complete.
+/// error when the blocking task could not complete. When an ambient Cx exists,
+/// the OS-thread closure uses that exact identity and its effective capability
+/// mask. Pool selection comes from the installed runtime handle, independently
+/// of that operation Cx, so a synthetic or otherwise driverless explicit
+/// context cannot accidentally force blocking work inline on the async
+/// executor. A pool-less runtime uses Asupersync's bounded fallback-thread
+/// path. The scoped closure guards are restored before the closure returns.
 pub async fn spawn_blocking<T, F>(work: F) -> Result<T, String>
 where
     T: Send + 'static,
     F: FnOnce() -> T + Send + 'static,
 {
-    frankenterm_sigpipe::catch_recoverable_future(
-        frankenterm_sigpipe::RecoverablePanicSite::CoreAsyncTaskJoin,
-        asupersync::runtime::spawn_blocking(work),
-    )
-        .await
-        .map_err(|_| "blocking task panicked (error_code=WA-RUNTIME-BLOCKING-PANIC)".to_string())
+    let blocking_context = crate::cx::Cx::current().map(|cx| {
+        let mask = crate::cx::effective_cap_mask(&cx);
+        (cx, mask)
+    });
+    spawn_blocking_in_context(blocking_context, current_runtime_handle(), work).await
 }
 
 /// Typed failure from [`spawn_blocking_with_cx`].
@@ -3733,10 +4107,10 @@ pub enum SpawnBlockingWithCxError {
         /// Structured cancellation kind, when the Cx carries one.
         kind: Option<crate::outcome::CancelKind>,
     },
-    /// The Cx cancelled while the blocking closure was running.
+    /// The Cx cancelled after the blocking handoff was admitted.
     ///
-    /// The blocking closure itself continues to completion on the blocking
-    /// pool; only the caller's await is released.
+    /// Work still queued may be skipped by the blocking pool. A closure that
+    /// already started is not preempted and continues until it returns.
     #[error("blocking task cancelled mid-flight (kind={kind:?})")]
     CancelledMidFlight {
         /// Structured cancellation kind, when the Cx carries one.
@@ -3744,11 +4118,12 @@ pub enum SpawnBlockingWithCxError {
     },
     /// The blocking executor or join surface failed independently of Cx
     /// cancellation.
-    #[error("blocking task runtime failure: {detail}")]
-    RuntimeFailure {
-        /// Runtime/join failure detail.
-        detail: String,
-    },
+    #[error("blocking task runtime failure")]
+    RuntimeFailure,
+    /// The bounded cancellation watcher timer failed while the Cx itself was
+    /// still live.
+    #[error("blocking cancellation watcher timer failure")]
+    CancellationWatcherTimerFailure,
 }
 
 impl SpawnBlockingWithCxError {
@@ -3765,7 +4140,13 @@ impl SpawnBlockingWithCxError {
 fn map_spawn_blocking_runtime_result<T>(
     result: Result<T, String>,
 ) -> Result<T, SpawnBlockingWithCxError> {
-    result.map_err(|detail| SpawnBlockingWithCxError::RuntimeFailure { detail })
+    result.map_err(|_| SpawnBlockingWithCxError::RuntimeFailure)
+}
+
+fn spawn_blocking_root_cancel_kind(
+    cx: &crate::cx::Cx,
+) -> Option<crate::outcome::CancelKind> {
+    cx.root_cancel_cause().map(|reason| reason.kind)
 }
 
 /// br-ft-6qoxd: Cx-aware [`spawn_blocking`] that select-races the
@@ -3781,16 +4162,16 @@ fn map_spawn_blocking_runtime_result<T>(
 /// short-circuits as a defense-in-depth on top.
 ///
 /// **Mid-flight cancel:** if the Cx cancels while the blocking
-/// work is running, the await resolves with
+/// work is queued or running, the await resolves with
 /// [`SpawnBlockingWithCxError::CancelledMidFlight`] within ~50–100 ms
 /// (the cancel-watcher checkpoints the Cx on a 50 ms cadence). The
-/// orphaned blocking task **continues to
-/// run** on the blocking thread pool until the closure returns
-/// naturally — its result is discarded. The blocking work
-/// itself does not see the cancel signal; if the closure
-/// performs a long-running syscall (large SQLite scan, FTS
-/// reindex, file mmap), it runs to completion. The await just
-/// unblocks promptly.
+/// blocking pool may skip work that is still queued. Once the OS-thread
+/// closure has started, however, it **continues to run** until it returns
+/// naturally and its result is discarded. The exact explicit Cx is installed
+/// inside that closure, so cooperative code can observe cancellation between
+/// operations through `Cx::current()`; cancellation cannot interrupt a
+/// syscall already in progress (large SQLite scan, FTS reindex, file mmap).
+/// The await just unblocks promptly.
 ///
 /// This matches the existing select-race pattern documented at
 /// `runtime_async.rs:340 / 442 / 486 / 2184 / 2277` for the
@@ -3799,14 +4180,15 @@ fn map_spawn_blocking_runtime_result<T>(
 ///
 /// # Trade-off
 ///
-/// Mid-flight cancel **abandons** the result, not the work.
+/// Mid-flight cancel **abandons** the result, not necessarily the work.
 /// For SQLite reads that's typically fine — an abandoned scan
 /// returns no data and the connection auto-rolls-back its
 /// implicit transaction. For long-running writes, the abandoned
 /// blocking task may still mutate state after the caller has
-/// observed cancellation. Callers that need write-side abort
-/// must layer their own cancellation token through the closure
-/// (e.g., a `&AtomicBool` checked between SQLite statements).
+/// observed cancellation. Callers that need write-side abort must
+/// cooperatively checkpoint the installed Cx (or layer their own cancellation
+/// token) between atomic write steps and define settlement for effects already
+/// committed.
 pub async fn spawn_blocking_with_cx<T, F>(
     cx: &crate::cx::Cx,
     work: F,
@@ -3820,13 +4202,23 @@ where
     // matches the eager-cancel-shape callers expect.
     if cx.checkpoint().is_err() {
         return Err(SpawnBlockingWithCxError::CancelledBeforeSpawn {
-            kind: cx.cancel_reason().map(|reason| reason.kind),
+            kind: spawn_blocking_root_cancel_kind(cx),
         });
     }
 
     use futures::future::{Either, select};
 
-    let join_fut = std::pin::pin!(spawn_blocking(work));
+    // The explicit Cx is authoritative inside the blocking closure even when
+    // this future is polled under a different ambient task. Pool selection is
+    // independently derived from the installed runtime handle; the closure
+    // installs the explicit identity/mask because TLS does not migrate between
+    // executor and blocking-pool threads.
+    let blocking_context = Some((cx.clone(), crate::cx::effective_cap_mask(cx)));
+    let join_fut = std::pin::pin!(spawn_blocking_in_context(
+        blocking_context,
+        current_runtime_handle(),
+        work,
+    ));
     let cancel_watcher = std::pin::pin!(async {
         loop {
             // 50 ms poll mirrors distributed::race_with_cx_cancel
@@ -3835,15 +4227,14 @@ where
             // every wakeup must run a checkpoint. Ignoring that error used
             // to turn an expired finite budget into a non-yielding hot loop
             // until the blocking closure happened to finish.
-            if let Err(sleep_error) =
-                sleep_with_cx(cx, std::time::Duration::from_millis(50)).await
+            if sleep_with_cx(cx, std::time::Duration::from_millis(50))
+                .await
+                .is_err()
             {
                 if cx.checkpoint().is_err() {
                     return Ok(());
                 }
-                return Err(format!(
-                    "blocking cancellation watcher sleep failed: {sleep_error}"
-                ));
+                return Err(());
             }
             if cx.checkpoint().is_err() {
                 return Ok(());
@@ -3855,11 +4246,11 @@ where
         Either::Left((result, _)) => map_spawn_blocking_runtime_result(result),
         Either::Right((Ok(()), _)) => {
             Err(SpawnBlockingWithCxError::CancelledMidFlight {
-                kind: cx.cancel_reason().map(|reason| reason.kind),
+                kind: spawn_blocking_root_cancel_kind(cx),
             })
         }
-        Either::Right((Err(detail), _)) => {
-            Err(SpawnBlockingWithCxError::RuntimeFailure { detail })
+        Either::Right((Err(()), _)) => {
+            Err(SpawnBlockingWithCxError::CancellationWatcherTimerFailure)
         }
     }
 }
@@ -4424,14 +4815,11 @@ mod tests {
         );
     }
 
-    async fn drive_spawned_task_to_completion(completed: &std::sync::atomic::AtomicBool) {
-        for _ in 0..256 {
-            if completed.load(std::sync::atomic::Ordering::SeqCst) {
-                return;
-            }
-            task::yield_now().await;
-        }
-        panic!("spawned task did not complete within the deterministic yield budget");
+    async fn await_test_signal(signal: oneshot::Receiver<()>, description: &'static str) {
+        timeout(Duration::from_secs(5), oneshot_recv(signal))
+            .await
+            .unwrap_or_else(|_| panic!("timed out waiting for {description}"))
+            .unwrap_or_else(|_| panic!("sender dropped before publishing {description}"));
     }
 
     // ft-yqd3w: the four `surface_contract_*` self-tests that used to live
@@ -7035,6 +7423,154 @@ mod tests {
         });
     }
 
+    #[test]
+    fn spawn_blocking_with_cx_uses_exact_explicit_identity_caps_and_cancellation() {
+        let rt = RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        for (explicit_mask, expected_caps) in crate::cx::capability_mask_test_cases() {
+            let explicit = {
+                let _base_guard =
+                    crate::cx::Cx::set_current(Some(crate::cx::for_request()));
+                let _restriction = crate::cx::Cx::push_restriction(explicit_mask);
+                crate::cx::Cx::current().expect("restricted explicit blocking cx")
+            };
+            let ambient_mask = if expected_caps == [false; 5] {
+                asupersync::cx::CapMask::all()
+            } else {
+                asupersync::cx::CapMask::none()
+            };
+            let ambient = {
+                let _base_guard =
+                    crate::cx::Cx::set_current(Some(crate::cx::for_request()));
+                let _restriction = crate::cx::Cx::push_restriction(ambient_mask);
+                crate::cx::Cx::current().expect("restricted mismatched ambient cx")
+            };
+            ambient.cancel_with(
+                crate::outcome::CancelKind::ParentCancelled,
+                Some("SECRET ambient blocking context must not leak"),
+            );
+
+            let expected_identity = (explicit.region_id(), explicit.task_id());
+            let ambient_identity = (ambient.region_id(), ambient.task_id());
+            assert_ne!(
+                expected_identity, ambient_identity,
+                "identity test requires structurally distinct contexts"
+            );
+
+            let observed = rt.block_on(async move {
+                task::spawn_with_cx(&ambient, move |_ambient_cx| async move {
+                    let executor_thread = std::thread::current().id();
+                    spawn_blocking_with_cx(&explicit, move || {
+                        let active = crate::cx::Cx::current()
+                            .expect("explicit cx installed inside blocking closure");
+                        (
+                            (active.region_id(), active.task_id()),
+                            crate::cx::effective_capability_bits(&active),
+                            active.checkpoint().is_err(),
+                            std::thread::current().id(),
+                            executor_thread,
+                        )
+                    })
+                    .await
+                })
+                .await
+                .expect("mismatched ambient task must settle")
+            });
+            let (identity, caps, cancelled, blocking_thread, executor_thread) =
+                observed.expect("live explicit blocking cx must complete");
+            assert_eq!(identity, expected_identity);
+            assert_eq!(caps, expected_caps);
+            assert!(
+                !cancelled,
+                "cancelled ambient cx must not replace the live explicit cx"
+            );
+            assert_ne!(
+                blocking_thread, executor_thread,
+                "driverless explicit/ambient contexts must not force blocking work inline"
+            );
+        }
+    }
+
+    #[test]
+    fn spawn_blocking_with_cx_shares_midflight_cancel_state_with_closure() {
+        let rt = RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let cx = crate::cx::for_request();
+            let expected_identity = (cx.region_id(), cx.task_id());
+            let cx_for_helper = cx.clone();
+            let (started_tx, started_rx) = oneshot::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+            let (completed_tx, completed_rx) = oneshot::channel();
+
+            let helper = task::spawn(async move {
+                spawn_blocking_with_cx(&cx_for_helper, move || {
+                    let active = crate::cx::Cx::current()
+                        .expect("explicit cx installed before blocking wait");
+                    let _ = started_tx.send((
+                        (active.region_id(), active.task_id()),
+                        crate::cx::effective_capability_bits(&active),
+                        active.checkpoint().is_err(),
+                    ));
+                    release_rx
+                        .recv_timeout(Duration::from_secs(5))
+                        .expect("midflight-cancel release signal");
+                    let active_after = crate::cx::Cx::current()
+                        .expect("explicit cx remains installed after blocking wait");
+                    let _ = completed_tx.send((
+                        (active_after.region_id(), active_after.task_id()),
+                        active_after.checkpoint().is_err(),
+                    ));
+                })
+                .await
+            });
+
+            let before = timeout(Duration::from_secs(5), oneshot_recv(started_rx))
+                .await
+                .expect("blocking closure did not publish its start")
+                .expect("blocking closure dropped its start signal");
+            assert_eq!(before.0, expected_identity);
+            assert_eq!(before.1, [true; 5]);
+            assert!(!before.2);
+
+            cx.cancel_with(
+                crate::outcome::CancelKind::User,
+                Some("SECRET explicit midflight cancellation"),
+            );
+            release_tx
+                .send(())
+                .expect("blocking closure must retain its release receiver");
+
+            let after = timeout(Duration::from_secs(5), oneshot_recv(completed_rx))
+                .await
+                .expect("blocking closure did not publish cancellation observation")
+                .expect("blocking closure dropped its completion signal");
+            assert_eq!(after.0, expected_identity);
+            assert!(after.1, "blocking closure must share explicit Cx cancel state");
+
+            let helper_result = helper.await.expect("blocking helper task must settle");
+            assert!(
+                matches!(
+                    &helper_result,
+                    Ok(())
+                        | Err(SpawnBlockingWithCxError::CancelledMidFlight {
+                            kind: Some(crate::outcome::CancelKind::User)
+                        })
+                ),
+                "closure completion and cancellation watcher may race, but no other class is valid: {helper_result:?}"
+            );
+            if let Err(error) = &helper_result {
+                assert!(!error.to_string().contains("SECRET"));
+                assert!(!format!("{error:?}").contains("SECRET"));
+            }
+        });
+    }
+
     /// ft-7p1bx: pins the blocking-pool regression directly. asupersync's
     /// `spawn_blocking` with an ambient `Cx` but NO blocking pool runs the
     /// closure INLINE on the executor thread — which froze the runtime for
@@ -7064,10 +7600,9 @@ mod tests {
     /// br-ft-6qoxd: mid-flight cancel branch — cx cancels while the
     /// blocking work is still running. The helper must select-race the
     /// JoinHandle against the cx cancel watcher and resolve the await
-    /// with a typed cancellation error within ~150 ms (50 ms poll
-    /// cadence × ~2 ticks). The orphaned blocking task continues to
-    /// run on the blocking pool until its closure returns naturally —
-    /// this matches the contract documented for the helper.
+    /// with a typed cancellation error. This test gates the closure until it is
+    /// definitely running, so it continues on the blocking pool until natural
+    /// return; queued work may instead be skipped on cancellation.
     ///
     /// Pattern mirrors `oneshot_recv_with_cx_mid_flight_cancel_via_select_race_pattern`
     /// at line 5710 and `distributed::race_with_cx_cancel` at tick 387.
@@ -7080,26 +7615,38 @@ mod tests {
         rt.block_on(async {
             let cx = crate::cx::Cx::for_testing();
             let cancel_trigger = cx.clone();
+            let (started_tx, started_rx) = oneshot::channel::<()>();
+            let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+            let (completed_tx, completed_rx) = oneshot::channel::<()>();
 
-            // Background trigger: cancels the cx 100 ms after the
-            // blocking work has started spinning. The blocking
-            // closure itself sleeps 5 s so it definitively cannot
-            // complete before the cancel fires.
-            task::spawn(async move {
-                sleep(Duration::from_millis(100)).await;
+            let cancel_task = task::spawn(async move {
+                await_test_signal(started_rx, "midflight-cancel closure start").await;
                 cancel_trigger.cancel_with(
                     crate::outcome::CancelKind::User,
                     Some("br-ft-6qoxd mid-flight cancel"),
                 );
             });
 
-            let started = std::time::Instant::now();
-            let result: Result<u64, SpawnBlockingWithCxError> = spawn_blocking_with_cx(&cx, || {
-                std::thread::sleep(Duration::from_secs(5));
-                42
-            })
+            let result = timeout(
+                Duration::from_secs(2),
+                spawn_blocking_with_cx(&cx, move || {
+                    let _ = started_tx.send(());
+                    release_rx
+                        .recv_timeout(Duration::from_secs(5))
+                        .expect("midflight-cancel closure release signal");
+                    let _ = completed_tx.send(());
+                    42
+                }),
+            )
             .await;
-            let elapsed = started.elapsed();
+            release_tx
+                .send(())
+                .expect("midflight-cancel closure must retain its release receiver");
+            await_test_signal(completed_rx, "midflight-cancel closure completion").await;
+            cancel_task
+                .await
+                .expect("midflight cancellation trigger must settle");
+            let result = result.expect("cancellation watcher did not settle within 2s");
 
             assert!(
                 matches!(
@@ -7109,12 +7656,6 @@ mod tests {
                     })
                 ),
                 "mid-flight cancel must return the exact typed phase and kind; got: {result:?}"
-            );
-            assert!(
-                elapsed < Duration::from_secs(2),
-                "select-race watcher must catch mid-flight cancel within ~2 s \
-                 (expected ~150 ms; 2 s envelope absorbs CI/load drift); \
-                 took {elapsed:?}"
             );
         });
     }
@@ -7133,22 +7674,10 @@ mod tests {
             .await
             .expect_err("blocking closure panic must become a typed runtime failure");
 
-            match error {
-                SpawnBlockingWithCxError::RuntimeFailure { detail } => {
-                    assert_eq!(
-                        detail,
-                        "blocking task panicked (error_code=WA-RUNTIME-BLOCKING-PANIC)",
-                        "runtime failure must be stable and content-free"
-                    );
-                    assert!(
-                        !detail.contains("injected blocking closure panic"),
-                        "runtime failure must not reflect panic payload text"
-                    );
-                }
-                other => {
-                    panic!("runtime failure must not be classified as cancellation: {other:?}")
-                }
-            }
+            assert!(matches!(error, SpawnBlockingWithCxError::RuntimeFailure));
+            assert_eq!(error.to_string(), "blocking task runtime failure");
+            assert!(!error.to_string().contains("injected blocking closure panic"));
+            assert!(!format!("{error:?}").contains("injected blocking closure panic"));
         });
     }
 
@@ -7161,16 +7690,29 @@ mod tests {
         rt.block_on(async {
             let probe = crate::cx::Cx::for_testing();
             let budget = asupersync::types::Budget::new()
-                .with_deadline(cx_timer_now(&probe) + Duration::from_millis(40));
+                .with_deadline(cx_timer_now(&probe) + Duration::from_millis(200));
             let cx = crate::cx::Cx::for_testing_with_budget(budget);
+            let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+            let (completed_tx, completed_rx) = oneshot::channel::<()>();
 
             let started = std::time::Instant::now();
-            let result = spawn_blocking_with_cx(&cx, || {
-                std::thread::sleep(Duration::from_secs(1));
-                42_u64
-            })
+            let result = timeout(
+                Duration::from_secs(2),
+                spawn_blocking_with_cx(&cx, move || {
+                    release_rx
+                        .recv_timeout(Duration::from_secs(5))
+                        .expect("deadline closure release signal");
+                    let _ = completed_tx.send(());
+                    42_u64
+                }),
+            )
             .await;
+            release_tx
+                .send(())
+                .expect("deadline closure must retain its release receiver");
+            await_test_signal(completed_rx, "deadline closure completion").await;
             let elapsed = started.elapsed();
+            let result = result.expect("deadline watcher did not settle within 2s");
 
             assert!(
                 matches!(
@@ -7182,7 +7724,7 @@ mod tests {
                 "finite Cx deadline must surface as typed mid-flight cancellation; got: {result:?}"
             );
             assert!(
-                elapsed < Duration::from_millis(750),
+                elapsed < Duration::from_secs(1),
                 "deadline watcher must return before the blocking closure completes; took {elapsed:?}"
             );
         });
@@ -7214,12 +7756,23 @@ mod tests {
     fn task_spawn_with_cx_receives_explicit_context() {
         let rt = RuntimeBuilder::current_thread().build().unwrap();
         let cx = crate::cx::for_testing();
+        let expected_region = cx.region_id();
+        let expected_task = cx.task_id();
         rt.block_on(async move {
             let handle = task::spawn_with_cx(&cx, |child_cx| async move {
-                // Verify child_cx is installed as the active Cx
-                let active = crate::cx::Cx::current().expect("installed child cx");
-                // Both should be functional Cx instances
-                active.checkpoint().expect("active cx checkpoint");
+                let active_before = crate::cx::Cx::current().expect("installed child cx");
+                assert_eq!(active_before.region_id(), expected_region);
+                assert_eq!(active_before.task_id(), expected_task);
+                assert_eq!(child_cx.region_id(), expected_region);
+                assert_eq!(child_cx.task_id(), expected_task);
+
+                // Force a second poll and prove the scoped installation is
+                // repeated rather than being a first-poll accident.
+                task::yield_now().await;
+                let active_after = crate::cx::Cx::current().expect("reinstalled child cx");
+                assert_eq!(active_after.region_id(), expected_region);
+                assert_eq!(active_after.task_id(), expected_task);
+                active_after.checkpoint().expect("active cx checkpoint");
                 child_cx.checkpoint().expect("child cx checkpoint");
                 crate::runtime_async::current_runtime_handle().is_some()
             });
@@ -7235,12 +7788,16 @@ mod tests {
     fn joinset_spawn_with_cx_receives_explicit_context() {
         let rt = RuntimeBuilder::current_thread().build().unwrap();
         let cx = crate::cx::for_testing();
+        let expected_region = cx.region_id();
+        let expected_task = cx.task_id();
         rt.block_on(async move {
             let mut set = task::JoinSet::new();
             set.spawn_with_cx(&cx, |child_cx| async move {
-                // Verify child_cx is installed as the active Cx
                 let active = crate::cx::Cx::current().expect("installed child cx");
-                // Both should be functional Cx instances
+                assert_eq!(active.region_id(), expected_region);
+                assert_eq!(active.task_id(), expected_task);
+                assert_eq!(child_cx.region_id(), expected_region);
+                assert_eq!(child_cx.task_id(), expected_task);
                 active.checkpoint().expect("active cx checkpoint");
                 child_cx.checkpoint().expect("child cx checkpoint");
                 crate::runtime_async::current_runtime_handle().is_some()
@@ -7256,6 +7813,273 @@ mod tests {
                 "runtime handle should be available in spawned task"
             );
         });
+    }
+
+    #[test]
+    fn task_spawn_with_cx_ambient_context_inherits_cancellation() {
+        let rt = RuntimeBuilder::current_thread().build().unwrap();
+        let cx = crate::cx::for_testing();
+        cx.cancel_with(
+            crate::outcome::CancelKind::ParentCancelled,
+            Some("explicit spawn parent cancelled"),
+        );
+
+        rt.block_on(async move {
+            let handle = task::spawn_with_cx(&cx, |_child_cx| async move {
+                crate::cx::Cx::current()
+                    .expect("installed child cx")
+                    .checkpoint()
+                    .is_err()
+            });
+            assert!(
+                handle.await.expect("task should complete"),
+                "ambient adapters must observe explicit parent cancellation"
+            );
+        });
+    }
+
+    #[test]
+    fn task_spawn_with_cx_preserves_all_effective_capability_bits_across_yield() {
+        let rt = RuntimeBuilder::current_thread().build().unwrap();
+        for (mask, expected) in crate::cx::capability_mask_test_cases() {
+            let restricted = {
+                let _base_guard =
+                    crate::cx::Cx::set_current(Some(crate::cx::for_testing()));
+                let _restriction = crate::cx::Cx::push_restriction(mask);
+                crate::cx::Cx::current().expect("restricted explicit cx")
+            };
+            assert_eq!(crate::cx::effective_capability_bits(&restricted), expected);
+
+            rt.block_on(async move {
+                let handle = task::spawn_with_cx(&restricted, |child_cx| async move {
+                    assert_eq!(crate::cx::effective_capability_bits(&child_cx), expected);
+                    let before = crate::cx::effective_capability_bits(
+                        &crate::cx::Cx::current().expect("installed restricted cx"),
+                    );
+                    task::yield_now().await;
+                    let after = crate::cx::effective_capability_bits(
+                        &crate::cx::Cx::current().expect("reinstalled restricted cx"),
+                    );
+                    (before, after)
+                });
+                assert_eq!(handle.await.expect("task should complete"), (expected, expected));
+            });
+        }
+    }
+
+    #[test]
+    fn task_try_spawn_with_cx_preserves_exact_identity_caps_and_cancellation() {
+        let rt = RuntimeBuilder::current_thread().build().unwrap();
+
+        for (mask, expected) in crate::cx::capability_mask_test_cases() {
+            let explicit = {
+                let _base_guard =
+                    crate::cx::Cx::set_current(Some(crate::cx::for_request()));
+                let _restriction = crate::cx::Cx::push_restriction(mask);
+                crate::cx::Cx::current().expect("restricted explicit cx")
+            };
+            let expected_region = explicit.region_id();
+            let expected_task = explicit.task_id();
+            explicit.cancel_with(
+                crate::outcome::CancelKind::ParentCancelled,
+                Some("SECRET exact try-spawn cancellation"),
+            );
+
+            rt.block_on(async move {
+                let handle = task::try_spawn_with_cx(&explicit, |child_cx| async move {
+                    let before = crate::cx::Cx::current().expect("installed try-spawn cx");
+                    assert_eq!(before.region_id(), expected_region);
+                    assert_eq!(before.task_id(), expected_task);
+                    assert_eq!(child_cx.region_id(), expected_region);
+                    assert_eq!(child_cx.task_id(), expected_task);
+                    assert_eq!(crate::cx::effective_capability_bits(&before), expected);
+                    assert_eq!(crate::cx::effective_capability_bits(&child_cx), expected);
+                    assert!(before.checkpoint().is_err());
+
+                    task::yield_now().await;
+                    let after = crate::cx::Cx::current().expect("reinstalled try-spawn cx");
+                    (
+                        after.region_id(),
+                        after.task_id(),
+                        crate::cx::effective_capability_bits(&after),
+                        after.checkpoint().is_err(),
+                    )
+                })
+                .expect("installed runtime must admit try-spawn child");
+
+                let observed = handle.await.expect("try-spawn child must settle");
+                assert_eq!(observed.0, expected_region);
+                assert_eq!(observed.1, expected_task);
+                assert_eq!(observed.2, expected);
+                assert!(observed.3);
+            });
+        }
+    }
+
+    #[test]
+    fn task_try_spawn_with_cx_returns_typed_error_without_installed_handle() {
+        let previous = current_runtime_handle();
+        clear_runtime_handle();
+        let cx = crate::cx::for_request();
+        let result = task::try_spawn_with_cx(&cx, |_child_cx| async {});
+        let unavailable = matches!(result, Err(task::SpawnError::RuntimeUnavailable));
+        if let Some(previous) = previous {
+            install_runtime_handle(previous);
+        }
+        assert!(
+            unavailable,
+            "missing installed handle must be a typed admission error, not a panic"
+        );
+    }
+
+    #[test]
+    fn nested_plain_and_join_set_spawn_never_regain_denied_capability_bits() {
+        let rt = RuntimeBuilder::current_thread().build().unwrap();
+
+        for (mask, expected) in crate::cx::capability_mask_test_cases() {
+            let restricted = {
+                let _base_guard =
+                    crate::cx::Cx::set_current(Some(crate::cx::for_testing()));
+                let _restriction = crate::cx::Cx::push_restriction(mask);
+                crate::cx::Cx::current().expect("restricted explicit cx")
+            };
+
+            rt.block_on(async move {
+                let outer = task::spawn_with_cx(&restricted, move |_child_cx| async move {
+                    let plain = task::spawn(async move {
+                        let before = crate::cx::effective_capability_bits(
+                            &crate::cx::Cx::current().expect("plain nested spawn cx"),
+                        );
+                        task::yield_now().await;
+                        let after = crate::cx::effective_capability_bits(
+                            &crate::cx::Cx::current().expect("plain nested spawn cx after yield"),
+                        );
+                        (before, after)
+                    })
+                    .await
+                    .expect("plain nested spawn must settle");
+
+                    let mut set = task::JoinSet::new();
+                    set.spawn(async move {
+                        let before = crate::cx::effective_capability_bits(
+                            &crate::cx::Cx::current().expect("JoinSet nested spawn cx"),
+                        );
+                        task::yield_now().await;
+                        let after = crate::cx::effective_capability_bits(
+                            &crate::cx::Cx::current()
+                                .expect("JoinSet nested spawn cx after yield"),
+                        );
+                        (before, after)
+                    });
+                    let join_set = set
+                        .join_next()
+                        .await
+                        .expect("JoinSet has one child")
+                        .expect("JoinSet child must settle");
+                    (plain, join_set)
+                });
+
+                assert_eq!(
+                    outer.await.expect("explicit parent must settle"),
+                    ((expected, expected), (expected, expected))
+                );
+            });
+        }
+    }
+
+    #[test]
+    fn nested_plain_spawn_inherits_explicit_parent_cancellation_and_identity() {
+        let rt = RuntimeBuilder::current_thread().build().unwrap();
+        let parent = crate::cx::for_testing();
+        let expected_region = parent.region_id();
+        let expected_task = parent.task_id();
+        parent.cancel_with(
+            crate::outcome::CancelKind::ParentCancelled,
+            Some("SECRET nested plain spawn cancellation"),
+        );
+
+        rt.block_on(async move {
+            let outer = task::spawn_with_cx(&parent, move |_child_cx| async move {
+                task::spawn(async move {
+                    let before = crate::cx::Cx::current().expect("plain nested inherited cx");
+                    let identity_before = (before.region_id(), before.task_id());
+                    let cancelled_before = before.checkpoint().is_err();
+                    task::yield_now().await;
+                    let after = crate::cx::Cx::current().expect("plain nested cx after yield");
+                    (
+                        identity_before,
+                        (after.region_id(), after.task_id()),
+                        cancelled_before,
+                        after.checkpoint().is_err(),
+                    )
+                })
+                .await
+                .expect("plain nested task must settle")
+            });
+
+            let observed = outer.await.expect("explicit parent task must settle");
+            assert_eq!(observed.0, (expected_region, expected_task));
+            assert_eq!(observed.1, (expected_region, expected_task));
+            assert!(observed.2 && observed.3);
+        });
+    }
+
+    #[test]
+    fn spawn_blocking_inherits_each_ambient_capability_bit() {
+        let rt = RuntimeBuilder::current_thread().build().unwrap();
+
+        for (mask, expected) in crate::cx::capability_mask_test_cases() {
+            let restricted = {
+                let _base_guard =
+                    crate::cx::Cx::set_current(Some(crate::cx::for_testing()));
+                let _restriction = crate::cx::Cx::push_restriction(mask);
+                crate::cx::Cx::current().expect("restricted explicit cx")
+            };
+
+            rt.block_on(async move {
+                let outer = task::spawn_with_cx(&restricted, move |_child_cx| async move {
+                    task::spawn_blocking(move || {
+                        crate::cx::effective_capability_bits(
+                            &crate::cx::Cx::current().expect("blocking closure inherited cx"),
+                        )
+                    })
+                    .await
+                    .expect("blocking wrapper must settle")
+                });
+                assert_eq!(outer.await.expect("explicit parent must settle"), expected);
+            });
+        }
+    }
+
+    #[test]
+    fn spawn_detached_never_regains_denied_capability_bits() {
+        let rt = RuntimeBuilder::current_thread().build().unwrap();
+
+        for (mask, expected) in crate::cx::capability_mask_test_cases() {
+            let (tx, rx) = oneshot::channel();
+            {
+                let _base_guard =
+                    crate::cx::Cx::set_current(Some(crate::cx::for_testing()));
+                let _restriction = crate::cx::Cx::push_restriction(mask);
+                rt.spawn_detached(async move {
+                    let before = crate::cx::effective_capability_bits(
+                        &crate::cx::Cx::current().expect("detached task cx"),
+                    );
+                    task::yield_now().await;
+                    let after = crate::cx::effective_capability_bits(
+                        &crate::cx::Cx::current().expect("detached task cx after yield"),
+                    );
+                    let _ = tx.send((before, after));
+                });
+            }
+
+            let observed = rt.block_on(async {
+                oneshot_recv(rx)
+                    .await
+                    .expect("detached capability probe must publish its result")
+            });
+            assert_eq!(observed, (expected, expected));
+        }
     }
 
     // -- Semaphore permit count verification --
@@ -7998,25 +8822,89 @@ mod tests {
     }
 
     #[test]
-    fn task_spawn_blocking_abort_cancels() {
-        // spawn_blocking runs on a real OS thread — abort() marks the handle
-        // as cancelled but cannot interrupt a thread mid-sleep. Use a short
-        // sleep so the thread finishes quickly, then verify abort semantics.
+    fn task_spawn_blocking_preserves_exact_context_and_never_runs_inline() {
+        let rt = RuntimeBuilder::current_thread().build().unwrap();
+
+        for (mask, expected) in crate::cx::capability_mask_test_cases() {
+            let explicit = {
+                let _base_guard =
+                    crate::cx::Cx::set_current(Some(crate::cx::for_request()));
+                let _restriction = crate::cx::Cx::push_restriction(mask);
+                crate::cx::Cx::current().expect("restricted blocking cx")
+            };
+            let expected_identity = (explicit.region_id(), explicit.task_id());
+
+            let observed = rt.block_on(async move {
+                task::spawn_with_cx(&explicit, move |_child_cx| async move {
+                    let executor_thread = std::thread::current().id();
+                    task::spawn_blocking(move || {
+                        let active = crate::cx::Cx::current()
+                            .expect("blocking closure must inherit exact ambient cx");
+                        (
+                            (active.region_id(), active.task_id()),
+                            crate::cx::effective_capability_bits(&active),
+                            std::thread::current().id(),
+                            executor_thread,
+                        )
+                    })
+                    .await
+                    .expect("blocking child must settle")
+                })
+                .await
+                .expect("explicit-cx parent must settle")
+            });
+
+            assert_eq!(observed.0, expected_identity);
+            assert_eq!(observed.1, expected);
+            assert_ne!(
+                observed.2, observed.3,
+                "driverless explicit Cx must not force task::spawn_blocking inline"
+            );
+        }
+    }
+
+    #[test]
+    fn task_spawn_blocking_abort_stops_delivery_but_not_a_started_closure() {
         let rt = RuntimeBuilder::current_thread().build().unwrap();
         rt.block_on(async {
-            let handle = task::spawn_blocking(|| {
-                std::thread::sleep(Duration::from_millis(50));
+            let finished = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let (started_tx, started_rx) = oneshot::channel::<()>();
+            let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+            let (completion_tx, completion_rx) = oneshot::channel::<()>();
+            let finished_by_closure = std::sync::Arc::clone(&finished);
+
+            let handle = task::spawn_blocking(move || {
+                let _ = started_tx.send(());
+                release_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("blocking-closure release signal");
+                finished_by_closure.store(true, std::sync::atomic::Ordering::SeqCst);
+                let _ = completion_tx.send(());
                 "done"
             });
+
+            await_test_signal(started_rx, "blocking-closure start").await;
+
             handle.abort();
             let result = timeout(Duration::from_secs(5), handle).await;
             let inner = result.expect("handle.await did not resolve within 5s after abort");
-            // Depending on timing, the task may complete before abort takes
-            // effect (Ok) or be cancelled (Err). Either is valid.
-            match inner {
-                Ok(val) => assert_eq!(val, "done"),
-                Err(_) => { /* cancelled — expected */ }
-            }
+            assert!(
+                matches!(inner, Err(ref error) if error.kind() == task::JoinErrorKind::Aborted),
+                "a started blocking closure held behind a gate cannot win the abort race"
+            );
+            assert!(
+                !finished.load(std::sync::atomic::Ordering::SeqCst),
+                "aborted wrapper acknowledgement must not falsely imply OS work stopped"
+            );
+
+            release_tx
+                .send(())
+                .expect("started blocking closure must retain its release receiver");
+            await_test_signal(completion_rx, "blocking-closure completion").await;
+            assert!(
+                finished.load(std::sync::atomic::Ordering::SeqCst),
+                "the already-started closure must remain alive and finish naturally"
+            );
         });
     }
 
@@ -8058,11 +8946,8 @@ mod tests {
                 "abort() should wake the current waiter"
             );
 
-            let result = pinned.as_mut().poll(&mut cx);
-            assert!(matches!(
-                result,
-                std::task::Poll::Ready(Err(ref err)) if err.is_cancelled()
-            ));
+            let result = pinned.as_mut().await;
+            assert!(matches!(result, Err(ref err) if err.is_cancelled()));
         });
     }
 
@@ -8104,11 +8989,8 @@ mod tests {
                 "an executor waker panic must not escape task abort"
             );
 
-            let result = pinned.as_mut().poll(&mut cx);
-            assert!(matches!(
-                result,
-                std::task::Poll::Ready(Err(ref error)) if error.is_cancelled()
-            ));
+            let result = pinned.as_mut().await;
+            assert!(matches!(result, Err(ref error) if error.is_cancelled()));
         });
     }
 
@@ -8120,9 +9002,11 @@ mod tests {
             let (tx, rx) = futures::channel::oneshot::channel::<u32>();
             let completed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             let completed_by_task = std::sync::Arc::clone(&completed);
+            let (completed_tx, completed_rx) = oneshot::channel::<()>();
             let mut handle = Box::pin(task::spawn(async move {
                 let value = rx.await.expect("completion gate sender");
                 completed_by_task.store(true, std::sync::atomic::Ordering::SeqCst);
+                let _ = completed_tx.send(());
                 value
             }));
             let (probe, panicking_waker) = probe_waker(true);
@@ -8133,7 +9017,8 @@ mod tests {
             ));
 
             tx.send(51).expect("open completion gate");
-            drive_spawned_task_to_completion(&completed).await;
+            await_test_signal(completed_rx, "panicking-waker task completion").await;
+            assert!(completed.load(std::sync::atomic::Ordering::SeqCst));
             assert_eq!(probe.count(), 1);
 
             let noop = futures::task::noop_waker();
@@ -8152,9 +9037,11 @@ mod tests {
             let (tx, rx) = futures::channel::oneshot::channel::<u32>();
             let completed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             let completed_by_task = std::sync::Arc::clone(&completed);
+            let (completed_tx, completed_rx) = oneshot::channel::<()>();
             let mut handle = Box::pin(task::spawn(async move {
                 let value = rx.await.expect("completion gate sender");
                 completed_by_task.store(true, std::sync::atomic::Ordering::SeqCst);
+                let _ = completed_tx.send(());
                 value
             }));
             let (probe_a, waker_a) = probe_waker(false);
@@ -8171,7 +9058,8 @@ mod tests {
             ));
 
             tx.send(52).expect("open completion gate");
-            drive_spawned_task_to_completion(&completed).await;
+            await_test_signal(completed_rx, "replacement-waker task completion").await;
+            assert!(completed.load(std::sync::atomic::Ordering::SeqCst));
             assert_eq!(probe_a.count(), 0);
             assert_eq!(probe_b.count(), 1);
 
@@ -8191,9 +9079,11 @@ mod tests {
             let (tx, rx) = futures::channel::oneshot::channel::<u32>();
             let completed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             let completed_by_task = std::sync::Arc::clone(&completed);
+            let (completed_tx, completed_rx) = oneshot::channel::<()>();
             let mut handle = Box::pin(task::spawn(async move {
                 let value = rx.await.expect("completion gate sender");
                 completed_by_task.store(true, std::sync::atomic::Ordering::SeqCst);
+                let _ = completed_tx.send(());
                 value
             }));
             let (probe, waker) = probe_waker(false);
@@ -8205,14 +9095,15 @@ mod tests {
 
             drop(handle);
             tx.send(53).expect("open completion gate");
-            drive_spawned_task_to_completion(&completed).await;
+            await_test_signal(completed_rx, "detached task completion").await;
+            assert!(completed.load(std::sync::atomic::Ordering::SeqCst));
             assert_eq!(probe.count(), 0);
         });
     }
 
     #[cfg(panic = "unwind")]
     #[test]
-    fn task_abort_and_later_detached_completion_emit_no_second_stale_wake() {
+    fn task_abort_drops_pending_future_before_join_acknowledgement() {
         let rt = RuntimeBuilder::current_thread().build().unwrap();
         rt.block_on(async {
             let (tx, rx) = futures::channel::oneshot::channel::<u32>();
@@ -8236,20 +9127,57 @@ mod tests {
             assert!(abort.is_ok(), "abort wake must remain contained");
             assert_eq!(probe.count(), 1);
 
-            let noop = futures::task::noop_waker();
-            let mut noop_cx = std::task::Context::from_waker(&noop);
-            assert!(matches!(
-                handle.as_mut().poll(&mut noop_cx),
-                std::task::Poll::Ready(Err(ref error)) if error.is_cancelled()
-            ));
-
-            tx.send(54).expect("open detached completion gate");
-            drive_spawned_task_to_completion(&completed).await;
+            let result = handle.as_mut().await;
+            assert!(matches!(result, Err(ref error) if error.is_cancelled()));
+            assert!(
+                tx.send(54).is_err(),
+                "abort acknowledgement must mean the pending task future and receiver are gone"
+            );
+            assert!(!completed.load(std::sync::atomic::Ordering::SeqCst));
             assert_eq!(
                 probe.count(),
                 1,
-                "detached completion must not re-wake the retired abort caller"
+                "abort completion must not re-wake the retired panicking caller"
             );
+        });
+    }
+
+    #[test]
+    fn join_set_abort_all_retains_and_drains_real_task_cancellation() {
+        struct DropFlag(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+        impl Drop for DropFlag {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+
+        let rt = RuntimeBuilder::current_thread().build().unwrap();
+        rt.block_on(async {
+            let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let dropped_by_task = std::sync::Arc::clone(&dropped);
+            let (started_tx, started_rx) = oneshot::channel::<()>();
+            let mut set = task::JoinSet::new();
+            set.spawn(async move {
+                let _drop_flag = DropFlag(dropped_by_task);
+                let _ = started_tx.send(());
+                std::future::pending::<()>().await;
+            });
+
+            await_test_signal(started_rx, "JoinSet child start").await;
+
+            set.abort_all();
+            assert_eq!(set.len(), 1, "abort_all must retain handles for draining");
+            let result = set
+                .join_next()
+                .await
+                .expect("retained aborted task acknowledgement");
+            assert!(matches!(result, Err(ref error) if error.is_cancelled()));
+            assert!(
+                dropped.load(std::sync::atomic::Ordering::SeqCst),
+                "join acknowledgement must follow task-future destruction"
+            );
+            assert!(set.is_empty());
         });
     }
 
@@ -8375,7 +9303,7 @@ mod tests {
     /// short-circuit on entry when the caller's cx is already
     /// cancelled — never polling the inner handles. A
     /// pre-cancelled cx with a never-completing task must yield
-    /// `Some(Err(JoinError { is_cancelled: true }))` immediately
+    /// `Some(Err(JoinErrorKind::ContextCancelled))` immediately
     /// instead of blocking forever.
     #[test]
     fn join_next_with_cx_short_circuits_on_precancelled_cx() {
@@ -8403,11 +9331,9 @@ mod tests {
                         err.is_cancelled(),
                         "pre-cancelled cx must produce a cancelled JoinError: {err}"
                     );
-                    let msg = err.to_string();
-                    assert!(
-                        msg.contains("join_next cancelled"),
-                        "error should mention join_next cancellation: {msg}"
-                    );
+                    assert_eq!(err.kind(), task::JoinErrorKind::ContextCancelled);
+                    assert!(!err.to_string().contains("pre-cancel join_next"));
+                    assert!(!format!("{err:?}").contains("pre-cancel join_next"));
                 }
                 other => panic!("expected Some(Err(cancelled)) on pre-cancel, got {other:?}"),
             }
@@ -8515,7 +9441,7 @@ mod tests {
     ///
     /// This pins that contract. Setup: pre-cancelled cx (no budget
     /// manipulation — cancel is direct). `yield_now_with_cx(&cx)`
-    /// must return `Err(String)` rather than yielding.
+    /// must return a typed cancellation rather than yielding.
     ///
     /// Complements the two budget-observation tests above: together
     /// the three tests cover the matrix of primitive × signal-kind:
@@ -8532,7 +9458,7 @@ mod tests {
             let cx = crate::cx::Cx::for_testing();
             cx.cancel_with(
                 crate::outcome::CancelKind::User,
-                Some("tick 418 pre-cancel yield_now_with_cx test"),
+                Some("SECRET tick 418 pre-cancel yield test"),
             );
 
             let started = std::time::Instant::now();
@@ -8543,15 +9469,88 @@ mod tests {
                 result.is_err(),
                 "pre-cancelled cx must cause yield_now_with_cx to return Err, got: {result:?}"
             );
-            let err_msg = result.err().unwrap();
-            assert!(
-                err_msg.contains("cancelled") || err_msg.contains("yield_now_with_cx cancelled"),
-                "error should surface cancellation; got: {err_msg}"
-            );
+            let error = result.expect_err("pre-cancel must fail");
+            assert_eq!(error.kind(), task::JoinErrorKind::ContextCancelled);
+            assert!(!error.to_string().contains("SECRET"));
+            assert!(!format!("{error:?}").contains("SECRET"));
             assert!(
                 elapsed < Duration::from_secs(1),
                 "pre-cancelled cx must short-circuit yield_now_with_cx promptly; took {elapsed:?}"
             );
+        });
+    }
+
+    #[test]
+    fn join_error_context_failure_mapping_is_exhaustive_and_content_free() {
+        use crate::outcome::CancelKind;
+
+        let cases = [
+            (CancelKind::User, task::JoinErrorKind::ContextCancelled, true),
+            (
+                CancelKind::Timeout,
+                task::JoinErrorKind::DeadlineExceeded,
+                false,
+            ),
+            (
+                CancelKind::Deadline,
+                task::JoinErrorKind::DeadlineExceeded,
+                false,
+            ),
+            (
+                CancelKind::PollQuota,
+                task::JoinErrorKind::PollQuotaExhausted,
+                false,
+            ),
+            (
+                CancelKind::CostBudget,
+                task::JoinErrorKind::CostBudgetExhausted,
+                false,
+            ),
+            (
+                CancelKind::FailFast,
+                task::JoinErrorKind::ContextCancelled,
+                true,
+            ),
+            (
+                CancelKind::RaceLost,
+                task::JoinErrorKind::ContextCancelled,
+                true,
+            ),
+            (
+                CancelKind::ParentCancelled,
+                task::JoinErrorKind::ContextCancelled,
+                true,
+            ),
+            (
+                CancelKind::ResourceUnavailable,
+                task::JoinErrorKind::ContextCancelled,
+                true,
+            ),
+            (
+                CancelKind::Shutdown,
+                task::JoinErrorKind::ContextCancelled,
+                true,
+            ),
+            (
+                CancelKind::LinkedExit,
+                task::JoinErrorKind::ContextCancelled,
+                true,
+            ),
+        ];
+
+        let rt = RuntimeBuilder::current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            for (kind, expected, expected_cancelled) in cases {
+                let cx = crate::cx::Cx::for_testing();
+                cx.cancel_with(kind, Some("SECRET exhaustive join classification"));
+                let error = task::yield_now_with_cx(&cx)
+                    .await
+                    .expect_err("cancelled context must fail the Cx-aware yield");
+                assert_eq!(error.kind(), expected);
+                assert_eq!(error.is_cancelled(), expected_cancelled);
+                assert!(!error.to_string().contains("SECRET"));
+                assert!(!format!("{error:?}").contains("SECRET"));
+            }
         });
     }
 
@@ -8592,16 +9591,13 @@ mod tests {
     /// primitive. With a spawned task that never completes
     /// (`pending::<()>().await`) and a pre-cancelled cx,
     /// `set.join_next_with_cx(&cx).await` must return
-    /// `Some(Err(JoinError))` with a message containing
-    /// "join_next cancelled" rather than blocking indefinitely for
-    /// a task that will never complete.
+    /// `Some(Err(JoinErrorKind::ContextCancelled))` rather than blocking
+    /// indefinitely for a task that will never complete.
     ///
     /// Cancel semantics surfaced by runtime_async's own pre-flight:
     ///
-    ///     if let Err(err) = caller_cx.checkpoint() {
-    ///         return Some(Err(JoinError::new(
-    ///             format!("aborted: join_next cancelled: {err}")
-    ///         )));
+    ///     if caller_cx.checkpoint().is_err() {
+    ///         return Some(Err(JoinError::from_context_failure(caller_cx)));
     ///     }
     ///
     /// Unlike the channel/semaphore primitives which delegate their
@@ -8618,13 +9614,11 @@ mod tests {
     /// 3. Pre-cancel cx via `cx.cancel_with(User, ...)`.
     /// 4. Wrap `set.join_next_with_cx(&cx)` in a 2 s outer safety-net
     ///    timeout.
-    /// 5. Assert elapsed < 1 s AND `Some(Err(JoinError))` with message
-    ///    surfacing the cancel.
+    /// 5. Assert elapsed < 1 s AND a typed cancelled JoinError that does not
+    ///    expose the cancellation reason.
     ///
-    /// `join_next_with_cx` also surfaces `JoinError::is_cancelled()`
-    /// as `true` via the "aborted" substring test — pins that check
-    /// too so downstream error-handling code can fold cx-cancel into
-    /// its abort path cleanly.
+    /// `join_next_with_cx` also surfaces `JoinError::is_cancelled()` as true
+    /// from the structural kind, with no message parsing.
     #[test]
     fn join_set_join_next_with_cx_observes_pre_cancel() {
         let rt = RuntimeBuilder::current_thread()
@@ -8640,7 +9634,7 @@ mod tests {
             let cx = crate::cx::Cx::for_testing();
             cx.cancel_with(
                 crate::outcome::CancelKind::User,
-                Some("tick 426 pre-cancel JoinSet::join_next_with_cx test"),
+                Some("SECRET tick 426 pre-cancel JoinSet test"),
             );
 
             let started = std::time::Instant::now();
@@ -8661,15 +9655,14 @@ mod tests {
             match inner {
                 Some(Err(err)) => {
                     let msg = err.to_string();
-                    assert!(
-                        msg.contains("join_next cancelled"),
-                        "JoinError should surface join_next cancellation; got: {msg}"
-                    );
+                    assert_eq!(err.kind(), task::JoinErrorKind::ContextCancelled);
                     assert!(
                         err.is_cancelled(),
                         "pre-cancelled cx must make JoinError::is_cancelled() return true; \
                          msg: {msg}"
                     );
+                    assert!(!msg.contains("SECRET"));
+                    assert!(!format!("{err:?}").contains("SECRET"));
                 }
                 Some(Ok(())) => panic!(
                     "pre-cancelled cx must surface Err(JoinError), not Ok — pending task \

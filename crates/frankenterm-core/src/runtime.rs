@@ -80,7 +80,7 @@ use crate::patterns::{AgentType, Detection, DetectionContext, PatternEngine, Sev
 use crate::policy::Redactor;
 use crate::recording::RecordingManager;
 use crate::resize_scheduler::{ResizeSchedulerDebugSnapshot, ResizeStalledTransaction};
-use crate::runtime_async::{RwLock, mpsc, task::JoinHandle, watch};
+use crate::runtime_async::{RuntimeTime, RwLock, mpsc, task::JoinHandle, watch};
 use crate::scrollback_tiers::ScrollbackTierSnapshot;
 #[cfg(all(feature = "vendored", unix))]
 use crate::sharding::{ShardId, try_decode_sharded_pane_id};
@@ -105,10 +105,33 @@ use crate::wezterm::{
     wezterm_handle_with_timeout,
 };
 
-fn runtime_cancelled_error(operation: &'static str, err: impl std::fmt::Display) -> Error {
-    Error::RuntimeOperation {
-        operation,
-        source: RuntimeOperationSource::Cancelled(err.to_string()),
+fn runtime_cx_error(
+    operation: &'static str,
+    cx: &crate::cx::Cx,
+    fallback: &'static str,
+) -> Error {
+    use crate::outcome::CancelKind;
+
+    match cx.root_cancel_cause().map(|reason| reason.kind) {
+        Some(CancelKind::Deadline | CancelKind::Timeout) => {
+            Error::runtime_backend(operation, "capability deadline exceeded")
+        }
+        Some(CancelKind::PollQuota) => {
+            Error::runtime_backend(operation, "capability poll quota exhausted")
+        }
+        Some(CancelKind::CostBudget) => {
+            Error::runtime_backend(operation, "capability cost budget exhausted")
+        }
+        Some(
+            CancelKind::User
+            | CancelKind::FailFast
+            | CancelKind::RaceLost
+            | CancelKind::ParentCancelled
+            | CancelKind::ResourceUnavailable
+            | CancelKind::Shutdown
+            | CancelKind::LinkedExit,
+        ) => Error::runtime_cancelled(operation, "capability context cancelled"),
+        None => Error::runtime_backend(operation, fallback),
     }
 }
 
@@ -521,36 +544,135 @@ fn config_take_update(rx: &mut watch::Receiver<HotReloadableConfig>) -> HotReloa
     rx.borrow_and_clone()
 }
 
-async fn runtime_sleep(runtime_cx: &RuntimeLoopCx, duration: Duration) {
-    {
-        let _ = crate::runtime_async::sleep_with_cx(runtime_cx, duration).await;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuntimeWaitFailureKind {
+    ContextCancelled,
+    DeadlineExceeded,
+    PollQuotaExhausted,
+    CostBudgetExhausted,
+    ContextFailure,
+    TimerFailure,
+}
+
+impl RuntimeWaitFailureKind {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::ContextCancelled => "context_cancelled",
+            Self::DeadlineExceeded => "deadline_exceeded",
+            Self::PollQuotaExhausted => "poll_quota_exhausted",
+            Self::CostBudgetExhausted => "cost_budget_exhausted",
+            Self::ContextFailure => "context_failure",
+            Self::TimerFailure => "timer_failure",
+        }
     }
 }
 
+static RUNTIME_WAIT_FAILURES_TOTAL: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+fn increment_saturating_atomic(counter: &std::sync::atomic::AtomicU64) -> u64 {
+    counter
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            Some(current.saturating_add(1))
+        })
+        .unwrap_or_else(|current| current)
+        .saturating_add(1)
+}
+
+fn runtime_context_failure_kind(runtime_cx: &RuntimeLoopCx) -> RuntimeWaitFailureKind {
+    use crate::outcome::CancelKind;
+
+    match runtime_cx.root_cancel_cause().map(|reason| reason.kind) {
+        Some(CancelKind::Deadline | CancelKind::Timeout) => {
+            RuntimeWaitFailureKind::DeadlineExceeded
+        }
+        Some(CancelKind::PollQuota) => RuntimeWaitFailureKind::PollQuotaExhausted,
+        Some(CancelKind::CostBudget) => RuntimeWaitFailureKind::CostBudgetExhausted,
+        Some(
+            CancelKind::User
+            | CancelKind::FailFast
+            | CancelKind::RaceLost
+            | CancelKind::ParentCancelled
+            | CancelKind::ResourceUnavailable
+            | CancelKind::Shutdown
+            | CancelKind::LinkedExit,
+        ) => RuntimeWaitFailureKind::ContextCancelled,
+        None => RuntimeWaitFailureKind::ContextFailure,
+    }
+}
+
+fn record_runtime_wait_failure(operation: &'static str, failure: RuntimeWaitFailureKind) {
+    let failures_total = increment_saturating_atomic(&RUNTIME_WAIT_FAILURES_TOTAL);
+    warn!(
+        event = "runtime_wait_failed",
+        operation,
+        failure_class = failure.as_str(),
+        failures_total,
+        "runtime wait stopped without exposing backend or cancellation text"
+    );
+}
+
+async fn runtime_sleep(
+    runtime_cx: &RuntimeLoopCx,
+    duration: Duration,
+) -> std::result::Result<(), RuntimeWaitFailureKind> {
+    crate::runtime_async::sleep_with_cx(runtime_cx, duration)
+        .await
+        .map_err(|_| {
+            if runtime_cx.checkpoint().is_err() {
+                runtime_context_failure_kind(runtime_cx)
+            } else {
+                RuntimeWaitFailureKind::TimerFailure
+            }
+        })?;
+    if runtime_cx.checkpoint().is_err() {
+        return Err(runtime_context_failure_kind(runtime_cx));
+    }
+    Ok(())
+}
+
 const SHUTDOWN_AWARE_SLEEP_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+fn runtime_time_elapsed_at_least(
+    now: RuntimeTime,
+    since: RuntimeTime,
+    duration: Duration,
+) -> bool {
+    u128::from(now.duration_since(since)) >= duration.as_nanos()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShutdownAwareSleepOutcome {
+    Elapsed,
+    ShutdownRequested,
+    WaitFailed(RuntimeWaitFailureKind),
+}
 
 async fn runtime_sleep_until_shutdown(
     runtime_cx: &RuntimeLoopCx,
     shutdown_flag: &AtomicBool,
     duration: Duration,
-) -> bool {
-    let started_at = Instant::now();
+) -> ShutdownAwareSleepOutcome {
+    let deadline = crate::runtime_async::timer_now_with_cx(runtime_cx) + duration;
     loop {
         if shutdown_flag.load(Ordering::SeqCst) {
-            return true;
+            return ShutdownAwareSleepOutcome::ShutdownRequested;
         }
 
-        let elapsed = started_at.elapsed();
-        if elapsed >= duration {
-            return false;
+        let now = crate::runtime_async::timer_now_with_cx(runtime_cx);
+        if now >= deadline {
+            return ShutdownAwareSleepOutcome::Elapsed;
         }
 
-        let remaining = duration.saturating_sub(elapsed);
-        runtime_sleep(
+        let remaining = Duration::from_nanos(deadline.duration_since(now));
+        if let Err(failure) = runtime_sleep(
             runtime_cx,
             remaining.min(SHUTDOWN_AWARE_SLEEP_POLL_INTERVAL),
         )
-        .await;
+        .await
+        {
+            return ShutdownAwareSleepOutcome::WaitFailed(failure);
+        }
     }
 }
 
@@ -558,11 +680,32 @@ async fn runtime_timeout<F>(
     runtime_cx: &RuntimeLoopCx,
     duration: Duration,
     future: F,
-) -> std::result::Result<F::Output, String>
+) -> std::result::Result<F::Output, RuntimeTimeoutFailure>
 where
     F: Future,
 {
-    crate::runtime_async::timeout_with_cx(runtime_cx, duration, future).await
+    if runtime_cx.checkpoint().is_err() {
+        return Err(RuntimeTimeoutFailure::Context(
+            runtime_context_failure_kind(runtime_cx),
+        ));
+    }
+
+    match crate::runtime_async::timeout_with_cx(runtime_cx, duration, future).await {
+        Ok(_output) if runtime_cx.checkpoint().is_err() => Err(RuntimeTimeoutFailure::Context(
+            runtime_context_failure_kind(runtime_cx),
+        )),
+        Ok(output) => Ok(output),
+        Err(_) if runtime_cx.checkpoint().is_err() => Err(RuntimeTimeoutFailure::Context(
+            runtime_context_failure_kind(runtime_cx),
+        )),
+        Err(_) => Err(RuntimeTimeoutFailure::Elapsed),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuntimeTimeoutFailure {
+    Elapsed,
+    Context(RuntimeWaitFailureKind),
 }
 
 fn spawn_runtime_task<F, Fut, T>(runtime_cx: &RuntimeLoopCx, task_fn: F) -> JoinHandle<T>
@@ -707,6 +850,57 @@ impl Drop for StreamingTasks {
         for (_pane_id, task) in self.tasks.drain() {
             task.handle.abort();
         }
+    }
+}
+
+/// Owns the native listener's nested accept loop and guarantees that dropping
+/// the outer coalescer future signals the child before its join handle can
+/// detach. Normal shutdown additionally awaits the child; the only
+/// non-acknowledging exit is the finite waker-registration containment failure,
+/// which preserves and re-aborts the handle on guard drop.
+#[cfg(feature = "native-wezterm")]
+struct AbortOnDropNativeAcceptTask {
+    handle: Option<JoinHandle<()>>,
+}
+
+#[cfg(feature = "native-wezterm")]
+impl AbortOnDropNativeAcceptTask {
+    fn new(handle: JoinHandle<()>) -> Self {
+        Self {
+            handle: Some(handle),
+        }
+    }
+
+    fn abort(&self) {
+        if let Some(handle) = &self.handle {
+            handle.abort();
+        }
+    }
+
+    async fn abort_and_settle(
+        &mut self,
+    ) -> std::result::Result<(), crate::runtime_async::task::JoinError> {
+        self.abort();
+        let result = match self.handle.as_mut() {
+            Some(handle) => handle.await,
+            None => return Ok(()),
+        };
+        if !matches!(
+            &result,
+            Err(error)
+                if error.kind()
+                    == crate::runtime_async::task::JoinErrorKind::WakerRegistrationFailed
+        ) {
+            self.handle = None;
+        }
+        result
+    }
+}
+
+#[cfg(feature = "native-wezterm")]
+impl Drop for AbortOnDropNativeAcceptTask {
+    fn drop(&mut self) {
+        self.abort();
     }
 }
 
@@ -1821,7 +2015,17 @@ async fn relay_capture_event_with_cx(
     capture_ring_tx
         .send_with_cx(cx, event)
         .await
-        .map_err(|_| runtime_backend_error("capture.relay", "persistence ring closed"))
+        .map_err(|_| {
+            if cx.checkpoint().is_err() {
+                runtime_cx_error(
+                    "capture.relay",
+                    cx,
+                    "capability context failed while relaying capture",
+                )
+            } else {
+                runtime_backend_error("capture.relay", "persistence ring closed")
+            }
+        })
 }
 
 /// Acquire the complete persistence-side admission before any semantic lookup
@@ -2209,11 +2413,16 @@ async fn emit_capture_generation_resync(
         capture_tx.reserve(cx),
     )
     .await
-    .map_err(|_| {
-        runtime_backend_error(
+    .map_err(|failure| match failure {
+        RuntimeTimeoutFailure::Elapsed => runtime_backend_error(
             "capture.transition.reserve",
             format!("pane {pane_id} capture ingress stayed full"),
-        )
+        ),
+        RuntimeTimeoutFailure::Context(_) => runtime_cx_error(
+            "capture.transition.reserve",
+            cx,
+            "capability context failed while reserving capture ingress",
+        ),
     })?
     .map_err(|error| runtime_backend_error("capture.transition.reserve", error))?;
     let producer_guard = binding.polling_lease.try_acquire_producer(
@@ -2223,17 +2432,35 @@ async fn emit_capture_generation_resync(
     let text = runtime_timeout(
         cx,
         Duration::from_secs(2),
-        source.get_text(pane_id, false),
+        source.get_text_with_cx(cx, pane_id, false),
     )
     .await
-    .map_err(|_| {
-        runtime_backend_error(
+    .map_err(|failure| match failure {
+        RuntimeTimeoutFailure::Elapsed => runtime_backend_error(
             "capture.transition.snapshot",
             format!("pane {pane_id} resync snapshot timed out"),
-        )
+        ),
+        RuntimeTimeoutFailure::Context(_) => runtime_cx_error(
+            "capture.transition.snapshot",
+            cx,
+            "capability context failed while reading resync snapshot",
+        ),
     })??;
     let segment = {
-        let mut cursor_guard = cursors.write().await;
+        let mut cursor_guard = cursors.write_with_cx(cx).await.map_err(|_| {
+            runtime_cx_error(
+                "capture.transition.cursor",
+                cx,
+                "cursor lock acquisition failed during capture resync",
+            )
+        })?;
+        cx.checkpoint().map_err(|_| {
+            runtime_cx_error(
+                "capture.transition.cursor",
+                cx,
+                "capability checkpoint failed before capture resync mutation",
+            )
+        })?;
         let cursor = cursor_guard.get_mut(&pane_id).ok_or_else(|| {
             runtime_backend_error(
                 "capture.transition.cursor",
@@ -3293,7 +3520,13 @@ impl ObservationRuntime {
     /// preserved at every boundary the runtime crosses.
     pub async fn start_with_cx(&mut self, cx: &crate::cx::Cx) -> Result<RuntimeHandle> {
         cx.checkpoint()
-            .map_err(|e| runtime_cancelled_error("runtime.start", e))?;
+            .map_err(|_| {
+                runtime_cx_error(
+                    "runtime.start",
+                    cx,
+                    "capability checkpoint failed before runtime startup",
+                )
+            })?;
         self.start_impl().await
     }
 
@@ -3495,11 +3728,10 @@ impl ObservationRuntime {
         spawn_runtime_task(&loop_cx, move |loop_cx| async move {
             let mut subscriber = event_bus.as_ref().map(|bus| bus.subscribe());
             let idle_enabled = subscriber.is_some();
-            let mut last_activity = Instant::now();
-            let mut last_idle_trigger = Instant::now();
-            let mut last_memory_trigger = Instant::now()
-                .checked_sub(Duration::from_secs(SNAPSHOT_MEMORY_TRIGGER_COOLDOWN_SECS))
-                .unwrap_or_else(Instant::now);
+            let started_at = crate::runtime_async::timer_now_with_cx(&loop_cx);
+            let mut last_activity = started_at;
+            let mut last_idle_trigger = started_at;
+            let mut last_memory_trigger = None;
 
             loop {
                 if shutdown_flag.load(Ordering::SeqCst) {
@@ -3518,27 +3750,46 @@ impl ObservationRuntime {
                         Duration::from_secs(SNAPSHOT_TRIGGER_BRIDGE_TICK_SECS),
                         sub.recv(),
                     )
-                    .await
+                        .await
                     {
                         Ok(recv) => {
+                            if shutdown_flag.load(Ordering::SeqCst) {
+                                break;
+                            }
+                            if loop_cx.checkpoint().is_err() {
+                                record_runtime_wait_failure(
+                                    "snapshot_trigger_bridge_event",
+                                    runtime_context_failure_kind(&loop_cx),
+                                );
+                                break;
+                            }
                             tick_only = false;
                             match recv {
                                 Ok(event) => {
                                     if event_counts_as_activity(&event) {
-                                        last_activity = Instant::now();
+                                        last_activity =
+                                            crate::runtime_async::timer_now_with_cx(&loop_cx);
                                     }
-                                    if let Some(trigger) = snapshot_trigger_from_event(&event)
-                                        && !snapshot_engine.emit_trigger(trigger)
-                                    {
-                                        debug!(
-                                            trigger = ?trigger,
-                                            event_type = event.type_name(),
-                                            "snapshot trigger dropped (queue full or inactive)"
-                                        );
+                                    if let Some(trigger) = snapshot_trigger_from_event(&event) {
+                                        if loop_cx.checkpoint().is_err() {
+                                            record_runtime_wait_failure(
+                                                "snapshot_trigger_bridge_emit",
+                                                runtime_context_failure_kind(&loop_cx),
+                                            );
+                                            break;
+                                        }
+                                        if !snapshot_engine.emit_trigger(trigger) {
+                                            debug!(
+                                                trigger = ?trigger,
+                                                event_type = event.type_name(),
+                                                "snapshot trigger dropped (queue full or inactive)"
+                                            );
+                                        }
                                     }
                                 }
                                 Err(crate::events::RecvError::Lagged { missed_count }) => {
-                                    last_activity = Instant::now();
+                                    last_activity =
+                                        crate::runtime_async::timer_now_with_cx(&loop_cx);
                                     warn!(
                                         missed = missed_count,
                                         "snapshot trigger bridge lagged on event bus"
@@ -3553,14 +3804,36 @@ impl ObservationRuntime {
                                 }
                             }
                         }
-                        Err(_elapsed) => {}
+                        Err(RuntimeTimeoutFailure::Context(failure)) => {
+                            record_runtime_wait_failure(
+                                "snapshot_trigger_bridge_recv",
+                                failure,
+                            );
+                            break;
+                        }
+                        Err(RuntimeTimeoutFailure::Elapsed) => {}
                     }
                 } else {
-                    runtime_sleep(
+                    if let Err(failure) = runtime_sleep(
                         &loop_cx,
                         Duration::from_secs(SNAPSHOT_TRIGGER_BRIDGE_TICK_SECS),
                     )
-                    .await;
+                    .await
+                    {
+                        record_runtime_wait_failure("snapshot_trigger_bridge", failure);
+                        break;
+                    }
+                }
+
+                if shutdown_flag.load(Ordering::SeqCst) {
+                    break;
+                }
+                if loop_cx.checkpoint().is_err() {
+                    record_runtime_wait_failure(
+                        "snapshot_trigger_bridge_tick",
+                        runtime_context_failure_kind(&loop_cx),
+                    );
+                    break;
                 }
 
                 if subscriber_closed {
@@ -3571,18 +3844,31 @@ impl ObservationRuntime {
                     continue;
                 }
 
-                let now = Instant::now();
+                let now = crate::runtime_async::timer_now_with_cx(&loop_cx);
 
                 if idle_enabled
-                    && now.duration_since(last_activity)
-                        >= Duration::from_secs(SNAPSHOT_IDLE_WINDOW_SECS)
-                    && now.duration_since(last_idle_trigger)
-                        >= Duration::from_secs(SNAPSHOT_IDLE_WINDOW_SECS)
+                    && runtime_time_elapsed_at_least(
+                        now,
+                        last_activity,
+                        Duration::from_secs(SNAPSHOT_IDLE_WINDOW_SECS),
+                    )
+                    && runtime_time_elapsed_at_least(
+                        now,
+                        last_idle_trigger,
+                        Duration::from_secs(SNAPSHOT_IDLE_WINDOW_SECS),
+                    )
                 {
                     let observed_panes = {
                         let reg = registry.read().await;
                         reg.observed_pane_ids().len()
                     };
+                    if loop_cx.checkpoint().is_err() {
+                        record_runtime_wait_failure(
+                            "snapshot_trigger_bridge_idle_emit",
+                            runtime_context_failure_kind(&loop_cx),
+                        );
+                        break;
+                    }
                     if observed_panes > 0 {
                         if !snapshot_engine
                             .emit_trigger(crate::snapshot_engine::SnapshotTrigger::IdleWindow)
@@ -3595,15 +3881,27 @@ impl ObservationRuntime {
 
                 let cursor_snapshot_bytes = metrics.cursor_snapshot_bytes_last();
                 if cursor_snapshot_bytes >= CURSOR_SNAPSHOT_MEMORY_WARN_BYTES
-                    && now.duration_since(last_memory_trigger)
-                        >= Duration::from_secs(SNAPSHOT_MEMORY_TRIGGER_COOLDOWN_SECS)
+                    && last_memory_trigger.is_none_or(|last_trigger| {
+                        runtime_time_elapsed_at_least(
+                            now,
+                            last_trigger,
+                            Duration::from_secs(SNAPSHOT_MEMORY_TRIGGER_COOLDOWN_SECS),
+                        )
+                    })
                 {
+                    if loop_cx.checkpoint().is_err() {
+                        record_runtime_wait_failure(
+                            "snapshot_trigger_bridge_memory_emit",
+                            runtime_context_failure_kind(&loop_cx),
+                        );
+                        break;
+                    }
                     if !snapshot_engine
                         .emit_trigger(crate::snapshot_engine::SnapshotTrigger::MemoryPressure)
                     {
                         debug!("snapshot memory-pressure trigger dropped (queue full or inactive)");
                     }
-                    last_memory_trigger = now;
+                    last_memory_trigger = Some(now);
                 }
             }
         })
@@ -3629,6 +3927,13 @@ impl ObservationRuntime {
                 if shutdown_flag.load(Ordering::SeqCst) {
                     break;
                 }
+                if loop_cx.checkpoint().is_err() {
+                    record_runtime_wait_failure(
+                        "connector_outbound_bridge",
+                        runtime_context_failure_kind(&loop_cx),
+                    );
+                    break;
+                }
 
                 match runtime_timeout(
                     &loop_cx,
@@ -3638,9 +3943,29 @@ impl ObservationRuntime {
                 .await
                 {
                     Ok(Ok(event)) => {
+                        if shutdown_flag.load(Ordering::SeqCst) {
+                            break;
+                        }
+                        if loop_cx.checkpoint().is_err() {
+                            record_runtime_wait_failure(
+                                "connector_outbound_bridge_event",
+                                runtime_context_failure_kind(&loop_cx),
+                            );
+                            break;
+                        }
                         let now_ms = epoch_ms_u64();
                         match bridge.lock() {
                             Ok(mut guard) => {
+                                if shutdown_flag.load(Ordering::SeqCst) {
+                                    break;
+                                }
+                                if loop_cx.checkpoint().is_err() {
+                                    record_runtime_wait_failure(
+                                        "connector_outbound_bridge_dispatch",
+                                        runtime_context_failure_kind(&loop_cx),
+                                    );
+                                    break;
+                                }
                                 process_connector_outbound_runtime_event(
                                     &mut guard, &event, now_ms,
                                 );
@@ -3662,7 +3987,14 @@ impl ObservationRuntime {
                         break;
                     }
                     Ok(Err(crate::events::RecvError::Closed)) => break,
-                    Err(_elapsed) => {}
+                    Err(RuntimeTimeoutFailure::Context(failure)) => {
+                        record_runtime_wait_failure(
+                            "connector_outbound_bridge_recv",
+                            failure,
+                        );
+                        break;
+                    }
+                    Err(RuntimeTimeoutFailure::Elapsed) => {}
                 }
             }
         }))
@@ -3741,15 +4073,21 @@ impl ObservationRuntime {
                 None::<FleetCoordinatorMaintenanceState>;
 
             loop {
-                if !first_tick
-                    && runtime_sleep_until_shutdown(
+                if !first_tick {
+                    match runtime_sleep_until_shutdown(
                         &loop_cx,
                         shutdown_flag.as_ref(),
                         maintenance_interval,
                     )
                     .await
-                {
-                    break;
+                    {
+                        ShutdownAwareSleepOutcome::Elapsed => {}
+                        ShutdownAwareSleepOutcome::ShutdownRequested => break,
+                        ShutdownAwareSleepOutcome::WaitFailed(failure) => {
+                            record_runtime_wait_failure("maintenance_interval", failure);
+                            break;
+                        }
+                    }
                 }
                 first_tick = false;
                 heartbeats.record_maintenance();
@@ -4623,31 +4961,41 @@ impl ObservationRuntime {
                 HashMap::<u64, DiscoveryRevision>::new();
             let mut capture_setup_pending = HashMap::<u64, &'static str>::new();
 
-            loop {
+            'discovery: loop {
                 if first_tick {
                     first_tick = false;
                 } else {
                     // Wait for interval, checking shutdown periodically to ensure responsiveness
-                    let deadline = runtime_deadline_after(
-                        Instant::now(),
-                        current_interval,
-                        "discovery interval",
-                    );
+                    let deadline = crate::runtime_async::timer_now_with_cx(&loop_cx)
+                        + current_interval;
                     loop {
                         if shutdown_flag.load(Ordering::SeqCst) {
                             break;
                         }
-                        if Instant::now() >= deadline {
+                        let now = crate::runtime_async::timer_now_with_cx(&loop_cx);
+                        if now >= deadline {
                             break;
                         }
                         // Sleep in short bursts to remain responsive to shutdown signals
-                        runtime_sleep(&loop_cx, Duration::from_millis(100)).await;
+                        let remaining = Duration::from_nanos(deadline.duration_since(now));
+                        if let Err(failure) = runtime_sleep(
+                            &loop_cx,
+                            remaining.min(Duration::from_millis(100)),
+                        )
+                        .await
+                        {
+                            record_runtime_wait_failure("discovery_interval", failure);
+                            break 'discovery;
+                        }
                     }
                 }
 
                 // Check shutdown flag
                 if shutdown_flag.load(Ordering::SeqCst) {
                     debug!("Discovery task: shutdown signal received");
+                    break;
+                }
+                if loop_cx.checkpoint().is_err() {
                     break;
                 }
 
@@ -6262,18 +6610,27 @@ impl ObservationRuntime {
                                         true
                                 });
                                 if !installed {
-                                    if let Ok(revocation) = capture_authority
+                                    let cleanup = match capture_authority
                                         .begin_source_revocation(
                                             binding_identity,
                                             streaming_lease.stamp(),
                                         )
                                     {
-                                        let _ = revocation
+                                        Ok(revocation) => revocation
                                             .wait_with_cx(
                                                 &loop_cx,
                                                 CAPTURE_AUTHORITY_DRAIN_TIMEOUT,
                                             )
-                                            .await;
+                                            .await,
+                                        Err(error) => Err(error),
+                                    };
+                                    if let Err(error) = cleanup {
+                                        error!(
+                                            pane_id,
+                                            capture_stamp = ?streaming_lease.stamp(),
+                                            error = %error,
+                                            "Uninstalled stream authority revocation did not drain; capture remains fail-closed"
+                                        );
                                     }
                                     error!(
                                         pane_id,
@@ -6487,15 +6844,32 @@ impl ObservationRuntime {
                 }
 
                 if !poll_tasks.is_empty() {
-                    if let Ok(Some((pane_id, outcome))) =
-                        runtime_timeout(&loop_cx, wait_duration, poll_tasks.join_next()).await
-                    {
-                        supervisor.handle_poll_result(pane_id, outcome);
+                    match runtime_timeout(&loop_cx, wait_duration, poll_tasks.join_next()).await {
+                        Ok(Some((pane_id, outcome))) => {
+                            supervisor.handle_poll_result(pane_id, outcome);
+                        }
+                        Ok(None) => {}
+                        Err(RuntimeTimeoutFailure::Context(failure)) => {
+                            record_runtime_wait_failure("capture_poll_wait", failure);
+                            break;
+                        }
+                        // The bounded wait expiring is the normal scheduler
+                        // wakeup: keep the in-flight poll futures owned and
+                        // let the next loop iteration run sync/spawn work.
+                        Err(RuntimeTimeoutFailure::Elapsed) => continue,
                     }
-                } else {
-                    runtime_sleep(&loop_cx, wait_duration).await;
+                } else if let Err(failure) = runtime_sleep(&loop_cx, wait_duration).await {
+                    record_runtime_wait_failure("capture_scheduler_wait", failure);
+                    break;
                 }
             }
+
+            // TailerPollTaskSet owns futures directly rather than detached
+            // executor tasks. Drop it before supervisor shutdown so every
+            // pending poll future is synchronously cancelled and releases its
+            // producer/semaphore guards; retaining the set across shutdown can
+            // otherwise make the supervisor wait on work it no longer polls.
+            drop(poll_tasks);
 
             #[cfg(all(feature = "vendored", unix))]
             for (_pane_id, task) in streaming_tasks.drain() {
@@ -6524,13 +6898,29 @@ impl ObservationRuntime {
 
         let loop_cx = runtime_loop_cx();
         spawn_runtime_task(&loop_cx, move |loop_cx| async move {
-            let listener = match NativeEventListener::bind(socket_path.clone()).await {
+            let listener = match NativeEventListener::bind_with_cx(&loop_cx, socket_path.clone())
+                .await
+            {
                 Ok(listener) => {
+                    if loop_cx.checkpoint().is_err() {
+                        record_runtime_wait_failure(
+                            "native_event_bind",
+                            runtime_context_failure_kind(&loop_cx),
+                        );
+                        return;
+                    }
                     info!(
                         path = %socket_path.display(),
                         "Native event listener bound — waiting for GUI connections"
                     );
                     listener
+                }
+                Err(_) if loop_cx.checkpoint().is_err() => {
+                    record_runtime_wait_failure(
+                        "native_event_bind",
+                        runtime_context_failure_kind(&loop_cx),
+                    );
+                    return;
                 }
                 Err(err) => {
                     warn!(
@@ -6545,29 +6935,54 @@ impl ObservationRuntime {
             let (event_tx, mut event_rx) = mpsc::channel::<NativeEvent>(1024);
 
             let accept_shutdown_flag = Arc::clone(&shutdown_flag);
-            let accept_handle = spawn_runtime_task(&loop_cx, move |_accept_cx| {
-                listener.run(event_tx, accept_shutdown_flag)
-            });
+            let mut accept_task = AbortOnDropNativeAcceptTask::new(spawn_runtime_task(
+                &loop_cx,
+                move |accept_cx| async move {
+                    listener
+                        .run_with_cx(&accept_cx, event_tx, accept_shutdown_flag)
+                        .await;
+                },
+            ));
 
             let mut coalescer = NativeOutputCoalescer::new(
                 NATIVE_OUTPUT_COALESCE_WINDOW_MS,
                 NATIVE_OUTPUT_COALESCE_MAX_DELAY_MS,
                 NATIVE_OUTPUT_COALESCE_MAX_BYTES,
             );
-            let start = Instant::now();
+            // Keep coalescing deadlines in the same clock domain as the Cx
+            // timer used by runtime_timeout. Mixing std::Instant with a lab
+            // timer can turn an elapsed virtual timeout into a wall-clock spin.
+            let start = crate::runtime_async::timer_now_with_cx(&loop_cx);
             let flush_interval = Duration::from_millis(NATIVE_OUTPUT_COALESCE_WINDOW_MS / 2)
                 .max(Duration::from_millis(5));
-            let mut next_flush =
-                runtime_deadline_after(Instant::now(), flush_interval, "native output flush");
+            let mut next_flush = start + flush_interval;
+            let mut drain_pending_output_on_shutdown = false;
+            let mut graceful_shutdown_requested = false;
 
-            loop {
-                let now = Instant::now();
+            'native_events: loop {
+                if loop_cx.checkpoint().is_err() {
+                    break;
+                }
+                if shutdown_flag.load(Ordering::SeqCst) && !graceful_shutdown_requested {
+                    // Stop the producer first, then continue receiving until
+                    // its sender closes. This drains every event admitted
+                    // before graceful shutdown instead of flushing only the
+                    // subset already present in the coalescer.
+                    graceful_shutdown_requested = true;
+                    drain_pending_output_on_shutdown = true;
+                    accept_task.abort();
+                }
+                let now = crate::runtime_async::timer_now_with_cx(&loop_cx);
                 if now >= next_flush {
-                    next_flush = runtime_deadline_after(now, flush_interval, "native output flush");
-                    let now_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+                    next_flush = now + flush_interval;
+                    let now_ms = now.duration_since(start) / 1_000_000;
                     for item in coalescer.drain_due(now_ms) {
+                        if loop_cx.checkpoint().is_err() {
+                            break 'native_events;
+                        }
                         metrics.record_native_output_batch(item.input_events, item.bytes.len());
                         emit_native_output_delta(
+                            &loop_cx,
                             item.pane_id,
                             item.bytes,
                             item.timestamp_ms,
@@ -6579,18 +6994,15 @@ impl ObservationRuntime {
                         .await;
                     }
 
-                    if shutdown_flag.load(Ordering::SeqCst) {
-                        break;
-                    }
                     continue;
                 }
 
-                let flush_wait = next_flush.saturating_duration_since(now);
+                let flush_wait = Duration::from_nanos(next_flush.duration_since(now));
                 match runtime_timeout(&loop_cx, flush_wait, recv_event(&loop_cx, &mut event_rx))
                     .await
                 {
                     Ok(RecvEvent::Item(event)) => {
-                        if shutdown_flag.load(Ordering::SeqCst) {
+                        if loop_cx.checkpoint().is_err() {
                             break;
                         }
 
@@ -6611,7 +7023,11 @@ impl ObservationRuntime {
                                 metrics.record_native_output_input(data.len());
                                 if data.is_empty() {
                                     if dropped_bytes > 0 {
+                                        if loop_cx.checkpoint().is_err() {
+                                            break 'native_events;
+                                        }
                                         emit_native_output_gap(
+                                            &loop_cx,
                                             pane_id,
                                             &crate::native_events::native_output_truncation_gap_reason(
                                                 dropped_bytes,
@@ -6624,8 +7040,9 @@ impl ObservationRuntime {
                                     }
                                     continue;
                                 }
-                                let now_ms =
-                                    u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+                                let now_ms = crate::runtime_async::timer_now_with_cx(&loop_cx)
+                                    .duration_since(start)
+                                    / 1_000_000;
                                 if let Some(item) =
                                     coalescer.push(
                                         pane_id,
@@ -6635,11 +7052,15 @@ impl ObservationRuntime {
                                         producer_guard,
                                     )
                                 {
+                                    if loop_cx.checkpoint().is_err() {
+                                        break 'native_events;
+                                    }
                                     metrics.record_native_output_batch(
                                         item.input_events,
                                         item.bytes.len(),
                                     );
                                     emit_native_output_delta(
+                                        &loop_cx,
                                         item.pane_id,
                                         item.bytes,
                                         item.timestamp_ms,
@@ -6659,11 +7080,15 @@ impl ObservationRuntime {
                                     // holed stream as complete (mirrors the capture-
                                     // tiering explicit_gap invariant).
                                     if let Some(item) = coalescer.flush_pane(pane_id) {
+                                        if loop_cx.checkpoint().is_err() {
+                                            break 'native_events;
+                                        }
                                         metrics.record_native_output_batch(
                                             item.input_events,
                                             item.bytes.len(),
                                         );
                                         emit_native_output_delta(
+                                            &loop_cx,
                                             item.pane_id,
                                             item.bytes,
                                             item.timestamp_ms,
@@ -6673,7 +7098,11 @@ impl ObservationRuntime {
                                             &item.producer_guard,
                                         )
                                         .await;
+                                        if loop_cx.checkpoint().is_err() {
+                                            break 'native_events;
+                                        }
                                         emit_native_output_gap(
+                                            &loop_cx,
                                             pane_id,
                                             &crate::native_events::native_output_truncation_gap_reason(
                                                 dropped_bytes,
@@ -6689,11 +7118,15 @@ impl ObservationRuntime {
                             NativeEvent::StateChange { pane_id, .. }
                             | NativeEvent::PaneDestroyed { pane_id, .. } => {
                                 if let Some(item) = coalescer.flush_pane(pane_id) {
+                                    if loop_cx.checkpoint().is_err() {
+                                        break 'native_events;
+                                    }
                                     metrics.record_native_output_batch(
                                         item.input_events,
                                         item.bytes.len(),
                                     );
                                     emit_native_output_delta(
+                                        &loop_cx,
                                         item.pane_id,
                                         item.bytes,
                                         item.timestamp_ms,
@@ -6705,6 +7138,9 @@ impl ObservationRuntime {
                                     .await;
                                 }
 
+                                if loop_cx.checkpoint().is_err() {
+                                    break 'native_events;
+                                }
                                 handle_native_event(
                                     &loop_cx,
                                     event,
@@ -6720,6 +7156,9 @@ impl ObservationRuntime {
                                 .await;
                             }
                             _ => {
+                                if loop_cx.checkpoint().is_err() {
+                                    break 'native_events;
+                                }
                                 handle_native_event(
                                     &loop_cx,
                                     event,
@@ -6736,32 +7175,55 @@ impl ObservationRuntime {
                             }
                         }
                     }
-                    Ok(RecvEvent::Closed) => break,
+                    Ok(RecvEvent::Closed) => {
+                        // Producer completion is a clean terminal boundary;
+                        // preserve already-coalesced bytes before exit.
+                        drain_pending_output_on_shutdown = true;
+                        break;
+                    }
                     Ok(RecvEvent::Cancelled) => {
                         debug!("Native event coalescer recv cancelled");
                         break;
                     }
-                    Err(_elapsed) => {
+                    Err(RuntimeTimeoutFailure::Context(failure)) => {
+                        record_runtime_wait_failure("native_event_recv", failure);
+                        break;
+                    }
+                    Err(RuntimeTimeoutFailure::Elapsed) => {
                         // Timer elapsed; next loop iteration drains due batches.
                     }
                 }
             }
 
-            for item in coalescer.drain_all() {
-                metrics.record_native_output_batch(item.input_events, item.bytes.len());
-                emit_native_output_delta(
-                    item.pane_id,
-                    item.bytes,
-                    item.timestamp_ms,
-                    &capture_tx,
-                    &cursors,
-                    metrics.backpressure_metrics(),
-                    &item.producer_guard,
-                )
-                .await;
+            // A graceful shutdown deliberately flushes already-admitted output.
+            // Direct Cx cancellation is different: it forbids new output side
+            // effects, so dropping the coalescer releases pending guards/data.
+            if drain_pending_output_on_shutdown {
+                for item in coalescer.drain_all() {
+                    if loop_cx.checkpoint().is_err() {
+                        break;
+                    }
+                    metrics.record_native_output_batch(item.input_events, item.bytes.len());
+                    emit_native_output_delta(
+                        &loop_cx,
+                        item.pane_id,
+                        item.bytes,
+                        item.timestamp_ms,
+                        &capture_tx,
+                        &cursors,
+                        metrics.backpressure_metrics(),
+                        &item.producer_guard,
+                    )
+                    .await;
+                }
             }
 
-            let _ = accept_handle.await;
+            if let Err(error) = accept_task.abort_and_settle().await {
+                warn!(
+                    failure_class = ?error.kind(),
+                    "Native event listener did not settle successfully"
+                );
+            }
         })
     }
 
@@ -6780,6 +7242,12 @@ impl ObservationRuntime {
         let loop_cx = runtime_loop_cx();
         spawn_runtime_task(&loop_cx, move |loop_cx| async move {
             loop {
+                // Graceful shutdown intentionally drains already-admitted
+                // ingress below. Direct capability cancellation does not: it
+                // must stop before the next persistence-side mutation.
+                if loop_cx.checkpoint().is_err() {
+                    break;
+                }
                 record_capture_pipeline_depth(&metrics, &capture_ingress_rx, &capture_ring_tx, 0);
                 match runtime_timeout(
                     &loop_cx,
@@ -6789,6 +7257,9 @@ impl ObservationRuntime {
                 .await
                 {
                     Ok(RecvEvent::Item(event)) => {
+                        if loop_cx.checkpoint().is_err() {
+                            break;
+                        }
                         record_capture_pipeline_depth(
                             &metrics,
                             &capture_ingress_rx,
@@ -6802,12 +7273,18 @@ impl ObservationRuntime {
                         }
 
                         // ft-xbnl0.2.3 tick 267: cx-first capture relay enqueue.
-                        if relay_capture_event_with_cx(&loop_cx, &capture_ring_tx, event)
-                            .await
-                            .is_err()
+                        // `SpscProducer::send_with_cx` performs another
+                        // checkpoint immediately before the queue push, closing
+                        // the final race between this boundary and mutation.
+                        if let Err(error) =
+                            relay_capture_event_with_cx(&loop_cx, &capture_ring_tx, event).await
                         {
                             metrics.record_capture_queue_depth(0);
-                            debug!("Capture relay: persistence ring closed");
+                            if is_runtime_cancellation(&error) {
+                                debug!("Capture relay: capability context cancelled");
+                            } else {
+                                debug!("Capture relay: persistence ring closed");
+                            }
                             return;
                         }
                         record_capture_pipeline_depth(
@@ -6822,7 +7299,11 @@ impl ObservationRuntime {
                         debug!("Capture relay recv cancelled");
                         break;
                     }
-                    Err(_elapsed) => {
+                    Err(RuntimeTimeoutFailure::Context(failure)) => {
+                        record_runtime_wait_failure("capture_relay_recv", failure);
+                        break;
+                    }
+                    Err(RuntimeTimeoutFailure::Elapsed) => {
                         if shutdown_flag.load(Ordering::SeqCst) && capture_ingress_rx.is_empty() {
                             break;
                         }
@@ -7283,16 +7764,9 @@ async fn handle_native_event(
     capture_authority: &CaptureAuthority,
     metrics: &RuntimeMetrics,
 ) {
-    let pane_id = match &event {
-        NativeEvent::PaneOutput { pane_id, .. }
-        | NativeEvent::StateChange { pane_id, .. }
-        | NativeEvent::UserVarChanged { pane_id, .. }
-        | NativeEvent::PaneCreated { pane_id, .. }
-        | NativeEvent::PaneDestroyed { pane_id, .. } => *pane_id,
-    };
-    let Some(producer_guard) = acquire_native_producer(capture_authority, metrics, pane_id) else {
+    if runtime_cx.checkpoint().is_err() {
         return;
-    };
+    }
     match event {
         NativeEvent::PaneOutput {
             pane_id,
@@ -7300,7 +7774,13 @@ async fn handle_native_event(
             timestamp_ms,
             dropped_bytes,
         } => {
+            let Some(producer_guard) =
+                acquire_native_producer(capture_authority, metrics, pane_id)
+            else {
+                return;
+            };
             emit_native_output_delta(
+                runtime_cx,
                 pane_id,
                 data,
                 timestamp_ms,
@@ -7314,6 +7794,7 @@ async fn handle_native_event(
                 // ft-wtd5g: mirror the main loop — a truncated frame must leave
                 // an explicit capture gap so replay records the loss.
                 emit_native_output_gap(
+                    runtime_cx,
                     pane_id,
                     &crate::native_events::native_output_truncation_gap_reason(dropped_bytes),
                     capture_tx,
@@ -7324,9 +7805,30 @@ async fn handle_native_event(
             }
         }
         NativeEvent::StateChange { pane_id, state, .. } => {
+            let Some(producer_guard) =
+                acquire_native_producer(capture_authority, metrics, pane_id)
+            else {
+                return;
+            };
             let mut gap_segment = None;
             {
-                let mut cursors_guard = cursors.write().await;
+                let mut cursors_guard = match cursors.write_with_cx(runtime_cx).await {
+                    Ok(guard) => guard,
+                    Err(_) => {
+                        record_runtime_wait_failure(
+                            "native_state_change_cursor_lock",
+                            if runtime_cx.checkpoint().is_err() {
+                                runtime_context_failure_kind(runtime_cx)
+                            } else {
+                                RuntimeWaitFailureKind::ContextFailure
+                            },
+                        );
+                        return;
+                    }
+                };
+                if runtime_cx.checkpoint().is_err() {
+                    return;
+                }
                 if let Some(cursor) = cursors_guard.get_mut(&pane_id) {
                     if cursor.in_alt_screen != state.is_alt_screen {
                         let reason = if state.is_alt_screen {
@@ -7370,6 +7872,9 @@ async fn handle_native_event(
             if let Some(bus) = event_bus {
                 match UserVarPayload::decode(&value, true) {
                     Ok(payload) => {
+                        if runtime_cx.checkpoint().is_err() {
+                            return;
+                        }
                         let event = Event::UserVarReceived {
                             pane_id,
                             name,
@@ -7414,6 +7919,9 @@ async fn handle_native_event(
             }
         }
         NativeEvent::PaneDestroyed { pane_id, .. } => {
+            if runtime_cx.checkpoint().is_err() {
+                return;
+            }
             // Native lifecycle frames do not own cursor/context teardown.
             // Discovery first withdraws the pane from capture publication;
             // capture reconciliation removes semantic runtime state only after
@@ -7442,6 +7950,7 @@ async fn handle_native_event(
 
 #[cfg(feature = "native-wezterm")]
 async fn emit_native_output_delta(
+    runtime_cx: &RuntimeLoopCx,
     pane_id: u64,
     data: Vec<u8>,
     timestamp_ms: i64,
@@ -7450,13 +7959,29 @@ async fn emit_native_output_delta(
     backpressure: &Arc<BackpressureMetrics>,
     producer_guard: &CaptureProducerGuard,
 ) {
-    if data.is_empty() {
+    if data.is_empty() || runtime_cx.checkpoint().is_err() {
         return;
     }
 
     let content = String::from_utf8_lossy(&data).to_string();
     let segment = {
-        let mut cursors_guard = cursors.write().await;
+        let mut cursors_guard = match cursors.write_with_cx(runtime_cx).await {
+            Ok(guard) => guard,
+            Err(_) => {
+                record_runtime_wait_failure(
+                    "native_output_cursor_lock",
+                    if runtime_cx.checkpoint().is_err() {
+                        runtime_context_failure_kind(runtime_cx)
+                    } else {
+                        RuntimeWaitFailureKind::ContextFailure
+                    },
+                );
+                return;
+            }
+        };
+        if runtime_cx.checkpoint().is_err() {
+            return;
+        }
         cursors_guard
             .get_mut(&pane_id)
             .map(|cursor| cursor.capture_delta(content, timestamp_ms))
@@ -7495,14 +8020,34 @@ async fn emit_native_output_delta(
 /// still surfaced by the upstream `dropped_bytes` accounting.
 #[cfg(feature = "native-wezterm")]
 async fn emit_native_output_gap(
+    runtime_cx: &RuntimeLoopCx,
     pane_id: u64,
     reason: &str,
     capture_tx: &mpsc::Sender<CaptureEvent>,
     cursors: &Arc<RwLock<HashMap<u64, PaneCursor>>>,
     producer_guard: &CaptureProducerGuard,
 ) {
+    if runtime_cx.checkpoint().is_err() {
+        return;
+    }
     let gap = {
-        let mut cursors_guard = cursors.write().await;
+        let mut cursors_guard = match cursors.write_with_cx(runtime_cx).await {
+            Ok(guard) => guard,
+            Err(_) => {
+                record_runtime_wait_failure(
+                    "native_output_gap_cursor_lock",
+                    if runtime_cx.checkpoint().is_err() {
+                        runtime_context_failure_kind(runtime_cx)
+                    } else {
+                        RuntimeWaitFailureKind::ContextFailure
+                    },
+                );
+                return;
+            }
+        };
+        if runtime_cx.checkpoint().is_err() {
+            return;
+        }
         cursors_guard
             .get_mut(&pane_id)
             .map(|cursor| cursor.emit_gap(reason))
@@ -8293,10 +8838,12 @@ async fn collect_pane_tiered_scrollback_summaries(
     wezterm_handle: &WeztermHandle,
     pane_ids: &[u64],
 ) -> Result<PaneTieredScrollbackFetch> {
-    runtime_cx.checkpoint().map_err(|error| {
-        crate::Error::Cancelled(format!(
-            "tiered scrollback collection cancelled before dispatch: {error}"
-        ))
+    runtime_cx.checkpoint().map_err(|_| {
+        runtime_cx_error(
+            "tiered scrollback collection",
+            runtime_cx,
+            "capability checkpoint failed before dispatch",
+        )
     })?;
     let mut fetch = PaneTieredScrollbackFetch::default();
     let mut remaining = pane_ids.iter().copied();
@@ -8322,10 +8869,12 @@ async fn collect_pane_tiered_scrollback_summaries(
             Err(error) if is_runtime_cancellation(&error) => return Err(error),
             result => record_pane_tiered_scrollback_summary_result(&mut fetch, pane_id, result),
         }
-        runtime_cx.checkpoint().map_err(|error| {
-            crate::Error::Cancelled(format!(
-                "tiered scrollback collection cancelled after pane {pane_id}: {error}"
-            ))
+        runtime_cx.checkpoint().map_err(|_| {
+            runtime_cx_error(
+                "tiered scrollback collection",
+                runtime_cx,
+                "capability checkpoint failed after pane summary",
+            )
         })?;
         if let Some(next_pane_id) = remaining.next() {
             pending.push(probe(next_pane_id));
@@ -8627,8 +9176,10 @@ impl RuntimeHandle {
     }
 
     /// ft-e87u6.13 Cx-first sibling of [`Self::shutdown_with_timeout`].
-    /// Pre-flight checkpoint only; once bounded shutdown begins, joins and
-    /// storage flushes use their own timeout budget and must run to completion.
+    /// The caller checkpoint is deliberately observational rather than a gate:
+    /// once cleanup is requested, an already-cancelled caller must not prevent
+    /// bounded joins and storage flushes. Each cleanup phase therefore uses a
+    /// fresh, independently bounded context.
     pub async fn shutdown_with_timeout_with_cx(
         self,
         cx: &crate::cx::Cx,
@@ -8644,11 +9195,12 @@ impl RuntimeHandle {
     /// paths. A stubborn background task can make the returned summary
     /// unclean, but it must not hold operator shutdown forever.
     ///
-    /// `shutdown_timeout` bounds *both* the task-join phase and the
-    /// subsequent storage flush. A stubborn writer task that misses the
-    /// join window — and is therefore still running concurrently with the
-    /// flush — cannot wedge the flush either: each phase has its own
-    /// independent timeout budget of `shutdown_timeout`.
+    /// `shutdown_timeout` independently bounds the graceful task-join phase,
+    /// the forced-cancellation settlement phase (when needed), the final
+    /// cursor snapshot, and the subsequent storage flush. A stubborn writer
+    /// task that misses both join windows — and is therefore still running
+    /// concurrently with the flush — cannot wedge the flush either. Total
+    /// shutdown latency may therefore span multiple timeout budgets.
     pub async fn shutdown_with_timeout(self, shutdown_timeout: Duration) -> ShutdownSummary {
         let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
         self.shutdown_with_timeout_with_cx(&cx, shutdown_timeout)
@@ -8672,63 +9224,173 @@ impl RuntimeHandle {
         }
         info!("Shutdown signal sent");
 
-        // Wait for tasks with timeout. Each `.take()` moves a handle into the
-        // timed future. If the timeout wins, dropping that future also drops
-        // every remaining handle; the fields are already `None`, so
-        // `RuntimeHandle::drop` cannot abort them. More importantly, dropping
-        // the runtime_async join wrapper does not stop its underlying task, so
-        // a timed-out task may remain detached until its body cooperatively
-        // observes shutdown. Bead ft-interactive-systems-performance-4tenz.31
-        // owns the deeper cancellation redesign.
-        let discovery = self.discovery.take();
-        let capture = self.capture.take();
-        let relay = self.relay.take();
-        let native_events = self.native_events.take();
-        let persistence = self.persistence.take();
-        let maintenance = self.maintenance.take();
-        let connector_outbound = self.connector_outbound.take();
-        let snapshot = self.snapshot.take();
-        let snapshot_triggers = self.snapshot_triggers.take();
+        // Keep every handle in an owning Option outside the timed join future.
+        // Completed handles are awaited even when `is_finished()` was already
+        // true, so task panic/abort is observed rather than silently reported
+        // as a clean shutdown. A timeout leaves the current Option intact for
+        // real Abortable cancellation plus a second bounded settlement phase.
+        let mut task_handles = Vec::new();
+        for handle in [
+            self.discovery.take(),
+            self.capture.take(),
+            self.relay.take(),
+            self.native_events.take(),
+            self.persistence.take(),
+            self.maintenance.take(),
+            self.connector_outbound.take(),
+            self.snapshot.take(),
+            self.snapshot_triggers.take(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            task_handles.push(Some(handle));
+        }
         // Shutdown phases must never inherit an already-cancelled ambient Cx:
         // each phase gets a fresh context and its own bounded timeout.
+        let mut graceful_join_failures = 0_usize;
+        let mut graceful_join_unacknowledged = 0_usize;
         let join_cx = crate::cx::for_request();
         let join_result = runtime_timeout(&join_cx, shutdown_timeout, async {
-            if let Some(h) = discovery {
-                let _ = h.await;
-            }
-            if let Some(h) = capture {
-                let _ = h.await;
-            }
-            if let Some(h) = relay {
-                let _ = h.await;
-            }
-            if let Some(h) = native_events {
-                let _ = h.await;
-            }
-            if let Some(h) = persistence {
-                let _ = h.await;
-            }
-            if let Some(h) = maintenance {
-                let _ = h.await;
-            }
-            if let Some(h) = connector_outbound {
-                let _ = h.await;
-            }
-            if let Some(h) = snapshot {
-                let _ = h.await;
-            }
-            if let Some(h) = snapshot_triggers {
-                let _ = h.await;
+            for slot in &mut task_handles {
+                let retain_for_settlement = {
+                    let Some(handle) = slot.as_mut() else {
+                        continue;
+                    };
+                    match handle.await {
+                        Ok(()) => false,
+                        Err(error)
+                            if error.kind()
+                                == crate::runtime_async::task::JoinErrorKind::WakerRegistrationFailed =>
+                        {
+                            graceful_join_failures = graceful_join_failures.saturating_add(1);
+                            graceful_join_unacknowledged =
+                                graceful_join_unacknowledged.saturating_add(1);
+                            // The join boundary already signalled abort on this
+                            // class, but retain authority for a second poll that
+                            // can acknowledge terminal task destruction.
+                            handle.abort();
+                            true
+                        }
+                        Err(_) => {
+                            graceful_join_failures = graceful_join_failures.saturating_add(1);
+                            false
+                        }
+                    }
+                };
+                if !retain_for_settlement {
+                    *slot = None;
+                }
             }
         })
         .await;
 
-        if join_result.is_err() {
-            warnings.push(
-                "Tasks did not complete within timeout; underlying tasks may remain detached"
-                    .to_string(),
-            );
+        if graceful_join_failures > 0 {
             clean = false;
+            warnings.push(format!(
+                "{graceful_join_failures} top-level runtime task(s) failed during graceful shutdown"
+            ));
+        }
+
+        let (graceful_timed_out, graceful_wait_failure) = match join_result {
+            Ok(()) => (false, None),
+            Err(RuntimeTimeoutFailure::Elapsed) => (true, None),
+            Err(RuntimeTimeoutFailure::Context(failure)) => {
+                record_runtime_wait_failure("runtime_shutdown_graceful_join", failure);
+                (false, Some(failure))
+            }
+        };
+        let graceful_has_unsettled_handles = task_handles.iter().any(Option::is_some);
+        if graceful_timed_out
+            || graceful_wait_failure.is_some()
+            || graceful_has_unsettled_handles
+        {
+            clean = false;
+            for handle in task_handles.iter().filter_map(Option::as_ref) {
+                handle.abort();
+            }
+
+            let cancellation_cx = crate::cx::for_request();
+            let mut cancellation_unacknowledged = 0_usize;
+            let cancellation_result = runtime_timeout(&cancellation_cx, shutdown_timeout, async {
+                for slot in &mut task_handles {
+                    let retain_for_settlement = {
+                        let Some(handle) = slot.as_mut() else {
+                            continue;
+                        };
+                        match handle.await {
+                            Err(error)
+                                if error.kind()
+                                    == crate::runtime_async::task::JoinErrorKind::WakerRegistrationFailed =>
+                            {
+                                cancellation_unacknowledged =
+                                    cancellation_unacknowledged.saturating_add(1);
+                                handle.abort();
+                                true
+                            }
+                            Ok(()) | Err(_) => false,
+                        }
+                    };
+                    if !retain_for_settlement {
+                        *slot = None;
+                    }
+                }
+            })
+            .await;
+            let cancellation_wait_failure = match cancellation_result {
+                Ok(()) => None,
+                Err(RuntimeTimeoutFailure::Elapsed) => Some(RuntimeTimeoutFailure::Elapsed),
+                Err(RuntimeTimeoutFailure::Context(failure)) => {
+                    record_runtime_wait_failure("runtime_shutdown_cancellation_join", failure);
+                    Some(RuntimeTimeoutFailure::Context(failure))
+                }
+            };
+            let cancellation_settled = cancellation_wait_failure.is_none()
+                && cancellation_unacknowledged == 0
+                && task_handles.iter().all(Option::is_none);
+
+            if cancellation_settled && graceful_timed_out {
+                warnings.push(
+                    "Tasks exceeded graceful shutdown timeout; every retained top-level task acknowledged cancellation, but independently delegated nested or blocking work is not proven stopped"
+                        .to_string(),
+                );
+            } else if cancellation_settled
+                && let Some(failure) = graceful_wait_failure
+            {
+                warnings.push(format!(
+                    "Graceful task-join wait failed with class {}; every retained top-level task subsequently acknowledged cancellation, but independently delegated nested or blocking work is not proven stopped",
+                    failure.as_str()
+                ));
+            } else if cancellation_settled {
+                warnings.push(
+                    "A top-level join could not initially acknowledge completion; retained cancellation authority subsequently settled every top-level task, but independently delegated nested or blocking work is not proven stopped"
+                        .to_string(),
+                );
+            } else if let Some(RuntimeTimeoutFailure::Context(failure)) =
+                cancellation_wait_failure
+            {
+                warnings.push(format!(
+                    "Cancellation settlement wait failed with class {}; terminal acknowledgement remained incomplete, so orphan risk remains",
+                    failure.as_str()
+                ));
+            } else if matches!(
+                cancellation_wait_failure,
+                Some(RuntimeTimeoutFailure::Elapsed)
+            ) {
+                warnings.push(
+                    "Cancellation settlement exceeded its timeout; terminal acknowledgement remained incomplete, so orphan risk remains"
+                        .to_string(),
+                );
+            } else if graceful_join_unacknowledged > 0 {
+                warnings.push(format!(
+                    "Cancellation was requested after {graceful_join_unacknowledged} top-level join acknowledgement failure(s), but bounded terminal settlement remained incomplete; orphan risk remains"
+                ));
+            } else {
+                warnings.push(
+                    "Tasks exceeded graceful shutdown timeout; cancellation was requested but terminal acknowledgement also timed out, so orphan risk remains"
+                        .to_string(),
+                );
+            }
         }
 
         // Get final metrics
@@ -8751,13 +9413,22 @@ impl RuntimeHandle {
         .await
         {
             Ok(Ok(snapshot)) => snapshot,
-            Ok(Err(error)) => {
-                warnings.push(format!("Final cursor snapshot failed: {error}"));
+            Ok(Err(_)) => {
+                warnings.push("Final cursor snapshot failed".to_string());
                 clean = false;
                 Vec::new()
             }
-            Err(_) => {
+            Err(RuntimeTimeoutFailure::Elapsed) => {
                 warnings.push("Final cursor snapshot did not complete within timeout".to_string());
+                clean = false;
+                Vec::new()
+            }
+            Err(RuntimeTimeoutFailure::Context(failure)) => {
+                record_runtime_wait_failure("runtime_shutdown_cursor_snapshot", failure);
+                warnings.push(format!(
+                    "Final cursor snapshot wait failed with class {}",
+                    failure.as_str()
+                ));
                 clean = false;
                 Vec::new()
             }
@@ -8780,12 +9451,20 @@ impl RuntimeHandle {
         .await;
         match flush_result {
             Ok(Ok(())) => {}
-            Ok(Err(e)) => {
-                warnings.push(format!("Storage shutdown error: {e}"));
+            Ok(Err(_)) => {
+                warnings.push("Storage shutdown failed".to_string());
                 clean = false;
             }
-            Err(_) => {
+            Err(RuntimeTimeoutFailure::Elapsed) => {
                 warnings.push("Storage flush did not complete within timeout".to_string());
+                clean = false;
+            }
+            Err(RuntimeTimeoutFailure::Context(failure)) => {
+                record_runtime_wait_failure("runtime_shutdown_storage_flush", failure);
+                warnings.push(format!(
+                    "Storage flush wait failed with class {}",
+                    failure.as_str()
+                ));
                 clean = false;
             }
         }
@@ -9079,10 +9758,10 @@ impl Drop for RuntimeHandle {
     ///     still polling it observes cancellation on its next tick.
     ///   - Send the snapshot-shutdown wake-up so the snapshot task
     ///     breaks out of any pending `watch` / `select` wait.
-    ///   - Call `JoinHandle::abort` on every wrapper handle so a subsequent
-    ///     poll of that wrapper observes `JoinError`. The current wrapper cannot
-    ///     cancel the underlying asupersync task; dropping it may detach that
-    ///     task, which must observe the shared shutdown signal itself.
+    ///   - Call `JoinHandle::abort` on every wrapper handle, signalling the
+    ///     abortable task future. Drop cannot await terminal acknowledgement,
+    ///     so the shared shutdown signal remains the complementary cooperative
+    ///     path while the runtime schedules those cancellations.
     ///
     /// A `tracing::warn` records the unclean exit so the leak shows
     /// up in operator logs instead of failing silently.
@@ -9093,7 +9772,7 @@ impl Drop for RuntimeHandle {
                 target: "ft.runtime",
                 event = "runtime_handle_dropped_without_shutdown",
                 "RuntimeHandle dropped without explicit shutdown — \
-                 background tasks may remain detached; storage may not be flushed; \
+                 background cancellation is not drained; storage may not be flushed; \
                  call shutdown_with_summary or shutdown_with_timeout for a \
                  clean exit"
             );
@@ -10897,31 +11576,83 @@ mod tests {
     }
 
     #[test]
-    fn runtime_cancelled_error_uses_structured_runtime_operation() {
-        let err = runtime_cancelled_error("runtime.test_start", "caller cancelled");
+    fn runtime_cx_error_uses_structured_content_free_cancellation() {
+        let cx = crate::cx::for_testing();
+        cx.cancel_with(
+            crate::outcome::CancelKind::User,
+            Some("SECRET caller cancellation detail"),
+        );
+        let err = runtime_cx_error("runtime.test_start", &cx, "fallback");
 
         assert!(
             matches!(&err, Error::RuntimeOperation { .. }),
             "expected structured runtime operation, got {err:?}"
         );
-        if let Error::RuntimeOperation { operation, source } = err {
-            assert_eq!(operation, "runtime.test_start");
+        if let Error::RuntimeOperation { operation, source } = &err {
+            assert_eq!(*operation, "runtime.test_start");
             assert_eq!(
                 source,
-                RuntimeOperationSource::Cancelled("caller cancelled".to_string())
+                &RuntimeOperationSource::Cancelled("capability context cancelled".to_string())
             );
         }
+        assert!(!format!("{err:?}").contains("SECRET"));
     }
 
     #[test]
     fn runtime_cancellation_classifier_covers_structured_and_legacy_errors() {
-        let structured = runtime_cancelled_error("runtime.test", "structured cancel");
+        let cx = crate::cx::for_testing();
+        cx.cancel_with(crate::outcome::CancelKind::User, Some("SECRET structured cancel"));
+        let structured = runtime_cx_error("runtime.test", &cx, "fallback");
         let legacy = Error::Cancelled("legacy cancel".to_string());
         let backend = runtime_backend_error("runtime.test", "backend failure");
 
         assert!(is_runtime_cancellation(&structured));
         assert!(is_runtime_cancellation(&legacy));
         assert!(!is_runtime_cancellation(&backend));
+        assert!(!format!("{structured:?}").contains("SECRET"));
+    }
+
+    #[test]
+    fn runtime_timeout_cancel_kind_is_classified_as_deadline_exhaustion() {
+        let cx = crate::cx::for_testing();
+        cx.cancel_with(
+            crate::outcome::CancelKind::Timeout,
+            Some("SECRET timeout detail"),
+        );
+        let error = runtime_cx_error("runtime.test", &cx, "fallback");
+        assert!(matches!(
+            &error,
+            Error::RuntimeOperation {
+                source: RuntimeOperationSource::Backend(message),
+                ..
+            } if message == "capability deadline exceeded"
+        ));
+        assert!(!is_runtime_cancellation(&error));
+        assert!(!format!("{error:?}").contains("SECRET"));
+    }
+
+    #[test]
+    fn runtime_wait_failure_counter_increment_saturates() {
+        let counter = std::sync::atomic::AtomicU64::new(u64::MAX - 1);
+        assert_eq!(increment_saturating_atomic(&counter), u64::MAX);
+        assert_eq!(increment_saturating_atomic(&counter), u64::MAX);
+        assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
+    }
+
+    #[test]
+    fn runtime_sleep_checks_context_after_successful_timer_completion() {
+        run_async_test(async {
+            let cx = crate::cx::for_testing();
+            cx.cancel_with(
+                crate::outcome::CancelKind::User,
+                Some("SECRET cancellation before zero-duration timer"),
+            );
+
+            let failure = runtime_sleep(&cx, Duration::ZERO)
+                .await
+                .expect_err("successful timer completion must not hide context cancellation");
+            assert_eq!(failure, RuntimeWaitFailureKind::ContextCancelled);
+        });
     }
 
     #[test]
@@ -11461,14 +12192,26 @@ mod tests {
         });
     }
 
-    fn stubborn_runtime_task(duration: Duration) -> JoinHandle<()> {
+    struct StubbornRuntimeTaskDropFlag(Arc<AtomicBool>);
+
+    impl Drop for StubbornRuntimeTaskDropFlag {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    fn stubborn_runtime_task(duration: Duration, dropped: Arc<AtomicBool>) -> JoinHandle<()> {
         let loop_cx = runtime_loop_cx();
+        let drop_flag = StubbornRuntimeTaskDropFlag(dropped);
         spawn_runtime_task(&loop_cx, move |_task_cx| async move {
+            let _drop_flag = drop_flag;
             sleep(duration).await;
         })
     }
 
-    async fn runtime_handle_with_stubborn_tasks(duration: Duration) -> (TempDir, RuntimeHandle) {
+    async fn runtime_handle_with_stubborn_tasks(
+        duration: Duration,
+    ) -> (TempDir, RuntimeHandle, Vec<Arc<AtomicBool>>) {
         let (dir, db_path) = temp_db_path();
         let storage = StorageHandle::new(&db_path).await.unwrap();
         let engine = PatternEngine::new();
@@ -11478,13 +12221,16 @@ mod tests {
             Arc::new(RwLock::new(engine)),
         );
         let (capture_tx, _capture_rx) = mpsc::channel(1);
+        let dropped = (0..4)
+            .map(|_| Arc::new(AtomicBool::new(false)))
+            .collect::<Vec<_>>();
 
         let handle = RuntimeHandle {
-            discovery: Some(stubborn_runtime_task(duration)),
-            capture: Some(stubborn_runtime_task(duration)),
-            relay: Some(stubborn_runtime_task(duration)),
+            discovery: Some(stubborn_runtime_task(duration, Arc::clone(&dropped[0]))),
+            capture: Some(stubborn_runtime_task(duration, Arc::clone(&dropped[1]))),
+            relay: Some(stubborn_runtime_task(duration, Arc::clone(&dropped[2]))),
             native_events: None,
-            persistence: Some(stubborn_runtime_task(duration)),
+            persistence: Some(stubborn_runtime_task(duration, Arc::clone(&dropped[3]))),
             maintenance: None,
             connector_outbound: None,
             snapshot: None,
@@ -11507,7 +12253,7 @@ mod tests {
             scheduler_snapshot: Arc::clone(&runtime.scheduler_snapshot),
         };
 
-        (dir, handle)
+        (dir, handle, dropped)
     }
 
     #[allow(dead_code)]
@@ -12002,7 +12748,7 @@ mod tests {
     #[test]
     fn runtime_shutdown_timeout_reports_stubborn_tasks_without_hanging() {
         run_async_test_isolated(|| async {
-            let (_dir, handle) =
+            let (_dir, handle, dropped) =
                 runtime_handle_with_stubborn_tasks(Duration::from_millis(300)).await;
 
             let started = Instant::now();
@@ -12027,11 +12773,48 @@ mod tests {
                 elapsed < Duration::from_secs(1),
                 "bounded shutdown should return promptly, took {elapsed:?}"
             );
+            assert!(
+                dropped.iter().all(|flag| flag.load(Ordering::SeqCst)),
+                "shutdown timeout must abort and terminally settle every retained task future"
+            );
+        });
+    }
 
-            // Let detached stubborn tasks finish before the isolated runtime is
-            // dropped so the test does not leave intentionally sleeping tasks
-            // behind.
-            sleep(Duration::from_millis(350)).await;
+    #[test]
+    fn runtime_shutdown_observes_already_aborted_task_results() {
+        run_async_test_isolated(|| async {
+            let (_dir, handle, dropped) =
+                runtime_handle_with_stubborn_tasks(Duration::from_secs(30)).await;
+            for task in [
+                handle.discovery.as_ref(),
+                handle.capture.as_ref(),
+                handle.relay.as_ref(),
+                handle.persistence.as_ref(),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                task.abort();
+            }
+
+            let summary = handle.shutdown_with_timeout(Duration::from_secs(2)).await;
+
+            assert!(
+                !summary.clean,
+                "pre-aborted top-level task results must make shutdown unclean"
+            );
+            assert!(
+                summary
+                    .warnings
+                    .iter()
+                    .any(|warning| warning.contains("top-level runtime task")),
+                "shutdown must report observed task failures: {:?}",
+                summary.warnings
+            );
+            assert!(
+                dropped.iter().all(|flag| flag.load(Ordering::SeqCst)),
+                "every pre-aborted task future must be terminally dropped"
+            );
         });
     }
 
@@ -13211,6 +13994,93 @@ mod tests {
 
     #[cfg(feature = "native-wezterm")]
     #[test]
+    fn native_event_precancel_has_no_cursor_queue_or_lifecycle_side_effects() {
+        run_async_test(async {
+            let pane_id = 73;
+            let (_dir, db_path) = temp_db_path();
+            let storage = StorageHandle::new(&db_path).await.unwrap();
+            let bus = Arc::new(crate::events::EventBus::new(8));
+            let mut subscriber = bus.subscribe();
+            let (capture_tx, mut capture_rx) = mpsc::channel::<CaptureEvent>(4);
+            let cursors = Arc::new(RwLock::new(HashMap::<u64, PaneCursor>::from([(
+                pane_id,
+                PaneCursor::from_seq(pane_id, 0),
+            )])));
+            let pane_filter = PaneFilterConfig::default();
+            let backpressure = Arc::new(BackpressureMetrics::default());
+            backpressure.record_segment_dropped(pane_id);
+            let capture_authority = CaptureAuthority::new();
+            let pane_identity = capture_authority
+                .activate_pane(pane_id)
+                .expect("native test pane authority");
+            let _native_lease = capture_authority
+                .issue_source(pane_identity, CaptureSourceKind::NativePush)
+                .expect("native test source authority");
+            let metrics = RuntimeMetrics::default();
+            let runtime_cx = crate::cx::for_testing();
+            runtime_cx.cancel_with(
+                crate::outcome::CancelKind::User,
+                Some("SECRET native event cancellation"),
+            );
+
+            handle_native_event(
+                &runtime_cx,
+                NativeEvent::PaneOutput {
+                    pane_id,
+                    data: b"must not be captured".to_vec(),
+                    timestamp_ms: 1_000,
+                    dropped_bytes: 0,
+                },
+                &capture_tx,
+                &cursors,
+                &storage,
+                Some(&bus),
+                &pane_filter,
+                &backpressure,
+                &capture_authority,
+                &metrics,
+            )
+            .await;
+            handle_native_event(
+                &runtime_cx,
+                NativeEvent::PaneDestroyed {
+                    pane_id,
+                    timestamp_ms: 1_001,
+                },
+                &capture_tx,
+                &cursors,
+                &storage,
+                Some(&bus),
+                &pane_filter,
+                &backpressure,
+                &capture_authority,
+                &metrics,
+            )
+            .await;
+
+            assert_eq!(
+                cursors.read().await.get(&pane_id).map(PaneCursor::last_seq),
+                Some(-1),
+                "pre-cancelled native output must not advance the cursor"
+            );
+            assert!(
+                capture_rx.try_recv().is_err(),
+                "pre-cancelled native output must not enqueue capture work"
+            );
+            assert_eq!(
+                backpressure.panes_with_drops(),
+                1,
+                "pre-cancelled pane destruction must not mutate lifecycle metrics"
+            );
+            assert!(
+                subscriber.try_recv().is_none(),
+                "pre-cancelled pane destruction must not publish a lifecycle event"
+            );
+        });
+    }
+
+    #[cfg(feature = "native-wezterm")]
+    #[test]
     fn native_pane_created_persists_identity_without_initializing_capture_state() {
         run_async_test(async {
             let pane_id = 23;
@@ -13221,12 +14091,6 @@ mod tests {
             let pane_filter = PaneFilterConfig::default();
             let backpressure = Arc::new(BackpressureMetrics::default());
             let capture_authority = CaptureAuthority::new();
-            let pane_identity = capture_authority
-                .activate_pane(pane_id)
-                .expect("native test pane authority");
-            let _native_lease = capture_authority
-                .issue_source(pane_identity, CaptureSourceKind::NativePush)
-                .expect("native test source authority");
             let metrics = RuntimeMetrics::default();
             let runtime_cx = runtime_loop_cx();
 
@@ -13259,6 +14123,11 @@ mod tests {
             assert_eq!(record.first_seen_at, 1_234);
             assert_eq!(record.last_seen_at, 1_234);
             assert!(record.observed);
+            assert_eq!(
+                metrics.capture_authority_rejections(),
+                0,
+                "lifecycle-only native events must not require capture producer authority"
+            );
             assert!(
                 !cursors.read().await.contains_key(&pane_id),
                 "only post-drain capture reconciliation may initialize a cursor"

@@ -183,8 +183,102 @@ where
     f(cx).await
 }
 
+/// Reconstruct the effective runtime capability mask visible through `cx`.
+///
+/// asupersync intentionally keeps the raw mask field private. Its public
+/// snapshot plus monotone `CapMask::intersect` API is sufficient to rebuild
+/// the same mask without forging authority: start from all capabilities and
+/// intersect one type-level "all except X" mask for every denied bit.
+pub(crate) fn effective_cap_mask(cx: &Cx) -> asupersync::cx::CapMask {
+    use asupersync::cx::{CapMask, CapSet, CapSetRuntimeMask};
+
+    let effective = cx.capabilities().effective;
+    let mut mask = CapMask::all();
+    if !effective.spawn {
+        mask = mask.intersect(
+            <CapSet<false, true, true, true, true> as CapSetRuntimeMask>::MASK,
+        );
+    }
+    if !effective.time {
+        mask = mask.intersect(
+            <CapSet<true, false, true, true, true> as CapSetRuntimeMask>::MASK,
+        );
+    }
+    if !effective.entropy {
+        mask = mask.intersect(
+            <CapSet<true, true, false, true, true> as CapSetRuntimeMask>::MASK,
+        );
+    }
+    if !effective.io {
+        mask = mask.intersect(
+            <CapSet<true, true, true, false, true> as CapSetRuntimeMask>::MASK,
+        );
+    }
+    if !effective.remote {
+        mask = mask.intersect(
+            <CapSet<true, true, true, true, false> as CapSetRuntimeMask>::MASK,
+        );
+    }
+    mask
+}
+
+#[cfg(test)]
+pub(crate) fn effective_capability_bits(cx: &Cx) -> [bool; 5] {
+    let effective = cx.capabilities().effective;
+    [
+        effective.spawn,
+        effective.time,
+        effective.entropy,
+        effective.io,
+        effective.remote,
+    ]
+}
+
+/// Exhaustive bit-position cases for explicit-Cx spawn adapter regressions.
+///
+/// The five single-denial cases are intentionally separate: one mixed mask
+/// cannot catch an implementation that swaps two capability positions with
+/// equal boolean values. All-enabled and all-disabled pin the endpoints.
+#[cfg(test)]
+pub(crate) fn capability_mask_test_cases() -> [(asupersync::cx::CapMask, [bool; 5]); 7] {
+    use asupersync::cx::{CapSet, CapSetRuntimeMask};
+
+    [
+        (
+            <CapSet<false, true, true, true, true> as CapSetRuntimeMask>::MASK,
+            [false, true, true, true, true],
+        ),
+        (
+            <CapSet<true, false, true, true, true> as CapSetRuntimeMask>::MASK,
+            [true, false, true, true, true],
+        ),
+        (
+            <CapSet<true, true, false, true, true> as CapSetRuntimeMask>::MASK,
+            [true, true, false, true, true],
+        ),
+        (
+            <CapSet<true, true, true, false, true> as CapSetRuntimeMask>::MASK,
+            [true, true, true, false, true],
+        ),
+        (
+            <CapSet<true, true, true, true, false> as CapSetRuntimeMask>::MASK,
+            [true, true, true, true, false],
+        ),
+        (
+            <CapSet<true, true, true, true, true> as CapSetRuntimeMask>::MASK,
+            [true, true, true, true, true],
+        ),
+        (
+            <CapSet<false, false, false, false, false> as CapSetRuntimeMask>::MASK,
+            [false, false, false, false, false],
+        ),
+    ]
+}
+
 struct HandleContextFuture<F> {
     handle: RuntimeHandle,
+    task_cx: Cx,
+    task_cap_mask: asupersync::cx::CapMask,
     future: Pin<Box<F>>,
 }
 
@@ -192,13 +286,21 @@ impl<F: Future> Future for HandleContextFuture<F> {
     type Output = F::Output;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        install_runtime_handle_for_poll(self.handle.clone());
+        let _runtime_handle_guard = install_runtime_handle_for_poll(self.handle.clone());
+        // `RuntimeHandle::spawn` installs its own scheduler context. The
+        // adapter's contract is stronger: ambient Cx-aware helpers inside the
+        // child must observe the exact explicitly threaded context. Scope the
+        // installation to one poll so Pending never leaks it to sibling work.
+        let _task_cx_guard = Cx::set_current(Some(self.task_cx.clone()));
+        let _task_capability_guard = Cx::push_restriction(self.task_cap_mask);
         self.future.as_mut().poll(cx)
     }
 }
 
-fn install_runtime_handle_for_poll(handle: RuntimeHandle) {
-    crate::runtime_async::install_runtime_handle(handle);
+fn install_runtime_handle_for_poll(
+    handle: RuntimeHandle,
+) -> crate::runtime_async::ScopedRuntimeHandle {
+    crate::runtime_async::install_runtime_handle_scoped(handle)
 }
 
 /// Spawn a runtime task after cloning and threading a `Cx` into the task body.
@@ -211,6 +313,8 @@ where
     let child_cx = cx.clone();
     let wrapped = HandleContextFuture {
         handle: handle.clone(),
+        task_cx: child_cx.clone(),
+        task_cap_mask: effective_cap_mask(&child_cx),
         future: Box::pin(async move { task(child_cx).await }),
     };
     handle.spawn(wrapped)
@@ -230,6 +334,8 @@ where
     let child_cx = cx.clone();
     let wrapped = HandleContextFuture {
         handle: handle.clone(),
+        task_cx: child_cx.clone(),
+        task_cap_mask: effective_cap_mask(&child_cx),
         future: Box::pin(async move { task(child_cx).await }),
     };
     handle.try_spawn(wrapped)
@@ -268,9 +374,99 @@ where
     .await
 }
 
+/// Finite failure class for [`spawn_with_timeout`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpawnWithTimeoutErrorKind {
+    /// The helper's explicit timeout elapsed.
+    TimeoutElapsed,
+    /// The caller's capability context was cancelled.
+    ContextCancelled,
+    /// The caller's capability deadline elapsed first.
+    DeadlineExceeded,
+    /// The caller exhausted its cooperative poll quota.
+    PollQuotaExhausted,
+    /// The caller exhausted its cost budget.
+    CostBudgetExhausted,
+    /// The timeout boundary failed without an attributable root cause.
+    ContextFailure,
+}
+
+/// Content-free error returned by [`spawn_with_timeout`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SpawnWithTimeoutError {
+    kind: SpawnWithTimeoutErrorKind,
+}
+
+impl SpawnWithTimeoutError {
+    fn from_timeout_failure(cx: &Cx) -> Self {
+        use crate::outcome::CancelKind;
+
+        // budget_timeout may be the operation that first observes an expired
+        // budget. Checkpoint once to latch its structural root cause before
+        // falling back to the helper's own elapsed-time class.
+        let context_failed = cx.checkpoint().is_err();
+        let kind = match cx.root_cancel_cause().map(|reason| reason.kind) {
+            Some(CancelKind::Deadline | CancelKind::Timeout) => {
+                SpawnWithTimeoutErrorKind::DeadlineExceeded
+            }
+            Some(CancelKind::PollQuota) => SpawnWithTimeoutErrorKind::PollQuotaExhausted,
+            Some(CancelKind::CostBudget) => SpawnWithTimeoutErrorKind::CostBudgetExhausted,
+            Some(
+                CancelKind::User
+                | CancelKind::FailFast
+                | CancelKind::RaceLost
+                | CancelKind::ParentCancelled
+                | CancelKind::ResourceUnavailable
+                | CancelKind::Shutdown
+                | CancelKind::LinkedExit,
+            ) => SpawnWithTimeoutErrorKind::ContextCancelled,
+            None if context_failed => SpawnWithTimeoutErrorKind::ContextFailure,
+            None => SpawnWithTimeoutErrorKind::TimeoutElapsed,
+        };
+        Self { kind }
+    }
+
+    /// Return the finite structural failure class.
+    #[must_use]
+    pub const fn kind(self) -> SpawnWithTimeoutErrorKind {
+        self.kind
+    }
+
+    /// Return true only for caller-context cancellation, not timeout or budget
+    /// exhaustion.
+    #[must_use]
+    pub const fn is_cancelled(self) -> bool {
+        matches!(self.kind, SpawnWithTimeoutErrorKind::ContextCancelled)
+    }
+}
+
+impl std::fmt::Display for SpawnWithTimeoutError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let message = match self.kind {
+            SpawnWithTimeoutErrorKind::TimeoutElapsed => "child task timeout elapsed",
+            SpawnWithTimeoutErrorKind::ContextCancelled => {
+                "child task cancelled by capability context"
+            }
+            SpawnWithTimeoutErrorKind::DeadlineExceeded => {
+                "child task capability deadline exceeded"
+            }
+            SpawnWithTimeoutErrorKind::PollQuotaExhausted => {
+                "child task capability poll quota exhausted"
+            }
+            SpawnWithTimeoutErrorKind::CostBudgetExhausted => {
+                "child task capability cost budget exhausted"
+            }
+            SpawnWithTimeoutErrorKind::ContextFailure => {
+                "child task capability context failed"
+            }
+        };
+        write!(f, "SpawnWithTimeoutError: {message}")
+    }
+}
+
+impl std::error::Error for SpawnWithTimeoutError {}
+
 /// Spawn a child task with explicit `Cx` threading and wait for it with a timeout.
-///
-/// Returns an error string when the timeout elapses before completion.
 ///
 /// The task future is driven directly under the timeout — a cancel-on-drop
 /// task — rather than eagerly scheduled as a detached runtime task. asupersync's
@@ -279,26 +475,41 @@ where
 /// `JoinHandle` on the timeout branch would DETACH the task: it would keep
 /// running unbounded past the deadline while the caller already saw a timeout
 /// error. Driving the future inline means a timeout drops (cooperatively
-/// cancels) the actual task future, so no work outlives the timeout. The
+/// cancels) the direct outer task future, so that future cannot outlive the
+/// timeout. The
 /// `HandleContextFuture` wrapper still installs the `RuntimeHandle`, so nested
 /// `task::spawn` / `spawn_*_with_cx` calls inside the task keep working.
+/// Those nested spawns are independently scheduled: if their JoinHandles are
+/// dropped before the outer future times out, they are detached and may
+/// outlive this helper. The timeout owns and drops only the direct `task`
+/// future. Callers requiring a no-descendant-survival guarantee must not spawn
+/// detached nested work; they must retain and settle an explicit structured
+/// owner before the direct future can return or be dropped.
 pub async fn spawn_with_timeout<F, Fut, T>(
     handle: &RuntimeHandle,
     cx: &Cx,
     timeout: Duration,
     task: F,
-) -> Result<T, String>
+) -> Result<T, SpawnWithTimeoutError>
 where
     F: FnOnce(Cx) -> Fut + Send + 'static,
     Fut: Future<Output = T> + Send + 'static,
     T: Send + 'static,
 {
+    if cx.checkpoint().is_err() {
+        return Err(SpawnWithTimeoutError::from_timeout_failure(cx));
+    }
+
     let child_cx = cx.clone();
     let wrapped = HandleContextFuture {
         handle: handle.clone(),
+        task_cx: child_cx.clone(),
+        task_cap_mask: effective_cap_mask(&child_cx),
         future: Box::pin(async move { task(child_cx).await }),
     };
-    crate::runtime_async::timeout_with_cx(cx, timeout, wrapped).await
+    crate::runtime_async::timeout_with_cx(cx, timeout, wrapped)
+        .await
+        .map_err(|_| SpawnWithTimeoutError::from_timeout_failure(cx))
 }
 
 #[cfg(test)]
@@ -544,15 +755,80 @@ mod tests {
     fn spawn_with_cx_receives_cloned_cx() {
         let runtime = CxRuntimeBuilder::current_thread().build().expect("runtime");
         let cx = for_testing();
+        let expected_region = cx.region_id();
+        let expected_task = cx.task_id();
         let handle = runtime.handle();
 
         let result = runtime.block_on(async {
             let join = spawn_with_cx(&handle, &cx, |child_cx| async move {
-                child_cx.checkpoint().is_ok()
+                let active_before = Cx::current().expect("explicit cx installed for child poll");
+                assert_eq!(active_before.region_id(), expected_region);
+                assert_eq!(active_before.task_id(), expected_task);
+                assert_eq!(child_cx.region_id(), expected_region);
+                assert_eq!(child_cx.task_id(), expected_task);
+
+                crate::runtime_async::task::yield_now().await;
+                let active_after = Cx::current().expect("explicit cx reinstalled after yield");
+                active_after.region_id() == expected_region
+                    && active_after.task_id() == expected_task
+                    && child_cx.checkpoint().is_ok()
             });
             join.await
         });
         assert!(result);
+    }
+
+    #[test]
+    fn spawn_with_cx_ambient_context_inherits_cancellation() {
+        let runtime = CxRuntimeBuilder::current_thread().build().expect("runtime");
+        let cx = for_testing();
+        cx.cancel_with(
+            crate::outcome::CancelKind::ParentCancelled,
+            Some("explicit cx parent cancelled"),
+        );
+        let handle = runtime.handle();
+
+        let cancelled = runtime.block_on(async {
+            spawn_with_cx(&handle, &cx, |_child_cx| async move {
+                Cx::current()
+                    .expect("explicit cx installed for child poll")
+                    .checkpoint()
+                    .is_err()
+            })
+            .await
+        });
+        assert!(cancelled);
+    }
+
+    #[test]
+    fn spawn_with_cx_preserves_all_effective_capability_bits_across_yield() {
+        let runtime = CxRuntimeBuilder::current_thread().build().expect("runtime");
+        let handle = runtime.handle();
+
+        for (mask, expected) in capability_mask_test_cases() {
+            let restricted = {
+                let _base_guard = Cx::set_current(Some(for_testing()));
+                let _restriction = Cx::push_restriction(mask);
+                Cx::current().expect("restricted explicit cx")
+            };
+            assert_eq!(effective_capability_bits(&restricted), expected);
+
+            let observed = runtime.block_on(async {
+                spawn_with_cx(&handle, &restricted, |child_cx| async move {
+                    assert_eq!(effective_capability_bits(&child_cx), expected);
+                    let before = effective_capability_bits(
+                        &Cx::current().expect("installed restricted cx"),
+                    );
+                    crate::runtime_async::task::yield_now().await;
+                    let after = effective_capability_bits(
+                        &Cx::current().expect("reinstalled restricted cx"),
+                    );
+                    (before, after)
+                })
+                .await
+            });
+            assert_eq!(observed, (expected, expected));
+        }
     }
 
     #[test]
@@ -935,18 +1211,75 @@ mod tests {
 
     #[test]
     fn spawn_with_timeout_returns_error_on_timeout() {
+        struct DropFlag(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+        impl Drop for DropFlag {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+
         let runtime = CxRuntimeBuilder::current_thread().build().expect("runtime");
         let cx = for_testing();
         let handle = runtime.handle();
+        let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let dropped_by_child = std::sync::Arc::clone(&dropped);
 
         let result = runtime.block_on(async {
-            spawn_with_timeout(&handle, &cx, Duration::from_millis(1), |_cx| async {
-                crate::runtime_async::sleep(Duration::from_secs(10)).await;
-                "slow"
-            })
+            spawn_with_timeout(
+                &handle,
+                &cx,
+                Duration::from_millis(1),
+                move |_cx| async move {
+                    let _drop_flag = DropFlag(dropped_by_child);
+                    std::future::pending::<&'static str>().await
+                },
+            )
             .await
         });
-        assert!(result.is_err());
+        let error = result.expect_err("direct child must time out");
+        assert_eq!(error.kind(), SpawnWithTimeoutErrorKind::TimeoutElapsed);
+        assert!(!error.is_cancelled());
+        assert!(
+            dropped.load(std::sync::atomic::Ordering::SeqCst),
+            "timeout result must follow destruction of the direct child future"
+        );
+    }
+
+    #[test]
+    fn spawn_with_timeout_precancel_is_prompt_and_never_polls_child() {
+        let runtime = CxRuntimeBuilder::current_thread().build().expect("runtime");
+        let cx = for_testing();
+        cx.cancel_with(
+            crate::outcome::CancelKind::User,
+            Some("SECRET spawn_with_timeout pre-cancel"),
+        );
+        let handle = runtime.handle();
+        let polls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let polls_by_child = std::sync::Arc::clone(&polls);
+
+        let started = std::time::Instant::now();
+        let result = runtime.block_on(async {
+            spawn_with_timeout(
+                &handle,
+                &cx,
+                Duration::from_secs(30),
+                move |_cx| async move {
+                    polls_by_child.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    std::future::pending::<()>().await;
+                },
+            )
+            .await
+        });
+        let elapsed = started.elapsed();
+
+        let error = result.expect_err("pre-cancelled Cx must reject before polling");
+        assert_eq!(error.kind(), SpawnWithTimeoutErrorKind::ContextCancelled);
+        assert!(error.is_cancelled());
+        assert_eq!(polls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(elapsed < Duration::from_secs(1));
+        assert!(!error.to_string().contains("SECRET"));
+        assert!(!format!("{error:?}").contains("SECRET"));
     }
 
     #[test]
@@ -969,9 +1302,84 @@ mod tests {
         });
 
         assert!(
-            result.is_err(),
+            matches!(
+                result,
+                Err(SpawnWithTimeoutError {
+                    kind: SpawnWithTimeoutErrorKind::DeadlineExceeded
+                })
+            ),
             "explicit Cx deadline should win over a looser timeout argument"
         );
+    }
+
+    #[test]
+    fn spawn_with_timeout_does_not_claim_ownership_of_detached_nested_spawns() {
+        struct DropFlag(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+        impl Drop for DropFlag {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+
+        let runtime = CxRuntimeBuilder::current_thread().build().expect("runtime");
+        let cx = for_testing();
+        let handle = runtime.handle();
+        let direct_dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let nested_completed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let direct_dropped_by_child = std::sync::Arc::clone(&direct_dropped);
+        let nested_completed_by_task = std::sync::Arc::clone(&nested_completed);
+        let (release_tx, release_rx) = crate::runtime_async::oneshot::channel::<()>();
+        let (completed_tx, completed_rx) = crate::runtime_async::oneshot::channel::<()>();
+
+        runtime.block_on(async {
+            let result = spawn_with_timeout(
+                &handle,
+                &cx,
+                Duration::from_millis(1),
+                move |_cx| async move {
+                    let _drop_flag = DropFlag(direct_dropped_by_child);
+                    // Deliberately discard the nested JoinHandle. This is the
+                    // unsupported structured-ownership case documented on the
+                    // helper: timeout drops this direct future, not the already
+                    // scheduled descendant.
+                    drop(crate::runtime_async::task::spawn(async move {
+                        crate::runtime_async::oneshot_recv(release_rx)
+                            .await
+                            .expect("detached nested release sender");
+                        nested_completed_by_task
+                            .store(true, std::sync::atomic::Ordering::SeqCst);
+                        let _ = completed_tx.send(());
+                    }));
+                    std::future::pending::<()>().await;
+                },
+            )
+            .await;
+
+            assert!(matches!(
+                result,
+                Err(SpawnWithTimeoutError {
+                    kind: SpawnWithTimeoutErrorKind::TimeoutElapsed
+                })
+            ));
+            assert!(direct_dropped.load(std::sync::atomic::Ordering::SeqCst));
+            assert!(!nested_completed.load(std::sync::atomic::Ordering::SeqCst));
+
+            release_tx
+                .send(())
+                .expect("detached nested receiver must still be alive after outer timeout");
+            crate::runtime_async::timeout(
+                Duration::from_secs(5),
+                crate::runtime_async::oneshot_recv(completed_rx),
+            )
+            .await
+            .expect("detached nested task did not settle within 5s")
+            .expect("detached nested task dropped completion sender");
+            assert!(
+                nested_completed.load(std::sync::atomic::Ordering::SeqCst),
+                "detached nested work may outlive the direct timeout boundary"
+            );
+        });
     }
 
     #[test]
