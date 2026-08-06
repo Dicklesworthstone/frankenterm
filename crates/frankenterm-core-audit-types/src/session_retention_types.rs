@@ -9,9 +9,11 @@
 
 /// Result of a session cleanup operation.
 ///
-/// This receipt covers logical row reclamation only. Online session retention
-/// never performs physical database compaction; SQLite keeps freed pages on
-/// its freelist for subsequent writes to reuse.
+/// This receipt covers logical row reclamation only: session retention issues
+/// no `VACUUM` or `incremental_vacuum` operation. Under FrankenTerm's normal
+/// `auto_vacuum=NONE` policy, SQLite keeps freed pages on its freelist for reuse.
+/// An externally-created `auto_vacuum=FULL` database may still compact pages at
+/// transaction commit and is outside that physical-behavior guarantee.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CleanupResult {
     /// Sessions deleted by age policy.

@@ -287,6 +287,36 @@ pub struct SnapshotCaptureOptions {
     pub include_scrollback: bool,
 }
 
+/// Finite identity for a durable snapshot-authority mutation.
+///
+/// These labels intentionally contain no session IDs, paths, or pane content,
+/// so an indeterminate outcome can be reported without leaking authority data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SnapshotAuthorityOperation {
+    /// Atomically create/update a session and persist one checkpoint.
+    CheckpointCommit,
+    /// Delete checkpoints under the configured retention policy.
+    CheckpointCleanup,
+    /// Mark the current session as cleanly shut down.
+    ShutdownMark,
+}
+
+impl SnapshotAuthorityOperation {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::CheckpointCommit => "checkpoint_commit",
+            Self::CheckpointCleanup => "checkpoint_cleanup",
+            Self::ShutdownMark => "shutdown_mark",
+        }
+    }
+}
+
+impl std::fmt::Display for SnapshotAuthorityOperation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
 /// Error returned when a snapshot cannot be captured.
 #[derive(Debug, thiserror::Error)]
 pub enum SnapshotError {
@@ -304,10 +334,28 @@ pub enum SnapshotError {
     Database(String),
     #[error("serialization error: {0}")]
     Serialization(String),
-    /// The caller's capability context (`Cx`) was cancelled before or
-    /// during the capture. Surfaced only by `capture_with_cx` /
-    /// `shutdown_checkpoint_with_cx` when the outer scope abandons
-    /// the capture race.
+    /// The blocking closure was admitted, but its authoritative result was
+    /// lost. The closure may still be running or may already have committed.
+    #[error(
+        "snapshot authority outcome is indeterminate after {operation} handoff; reconcile durable state before retrying"
+    )]
+    IndeterminateAuthorityMutation {
+        /// Finite operation identity; contains no session data.
+        operation: SnapshotAuthorityOperation,
+    },
+    /// A prior mutation lost its authoritative result. All later durable
+    /// mutations fail closed until an external authority reconciles the durable
+    /// state. Merely constructing a fresh engine does not prove reconciliation.
+    #[error(
+        "snapshot authority reconciliation is required before {operation}; durable mutation suppressed"
+    )]
+    AuthorityReconciliationRequired {
+        /// Mutation that was suppressed by the sticky latch.
+        operation: SnapshotAuthorityOperation,
+    },
+    /// The caller's capability context (`Cx`) cancelled before a durable
+    /// blocking mutation was admitted, or during non-mutating preflight.
+    /// Cancellation after mutation admission is indeterminate instead.
     #[error("snapshot capture cancelled via capability context")]
     Cancelled,
     #[error("snapshot capability deadline exceeded")]
@@ -324,6 +372,19 @@ pub enum SnapshotError {
     LockPoisoned,
     #[error("snapshot lock acquisition future polled after completion")]
     LockPolledAfterCompletion,
+}
+
+impl SnapshotError {
+    /// Whether the engine must reconcile durable state before another snapshot
+    /// authority mutation can be attempted safely.
+    #[must_use]
+    pub const fn requires_reconciliation(&self) -> bool {
+        matches!(
+            self,
+            Self::IndeterminateAuthorityMutation { .. }
+                | Self::AuthorityReconciliationRequired { .. }
+        )
+    }
 }
 
 fn snapshot_lock_error(error: LockAcquireError) -> SnapshotError {
@@ -381,6 +442,7 @@ impl SessionCleanupSchedule {
 struct SessionCleanupAttemptGuard<'a> {
     in_progress: &'a AtomicBool,
     reconciliation_required: &'a AtomicBool,
+    snapshot_authority_reconciliation_required: &'a AtomicBool,
     settled: bool,
 }
 
@@ -394,8 +456,57 @@ impl Drop for SessionCleanupAttemptGuard<'_> {
     fn drop(&mut self) {
         if !self.settled {
             self.reconciliation_required.store(true, Ordering::Release);
+            self.snapshot_authority_reconciliation_required
+                .store(true, Ordering::Release);
         }
         self.in_progress.store(false, Ordering::Release);
+    }
+}
+
+/// Latches both durable-authority and retention-scheduler reconciliation if an
+/// admitted mutation future disappears before publishing a typed settlement.
+struct SnapshotAuthorityAttemptGuard<'a> {
+    reconciliation_required: &'a AtomicBool,
+    session_cleanup_reconciliation_required: &'a AtomicBool,
+    settled: bool,
+}
+
+impl SnapshotAuthorityAttemptGuard<'_> {
+    fn settle(mut self) {
+        self.settled = true;
+    }
+
+    fn latch_and_settle(mut self) {
+        self.reconciliation_required.store(true, Ordering::Release);
+        self.session_cleanup_reconciliation_required
+            .store(true, Ordering::Release);
+        self.settled = true;
+    }
+}
+
+impl Drop for SnapshotAuthorityAttemptGuard<'_> {
+    fn drop(&mut self) {
+        if !self.settled {
+            self.reconciliation_required.store(true, Ordering::Release);
+            self.session_cleanup_reconciliation_required
+                .store(true, Ordering::Release);
+        }
+    }
+}
+
+fn classify_snapshot_authority_blocking_failure(
+    operation: SnapshotAuthorityOperation,
+    error: crate::runtime_async::SpawnBlockingWithCxError,
+) -> SnapshotError {
+    match error {
+        crate::runtime_async::SpawnBlockingWithCxError::CancelledBeforeSpawn { .. } => {
+            SnapshotError::Cancelled
+        }
+        crate::runtime_async::SpawnBlockingWithCxError::CancelledMidFlight { .. }
+        | crate::runtime_async::SpawnBlockingWithCxError::RuntimeFailure
+        | crate::runtime_async::SpawnBlockingWithCxError::CancellationWatcherTimerFailure => {
+            SnapshotError::IndeterminateAuthorityMutation { operation }
+        }
     }
 }
 
@@ -411,7 +522,7 @@ pub struct SnapshotEngine {
     config: SnapshotConfig,
     /// Current session ID (set on first capture).
     session_id: RwLock<Option<String>>,
-    /// BLAKE3 hash of last captured state (for dedup).
+    /// SipHash-based 16-hex-character witness of last captured state (for dedup).
     last_state_hash: RwLock<Option<String>>,
     /// Guard: true while a capture is running.
     in_progress: AtomicBool,
@@ -419,13 +530,22 @@ pub struct SnapshotEngine {
     /// state is scheduler-local, so admitting two periodic loops would let a
     /// contender repeat retention cleanup after the first loop succeeds.
     scheduler_in_progress: AtomicBool,
-    /// Sticky safety latch set when session-retention cleanup may have changed
-    /// durable state without publishing an authoritative completion result.
-    /// This belongs to the engine rather than one scheduler invocation so a
-    /// same-engine scheduler restart cannot blindly repeat the cleanup.
+    /// Sticky scheduler-suppression latch set when any authority-table mutation
+    /// may have changed durable state without an authoritative receipt. It
+    /// belongs to the engine so a same-engine scheduler restart cannot blindly
+    /// repeat retention cleanup.
     session_cleanup_reconciliation_required: AtomicBool,
     /// Exclusive admission flag for automatic session-retention cleanup.
     session_cleanup_in_progress: AtomicBool,
+    /// Sticky latch set whenever an admitted snapshot-authority mutation loses
+    /// its typed completion receipt. Once set, retrying any durable mutation on
+    /// this engine is unsafe until durable state has been reconciled. There is
+    /// deliberately no in-process clear operation; this in-memory latch alone
+    /// does not make a later process restart authoritative.
+    snapshot_authority_reconciliation_required: AtomicBool,
+    /// Serializes checkpoint commits, both cleanup lanes, and shutdown marking
+    /// so a newly latched indeterminate outcome cannot race with another write.
+    snapshot_authority_mutation: Mutex<()>,
     /// External trigger ingress sender for intelligent scheduling mode.
     trigger_tx: mpsc::Sender<SnapshotTrigger>,
     /// Runtime-owned receiver, taken by `run_periodic`.
@@ -447,6 +567,8 @@ impl SnapshotEngine {
             scheduler_in_progress: AtomicBool::new(false),
             session_cleanup_reconciliation_required: AtomicBool::new(false),
             session_cleanup_in_progress: AtomicBool::new(false),
+            snapshot_authority_reconciliation_required: AtomicBool::new(false),
+            snapshot_authority_mutation: Mutex::new(()),
             trigger_tx,
             trigger_rx: Mutex::new(Some(trigger_rx)),
             telemetry: SnapshotEngineTelemetry::new(),
@@ -476,6 +598,72 @@ impl SnapshotEngine {
             .await
             .map_err(|e| SnapshotError::Database(format!("task join: {e}")))?
             .map_err(|e| SnapshotError::Database(e.to_string()))
+    }
+
+    /// Execute one serialized durable mutation and preserve the distinction
+    /// between cancellation before admission and observation loss afterwards.
+    ///
+    /// The attempt guard is created only after the authority mutex and the
+    /// explicit pre-handoff checkpoint. If this future is dropped while the
+    /// blocking closure is outstanding, the guard latches reconciliation before
+    /// the mutex is released. Every subsequent authority mutation therefore
+    /// fails closed rather than racing a closure that may still commit.
+    async fn spawn_blocking_authority_with_cx<T, E, F>(
+        &self,
+        cx: &crate::cx::Cx,
+        operation: SnapshotAuthorityOperation,
+        work: F,
+    ) -> std::result::Result<T, SnapshotError>
+    where
+        T: Send + 'static,
+        E: std::fmt::Display + Send + 'static,
+        F: FnOnce() -> std::result::Result<T, E> + Send + 'static,
+    {
+        let _authority = self
+            .snapshot_authority_mutation
+            .lock_with_cx(cx)
+            .await
+            .map_err(snapshot_lock_error)?;
+
+        if self
+            .snapshot_authority_reconciliation_required
+            .load(Ordering::Acquire)
+            || self
+                .session_cleanup_reconciliation_required
+                .load(Ordering::Acquire)
+        {
+            return Err(SnapshotError::AuthorityReconciliationRequired { operation });
+        }
+        if cx.checkpoint().is_err() {
+            return Err(SnapshotError::Cancelled);
+        }
+
+        let attempt = SnapshotAuthorityAttemptGuard {
+            reconciliation_required: &self.snapshot_authority_reconciliation_required,
+            session_cleanup_reconciliation_required: &self
+                .session_cleanup_reconciliation_required,
+            settled: false,
+        };
+        match crate::runtime_async::spawn_blocking_with_cx(cx, work).await {
+            Ok(result) => {
+                attempt.settle();
+                result.map_err(|error| SnapshotError::Database(error.to_string()))
+            }
+            Err(error @ crate::runtime_async::SpawnBlockingWithCxError::CancelledBeforeSpawn {
+                ..
+            }) => {
+                attempt.settle();
+                Err(classify_snapshot_authority_blocking_failure(
+                    operation, error,
+                ))
+            }
+            Err(error) => {
+                attempt.latch_and_settle();
+                Err(classify_snapshot_authority_blocking_failure(
+                    operation, error,
+                ))
+            }
+        }
     }
 
     async fn spawn_blocking_db_best_effort<T, E, F>(work: F) -> T
@@ -527,9 +715,9 @@ impl SnapshotEngine {
     ///     `write_with_cx(cx)` so caller cancellation propagates through
     ///     the dedup cache lookups.
     ///
-    ///   * `ensure_session` is replaced with `ensure_session_with_cx`
-    ///     which threads `cx` through the inner `session_id` RwLock
-    ///     acquire.
+    ///   * First-session creation and the first checkpoint share one SQLite
+    ///     transaction. The `session_id` lock keeps that durable commit and
+    ///     subsequent in-memory publication in one ordered operation.
     ///
     /// Pre-flight: if `cx` is already cancelled on entry, the
     /// `captures_attempted` counter is still incremented (parity with
@@ -564,22 +752,49 @@ impl SnapshotEngine {
             saturating_telemetry_add(&self.telemetry.capture_errors, 1);
             return Err(SnapshotError::Cancelled);
         }
+        if self
+            .snapshot_authority_reconciliation_required
+            .load(Ordering::Acquire)
+            || self
+                .session_cleanup_reconciliation_required
+                .load(Ordering::Acquire)
+        {
+            saturating_telemetry_add(&self.telemetry.capture_errors, 1);
+            return Err(SnapshotError::AuthorityReconciliationRequired {
+                operation: SnapshotAuthorityOperation::CheckpointCommit,
+            });
+        }
 
         // 1. Guard: prevent concurrent captures
         if self.in_progress.swap(true, Ordering::SeqCst) {
             saturating_telemetry_add(&self.telemetry.capture_errors, 1);
             return Err(SnapshotError::InProgress);
         }
-        struct InProgressGuard<'a>(&'a AtomicBool);
-        impl Drop for InProgressGuard<'_> {
-            fn drop(&mut self) {
-                self.0.store(false, Ordering::Release);
+        struct InProgressGuard<'a> {
+            in_progress: &'a AtomicBool,
+            capture_errors: &'a AtomicU64,
+            completed_without_error: bool,
+        }
+        impl InProgressGuard<'_> {
+            fn complete_without_error(&mut self) {
+                self.completed_without_error = true;
             }
         }
-        let _guard = InProgressGuard(&self.in_progress);
+        impl Drop for InProgressGuard<'_> {
+            fn drop(&mut self) {
+                if !self.completed_without_error {
+                    saturating_telemetry_add(self.capture_errors, 1);
+                }
+                self.in_progress.store(false, Ordering::Release);
+            }
+        }
+        let mut capture_guard = InProgressGuard {
+            in_progress: &self.in_progress,
+            capture_errors: &self.telemetry.capture_errors,
+            completed_without_error: false,
+        };
 
         if panes.is_empty() {
-            saturating_telemetry_add(&self.telemetry.capture_errors, 1);
             return Err(SnapshotError::NoPanes);
         }
 
@@ -660,14 +875,27 @@ impl SnapshotEngine {
                 .map_err(snapshot_lock_error)?;
             if last.as_deref() == Some(&state_hash) {
                 saturating_telemetry_add(&self.telemetry.dedup_skips, 1);
+                capture_guard.complete_without_error();
                 return Err(SnapshotError::NoChanges);
             }
         }
 
-        // 6. Ensure session exists (Cx-bound)
-        let session_id = self
-            .ensure_session_with_cx(cx, &topology_json, now_ms)
-            .await?;
+        // 6. Acquire the session publication guard before the durable write.
+        // A first capture proposes an ID here but does not publish it in memory
+        // or SQLite until the checkpoint transaction succeeds.
+        let mut session_id_guard = self
+            .session_id
+            .write_with_cx(cx)
+            .await
+            .map_err(snapshot_lock_error)?;
+        let creates_session = session_id_guard.is_none();
+        let session_id = session_id_guard
+            .clone()
+            .unwrap_or_else(generate_session_id);
+        let new_session = creates_session.then(|| NewSessionMetadata {
+            ft_version: crate::VERSION.to_string(),
+            host_id: current_host_id(),
+        });
 
         // 7. Acquire the final in-memory commit guard before the durable write.
         // Once the SQLite transaction commits, cancellation is too late to
@@ -687,26 +915,31 @@ impl SnapshotEngine {
         let db_path = Arc::clone(&self.db_path);
         let state_hash_clone = state_hash.clone();
 
-        // Checkpoint before the blocking handoff so a canceled caller
-        // skips the DB write entirely.
-        if cx.checkpoint().is_err() {
-            return Err(SnapshotError::Cancelled);
-        }
-        let result = Self::spawn_blocking_db(move || {
-            save_checkpoint_sync(
-                &db_path,
-                &session_id,
-                now_ms,
-                &checkpoint_type,
-                &state_hash_clone,
-                &topology_json,
-                &pane_states,
+        let result = self
+            .spawn_blocking_authority_with_cx(
+                cx,
+                SnapshotAuthorityOperation::CheckpointCommit,
+                move || {
+                    save_checkpoint_sync(
+                        &db_path,
+                        &session_id,
+                        now_ms,
+                        &checkpoint_type,
+                        &state_hash_clone,
+                        &topology_json,
+                        &pane_states,
+                        new_session.as_ref(),
+                    )
+                },
             )
-        })
-        .await?;
+            .await?;
 
-        // 9. Complete the in-memory half of the commit while the guard
-        // acquired before the durable effect is still held.
+        // 9. Publish both in-memory authorities only after the typed durable
+        // receipt. An indeterminate handoff leaves the sticky latch set and a
+        // failed first transaction leaves `session_id` as `None`.
+        if creates_session {
+            *session_id_guard = Some(result.0.clone());
+        }
         *last_state_hash = Some(state_hash);
 
         // 10. Record success telemetry
@@ -719,6 +952,7 @@ impl SnapshotEngine {
             &self.telemetry.bytes_persisted,
             u64::try_from(result.2).unwrap_or(u64::MAX),
         );
+        capture_guard.complete_without_error();
 
         Ok(SnapshotResult {
             session_id: result.0,
@@ -738,11 +972,11 @@ impl SnapshotEngine {
     /// Run retention cleanup bound to the caller's asupersync capability
     /// context (ft-xbnl0.2.x Cx-first entry point).
     ///
-    /// A `cx.checkpoint()` before the `spawn_blocking` handoff lets a
-    /// cancelled caller skip the blocking DB work entirely. Once the cleanup
-    /// transaction commits, its removal count is authoritative and is returned
-    /// even if cancellation arrives concurrently; reporting cancellation or
-    /// zero after that commit would misrepresent the durable effect.
+    /// A `cx.checkpoint()` before the blocking handoff lets a cancelled caller
+    /// skip the DB work entirely. Cancellation or executor failure after
+    /// admission is explicitly indeterminate: the engine latches reconciliation
+    /// and suppresses every later durable mutation rather than claiming the
+    /// cleanup is retry-safe.
     ///
     /// Pre-flight: if `cx` is already cancelled on entry, the
     /// `cleanup_runs` counter is still incremented (to preserve
@@ -769,10 +1003,13 @@ impl SnapshotEngine {
         let retention_count = self.config.retention_count;
         let retention_days = self.config.retention_days;
 
-        let removed = Self::spawn_blocking_db(move || {
-            cleanup_sync(&db_path, retention_count, retention_days)
-        })
-        .await?;
+        let removed = self
+            .spawn_blocking_authority_with_cx(
+                cx,
+                SnapshotAuthorityOperation::CheckpointCleanup,
+                move || cleanup_sync(&db_path, retention_count, retention_days),
+            )
+            .await?;
         saturating_telemetry_add(
             &self.telemetry.cleanup_removed,
             u64::try_from(removed).unwrap_or(u64::MAX),
@@ -1019,7 +1256,10 @@ impl SnapshotEngine {
                         &session_cleanup_schedule,
                         self.config.session_retention.cleanup_interval_hours,
                         self.session_cleanup_reconciliation_required
-                            .load(Ordering::Acquire),
+                            .load(Ordering::Acquire)
+                            || self
+                                .snapshot_authority_reconciliation_required
+                                .load(Ordering::Acquire),
                         last_snapshot_completion,
                         interval,
                         now,
@@ -1292,9 +1532,10 @@ impl SnapshotEngine {
     /// value reruns every N hours after authoritative success. The DB connection
     /// is opened fresh inside the cleanup engine (a blocking SQLite pipeline run
     /// on the blocking pool). If its authoritative completion is lost, the
-    /// engine latches `session_cleanup_reconciliation_required` and suppresses
-    /// all further automatic cleanup attempts for this engine instance's
-    /// lifetime, including after a same-engine scheduler restart.
+    /// engine latches both `session_cleanup_reconciliation_required` and the
+    /// shared snapshot-authority reconciliation state. This suppresses every
+    /// later mutation of the same authority tables for this engine instance,
+    /// including after a same-engine scheduler restart.
     async fn maybe_run_session_cleanup(
         &self,
         cx: &crate::cx::Cx,
@@ -1303,6 +1544,9 @@ impl SnapshotEngine {
         if self
             .session_cleanup_reconciliation_required
             .load(Ordering::Acquire)
+            || self
+                .snapshot_authority_reconciliation_required
+                .load(Ordering::Acquire)
         {
             return;
         }
@@ -1311,10 +1555,43 @@ impl SnapshotEngine {
             return;
         }
 
+        // Session retention mutates the same three authority tables as capture,
+        // checkpoint cleanup, and shutdown marking. Hold the shared mutation
+        // authority across its blocking handoff so either lane's indeterminate
+        // result latches before another lane can enter.
+        let _snapshot_authority = match self
+            .snapshot_authority_mutation
+            .lock_with_cx(cx)
+            .await
+        {
+            Ok(authority) => authority,
+            Err(error) => {
+                schedule.defer_retry(Instant::now());
+                tracing::debug!(
+                    error = %snapshot_lock_error(error),
+                    retry_delay_seconds = SESSION_CLEANUP_RETRY_DELAY.as_secs(),
+                    "Session retention cleanup authority admission failed; retry deferred"
+                );
+                return;
+            }
+        };
+        if self
+            .session_cleanup_reconciliation_required
+            .load(Ordering::Acquire)
+            || self
+                .snapshot_authority_reconciliation_required
+                .load(Ordering::Acquire)
+        {
+            return;
+        }
+
         let Some(cleanup_attempt) = self.try_begin_session_cleanup() else {
             if !self
                 .session_cleanup_reconciliation_required
                 .load(Ordering::Acquire)
+                && !self
+                    .snapshot_authority_reconciliation_required
+                    .load(Ordering::Acquire)
             {
                 schedule.defer_retry(Instant::now());
                 tracing::debug!(
@@ -1336,8 +1613,8 @@ impl SnapshotEngine {
                         sessions_deleted = total,
                         orphaned_checkpoints = result.orphaned_checkpoints,
                         orphaned_pane_states = result.orphaned_pane_states,
-                        physical_compaction_attempted = false,
-                        free_space_policy = "sqlite_freelist_reuse",
+                        explicit_vacuum_attempted = false,
+                        normal_free_space_policy = "auto_vacuum_none_freelist_reuse",
                         interval_hours,
                         "Session retention cleanup completed"
                     );
@@ -1394,6 +1671,9 @@ impl SnapshotEngine {
         if self
             .session_cleanup_reconciliation_required
             .load(Ordering::Acquire)
+            || self
+                .snapshot_authority_reconciliation_required
+                .load(Ordering::Acquire)
         {
             return None;
         }
@@ -1408,6 +1688,9 @@ impl SnapshotEngine {
         if self
             .session_cleanup_reconciliation_required
             .load(Ordering::Acquire)
+            || self
+                .snapshot_authority_reconciliation_required
+                .load(Ordering::Acquire)
         {
             self.session_cleanup_in_progress
                 .store(false, Ordering::Release);
@@ -1417,6 +1700,8 @@ impl SnapshotEngine {
         Some(SessionCleanupAttemptGuard {
             in_progress: &self.session_cleanup_in_progress,
             reconciliation_required: &self.session_cleanup_reconciliation_required,
+            snapshot_authority_reconciliation_required: &self
+                .snapshot_authority_reconciliation_required,
             settled: false,
         })
     }
@@ -1431,58 +1716,11 @@ impl SnapshotEngine {
         if error.requires_reconciliation() {
             self.session_cleanup_reconciliation_required
                 .store(true, Ordering::Release);
+            self.snapshot_authority_reconciliation_required
+                .store(true, Ordering::Release);
         }
         self.session_cleanup_reconciliation_required
             .load(Ordering::Acquire)
-    }
-
-    /// Legacy non-cx scheduler body for builds without
-    /// `asupersync-runtime`. Preserves the exact prior behavior
-    /// — shutdown.changed() and trigger_rx.recv() without cx.
-    /// Get or create the session ID.
-    /// Get or create the session ID, bound to the caller's asupersync
-    /// capability context (ft-xbnl0.2.3 Cx-first internal helper).
-    ///
-    /// Threads `cx` through the `session_id` RwLock acquires via
-    /// `read_with_cx` / `write_with_cx` and checkpoints before the
-    /// blocking DB handoff so a canceled caller skips session
-    /// creation cleanly.
-    async fn ensure_session_with_cx(
-        &self,
-        cx: &crate::cx::Cx,
-        topology_json: &str,
-        now_ms: u64,
-    ) -> std::result::Result<String, SnapshotError> {
-        // Acquire the state commit guard before creating the durable session.
-        // The previous read-DB-write sequence had both a duplicate-session race
-        // and a post-effect cancellation hole: SQLite could contain a new
-        // session even though a cancelled final write-lock acquire returned an
-        // error and left `session_id` unset.
-        let mut session_id_guard = self
-            .session_id
-            .write_with_cx(cx)
-            .await
-            .map_err(snapshot_lock_error)?;
-        if let Some(id) = session_id_guard.as_ref() {
-            return Ok(id.clone());
-        }
-
-        if cx.checkpoint().is_err() {
-            return Err(SnapshotError::Cancelled);
-        }
-
-        let session_id = generate_session_id();
-        let db_path = Arc::clone(&self.db_path);
-        let id = session_id.clone();
-        let topo = topology_json.to_string();
-        let version = crate::VERSION.to_string();
-        Self::spawn_blocking_db(move || {
-            create_session_sync(&db_path, &id, now_ms, &topo, &version)
-        })
-        .await?;
-
-        *session_id_guard = Some(session_id.clone());
-        Ok(session_id)
     }
 
     /// Capture a final shutdown checkpoint and mark the session as cleanly shut down.
@@ -1588,21 +1826,27 @@ impl SnapshotEngine {
     /// ft-xbnl0.2.3 Cx-first sibling of [`mark_shutdown`].
     ///
     /// Cancellation is accepted before the session-id lock/DB mutation. Once
-    /// the clean-shutdown update commits, the method returns success even if
-    /// cancellation arrives concurrently; the durable effect is then
-    /// authoritative and must not be reported as a failed operation.
+    /// admitted, loss of the blocking task's typed result is reported as an
+    /// indeterminate authority mutation and latches all later durable writes.
     pub async fn mark_shutdown_with_cx(
         &self,
         cx: &crate::cx::Cx,
     ) -> std::result::Result<(), SnapshotError> {
         cx.checkpoint().map_err(|_| SnapshotError::Cancelled)?;
+        if self
+            .snapshot_authority_reconciliation_required
+            .load(Ordering::Acquire)
+            || self
+                .session_cleanup_reconciliation_required
+                .load(Ordering::Acquire)
+        {
+            return Err(SnapshotError::AuthorityReconciliationRequired {
+                operation: SnapshotAuthorityOperation::ShutdownMark,
+            });
+        }
 
-        // Tick 204 (ft-xbnl0.2.3): route the session_id read-lock
-        // through read_with_cx(cx) so the lock wait honors caller
-        // cancellation. Previously used the legacy ambient
-        // `read().await` which picks up cx via Cx::current()
-        // thread-local fallback. Matches the pattern already used
-        // by ensure_session_with_cx (L1260) in this same file.
+        // Route the session_id read-lock through read_with_cx(cx) so the lock
+        // wait honors caller cancellation rather than an ambient context.
         let session_id = {
             self.session_id
                 .read_with_cx(cx)
@@ -1612,7 +1856,12 @@ impl SnapshotEngine {
         };
         if let Some(id) = session_id {
             let db_path = Arc::clone(&self.db_path);
-            Self::spawn_blocking_db(move || mark_shutdown_sync(&db_path, &id)).await?;
+            self.spawn_blocking_authority_with_cx(
+                cx,
+                SnapshotAuthorityOperation::ShutdownMark,
+                move || mark_shutdown_sync(&db_path, &id),
+            )
+            .await?;
         }
 
         Ok(())
@@ -1997,6 +2246,22 @@ fn open_conn(db_path: &str) -> std::result::Result<Connection, rusqlite::Error> 
     Ok(conn)
 }
 
+fn current_host_id() -> String {
+    std::env::var("HOSTNAME")
+        .or_else(|_| std::env::var("HOST"))
+        .unwrap_or_default()
+}
+
+/// Creation-only fields inserted alongside a first checkpoint. Keeping this
+/// separate from the checkpoint arguments makes it impossible for an existing
+/// session capture to accidentally rewrite creation authority.
+#[derive(Debug)]
+struct NewSessionMetadata {
+    ft_version: String,
+    host_id: String,
+}
+
+#[cfg(test)]
 fn create_session_sync(
     db_path: &str,
     session_id: &str,
@@ -2006,10 +2271,12 @@ fn create_session_sync(
 ) -> std::result::Result<(), rusqlite::Error> {
     let now_ms = u64_to_sqlite_integer(now_ms)?;
     let conn = open_conn(db_path)?;
-    let host_id = std::env::var("HOSTNAME")
-        .or_else(|_| std::env::var("HOST"))
-        .unwrap_or_default();
-    let inserted = conn.execute(
+    let host_id = current_host_id();
+    let tx = conn.unchecked_transaction()?;
+    crate::session_retention::ensure_session_authority_tables_have_no_unaudited_triggers(
+        &tx,
+    )?;
+    let inserted = tx.execute(
         "INSERT INTO mux_sessions (session_id, created_at, topology_json, ft_version, host_id)
          VALUES (?1, ?2, ?3, ?4, ?5)",
         rusqlite::params![
@@ -2020,19 +2287,26 @@ fn create_session_sync(
             host_id
         ],
     )?;
-    require_exactly_one_changed_row(inserted)
+    require_exactly_one_changed_row(inserted)?;
+    tx.commit()
 }
 
 fn mark_shutdown_sync(db_path: &str, session_id: &str) -> std::result::Result<(), rusqlite::Error> {
     let conn = open_conn(db_path)?;
-    let updated = conn.execute(
+    let tx = conn.unchecked_transaction()?;
+    crate::session_retention::ensure_session_authority_tables_have_no_unaudited_triggers(
+        &tx,
+    )?;
+    let updated = tx.execute(
         "UPDATE mux_sessions SET shutdown_clean = 1 WHERE session_id = ?1",
         [session_id],
     )?;
-    require_exactly_one_changed_row(updated)
+    require_exactly_one_changed_row(updated)?;
+    tx.commit()
 }
 
-/// Save a checkpoint with all pane states in a single transaction.
+/// Save a checkpoint with all pane states in a single transaction. When
+/// `new_session` is present, session creation is part of that same transaction.
 /// Returns (session_id, checkpoint_id, total_bytes).
 fn save_checkpoint_sync(
     db_path: &str,
@@ -2042,6 +2316,7 @@ fn save_checkpoint_sync(
     state_hash: &str,
     topology_json: &str,
     pane_states: &[PaneStateSnapshot],
+    new_session: Option<&NewSessionMetadata>,
 ) -> std::result::Result<(String, i64, usize), rusqlite::Error> {
     struct SerializedPaneState {
         pane_id: i64,
@@ -2055,9 +2330,9 @@ fn save_checkpoint_sync(
     }
 
     let now_ms = u64_to_sqlite_integer(now_ms)?;
-    let conn = open_conn(db_path)?;
 
-    // Serialize all pane states and compute total bytes
+    // Serialize and validate every pane before opening the transaction. A first
+    // capture with invalid pane state must not leave a zero-checkpoint session.
     let mut serialized_states: Vec<SerializedPaneState> =
         Vec::with_capacity(pane_states.len());
     let mut total_bytes: usize = 0;
@@ -2119,12 +2394,30 @@ fn save_checkpoint_sync(
             last_output_at,
         });
     }
+
+    let conn = open_conn(db_path)?;
     let tx = conn.unchecked_transaction()?;
     let total_changes_before: i64 =
         tx.query_row("SELECT total_changes()", [], |row| row.get(0))?;
     let persisted_pane_count = serialized_states.len();
     let persisted_pane_count_sql = usize_to_sqlite_integer(persisted_pane_count)?;
     let total_bytes_sql = usize_to_sqlite_integer(total_bytes)?;
+
+    if let Some(metadata) = new_session {
+        let inserted_session = tx.execute(
+            "INSERT INTO mux_sessions
+             (session_id, created_at, last_checkpoint_at, topology_json, ft_version, host_id)
+             VALUES (?1, ?2, ?2, ?3, ?4, ?5)",
+            rusqlite::params![
+                session_id,
+                now_ms,
+                topology_json,
+                metadata.ft_version.as_str(),
+                metadata.host_id.as_str(),
+            ],
+        )?;
+        require_exactly_one_changed_row(inserted_session)?;
+    }
 
     // Insert checkpoint
     let inserted_checkpoint = tx.execute(
@@ -2169,13 +2462,15 @@ fn save_checkpoint_sync(
         }
     } // drop stmt before commit
 
-    let updated_session = tx.execute(
-        "UPDATE mux_sessions
-         SET last_checkpoint_at = ?1, topology_json = ?2
-         WHERE session_id = ?3",
-        rusqlite::params![now_ms, topology_json, session_id],
-    )?;
-    require_exactly_one_changed_row(updated_session)?;
+    if new_session.is_none() {
+        let updated_session = tx.execute(
+            "UPDATE mux_sessions
+             SET last_checkpoint_at = ?1, topology_json = ?2
+             WHERE session_id = ?3",
+            rusqlite::params![now_ms, topology_json, session_id],
+        )?;
+        require_exactly_one_changed_row(updated_session)?;
+    }
 
     // Direct execute counts deliberately exclude trigger side effects. The
     // connection-wide DML delta therefore proves that the transaction changed
@@ -2216,6 +2511,9 @@ fn cleanup_sync(
     // Wrap both DELETEs in a transaction so a concurrent checkpoint insert
     // between them cannot be incorrectly deleted by the second statement.
     let tx = conn.unchecked_transaction()?;
+    crate::session_retention::ensure_session_authority_tables_have_no_unaudited_triggers(
+        &tx,
+    )?;
 
     // Delete checkpoints older than retention_days
     let deleted_by_age: usize = tx.execute(
@@ -2340,6 +2638,82 @@ mod tests {
     }
 
     #[test]
+    fn create_session_rejects_authority_triggers_before_insert() {
+        let (_tmp, db_path) = setup_test_db();
+        let conn = Connection::open(db_path.as_str()).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER observe_session_insert
+             AFTER INSERT ON MuX_sEsSiOnS
+             BEGIN
+                 SELECT 1;
+             END;",
+        )
+        .unwrap();
+        drop(conn);
+
+        let error = create_session_sync(
+            db_path.as_str(),
+            "sess-trigger-create",
+            1_000,
+            r#"{"version":"trigger"}"#,
+            crate::VERSION,
+        )
+        .expect_err("an unaudited session trigger must fail before creation");
+        assert!(matches!(
+            error,
+            rusqlite::Error::ToSqlConversionFailure(_)
+        ));
+
+        let session_count: i64 = Connection::open(db_path.as_str())
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM mux_sessions", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(session_count, 0);
+    }
+
+    #[test]
+    fn mark_shutdown_rejects_authority_triggers_before_update() {
+        let (_tmp, db_path) = setup_test_db();
+        create_session_sync(
+            db_path.as_str(),
+            "sess-trigger-shutdown",
+            1_000,
+            r#"{"version":"trigger"}"#,
+            crate::VERSION,
+        )
+        .unwrap();
+
+        let conn = Connection::open(db_path.as_str()).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER observe_shutdown_update
+             AFTER UPDATE ON MUX_SESSIONS
+             BEGIN
+                 SELECT 1;
+             END;",
+        )
+        .unwrap();
+        drop(conn);
+
+        let error = mark_shutdown_sync(db_path.as_str(), "sess-trigger-shutdown")
+            .expect_err("an unaudited session trigger must fail before shutdown marking");
+        assert!(matches!(
+            error,
+            rusqlite::Error::ToSqlConversionFailure(_)
+        ));
+
+        let shutdown_clean: i64 = Connection::open(db_path.as_str())
+            .unwrap()
+            .query_row(
+                "SELECT shutdown_clean FROM mux_sessions
+                 WHERE session_id = 'sess-trigger-shutdown'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(shutdown_clean, 0);
+    }
+
+    #[test]
     fn snapshot_lock_errors_preserve_finite_failure_identity() {
         let cases = [
             (LockAcquireError::Cancelled, SnapshotError::Cancelled),
@@ -2391,6 +2765,110 @@ mod tests {
                 assert_eq!(actual, expected);
             }
         }
+    }
+
+    #[test]
+    fn authority_blocking_failure_classification_preserves_retry_safety_boundary() {
+        let before_handoff = classify_snapshot_authority_blocking_failure(
+            SnapshotAuthorityOperation::CheckpointCommit,
+            crate::runtime_async::SpawnBlockingWithCxError::CancelledBeforeSpawn { kind: None },
+        );
+        assert!(matches!(&before_handoff, SnapshotError::Cancelled));
+        assert!(!before_handoff.requires_reconciliation());
+
+        let post_handoff_failures = [
+            crate::runtime_async::SpawnBlockingWithCxError::CancelledMidFlight { kind: None },
+            crate::runtime_async::SpawnBlockingWithCxError::RuntimeFailure,
+            crate::runtime_async::SpawnBlockingWithCxError::CancellationWatcherTimerFailure,
+        ];
+        for failure in post_handoff_failures {
+            let error = classify_snapshot_authority_blocking_failure(
+                SnapshotAuthorityOperation::ShutdownMark,
+                failure,
+            );
+            assert!(matches!(
+                &error,
+                SnapshotError::IndeterminateAuthorityMutation {
+                    operation: SnapshotAuthorityOperation::ShutdownMark
+                }
+            ));
+            assert!(error.requires_reconciliation());
+        }
+    }
+
+    #[test]
+    fn abandoned_authority_attempt_latches_reconciliation_monotonically() {
+        let reconciliation_required = AtomicBool::new(false);
+        let session_cleanup_reconciliation_required = AtomicBool::new(false);
+
+        SnapshotAuthorityAttemptGuard {
+            reconciliation_required: &reconciliation_required,
+            session_cleanup_reconciliation_required:
+                &session_cleanup_reconciliation_required,
+            settled: false,
+        }
+        .settle();
+        assert!(!reconciliation_required.load(Ordering::Acquire));
+        assert!(!session_cleanup_reconciliation_required.load(Ordering::Acquire));
+
+        {
+            let _abandoned = SnapshotAuthorityAttemptGuard {
+                reconciliation_required: &reconciliation_required,
+                session_cleanup_reconciliation_required:
+                    &session_cleanup_reconciliation_required,
+                settled: false,
+            };
+        }
+        assert!(reconciliation_required.load(Ordering::Acquire));
+        assert!(session_cleanup_reconciliation_required.load(Ordering::Acquire));
+
+        SnapshotAuthorityAttemptGuard {
+            reconciliation_required: &reconciliation_required,
+            session_cleanup_reconciliation_required:
+                &session_cleanup_reconciliation_required,
+            settled: false,
+        }
+        .settle();
+        assert!(
+            reconciliation_required.load(Ordering::Acquire),
+            "a later settled attempt must not clear historical observation loss"
+        );
+    }
+
+    #[test]
+    fn authority_reconciliation_latch_suppresses_later_mutations() {
+        run_async_test(async {
+            let (_tmp, db_path) = setup_test_db();
+            let engine = SnapshotEngine::new(db_path, SnapshotConfig::default());
+            engine
+                .snapshot_authority_reconciliation_required
+                .store(true, Ordering::Release);
+
+            let cx = crate::cx::for_testing();
+            let shutdown_error = engine
+                .mark_shutdown_with_cx(&cx)
+                .await
+                .expect_err("a latched engine with no in-memory ID must not report shutdown");
+            assert!(matches!(
+                &shutdown_error,
+                SnapshotError::AuthorityReconciliationRequired {
+                    operation: SnapshotAuthorityOperation::ShutdownMark
+                }
+            ));
+            assert!(shutdown_error.requires_reconciliation());
+
+            let error = engine
+                .cleanup_with_cx(&cx)
+                .await
+                .expect_err("a latched engine must suppress checkpoint cleanup");
+            assert!(matches!(
+                &error,
+                SnapshotError::AuthorityReconciliationRequired {
+                    operation: SnapshotAuthorityOperation::CheckpointCleanup
+                }
+            ));
+            assert!(error.requires_reconciliation());
+        });
     }
 
     async fn recv_trigger(rx: &mut mpsc::Receiver<SnapshotTrigger>) -> SnapshotTrigger {
@@ -2540,6 +3018,12 @@ mod tests {
                 .session_cleanup_reconciliation_required
                 .load(Ordering::Acquire),
             "a same-engine scheduler restart must observe the sticky latch"
+        );
+        assert!(
+            engine
+                .snapshot_authority_reconciliation_required
+                .load(Ordering::Acquire),
+            "session-cleanup observation loss must suppress every authority mutation"
         );
     }
 
@@ -2700,6 +3184,12 @@ mod tests {
                 .session_cleanup_reconciliation_required
                 .load(Ordering::Acquire),
             "dropping an unclassified attempt must fail closed"
+        );
+        assert!(
+            engine
+                .snapshot_authority_reconciliation_required
+                .load(Ordering::Acquire),
+            "abandoned retention cleanup must suppress every authority mutation"
         );
         assert!(engine.try_begin_session_cleanup().is_none());
     }
@@ -2920,6 +3410,137 @@ mod tests {
             assert_eq!(result.pane_count, 1);
             assert!(result.checkpoint_id > 0);
             assert!(result.session_id.starts_with("sess-"));
+
+            let conn = Connection::open(db_path.as_str()).unwrap();
+            let (session_count, checkpoint_count): (i64, i64) = conn
+                .query_row(
+                    "SELECT
+                         (SELECT COUNT(*) FROM mux_sessions),
+                         (SELECT COUNT(*) FROM session_checkpoints)",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!((session_count, checkpoint_count), (1, 1));
+            let (last_checkpoint_at, checkpoint_at): (i64, i64) = conn
+                .query_row(
+                    "SELECT s.last_checkpoint_at, c.checkpoint_at
+                     FROM mux_sessions s
+                     JOIN session_checkpoints c ON c.session_id = s.session_id
+                     WHERE s.session_id = ?1 AND c.id = ?2",
+                    rusqlite::params![&result.session_id, result.checkpoint_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(last_checkpoint_at, checkpoint_at);
+        });
+    }
+
+    #[test]
+    fn failed_first_capture_leaves_no_session_or_in_memory_authority() {
+        run_async_test(async {
+            let (_tmp, db_path) = setup_test_db();
+            let engine = SnapshotEngine::new(db_path.clone(), SnapshotConfig::default());
+            let panes = vec![make_test_pane(u64::MAX, 24, 80)];
+
+            let error = engine
+                .capture(&panes, SnapshotTrigger::Manual)
+                .await
+                .expect_err("an unrepresentable pane ID must abort the first capture");
+            assert!(matches!(&error, SnapshotError::Database(_)));
+            assert!(!error.requires_reconciliation());
+            assert!(
+                !engine
+                    .snapshot_authority_reconciliation_required
+                    .load(Ordering::Acquire),
+                "an observed validation failure remains retry-safe"
+            );
+
+            let cx = crate::cx::for_testing();
+            assert!(
+                engine
+                    .session_id
+                    .read_with_cx(&cx)
+                    .await
+                    .expect("session publication lock")
+                    .is_none(),
+                "a failed first transaction must not publish an in-memory session ID"
+            );
+            assert!(
+                engine
+                    .last_state_hash
+                    .read_with_cx(&cx)
+                    .await
+                    .expect("state-hash publication lock")
+                    .is_none(),
+                "a failed first transaction must not publish the dedup hash"
+            );
+
+            let conn = Connection::open(db_path.as_str()).unwrap();
+            let session_count: i64 = conn
+                .query_row("SELECT COUNT(*) FROM mux_sessions", [], |row| row.get(0))
+                .unwrap();
+            let checkpoint_count: i64 = conn
+                .query_row("SELECT COUNT(*) FROM session_checkpoints", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(session_count, 0);
+            assert_eq!(checkpoint_count, 0);
+            assert_eq!(engine.telemetry().snapshot().capture_errors, 1);
+        });
+    }
+
+    #[test]
+    fn failed_first_checkpoint_insert_rolls_back_new_session_transaction() {
+        run_async_test(async {
+            let (_tmp, db_path) = setup_test_db();
+            let conn = Connection::open(db_path.as_str()).unwrap();
+            conn.execute_batch(
+                "CREATE TRIGGER abort_first_checkpoint
+                 BEFORE INSERT ON session_checkpoints
+                 BEGIN
+                     SELECT RAISE(ABORT, 'synthetic checkpoint failure');
+                 END;",
+            )
+            .unwrap();
+            drop(conn);
+
+            let engine = SnapshotEngine::new(db_path.clone(), SnapshotConfig::default());
+            let error = engine
+                .capture(&[make_test_pane(17, 24, 80)], SnapshotTrigger::Manual)
+                .await
+                .expect_err("checkpoint failure must roll back first-session creation");
+            assert!(matches!(&error, SnapshotError::Database(_)));
+            assert!(!error.requires_reconciliation());
+            assert!(
+                !engine
+                    .snapshot_authority_reconciliation_required
+                    .load(Ordering::Acquire),
+                "an observed transactional rollback remains retry-safe"
+            );
+
+            let cx = crate::cx::for_testing();
+            assert!(
+                engine
+                    .session_id
+                    .read_with_cx(&cx)
+                    .await
+                    .expect("session publication lock")
+                    .is_none()
+            );
+            let conn = Connection::open(db_path.as_str()).unwrap();
+            let (session_count, checkpoint_count): (i64, i64) = conn
+                .query_row(
+                    "SELECT
+                         (SELECT COUNT(*) FROM mux_sessions),
+                         (SELECT COUNT(*) FROM session_checkpoints)",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!((session_count, checkpoint_count), (0, 0));
+            assert_eq!(engine.telemetry().snapshot().capture_errors, 1);
         });
     }
 
@@ -3180,6 +3801,7 @@ mod tests {
             "state-hash-2",
             r#"{"version":"new"}"#,
             &[pane],
+            None,
         )
         .unwrap();
 
@@ -3223,6 +3845,7 @@ mod tests {
             "state-hash-corrupt",
             r#"{"version":"corrupt"}"#,
             &[corrupt_pane],
+            None,
         )
         .expect_err("a negative scrollback sequence cannot be persisted");
         assert!(matches!(
@@ -3286,6 +3909,7 @@ mod tests {
             "state-hash-bytes",
             r#"{"version":"bytes-2"}"#,
             &[pane],
+            None,
         )
         .unwrap();
         assert_eq!(receipt_bytes, expected);
@@ -3334,6 +3958,7 @@ mod tests {
             "state-hash-ignored-update",
             r#"{"version":"new"}"#,
             &[pane],
+            None,
         )
         .expect_err("an ignored authority-row update must abort the checkpoint transaction");
         assert!(matches!(error, rusqlite::Error::StatementChangedRows(0)));
@@ -3405,6 +4030,7 @@ mod tests {
             "state-hash-extra-dml",
             r#"{"version":"new"}"#,
             &[pane],
+            None,
         )
         .expect_err("unexpected trigger DML must invalidate the checkpoint receipt");
         assert!(matches!(
@@ -3427,6 +4053,70 @@ mod tests {
             .unwrap();
         assert_eq!(checkpoint_count, 0);
         assert_eq!(unrelated_topology, r#"{"version":"unrelated"}"#);
+    }
+
+    #[test]
+    fn cleanup_rejects_triggers_on_foreign_key_cascade_targets_before_delete() {
+        let (_tmp, db_path) = setup_test_db();
+        create_session_sync(
+            db_path.as_str(),
+            "sess-cleanup-trigger",
+            1_000,
+            r#"{"version":"old"}"#,
+            crate::VERSION,
+        )
+        .unwrap();
+
+        for checkpoint_at in [2_000_u64, 3_000_u64] {
+            let pane = PaneStateSnapshot::from_pane_info(
+                &make_test_pane(checkpoint_at, 24, 80),
+                checkpoint_at,
+                false,
+            );
+            save_checkpoint_sync(
+                db_path.as_str(),
+                "sess-cleanup-trigger",
+                checkpoint_at,
+                "event",
+                &format!("state-hash-{checkpoint_at}"),
+                r#"{"version":"new"}"#,
+                &[pane],
+                None,
+            )
+            .unwrap();
+        }
+
+        let conn = Connection::open(db_path.as_str()).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER observe_cascaded_pane_delete
+             AFTER DELETE ON MuX_PaNe_StAtE
+             BEGIN
+                 SELECT 1;
+             END;",
+        )
+        .unwrap();
+        drop(conn);
+
+        let error = cleanup_sync(db_path.as_str(), 0, 365)
+            .expect_err("a trigger on an FK cascade target must block cleanup before deletion");
+        assert!(matches!(
+            error,
+            rusqlite::Error::ToSqlConversionFailure(_)
+        ));
+
+        let conn = Connection::open(db_path.as_str()).unwrap();
+        let checkpoint_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM session_checkpoints", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let pane_state_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM mux_pane_state", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(checkpoint_count, 2);
+        assert_eq!(pane_state_count, 2);
     }
 
     #[test]
@@ -4097,6 +4787,8 @@ mod tests {
             scheduler_in_progress: AtomicBool::new(false),
             session_cleanup_reconciliation_required: AtomicBool::new(false),
             session_cleanup_in_progress: AtomicBool::new(false),
+            snapshot_authority_reconciliation_required: AtomicBool::new(false),
+            snapshot_authority_mutation: Mutex::new(()),
             trigger_tx,
             trigger_rx: Mutex::new(None),
             telemetry: SnapshotEngineTelemetry::new(),
@@ -4733,6 +5425,22 @@ mod tests {
             SnapshotError::Serialization("bad json".into())
                 .to_string()
                 .contains("bad json")
+        );
+        assert_eq!(
+            SnapshotError::IndeterminateAuthorityMutation {
+                operation: SnapshotAuthorityOperation::CheckpointCommit,
+            }
+            .to_string(),
+            "snapshot authority outcome is indeterminate after checkpoint_commit handoff; \
+             reconcile durable state before retrying"
+        );
+        assert_eq!(
+            SnapshotError::AuthorityReconciliationRequired {
+                operation: SnapshotAuthorityOperation::ShutdownMark,
+            }
+            .to_string(),
+            "snapshot authority reconciliation is required before shutdown_mark; durable \
+             mutation suppressed"
         );
     }
 

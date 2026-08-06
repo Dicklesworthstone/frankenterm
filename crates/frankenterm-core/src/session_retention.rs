@@ -163,13 +163,15 @@ pub fn cleanup_sessions(
         );
     }
 
-    // Deliberately leave freed pages on SQLite's freelist for reuse. Full
-    // VACUUM rewrites the entire database and can monopolize the interactive
-    // writer for an unbounded interval; retention cleanup must never trigger
-    // it implicitly. The runtime's ordinary online-maintenance lane owns
-    // PASSIVE WAL checkpointing and PRAGMA optimize. Physical compaction, when
-    // explicitly requested by an operator, remains a separate disruptive
-    // maintenance operation.
+    // Deliberately issue no VACUUM or incremental_vacuum operation here. Under
+    // FrankenTerm's normal `auto_vacuum=NONE` database policy, freed pages stay
+    // on SQLite's freelist for reuse. An externally-created database configured
+    // with `auto_vacuum=FULL` may still relocate and truncate pages as part of a
+    // committing DELETE; absence of an explicit VACUUM is not a universal
+    // no-compaction guarantee for that non-default mode. The runtime's ordinary
+    // online-maintenance lane owns PASSIVE WAL checkpointing and PRAGMA optimize.
+    // Explicit operator-requested physical compaction remains a separate,
+    // disruptive maintenance operation.
     Ok(result)
 }
 
@@ -178,7 +180,18 @@ fn u64_to_sqlite_integer(value: u64) -> Result<i64, rusqlite::Error> {
         .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
 }
 
-fn ensure_retention_tables_have_no_unaudited_triggers(
+/// Fail closed when authority-table triggers could invalidate direct SQLite
+/// row-count receipts.
+///
+/// SQLite identifiers are case-insensitive while both schema catalogs preserve
+/// the spelling used by `CREATE TRIGGER`, so both the persistent and TEMP
+/// catalog comparisons must use `NOCASE`.
+///
+/// # Errors
+///
+/// Returns the underlying catalog-query error, or a fail-closed conversion
+/// error when any unaudited trigger targets an authority table.
+pub(crate) fn ensure_session_authority_tables_have_no_unaudited_triggers(
     conn: &Connection,
 ) -> Result<(), rusqlite::Error> {
     let trigger_count: i64 = conn.query_row(
@@ -199,7 +212,7 @@ fn ensure_retention_tables_have_no_unaudited_triggers(
     } else {
         Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
             std::io::Error::other(
-                "session retention refuses unaudited triggers on authoritative tables",
+                "session authority mutation refuses unaudited triggers on authoritative tables",
             ),
         )))
     }
@@ -218,7 +231,7 @@ fn delete_sessions_by_age(conn: &Connection, max_age_days: u64) -> Result<usize,
     let cutoff_ms = u64_to_sqlite_integer(cutoff_ms)?;
 
     let tx = conn.unchecked_transaction()?;
-    ensure_retention_tables_have_no_unaudited_triggers(&tx)?;
+    ensure_session_authority_tables_have_no_unaudited_triggers(&tx)?;
     let deleted = tx.execute(
         "DELETE FROM mux_sessions
          WHERE MAX(
@@ -245,7 +258,7 @@ fn delete_excess_closed_sessions(
 ) -> Result<usize, rusqlite::Error> {
     let max_count = i64::try_from(max_count).unwrap_or(i64::MAX);
     let tx = conn.unchecked_transaction()?;
-    ensure_retention_tables_have_no_unaudited_triggers(&tx)?;
+    ensure_session_authority_tables_have_no_unaudited_triggers(&tx)?;
     let deleted = tx.execute(
         "DELETE FROM mux_sessions
          WHERE shutdown_clean = 1
@@ -287,7 +300,7 @@ fn delete_sessions_by_size(
     // result, and a concurrent cleanup could make us claim bytes for a row our
     // connection did not delete.
     let tx = conn.unchecked_transaction()?;
-    ensure_retention_tables_have_no_unaudited_triggers(&tx)?;
+    ensure_session_authority_tables_have_no_unaudited_triggers(&tx)?;
 
     // Measure only checkpoints owned by a current session. Orphan checkpoints
     // are reclaimed by `cleanup_orphaned_data`; counting them here would make
@@ -403,7 +416,7 @@ fn cleanup_orphaned_data(conn: &Connection) -> Result<(usize, usize), rusqlite::
     // correct AND correctly counted under either FK setting. The transaction
     // makes both deletes commit atomically.
     let tx = conn.unchecked_transaction()?;
-    ensure_retention_tables_have_no_unaudited_triggers(&tx)?;
+    ensure_session_authority_tables_have_no_unaudited_triggers(&tx)?;
 
     // Orphaned pane_state rows: checkpoint already deleted, OR checkpoint is
     // itself a session-orphan that the next statement removes.
@@ -646,7 +659,10 @@ mod tests {
 
     fn make_test_db() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        // Pin the physical-reclamation proof contract rather than relying on a
+        // platform SQLite build's compile-time auto-vacuum default.
+        conn.execute_batch("PRAGMA auto_vacuum = NONE; PRAGMA foreign_keys = ON;")
+            .unwrap();
         conn.execute_batch(crate::storage::SCHEMA_SQL).unwrap();
         conn
     }
@@ -1446,12 +1462,19 @@ mod tests {
     }
 
     // ====================================================================
-    // Online cleanup must not perform physical compaction
+    // Online cleanup issues no explicit compaction; this fixture pins NONE
     // ====================================================================
 
     #[test]
     fn cleanup_leaves_reclaimable_pages_for_sqlite_reuse_after_many_deletions() {
         let conn = make_test_db();
+        let auto_vacuum: i64 = conn
+            .query_row("PRAGMA auto_vacuum", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            auto_vacuum, 0,
+            "freelist-reuse proof requires auto_vacuum=NONE"
+        );
         let now = epoch_ms() as i64;
         let old = now - 31 * 86_400_000;
 
@@ -1486,7 +1509,7 @@ mod tests {
         );
 
         // A sentinel interactive write must remain available immediately after
-        // cleanup; physical compaction is not part of this operation.
+        // cleanup; under this pinned NONE policy, cleanup does not compact.
         insert_session(&conn, "interactive-sentinel", now, false);
         assert_eq!(count_sessions(&conn), 1);
     }
