@@ -31,7 +31,8 @@ use serde_json::Value;
 use crate::agent_correlator::AgentCorrelator;
 use crate::checkpoint_witness::{
     CHECKPOINT_ROLE_SNAPSHOT, CheckpointWitnessError, PersistedPaneState,
-    canonical_json_string, checkpoint_witness, snapshot_dedup_witness,
+    SNAPSHOT_WITNESS_PREFIX, canonical_json_string, checkpoint_witness,
+    snapshot_dedup_witness,
 };
 use crate::config::{SnapshotConfig, SnapshotSchedulingMode};
 use crate::outcome::CancelKind;
@@ -82,7 +83,8 @@ pub struct SnapshotEngineTelemetry {
     dedup_skips: AtomicU64,
     /// Captures that failed with an error.
     capture_errors: AtomicU64,
-    /// Number of cleanup() calls.
+    /// Number of cleanup attempts that entered `cleanup_with_cx`. Automatic
+    /// cadence checks that skip a full scan do not increment this counter.
     cleanup_runs: AtomicU64,
     /// Checkpoints removed by cleanup.
     cleanup_removed: AtomicU64,
@@ -197,7 +199,8 @@ pub struct SnapshotEngineTelemetrySnapshot {
     pub dedup_skips: u64,
     /// Captures that failed with an error.
     pub capture_errors: u64,
-    /// Number of cleanup() calls.
+    /// Number of cleanup attempts that entered `cleanup_with_cx`; cadence-only
+    /// skips are excluded.
     pub cleanup_runs: u64,
     /// Checkpoints removed by cleanup.
     pub cleanup_removed: u64,
@@ -365,6 +368,14 @@ pub enum SnapshotAuthorityOperation {
     ShutdownMark,
     /// Delete one exact checkpoint and reconcile its session summary.
     CheckpointDelete,
+    /// Persist an unclean restore receipt after layout reconstruction.
+    RestoreReceiptCommit,
+    /// Bind an exact restore receipt after process relaunch settles.
+    RestoreCleanMark,
+    /// Delete one operator-selected session and its dependent state.
+    SessionDelete,
+    /// Persist a restore attempt intent before the first external mux effect.
+    RestoreIntentCommit,
 }
 
 impl SnapshotAuthorityOperation {
@@ -375,6 +386,10 @@ impl SnapshotAuthorityOperation {
             Self::SessionRetentionCleanup => "session_retention_cleanup",
             Self::ShutdownMark => "shutdown_mark",
             Self::CheckpointDelete => "checkpoint_delete",
+            Self::RestoreReceiptCommit => "restore_receipt_commit",
+            Self::RestoreCleanMark => "restore_clean_mark",
+            Self::SessionDelete => "session_delete",
+            Self::RestoreIntentCommit => "restore_intent_commit",
         }
     }
 
@@ -385,6 +400,10 @@ impl SnapshotAuthorityOperation {
             Self::SessionRetentionCleanup => 3,
             Self::ShutdownMark => 4,
             Self::CheckpointDelete => 5,
+            Self::RestoreReceiptCommit => 6,
+            Self::RestoreCleanMark => 7,
+            Self::SessionDelete => 8,
+            Self::RestoreIntentCommit => 9,
         }
     }
 
@@ -395,6 +414,10 @@ impl SnapshotAuthorityOperation {
             3 => Some(Self::SessionRetentionCleanup),
             4 => Some(Self::ShutdownMark),
             5 => Some(Self::CheckpointDelete),
+            6 => Some(Self::RestoreReceiptCommit),
+            7 => Some(Self::RestoreCleanMark),
+            8 => Some(Self::SessionDelete),
+            9 => Some(Self::RestoreIntentCommit),
             _ => None,
         }
     }
@@ -415,6 +438,8 @@ pub enum SnapshotError {
     ShuttingDown,
     #[error("snapshot scheduler already running for this engine")]
     SchedulerInProgress,
+    #[error("snapshot intelligent scheduler trigger receiver is unavailable")]
+    TriggerReceiverUnavailable,
     #[error("no panes found")]
     NoPanes,
     #[error("no changes since last snapshot")]
@@ -547,19 +572,32 @@ fn snapshot_lock_error(error: LockAcquireError) -> SnapshotError {
     }
 }
 
-fn classify_shutdown_timeout(
-    cx: &crate::cx::Cx,
-    timeout: Duration,
-) -> SnapshotError {
+fn snapshot_context_error(cx: &crate::cx::Cx) -> SnapshotError {
     match cx.root_cancel_cause().map(|reason| reason.kind) {
         Some(CancelKind::Deadline | CancelKind::Timeout) => SnapshotError::DeadlineExceeded,
         Some(CancelKind::PollQuota) => SnapshotError::PollQuotaExhausted,
         Some(CancelKind::CostBudget) => SnapshotError::CostBudgetExhausted,
         Some(_) => SnapshotError::Cancelled,
-        None if cx.is_cancel_requested() => SnapshotError::ContextFailure,
-        None => SnapshotError::ShutdownTimedOut {
+        None => SnapshotError::ContextFailure,
+    }
+}
+
+fn snapshot_cx_checkpoint(
+    cx: &crate::cx::Cx,
+) -> std::result::Result<(), SnapshotError> {
+    cx.checkpoint().map_err(|_| snapshot_context_error(cx))
+}
+
+fn classify_shutdown_timeout(
+    cx: &crate::cx::Cx,
+    timeout: Duration,
+) -> SnapshotError {
+    if cx.root_cancel_cause().is_some() || cx.is_cancel_requested() {
+        snapshot_context_error(cx)
+    } else {
+        SnapshotError::ShutdownTimedOut {
             timeout_ms: u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX),
-        },
+        }
     }
 }
 
@@ -571,6 +609,18 @@ fn classify_shutdown_timeout(
 /// retried soon enough to recover without waiting for the normal hours-long
 /// cadence, but not on every 250 ms intelligent-scheduler poll.
 const SESSION_CLEANUP_RETRY_DELAY: Duration = Duration::from_secs(30);
+/// Automatic per-checkpoint pruning is a full authority-table scan. Bound it
+/// away from the hot capture path while still guaranteeing that an active
+/// scheduler revisits retention promptly. The configured snapshot interval is
+/// clamped into this range: high-frequency intelligent captures therefore do
+/// not manufacture high-frequency scans, while very sparse configurations do
+/// not defer pruning for hours.
+const CHECKPOINT_CLEANUP_MIN_INTERVAL: Duration = Duration::from_secs(30);
+const CHECKPOINT_CLEANUP_MAX_INTERVAL: Duration = Duration::from_secs(5 * 60);
+/// Admission contention and retry-safe failure must not turn into a tight
+/// cleanup loop, but also must not postpone the next attempt until the normal
+/// cadence elapses again.
+const CHECKPOINT_CLEANUP_RETRY_DELAY: Duration = Duration::from_secs(30);
 /// A scheduler capture that was provably not admitted must retry promptly
 /// without spinning or pretending the cadence completed. This is short enough
 /// for hazard/memory-pressure triggers while still bounding contention load.
@@ -753,6 +803,55 @@ impl SessionCleanupSchedule {
     }
 }
 
+/// Process-local, database-keyed checkpoint-pruning cadence.
+///
+/// This lives inside [`SnapshotAuthorityState`] rather than one scheduler so
+/// independently constructed engines that target the same SQLite object share
+/// both the last successful scan and one in-flight admission bit. `Instant`
+/// makes every decision immune to wall-clock jumps.
+#[derive(Debug, Clone, Copy)]
+struct CheckpointCleanupCadence {
+    last_authoritative_success: Option<Instant>,
+    retry_deferred_at: Option<Instant>,
+    in_progress: bool,
+}
+
+impl CheckpointCleanupCadence {
+    fn new() -> Self {
+        Self {
+            last_authoritative_success: None,
+            retry_deferred_at: None,
+            in_progress: false,
+        }
+    }
+}
+
+/// Shared automatic-cleanup admission. Dropping an unfinished attempt always
+/// releases admission and publishes a bounded retry deadline. If another
+/// explicit cleanup completed after this attempt was claimed, that newer
+/// authoritative success wins and no redundant retry is scheduled.
+struct CheckpointCleanupAttemptGuard {
+    authority: Arc<SnapshotAuthorityState>,
+    claimed_at: Instant,
+}
+
+impl Drop for CheckpointCleanupAttemptGuard {
+    fn drop(&mut self) {
+        let mut cadence = self
+            .authority
+            .checkpoint_cleanup_cadence
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        cadence.in_progress = false;
+        if cadence
+            .last_authoritative_success
+            .is_none_or(|completed_at| completed_at < self.claimed_at)
+        {
+            cadence.retry_deferred_at = Some(Instant::now());
+        }
+    }
+}
+
 /// Scheduler-local exclusion for one automatic session-cleanup attempt.
 /// Durable unknown-effect classification belongs exclusively to the shared
 /// start/suppress authority guard below; this guard only releases the scheduler
@@ -850,6 +949,10 @@ struct SnapshotAuthorityState {
     reconciliation_required: AtomicBool,
     session_cleanup_reconciliation_required: AtomicBool,
     first_latched_operation: AtomicU8,
+    /// Shared monotonic checkpoint-retention schedule. This prevents multiple
+    /// engines for one database from each running the same full scan after a
+    /// capture.
+    checkpoint_cleanup_cadence: StdMutex<CheckpointCleanupCadence>,
 }
 
 impl SnapshotAuthorityState {
@@ -868,6 +971,7 @@ impl SnapshotAuthorityState {
             reconciliation_required: AtomicBool::new(false),
             session_cleanup_reconciliation_required: AtomicBool::new(false),
             first_latched_operation: AtomicU8::new(0),
+            checkpoint_cleanup_cadence: StdMutex::new(CheckpointCleanupCadence::new()),
         }
     }
 
@@ -903,6 +1007,35 @@ enum SnapshotAuthorityRegistryEntry {
     Latched(Arc<SnapshotAuthorityState>),
 }
 
+const SNAPSHOT_AUTHORITY_OBJECT_IDENTITY_PREFIX: &str = "sqlite-file-object-unix:";
+
+/// Finite, content-free reason that a filesystem-backed authority can no
+/// longer prove it still names the SQLite object originally admitted.
+#[derive(Debug, thiserror::Error)]
+enum SnapshotAuthorityIdentityError {
+    #[error("snapshot database has more than one registered filesystem object identity")]
+    MultipleRegisteredObjects,
+    #[error("snapshot database resolved to more than one filesystem object identity")]
+    MultipleObservedObjects,
+    #[error("snapshot database filesystem object disappeared after authority was established")]
+    EstablishedObjectMissing,
+    #[error("snapshot database filesystem object changed after authority was established")]
+    EstablishedObjectReplaced,
+    #[error("snapshot database filesystem object is already owned by another authority state")]
+    SplitAuthority,
+}
+
+fn snapshot_authority_object_identities(identities: &[String]) -> Vec<&str> {
+    identities
+        .iter()
+        .filter_map(|identity| {
+            identity
+                .starts_with(SNAPSHOT_AUTHORITY_OBJECT_IDENTITY_PREFIX)
+                .then_some(identity.as_str())
+        })
+        .collect()
+}
+
 fn snapshot_authority_registry(
 ) -> &'static StdMutex<HashMap<String, SnapshotAuthorityRegistryEntry>> {
     static REGISTRY: OnceLock<
@@ -934,13 +1067,15 @@ fn retain_latched_snapshot_authority(state: &Arc<SnapshotAuthorityState>) {
 fn refresh_snapshot_authority_file_identities(
     db_path: &str,
     state: &Arc<SnapshotAuthorityState>,
-) {
+    operation: SnapshotAuthorityOperation,
+) -> std::result::Result<(), SnapshotAuthorityIdentityError> {
     let identities = snapshot_authority_file_identities(db_path);
     if identities.is_empty() {
-        return;
+        return Ok(());
     }
 
     let mut conflicts: Vec<Arc<SnapshotAuthorityState>> = Vec::new();
+    let identity_error;
     {
         // Lock order is registry then per-state identities, matching
         // shared_snapshot_authority_state and the type-level invariant.
@@ -963,11 +1098,32 @@ fn refresh_snapshot_authority_file_identities(
             }
         }
 
-        if conflicts.is_empty() {
-            let mut registered = state
-                .registry_identities
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut registered = state
+            .registry_identities
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let registered_objects = snapshot_authority_object_identities(&registered);
+        let observed_objects = snapshot_authority_object_identities(&identities);
+        let mut observed_error = if registered_objects.len() > 1 {
+            Some(SnapshotAuthorityIdentityError::MultipleRegisteredObjects)
+        } else if observed_objects.len() > 1 {
+            Some(SnapshotAuthorityIdentityError::MultipleObservedObjects)
+        } else {
+            match (registered_objects.first(), observed_objects.first()) {
+                (Some(_), None) => {
+                    Some(SnapshotAuthorityIdentityError::EstablishedObjectMissing)
+                }
+                (Some(registered), Some(observed)) if registered != observed => {
+                    Some(SnapshotAuthorityIdentityError::EstablishedObjectReplaced)
+                }
+                _ => None,
+            }
+        };
+        if observed_error.is_none() && !conflicts.is_empty() {
+            observed_error = Some(SnapshotAuthorityIdentityError::SplitAuthority);
+        }
+
+        if observed_error.is_none() {
             for identity in identities {
                 if !registered.contains(&identity) {
                     registered.push(identity.clone());
@@ -979,21 +1135,26 @@ fn refresh_snapshot_authority_file_identities(
                 };
                 entries.insert(identity, entry);
             }
-            return;
+            return Ok(());
         }
+        identity_error = observed_error;
     }
 
-    // A split was already live before refresh could publish the inode. Do not
-    // guess which state owned earlier work: latch every participant after
-    // releasing registry locks so all future mutations fail closed.
+    // A split, disappearance, or replacement was observed. Do not guess which
+    // state owns the object or whether an alias still references an older
+    // inode: latch every participant after releasing registry locks so every
+    // future authority observation and mutation fails closed.
+    let error = identity_error.unwrap_or(SnapshotAuthorityIdentityError::SplitAuthority);
     tracing::error!(
+        reason = %error,
         conflict_count = conflicts.len(),
-        "detected split snapshot authority for one SQLite filesystem object"
+        "snapshot filesystem authority identity could not be proven"
     );
-    state.latch_reconciliation(SnapshotAuthorityOperation::CheckpointCommit);
+    state.latch_reconciliation(operation);
     for conflict in conflicts {
-        conflict.latch_reconciliation(SnapshotAuthorityOperation::CheckpointCommit);
+        conflict.latch_reconciliation(operation);
     }
+    Err(error)
 }
 
 fn freeze_filesystem_path_from_base(path: &Path, base: &Path) -> PathBuf {
@@ -1371,47 +1532,50 @@ fn shared_snapshot_authority_state(db_path: &str) -> Arc<SnapshotAuthorityState>
     if identities.is_empty() {
         return Arc::new(SnapshotAuthorityState::new(None));
     }
-    let mut entries = snapshot_authority_registry()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    entries.retain(|_, entry| match entry {
-        SnapshotAuthorityRegistryEntry::Live(state) => state.strong_count() > 0,
-        SnapshotAuthorityRegistryEntry::Latched(_) => true,
-    });
-    let state = identities
-        .iter()
-        .find_map(|identity| match entries.get(identity) {
-            Some(SnapshotAuthorityRegistryEntry::Live(state)) => state.upgrade(),
-            Some(SnapshotAuthorityRegistryEntry::Latched(state)) => Some(Arc::clone(state)),
-            None => None,
-        })
-        .unwrap_or_else(|| {
-            Arc::new(SnapshotAuthorityState::new_with_registry_identities(
-                identities.clone(),
-                Some(db_path.to_owned()),
-            ))
-        });
-
-    {
-        let mut registered = state
-            .registry_identities
+    let state = {
+        let mut entries = snapshot_authority_registry()
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        entries.retain(|_, entry| match entry {
+            SnapshotAuthorityRegistryEntry::Live(state) => state.strong_count() > 0,
+            SnapshotAuthorityRegistryEntry::Latched(_) => true,
+        });
+
+        let mut matched_states = Vec::new();
         for identity in &identities {
-            if !registered.contains(identity) {
-                registered.push(identity.clone());
+            let matched = match entries.get(identity) {
+                Some(SnapshotAuthorityRegistryEntry::Live(state)) => state.upgrade(),
+                Some(SnapshotAuthorityRegistryEntry::Latched(state)) => {
+                    Some(Arc::clone(state))
+                }
+                None => None,
+            };
+            if let Some(matched) = matched
+                && !matched_states
+                    .iter()
+                    .any(|known| Arc::ptr_eq(known, &matched))
+            {
+                matched_states.push(matched);
             }
         }
-    }
-    let latched = state.reconciliation_is_required();
-    for identity in identities {
-        let entry = if latched {
-            SnapshotAuthorityRegistryEntry::Latched(Arc::clone(&state))
-        } else {
-            SnapshotAuthorityRegistryEntry::Live(Arc::downgrade(&state))
-        };
-        entries.insert(identity, entry);
-    }
+
+        matched_states.into_iter().next().unwrap_or_else(|| {
+            Arc::new(SnapshotAuthorityState::new_with_registry_identities(
+                Vec::new(),
+                Some(db_path.to_owned()),
+            ))
+        })
+    };
+
+    // Publish every spelling through the same invariant checker. If two
+    // identities already resolve to distinct live states, or this pathname
+    // now resolves to a replacement inode, the checker latches all known
+    // participants instead of silently overwriting one registry entry.
+    let _ = refresh_snapshot_authority_file_identities(
+        db_path,
+        &state,
+        SnapshotAuthorityOperation::CheckpointCommit,
+    );
     state
 }
 
@@ -1421,6 +1585,7 @@ fn shared_snapshot_authority_state(db_path: &str) -> Arc<SnapshotAuthorityState>
 enum AuthorityBlockingOutcome<T, E> {
     Suppressed,
     Executed(std::result::Result<T, E>),
+    IdentityRefreshFailed(SnapshotAuthorityIdentityError),
 }
 
 fn run_authority_work_if_started<T, E, F>(
@@ -1452,7 +1617,7 @@ where
 /// sticky reconciliation latch as a lost blocking-task result. Errors proven
 /// to precede mutation, or followed by an acknowledged rollback, remain safe
 /// to report and retry.
-trait SnapshotAuthorityWorkFailure: std::fmt::Display {
+pub(crate) trait SnapshotAuthorityWorkFailure: std::fmt::Display {
     fn requires_reconciliation(&self) -> bool;
 }
 
@@ -1476,6 +1641,55 @@ struct SnapshotAuthorityReadGuard {
 impl Drop for SnapshotAuthorityReadGuard {
     fn drop(&mut self) {
         self.authority.in_progress.store(false, Ordering::Release);
+    }
+}
+
+/// Temporarily lends the engine-owned intelligent-scheduler receiver to one
+/// admitted scheduler invocation and restores it on every exit path. The slot
+/// uses a standard mutex because it is held only while moving the receiver,
+/// never while awaiting channel input.
+struct SnapshotTriggerReceiverLease<'a> {
+    slot: &'a StdMutex<Option<mpsc::Receiver<SnapshotTrigger>>>,
+    receiver: Option<mpsc::Receiver<SnapshotTrigger>>,
+}
+
+impl<'a> SnapshotTriggerReceiverLease<'a> {
+    fn take(slot: &'a StdMutex<Option<mpsc::Receiver<SnapshotTrigger>>>) -> Option<Self> {
+        let receiver = slot
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()?;
+        Some(Self {
+            slot,
+            receiver: Some(receiver),
+        })
+    }
+
+    fn receiver_mut(
+        &mut self,
+    ) -> std::result::Result<&mut mpsc::Receiver<SnapshotTrigger>, SnapshotError> {
+        self.receiver
+            .as_mut()
+            .ok_or(SnapshotError::TriggerReceiverUnavailable)
+    }
+}
+
+impl Drop for SnapshotTriggerReceiverLease<'_> {
+    fn drop(&mut self) {
+        let Some(receiver) = self.receiver.take() else {
+            return;
+        };
+        let mut slot = self
+            .slot
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if slot.is_none() {
+            *slot = Some(receiver);
+        } else {
+            tracing::error!(
+                "snapshot trigger receiver slot was unexpectedly occupied during lease return"
+            );
+        }
     }
 }
 
@@ -1581,8 +1795,9 @@ pub struct SnapshotEngine {
     snapshot_authority: Arc<SnapshotAuthorityState>,
     /// External trigger ingress sender for intelligent scheduling mode.
     trigger_tx: mpsc::Sender<SnapshotTrigger>,
-    /// Runtime-owned receiver, taken by `run_periodic`.
-    trigger_rx: Mutex<Option<mpsc::Receiver<SnapshotTrigger>>>,
+    /// Runtime-owned receiver, leased by one admitted `run_periodic` call and
+    /// restored when that scheduler invocation exits.
+    trigger_rx: StdMutex<Option<mpsc::Receiver<SnapshotTrigger>>>,
     /// Operational telemetry counters.
     telemetry: SnapshotEngineTelemetry,
 }
@@ -1613,7 +1828,7 @@ impl SnapshotEngine {
             session_cleanup_in_progress: AtomicBool::new(false),
             snapshot_authority,
             trigger_tx,
-            trigger_rx: Mutex::new(Some(trigger_rx)),
+            trigger_rx: StdMutex::new(Some(trigger_rx)),
             telemetry: SnapshotEngineTelemetry::new(),
         }
     }
@@ -1653,6 +1868,7 @@ impl SnapshotEngine {
         &self,
         cx: &crate::cx::Cx,
     ) -> std::result::Result<CaptureShutdownReservation<'_>, SnapshotError> {
+        snapshot_cx_checkpoint(cx)?;
         loop {
             let current = self.capture_lifecycle.load(Ordering::Acquire);
             match current {
@@ -1700,7 +1916,7 @@ impl SnapshotEngine {
                                     Duration::from_millis(1),
                                 )
                                 .await
-                                .map_err(|_| SnapshotError::Cancelled)?;
+                                .map_err(|_| snapshot_context_error(cx))?;
                             }
                             _ => return Err(SnapshotError::ContextFailure),
                         }
@@ -1733,7 +1949,7 @@ impl SnapshotEngine {
                                     Duration::from_millis(1),
                                 )
                                 .await
-                                .map_err(|_| SnapshotError::Cancelled)?;
+                                .map_err(|_| snapshot_context_error(cx))?;
                             }
                             _ => return Err(SnapshotError::ContextFailure),
                         }
@@ -1779,6 +1995,15 @@ impl SnapshotEngine {
         if self.authority_reconciliation_is_required() {
             return Err(self.authority_reconciliation_error(operation));
         }
+        if refresh_snapshot_authority_file_identities(
+            self.db_path.as_str(),
+            &self.snapshot_authority,
+            operation,
+        )
+        .is_err()
+        {
+            return Err(self.authority_reconciliation_error(operation));
+        }
 
         if self
             .snapshot_authority
@@ -1818,6 +2043,15 @@ impl SnapshotEngine {
         if self.authority_reconciliation_is_required() {
             return Err(self.authority_reconciliation_error(operation));
         }
+        if refresh_snapshot_authority_file_identities(
+            self.db_path.as_str(),
+            &self.snapshot_authority,
+            operation,
+        )
+        .is_err()
+        {
+            return Err(self.authority_reconciliation_error(operation));
+        }
         if self
             .snapshot_authority
             .in_progress
@@ -1838,18 +2072,6 @@ impl SnapshotEngine {
         Ok(SnapshotAuthorityReadGuard {
             authority: Arc::clone(&self.snapshot_authority),
         })
-    }
-
-    async fn spawn_blocking_db<T, E, F>(work: F) -> std::result::Result<T, SnapshotError>
-    where
-        T: Send + 'static,
-        E: std::fmt::Display + Send + 'static,
-        F: FnOnce() -> std::result::Result<T, E> + Send + 'static,
-    {
-        crate::runtime_async::spawn_blocking(work)
-            .await
-            .map_err(|e| SnapshotError::Database(format!("task join: {e}")))?
-            .map_err(|e| SnapshotError::Database(e.to_string()))
     }
 
     /// Execute one exclusively admitted durable mutation and preserve the
@@ -1873,19 +2095,30 @@ impl SnapshotEngine {
         F: FnOnce() -> std::result::Result<T, E> + Send + 'static,
     {
         let attempt = self.try_begin_snapshot_authority(operation)?;
-        if cx.checkpoint().is_err() {
-            return Err(SnapshotError::Cancelled);
-        }
+        snapshot_cx_checkpoint(cx)?;
 
         let handoff_state = attempt.handoff_state();
         let authority_lifetime = Arc::clone(&attempt.authority);
+        let db_path_for_identity_refresh = Arc::clone(&self.db_path);
         let outcome = crate::runtime_async::spawn_blocking_with_cx(cx, move || {
             // Keep the database-keyed authority alive until the queued closure
             // has either suppressed itself or reached terminal return. A new
             // engine must not prune the Weak registry entry while old work can
             // still commit.
-            let _authority_lifetime = authority_lifetime;
-            run_authority_work_if_started(&handoff_state, work)
+            let outcome = run_authority_work_if_started(&handoff_state, work);
+            match outcome {
+                AuthorityBlockingOutcome::Executed(result) => {
+                    match refresh_snapshot_authority_file_identities(
+                        db_path_for_identity_refresh.as_str(),
+                        &authority_lifetime,
+                        operation,
+                    ) {
+                        Ok(()) => AuthorityBlockingOutcome::Executed(result),
+                        Err(error) => AuthorityBlockingOutcome::IdentityRefreshFailed(error),
+                    }
+                }
+                other => other,
+            }
         })
         .await;
 
@@ -1912,6 +2145,15 @@ impl SnapshotEngine {
                 attempt.settle();
                 Err(SnapshotError::Cancelled)
             }
+            Ok(AuthorityBlockingOutcome::IdentityRefreshFailed(error)) => {
+                tracing::warn!(
+                    %operation,
+                    error = %error,
+                    "snapshot authority work settled but filesystem identity publication failed"
+                );
+                attempt.latch_and_settle();
+                Err(SnapshotError::IndeterminateAuthorityMutation { operation })
+            }
             Err(error) => {
                 let no_mutation_started = attempt.suppress_pending_handoff();
                 let mutation_started = !no_mutation_started;
@@ -1925,21 +2167,6 @@ impl SnapshotEngine {
                     error,
                     mutation_started,
                 ))
-            }
-        }
-    }
-
-    async fn spawn_blocking_db_best_effort<T, E, F>(work: F) -> T
-    where
-        T: Default + Send + 'static,
-        E: std::fmt::Display + Send + 'static,
-        F: FnOnce() -> std::result::Result<T, E> + Send + 'static,
-    {
-        match Self::spawn_blocking_db(work).await {
-            Ok(val) => val,
-            Err(e) => {
-                tracing::warn!(error = %e, "best-effort DB operation failed, returning default");
-                T::default()
             }
         }
     }
@@ -2023,9 +2250,9 @@ impl SnapshotEngine {
     ) -> std::result::Result<SnapshotResult, SnapshotError> {
         saturating_telemetry_add(&self.telemetry.captures_attempted, 1);
 
-        if cx.checkpoint().is_err() {
+        if let Err(error) = snapshot_cx_checkpoint(cx) {
             saturating_telemetry_add(&self.telemetry.capture_errors, 1);
-            return Err(SnapshotError::Cancelled);
+            return Err(error);
         }
         if self.authority_reconciliation_is_required() {
             saturating_telemetry_add(&self.telemetry.capture_errors, 1);
@@ -2140,25 +2367,38 @@ impl SnapshotEngine {
         let cutoff_ms: i64 = i64::try_from(now_ms.saturating_sub(detection_max_age_ms))
             .unwrap_or(i64::MAX);
 
-        let detections_by_pane = Self::spawn_blocking_db_best_effort(move || {
+        let detections_by_pane = match crate::runtime_async::spawn_blocking_with_cx(cx, move || {
             load_latest_detections_by_pane_sync(
                 db_path_for_detections.as_str(),
                 &detection_pane_ids,
                 cutoff_ms,
             )
         })
-        .await;
+        .await
+        .map_err(classify_snapshot_pure_blocking_failure)?
+        {
+            Ok(detections) => detections,
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "best-effort snapshot detection projection failed; continuing without detections"
+                );
+                HashMap::new()
+            }
+        };
 
         let scrollback_refs = if options.include_scrollback {
             let db_path_for_scrollback = Arc::clone(&self.db_path);
             let scrollback_pane_ids = pane_ids.clone();
-            Self::spawn_blocking_db(move || {
+            crate::runtime_async::spawn_blocking_with_cx(cx, move || {
                 load_latest_scrollback_refs_sync(
                     db_path_for_scrollback.as_str(),
                     &scrollback_pane_ids,
                 )
             })
-            .await?
+            .await
+            .map_err(classify_snapshot_pure_blocking_failure)?
+            .map_err(SnapshotError::Database)?
         } else {
             std::collections::HashMap::new()
         };
@@ -2170,6 +2410,10 @@ impl SnapshotEngine {
         // cost retained by this compatibility API; the expensive work happens
         // in the bounded blocking pool and has no durable side effects.
         let owned_panes = panes.to_vec();
+        // Operator/event metadata is part of the persisted v2 witness but not
+        // the topology/pane dedup digest. A metadata-bearing capture must
+        // therefore reach durable storage even when its panes are unchanged.
+        let periodic_dedup_allowed = options.metadata.is_none();
         let metadata = options.metadata;
         let prepared = crate::runtime_async::spawn_blocking_with_cx(cx, move || {
             let (topology, _report) = TopologySnapshot::from_panes(&owned_panes, now_ms);
@@ -2202,10 +2446,12 @@ impl SnapshotEngine {
         let dedup_hash = prepared.dedup_hash.clone();
 
         // 4. Skip if periodic-like and unchanged — Cx-bound read
-        if matches!(
+        if periodic_dedup_allowed
+            && matches!(
             trigger,
             SnapshotTrigger::Periodic | SnapshotTrigger::PeriodicFallback
-        ) {
+        )
+        {
             let cached_checkpoint = {
                 let last = self
                     .last_dedup_hash
@@ -2213,7 +2459,7 @@ impl SnapshotEngine {
                     .await
                     .map_err(snapshot_lock_error)?;
                 last.as_ref()
-                    .filter(|cached| cached.dedup_hash == dedup_hash)
+                    .filter(|cached| cached.dedup_hash.as_str() == dedup_hash.as_str())
                     .cloned()
             };
             if self.authority_reconciliation_is_required() {
@@ -2278,29 +2524,20 @@ impl SnapshotEngine {
         let pane_count = prepared.pane_count;
 
         let db_path = Arc::clone(&self.db_path);
-        let authority_for_identity_refresh = Arc::clone(&self.snapshot_authority);
 
         let result = self
             .spawn_blocking_authority_with_cx(
                 cx,
                 SnapshotAuthorityOperation::CheckpointCommit,
                 move || {
-                    let receipt = save_checkpoint_authoritatively_sync(
+                    save_checkpoint_authoritatively_sync(
                         db_path.as_str(),
                         &session_id,
                         now_ms,
                         &checkpoint_type,
                         &prepared,
                         new_session.as_ref(),
-                    )?;
-                    // Keep mutation admission held while publishing an inode
-                    // discovered by the first commit, closing the construction
-                    // race with a later hard-link-spelled engine.
-                    refresh_snapshot_authority_file_identities(
-                        db_path.as_str(),
-                        &authority_for_identity_refresh,
-                    );
-                    Ok(receipt)
+                    )
                 },
             )
             .await?;
@@ -2414,8 +2651,107 @@ impl SnapshotEngine {
             &self.telemetry.cleanup_removed,
             u64::try_from(removed).unwrap_or(u64::MAX),
         );
+        self.record_checkpoint_cleanup_success(Instant::now());
 
         Ok(removed)
+    }
+
+    fn checkpoint_cleanup_interval(&self) -> Duration {
+        checkpoint_cleanup_interval(self.config.interval_seconds)
+    }
+
+    fn record_checkpoint_cleanup_success(&self, completed_at: Instant) {
+        let mut cadence = self
+            .snapshot_authority
+            .checkpoint_cleanup_cadence
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        cadence.last_authoritative_success = Some(completed_at);
+        cadence.retry_deferred_at = None;
+    }
+
+    fn automatic_checkpoint_cleanup_wait(&self, now: Instant) -> Option<Duration> {
+        if self.authority_reconciliation_is_required() {
+            return None;
+        }
+        let cadence = self
+            .snapshot_authority
+            .checkpoint_cleanup_cadence
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Some(checkpoint_cleanup_wait_duration(
+            &cadence,
+            self.checkpoint_cleanup_interval(),
+            now,
+        ))
+    }
+
+    fn try_begin_automatic_checkpoint_cleanup(
+        &self,
+        now: Instant,
+    ) -> Option<CheckpointCleanupAttemptGuard> {
+        if self.authority_reconciliation_is_required() {
+            return None;
+        }
+        let mut cadence = self
+            .snapshot_authority
+            .checkpoint_cleanup_cadence
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !checkpoint_cleanup_due(&cadence, self.checkpoint_cleanup_interval(), now) {
+            return None;
+        }
+        cadence.in_progress = true;
+        drop(cadence);
+
+        let attempt = CheckpointCleanupAttemptGuard {
+            authority: Arc::clone(&self.snapshot_authority),
+            claimed_at: now,
+        };
+        if self.authority_reconciliation_is_required() {
+            drop(attempt);
+            return None;
+        }
+        Some(attempt)
+    }
+
+    /// Run automatic checkpoint pruning only when the shared database cadence
+    /// is due. Retry-safe failures are logged and deferred; indeterminate
+    /// outcomes retain the existing fail-closed scheduler contract.
+    async fn maybe_run_checkpoint_cleanup_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+    ) -> std::result::Result<(), SnapshotError> {
+        if self.authority_reconciliation_is_required() {
+            return Err(self.authority_reconciliation_error(
+                SnapshotAuthorityOperation::CheckpointCleanup,
+            ));
+        }
+        let Some(_attempt) = self.try_begin_automatic_checkpoint_cleanup(Instant::now()) else {
+            return Ok(());
+        };
+
+        match self.cleanup_with_cx(cx).await {
+            Ok(removed) => {
+                tracing::debug!(removed, "automatic snapshot retention cleanup completed");
+                Ok(())
+            }
+            Err(error) if error.requires_reconciliation() => {
+                tracing::warn!(
+                    error = %error,
+                    "automatic snapshot retention cleanup requires durable-state reconciliation"
+                );
+                Err(error)
+            }
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    retry_delay_seconds = CHECKPOINT_CLEANUP_RETRY_DELAY.as_secs(),
+                    "automatic snapshot retention cleanup failed; retry deferred"
+                );
+                Ok(())
+            }
+        }
     }
 
     /// Delete one checkpoint through the database-keyed durable-authority
@@ -2514,13 +2850,24 @@ impl SnapshotEngine {
                         checkpoint_id = result.checkpoint_id,
                         "snapshot captured"
                     );
-                    if let Err(e) = self.cleanup().await {
-                        tracing::warn!(error = %e, "snapshot retention cleanup failed");
+                    let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+                    if let Err(error) = self.maybe_run_checkpoint_cleanup_with_cx(&cx).await {
+                        tracing::warn!(
+                            error = %error,
+                            "automatic snapshot retention cleanup failed after capture"
+                        );
                     }
                     true
                 }
                 Err(SnapshotError::NoChanges) => {
                     tracing::debug!(trigger = ?trigger, "snapshot skipped: no changes");
+                    let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+                    if let Err(error) = self.maybe_run_checkpoint_cleanup_with_cx(&cx).await {
+                        tracing::warn!(
+                            error = %error,
+                            "automatic snapshot retention cleanup failed after dedup"
+                        );
+                    }
                     false
                 }
                 Err(SnapshotError::InProgress) => {
@@ -2549,9 +2896,9 @@ impl SnapshotEngine {
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`capture_from_provider`].
     ///
-    /// Routes both the `capture` and post-capture `cleanup` writes
-    /// through their cx-first siblings so the scheduler's main work
-    /// loop honours caller cancellation across every write seam.
+    /// Routes both capture and cadence-bounded checkpoint cleanup through
+    /// their cx-first siblings so the scheduler's main work loop honours
+    /// caller cancellation across every write seam.
     /// The pane provider is awaited directly — it's a caller-supplied
     /// future that doesn't inherently know about cx; if a caller
     /// needs cx threaded there they can capture one in the closure.
@@ -2610,23 +2957,12 @@ impl SnapshotEngine {
                         checkpoint_id = result.checkpoint_id,
                         "snapshot captured (cx path)"
                     );
-                    if let Err(error) = self.cleanup_with_cx(cx).await {
-                        if error.requires_reconciliation() {
-                            tracing::warn!(
-                                error = %error,
-                                "snapshot retention cleanup requires durable-state reconciliation"
-                            );
-                            return Err(error);
-                        }
-                        tracing::warn!(
-                            error = %error,
-                            "snapshot retention cleanup failed (cx path)"
-                        );
-                    }
+                    self.maybe_run_checkpoint_cleanup_with_cx(cx).await?;
                     Ok(SchedulerCaptureOutcome::Captured)
                 }
                 Err(SnapshotError::NoChanges) => {
                     tracing::debug!(trigger = ?trigger, "snapshot skipped: no changes");
+                    self.maybe_run_checkpoint_cleanup_with_cx(cx).await?;
                     Ok(SchedulerCaptureOutcome::Unchanged)
                 }
                 Err(SnapshotError::InProgress) => {
@@ -2790,7 +3126,7 @@ impl SnapshotEngine {
 
                 loop {
                     let now = Instant::now();
-                    let next_wait = periodic_scheduler_wait_duration(
+                    let mut next_wait = periodic_scheduler_wait_duration(
                         &session_cleanup_schedule,
                         self.config.session_retention.cleanup_interval_hours,
                         self.authority_reconciliation_is_required(),
@@ -2799,6 +3135,11 @@ impl SnapshotEngine {
                         interval,
                         now,
                     );
+                    if let Some(checkpoint_cleanup_wait) =
+                        self.automatic_checkpoint_cleanup_wait(now)
+                    {
+                        next_wait = next_wait.min(checkpoint_cleanup_wait);
+                    }
 
                     if !next_wait.is_zero() {
                         // ft-xbnl0.2.3 tick 296: cx-first timeout wrapping
@@ -2834,9 +3175,11 @@ impl SnapshotEngine {
                         break;
                     }
 
+                    self.maybe_run_checkpoint_cleanup_with_cx(cx).await?;
+                    snapshot_cx_checkpoint(cx)?;
                     self.maybe_run_session_cleanup(cx, &mut session_cleanup_schedule)
                         .await;
-                    cx.checkpoint().map_err(|_| SnapshotError::Cancelled)?;
+                    snapshot_cx_checkpoint(cx)?;
                     if *shutdown.borrow() {
                         tracing::info!("snapshot engine shutting down after cleanup");
                         break;
@@ -2881,25 +3224,23 @@ impl SnapshotEngine {
                     return Ok(());
                 }
 
-                let mut trigger_rx = {
-                    let mut guard = self.trigger_rx.lock().await;
-                    match guard.take() {
-                        Some(rx) => rx,
-                        None => {
-                            tracing::warn!(
-                                "snapshot intelligent scheduler: receiver already taken"
-                            );
-                            return Ok(());
-                        }
-                    }
-                };
+                let mut trigger_rx = SnapshotTriggerReceiverLease::take(&self.trigger_rx)
+                    .ok_or_else(|| {
+                        tracing::error!(
+                            "snapshot intelligent scheduler receiver is unavailable despite exclusive scheduler admission"
+                        );
+                        SnapshotError::TriggerReceiverUnavailable
+                    })?;
 
-                // Retention has its own startup contract. Attempt it before
-                // pane capture so a transient capture/provider failure cannot
-                // suppress cleanup for the entire scheduler invocation.
+                // Both retention lanes have independent startup contracts.
+                // Attempt them before pane capture so a transient
+                // capture/provider failure cannot suppress cleanup for the
+                // entire scheduler invocation.
+                self.maybe_run_checkpoint_cleanup_with_cx(cx).await?;
+                snapshot_cx_checkpoint(cx)?;
                 self.maybe_run_session_cleanup(cx, &mut session_cleanup_schedule)
                     .await;
-                cx.checkpoint().map_err(|_| SnapshotError::Cancelled)?;
+                snapshot_cx_checkpoint(cx)?;
                 if *shutdown.borrow() {
                     tracing::info!("snapshot engine shutting down after startup cleanup");
                     return Ok(());
@@ -2969,9 +3310,11 @@ impl SnapshotEngine {
                         break;
                     }
 
+                    self.maybe_run_checkpoint_cleanup_with_cx(cx).await?;
+                    snapshot_cx_checkpoint(cx)?;
                     self.maybe_run_session_cleanup(cx, &mut session_cleanup_schedule)
                         .await;
-                    cx.checkpoint().map_err(|_| SnapshotError::Cancelled)?;
+                    snapshot_cx_checkpoint(cx)?;
                     if *shutdown.borrow() {
                         tracing::info!("snapshot engine shutting down after cleanup");
                         break;
@@ -3069,7 +3412,7 @@ impl SnapshotEngine {
                         TriggerPoll::TimedOut
                     } else {
                         let wait_step = poll_wait.min(Duration::from_millis(250));
-                        let recv_fut = trigger_rx.recv(cx);
+                        let recv_fut = trigger_rx.receiver_mut()?.recv(cx);
                         let recv_result =
                             crate::runtime_async::timeout_with_cx(cx, wait_step, recv_fut)
                                 .await;
@@ -3390,11 +3733,11 @@ impl SnapshotEngine {
                 SnapshotAuthorityOperation::CheckpointCommit,
             ));
         }
-        if cx.is_cancel_requested() {
+        if let Err(error) = snapshot_cx_checkpoint(cx) {
             tracing::debug!(
                 "shutdown_checkpoint_with_cx: Cx pre-cancelled; skipping checkpoint and clean mark"
             );
-            return Err(SnapshotError::Cancelled);
+            return Err(error);
         }
         let mut checkpoint_receipt: Option<SnapshotResult> = None;
         let result = crate::runtime_async::timeout_with_cx(cx, timeout, async {
@@ -3495,7 +3838,7 @@ impl SnapshotEngine {
         cx: &crate::cx::Cx,
         checkpoint: &SnapshotResult,
     ) -> std::result::Result<(), SnapshotError> {
-        cx.checkpoint().map_err(|_| SnapshotError::Cancelled)?;
+        snapshot_cx_checkpoint(cx)?;
         if self.authority_reconciliation_is_required() {
             return Err(self.authority_reconciliation_error(
                 SnapshotAuthorityOperation::ShutdownMark,
@@ -3512,6 +3855,7 @@ impl SnapshotEngine {
         reservation: &CaptureShutdownReservation<'_>,
         checkpoint: &SnapshotResult,
     ) -> std::result::Result<(), SnapshotError> {
+        snapshot_cx_checkpoint(cx)?;
         // Route the session_id read-lock through read_with_cx(cx) so the lock
         // wait honors caller cancellation rather than an ambient context.
         let session_id = {
@@ -3557,6 +3901,98 @@ impl SnapshotEngine {
     }
 }
 
+/// Run a non-SnapshotEngine checkpoint mutation through the same frozen
+/// database locator, exclusive same-process admission, cancellation handoff,
+/// and sticky reconciliation latch as capture/delete/cleanup. Restore receipt
+/// bookkeeping uses this doorway instead of creating a second authority lane.
+pub(crate) async fn run_checkpoint_authority_with_cx<T, E, F>(
+    cx: &crate::cx::Cx,
+    db_path: Arc<String>,
+    operation: SnapshotAuthorityOperation,
+    work: F,
+) -> std::result::Result<T, SnapshotError>
+where
+    T: Send + 'static,
+    E: SnapshotAuthorityWorkFailure + Send + 'static,
+    F: FnOnce(&str) -> std::result::Result<T, E> + Send + 'static,
+{
+    let engine = SnapshotEngine::new(db_path, SnapshotConfig::default());
+    let frozen_db_path = Arc::clone(&engine.db_path);
+    engine
+        .spawn_blocking_authority_with_cx(cx, operation, move || {
+            work(frozen_db_path.as_str())
+        })
+        .await
+}
+
+/// Synchronous sibling for explicitly synchronous callers. It shares the
+/// same database-keyed admission and sticky error classification, but performs
+/// the caller-supplied transaction on the current blocking thread.
+pub(crate) fn run_checkpoint_authority_sync<T, E, F>(
+    db_path: Arc<String>,
+    operation: SnapshotAuthorityOperation,
+    work: F,
+) -> std::result::Result<T, SnapshotError>
+where
+    E: SnapshotAuthorityWorkFailure,
+    F: FnOnce(&str) -> std::result::Result<T, E>,
+{
+    let engine = SnapshotEngine::new(db_path, SnapshotConfig::default());
+    let attempt = engine.try_begin_snapshot_authority(operation)?;
+    let handoff_state = attempt.handoff_state();
+    let outcome = run_authority_work_if_started(&handoff_state, || work(engine.db_path.as_str()));
+    let outcome = match outcome {
+        AuthorityBlockingOutcome::Executed(result) => {
+            match refresh_snapshot_authority_file_identities(
+                engine.db_path.as_str(),
+                &engine.snapshot_authority,
+                operation,
+            ) {
+                Ok(()) => AuthorityBlockingOutcome::Executed(result),
+                Err(error) => AuthorityBlockingOutcome::IdentityRefreshFailed(error),
+            }
+        }
+        other => other,
+    };
+    match outcome {
+        AuthorityBlockingOutcome::Executed(Ok(value)) => {
+            attempt.settle();
+            Ok(value)
+        }
+        AuthorityBlockingOutcome::Executed(Err(error)) if error.requires_reconciliation() => {
+            tracing::warn!(
+                %operation,
+                error = %error,
+                "synchronous checkpoint authority work returned an indeterminate outcome"
+            );
+            attempt.latch_and_settle();
+            Err(SnapshotError::IndeterminateAuthorityMutation { operation })
+        }
+        AuthorityBlockingOutcome::Executed(Err(error)) => {
+            attempt.settle();
+            Err(SnapshotError::Database(error.to_string()))
+        }
+        AuthorityBlockingOutcome::Suppressed => {
+            // A synchronous caller has no cancellation path capable of
+            // suppressing this just-created handoff. Preserve fail-closed
+            // behavior if that invariant is ever violated.
+            attempt.latch_and_settle();
+            Err(SnapshotError::IndeterminateAuthorityMutation { operation })
+        }
+        AuthorityBlockingOutcome::IdentityRefreshFailed(error) => {
+            tracing::warn!(
+                %operation,
+                error = %error,
+                "synchronous authority identity refresh failed"
+            );
+            attempt.latch_and_settle();
+            Err(SnapshotError::IndeterminateAuthorityMutation { operation })
+        }
+    }
+}
+
+const SNAPSHOT_SQLITE_IN_LIST_CHUNK: usize = 900;
+
 /// Load the most recent detections per pane from storage.
 ///
 /// This is best-effort: if the `events` table does not exist (e.g., tests using a
@@ -3572,77 +4008,63 @@ fn load_latest_detections_by_pane_sync(
         return Ok(HashMap::new());
     }
 
-    let conn = open_conn(db_path)?;
-
-    let placeholders = std::iter::repeat_n("?", pane_ids.len())
-        .collect::<Vec<_>>()
-        .join(",");
-
-    let sql = format!(
-        "WITH ranked AS (
-            SELECT pane_id,
-                   rule_id,
-                   agent_type,
-                   event_type,
-                   severity,
-                   confidence,
-                   extracted,
-                   matched_text,
-                   ROW_NUMBER() OVER (
-                       PARTITION BY pane_id
-                       ORDER BY detected_at DESC, id DESC
-                   ) AS rn
-            FROM events
-            WHERE pane_id IN ({placeholders})
-              AND detected_at >= ?
-              AND agent_type NOT IN ('unknown', 'wezterm')
-        )
-        SELECT pane_id, rule_id, agent_type, event_type, severity, confidence, extracted, matched_text
-        FROM ranked
-        WHERE rn = 1"
-    );
-
-    let mut stmt = match conn.prepare(&sql) {
-        Ok(stmt) => stmt,
-        Err(err) if is_missing_events_table(&err) => return Ok(HashMap::new()),
-        Err(err) => return Err(err),
-    };
-
-    let mut params = Vec::with_capacity(pane_ids.len().saturating_add(1));
-    for &pane_id in pane_ids {
-        params.push(u64_to_sqlite_integer(pane_id)?);
-    }
-    params.push(cutoff_ms);
-
-    let mut rows = stmt.query(rusqlite::params_from_iter(params))?;
+    let conn = open_snapshot_query_conn(db_path)?;
     let mut out: HashMap<u64, Vec<Detection>> = HashMap::new();
-
-    while let Some(row) = rows.next()? {
-        let pane_id: i64 = row.get(0)?;
-        let rule_id: String = row.get(1)?;
-        let agent_type: String = row.get(2)?;
-        let event_type: String = row.get(3)?;
-        let severity: String = row.get(4)?;
-        let confidence: f64 = row.get(5)?;
-        let extracted: Option<String> = row.get(6)?;
-        let matched_text: Option<String> = row.get(7)?;
-
-        let detection = Detection {
-            rule_id,
-            agent_type: agent_type_from_db(&agent_type),
-            event_type,
-            severity: severity_from_db(&severity),
-            confidence,
-            extracted: extracted
-                .as_deref()
-                .and_then(|s| serde_json::from_str::<Value>(s).ok())
-                .unwrap_or(Value::Null),
-            matched_text: matched_text.unwrap_or_default(),
-            span: (0, 0),
+    for pane_chunk in pane_ids.chunks(SNAPSHOT_SQLITE_IN_LIST_CHUNK) {
+        let placeholders = std::iter::repeat_n("?", pane_chunk.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "WITH ranked AS (
+                 SELECT pane_id,
+                        rule_id,
+                        agent_type,
+                        extracted,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY pane_id
+                            ORDER BY detected_at DESC, id DESC
+                        ) AS rn
+                 FROM events
+                 WHERE pane_id IN ({placeholders})
+                   AND detected_at >= ?
+                   AND agent_type NOT IN ('unknown', 'wezterm')
+             )
+             SELECT pane_id, rule_id, agent_type, extracted
+             FROM ranked
+             WHERE rn = 1"
+        );
+        let mut stmt = match conn.prepare(&sql) {
+            Ok(stmt) => stmt,
+            Err(err) if is_missing_events_table(&err) => return Ok(HashMap::new()),
+            Err(err) => return Err(err),
         };
+        let mut params = Vec::with_capacity(pane_chunk.len().saturating_add(1));
+        for &pane_id in pane_chunk {
+            params.push(u64_to_sqlite_integer(pane_id)?);
+        }
+        params.push(cutoff_ms);
 
-        let pane_id = sqlite_integer_to_u64(0, pane_id)?;
-        out.insert(pane_id, vec![detection]);
+        let mut rows = stmt.query(rusqlite::params_from_iter(params))?;
+        while let Some(row) = rows.next()? {
+            let pane_id = sqlite_integer_to_u64(0, row.get(0)?)?;
+            let rule_id: String = row.get(1)?;
+            let agent_type: String = row.get(2)?;
+            let extracted: Option<String> = row.get(3)?;
+            let detection = Detection {
+                rule_id,
+                agent_type: agent_type_from_db(&agent_type),
+                event_type: String::new(),
+                severity: Severity::Info,
+                confidence: 0.0,
+                extracted: extracted
+                    .as_deref()
+                    .and_then(|value| serde_json::from_str::<Value>(value).ok())
+                    .unwrap_or(Value::Null),
+                matched_text: String::new(),
+                span: (0, 0),
+            };
+            out.insert(pane_id, vec![detection]);
+        }
     }
 
     Ok(out)
@@ -3658,72 +4080,80 @@ fn load_latest_scrollback_refs_sync(
         return Ok(HashMap::new());
     }
 
-    let conn = open_conn(db_path).map_err(|error| error.to_string())?;
-    let mut stmt = conn
-        .prepare(
-            "SELECT MIN(seq), MAX(seq), COUNT(*), MIN(captured_at), MAX(captured_at)
-             FROM output_segments
-             WHERE pane_id = ?1",
-        )
-        .map_err(|error| error.to_string())?;
-
+    let conn = open_snapshot_query_conn(db_path).map_err(|error| error.to_string())?;
     let mut refs = HashMap::new();
-    for &pane_id in pane_ids {
-        let pane_id_i64 = i64::try_from(pane_id)
-            .map_err(|_| format!("pane_id {pane_id} exceeds sqlite integer range"))?;
-        let (min_seq, max_seq, segment_count, min_capture_at, last_capture_at): (
-            Option<i64>,
-            Option<i64>,
-            i64,
-            Option<i64>,
-            Option<i64>,
-        ) = stmt
-            .query_row([pane_id_i64], |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                ))
-            })
-            .map_err(|error| error.to_string())?;
-
-        let Some(min_seq) = min_seq else {
-            continue;
-        };
-        let Some(output_segments_seq) = max_seq else {
-            continue;
-        };
-        let Some(min_capture_at) = min_capture_at else {
-            continue;
-        };
-        let Some(last_capture_at) = last_capture_at else {
-            continue;
-        };
-        if min_seq < 0
-            || output_segments_seq < 0
-            || segment_count <= 0
-            || min_capture_at < 0
-            || last_capture_at < 0
-        {
-            return Err(format!(
-                "invalid scrollback segment metadata for pane_id={pane_id}: \
-                 min_seq={min_seq}, max_seq={output_segments_seq}, count={segment_count}, \
-                 min_capture_at={min_capture_at}, last_capture_at={last_capture_at}"
-            ));
-        }
-
-        refs.insert(
-            pane_id,
-            ScrollbackRef {
-                output_segments_seq,
-                total_lines_captured: u64::try_from(segment_count)
-                    .map_err(|error| error.to_string())?,
-                last_capture_at: u64::try_from(last_capture_at)
-                    .map_err(|error| error.to_string())?,
-            },
+    for pane_chunk in pane_ids.chunks(SNAPSHOT_SQLITE_IN_LIST_CHUNK) {
+        let placeholders = std::iter::repeat_n("?", pane_chunk.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT pane_id, MIN(seq), MAX(seq), COUNT(*),
+                    MIN(captured_at), MAX(captured_at)
+             FROM output_segments
+             WHERE pane_id IN ({placeholders})
+             GROUP BY pane_id"
         );
+        let mut params = Vec::with_capacity(pane_chunk.len());
+        for &pane_id in pane_chunk {
+            params.push(
+                i64::try_from(pane_id)
+                    .map_err(|_| format!("pane_id {pane_id} exceeds sqlite integer range"))?,
+            );
+        }
+        let mut stmt = conn.prepare(&sql).map_err(|error| error.to_string())?;
+        let mut rows = stmt
+            .query(rusqlite::params_from_iter(params))
+            .map_err(|error| error.to_string())?;
+        while let Some(row) = rows.next().map_err(|error| error.to_string())? {
+            let pane_id_raw: i64 = row.get(0).map_err(|error| error.to_string())?;
+            let pane_id = sqlite_integer_to_u64(0, pane_id_raw)
+                .map_err(|error| error.to_string())?;
+            let min_seq: Option<i64> = row.get(1).map_err(|error| error.to_string())?;
+            let max_seq: Option<i64> = row.get(2).map_err(|error| error.to_string())?;
+            let total_segments_captured: i64 =
+                row.get(3).map_err(|error| error.to_string())?;
+            let min_capture_at: Option<i64> =
+                row.get(4).map_err(|error| error.to_string())?;
+            let last_capture_at: Option<i64> =
+                row.get(5).map_err(|error| error.to_string())?;
+
+            let Some(min_seq) = min_seq else {
+                continue;
+            };
+            let Some(output_segments_seq) = max_seq else {
+                continue;
+            };
+            let Some(min_capture_at) = min_capture_at else {
+                continue;
+            };
+            let Some(last_capture_at) = last_capture_at else {
+                continue;
+            };
+            if min_seq < 0
+                || output_segments_seq < 0
+                || total_segments_captured <= 0
+                || min_capture_at < 0
+                || last_capture_at < 0
+            {
+                return Err(format!(
+                    "invalid scrollback segment metadata for pane_id={pane_id}: \
+                     min_seq={min_seq}, max_seq={output_segments_seq}, \
+                     count={total_segments_captured}, min_capture_at={min_capture_at}, \
+                     last_capture_at={last_capture_at}"
+                ));
+            }
+
+            refs.insert(
+                pane_id,
+                ScrollbackRef {
+                    output_segments_seq,
+                    total_segments_captured: u64::try_from(total_segments_captured)
+                        .map_err(|error| error.to_string())?,
+                    last_capture_at: u64::try_from(last_capture_at)
+                        .map_err(|error| error.to_string())?,
+                },
+            );
+        }
     }
 
     Ok(refs)
@@ -3743,14 +4173,6 @@ fn agent_type_from_db(agent_type: &str) -> AgentType {
     }
 }
 
-fn severity_from_db(severity: &str) -> Severity {
-    match severity {
-        "warning" => Severity::Warning,
-        "critical" => Severity::Critical,
-        _ => Severity::Info,
-    }
-}
-
 // =============================================================================
 // Helpers
 // =============================================================================
@@ -3761,6 +4183,54 @@ fn epoch_ms() -> u64 {
         .unwrap_or_default()
         .as_millis();
     u64::try_from(epoch_ms).unwrap_or(u64::MAX)
+}
+
+fn checkpoint_cleanup_interval(configured_snapshot_interval_seconds: u64) -> Duration {
+    Duration::from_secs(configured_snapshot_interval_seconds).clamp(
+        CHECKPOINT_CLEANUP_MIN_INTERVAL,
+        CHECKPOINT_CLEANUP_MAX_INTERVAL,
+    )
+}
+
+fn checkpoint_cleanup_due(
+    cadence: &CheckpointCleanupCadence,
+    interval: Duration,
+    now: Instant,
+) -> bool {
+    if cadence.in_progress {
+        return false;
+    }
+    if cadence.retry_deferred_at.is_some_and(|deferred_at| {
+        now.saturating_duration_since(deferred_at) < CHECKPOINT_CLEANUP_RETRY_DELAY
+    }) {
+        return false;
+    }
+    cadence.last_authoritative_success.is_none_or(|completed_at| {
+        now.saturating_duration_since(completed_at) >= interval
+    })
+}
+
+/// Monotonic wait until this database may next run automatic checkpoint
+/// pruning. An in-flight peer is polled only at the bounded retry cadence so a
+/// dropped peer cannot strand cleanup, while a successful peer advances the
+/// shared authoritative-success timestamp for every engine.
+fn checkpoint_cleanup_wait_duration(
+    cadence: &CheckpointCleanupCadence,
+    interval: Duration,
+    now: Instant,
+) -> Duration {
+    if cadence.in_progress {
+        return CHECKPOINT_CLEANUP_RETRY_DELAY;
+    }
+    if let Some(deferred_at) = cadence.retry_deferred_at {
+        let elapsed = now.saturating_duration_since(deferred_at);
+        if elapsed < CHECKPOINT_CLEANUP_RETRY_DELAY {
+            return CHECKPOINT_CLEANUP_RETRY_DELAY - elapsed;
+        }
+    }
+    cadence.last_authoritative_success.map_or(Duration::ZERO, |completed_at| {
+        interval.saturating_sub(now.saturating_duration_since(completed_at))
+    })
 }
 
 /// Decide whether `[snapshots.session_retention]` cleanup is due (ft-0yuxe).
@@ -3881,7 +4351,7 @@ struct PreparedSnapshotPersistence {
 }
 
 /// Build once from exactly the values the SQLite transaction will insert.
-/// Non-persisted process PID/argv, shell, and scrollback line counts are
+/// Non-persisted process PID/argv, shell, and scrollback segment counts are
 /// deliberately absent so they cannot manufacture redundant checkpoints.
 fn prepare_snapshot_persistence(
     topology: &TopologySnapshot,
@@ -4033,7 +4503,8 @@ impl SnapshotAuthorityWorkFailure for SnapshotAuthorityDbError {
     fn requires_reconciliation(&self) -> bool {
         matches!(
             self,
-            Self::IndeterminateCommit { .. } | Self::IndeterminateRollback { .. }
+            Self::IndeterminateCommit { .. }
+                | Self::IndeterminateRollback { .. }
         )
     }
 }
@@ -4183,45 +4654,179 @@ fn open_conn(db_path: &str) -> std::result::Result<Connection, rusqlite::Error> 
 fn open_snapshot_query_conn(
     db_path: &str,
 ) -> std::result::Result<Connection, rusqlite::Error> {
+    let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
+        | OpenFlags::SQLITE_OPEN_URI
+        | OpenFlags::SQLITE_OPEN_NO_MUTEX
+        | OpenFlags::SQLITE_OPEN_PRIVATE_CACHE;
     #[cfg(any(unix, windows))]
     let conn = Connection::open_with_flags_and_vfs(
         db_path,
-        OpenFlags::default() | OpenFlags::SQLITE_OPEN_PRIVATE_CACHE,
+        flags,
         SNAPSHOT_SQLITE_DEFAULT_VFS,
     )?;
     #[cfg(not(any(unix, windows)))]
-    let conn = Connection::open_with_flags(
-        db_path,
-        OpenFlags::default() | OpenFlags::SQLITE_OPEN_PRIVATE_CACHE,
-    )?;
+    let conn = Connection::open_with_flags(db_path, flags)?;
     conn.busy_timeout(Duration::from_secs(5))?;
     Ok(conn)
+}
+
+fn decode_persisted_pane_state(
+    row: &rusqlite::Row<'_>,
+) -> std::result::Result<PersistedPaneState, rusqlite::Error> {
+    Ok(PersistedPaneState {
+        pane_id: row.get(0)?,
+        cwd: row.get(1)?,
+        command: row.get(2)?,
+        env_json: row.get(3)?,
+        terminal_state_json: row.get(4)?,
+        agent_metadata_json: row.get(5)?,
+        scrollback_checkpoint_seq: row.get(6)?,
+        last_output_at: row.get(7)?,
+    })
+}
+
+/// Re-read and recompute the complete persisted v2 snapshot witness. The
+/// in-memory dedup cache is only a hint: a row with matching identity columns
+/// is not durable authority if its parent, topology, pane projection, or
+/// witness has been deleted or rewritten.
+fn exact_snapshot_checkpoint_is_verified(
+    conn: &Connection,
+    identity: &SnapshotCheckpointIdentity,
+) -> std::result::Result<bool, rusqlite::Error> {
+    if identity.checkpoint_role != CHECKPOINT_ROLE_SNAPSHOT
+        || !identity.state_hash.starts_with(SNAPSHOT_WITNESS_PREFIX)
+    {
+        return Ok(false);
+    }
+    let checkpoint_at = u64_to_sqlite_integer(identity.checkpoint_at)?;
+    let checkpoint = conn
+        .query_row(
+            "SELECT checkpoint.checkpoint_type,
+                    checkpoint.state_hash,
+                    checkpoint.pane_count,
+                    checkpoint.total_bytes,
+                    checkpoint.metadata_json,
+                    checkpoint.topology_json
+             FROM session_checkpoints AS checkpoint
+             JOIN mux_sessions AS session
+               ON session.session_id = checkpoint.session_id
+             WHERE checkpoint.id = ?1
+               AND checkpoint.session_id = ?2
+               AND checkpoint.checkpoint_at = ?3
+               AND checkpoint.checkpoint_role = ?4
+               AND checkpoint.state_hash = ?5
+               AND session.last_checkpoint_at = checkpoint.checkpoint_at
+               AND session.topology_json = checkpoint.topology_json
+               AND checkpoint.id = (
+                   SELECT latest.id
+                   FROM session_checkpoints AS latest
+                   WHERE latest.session_id = checkpoint.session_id
+                   ORDER BY latest.id DESC
+                   LIMIT 1
+               )",
+            rusqlite::params![
+                identity.checkpoint_id,
+                identity.session_id.as_str(),
+                checkpoint_at,
+                identity.checkpoint_role.as_str(),
+                identity.state_hash.as_str(),
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((
+        checkpoint_type,
+        stored_state_hash,
+        pane_count,
+        total_bytes,
+        metadata_json,
+        topology_json,
+    )) = checkpoint
+    else {
+        return Ok(false);
+    };
+    if pane_count < 0
+        || total_bytes < 0
+        || !stored_state_hash.starts_with(SNAPSHOT_WITNESS_PREFIX)
+    {
+        return Ok(false);
+    }
+    let Ok(declared_pane_count) = usize::try_from(pane_count) else {
+        return Ok(false);
+    };
+    let Some(topology_json) = topology_json else {
+        return Ok(false);
+    };
+
+    let mut stmt = conn.prepare(
+        "SELECT pane_id, cwd, command, env_json, terminal_state_json,
+                agent_metadata_json, scrollback_checkpoint_seq, last_output_at
+         FROM mux_pane_state
+         WHERE checkpoint_id = ?1
+         ORDER BY pane_id ASC, id ASC",
+    )?;
+    let mut rows = stmt.query([identity.checkpoint_id])?;
+    // Avoid trusting a corrupt on-disk count as an unbounded upfront
+    // allocation request. Valid large sessions still grow normally.
+    let mut panes = Vec::with_capacity(declared_pane_count.min(4_096));
+    while let Some(row) = rows.next()? {
+        if panes.len() == declared_pane_count {
+            return Ok(false);
+        }
+        let Ok(pane) = decode_persisted_pane_state(row) else {
+            return Ok(false);
+        };
+        if pane.pane_id < 0 || panes.last().is_some_and(|prior: &PersistedPaneState| {
+            prior.pane_id == pane.pane_id
+        }) {
+            return Ok(false);
+        }
+        panes.push(pane);
+    }
+    if panes.len() != declared_pane_count {
+        return Ok(false);
+    }
+
+    let recomputed = match checkpoint_witness(
+        CHECKPOINT_ROLE_SNAPSHOT,
+        identity.session_id.as_str(),
+        identity.checkpoint_id,
+        checkpoint_at,
+        &checkpoint_type,
+        pane_count,
+        total_bytes,
+        metadata_json.as_deref(),
+        Some(topology_json.as_str()),
+        &panes,
+    ) {
+        Ok(witness) => witness,
+        Err(error) => {
+            tracing::warn!(
+                checkpoint_id = identity.checkpoint_id,
+                error = %error,
+                "snapshot checkpoint witness projection is structurally invalid"
+            );
+            return Ok(false);
+        }
+    };
+    Ok(recomputed == stored_state_hash)
 }
 
 fn exact_snapshot_checkpoint_exists_sync(
     db_path: &str,
     identity: &SnapshotCheckpointIdentity,
 ) -> std::result::Result<bool, rusqlite::Error> {
-    let checkpoint_at = u64_to_sqlite_integer(identity.checkpoint_at)?;
     let conn = open_snapshot_query_conn(db_path)?;
-    conn.query_row(
-        "SELECT EXISTS (
-             SELECT 1
-             FROM session_checkpoints
-             WHERE id = ?1
-               AND session_id = ?2
-               AND checkpoint_at = ?3
-               AND checkpoint_role = 'snapshot'
-               AND state_hash = ?4
-         )",
-        rusqlite::params![
-            identity.checkpoint_id,
-            identity.session_id.as_str(),
-            checkpoint_at,
-            identity.state_hash.as_str(),
-        ],
-        |row| row.get(0),
-    )
+    exact_snapshot_checkpoint_is_verified(&conn, identity)
 }
 
 fn current_host_id() -> String {
@@ -4285,15 +4890,32 @@ fn mark_shutdown_authoritatively_sync(
     checkpoint_at: u64,
     state_hash: &str,
 ) -> std::result::Result<(), SnapshotAuthorityDbError> {
+    let identity = SnapshotCheckpointIdentity {
+        checkpoint_id,
+        session_id: session_id.to_string(),
+        checkpoint_at,
+        checkpoint_role: CHECKPOINT_ROLE_SNAPSHOT.to_string(),
+        state_hash: state_hash.to_string(),
+    };
     let checkpoint_at = u64_to_sqlite_integer(checkpoint_at)?;
     let conn = open_conn(db_path).map_err(SnapshotAuthorityDbError::retry_safe)?;
     run_snapshot_authority_transaction(&conn, |tx| {
         crate::session_retention::ensure_session_authority_tables_have_no_unaudited_triggers(tx)?;
+        if !exact_snapshot_checkpoint_is_verified(tx, &identity)? {
+            return Err(rusqlite::Error::StatementChangedRows(0));
+        }
         let updated = tx.execute(
-            "UPDATE mux_sessions
+            "UPDATE mux_sessions AS session
              SET shutdown_clean = 1,
                  clean_checkpoint_id = ?3
-             WHERE session_id = ?1
+             WHERE session.session_id = ?1
+               AND session.last_checkpoint_at = ?2
+               AND session.topology_json = (
+                   SELECT exact.topology_json
+                   FROM session_checkpoints AS exact
+                   WHERE exact.id = ?3
+                     AND exact.session_id = ?1
+               )
                AND EXISTS (
                    SELECT 1
                    FROM session_checkpoints AS exact
@@ -4307,7 +4929,7 @@ fn mark_shutdown_authoritatively_sync(
                    SELECT latest.id
                    FROM session_checkpoints AS latest
                    WHERE latest.session_id = ?1
-                   ORDER BY latest.checkpoint_at DESC, latest.id DESC
+                   ORDER BY latest.id DESC
                    LIMIT 1
                )",
             rusqlite::params![session_id, checkpoint_at, checkpoint_id, state_hash],
@@ -4507,7 +5129,7 @@ fn reconcile_session_after_checkpoint_deletion(
                  SELECT checkpoint.checkpoint_at
                  FROM session_checkpoints AS checkpoint
                  WHERE checkpoint.session_id = session.session_id
-                 ORDER BY checkpoint.checkpoint_at DESC, checkpoint.id DESC
+                 ORDER BY checkpoint.id DESC
                  LIMIT 1
              ),
              topology_json = COALESCE(
@@ -4517,7 +5139,7 @@ fn reconcile_session_after_checkpoint_deletion(
                      WHERE checkpoint.session_id = session.session_id
                        AND checkpoint.checkpoint_role = 'snapshot'
                        AND checkpoint.topology_json IS NOT NULL
-                     ORDER BY checkpoint.checkpoint_at DESC, checkpoint.id DESC
+                     ORDER BY checkpoint.id DESC
                      LIMIT 1
                  ),
                  session.topology_json
@@ -4534,7 +5156,7 @@ fn reconcile_session_after_checkpoint_deletion(
                             SELECT latest.id
                             FROM session_checkpoints AS latest
                             WHERE latest.session_id = session.session_id
-                            ORDER BY latest.checkpoint_at DESC, latest.id DESC
+                            ORDER BY latest.id DESC
                             LIMIT 1
                         )
                   )
@@ -4553,7 +5175,7 @@ fn reconcile_session_after_checkpoint_deletion(
                             SELECT latest.id
                             FROM session_checkpoints AS latest
                             WHERE latest.session_id = session.session_id
-                            ORDER BY latest.checkpoint_at DESC, latest.id DESC
+                            ORDER BY latest.id DESC
                             LIMIT 1
                         )
                   )
@@ -4619,7 +5241,7 @@ fn delete_checkpoint_authoritatively_sync(
                                          SELECT latest.id
                                          FROM session_checkpoints AS latest
                                          WHERE latest.session_id = checkpoint.session_id
-                                         ORDER BY latest.checkpoint_at DESC, latest.id DESC
+                                         ORDER BY latest.id DESC
                                          LIMIT 1
                                      ),
                                      0
@@ -4631,8 +5253,7 @@ fn delete_checkpoint_authoritatively_sync(
                                          FROM session_checkpoints AS latest_snapshot
                                          WHERE latest_snapshot.session_id = checkpoint.session_id
                                            AND latest_snapshot.checkpoint_role = 'snapshot'
-                                         ORDER BY latest_snapshot.checkpoint_at DESC,
-                                                  latest_snapshot.id DESC
+                                         ORDER BY latest_snapshot.id DESC
                                          LIMIT 1
                                      ),
                                      0
@@ -4681,7 +5302,7 @@ fn delete_checkpoint_authoritatively_sync(
                 tx.query_row(
                     &format!(
                         "{projection}{role_predicate}
-                         ORDER BY checkpoint.checkpoint_at DESC, checkpoint.id DESC
+                         ORDER BY checkpoint.id DESC
                          LIMIT 1"
                     ),
                     [],
@@ -4757,7 +5378,7 @@ fn cleanup_authoritatively_sync(
                         checkpoint_at,
                         ROW_NUMBER() OVER (
                             PARTITION BY session_id
-                            ORDER BY checkpoint_at DESC, id DESC
+                            ORDER BY id DESC
                         ) AS checkpoint_rank
                  FROM session_checkpoints
                  WHERE checkpoint_role = 'snapshot'
@@ -4800,7 +5421,7 @@ fn cleanup_authoritatively_sync(
                      SELECT id,
                             ROW_NUMBER() OVER (
                                 PARTITION BY session_id
-                                ORDER BY checkpoint_at DESC, id DESC
+                                ORDER BY id DESC
                             ) AS checkpoint_rank
                      FROM session_checkpoints
                      WHERE checkpoint_role = 'snapshot'
@@ -4897,6 +5518,73 @@ mod tests {
         let oversized_pane_id = load_latest_scrollback_refs_sync(db_path, &[u64::MAX])
             .expect_err("an unrepresentable pane id must not wrap to a SQLite integer");
         assert!(oversized_pane_id.contains("exceeds sqlite integer range"));
+    }
+
+    #[test]
+    fn observation_connection_never_creates_a_missing_database() {
+        let directory = tempfile::tempdir().unwrap();
+        let missing = directory.path().join("observation-must-not-create.db");
+        assert!(!missing.exists());
+        assert!(open_snapshot_query_conn(missing.to_str().unwrap()).is_err());
+        assert!(
+            !missing.exists(),
+            "an observation-only open must not materialize a database file"
+        );
+    }
+
+    #[test]
+    fn auxiliary_snapshot_queries_chunk_large_pane_sets() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let db_path = tmp.path().to_str().unwrap();
+        let mut conn = Connection::open(db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE events (
+                 id INTEGER PRIMARY KEY,
+                 pane_id INTEGER NOT NULL,
+                 rule_id TEXT NOT NULL,
+                 agent_type TEXT NOT NULL,
+                 extracted TEXT,
+                 detected_at INTEGER NOT NULL
+             );
+             CREATE TABLE output_segments (
+                 pane_id INTEGER NOT NULL,
+                 seq INTEGER NOT NULL,
+                 captured_at INTEGER NOT NULL
+             );",
+        )
+        .unwrap();
+        let pane_count = SNAPSHOT_SQLITE_IN_LIST_CHUNK + 17;
+        let tx = conn.transaction().unwrap();
+        for pane_id in 0..pane_count {
+            let pane_id = i64::try_from(pane_id).unwrap();
+            tx.execute(
+                "INSERT INTO events
+                 (pane_id, rule_id, agent_type, extracted, detected_at)
+                 VALUES (?1, 'codex-working', 'codex', '{}', 10)",
+                [pane_id],
+            )
+            .unwrap();
+            tx.execute(
+                "INSERT INTO output_segments (pane_id, seq, captured_at)
+                 VALUES (?1, 0, 10)",
+                [pane_id],
+            )
+            .unwrap();
+        }
+        tx.commit().unwrap();
+        drop(conn);
+
+        let pane_ids: Vec<u64> = (0..u64::try_from(pane_count).unwrap()).collect();
+        let detections = load_latest_detections_by_pane_sync(db_path, &pane_ids, 0).unwrap();
+        let scrollback = load_latest_scrollback_refs_sync(db_path, &pane_ids).unwrap();
+        assert_eq!(detections.len(), pane_count);
+        assert_eq!(scrollback.len(), pane_count);
+        assert!(detections.values().all(|values| values.len() == 1));
+        assert!(
+            scrollback
+                .values()
+                .all(|reference| reference.output_segments_seq == 0)
+        );
     }
 
     #[test]
@@ -5084,6 +5772,26 @@ mod tests {
                 5,
                 "checkpoint_delete",
             ),
+            (
+                SnapshotAuthorityOperation::RestoreReceiptCommit,
+                6,
+                "restore_receipt_commit",
+            ),
+            (
+                SnapshotAuthorityOperation::RestoreCleanMark,
+                7,
+                "restore_clean_mark",
+            ),
+            (
+                SnapshotAuthorityOperation::SessionDelete,
+                8,
+                "session_delete",
+            ),
+            (
+                SnapshotAuthorityOperation::RestoreIntentCommit,
+                9,
+                "restore_intent_commit",
+            ),
         ];
 
         for (operation, code, label) in cases {
@@ -5093,7 +5801,7 @@ mod tests {
             assert_eq!(SnapshotAuthorityOperation::from_code(code), Some(operation));
         }
         assert_eq!(SnapshotAuthorityOperation::from_code(0), None);
-        assert_eq!(SnapshotAuthorityOperation::from_code(6), None);
+        assert_eq!(SnapshotAuthorityOperation::from_code(10), None);
         assert_eq!(SnapshotAuthorityOperation::from_code(u8::MAX), None);
     }
 
@@ -5350,6 +6058,92 @@ mod tests {
             authority.first_latched_operation(),
             Some(SnapshotAuthorityOperation::CheckpointCleanup)
         );
+    }
+
+    #[test]
+    fn synchronous_authority_panic_latches_started_handoff() {
+        let (_tmp, db_path) = setup_test_db();
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = run_checkpoint_authority_sync::<(), SnapshotAuthorityDbError, _>(
+                Arc::clone(&db_path),
+                SnapshotAuthorityOperation::CheckpointCommit,
+                |_| -> std::result::Result<(), SnapshotAuthorityDbError> {
+                    panic!("synchronous authority panic fixture")
+                },
+            );
+        }));
+        assert!(panic.is_err());
+
+        let replacement = SnapshotEngine::new(db_path, SnapshotConfig::default());
+        assert!(replacement.authority_reconciliation_is_required());
+        assert_eq!(
+            replacement.snapshot_authority.first_latched_operation(),
+            Some(SnapshotAuthorityOperation::CheckpointCommit)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn established_filesystem_object_replacement_fails_closed() {
+        let (_tmp, db_path) = setup_test_db();
+        let engine = SnapshotEngine::new(db_path, SnapshotConfig::default());
+        {
+            let mut identities = engine
+                .snapshot_authority
+                .registry_identities
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let object_identity = identities
+                .iter_mut()
+                .find(|identity| {
+                    identity.starts_with(SNAPSHOT_AUTHORITY_OBJECT_IDENTITY_PREFIX)
+                })
+                .expect("existing database object identity");
+            *object_identity =
+                "sqlite-file-object-unix:18446744073709551615:18446744073709551615"
+                    .to_string();
+        }
+
+        let blocked = engine
+            .try_begin_snapshot_authority(SnapshotAuthorityOperation::ShutdownMark)
+            .expect_err("replacement identity must latch reconciliation");
+        assert!(matches!(
+            blocked,
+            SnapshotError::AuthorityReconciliationRequired {
+                first_indeterminate_operation: Some(SnapshotAuthorityOperation::ShutdownMark),
+                ..
+            }
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn multiple_registry_identity_matches_latch_every_authority_state() {
+        let (_tmp, db_path) = setup_test_db();
+        let primary = SnapshotEngine::new(Arc::clone(&db_path), SnapshotConfig::default());
+        let object_identity = snapshot_authority_file_identities(db_path.as_str())
+            .into_iter()
+            .find(|identity| identity.starts_with(SNAPSHOT_AUTHORITY_OBJECT_IDENTITY_PREFIX))
+            .expect("filesystem object identity");
+        let rogue = Arc::new(SnapshotAuthorityState::new_with_registry_identities(
+            vec![object_identity.clone()],
+            Some(db_path.as_str().to_string()),
+        ));
+        snapshot_authority_registry()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(
+                object_identity,
+                SnapshotAuthorityRegistryEntry::Live(Arc::downgrade(&rogue)),
+            );
+
+        let observed = SnapshotEngine::new(db_path, SnapshotConfig::default());
+        assert!(Arc::ptr_eq(
+            &observed.snapshot_authority,
+            &primary.snapshot_authority
+        ));
+        assert!(primary.authority_reconciliation_is_required());
+        assert!(rogue.reconciliation_is_required());
     }
 
     #[test]
@@ -5684,6 +6478,43 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn snapshot_authority_refreshes_inode_after_missing_database_is_created() {
+        let directory = tempfile::tempdir().expect("authority tempdir");
+        let primary_path = directory.path().join("created-after-engine.db");
+        assert!(!primary_path.exists());
+
+        let primary = SnapshotEngine::new(
+            Arc::new(primary_path.to_string_lossy().into_owned()),
+            SnapshotConfig::default(),
+        );
+        let connection = Connection::open(&primary_path).expect("create database after engine");
+        connection
+            .execute_batch("CREATE TABLE creation_probe (id INTEGER PRIMARY KEY);")
+            .expect("initialize created database");
+        drop(connection);
+
+        refresh_snapshot_authority_file_identities(
+            primary.db_path.as_str(),
+            &primary.snapshot_authority,
+            SnapshotAuthorityOperation::CheckpointCommit,
+        )
+        .expect("publish created database identity");
+
+        let hard_link = directory.path().join("created-after-engine-hard-link.db");
+        std::fs::hard_link(&primary_path, &hard_link).expect("create late hard-link alias");
+        let alias = SnapshotEngine::new(
+            Arc::new(hard_link.to_string_lossy().into_owned()),
+            SnapshotConfig::default(),
+        );
+        assert!(Arc::ptr_eq(
+            &primary.snapshot_authority,
+            &alias.snapshot_authority
+        ));
+        assert_eq!(primary.db_path, alias.db_path);
     }
 
     #[test]
@@ -6802,7 +7633,7 @@ mod tests {
                     REFERENCES session_checkpoints(id) ON DELETE SET NULL
             );
             CREATE TABLE IF NOT EXISTS session_checkpoints (
-                id INTEGER PRIMARY KEY,
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
                 session_id TEXT NOT NULL REFERENCES mux_sessions(session_id) ON DELETE CASCADE,
                 checkpoint_at INTEGER NOT NULL,
                 checkpoint_type TEXT NOT NULL CHECK(checkpoint_type IN ('periodic','event','shutdown','startup')),
@@ -6811,8 +7642,45 @@ mod tests {
                 total_bytes INTEGER NOT NULL,
                 metadata_json TEXT,
                 checkpoint_role TEXT NOT NULL DEFAULT 'snapshot'
-                    CHECK(checkpoint_role IN ('snapshot','restore_receipt')),
-                topology_json TEXT
+                    CHECK(checkpoint_role IN ('snapshot','restore_intent','restore_receipt')),
+                topology_json TEXT,
+                restore_intent_checkpoint_id INTEGER
+                    REFERENCES session_checkpoints(id) ON DELETE CASCADE,
+                CHECK(checkpoint_role = 'restore_receipt'
+                      OR restore_intent_checkpoint_id IS NULL)
+            );
+            CREATE TABLE IF NOT EXISTS restore_attempt_lifecycle (
+                intent_checkpoint_id INTEGER PRIMARY KEY
+                    REFERENCES session_checkpoints(id)
+                    ON DELETE NO ACTION DEFERRABLE INITIALLY DEFERRED,
+                session_id TEXT NOT NULL
+                    REFERENCES mux_sessions(session_id) ON DELETE CASCADE,
+                source_checkpoint_id INTEGER NOT NULL,
+                outcome_checkpoint_id INTEGER
+                    REFERENCES session_checkpoints(id) ON DELETE SET NULL,
+                status TEXT NOT NULL
+                    CHECK(status IN ('intent','outcome_complete','resolved','reconciliation_required')),
+                created_at INTEGER NOT NULL,
+                resolved_at INTEGER,
+                CHECK(intent_checkpoint_id <> source_checkpoint_id),
+                CHECK(outcome_checkpoint_id IS NULL
+                      OR outcome_checkpoint_id <> intent_checkpoint_id),
+                CHECK(outcome_checkpoint_id IS NULL
+                      OR outcome_checkpoint_id <> source_checkpoint_id),
+                CHECK(created_at >= 0),
+                CHECK(resolved_at IS NULL OR resolved_at >= created_at),
+                CHECK(
+                    (status = 'intent'
+                        AND outcome_checkpoint_id IS NULL
+                        AND resolved_at IS NULL)
+                    OR (status = 'outcome_complete'
+                        AND outcome_checkpoint_id IS NOT NULL
+                        AND resolved_at IS NULL)
+                    OR (status = 'reconciliation_required'
+                        AND resolved_at IS NULL)
+                    OR (status = 'resolved'
+                        AND resolved_at IS NOT NULL)
+                )
             );
             CREATE TABLE IF NOT EXISTS mux_pane_state (
                 id INTEGER PRIMARY KEY,
@@ -6826,6 +7694,8 @@ mod tests {
                 scrollback_checkpoint_seq INTEGER,
                 last_output_at INTEGER
             );
+            CREATE INDEX IF NOT EXISTS idx_checkpoints_session
+                ON session_checkpoints(session_id, checkpoint_at);
             CREATE INDEX IF NOT EXISTS idx_checkpoints_session_role_latest
                 ON session_checkpoints(
                     session_id,
@@ -6833,6 +7703,27 @@ mod tests {
                     checkpoint_at DESC,
                     id DESC
                 );
+            CREATE INDEX IF NOT EXISTS idx_checkpoints_session_role_causal
+                ON session_checkpoints(session_id, checkpoint_role, id DESC);
+            CREATE INDEX IF NOT EXISTS idx_checkpoints_global_latest
+                ON session_checkpoints(checkpoint_at DESC, id DESC);
+            CREATE INDEX IF NOT EXISTS idx_checkpoints_global_snapshot_latest
+                ON session_checkpoints(checkpoint_at DESC, id DESC)
+                WHERE checkpoint_role = 'snapshot';
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_checkpoints_restore_intent_outcome
+                ON session_checkpoints(restore_intent_checkpoint_id)
+                WHERE restore_intent_checkpoint_id IS NOT NULL;
+            CREATE INDEX IF NOT EXISTS idx_mux_sessions_clean_checkpoint
+                ON mux_sessions(clean_checkpoint_id);
+            CREATE INDEX IF NOT EXISTS idx_restore_attempt_lifecycle_session_status
+                ON restore_attempt_lifecycle(session_id, status, intent_checkpoint_id);
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_restore_attempt_lifecycle_outcome
+                ON restore_attempt_lifecycle(outcome_checkpoint_id)
+                WHERE outcome_checkpoint_id IS NOT NULL;
+            CREATE INDEX IF NOT EXISTS idx_pane_state_checkpoint
+                ON mux_pane_state(checkpoint_id);
+            CREATE INDEX IF NOT EXISTS idx_pane_state_pane
+                ON mux_pane_state(pane_id);
             PRAGMA foreign_keys = ON;
             ",
         )
@@ -7141,6 +8032,71 @@ mod tests {
     }
 
     #[test]
+    fn periodic_metadata_is_never_discarded_by_state_dedup() {
+        run_async_test(async {
+            let (_tmp, db_path) = setup_test_db();
+            let engine = SnapshotEngine::new(db_path.clone(), SnapshotConfig::default());
+            let panes = vec![make_test_pane(1, 24, 80)];
+            engine
+                .capture(&panes, SnapshotTrigger::Periodic)
+                .await
+                .unwrap();
+
+            let metadata = serde_json::json!({"reason": "operator-request"});
+            let result = engine
+                .capture_with_options(
+                    &panes,
+                    SnapshotTrigger::Periodic,
+                    SnapshotCaptureOptions {
+                        include_scrollback: false,
+                        metadata: Some(metadata.clone()),
+                    },
+                )
+                .await
+                .expect("metadata-bearing periodic capture must persist");
+            let persisted_metadata: String = Connection::open(db_path.as_str())
+                .unwrap()
+                .query_row(
+                    "SELECT metadata_json FROM session_checkpoints WHERE id = ?1",
+                    [result.checkpoint_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(persisted_metadata, canonical_json_string(&metadata).unwrap());
+        });
+    }
+
+    #[test]
+    fn periodic_dedup_recomputes_persisted_pane_witness_before_skipping() {
+        run_async_test(async {
+            let (_tmp, db_path) = setup_test_db();
+            let engine = SnapshotEngine::new(db_path.clone(), SnapshotConfig::default());
+            let panes = vec![make_test_pane(1, 24, 80)];
+            let first = engine
+                .capture(&panes, SnapshotTrigger::Periodic)
+                .await
+                .unwrap();
+            Connection::open(db_path.as_str())
+                .unwrap()
+                .execute(
+                    "UPDATE mux_pane_state
+                     SET terminal_state_json = '{}'
+                     WHERE checkpoint_id = ?1",
+                    [first.checkpoint_id],
+                )
+                .unwrap();
+
+            let healed = engine
+                .capture(&panes, SnapshotTrigger::Periodic)
+                .await
+                .expect("a corrupt cached row must be replaced, not deduplicated");
+            assert_eq!(healed.pane_count, 1);
+            assert_eq!(checkpoint_count(db_path.as_str()), 2);
+            assert_eq!(engine.telemetry().snapshot().dedup_skips, 0);
+        });
+    }
+
+    #[test]
     fn dedup_does_not_skip_manual() {
         run_async_test(async {
             let (_tmp, db_path) = setup_test_db();
@@ -7353,7 +8309,7 @@ mod tests {
             PaneStateSnapshot::from_pane_info(&make_test_pane(8, 24, 80), 3000, false);
         corrupt_pane.scrollback_ref = Some(ScrollbackRef {
             output_segments_seq: -1,
-            total_lines_captured: 1,
+            total_segments_captured: 1,
             last_capture_at: 3000,
         });
         let error = prepare_snapshot_persistence(
@@ -7448,39 +8404,48 @@ mod tests {
             crate::VERSION,
         )
         .unwrap();
-        let first_id = insert_checkpoint_fixture(
-            db_path.as_str(),
-            "sess-exact-close",
-            2_000,
-            CHECKPOINT_ROLE_SNAPSHOT,
-            "0000000000000001",
-            Some(r#"{"version":"first"}"#),
-            10,
+        let first = prepare_test_snapshot(
+            r#"{"version":"first"}"#,
+            &[PaneStateSnapshot::from_pane_info(
+                &make_test_pane(1, 24, 80),
+                2_000,
+                false,
+            )],
         );
-        let latest_id = insert_checkpoint_fixture(
+        let first_receipt = save_checkpoint_sync(
             db_path.as_str(),
             "sess-exact-close",
             2_000,
-            CHECKPOINT_ROLE_SNAPSHOT,
-            "0000000000000002",
-            Some(r#"{"version":"latest"}"#),
-            20,
-        );
-        set_session_checkpoint_summary(
-            db_path.as_str(),
-            "sess-exact-close",
-            2_000,
-            r#"{"version":"latest"}"#,
+            "event",
+            &first,
             None,
+        )
+        .unwrap();
+        let latest = prepare_test_snapshot(
+            r#"{"version":"latest"}"#,
+            &[PaneStateSnapshot::from_pane_info(
+                &make_test_pane(1, 30, 100),
+                2_000,
+                false,
+            )],
         );
+        let latest_receipt = save_checkpoint_sync(
+            db_path.as_str(),
+            "sess-exact-close",
+            2_000,
+            "event",
+            &latest,
+            None,
+        )
+        .unwrap();
 
         assert!(
             mark_shutdown_sync(
                 db_path.as_str(),
                 "sess-exact-close",
-                first_id,
+                first_receipt.checkpoint_id,
                 2_000,
-                "0000000000000001",
+                &first_receipt.state_hash,
             )
             .is_err(),
             "the lower ID in a timestamp tie is not the latest checkpoint"
@@ -7489,9 +8454,9 @@ mod tests {
             mark_shutdown_sync(
                 db_path.as_str(),
                 "sess-exact-close",
-                latest_id,
+                latest_receipt.checkpoint_id,
                 2_000,
-                "0000000000000001",
+                &first_receipt.state_hash,
             )
             .is_err(),
             "a stale witness must not authorize a clean transition"
@@ -7499,9 +8464,9 @@ mod tests {
         mark_shutdown_sync(
             db_path.as_str(),
             "sess-exact-close",
-            latest_id,
+            latest_receipt.checkpoint_id,
             2_000,
-            "0000000000000002",
+            &latest_receipt.state_hash,
         )
         .unwrap();
 
@@ -7532,6 +8497,147 @@ mod tests {
             .is_err(),
             "a restore receipt cannot masquerade as a shutdown snapshot"
         );
+    }
+
+    #[test]
+    fn mark_shutdown_requires_verified_witness_and_matching_session_summary() {
+        let (_witness_tmp, witness_db) = setup_test_db();
+        create_session_sync(
+            witness_db.as_str(),
+            "sess-corrupt-close",
+            1_000,
+            r#"{"version":"initial"}"#,
+            crate::VERSION,
+        )
+        .unwrap();
+        let prepared = prepare_test_snapshot(
+            r#"{"version":"final"}"#,
+            &[PaneStateSnapshot::from_pane_info(
+                &make_test_pane(1, 24, 80),
+                2_000,
+                false,
+            )],
+        );
+        let receipt = save_checkpoint_sync(
+            witness_db.as_str(),
+            "sess-corrupt-close",
+            2_000,
+            "shutdown",
+            &prepared,
+            None,
+        )
+        .unwrap();
+        Connection::open(witness_db.as_str())
+            .unwrap()
+            .execute(
+                "UPDATE mux_pane_state SET terminal_state_json = '{}'
+                 WHERE checkpoint_id = ?1",
+                [receipt.checkpoint_id],
+            )
+            .unwrap();
+        assert!(
+            mark_shutdown_sync(
+                witness_db.as_str(),
+                "sess-corrupt-close",
+                receipt.checkpoint_id,
+                2_000,
+                &receipt.state_hash,
+            )
+            .is_err(),
+            "matching identity columns cannot authorize a corrupt pane projection"
+        );
+
+        let (_summary_tmp, summary_db) = setup_test_db();
+        create_session_sync(
+            summary_db.as_str(),
+            "sess-stale-summary",
+            1_000,
+            r#"{"version":"initial"}"#,
+            crate::VERSION,
+        )
+        .unwrap();
+        let prepared = prepare_test_snapshot(r#"{"version":"final"}"#, &[]);
+        let receipt = save_checkpoint_sync(
+            summary_db.as_str(),
+            "sess-stale-summary",
+            2_000,
+            "shutdown",
+            &prepared,
+            None,
+        )
+        .unwrap();
+        Connection::open(summary_db.as_str())
+            .unwrap()
+            .execute(
+                "UPDATE mux_sessions
+                 SET last_checkpoint_at = 1999, topology_json = '{}'
+                 WHERE session_id = 'sess-stale-summary'",
+                [],
+            )
+            .unwrap();
+        assert!(
+            mark_shutdown_sync(
+                summary_db.as_str(),
+                "sess-stale-summary",
+                receipt.checkpoint_id,
+                2_000,
+                &receipt.state_hash,
+            )
+            .is_err(),
+            "clean marking must compare-and-swap the exact session summary"
+        );
+        let clean: i64 = Connection::open(summary_db.as_str())
+            .unwrap()
+            .query_row(
+                "SELECT shutdown_clean FROM mux_sessions
+                 WHERE session_id = 'sess-stale-summary'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(clean, 0);
+    }
+
+    #[test]
+    fn causal_checkpoint_id_beats_rolled_back_wall_clock_for_clean_marking() {
+        let (_tmp, db_path) = setup_test_db();
+        create_session_sync(
+            db_path.as_str(),
+            "sess-clock-rollback",
+            500,
+            r#"{"version":"initial"}"#,
+            crate::VERSION,
+        )
+        .unwrap();
+        let first = prepare_test_snapshot(r#"{"version":"first"}"#, &[]);
+        save_checkpoint_sync(
+            db_path.as_str(),
+            "sess-clock-rollback",
+            3_000,
+            "event",
+            &first,
+            None,
+        )
+        .unwrap();
+        let causal_latest = prepare_test_snapshot(r#"{"version":"second"}"#, &[]);
+        let latest_receipt = save_checkpoint_sync(
+            db_path.as_str(),
+            "sess-clock-rollback",
+            1_000,
+            "shutdown",
+            &causal_latest,
+            None,
+        )
+        .unwrap();
+
+        mark_shutdown_sync(
+            db_path.as_str(),
+            "sess-clock-rollback",
+            latest_receipt.checkpoint_id,
+            1_000,
+            &latest_receipt.state_hash,
+        )
+        .expect("the causally latest inserted checkpoint must remain close authority");
     }
 
     #[test]
@@ -8488,7 +9594,7 @@ mod tests {
 
         let scrollback_changed = state_at_200.clone().with_scrollback(ScrollbackRef {
             output_segments_seq: 42,
-            total_lines_captured: 500,
+            total_segments_captured: 500,
             last_capture_at: 150,
         });
         assert_ne!(
@@ -8498,23 +9604,23 @@ mod tests {
                 .dedup_hash,
             "scrollback authority changes must participate in dedup"
         );
-        let total_lines_only = state_at_200.clone().with_scrollback(ScrollbackRef {
-            total_lines_captured: 999_999,
+        let total_segments_only = state_at_200.clone().with_scrollback(ScrollbackRef {
+            total_segments_captured: 999_999,
             ..scrollback_changed.scrollback_ref.unwrap()
         });
         let same_scrollback_columns = state_at_200.clone().with_scrollback(ScrollbackRef {
             output_segments_seq: 42,
-            total_lines_captured: 1,
+            total_segments_captured: 1,
             last_capture_at: 150,
         });
         assert_eq!(
-            prepare_snapshot_persistence(&topology_at_200, &[total_lines_only], None)
+            prepare_snapshot_persistence(&topology_at_200, &[total_segments_only], None)
                 .unwrap()
                 .dedup_hash,
             prepare_snapshot_persistence(&topology_at_200, &[same_scrollback_columns], None)
                 .unwrap()
                 .dedup_hash,
-            "non-persisted scrollback line counts must not create checkpoints"
+            "non-persisted scrollback segment counts must not create checkpoints"
         );
 
         let process_baseline = state_at_200.clone().with_process(ProcessInfo {
@@ -8699,7 +9805,12 @@ mod tests {
             assert!(engine.emit_trigger(SnapshotTrigger::WorkCompleted));
             assert!(engine.emit_trigger(SnapshotTrigger::StateTransition));
 
-            let mut rx = engine.trigger_rx.lock().await.take().unwrap();
+            let mut rx = engine
+                .trigger_rx
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take()
+                .unwrap();
             assert_eq!(recv_trigger(&mut rx).await, SnapshotTrigger::WorkCompleted);
             assert_eq!(
                 recv_trigger(&mut rx).await,
@@ -9061,7 +10172,7 @@ mod tests {
             session_cleanup_in_progress: AtomicBool::new(false),
             snapshot_authority: Arc::new(SnapshotAuthorityState::new(None)),
             trigger_tx,
-            trigger_rx: Mutex::new(None),
+            trigger_rx: StdMutex::new(None),
             telemetry: SnapshotEngineTelemetry::new(),
         };
 
@@ -9337,10 +10448,8 @@ mod tests {
     }
 
     #[test]
-    fn intelligent_receiver_already_taken_returns_immediately() {
+    fn intelligent_scheduler_rejects_concurrency_and_restores_receiver_for_restart() {
         run_async_test(async {
-            // If run_periodic is called twice, the second call should return
-            // immediately because the receiver was already taken.
             let (_tmp, db_path) = setup_test_db();
             let engine = Arc::new(SnapshotEngine::new(
                 db_path.clone(),
@@ -9355,21 +10464,33 @@ mod tests {
                     .await
                     .expect("snapshot scheduler");
             });
-            sleep(Duration::from_millis(100)).await;
+            await_checkpoint_count(db_path.as_str(), 1, "first scheduler startup").await;
 
-            // Second call should return immediately (receiver already taken)
             let (_shutdown_tx2, shutdown_rx2) = watch::channel(false);
-            let e3 = engine.clone();
-            let result = timeout(Duration::from_secs(2), async move {
-                e3.run_periodic(shutdown_rx2, counting_pane_provider())
-                    .await
-                    .expect("second snapshot scheduler call");
-            })
-            .await;
-            assert!(result.is_ok(), "second run_periodic returns immediately");
+            let concurrent = engine
+                .run_periodic(shutdown_rx2, counting_pane_provider())
+                .await;
+            assert!(matches!(
+                concurrent,
+                Err(SnapshotError::SchedulerInProgress)
+            ));
 
             shutdown_tx.send(true).unwrap();
             handle.await.unwrap();
+
+            let (restart_shutdown_tx, restart_shutdown_rx) = watch::channel(false);
+            let restarted_engine = Arc::clone(&engine);
+            let restarted = crate::runtime_async::task::spawn(async move {
+                restarted_engine
+                    .run_periodic(restart_shutdown_rx, counting_pane_provider())
+                    .await
+                    .expect("restarted snapshot scheduler");
+            });
+            await_checkpoint_count(db_path.as_str(), 2, "restarted scheduler startup").await;
+            assert!(engine.emit_trigger(SnapshotTrigger::HazardThreshold));
+            await_checkpoint_count(db_path.as_str(), 3, "restarted scheduler trigger").await;
+            restart_shutdown_tx.send(true).unwrap();
+            restarted.await.unwrap();
         });
     }
 
@@ -9583,20 +10704,6 @@ mod tests {
     }
 
     #[test]
-    fn severity_from_db_known() {
-        assert!(matches!(severity_from_db("warning"), Severity::Warning));
-        assert!(matches!(severity_from_db("critical"), Severity::Critical));
-        assert!(matches!(severity_from_db("info"), Severity::Info));
-    }
-
-    #[test]
-    fn severity_from_db_unknown_defaults_to_info() {
-        assert!(matches!(severity_from_db(""), Severity::Info));
-        assert!(matches!(severity_from_db("debug"), Severity::Info));
-        assert!(matches!(severity_from_db("WARNING"), Severity::Info)); // case-sensitive
-    }
-
-    #[test]
     fn is_missing_events_table_detects_error() {
         let err = rusqlite::Error::SqliteFailure(
             rusqlite::ffi::Error {
@@ -9675,6 +10782,10 @@ mod tests {
         assert_eq!(
             SnapshotError::SchedulerInProgress.to_string(),
             "snapshot scheduler already running for this engine"
+        );
+        assert_eq!(
+            SnapshotError::TriggerReceiverUnavailable.to_string(),
+            "snapshot intelligent scheduler trigger receiver is unavailable"
         );
         assert_eq!(SnapshotError::NoPanes.to_string(), "no panes found");
         assert_eq!(
