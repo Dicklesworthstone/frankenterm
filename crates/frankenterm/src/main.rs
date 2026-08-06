@@ -30541,6 +30541,62 @@ fn runtime_task_join_failure(
     frankenterm_core::Error::RuntimeOperation { operation, source }
 }
 
+fn semaphore_acquire_failure(
+    operation: &'static str,
+    cx: &frankenterm_core::cx::Cx,
+    error: frankenterm_core::runtime_async::AcquireError,
+) -> frankenterm_core::Error {
+    use frankenterm_core::outcome::CancelKind;
+
+    let source = match error {
+        frankenterm_core::runtime_async::AcquireError::Closed => {
+            frankenterm_core::error::RuntimeOperationSource::Backend(
+                "semaphore closed".to_string(),
+            )
+        }
+        frankenterm_core::runtime_async::AcquireError::PolledAfterCompletion => {
+            frankenterm_core::error::RuntimeOperationSource::Backend(
+                "semaphore acquire future polled after completion".to_string(),
+            )
+        }
+        frankenterm_core::runtime_async::AcquireError::Cancelled => {
+            match cx.root_cancel_cause().map(|reason| reason.kind) {
+                Some(CancelKind::Deadline) => {
+                    frankenterm_core::error::RuntimeOperationSource::Backend(
+                        "capability deadline exceeded".to_string(),
+                    )
+                }
+                Some(CancelKind::PollQuota) => {
+                    frankenterm_core::error::RuntimeOperationSource::Backend(
+                        "capability poll quota exhausted".to_string(),
+                    )
+                }
+                Some(CancelKind::CostBudget) => {
+                    frankenterm_core::error::RuntimeOperationSource::Backend(
+                        "capability cost budget exhausted".to_string(),
+                    )
+                }
+                Some(
+                    CancelKind::User
+                    | CancelKind::Timeout
+                    | CancelKind::FailFast
+                    | CancelKind::RaceLost
+                    | CancelKind::ParentCancelled
+                    | CancelKind::ResourceUnavailable
+                    | CancelKind::Shutdown
+                    | CancelKind::LinkedExit,
+                ) => frankenterm_core::error::RuntimeOperationSource::Cancelled(
+                    "semaphore acquire cancelled".to_string(),
+                ),
+                None => frankenterm_core::error::RuntimeOperationSource::Backend(
+                    "capability context failed".to_string(),
+                ),
+            }
+        }
+    };
+    frankenterm_core::Error::RuntimeOperation { operation, source }
+}
+
 #[cfg(test)]
 #[test]
 fn runtime_task_join_failure_preserves_cancellation_vs_failure_class() {
@@ -30674,11 +30730,12 @@ async fn batch_get_pane_text(
                 let _permit = semaphore
                     .acquire_owned_with_cx(&child_cx)
                     .await
-                    .map_err(|err| frankenterm_core::Error::RuntimeOperation {
-                        operation: "batch_get_text.acquire_permit",
-                        source: frankenterm_core::error::RuntimeOperationSource::Cancelled(
-                            err.to_string(),
-                        ),
+                    .map_err(|error| {
+                        semaphore_acquire_failure(
+                            "batch_get_text.acquire_permit",
+                            &child_cx,
+                            error,
+                        )
                     })?;
                 wezterm.get_text_with_cx(&child_cx, pane_id, escapes).await
             },
