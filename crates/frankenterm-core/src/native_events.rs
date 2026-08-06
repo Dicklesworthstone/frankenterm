@@ -1207,7 +1207,8 @@ impl NativeEventListener {
                         }
                         Err(error) => {
                             let shutdown_observed = shutdown_flag.load(Ordering::SeqCst)
-                                || cx.checkpoint().is_err();
+                                || (native_spawn_error_may_be_shutdown_race(error.code())
+                                    && cx.checkpoint().is_err());
                             match classify_native_spawn_failure(
                                 error.code(),
                                 shutdown_observed,
@@ -1962,7 +1963,7 @@ mod native_accept_error_classifier_tests {
             ));
             assert_eq!(
                 record_native_listener_anomaly(&counters.connections_with_drops),
-                listener_counts.len() as u64,
+                u64::try_from(listener_counts.len()).expect("four reconnects fit u64"),
             );
         }
 
@@ -2031,7 +2032,7 @@ mod native_accept_error_classifier_tests {
             classify_native_spawn_failure("ASUP-E006", false, &mut retry_state),
             NativeSpawnAdmissionDecision::RetryCapacity {
                 consecutive_capacity_errors: 2,
-                retry_backoff: ACCEPT_ERROR_INITIAL_BACKOFF * 2,
+                retry_backoff: ACCEPT_ERROR_INITIAL_BACKOFF.saturating_mul(2),
             }
         );
 

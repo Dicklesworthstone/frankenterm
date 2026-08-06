@@ -1092,9 +1092,7 @@ enum NativeEventShutdownDrainState {
         deadline: RuntimeTime,
     },
     ProducerClosed,
-    Abandoned {
-        queued_events: usize,
-    },
+    Abandoned,
 }
 
 #[cfg(feature = "native-wezterm")]
@@ -1104,7 +1102,7 @@ enum NativeEventShutdownDrainAction {
     BeginGraceful,
     AbortProducer,
     ProducerClosed,
-    Abandon { queued_events: usize },
+    Abandon,
 }
 
 #[cfg(feature = "native-wezterm")]
@@ -1113,7 +1111,6 @@ impl NativeEventShutdownDrainState {
         &mut self,
         now: RuntimeTime,
         shutdown_requested: bool,
-        queued_events: usize,
     ) -> NativeEventShutdownDrainAction {
         match *self {
             Self::Running if shutdown_requested => {
@@ -1129,20 +1126,20 @@ impl NativeEventShutdownDrainState {
                 NativeEventShutdownDrainAction::AbortProducer
             }
             Self::Forced { deadline } if now >= deadline => {
-                *self = Self::Abandoned { queued_events };
-                NativeEventShutdownDrainAction::Abandon { queued_events }
+                *self = Self::Abandoned;
+                NativeEventShutdownDrainAction::Abandon
             }
             Self::Running
             | Self::Graceful { .. }
             | Self::Forced { .. }
             | Self::ProducerClosed
-            | Self::Abandoned { .. } => NativeEventShutdownDrainAction::None,
+            | Self::Abandoned => NativeEventShutdownDrainAction::None,
         }
     }
 
     fn mark_producer_closed(&mut self) -> NativeEventShutdownDrainAction {
         match self {
-            Self::Abandoned { .. } => NativeEventShutdownDrainAction::None,
+            Self::Abandoned => NativeEventShutdownDrainAction::None,
             Self::ProducerClosed => NativeEventShutdownDrainAction::ProducerClosed,
             Self::Running | Self::Graceful { .. } | Self::Forced { .. } => {
                 *self = Self::ProducerClosed;
@@ -7430,11 +7427,9 @@ impl ObservationRuntime {
                     break;
                 }
                 let now = crate::runtime_async::timer_now_with_cx(&loop_cx);
-                match shutdown_drain_state.advance(
-                    now,
-                    shutdown_flag.load(Ordering::SeqCst),
-                    event_rx.len(),
-                ) {
+                match shutdown_drain_state
+                    .advance(now, shutdown_flag.load(Ordering::SeqCst))
+                {
                     NativeEventShutdownDrainAction::None => {}
                     NativeEventShutdownDrainAction::BeginGraceful => {
                         // Stop admitting new work through the shared shutdown
@@ -7451,10 +7446,10 @@ impl ObservationRuntime {
                         // admitted to the bounded channel can still be drained.
                         accept_task.abort();
                     }
-                    NativeEventShutdownDrainAction::Abandon { queued_events } => {
+                    NativeEventShutdownDrainAction::Abandon => {
                         warn!(
                             event = "native_event_queue_drain_timeout",
-                            queued_events_observed = queued_events,
+                            queued_events_observed = event_rx.len(),
                             drain_ms = NATIVE_EVENT_QUEUE_DRAIN_TIMEOUT.as_millis(),
                             data_loss_indeterminate = true,
                             loss_scope = "queued_or_inflight_native_events",
@@ -10951,14 +10946,13 @@ mod tests {
             let start = RuntimeTime::ZERO;
             let mut drain_state = NativeEventShutdownDrainState::Running;
             assert_eq!(
-                drain_state.advance(start, true, event_rx.len()),
+                drain_state.advance(start, true),
                 NativeEventShutdownDrainAction::BeginGraceful,
             );
             assert_eq!(
                 drain_state.advance(
                     start + NATIVE_ACCEPT_TASK_GRACEFUL_TIMEOUT,
                     true,
-                    event_rx.len(),
                 ),
                 NativeEventShutdownDrainAction::AbortProducer,
             );
@@ -10991,7 +10985,6 @@ mod tests {
                         + NATIVE_ACCEPT_TASK_GRACEFUL_TIMEOUT
                         + NATIVE_EVENT_QUEUE_DRAIN_TIMEOUT,
                     true,
-                    event_rx.len(),
                 ),
                 NativeEventShutdownDrainAction::None,
                 "clean producer closure after draining must not become abandonment",
@@ -11008,33 +11001,32 @@ mod tests {
         let mut drain_state = NativeEventShutdownDrainState::Running;
 
         assert_eq!(
-            drain_state.advance(start, false, 0),
+            drain_state.advance(start, false),
             NativeEventShutdownDrainAction::None,
         );
         assert_eq!(
-            drain_state.advance(start, true, 3),
+            drain_state.advance(start, true),
             NativeEventShutdownDrainAction::BeginGraceful,
         );
         assert_eq!(
-            drain_state.advance(graceful_deadline, true, 3),
+            drain_state.advance(graceful_deadline, true),
             NativeEventShutdownDrainAction::AbortProducer,
         );
         assert_eq!(
             drain_state.advance(
                 graceful_deadline + NATIVE_EVENT_QUEUE_DRAIN_TIMEOUT / 2,
                 true,
-                2,
             ),
             NativeEventShutdownDrainAction::None,
             "admitted events remain drainable throughout the forced window",
         );
         assert_eq!(
-            drain_state.advance(forced_deadline, true, 2),
-            NativeEventShutdownDrainAction::Abandon { queued_events: 2 },
+            drain_state.advance(forced_deadline, true),
+            NativeEventShutdownDrainAction::Abandon,
         );
         assert_eq!(
             drain_state,
-            NativeEventShutdownDrainState::Abandoned { queued_events: 2 },
+            NativeEventShutdownDrainState::Abandoned,
         );
         assert_eq!(
             drain_state.mark_producer_closed(),
