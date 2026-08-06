@@ -22851,7 +22851,7 @@ async fn execute_snapshot_restore_workflow(
         (Err(mut abort), Err(error)) => {
             abort.error = bounded_restore_diagnostic(format!(
                 "{}; operation-lock cleanup also failed: {error}",
-                abort.error
+                abort.error.as_str()
             ));
             Err(abort)
         }
@@ -23449,7 +23449,7 @@ async fn execute_restart_workflow(
         (Err(mut abort), Err(error)) => {
             abort.error = bounded_restore_diagnostic(format!(
                 "{}; operation-lock cleanup also failed: {error}",
-                abort.error
+                abort.error.as_str()
             ));
             Err(abort)
         }
