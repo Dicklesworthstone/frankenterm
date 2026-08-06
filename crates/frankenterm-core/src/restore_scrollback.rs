@@ -128,7 +128,6 @@ impl fmt::Debug for ScrollbackData {
         formatter
             .debug_struct("ScrollbackData")
             .field("line_count", &self.lines.len())
-            .field("total_bytes", &self.total_bytes())
             .finish()
     }
 }
@@ -202,7 +201,6 @@ impl fmt::Debug for InjectionReport {
             .debug_struct("InjectionReport")
             .field("success_count", &self.success_count())
             .field("failure_count", &self.failure_count())
-            .field("total_bytes", &self.total_bytes())
             .field("skipped_count", &self.skipped_count())
             .field("skipped_sample", &self.skipped_sample())
             .finish()
@@ -218,7 +216,8 @@ impl fmt::Debug for InjectionReport {
 /// Callers should check [`InjectionGuard::is_suppressed`] in their pattern
 /// detection hot path to skip detection for panes receiving injected content.
 ///
-/// The guard automatically clears suppression when dropped.
+/// The guard clears its reference when dropped. If the shared authority is
+/// poisoned, suppression remains fail-closed rather than guessing at state.
 pub struct InjectionGuard {
     suppressed: Arc<std::sync::Mutex<HashMap<u64, usize>>>,
     pane_ids: Vec<u64>,
@@ -229,6 +228,11 @@ impl InjectionGuard {
     ///
     /// Duplicate IDs are counted once per guard. Lock poison and reference
     /// counter exhaustion fail closed without partially changing the map.
+    ///
+    /// # Errors
+    ///
+    /// Returns a finite structured error if the suppression authority is
+    /// poisoned or a reference counter cannot be incremented safely.
     pub fn new(
         suppressed: Arc<std::sync::Mutex<HashMap<u64, usize>>>,
         mut pane_ids: Vec<u64>,
@@ -297,7 +301,7 @@ impl Drop for InjectionGuard {
         for &id in &self.pane_ids {
             let remove = if let Some(count) = set.get_mut(&id) {
                 if *count == 0 {
-                    false
+                    true
                 } else {
                     *count -= 1;
                     *count == 0
@@ -613,7 +617,6 @@ mod tests {
         let debug = format!("{data:?}");
 
         assert!(debug.contains("line_count: 1"));
-        assert!(debug.contains("total_bytes: 19"));
         assert!(!debug.contains("raw-terminal-canary"));
     }
 
@@ -872,7 +875,6 @@ mod tests {
     #[test]
     fn inject_skips_unmapped_panes() {
         run_async_test(async {
-            let mock = Arc::new(MockWezterm::new());
             let injector = make_injector();
 
             let pane_id_map = HashMap::new(); // Empty — no mappings.
