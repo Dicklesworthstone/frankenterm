@@ -1131,6 +1131,25 @@ fn inject_no_auto_start<'a>(args: &'a [&'a str], enabled: bool) -> Vec<&'a str> 
 /// - `NotRunning`: wezterm process not running
 /// - `PaneNotFound`: specified pane ID doesn't exist
 /// - `Timeout`: command took too long
+struct ListPanesCliCache {
+    generation: u64,
+    entry: Option<(Instant, Vec<PaneInfo>)>,
+}
+
+impl Default for ListPanesCliCache {
+    fn default() -> Self {
+        Self {
+            generation: 0,
+            entry: None,
+        }
+    }
+}
+
+enum ListPanesCacheProbe {
+    Hit(Vec<PaneInfo>),
+    Miss { generation: u64 },
+}
+
 #[derive(Clone)]
 pub struct WeztermClient {
     /// Optional socket path override (WEZTERM_UNIX_SOCKET)
@@ -1168,11 +1187,24 @@ pub struct WeztermClient {
     ///
     /// Multiple concurrent callers (discovery, snapshot engine, watchdog) hit
     /// `list_panes()` independently.  In CLI-only mode each call spawns a
-    /// `wezterm cli list --format json` subprocess.  This cache coalesces those
-    /// calls within a [`LIST_PANES_CLI_CACHE_MS`] window so only one subprocess
-    /// is spawned per window.
-    #[allow(clippy::type_complexity)]
-    list_panes_cache: Arc<Mutex<Option<(Instant, Vec<PaneInfo>)>>>,
+    /// `wezterm cli list --format json` subprocess. This cache reuses completed
+    /// results within a [`LIST_PANES_CLI_CACHE_MS`] window. It is a completed-
+    /// result cache, not an in-flight single-flight coordinator: simultaneous
+    /// misses may each run a subprocess.
+    list_panes_cache: Arc<Mutex<ListPanesCliCache>>,
+}
+
+/// Pre/post generation fence around mux mutations that change pane-list
+/// topology or selection metadata. Dropping the future also drops this guard,
+/// so cancellation cannot leave an in-flight list result cacheable.
+struct ListPanesMutationFence<'a> {
+    client: &'a WeztermClient,
+}
+
+impl Drop for ListPanesMutationFence<'_> {
+    fn drop(&mut self) {
+        self.client.invalidate_list_panes_cache();
+    }
 }
 
 impl Default for WeztermClient {
@@ -1204,7 +1236,7 @@ impl WeztermClient {
             ),
             #[cfg(all(feature = "vendored", unix))]
             mux_pool: None,
-            list_panes_cache: Arc::new(Mutex::new(None)),
+            list_panes_cache: Arc::new(Mutex::new(ListPanesCliCache::default())),
         }
     }
 
@@ -1233,7 +1265,7 @@ impl WeztermClient {
             ),
             #[cfg(all(feature = "vendored", unix))]
             mux_pool: None,
-            list_panes_cache: Arc::new(Mutex::new(None)),
+            list_panes_cache: Arc::new(Mutex::new(ListPanesCliCache::default())),
         }
     }
 
@@ -1390,6 +1422,56 @@ impl WeztermClient {
         guard.status()
     }
 
+    fn probe_list_panes_cache(&self) -> ListPanesCacheProbe {
+        let cache = self
+            .list_panes_cache
+            .lock()
+            .unwrap_or_else(record_poison_and_recover);
+        if let Some((timestamp, panes)) = &cache.entry
+            && timestamp.elapsed() < Duration::from_millis(LIST_PANES_CLI_CACHE_MS)
+        {
+            return ListPanesCacheProbe::Hit(panes.clone());
+        }
+        ListPanesCacheProbe::Miss {
+            generation: cache.generation,
+        }
+    }
+
+    /// Publish a CLI list result only if no topology mutation invalidated its
+    /// generation while the subprocess was in flight.
+    fn publish_list_panes_cache(&self, generation: u64, panes: Vec<PaneInfo>) -> bool {
+        let mut cache = self
+            .list_panes_cache
+            .lock()
+            .unwrap_or_else(record_poison_and_recover);
+        if cache.generation != generation {
+            return false;
+        }
+        cache.entry = Some((Instant::now(), panes));
+        true
+    }
+
+    /// Drop cached mux metadata before a topology/selection mutation. The
+    /// generation prevents an older in-flight CLI list from repopulating the
+    /// cache after this invalidation.
+    fn invalidate_list_panes_cache(&self) {
+        let mut cache = self
+            .list_panes_cache
+            .lock()
+            .unwrap_or_else(record_poison_and_recover);
+        // Saturation would permanently pin the token at `u64::MAX`, allowing
+        // every later invalidation-era result to publish under the same token.
+        // Wrapping preserves change detection. A false match would require a
+        // single list subprocess to remain in flight across 2^64 mutations.
+        cache.generation = cache.generation.wrapping_add(1);
+        cache.entry = None;
+    }
+
+    fn begin_list_panes_mutation_fence(&self) -> ListPanesMutationFence<'_> {
+        self.invalidate_list_panes_cache();
+        ListPanesMutationFence { client: self }
+    }
+
     /// List all panes across all windows and tabs
     ///
     /// Returns a vector of `PaneInfo` structs with full metadata about each pane.
@@ -1444,20 +1526,15 @@ impl WeztermClient {
         // CLI path: check the time-windowed cache before spawning a subprocess.
         // Multiple callers (discovery, snapshot engine, watchdog) independently
         // call list_panes() and each would spawn a separate `wezterm cli list`
-        // process.  This cache coalesces those calls within a short window.
-        let cache_window = Duration::from_millis(LIST_PANES_CLI_CACHE_MS);
-        {
-            let cache = match self.list_panes_cache.lock() {
-                Ok(guard) => guard,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-            if let Some((ts, ref panes)) = *cache {
-                if ts.elapsed() < cache_window {
-                    tracing::trace!("list_panes: returning cached CLI result");
-                    return Ok(panes.clone());
-                }
+        // process. The generation fence prevents an in-flight pre-mutation
+        // response from repopulating the cache after topology changes.
+        let cache_generation = match self.probe_list_panes_cache() {
+            ListPanesCacheProbe::Hit(panes) => {
+                tracing::trace!("list_panes: returning cached CLI result");
+                return Ok(panes);
             }
-        }
+            ListPanesCacheProbe::Miss { generation } => generation,
+        };
 
         let output = self
             .run_cli_with_retry_with_cx(cx, &["cli", "list", "--format", "json"])
@@ -1466,14 +1543,7 @@ impl WeztermClient {
         let panes: Vec<PaneInfo> =
             serde_json::from_str(&output).map_err(|e| WeztermError::ParseError(e.to_string()))?;
 
-        // Update cache with the fresh result.
-        {
-            let mut cache = match self.list_panes_cache.lock() {
-                Ok(guard) => guard,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-            *cache = Some((Instant::now(), panes.clone()));
-        }
+        self.publish_list_panes_cache(cache_generation, panes.clone());
 
         Ok(panes)
     }
@@ -1484,19 +1554,13 @@ impl WeztermClient {
     /// identically.
     #[cfg(not(all(feature = "vendored", unix)))]
     pub async fn list_panes_with_cx(&self, cx: &crate::cx::Cx) -> Result<Vec<PaneInfo>> {
-        let cache_window = Duration::from_millis(LIST_PANES_CLI_CACHE_MS);
-        {
-            let cache = match self.list_panes_cache.lock() {
-                Ok(guard) => guard,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-            if let Some((ts, ref panes)) = *cache {
-                if ts.elapsed() < cache_window {
-                    tracing::trace!("list_panes: returning cached CLI result");
-                    return Ok(panes.clone());
-                }
+        let cache_generation = match self.probe_list_panes_cache() {
+            ListPanesCacheProbe::Hit(panes) => {
+                tracing::trace!("list_panes: returning cached CLI result");
+                return Ok(panes);
             }
-        }
+            ListPanesCacheProbe::Miss { generation } => generation,
+        };
 
         let output = self
             .run_cli_with_retry_with_cx(cx, &["cli", "list", "--format", "json"])
@@ -1505,13 +1569,7 @@ impl WeztermClient {
         let panes: Vec<PaneInfo> =
             serde_json::from_str(&output).map_err(|e| WeztermError::ParseError(e.to_string()))?;
 
-        {
-            let mut cache = match self.list_panes_cache.lock() {
-                Ok(guard) => guard,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-            *cache = Some((Instant::now(), panes.clone()));
-        }
+        self.publish_list_panes_cache(cache_generation, panes.clone());
 
         Ok(panes)
     }
@@ -2064,6 +2122,7 @@ impl WeztermClient {
         domain_name: Option<&str>,
         target: SpawnTarget,
     ) -> Result<u64> {
+        let _list_panes_cache_fence = self.begin_list_panes_mutation_fence();
         #[cfg(all(feature = "vendored", unix))]
         if let Some(ref pool) = self.mux_pool {
             // Finish all fallible local request construction before allowing
@@ -2159,6 +2218,7 @@ impl WeztermClient {
         frankenterm_core_replay_types::simulation_guard::SimulationGuard::assert_not_simulating(
             "wezterm::WeztermClient::split_pane_with_cx",
         );
+        let _list_panes_cache_fence = self.begin_list_panes_mutation_fence();
         #[cfg(all(feature = "vendored", unix))]
         if let Some(ref pool) = self.mux_pool {
             // As with spawn, local protocol conversion must settle before the
@@ -2233,6 +2293,7 @@ impl WeztermClient {
         frankenterm_core_replay_types::simulation_guard::SimulationGuard::assert_not_simulating(
             "wezterm::WeztermClient::activate_pane_with_cx",
         );
+        let _list_panes_cache_fence = self.begin_list_panes_mutation_fence();
         let pane_id_str = pane_id.to_string();
         let args = ["cli", "activate-pane", "--pane-id", &pane_id_str];
         self.run_cli_mutation_with_pane_check_with_cx(cx, &args, pane_id, "activate_pane")
@@ -2295,6 +2356,7 @@ impl WeztermClient {
         frankenterm_core_replay_types::simulation_guard::SimulationGuard::assert_not_simulating(
             "wezterm::WeztermClient::kill_pane_with_cx",
         );
+        let _list_panes_cache_fence = self.begin_list_panes_mutation_fence();
         let pane_id_str = pane_id.to_string();
         let args = ["cli", "kill-pane", "--pane-id", &pane_id_str];
         self.run_cli_mutation_with_pane_check_with_cx(cx, &args, pane_id, "kill_pane")
@@ -2323,6 +2385,7 @@ impl WeztermClient {
         pane_id: u64,
         zoom: bool,
     ) -> Result<()> {
+        let _list_panes_cache_fence = self.begin_list_panes_mutation_fence();
         let pane_id_str = pane_id.to_string();
         let mut args = vec!["cli", "zoom-pane", "--pane-id", &pane_id_str];
         if !zoom {
@@ -4780,6 +4843,88 @@ mod tests {
         assert_eq!(normalize_split_percent(99), 99);
         assert_eq!(normalize_split_percent(100), 99);
         assert_eq!(normalize_split_percent(u8::MAX), 99);
+    }
+
+    fn cache_test_pane(pane_id: u64) -> PaneInfo {
+        serde_json::from_value(serde_json::json!({
+            "pane_id": pane_id,
+            "tab_id": pane_id,
+            "window_id": pane_id,
+        }))
+        .expect("minimal pane metadata")
+    }
+
+    #[test]
+    fn list_panes_cache_invalidation_rejects_stale_in_flight_publish() {
+        let client = WeztermClient::new();
+        let generation = match client.probe_list_panes_cache() {
+            ListPanesCacheProbe::Miss { generation } => generation,
+            ListPanesCacheProbe::Hit(_) => panic!("new client cache must be empty"),
+        };
+
+        client.invalidate_list_panes_cache();
+        assert!(
+            !client.publish_list_panes_cache(generation, vec![cache_test_pane(1)]),
+            "a pre-mutation list result must not repopulate the cache"
+        );
+        assert!(matches!(
+            client.probe_list_panes_cache(),
+            ListPanesCacheProbe::Miss { .. }
+        ));
+    }
+
+    #[test]
+    fn list_panes_cache_generation_does_not_pin_at_u64_max() {
+        let client = WeztermClient::new();
+        {
+            let mut cache = client
+                .list_panes_cache
+                .lock()
+                .unwrap_or_else(record_poison_and_recover);
+            cache.generation = u64::MAX;
+        }
+
+        client.invalidate_list_panes_cache();
+        assert!(matches!(
+            client.probe_list_panes_cache(),
+            ListPanesCacheProbe::Miss { generation: 0 }
+        ));
+        assert!(
+            !client.publish_list_panes_cache(u64::MAX, vec![cache_test_pane(1)]),
+            "the pre-wrap generation must remain stale after invalidation"
+        );
+    }
+
+    #[test]
+    fn list_panes_mutation_fence_clears_before_and_after_mutation() {
+        let client = WeztermClient::new();
+        let initial_generation = match client.probe_list_panes_cache() {
+            ListPanesCacheProbe::Miss { generation } => generation,
+            ListPanesCacheProbe::Hit(_) => panic!("new client cache must be empty"),
+        };
+        assert!(client.publish_list_panes_cache(
+            initial_generation,
+            vec![cache_test_pane(1)],
+        ));
+
+        let during_generation = {
+            let _fence = client.begin_list_panes_mutation_fence();
+            let generation = match client.probe_list_panes_cache() {
+                ListPanesCacheProbe::Miss { generation } => generation,
+                ListPanesCacheProbe::Hit(_) => panic!("pre-mutation fence must clear cache"),
+            };
+            assert!(client.publish_list_panes_cache(generation, vec![cache_test_pane(1)]));
+            generation
+        };
+
+        assert!(
+            !client.publish_list_panes_cache(during_generation, vec![cache_test_pane(1)]),
+            "a list result observed during mutation must not survive post-mutation fencing"
+        );
+        assert!(matches!(
+            client.probe_list_panes_cache(),
+            ListPanesCacheProbe::Miss { .. }
+        ));
     }
 
     fn run_async_test<F>(future: F)
