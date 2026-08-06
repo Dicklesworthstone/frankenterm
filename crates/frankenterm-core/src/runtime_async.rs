@@ -467,9 +467,17 @@ pub fn clear_runtime_handle() {
 pub enum LockAcquireError {
     /// A panic occurred while a guard was held.
     Poisoned,
-    /// The caller's capability context was cancelled.
+    /// The caller's capability context was explicitly cancelled.
     Cancelled,
-    /// The capability-context deadline elapsed before acquisition.
+    /// The caller's capability-context deadline elapsed.
+    DeadlineExceeded,
+    /// The caller exhausted its cooperative poll quota.
+    PollQuotaExhausted,
+    /// The caller exhausted its cost budget.
+    CostBudgetExhausted,
+    /// The capability checkpoint failed without a stable typed root cause.
+    ContextFailure,
+    /// The lock's own logical acquisition deadline elapsed.
     TimedOut {
         /// Logical deadline reported by asupersync, in nanoseconds.
         deadline_nanos: u64,
@@ -483,6 +491,10 @@ impl std::fmt::Display for LockAcquireError {
         match self {
             Self::Poisoned => write!(f, "lock is poisoned"),
             Self::Cancelled => write!(f, "lock acquisition cancelled"),
+            Self::DeadlineExceeded => write!(f, "lock capability deadline exceeded"),
+            Self::PollQuotaExhausted => write!(f, "lock capability poll quota exhausted"),
+            Self::CostBudgetExhausted => write!(f, "lock capability cost budget exhausted"),
+            Self::ContextFailure => write!(f, "lock capability context failed"),
             Self::TimedOut { deadline_nanos } => {
                 write!(f, "lock acquisition timed out at {deadline_nanos}ns")
             }
@@ -495,10 +507,33 @@ impl std::fmt::Display for LockAcquireError {
 
 impl std::error::Error for LockAcquireError {}
 
-fn map_mutex_lock_error(error: asupersync::sync::LockError) -> LockAcquireError {
+fn classify_lock_context_failure(cx: &crate::cx::Cx) -> LockAcquireError {
+    use crate::outcome::CancelKind;
+
+    match cx.root_cancel_cause().map(|reason| reason.kind) {
+        Some(CancelKind::Deadline | CancelKind::Timeout) => LockAcquireError::DeadlineExceeded,
+        Some(CancelKind::PollQuota) => LockAcquireError::PollQuotaExhausted,
+        Some(CancelKind::CostBudget) => LockAcquireError::CostBudgetExhausted,
+        Some(
+            CancelKind::User
+            | CancelKind::FailFast
+            | CancelKind::RaceLost
+            | CancelKind::ParentCancelled
+            | CancelKind::ResourceUnavailable
+            | CancelKind::Shutdown
+            | CancelKind::LinkedExit,
+        ) => LockAcquireError::Cancelled,
+        None => LockAcquireError::ContextFailure,
+    }
+}
+
+fn map_mutex_lock_error(
+    cx: &crate::cx::Cx,
+    error: asupersync::sync::LockError,
+) -> LockAcquireError {
     match error {
         asupersync::sync::LockError::Poisoned => LockAcquireError::Poisoned,
-        asupersync::sync::LockError::Cancelled => LockAcquireError::Cancelled,
+        asupersync::sync::LockError::Cancelled => classify_lock_context_failure(cx),
         asupersync::sync::LockError::TimedOut(deadline) => LockAcquireError::TimedOut {
             deadline_nanos: deadline.as_nanos(),
         },
@@ -508,10 +543,13 @@ fn map_mutex_lock_error(error: asupersync::sync::LockError) -> LockAcquireError 
     }
 }
 
-fn map_rwlock_error(error: asupersync::sync::RwLockError) -> LockAcquireError {
+fn map_rwlock_error(
+    cx: &crate::cx::Cx,
+    error: asupersync::sync::RwLockError,
+) -> LockAcquireError {
     match error {
         asupersync::sync::RwLockError::Poisoned => LockAcquireError::Poisoned,
-        asupersync::sync::RwLockError::Cancelled => LockAcquireError::Cancelled,
+        asupersync::sync::RwLockError::Cancelled => classify_lock_context_failure(cx),
         asupersync::sync::RwLockError::PolledAfterCompletion => {
             LockAcquireError::PolledAfterCompletion
         }
@@ -565,7 +603,7 @@ impl<T> Mutex<T> {
             .lock(cx)
             .await
             .map(|inner| MutexGuard { inner })
-            .map_err(map_mutex_lock_error)
+            .map_err(|error| map_mutex_lock_error(cx, error))
     }
 }
 
@@ -631,7 +669,7 @@ impl<T> RwLock<T> {
             .read(cx)
             .await
             .map(|inner| RwLockReadGuard { inner })
-            .map_err(map_rwlock_error)
+            .map_err(|error| map_rwlock_error(cx, error))
     }
 
     #[allow(clippy::future_not_send)] // asupersync RwLock is !Sync by design
@@ -665,7 +703,7 @@ impl<T> RwLock<T> {
             .write(cx)
             .await
             .map(|inner| RwLockWriteGuard { inner })
-            .map_err(map_rwlock_error)
+            .map_err(|error| map_rwlock_error(cx, error))
     }
 }
 
@@ -2774,7 +2812,7 @@ pub mod task {
             forwarding,
             completion_waker,
             #[cfg(test)]
-            fail_next_registration: std::sync::atomic::AtomicBool::new(false),
+            force_registration_failure: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -2815,7 +2853,7 @@ pub mod task {
             forwarding,
             completion_waker,
             #[cfg(test)]
-            fail_next_registration: std::sync::atomic::AtomicBool::new(false),
+            force_registration_failure: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -2861,7 +2899,7 @@ pub mod task {
             forwarding,
             completion_waker,
             #[cfg(test)]
-            fail_next_registration: std::sync::atomic::AtomicBool::new(false),
+            force_registration_failure: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -9338,6 +9376,115 @@ mod tests {
     }
 
     #[test]
+    fn join_set_persistent_registration_failure_is_reported_once_and_retained() {
+        let rt = RuntimeBuilder::current_thread().build().unwrap();
+        rt.block_on(async {
+            let mut set = task::JoinSet::new();
+            set.spawn(std::future::pending::<()>());
+            set.force_join_registration_failure_for_test();
+
+            let error = set
+                .join_next()
+                .await
+                .expect("set contains one task")
+                .expect_err("forced registration failure must be observable");
+            assert_eq!(
+                error.kind(),
+                task::JoinErrorKind::WakerRegistrationFailed
+            );
+            assert_eq!(
+                set.settlement(),
+                task::JoinSetSettlement::Incomplete {
+                    active_tasks: 0,
+                    unacknowledged_tasks: 1,
+                }
+            );
+
+            assert!(
+                set.join_next().await.is_none(),
+                "a persistent caller-waker failure must not spin on the same task"
+            );
+            assert_eq!(set.unacknowledged_len(), 1);
+
+            let mut terminal = None;
+            for _ in 0..4_096 {
+                task::yield_now().await;
+                if let Some(result) = set.try_join_next() {
+                    terminal = Some(result);
+                    break;
+                }
+            }
+            let error = terminal
+                .expect("aborted quarantined task must become terminally drainable")
+                .expect_err("pending task was aborted after registration failure");
+            assert_eq!(error.kind(), task::JoinErrorKind::Aborted);
+            assert_eq!(set.settlement(), task::JoinSetSettlement::Settled);
+        });
+    }
+
+    #[test]
+    fn join_set_cx_join_quarantines_nonterminal_registration_failure_without_spin() {
+        let rt = RuntimeBuilder::current_thread().build().unwrap();
+        rt.block_on(async {
+            let mut set = task::JoinSet::new();
+            set.spawn(std::future::pending::<()>());
+            set.force_join_registration_failure_for_test();
+            let cx = crate::cx::Cx::for_testing();
+
+            let error = set
+                .join_next_with_cx(&cx)
+                .await
+                .expect("set contains one task")
+                .expect_err("forced registration failure must be observable");
+            assert_eq!(
+                error.kind(),
+                task::JoinErrorKind::WakerRegistrationFailed
+            );
+            assert!(set.join_next_with_cx(&cx).await.is_none());
+            assert_eq!(set.unacknowledged_len(), 1);
+
+            let mut terminal = None;
+            for _ in 0..4_096 {
+                task::yield_now().await;
+                if let Some(result) = set.try_join_next() {
+                    terminal = Some(result);
+                    break;
+                }
+            }
+            let error = terminal
+                .expect("trusted polling must recover terminal authority")
+                .expect_err("pending task was aborted after registration failure");
+            assert_eq!(error.kind(), task::JoinErrorKind::Aborted);
+            assert!(set.is_empty());
+        });
+    }
+
+    #[test]
+    fn join_set_try_join_next_uses_trusted_terminal_poll_after_registration_failure() {
+        let rt = RuntimeBuilder::current_thread().build().unwrap();
+        rt.block_on(async {
+            let mut set = task::JoinSet::new();
+            set.spawn(async { 7_u32 });
+            set.force_join_registration_failure_for_test();
+
+            let mut terminal = None;
+            for _ in 0..4_096 {
+                if let Some(result) = set.try_join_next() {
+                    terminal = Some(result);
+                    break;
+                }
+                task::yield_now().await;
+            }
+
+            assert_eq!(
+                terminal.expect("completed task must become synchronously pollable"),
+                Ok(7)
+            );
+            assert_eq!(set.settlement(), task::JoinSetSettlement::Settled);
+        });
+    }
+
+    #[test]
     fn task_spawn_blocking_returns_join_handle() {
         let rt = RuntimeBuilder::current_thread().build().unwrap();
         rt.block_on(async {
@@ -11344,6 +11491,22 @@ mod tests {
             "lock acquisition cancelled"
         );
         assert_eq!(
+            LockAcquireError::DeadlineExceeded.to_string(),
+            "lock capability deadline exceeded"
+        );
+        assert_eq!(
+            LockAcquireError::PollQuotaExhausted.to_string(),
+            "lock capability poll quota exhausted"
+        );
+        assert_eq!(
+            LockAcquireError::CostBudgetExhausted.to_string(),
+            "lock capability cost budget exhausted"
+        );
+        assert_eq!(
+            LockAcquireError::ContextFailure.to_string(),
+            "lock capability context failed"
+        );
+        assert_eq!(
             LockAcquireError::TimedOut {
                 deadline_nanos: 42,
             }
@@ -11353,6 +11516,57 @@ mod tests {
         assert_eq!(
             LockAcquireError::PolledAfterCompletion.to_string(),
             "lock acquisition future polled after completion"
+        );
+    }
+
+    #[test]
+    fn lock_cancelled_error_preserves_exact_capability_context_class() {
+        use crate::outcome::CancelKind;
+
+        let cases = [
+            (CancelKind::User, LockAcquireError::Cancelled),
+            (CancelKind::Timeout, LockAcquireError::DeadlineExceeded),
+            (CancelKind::Deadline, LockAcquireError::DeadlineExceeded),
+            (
+                CancelKind::PollQuota,
+                LockAcquireError::PollQuotaExhausted,
+            ),
+            (
+                CancelKind::CostBudget,
+                LockAcquireError::CostBudgetExhausted,
+            ),
+            (CancelKind::FailFast, LockAcquireError::Cancelled),
+            (CancelKind::RaceLost, LockAcquireError::Cancelled),
+            (CancelKind::ParentCancelled, LockAcquireError::Cancelled),
+            (
+                CancelKind::ResourceUnavailable,
+                LockAcquireError::Cancelled,
+            ),
+            (CancelKind::Shutdown, LockAcquireError::Cancelled),
+            (CancelKind::LinkedExit, LockAcquireError::Cancelled),
+        ];
+
+        for (kind, expected) in cases {
+            let cx = crate::cx::Cx::for_testing();
+            cx.cancel_with(kind, Some("SECRET exact lock cancellation class"));
+            assert_eq!(
+                map_mutex_lock_error(&cx, asupersync::sync::LockError::Cancelled),
+                expected
+            );
+            assert_eq!(
+                map_rwlock_error(&cx, asupersync::sync::RwLockError::Cancelled),
+                expected
+            );
+        }
+
+        let live_cx = crate::cx::Cx::for_testing();
+        assert_eq!(
+            map_mutex_lock_error(&live_cx, asupersync::sync::LockError::Cancelled),
+            LockAcquireError::ContextFailure
+        );
+        assert_eq!(
+            map_rwlock_error(&live_cx, asupersync::sync::RwLockError::Cancelled),
+            LockAcquireError::ContextFailure
         );
     }
 
