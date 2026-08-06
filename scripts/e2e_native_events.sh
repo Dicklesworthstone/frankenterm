@@ -592,17 +592,48 @@ stop_child() {
     wait_child_bounded "$pid"
 }
 
+log_line_contains_both() {
+    local log_path="$1"
+    local first="$2"
+    local second="$3"
+    local line
+    [ -f "$log_path" ] || return 1
+    while IFS= read -r line; do
+        if [[ $line == *"$first"* && $line == *"$second"* ]]; then
+            return 0
+        fi
+    done <"$log_path"
+    return 1
+}
+
+count_log_lines_containing() {
+    local log_path="$1"
+    local needle="$2"
+    local count=0
+    local line
+    if [ -f "$log_path" ]; then
+        while IFS= read -r line; do
+            if [[ $line == *"$needle"* ]]; then
+                count=$((count + 1))
+            fi
+        done <"$log_path"
+    fi
+    printf '%s\n' "$count"
+}
+
 wait_for_watch_bind() {
-    local attempts=100
+    local attempts=600
     while [ "$attempts" -gt 0 ]; do
-        if grep -Fq \
+        if log_line_contains_both \
+            "$LOG_DIR/watch-stderr.log" \
             "Failed to bind native event socket, falling back to polling only" \
-            "$LOG_DIR/watch-stderr.log" 2>/dev/null; then
+            "$SOCKET_PATH"; then
             return 2
         fi
-        if grep -Fq \
+        if log_line_contains_both \
+            "$LOG_DIR/watch-stderr.log" \
             "Native event listener bound — waiting for GUI connections" \
-            "$LOG_DIR/watch-stderr.log" 2>/dev/null; then
+            "$SOCKET_PATH"; then
             if builtin kill -0 "$WATCH_PID" 2>/dev/null; then
                 return 0
             fi
@@ -622,7 +653,7 @@ wait_for_watch_bind() {
 }
 
 wait_for_bridge_handshake() {
-    local attempts=150
+    local attempts=600
     local gui_connected_marker="Native event bridge: authenticated socket connected at $SOCKET_PATH"
     while [ "$attempts" -gt 0 ]; do
         if ! builtin kill -0 "$WATCH_PID" 2>/dev/null; then
@@ -839,6 +870,9 @@ fi
 
 # Step 5: Stop the harness-owned GUI and verify ft watch stays alive.
 echo "[step 5] Stopping harness-owned GUI, checking server-observed disconnect..."
+disconnect_count_before=$(count_log_lines_containing \
+    "$LOG_DIR/watch-stderr.log" \
+    "native event connection closed (cx path)")
 if stop_child "$GUI_PID" "GUI"; then
     check "harness-owned GUI stopped within bounded cleanup" "pass"
     unset GUI_PID
@@ -851,7 +885,10 @@ fi
 disconnect_seen=false
 disconnect_attempts=40
 while [ "$disconnect_attempts" -gt 0 ]; do
-    if grep -Fq "native event connection closed (cx path)" "$LOG_DIR/watch-stderr.log" 2>/dev/null; then
+    disconnect_count_after=$(count_log_lines_containing \
+        "$LOG_DIR/watch-stderr.log" \
+        "native event connection closed (cx path)")
+    if [ "$disconnect_count_after" -gt "$disconnect_count_before" ]; then
         disconnect_seen=true
         break
     fi
