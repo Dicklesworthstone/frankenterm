@@ -2793,20 +2793,24 @@ impl WeztermClient {
     fn settle_cli_pane_id_mutation(
         &self,
         operation: &'static str,
-        mut outcome: CliMutationOutcome<String>,
+        outcome: CliMutationOutcome<String>,
     ) -> Result<u64> {
-        outcome.result = match outcome.result {
+        let CliMutationOutcome {
+            result,
+            mut circuit_evidence,
+        } = outcome;
+        let parsed_result = match result {
             Ok(output) => {
                 let result = Self::parse_mutation_pane_id(operation, &output);
                 if result.is_err() {
-                    outcome.circuit_evidence = CliMutationCircuitEvidence::BackendFailure;
+                    circuit_evidence = CliMutationCircuitEvidence::BackendFailure;
                 }
                 result
             }
             Err(error) => Err(error),
         };
-        self.circuit_record_mutation_evidence(outcome.circuit_evidence);
-        outcome.result
+        self.circuit_record_mutation_evidence(circuit_evidence);
+        parsed_result
     }
 
     /// Guards a parsed-JSON *metadata* command's stdout against

@@ -391,7 +391,32 @@ impl MuxPool {
     }
 
     fn pool_context_error(cx: &Cx) -> PoolError {
-        Pool::<DirectMuxClient>::classify_cx_failure(cx)
+        let classified = Pool::<DirectMuxClient>::classify_cx_failure(cx);
+        if classified != PoolError::ContextFailure {
+            return classified;
+        }
+
+        // A budget-aware wait can observe exhaustion before a root
+        // cancellation cause is visible. Fall back to the finite accounting
+        // snapshot rather than collapsing poll/cost/deadline failures.
+        let budget = cx.budget_stats();
+        if budget.deadline.at.is_some() && budget.deadline.remaining.is_none() {
+            PoolError::DeadlineExceeded
+        } else if budget.polls.remaining == Some(0) {
+            PoolError::PollQuotaExhausted
+        } else if budget.cost.remaining == Some(0) {
+            PoolError::CostBudgetExhausted
+        } else {
+            PoolError::ContextFailure
+        }
+    }
+
+    fn retry_wait_error(cx: &Cx) -> MuxPoolError {
+        // `budget_sleep` can be the first operation to observe an expired
+        // capability deadline. Checkpoint once to latch its structural cause
+        // before falling back to the finite context-failure class.
+        let _ = cx.checkpoint();
+        MuxPoolError::Pool(Self::pool_context_error(cx))
     }
 
     fn render_batch_timeout_error(&self) -> MuxPoolError {
@@ -476,7 +501,9 @@ impl MuxPool {
             .retry_policy
             .delay_for_attempt(failed_attempt.saturating_sub(1));
         if !delay.is_zero() {
-            let _ = crate::runtime_async::sleep_with_cx(cx, delay).await;
+            crate::runtime_async::sleep_with_cx(cx, delay)
+                .await
+                .map_err(|_| Self::retry_wait_error(cx))?;
         }
         Self::checkpoint_cx(cx)
     }
@@ -494,7 +521,15 @@ impl MuxPool {
             .delay_for_attempt(failed_attempt.saturating_sub(1))
             .min(remaining);
         if !delay.is_zero() {
-            let _ = crate::runtime_async::sleep_with_cx(cx, delay).await;
+            if crate::runtime_async::sleep_with_cx(cx, delay)
+                .await
+                .is_err()
+            {
+                return Err(self
+                    .remaining_render_batch_time(cx, deadline)
+                    .err()
+                    .unwrap_or_else(|| Self::retry_wait_error(cx)));
+            }
         }
         self.remaining_render_batch_time(cx, deadline)?;
         Ok(())
@@ -1425,6 +1460,43 @@ mod tests {
         assert_eq!(saturating_atomic_increment(&counter), u64::MAX);
         assert_eq!(saturating_atomic_increment(&counter), u64::MAX);
         assert_eq!(counter.load(AtomicOrdering::Relaxed), u64::MAX);
+    }
+
+    #[test]
+    fn retry_wait_failure_is_typed_and_never_treated_as_success() {
+        let live_cx = Cx::for_testing();
+        assert!(matches!(
+            MuxPool::retry_wait_error(&live_cx),
+            MuxPoolError::Pool(PoolError::ContextFailure)
+        ));
+
+        let cancelled_cx = Cx::for_testing();
+        cancelled_cx.cancel_with(
+            CancelKind::User,
+            Some("mux retry wait cancellation classification"),
+        );
+        assert!(matches!(
+            MuxPool::retry_wait_error(&cancelled_cx),
+            MuxPoolError::Pool(PoolError::Cancelled)
+        ));
+
+        let expired_cx = Cx::for_testing_with_budget(Budget::with_deadline_at_ns(0));
+        assert!(matches!(
+            MuxPool::retry_wait_error(&expired_cx),
+            MuxPoolError::Pool(PoolError::DeadlineExceeded)
+        ));
+
+        let poll_exhausted_cx = Cx::for_testing_with_budget(Budget::new().with_poll_quota(0));
+        assert!(matches!(
+            MuxPool::retry_wait_error(&poll_exhausted_cx),
+            MuxPoolError::Pool(PoolError::PollQuotaExhausted)
+        ));
+
+        let cost_exhausted_cx = Cx::for_testing_with_budget(Budget::new().with_cost_quota(0));
+        assert!(matches!(
+            MuxPool::retry_wait_error(&cost_exhausted_cx),
+            MuxPoolError::Pool(PoolError::CostBudgetExhausted)
+        ));
     }
 
     async fn unix_stream_read(

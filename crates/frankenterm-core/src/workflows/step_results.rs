@@ -17,7 +17,7 @@ use super::*;
 /// Each step returns a `StepResult` that determines what happens next:
 /// - `Continue`: Proceed to the next step
 /// - `Done`: Workflow completed successfully with a result
-/// - `Retry`: Retry this step after a delay
+/// - `Retry`: Retry this step using the runner's exponential-backoff policy
 /// - `Abort`: Stop workflow with an error
 /// - `WaitFor`: Pause until a condition is met
 /// - `SendText`: Send text to pane and proceed (policy-gated)
@@ -28,9 +28,11 @@ pub enum StepResult {
     Continue,
     /// Workflow completed successfully with optional result data
     Done { result: serde_json::Value },
-    /// Retry this step after delay
+    /// Retry this step using the runner's exponential-backoff policy.
     Retry {
-        /// Delay before retry in milliseconds
+        /// First-retry base delay in milliseconds. Retry N waits for this base
+        /// scaled by `WorkflowRunnerConfig::retry_backoff_multiplier^(N - 1)`;
+        /// the runner rounds conservatively and saturates on overflow.
         delay_ms: u64,
     },
     /// Abort workflow with error

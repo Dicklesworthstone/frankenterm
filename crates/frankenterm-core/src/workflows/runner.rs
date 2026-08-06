@@ -248,6 +248,92 @@ fn cap_wait_by_workflow_deadline(
     requested.min(deadline.saturating_duration_since(Instant::now()))
 }
 
+fn normalized_retry_backoff_multiplier(multiplier: f64) -> f64 {
+    if multiplier.is_finite() && multiplier >= 1.0 {
+        multiplier
+    } else {
+        1.0
+    }
+}
+
+fn admit_retry_ordinal(current: usize, maximum: usize) -> Option<usize> {
+    current
+        .checked_add(1)
+        .filter(|next_ordinal| *next_ordinal <= maximum)
+}
+
+fn next_up_nonnegative(value: f64) -> f64 {
+    debug_assert!(!value.is_sign_negative());
+    if value.is_infinite() {
+        value
+    } else {
+        f64::from_bits(value.to_bits().saturating_add(1))
+    }
+}
+
+fn conservative_nonnegative_product(lhs: f64, rhs: f64) -> f64 {
+    let product = lhs * rhs;
+    if !product.is_finite() {
+        return f64::INFINITY;
+    }
+    let rounding_residual = lhs.mul_add(rhs, -product);
+    if rounding_residual > 0.0 {
+        next_up_nonnegative(product)
+    } else {
+        product
+    }
+}
+
+fn retry_backoff_scale(multiplier: f64, mut exponent: usize) -> f64 {
+    let mut scale = 1.0;
+    let mut factor = normalized_retry_backoff_multiplier(multiplier);
+    while exponent > 0 {
+        if exponent & 1 == 1 {
+            scale = conservative_nonnegative_product(scale, factor);
+            if !scale.is_finite() {
+                return f64::INFINITY;
+            }
+        }
+        exponent >>= 1;
+        if exponent > 0 {
+            factor = conservative_nonnegative_product(factor, factor);
+            if !factor.is_finite() {
+                return f64::INFINITY;
+            }
+        }
+    }
+    scale
+}
+
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss
+)]
+fn retry_backoff_delay(
+    base_delay_ms: u64,
+    retry_attempt: usize,
+    multiplier: f64,
+) -> Duration {
+    let base_delay = Duration::from_millis(base_delay_ms);
+    if base_delay.is_zero() || retry_attempt <= 1 {
+        return base_delay;
+    }
+
+    let scale = retry_backoff_scale(multiplier, retry_attempt.saturating_sub(1));
+    let approximate_base_ms = base_delay_ms as f64;
+    let base_ms_upper_bound = if (approximate_base_ms as u64) < base_delay_ms {
+        next_up_nonnegative(approximate_base_ms)
+    } else {
+        approximate_base_ms
+    };
+    let scaled_ms = conservative_nonnegative_product(base_ms_upper_bound, scale);
+    if !scaled_ms.is_finite() || scaled_ms >= u64::MAX as f64 {
+        return Duration::from_millis(u64::MAX);
+    }
+    Duration::from_millis((scaled_ms.ceil() as u64).max(base_delay_ms))
+}
+
 fn invalid_jump_target_reason(step: usize, step_count: usize) -> Option<String> {
     if step < step_count {
         None
@@ -599,7 +685,9 @@ pub struct WorkflowRunnerConfig {
     pub max_concurrent: usize,
     /// Default timeout for step execution (milliseconds)
     pub step_timeout_ms: u64,
-    /// Retry delay multiplier for exponential backoff
+    /// Retry delay multiplier for exponential backoff. A step's returned
+    /// `Retry::delay_ms` is the first-attempt base; retry N waits
+    /// `base * multiplier^(N - 1)`.
     pub retry_backoff_multiplier: f64,
     /// Maximum retries per step
     pub max_retries_per_step: usize,
@@ -687,8 +775,18 @@ impl WorkflowRunner {
         lock_manager: Arc<PaneWorkflowLockManager>,
         storage: Arc<crate::storage::StorageHandle>,
         injector: CxPolicyInjector,
-        config: WorkflowRunnerConfig,
+        mut config: WorkflowRunnerConfig,
     ) -> Self {
+        let normalized_multiplier =
+            normalized_retry_backoff_multiplier(config.retry_backoff_multiplier);
+        if config.retry_backoff_multiplier.to_bits() != normalized_multiplier.to_bits() {
+            warn!(
+                failure_class = "invalid_retry_backoff_multiplier",
+                fallback_multiplier = normalized_multiplier,
+                "Workflow runner retry multiplier must be finite and at least 1.0; using safe constant-delay fallback"
+            );
+            config.retry_backoff_multiplier = normalized_multiplier;
+        }
         Self {
             workflows: std::sync::RwLock::new(Vec::new()),
             engine,
@@ -2023,8 +2121,9 @@ impl WorkflowRunner {
                     };
                 }
                 StepResult::Retry { delay_ms } => {
-                    retries += 1;
-                    if retries > self.config.max_retries_per_step {
+                    let Some(next_retry_ordinal) =
+                        admit_retry_ordinal(retries, self.config.max_retries_per_step)
+                    else {
                         let elapsed_ms = elapsed_ms(start_time);
                         let reason = format!(
                             "Max retries ({}) exceeded at step {}",
@@ -2071,14 +2170,31 @@ impl WorkflowRunner {
                             step_index: current_step,
                             elapsed_ms,
                         };
-                    }
+                    };
+                    retries = next_retry_ordinal;
 
+                    let retry_delay = retry_backoff_delay(
+                        delay_ms,
+                        retries,
+                        self.config.retry_backoff_multiplier,
+                    );
+                    let effective_delay_ms =
+                        u64::try_from(retry_delay.as_millis()).unwrap_or(u64::MAX);
+                    debug!(
+                        execution_id,
+                        step_index = current_step,
+                        retry_attempt = retries,
+                        base_delay_ms = delay_ms,
+                        effective_delay_ms,
+                        retry_backoff_multiplier = self.config.retry_backoff_multiplier,
+                        "Workflow step scheduled for exponential-backoff retry"
+                    );
                     // Cancellation during backoff must abort promptly instead
                     // of sleeping until the retry delay elapses.
                     if let Err(e) = wait_duration_with_cx(
                         cx,
                         cap_wait_by_workflow_deadline(
-                            Duration::from_millis(delay_ms),
+                            retry_delay,
                             start_time,
                             self.config.workflow_total_deadline_ms,
                         ),
@@ -4422,6 +4538,75 @@ mod tests {
         assert_eq!(config.workflow_total_deadline_ms, 600_000);
     }
 
+    #[test]
+    fn retry_backoff_uses_step_delay_as_first_attempt_base() {
+        assert_eq!(
+            retry_backoff_delay(100, 1, 2.0),
+            Duration::from_millis(100)
+        );
+        assert_eq!(
+            retry_backoff_delay(100, 2, 2.0),
+            Duration::from_millis(200)
+        );
+        assert_eq!(
+            retry_backoff_delay(100, 3, 2.0),
+            Duration::from_millis(400)
+        );
+        assert_eq!(
+            retry_backoff_delay(100, 4, 1.5),
+            Duration::from_millis(338),
+            "fractional backoff rounds up so configured delay is never shortened"
+        );
+    }
+
+    #[test]
+    fn retry_backoff_invalid_multiplier_uses_safe_constant_delay() {
+        for multiplier in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -1.0, 0.5] {
+            assert_eq!(normalized_retry_backoff_multiplier(multiplier), 1.0);
+            assert_eq!(
+                retry_backoff_delay(250, 10, multiplier),
+                Duration::from_millis(250)
+            );
+        }
+    }
+
+    #[test]
+    fn retry_backoff_saturates_instead_of_wrapping() {
+        assert_eq!(
+            retry_backoff_delay(u64::MAX, 2, 2.0),
+            Duration::from_millis(u64::MAX)
+        );
+        assert_eq!(retry_backoff_delay(0, usize::MAX, f64::MAX), Duration::ZERO);
+    }
+
+    #[test]
+    fn retry_admission_never_overflows_at_usize_max() {
+        assert_eq!(admit_retry_ordinal(0, 0), None);
+        assert_eq!(admit_retry_ordinal(0, 1), Some(1));
+        assert_eq!(admit_retry_ordinal(1, 1), None);
+        assert_eq!(
+            admit_retry_ordinal(usize::MAX - 1, usize::MAX),
+            Some(usize::MAX)
+        );
+        assert_eq!(admit_retry_ordinal(usize::MAX, usize::MAX), None);
+    }
+
+    #[test]
+    fn retry_backoff_never_rounds_large_integer_base_down() {
+        for base_delay_ms in [
+            (1_u64 << 53) + 1,
+            (1_u64 << 53) + 3,
+            (1_u64 << 54) + 1,
+            u64::MAX - 2_048,
+        ] {
+            let effective = retry_backoff_delay(base_delay_ms, 2, 1.0);
+            assert!(
+                effective >= Duration::from_millis(base_delay_ms),
+                "large integer base {base_delay_ms}ms rounded down to {effective:?}"
+            );
+        }
+    }
+
     // ========================================================================
     // AbortResult serialization
     // ========================================================================
@@ -4555,6 +4740,38 @@ mod tests {
         assert!((config.retry_backoff_multiplier - 1.5).abs() < f64::EPSILON);
         assert_eq!(config.max_retries_per_step, 5);
         assert_eq!(config.workflow_total_deadline_ms, 1_800_000);
+    }
+
+    #[test]
+    fn runner_new_normalizes_invalid_retry_multiplier() {
+        run_async_test(async {
+            let temp_dir = tempfile::TempDir::new().unwrap();
+            let db_path = temp_dir
+                .path()
+                .join("runner_invalid_retry_multiplier.db")
+                .to_string_lossy()
+                .to_string();
+            let storage = Arc::new(crate::storage::StorageHandle::new(&db_path).await.unwrap());
+            let handle: crate::wezterm::WeztermHandle =
+                Arc::new(crate::wezterm::MockWezterm::new());
+            let injector = CxPolicyInjector::new(crate::policy::PolicyGatedInjector::new(
+                crate::policy::PolicyEngine::permissive(),
+                handle,
+            ));
+            let runner = WorkflowRunner::new(
+                WorkflowEngine::default(),
+                Arc::new(PaneWorkflowLockManager::new()),
+                Arc::clone(&storage),
+                injector,
+                WorkflowRunnerConfig {
+                    retry_backoff_multiplier: f64::NAN,
+                    ..WorkflowRunnerConfig::default()
+                },
+            );
+
+            assert_eq!(runner.config.retry_backoff_multiplier, 1.0);
+            storage.shutdown().await.unwrap();
+        });
     }
 
     #[test]
