@@ -39,7 +39,9 @@ use crate::outcome::CancelKind;
 use crate::patterns::{AgentType, Detection, Severity};
 use crate::runtime_async::{LockAcquireError, Mutex, RwLock, mpsc, watch};
 use crate::session_pane_state::{PaneStateSnapshot, ScrollbackRef};
-use crate::session_topology::TopologySnapshot;
+use crate::session_topology::{
+    MAX_TOPOLOGY_PANES, TopologySnapshot, TopologySnapshotError,
+};
 use crate::wezterm::PaneInfo;
 
 // =============================================================================
@@ -450,6 +452,8 @@ pub enum SnapshotError {
     Database(String),
     #[error("serialization error: {0}")]
     Serialization(String),
+    #[error("topology admission failed: {0}")]
+    Topology(#[from] TopologySnapshotError),
     /// The blocking closure was admitted, but its authoritative result was
     /// lost. The closure may still be running or may already have committed.
     #[error(
@@ -550,7 +554,6 @@ impl SnapshotError {
             self,
             Self::PaneList(_)
                 | Self::Database(_)
-                | Self::Serialization(_)
                 | Self::BlockingRuntimeFailure
                 | Self::LockTimedOut { .. }
         )
@@ -661,6 +664,10 @@ enum SchedulerCaptureOutcome {
 enum SchedulerCaptureDeferredReason {
     Busy,
     NoPanes,
+    /// Deterministic admission rejected the current pane projection. The live
+    /// pane set may later shrink or become internally consistent, so retain
+    /// demand with bounded backoff instead of terminating the scheduler.
+    CapacityAdmission,
     /// The attempted work settled without an indeterminate durable effect, but
     /// a transient database, serialization, pane-list, blocking-runtime, or
     /// lock-timeout failure prevented a checkpoint receipt.
@@ -689,7 +696,11 @@ impl SchedulerCaptureRetryState {
         trigger: SnapshotTrigger,
         reason: SchedulerCaptureDeferredReason,
     ) -> Instant {
-        if reason == SchedulerCaptureDeferredReason::RetrySafeFailure {
+        if matches!(
+            reason,
+            SchedulerCaptureDeferredReason::RetrySafeFailure
+                | SchedulerCaptureDeferredReason::CapacityAdmission
+        ) {
             self.consecutive_retry_safe_failures =
                 self.consecutive_retry_safe_failures.saturating_add(1);
         }
@@ -708,7 +719,8 @@ fn scheduler_capture_retry_delay(
     consecutive_retry_safe_failures: u32,
 ) -> Duration {
     match reason {
-        SchedulerCaptureDeferredReason::RetrySafeFailure => {
+        SchedulerCaptureDeferredReason::RetrySafeFailure
+        | SchedulerCaptureDeferredReason::CapacityAdmission => {
             let exponent = consecutive_retry_safe_failures.saturating_sub(1).min(5);
             let delay = SCHEDULER_RETRY_SAFE_CAPTURE_MIN_DELAY
                 .saturating_mul(1_u32 << exponent);
@@ -2354,6 +2366,15 @@ impl SnapshotEngine {
         if panes.is_empty() && trigger != SnapshotTrigger::Shutdown {
             return Err(SnapshotError::NoPanes);
         }
+        if panes.len() > MAX_TOPOLOGY_PANES {
+            return Err(SnapshotError::Topology(
+                TopologySnapshotError::ResourceLimit {
+                    resource: "panes",
+                    count: panes.len(),
+                    limit: MAX_TOPOLOGY_PANES,
+                },
+            ));
+        }
 
         let now_ms = epoch_ms();
 
@@ -2442,7 +2463,7 @@ impl SnapshotEngine {
         })
         .await
         .map_err(classify_snapshot_pure_blocking_failure)?
-        .map_err(|error| SnapshotError::Serialization(error.to_string()))?;
+        .map_err(SnapshotError::from)?;
         let dedup_hash = prepared.dedup_hash.clone();
 
         // 4. Skip if periodic-like and unchanged — Cx-bound read
@@ -2986,6 +3007,16 @@ impl SnapshotEngine {
                     );
                     Ok(SchedulerCaptureOutcome::Deferred(
                         SchedulerCaptureDeferredReason::Busy,
+                    ))
+                }
+                Err(error @ SnapshotError::Topology(_)) => {
+                    tracing::warn!(
+                        trigger = ?trigger,
+                        error = %error,
+                        "snapshot projection exceeded deterministic admission; scheduler will retain demand with bounded backoff"
+                    );
+                    Ok(SchedulerCaptureOutcome::Deferred(
+                        SchedulerCaptureDeferredReason::CapacityAdmission,
                     ))
                 }
                 Err(error) if error.is_retry_safe_scheduler_failure() => {
@@ -4326,6 +4357,8 @@ fn generate_session_id() -> String {
 #[derive(Debug, thiserror::Error)]
 enum SnapshotPreparationError {
     #[error(transparent)]
+    Topology(#[from] TopologySnapshotError),
+    #[error(transparent)]
     Witness(#[from] CheckpointWitnessError),
     #[error("snapshot pane id {0} exceeds SQLite integer range")]
     PaneIdRange(u64),
@@ -4337,6 +4370,15 @@ enum SnapshotPreparationError {
     ByteCountOverflow,
     #[error("snapshot pane count exceeds SQLite integer range")]
     PaneCountOverflow,
+}
+
+impl From<SnapshotPreparationError> for SnapshotError {
+    fn from(error: SnapshotPreparationError) -> Self {
+        match error {
+            SnapshotPreparationError::Topology(source) => Self::Topology(source),
+            other => Self::Serialization(other.to_string()),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -4359,7 +4401,7 @@ fn prepare_snapshot_persistence(
     pane_states: &[PaneStateSnapshot],
     metadata: Option<&Value>,
 ) -> std::result::Result<PreparedSnapshotPersistence, SnapshotPreparationError> {
-    let topology_json = canonical_json_string(topology)?;
+    let topology_json = topology.to_persistence_json()?;
     let metadata_json = metadata.map(canonical_json_string).transpose()?;
     let mut panes = Vec::with_capacity(pane_states.len());
     let mut total_bytes = 0_usize;
@@ -6850,6 +6892,52 @@ mod tests {
     }
 
     #[test]
+    fn scheduler_defers_capacity_admission_and_can_capture_after_pane_count_drops() {
+        run_async_test(async {
+            let (_tmp, db_path) = setup_test_db();
+            let engine = SnapshotEngine::new(db_path, SnapshotConfig::default());
+            let cx = crate::cx::for_testing();
+            let over_limit_provider = || async {
+                Ok((0..=MAX_TOPOLOGY_PANES)
+                    .map(|pane_id| {
+                        make_test_pane(
+                            u64::try_from(pane_id).expect("test pane id fits u64"),
+                            24,
+                            80,
+                        )
+                    })
+                    .collect::<Vec<_>>())
+            };
+
+            let outcome = engine
+                .capture_from_provider_with_cx(
+                    &cx,
+                    &over_limit_provider,
+                    SnapshotTrigger::Periodic,
+                )
+                .await
+                .expect("capacity admission should defer rather than terminate the scheduler");
+            assert_eq!(
+                outcome,
+                SchedulerCaptureOutcome::Deferred(
+                    SchedulerCaptureDeferredReason::CapacityAdmission
+                )
+            );
+
+            let recovered_provider = || async { Ok(vec![make_test_pane(1, 24, 80)]) };
+            let recovered = engine
+                .capture_from_provider_with_cx(
+                    &cx,
+                    &recovered_provider,
+                    SnapshotTrigger::Periodic,
+                )
+                .await
+                .expect("scheduler should remain usable after capacity recovers");
+            assert_eq!(recovered, SchedulerCaptureOutcome::Captured);
+        });
+    }
+
+    #[test]
     fn periodic_scheduler_survives_retry_safe_startup_database_failure() {
         run_async_test_isolated(|| async {
             let invalid_db_directory = tempfile::tempdir().expect("temporary directory");
@@ -7390,7 +7478,7 @@ mod tests {
     fn scheduler_retry_classification_excludes_indeterminate_and_capability_failures() {
         assert!(SnapshotError::Database("busy".to_string()).is_retry_safe_scheduler_failure());
         assert!(
-            SnapshotError::Serialization("temporary projection failure".to_string())
+            !SnapshotError::Serialization("deterministic projection failure".to_string())
                 .is_retry_safe_scheduler_failure()
         );
         assert!(SnapshotError::BlockingRuntimeFailure.is_retry_safe_scheduler_failure());
@@ -7404,6 +7492,23 @@ mod tests {
         .is_retry_safe_scheduler_failure());
         assert!(!SnapshotError::Cancelled.is_retry_safe_scheduler_failure());
         assert!(!SnapshotError::ContextFailure.is_retry_safe_scheduler_failure());
+    }
+
+    #[test]
+    fn capacity_admission_deferral_uses_bounded_backoff() {
+        let base = Instant::now();
+        let mut retry_state = SchedulerCaptureRetryState::default();
+        for expected_seconds in [1, 2, 4, 8, 16, 30, 30] {
+            let retry_at = retry_state.retry_deadline(
+                base,
+                SnapshotTrigger::Periodic,
+                SchedulerCaptureDeferredReason::CapacityAdmission,
+            );
+            assert_eq!(
+                retry_at.saturating_duration_since(base),
+                Duration::from_secs(expected_seconds)
+            );
+        }
     }
 
     #[test]
@@ -8278,6 +8383,74 @@ mod tests {
     }
 
     #[test]
+    fn capture_rejects_panes_above_legacy_topology_cap_before_db_mutation() {
+        run_async_test(async {
+            let (_tmp, db_path) = setup_test_db();
+            let engine = SnapshotEngine::new(db_path.clone(), SnapshotConfig::default());
+            let panes = (0..=MAX_TOPOLOGY_PANES)
+                .map(|pane_id| {
+                    make_test_pane(
+                        u64::try_from(pane_id).expect("test pane id fits u64"),
+                        24,
+                        80,
+                    )
+                })
+                .collect::<Vec<_>>();
+
+            let error = engine
+                .capture(&panes, SnapshotTrigger::Manual)
+                .await
+                .expect_err("writer must reject a self-unrestorable topology");
+            assert!(matches!(
+                error,
+                SnapshotError::Topology(TopologySnapshotError::ResourceLimit {
+                    resource: "panes",
+                    count,
+                    limit: MAX_TOPOLOGY_PANES,
+                }) if count == MAX_TOPOLOGY_PANES + 1
+            ));
+
+            let conn = Connection::open(db_path.as_str()).expect("open verification database");
+            let sessions: i64 = conn
+                .query_row("SELECT COUNT(*) FROM mux_sessions", [], |row| row.get(0))
+                .expect("count sessions");
+            let checkpoints: i64 = conn
+                .query_row("SELECT COUNT(*) FROM session_checkpoints", [], |row| row.get(0))
+                .expect("count checkpoints");
+            assert_eq!((sessions, checkpoints), (0, 0));
+        });
+    }
+
+    #[test]
+    fn capture_rejects_duplicate_pane_ids_before_db_mutation() {
+        run_async_test(async {
+            let (_tmp, db_path) = setup_test_db();
+            let engine = SnapshotEngine::new(db_path.clone(), SnapshotConfig::default());
+            let panes = vec![make_test_pane(0, 24, 80), make_test_pane(0, 24, 80)];
+
+            let error = engine
+                .capture(&panes, SnapshotTrigger::Manual)
+                .await
+                .expect_err("writer must reject duplicate pane identities");
+            assert!(matches!(
+                error,
+                SnapshotError::Topology(TopologySnapshotError::InvalidStructure {
+                    reason: "duplicate pane id",
+                })
+            ));
+
+            let conn = Connection::open(db_path.as_str()).expect("open verification database");
+            let sessions: i64 = conn
+                .query_row("SELECT COUNT(*) FROM mux_sessions", [], |row| row.get(0))
+                .expect("count sessions");
+            let checkpoints: i64 = conn
+                .query_row("SELECT COUNT(*) FROM session_checkpoints", [], |row| row.get(0))
+                .expect("count checkpoints");
+            assert_eq!((sessions, checkpoints), (0, 0));
+        });
+    }
+
+    #[test]
     fn session_reused_across_captures() {
         run_async_test(async {
             let (_tmp, db_path) = setup_test_db();
@@ -8475,6 +8648,71 @@ mod tests {
         assert!(matches!(
             error,
             SnapshotPreparationError::NegativeScrollbackSequence
+        ));
+
+        let wide_topology = TopologySnapshot {
+            schema_version: crate::session_topology::TOPOLOGY_SCHEMA_VERSION,
+            captured_at: 3_000,
+            workspace_id: None,
+            windows: vec![crate::session_topology::WindowSnapshot {
+                window_id: 1,
+                title: None,
+                position: None,
+                size: None,
+                tabs: vec![crate::session_topology::TabSnapshot {
+                    tab_id: 1,
+                    title: None,
+                    pane_tree: crate::session_topology::PaneNode::VSplit {
+                        children: (0..=crate::session_topology::MAX_SPLIT_FANOUT)
+                            .map(|pane_id| {
+                                (
+                                    1.0,
+                                    crate::session_topology::PaneNode::Leaf {
+                                        pane_id: u64::try_from(pane_id)
+                                            .expect("test pane id fits u64"),
+                                        rows: 24,
+                                        cols: 80,
+                                        cwd: None,
+                                        title: None,
+                                        is_active: pane_id == 0,
+                                    },
+                                )
+                            })
+                            .collect(),
+                    },
+                    active_pane_id: Some(0),
+                }],
+                active_tab_index: None,
+            }],
+        };
+        let error = prepare_snapshot_persistence(&wide_topology, &[], None)
+            .expect_err("persistence preparation must enforce topology admission");
+        assert!(matches!(
+            error,
+            SnapshotPreparationError::Topology(
+                TopologySnapshotError::ResourceLimit {
+                    resource: "split_fanout",
+                    ..
+                }
+            )
+        ));
+
+        let oversized_topology = TopologySnapshot {
+            schema_version: crate::session_topology::TOPOLOGY_SCHEMA_VERSION,
+            captured_at: 3_000,
+            workspace_id: Some("x".repeat(
+                crate::session_topology::MAX_SNAPSHOT_BYTES.saturating_add(1),
+            )),
+            windows: Vec::new(),
+        };
+        let error = prepare_snapshot_persistence(&oversized_topology, &[], None)
+            .expect_err("persistence must not write topology JSON its reader rejects");
+        assert!(matches!(
+            error,
+            SnapshotPreparationError::Topology(TopologySnapshotError::TooLarge {
+                bytes,
+                limit: crate::session_topology::MAX_SNAPSHOT_BYTES,
+            }) if bytes > crate::session_topology::MAX_SNAPSHOT_BYTES
         ));
 
         let checkpoint_count: i64 = conn

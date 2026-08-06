@@ -27,6 +27,7 @@ use std::fmt;
 use std::sync::Arc;
 
 use crate::error::RuntimeOperationSource;
+use crate::session_topology::MAX_TOPOLOGY_PANES;
 
 /// Maximum number of skipped pane IDs retained for diagnostics.
 ///
@@ -35,7 +36,7 @@ use crate::error::RuntimeOperationSource;
 /// memory to this fixed number of entries.
 pub const INJECTION_SKIPPED_SAMPLE_CAP: usize = 16;
 
-/// Number of scrollback rows scanned between cooperative capability checks.
+/// Number of scrollback pane entries scanned between cooperative capability checks.
 const INJECTION_SCAN_CHECKPOINT_INTERVAL: usize = 256;
 
 fn restore_scrollback_context_error(
@@ -50,7 +51,8 @@ fn restore_scrollback_context_error(
         ContextErrorKind::DeadlineExceeded => RuntimeOperationSource::DeadlineExceeded,
         ContextErrorKind::PollQuotaExhausted => RuntimeOperationSource::PollQuotaExhausted,
         ContextErrorKind::CostQuotaExhausted => RuntimeOperationSource::CostBudgetExhausted,
-        ContextErrorKind::Cancelled | ContextErrorKind::CancelTimeout => {
+        ContextErrorKind::CancelTimeout => RuntimeOperationSource::CancellationCleanupTimedOut,
+        ContextErrorKind::Cancelled => {
             match cx.root_cancel_cause().map(|reason| reason.kind) {
                 Some(CancelKind::Deadline | CancelKind::Timeout) => {
                     RuntimeOperationSource::DeadlineExceeded
@@ -82,6 +84,15 @@ fn restore_scrollback_unsupported_error() -> crate::Error {
         operation: "restore_scrollback.inject.no_safe_output_channel",
         source: RuntimeOperationSource::Backend(
             "historical terminal output cannot be restored through PTY input".to_string(),
+        ),
+    }
+}
+
+fn restore_scrollback_resource_limit_error() -> crate::Error {
+    crate::Error::RuntimeOperation {
+        operation: "restore_scrollback.inject.resource_limit",
+        source: RuntimeOperationSource::Backend(
+            "scrollback preflight exceeds the legacy pane admission limit".to_string(),
         ),
     }
 }
@@ -136,29 +147,21 @@ impl fmt::Debug for ScrollbackData {
 // Injection report
 // =============================================================================
 
-/// Per-pane injection statistics.
-#[derive(Debug, Clone)]
-pub struct PaneInjectionStats {
-    /// Old pane ID (from snapshot).
-    pub old_pane_id: u64,
-    /// New pane ID (live session).
-    pub new_pane_id: u64,
-    /// Number of lines injected.
-    pub lines_injected: usize,
-    /// Total bytes written.
-    pub bytes_written: usize,
-    /// Number of chunks sent.
-    pub chunks_sent: usize,
-}
-
 /// Report from a scrollback injection operation.
+///
+/// The current fail-closed gate never performs a per-pane restoration, so its
+/// success, failure, and byte aggregates remain exactly zero. A future safe
+/// mux-owned channel must update these fixed-size aggregates with saturating
+/// arithmetic; it must not reintroduce per-pane result vectors or raw errors.
 #[derive(Clone, Default)]
 pub struct InjectionReport {
-    /// Per-pane results for successful injections.
-    pub successes: Vec<PaneInjectionStats>,
-    /// Per-pane failures (old pane ID, error message).
-    pub failures: Vec<(u64, String)>,
-    /// Exact count of panes skipped because they were absent from the pane map.
+    /// Saturating aggregate of successful pane restorations.
+    success_count: usize,
+    /// Saturating aggregate of failed pane restorations.
+    failure_count: usize,
+    /// Saturating aggregate of restored bytes.
+    total_bytes: usize,
+    /// Saturating count of panes skipped because they were absent from the pane map.
     ///
     /// Saturates only if the platform's `usize` counter is exhausted.
     skipped_count: usize,
@@ -169,40 +172,46 @@ pub struct InjectionReport {
 impl InjectionReport {
     /// Total panes successfully injected.
     pub fn success_count(&self) -> usize {
-        self.successes.len()
+        self.success_count
     }
 
     /// Total panes that failed injection.
     pub fn failure_count(&self) -> usize {
-        self.failures.len()
+        self.failure_count
     }
 
-    /// Exact number of skipped panes, saturating only at `usize::MAX`.
+    /// Number of skipped panes, saturating only at `usize::MAX`.
     pub fn skipped_count(&self) -> usize {
         self.skipped_count
     }
 
     /// Deterministic ascending sample of the smallest skipped pane IDs.
     pub fn skipped_sample(&self) -> &[u64] {
-        &self.skipped_sample
+        let retained = self
+            .skipped_sample
+            .len()
+            .min(INJECTION_SKIPPED_SAMPLE_CAP);
+        &self.skipped_sample[..retained]
     }
 
     /// Total bytes written across all panes.
     pub fn total_bytes(&self) -> usize {
-        self.successes.iter().fold(0usize, |total, pane| {
-            total.saturating_add(pane.bytes_written)
-        })
+        self.total_bytes
     }
 }
 
 impl fmt::Debug for InjectionReport {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let skipped_sample_omitted = self
+            .skipped_count()
+            .saturating_sub(self.skipped_sample().len());
         formatter
             .debug_struct("InjectionReport")
             .field("success_count", &self.success_count())
             .field("failure_count", &self.failure_count())
             .field("skipped_count", &self.skipped_count())
             .field("skipped_sample", &self.skipped_sample())
+            .field("skipped_sample_omitted", &skipped_sample_omitted)
             .finish()
     }
 }
@@ -247,9 +256,10 @@ impl InjectionGuard {
                     operation: "restore_scrollback.suppression_guard.acquire",
                     source: RuntimeOperationSource::LockPoisoned,
                 })?;
-            if pane_ids
-                .iter()
-                .any(|id| set.get(id).is_some_and(|count| *count == usize::MAX))
+            if pane_ids.iter().any(|id| {
+                set.get(id)
+                    .is_some_and(|count| *count == 0 || *count == usize::MAX)
+            })
             {
                 return Err(crate::Error::RuntimeOperation {
                     operation: "restore_scrollback.suppression_guard.acquire",
@@ -273,7 +283,10 @@ impl InjectionGuard {
         pane_id: u64,
     ) -> bool {
         match suppressed.lock() {
-            Ok(set) => set.get(&pane_id).is_some_and(|count| *count > 0),
+            // Entry presence is the authority. A zero count is corrupted
+            // state and therefore remains suppressed rather than silently
+            // re-enabling detection.
+            Ok(set) => set.contains_key(&pane_id),
             // A poisoned suppression map has unknown state. Suppressing is the
             // fail-closed answer: it cannot create detections from historical
             // content while the guard authority is uncertain.
@@ -301,7 +314,7 @@ impl Drop for InjectionGuard {
         for &id in &self.pane_ids {
             let remove = if let Some(count) = set.get_mut(&id) {
                 if *count == 0 {
-                    true
+                    false
                 } else {
                     *count -= 1;
                     *count == 0
@@ -373,7 +386,8 @@ impl ScrollbackInjector {
     /// ft-xbnl0.2.3 Cx-first sibling of [`inject`].
     ///
     /// The caller's capability is checked first. An uncancelled request then
-    /// receives a structured unsupported-channel error; no pane API is called.
+    /// receives a structured resource-limit or unsupported-channel error; no
+    /// pane API is called.
     pub async fn inject_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -385,18 +399,30 @@ impl ScrollbackInjector {
         cx.checkpoint()
             .map_err(|error| restore_scrollback_context_error(OPERATION, cx, &error))?;
 
+        // Restore inputs originate from an admitted topology, but this public
+        // API also fails closed for programmatic callers. Keeping both maps in
+        // the q4096 legacy envelope makes the intersection preflight bounded.
+        if pane_id_map.len() > MAX_TOPOLOGY_PANES || scrollbacks.len() > MAX_TOPOLOGY_PANES {
+            return Err(restore_scrollback_resource_limit_error());
+        }
+
+        // Capability failure wins only at the entry checkpoint. Thereafter a
+        // mapped scrollback deterministically proves the unsupported output
+        // channel before skipped-report accounting, independent of HashMap
+        // iteration order and checkpoint cadence.
+        if pane_id_map
+            .keys()
+            .any(|old_pane_id| scrollbacks.contains_key(old_pane_id))
+        {
+            return Err(restore_scrollback_unsupported_error());
+        }
+
         let mut skipped_count = 0usize;
         let mut smallest_skipped = BinaryHeap::with_capacity(INJECTION_SKIPPED_SAMPLE_CAP);
         for (index, old_pane_id) in scrollbacks.keys().copied().enumerate() {
             if index != 0 && index % INJECTION_SCAN_CHECKPOINT_INTERVAL == 0 {
                 cx.checkpoint()
                     .map_err(|error| restore_scrollback_context_error(OPERATION, cx, &error))?;
-            }
-
-            // Any mapped data requires a terminal-state output channel. Return
-            // before allocating, formatting, suppressing, or touching the mux.
-            if pane_id_map.contains_key(&old_pane_id) {
-                return Err(restore_scrollback_unsupported_error());
             }
 
             skipped_count = skipped_count.saturating_add(1);
@@ -563,6 +589,10 @@ mod tests {
                 ),
             ),
             (
+                ContextErrorKind::CancelTimeout,
+                RuntimeOperationSource::CancellationCleanupTimedOut,
+            ),
+            (
                 ContextErrorKind::Internal,
                 RuntimeOperationSource::ContextFailure,
             ),
@@ -634,65 +664,48 @@ mod tests {
 
     #[test]
     fn injection_report_totals() {
-        let mut r = InjectionReport::default();
-        r.successes.push(PaneInjectionStats {
-            old_pane_id: 1,
-            new_pane_id: 10,
-            lines_injected: 100,
-            bytes_written: 5000,
-            chunks_sent: 2,
-        });
-        r.successes.push(PaneInjectionStats {
-            old_pane_id: 2,
-            new_pane_id: 11,
-            lines_injected: 50,
-            bytes_written: 3000,
-            chunks_sent: 1,
-        });
-        r.failures.push((3, "timeout".into()));
+        let r = InjectionReport {
+            success_count: 2,
+            failure_count: 1,
+            total_bytes: 8000,
+            ..InjectionReport::default()
+        };
         assert_eq!(r.success_count(), 2);
         assert_eq!(r.failure_count(), 1);
         assert_eq!(r.total_bytes(), 8000);
     }
 
     #[test]
-    fn injection_report_total_bytes_saturates() {
+    fn injection_report_supports_saturated_aggregate_boundary() {
         let report = InjectionReport {
-            successes: vec![
-                PaneInjectionStats {
-                    old_pane_id: 1,
-                    new_pane_id: 10,
-                    lines_injected: 0,
-                    bytes_written: usize::MAX,
-                    chunks_sent: 0,
-                },
-                PaneInjectionStats {
-                    old_pane_id: 2,
-                    new_pane_id: 11,
-                    lines_injected: 0,
-                    bytes_written: 1,
-                    chunks_sent: 0,
-                },
-            ],
+            success_count: usize::MAX,
+            failure_count: usize::MAX,
+            total_bytes: usize::MAX,
             ..InjectionReport::default()
         };
 
+        assert_eq!(report.success_count(), usize::MAX);
+        assert_eq!(report.failure_count(), usize::MAX);
         assert_eq!(report.total_bytes(), usize::MAX);
     }
 
     #[test]
     fn injection_report_debug_is_bounded_and_content_free() {
         let report = InjectionReport {
-            failures: vec![(7, "raw-backend-canary".into())],
-            skipped_count: 1,
-            skipped_sample: vec![7],
+            failure_count: 1,
+            total_bytes: 424_242,
+            skipped_count: 100,
+            skipped_sample: (0..100).collect(),
             ..InjectionReport::default()
         };
         let debug = format!("{report:?}");
 
         assert!(debug.contains("failure_count: 1"));
-        assert!(debug.contains("skipped_count: 1"));
-        assert!(!debug.contains("raw-backend-canary"));
+        assert!(debug.contains("skipped_count: 100"));
+        assert!(debug.contains("skipped_sample_omitted: 84"));
+        assert!(!debug.contains("99"));
+        assert!(!debug.contains("424242"));
+        assert!(!debug.contains("424_242"));
     }
 
     // --- InjectionGuard ---
@@ -1118,6 +1131,23 @@ mod tests {
     }
 
     #[test]
+    fn injection_guard_zero_count_remains_fail_closed() {
+        let set = Arc::new(std::sync::Mutex::new(HashMap::from([(42, 0)])));
+
+        assert!(InjectionGuard::is_suppressed(&set, 42));
+        let error = InjectionGuard::new(set.clone(), vec![42])
+            .expect_err("corrupted zero-count authority must reject a new guard");
+        assert!(matches!(
+            error,
+            crate::Error::RuntimeOperation {
+                operation: "restore_scrollback.suppression_guard.acquire",
+                source: RuntimeOperationSource::ContextFailure,
+            }
+        ));
+        assert_eq!(set.lock().unwrap().get(&42), Some(&0));
+    }
+
+    #[test]
     fn injection_guard_lock_poison_fails_closed() {
         let set = Arc::new(std::sync::Mutex::new(HashMap::new()));
         let poison_target = set.clone();
@@ -1142,21 +1172,11 @@ mod tests {
 
     #[test]
     fn injection_report_total_bytes_with_mixed() {
-        let mut r = InjectionReport::default();
-        r.successes.push(PaneInjectionStats {
-            old_pane_id: 1,
-            new_pane_id: 10,
-            lines_injected: 0,
-            bytes_written: 0,
-            chunks_sent: 0,
-        });
-        r.successes.push(PaneInjectionStats {
-            old_pane_id: 2,
-            new_pane_id: 11,
-            lines_injected: 10,
-            bytes_written: 500,
-            chunks_sent: 1,
-        });
+        let r = InjectionReport {
+            success_count: 2,
+            total_bytes: 500,
+            ..InjectionReport::default()
+        };
         assert_eq!(r.success_count(), 2);
         assert_eq!(r.total_bytes(), 500);
     }

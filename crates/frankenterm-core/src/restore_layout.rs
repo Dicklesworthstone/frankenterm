@@ -30,10 +30,20 @@ use crate::session_topology::{
 };
 use crate::wezterm::{SpawnTarget, SplitDirection, WeztermHandle};
 
-fn restore_context_error(cx: &crate::cx::Cx, operation: &'static str) -> crate::Error {
+fn restore_context_error(
+    cx: &crate::cx::Cx,
+    operation: &'static str,
+    error: &crate::runtime_async::ContextError,
+) -> crate::Error {
     use crate::outcome::CancelKind;
+    use crate::runtime_async::ContextErrorKind;
 
-    let source = match cx.root_cancel_cause().map(|reason| reason.kind) {
+    let source = match error.kind() {
+        ContextErrorKind::DeadlineExceeded => RuntimeOperationSource::DeadlineExceeded,
+        ContextErrorKind::PollQuotaExhausted => RuntimeOperationSource::PollQuotaExhausted,
+        ContextErrorKind::CostQuotaExhausted => RuntimeOperationSource::CostBudgetExhausted,
+        ContextErrorKind::CancelTimeout => RuntimeOperationSource::CancellationCleanupTimedOut,
+        ContextErrorKind::Cancelled => match cx.root_cancel_cause().map(|reason| reason.kind) {
         Some(CancelKind::Deadline | CancelKind::Timeout) => {
             RuntimeOperationSource::DeadlineExceeded
         }
@@ -60,13 +70,15 @@ fn restore_context_error(cx: &crate::cx::Cx, operation: &'static str) -> crate::
                 RuntimeOperationSource::ContextFailure
             }
         }
+        },
+        _ => RuntimeOperationSource::ContextFailure,
     };
     crate::Error::RuntimeOperation { operation, source }
 }
 
 fn restore_checkpoint(cx: &crate::cx::Cx, operation: &'static str) -> crate::Result<()> {
     cx.checkpoint()
-        .map_err(|_| restore_context_error(cx, operation))
+        .map_err(|error| restore_context_error(cx, operation, &error))
 }
 
 fn restore_layout_error(operation: &'static str, detail: &'static str) -> crate::Error {
@@ -129,7 +141,7 @@ impl Default for RestoreConfig {
 pub struct RestoreResult {
     /// Mapping from old pane IDs (snapshot) to new pane IDs (live session).
     pub pane_id_map: HashMap<u64, u64>,
-    /// Panes that failed to restore (old pane ID → error description).
+    /// Pane failures (old pane ID → finite content-free reason code).
     pub failed_panes: Vec<(u64, String)>,
     /// Number of windows created.
     pub windows_created: usize,
@@ -169,6 +181,174 @@ impl RestoreResult {
             panes_created: 0,
         }
     }
+}
+
+/// Finite reason that a layout attempt stopped before the complete topology
+/// settled. No backend message, cwd, title, command, or pane content is
+/// retained in this classification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LayoutRestoreInterruptionReason {
+    Cancelled,
+    CancellationCleanupTimedOut,
+    DeadlineExceeded,
+    PollQuotaExhausted,
+    CostQuotaExhausted,
+    ContextFailure,
+    ValidationFailure,
+    BackendFailure,
+    MuxOutcomeIndeterminate,
+    IntegrityFailure,
+}
+
+/// Typed, content-free terminal state for a partial layout attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LayoutRestoreInterruption {
+    /// Finite code-owned operation label at which restoration stopped.
+    pub phase: &'static str,
+    /// Finite interruption class.
+    pub reason: LayoutRestoreInterruptionReason,
+}
+
+/// Complete or partial receipt from one layout attempt.
+///
+/// `result` contains every authoritative successful spawn/split receipt that
+/// was observed before `interruption`. The original crate error is retained
+/// privately only so the legacy `Result` API can preserve its exact error
+/// variant; diagnostics for this type are aggregate and content-free.
+pub struct LayoutRestoreAttempt {
+    pub result: RestoreResult,
+    pub interruption: Option<LayoutRestoreInterruption>,
+    terminal_error: Option<crate::Error>,
+}
+
+impl std::fmt::Debug for LayoutRestoreAttempt {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("LayoutRestoreAttempt")
+            .field("result", &self.result)
+            .field("interruption", &self.interruption)
+            .finish()
+    }
+}
+
+impl LayoutRestoreAttempt {
+    fn complete(result: RestoreResult) -> Self {
+        Self {
+            result,
+            interruption: None,
+            terminal_error: None,
+        }
+    }
+
+    fn interrupted(result: RestoreResult, terminal_error: crate::Error) -> Self {
+        let interruption = Some(classify_layout_restore_error(&terminal_error));
+        Self {
+            result,
+            interruption,
+            terminal_error: Some(terminal_error),
+        }
+    }
+
+    fn into_result(self) -> crate::Result<RestoreResult> {
+        let Self {
+            result,
+            terminal_error,
+            ..
+        } = self;
+        match terminal_error {
+            Some(error) => Err(error),
+            None => Ok(result),
+        }
+    }
+}
+
+#[allow(deprecated)]
+fn classify_layout_restore_error(error: &crate::Error) -> LayoutRestoreInterruption {
+    use crate::error::{RuntimeOperationSource, WeztermError};
+
+    let (phase, reason) = match error {
+        crate::Error::RuntimeOperation { operation, source } => {
+            let reason = match source {
+                RuntimeOperationSource::Cancelled(_) => {
+                    LayoutRestoreInterruptionReason::Cancelled
+                }
+                RuntimeOperationSource::DeadlineExceeded => {
+                    LayoutRestoreInterruptionReason::DeadlineExceeded
+                }
+                RuntimeOperationSource::PollQuotaExhausted => {
+                    LayoutRestoreInterruptionReason::PollQuotaExhausted
+                }
+                RuntimeOperationSource::CostBudgetExhausted => {
+                    LayoutRestoreInterruptionReason::CostQuotaExhausted
+                }
+                RuntimeOperationSource::ContextFailure => {
+                    LayoutRestoreInterruptionReason::ContextFailure
+                }
+                RuntimeOperationSource::CancellationCleanupTimedOut => {
+                    LayoutRestoreInterruptionReason::CancellationCleanupTimedOut
+                }
+                RuntimeOperationSource::LockPoisoned
+                | RuntimeOperationSource::PolledAfterCompletion => {
+                    LayoutRestoreInterruptionReason::IntegrityFailure
+                }
+                RuntimeOperationSource::Backend(_)
+                    if *operation == "restore_layout.preflight" =>
+                {
+                    LayoutRestoreInterruptionReason::ValidationFailure
+                }
+                RuntimeOperationSource::Backend(_)
+                    if operation.starts_with("restore_layout.pane_mapping.")
+                        || operation.starts_with("restore_layout.receipt.")
+                        || operation.starts_with("restore_layout.split_plan.") =>
+                {
+                    LayoutRestoreInterruptionReason::IntegrityFailure
+                }
+                RuntimeOperationSource::WatchChannelClosed
+                | RuntimeOperationSource::Backend(_)
+                | RuntimeOperationSource::LockTimedOut => {
+                    LayoutRestoreInterruptionReason::BackendFailure
+                }
+            };
+            (*operation, reason)
+        }
+        crate::Error::Wezterm(WeztermError::IndeterminateMutation { operation }) => (
+            *operation,
+            LayoutRestoreInterruptionReason::MuxOutcomeIndeterminate,
+        ),
+        crate::Error::Wezterm(_) => (
+            "restore_layout.mux_operation",
+            LayoutRestoreInterruptionReason::BackendFailure,
+        ),
+        crate::Error::PaneOperation { operation, .. } => {
+            (*operation, LayoutRestoreInterruptionReason::BackendFailure)
+        }
+        crate::Error::Cancelled(_) => (
+            "restore_layout.operation",
+            LayoutRestoreInterruptionReason::Cancelled,
+        ),
+        crate::Error::Panicked(_) => (
+            "restore_layout.operation",
+            LayoutRestoreInterruptionReason::IntegrityFailure,
+        ),
+        crate::Error::Json(_) | crate::Error::Config(_) => (
+            "restore_layout.preflight",
+            LayoutRestoreInterruptionReason::ValidationFailure,
+        ),
+        crate::Error::CaptureAuthority(_)
+        | crate::Error::Storage(_)
+        | crate::Error::Pattern(_)
+        | crate::Error::Workflow(_)
+        | crate::Error::Policy(_)
+        | crate::Error::Io(_)
+        | crate::Error::WatchdogWarningRead { .. }
+        | crate::Error::Runtime(_)
+        | crate::Error::SetupError(_) => (
+            "restore_layout.operation",
+            LayoutRestoreInterruptionReason::BackendFailure,
+        ),
+    };
+    LayoutRestoreInterruption { phase, reason }
 }
 
 struct RestoreAccumulator {
@@ -241,6 +421,45 @@ impl RestoreAccumulator {
         self.result.panes_created = panes_created;
         Ok(())
     }
+
+    fn record_created_tab(&mut self, created_new_window: bool) -> crate::Result<()> {
+        let tabs_created = self.result.tabs_created.checked_add(1).ok_or_else(|| {
+            restore_layout_integrity_error("restore_layout.receipt.tab_count_overflow")
+        })?;
+        let windows_created = if created_new_window {
+            self.result.windows_created.checked_add(1).ok_or_else(|| {
+                restore_layout_integrity_error("restore_layout.receipt.window_count_overflow")
+            })?
+        } else {
+            self.result.windows_created
+        };
+        self.result.tabs_created = tabs_created;
+        self.result.windows_created = windows_created;
+        Ok(())
+    }
+
+    fn validate_receipt_invariants(&self) -> crate::Result<()> {
+        if self.result.panes_created != self.result.pane_id_map.len()
+            || self.result.pane_id_map.len() != self.mapped_new_pane_ids.len()
+        {
+            return Err(restore_layout_integrity_error(
+                "restore_layout.receipt.pane_count_mismatch",
+            ));
+        }
+        if self.result.failed_panes.len() != self.failed_pane_ids.len() {
+            return Err(restore_layout_integrity_error(
+                "restore_layout.receipt.failure_count_mismatch",
+            ));
+        }
+        if self.result.windows_created > self.result.tabs_created
+            || self.result.tabs_created > self.result.panes_created
+        {
+            return Err(restore_layout_integrity_error(
+                "restore_layout.receipt.hierarchy_count_mismatch",
+            ));
+        }
+        Ok(())
+    }
 }
 
 struct RestorePreflight {
@@ -278,7 +497,6 @@ impl RestoreFlow {
 
 #[derive(Debug, Clone, Copy)]
 struct RestoredWindow {
-    restored_any_tabs: bool,
     flow: RestoreFlow,
 }
 
@@ -303,8 +521,10 @@ impl LayoutRestorer {
     /// Creates windows, tabs, and pane splits to match the captured layout.
     /// Returns a mapping from old pane IDs to new pane IDs, including every
     /// authoritative successful spawn/split receipt before a finite rejection.
-    /// Fatal or uncertain errors propagate; they cannot currently carry a
-    /// partial receipt through the workspace-wide [`crate::Error`] type.
+    /// Fatal or uncertain errors propagate through this compatibility wrapper.
+    /// Callers that must retain acknowledged partial mux effects use
+    /// [`Self::restore_attempt_with_cx`]; `SessionRestorer` uses that typed
+    /// attempt surface before committing its durable outcome receipt.
     pub async fn restore(&self, snapshot: &TopologySnapshot) -> crate::Result<RestoreResult> {
         let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
         self.restore_with_cx(&cx, snapshot).await
@@ -322,12 +542,39 @@ impl LayoutRestorer {
         cx: &crate::cx::Cx,
         snapshot: &TopologySnapshot,
     ) -> crate::Result<RestoreResult> {
-        restore_checkpoint(cx, "restore_layout.restore.preflight")?;
+        self.restore_attempt_with_cx(cx, snapshot)
+            .await
+            .into_result()
+    }
+
+    /// Restore a topology while retaining a truthful partial receipt if a
+    /// fatal, uncertain, cancellation, budget, or integrity error occurs after
+    /// one or more authoritative mux mutations.
+    pub async fn restore_attempt_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        snapshot: &TopologySnapshot,
+    ) -> LayoutRestoreAttempt {
+        if let Err(error) = restore_checkpoint(cx, "restore_layout.restore.preflight") {
+            return LayoutRestoreAttempt::interrupted(RestoreResult::with_capacity(0), error);
+        }
 
         // Validate the complete immutable snapshot before the first mux mutation.
         // A malformed later window/tab must never be discovered only after earlier
         // windows have already been created.
-        let preflight = validate_restore_snapshot(snapshot, self.config.restore_working_dirs)?;
+        let preflight = match validate_restore_snapshot(
+            snapshot,
+            self.config.restore_working_dirs,
+            self.config.restore_split_ratios,
+        ) {
+            Ok(preflight) => preflight,
+            Err(error) => {
+                return LayoutRestoreAttempt::interrupted(
+                    RestoreResult::with_capacity(0),
+                    error,
+                );
+            }
+        };
         let mut state = RestoreAccumulator::with_capacity(preflight.pane_count);
 
         info!(
@@ -335,29 +582,50 @@ impl LayoutRestorer {
             "starting layout restoration from snapshot (cx-first)"
         );
 
-        for (win_idx, window) in snapshot.windows.iter().enumerate() {
-            restore_checkpoint(cx, "restore_layout.restore.between_windows")?;
-            let restored_window = self
-                .restore_window(cx, window, win_idx, &preflight, &mut state)
-                .await?;
-            if restored_window.restored_any_tabs {
-                state.result.windows_created += 1;
-            }
-            if restored_window.flow.should_stop() {
-                break;
-            }
-        }
+        let terminal = self
+            .restore_validated_with_cx(cx, snapshot, &preflight, &mut state)
+            .await;
+        let terminal = match (terminal, state.validate_receipt_invariants()) {
+            (Ok(()), Ok(())) => None,
+            (Err(error), Ok(())) => Some(error),
+            (_, Err(integrity_error)) => Some(integrity_error),
+        };
 
         info!(
             windows = state.result.windows_created,
             tabs = state.result.tabs_created,
             panes = state.result.panes_created,
             failed = state.result.failed_panes.len(),
+            interrupted = terminal.is_some(),
             suppressed_failure_logs = state.failure_logs_suppressed,
-            "layout restoration complete (cx-first)"
+            "layout restoration attempt settled (cx-first)"
         );
 
-        Ok(state.result)
+        match terminal {
+            Some(error) => LayoutRestoreAttempt::interrupted(state.result, error),
+            None => LayoutRestoreAttempt::complete(state.result),
+        }
+    }
+
+    async fn restore_validated_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        snapshot: &TopologySnapshot,
+        preflight: &RestorePreflight,
+        state: &mut RestoreAccumulator,
+    ) -> crate::Result<()> {
+
+        for (win_idx, window) in snapshot.windows.iter().enumerate() {
+            restore_checkpoint(cx, "restore_layout.restore.between_windows")?;
+            let restored_window = self
+                .restore_window(cx, window, win_idx, preflight, state)
+                .await?;
+            if restored_window.flow.should_stop() {
+                break;
+            }
+        }
+
+        Ok(())
     }
 
     /// Restore a single window and all its tabs.
@@ -378,7 +646,7 @@ impl LayoutRestorer {
         let mut restored_window_id = None;
         let selected_tab_index = window.active_tab_index.unwrap_or(0);
         let mut selected_tab = None;
-        let mut restored_any_tabs = false;
+        let mut window_flow = RestoreFlow::Continue;
 
         for (tab_idx, tab) in window.tabs.iter().enumerate() {
             restore_checkpoint(cx, "restore_layout.restore_window.between_tabs")?;
@@ -402,13 +670,9 @@ impl LayoutRestorer {
             if tab_idx == selected_tab_index {
                 selected_tab = Some(restored_tab);
             }
-            state.result.tabs_created += 1;
-            restored_any_tabs = true;
             if restored_tab.flow.should_stop() {
-                return Ok(RestoredWindow {
-                    restored_any_tabs,
-                    flow: RestoreFlow::Stop,
-                });
+                window_flow = RestoreFlow::Stop;
+                break;
             }
         }
 
@@ -416,7 +680,19 @@ impl LayoutRestorer {
         // Select the recorded tab exactly once, and only after later tab spawns
         // have finished changing the selected tab as a side effect.
         if let Some(selected_tab) = selected_tab {
-            restore_checkpoint(cx, "restore_layout.restore_window.before_activate")?;
+            if window_flow.should_stop() {
+                // A finite authoritative rejection already produced a useful
+                // partial receipt. Cancellation, deadline, or budget expiry
+                // observed immediately afterward must not overwrite it while
+                // attempting best-effort focus cleanup.
+                if cx.checkpoint().is_err() {
+                    return Ok(RestoredWindow {
+                        flow: window_flow,
+                    });
+                }
+            } else {
+                restore_checkpoint(cx, "restore_layout.restore_window.before_activate")?;
+            }
             match self
                 .wezterm
                 .activate_pane_with_cx(cx, selected_tab.active_new_pane_id)
@@ -438,7 +714,6 @@ impl LayoutRestorer {
                     }
                     if !self.config.continue_on_error {
                         return Ok(RestoredWindow {
-                            restored_any_tabs,
                             flow: RestoreFlow::Stop,
                         });
                     }
@@ -447,10 +722,7 @@ impl LayoutRestorer {
             }
         }
 
-        Ok(RestoredWindow {
-            restored_any_tabs,
-            flow: RestoreFlow::Continue,
-        })
+        Ok(RestoredWindow { flow: window_flow })
     }
 
     /// Restore a single tab with its pane tree.
@@ -482,6 +754,11 @@ impl LayoutRestorer {
             .wezterm
             .spawn_targeted_with_cx(cx, initial_cwd, None, spawn_target)
             .await?;
+        // A successful targeted spawn is the authoritative receipt for both
+        // the tab and, for the first tab, its window. Record those effects
+        // before any follow-up lookup, pane-tree reconstruction, activation,
+        // cancellation checkpoint, or backend failure can interrupt us.
+        state.record_created_tab(spawn_target.new_window)?;
         record_created_first_leaf(state, &tab.pane_tree, root_pane_id)?;
         let window_id = if let Some(window_id) = spawn_target.window_id {
             window_id
@@ -644,7 +921,11 @@ impl LayoutRestorer {
                             })?,
                     )
                 } else {
-                    Some(equal_split_percent(remaining_children))
+                    Some(equal_split_percent(remaining_children).map_err(|_| {
+                        restore_layout_integrity_error(
+                            "restore_layout.split_plan.invalid_equal_prefix",
+                        )
+                    })?)
                 };
 
                 let cwd = first_leaf_cwd(child, &preflight.normalized_cwds);
@@ -702,6 +983,7 @@ impl LayoutRestorer {
 fn validate_restore_snapshot(
     snapshot: &TopologySnapshot,
     restore_working_dirs: bool,
+    restore_split_ratios: bool,
 ) -> crate::Result<RestorePreflight> {
     const OPERATION: &str = "restore_layout.preflight";
 
@@ -717,6 +999,9 @@ fn validate_restore_snapshot(
             "topology contains no windows",
         ));
     }
+    snapshot.validate_resource_limits().map_err(|_error| {
+        restore_layout_error(OPERATION, "topology exceeds supported resource limits")
+    })?;
 
     let mut seen_window_ids = HashSet::with_capacity(snapshot.windows.len());
     let mut seen_tab_ids = HashSet::new();
@@ -759,6 +1044,7 @@ fn validate_restore_snapshot(
                 &tab.pane_tree,
                 1,
                 restore_working_dirs,
+                restore_split_ratios,
                 &mut seen_pane_ids,
                 &mut normalized_cwds,
                 &mut split_percents,
@@ -805,6 +1091,7 @@ fn validate_pane_tree(
     node: &PaneNode,
     depth: usize,
     restore_working_dirs: bool,
+    restore_split_ratios: bool,
     seen_pane_ids: &mut HashSet<u64>,
     normalized_cwds: &mut HashMap<u64, String>,
     split_percents: &mut HashMap<u64, u8>,
@@ -869,12 +1156,11 @@ fn validate_pane_tree(
                         "split node has a non-positive or non-finite ratio",
                     ));
                 }
-                if *ratio > prefix_scale {
-                    scaled_prefix_sum = if prefix_scale == 0.0 {
-                        1.0
-                    } else {
-                        scaled_prefix_sum * (prefix_scale / *ratio) + 1.0
-                    };
+                if child_index == 0 {
+                    prefix_scale = *ratio;
+                    scaled_prefix_sum = 1.0;
+                } else if *ratio > prefix_scale {
+                    scaled_prefix_sum = scaled_prefix_sum * (prefix_scale / *ratio) + 1.0;
                     prefix_scale = *ratio;
                 } else {
                     scaled_prefix_sum += *ratio / prefix_scale;
@@ -893,13 +1179,14 @@ fn validate_pane_tree(
                     child,
                     depth + 1,
                     restore_working_dirs,
+                    restore_split_ratios,
                     seen_pane_ids,
                     normalized_cwds,
                     split_percents,
                 )?;
                 if child_index == 0 {
                     first_child_leaf_id = Some(validated_child.first_leaf_id);
-                } else {
+                } else if restore_split_ratios {
                     let child_scaled_ratio = *ratio / prefix_scale;
                     let percent = split_percent(child_scaled_ratio, scaled_prefix_sum)
                         .map_err(|detail| restore_layout_error(OPERATION, detail))?;
@@ -1113,7 +1400,7 @@ fn split_percent(child_scaled_ratio: f64, scaled_prefix_sum: f64) -> Result<u8, 
     {
         return Err("split ratio percentage invariant failed");
     }
-    if child_scaled_ratio == 0.0 {
+    if child_scaled_ratio <= 0.0 {
         // A validated positive ratio can underflow only after normalization by
         // an astronomically larger sibling. The backend's minimum 1% is the
         // closest representable request and is not an invariant failure.
@@ -1126,12 +1413,12 @@ fn split_percent(child_scaled_ratio: f64, scaled_prefix_sum: f64) -> Result<u8, 
     Ok((percent as u8).clamp(1, 99))
 }
 
-fn equal_split_percent(remaining_children: usize) -> u8 {
+fn equal_split_percent(remaining_children: usize) -> Result<u8, &'static str> {
     if remaining_children < 2 {
-        return 50;
+        return Err("equal split requires at least two remaining children");
     }
     let rounded = (100usize.saturating_add(remaining_children / 2)) / remaining_children;
-    u8::try_from(rounded).unwrap_or(99).clamp(1, 99)
+    Ok(u8::try_from(rounded).unwrap_or(99).clamp(1, 99))
 }
 
 fn record_failed_tree(
@@ -1257,6 +1544,7 @@ mod tests {
         AuthoritativePaneRejectionThenCancel,
         Indeterminate,
         DeadlineExceeded,
+        ContextFailure,
         LockPoisoned,
     }
 
@@ -1279,6 +1567,10 @@ mod tests {
                 Self::DeadlineExceeded => crate::Error::RuntimeOperation {
                     operation,
                     source: RuntimeOperationSource::DeadlineExceeded,
+                },
+                Self::ContextFailure => crate::Error::RuntimeOperation {
+                    operation,
+                    source: RuntimeOperationSource::ContextFailure,
                 },
                 Self::LockPoisoned => crate::Error::RuntimeOperation {
                     operation,
@@ -1717,8 +2009,12 @@ mod tests {
     }
 
     #[test]
-    fn restore_checkpoint_preserves_poll_and_cost_budget_classes() {
+    fn restore_checkpoint_preserves_deadline_poll_and_cost_budget_classes() {
         for (budget, expected) in [
+            (
+                crate::cx::Budget::new().with_deadline(Default::default()),
+                RuntimeOperationSource::DeadlineExceeded,
+            ),
             (
                 crate::cx::Budget::new().with_poll_quota(0),
                 RuntimeOperationSource::PollQuotaExhausted,
@@ -1739,6 +2035,28 @@ mod tests {
                 } if source == expected
             ));
         }
+    }
+
+    #[test]
+    fn restore_context_error_preserves_cancellation_cleanup_timeout() {
+        let cx = crate::cx::for_testing();
+        let error = crate::runtime_async::ContextError::new(
+            crate::runtime_async::ContextErrorKind::CancelTimeout,
+        )
+        .with_message("raw-cleanup-detail-canary");
+        let classified = restore_context_error(
+            &cx,
+            "restore_layout.test_cleanup_timeout",
+            &error,
+        );
+        assert!(matches!(
+            classified,
+            crate::Error::RuntimeOperation {
+                operation: "restore_layout.test_cleanup_timeout",
+                source: RuntimeOperationSource::CancellationCleanupTimedOut,
+            }
+        ));
+        assert!(!format!("{classified:?}").contains("raw-cleanup-detail-canary"));
     }
 
     #[test]
@@ -2058,9 +2376,12 @@ mod tests {
             let result = restorer.restore(&snapshot).await.unwrap();
 
             let active_first = mock.pane_state(result.pane_id_map[&1]).await.unwrap();
-            let inactive_second = mock.pane_state(result.pane_id_map[&3]).await.unwrap();
+            let active_second = mock.pane_state(result.pane_id_map[&3]).await.unwrap();
             assert!(active_first.is_active);
-            assert!(!inactive_second.is_active);
+            assert!(
+                active_second.is_active,
+                "each tab retains its own active-pane marker"
+            );
             assert_eq!(
                 *instrumented
                     .activation_attempts
@@ -2077,6 +2398,75 @@ mod tests {
                     .len(),
                 1,
                 "only the first tab needs a pane lookup to discover its new window id"
+            );
+        });
+    }
+
+    #[test]
+    fn fail_fast_later_tab_reactivates_already_restored_selected_tab() {
+        run_async_test(async {
+            let mock = Arc::new(MockWezterm::new());
+            let instrumented = Arc::new(InstrumentedWezterm::new(
+                mock.clone(),
+                true,
+                false,
+            ));
+            let restorer = LayoutRestorer::new(
+                instrumented.clone(),
+                RestoreConfig {
+                    continue_on_error: false,
+                    ..RestoreConfig::default()
+                },
+            );
+            let snapshot = TopologySnapshot {
+                schema_version: 1,
+                captured_at: 1_000,
+                workspace_id: None,
+                windows: vec![WindowSnapshot {
+                    window_id: 0,
+                    title: None,
+                    position: None,
+                    size: None,
+                    tabs: vec![
+                        TabSnapshot {
+                            tab_id: 0,
+                            title: None,
+                            pane_tree: leaf(1, None),
+                            active_pane_id: Some(1),
+                        },
+                        TabSnapshot {
+                            tab_id: 1,
+                            title: None,
+                            pane_tree: vsplit(vec![
+                                (0.5, leaf(2, None)),
+                                (0.5, leaf(3, None)),
+                            ]),
+                            active_pane_id: Some(2),
+                        },
+                    ],
+                    active_tab_index: Some(0),
+                }],
+            };
+
+            let result = restorer.restore(&snapshot).await.unwrap();
+
+            assert_eq!(result.windows_created, 1);
+            assert_eq!(result.tabs_created, 2);
+            assert_eq!(result.panes_created, 2);
+            assert_eq!(result.failed_panes, vec![(3, FAILURE_SPLIT.to_string())]);
+            assert_eq!(
+                *instrumented
+                    .activation_attempts
+                    .lock()
+                    .expect("activation-attempt lock poisoned"),
+                vec![result.pane_id_map[&1]],
+                "fail-fast must still restore focus to an already-created selected tab"
+            );
+            assert!(
+                mock.pane_state(result.pane_id_map[&1])
+                    .await
+                    .expect("selected pane exists")
+                    .is_active
             );
         });
     }
@@ -2177,6 +2567,10 @@ mod tests {
         assert!(split_percent(f64::NAN, 1.0).is_err());
         assert!(split_percent(1.0, 0.0).is_err());
         assert!(split_percent(2.0, 1.0).is_err());
+        assert_eq!(equal_split_percent(4).unwrap(), 25);
+        assert_eq!(equal_split_percent(3).unwrap(), 33);
+        assert_eq!(equal_split_percent(2).unwrap(), 50);
+        assert!(equal_split_percent(1).is_err());
     }
 
     #[test]
@@ -2440,6 +2834,7 @@ mod tests {
             for failure in [
                 InjectedMutationFailure::Indeterminate,
                 InjectedMutationFailure::DeadlineExceeded,
+                InjectedMutationFailure::ContextFailure,
                 InjectedMutationFailure::LockPoisoned,
             ] {
                 let inner = Arc::new(MockWezterm::new());
@@ -2472,6 +2867,13 @@ mod tests {
                             source: RuntimeOperationSource::DeadlineExceeded,
                         }
                     )),
+                    InjectedMutationFailure::ContextFailure => assert!(matches!(
+                        error,
+                        crate::Error::RuntimeOperation {
+                            operation: "restore_layout.test.split_pane_with_cx",
+                            source: RuntimeOperationSource::ContextFailure,
+                        }
+                    )),
                     InjectedMutationFailure::LockPoisoned => assert!(matches!(
                         error,
                         crate::Error::RuntimeOperation {
@@ -2490,6 +2892,43 @@ mod tests {
                     "the successful root spawn must remain visible after later failure"
                 );
             }
+        });
+    }
+
+    #[test]
+    fn typed_attempt_retains_partial_mapping_after_indeterminate_split() {
+        run_async_test(async {
+            let inner = Arc::new(MockWezterm::new());
+            let wezterm: WeztermHandle = Arc::new(
+                InstrumentedWezterm::with_split_failure(
+                    inner.clone(),
+                    InjectedMutationFailure::Indeterminate,
+                ),
+            );
+            let restorer = LayoutRestorer::new(wezterm, RestoreConfig::default());
+            let snapshot = single_tab_snapshot(vsplit(vec![
+                (0.5, leaf(1, None)),
+                (0.5, leaf(2, None)),
+            ]));
+            let cx = crate::cx::for_testing();
+
+            let attempt = restorer.restore_attempt_with_cx(&cx, &snapshot).await;
+            assert_eq!(attempt.result.windows_created, 1);
+            assert_eq!(attempt.result.tabs_created, 1);
+            assert_eq!(attempt.result.panes_created, 1);
+            assert_eq!(attempt.result.pane_id_map.len(), 1);
+            assert!(attempt.result.pane_id_map.contains_key(&1));
+            assert_eq!(
+                attempt.interruption,
+                Some(LayoutRestoreInterruption {
+                    phase: "restore_layout.test.split_pane_with_cx",
+                    reason: LayoutRestoreInterruptionReason::MuxOutcomeIndeterminate,
+                })
+            );
+            assert_eq!(inner.list_panes().await.unwrap().len(), 1);
+            let diagnostic = format!("{attempt:?}");
+            assert!(!diagnostic.contains("raw-"));
+            assert!(diagnostic.len() < 512);
         });
     }
 

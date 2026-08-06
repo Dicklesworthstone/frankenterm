@@ -2,13 +2,17 @@
 //!
 //! Captures WezTerm mux session topology (windows, tabs, pane split trees)
 //! into a versioned JSON format for storage in `mux_sessions.topology_json`.
-//! Supports reconstruction after crash/restart via split-tree inference from
-//! pane positions.
+//! Supports best-effort reconstruction after a crash via legacy heuristics over
+//! pane dimensions. `PaneInfo` can carry coordinates and the direct mux
+//! response carries an exact ordered tree, but the legacy builder below does
+//! not consume that authority after the response is flattened. Schema v1
+//! therefore cannot promise appearance fidelity.
 //!
 //! Schema v1 is a deterministic, pane-list-derived layout snapshot. It sorts
-//! numeric window/tab IDs and therefore does **not** preserve authoritative
-//! user tab order. Its `active_tab_index` is relative to that sorted vector,
-//! not a stable tab identity. Durable order/active-tab capture must use the
+//! numeric window/tab/pane IDs and therefore does **not** preserve authoritative
+//! user tab or pane order. The legacy builder leaves `active_tab_index` unknown because
+//! pane activity identifies the active pane within each tab, not the selected
+//! tab for the window. Durable order/active-tab capture must use the
 //! richer identity and authority contract in
 //! `docs/proposals/ft-7xqz4-8-10-1-tab-order-authority-contract.md`; the schema
 //! migration is owned by `ft-interactive-swarm-product-convergence-7xqz4.8.10.7`.
@@ -18,11 +22,12 @@
 //! ```text
 //! wezterm cli list (JSON) → Vec<PaneInfo> → TopologySnapshot → topology_json
 //!                                                ↑
-//!                              split-tree inference from pane positions
+//!                           legacy dimension-only split-tree heuristics
 //! ```
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::io::Write;
 use thiserror::Error;
 
 use crate::wezterm::PaneInfo;
@@ -53,6 +58,21 @@ pub const MAX_SNAPSHOT_BYTES: usize = 64 * 1024 * 1024;
 /// attack inputs.
 pub const MAX_PANE_TREE_DEPTH: usize = 32;
 
+/// Maximum windows accepted by the legacy pane-list checkpoint/restore schema.
+///
+/// These q4096 limits are an intentionally lower local admission envelope than
+/// the maximum future ordered-protocol ceilings. They prevent legacy restore
+/// from claiming a scale class that has no retained memory/latency proof.
+pub const MAX_TOPOLOGY_WINDOWS: usize = 4_096;
+/// Maximum tabs accepted across one legacy topology snapshot.
+pub const MAX_TOPOLOGY_TABS: usize = 4_096;
+/// Maximum pane leaves accepted across one legacy topology snapshot.
+pub const MAX_TOPOLOGY_PANES: usize = 4_096;
+/// Maximum split and leaf nodes accepted across one legacy topology snapshot.
+pub const MAX_TOPOLOGY_NODES: usize = 8_192;
+/// Maximum direct children accepted by one legacy split node.
+pub const MAX_SPLIT_FANOUT: usize = 4_096;
+
 /// Errors returned by `TopologySnapshot::from_json`. Distinguishes
 /// the DoS guards (TooLarge / TooDeep) from genuine parse errors so
 /// callers can log and alert without panicking.
@@ -65,6 +85,17 @@ pub enum TopologySnapshotError {
     /// ft-nrqf7 guard.
     #[error("topology pane-tree too deeply nested: depth {depth} (limit {limit})")]
     TooDeep { depth: usize, limit: usize },
+    /// A bounded topology resource exceeds its admission limit.
+    #[error("topology {resource} count exceeds limit: {count} (limit {limit})")]
+    ResourceLimit {
+        resource: &'static str,
+        count: usize,
+        limit: usize,
+    },
+    /// A topology is within numeric limits but cannot be restored faithfully
+    /// because its IDs, active markers, dimensions, or split shape conflict.
+    #[error("invalid topology structure: {reason}")]
+    InvalidStructure { reason: &'static str },
     /// Underlying serde_json parse error.
     #[error("invalid topology snapshot JSON: {0}")]
     Json(#[from] serde_json::Error),
@@ -152,6 +183,44 @@ pub struct CaptureReport {
     pub inference_quality: HashMap<u64, InferenceQuality>,
 }
 
+/// Counts the exact serialized size while retaining bytes only until the
+/// restore input cap is crossed. This avoids allocating an arbitrarily large
+/// intermediate string merely to discover that persistence must reject it.
+struct BoundedTopologyJsonWriter {
+    bytes: Vec<u8>,
+    serialized_bytes: usize,
+    limit: usize,
+    overflowed: bool,
+}
+
+impl BoundedTopologyJsonWriter {
+    fn new(limit: usize) -> Self {
+        Self {
+            bytes: Vec::new(),
+            serialized_bytes: 0,
+            limit,
+            overflowed: false,
+        }
+    }
+}
+
+impl Write for BoundedTopologyJsonWriter {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        self.serialized_bytes = self.serialized_bytes.saturating_add(buffer.len());
+        if !self.overflowed && self.serialized_bytes <= self.limit {
+            self.bytes.extend_from_slice(buffer);
+        } else if !self.overflowed {
+            self.overflowed = true;
+            self.bytes.clear();
+        }
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 // =============================================================================
 // Capture / construction
 // =============================================================================
@@ -160,11 +229,20 @@ impl TopologySnapshot {
     /// Build a `TopologySnapshot` from a list of panes.
     ///
     /// Groups panes by window and tab, then infers split structure within
-    /// each tab from pane sizes. This legacy builder sorts numeric IDs for
+    /// each tab from pane sizes. This legacy builder sorts window, tab, and
+    /// pane IDs for
     /// reproducibility; it is not an authoritative user-tab-order capture.
     #[must_use]
     pub fn from_panes(panes: &[PaneInfo], captured_at: u64) -> (Self, CaptureReport) {
-        let workspace_id = panes.first().and_then(|p| p.workspace.clone());
+        let first_workspace = panes.first().and_then(|pane| pane.workspace.as_deref());
+        let workspace_id = if panes
+            .iter()
+            .all(|pane| pane.workspace.as_deref() == first_workspace)
+        {
+            first_workspace.map(str::to_owned)
+        } else {
+            None
+        };
 
         // Group panes by (window_id, tab_id)
         let mut windows_map: HashMap<u64, HashMap<u64, Vec<&PaneInfo>>> = HashMap::new();
@@ -185,35 +263,39 @@ impl TopologySnapshot {
         window_ids.sort_unstable();
 
         for window_id in window_ids {
-            let tabs_map = &windows_map[&window_id];
+            let mut tabs_map = windows_map
+                .remove(&window_id)
+                .expect("window id came from the same grouping map");
             let mut tabs = Vec::new();
 
             let mut tab_ids: Vec<u64> = tabs_map.keys().copied().collect();
             tab_ids.sort_unstable();
 
             for tab_id in tab_ids {
-                let tab_panes = &tabs_map[&tab_id];
-                let (pane_tree, quality) = infer_split_tree(tab_panes);
+                // Pane enumeration order is not a visual-order authority. Use
+                // a stable source-ID order so the same pane set cannot produce
+                // a different topology hash and redundant checkpoint merely
+                // because a backend returned its list in another order.
+                let mut tab_panes = tabs_map
+                    .remove(&tab_id)
+                    .expect("tab id came from the same grouping map");
+                tab_panes.sort_unstable_by_key(|pane| pane.pane_id);
+                let (pane_tree, quality) = infer_split_tree(&tab_panes);
                 inference_quality.insert(tab_id, quality);
 
                 let active_pane_id = tab_panes.iter().find(|p| p.is_active).map(|p| p.pane_id);
 
-                let title = tab_panes
-                    .iter()
-                    .find(|p| p.is_active)
-                    .and_then(|p| p.title.clone());
-
                 tabs.push(TabSnapshot {
                     tab_id,
-                    title,
+                    // `PaneInfo::title` is pane/application title, not tab-title
+                    // authority. The flattened legacy surface cannot persist an
+                    // authoritative tab title.
+                    title: None,
                     pane_tree,
                     active_pane_id,
                 });
                 total_tabs += 1;
             }
-
-            // Find active tab (the one containing the active pane)
-            let active_tab_index = tabs.iter().position(|t| t.active_pane_id.is_some());
 
             windows.push(WindowSnapshot {
                 window_id,
@@ -221,7 +303,10 @@ impl TopologySnapshot {
                 position: None,
                 size: None,
                 tabs,
-                active_tab_index,
+                // `PaneInfo::is_active` is per-tab active-pane authority. It
+                // cannot identify the selected tab for this window, so the
+                // legacy pane-list builder must not manufacture that state.
+                active_tab_index: None,
             });
         }
 
@@ -261,24 +346,54 @@ impl TopologySnapshot {
         serde_json::to_string(self)
     }
 
+    /// Validate and serialize a topology for durable snapshot persistence.
+    ///
+    /// Unlike [`Self::to_json`], this writer fails closed on restore-invalid
+    /// structure and never retains more than [`MAX_SNAPSHOT_BYTES`] of output.
+    /// Derived topology structs contain no map-valued fields, so serde's stable
+    /// declaration/sequence order is already the canonical persisted order.
+    pub(crate) fn to_persistence_json(&self) -> Result<String, TopologySnapshotError> {
+        self.validate_persistence_semantics()?;
+        let mut writer = BoundedTopologyJsonWriter::new(MAX_SNAPSHOT_BYTES);
+        serde_json::to_writer(&mut writer, self)?;
+        if writer.overflowed {
+            return Err(TopologySnapshotError::TooLarge {
+                bytes: writer.serialized_bytes,
+                limit: MAX_SNAPSHOT_BYTES,
+            });
+        }
+        String::from_utf8(writer.bytes).map_err(|_error| {
+            TopologySnapshotError::InvalidStructure {
+                reason: "topology serializer emitted non-UTF-8 JSON",
+            }
+        })
+    }
+
     /// Deserialize a topology snapshot from JSON.
     ///
-    /// ft-nrqf7: enforces two DoS guards before returning a snapshot:
+    /// ft-nrqf7: enforces bounded-input and bounded-topology guards before
+    /// returning a snapshot:
     ///
     /// * Total input bytes ≤ `MAX_SNAPSHOT_BYTES` (64 MB). A crafted
     ///   `.ft/snapshots/<session>.json` larger than this is rejected
     ///   without invoking serde_json, so the recorder cannot be
     ///   memory-exhausted by simply handing it a multi-gigabyte file.
-    /// * `PaneNode` recursion depth ≤ `MAX_PANE_TREE_DEPTH` (64).
+    /// * `PaneNode` recursion depth ≤ [`MAX_PANE_TREE_DEPTH`].
     ///   `serde_json`'s built-in 128-level recursion limit prevents
     ///   stack overflow during parsing; the post-parse walk catches
     ///   inputs that satisfy the parser's stack guard but still
     ///   represent pathological non-real input.
+    /// * Window, tab, pane, total-node, and split-fanout counts stay within
+    ///   the public admission constants. These post-parse limits prevent a
+    ///   shallow but extremely wide snapshot from amplifying into restore
+    ///   maps, failure ledgers, and mux mutations.
     ///
     /// # Errors
     /// Returns [`TopologySnapshotError::TooLarge`] if the input exceeds
     /// the byte cap, [`TopologySnapshotError::TooDeep`] if the parsed
-    /// `pane_tree` exceeds the depth cap, or
+    /// `pane_tree` exceeds the depth cap,
+    /// [`TopologySnapshotError::ResourceLimit`] if a topology count exceeds
+    /// its admission limit, or
     /// [`TopologySnapshotError::Json`] for ordinary parse errors.
     pub fn from_json(json: &str) -> Result<Self, TopologySnapshotError> {
         if json.len() > MAX_SNAPSHOT_BYTES {
@@ -290,40 +405,256 @@ impl TopologySnapshot {
 
         let snapshot: Self = serde_json::from_str(json)?;
 
-        // Post-parse walk: serde_json guards the parser stack but does
-        // not enforce a domain-specific nesting bound on PaneNode.
-        for window in &snapshot.windows {
+        snapshot.validate_resource_limits()?;
+
+        Ok(snapshot)
+    }
+
+    /// Validate topology resource bounds without recursion.
+    ///
+    /// Layout restoration invokes this for programmatically constructed
+    /// snapshots as well as snapshots parsed through [`Self::from_json`], so
+    /// bypassing JSON cannot bypass admission.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TopologySnapshotError::TooDeep`] when a pane tree exceeds the
+    /// depth limit, or [`TopologySnapshotError::ResourceLimit`] when a window,
+    /// tab, pane, node, or split-fanout count exceeds its legacy admission cap.
+    pub fn validate_resource_limits(&self) -> Result<(), TopologySnapshotError> {
+        if self.windows.len() > MAX_TOPOLOGY_WINDOWS {
+            return Err(TopologySnapshotError::ResourceLimit {
+                resource: "windows",
+                count: self.windows.len(),
+                limit: MAX_TOPOLOGY_WINDOWS,
+            });
+        }
+
+        let mut tab_count = 0_usize;
+        let mut pane_count = 0_usize;
+        let mut node_count = 0_usize;
+        let mut stack = Vec::new();
+
+        for window in &self.windows {
+            tab_count = tab_count.saturating_add(window.tabs.len());
+            if tab_count > MAX_TOPOLOGY_TABS {
+                return Err(TopologySnapshotError::ResourceLimit {
+                    resource: "tabs",
+                    count: tab_count,
+                    limit: MAX_TOPOLOGY_TABS,
+                });
+            }
+
             for tab in &window.tabs {
-                let depth = tab.pane_tree.depth();
-                if depth > MAX_PANE_TREE_DEPTH {
-                    return Err(TopologySnapshotError::TooDeep {
-                        depth,
-                        limit: MAX_PANE_TREE_DEPTH,
+                stack.push((&tab.pane_tree, 1_usize));
+                while let Some((node, depth)) = stack.pop() {
+                    if depth > MAX_PANE_TREE_DEPTH {
+                        return Err(TopologySnapshotError::TooDeep {
+                            depth,
+                            limit: MAX_PANE_TREE_DEPTH,
+                        });
+                    }
+
+                    node_count = node_count.saturating_add(1);
+                    if node_count > MAX_TOPOLOGY_NODES {
+                        return Err(TopologySnapshotError::ResourceLimit {
+                            resource: "nodes",
+                            count: node_count,
+                            limit: MAX_TOPOLOGY_NODES,
+                        });
+                    }
+
+                    match node {
+                        PaneNode::Leaf { .. } => {
+                            pane_count = pane_count.saturating_add(1);
+                            if pane_count > MAX_TOPOLOGY_PANES {
+                                return Err(TopologySnapshotError::ResourceLimit {
+                                    resource: "panes",
+                                    count: pane_count,
+                                    limit: MAX_TOPOLOGY_PANES,
+                                });
+                            }
+                        }
+                        PaneNode::HSplit { children } | PaneNode::VSplit { children } => {
+                            if children.len() > MAX_SPLIT_FANOUT {
+                                return Err(TopologySnapshotError::ResourceLimit {
+                                    resource: "split_fanout",
+                                    count: children.len(),
+                                    limit: MAX_SPLIT_FANOUT,
+                                });
+                            }
+                            for (_, child) in children.iter().rev() {
+                                stack.push((child, depth.saturating_add(1)));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Validate semantics required for a newly persisted topology to remain
+    /// admissible to the layout restorer.
+    ///
+    /// Empty whole-session snapshots remain valid shutdown evidence. Any
+    /// represented window/tab/tree, however, must have unique identities,
+    /// valid focus markers, positive leaf dimensions, and real split nodes.
+    ///
+    /// # Errors
+    ///
+    /// Returns the resource error from [`Self::validate_resource_limits`] or a
+    /// finite [`TopologySnapshotError::InvalidStructure`] classification.
+    pub fn validate_persistence_semantics(&self) -> Result<(), TopologySnapshotError> {
+        self.validate_resource_limits()?;
+        if self.schema_version != TOPOLOGY_SCHEMA_VERSION {
+            return Err(TopologySnapshotError::InvalidStructure {
+                reason: "unsupported topology schema version",
+            });
+        }
+
+        let mut seen_window_ids = HashSet::with_capacity(self.windows.len());
+        let mut seen_tab_ids = HashSet::new();
+        let mut seen_pane_ids = HashSet::new();
+        let mut stack = Vec::new();
+
+        for window in &self.windows {
+            if !seen_window_ids.insert(window.window_id) {
+                return Err(TopologySnapshotError::InvalidStructure {
+                    reason: "duplicate window id",
+                });
+            }
+            if window.tabs.is_empty() {
+                return Err(TopologySnapshotError::InvalidStructure {
+                    reason: "window contains no tabs",
+                });
+            }
+            if window
+                .active_tab_index
+                .is_some_and(|index| index >= window.tabs.len())
+            {
+                return Err(TopologySnapshotError::InvalidStructure {
+                    reason: "active tab index is outside its window",
+                });
+            }
+
+            for tab in &window.tabs {
+                if !seen_tab_ids.insert(tab.tab_id) {
+                    return Err(TopologySnapshotError::InvalidStructure {
+                        reason: "duplicate tab id",
+                    });
+                }
+
+                let mut active_leaf_id = None;
+                let mut explicit_active_found = tab.active_pane_id.is_none();
+                stack.push(&tab.pane_tree);
+                while let Some(node) = stack.pop() {
+                    match node {
+                        PaneNode::Leaf {
+                            pane_id,
+                            rows,
+                            cols,
+                            is_active,
+                            ..
+                        } => {
+                            if *rows == 0 || *cols == 0 {
+                                return Err(TopologySnapshotError::InvalidStructure {
+                                    reason: "pane has zero terminal dimensions",
+                                });
+                            }
+                            if !seen_pane_ids.insert(*pane_id) {
+                                return Err(TopologySnapshotError::InvalidStructure {
+                                    reason: "duplicate pane id",
+                                });
+                            }
+                            if tab.active_pane_id == Some(*pane_id) {
+                                explicit_active_found = true;
+                            }
+                            if *is_active && active_leaf_id.replace(*pane_id).is_some() {
+                                return Err(TopologySnapshotError::InvalidStructure {
+                                    reason: "tab contains multiple active pane markers",
+                                });
+                            }
+                        }
+                        PaneNode::HSplit { children } | PaneNode::VSplit { children } => {
+                            if children.len() < 2 {
+                                return Err(TopologySnapshotError::InvalidStructure {
+                                    reason: "split node has fewer than two children",
+                                });
+                            }
+                            for (ratio, child) in children.iter().rev() {
+                                if !ratio.is_finite() || *ratio <= 0.0 {
+                                    return Err(TopologySnapshotError::InvalidStructure {
+                                        reason: "split ratio is non-positive or non-finite",
+                                    });
+                                }
+                                stack.push(child);
+                            }
+                        }
+                    }
+                }
+
+                if !explicit_active_found {
+                    return Err(TopologySnapshotError::InvalidStructure {
+                        reason: "active pane id is outside its tab",
+                    });
+                }
+                if matches!(
+                    (tab.active_pane_id, active_leaf_id),
+                    (Some(explicit), Some(marked)) if explicit != marked
+                ) {
+                    return Err(TopologySnapshotError::InvalidStructure {
+                        reason: "active pane id contradicts the active pane marker",
                     });
                 }
             }
         }
 
-        Ok(snapshot)
+        Ok(())
     }
 
     /// Count total panes across all windows and tabs.
     #[must_use]
     pub fn pane_count(&self) -> usize {
-        self.windows
-            .iter()
-            .flat_map(|w| &w.tabs)
-            .map(|t| t.pane_tree.pane_count())
-            .sum()
+        let mut count = 0_usize;
+        let mut stack = Vec::new();
+        for window in self.windows.iter().rev() {
+            for tab in window.tabs.iter().rev() {
+                stack.push(&tab.pane_tree);
+            }
+        }
+        while let Some(node) = stack.pop() {
+            match node {
+                PaneNode::Leaf { .. } => count = count.saturating_add(1),
+                PaneNode::HSplit { children } | PaneNode::VSplit { children } => {
+                    for (_, child) in children.iter().rev() {
+                        stack.push(child);
+                    }
+                }
+            }
+        }
+        count
     }
 
     /// Collect all pane IDs in the snapshot.
     #[must_use]
     pub fn pane_ids(&self) -> Vec<u64> {
         let mut ids = Vec::new();
-        for window in &self.windows {
-            for tab in &window.tabs {
-                tab.pane_tree.collect_pane_ids(&mut ids);
+        let mut stack = Vec::new();
+        for window in self.windows.iter().rev() {
+            for tab in window.tabs.iter().rev() {
+                stack.push(&tab.pane_tree);
+            }
+        }
+        while let Some(node) = stack.pop() {
+            match node {
+                PaneNode::Leaf { pane_id, .. } => ids.push(*pane_id),
+                PaneNode::HSplit { children } | PaneNode::VSplit { children } => {
+                    for (_, child) in children.iter().rev() {
+                        stack.push(child);
+                    }
+                }
             }
         }
         ids
@@ -334,21 +665,29 @@ impl PaneNode {
     /// Count panes in this subtree.
     #[must_use]
     pub fn pane_count(&self) -> usize {
-        match self {
-            Self::Leaf { .. } => 1,
-            Self::HSplit { children } | Self::VSplit { children } => {
-                children.iter().map(|(_, child)| child.pane_count()).sum()
+        let mut count = 0_usize;
+        let mut stack = vec![self];
+        while let Some(node) = stack.pop() {
+            match node {
+                Self::Leaf { .. } => count = count.saturating_add(1),
+                Self::HSplit { children } | Self::VSplit { children } => {
+                    stack.extend(children.iter().map(|(_, child)| child));
+                }
             }
         }
+        count
     }
 
     /// Collect all pane IDs in this subtree.
     pub fn collect_pane_ids(&self, out: &mut Vec<u64>) {
-        match self {
-            Self::Leaf { pane_id, .. } => out.push(*pane_id),
-            Self::HSplit { children } | Self::VSplit { children } => {
-                for (_, child) in children {
-                    child.collect_pane_ids(out);
+        let mut stack = vec![self];
+        while let Some(node) = stack.pop() {
+            match node {
+                Self::Leaf { pane_id, .. } => out.push(*pane_id),
+                Self::HSplit { children } | Self::VSplit { children } => {
+                    for (_, child) in children.iter().rev() {
+                        stack.push(child);
+                    }
                 }
             }
         }
@@ -386,51 +725,50 @@ impl PaneNode {
 // =============================================================================
 
 /// Internal representation of pane geometry for split inference.
-#[derive(Debug, Clone)]
-struct PaneGeometry {
-    pane_id: u64,
+#[derive(Debug, Clone, Copy)]
+struct PaneGeometry<'a> {
+    pane: &'a PaneInfo,
     rows: u16,
     cols: u16,
-    cwd: Option<String>,
-    title: Option<String>,
-    is_active: bool,
 }
 
-impl PaneGeometry {
-    fn from_pane_info(p: &PaneInfo) -> Self {
+impl<'a> PaneGeometry<'a> {
+    fn from_pane_info(pane: &'a PaneInfo) -> Self {
         Self {
-            pane_id: p.pane_id,
-            rows: p.effective_rows() as u16,
-            cols: p.effective_cols() as u16,
-            cwd: p.cwd.clone(),
-            title: p.title.clone(),
-            is_active: p.is_active,
+            pane,
+            rows: schema_v1_dimension(pane.effective_rows()),
+            cols: schema_v1_dimension(pane.effective_cols()),
         }
     }
 
     fn to_leaf(&self) -> PaneNode {
         PaneNode::Leaf {
-            pane_id: self.pane_id,
+            pane_id: self.pane.pane_id,
             rows: self.rows,
             cols: self.cols,
-            cwd: self.cwd.clone(),
-            title: self.title.clone(),
-            is_active: self.is_active,
+            cwd: self.pane.cwd.clone(),
+            title: self.pane.title.clone(),
+            is_active: self.pane.is_active,
         }
     }
+}
+
+fn schema_v1_dimension(value: u32) -> u16 {
+    u16::try_from(value).unwrap_or(u16::MAX)
 }
 
 /// Infer split tree structure from a set of panes within a single tab.
 ///
 /// Strategy:
 /// 1. Single pane → Leaf node.
-/// 2. Two panes → detect HSplit (same cols) or VSplit (same rows).
-/// 3. Multiple panes → group by common dimensions, recurse.
-/// 4. If inference fails, fall back to flat HSplit layout.
+/// 2. Multiple panes with one common dimension → one flat split.
+/// 3. Equal or mixed dimensions without coordinates → deterministic flat
+///    fallback, explicitly marked non-authoritative.
 fn infer_split_tree(panes: &[&PaneInfo]) -> (PaneNode, InferenceQuality) {
-    let geometries: Vec<PaneGeometry> = panes
+    let geometries: Vec<PaneGeometry<'_>> = panes
         .iter()
-        .map(|p| PaneGeometry::from_pane_info(p))
+        .copied()
+        .map(PaneGeometry::from_pane_info)
         .collect();
 
     match geometries.len() {
@@ -450,15 +788,14 @@ fn infer_split_tree(panes: &[&PaneInfo]) -> (PaneNode, InferenceQuality) {
             let g = &geometries[0];
             (g.to_leaf(), InferenceQuality::Inferred)
         }
-        _ => infer_split_recursive(&geometries),
+        _ => infer_flat_split(&geometries),
     }
 }
 
-/// Recursive split inference.
-///
-/// Checks if all panes share the same column count (→ HSplit) or row count
-/// (→ VSplit). If neither, falls back to a flat HSplit.
-fn infer_split_recursive(geometries: &[PaneGeometry]) -> (PaneNode, InferenceQuality) {
+/// Uses common dimensions as a two-pane orientation hint. With more than two
+/// panes the same dimensions cannot prove grouping or order, so the produced
+/// flat tree is always marked as fallback even when an orientation is chosen.
+fn infer_flat_split(geometries: &[PaneGeometry<'_>]) -> (PaneNode, InferenceQuality) {
     if geometries.len() == 1 {
         return (geometries[0].to_leaf(), InferenceQuality::Inferred);
     }
@@ -480,7 +817,10 @@ fn infer_split_recursive(geometries: &[PaneGeometry]) -> (PaneNode, InferenceQua
                 (proportion, g.to_leaf())
             })
             .collect();
-        (PaneNode::HSplit { children }, InferenceQuality::Inferred)
+        // Dimensions hint at orientation and ratios, but not which pane is
+        // topmost. Canonical pane-ID order is deterministic, not visual-order
+        // authority, so every multi-pane legacy tree remains a fallback.
+        (PaneNode::HSplit { children }, InferenceQuality::FlatFallback)
     } else if all_same_rows && !all_same_cols {
         // Vertical split: same height, different widths → side by side
         let total_cols: f64 = geometries.iter().map(|g| f64::from(g.cols)).sum();
@@ -495,25 +835,26 @@ fn infer_split_recursive(geometries: &[PaneGeometry]) -> (PaneNode, InferenceQua
                 (proportion, g.to_leaf())
             })
             .collect();
-        (PaneNode::VSplit { children }, InferenceQuality::Inferred)
+        // Dimensions hint at orientation and ratios, but not which pane is
+        // leftmost. Canonical pane-ID order is deterministic, not visual-order
+        // authority, so every multi-pane legacy tree remains a fallback.
+        (PaneNode::VSplit { children }, InferenceQuality::FlatFallback)
     } else if all_same_cols && all_same_rows {
-        // All panes same size — cannot determine split direction.
-        // Default to VSplit (side-by-side).
+        // Equal dimensions carry no split-direction authority. Preserve the
+        // canonical pane-ID order, but mark the arbitrary
+        // flat orientation as fallback rather than inferred truth.
         let n = geometries.len() as f64;
         let children: Vec<(f64, PaneNode)> =
             geometries.iter().map(|g| (1.0 / n, g.to_leaf())).collect();
-        (PaneNode::VSplit { children }, InferenceQuality::Inferred)
+        (
+            PaneNode::VSplit { children },
+            InferenceQuality::FlatFallback,
+        )
     } else {
-        // Mixed dimensions — try grouping by cols (VSplit of HSplit groups)
-        if let Some(node) = try_group_by_cols(geometries) {
-            return (node, InferenceQuality::Inferred);
-        }
-
-        // Fall back to flat HSplit
-        tracing::warn!(
-            pane_count = geometries.len(),
-            "Could not infer split structure, falling back to flat layout"
-        );
+        // This legacy dimension-only heuristic does not consume PaneInfo
+        // coordinates. Mixed dimensions therefore cannot establish grouping,
+        // orientation, or visual order here. Do not sort panes by width and
+        // present that manufactured tree as inferred authority.
         let n = geometries.len() as f64;
         let children: Vec<(f64, PaneNode)> =
             geometries.iter().map(|g| (1.0 / n, g.to_leaf())).collect();
@@ -522,67 +863,6 @@ fn infer_split_recursive(geometries: &[PaneGeometry]) -> (PaneNode, InferenceQua
             InferenceQuality::FlatFallback,
         )
     }
-}
-
-/// Try to group panes by column count (for a VSplit of HSplit groups).
-///
-/// This handles common layouts like a 2x2 grid where the top-left and
-/// bottom-left have the same cols, and top-right and bottom-right have
-/// the same cols (but different from left).
-fn try_group_by_cols(geometries: &[PaneGeometry]) -> Option<PaneNode> {
-    let mut groups: HashMap<u16, Vec<&PaneGeometry>> = HashMap::new();
-    for g in geometries {
-        groups.entry(g.cols).or_default().push(g);
-    }
-
-    // Need at least 2 groups for this to be meaningful
-    if groups.len() < 2 {
-        return None;
-    }
-
-    let mut col_groups: Vec<(u16, Vec<&PaneGeometry>)> = groups.into_iter().collect();
-    col_groups.sort_by_key(|(cols, _)| *cols);
-
-    let total_cols: f64 = col_groups
-        .iter()
-        .map(|(_, group)| f64::from(group[0].cols))
-        .sum();
-
-    let children: Vec<(f64, PaneNode)> = col_groups
-        .iter()
-        .map(|(_, group)| {
-            let proportion = if total_cols > 0.0 {
-                f64::from(group[0].cols) / total_cols
-            } else {
-                1.0 / col_groups.len() as f64
-            };
-
-            let child = if group.len() == 1 {
-                group[0].to_leaf()
-            } else {
-                // Sub-group: vertical stack (HSplit)
-                let total_rows: f64 = group.iter().map(|g| f64::from(g.rows)).sum();
-                let sub_children: Vec<(f64, PaneNode)> = group
-                    .iter()
-                    .map(|g| {
-                        let sub_prop = if total_rows > 0.0 {
-                            f64::from(g.rows) / total_rows
-                        } else {
-                            1.0 / group.len() as f64
-                        };
-                        (sub_prop, g.to_leaf())
-                    })
-                    .collect();
-                PaneNode::HSplit {
-                    children: sub_children,
-                }
-            };
-
-            (proportion, child)
-        })
-        .collect();
-
-    Some(PaneNode::VSplit { children })
 }
 
 // =============================================================================
@@ -640,8 +920,8 @@ pub fn match_panes(old_snapshot: &TopologySnapshot, new_panes: &[PaneInfo]) -> P
                 if title_match {
                     score += 1;
                 }
-                let size_match = old_leaf.rows == new_pane.effective_rows() as u16
-                    && old_leaf.cols == new_pane.effective_cols() as u16;
+                let size_match = old_leaf.rows == schema_v1_dimension(new_pane.effective_rows())
+                    && old_leaf.cols == schema_v1_dimension(new_pane.effective_cols());
                 if size_match {
                     score += 1;
                 }
@@ -1882,21 +2162,15 @@ mod tests {
         // Same cols (80), different rows → HSplit
         let panes = [
             make_pane(0, 0, 0, 12, 80, None, None, true),
-            make_pane(1, 0, 0, 12, 80, None, None, false),
+            make_pane(1, 0, 0, 20, 80, None, None, false),
         ];
         let refs: Vec<&PaneInfo> = panes.iter().collect();
         let (tree, quality) = infer_split_tree(&refs);
 
-        assert_eq!(quality, InferenceQuality::Inferred);
+        assert_eq!(quality, InferenceQuality::FlatFallback);
         match &tree {
-            PaneNode::VSplit { children } => {
-                // Same rows AND same cols → defaults to VSplit
-                assert_eq!(children.len(), 2);
-            }
-            PaneNode::HSplit { children } => {
-                assert_eq!(children.len(), 2);
-            }
-            PaneNode::Leaf { .. } => panic!("Expected split, got leaf"),
+            PaneNode::HSplit { children } => assert_eq!(children.len(), 2),
+            _ => panic!("Expected HSplit"),
         }
     }
 
@@ -1905,12 +2179,12 @@ mod tests {
         // Same rows (24), different cols → VSplit
         let panes = [
             make_pane(0, 0, 0, 24, 40, None, None, true),
-            make_pane(1, 0, 0, 24, 40, None, None, false),
+            make_pane(1, 0, 0, 24, 60, None, None, false),
         ];
         let refs: Vec<&PaneInfo> = panes.iter().collect();
         let (tree, quality) = infer_split_tree(&refs);
 
-        assert_eq!(quality, InferenceQuality::Inferred);
+        assert_eq!(quality, InferenceQuality::FlatFallback);
         match &tree {
             PaneNode::VSplit { children } => {
                 assert_eq!(children.len(), 2);
@@ -1929,10 +2203,8 @@ mod tests {
         let refs: Vec<&PaneInfo> = panes.iter().collect();
         let (tree, quality) = infer_split_tree(&refs);
 
-        // Should try grouping, but with only 1 pane per column group,
-        // it's still a valid inference (VSplit from group_by_cols)
         assert_eq!(tree.pane_count(), 2);
-        assert!(quality == InferenceQuality::Inferred || quality == InferenceQuality::FlatFallback);
+        assert_eq!(quality, InferenceQuality::FlatFallback);
     }
 
     // -------------------------------------------------------------------------
@@ -2307,15 +2579,77 @@ mod tests {
     }
 
     #[test]
-    fn from_panes_active_tab_index_points_to_active_pane() {
+    fn from_panes_mixed_workspaces_are_unknown_and_order_independent() {
+        let mut first = make_pane(9, 0, 0, 24, 80, None, None, true);
+        first.workspace = Some("workspace-b".to_string());
+        let mut second = make_pane(2, 1, 0, 24, 80, None, None, true);
+        second.workspace = Some("workspace-a".to_string());
+
+        let (forward, _) = TopologySnapshot::from_panes(&[first.clone(), second.clone()], 1_000);
+        let (reversed, _) = TopologySnapshot::from_panes(&[second, first], 1_000);
+
+        assert!(forward.workspace_id.is_none());
+        assert_eq!(forward, reversed);
+    }
+
+    #[test]
+    fn from_panes_does_not_invent_selected_tab_from_per_tab_activity() {
         let panes = vec![
-            make_pane(0, 0, 0, 24, 80, None, None, false),
+            make_pane(0, 0, 0, 24, 80, None, None, true),
             make_pane(1, 1, 0, 24, 80, None, None, true),
         ];
         let (snapshot, _) = TopologySnapshot::from_panes(&panes, 1000);
         assert_eq!(snapshot.windows.len(), 1);
-        // Tab 1 (index 1) has the active pane
-        assert_eq!(snapshot.windows[0].active_tab_index, Some(1));
+        assert!(snapshot.windows[0].active_tab_index.is_none());
+        assert_eq!(snapshot.windows[0].tabs[0].active_pane_id, Some(0));
+        assert_eq!(snapshot.windows[0].tabs[1].active_pane_id, Some(1));
+    }
+
+    #[test]
+    fn from_panes_same_tab_permutations_produce_identical_topology() {
+        let panes = vec![
+            make_pane(9, 4, 2, 24, 80, Some("/nine"), Some("nine"), false),
+            make_pane(2, 4, 2, 24, 80, Some("/two"), Some("two"), false),
+            make_pane(7, 4, 2, 24, 80, Some("/seven"), Some("seven"), true),
+        ];
+        let permuted = vec![panes[2].clone(), panes[0].clone(), panes[1].clone()];
+
+        let (first, first_report) = TopologySnapshot::from_panes(&panes, 1_000);
+        let (second, second_report) = TopologySnapshot::from_panes(&permuted, 1_000);
+
+        assert_eq!(first, second);
+        assert_eq!(
+            first.to_json().expect("serialize first topology"),
+            second.to_json().expect("serialize permuted topology")
+        );
+        assert_eq!(
+            first_report.inference_quality,
+            second_report.inference_quality
+        );
+        assert_eq!(
+            first_report.inference_quality.get(&2),
+            Some(&InferenceQuality::FlatFallback)
+        );
+    }
+
+    #[test]
+    fn schema_v1_dimensions_saturate_instead_of_wrapping() {
+        let pane = make_pane(
+            0,
+            0,
+            0,
+            u32::from(u16::MAX) + 1,
+            u32::MAX,
+            None,
+            None,
+            true,
+        );
+        let (snapshot, _) = TopologySnapshot::from_panes(&[pane], 1000);
+        let PaneNode::Leaf { rows, cols, .. } = snapshot.windows[0].tabs[0].pane_tree else {
+            panic!("one pane must produce one leaf");
+        };
+        assert_eq!(rows, u16::MAX);
+        assert_eq!(cols, u16::MAX);
     }
 
     #[test]
@@ -2327,16 +2661,13 @@ mod tests {
     }
 
     #[test]
-    fn from_panes_tab_title_from_active_pane() {
+    fn from_panes_does_not_mislabel_active_pane_title_as_tab_title() {
         let panes = vec![
             make_pane(0, 0, 0, 24, 80, None, Some("inactive"), false),
             make_pane(1, 0, 0, 24, 80, None, Some("active-title"), true),
         ];
         let (snapshot, _) = TopologySnapshot::from_panes(&panes, 1000);
-        assert_eq!(
-            snapshot.windows[0].tabs[0].title.as_deref(),
-            Some("active-title")
-        );
+        assert!(snapshot.windows[0].tabs[0].title.is_none());
     }
 
     // ── split inference extras ─────────────────────────────────────────
@@ -2346,7 +2677,7 @@ mod tests {
         let panes = [make_pane(1, 0, 0, 24, 80, None, None, true)];
         let refs: Vec<&PaneInfo> = panes.iter().collect();
         let (tree, quality) = infer_split_tree(&refs);
-        assert_eq!(quality, InferenceQuality::Inferred);
+        assert_eq!(quality, InferenceQuality::FlatFallback);
         assert!(matches!(tree, PaneNode::Leaf { pane_id: 1, .. }));
     }
 
@@ -2358,7 +2689,7 @@ mod tests {
         ];
         let refs: Vec<&PaneInfo> = panes.iter().collect();
         let (tree, quality) = infer_split_tree(&refs);
-        assert_eq!(quality, InferenceQuality::Inferred);
+        assert_eq!(quality, InferenceQuality::FlatFallback);
         match tree {
             PaneNode::HSplit { children } => {
                 assert_eq!(children.len(), 2);
@@ -3398,6 +3729,151 @@ mod tests {
     }
 
     #[test]
+    fn from_json_rejects_shallow_split_above_fanout_cap() {
+        let children = (0..=MAX_SPLIT_FANOUT)
+            .map(|pane_id| {
+                (
+                    1.0,
+                    PaneNode::Leaf {
+                        pane_id: u64::try_from(pane_id).expect("test pane id fits u64"),
+                        rows: 24,
+                        cols: 80,
+                        cwd: None,
+                        title: None,
+                        is_active: pane_id == 0,
+                    },
+                )
+            })
+            .collect();
+        let snapshot = TopologySnapshot {
+            schema_version: TOPOLOGY_SCHEMA_VERSION,
+            captured_at: 1_000,
+            workspace_id: None,
+            windows: vec![WindowSnapshot {
+                window_id: 1,
+                title: None,
+                position: None,
+                size: None,
+                tabs: vec![TabSnapshot {
+                    tab_id: 1,
+                    title: None,
+                    pane_tree: PaneNode::VSplit { children },
+                    active_pane_id: Some(0),
+                }],
+                active_tab_index: None,
+            }],
+        };
+        let json = snapshot.to_json().expect("serialize wide topology");
+
+        let error = TopologySnapshot::from_json(&json)
+            .expect_err("wide split must fail bounded topology admission");
+        assert!(matches!(
+            error,
+            TopologySnapshotError::ResourceLimit {
+                resource: "split_fanout",
+                count,
+                limit: MAX_SPLIT_FANOUT,
+            } if count == MAX_SPLIT_FANOUT + 1
+        ));
+    }
+
+    #[test]
+    fn programmatic_topology_rejects_total_panes_above_cap() {
+        let leaf = |pane_id: usize| PaneNode::Leaf {
+            pane_id: u64::try_from(pane_id).expect("test pane id fits u64"),
+            rows: 24,
+            cols: 80,
+            cwd: None,
+            title: None,
+            is_active: pane_id == 0,
+        };
+        let first_children = (0..MAX_TOPOLOGY_PANES)
+            .map(|pane_id| (1.0, leaf(pane_id)))
+            .collect();
+        let snapshot = TopologySnapshot {
+            schema_version: TOPOLOGY_SCHEMA_VERSION,
+            captured_at: 1_000,
+            workspace_id: None,
+            windows: vec![WindowSnapshot {
+                window_id: 1,
+                title: None,
+                position: None,
+                size: None,
+                tabs: vec![
+                    TabSnapshot {
+                        tab_id: 1,
+                        title: None,
+                        pane_tree: PaneNode::VSplit {
+                            children: first_children,
+                        },
+                        active_pane_id: Some(0),
+                    },
+                    TabSnapshot {
+                        tab_id: 2,
+                        title: None,
+                        pane_tree: leaf(MAX_TOPOLOGY_PANES),
+                        active_pane_id: Some(
+                            u64::try_from(MAX_TOPOLOGY_PANES)
+                                .expect("test pane id fits u64"),
+                        ),
+                    },
+                ],
+                active_tab_index: Some(0),
+            }],
+        };
+
+        assert!(matches!(
+            snapshot.validate_resource_limits(),
+            Err(TopologySnapshotError::ResourceLimit {
+                resource: "panes",
+                count,
+                limit: MAX_TOPOLOGY_PANES,
+            }) if count == MAX_TOPOLOGY_PANES + 1
+        ));
+    }
+
+    #[test]
+    fn programmatic_topology_rejects_total_nodes_above_cap() {
+        let children = (0..MAX_SPLIT_FANOUT)
+            .map(|_| {
+                (
+                    1.0,
+                    PaneNode::HSplit {
+                        children: vec![(1.0, PaneNode::VSplit { children: Vec::new() })],
+                    },
+                )
+            })
+            .collect();
+        let snapshot = TopologySnapshot {
+            schema_version: TOPOLOGY_SCHEMA_VERSION,
+            captured_at: 1_000,
+            workspace_id: None,
+            windows: vec![WindowSnapshot {
+                window_id: 1,
+                title: None,
+                position: None,
+                size: None,
+                tabs: vec![TabSnapshot {
+                    tab_id: 1,
+                    title: None,
+                    pane_tree: PaneNode::VSplit { children },
+                    active_pane_id: None,
+                }],
+                active_tab_index: None,
+            }],
+        };
+
+        assert!(matches!(
+            snapshot.validate_resource_limits(),
+            Err(TopologySnapshotError::ResourceLimit {
+                resource: "nodes",
+                count,
+                limit: MAX_TOPOLOGY_NODES,
+            }) if count == MAX_TOPOLOGY_NODES + 1
+        ));
+    }
+
+    #[test]
     fn from_json_round_trips_typical_capture() {
         // Pin that the new return type doesn't break ordinary capture →
         // serialize → deserialize on a small realistic topology.
@@ -3405,6 +3881,36 @@ mod tests {
         let json = snapshot.to_json().expect("serialize");
         let restored = TopologySnapshot::from_json(&json).expect("deserialize");
         assert_eq!(restored, snapshot);
+    }
+
+    #[test]
+    fn persistence_semantics_reject_duplicate_pane_ids() {
+        let panes = vec![
+            make_pane(7, 1, 1, 24, 80, None, None, true),
+            make_pane(7, 1, 1, 24, 80, None, None, false),
+        ];
+        let (snapshot, _) = TopologySnapshot::from_panes(&panes, 1_000);
+        assert!(matches!(
+            snapshot.validate_persistence_semantics(),
+            Err(TopologySnapshotError::InvalidStructure {
+                reason: "duplicate pane id",
+            })
+        ));
+    }
+
+    #[test]
+    fn persistence_semantics_reject_multiple_active_pane_markers() {
+        let panes = vec![
+            make_pane(7, 1, 1, 24, 80, None, None, true),
+            make_pane(8, 1, 1, 24, 80, None, None, true),
+        ];
+        let (snapshot, _) = TopologySnapshot::from_panes(&panes, 1_000);
+        assert!(matches!(
+            snapshot.validate_persistence_semantics(),
+            Err(TopologySnapshotError::InvalidStructure {
+                reason: "tab contains multiple active pane markers",
+            })
+        ));
     }
 
     #[test]
@@ -3432,7 +3938,9 @@ mod tests {
             TopologySnapshot::from_json(&json).expect_err("ft-nrqf7: extreme depth must reject");
         match err {
             TopologySnapshotError::TooDeep { .. } | TopologySnapshotError::Json(_) => {}
-            other @ TopologySnapshotError::TooLarge { .. } => {
+            other @ (TopologySnapshotError::TooLarge { .. }
+            | TopologySnapshotError::ResourceLimit { .. }
+            | TopologySnapshotError::InvalidStructure { .. }) => {
                 panic!("ft-nrqf7: expected TooDeep or Json, got {other:?}")
             }
         }

@@ -28,7 +28,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 // =============================================================================
 // br-ft-wd0fc: wezterm Mutex poison-recovery observability counter
@@ -722,11 +722,13 @@ pub struct PaneInfo {
     #[serde(default)]
     pub cursor_visibility: Option<CursorVisibility>,
 
-    // --- Viewport state ---
-    /// Left column of viewport (for scrollback)
+    // --- Layout coordinates ---
+    /// Pane's left-column layout coordinate in the tab when supplied by the
+    /// direct mux protocol. Legacy CLI sources may omit or reinterpret it.
     #[serde(default)]
     pub left_col: Option<u32>,
-    /// Top row of viewport (for scrollback)
+    /// Pane's top-row layout coordinate in the tab when supplied by the direct
+    /// mux protocol. Legacy CLI sources may omit or reinterpret it.
     #[serde(default)]
     pub top_row: Option<i64>,
 
@@ -996,16 +998,6 @@ const DEFAULT_TIMEOUT_SECS: u64 = crate::tuning_config::WeztermTuning::DEFAULT_T
 const DEFAULT_RETRY_ATTEMPTS: u32 = 3;
 const DEFAULT_RETRY_DELAY_MS: u64 = crate::tuning_config::WeztermTuning::DEFAULT_RETRY_DELAY_MS;
 
-/// Time-window for the CLI `list_panes` cache.
-///
-/// When `list_panes()` is served via the CLI subprocess path, the result is
-/// cached for this duration.  Multiple callers (discovery, snapshot engine,
-/// watchdog) that fire within the same window will receive a clone of the
-/// cached result instead of spawning another `wezterm cli list --format json`
-/// subprocess.  500 ms is safe because pane topology rarely changes faster
-/// than once per second.
-const LIST_PANES_CLI_CACHE_MS: u64 = 500;
-
 /// Upper bound on the byte size of a parsed-JSON *metadata* command's stdout
 /// (e.g. `wezterm cli list --format json`).
 ///
@@ -1131,34 +1123,6 @@ fn inject_no_auto_start<'a>(args: &'a [&'a str], enabled: bool) -> Vec<&'a str> 
 /// - `NotRunning`: wezterm process not running
 /// - `PaneNotFound`: specified pane ID doesn't exist
 /// - `Timeout`: command took too long
-struct ListPanesCliCache {
-    epoch: Arc<()>,
-    next_request_ordinal: u64,
-    published_request_ordinal: Option<u64>,
-    entry: Option<(Instant, Vec<PaneInfo>)>,
-}
-
-impl Default for ListPanesCliCache {
-    fn default() -> Self {
-        Self {
-            epoch: Arc::new(()),
-            next_request_ordinal: 0,
-            published_request_ordinal: None,
-            entry: None,
-        }
-    }
-}
-
-struct ListPanesCacheToken {
-    epoch: Arc<()>,
-    request_ordinal: u64,
-}
-
-enum ListPanesCacheProbe {
-    Hit(Vec<PaneInfo>),
-    Miss(ListPanesCacheToken),
-}
-
 #[derive(Clone)]
 pub struct WeztermClient {
     /// Optional socket path override (WEZTERM_UNIX_SOCKET)
@@ -1192,28 +1156,6 @@ pub struct WeztermClient {
     /// failure hermetic.
     #[cfg(all(feature = "vendored", unix))]
     mux_pool: Option<Arc<crate::vendored::MuxPool>>,
-    /// Time-windowed cache for CLI `list_panes` results.
-    ///
-    /// Multiple concurrent callers (discovery, snapshot engine, watchdog) hit
-    /// `list_panes()` independently.  In CLI-only mode each call spawns a
-    /// `wezterm cli list --format json` subprocess. This cache reuses completed
-    /// results within a [`LIST_PANES_CLI_CACHE_MS`] window. It is a completed-
-    /// result cache, not an in-flight single-flight coordinator: simultaneous
-    /// misses may each run a subprocess.
-    list_panes_cache: Arc<Mutex<ListPanesCliCache>>,
-}
-
-/// Pre/post epoch fence around mux mutations that change pane-list
-/// topology or selection metadata. Dropping the future also drops this guard,
-/// so cancellation cannot leave an in-flight list result cacheable.
-struct ListPanesMutationFence<'a> {
-    client: &'a WeztermClient,
-}
-
-impl Drop for ListPanesMutationFence<'_> {
-    fn drop(&mut self) {
-        self.client.invalidate_list_panes_cache();
-    }
 }
 
 impl Default for WeztermClient {
@@ -1245,7 +1187,6 @@ impl WeztermClient {
             ),
             #[cfg(all(feature = "vendored", unix))]
             mux_pool: None,
-            list_panes_cache: Arc::new(Mutex::new(ListPanesCliCache::default())),
         }
     }
 
@@ -1274,7 +1215,6 @@ impl WeztermClient {
             ),
             #[cfg(all(feature = "vendored", unix))]
             mux_pool: None,
-            list_panes_cache: Arc::new(Mutex::new(ListPanesCliCache::default())),
         }
     }
 
@@ -1431,73 +1371,6 @@ impl WeztermClient {
         guard.status()
     }
 
-    fn probe_list_panes_cache(&self) -> ListPanesCacheProbe {
-        let mut cache = self
-            .list_panes_cache
-            .lock()
-            .unwrap_or_else(record_poison_and_recover);
-        if let Some((timestamp, panes)) = &cache.entry
-            && timestamp.elapsed() < Duration::from_millis(LIST_PANES_CLI_CACHE_MS)
-        {
-            return ListPanesCacheProbe::Hit(panes.clone());
-        }
-
-        // Rotate the opaque epoch before the per-epoch request ordinal could
-        // wrap. This rejects every older in-flight publisher without relying
-        // on an integer generation that can saturate or exhibit ABA equality.
-        if cache.next_request_ordinal == u64::MAX {
-            cache.epoch = Arc::new(());
-            cache.next_request_ordinal = 0;
-            cache.published_request_ordinal = None;
-            cache.entry = None;
-        }
-        let token = ListPanesCacheToken {
-            epoch: Arc::clone(&cache.epoch),
-            request_ordinal: cache.next_request_ordinal,
-        };
-        cache.next_request_ordinal += 1;
-        ListPanesCacheProbe::Miss(token)
-    }
-
-    /// Publish a CLI list result only if no topology mutation invalidated its
-    /// epoch while the subprocess was in flight and no newer request in the
-    /// same epoch has already published.
-    fn publish_list_panes_cache(&self, token: ListPanesCacheToken, panes: Vec<PaneInfo>) -> bool {
-        let mut cache = self
-            .list_panes_cache
-            .lock()
-            .unwrap_or_else(record_poison_and_recover);
-        if !Arc::ptr_eq(&cache.epoch, &token.epoch)
-            || cache
-                .published_request_ordinal
-                .is_some_and(|published| published > token.request_ordinal)
-        {
-            return false;
-        }
-        cache.published_request_ordinal = Some(token.request_ordinal);
-        cache.entry = Some((Instant::now(), panes));
-        true
-    }
-
-    /// Drop cached mux metadata before a topology/selection mutation. The
-    /// opaque epoch prevents an older in-flight CLI list from repopulating the
-    /// cache after this invalidation.
-    fn invalidate_list_panes_cache(&self) {
-        let mut cache = self
-            .list_panes_cache
-            .lock()
-            .unwrap_or_else(record_poison_and_recover);
-        cache.epoch = Arc::new(());
-        cache.next_request_ordinal = 0;
-        cache.published_request_ordinal = None;
-        cache.entry = None;
-    }
-
-    fn begin_list_panes_mutation_fence(&self) -> ListPanesMutationFence<'_> {
-        self.invalidate_list_panes_cache();
-        ListPanesMutationFence { client: self }
-    }
-
     /// List all panes across all windows and tabs
     ///
     /// Returns a vector of `PaneInfo` structs with full metadata about each pane.
@@ -1515,9 +1388,12 @@ impl WeztermClient {
     /// Same semantics as [`list_panes`](Self::list_panes) with the
     /// mux-pool call rebound via `MuxPool::list_panes_with_cx(cx)`
     /// (already Cx-first from prior ticks). Eligible transport failures retain
-    /// the CLI fallback and time-windowed cache — the cache is a std Mutex
-    /// (sync, no Cx needed), while `run_cli_with_retry_with_cx` keeps subprocess
-    /// attempts and retry sleeps on this same caller context.
+    /// CLI fallback, while `run_cli_with_retry_with_cx` keeps subprocess
+    /// attempts and retry sleeps on this same caller context. Full `PaneInfo`
+    /// contains volatile focus, cursor, cwd, title, viewport, and zoom state,
+    /// so completed results are deliberately not retained behind a TTL. A
+    /// future coalescing path must share one authoritative in-flight revision,
+    /// not reuse temporally stale metadata.
     ///
     /// Most callers (snapshot engine, watchdog, native-events,
     /// discovery loop) go through the mux-pool fast path, so the
@@ -1541,7 +1417,7 @@ impl WeztermClient {
                             return Err(Self::mux_cancelled_error("list_panes_with_cx", e));
                         }
                         tracing::debug!(
-                            error = %e,
+                            failure_class = Self::mux_error_public_code(&e),
                             "mux pool list_panes_with_cx failed, falling back to CLI"
                         );
                     }
@@ -1549,29 +1425,11 @@ impl WeztermClient {
             }
         }
 
-        // CLI path: check the time-windowed cache before spawning a subprocess.
-        // Multiple callers (discovery, snapshot engine, watchdog) independently
-        // call list_panes() and each would spawn a separate `wezterm cli list`
-        // process. The epoch fence prevents an in-flight pre-mutation
-        // response from repopulating the cache after topology changes.
-        let cache_token = match self.probe_list_panes_cache() {
-            ListPanesCacheProbe::Hit(panes) => {
-                tracing::trace!("list_panes: returning cached CLI result");
-                return Ok(panes);
-            }
-            ListPanesCacheProbe::Miss(token) => token,
-        };
-
         let output = self
             .run_cli_with_retry_with_cx(cx, &["cli", "list", "--format", "json"])
             .await?;
         Self::guard_metadata_output_size("cli list", &output)?;
-        let panes: Vec<PaneInfo> =
-            serde_json::from_str(&output).map_err(|e| WeztermError::ParseError(e.to_string()))?;
-
-        self.publish_list_panes_cache(cache_token, panes.clone());
-
-        Ok(panes)
+        serde_json::from_str(&output).map_err(|e| WeztermError::ParseError(e.to_string()).into())
     }
 
     /// Cx-first `list_panes` fallback stub for configurations that do
@@ -1580,24 +1438,11 @@ impl WeztermClient {
     /// identically.
     #[cfg(not(all(feature = "vendored", unix)))]
     pub async fn list_panes_with_cx(&self, cx: &crate::cx::Cx) -> Result<Vec<PaneInfo>> {
-        let cache_token = match self.probe_list_panes_cache() {
-            ListPanesCacheProbe::Hit(panes) => {
-                tracing::trace!("list_panes: returning cached CLI result");
-                return Ok(panes);
-            }
-            ListPanesCacheProbe::Miss(token) => token,
-        };
-
         let output = self
             .run_cli_with_retry_with_cx(cx, &["cli", "list", "--format", "json"])
             .await?;
         Self::guard_metadata_output_size("cli list", &output)?;
-        let panes: Vec<PaneInfo> =
-            serde_json::from_str(&output).map_err(|e| WeztermError::ParseError(e.to_string()))?;
-
-        self.publish_list_panes_cache(cache_token, panes.clone());
-
-        Ok(panes)
+        serde_json::from_str(&output).map_err(|e| WeztermError::ParseError(e.to_string()).into())
     }
 
     /// Get a specific pane by ID
@@ -1671,7 +1516,7 @@ impl WeztermClient {
                                 return Err(Self::mux_cancelled_error("get_text_with_cx", e));
                             }
                             tracing::debug!(
-                                error = %e,
+                                failure_class = Self::mux_error_public_code(&e),
                                 "mux pool get_text_with_cx: render_changes failed; falling back to CLI"
                             );
                             break 'mux_text;
@@ -1747,7 +1592,7 @@ impl WeztermClient {
                                     return Err(Self::mux_cancelled_error("get_text_with_cx", e));
                                 }
                                 tracing::debug!(
-                                    error = %e,
+                                    failure_class = Self::mux_error_public_code(&e),
                                     "mux pool get_text_with_cx: get_lines failed; falling back to CLI"
                                 );
                                 break 'mux_text;
@@ -1842,7 +1687,7 @@ impl WeztermClient {
                         return Err(Self::mux_cancelled_error("get_semantic_zones_with_cx", err));
                     }
                     tracing::debug!(
-                        error = %err,
+                        failure_class = Self::mux_error_public_code(&err),
                         "mux pool get_semantic_zones_with_cx failed; no CLI fallback can expose SemanticZone data"
                     );
                 }
@@ -1919,10 +1764,9 @@ impl WeztermClient {
                                 err,
                             ));
                         }
-                        return Err(WeztermError::CommandFailed(format!(
-                            "failed to read tiered scrollback status for pane {pane_id}: {err}"
-                        ))
-                        .into());
+                        return Err(Self::mux_tiered_scrollback_unavailable_error(
+                            pane_id, &err,
+                        ));
                     }
                 }
             }
@@ -2148,7 +1992,6 @@ impl WeztermClient {
         domain_name: Option<&str>,
         target: SpawnTarget,
     ) -> Result<u64> {
-        let _list_panes_cache_fence = self.begin_list_panes_mutation_fence();
         #[cfg(all(feature = "vendored", unix))]
         if let Some(ref pool) = self.mux_pool {
             // Finish all fallible local request construction before allowing
@@ -2167,7 +2010,7 @@ impl WeztermClient {
                             return Err(Self::mux_cancelled_error("spawn_targeted_with_cx", e));
                         }
                         tracing::debug!(
-                            error = %e,
+                            failure_class = Self::mux_error_public_code(&e),
                             "mux pool spawn_targeted_with_cx failed, falling back to CLI"
                         );
                     }
@@ -2244,7 +2087,6 @@ impl WeztermClient {
         frankenterm_core_replay_types::simulation_guard::SimulationGuard::assert_not_simulating(
             "wezterm::WeztermClient::split_pane_with_cx",
         );
-        let _list_panes_cache_fence = self.begin_list_panes_mutation_fence();
         #[cfg(all(feature = "vendored", unix))]
         if let Some(ref pool) = self.mux_pool {
             // As with spawn, local protocol conversion must settle before the
@@ -2262,7 +2104,7 @@ impl WeztermClient {
                             return Err(Self::mux_cancelled_error("split_pane_with_cx", e));
                         }
                         tracing::debug!(
-                            error = %e,
+                            failure_class = Self::mux_error_public_code(&e),
                             "mux pool split_pane_with_cx failed, falling back to CLI"
                         );
                     }
@@ -2319,7 +2161,6 @@ impl WeztermClient {
         frankenterm_core_replay_types::simulation_guard::SimulationGuard::assert_not_simulating(
             "wezterm::WeztermClient::activate_pane_with_cx",
         );
-        let _list_panes_cache_fence = self.begin_list_panes_mutation_fence();
         let pane_id_str = pane_id.to_string();
         let args = ["cli", "activate-pane", "--pane-id", &pane_id_str];
         self.run_cli_mutation_with_pane_check_with_cx(cx, &args, pane_id, "activate_pane")
@@ -2382,7 +2223,6 @@ impl WeztermClient {
         frankenterm_core_replay_types::simulation_guard::SimulationGuard::assert_not_simulating(
             "wezterm::WeztermClient::kill_pane_with_cx",
         );
-        let _list_panes_cache_fence = self.begin_list_panes_mutation_fence();
         let pane_id_str = pane_id.to_string();
         let args = ["cli", "kill-pane", "--pane-id", &pane_id_str];
         self.run_cli_mutation_with_pane_check_with_cx(cx, &args, pane_id, "kill_pane")
@@ -2411,7 +2251,6 @@ impl WeztermClient {
         pane_id: u64,
         zoom: bool,
     ) -> Result<()> {
-        let _list_panes_cache_fence = self.begin_list_panes_mutation_fence();
         let pane_id_str = pane_id.to_string();
         let mut args = vec!["cli", "zoom-pane", "--pane-id", &pane_id_str];
         if !zoom {
@@ -2477,7 +2316,7 @@ impl WeztermClient {
                             return Err(Self::mux_cancelled_error("send_text_with_cx", e));
                         }
                         tracing::debug!(
-                            error = %e,
+                            failure_class = Self::mux_error_public_code(&e),
                             "mux pool send_with_cx failed, falling back to CLI"
                         );
                     }
@@ -3067,6 +2906,35 @@ impl WeztermClient {
         }
     }
 
+    #[cfg(all(feature = "vendored", unix))]
+    fn mux_error_public_code(err: &crate::vendored::MuxPoolError) -> &'static str {
+        match err {
+            crate::vendored::MuxPoolError::Pool(_) => "mux_pool_failure",
+            crate::vendored::MuxPoolError::IndeterminateMutation(_) => {
+                "mux_indeterminate_mutation"
+            }
+            crate::vendored::MuxPoolError::Mux(
+                crate::vendored::DirectMuxError::RemoteError(_),
+            ) => "mux_authoritative_rejection",
+            crate::vendored::MuxPoolError::Mux(
+                crate::vendored::DirectMuxError::AlignedUnexpectedResponse { .. },
+            ) => "mux_authoritative_response_mismatch",
+            crate::vendored::MuxPoolError::Mux(_) => "mux_transport_or_protocol_failure",
+        }
+    }
+
+    #[cfg(all(feature = "vendored", unix))]
+    fn mux_tiered_scrollback_unavailable_error(
+        pane_id: u64,
+        err: &crate::vendored::MuxPoolError,
+    ) -> crate::Error {
+        WeztermError::CommandFailed(format!(
+            "failed to read tiered scrollback status for pane {pane_id}: {}",
+            Self::mux_error_public_code(err)
+        ))
+        .into()
+    }
+
     #[cfg(all(test, feature = "vendored", unix))]
     fn mux_error_is_circuit_breaker_trigger(err: &crate::vendored::MuxPoolError) -> bool {
         matches!(
@@ -3159,7 +3027,8 @@ impl WeztermClient {
                 ))
             }
             _ => WeztermError::CommandFailed(format!(
-                "wezterm mux {op} failed without CLI fallback: {err}"
+                "wezterm mux {op} failed without CLI fallback: {}",
+                Self::mux_error_public_code(&err)
             ))
             .into(),
         }
@@ -4925,125 +4794,6 @@ mod tests {
                 mux::tab::SplitSize::Percent(50)
             );
         }
-    }
-
-    fn cache_test_pane(pane_id: u64) -> PaneInfo {
-        serde_json::from_value(serde_json::json!({
-            "pane_id": pane_id,
-            "tab_id": pane_id,
-            "window_id": pane_id,
-        }))
-        .expect("minimal pane metadata")
-    }
-
-    #[test]
-    fn list_panes_cache_invalidation_rejects_stale_in_flight_publish() {
-        let client = WeztermClient::new();
-        let token = match client.probe_list_panes_cache() {
-            ListPanesCacheProbe::Miss(token) => token,
-            ListPanesCacheProbe::Hit(_) => panic!("new client cache must be empty"),
-        };
-
-        client.invalidate_list_panes_cache();
-        assert!(
-            !client.publish_list_panes_cache(token, vec![cache_test_pane(1)]),
-            "a pre-mutation list result must not repopulate the cache"
-        );
-        assert!(matches!(
-            client.probe_list_panes_cache(),
-            ListPanesCacheProbe::Miss(_)
-        ));
-    }
-
-    #[test]
-    fn list_panes_cache_request_ordinal_rollover_rotates_epoch() {
-        let client = WeztermClient::new();
-        let old_token = match client.probe_list_panes_cache() {
-            ListPanesCacheProbe::Miss(token) => token,
-            ListPanesCacheProbe::Hit(_) => panic!("new client cache must be empty"),
-        };
-        {
-            let mut cache = client
-                .list_panes_cache
-                .lock()
-                .unwrap_or_else(record_poison_and_recover);
-            cache.next_request_ordinal = u64::MAX;
-        }
-
-        let new_token = match client.probe_list_panes_cache() {
-            ListPanesCacheProbe::Miss(token) => token,
-            ListPanesCacheProbe::Hit(_) => panic!("rollover probe must miss"),
-        };
-        assert_eq!(new_token.request_ordinal, 0);
-        assert!(!Arc::ptr_eq(&old_token.epoch, &new_token.epoch));
-        assert!(
-            !client.publish_list_panes_cache(old_token, vec![cache_test_pane(1)]),
-            "the pre-rollover epoch must remain stale"
-        );
-        assert!(client.publish_list_panes_cache(new_token, vec![cache_test_pane(2)]));
-    }
-
-    #[test]
-    fn list_panes_cache_rejects_older_same_epoch_publish_after_newer_result() {
-        let client = WeztermClient::new();
-        let older = match client.probe_list_panes_cache() {
-            ListPanesCacheProbe::Miss(token) => token,
-            ListPanesCacheProbe::Hit(_) => panic!("new client cache must be empty"),
-        };
-        let newer = match client.probe_list_panes_cache() {
-            ListPanesCacheProbe::Miss(token) => token,
-            ListPanesCacheProbe::Hit(_) => panic!("concurrent miss must not be a hit"),
-        };
-
-        assert!(client.publish_list_panes_cache(newer, vec![cache_test_pane(2)]));
-        assert!(
-            !client.publish_list_panes_cache(older, vec![cache_test_pane(1)]),
-            "an older response must not overwrite a newer published snapshot"
-        );
-        match client.probe_list_panes_cache() {
-            ListPanesCacheProbe::Hit(panes) => assert_eq!(panes[0].pane_id, 2),
-            ListPanesCacheProbe::Miss(_) => panic!("newer result must remain cached"),
-        }
-    }
-
-    #[test]
-    fn list_panes_mutation_fence_clears_before_and_after_mutation() {
-        let client = WeztermClient::new();
-        let initial_token = match client.probe_list_panes_cache() {
-            ListPanesCacheProbe::Miss(token) => token,
-            ListPanesCacheProbe::Hit(_) => panic!("new client cache must be empty"),
-        };
-        assert!(client.publish_list_panes_cache(initial_token, vec![cache_test_pane(1)]));
-
-        let during_token = {
-            let _fence = client.begin_list_panes_mutation_fence();
-            match client.probe_list_panes_cache() {
-                ListPanesCacheProbe::Miss(token) => token,
-                ListPanesCacheProbe::Hit(_) => panic!("pre-mutation fence must clear cache"),
-            }
-        };
-
-        assert!(
-            !client.publish_list_panes_cache(during_token, vec![cache_test_pane(1)]),
-            "a list result observed during mutation must not survive post-mutation fencing"
-        );
-        assert!(matches!(
-            client.probe_list_panes_cache(),
-            ListPanesCacheProbe::Miss(_)
-        ));
-    }
-
-    #[test]
-    fn list_panes_cache_fence_is_shared_across_client_clones() {
-        let client = WeztermClient::new();
-        let clone = client.clone();
-        let token = match client.probe_list_panes_cache() {
-            ListPanesCacheProbe::Miss(token) => token,
-            ListPanesCacheProbe::Hit(_) => panic!("new client cache must be empty"),
-        };
-
-        clone.invalidate_list_panes_cache();
-        assert!(!client.publish_list_panes_cache(token, vec![cache_test_pane(1)]));
     }
 
     fn run_async_test<F>(future: F)
@@ -6996,12 +6746,35 @@ mod tests {
     #[test]
     fn mux_remote_error_maps_to_command_failed() {
         let err = crate::vendored::MuxPoolError::Mux(crate::vendored::DirectMuxError::RemoteError(
-            "invalid spawn domain".to_string(),
+            "credential-bearing-remote-canary".to_string(),
         ));
         let mapped = WeztermClient::mux_cancelled_error("spawn_targeted", err);
+        let crate::Error::Wezterm(WeztermError::CommandFailed(message)) = mapped else {
+            panic!("framed remote rejection must map to a finite command failure");
+        };
+        assert!(message.contains("spawn_targeted"));
+        assert!(message.contains("mux_authoritative_rejection"));
+        assert!(!message.contains("credential-bearing-remote-canary"));
+    }
+
+    #[cfg(all(feature = "vendored", unix))]
+    #[test]
+    fn tiered_scrollback_fallback_error_uses_finite_mux_code() {
+        let err = crate::vendored::MuxPoolError::Mux(crate::vendored::DirectMuxError::Io(
+            std::io::Error::other("credential-bearing-tiered-scrollback-canary"),
+        ));
+        let client = WeztermClient::new();
         assert!(
-            matches!(mapped, crate::Error::Wezterm(WeztermError::CommandFailed(message)) if message.contains("spawn_targeted"))
+            client.mux_error_should_fallback_to_cli_for_client(&err),
+            "the canary must exercise the fallback-eligible transport branch"
         );
+        let mapped = WeztermClient::mux_tiered_scrollback_unavailable_error(7, &err);
+        let crate::Error::Wezterm(WeztermError::CommandFailed(message)) = mapped else {
+            panic!("tiered scrollback fallback must map to a finite command failure");
+        };
+        assert!(message.contains("pane 7"));
+        assert!(message.contains("mux_transport_or_protocol_failure"));
+        assert!(!message.contains("credential-bearing-tiered-scrollback-canary"));
     }
 
     // =====================================================================
@@ -8495,9 +8268,9 @@ pub fn build_unified_client(config: &crate::config::Config) -> UnifiedClient {
                     selection: shard_selection,
                 };
             }
-            Err(err) => {
+            Err(_err) => {
                 tracing::warn!(
-                    error = %err,
+                    failure_class = "invalid_sharding_configuration",
                     "Failed to construct sharded WezTerm client; falling back to single backend"
                 );
             }
@@ -8940,6 +8713,20 @@ fn allocate_mock_id(counter: &AtomicU64, label: &str) -> crate::Result<u64> {
     }
 }
 
+fn activate_mock_pane(
+    panes: &mut std::collections::HashMap<u64, MockPane>,
+    pane_id: u64,
+) -> crate::Result<()> {
+    let tab_id = panes
+        .get(&pane_id)
+        .ok_or(crate::Error::Wezterm(WeztermError::PaneNotFound(pane_id)))?
+        .tab_id;
+    for pane in panes.values_mut().filter(|pane| pane.tab_id == tab_id) {
+        pane.is_active = pane.pane_id == pane_id;
+    }
+    Ok(())
+}
+
 fn mock_lock_error(
     _cx: &crate::cx::Cx,
     operation: &'static str,
@@ -9004,11 +8791,12 @@ impl MockWezterm {
 
     /// Atomically add a validated batch of panes under one write-lock acquire.
     ///
-    /// Duplicate pane IDs, collisions with existing panes, and a combined
-    /// state containing more than one active pane are rejected before any
-    /// mutation. ID allocation counters advance only after every pane has been
-    /// inserted, so cancellation or validation failure leaves the mock
-    /// unchanged.
+    /// Duplicate pane IDs, collisions with existing panes, and more than one
+    /// active pane in the same tab are rejected before any mutation. Each tab
+    /// independently owns one active-pane marker; selected-tab authority is a
+    /// separate mux concern. ID allocation counters advance only after every
+    /// pane has been inserted, so cancellation or validation failure leaves
+    /// the mock unchanged.
     ///
     /// # Errors
     ///
@@ -9023,7 +8811,7 @@ impl MockWezterm {
         mock_checkpoint(cx, "mock add panes")?;
 
         let mut batch_ids = std::collections::HashSet::with_capacity(new_panes.len());
-        let mut batch_active_count = 0usize;
+        let mut batch_active_tabs = std::collections::HashSet::new();
         for pane in &new_panes {
             if !batch_ids.insert(pane.pane_id) {
                 return Err(crate::Error::runtime_backend(
@@ -9031,13 +8819,12 @@ impl MockWezterm {
                     format!("duplicate pane id {} in batch", pane.pane_id),
                 ));
             }
-            batch_active_count += usize::from(pane.is_active);
-        }
-        if batch_active_count > 1 {
-            return Err(crate::Error::runtime_backend(
-                "mock add panes",
-                format!("batch contains {batch_active_count} active panes; maximum is one"),
-            ));
+            if pane.is_active && !batch_active_tabs.insert(pane.tab_id) {
+                return Err(crate::Error::runtime_backend(
+                    "mock add panes",
+                    format!("batch contains multiple active panes in tab {}", pane.tab_id),
+                ));
+            }
         }
 
         let mut panes = self
@@ -9056,14 +8843,18 @@ impl MockWezterm {
                 format!("pane id {} already exists", collision.pane_id),
             ));
         }
-        let existing_active_count = panes.values().filter(|pane| pane.is_active).count();
-        let combined_active_count = existing_active_count.saturating_add(batch_active_count);
-        if combined_active_count > 1 {
+        let existing_active_tabs = panes
+            .values()
+            .filter(|pane| pane.is_active)
+            .map(|pane| pane.tab_id)
+            .collect::<std::collections::HashSet<_>>();
+        if let Some(conflicting_tab_id) = batch_active_tabs
+            .iter()
+            .find(|tab_id| existing_active_tabs.contains(tab_id))
+        {
             return Err(crate::Error::runtime_backend(
                 "mock add panes",
-                format!(
-                    "combined mock state would contain {combined_active_count} active panes; maximum is one"
-                ),
+                format!("combined mock state would contain multiple active panes in tab {conflicting_tab_id}"),
             ));
         }
 
@@ -9435,13 +9226,7 @@ impl WeztermInterface for MockWezterm {
     fn activate_pane(&self, pane_id: u64) -> WeztermFuture<'_, ()> {
         Box::pin(async move {
             let mut panes = self.panes.write().await;
-            if !panes.contains_key(&pane_id) {
-                return Err(crate::Error::Wezterm(WeztermError::PaneNotFound(pane_id)));
-            }
-            for pane in panes.values_mut() {
-                pane.is_active = pane.pane_id == pane_id;
-            }
-            Ok(())
+            activate_mock_pane(&mut panes, pane_id)
         })
     }
 
@@ -9743,13 +9528,7 @@ impl WeztermInterface for MockWezterm {
                 .await
                 .map_err(|error| mock_lock_error(cx, "mock activate pane", error))?;
             mock_checkpoint(cx, "mock activate pane")?;
-            if !panes.contains_key(&pane_id) {
-                return Err(crate::Error::Wezterm(WeztermError::PaneNotFound(pane_id)));
-            }
-            for pane in panes.values_mut() {
-                pane.is_active = pane.pane_id == pane_id;
-            }
-            Ok(())
+            activate_mock_pane(&mut panes, pane_id)
         })
     }
 
@@ -10016,9 +9795,55 @@ mod mock_tests {
                 .await
                 .expect_err("multiple active panes must reject the whole batch");
 
-            assert!(error.to_string().contains("2 active panes"));
+            assert!(error
+                .to_string()
+                .contains("multiple active panes in tab 0"));
             assert_eq!(mock.pane_count().await, 0);
             assert_eq!(mock.next_pane_id.load(Ordering::SeqCst), 0);
+        });
+    }
+
+    #[test]
+    fn mock_active_pane_authority_is_independent_per_tab() {
+        run_async_test(async {
+            let mock = MockWezterm::new();
+            let pane = |pane_id, tab_id, is_active| MockPane {
+                pane_id,
+                window_id: 0,
+                tab_id,
+                title: format!("pane-{pane_id}"),
+                domain: "local".to_string(),
+                cwd: "/tmp".to_string(),
+                is_active,
+                is_zoomed: false,
+                cols: 80,
+                rows: 24,
+                content: String::new(),
+            };
+            let cx = crate::cx::for_request();
+            mock.add_panes_with_cx(
+                &cx,
+                vec![
+                    pane(1, 10, true),
+                    pane(2, 10, false),
+                    pane(3, 20, true),
+                    pane(4, 20, false),
+                ],
+            )
+            .await
+            .expect("one active pane per tab is valid");
+
+            WeztermInterface::activate_pane(&mock, 2)
+                .await
+                .expect("activate pane in first tab");
+
+            assert!(!mock.pane_state(1).await.unwrap().is_active);
+            assert!(mock.pane_state(2).await.unwrap().is_active);
+            assert!(
+                mock.pane_state(3).await.unwrap().is_active,
+                "activating another tab must not clear this tab's active pane"
+            );
+            assert!(!mock.pane_state(4).await.unwrap().is_active);
         });
     }
 
