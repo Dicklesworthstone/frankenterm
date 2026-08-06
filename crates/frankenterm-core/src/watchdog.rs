@@ -431,8 +431,17 @@ impl WatchdogHandle {
     /// cancelled. Callers must await this method; `Drop` can request abort but
     /// cannot synchronously prove acknowledgement from inside an executor.
     pub async fn join_with_cx(
+        self,
+        cx: &crate::cx::Cx,
+    ) -> Result<(), WatchdogJoinError> {
+        self.join_with_cx_with_grace_timeout(cx, WATCHDOG_JOIN_SETTLEMENT_TIMEOUT)
+            .await
+    }
+
+    async fn join_with_cx_with_grace_timeout(
         mut self,
         cx: &crate::cx::Cx,
+        grace_timeout: Duration,
     ) -> Result<(), WatchdogJoinError> {
         self.signal_shutdown();
 
@@ -445,7 +454,7 @@ impl WatchdogHandle {
         let mut terminal_failure = None;
         let _graceful_result = crate::runtime_async::timeout_with_cx(
             graceful_cx,
-            WATCHDOG_JOIN_SETTLEMENT_TIMEOUT,
+            grace_timeout,
             self.drain_tasks_with_cx(graceful_cx, &mut terminal_failure),
         )
         .await;
@@ -1699,6 +1708,37 @@ mod tests {
             assert!(
                 elapsed < Duration::from_millis(500),
                 "join_with_cx on cancelled cx should settle quickly, took {elapsed:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn watchdog_grace_envelope_leaves_room_for_nested_cleanup() {
+        assert_eq!(
+            WATCHDOG_JOIN_SETTLEMENT_TIMEOUT,
+            Duration::from_secs(2),
+            "top-level graceful settlement must outlive the one-second nested child drains",
+        );
+    }
+
+    #[test]
+    fn watchdog_grace_timeout_falls_back_to_bounded_abort_settlement() {
+        run_async_test(async {
+            let shutdown = Arc::new(AtomicBool::new(false));
+            let task = crate::runtime_async::task::spawn(std::future::pending::<()>());
+            let handle = WatchdogHandle::adopt_shutdown_task(task, Arc::clone(&shutdown));
+            let cx = crate::cx::for_testing();
+            let started = std::time::Instant::now();
+
+            handle
+                .join_with_cx_with_grace_timeout(&cx, Duration::from_millis(5))
+                .await
+                .expect("a task that ignores cooperative shutdown must settle after fallback abort");
+
+            assert!(shutdown.load(Ordering::SeqCst));
+            assert!(
+                started.elapsed() < Duration::from_millis(500),
+                "test-sized graceful timeout must transition promptly to abort settlement"
             );
         });
     }
